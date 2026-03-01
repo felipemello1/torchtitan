@@ -14,6 +14,10 @@ PR1 — System metrics (phase timing, step context):
 PR2 — Tensor experiment metrics (compile-safe):
     record_tensor_metric, InvocationContext, replicate_to_host,
     MeanTMetric, SumTMetric, MaxTMetric, MinTMetric, DerivedTMetric
+
+PR3 — Logging boundary + backends:
+    EveryNSteps, CompositeSummaryWriter, TensorBoardSummaryWriter,
+    WandbSummaryWriter, LoggingSummaryWriter, InMemorySummaryWriter
 """
 
 from torchtitan.observability.invocation_context import (
@@ -32,6 +36,15 @@ from torchtitan.observability.structured_logging import (
     set_step,
 )
 
+from torchtitan.observability.backends import (
+    CompositeSummaryWriter,
+    InMemorySummaryWriter,
+    LoggingSummaryWriter,
+    SummaryWriter,
+    TensorBoardSummaryWriter,
+    WandbSummaryWriter,
+)
+from torchtitan.observability.logging_boundary import EveryNSteps
 from torchtitan.observability.tensor_metrics import (
     DerivedTMetric,
     MaxTMetric,
@@ -63,4 +76,12 @@ __all__ = [
     "MaxTMetric",
     "MinTMetric",
     "DerivedTMetric",
+    # PR3
+    "EveryNSteps",
+    "SummaryWriter",
+    "CompositeSummaryWriter",
+    "TensorBoardSummaryWriter",
+    "WandbSummaryWriter",
+    "LoggingSummaryWriter",
+    "InMemorySummaryWriter",
 ]

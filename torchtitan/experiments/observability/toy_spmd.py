@@ -17,6 +17,7 @@ Run:
     torchrun --nproc_per_node=4 torchtitan/experiments/observability/toy_spmd.py
 """
 
+from dataclasses import dataclass
 import json
 import os
 import shutil
@@ -47,6 +48,11 @@ from torchtitan.observability import (
 from torchtitan.observability import (
     child_context, InvocationContext, MaxTMetric, MeanTMetric,
     record_tensor_metric, replicate_to_host,
+)
+
+# PR3: Logging boundary + backends
+from torchtitan.observability import (
+    CompositeSummaryWriter, EveryNSteps,
 )
 
 # ---- Config ----
@@ -105,11 +111,21 @@ class TinyModel(nn.Module):
         return self.output(h)
 
 
+@dataclass
+class LoggingConfig:
+    log_freq: int = 5
+    enable_tensorboard: bool = False
+    tb_log_dir: str = "tb"
+    enable_wandb: bool = False
+    enable_console: bool = True
+
+
 # ---- Trainer (mirrors TorchTitan Trainer pattern) ----
 class ToyTrainer:
     """Minimal trainer with TP + compile + FSDP, matching TorchTitan's structure."""
 
-    def __init__(self, device, dp_mesh, tp_mesh, output_dir):
+    def __init__(self, device, dp_mesh, tp_mesh, output_dir,
+                 logging_cfg: LoggingConfig = LoggingConfig()):
         self.device = device
         self.rank = dist.get_rank()
         self.output_dir = output_dir
@@ -120,6 +136,7 @@ class ToyTrainer:
         self.model = model
         self.optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
         init_observability(source="trainer", output_dir=output_dir, rank=self.rank)
+        self._setup_logging(logging_cfg)
 
     @staticmethod
     def _replicate_params(module: nn.Module, tp_mesh) -> None:
@@ -160,8 +177,26 @@ class ToyTrainer:
         fully_shard([model.norm, model.output], mesh=dp_mesh)
         fully_shard(model, mesh=dp_mesh)
 
+    def _setup_logging(self, cfg: LoggingConfig):
+        """Configure logging schedule and optional writer based on LoggingConfig.
+
+        The log_schedule always exists — it gates replicate_to_host.
+        Writer and aggregator are only created if there are backends.
+        """
+        self.log_schedule = EveryNSteps(every_n=cfg.log_freq, additional_steps={1})
+        writers = {}
+        if cfg.enable_console:
+            from torchtitan.observability import LoggingSummaryWriter
+            writers["console"] = LoggingSummaryWriter()
+        # Add more backends here (tensorboard, wandb) as needed
+        if writers:
+            self.writer = CompositeSummaryWriter(writers=writers)
+            self.writer.open()
+        else:
+            self.writer = None
+
     def train_step(self, tokens, labels, step):
-        """One training step. Returns (loss, grad_norm, dt_ms)."""
+        """One training step. Returns (loss, grad_norm, dt_ms, ctx)."""
         t0 = time.perf_counter()
         set_step(step)
         clear_step_tags()
@@ -181,6 +216,15 @@ class ToyTrainer:
                 w1 = list(self.model.layers.values())[0].w1.weight
                 record_tensor_metric("w1_norm", MeanTMetric(mean=w1.float().norm(), weight=torch.tensor(1.0, device=self.device)))
         dt_ms = (time.perf_counter() - t0) * 1000
+        if self.log_schedule(step):
+            scalars = replicate_to_host(ctx.summaries())
+            add_step_tag("logging")
+            record_event({"train.loss": loss.item(), "train.grad_norm": grad_norm.item()})
+            if self.writer and self.rank == 0:
+                self.writer(step=step, values=scalars)
+            if self.rank == 0:
+                with open(os.path.join(self.output_dir, f"scalars_step_{step}.json"), "w") as f:
+                    json.dump(scalars, f)
         return loss, grad_norm, dt_ms, ctx
 
     def train(self, tokens, labels, num_steps):
@@ -192,13 +236,6 @@ class ToyTrainer:
         for step in range(1, num_steps + 1):
             loss, grad_norm, dt_ms, ctx = self.train_step(tokens, labels, step)
             losses.append(loss.item())
-            if step % 5 == 0 or step == 1:
-                add_step_tag("logging")
-                record_event({"train.loss": loss.item(), "train.grad_norm": grad_norm.item()})
-                scalars = replicate_to_host(ctx.summaries())
-                if self.rank == 0:
-                    with open(os.path.join(self.output_dir, f"scalars_step_{step}.json"), "w") as f:
-                        json.dump(scalars, f)
             if self.rank == 0:
                 print(f"{step:>4}  {loss.item():>10.4f}  {grad_norm.item():>10.4f}  {dt_ms:>10.1f}")
         if self.rank == 0:
@@ -206,8 +243,9 @@ class ToyTrainer:
                 json.dump(losses, f)
 
     def close(self):
-        """Cleanup. Override in subclasses to close writers."""
-        pass
+        """Close writer if present."""
+        if self.writer:
+            self.writer.close()
 
 
 def main():
@@ -223,7 +261,8 @@ def main():
     dist.barrier()
 
     mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
-    trainer = ToyTrainer(device, mesh["dp"], mesh["tp"], OUTPUT_DIR)
+    trainer = ToyTrainer(device, mesh["dp"], mesh["tp"], OUTPUT_DIR,
+                         logging_cfg=LoggingConfig(log_freq=5, enable_console=True))
 
     if rank == 0:
         print(f"Toy SPMD: {world_size} GPUs, 2DP×2TP, {NUM_STEPS} steps")
