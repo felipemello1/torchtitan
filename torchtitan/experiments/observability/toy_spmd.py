@@ -55,6 +55,11 @@ from torchtitan.observability import (
     CompositeSummaryWriter, EveryNSteps,
 )
 
+# PR4: CPU metrics + aggregation
+from torchtitan.observability import (
+    DefaultAggregator, log_reduced_metrics, MeanMetric, MaxMetric, record_metric,
+)
+
 # ---- Config ----
 NUM_STEPS = 20
 D_MODEL = 64
@@ -178,7 +183,7 @@ class ToyTrainer:
         fully_shard(model, mesh=dp_mesh)
 
     def _setup_logging(self, cfg: LoggingConfig):
-        """Configure logging schedule and optional writer based on LoggingConfig.
+        """Configure logging schedule and optional writer/aggregator.
 
         The log_schedule always exists — it gates replicate_to_host.
         Writer and aggregator are only created if there are backends.
@@ -192,8 +197,12 @@ class ToyTrainer:
         if writers:
             self.writer = CompositeSummaryWriter(writers=writers)
             self.writer.open()
+            self.aggregator = DefaultAggregator(
+                experiment_log_dir=os.path.join(self.output_dir, 'experiment_logs')
+            )
         else:
             self.writer = None
+            self.aggregator = None
 
     def train_step(self, tokens, labels, step):
         """One training step. Returns (loss, grad_norm, dt_ms, ctx)."""
@@ -216,12 +225,16 @@ class ToyTrainer:
                 w1 = list(self.model.layers.values())[0].w1.weight
                 record_tensor_metric("w1_norm", MeanTMetric(mean=w1.float().norm(), weight=torch.tensor(1.0, device=self.device)))
         dt_ms = (time.perf_counter() - t0) * 1000
+        record_metric("learning_rate", MeanMetric(value=LR))
+        record_metric("step_time_ms", MeanMetric(value=dt_ms))
         if self.log_schedule(step):
             scalars = replicate_to_host(ctx.summaries())
+            log_reduced_metrics(scalars)
             add_step_tag("logging")
             record_event({"train.loss": loss.item(), "train.grad_norm": grad_norm.item()})
             if self.writer and self.rank == 0:
-                self.writer(step=step, values=scalars)
+                aggregated = self.aggregator.collect_and_aggregate(step=step)
+                self.writer(step=step, values=aggregated)
             if self.rank == 0:
                 with open(os.path.join(self.output_dir, f"scalars_step_{step}.json"), "w") as f:
                     json.dump(scalars, f)

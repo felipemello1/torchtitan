@@ -433,10 +433,10 @@ _system_logger = logging.getLogger(SYSTEM_LOGGER_NAME)
 def init_observability(
     source: str, output_dir: str, rank: int | None = None
 ) -> None:
-    """Initialize system structured logging. Called ONCE in setup().
+    """Initialize system + experiment structured logging. Called ONCE in setup().
 
-    Rank/source are baked into the formatter (constants). Step is set per-step
-    via set_step(). Idempotent — skips if handler already exists.
+    Rank/source are baked into formatters (constants). Step is set per-step
+    via set_step(). Idempotent — skips if handlers already exist.
 
     Can be called before torch.distributed is initialized — rank defaults to
     the RANK environment variable (always set by torchrun/MAST). This matches
@@ -444,29 +444,45 @@ def init_observability(
 
     Args:
         source: Component name (e.g., "trainer", "generator").
-        output_dir: Root output directory. System logs go to
-            {output_dir}/system_logs/{source}_rank_{rank}_system.jsonl
+        output_dir: Root output directory.
         rank: Global rank. If None, reads from RANK env var (default 0).
     """
     if rank is None:
         rank = int(os.environ.get("RANK", 0))
 
-    if any(isinstance(h, StructuredLoggingHandler) for h in _system_logger.handlers):
-        return
+    # --- System handler (PR1) ---
+    sys_logger = logging.getLogger(SYSTEM_LOGGER_NAME)
+    if not any(isinstance(h, StructuredLoggingHandler) for h in sys_logger.handlers):
+        sys_path = os.path.join(
+            output_dir, "system_logs", f"{source}_rank_{rank}_system.jsonl"
+        )
+        handler = StructuredLoggingHandler(filepath=sys_path)
+        handler.setFormatter(StructuredJSONFormatter(rank=rank, source=source))
+        sys_logger.addHandler(handler)
+        sys_logger.addHandler(InflightEventTrackingHandler())
+        sys_logger.propagate = False
+        if sys_logger.level == logging.NOTSET or sys_logger.level > logging.INFO:
+            sys_logger.setLevel(logging.INFO)
 
-    sys_path = os.path.join(
-        output_dir, "system_logs", f"{source}_rank_{rank}_system.jsonl"
+    # --- Experiment handler (PR4) ---
+    # Lazy import to avoid circular dependency (metrics.py imports from this module)
+    from torchtitan.observability.metrics import (
+        ExperimentJSONFormatter,
+        ExperimentLoggingHandler,
     )
-    handler = StructuredLoggingHandler(filepath=sys_path)
-    handler.setFormatter(StructuredJSONFormatter(rank=rank, source=source))
-    _system_logger.addHandler(handler)
 
-    # Also add inflight tracking for crash forensics
-    _system_logger.addHandler(InflightEventTrackingHandler())
-
-    _system_logger.propagate = False
-    if _system_logger.level == logging.NOTSET or _system_logger.level > logging.INFO:
-        _system_logger.setLevel(logging.INFO)
+    exp_logger = logging.getLogger(EXPERIMENT_LOGGER_NAME)
+    if not any(isinstance(h, ExperimentLoggingHandler) for h in exp_logger.handlers):
+        exp_path = os.path.join(
+            output_dir, "experiment_logs",
+            f"{source}_rank_{rank}_experiment.jsonl",
+        )
+        handler = ExperimentLoggingHandler(filepath=exp_path)
+        handler.setFormatter(ExperimentJSONFormatter(rank=rank, source=source))
+        exp_logger.addHandler(handler)
+    exp_logger.propagate = False
+    if exp_logger.level == logging.NOTSET or exp_logger.level > logging.INFO:
+        exp_logger.setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------------------

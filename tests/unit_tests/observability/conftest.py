@@ -67,6 +67,22 @@ def assert_nested_equal(a, b, rtol=1e-5, atol=1e-8):
 
 
 # ---------------------------------------------------------------------------
+# Logger cleanup (prevents handler leaks between tests)
+# ---------------------------------------------------------------------------
+
+import logging
+
+@pytest.fixture(autouse=True)
+def _clean_observability_loggers():
+    """Reset observability loggers between tests to prevent handler leaks."""
+    yield
+    for name in ("torchtitan.observability.system", "torchtitan.observability.experiment"):
+        logger = logging.getLogger(name)
+        logger.handlers.clear()
+        logger.level = logging.NOTSET
+
+
+# ---------------------------------------------------------------------------
 # Temp directory fixture
 # ---------------------------------------------------------------------------
 

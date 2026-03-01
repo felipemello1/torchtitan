@@ -18,6 +18,11 @@ PR2 — Tensor experiment metrics (compile-safe):
 PR3 — Logging boundary + backends:
     EveryNSteps, CompositeSummaryWriter, TensorBoardSummaryWriter,
     WandbSummaryWriter, LoggingSummaryWriter, InMemorySummaryWriter
+
+PR4 — CPU experiment metrics + JSONL + aggregation:
+    record_metric, log_reduced_metrics, DefaultAggregator,
+    MeanMetric, MaxMetric, MinMetric, SumMetric
+    (init_observability extended to create experiment handler)
 """
 
 from torchtitan.observability.invocation_context import (
@@ -25,6 +30,15 @@ from torchtitan.observability.invocation_context import (
     current_context,
     InvocationContext,
     record_tensor_metric,
+)
+from torchtitan.observability.metrics import (
+    DefaultAggregator,
+    log_reduced_metrics,
+    MaxMetric,
+    MeanMetric,
+    MinMetric,
+    record_metric,
+    SumMetric,
 )
 from torchtitan.observability.structured_logging import (
     add_step_tag,
@@ -84,4 +98,12 @@ __all__ = [
     "WandbSummaryWriter",
     "LoggingSummaryWriter",
     "InMemorySummaryWriter",
+    # PR4
+    "record_metric",
+    "log_reduced_metrics",
+    "DefaultAggregator",
+    "MeanMetric",
+    "MaxMetric",
+    "MinMetric",
+    "SumMetric",
 ]

@@ -26,6 +26,7 @@ import pytest
 
 from torchtitan.observability.structured_logging import (
     _STEP,
+    init_observability,
     _STEP_TAGS,
     add_step_tag,
     clear_step_tags,
@@ -35,7 +36,6 @@ from torchtitan.observability.structured_logging import (
     EventType,
     ExtraFields,
     InflightEventTrackingHandler,
-    init_observability,
     LogType,
     MAX_MESSAGE_SIZE,
     record_event,
