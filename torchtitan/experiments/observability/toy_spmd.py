@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Toy SPMD Training Example — Observability Baseline (PR0)
+Toy SPMD Training Example — PR0 + PR1
 
 ToyTrainer mirrors TorchTitan's Trainer pattern:
 - __init__: builds model, applies TP/compile/FSDP, creates optimizer
@@ -17,6 +17,7 @@ Run:
     torchrun --nproc_per_node=4 torchtitan/experiments/observability/toy_spmd.py
 """
 
+import json
 import os
 import shutil
 import time
@@ -35,6 +36,12 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torchtitan.distributed.utils import clip_grad_norm_
+
+# PR1: System metrics
+from torchtitan.observability import (
+    add_step_tag, clear_step_tags, EventType, init_observability,
+    record_event, record_span, set_step,
+)
 
 # ---- Config ----
 NUM_STEPS = 20
@@ -103,6 +110,7 @@ class ToyTrainer:
         self._apply_fsdp(model, dp_mesh)
         self.model = model
         self.optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+        init_observability(source="trainer", output_dir=output_dir, rank=self.rank)
 
     @staticmethod
     def _replicate_params(module: nn.Module, tp_mesh) -> None:
@@ -144,15 +152,19 @@ class ToyTrainer:
         fully_shard(model, mesh=dp_mesh)
 
     def train_step(self, tokens, labels, step):
-        """One training step. Returns (loss, grad_norm)."""
+        """One training step. Returns (loss, grad_norm, dt_ms)."""
         t0 = time.perf_counter()
-        logits = self.model(tokens)
-        with loss_parallel():
-            loss = F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten(0, 1))
-            self.optimizer.zero_grad()
-            loss.backward()
-        grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-        self.optimizer.step()
+        set_step(step)
+        clear_step_tags()
+        with record_span("Forward/Backward", EventType.FWD_BWD):
+            logits = self.model(tokens)
+            with loss_parallel():
+                loss = F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten(0, 1))
+                self.optimizer.zero_grad()
+                loss.backward()
+        with record_span("Optimizer", EventType.OPTIM):
+            grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
         dt_ms = (time.perf_counter() - t0) * 1000
         return loss, grad_norm, dt_ms
 
@@ -161,10 +173,18 @@ class ToyTrainer:
         if self.rank == 0:
             print(f"{'Step':>4}  {'Loss':>10}  {'GradNorm':>10}  {'Time(ms)':>10}")
             print("-" * 50)
+        losses = []
         for step in range(1, num_steps + 1):
             loss, grad_norm, dt_ms = self.train_step(tokens, labels, step)
+            losses.append(loss.item())
+            if step % 5 == 0 or step == 1:
+                add_step_tag("logging")
+                record_event({"train.loss": loss.item(), "train.grad_norm": grad_norm.item()})
             if self.rank == 0:
                 print(f"{step:>4}  {loss.item():>10.4f}  {grad_norm.item():>10.4f}  {dt_ms:>10.1f}")
+        if self.rank == 0:
+            with open(os.path.join(self.output_dir, "losses.json"), "w") as f:
+                json.dump(losses, f)
 
     def close(self):
         """Cleanup. Override in subclasses to close writers."""
@@ -197,6 +217,11 @@ def main():
     trainer.close()
 
     if rank == 0:
+        from torchtitan.experiments.observability.visualize import to_chrome_trace
+
+        sys_log_dir = os.path.join(OUTPUT_DIR, "system_logs")
+        trace_path = os.path.join(OUTPUT_DIR, "trace.json")
+        to_chrome_trace(sys_log_dir, trace_path)
         print(f"\nDone. Output: {OUTPUT_DIR}")
     dist.destroy_process_group()
 
