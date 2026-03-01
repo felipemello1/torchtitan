@@ -23,6 +23,9 @@ PR4 — CPU experiment metrics + JSONL + aggregation:
     record_metric, log_reduced_metrics, DefaultAggregator,
     MeanMetric, MaxMetric, MinMetric, SumMetric
     (init_observability extended to create experiment handler)
+
+PR5 — Profiling:
+    Profiler, ProfilerConfig, profile_annotation
 """
 
 from torchtitan.observability.invocation_context import (
@@ -59,6 +62,11 @@ from torchtitan.observability.backends import (
     WandbSummaryWriter,
 )
 from torchtitan.observability.logging_boundary import EveryNSteps
+from torchtitan.observability.profiling import (
+    Profiler,
+    ProfilerConfig,
+    profile_annotation,
+)
 from torchtitan.observability.tensor_metrics import (
     DerivedTMetric,
     MaxTMetric,
@@ -106,4 +114,8 @@ __all__ = [
     "MaxMetric",
     "MinMetric",
     "SumMetric",
+    # PR5
+    "Profiler",
+    "ProfilerConfig",
+    "profile_annotation",
 ]

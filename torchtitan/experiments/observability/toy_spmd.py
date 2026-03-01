@@ -60,6 +60,9 @@ from torchtitan.observability import (
     DefaultAggregator, log_reduced_metrics, MeanMetric, MaxMetric, record_metric,
 )
 
+# PR5: Profiling
+from torchtitan.observability import profile_annotation
+
 # ---- Config ----
 NUM_STEPS = 20
 D_MODEL = 64
@@ -216,10 +219,12 @@ class ToyTrainer:
                     loss = F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten(0, 1))
                     record_tensor_metric("loss", MeanTMetric(sum=loss, weight=torch.tensor(1.0, device=self.device)))
                     self.optimizer.zero_grad()
-                    loss.backward()
+                    with profile_annotation("backward"):
+                        loss.backward()
             with record_span("Optimizer", EventType.OPTIM):
-                grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
+                with profile_annotation("optimizer"):
+                    grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
             record_tensor_metric("grad_norm", MeanTMetric(mean=grad_norm, weight=torch.tensor(1.0, device=self.device)))
             with child_context("layer_0"):
                 w1 = list(self.model.layers.values())[0].w1.weight

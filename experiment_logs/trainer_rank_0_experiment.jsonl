@@ -1,0 +1,390 @@
+{"reduce": "MeanMetric", "sum": 7.960761070251465, "weight": 1.0, "key": "loss/global_avg", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772428339.665342}
+{"reduce": "MaxMetric", "value": 7.968990325927734, "key": "loss/global_max", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772428339.6654103}
+{"reduce": "MaxMetric", "value": 1.411298394203186, "key": "grad_norm", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772428339.6654692}
+{"reduce": "MeanMetric", "sum": 41290.10227830869, "weight": 1.0, "key": "throughput/tps", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772428339.6654902}
+{"reduce": "MeanMetric", "sum": 2.9557635328213654, "weight": 1.0, "key": "throughput/tflops", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772428339.6655154}
+{"reduce": "MeanMetric", "sum": 0.29886385569477913, "weight": 1.0, "key": "throughput/mfu_pct", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772428339.665532}
+{"reduce": "MeanMetric", "sum": 0.19840105855837464, "weight": 1.0, "key": "time/end_to_end_s", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772428339.6655488}
+{"reduce": "MeanMetric", "sum": 0.014383855042979121, "weight": 1.0, "key": "time/data_loading_s", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772428339.665564}
+{"reduce": "MeanMetric", "sum": 3.624944127691492, "weight": 1.0, "key": "time/data_loading_pct", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772428339.6655793}
+{"reduce": "MaxMetric", "value": 1.216796875, "key": "memory/max_reserved_gib", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772428339.665596}
+{"reduce": "MaxMetric", "value": 0.9245100021362305, "key": "memory/max_active_gib", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772428339.6656117}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772428339.6656334}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772428339.66565}
+{"reduce": "SumMetric", "value": 65536.0, "key": "n_tokens_seen", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772428339.6656654}
+{"reduce": "MeanMetric", "sum": 0.00013333333333333334, "weight": 1.0, "key": "learning_rate", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772428339.6656802}
+{"reduce": "MeanMetric", "sum": 7.848427772521973, "weight": 1.0, "key": "loss/global_avg", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772428339.714243}
+{"reduce": "MaxMetric", "value": 7.872210502624512, "key": "loss/global_max", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772428339.7142859}
+{"reduce": "MaxMetric", "value": 1.4496362209320068, "key": "grad_norm", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772428339.7143283}
+{"reduce": "MeanMetric", "sum": 344179.9233253224, "weight": 1.0, "key": "throughput/tps", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772428339.7143495}
+{"reduce": "MeanMetric", "sum": 24.638216181621733, "weight": 1.0, "key": "throughput/tflops", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772428339.7143688}
+{"reduce": "MeanMetric", "sum": 2.4912250941983554, "weight": 1.0, "key": "throughput/mfu_pct", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772428339.7143865}
+{"reduce": "MeanMetric", "sum": 0.023801504517905414, "weight": 1.0, "key": "time/end_to_end_s", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772428339.7144015}
+{"reduce": "MeanMetric", "sum": 0.007711731130257249, "weight": 1.0, "key": "time/data_loading_s", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772428339.7144241}
+{"reduce": "MeanMetric", "sum": 16.200091730453135, "weight": 1.0, "key": "time/data_loading_pct", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772428339.7144446}
+{"reduce": "MaxMetric", "value": 1.349609375, "key": "memory/max_reserved_gib", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772428339.7144601}
+{"reduce": "MaxMetric", "value": 0.9672746658325195, "key": "memory/max_active_gib", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772428339.7144747}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772428339.7145004}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772428339.7145166}
+{"reduce": "SumMetric", "value": 131072.0, "key": "n_tokens_seen", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772428339.7145314}
+{"reduce": "MeanMetric", "sum": 0.0002666666666666667, "weight": 1.0, "key": "learning_rate", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772428339.714546}
+{"key": "embedding/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428339.7589524}
+{"key": "attention/q/abs_mean", "value": 0.2565104166666667, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428339.7589629}
+{"key": "attention/output/abs_mean", "value": 0.068359375, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428339.758968}
+{"key": "layers/0/residual/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428339.7589717}
+{"key": "layers/1/residual/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428339.7589753}
+{"key": "layers/2/residual/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428339.7589781}
+{"key": "layers/3/residual/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428339.7589815}
+{"key": "layers/4/residual/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428339.758984}
+{"key": "layers/5/residual/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428339.758987}
+{"reduce": "MeanMetric", "sum": 7.320087432861328, "weight": 1.0, "key": "loss/global_avg", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772428340.6922755}
+{"reduce": "MaxMetric", "value": 7.3633294105529785, "key": "loss/global_max", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772428340.692321}
+{"reduce": "MaxMetric", "value": 1.5995526313781738, "key": "grad_norm", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772428340.6923695}
+{"reduce": "MeanMetric", "sum": 33547.96237564774, "weight": 1.0, "key": "throughput/tps", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772428340.6923904}
+{"reduce": "MeanMetric", "sum": 2.4015402800902086, "weight": 1.0, "key": "throughput/tflops", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772428340.6924093}
+{"reduce": "MeanMetric", "sum": 0.2428251041547228, "weight": 1.0, "key": "throughput/mfu_pct", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772428340.6924253}
+{"reduce": "MeanMetric", "sum": 0.4883754135807976, "weight": 1.0, "key": "time/end_to_end_s", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772428340.6924405}
+{"reduce": "MeanMetric", "sum": 0.008978738449513912, "weight": 1.0, "key": "time/data_loading_s", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772428340.692458}
+{"reduce": "MeanMetric", "sum": 1.8384910869450342, "weight": 1.0, "key": "time/data_loading_pct", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772428340.6924784}
+{"reduce": "MaxMetric", "value": 1.349609375, "key": "memory/max_reserved_gib", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772428340.692508}
+{"reduce": "MaxMetric", "value": 0.9672789573669434, "key": "memory/max_active_gib", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772428340.692525}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772428340.6925442}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772428340.6925592}
+{"reduce": "SumMetric", "value": 262144.0, "key": "n_tokens_seen", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772428340.6925752}
+{"reduce": "MeanMetric", "sum": 0.0005333333333333334, "weight": 1.0, "key": "learning_rate", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772428340.6925902}
+{"key": "embedding/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428340.8019717}
+{"key": "attention/q/abs_mean", "value": 0.2734375, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428340.8019817}
+{"key": "attention/output/abs_mean", "value": 0.14908854166666666, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428340.8019862}
+{"key": "layers/0/residual/abs_mean", "value": 0.80859375, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428340.80199}
+{"key": "layers/1/residual/abs_mean", "value": 0.81640625, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428340.8019931}
+{"key": "layers/2/residual/abs_mean", "value": 0.83203125, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428340.8019962}
+{"key": "layers/3/residual/abs_mean", "value": 0.8515625, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428340.801999}
+{"key": "layers/4/residual/abs_mean", "value": 0.87890625, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428340.8020024}
+{"key": "layers/5/residual/abs_mean", "value": 0.9140625, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428340.802005}
+{"reduce": "MeanMetric", "sum": 5.904078006744385, "weight": 1.0, "key": "loss/global_avg", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772428340.8045955}
+{"reduce": "MaxMetric", "value": 6.013250350952148, "key": "loss/global_max", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772428340.8046367}
+{"reduce": "MaxMetric", "value": 2.3960235118865967, "key": "grad_norm", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772428340.8046894}
+{"reduce": "MeanMetric", "sum": 295172.6828979766, "weight": 1.0, "key": "throughput/tps", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772428340.8047106}
+{"reduce": "MeanMetric", "sum": 21.130019153602866, "weight": 1.0, "key": "throughput/tflops", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772428340.80473}
+{"reduce": "MeanMetric", "sum": 2.136503453347105, "weight": 1.0, "key": "throughput/mfu_pct", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772428340.8047462}
+{"reduce": "MeanMetric", "sum": 0.0555064914515242, "weight": 1.0, "key": "time/end_to_end_s", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772428340.8047652}
+{"reduce": "MeanMetric", "sum": 0.010914150509051979, "weight": 1.0, "key": "time/data_loading_s", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772428340.8047907}
+{"reduce": "MeanMetric", "sum": 19.662836226252377, "weight": 1.0, "key": "time/data_loading_pct", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772428340.8048077}
+{"reduce": "MaxMetric", "value": 1.349609375, "key": "memory/max_reserved_gib", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772428340.8048239}
+{"reduce": "MaxMetric", "value": 0.9672789573669434, "key": "memory/max_active_gib", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772428340.8048384}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772428340.804857}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772428340.8048735}
+{"reduce": "SumMetric", "value": 393216.0, "key": "n_tokens_seen", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772428340.8048885}
+{"reduce": "MeanMetric", "sum": 0.0008, "weight": 1.0, "key": "learning_rate", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772428340.8049033}
+{"reduce": "MeanMetric", "sum": 8.076168060302734, "weight": 1.0, "key": "loss/global_avg", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772428878.2215896}
+{"reduce": "MaxMetric", "value": 8.086535453796387, "key": "loss/global_max", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772428878.2216542}
+{"reduce": "MaxMetric", "value": 1.396530032157898, "key": "grad_norm", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772428878.2217026}
+{"reduce": "MeanMetric", "sum": 37929.19056019095, "weight": 1.0, "key": "throughput/tps", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772428878.2217243}
+{"reduce": "MeanMetric", "sum": 2.7151717264246265, "weight": 1.0, "key": "throughput/tflops", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772428878.2217433}
+{"reduce": "MeanMetric", "sum": 0.27453708052827364, "weight": 1.0, "key": "throughput/mfu_pct", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772428878.2217603}
+{"reduce": "MeanMetric", "sum": 0.2159814084880054, "weight": 1.0, "key": "time/end_to_end_s", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772428878.221777}
+{"reduce": "MeanMetric", "sum": 0.011856489814817905, "weight": 1.0, "key": "time/data_loading_s", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772428878.221793}
+{"reduce": "MeanMetric", "sum": 2.744794076911569, "weight": 1.0, "key": "time/data_loading_pct", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772428878.2218091}
+{"reduce": "MaxMetric", "value": 1.216796875, "key": "memory/max_reserved_gib", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772428878.221824}
+{"reduce": "MaxMetric", "value": 0.9245100021362305, "key": "memory/max_active_gib", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772428878.2218385}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772428878.221858}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772428878.221874}
+{"reduce": "SumMetric", "value": 65536.0, "key": "n_tokens_seen", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772428878.2218904}
+{"reduce": "MeanMetric", "sum": 0.00013333333333333334, "weight": 1.0, "key": "learning_rate", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772428878.2219093}
+{"reduce": "MeanMetric", "sum": 7.987142086029053, "weight": 1.0, "key": "loss/global_avg", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772428878.2690911}
+{"reduce": "MaxMetric", "value": 7.996550559997559, "key": "loss/global_max", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772428878.2691364}
+{"reduce": "MaxMetric", "value": 1.4217251539230347, "key": "grad_norm", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772428878.269178}
+{"reduce": "MeanMetric", "sum": 355238.08473077783, "weight": 1.0, "key": "throughput/tps", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772428878.269197}
+{"reduce": "MeanMetric", "sum": 25.429817762116457, "weight": 1.0, "key": "throughput/tflops", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772428878.269213}
+{"reduce": "MeanMetric", "sum": 2.5712656988995404, "weight": 1.0, "key": "throughput/mfu_pct", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772428878.269228}
+{"reduce": "MeanMetric", "sum": 0.023060590494424105, "weight": 1.0, "key": "time/end_to_end_s", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772428878.2692418}
+{"reduce": "MeanMetric", "sum": 0.0085148299112916, "weight": 1.0, "key": "time/data_loading_s", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772428878.2692554}
+{"reduce": "MeanMetric", "sum": 18.461864437839154, "weight": 1.0, "key": "time/data_loading_pct", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772428878.269269}
+{"reduce": "MaxMetric", "value": 1.349609375, "key": "memory/max_reserved_gib", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772428878.269284}
+{"reduce": "MaxMetric", "value": 0.9672746658325195, "key": "memory/max_active_gib", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772428878.2692995}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772428878.2693172}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772428878.2693312}
+{"reduce": "SumMetric", "value": 131072.0, "key": "n_tokens_seen", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772428878.2693443}
+{"reduce": "MeanMetric", "sum": 0.0002666666666666667, "weight": 1.0, "key": "learning_rate", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772428878.2693577}
+{"key": "embedding/abs_mean", "value": 0.8125, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428878.314174}
+{"key": "attention/q/abs_mean", "value": 0.2578125, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428878.3141847}
+{"key": "attention/output/abs_mean", "value": 0.06901041666666667, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428878.3141901}
+{"key": "layers/0/residual/abs_mean", "value": 0.8125, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428878.3141942}
+{"key": "layers/1/residual/abs_mean", "value": 0.8125, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428878.3141978}
+{"key": "layers/2/residual/abs_mean", "value": 0.8125, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428878.3142009}
+{"key": "layers/3/residual/abs_mean", "value": 0.8125, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428878.3142042}
+{"key": "layers/4/residual/abs_mean", "value": 0.8125, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428878.3142068}
+{"key": "layers/5/residual/abs_mean", "value": 0.8125, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428878.3142095}
+{"reduce": "MeanMetric", "sum": 7.454673767089844, "weight": 1.0, "key": "loss/global_avg", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772428879.3362205}
+{"reduce": "MaxMetric", "value": 7.492595195770264, "key": "loss/global_max", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772428879.3362796}
+{"reduce": "MaxMetric", "value": 1.5495851039886475, "key": "grad_norm", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772428879.33633}
+{"reduce": "MeanMetric", "sum": 30742.014573025634, "weight": 1.0, "key": "throughput/tps", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772428879.3363512}
+{"reduce": "MeanMetric", "sum": 2.200675720974121, "weight": 1.0, "key": "throughput/tflops", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772428879.336369}
+{"reduce": "MeanMetric", "sum": 0.22251523973449144, "weight": 1.0, "key": "throughput/mfu_pct", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772428879.3363848}
+{"reduce": "MeanMetric", "sum": 0.5329514095792547, "weight": 1.0, "key": "time/end_to_end_s", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772428879.3364007}
+{"reduce": "MeanMetric", "sum": 0.009172106976620853, "weight": 1.0, "key": "time/data_loading_s", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772428879.3364167}
+{"reduce": "MeanMetric", "sum": 1.7210024801063741, "weight": 1.0, "key": "time/data_loading_pct", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772428879.336432}
+{"reduce": "MaxMetric", "value": 1.349609375, "key": "memory/max_reserved_gib", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772428879.336448}
+{"reduce": "MaxMetric", "value": 0.9672789573669434, "key": "memory/max_active_gib", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772428879.3364644}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772428879.3364823}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772428879.3365042}
+{"reduce": "SumMetric", "value": 262144.0, "key": "n_tokens_seen", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772428879.3365183}
+{"reduce": "MeanMetric", "sum": 0.0005333333333333334, "weight": 1.0, "key": "learning_rate", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772428879.3365326}
+{"key": "embedding/abs_mean", "value": 0.8125, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428879.4505625}
+{"key": "attention/q/abs_mean", "value": 0.2682291666666667, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428879.4505718}
+{"key": "attention/output/abs_mean", "value": 0.13997395833333334, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428879.4505768}
+{"key": "layers/0/residual/abs_mean", "value": 0.8125, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428879.4505806}
+{"key": "layers/1/residual/abs_mean", "value": 0.8203125, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428879.4505856}
+{"key": "layers/2/residual/abs_mean", "value": 0.83203125, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428879.450589}
+{"key": "layers/3/residual/abs_mean", "value": 0.8515625, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428879.4505923}
+{"key": "layers/4/residual/abs_mean", "value": 0.87890625, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428879.4505954}
+{"key": "layers/5/residual/abs_mean", "value": 0.91015625, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428879.4505982}
+{"reduce": "MeanMetric", "sum": 6.110491752624512, "weight": 1.0, "key": "loss/global_avg", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772428879.45261}
+{"reduce": "MaxMetric", "value": 6.205607891082764, "key": "loss/global_max", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772428879.4526625}
+{"reduce": "MaxMetric", "value": 2.338618040084839, "key": "grad_norm", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772428879.4527156}
+{"reduce": "MeanMetric", "sum": 284978.1400316614, "weight": 1.0, "key": "throughput/tps", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772428879.4527354}
+{"reduce": "MeanMetric", "sum": 20.400239948045687, "weight": 1.0, "key": "throughput/tflops", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772428879.452754}
+{"reduce": "MeanMetric", "sum": 2.0627138471229207, "weight": 1.0, "key": "throughput/mfu_pct", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772428879.452769}
+{"reduce": "MeanMetric", "sum": 0.057492129039019346, "weight": 1.0, "key": "time/end_to_end_s", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772428879.4527836}
+{"reduce": "MeanMetric", "sum": 0.011450258549302816, "weight": 1.0, "key": "time/data_loading_s", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772428879.4527986}
+{"reduce": "MeanMetric", "sum": 19.916219386364414, "weight": 1.0, "key": "time/data_loading_pct", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772428879.4528155}
+{"reduce": "MaxMetric", "value": 1.349609375, "key": "memory/max_reserved_gib", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772428879.4528303}
+{"reduce": "MaxMetric", "value": 0.9672789573669434, "key": "memory/max_active_gib", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772428879.4528446}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772428879.4528618}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772428879.452876}
+{"reduce": "SumMetric", "value": 393216.0, "key": "n_tokens_seen", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772428879.4528909}
+{"reduce": "MeanMetric", "sum": 0.0008, "weight": 1.0, "key": "learning_rate", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772428879.452904}
+{"reduce": "MeanMetric", "sum": 8.198031425476074, "weight": 1.0, "key": "loss/global_avg", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772428951.6425238}
+{"reduce": "MaxMetric", "value": 8.21729850769043, "key": "loss/global_max", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772428951.642596}
+{"reduce": "MaxMetric", "value": 1.3775131702423096, "key": "grad_norm", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772428951.6426482}
+{"reduce": "MeanMetric", "sum": 42989.55225068138, "weight": 1.0, "key": "throughput/tps", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772428951.642672}
+{"reduce": "MeanMetric", "sum": 3.0774191349396567, "weight": 1.0, "key": "throughput/tflops", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772428951.6426966}
+{"reduce": "MeanMetric", "sum": 0.31116472547418167, "weight": 1.0, "key": "throughput/mfu_pct", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772428951.6427262}
+{"reduce": "MeanMetric", "sum": 0.19055792794097215, "weight": 1.0, "key": "time/end_to_end_s", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772428951.642741}
+{"reduce": "MeanMetric", "sum": 0.012388666858896613, "weight": 1.0, "key": "time/data_loading_s", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772428951.6427553}
+{"reduce": "MeanMetric", "sum": 3.250630134563115, "weight": 1.0, "key": "time/data_loading_pct", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772428951.6427696}
+{"reduce": "MaxMetric", "value": 1.216796875, "key": "memory/max_reserved_gib", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772428951.6427865}
+{"reduce": "MaxMetric", "value": 0.9245100021362305, "key": "memory/max_active_gib", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772428951.6428022}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772428951.6428244}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772428951.6428404}
+{"reduce": "SumMetric", "value": 65536.0, "key": "n_tokens_seen", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772428951.6428554}
+{"reduce": "MeanMetric", "sum": 0.00013333333333333334, "weight": 1.0, "key": "learning_rate", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772428951.6428714}
+{"reduce": "MeanMetric", "sum": 8.128314018249512, "weight": 1.0, "key": "loss/global_avg", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772428951.6918724}
+{"reduce": "MaxMetric", "value": 8.156841278076172, "key": "loss/global_max", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772428951.691916}
+{"reduce": "MaxMetric", "value": 1.4022066593170166, "key": "grad_norm", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772428951.6919591}
+{"reduce": "MeanMetric", "sum": 341182.18861852825, "weight": 1.0, "key": "throughput/tps", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772428951.6919792}
+{"reduce": "MeanMetric", "sum": 24.423622503270156, "weight": 1.0, "key": "throughput/tflops", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772428951.6919968}
+{"reduce": "MeanMetric", "sum": 2.4695270478534033, "weight": 1.0, "key": "throughput/mfu_pct", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772428951.692012}
+{"reduce": "MeanMetric", "sum": 0.024010632070712745, "weight": 1.0, "key": "time/end_to_end_s", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772428951.6920266}
+{"reduce": "MeanMetric", "sum": 0.007925244979560375, "weight": 1.0, "key": "time/data_loading_s", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772428951.6920435}
+{"reduce": "MeanMetric", "sum": 16.50361589028572, "weight": 1.0, "key": "time/data_loading_pct", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772428951.6920593}
+{"reduce": "MaxMetric", "value": 1.349609375, "key": "memory/max_reserved_gib", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772428951.6920748}
+{"reduce": "MaxMetric", "value": 0.9672746658325195, "key": "memory/max_active_gib", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772428951.69209}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772428951.6921117}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772428951.692135}
+{"reduce": "SumMetric", "value": 131072.0, "key": "n_tokens_seen", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772428951.6921492}
+{"reduce": "MeanMetric", "sum": 0.0002666666666666667, "weight": 1.0, "key": "learning_rate", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772428951.6921635}
+{"key": "embedding/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428951.7349927}
+{"key": "attention/q/abs_mean", "value": 0.2552083333333333, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428951.7350032}
+{"key": "attention/output/abs_mean", "value": 0.0654296875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428951.7350082}
+{"key": "layers/0/residual/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428951.735012}
+{"key": "layers/1/residual/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428951.735015}
+{"key": "layers/2/residual/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428951.7350185}
+{"key": "layers/3/residual/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428951.7350216}
+{"key": "layers/4/residual/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428951.7350245}
+{"key": "layers/5/residual/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772428951.7350268}
+{"reduce": "MeanMetric", "sum": 7.604662895202637, "weight": 1.0, "key": "loss/global_avg", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772428952.6739907}
+{"reduce": "MaxMetric", "value": 7.637659549713135, "key": "loss/global_max", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772428952.674034}
+{"reduce": "MaxMetric", "value": 1.4963350296020508, "key": "grad_norm", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772428952.674083}
+{"reduce": "MeanMetric", "sum": 33402.11142946054, "weight": 1.0, "key": "throughput/tps", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772428952.674104}
+{"reduce": "MeanMetric", "sum": 2.3910994992691332, "weight": 1.0, "key": "throughput/tflops", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772428952.6741211}
+{"reduce": "MeanMetric", "sum": 0.24176941347513986, "weight": 1.0, "key": "throughput/mfu_pct", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772428952.6741385}
+{"reduce": "MeanMetric", "sum": 0.49050791398622096, "weight": 1.0, "key": "time/end_to_end_s", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772428952.6741538}
+{"reduce": "MeanMetric", "sum": 0.009051324450410903, "weight": 1.0, "key": "time/data_loading_s", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772428952.6741688}
+{"reduce": "MeanMetric", "sum": 1.8452963127247661, "weight": 1.0, "key": "time/data_loading_pct", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772428952.6741838}
+{"reduce": "MaxMetric", "value": 1.349609375, "key": "memory/max_reserved_gib", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772428952.6741993}
+{"reduce": "MaxMetric", "value": 0.9672789573669434, "key": "memory/max_active_gib", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772428952.6742167}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772428952.67424}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772428952.6742558}
+{"reduce": "SumMetric", "value": 262144.0, "key": "n_tokens_seen", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772428952.6742702}
+{"reduce": "MeanMetric", "sum": 0.0005333333333333334, "weight": 1.0, "key": "learning_rate", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772428952.6742847}
+{"key": "embedding/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428952.788756}
+{"key": "attention/q/abs_mean", "value": 0.26953125, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428952.7887664}
+{"key": "attention/output/abs_mean", "value": 0.13020833333333334, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428952.7887714}
+{"key": "layers/0/residual/abs_mean", "value": 0.80859375, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428952.7887752}
+{"key": "layers/1/residual/abs_mean", "value": 0.8125, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428952.788779}
+{"key": "layers/2/residual/abs_mean", "value": 0.82421875, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428952.7887824}
+{"key": "layers/3/residual/abs_mean", "value": 0.84375, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428952.7887857}
+{"key": "layers/4/residual/abs_mean", "value": 0.86328125, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428952.7887883}
+{"key": "layers/5/residual/abs_mean", "value": 0.890625, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772428952.788791}
+{"reduce": "MeanMetric", "sum": 6.3025898933410645, "weight": 1.0, "key": "loss/global_avg", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772428952.7927122}
+{"reduce": "MaxMetric", "value": 6.398778915405273, "key": "loss/global_max", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772428952.7927527}
+{"reduce": "MaxMetric", "value": 2.258143901824951, "key": "grad_norm", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772428952.7928064}
+{"reduce": "MeanMetric", "sum": 279076.8730476339, "weight": 1.0, "key": "throughput/tps", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772428952.7928278}
+{"reduce": "MeanMetric", "sum": 19.977796098639327, "weight": 1.0, "key": "throughput/tflops", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772428952.792847}
+{"reduce": "MeanMetric", "sum": 2.0199996055247045, "weight": 1.0, "key": "throughput/mfu_pct", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772428952.7928662}
+{"reduce": "MeanMetric", "sum": 0.05870783852878958, "weight": 1.0, "key": "time/end_to_end_s", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772428952.792883}
+{"reduce": "MeanMetric", "sum": 0.0110248529817909, "weight": 1.0, "key": "time/data_loading_s", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772428952.7929008}
+{"reduce": "MeanMetric", "sum": 18.779183935352094, "weight": 1.0, "key": "time/data_loading_pct", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772428952.7929153}
+{"reduce": "MaxMetric", "value": 1.349609375, "key": "memory/max_reserved_gib", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772428952.7929327}
+{"reduce": "MaxMetric", "value": 0.9672789573669434, "key": "memory/max_active_gib", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772428952.7929506}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772428952.7929819}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772428952.7929978}
+{"reduce": "SumMetric", "value": 393216.0, "key": "n_tokens_seen", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772428952.7930126}
+{"reduce": "MeanMetric", "sum": 0.0008, "weight": 1.0, "key": "learning_rate", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772428952.793026}
+{"reduce": "MeanMetric", "sum": 8.047454833984375, "weight": 1.0, "key": "loss/global_avg", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772429065.1712198}
+{"reduce": "MaxMetric", "value": 8.05532455444336, "key": "loss/global_max", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772429065.1712923}
+{"reduce": "MaxMetric", "value": 1.431395173072815, "key": "grad_norm", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772429065.1713395}
+{"reduce": "MeanMetric", "sum": 40159.56307363323, "weight": 1.0, "key": "throughput/tps", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772429065.171361}
+{"reduce": "MeanMetric", "sum": 2.8748335673036953, "weight": 1.0, "key": "throughput/tflops", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772429065.1713815}
+{"reduce": "MeanMetric", "sum": 0.2906808460367741, "weight": 1.0, "key": "throughput/mfu_pct", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772429065.1713996}
+{"reduce": "MeanMetric", "sum": 0.20398628304246813, "weight": 1.0, "key": "time/end_to_end_s", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772429065.1714149}
+{"reduce": "MeanMetric", "sum": 0.01162636000663042, "weight": 1.0, "key": "time/data_loading_s", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772429065.171434}
+{"reduce": "MeanMetric", "sum": 2.8497896606630935, "weight": 1.0, "key": "time/data_loading_pct", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772429065.1714504}
+{"reduce": "MaxMetric", "value": 1.216796875, "key": "memory/max_reserved_gib", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772429065.1714673}
+{"reduce": "MaxMetric", "value": 0.9245100021362305, "key": "memory/max_active_gib", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772429065.1714826}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772429065.1715057}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772429065.1715226}
+{"reduce": "SumMetric", "value": 65536.0, "key": "n_tokens_seen", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772429065.1715376}
+{"reduce": "MeanMetric", "sum": 0.00013333333333333334, "weight": 1.0, "key": "learning_rate", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772429065.1715531}
+{"reduce": "MeanMetric", "sum": 7.938221454620361, "weight": 1.0, "key": "loss/global_avg", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772429065.22224}
+{"reduce": "MaxMetric", "value": 7.953030586242676, "key": "loss/global_max", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772429065.2222872}
+{"reduce": "MaxMetric", "value": 1.469963788986206, "key": "grad_norm", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772429065.2223322}
+{"reduce": "MeanMetric", "sum": 329406.76232268, "weight": 1.0, "key": "throughput/tps", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772429065.222363}
+{"reduce": "MeanMetric", "sum": 23.580675314762495, "weight": 1.0, "key": "throughput/tflops", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772429065.222381}
+{"reduce": "MeanMetric", "sum": 2.384294773990141, "weight": 1.0, "key": "throughput/mfu_pct", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772429065.2223961}
+{"reduce": "MeanMetric", "sum": 0.02486894908361137, "weight": 1.0, "key": "time/end_to_end_s", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772429065.222411}
+{"reduce": "MeanMetric", "sum": 0.007577697979286313, "weight": 1.0, "key": "time/data_loading_s", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772429065.2224262}
+{"reduce": "MeanMetric", "sum": 15.235259748631707, "weight": 1.0, "key": "time/data_loading_pct", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772429065.2224407}
+{"reduce": "MaxMetric", "value": 1.349609375, "key": "memory/max_reserved_gib", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772429065.222457}
+{"reduce": "MaxMetric", "value": 0.9672746658325195, "key": "memory/max_active_gib", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772429065.222473}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772429065.2224905}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772429065.2225153}
+{"reduce": "SumMetric", "value": 131072.0, "key": "n_tokens_seen", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772429065.2225308}
+{"reduce": "MeanMetric", "sum": 0.0002666666666666667, "weight": 1.0, "key": "learning_rate", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772429065.222545}
+{"key": "embedding/abs_mean", "value": 0.796875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429065.2654562}
+{"key": "attention/q/abs_mean", "value": 0.2552083333333333, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429065.265466}
+{"key": "attention/output/abs_mean", "value": 0.06705729166666667, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429065.265471}
+{"key": "layers/0/residual/abs_mean", "value": 0.796875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429065.2654748}
+{"key": "layers/1/residual/abs_mean", "value": 0.796875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429065.2654781}
+{"key": "layers/2/residual/abs_mean", "value": 0.796875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429065.2654815}
+{"key": "layers/3/residual/abs_mean", "value": 0.796875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429065.2654848}
+{"key": "layers/4/residual/abs_mean", "value": 0.796875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429065.2654877}
+{"key": "layers/5/residual/abs_mean", "value": 0.796875, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429065.2654905}
+{"reduce": "MeanMetric", "sum": 7.404310703277588, "weight": 1.0, "key": "loss/global_avg", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772429066.2251606}
+{"reduce": "MaxMetric", "value": 7.451450347900391, "key": "loss/global_max", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772429066.2252076}
+{"reduce": "MaxMetric", "value": 1.6052091121673584, "key": "grad_norm", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772429066.225257}
+{"reduce": "MeanMetric", "sum": 32709.22119617783, "weight": 1.0, "key": "throughput/tps", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772429066.2252853}
+{"reduce": "MeanMetric", "sum": 2.341498757910325, "weight": 1.0, "key": "throughput/tflops", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772429066.2253044}
+{"reduce": "MeanMetric", "sum": 0.23675417167950707, "weight": 1.0, "key": "throughput/mfu_pct", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772429066.225321}
+{"reduce": "MeanMetric", "sum": 0.5008985050953925, "weight": 1.0, "key": "time/end_to_end_s", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772429066.2253368}
+{"reduce": "MeanMetric", "sum": 0.008959944942034781, "weight": 1.0, "key": "time/data_loading_s", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772429066.2253516}
+{"reduce": "MeanMetric", "sum": 1.788774542325381, "weight": 1.0, "key": "time/data_loading_pct", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772429066.2253668}
+{"reduce": "MaxMetric", "value": 1.349609375, "key": "memory/max_reserved_gib", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772429066.2253828}
+{"reduce": "MaxMetric", "value": 0.9672789573669434, "key": "memory/max_active_gib", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772429066.225398}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772429066.2254152}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772429066.225431}
+{"reduce": "SumMetric", "value": 262144.0, "key": "n_tokens_seen", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772429066.2254465}
+{"reduce": "MeanMetric", "sum": 0.0005333333333333334, "weight": 1.0, "key": "learning_rate", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772429066.2254605}
+{"key": "embedding/abs_mean", "value": 0.79296875, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429066.3445218}
+{"key": "attention/q/abs_mean", "value": 0.2708333333333333, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429066.3445327}
+{"key": "attention/output/abs_mean", "value": 0.13736979166666666, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429066.3445385}
+{"key": "layers/0/residual/abs_mean", "value": 0.796875, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429066.3445423}
+{"key": "layers/1/residual/abs_mean", "value": 0.8046875, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429066.3445454}
+{"key": "layers/2/residual/abs_mean", "value": 0.8203125, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429066.3445487}
+{"key": "layers/3/residual/abs_mean", "value": 0.83984375, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429066.344552}
+{"key": "layers/4/residual/abs_mean", "value": 0.8671875, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429066.344555}
+{"key": "layers/5/residual/abs_mean", "value": 0.90234375, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429066.344558}
+{"reduce": "MeanMetric", "sum": 5.989640712738037, "weight": 1.0, "key": "loss/global_avg", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772429066.3484404}
+{"reduce": "MaxMetric", "value": 6.079315185546875, "key": "loss/global_max", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772429066.3484821}
+{"reduce": "MaxMetric", "value": 2.3476314544677734, "key": "grad_norm", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772429066.3485634}
+{"reduce": "MeanMetric", "sum": 268540.5569742514, "weight": 1.0, "key": "throughput/tps", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772429066.3485873}
+{"reduce": "MeanMetric", "sum": 19.223550962357738, "weight": 1.0, "key": "throughput/tflops", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772429066.348605}
+{"reduce": "MeanMetric", "sum": 1.9437361943738867, "weight": 1.0, "key": "throughput/mfu_pct", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772429066.3486226}
+{"reduce": "MeanMetric", "sum": 0.06101126840803772, "weight": 1.0, "key": "time/end_to_end_s", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772429066.3486395}
+{"reduce": "MeanMetric", "sum": 0.010823477525264025, "weight": 1.0, "key": "time/data_loading_s", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772429066.3486545}
+{"reduce": "MeanMetric", "sum": 17.740128680619467, "weight": 1.0, "key": "time/data_loading_pct", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772429066.3486693}
+{"reduce": "MaxMetric", "value": 1.349609375, "key": "memory/max_reserved_gib", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772429066.3486843}
+{"reduce": "MaxMetric", "value": 0.9672789573669434, "key": "memory/max_active_gib", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772429066.3486993}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772429066.3487165}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772429066.348733}
+{"reduce": "SumMetric", "value": 393216.0, "key": "n_tokens_seen", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772429066.3487465}
+{"reduce": "MeanMetric", "sum": 0.0008, "weight": 1.0, "key": "learning_rate", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772429066.3487613}
+{"reduce": "MeanMetric", "sum": 8.110518455505371, "weight": 1.0, "key": "loss/global_avg", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772429096.7238963}
+{"reduce": "MaxMetric", "value": 8.110518455505371, "key": "loss/global_max", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772429096.7239764}
+{"reduce": "MaxMetric", "value": 1.3637839555740356, "key": "grad_norm", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772429096.7240212}
+{"reduce": "MeanMetric", "sum": 70078.29180288127, "weight": 1.0, "key": "throughput/tps", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772429096.7240403}
+{"reduce": "MeanMetric", "sum": 5.0165741406309605, "weight": 1.0, "key": "throughput/tflops", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772429096.724058}
+{"reduce": "MeanMetric", "sum": 0.5072370212973671, "weight": 1.0, "key": "throughput/mfu_pct", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772429096.7240736}
+{"reduce": "MeanMetric", "sum": 0.11689782654866576, "weight": 1.0, "key": "time/end_to_end_s", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772429096.7240891}
+{"reduce": "MeanMetric", "sum": 0.012412915006279945, "weight": 1.0, "key": "time/data_loading_s", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772429096.724104}
+{"reduce": "MeanMetric", "sum": 5.309301024990538, "weight": 1.0, "key": "time/data_loading_pct", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772429096.7241218}
+{"reduce": "MaxMetric", "value": 1.400390625, "key": "memory/max_reserved_gib", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772429096.72415}
+{"reduce": "MaxMetric", "value": 1.094925880432129, "key": "memory/max_active_gib", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772429096.7241673}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772429096.7241893}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772429096.7242055}
+{"reduce": "SumMetric", "value": 16384.0, "key": "n_tokens_seen", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772429096.7242203}
+{"reduce": "MeanMetric", "sum": 0.00013333333333333334, "weight": 1.0, "key": "learning_rate", "step": 1, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772429096.7242339}
+{"reduce": "MeanMetric", "sum": 8.009979248046875, "weight": 1.0, "key": "loss/global_avg", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772429096.7537627}
+{"reduce": "MaxMetric", "value": 8.009979248046875, "key": "loss/global_max", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772429096.7538006}
+{"reduce": "MaxMetric", "value": 1.4191292524337769, "key": "grad_norm", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772429096.7538397}
+{"reduce": "MeanMetric", "sum": 572881.4771222738, "weight": 1.0, "key": "throughput/tps", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772429096.7538583}
+{"reduce": "MeanMetric", "sum": 41.00988094661156, "weight": 1.0, "key": "throughput/tflops", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772429096.7538748}
+{"reduce": "MeanMetric", "sum": 4.146600702387418, "weight": 1.0, "key": "throughput/mfu_pct", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772429096.7538898}
+{"reduce": "MeanMetric", "sum": 0.014299641945399344, "weight": 1.0, "key": "time/end_to_end_s", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772429096.7539036}
+{"reduce": "MeanMetric", "sum": 0.0076329209841787815, "weight": 1.0, "key": "time/data_loading_s", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772429096.7539184}
+{"reduce": "MeanMetric", "sum": 26.68920317488977, "weight": 1.0, "key": "time/data_loading_pct", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772429096.7539322}
+{"reduce": "MaxMetric", "value": 1.52734375, "key": "memory/max_reserved_gib", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772429096.7539458}
+{"reduce": "MaxMetric", "value": 1.1721267700195312, "key": "memory/max_active_gib", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772429096.7539597}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772429096.753976}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772429096.7539897}
+{"reduce": "SumMetric", "value": 32768.0, "key": "n_tokens_seen", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772429096.7540026}
+{"reduce": "MeanMetric", "sum": 0.0002666666666666667, "weight": 1.0, "key": "learning_rate", "step": 2, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772429096.7540157}
+{"key": "embedding/abs_mean", "value": 0.8088268637657166, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429096.7841263}
+{"key": "attention/q/abs_mean", "value": 0.2565104166666667, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429096.7841365}
+{"key": "attention/output/abs_mean", "value": 0.06315104166666667, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429096.7841415}
+{"key": "layers/0/residual/abs_mean", "value": 0.8084486722946167, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429096.784145}
+{"key": "layers/1/residual/abs_mean", "value": 0.8083603978157043, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429096.7841482}
+{"key": "layers/2/residual/abs_mean", "value": 0.8082640171051025, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429096.7841513}
+{"key": "layers/3/residual/abs_mean", "value": 0.8082026243209839, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429096.7841547}
+{"key": "layers/4/residual/abs_mean", "value": 0.8084301948547363, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429096.7841578}
+{"key": "layers/5/residual/abs_mean", "value": 0.8087360262870789, "all_reduced": true, "step": 3, "rank": 0, "source": "trainer", "timestamp": 1772429096.7841606}
+{"reduce": "MeanMetric", "sum": 7.514475345611572, "weight": 1.0, "key": "loss/global_avg", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772429097.0536456}
+{"reduce": "MaxMetric", "value": 7.514475345611572, "key": "loss/global_max", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772429097.0536876}
+{"reduce": "MaxMetric", "value": 1.4863831996917725, "key": "grad_norm", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772429097.0537305}
+{"reduce": "MeanMetric", "sum": 109641.82028807362, "weight": 1.0, "key": "throughput/tps", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772429097.0537496}
+{"reduce": "MeanMetric", "sum": 7.848740405031431, "weight": 1.0, "key": "throughput/tflops", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772429097.0537648}
+{"reduce": "MeanMetric", "sum": 0.793603680994078, "weight": 1.0, "key": "throughput/mfu_pct", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772429097.0537791}
+{"reduce": "MeanMetric", "sum": 0.14943203201983124, "weight": 1.0, "key": "time/end_to_end_s", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772429097.053793}
+{"reduce": "MeanMetric", "sum": 0.008936404366977513, "weight": 1.0, "key": "time/data_loading_s", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772429097.0538075}
+{"reduce": "MeanMetric", "sum": 5.9802468360943895, "weight": 1.0, "key": "time/data_loading_pct", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772429097.0538213}
+{"reduce": "MaxMetric", "value": 1.52734375, "key": "memory/max_reserved_gib", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772429097.053835}
+{"reduce": "MaxMetric", "value": 1.172131061553955, "key": "memory/max_active_gib", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772429097.053849}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772429097.0538652}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772429097.053878}
+{"reduce": "SumMetric", "value": 65536.0, "key": "n_tokens_seen", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772429097.0538926}
+{"reduce": "MeanMetric", "sum": 0.0005333333333333334, "weight": 1.0, "key": "learning_rate", "step": 4, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772429097.0539093}
+{"key": "embedding/abs_mean", "value": 0.8058582544326782, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429097.1367486}
+{"key": "attention/q/abs_mean", "value": 0.2708333333333333, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429097.136758}
+{"key": "attention/output/abs_mean", "value": 0.12890625, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429097.1367629}
+{"key": "layers/0/residual/abs_mean", "value": 0.8066180944442749, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429097.136767}
+{"key": "layers/1/residual/abs_mean", "value": 0.8121595978736877, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429097.1367705}
+{"key": "layers/2/residual/abs_mean", "value": 0.8223503828048706, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429097.1367733}
+{"key": "layers/3/residual/abs_mean", "value": 0.8371519446372986, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429097.136777}
+{"key": "layers/4/residual/abs_mean", "value": 0.8569034337997437, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429097.13678}
+{"key": "layers/5/residual/abs_mean", "value": 0.8818027973175049, "all_reduced": true, "step": 6, "rank": 0, "source": "trainer", "timestamp": 1772429097.136783}
+{"reduce": "MeanMetric", "sum": 6.135300636291504, "weight": 1.0, "key": "loss/global_avg", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:658", "timestamp": 1772429097.1374738}
+{"reduce": "MaxMetric", "value": 6.135300636291504, "key": "loss/global_max", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:659", "timestamp": 1772429097.1375206}
+{"reduce": "MaxMetric", "value": 2.339740514755249, "key": "grad_norm", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:660", "timestamp": 1772429097.1375701}
+{"reduce": "MeanMetric", "sum": 396037.96692261926, "weight": 1.0, "key": "throughput/tps", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:661", "timestamp": 1772429097.137589}
+{"reduce": "MeanMetric", "sum": 28.350488752786436, "weight": 1.0, "key": "throughput/tflops", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:662", "timestamp": 1772429097.137605}
+{"reduce": "MeanMetric", "sum": 2.866581269240287, "weight": 1.0, "key": "throughput/mfu_pct", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:663", "timestamp": 1772429097.1376197}
+{"reduce": "MeanMetric", "sum": 0.04136977100279182, "weight": 1.0, "key": "time/end_to_end_s", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:664", "timestamp": 1772429097.1376336}
+{"reduce": "MeanMetric", "sum": 0.011320232064463198, "weight": 1.0, "key": "time/data_loading_s", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:665", "timestamp": 1772429097.1376467}
+{"reduce": "MeanMetric", "sum": 27.363535717176816, "weight": 1.0, "key": "time/data_loading_pct", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:666", "timestamp": 1772429097.1376595}
+{"reduce": "MaxMetric", "value": 1.52734375, "key": "memory/max_reserved_gib", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:667", "timestamp": 1772429097.137673}
+{"reduce": "MaxMetric", "value": 1.172131061553955, "key": "memory/max_active_gib", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:671", "timestamp": 1772429097.1376867}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_alloc_retries", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:675", "timestamp": 1772429097.137704}
+{"reduce": "SumMetric", "value": 0.0, "key": "memory/num_ooms", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:679", "timestamp": 1772429097.137718}
+{"reduce": "SumMetric", "value": 98304.0, "key": "n_tokens_seen", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:683", "timestamp": 1772429097.137734}
+{"reduce": "MeanMetric", "sum": 0.0008, "weight": 1.0, "key": "learning_rate", "step": 6, "rank": 0, "source": "trainer", "caller": "train.py:684", "timestamp": 1772429097.137752}
