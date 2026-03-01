@@ -67,6 +67,10 @@ from torchtitan.observability.profiling import (
     ProfilerConfig,
     profile_annotation,
 )
+from torchtitan.observability.rollout_logger import (
+    filter_top_bottom,
+    RolloutLogger,
+)
 from torchtitan.observability.tensor_metrics import (
     DerivedTMetric,
     MaxTMetric,
@@ -118,4 +122,7 @@ __all__ = [
     "Profiler",
     "ProfilerConfig",
     "profile_annotation",
+    # PR6
+    "RolloutLogger",
+    "filter_top_bottom",
 ]
