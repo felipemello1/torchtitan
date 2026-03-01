@@ -1,17 +1,11 @@
 """
-Reference conftest.py for observability tests.
+Shared conftest.py for observability tests.
 
-This is a STARTING POINT — the implementing agent should review the actual
-sixlib test imports and adapt as needed. Not gospel.
-
-The sixlib tests import from sixlib.test_utils:
-- distributed_test: decorator for multi-GPU tests
-- assert_nested_equal: deep comparison of nested dicts/tensors
-- maybe_to_full_tensor: DTensor → local tensor for assertions
-- mock_env: mocks sixlib's Env singleton (WE DON'T HAVE THIS — skip)
-
-TorchTitan convention: use torch.testing.assert_close for tensor comparisons.
-No existing conftest.py or test_utils.py in TorchTitan.
+Provides:
+- requires_distributed / requires_gpu markers
+- maybe_to_local: DTensor → local tensor for assertions
+- assert_nested_equal: deep comparison of nested dicts/lists/tensors
+- tmp_output_dir fixture
 """
 
 import os
@@ -23,7 +17,6 @@ import torch.distributed as dist
 # ---------------------------------------------------------------------------
 # Distributed test support
 # ---------------------------------------------------------------------------
-# sixlib uses @distributed_test decorator. We use pytest.mark.skipif.
 # For tests that NEED multi-GPU, mark them and run with torchrun.
 
 requires_distributed = pytest.mark.skipif(
@@ -42,8 +35,7 @@ requires_gpu = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 def maybe_to_local(tensor):
-    """Convert DTensor to local tensor for assertions. No-op for plain tensors.
-    Replaces sixlib's maybe_to_full_tensor."""
+    """Convert DTensor to local tensor for assertions. No-op for plain tensors."""
     if hasattr(tensor, "to_local"):
         return tensor.to_local()
     return tensor
@@ -54,8 +46,7 @@ def maybe_to_local(tensor):
 # ---------------------------------------------------------------------------
 
 def assert_nested_equal(a, b, rtol=1e-5, atol=1e-8):
-    """Deep comparison of nested dicts/lists/tensors.
-    Replaces sixlib's assert_nested_equal."""
+    """Deep comparison of nested dicts/lists/tensors."""
     if isinstance(a, dict):
         assert isinstance(b, dict), f"Type mismatch: {type(a)} vs {type(b)}"
         assert set(a.keys()) == set(b.keys()), f"Key mismatch: {a.keys()} vs {b.keys()}"
