@@ -43,6 +43,12 @@ from torchtitan.observability import (
     record_event, record_span, set_step,
 )
 
+# PR2: Tensor metrics
+from torchtitan.observability import (
+    child_context, InvocationContext, MaxTMetric, MeanTMetric,
+    record_tensor_metric, replicate_to_host,
+)
+
 # ---- Config ----
 NUM_STEPS = 20
 D_MODEL = 64
@@ -67,7 +73,10 @@ class TransformerBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
         h = F.silu(self.w1(h))
-        return x + self.w2(h)
+        w2_out = self.w2(h)
+        # PR2: Partial DTensor metric — exercises deferred reduction
+        record_tensor_metric("w2_partial", MeanTMetric(sum=w2_out.abs().mean(), weight=1))
+        return x + w2_out
 
 
 class TinyModel(nn.Module):
@@ -156,17 +165,23 @@ class ToyTrainer:
         t0 = time.perf_counter()
         set_step(step)
         clear_step_tags()
-        with record_span("Forward/Backward", EventType.FWD_BWD):
-            logits = self.model(tokens)
-            with loss_parallel():
-                loss = F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten(0, 1))
-                self.optimizer.zero_grad()
-                loss.backward()
-        with record_span("Optimizer", EventType.OPTIM):
-            grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+        with InvocationContext() as ctx:
+            with record_span("Forward/Backward", EventType.FWD_BWD):
+                logits = self.model(tokens)
+                with loss_parallel():
+                    loss = F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten(0, 1))
+                    record_tensor_metric("loss", MeanTMetric(sum=loss, weight=torch.tensor(1.0, device=self.device)))
+                    self.optimizer.zero_grad()
+                    loss.backward()
+            with record_span("Optimizer", EventType.OPTIM):
+                grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+            record_tensor_metric("grad_norm", MeanTMetric(mean=grad_norm, weight=torch.tensor(1.0, device=self.device)))
+            with child_context("layer_0"):
+                w1 = list(self.model.layers.values())[0].w1.weight
+                record_tensor_metric("w1_norm", MeanTMetric(mean=w1.float().norm(), weight=torch.tensor(1.0, device=self.device)))
         dt_ms = (time.perf_counter() - t0) * 1000
-        return loss, grad_norm, dt_ms
+        return loss, grad_norm, dt_ms, ctx
 
     def train(self, tokens, labels, num_steps):
         """Full training loop."""
@@ -175,11 +190,15 @@ class ToyTrainer:
             print("-" * 50)
         losses = []
         for step in range(1, num_steps + 1):
-            loss, grad_norm, dt_ms = self.train_step(tokens, labels, step)
+            loss, grad_norm, dt_ms, ctx = self.train_step(tokens, labels, step)
             losses.append(loss.item())
             if step % 5 == 0 or step == 1:
                 add_step_tag("logging")
                 record_event({"train.loss": loss.item(), "train.grad_norm": grad_norm.item()})
+                scalars = replicate_to_host(ctx.summaries())
+                if self.rank == 0:
+                    with open(os.path.join(self.output_dir, f"scalars_step_{step}.json"), "w") as f:
+                        json.dump(scalars, f)
             if self.rank == 0:
                 print(f"{step:>4}  {loss.item():>10.4f}  {grad_norm.item():>10.4f}  {dt_ms:>10.1f}")
         if self.rank == 0:
