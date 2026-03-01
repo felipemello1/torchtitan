@@ -1,0 +1,10 @@
+Total records: 360
+Sources:
+  trainer_rank_0_system: 90
+  trainer_rank_1_system: 90
+  trainer_rank_2_system: 90
+  trainer_rank_3_system: 90
+
+Phase timing (from _end events):
+  fwd_bwd: avg=212.7ms, min=14.4ms, max=4005.2ms, n=80
+  optim: avg=8.5ms, min=2.5ms, max=121.2ms, n=80

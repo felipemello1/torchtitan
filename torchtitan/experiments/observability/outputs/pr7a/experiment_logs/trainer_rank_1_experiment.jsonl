@@ -1,0 +1,60 @@
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 1, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418899.7577767}
+{"reduce": "MeanMetric", "sum": 4068.3071040548384, "weight": 1.0, "key": "step_time_ms", "step": 1, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418899.7578192}
+{"key": "w2_partial", "value": 0.1102251907189687, "all_reduced": true, "step": 1, "rank": 1, "source": "trainer", "timestamp": 1772418899.764926}
+{"key": "loss", "value": 3.4168732166290283, "all_reduced": true, "step": 1, "rank": 1, "source": "trainer", "timestamp": 1772418899.7649379}
+{"key": "grad_norm", "value": 2315.0224609375, "all_reduced": true, "step": 1, "rank": 1, "source": "trainer", "timestamp": 1772418899.7649434}
+{"key": "layer_0/w1_norm", "value": 6.576671123504639, "all_reduced": true, "step": 1, "rank": 1, "source": "trainer", "timestamp": 1772418899.7649472}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 2, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418899.787194}
+{"reduce": "MeanMetric", "sum": 21.90054883249104, "weight": 1.0, "key": "step_time_ms", "step": 2, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418899.7872283}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 3, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418899.8063655}
+{"reduce": "MeanMetric", "sum": 18.956602085381746, "weight": 1.0, "key": "step_time_ms", "step": 3, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418899.8063986}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 4, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418899.826215}
+{"reduce": "MeanMetric", "sum": 19.626179011538625, "weight": 1.0, "key": "step_time_ms", "step": 4, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418899.8262486}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 5, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418899.8445773}
+{"reduce": "MeanMetric", "sum": 18.167675007134676, "weight": 1.0, "key": "step_time_ms", "step": 5, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418899.8446114}
+{"key": "w2_partial", "value": 0.13134833176930746, "all_reduced": true, "step": 5, "rank": 1, "source": "trainer", "timestamp": 1772418899.8452675}
+{"key": "loss", "value": 3.2213635444641113, "all_reduced": true, "step": 5, "rank": 1, "source": "trainer", "timestamp": 1772418899.845277}
+{"key": "grad_norm", "value": 1.7539275884628296, "all_reduced": true, "step": 5, "rank": 1, "source": "trainer", "timestamp": 1772418899.845282}
+{"key": "layer_0/w1_norm", "value": 6.580204010009766, "all_reduced": true, "step": 5, "rank": 1, "source": "trainer", "timestamp": 1772418899.8452857}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 6, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418899.864139}
+{"reduce": "MeanMetric", "sum": 18.48679012618959, "weight": 1.0, "key": "step_time_ms", "step": 6, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418899.8641737}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 7, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418899.8825648}
+{"reduce": "MeanMetric", "sum": 18.22789595462382, "weight": 1.0, "key": "step_time_ms", "step": 7, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418899.8825984}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 8, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418899.901213}
+{"reduce": "MeanMetric", "sum": 18.449232913553715, "weight": 1.0, "key": "step_time_ms", "step": 8, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418899.901247}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 9, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418899.9195228}
+{"reduce": "MeanMetric", "sum": 18.108585849404335, "weight": 1.0, "key": "step_time_ms", "step": 9, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418899.9195592}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 10, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418899.937997}
+{"reduce": "MeanMetric", "sum": 18.275619950145483, "weight": 1.0, "key": "step_time_ms", "step": 10, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418899.9380293}
+{"key": "w2_partial", "value": 0.14325177669525146, "all_reduced": true, "step": 10, "rank": 1, "source": "trainer", "timestamp": 1772418899.9399965}
+{"key": "loss", "value": 3.0440785884857178, "all_reduced": true, "step": 10, "rank": 1, "source": "trainer", "timestamp": 1772418899.940008}
+{"key": "grad_norm", "value": 0.6880897283554077, "all_reduced": true, "step": 10, "rank": 1, "source": "trainer", "timestamp": 1772418899.9400132}
+{"key": "layer_0/w1_norm", "value": 6.606057167053223, "all_reduced": true, "step": 10, "rank": 1, "source": "trainer", "timestamp": 1772418899.940017}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 11, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418899.959432}
+{"reduce": "MeanMetric", "sum": 19.055722979828715, "weight": 1.0, "key": "step_time_ms", "step": 11, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418899.9594662}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 12, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418899.9784138}
+{"reduce": "MeanMetric", "sum": 18.76528188586235, "weight": 1.0, "key": "step_time_ms", "step": 12, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418899.9784474}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 13, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418899.996923}
+{"reduce": "MeanMetric", "sum": 18.30265996977687, "weight": 1.0, "key": "step_time_ms", "step": 13, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418899.9969573}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 14, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418900.0155911}
+{"reduce": "MeanMetric", "sum": 18.475872930139303, "weight": 1.0, "key": "step_time_ms", "step": 14, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418900.015625}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 15, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418900.0337408}
+{"reduce": "MeanMetric", "sum": 17.952209105715156, "weight": 1.0, "key": "step_time_ms", "step": 15, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418900.0337744}
+{"key": "w2_partial", "value": 0.16558081905047098, "all_reduced": true, "step": 15, "rank": 1, "source": "trainer", "timestamp": 1772418900.0354033}
+{"key": "loss", "value": 2.8420379161834717, "all_reduced": true, "step": 15, "rank": 1, "source": "trainer", "timestamp": 1772418900.0354133}
+{"key": "grad_norm", "value": 0.4947686493396759, "all_reduced": true, "step": 15, "rank": 1, "source": "trainer", "timestamp": 1772418900.0354183}
+{"key": "layer_0/w1_norm", "value": 6.663894176483154, "all_reduced": true, "step": 15, "rank": 1, "source": "trainer", "timestamp": 1772418900.0354218}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 16, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418900.0545092}
+{"reduce": "MeanMetric", "sum": 18.717509927228093, "weight": 1.0, "key": "step_time_ms", "step": 16, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418900.0545464}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 17, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418900.0730813}
+{"reduce": "MeanMetric", "sum": 18.36671819910407, "weight": 1.0, "key": "step_time_ms", "step": 17, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418900.0731146}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 18, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418900.0917335}
+{"reduce": "MeanMetric", "sum": 18.44683918170631, "weight": 1.0, "key": "step_time_ms", "step": 18, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418900.0917675}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 19, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418900.1101282}
+{"reduce": "MeanMetric", "sum": 18.191411858424544, "weight": 1.0, "key": "step_time_ms", "step": 19, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418900.1101613}
+{"reduce": "MeanMetric", "sum": 0.001, "weight": 1.0, "key": "learning_rate", "step": 20, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:233", "timestamp": 1772418900.128701}
+{"reduce": "MeanMetric", "sum": 18.374118022620678, "weight": 1.0, "key": "step_time_ms", "step": 20, "rank": 1, "source": "trainer", "caller": "toy_spmd.py:234", "timestamp": 1772418900.1287339}
+{"key": "w2_partial", "value": 0.1947721242904663, "all_reduced": true, "step": 20, "rank": 1, "source": "trainer", "timestamp": 1772418900.1293812}
+{"key": "loss", "value": 2.6579036712646484, "all_reduced": true, "step": 20, "rank": 1, "source": "trainer", "timestamp": 1772418900.1293912}
+{"key": "grad_norm", "value": 0.40678882598876953, "all_reduced": true, "step": 20, "rank": 1, "source": "trainer", "timestamp": 1772418900.129396}
+{"key": "layer_0/w1_norm", "value": 6.750651836395264, "all_reduced": true, "step": 20, "rank": 1, "source": "trainer", "timestamp": 1772418900.1293998}

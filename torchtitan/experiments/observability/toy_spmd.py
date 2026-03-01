@@ -292,6 +292,7 @@ def main():
     trainer.train(tokens, labels, NUM_STEPS)
     trainer.close()
 
+    # Generate Chrome Trace for visualization (rank 0 only)
     if rank == 0:
         from torchtitan.experiments.observability.visualize import to_chrome_trace
 

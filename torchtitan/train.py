@@ -28,6 +28,12 @@ from torchtitan.models.attention import init_attention_mask
 from torchtitan.protocols.model_converter import build_model_converters
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
+from torchtitan.observability import (
+    EventType,
+    init_observability,
+    record_span,
+    set_step,
+)
 from torchtitan.tools.profiling import (
     maybe_enable_memory_snapshot,
     maybe_enable_profiling,
@@ -87,12 +93,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
 
+        # Structured logging: per-rank JSONL for phase timing and events.
+        # Called before dist init — rank read from RANK env var (set by torchrun).
+        init_observability(source="trainer", output_dir=job_config.job.dump_folder)
+
         # init distributed and build meshes
-        dist_utils.init_distributed(
-            job_config.comm,
-            enable_cpu_backend=job_config.training.enable_cpu_offload,
-            base_folder=job_config.job.dump_folder,
-        )
+        with record_span("DistInit", EventType.TORCH_DISTRIBUTED_INIT):
+            dist_utils.init_distributed(
+                job_config.comm,
+                enable_cpu_backend=job_config.training.enable_cpu_offload,
+                base_folder=job_config.job.dump_folder,
+            )
+
         world_size = int(os.environ["WORLD_SIZE"])
         parallelism_config = job_config.parallelism
         self.parallel_dims = parallel_dims = ParallelDims(
@@ -132,18 +144,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.train_spec = train_spec_module.get_train_spec(job_config.model.name)
 
         # build tokenizer and dataloader
-        self.tokenizer = (
-            self.train_spec.build_tokenizer_fn(job_config)
-            if self.train_spec.build_tokenizer_fn is not None
-            else None
-        )
+        with record_span("Tokenizer", EventType.TOKENIZER_INIT):
+            self.tokenizer = (
+                self.train_spec.build_tokenizer_fn(job_config)
+                if self.train_spec.build_tokenizer_fn is not None
+                else None
+            )
 
-        self.dataloader = self.train_spec.build_dataloader_fn(
-            dp_world_size=dp_degree,
-            dp_rank=dp_rank,
-            tokenizer=self.tokenizer,
-            job_config=job_config,
-        )
+        with record_span("Dataloader", EventType.DATA_ITERATOR_INIT):
+            self.dataloader = self.train_spec.build_dataloader_fn(
+                dp_world_size=dp_degree,
+                dp_rank=dp_rank,
+                tokenizer=self.tokenizer,
+                job_config=job_config,
+            )
 
         # build model (using meta init)
         model_args = self.train_spec.model_args[job_config.model.flavor]
@@ -151,18 +165,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         model_args.update_from_config(job_config)
         self.model_args = model_args
 
-        logger.info(
-            f"Building {self.train_spec.name} {job_config.model.flavor} with {model_args}"
-        )
-        with (
-            torch.device("meta"),
-            utils.set_default_dtype(TORCH_DTYPE_MAP[job_config.training.dtype]),
-        ):
-            model = self.train_spec.model_cls(model_args)
+        with record_span("BuildModel", EventType.BUILD_MODEL):
+            logger.info(
+                f"Building {self.train_spec.name} {job_config.model.flavor} with {model_args}"
+            )
+            with (
+                torch.device("meta"),
+                utils.set_default_dtype(TORCH_DTYPE_MAP[job_config.training.dtype]),
+            ):
+                model = self.train_spec.model_cls(model_args)
 
-        # Build the collection of model converters. No-op if `model.converters` empty
-        model_converters = build_model_converters(job_config, parallel_dims)
-        model_converters.convert(model)
+            # Build the collection of model converters. No-op if `model.converters` empty
+            model_converters = build_model_converters(job_config, parallel_dims)
+            model_converters.convert(model)
 
         # metrics logging
         build_metrics_processor_fn = (
@@ -232,40 +247,42 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 )
 
             # apply both PT-D Pipeline Parallel and SPMD-style PT-D techniques
-            (
-                self.pp_schedule,
-                self.model_parts,
-                self.pp_has_first_stage,
-                self.pp_has_last_stage,
-            ) = self.train_spec.pipelining_fn(
-                model,
-                parallel_dims,
-                job_config,
-                self.device,
-                model_args,
-                self.train_spec.parallelize_fn,
-                self.loss_fn,
-            )
-            # when PP is enabled, `model` obj is no longer used after this point,
-            # model_parts is used instead
-            del model
+            with record_span("Parallelize", EventType.MODEL_PARALLELISM_INIT):
+                (
+                    self.pp_schedule,
+                    self.model_parts,
+                    self.pp_has_first_stage,
+                    self.pp_has_last_stage,
+                ) = self.train_spec.pipelining_fn(
+                    model,
+                    parallel_dims,
+                    job_config,
+                    self.device,
+                    model_args,
+                    self.train_spec.parallelize_fn,
+                    self.loss_fn,
+                )
+                # when PP is enabled, `model` obj is no longer used after this point,
+                # model_parts is used instead
+                del model
 
-            for m in self.model_parts:
-                m.to_empty(device=init_device)
-                with torch.no_grad():
-                    m.init_weights(buffer_device=buffer_device)
-                m.train()
+                for m in self.model_parts:
+                    m.to_empty(device=init_device)
+                    with torch.no_grad():
+                        m.init_weights(buffer_device=buffer_device)
+                    m.train()
 
             # confirm that user will be able to view loss metrics on the console
             ensure_pp_loss_visible(parallel_dims, job_config, color)
         else:
             # apply PT-D Tensor Parallel, activation checkpointing, torch.compile, Data Parallel
-            model = self.train_spec.parallelize_fn(model, parallel_dims, job_config)
+            with record_span("Parallelize", EventType.MODEL_PARALLELISM_INIT):
+                model = self.train_spec.parallelize_fn(model, parallel_dims, job_config)
 
-            model.to_empty(device=init_device)
-            with torch.no_grad():
-                model.init_weights(buffer_device=buffer_device)
-            model.train()
+                model.to_empty(device=init_device)
+                with torch.no_grad():
+                    model.init_weights(buffer_device=buffer_device)
+                model.train()
 
             self.model_parts = [model]
 
@@ -283,12 +300,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
         # build optimizer after applying parallelisms to the model
-        self.optimizers = self.train_spec.build_optimizers_fn(
-            self.model_parts, job_config.optimizer, parallel_dims, self.ft_manager
-        )
-        self.lr_schedulers = self.train_spec.build_lr_schedulers_fn(
-            self.optimizers, job_config.lr_scheduler, job_config.training.steps
-        )
+        with record_span("BuildOptimizer", EventType.OPTIMIZER_INIT):
+            self.optimizers = self.train_spec.build_optimizers_fn(
+                self.model_parts, job_config.optimizer, parallel_dims, self.ft_manager
+            )
+            self.lr_schedulers = self.train_spec.build_lr_schedulers_fn(
+                self.optimizers, job_config.lr_scheduler, job_config.training.steps
+            )
         # Post optimizer step model converters hook.
         # e.g. calculate float8 dynamic amax/scale for all-parameter for FSDP2
         # where it issues a single all-reduce for all parameters at once for better performance
@@ -305,23 +323,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.step = 0
         self.ntokens_seen = 0
 
-        self.checkpointer = CheckpointManager(
-            dataloader=self.dataloader,
-            model_parts=self.model_parts,
-            optimizers=self.optimizers,
-            lr_schedulers=self.lr_schedulers,
-            states={"train_state": self},
-            checkpoint_config=job_config.checkpoint,
-            sd_adapter=(
-                self.train_spec.state_dict_adapter(
-                    model_args, job_config.model.hf_assets_path
-                )
-                if self.train_spec.state_dict_adapter
-                else None
-            ),
-            base_folder=job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
-        )
+        with record_span("CheckpointInit", EventType.CHECKPOINT_INIT):
+            self.checkpointer = CheckpointManager(
+                dataloader=self.dataloader,
+                model_parts=self.model_parts,
+                optimizers=self.optimizers,
+                lr_schedulers=self.lr_schedulers,
+                states={"train_state": self},
+                checkpoint_config=job_config.checkpoint,
+                sd_adapter=(
+                    self.train_spec.state_dict_adapter(
+                        model_args, job_config.model.hf_assets_path
+                    )
+                    if self.train_spec.state_dict_adapter
+                    else None
+                ),
+                base_folder=job_config.job.dump_folder,
+                ft_manager=self.ft_manager,
+            )
 
         loss_parallel_enabled = (
             parallel_dims.tp_enabled and not parallelism_config.disable_loss_parallel
@@ -384,12 +403,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         while True:
             data_load_start = time.perf_counter()
-            try:
-                batch = next(data_iterator)
-            except StopIteration as ex:
-                # If data runs out during gradient accumulation, that
-                # entire step will not be executed.
-                raise DataloaderExhaustedError() from ex
+            with record_span("FetchBatch", EventType.FETCHING_BATCH):
+                try:
+                    batch = next(data_iterator)
+                except StopIteration as ex:
+                    # If data runs out during gradient accumulation, that
+                    # entire step will not be executed.
+                    raise DataloaderExhaustedError() from ex
             input_dict, labels = batch
             ntokens_batch = labels.numel()
             self.ntokens_seen += ntokens_batch
@@ -491,23 +511,27 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         accumulated_losses = []
         # If data runs out during gradient accumulation, that
         # entire step will not be executed.
-        for _microbatch in range(self.gradient_accumulation_steps):
-            input_dict, labels = next(data_iterator)
-            loss = self.forward_backward_step(input_dict, labels)
-            accumulated_losses.append(loss.detach())
+        with record_span("Forward/Backward", EventType.FWD_BWD):
+            for _microbatch in range(self.gradient_accumulation_steps):
+                input_dict, labels = next(data_iterator)
+                loss = self.forward_backward_step(input_dict, labels)
+                accumulated_losses.append(loss.detach())
 
-        grad_norm = dist_utils.clip_grad_norm_(
-            [p for m in self.model_parts for p in m.parameters()],
-            self.job_config.training.max_norm,
-            foreach=True,
-            pp_mesh=(
-                parallel_dims.world_mesh["pp"] if parallel_dims.pp_enabled else None
-            ),
-            ep_enabled=parallel_dims.ep_enabled,
-        )
-        self.checkpointer.maybe_wait_for_staging()
-        self.optimizers.step()
-        self.lr_schedulers.step()
+        with record_span("Optimizer", EventType.OPTIM):
+            grad_norm = dist_utils.clip_grad_norm_(
+                [p for m in self.model_parts for p in m.parameters()],
+                self.job_config.training.max_norm,
+                foreach=True,
+                pp_mesh=(
+                    parallel_dims.world_mesh["pp"]
+                    if parallel_dims.pp_enabled
+                    else None
+                ),
+                ep_enabled=parallel_dims.ep_enabled,
+            )
+            self.checkpointer.maybe_wait_for_staging()
+            self.optimizers.step()
+            self.lr_schedulers.step()
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
@@ -550,7 +574,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def train(self):
         job_config = self.job_config
 
-        self.checkpointer.load(step=job_config.checkpoint.load_step)
+        with record_span("CheckpointLoad", EventType.CHECKPOINT_LOAD):
+            self.checkpointer.load(step=job_config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}")
 
         leaf_folder = (
@@ -591,24 +616,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
                 self.step += 1
-                self.gc_handler.run(self.step)
+                set_step(self.step)
+                with record_span("GC", EventType.GC_COLLECT):
+                    self.gc_handler.run(self.step)
                 try:
                     self.train_step(data_iterator)
                 except DataloaderExhaustedError:
                     logger.warning("Ran out of data; last step was canceled.")
                     break
 
-                self.checkpointer.save(
-                    self.step, last_step=(self.step == job_config.training.steps)
-                )
+                with record_span("Checkpoint", EventType.CHECKPOINT):
+                    self.checkpointer.save(
+                        self.step, last_step=(self.step == job_config.training.steps)
+                    )
 
                 # Run validation if validator is available
                 if (
                     self.job_config.validation.enable
                     and self.validator.should_validate(self.step)
                 ):
-                    with self.loss_fn.no_rescale():
-                        self.validator.validate(self.model_parts, self.step)
+                    with record_span("Validation", EventType.EVAL_LAUNCH):
+                        with self.loss_fn.no_rescale():
+                            self.validator.validate(self.model_parts, self.step)
 
                 # signal the profiler that the next profiling step has started
                 if torch_profiler:

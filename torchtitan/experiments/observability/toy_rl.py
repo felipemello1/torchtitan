@@ -77,7 +77,7 @@ class RewardActor(Actor):
     @endpoint
     async def setup(self):
         self.target = torch.ones(D_MODEL)
-        init_observability(rank=0, source="reward", output_dir=OUTPUT_DIR)
+        init_observability(source="reward", output_dir=OUTPUT_DIR, rank=0)
 
     @endpoint
     async def score(self, completions: list[torch.Tensor], step: int = 0) -> list[float]:
@@ -95,7 +95,7 @@ async def main():
     if os.path.exists(OUTPUT_DIR):
         shutil.rmtree(OUTPUT_DIR)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    init_observability(rank=0, source="controller", output_dir=OUTPUT_DIR)
+    init_observability(source="controller", output_dir=OUTPUT_DIR, rank=0)
 
     host = this_host()
     trainer_mesh = host.spawn_procs(per_host={"gpus": 4}, name="trainer")
