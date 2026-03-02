@@ -20,7 +20,6 @@ from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.ft import FTManager, maybe_semi_sync_training
 from torchtitan.components.loss import rescale_accumulated_loss
 from torchtitan.components.metrics import (
-    build_device_memory_monitor,
     build_metrics_processor,
     ensure_pp_loss_visible,
 )
@@ -47,9 +46,10 @@ from torchtitan.observability import (
     TensorBoardSummaryWriter,
     WandbSummaryWriter,
 )
-from torchtitan.tools.profiling import (
-    maybe_enable_memory_snapshot,
-    maybe_enable_profiling,
+from torchtitan.observability import (
+    Profiler,
+    ProfilerConfig,
+    profile_annotation,
 )
 
 
@@ -360,6 +360,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             experiment_log_dir=os.path.join(obs_dir, "experiment_logs")
         )
 
+        # --- Profiler orchestrator (Phase C) ---
+        profiling_cfg = job_config.profiling
+        self._profiler = Profiler(
+            cfg=ProfilerConfig(
+                enable_profiling=profiling_cfg.enable_profiling,
+                profile_freq=profiling_cfg.profile_freq,
+                enable_memory_snapshot=profiling_cfg.enable_memory_snapshot,
+            ),
+            output_dir=obs_dir,
+            global_rank=torch.distributed.get_rank(),
+            role_rank=torch.distributed.get_rank(),
+        )
+
         # Metric computation state (mirrors MetricsProcessor internals)
         self._time_last_log = time.perf_counter()
         self._ntokens_since_last_log = 0
@@ -568,24 +581,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             with record_span("Forward/Backward", EventType.FWD_BWD):
                 for _microbatch in range(self.gradient_accumulation_steps):
                     input_dict, labels = next(data_iterator)
-                    loss = self.forward_backward_step(input_dict, labels)
+                    with profile_annotation("forward_backward"):
+                        loss = self.forward_backward_step(input_dict, labels)
                     accumulated_losses.append(loss.detach())
 
             with record_span("Optimizer", EventType.OPTIM):
-                grad_norm = dist_utils.clip_grad_norm_(
-                    [p for m in self.model_parts for p in m.parameters()],
-                    self.job_config.training.max_norm,
-                    foreach=True,
-                    pp_mesh=(
-                        parallel_dims.world_mesh["pp"]
-                        if parallel_dims.pp_enabled
-                        else None
-                    ),
-                    ep_enabled=parallel_dims.ep_enabled,
-                )
-                self.checkpointer.maybe_wait_for_staging()
-                self.optimizers.step()
-                self.lr_schedulers.step()
+                with profile_annotation("optimizer"):
+                    grad_norm = dist_utils.clip_grad_norm_(
+                        [p for m in self.model_parts for p in m.parameters()],
+                        self.job_config.training.max_norm,
+                        foreach=True,
+                        pp_mesh=(
+                            parallel_dims.world_mesh["pp"]
+                            if parallel_dims.pp_enabled
+                            else None
+                        ),
+                        ep_enabled=parallel_dims.ep_enabled,
+                    )
+                    self.checkpointer.maybe_wait_for_staging()
+                    self.optimizers.step()
+                    self.lr_schedulers.step()
 
         if model_metrics_step and isinstance(ctx, InvocationContext):
             scalars = replicate_to_host(ctx.summaries())
@@ -700,24 +715,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.checkpointer.load(step=job_config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}")
 
-        leaf_folder = (
-            ""
-            if not self.ft_manager.enabled
-            else f"replica_{self.ft_manager.replica_id}"
-        )
         with (
-            maybe_enable_profiling(
-                job_config.profiling,
-                global_step=self.step,
-                base_folder=job_config.job.dump_folder,
-                leaf_folder=leaf_folder,
-            ) as torch_profiler,
-            maybe_enable_memory_snapshot(
-                job_config.profiling,
-                global_step=self.step,
-                base_folder=job_config.job.dump_folder,
-                leaf_folder=leaf_folder,
-            ) as memory_profiler,
             maybe_semi_sync_training(
                 job_config.fault_tolerance,
                 ft_manager=self.ft_manager,
@@ -734,6 +732,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     else None
                 ),
             ),
+            self._profiler,
         ):
             data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
@@ -761,11 +760,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         with self.loss_fn.no_rescale():
                             self.validator.validate(self.model_parts, self.step)
 
-                # signal the profiler that the next profiling step has started
-                if torch_profiler:
-                    torch_profiler.step()
-                if memory_profiler:
-                    memory_profiler.step()
+                self._profiler.step(self.step)
 
                 # reduce timeout after first train step for faster signal
                 # (assuming lazy init and compilation are finished)
@@ -796,6 +791,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def close(self) -> None:
         if self.checkpointer:
             self.checkpointer.close()
+        if hasattr(self, "_profiler") and self._profiler:
+            self._profiler.cleanup()
         if hasattr(self, "_summary_writer") and self._summary_writer:
             self._summary_writer.close()
         # Keep MetricsProcessor close for now (harmless, will be removed in cleanup)

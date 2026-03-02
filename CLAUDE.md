@@ -57,6 +57,15 @@ Integration tests go in `tests/unit_tests/observability/test_integration_prN.py`
 - Writer lifecycle: open in setup, close explicitly. No try/finally, no atexit.
 - If anything is changed/deleted/added outside of what the PR plan specifies, log it in `log.md` with justification
 - After copying from reference, launch a diff comparison subagent to verify faithfulness
+- Every PR MUST have an integration test. No exceptions.
+- When amending a PR, rebase all downstream PRs before proceeding.
+
+## NOT acceptable reasons to diverge
+
+- "We can do it simpler" (copy first, simplify later with justification)
+- "Starting point" / "good enough for now" (every function should be PR-worthy)
+- "We'll improve it later" (if it's not good enough, don't ship it)
+- Rationalizing what is clearly an error, so you don't have to handle it
 
 ## Environment
 
