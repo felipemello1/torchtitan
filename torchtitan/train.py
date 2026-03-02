@@ -7,6 +7,7 @@
 import importlib
 import os
 import time
+from contextlib import nullcontext
 from datetime import timedelta
 from typing import Any, Generator, Iterable, Optional
 
@@ -19,6 +20,7 @@ from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.ft import FTManager, maybe_semi_sync_training
 from torchtitan.components.loss import rescale_accumulated_loss
 from torchtitan.components.metrics import (
+    build_device_memory_monitor,
     build_metrics_processor,
     ensure_pp_loss_visible,
 )
@@ -29,10 +31,21 @@ from torchtitan.protocols.model_converter import build_model_converters
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.observability import (
+    CompositeSummaryWriter,
+    DefaultAggregator,
     EventType,
     init_observability,
+    InvocationContext,
+    log_reduced_metrics,
+    MaxMetric,
+    MeanMetric,
+    record_metric,
     record_span,
+    replicate_to_host,
     set_step,
+    SumMetric,
+    TensorBoardSummaryWriter,
+    WandbSummaryWriter,
 )
 from torchtitan.tools.profiling import (
     maybe_enable_memory_snapshot,
@@ -191,10 +204,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         color = self.metrics_processor.color
 
         # calculate model size and flops per token
-        (
-            model_param_count,
-            self.metrics_processor.num_flops_per_token,
-        ) = model_args.get_nparams_and_flops(model, job_config.training.seq_len)
+        (model_param_count, self._num_flops_per_token) = (
+            model_args.get_nparams_and_flops(model, job_config.training.seq_len)
+        )
+        # Keep old assignment for MetricsProcessor (still exists, will be cleaned up later)
+        self.metrics_processor.num_flops_per_token = self._num_flops_per_token
 
         logger.info(
             f"{color.blue}Model {self.train_spec.name} {job_config.model.flavor} "
@@ -289,8 +303,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.ft_manager.maybe_set_all_reduce_hook(self.model_parts)
 
         # initialize device memory monitor and get peak flops for MFU calculation
-        device_memory_monitor = self.metrics_processor.device_memory_monitor
-        gpu_peak_flops = utils.get_peak_flops(device_memory_monitor.device_name)
+        self._device_memory_monitor = self.metrics_processor.device_memory_monitor
+        self._gpu_peak_flops = utils.get_peak_flops(self._device_memory_monitor.device_name)
+        # Keep locals for the logger.info calls below
+        device_memory_monitor = self._device_memory_monitor
+        gpu_peak_flops = self._gpu_peak_flops
         logger.info(f"Peak FLOPS used for computing MFU: {gpu_peak_flops:.3e}")
         device_mem_stats = device_memory_monitor.get_peak_stats()
         logger.info(
@@ -317,6 +334,38 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         self.metrics_processor.optimizers = self.optimizers
         self.metrics_processor.model_parts = self.model_parts
+
+        # --- Observability: writers + aggregator (Phase B) ---
+        obs_dir = job_config.job.dump_folder
+        writers = {}
+        if job_config.metrics.enable_tensorboard:
+            from datetime import datetime
+
+            tb_log_dir = os.path.join(
+                obs_dir,
+                job_config.metrics.save_tb_folder,
+                datetime.now().strftime("%Y%m%d-%H%M"),
+            )
+            writers["tb"] = TensorBoardSummaryWriter(log_dir=tb_log_dir)
+        if job_config.metrics.enable_wandb:
+            writers["wandb"] = WandbSummaryWriter(
+                project=os.getenv("WANDB_PROJECT", "torchtitan"),
+                entity=os.getenv("WANDB_TEAM", None),
+                config_dict=job_config.to_dict(),
+            )
+        self._summary_writer = CompositeSummaryWriter(writers=writers)
+        self._summary_writer.open()
+
+        self._aggregator = DefaultAggregator(
+            experiment_log_dir=os.path.join(obs_dir, "experiment_logs")
+        )
+
+        # Metric computation state (mirrors MetricsProcessor internals)
+        self._time_last_log = time.perf_counter()
+        self._ntokens_since_last_log = 0
+        self._data_loading_times: list[float] = []
+        self._color = self.metrics_processor.color
+        self._device_memory_monitor.reset_peak_stats()
 
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
@@ -382,6 +431,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 pp_schedule=pp_schedule,
                 pp_has_first_stage=pp_has_first_stage,
                 pp_has_last_stage=pp_has_last_stage,
+                summary_writer=self._summary_writer,
+                experiment_log_dir=os.path.join(
+                    job_config.job.dump_folder, "experiment_logs"
+                ),
             )
 
         logger.info(
@@ -413,10 +466,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             input_dict, labels = batch
             ntokens_batch = labels.numel()
             self.ntokens_seen += ntokens_batch
-            self.metrics_processor.ntokens_since_last_log += ntokens_batch
-            self.metrics_processor.data_loading_times.append(
-                time.perf_counter() - data_load_start
-            )
+            self._ntokens_since_last_log += ntokens_batch
+            self._data_loading_times.append(time.perf_counter() - data_load_start)
 
             # Move tensors to the appropriate device
             for k, v in input_dict.items():
@@ -511,35 +562,45 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         accumulated_losses = []
         # If data runs out during gradient accumulation, that
         # entire step will not be executed.
-        with record_span("Forward/Backward", EventType.FWD_BWD):
-            for _microbatch in range(self.gradient_accumulation_steps):
-                input_dict, labels = next(data_iterator)
-                loss = self.forward_backward_step(input_dict, labels)
-                accumulated_losses.append(loss.detach())
+        model_metrics_step = (self.step % self.job_config.metrics.model_metrics_freq == 0)
+        ctx = InvocationContext() if model_metrics_step else nullcontext()
+        with ctx:
+            with record_span("Forward/Backward", EventType.FWD_BWD):
+                for _microbatch in range(self.gradient_accumulation_steps):
+                    input_dict, labels = next(data_iterator)
+                    loss = self.forward_backward_step(input_dict, labels)
+                    accumulated_losses.append(loss.detach())
 
-        with record_span("Optimizer", EventType.OPTIM):
-            grad_norm = dist_utils.clip_grad_norm_(
-                [p for m in self.model_parts for p in m.parameters()],
-                self.job_config.training.max_norm,
-                foreach=True,
-                pp_mesh=(
-                    parallel_dims.world_mesh["pp"]
-                    if parallel_dims.pp_enabled
-                    else None
-                ),
-                ep_enabled=parallel_dims.ep_enabled,
-            )
-            self.checkpointer.maybe_wait_for_staging()
-            self.optimizers.step()
-            self.lr_schedulers.step()
+            with record_span("Optimizer", EventType.OPTIM):
+                grad_norm = dist_utils.clip_grad_norm_(
+                    [p for m in self.model_parts for p in m.parameters()],
+                    self.job_config.training.max_norm,
+                    foreach=True,
+                    pp_mesh=(
+                        parallel_dims.world_mesh["pp"]
+                        if parallel_dims.pp_enabled
+                        else None
+                    ),
+                    ep_enabled=parallel_dims.ep_enabled,
+                )
+                self.checkpointer.maybe_wait_for_staging()
+                self.optimizers.step()
+                self.lr_schedulers.step()
+
+        if model_metrics_step and isinstance(ctx, InvocationContext):
+            scalars = replicate_to_host(ctx.summaries())
+            log_reduced_metrics(scalars)
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 
-        # log metrics
-        if not self.metrics_processor.should_log(self.step):
+        # --- Logging gate ---
+        log_freq = self.job_config.metrics.log_freq
+        should_log = self.step == 1 or self.step % log_freq == 0
+        if not should_log:
             return
 
+        # --- Loss all-reduce (unchanged logic) ---
         if parallel_dims.dp_cp_enabled:
             loss = loss.detach()
             ft_pg = self.ft_manager.loss_sync_pg
@@ -558,17 +619,78 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             global_avg_loss = global_max_loss = loss.detach().item()
             global_ntokens_seen = self.ntokens_seen
 
-        extra_metrics = {
-            "n_tokens_seen": global_ntokens_seen,
-            "lr": lr,
-        }
-        self.metrics_processor.log(
-            self.step,
-            global_avg_loss,
-            global_max_loss,
-            grad_norm.item(),
-            extra_metrics=extra_metrics,
+        # --- Compute derived metrics (logic from MetricsProcessor.log) ---
+        time_delta = time.perf_counter() - self._time_last_log
+        tps = self._ntokens_since_last_log / (
+            time_delta * parallel_dims.non_data_parallel_size
         )
+        mfu = 100 * self._num_flops_per_token * tps / self._gpu_peak_flops
+        tflops = self._num_flops_per_token * tps / 1e12
+        time_end_to_end = time_delta / log_freq
+        time_data_loading = (
+            sum(self._data_loading_times) / len(self._data_loading_times)
+            if self._data_loading_times
+            else 0.0
+        )
+        time_data_loading_pct = (
+            100 * sum(self._data_loading_times) / time_delta if time_delta > 0 else 0.0
+        )
+        device_mem_stats = self._device_memory_monitor.get_peak_stats()
+
+        # --- Record experiment metrics (fire-and-forget to JSONL) ---
+        # Loss metrics: only on last PP stage (or all ranks if PP disabled)
+        if not parallel_dims.pp_enabled or self.pp_has_last_stage:
+            record_metric("loss/global_avg", MeanMetric(value=float(global_avg_loss)))
+            record_metric("loss/global_max", MaxMetric(value=float(global_max_loss)))
+        record_metric("grad_norm", MaxMetric(value=float(grad_norm.item())))
+        record_metric("throughput/tps", MeanMetric(value=tps))
+        record_metric("throughput/tflops", MeanMetric(value=tflops))
+        record_metric("throughput/mfu_pct", MeanMetric(value=mfu))
+        record_metric("time/end_to_end_s", MeanMetric(value=time_end_to_end))
+        record_metric("time/data_loading_s", MeanMetric(value=time_data_loading))
+        record_metric("time/data_loading_pct", MeanMetric(value=time_data_loading_pct))
+        record_metric(
+            "memory/max_reserved_gib",
+            MaxMetric(value=device_mem_stats.max_reserved_gib),
+        )
+        record_metric(
+            "memory/max_active_gib",
+            MaxMetric(value=device_mem_stats.max_active_gib),
+        )
+        record_metric(
+            "memory/num_alloc_retries",
+            SumMetric(value=float(device_mem_stats.num_alloc_retries)),
+        )
+        record_metric(
+            "memory/num_ooms",
+            SumMetric(value=float(device_mem_stats.num_ooms)),
+        )
+        record_metric("n_tokens_seen", SumMetric(value=float(global_ntokens_seen)))
+        record_metric("learning_rate", MeanMetric(value=lr))
+
+        # --- Aggregate + write to backends (rank 0 only) ---
+        if torch.distributed.get_rank() == 0:
+            aggregated = self._aggregator.collect_and_aggregate(step=self.step)
+            self._summary_writer(step=self.step, values=aggregated)
+
+        # --- Console output (same format as MetricsProcessor.log) ---
+        color = self._color
+        logger.info(
+            f"{color.red}step: {self.step:2}  "
+            f"{color.green}loss: {float(global_avg_loss):7.4f}  "
+            f"{color.orange}grad_norm: {float(grad_norm.item()):7.4f}  "
+            f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
+            f"({device_mem_stats.max_reserved_pct:.2f}%)  "
+            f"{color.blue}tps: {round(tps):,}  "
+            f"{color.cyan}tflops: {tflops:,.2f}  "
+            f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
+        )
+
+        # --- Reset accumulators ---
+        self._ntokens_since_last_log = 0
+        self._data_loading_times.clear()
+        self._time_last_log = time.perf_counter()
+        self._device_memory_monitor.reset_peak_stats()
 
     @record
     def train(self):
@@ -674,6 +796,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def close(self) -> None:
         if self.checkpointer:
             self.checkpointer.close()
+        if hasattr(self, "_summary_writer") and self._summary_writer:
+            self._summary_writer.close()
+        # Keep MetricsProcessor close for now (harmless, will be removed in cleanup)
         if self.metrics_processor:
             self.metrics_processor.close()
 

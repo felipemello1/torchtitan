@@ -20,6 +20,7 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
+from torchtitan.observability import MeanTMetric, record_tensor_metric, profile_annotation
 from torchtitan.tools.utils import has_cuda_capability
 
 # FlexAttention mask type. For each mask type, we initialize it at most once per

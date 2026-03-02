@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from torchtitan.models.attention import build_attention
+from torchtitan.observability import MeanTMetric, record_tensor_metric, profile_annotation
+from torchtitan.observability.model_metrics import LoggingGrad
 from torchtitan.protocols.train_spec import ModelProtocol
 
 from .args import TransformerModelArgs
@@ -179,6 +181,8 @@ class Attention(nn.Module):
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
 
+        record_tensor_metric("attention/q/abs_mean", MeanTMetric(mean=xq.abs().mean(), weight=1))
+
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         # repeat k/v heads if n_kv_heads < n_heads
@@ -190,6 +194,8 @@ class Attention(nn.Module):
         xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 
         output = self.sdpa(xq, xk, xv)
+
+        record_tensor_metric("attention/output/abs_mean", MeanTMetric(mean=output.abs().mean(), weight=1))
 
         output = output.transpose(
             1, 2
@@ -297,8 +303,10 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(self.attention_norm(x), freqs_cis)
-        out = h + self.feed_forward(self.ffn_norm(h))
+        with profile_annotation("Attention"):
+            h = x + self.attention(self.attention_norm(x), freqs_cis)
+        with profile_annotation("FFN"):
+            out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
     def init_weights(self):
@@ -415,9 +423,12 @@ class Transformer(nn.Module, ModelProtocol):
         """
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
+        record_tensor_metric("embedding/abs_mean", MeanTMetric(mean=h.abs().mean(), weight=1))
 
-        for layer in self.layers.values():
+        for i, layer in enumerate(self.layers.values()):
             h = layer(h, self.freqs_cis)
+            record_tensor_metric(f"layers/{i}/residual/abs_mean", MeanTMetric(mean=h.abs().mean(), weight=1))
+            h = LoggingGrad.apply(h, f"layers/{i}")
 
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h

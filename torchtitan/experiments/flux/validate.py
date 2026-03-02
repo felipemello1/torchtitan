@@ -266,6 +266,7 @@ def build_flux_validator(
     pp_schedule: _PipelineSchedule | None = None,
     pp_has_first_stage: bool | None = None,
     pp_has_last_stage: bool | None = None,
+    **kwargs,
 ) -> FluxValidator:
     """Build a simple validator focused on correctness."""
     return FluxValidator(

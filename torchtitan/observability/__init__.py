@@ -67,6 +67,7 @@ from torchtitan.observability.profiling import (
     ProfilerConfig,
     profile_annotation,
 )
+from torchtitan.observability.model_metrics import LoggingGrad
 from torchtitan.observability.rollout_logger import (
     filter_top_bottom,
     RolloutLogger,
@@ -125,4 +126,6 @@ __all__ = [
     # PR6
     "RolloutLogger",
     "filter_top_bottom",
+    # PR7-B
+    "LoggingGrad",
 ]

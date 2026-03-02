@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from torchtitan.distributed.expert_parallel import expert_parallel
+from torchtitan.observability import MeanTMetric, MaxTMetric, record_tensor_metric, profile_annotation
 
 
 @dataclass
@@ -218,6 +219,8 @@ class TokenChoiceTopKRouter(nn.Module):
         else:
             raise NotImplementedError(f"Unknown score function {self.score_func}")
 
+        record_tensor_metric("router/scores/mean", MeanTMetric(mean=scores.mean(), weight=1))
+
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
@@ -242,6 +245,11 @@ class TokenChoiceTopKRouter(nn.Module):
             bins=self.num_experts,
             min=0,
             max=self.num_experts,
+        )
+
+        record_tensor_metric(
+            "router/balance_ratio",
+            MeanTMetric(mean=num_tokens_per_expert.min() / num_tokens_per_expert.max().clamp(min=1), weight=1),
         )
 
         return top_scores, selected_experts_indices, num_tokens_per_expert
@@ -372,11 +380,12 @@ class MoE(nn.Module):
 
         # top_scores and selected_experts_indices shape (bs*slen*top_k,)
         # num_tokens_per_expert shape (num_experts,)
-        (
-            top_scores,
-            selected_experts_indices,
-            num_tokens_per_expert,
-        ) = self.router(x, self.expert_bias)
+        with profile_annotation("Router"):
+            (
+                top_scores,
+                selected_experts_indices,
+                num_tokens_per_expert,
+            ) = self.router(x, self.expert_bias)
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # and also to count the expert usage
@@ -415,7 +424,10 @@ class MoE(nn.Module):
             ).to(x.dtype)
 
         # shape (bs*slen*top_k, dim)
-        routed_output = self.experts(routed_input, num_tokens_per_expert)
+        with profile_annotation("Experts"):
+            routed_output = self.experts(routed_input, num_tokens_per_expert)
+
+        record_tensor_metric("moe/expert_output/abs_mean", MeanTMetric(mean=routed_output.abs().mean(), weight=1))
 
         # shared expert
         # Note: we execute the shared expert before scoring the output of the routed expert

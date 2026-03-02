@@ -66,6 +66,9 @@ class Metrics:
     enable_wandb: bool = False
     """Whether to log metrics to Weights & Biases"""
 
+    model_metrics_freq: int = 100
+    """How often to collect per-layer model metrics (tensor metrics via InvocationContext), in iterations"""
+
 
 @dataclass
 class Model:

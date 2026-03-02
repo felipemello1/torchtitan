@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import time
 from typing import Generator
 
 import torch
@@ -16,6 +17,13 @@ from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.config import JobConfig
 from torchtitan.datasets.hf_datasets import build_hf_validation_dataloader
 from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.observability import (
+    CompositeSummaryWriter,
+    DefaultAggregator,
+    MaxMetric,
+    MeanMetric,
+    record_metric,
+)
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
 
@@ -58,6 +66,8 @@ class Validator(BaseValidator):
         pp_schedule: _PipelineSchedule | None = None,
         pp_has_first_stage: bool | None = None,
         pp_has_last_stage: bool | None = None,
+        summary_writer: CompositeSummaryWriter | None = None,
+        experiment_log_dir: str | None = None,
     ):
         self.job_config = job_config
         self.parallel_dims = parallel_dims
@@ -75,6 +85,14 @@ class Validator(BaseValidator):
         self.pp_schedule = pp_schedule
         self.pp_has_first_stage = pp_has_first_stage
         self.pp_has_last_stage = pp_has_last_stage
+        self._summary_writer = summary_writer
+        self._val_aggregator = (
+            DefaultAggregator(experiment_log_dir=experiment_log_dir)
+            if experiment_log_dir
+            else None
+        )
+        self._ntokens_since_last_log = 0
+        self._time_last_log = time.perf_counter()
 
         if self.job_config.validation.steps == -1:
             logger.warning(
@@ -105,7 +123,7 @@ class Validator(BaseValidator):
             ):
                 break
 
-            self.metrics_processor.ntokens_since_last_log += labels.numel()
+            self._ntokens_since_last_log += labels.numel()
             for k, v in input_dict.items():
                 input_dict[k] = v.to(device_type)
             inputs = input_dict["input"]
@@ -175,7 +193,45 @@ class Validator(BaseValidator):
         else:
             global_avg_loss = loss.item()
 
-        self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
+        # Compute validation metrics
+        time_delta = time.perf_counter() - self._time_last_log
+        tps = self._ntokens_since_last_log / (
+            time_delta * self.parallel_dims.non_data_parallel_size
+        )
+        device_mem_stats = self.metrics_processor.device_memory_monitor.get_peak_stats()
+
+        # Record to experiment JSONL
+        record_metric("validation/loss", MeanMetric(value=float(global_avg_loss)))
+        record_metric("validation/throughput_tps", MeanMetric(value=tps))
+        record_metric(
+            "validation/memory/max_active_gib",
+            MaxMetric(value=device_mem_stats.max_active_gib),
+        )
+        record_metric(
+            "validation/memory/max_reserved_gib",
+            MaxMetric(value=device_mem_stats.max_reserved_gib),
+        )
+
+        # Aggregate + write to backends (rank 0 only)
+        if self._val_aggregator and self._summary_writer:
+            if torch.distributed.get_rank() == 0:
+                aggregated = self._val_aggregator.collect_and_aggregate(step=step)
+                self._summary_writer(step=step, values=aggregated)
+
+        # Console output (same format as MetricsProcessor.log_validation)
+        color = self.metrics_processor.color
+        logger.info(
+            f"{color.yellow}validate step: {step:2}  "
+            f"{color.green}loss: {float(global_avg_loss):7.4f}  "
+            f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
+            f"({device_mem_stats.max_reserved_pct:.2f}%)  "
+            f"{color.blue}tps: {round(tps):,}{color.reset}"
+        )
+
+        # Reset
+        self._ntokens_since_last_log = 0
+        self._time_last_log = time.perf_counter()
+        self.metrics_processor.device_memory_monitor.reset_peak_stats()
 
         # Set model back to train mode
         for model in model_parts:
@@ -195,6 +251,8 @@ def build_validator(
     pp_schedule: _PipelineSchedule | None = None,
     pp_has_first_stage: bool | None = None,
     pp_has_last_stage: bool | None = None,
+    summary_writer: CompositeSummaryWriter | None = None,
+    experiment_log_dir: str | None = None,
 ) -> BaseValidator:
     """Build a simple validator focused on correctness."""
     return Validator(
@@ -210,4 +268,6 @@ def build_validator(
         pp_schedule=pp_schedule,
         pp_has_first_stage=pp_has_first_stage,
         pp_has_last_stage=pp_has_last_stage,
+        summary_writer=summary_writer,
+        experiment_log_dir=experiment_log_dir,
     )
