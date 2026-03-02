@@ -73,16 +73,10 @@ def discover_artifacts(output_dir: str, trace_step: str | None) -> dict:
     trace_dirs = sorted(
         glob(os.path.join(output_dir, "profiling", "traces", "iteration_*"))
     )
+    # Memory snapshots may be under profiling/memory_snapshot/ or memory_snapshot/
     snapshot_files = sorted(
-        glob(
-            os.path.join(
-                output_dir,
-                "profiling",
-                "memory_snapshot",
-                "*",
-                "rank*0*.pickle",
-            )
-        )
+        glob(os.path.join(output_dir, "profiling", "memory_snapshot", "*", "rank*0*.pickle"))
+        or glob(os.path.join(output_dir, "memory_snapshot", "*", "rank*0*.pickle"))
     )
     return {
         "trace_dir": _resolve_trace_dir(trace_dirs, trace_step),
