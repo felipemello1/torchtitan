@@ -40,10 +40,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor, Replicate
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
-    loss_parallel,
     RowwiseParallel,
     parallelize_module,
 )
@@ -154,7 +153,7 @@ class ToyTrainer:
             model, tp_mesh,
             {
                 "tok_embeddings": RowwiseParallel(input_layouts=Replicate(), use_local_output=False),
-                "output": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+                "output": ColwiseParallel(output_layouts=Replicate(), use_local_output=False),
             },
         )
         self._replicate_params(model.norm, tp_mesh)
@@ -192,15 +191,17 @@ class ToyTrainer:
         """
         t0 = time.perf_counter()
         logits = self.model(tokens)
-        with loss_parallel():
-            # Apply mask via ignore_index: set masked labels to -100
-            masked_labels = labels.clone()
-            masked_labels[loss_mask == 0] = -100
-            loss = F.cross_entropy(
-                logits.flatten(0, 1).float(), masked_labels.flatten(0, 1), ignore_index=-100
-            )
-            self.optimizer.zero_grad()
-            loss.backward()
+        # FSDP2 wraps all outputs as DTensors. Convert to local tensor for plain
+        # loss computation with loss_mask. For large vocabs, use loss_parallel()
+        # + ignore_index instead (see torchtitan/components/loss.py).
+        if isinstance(logits, DTensor):
+            logits = logits.full_tensor()
+        per_token_loss = F.cross_entropy(
+            logits.flatten(0, 1).float(), labels.flatten(0, 1), reduction="none"
+        )
+        loss = (per_token_loss * loss_mask.flatten()).sum() / loss_mask.sum()
+        self.optimizer.zero_grad()
+        loss.backward()
         grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
         dt_ms = (time.perf_counter() - t0) * 1000
