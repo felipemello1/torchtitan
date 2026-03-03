@@ -28,11 +28,10 @@ OUTPUT_DIR = os.path.join(
 @pytest.fixture
 def sys_log_dir():
     d = os.path.join(OUTPUT_DIR, "system_logs")
-    if not os.path.exists(d):
-        pytest.skip(
-            "Run toy_spmd.py first: "
-            "torchrun --nproc_per_node=4 -m torchtitan.experiments.observability.toy_spmd"
-        )
+    assert os.path.exists(d), (
+        f"Output not found at {d}. Run first:\n"
+        "  torchrun --nproc_per_node=4 -m torchtitan.experiments.observability.toy_spmd"
+    )
     return d
 
 
