@@ -24,7 +24,7 @@ import time
 
 import pytest
 
-from torchtitan.observability._common import (
+from torchtitan.observability.common import (
     _STEP,
     _STEP_TAGS,
     add_step_tag,

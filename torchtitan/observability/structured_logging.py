@@ -16,7 +16,7 @@ Public API:
     record_event(metrics_dict)     — point-in-time scalar events
     init_observability(...)        — one-time setup (creates file handlers)
 
-Step context (set_step, add_step_tag, clear_step_tags) is in _common.py.
+Step context (set_step, add_step_tag, clear_step_tags) is in common.py.
 """
 
 import enum
@@ -31,7 +31,7 @@ from contextlib import ContextDecorator
 from timeit import default_timer as timer
 from typing import Any
 
-from torchtitan.observability._common import (
+from torchtitan.observability.common import (
     _STEP,
     _STEP_TAGS,
     EXPERIMENT_LOGGER_NAME,

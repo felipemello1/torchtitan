@@ -12,7 +12,7 @@ System metrics (phase timing, step context):
     record_span, record_event, EventType
 """
 
-from torchtitan.observability._common import (
+from torchtitan.observability.common import (
     add_step_tag,
     clear_step_tags,
     set_step,
