@@ -7,19 +7,21 @@
 """
 TorchTitan Observability Library
 
-PR1 — System metrics (phase timing, step context):
+System metrics (phase timing, step context):
     init_observability, set_step, add_step_tag, clear_step_tags,
     record_span, record_event, EventType
 """
 
-from torchtitan.observability.structured_logging import (
+from torchtitan.observability._common import (
     add_step_tag,
     clear_step_tags,
+    set_step,
+)
+from torchtitan.observability.structured_logging import (
     EventType,
     init_observability,
     record_event,
     record_span,
-    set_step,
 )
 
 __all__ = [

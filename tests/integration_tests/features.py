@@ -5,7 +5,21 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import os
+
 from tests.integration_tests import OverrideDefinitions
+
+# Use RUNNER_TEMP if defined (GitHub Actions variable), else fallback to old path
+runner_temp = os.getenv("RUNNER_TEMP")
+if runner_temp:
+    checkpoint_path = os.path.join(
+        runner_temp,
+        "artifacts-to-be-uploaded/model_only_hf_checkpoint/hf_checkpoint/step-10/",
+    )
+else:
+    checkpoint_path = (
+        "artifacts-to-be-uploaded/model_only_hf_checkpoint/hf_checkpoint/step-10/"
+    )
 
 
 def build_features_test_list() -> list[OverrideDefinitions]:
@@ -100,7 +114,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
                 ],
                 [
                     "--checkpoint.enable",
-                    "--checkpoint.initial_load_path artifacts-to-be-uploaded/model_only_hf_checkpoint/hf_checkpoint/step-10/",
+                    f"--checkpoint.initial_load_path {checkpoint_path}",
                     "--checkpoint.initial_load_model_only",
                     "--checkpoint.initial_load_in_hf",
                 ],
@@ -309,31 +323,6 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
-                    "--parallelism.data_parallel_shard_degree=4",
-                    "--activation_checkpoint.mode='full'",
-                    "--model.flavor=debugmodel_flex_attn",
-                ]
-            ],
-            "FSDP+FLEX_ATTN",
-            "fsdp+flex_attn",
-            ngpu=4,
-        ),
-        OverrideDefinitions(
-            [
-                [
-                    "--parallelism.data_parallel_shard_degree=4",
-                    "--activation_checkpoint.mode=selective",
-                    "--activation_checkpoint.selective_ac_option=op",
-                    "--model.flavor=debugmodel_flex_attn",
-                ]
-            ],
-            "FSDP + FLEX + per op SAC",
-            "fsdp+flex_attn+per_op_sac",
-            ngpu=4,
-        ),
-        OverrideDefinitions(
-            [
-                [
                     "--parallelism.context_parallel_degree=4",
                     "--parallelism.context_parallel_rotate_method='allgather'",
                 ]
@@ -416,38 +405,6 @@ def build_features_test_list() -> list[OverrideDefinitions]:
             [
                 [
                     "--checkpoint.enable",
-                    "--parallelism.tensor_parallel_degree=2",
-                    "--parallelism.context_parallel_degree=2",
-                    "--training.enable_cpu_offload",
-                    "--optimizer.early_step_in_backward",
-                ],
-                [
-                    "--parallelism.tensor_parallel_degree=2",
-                    "--parallelism.context_parallel_degree=2",
-                    "--parallelism.data_parallel_replicate_degree=2",
-                    "--training.enable_cpu_offload",
-                    "--optimizer.early_step_in_backward",
-                ],
-            ],
-            "Enable CPU Offload, Optimizer in backward with TP, DP, CP",
-            "cpu_offload+opt_in_bwd+TP+DP+CP",
-            ngpu=8,
-        ),
-        OverrideDefinitions(
-            [
-                [
-                    "--memory_estimation.enable",
-                ]
-            ],
-            "FSDP2 Memory Tracking and Estimation",
-            "fsdp2_memory_estimation",
-            ngpu=2,
-            disabled=True,
-        ),
-        OverrideDefinitions(
-            [
-                [
-                    "--checkpoint.enable",
                 ],
                 [
                     # placeholder for the generation script's generate step
@@ -488,18 +445,6 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
-                    "--model.converters quantize.dense.float8",
-                    "--quantize.dense.float8.enable_fsdp_float8_all_gather",
-                    "--quantize.dense.float8.precompute_float8_dynamic_scale_for_fsdp",
-                    "--quantize.dense.float8.emulate",
-                ],
-            ],
-            "Float8 emulation test",
-            "float8_emulation",
-        ),
-        OverrideDefinitions(
-            [
-                [
                     # Local batch size = 8, and `ngpu=2`, so default
                     # global batch size = 8 * 2 = 16.
                     # To achieve 2 gradient accumulation steps, multiply
@@ -515,8 +460,8 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
-                    "--validation.enable",
-                    "--validation.dataset c4_test",
+                    "--validator.enable",
+                    "--validator.dataloader.dataset c4_test",
                     "--parallelism.tensor_parallel_degree=2",
                     "--parallelism.context_parallel_degree=2",
                     "--parallelism.pipeline_parallel_degree=2",
@@ -526,6 +471,92 @@ def build_features_test_list() -> list[OverrideDefinitions]:
             "Validation test with tp, cp, pp",
             "validation_tp_cp_pp",
             ngpu=8,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--dataloader.num_workers",
+                    "2",
+                    "--dataloader.pin_memory",
+                    "--dataloader.persistent_workers",
+                    "--dataloader.prefetch_factor",
+                    "4",
+                ],
+            ],
+            "Dataloader kwargs (via CLI args)",
+            "dataloader_kwargs",
+            ngpu=2,
+        ),
+        # NOTE: below are tests which require config change that cannot be done
+        #       via CLI overrides, so remain llama3 specific
+        OverrideDefinitions(
+            [
+                [
+                    "--module llama3 --config llama3_debugmodel_flex_attn",
+                    "--parallelism.data_parallel_shard_degree=4",
+                    "--activation_checkpoint.mode='full'",
+                ]
+            ],
+            "FSDP+FLEX_ATTN",
+            "fsdp+flex_attn",
+            ngpu=4,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--module llama3 --config llama3_debugmodel_flex_attn",
+                    "--parallelism.data_parallel_shard_degree=4",
+                    "--activation_checkpoint.mode=selective",
+                    "--activation_checkpoint.selective_ac_option=op",
+                ]
+            ],
+            "FSDP + FLEX + per op SAC",
+            "fsdp+flex_attn+per_op_sac",
+            ngpu=4,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--module llama3 --config llama3_debugmodel_varlen_attn",
+                    "--parallelism.data_parallel_shard_degree=4",
+                    "--activation_checkpoint.mode=selective",
+                    "--activation_checkpoint.selective_ac_option=op",
+                ]
+            ],
+            "FSDP+VARLEN_ATTN + per op SAC",
+            "fsdp+varlen_attn+per_op_sac",
+            ngpu=4,
+            skip_rocm_test=True,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--module llama3 --config llama3_debugmodel_opt_in_bwd",
+                    "--checkpoint.enable",
+                    "--parallelism.tensor_parallel_degree=2",
+                    "--parallelism.context_parallel_degree=2",
+                    "--training.enable_cpu_offload",
+                ],
+                [
+                    "--module llama3 --config llama3_debugmodel_opt_in_bwd",
+                    "--parallelism.tensor_parallel_degree=2",
+                    "--parallelism.context_parallel_degree=2",
+                    "--parallelism.data_parallel_replicate_degree=2",
+                    "--training.enable_cpu_offload",
+                ],
+            ],
+            "Enable CPU Offload, Optimizer in backward with TP, DP, CP",
+            "cpu_offload+opt_in_bwd+TP+DP+CP",
+            ngpu=8,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--module llama3 --config llama3_debugmodel_float8_emulate",
+                ],
+            ],
+            "Float8 emulation test",
+            "float8_emulation",
         ),
     ]
 

@@ -4,11 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-
-from typing import Callable, Literal
+from abc import ABC, abstractmethod
 
 import torch
 import torch.nn as nn
+from torch import Tensor
 from torch.distributed._functional_collectives import (
     all_to_all_single,
     all_to_all_single_autograd,
@@ -18,42 +18,46 @@ from torch.distributed.tensor import (
     distribute_module,
     distribute_tensor,
     DTensor,
+    Partial,
+    Replicate,
     Shard,
 )
 from torch.distributed.tensor.parallel import ParallelStyle
 
-from torchtitan.tools.utils import _round_up
+from torchtitan.models.common.moe.utils import _permute, _unpermute
 
 
-TOKEN_GROUP_ALIGN_SIZE_M = 8
-ValidTokenGroupAlignmentSize = Literal[8, 16, 32]
+class BaseExpertParallel(ParallelStyle, ABC):
+    @abstractmethod
+    def _partition_fn(self, name: str, mod: nn.Module, device_mesh: DeviceMesh) -> None:
+        ...
 
+    @abstractmethod
+    def _token_dispatch(
+        self, mod: nn.Module, inputs: tuple, device_mesh: DeviceMesh
+    ) -> tuple[Tensor, Tensor]:
+        ...
 
-def set_token_group_alignment_size_m(
-    alignment_size: ValidTokenGroupAlignmentSize,
-) -> None:
-    """
-    Set the token group alignment size for token groups in MoE. This is implemented by
-    padding each token group size to the next multiple of TOKEN_GROUP_ALIGN_SIZE_M.
-
-    Valid values are: 8, 16, or 32.
-    Different values are needed for different cases:
-
-    * For bf16, 8 is enough (16 byte alignment / 2 bytes per elem = 8 elements).
-    * For fp8, 16 byte alignment / 1 byte per elem = 16 elements.
-    * For mxfp8, we need 32 (or block_size) because scaling block size is (1 x 32),
-      so when doing per-token-group quantization on each logically distinct subtensor,
-      we need to ensure the contracting dim is divisible by block_size.
-      In the backward pass, grad_weight = (grad_output_t @ input).t() has gemm dims
-      of (N, M) @ (M, K) so M is the contracting dim, and group offsets are along M,
-      so we need 32 element alignment.
-    """
-    global TOKEN_GROUP_ALIGN_SIZE_M
-    TOKEN_GROUP_ALIGN_SIZE_M = alignment_size
+    @abstractmethod
+    def _token_combine(
+        self, mod: nn.Module, routed_output: Tensor, device_mesh: DeviceMesh
+    ) -> Tensor:
+        ...
 
 
 # implementation of Tensor Parallel for the GroupedExperts in MoE
 class TensorParallel(ParallelStyle):
+    def _prepare_input_fn(self, mod, inputs, device_mesh):
+        routed_input, num_tokens_per_expert = inputs
+        # NOTE: Currently in MoE TP, experts multiplication runs in plain Tensors.
+        #       The grad_placements on inputs is set to Partial so that necessary
+        #       reductions are performed during backward.
+        routed_input = DTensor.from_local(
+            routed_input, device_mesh, (Replicate(),)
+        ).to_local(grad_placements=(Partial(),))
+
+        return routed_input, num_tokens_per_expert
+
     def _partition_fn(self, name, module, device_mesh):
         # w1 shape = (experts, out_dim, in_dim)
         module.register_parameter(
@@ -77,20 +81,31 @@ class TensorParallel(ParallelStyle):
             module,
             device_mesh,
             self._partition_fn,
+            # pyrefly: ignore [bad-argument-type]
+            self._prepare_input_fn,
         )
 
 
-class ExpertParallel(ParallelStyle):
+class ExpertParallel(BaseExpertParallel):
     def __init__(self):
         super().__init__()
         self.input_splits = None
         self.output_splits = None
+        self.input_shape = None
+        self.permuted_indices = None
 
-    # performing all-to-all dispatch on the input
-    def _token_dispatch(self, mod, inputs, device_mesh):
+    def _partition_fn(self, name: str, mod: nn.Module, device_mesh: DeviceMesh) -> None:
+        for param_name, param in mod.named_parameters(recurse=False):
+            dist_param = nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)]))
+            mod.register_parameter(param_name, dist_param)
+
+    def _token_dispatch(
+        self, mod: nn.Module, inputs: tuple, device_mesh: DeviceMesh
+    ) -> tuple[Tensor, Tensor]:
         # annotate module input placements/sharding with input_layouts
         routed_input, num_tokens_per_expert = inputs
-        ep_size = device_mesh.shape[0]
+        ep_degree = device_mesh.shape[0]
+        num_local_experts = num_tokens_per_expert.shape[0] // ep_degree
 
         # generate the input splits and output splits for all-to-all
         with torch.no_grad():
@@ -106,13 +121,13 @@ class ExpertParallel(ParallelStyle):
                 num_tokens_per_expert_group
             )
             input_splits = (
-                num_tokens_per_expert.view(ep_size, -1)
+                num_tokens_per_expert.view(ep_degree, -1)
                 .sum(dim=1)
                 .to(torch.device("cpu"), non_blocking=True)
             )
             # NOTE: this would incur a device-to-host sync
             output_splits = (
-                num_tokens_per_expert_group.view(ep_size, -1)
+                num_tokens_per_expert_group.view(ep_degree, -1)
                 .sum(dim=1)
                 .to(torch.device("cpu"), non_blocking=False)
             )
@@ -133,21 +148,30 @@ class ExpertParallel(ParallelStyle):
         # Rather, it is of the format
         # [#tokens for local expert 0 from EP rank 0, #tokens for local expert 1 from EP rank 0, ...,
         #  #tokens for local expert 0 from EP rank 1, #tokens for local expert 1 from EP rank 1, ...]
-        # We need to perform another shuffle to get the correct format -- this is done via the function
-        # generate_permute_indices in moe.py, which also does padding to make sure the number of tokens
-        # each expert gets locally is a multiple of ALIGN_SIZE_M.
+        # We need to perform another shuffle to get the correct layout, via the _permute function
+        # below, which also does padding to make sure the number of tokens each expert gets locally
+        # is a multiple of TOKEN_GROUP_ALIGN_SIZE_M.
+        # Note that this will create side effects when wrapping the for-loop implementation
+        # of GroupedExperts, as it does not need padding.
+
+        (
+            self.input_shape,
+            routed_input,
+            self.permuted_indices,
+            num_tokens_per_expert_group,
+        ) = _permute(
+            routed_input, num_tokens_per_expert_group, ep_degree, num_local_experts
+        )
 
         return routed_input, num_tokens_per_expert_group
 
-    @staticmethod
-    def _partition_fn(name, mod, device_mesh):
-        # shard on the expert dimension
-        for name, param in mod.named_parameters(recurse=False):
-            dist_param = nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)]))
-            mod.register_parameter(name, dist_param)
+    def _token_combine(
+        self, mod: nn.Module, routed_output: Tensor, device_mesh: DeviceMesh
+    ) -> Tensor:
+        routed_output = _unpermute(
+            routed_output, self.input_shape, self.permuted_indices
+        )
 
-    # performing all-to-all combine on the output
-    def _token_combine(self, mod, routed_output, device_mesh):
         routed_output = all_to_all_single_autograd(
             routed_output,
             self.input_splits,
@@ -160,133 +184,73 @@ class ExpertParallel(ParallelStyle):
         return distribute_module(
             module,
             device_mesh,
-            partition_fn=ExpertParallel._partition_fn,
+            partition_fn=self._partition_fn,
+            # pyrefly: ignore [bad-argument-type]
             input_fn=self._token_dispatch,
+            # pyrefly: ignore [bad-argument-type]
             output_fn=self._token_combine,
         )
 
 
 # This class is for dp2ep with TP (without TP we can just use ExpertParallel)
 class ExpertTensorParallel(ExpertParallel):
-    def __init__(
-        self,
-        tp_mesh: DeviceMesh,
-        ep_mesh: DeviceMesh,
-    ):
-        super().__init__()
-        # TODO: has to pass in the meshes in addition to the [ep, tp] device_mesh,
-        #       as DeviceMesh doesn't support slicing from a submesh.
-        self.tp_mesh = tp_mesh
-        self.ep_mesh = ep_mesh
-
     def _token_dispatch(self, mod, inputs, device_mesh):
-        # token dispatch happens on the EP mesh, whereas device_mesh is [ep, tp] mesh
-        return super()._token_dispatch(mod, inputs, self.ep_mesh)
+        routed_input, num_tokens_per_expert = inputs
 
-    def _partition_fn_2d(self, name, mod, ep_tp_mesh):
+        # NOTE: Currently in MoE TP, experts multiplication runs in plain Tensors.
+        #       The grad_placements on inputs is set to Partial so that necessary
+        #       reductions are performed during backward.
+
+        # NOTE: The mesh used here should be dense_mesh["tp"] as routed_input is
+        #       technically wrapped with the dense_mesh["tp"] but this complicates
+        #       the interface of ExpertTensorParallel and it doesn't matter as etp
+        #       is almost always the same as tp or is 1. To avoid the complexity,
+        #       we use the etp mesh here.
+        routed_input = DTensor.from_local(
+            routed_input, device_mesh["etp"], (Replicate(),)
+        ).to_local(grad_placements=(Partial(),))
+
+        inputs = (routed_input, num_tokens_per_expert)
+
+        # token dispatch happens on the EP mesh, whereas device_mesh is [ep, tp] mesh
+        return super()._token_dispatch(mod, inputs, device_mesh["ep"])
+
+    def _partition_fn(self, name: str, mod: nn.Module, device_mesh: DeviceMesh) -> None:
         # w1 shape = (experts, out_dim, in_dim)
         mod.register_parameter(
             "w1",
-            nn.Parameter(distribute_tensor(mod.w1, ep_tp_mesh, [Shard(0), Shard(1)])),
+            # pyrefly: ignore [bad-argument-type]
+            nn.Parameter(distribute_tensor(mod.w1, device_mesh, [Shard(0), Shard(1)])),
         )  # Column-wise sharding
 
         # w2 shape = (experts, in_dim, out_dim)
         mod.register_parameter(
             "w2",
-            nn.Parameter(distribute_tensor(mod.w2, ep_tp_mesh, [Shard(0), Shard(2)])),
+            # pyrefly: ignore [bad-argument-type]
+            nn.Parameter(distribute_tensor(mod.w2, device_mesh, [Shard(0), Shard(2)])),
         )  # Row-wise sharding
 
         # w3 shape = (experts, out_dim, in_dim)
         mod.register_parameter(
             "w3",
-            nn.Parameter(distribute_tensor(mod.w3, ep_tp_mesh, [Shard(0), Shard(1)])),
+            # pyrefly: ignore [bad-argument-type]
+            nn.Parameter(distribute_tensor(mod.w3, device_mesh, [Shard(0), Shard(1)])),
         )  # Column-wise sharding
 
     def _token_combine(self, mod, routed_output, device_mesh):
         # token combine happens on the EP mesh, whereas device_mesh is [ep, tp] mesh
-        return super()._token_combine(mod, routed_output, self.ep_mesh)
+        return super()._token_combine(mod, routed_output, device_mesh["ep"])
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         return distribute_module(
             module,
             device_mesh,
-            partition_fn=self._partition_fn_2d,
+            partition_fn=self._partition_fn,
+            # pyrefly: ignore [bad-argument-type]
             input_fn=self._token_dispatch,
+            # pyrefly: ignore [bad-argument-type]
             output_fn=self._token_combine,
         )
-
-
-def expert_parallel(func: Callable) -> Callable:
-    """
-    This is a wrapper applied to the GroupedExperts computation, serving
-    the following three purposes:
-    1. Convert parameters from DTensors to plain Tensors, to work with
-    dynamic-shape inputs which cannot be easily expressed as DTensors.
-    2. In Expert Parallel, apply the generate_permute_indices kernel to
-    permute the inputs to be ordered by local experts (see the _token_dispatch
-    function in ExpertParallel) and permute the outputs back.
-    3. In order to use torch._grouped_mm, we need to make sure the number of
-    tokens each expert gets is a multiple of ALIGN_SIZE_M. The generate_permute_indices
-    kernel also helps achieve this via padding, without incurring synchronization
-    between device and host. Note that this will create side effects when wrapping
-    the for-loop implementation of GroupedExperts, as it does not need padding.
-
-    Among the above:
-    1 and 2 are needed only when expert_parallel_degree > 1.
-    3 is needed even for single-device computation.
-    2 can be moved to ExpertParallel _token_dispatch if not coupled with 3.
-    """
-
-    def wrapper(
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        w3: torch.Tensor,
-        x: torch.Tensor,
-        num_tokens_per_expert: torch.Tensor,
-    ) -> torch.Tensor:
-        global TOKEN_GROUP_ALIGN_SIZE_M
-        if isinstance(w1, DTensor):
-            w1 = w1.to_local()
-            w2 = w2.to_local()
-            w3 = w3.to_local()
-
-        from torchtitan.experiments.kernels.moe.indices import generate_permute_indices
-
-        experts_per_ep_rank = w1.shape[0]
-        num_ep_ranks = num_tokens_per_expert.shape[0] // experts_per_ep_rank
-
-        # Make sure max_len of permuted token indicies is divisible by TOKEN_GROUP_ALIGN_SIZE_M,
-        # by padding it to the nearest multiple of TOKEN_GROUP_ALIGN_SIZE_M.
-        x_padded_per_expert = (
-            x.shape[0] + experts_per_ep_rank * TOKEN_GROUP_ALIGN_SIZE_M
-        )
-        padded_max_len = _round_up(x_padded_per_expert, TOKEN_GROUP_ALIGN_SIZE_M)
-        with torch.no_grad():
-            (
-                permuted_indices,
-                num_tokens_per_expert,
-                _,  # offsets,
-            ) = generate_permute_indices(
-                num_tokens_per_expert,
-                experts_per_ep_rank,
-                num_ep_ranks,
-                padded_max_len,
-                TOKEN_GROUP_ALIGN_SIZE_M,
-            )
-
-        x = torch.vstack((x, x.new_zeros((x.shape[-1]))))
-        input_shape = x.shape
-        x = x[permuted_indices, :]
-
-        out = func(w1, w2, w3, x, num_tokens_per_expert)
-
-        out_unpermuted = out.new_empty(input_shape)
-        out_unpermuted[permuted_indices, :] = out
-        out = out_unpermuted[:-1]
-
-        return out
-
-    return wrapper
 
 
 # This class is to support Sequence Parallel for ETP=1
@@ -294,11 +258,11 @@ def expert_parallel(func: Callable) -> Callable:
 class ReordererSequenceParallel(ParallelStyle):
     def __init__(self):
         super().__init__()
-        self.num_tokens = None
 
     def _prepare_inputput_fn(self, mod, inputs, device_mesh):
+        # shape (batch_size*seq_len, top_k)
         top_scores, selected_experts_indices = inputs
-        self.num_tokens = top_scores.shape[0]
+        num_tokens, _ = top_scores.shape
 
         # NOTE: If needed, we can pad tokens in case bs*slen is not divisible by TP degree
         # if top_scores.shape[0] % device_mesh.size() != 0:
@@ -310,8 +274,12 @@ class ReordererSequenceParallel(ParallelStyle):
 
         def _split_along_first_dim(x: torch.Tensor) -> torch.Tensor:
             assert x.is_contiguous()
-            assert self.num_tokens % device_mesh.size() == 0
-            local_num_tokens = self.num_tokens // device_mesh.size()
+            if num_tokens % device_mesh.size() != 0:
+                raise ValueError(
+                    "Uneven split of tokens of is not supported yet. "
+                    "Requires EP degree dividing batch size * seq len."
+                )
+            local_num_tokens = num_tokens // device_mesh.size()
             local_rank = device_mesh.get_local_rank()
             offset = local_rank * local_num_tokens
             output = x[offset : offset + local_num_tokens]
@@ -321,16 +289,18 @@ class ReordererSequenceParallel(ParallelStyle):
         top_scores = _split_along_first_dim(top_scores)
         selected_experts_indices = _split_along_first_dim(selected_experts_indices)
 
+        # shape (batch_size * seq_len // ep_degree, top_k)
         return top_scores, selected_experts_indices
 
     def _prepare_output_fn(self, mod, outputs, device_mesh):
+        # shape (batch_size * seq_len * top_k // ep_degree)
         top_scores, token_indices_experts_sorted, num_tokens_per_expert = outputs
 
         # NOTE: As we shard routed tokens along bs*slen dim across the TP ranks,
         #       the MoE gather and scatter still require global token indices.
         local_rank = device_mesh.get_local_rank()
-        token_indices_experts_sorted += (
-            self.num_tokens // device_mesh.size() * local_rank
+        token_indices_experts_sorted = (
+            token_indices_experts_sorted + top_scores.shape[0] * local_rank
         )
 
         return top_scores, token_indices_experts_sorted, num_tokens_per_expert
@@ -340,6 +310,75 @@ class ReordererSequenceParallel(ParallelStyle):
             module,
             device_mesh,
             partition_fn=None,
+            # pyrefly: ignore [bad-argument-type]
             input_fn=self._prepare_inputput_fn,
+            # pyrefly: ignore [bad-argument-type]
             output_fn=self._prepare_output_fn,
+        )
+
+
+class DeepEPExpertParallel(BaseExpertParallel):
+    """Expert Parallel using DeepEP for efficient token dispatch/combine.
+
+    Expects inputs as:
+        (hidden_states, num_tokens_per_expert, selected_experts_indices, top_scores, num_experts)
+
+    Args:
+        score_before_experts: If True, apply routing scores before expert computation.
+    """
+
+    def __init__(self, score_before_experts: bool = True):
+        super().__init__()
+        self._state = None  # State preserved between dispatch and combine
+        self.score_before_experts = score_before_experts
+
+    def _token_dispatch(self, mod, inputs, device_mesh):
+        """Dispatch tokens via DeepEP."""
+        from torchtitan.distributed.deepep import dispatch_tokens
+
+        hidden_states, _, selected_experts_indices, top_scores, num_experts = inputs
+        if isinstance(mod.w1, DTensor):
+            num_local_experts = mod.w1.to_local().shape[0]
+        else:
+            num_local_experts = mod.w1.shape[0]
+        ep_group = device_mesh.get_group()
+
+        hidden_states, tokens_per_expert, self._state = dispatch_tokens(
+            hidden_states,
+            selected_experts_indices,
+            top_scores,
+            num_local_experts,
+            num_experts,
+            ep_group,
+            score_before_experts=self.score_before_experts,
+        )
+
+        return hidden_states, tokens_per_expert
+
+    @staticmethod
+    def _partition_fn(name, mod, device_mesh):
+        """Shard expert weights on expert dimension."""
+        for param_name, param in mod.named_parameters(recurse=False):
+            mod.register_parameter(
+                param_name,
+                nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)])),
+            )
+
+    def _token_combine(self, mod, routed_output, device_mesh):
+        """Combine tokens via DeepEP."""
+        from torchtitan.distributed.deepep import combine_tokens
+
+        # pyrefly: ignore [bad-argument-type]
+        routed_output = combine_tokens(routed_output, self._state)
+        self._state = None
+        return routed_output
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        """Apply DeepEP parallelization."""
+        return distribute_module(
+            module,
+            device_mesh,
+            partition_fn=DeepEPExpertParallel._partition_fn,
+            input_fn=self._token_dispatch,  # pyrefly: ignore [bad-argument-type]
+            output_fn=self._token_combine,  # pyrefly: ignore [bad-argument-type]
         )

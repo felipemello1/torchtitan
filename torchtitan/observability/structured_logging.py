@@ -7,12 +7,16 @@
 """
 Structured JSONL logging for system metrics (phase timing, step context).
 
-Ported from reference libraries with adaptations. Changes tagged with reason codes:
-  META_REMOVAL — removed Meta-internal code
-  MONARCH_COMPAT — adapted for Monarch async (ContextVar for step)
-  RENAME — renamed internal names to OSS equivalents
-  OSS_COMPAT — adapted for OSS (explicit args instead of env vars)
-  IMPROVEMENT — minor enhancement over reference
+Each rank writes its own JSONL file independently — no cross-rank coordination.
+The training process writes files; downstream tools (Grafana, DuckDB, Perfetto)
+consume them.
+
+Public API:
+    record_span(name, event_type)  — context manager for timing phases
+    record_event(metrics_dict)     — point-in-time scalar events
+    init_observability(...)        — one-time setup (creates file handlers)
+
+Step context (set_step, add_step_tag, clear_step_tags) is in _common.py.
 """
 
 import enum
@@ -24,39 +28,36 @@ import socket
 import threading
 import time
 from contextlib import ContextDecorator
-from contextvars import ContextVar
 from timeit import default_timer as timer
 from typing import Any
 
-# ---------------------------------------------------------------------------
-# ContextVars for mutable per-task state (MONARCH_COMPAT — decision_003)
-# Rank/source are constants stored on the formatter.
-# Step/step_tags are mutable, need ContextVar for async safety.
-# ---------------------------------------------------------------------------
-_STEP: ContextVar[int | None] = ContextVar("_STEP", default=None)
-_STEP_TAGS: ContextVar[tuple[str, ...]] = ContextVar("_STEP_TAGS", default=())
+from torchtitan.observability._common import (
+    _STEP,
+    _STEP_TAGS,
+    EXPERIMENT_LOGGER_NAME,
+    SYSTEM_LOGGER_NAME,
+)
 
-# Logger names
-SYSTEM_LOGGER_NAME = "torchtitan.observability.system"
-EXPERIMENT_LOGGER_NAME = "torchtitan.observability.experiment"
+MAX_MESSAGE_SIZE: int = 1000
 
 # ---------------------------------------------------------------------------
-# StrEnum — ported from reference
+# Enums
 # ---------------------------------------------------------------------------
 
 
 class StrEnum(enum.Enum):
+    """String-valued enum. str(member) returns the value, not 'Class.name'."""
+
     def __str__(self) -> str:
         return self.value
 
 
-# ---------------------------------------------------------------------------
-# EventType (CHANGED — META_REMOVAL: removed SDC, Triton cache, per-rank
-# cache, replicate consistency check entries)
-# ---------------------------------------------------------------------------
-
-
 class EventType(StrEnum):
+    """Phase identifiers for structured JSONL events.
+
+    Each phase has a base event plus _START and _END variants.
+    record_span auto-derives _START/_END from the base.
+    """
     BINARY_START = "binary_start"
     TORCH_DISTRIBUTED_INIT = "torch_distributed_init"
     TORCH_DISTRIBUTED_INIT_START = "torch_distributed_init_start"
@@ -134,17 +135,14 @@ class EventType(StrEnum):
     STATE_DICT_LOAD_END = "state_dict_load_end"
 
 
-# ---------------------------------------------------------------------------
-# LogType, ExtraFields — ported from reference
-# ---------------------------------------------------------------------------
-
-
 class LogType(StrEnum):
+    """Distinguishes event records from free-text log records in JSONL."""
     EVENT = "event"
     TEXT = "text"
 
 
 class ExtraFields(StrEnum):
+    """Keys for the `extra` dict passed to logging calls."""
     LOG_TYPE = "log_type"
     LOG_TYPE_NAME = "log_type_name"
     EVENT_NAME = "event_name"
@@ -155,22 +153,18 @@ class ExtraFields(StrEnum):
 
 
 # ---------------------------------------------------------------------------
-# dict_to_list_safe — ported from reference
+# Event helpers
 # ---------------------------------------------------------------------------
 
 
-def dict_to_list_safe(d: dict[str, str] | None) -> list[str] | None:
+def dict_to_str_list(d: dict[str, str] | None) -> list[str] | None:
+    """Convert a dict to a list of "key:value" strings for JSONL normvector field."""
     if d is None:
         return None
     try:
         return [f"{k}:{v}" for k, v in d.items()]
     except Exception:
         return None
-
-
-# ---------------------------------------------------------------------------
-# event_extra — ported from reference
-# ---------------------------------------------------------------------------
 
 
 def event_extra(
@@ -181,6 +175,7 @@ def event_extra(
     value: float | int | None = None,
     context: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    """Build the extra dict for a structured JSONL event record."""
     return {
         str(ExtraFields.LOG_TYPE): str(LogType.EVENT),
         str(ExtraFields.LOG_TYPE_NAME): str(event_type),
@@ -188,48 +183,15 @@ def event_extra(
         str(ExtraFields.STEP): step,
         str(ExtraFields.RELATIVE_STEP): relative_step,
         str(ExtraFields.VALUE): value,
-        str(ExtraFields.CONTEXT): dict_to_list_safe(context),
+        str(ExtraFields.CONTEXT): dict_to_str_list(context),
     }
 
 
-# ---------------------------------------------------------------------------
-# set_step / add_step_tag / clear_step_tags
-# (CHANGED — MONARCH_COMPAT: ContextVar instead of global mutable)
-# ---------------------------------------------------------------------------
-
-
-def set_step(step: int) -> None:
-    """Set the current training step in the ContextVar.
-
-    Called once per step/endpoint. Rank/source are constants on the formatter,
-    so only step needs updating per-task.
-    """
-    _STEP.set(step)
-
-
-def add_step_tag(tag: str) -> None:
-    """Add a tag to the current step. Tags are immutable tuples (ContextVar safe).
-
-    Uses tuple[str, ...] instead of list to avoid the mutable-list-in-ContextVar
-    footgun: ContextVar copies the reference, so a mutable list would leak across
-    asyncio tasks.
-    """
-    current = _STEP_TAGS.get()
-    if tag not in current:
-        _STEP_TAGS.set(current + (tag,))
-
-
-def clear_step_tags() -> None:
-    """Clear all step tags. Call at step boundaries."""
-    _STEP_TAGS.set(())
 
 
 # ---------------------------------------------------------------------------
-# to_structured_json (RENAME + IMPROVEMENT)
-# Based on reference handler. Added: None-skipping, bool→int, tuple support.
+# JSONL formatting
 # ---------------------------------------------------------------------------
-
-MAX_MESSAGE_SIZE: int = 1000
 
 
 def to_structured_json(log_dict: dict[str, Any]) -> str:
@@ -264,8 +226,6 @@ def to_structured_json(log_dict: dict[str, Any]) -> str:
 
 # ---------------------------------------------------------------------------
 # StructuredJSONFormatter
-# (RENAME + MONARCH_COMPAT + decision_003: rank/source on self, step from ContextVar)
-# (CHANGED — MONARCH_COMPAT + decision_003: rank/source on self, step from ContextVar)
 # ---------------------------------------------------------------------------
 
 
@@ -294,13 +254,13 @@ class StructuredJSONFormatter(logging.Formatter):
         log_dict["tid"] = threading.get_native_id()
         log_dict["thread_time_ns"] = time.thread_time_ns()
 
-        # Rank/source from self (constants — decision_003)
+        # Rank/source from self (constants, set once in init_observability)
         log_dict["rank"] = self.rank
         log_dict["source"] = self.source
         log_dict["host_name"] = socket.gethostname()
         log_dict["pid"] = os.getpid()
 
-        # Step/step_tags from ContextVar (mutable per-task — MONARCH_COMPAT)
+        # Step/step_tags from ContextVar (mutable, changes every step)
         step = _STEP.get()
         if step is not None:
             log_dict["step"] = step
@@ -367,7 +327,7 @@ class StructuredJSONFormatter(logging.Formatter):
 
 
 # ---------------------------------------------------------------------------
-# EventsOnlyFilter — ported from reference
+# Filters and handlers
 # ---------------------------------------------------------------------------
 
 
@@ -378,14 +338,12 @@ class EventsOnlyFilter(logging.Filter):
         return getattr(record, str(ExtraFields.LOG_TYPE_NAME), None) is not None
 
 
-# ---------------------------------------------------------------------------
-# StructuredLoggingHandler
-# (CHANGED — OSS_COMPAT: filepath from init_observability, not hardcoded /logs)
-# ---------------------------------------------------------------------------
-
-
 class StructuredLoggingHandler(logging.FileHandler):
-    """Writes structured JSONL to per-rank files."""
+    """Writes structured JSONL events to per-rank files.
+
+    Creates the output directory if needed. Only passes events
+    (records with LOG_TYPE_NAME set) — free-text logs are filtered out.
+    """
 
     def __init__(self, filepath: str):
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -394,8 +352,7 @@ class StructuredLoggingHandler(logging.FileHandler):
 
 
 # ---------------------------------------------------------------------------
-# InflightEventTrackingHandler (FROM llama4x handler.py:277-288)
-# Tracks last structured event for crash forensics.
+# Crash forensics
 # ---------------------------------------------------------------------------
 
 
@@ -421,10 +378,7 @@ class InflightEventTrackingHandler(logging.Handler):
 
 
 # ---------------------------------------------------------------------------
-# init_observability
-# (CHANGED — OSS_COMPAT + MONARCH_COMPAT: single init, explicit args,
-#  rank/source on formatter. PR1 scope: system handler only.
-#  PR4 extends this to add experiment handler.)
+# Initialization
 # ---------------------------------------------------------------------------
 
 _system_logger = logging.getLogger(SYSTEM_LOGGER_NAME)
@@ -433,14 +387,17 @@ _system_logger = logging.getLogger(SYSTEM_LOGGER_NAME)
 def init_observability(
     source: str, output_dir: str, rank: int | None = None
 ) -> None:
-    """Initialize system structured logging. Called ONCE in setup().
+    """Initialize structured logging. Called once per rank during process setup.
 
-    Rank/source are baked into the formatter (constants). Step is set per-step
-    via set_step(). Idempotent — skips if handler already exists.
+    Creates per-rank JSONL file handlers for system metrics (phase timing,
+    step events). Experiment metric handlers are added by PR4's metrics.py.
 
-    Can be called before torch.distributed is initialized — rank defaults to
-    the RANK environment variable (always set by torchrun/MAST). This matches
-    sixlib's pattern where RankContext reads from env vars, not dist.get_rank().
+    Rank and source are baked into the formatter as constants — they never
+    change for the lifetime of the process. Step is set per-step via set_step().
+
+    Idempotent: safe to call multiple times (skips if handler already exists).
+    Can be called before torch.distributed init — rank defaults to the RANK
+    environment variable (set by torchrun/MAST).
 
     Args:
         source: Component name (e.g., "trainer", "generator").
@@ -464,13 +421,16 @@ def init_observability(
     # Also add inflight tracking for crash forensics
     _system_logger.addHandler(InflightEventTrackingHandler())
 
+    # propagate=False prevents events from bubbling to the root logger
+    # (which would duplicate them in stderr). Level ensures INFO records
+    # are captured even if the root logger has a higher threshold.
     _system_logger.propagate = False
     if _system_logger.level == logging.NOTSET or _system_logger.level > logging.INFO:
         _system_logger.setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------------------
-# record_event (RENAME + MONARCH_COMPAT)
+# Public API: record_event, record_span
 # ---------------------------------------------------------------------------
 
 
@@ -487,13 +447,6 @@ def record_event(metrics: dict[str, float | int]) -> None:
             extra=event_extra(EventType.METRIC_VALUE, event_name=name, value=value, step=step),
             stacklevel=2,
         )
-
-
-# ---------------------------------------------------------------------------
-# record_span (RENAMED from structured_logger — RENAME + MONARCH_COMPAT)
-# ContextDecorator: works as both context manager and decorator.
-# Auto-derives _START/_END event types from base.
-# ---------------------------------------------------------------------------
 
 
 class record_span(ContextDecorator):
