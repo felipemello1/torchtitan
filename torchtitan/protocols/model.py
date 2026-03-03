@@ -6,50 +6,38 @@
 
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Protocol
 
-import torch
-import torch.nn as nn
-
-from torchtitan.config import JobConfig
+from .module import Module
 
 
-@dataclass
-class BaseModelArgs:
-    """All ModelArgs should inherit from this class.
+class BaseModel(Module):
+    """Base class for all model classes.
 
-    The only usage of this class is type checking but allows us to extend common
-    arguments to all models in the future.
+    Models inherit from BaseModel (which is Module = nn.Module + Configurable).
+    Each model defines a nested Config(BaseModel.Config) with model hyperparameters.
+    The model is constructed via ``config.build()``.
+
+    All models must implement ``init_weights`` (from Module).
     """
 
-    _enforced: str = "This field is used to enforce all fields have defaults."
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        """Base config for all models.
 
-    @abstractmethod
-    def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
-        pass
-
-    @abstractmethod
-    def get_nparams_and_flops(
-        self, model: nn.Module, seq_len: int
-    ) -> tuple[int, float]:
-        pass
-
-
-class ModelProtocol(Protocol):
-    """Defines the interface for a model class.
-
-    This is used to enforce that all model classes have some methods that are
-    required by the trainer.
-    """
-
-    def __init__(self, model_args: BaseModelArgs) -> None:
-        pass
-
-    @abstractmethod
-    def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        """Initialize model weights.
-
-        Args:
-            buffer_device: Optional device to place buffers on during initialization.
+        Subclasses define model-specific hyperparameters.
         """
-        pass
+
+        # TODO: This function violates encapsulation;
+        # maybe replace it with config passes from outside.
+        @abstractmethod
+        def update_from_config(
+            self,
+            *,
+            trainer_config,
+            **kwargs,
+        ) -> None:
+            pass
+
+        @abstractmethod
+        def get_nparams_and_flops(self, model: Module, seq_len: int) -> tuple[int, int]:
+            pass
