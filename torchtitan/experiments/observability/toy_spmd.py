@@ -7,14 +7,27 @@
 """
 Toy SPMD Training Example — Observability Baseline (PR0)
 
-ToyTrainer mirrors TorchTitan's Trainer pattern:
-- __init__: builds model, applies TP/compile/FSDP, creates optimizer
-- train_step: one step of forward/backward/optimizer
-- train: full training loop
-- close: cleanup
+Minimal SPMD training loop with no observability. Establishes the model
+and trainer patterns that later PRs will instrument.
+
+ToyTrainer mirrors key TorchTitan patterns:
+- Per-layer torch.compile (models/llama3/parallelize.py)
+- TP → compile → FSDP application order
+- 2D DeviceMesh (DP × TP) with DTensor parameters
+- clip_grad_norm_ from torchtitan
+
+The model (TinyModel) uses MLPBlock with multiple "heads" (parallel linear
+projections). This structure naturally supports three compile-safety
+scenarios for InvocationContext metrics (added in PR2):
+- Scenario 1: per-layer metrics via for-loop in eager (over model.layers)
+- Scenario 2: per-head metrics via for-loop inside compile (over block.heads)
+- Scenario 3: merged metrics via same key without child_context
+
+Each rank gets a different number of valid tokens (via loss_mask) to exercise
+weighted metric reduction when tensor metrics are added in PR2.
 
 Run:
-    torchrun --nproc_per_node=4 torchtitan/experiments/observability/toy_spmd.py
+    torchrun --nproc_per_node=4 -m torchtitan.experiments.observability.toy_spmd
 """
 
 import os
@@ -40,27 +53,38 @@ from torchtitan.distributed.utils import clip_grad_norm_
 NUM_STEPS = 20
 D_MODEL = 64
 HIDDEN_DIM = 128
+N_HEADS = 3
 VOCAB_SIZE = 32
 SEQ_LEN = 16
 BATCH_SIZE = 8
 LR = 1e-3
-OUTPUT_DIR = '/tmp/toy_spmd_output'
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs", "toy_spmd")
 
 
 # ---- Model ----
-class TransformerBlock(nn.Module):
-    """Minimal transformer block: attention-free, just MLP + norm + residual."""
+class MLPBlock(nn.Module):
+    """MLP block with multiple parallel projections (heads) + output projection.
 
-    def __init__(self, d_model: int, hidden_dim: int):
+    Each head is an independent linear projection. Their outputs are summed and
+    projected back to d_model. This gives us a natural for-loop over sub-modules
+    inside the compiled forward, which is needed to demonstrate per-head metrics
+    with child_context in PR2.
+    """
+
+    def __init__(self, d_model: int, hidden_dim: int, n_heads: int = N_HEADS):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
-        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, d_model, bias=False)
+        self.heads = nn.ModuleDict(
+            {str(i): nn.Linear(d_model, hidden_dim, bias=False) for i in range(n_heads)}
+        )
+        self.out_proj = nn.Linear(hidden_dim, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
-        h = F.silu(self.w1(h))
-        return x + self.w2(h)
+        parts = []
+        for head in self.heads.values():
+            parts.append(F.silu(head(h)))
+        return x + self.out_proj(sum(parts))
 
 
 class TinyModel(nn.Module):
@@ -76,7 +100,7 @@ class TinyModel(nn.Module):
         super().__init__()
         self.tok_embeddings = nn.Embedding(vocab_size, d_model)
         self.layers = nn.ModuleDict(
-            {str(i): TransformerBlock(d_model, hidden_dim) for i in range(n_layers)}
+            {str(i): MLPBlock(d_model, hidden_dim) for i in range(n_layers)}
         )
         self.norm = nn.LayerNorm(d_model)
         self.output = nn.Linear(d_model, vocab_size, bias=False)
@@ -89,9 +113,13 @@ class TinyModel(nn.Module):
         return self.output(h)
 
 
-# ---- Trainer (mirrors TorchTitan Trainer pattern) ----
+# ---- Trainer ----
 class ToyTrainer:
-    """Minimal trainer with TP + compile + FSDP, matching TorchTitan's structure."""
+    """Minimal trainer with TP + compile + FSDP.
+
+    Parallelism application order follows TorchTitan (parallelize.py):
+    TP first, then per-layer compile, then FSDP2.
+    """
 
     def __init__(self, device, dp_mesh, tp_mesh, output_dir):
         self.device = device
@@ -106,7 +134,13 @@ class ToyTrainer:
 
     @staticmethod
     def _replicate_params(module: nn.Module, tp_mesh) -> None:
-        """Put params on the TP mesh as Replicate DTensors."""
+        """Wrap non-TP-parallelized params as Replicate DTensors on the TP mesh.
+
+        This is needed in our simplified TP setup where LayerNorm and other
+        non-parallelized params must still be DTensors on the same mesh so
+        FSDP2 sees a consistent parameter space. TorchTitan's full TP plan
+        handles this via the model-specific parallelize functions.
+        """
         for p_name, param in module.named_parameters():
             replicated = nn.Parameter(
                 DTensor.from_local(param, tp_mesh, [Replicate()], run_check=False)
@@ -114,7 +148,8 @@ class ToyTrainer:
             module.register_parameter(p_name, replicated)
 
     def _apply_tp(self, model, tp_mesh):
-        """Apply TP to ALL params so they share the same 2D mesh."""
+        """Apply tensor parallelism. Embeddings and output use TP plans;
+        remaining params are wrapped as Replicate DTensors."""
         parallelize_module(
             model, tp_mesh,
             {
@@ -126,29 +161,44 @@ class ToyTrainer:
         for layer in model.layers.values():
             parallelize_module(
                 layer, tp_mesh,
-                {"w1": ColwiseParallel(use_local_output=False), "w2": RowwiseParallel(use_local_output=False)},
+                {"out_proj": RowwiseParallel(use_local_output=False)},
             )
+            # TP-parallelize each head
+            for head_name in layer.heads:
+                parallelize_module(
+                    layer, tp_mesh,
+                    {f"heads.{head_name}": ColwiseParallel(use_local_output=False)},
+                )
             self._replicate_params(layer.norm, tp_mesh)
 
     def _apply_compile(self, model):
-        """Per-layer torch.compile."""
+        """Per-layer torch.compile (same as TorchTitan default)."""
         for layer_id, block in model.layers.named_children():
             model.layers.register_module(layer_id, torch.compile(block, fullgraph=True))
 
     def _apply_fsdp(self, model, dp_mesh):
-        """FSDP2. Order: TP → compile → FSDP."""
+        """FSDP2 wrapping. Applied last (after TP and compile)."""
         fully_shard(model.tok_embeddings, mesh=dp_mesh)
         for layer in model.layers.values():
             fully_shard(layer, mesh=dp_mesh)
         fully_shard([model.norm, model.output], mesh=dp_mesh)
         fully_shard(model, mesh=dp_mesh)
 
-    def train_step(self, tokens, labels, step):
-        """One training step. Returns (loss, grad_norm)."""
+    def train_step(self, tokens, labels, loss_mask, step):
+        """One training step. Returns (loss, grad_norm, dt_ms).
+
+        loss_mask has different valid token counts per rank to exercise
+        weighted reduction when tensor metrics are added in PR2.
+        """
         t0 = time.perf_counter()
         logits = self.model(tokens)
         with loss_parallel():
-            loss = F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten(0, 1))
+            # Apply mask via ignore_index: set masked labels to -100
+            masked_labels = labels.clone()
+            masked_labels[loss_mask == 0] = -100
+            loss = F.cross_entropy(
+                logits.flatten(0, 1).float(), masked_labels.flatten(0, 1), ignore_index=-100
+            )
             self.optimizer.zero_grad()
             loss.backward()
         grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -156,18 +206,18 @@ class ToyTrainer:
         dt_ms = (time.perf_counter() - t0) * 1000
         return loss, grad_norm, dt_ms
 
-    def train(self, tokens, labels, num_steps):
-        """Full training loop."""
+    def train(self, tokens, labels, loss_mask, num_steps):
+        """Full training loop (overfitting to a single batch)."""
         if self.rank == 0:
             print(f"{'Step':>4}  {'Loss':>10}  {'GradNorm':>10}  {'Time(ms)':>10}")
             print("-" * 50)
         for step in range(1, num_steps + 1):
-            loss, grad_norm, dt_ms = self.train_step(tokens, labels, step)
+            loss, grad_norm, dt_ms = self.train_step(tokens, labels, loss_mask, step)
             if self.rank == 0:
                 print(f"{step:>4}  {loss.item():>10.4f}  {grad_norm.item():>10.4f}  {dt_ms:>10.1f}")
 
     def close(self):
-        """Cleanup. Override in subclasses to close writers."""
+        """Cleanup. Subclasses override to close writers, profilers, etc."""
         pass
 
 
@@ -182,6 +232,7 @@ def main():
     if rank == 0 and os.path.exists(OUTPUT_DIR):
         shutil.rmtree(OUTPUT_DIR)
     dist.barrier()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
     trainer = ToyTrainer(device, mesh["dp"], mesh["tp"], OUTPUT_DIR)
@@ -189,11 +240,19 @@ def main():
     if rank == 0:
         print(f"Toy SPMD: {world_size} GPUs, 2DP×2TP, {NUM_STEPS} steps")
 
+    # Fixed data for overfitting (same batch every step, like SPMD testbed)
     torch.manual_seed(42 + rank)
     tokens = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN), device=device)
     labels = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN), device=device)
 
-    trainer.train(tokens, labels, NUM_STEPS)
+    # Different valid token counts per rank for weighted metric reduction (PR2).
+    # Rank 0: 4 valid tokens, rank 1: 8, rank 2: 12, rank 3: all 16.
+    valid_lengths = [4, 8, 12, SEQ_LEN]
+    valid_len = valid_lengths[rank % len(valid_lengths)]
+    loss_mask = torch.zeros(BATCH_SIZE, SEQ_LEN, device=device)
+    loss_mask[:, :valid_len] = 1.0
+
+    trainer.train(tokens, labels, loss_mask, NUM_STEPS)
     trainer.close()
 
     if rank == 0:
