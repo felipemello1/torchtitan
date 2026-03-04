@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Integration test for PR2: validates tensor metric outputs from toy_spmd.py.
+"""Integration test: validates tensor metric outputs from toy_spmd.py.
 
 Prerequisites:
     torchrun --nproc_per_node=4 torchtitan/experiments/observability/toy_spmd.py
@@ -29,7 +29,7 @@ def scalars_files():
     return files
 
 
-class TestPR2Integration:
+class TestTensorMetricIntegration:
     def test_scalars_files_exist(self, scalars_files):
         """replicate_to_host should produce scalar JSON files on logging steps."""
         assert len(scalars_files) >= 2, f"Expected multiple scalar files, got {len(scalars_files)}"
@@ -72,7 +72,7 @@ class TestPR2Integration:
         assert "grad_norm" in data, f"Missing grad_norm. Keys: {list(data.keys())}"
 
     def test_pr1_still_works(self):
-        """System JSONL should still exist (PR1 not broken by PR2)."""
+        """System JSONL should still exist after adding tensor metrics."""
         sys_dir = os.path.join(OUTPUT_DIR, "system_logs")
         if not os.path.exists(sys_dir):
             pytest.skip("Run toy_spmd.py first")

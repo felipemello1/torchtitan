@@ -6,18 +6,14 @@
 
 """Summary writer backends for experiment metrics visualization.
 
-Ported from reference summary_writer.py. Changes:
-  OSS_COMPAT — removed Node base class, Config inner classes, get_env() calls.
-               Replaced with explicit constructor args.
-  META_REMOVAL — removed Meta keychain auth from WandbSummaryWriter.
-  RENAME — no name changes (SummaryWriter is already a good name).
+TensorBoardSummaryWriter, WandbSummaryWriter, LoggingSummaryWriter,
+InMemorySummaryWriter — all composed via CompositeSummaryWriter.
 
 Writer lifecycle follows TorchTitan's pattern: open() in setup, close()
 explicitly. No try/finally, no atexit. __enter__/__exit__ exist as
 convenience sugar from the reference for users who want context manager style.
 """
 
-from __future__ import annotations
 
 import logging
 import os
@@ -32,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# is_single_process_or_rank_zero (from reference utils_torch.py:158-160)
+
 # ---------------------------------------------------------------------------
 
 
@@ -44,7 +40,7 @@ def is_single_process_or_rank_zero() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# _to_scalar (from reference summary_writer.py:24-59)
+
 # ---------------------------------------------------------------------------
 
 
@@ -88,8 +84,8 @@ def _to_scalar(value: Any, path: str = "") -> int | float:
 
 # ---------------------------------------------------------------------------
 # SummaryWriter ABC
-# (CHANGED — OSS_COMPAT: removed Node base class. Added open()/close()
-#  methods alongside __enter__/__exit__ from reference.)
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -117,7 +113,7 @@ class SummaryWriter:
         """Close the writer. Called once after the training loop."""
         self._within_context = False
 
-    def __enter__(self) -> SummaryWriter:
+    def __enter__(self) -> "SummaryWriter":
         self.open()
         return self
 
@@ -171,7 +167,7 @@ class SummaryWriter:
 
 # ---------------------------------------------------------------------------
 # TensorBoardSummaryWriter
-# (CHANGED — OSS_COMPAT: removed Node/Config, explicit log_dir arg.
+
 #  Preserved _replace_gfile, max_queue, per-key error handling.)
 # ---------------------------------------------------------------------------
 
@@ -222,7 +218,7 @@ class TensorBoardSummaryWriter(SummaryWriter):
 
 
 # ---------------------------------------------------------------------------
-# _replace_gfile (from reference summary_writer.py:315-339)
+
 # ---------------------------------------------------------------------------
 
 
@@ -259,7 +255,7 @@ def _replace_gfile(tb_writer) -> None:
 
 # ---------------------------------------------------------------------------
 # WandbSummaryWriter
-# (CHANGED — META_REMOVAL: removed keychain auth. OSS_COMPAT: explicit args.)
+
 # ---------------------------------------------------------------------------
 
 
@@ -315,7 +311,7 @@ class WandbSummaryWriter(SummaryWriter):
 
 # ---------------------------------------------------------------------------
 # CompositeSummaryWriter
-# (CHANGED — OSS_COMPAT: removed Node/Config. Takes dict of writers directly.)
+
 # ---------------------------------------------------------------------------
 
 
@@ -372,7 +368,7 @@ class CompositeSummaryWriter(SummaryWriter):
 
 
 # ---------------------------------------------------------------------------
-# LoggingSummaryWriter (from reference summary_writer.py:416-418)
+
 # ---------------------------------------------------------------------------
 
 
@@ -384,7 +380,7 @@ class LoggingSummaryWriter(SummaryWriter):
 
 
 # ---------------------------------------------------------------------------
-# InMemorySummaryWriter (from reference summary_writer.py:421-429)
+
 # ---------------------------------------------------------------------------
 
 

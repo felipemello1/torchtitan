@@ -4,10 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Tests for backends.py (PR3).
-
-Adapted from reference summary_writer_test.py (TestToScalar + writer tests).
-"""
+"""Tests for backends.py (summary writers)."""
 
 import torch
 import pytest
@@ -24,7 +21,6 @@ from torchtitan.observability.tensor_metrics import MeanTMetric, MaxTMetric
 
 
 # ---------------------------------------------------------------------------
-# _to_scalar (adapted from reference TestToScalar)
 # ---------------------------------------------------------------------------
 
 

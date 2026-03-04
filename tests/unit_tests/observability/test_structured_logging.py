@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Tests for torchtitan.observability.structured_logging (PR1).
+"""Tests for torchtitan.observability.structured_logging.
 
 Coverage map:
 - set_step / add_step_tag / clear_step_tags: adapted from msl_tools context_test.py
@@ -24,12 +24,16 @@ import time
 
 import pytest
 
-from torchtitan.observability.structured_logging import (
+from torchtitan.observability.common import (
     _STEP,
     _STEP_TAGS,
     add_step_tag,
     clear_step_tags,
-    dict_to_list_safe,
+    set_step,
+    SYSTEM_LOGGER_NAME,
+)
+from torchtitan.observability.structured_logging import (
+    dict_to_str_list,
     event_extra,
     EventsOnlyFilter,
     EventType,
@@ -40,10 +44,8 @@ from torchtitan.observability.structured_logging import (
     MAX_MESSAGE_SIZE,
     record_event,
     record_span,
-    set_step,
     StructuredJSONFormatter,
     StructuredLoggingHandler,
-    SYSTEM_LOGGER_NAME,
     to_structured_json,
 )
 
@@ -131,19 +133,19 @@ class TestStepTags:
 
 
 # ---------------------------------------------------------------------------
-# dict_to_list_safe
+# dict_to_str_list
 # ---------------------------------------------------------------------------
 
 
 class TestDictToListSafe:
     def test_none_returns_none(self):
-        assert dict_to_list_safe(None) is None
+        assert dict_to_str_list(None) is None
 
     def test_empty_dict_returns_empty_list(self):
-        assert dict_to_list_safe({}) == []
+        assert dict_to_str_list({}) == []
 
     def test_normal_dict(self):
-        result = dict_to_list_safe({"a": "1", "b": "2"})
+        result = dict_to_str_list({"a": "1", "b": "2"})
         assert set(result) == {"a:1", "b:2"}
 
 

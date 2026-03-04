@@ -4,9 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Tests for tensor_metrics.py (PR2).
-
-Adapted from sixlib/metrics_test.py (non-distributed subset).
+"""Tests for tensor_metrics.py.
 """
 
 import torch
@@ -16,7 +14,6 @@ import pytest
 
 from torchtitan.observability.tensor_metrics import (
     _check_merge_compatibility,
-    DerivedTMetric,
     MaxTMetric,
     MeanTMetric,
     MinTMetric,
@@ -32,26 +29,18 @@ from torchtitan.observability.tensor_metrics import (
 
 
 class TestMeanTMetric:
-    def test_from_mean_and_weight(self):
-        m = MeanTMetric(mean=torch.tensor(2.0), weight=torch.tensor(3.0))
-        assert m.sum.item() == pytest.approx(6.0)
-        assert m.weight.item() == pytest.approx(3.0)
-
     def test_from_sum_and_weight(self):
         m = MeanTMetric(sum=torch.tensor(6.0), weight=torch.tensor(3.0))
         assert m.value() == pytest.approx(2.0, abs=1e-6)
 
     def test_python_scalars(self):
-        m = MeanTMetric(mean=2.0, weight=3.0)
+        m = MeanTMetric(sum=6.0, weight=3.0)
         assert m.value() == pytest.approx(2.0)
 
-    def test_neither_mean_nor_sum_raises(self):
-        with pytest.raises(ValueError, match="Exactly one"):
-            MeanTMetric(weight=1.0)
-
-    def test_both_mean_and_sum_raises(self):
-        with pytest.raises(ValueError, match="Exactly one"):
-            MeanTMetric(mean=1.0, sum=2.0, weight=1.0)
+    def test_default_weight_is_one(self):
+        m = MeanTMetric(sum=5.0)
+        assert m.weight == 1
+        assert m.value() == pytest.approx(5.0)
 
     def test_merge(self):
         a = MeanTMetric(sum=torch.tensor(4.0), weight=torch.tensor(2.0))
@@ -70,11 +59,6 @@ class TestMeanTMetric:
     def test_zero_weight(self):
         m = MeanTMetric(sum=0.0, weight=0.0)
         assert m.value() == 0.0
-
-    def test_weight_1(self):
-        m = MeanTMetric(mean=5.0, weight=1.0)
-        assert m.weight == 1.0
-        assert m.value() == pytest.approx(5.0)
 
     def test_pytree_roundtrip(self):
         m = MeanTMetric(sum=torch.tensor(6.0), weight=torch.tensor(3.0))
@@ -145,26 +129,6 @@ class TestMergeCompatibility:
                 "test",
             )
 
-
-# ---------------------------------------------------------------------------
-# DerivedTMetric
-# ---------------------------------------------------------------------------
-
-
-class TestDerivedTMetric:
-    def test_basic(self):
-        a = MeanTMetric(sum=6.0, weight=3.0)
-        b = MaxTMetric(10.0)
-        d = DerivedTMetric(
-            compute_fn=lambda vals: vals[0] / max(vals[1], 1),
-            deps=[a, b],
-        )
-        assert d.value() == pytest.approx(0.2)
-
-    def test_merge_raises(self):
-        d = DerivedTMetric(compute_fn=lambda v: v[0], deps=[MaxTMetric(1.0)])
-        with pytest.raises(ValueError, match="does not support"):
-            d.merge_(d)
 
 
 # ---------------------------------------------------------------------------

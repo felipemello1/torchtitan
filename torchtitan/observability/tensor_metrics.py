@@ -4,15 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Tensor metric types for compile-safe experiment metrics (PR2).
+"""Tensor metric types for compile-safe experiment metrics.
 
-Ported from reference library metrics.py with adaptations:
-  RENAME — MetricValue→TMetricValue, WeightedScalar→MeanTMetric, etc.
-  OSS_COMPAT — replaced internal imports with standard PyTorch equivalents
-  OSS_COMPAT — removed is_tracing() FX export block (TorchTitan uses torch.compile)
+MeanTMetric, SumTMetric, MaxTMetric, MinTMetric — accumulate values inside
+torch.compile regions. Use replicate_to_host() to batch-reduce and convert
+to Python scalars for logging.
 """
-
-from __future__ import annotations
 
 import enum
 import os
@@ -124,7 +121,7 @@ def _validate_no_tensors_in_context(context: Any, cls_name: str) -> None:
     Raises:
         ValueError: If context contains a Tensor.
     """
-    # OSS_COMPAT: get_env().debug_level() → os.environ
+    # Only validate in debug mode (env var check avoids overhead in production)
     debug_level = int(os.environ.get("TORCHTITAN_DEBUG_LEVEL", "0"))
     if debug_level <= 0:
         return
@@ -150,7 +147,7 @@ class TMetricValue:
     `replicate_to_host()` to convert DTensors to scalars. Subclasses are automatically registered
     with pytree via `__init_subclass__`.
 
-    When used with `InvocationContext`, metrics may contain Partial DTensors whose reduction is
+    When used with `TensorMetricContext`, metrics may contain Partial DTensors whose reduction is
     deferred until `summaries()` is called. Each subclass should implement
     `validate_placements()` to check that DTensor placements are compatible with its merge
     semantics.
@@ -221,7 +218,7 @@ class TMetricValue:
     def validate_placements(self, name: str) -> None:
         """Validates that DTensor placements are compatible with deferred reduction.
 
-        This method is called by `InvocationContext.add_summary()` to ensure that deferred reduction
+        This method is called by `TensorMetricContext.add_summary()` to ensure that deferred reduction
         will produce correct results. Subclasses may override this method to allow specific Partial
         DTensor placements that are compatible with their merge semantics.
 
@@ -276,31 +273,20 @@ class MeanTMetric(TMetricValue):
     def __init__(
         self,
         *,
-        mean: Scalar | None = None,
-        sum: Scalar | None = None,  # noqa: A002
-        weight: Scalar,
+        sum: Scalar,  # noqa: A002
+        weight: Scalar = 1,
     ) -> None:
         """Initialize a MeanTMetric.
 
         Args:
-            mean: The mean value. Mutually exclusive with `sum`.
-            sum: The sum value (numerator). Mutually exclusive with `mean`.
-            weight: The weight (denominator). Must be non-negative.
+            sum: The numerator (sum of values).
+            weight: The denominator (count). Defaults to 1.
 
-        Raises:
-            ValueError: If both or neither of `mean` and `sum` are provided.
-            ValueError: If weight is negative (only checked when debug_level > 0).
+        Example:
+            MeanTMetric(sum=loss)              # single value, weight=1
+            MeanTMetric(sum=total, weight=n)   # weighted: mean = total / n
         """
-        if (mean is None) == (sum is None):
-            raise ValueError("Exactly one of 'mean' or 'sum' must be provided.")
-
-        # OSS_COMPAT: removed is_tracing() FX export block (TorchTitan uses torch.compile)
-
-        # Store (sum, weight) internally. Compute sum = mean * weight if mean is provided.
-        if mean is not None:
-            self._sum = mean * weight
-        else:
-            self._sum = sum
+        self._sum = sum
         self._weight = weight
 
     @property
@@ -601,106 +587,10 @@ class MinTMetric(_ReducedTensorMetric):
         super().__init__(value, reduction=_ReducedTensorMetric.Reduction.MIN)
 
 
-class DerivedTMetric(TMetricValue):
-    """A metric computed lazily from other metrics.
-
-    The compute_fn receives reduced Scalar values from dependencies and returns a derived value.
-    This allows derived metrics to defer computation until reductions are applied via `summaries()`.
-
-    DerivedMetric does not support `merge_()`. Each DerivedMetric should be added to summaries
-    with a unique name. The underlying dependency metrics can be added separately and will be
-    merged independently.
-
-    Example:
-        ```
-        mean_metric = MeanTMetric(mean=partial_mean, weight=1)
-        max_metric = MaxMetric(partial_max)
-
-        # Add underlying metrics (these support merging)
-        ctx.add_summary("mean", mean_metric)
-        ctx.add_summary("max", max_metric)
-
-        # Add derived metric (computed lazily from reduced deps)
-        ctx.add_summary(
-            "fraction",
-            DerivedMetric(
-                compute_fn=lambda values: values[0] / max(values[1], 1),
-                deps=[mean_metric, max_metric],
-            ),
-        )
-        ```
-    """
-
-    _compute_fn: Callable[[list[Scalar]], Scalar]
-    _deps: list[TMetricValue]
-
-    def __init__(
-        self,
-        *,
-        compute_fn: Callable[[list[Scalar]], Scalar],
-        deps: list[TMetricValue],
-    ) -> None:
-        """Initializes a DerivedMetric.
-
-        Args:
-            compute_fn: A function that takes a list of reduced Scalar values (one per dep)
-                and returns the derived Scalar value.
-            deps: A list of TMetricValue objects whose values will be reduced and passed
-                to compute_fn.
-        """
-        self._compute_fn = compute_fn
-        self._deps = deps
-
-    def value(self) -> Scalar:
-        """Computes and returns the derived value.
-
-        Each dependency's value is reduced via `maybe_to_full_tensor` before being passed to
-        `compute_fn`. This ensures correctness for both:
-        - Calls after `summaries()`: deps are already Replicate, so reduction is a no-op.
-        - Out-of-band calls before `summaries()`: deps may be Partial and will be reduced.
-        """
-        reduced_values = _replicate_list([dep.value() for dep in self._deps])
-        return self._compute_fn(reduced_values)
-
-    def merge_(self, other: Self) -> Self:
-        """DerivedMetric does not support merging.
-
-        Raises:
-            ValueError: Always raised. DerivedMetric instances cannot be merged.
-                Each DerivedMetric should be added with a unique summary name.
-                The underlying dependency metrics can be merged separately.
-        """
-        raise ValueError(
-            "DerivedMetric does not support merge_(). "
-            "Each DerivedMetric should be added with a unique summary name. "
-            "The underlying dependency metrics will be merged independently "
-            "before being passed to `compute_fn`."
-        )
-
-    def validate_placements(self, name: str) -> None:
-        """Validates that dependency metrics have compatible DTensor placements.
-
-        Args:
-            name: The summary name, used for error messages.
-        """
-        for i, dep in enumerate(self._deps):
-            dep.validate_placements(f"{name}[dep_{i}]")
-
-    def __flatten__(self) -> tuple[list, tuple]:
-        """Returns (leaves, context) for pytree flattening.
-
-        The deps (list of TMetricValue) are the leaves; compute_fn is stored in context.
-        """
-        return self._deps, (self._compute_fn,)
-
-    @classmethod
-    def __unflatten__(cls, leaves: list, context: tuple) -> "DerivedMetric":
-        """Reconstructs from (leaves, context)."""
-        return cls(compute_fn=context[0], deps=list(leaves))
 
 
 # ---------------------------------------------------------------------------
-# DTensor helpers (ported from reference utils_spmd.py)
+# DTensor helpers for batched reduction
 # ---------------------------------------------------------------------------
 
 
