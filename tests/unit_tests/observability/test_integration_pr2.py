@@ -4,77 +4,104 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Integration test: validates tensor metric outputs from toy_spmd.py.
+"""Integration test: validates system JSONL outputs from toy_spmd.py (PR2).
+
+Reads system JSONL files produced by running toy_spmd.py with 4 GPUs.
+Checks that:
+- System JSONL files exist (one per rank)
+- record_span events have correct structure (FWD_BWD, OPTIM)
+- record_event metric values are present (train.loss, train.grad_norm)
+- Loss decreases over training (verifies learning)
 
 Prerequisites:
-    torchrun --nproc_per_node=4 torchtitan/experiments/observability/toy_spmd.py
+    torchrun --nproc_per_node=4 -m torchtitan.experiments.observability.toy_spmd
 """
 
 import json
 import os
 
-import pytest
+# Output dir matches toy_spmd.py:
+# OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs", "toy_spmd")
+OUTPUT_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(__file__),
+    "..", "..", "..",
+    "torchtitan", "experiments", "observability", "outputs", "toy_spmd",
+))
 
-OUTPUT_DIR = "/tmp/toy_spmd_output"
-
-
-@pytest.fixture
-def scalars_files():
-    files = sorted(
-        f for f in os.listdir(OUTPUT_DIR)
-        if f.startswith("scalars_step_") and f.endswith(".json")
-    ) if os.path.exists(OUTPUT_DIR) else []
-    if not files:
-        pytest.skip("Run toy_spmd.py first")
-    return files
+SYS_LOG_DIR = os.path.join(OUTPUT_DIR, "system_logs")
 
 
-class TestTensorMetricIntegration:
-    def test_scalars_files_exist(self, scalars_files):
-        """replicate_to_host should produce scalar JSON files on logging steps."""
-        assert len(scalars_files) >= 2, f"Expected multiple scalar files, got {len(scalars_files)}"
+def _load_system_records(rank: int = 0) -> list[dict]:
+    """Load all system JSONL records for a given rank."""
+    path = os.path.join(SYS_LOG_DIR, f"trainer_rank_{rank}_system.jsonl")
+    assert os.path.exists(path), (
+        f"System JSONL not found: {path}. "
+        "Run: torchrun --nproc_per_node=4 -m torchtitan.experiments.observability.toy_spmd"
+    )
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
 
-    def test_scalars_are_floats(self, scalars_files):
-        """Each scalar file should contain a dict of string → float."""
-        for f in scalars_files:
-            with open(os.path.join(OUTPUT_DIR, f)) as fh:
-                data = json.load(fh)
-            assert isinstance(data, dict), f"{f}: expected dict, got {type(data)}"
-            for key, val in data.items():
-                assert isinstance(key, str), f"{f}: key {key!r} should be string"
-                assert isinstance(val, (int, float)), f"{f}: value for {key!r} should be numeric, got {type(val)}"
 
-    def test_loss_scalar_present(self, scalars_files):
-        """The 'loss' key should be present (from record_tensor_metric)."""
-        with open(os.path.join(OUTPUT_DIR, scalars_files[0])) as f:
-            data = json.load(f)
-        assert "loss" in data, f"Missing 'loss' key. Keys: {list(data.keys())}"
+class TestSystemJSONL:
+    def test_system_jsonl_files_exist(self):
+        """All 4 ranks should produce system JSONL files."""
+        assert os.path.isdir(SYS_LOG_DIR), (
+            f"system_logs dir not found: {SYS_LOG_DIR}. "
+            "Run: torchrun --nproc_per_node=4 -m torchtitan.experiments.observability.toy_spmd"
+        )
+        files = [f for f in os.listdir(SYS_LOG_DIR) if f.endswith(".jsonl")]
+        assert len(files) == 4, f"Expected 4 system JSONL files (one per rank), got {len(files)}: {files}"
 
-    def test_loss_scalar_is_reasonable(self, scalars_files):
-        """Loss value should be a positive float (not NaN, not zero)."""
-        with open(os.path.join(OUTPUT_DIR, scalars_files[0])) as f:
-            data = json.load(f)
-        loss = data["loss"]
-        assert loss > 0, f"Loss should be positive, got {loss}"
-        assert loss < 100, f"Loss suspiciously high: {loss}"
+    def test_records_have_rank_and_source(self):
+        records = _load_system_records(rank=0)
+        assert len(records) > 0
+        for r in records:
+            assert r["int"]["rank"] == 0
+            assert r["normal"]["source"] == "trainer"
 
-    def test_dtensor_metric_present(self, scalars_files):
-        """DTensor metric (layer_0/w1_norm) should be present from child_context."""
-        with open(os.path.join(OUTPUT_DIR, scalars_files[0])) as f:
-            data = json.load(f)
-        assert "layer_0/w1_norm" in data, f"Missing DTensor metric. Keys: {list(data.keys())}"
-        assert data["layer_0/w1_norm"] > 0, "DTensor metric should be positive"
+    def test_fwd_bwd_spans_present(self):
+        """record_span("Forward/Backward", EventType.FWD_BWD) should produce start+end events."""
+        records = _load_system_records(rank=0)
+        event_types = [r["normal"].get("log_type_name", "") for r in records]
+        assert "fwd_bwd_start" in event_types, f"Missing fwd_bwd_start. Events: {set(event_types)}"
+        assert "fwd_bwd_end" in event_types, f"Missing fwd_bwd_end. Events: {set(event_types)}"
 
-    def test_grad_norm_present(self, scalars_files):
-        """grad_norm should be present (from record_tensor_metric with MaxTMetric)."""
-        with open(os.path.join(OUTPUT_DIR, scalars_files[0])) as f:
-            data = json.load(f)
-        assert "grad_norm" in data, f"Missing grad_norm. Keys: {list(data.keys())}"
+    def test_optim_spans_present(self):
+        records = _load_system_records(rank=0)
+        event_types = [r["normal"].get("log_type_name", "") for r in records]
+        assert "optim_start" in event_types
+        assert "optim_end" in event_types
 
-    def test_pr1_still_works(self):
-        """System JSONL should still exist after adding tensor metrics."""
-        sys_dir = os.path.join(OUTPUT_DIR, "system_logs")
-        if not os.path.exists(sys_dir):
-            pytest.skip("Run toy_spmd.py first")
-        files = [f for f in os.listdir(sys_dir) if f.endswith(".jsonl")]
-        assert len(files) == 4, f"Expected 4 system JSONL files, got {len(files)}"
+    def test_metric_value_events_present(self):
+        """record_event should produce metric_value events with train.loss and train.grad_norm."""
+        records = _load_system_records(rank=0)
+        metric_events = [
+            r for r in records
+            if r["normal"].get("log_type_name") == "metric_value"
+        ]
+        assert len(metric_events) > 0, "No metric_value events found"
+        event_names = {r["normal"].get("event_name") for r in metric_events}
+        assert "train.loss" in event_names, f"Missing train.loss. Found: {event_names}"
+        assert "train.grad_norm" in event_names, f"Missing train.grad_norm. Found: {event_names}"
+
+
+class TestLossDecreases:
+    def test_loss_decreases_over_training(self):
+        """Verify the model actually learns — loss at end should be lower than start."""
+        records = _load_system_records(rank=0)
+        loss_events = [
+            r for r in records
+            if r["normal"].get("log_type_name") == "metric_value"
+            and r["normal"].get("event_name") == "train.loss"
+        ]
+        assert len(loss_events) >= 2, f"Need at least 2 loss events, got {len(loss_events)}"
+        first_loss = loss_events[0]["double"]["value"]
+        last_loss = loss_events[-1]["double"]["value"]
+        assert last_loss < first_loss, (
+            f"Loss should decrease: first={first_loss:.4f}, last={last_loss:.4f}"
+        )
