@@ -115,6 +115,13 @@ class MLPBlock(nn.Module):
 
 
 class TinyModel(nn.Module):
+    """3-layer model with embedding and output head.
+
+    Scenario 1: per-layer metrics in eager mode — the for-loop over
+    self.layers is in eager (outside compile), so child_context("0") etc.
+    create separate metric namespaces per layer.
+    """
+
     def __init__(self, vocab_size=VOCAB_SIZE, d_model=D_MODEL, hidden_dim=HIDDEN_DIM, n_layers=3):
         super().__init__()
         self.tok_embeddings = nn.Embedding(vocab_size, d_model)
@@ -134,6 +141,12 @@ class TinyModel(nn.Module):
 
 # ---- Trainer ----
 class ToyTrainer:
+    """Minimal trainer with TP + compile + FSDP and logging backends.
+
+    Parallelism application order follows TorchTitan (parallelize.py):
+    TP first, then per-layer compile, then FSDP2.
+    """
+
     def __init__(self, device, dp_mesh, tp_mesh, output_dir, logging_cfg=LoggingConfig()):
         self.device = device
         self.rank = dist.get_rank()
@@ -149,6 +162,11 @@ class ToyTrainer:
 
     @staticmethod
     def _replicate_params(module, tp_mesh):
+        """Wrap non-TP-parallelized params as Replicate DTensors on the TP mesh.
+
+        Needed so FSDP2 sees a consistent DTensor parameter space.
+        TorchTitan's full TP plan handles this via model-specific parallelize functions.
+        """
         for p_name, param in module.named_parameters():
             module.register_parameter(
                 p_name, nn.Parameter(DTensor.from_local(param, tp_mesh, [Replicate()], run_check=False))

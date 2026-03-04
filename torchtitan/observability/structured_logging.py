@@ -117,6 +117,9 @@ class EventType(StrEnum):
     EVAL = "eval"
     EVAL_START = "eval_start"
     EVAL_END = "eval_end"
+    RL_SCORING = "rl_scoring"
+    RL_SCORING_START = "rl_scoring_start"
+    RL_SCORING_END = "rl_scoring_end"
     SUMMARY_WRITER = "summary_writer"
     SUMMARY_WRITER_START = "summary_writer_start"
     SUMMARY_WRITER_END = "summary_writer_end"
@@ -185,7 +188,6 @@ def event_extra(
         str(ExtraFields.VALUE): value,
         str(ExtraFields.CONTEXT): dict_to_str_list(context),
     }
-
 
 
 
@@ -497,10 +499,23 @@ class record_span(ContextDecorator):
         self.event_type = event_type
         self.start_time: float | None = None
 
-        # Derive START/END event types
+        # Derive START/END event types. Validate that the base event type
+        # is not itself a _START or _END variant — those cannot be used as
+        # span types because there's no _start_start or _end_end.
         base_name = str(event_type)
-        self.start_event_type = EventType(base_name + "_start")
-        self.end_event_type = EventType(base_name + "_end")
+        if base_name.endswith("_start") or base_name.endswith("_end"):
+            raise ValueError(
+                f"record_span requires a base EventType (e.g., EventType.FWD_BWD), "
+                f"not a START/END variant. Got: {event_type}"
+            )
+        try:
+            self.start_event_type = EventType(base_name + "_start")
+            self.end_event_type = EventType(base_name + "_end")
+        except ValueError:
+            raise ValueError(
+                f"EventType {event_type} has no _START/_END variants. "
+                f"Add {base_name}_start and {base_name}_end to EventType."
+            )
 
     def __enter__(self):
         self.start_time = timer()
