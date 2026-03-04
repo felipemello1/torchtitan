@@ -24,8 +24,8 @@ _T = TypeVar("_T")
 _S = TypeVar("_S")
 TreeSpec = pytree.TreeSpec
 
-# Type alias from sixlib: a value that may be arbitrarily nested in
-# dicts/lists/tuples, bottoming out at leaves of type _T.
+# Type alias: a value that may be arbitrarily nested in dicts/lists/tuples,
+# bottoming out at leaves of type _T.
 Nested = Any
 
 
