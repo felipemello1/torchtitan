@@ -29,8 +29,6 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-
 
 def is_single_process_or_rank_zero() -> bool:
     """Returns True if not in a distributed setting or if this is rank 0."""
@@ -38,8 +36,6 @@ def is_single_process_or_rank_zero() -> bool:
         return True
     return torch.distributed.get_rank() == 0
 
-
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 
@@ -148,8 +144,9 @@ class SummaryWriter:
         if not self.should_write(step):
             return
 
-        # Convert all values to scalars before logging
-        # Treat TMetricValue and Tensor as leaves, not containers to traverse
+        # Convert all values to scalars before logging.
+        # TMetricValue and Tensor are the values we want to convert to scalars,
+        # not nested containers to recurse into — mark them as pytree leaves.
         def is_leaf(v):
             return isinstance(v, (TMetricValue, torch.Tensor))
 
@@ -216,8 +213,6 @@ class TensorBoardSummaryWriter(SummaryWriter):
                         exc_info=e,
                     )
 
-
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 
@@ -369,8 +364,6 @@ class CompositeSummaryWriter(SummaryWriter):
 
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-
 
 class LoggingSummaryWriter(SummaryWriter):
     """A SummaryWriter that logs to Python logger.info. Useful for console output."""
@@ -378,8 +371,6 @@ class LoggingSummaryWriter(SummaryWriter):
     def _log(self, step: int, values: dict[str, Any]) -> None:
         logger.info("Summaries at step %d: %s", step, values)
 
-
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 
