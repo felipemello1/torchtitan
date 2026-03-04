@@ -4,16 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Rollout logger for RL training data.
-
-No enforced schema. Takes list[dict], writes one JSON line per dict.
-Separate from experiment JSONL (not consumed by DefaultAggregator).
-
-Query with:
-    jq 'select(.reward < 0.1)' rollouts.jsonl
-    # or DuckDB: SELECT * FROM read_json('rollouts.jsonl') WHERE policy_version = 5
-"""
-
 import json
 import os
 from collections.abc import Callable
