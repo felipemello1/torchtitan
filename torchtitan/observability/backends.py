@@ -167,8 +167,6 @@ class SummaryWriter:
 
 # ---------------------------------------------------------------------------
 # TensorBoardSummaryWriter
-
-#  Preserved _replace_gfile, max_queue, per-key error handling.)
 # ---------------------------------------------------------------------------
 
 
