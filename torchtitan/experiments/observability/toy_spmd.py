@@ -220,8 +220,20 @@ class ToyTrainer:
             self.writer = None
             self.aggregator = None
 
-    def train_step(self, tokens, labels, loss_mask, step):
+    def set_step(self, step: int) -> None:
+        """Set the current training step. Call before train_step().
+
+        In SPMD, called directly. In RL, called via Monarch broadcast so all
+        actor ranks see the step before train_step executes.
+        """
+        self.step = step
         set_step(step)
+
+    def train_step(self, tokens, labels, loss_mask):
+        # Re-set ContextVar from self.step — needed because Monarch actor
+        # endpoints run as separate asyncio tasks, so the ContextVar set in
+        # set_step() doesn't carry over to train_step().
+        set_step(self.step)
         clear_step_tags()
 
         # record_span(log_to_metrics=True) automatically records
@@ -248,13 +260,13 @@ class ToyTrainer:
         record_event({"train.loss": loss.item(), "train.grad_norm": grad_norm.item()})
 
         # Tensor metrics + aggregation: gated by schedule (expensive)
-        if self.log_schedule(step):
+        if self.log_schedule(self.step):
             scalars = replicate_to_host(ctx.summaries())
             log_reduced_metrics(scalars)
             if self.aggregator and self.rank == 0:
-                aggregated = self.aggregator.collect_and_aggregate(step=step)
+                aggregated = self.aggregator.collect_and_aggregate(step=self.step)
                 if self.writer:
-                    self.writer(step=step, values=aggregated)
+                    self.writer(step=self.step, values=aggregated)
             if self.rank == 0 and scalars:
                 keys = ", ".join(f"{k}={v:.4f}" for k, v in sorted(scalars.items())[:5])
                 print(f"  [tensor metrics] {keys} ...")
@@ -266,7 +278,8 @@ class ToyTrainer:
             print(f"{'Step':>4}  {'Loss':>10}  {'GradNorm':>10}")
             print("-" * 40)
         for step in range(1, num_steps + 1):
-            loss, grad_norm = self.train_step(tokens, labels, loss_mask, step)
+            self.set_step(step)
+            loss, grad_norm = self.train_step(tokens, labels, loss_mask)
             if self.rank == 0:
                 print(f"{step:>4}  {loss.item():>10.4f}  {grad_norm.item():>10.4f}")
 

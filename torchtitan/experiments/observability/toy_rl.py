@@ -79,13 +79,18 @@ class TrainerActor(Actor):
         )
 
     @endpoint
-    async def train_step(self, tokens, labels, loss_mask, step) -> float:
+    async def set_step(self, step: int):
+        """Receive step via broadcast. FIFO ordering guarantees this runs before train_step."""
+        self.trainer.set_step(step)
+
+    @endpoint
+    async def train_step(self, tokens, labels, loss_mask) -> float:
         """Returns loss as a scalar. Metrics are logged to JSONL inside the trainer."""
         # Controller sends CPU tensors; move to this actor's GPU
         tokens = tokens.to(self.device)
         labels = labels.to(self.device)
         loss_mask = loss_mask.to(self.device)
-        loss, _grad_norm = self.trainer.train_step(tokens, labels, loss_mask, step)
+        loss, _grad_norm = self.trainer.train_step(tokens, labels, loss_mask)
         return loss.item()
 
     @endpoint
@@ -157,8 +162,12 @@ async def main():
 
     # --- RL training loop ---
     for step in range(1, NUM_STEPS + 1):
-        set_step(step)
+        set_step(step)  # Controller's own ContextVar
         clear_step_tags()
+
+        # Broadcast step to all actors (fire-and-forget, FIFO ordering).
+        # Actors receive this before train_step executes.
+        await trainer.set_step.call(step)
 
         # Score completions
         with record_span("RewardScoring", EventType.RL_SCORING):
@@ -166,9 +175,9 @@ async def main():
         # Monarch returns dict[rank, result] — single reward actor has one rank
         rewards = next(iter(reward_results.values()))
 
-        # Train
+        # Train (no step parameter — set via broadcast above)
         with record_span("Training", EventType.FWD_BWD):
-            loss_results = await trainer.train_step.call(tokens, labels, loss_mask, step)
+            loss_results = await trainer.train_step.call(tokens, labels, loss_mask)
         loss = next(iter(loss_results.values()))
 
         # Rollout logging (non-blocking)
