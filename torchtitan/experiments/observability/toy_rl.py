@@ -106,7 +106,7 @@ class RewardActor(Actor):
     async def score(self, completions: list[torch.Tensor], step: int = 0) -> list[float]:
         """Score completions against a target. Returns list of rewards."""
         set_step(step)
-        with record_span("RewardScoring", EventType.EVAL):
+        with record_span("RewardScoring", EventType.RL_SCORING):
             rewards = [-((c - self.target) ** 2).mean().item() for c in completions]
         record_metric("reward/mean", MeanMetric(sum=sum(rewards), weight=len(rewards)))
         record_metric("reward/max", MaxMetric(value=max(rewards)))
@@ -150,13 +150,18 @@ async def main():
     # Dummy completions for reward scoring (fixed vectors for overfitting)
     completions = [torch.arange(D_MODEL, dtype=torch.float32) * (i + 1) / D_MODEL for i in range(4)]
 
+    def _aggregate_and_write(agg, wrt, s):
+        aggregated = agg.collect_and_aggregate(step=s)
+        if aggregated:
+            wrt(step=s, values=aggregated)
+
     # --- RL training loop ---
     for step in range(1, NUM_STEPS + 1):
         set_step(step)
         clear_step_tags()
 
         # Score completions
-        with record_span("RewardScoring", EventType.EVAL):
+        with record_span("RewardScoring", EventType.RL_SCORING):
             reward_results = await reward_actor.score.call(completions, step=step)
         # Monarch returns dict[rank, result] — single reward actor has one rank
         rewards = next(iter(reward_results.values()))
@@ -174,12 +179,7 @@ async def main():
         record_event({"train.loss": loss, "reward_mean": sum(rewards) / len(rewards)})
 
         # Aggregate and write to backends (non-blocking)
-        def _aggregate(agg, wrt, s):
-            aggregated = agg.collect_and_aggregate(step=s)
-            if aggregated:
-                wrt(step=s, values=aggregated)
-
-        executor.submit(_aggregate, aggregator, writer, step)
+        executor.submit(_aggregate_and_write, aggregator, writer, step)
 
         print(f"  Step {step}/{NUM_STEPS}: loss={loss:.4f}, rewards={[f'{r:.3f}' for r in rewards]}")
 

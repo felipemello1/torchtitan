@@ -13,10 +13,10 @@ Prerequisites:
 import json
 import os
 
-OUTPUT_DIR = os.path.join(
+OUTPUT_DIR = os.path.normpath(os.path.join(
     os.path.dirname(__file__), "..", "..", "..",
     "torchtitan", "experiments", "observability", "outputs", "toy_rl",
-)
+))
 
 
 class TestRolloutIntegration:
