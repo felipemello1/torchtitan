@@ -16,6 +16,7 @@ from torchtitan.observability.backends import (
     LoggingSummaryWriter,
     SummaryWriter,
     TensorBoardSummaryWriter,
+    WandbSummaryWriter,
 )
 from torchtitan.observability.tensor_metrics import MeanTMetric, MaxTMetric
 
@@ -135,3 +136,23 @@ class TestLoggingSummaryWriter:
                 writer(step=5, values={"loss": 1.5})
         assert "step 5" in caplog.text
         assert "1.5" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Configurable .build() pattern
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPattern:
+    def test_tensorboard_build(self):
+        cfg = TensorBoardSummaryWriter.Config(log_dir="/tmp/test_tb")
+        writer = cfg.build()
+        assert isinstance(writer, TensorBoardSummaryWriter)
+        assert writer.log_dir == "/tmp/test_tb"
+
+    def test_wandb_build(self):
+        cfg = WandbSummaryWriter.Config(project="test-proj", entity="test-team")
+        writer = cfg.build()
+        assert isinstance(writer, WandbSummaryWriter)
+        assert writer.project == "test-proj"
+        assert writer.entity == "test-team"
