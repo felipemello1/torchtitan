@@ -7,122 +7,47 @@
 """
 TorchTitan Observability Library
 
-PR1 — System metrics (phase timing, step context):
-    init_observability, set_step, add_step_tag, clear_step_tags,
-    record_span, record_event, EventType
-
-PR2 — Tensor experiment metrics (compile-safe):
-    record_tensor_metric, InvocationContext, replicate_to_host,
-    MeanTMetric, SumTMetric, MaxTMetric, MinTMetric, DerivedTMetric
-
-PR3 — Logging boundary + backends:
-    EveryNSteps, CompositeSummaryWriter, TensorBoardSummaryWriter,
-    WandbSummaryWriter, LoggingSummaryWriter, InMemorySummaryWriter
-
-PR4 — CPU experiment metrics + JSONL + aggregation:
-    record_metric, log_reduced_metrics, DefaultAggregator,
-    MeanMetric, MaxMetric, MinMetric, SumMetric
-    (init_observability extended to create experiment handler)
-
-PR5 — Profiling:
-    Profiler, ProfilerConfig, profile_annotation
+System metrics: init_observability, set_step, record_span, record_event, EventType
+Tensor metrics: record_tensor_metric, TensorMetricContext, child_context, replicate_to_host
+Backends: EveryNSteps, CompositeSummaryWriter, TensorBoard, WandB
+CPU metrics: record_metric, log_reduced_metrics, DefaultAggregator, MeanMetric
+Profiling: Profiler, ProfilerConfig, profile_annotation
+RL: RolloutLogger, filter_top_bottom
 """
 
-from torchtitan.observability.invocation_context import (
-    child_context,
-    current_context,
-    InvocationContext,
-    record_tensor_metric,
-)
-from torchtitan.observability.metrics import (
-    DefaultAggregator,
-    log_reduced_metrics,
-    MaxMetric,
-    MeanMetric,
-    MinMetric,
-    record_metric,
-    SumMetric,
-)
-from torchtitan.observability.structured_logging import (
-    add_step_tag,
-    clear_step_tags,
-    EventType,
-    init_observability,
-    record_event,
-    record_span,
-    set_step,
-)
-
 from torchtitan.observability.backends import (
-    CompositeSummaryWriter,
-    InMemorySummaryWriter,
-    LoggingSummaryWriter,
-    SummaryWriter,
-    TensorBoardSummaryWriter,
-    WandbSummaryWriter,
+    CompositeSummaryWriter, InMemorySummaryWriter, LoggingSummaryWriter,
+    SummaryWriter, TensorBoardSummaryWriter, WandbSummaryWriter,
 )
+from torchtitan.observability.common import add_step_tag, clear_step_tags, set_step
 from torchtitan.observability.logging_boundary import EveryNSteps
-from torchtitan.observability.profiling import (
-    Profiler,
-    ProfilerConfig,
-    profile_annotation,
+from torchtitan.observability.metrics import (
+    DefaultAggregator, log_reduced_metrics, MaxMetric, MeanMetric,
+    MinMetric, record_metric, SumMetric,
 )
-from torchtitan.observability.rollout_logger import (
-    filter_top_bottom,
-    RolloutLogger,
+from torchtitan.observability.profiling import Profiler, ProfilerConfig, profile_annotation
+from torchtitan.observability.rollout_logger import filter_top_bottom, RolloutLogger
+from torchtitan.observability.structured_logging import (
+    EventType, init_observability, record_event, record_span,
+)
+from torchtitan.observability.tensor_metric_context import (
+    child_context, current_tensor_metric_context, record_tensor_metric, TensorMetricContext,
 )
 from torchtitan.observability.tensor_metrics import (
-    DerivedTMetric,
-    MaxTMetric,
-    MeanTMetric,
-    MinTMetric,
-    replicate_to_host,
-    SumTMetric,
-    TMetricValue,
+    MaxTMetric, MeanTMetric, MinTMetric, replicate_to_host, SumTMetric, TMetricValue,
 )
 
 __all__ = [
-    # PR1
-    "init_observability",
-    "set_step",
-    "add_step_tag",
-    "clear_step_tags",
-    "record_span",
-    "record_event",
-    "EventType",
-    # PR2
-    "record_tensor_metric",
-    "InvocationContext",
-    "current_context",
-    "child_context",
-    "replicate_to_host",
-    "TMetricValue",
-    "MeanTMetric",
-    "SumTMetric",
-    "MaxTMetric",
-    "MinTMetric",
-    "DerivedTMetric",
-    # PR3
-    "EveryNSteps",
-    "SummaryWriter",
-    "CompositeSummaryWriter",
-    "TensorBoardSummaryWriter",
-    "WandbSummaryWriter",
-    "LoggingSummaryWriter",
-    "InMemorySummaryWriter",
-    # PR4
-    "record_metric",
-    "log_reduced_metrics",
-    "DefaultAggregator",
-    "MeanMetric",
-    "MaxMetric",
-    "MinMetric",
-    "SumMetric",
-    # PR5
-    "Profiler",
-    "ProfilerConfig",
-    "profile_annotation",
-    # PR6
-    "RolloutLogger",
-    "filter_top_bottom",
+    "init_observability", "set_step", "add_step_tag", "clear_step_tags",
+    "record_span", "record_event", "EventType",
+    "record_tensor_metric", "TensorMetricContext", "current_tensor_metric_context",
+    "child_context", "replicate_to_host", "TMetricValue",
+    "MeanTMetric", "SumTMetric", "MaxTMetric", "MinTMetric",
+    "EveryNSteps", "SummaryWriter", "CompositeSummaryWriter",
+    "TensorBoardSummaryWriter", "WandbSummaryWriter",
+    "LoggingSummaryWriter", "InMemorySummaryWriter",
+    "record_metric", "log_reduced_metrics", "DefaultAggregator",
+    "MeanMetric", "MaxMetric", "MinMetric", "SumMetric",
+    "Profiler", "ProfilerConfig", "profile_annotation",
+    "RolloutLogger", "filter_top_bottom",
 ]

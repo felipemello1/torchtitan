@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Tests for metrics.py (PR4 — novel code).
+"""Tests for metrics.py (non-tensor experiment metrics).
 
 Tests: MetricValue types, record_metric, log_reduced_metrics,
 ExperimentJSONFormatter, DefaultAggregator, init_observability.
@@ -16,7 +16,7 @@ import os
 
 import pytest
 
-from torchtitan.observability.structured_logging import _STEP, set_step
+from torchtitan.observability.common import _STEP, set_step
 from torchtitan.observability.structured_logging import init_observability
 from torchtitan.observability.metrics import (
     DefaultAggregator,
@@ -59,7 +59,7 @@ def exp_logger():
 
 class TestMeanMetric:
     def test_from_value(self):
-        m = MeanMetric(value=2.5)
+        m = MeanMetric(sum=2.5)
         state = m.get_state()
         assert state["reduce"] == "MeanMetric"
         assert state["sum"] == 2.5
@@ -79,9 +79,9 @@ class TestMeanMetric:
         result = MeanMetric.get_reduced_value_from_states(states)
         assert result == pytest.approx(2.0)  # 10/5
 
-    def test_both_value_and_sum_raises(self):
-        with pytest.raises(ValueError):
-            MeanMetric(value=1.0, sum=2.0)
+    def test_default_weight(self):
+        m = MeanMetric(sum=5.0)
+        assert m._weight == 1.0
 
 
 class TestMaxMetric:
@@ -175,7 +175,7 @@ class TestRecordMetricEndToEnd:
         set_step(42)
 
         record_metric("reward", MaxMetric(0.95))
-        record_metric("lr", MeanMetric(value=1e-4))
+        record_metric("lr", MeanMetric(sum=1e-4))
 
         # Flush
         for h in exp_logger.handlers:

@@ -4,18 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Rollout logger for RL training data (PR6).
+"""Rollout logger for RL training data.
 
 No enforced schema. Takes list[dict], writes one JSON line per dict.
-Single write call for the whole batch. Separate from experiment JSONL
-(not consumed by DefaultAggregator).
+Separate from experiment JSONL (not consumed by DefaultAggregator).
 
 Query with:
     jq 'select(.reward < 0.1)' rollouts.jsonl
     # or DuckDB: SELECT * FROM read_json('rollouts.jsonl') WHERE policy_version = 5
 """
-
-from __future__ import annotations
 
 import json
 import os
@@ -26,17 +23,24 @@ class RolloutLogger:
     """Logs rollout data as JSONL for offline analysis.
 
     No enforced schema — takes any list[dict]. Step is added to each record.
-    Supports optional filtering (e.g., keep top/bottom-k by reward).
+    Optional filter_fn can be set at init or overridden per log() call.
 
     Args:
         output_dir: Directory for rollout files.
         filename: Name of the JSONL file (default: rollouts.jsonl).
+        filter_fn: Optional default filter applied to every log() call.
     """
 
-    def __init__(self, output_dir: str, filename: str = "rollouts.jsonl"):
+    def __init__(
+        self,
+        output_dir: str,
+        filename: str = "rollouts.jsonl",
+        filter_fn: Callable[[list[dict]], list[dict]] | None = None,
+    ):
         os.makedirs(output_dir, exist_ok=True)
         self._filepath = os.path.join(output_dir, filename)
         self._file = open(self._filepath, "a")
+        self._filter_fn = filter_fn
 
     def log(
         self,
@@ -49,12 +53,13 @@ class RolloutLogger:
         Args:
             records: List of rollout dicts. No schema enforced.
             step: Training step (added to each record).
-            filter_fn: Optional filter (e.g., keep top/bottom-k by reward).
+            filter_fn: Override the default filter for this call.
         """
         if not records:
             return
-        if filter_fn is not None:
-            records = filter_fn(records)
+        fn = filter_fn if filter_fn is not None else self._filter_fn
+        if fn is not None:
+            records = fn(records)
         self._file.write(
             "\n".join(json.dumps({**r, "step": step}) for r in records) + "\n"
         )
@@ -68,20 +73,18 @@ class RolloutLogger:
 
 
 def filter_top_bottom(
-    records: list[dict], key: str = "reward", k: int = 5
+    records: list[dict], key: str = "reward", k: int = 1
 ) -> list[dict]:
     """Keep top-k and bottom-k records by a key.
-
-    Useful for logging only the most/least rewarded completions.
 
     Args:
         records: List of rollout dicts.
         key: Key to sort by (default: "reward").
-        k: Number of records to keep from each end.
+        k: Number of records to keep from each end (default: 1).
 
     Returns:
-        Bottom-k + top-k records. If fewer than 2*k records, returns all
-        without duplicates.
+        Bottom-k + top-k records. If fewer than 2*k records, clamps k
+        to len//2 to avoid duplicates.
     """
     sorted_recs = sorted(records, key=lambda r: r.get(key, 0))
     k = min(k, len(sorted_recs) // 2) if sorted_recs else 0

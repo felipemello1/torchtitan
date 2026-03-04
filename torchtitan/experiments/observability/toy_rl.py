@@ -5,38 +5,54 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Toy RL Example with Monarch Actors (PR6)
+Toy RL Example with Monarch Actors
 
 Reuses ToyTrainer from toy_spmd.py inside a Monarch actor.
-Controller owns aggregation + rollout logging.
+Controller owns aggregation, rollout logging, and backend writes.
+Actors write to per-rank JSONL; controller reads via DefaultAggregator.
 
 Run (requires 4 GPUs):
-    python torchtitan/experiments/observability/toy_rl.py
+    python -m torchtitan.experiments.observability.toy_rl
 """
 
 import asyncio
-import json
 import os
 import shutil
+import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from monarch.actor import Actor, current_rank, endpoint, this_host
+from torch.distributed.device_mesh import init_device_mesh
 
 from torchtitan.experiments.observability.toy_spmd import (
-    LoggingConfig, ToyTrainer, VOCAB_SIZE, D_MODEL,
+    BATCH_SIZE,
+    D_MODEL,
+    LoggingConfig,
+    SEQ_LEN,
+    ToyTrainer,
+    VOCAB_SIZE,
 )
 from torchtitan.observability import (
-    add_step_tag, clear_step_tags, CompositeSummaryWriter, DefaultAggregator,
-    EventType, init_observability, InMemorySummaryWriter,
-    MaxMetric, MeanMetric, record_event, record_metric, record_span, set_step,
+    clear_step_tags,
+    CompositeSummaryWriter,
+    DefaultAggregator,
+    EventType,
+    init_observability,
+    InMemorySummaryWriter,
+    MaxMetric,
+    MeanMetric,
+    record_event,
+    record_metric,
+    record_span,
+    set_step,
 )
-from torchtitan.observability.rollout_logger import RolloutLogger, filter_top_bottom
+from torchtitan.observability.rollout_logger import filter_top_bottom, RolloutLogger
 
 NUM_STEPS = 6
-LOG_EVERY = 2
-OUTPUT_DIR = "/tmp/toy_rl_output"
+TRAINER_LOG_FREQ = 2
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs", "toy_rl")
 
 
 class TrainerActor(Actor):
@@ -47,24 +63,26 @@ class TrainerActor(Actor):
         self.device = f"cuda:{rank}"
         torch.cuda.set_device(self.device)
         if not torch.distributed.is_initialized():
-            import socket
             os.environ.setdefault("MASTER_ADDR", socket.gethostname())
             os.environ.setdefault("MASTER_PORT", "29500")
-            torch.distributed.init_process_group(backend="nccl", rank=rank, world_size=4)
-        from torch.distributed.device_mesh import init_device_mesh
+            world_size = int(os.environ.get("WORLD_SIZE", 4))
+            torch.distributed.init_process_group(backend="nccl", rank=rank, world_size=world_size)
         mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
-        # No backends in actor — controller handles aggregation + backends.
-        # log_freq must match LOG_EVERY so trainer reduces tensor metrics
-        # on the same steps the controller aggregates.
         self.trainer = ToyTrainer(
             self.device, mesh["dp"], mesh["tp"], OUTPUT_DIR,
-            logging_cfg=LoggingConfig(log_freq=LOG_EVERY, enable_console=False),
+            logging_cfg=LoggingConfig(
+                log_freq=TRAINER_LOG_FREQ,
+                enable_console=False,
+                enable_tensorboard=False,
+                enable_wandb=False,
+            ),
         )
 
     @endpoint
-    async def train_step(self, tokens, labels, step) -> dict:
-        loss, grad_norm, dt_ms, ctx = self.trainer.train_step(tokens, labels, step)
-        return {"loss": loss.item(), "grad_norm": grad_norm.item(), "dt_ms": dt_ms}
+    async def train_step(self, tokens, labels, loss_mask, step) -> float:
+        """Returns loss as a scalar. Metrics are logged to JSONL inside the trainer."""
+        loss, _grad_norm, _dt_ms = self.trainer.train_step(tokens, labels, loss_mask, step)
+        return loss.item()
 
     @endpoint
     async def teardown(self):
@@ -77,14 +95,16 @@ class RewardActor(Actor):
     @endpoint
     async def setup(self):
         self.target = torch.ones(D_MODEL)
-        init_observability(rank=0, source="reward", output_dir=OUTPUT_DIR)
+        rank = current_rank().rank
+        init_observability(rank=rank, source="reward", output_dir=OUTPUT_DIR)
 
     @endpoint
     async def score(self, completions: list[torch.Tensor], step: int = 0) -> list[float]:
+        """Score completions against a target. Returns list of rewards."""
         set_step(step)
-        with record_span("Score", EventType.EVAL):
+        with record_span("RewardScoring", EventType.EVAL):
             rewards = [-((c - self.target) ** 2).mean().item() for c in completions]
-        record_metric("reward/mean", MeanMetric(value=sum(rewards) / len(rewards)))
+        record_metric("reward/mean", MeanMetric(sum=sum(rewards), weight=len(rewards)))
         record_metric("reward/max", MaxMetric(value=max(rewards)))
         return rewards
 
@@ -95,8 +115,11 @@ async def main():
     if os.path.exists(OUTPUT_DIR):
         shutil.rmtree(OUTPUT_DIR)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # --- Initialize controller observability ---
     init_observability(rank=0, source="controller", output_dir=OUTPUT_DIR)
 
+    # --- Spawn actors ---
     host = this_host()
     trainer_mesh = host.spawn_procs(per_host={"gpus": 4}, name="trainer")
     trainer = trainer_mesh.spawn("trainer", TrainerActor)
@@ -107,54 +130,60 @@ async def main():
     await reward_actor.setup.call()
     print("Actors spawned.\n")
 
-    # Controller owns aggregation + backends + rollout logging.
-    # Controller aggregates every step — the trainer gates its own
-    # replicate_to_host via log_freq, so tensor metrics only appear on
-    # scheduled steps. CPU metrics appear every step.
+    # --- Initialize backends and aggregator ---
     writer = CompositeSummaryWriter(writers={"memory": InMemorySummaryWriter()})
     writer.open()
     aggregator = DefaultAggregator(experiment_log_dir=os.path.join(OUTPUT_DIR, "experiment_logs"))
     rollout_logger = RolloutLogger(output_dir=os.path.join(OUTPUT_DIR, "rollouts"))
     executor = ThreadPoolExecutor(max_workers=2)
 
+    # --- Fixed data for overfitting (generated once, reused every step) ---
+    torch.manual_seed(42)
+    tokens = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN))
+    labels = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN))
+    loss_mask = torch.ones(BATCH_SIZE, SEQ_LEN)  # all tokens valid in RL toy
+
+    # Dummy completions for reward scoring (fixed vectors for overfitting)
+    completions = [torch.arange(D_MODEL, dtype=torch.float32) * (i + 1) / D_MODEL for i in range(4)]
+
+    # --- RL training loop ---
     for step in range(1, NUM_STEPS + 1):
         set_step(step)
         clear_step_tags()
 
-        # Score
-        completions = [torch.arange(D_MODEL, dtype=torch.float32) * (i+1) / D_MODEL for i in range(4)]
-        reward_results = await reward_actor.score.call(completions, step=step)
+        # Score completions
+        with record_span("RewardScoring", EventType.EVAL):
+            reward_results = await reward_actor.score.call(completions, step=step)
+        # Monarch returns dict[rank, result] — single reward actor has one rank
         rewards = next(iter(reward_results.values()))
 
         # Train
-        tokens = torch.randint(0, VOCAB_SIZE, (8, 16))
-        labels = torch.randint(0, VOCAB_SIZE, (8, 16))
         with record_span("Training", EventType.FWD_BWD):
-            results = await trainer.train_step.call(tokens, labels, step)
-        r0 = next(iter(results.values()))
+            loss_results = await trainer.train_step.call(tokens, labels, loss_mask, step)
+        loss = next(iter(loss_results.values()))
 
         # Rollout logging (non-blocking)
         records = [{"prompt_id": i, "reward": rewards[i], "policy_version": step} for i in range(len(rewards))]
-        executor.submit(rollout_logger.log, records, step, lambda r: filter_top_bottom(r, k=2))
+        executor.submit(rollout_logger.log, records, step, lambda r: filter_top_bottom(r, k=1))
 
-        # Aggregation every step (non-blocking, controller-side)
-        add_step_tag("logging")
-        record_event({"train.loss": r0["loss"], "train.grad_norm": r0["grad_norm"]})
+        # System metrics (always, every step)
+        record_event({"train.loss": loss, "reward_mean": sum(rewards) / len(rewards)})
 
-        def _agg(a, w, s):
-            agged = a.collect_and_aggregate(step=s)
-            if agged:
-                w(step=s, values=agged)
+        # Aggregate and write to backends (non-blocking)
+        def _aggregate(agg, wrt, s):
+            aggregated = agg.collect_and_aggregate(step=s)
+            if aggregated:
+                wrt(step=s, values=aggregated)
 
-        executor.submit(_agg, aggregator, writer, step)
+        executor.submit(_aggregate, aggregator, writer, step)
 
-        print(f"  Step {step}/{NUM_STEPS}: loss={r0['loss']:.4f}, rewards={[f'{r:.3f}' for r in rewards]}")
+        print(f"  Step {step}/{NUM_STEPS}: loss={loss:.4f}, rewards={[f'{r:.3f}' for r in rewards]}")
 
     executor.shutdown(wait=True)
     rollout_logger.close()
     writer.close()
     await trainer.teardown.call()
-    print(f"\nDone in {time.time()-t0:.1f}s. Output: {OUTPUT_DIR}")
+    print(f"\nDone in {time.time() - t0:.1f}s. Output: {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":

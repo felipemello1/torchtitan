@@ -11,11 +11,11 @@ Changes:
   OSS_COMPAT — removed Node base class, Config inner classes, get_env() calls.
                Replaced with explicit constructor args and dataclass configs.
   META_REMOVAL — removed ODS/fb303 calls, torchx_run.sh reference.
-  FIX — set_profiling_step called AFTER step(), only during RECORD/RECORD_AND_SAVE.
-  FIX — dist.barrier() in stop() prevents NCCL timeout.
+  set_profiling_step called AFTER step(), only during RECORD/RECORD_AND_SAVE.
+  dist.barrier() in stop() prevents NCCL timeout.
 """
 
-from __future__ import annotations
+
 
 import contextlib
 import copy
@@ -34,6 +34,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch.profiler import ProfilerAction
+
+from torchtitan.observability.logging_boundary import EveryNSteps
 
 logger = logging.getLogger(__name__)
 
@@ -580,8 +582,6 @@ class Profiler:
         return self._torch_profiler
 
     def _create_torch_profiler(self) -> torch.profiler.profile | None:
-        from torchtitan.observability.logging_boundary import EveryNSteps
-
         cfg = self.cfg
         trace_dir = os.path.join(self.output_dir, "profiling", "traces")
         os.makedirs(trace_dir, exist_ok=True)

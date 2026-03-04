@@ -4,10 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Integration test for PR3: validates EveryNSteps schedule + writer lifecycle.
+"""Integration test: validates EveryNSteps schedule + writer lifecycle.
 
 Prerequisites:
-    torchrun --nproc_per_node=4 torchtitan/experiments/observability/toy_spmd.py
+    torchrun --nproc_per_node=4 -m torchtitan.experiments.observability.toy_spmd
 """
 
 import json
@@ -15,48 +15,63 @@ import os
 
 import pytest
 
-OUTPUT_DIR = "/tmp/toy_spmd_output"
+OUTPUT_DIR = os.path.join(
+    os.path.dirname(__file__), "..", "..", "..",
+    "torchtitan", "experiments", "observability", "outputs", "toy_spmd",
+)
 
 
 @pytest.fixture
-def scalars_files():
-    """Collect all scalars_step_N.json files."""
-    if not os.path.exists(OUTPUT_DIR):
-        pytest.skip("Run toy_spmd.py first")
-    files = {}
-    for f in os.listdir(OUTPUT_DIR):
-        if f.startswith("scalars_step_") and f.endswith(".json"):
-            step = int(f.replace("scalars_step_", "").replace(".json", ""))
-            with open(os.path.join(OUTPUT_DIR, f)) as fh:
-                files[step] = json.load(fh)
-    if not files:
-        pytest.skip("No scalars files found — run toy_spmd.py first")
-    return files
+def sys_log_dir():
+    d = os.path.join(OUTPUT_DIR, "system_logs")
+    assert os.path.exists(d), (
+        f"Output not found at {d}. Run first:\n"
+        "  torchrun --nproc_per_node=4 -m torchtitan.experiments.observability.toy_spmd"
+    )
+    return d
 
 
-class TestPR3Integration:
-    def test_schedule_logged_on_correct_steps(self, scalars_files):
-        """EveryNSteps(5) + additional_steps={1} → steps 1, 5, 10, 15, 20."""
-        expected_steps = {1, 5, 10, 15, 20}
-        actual_steps = set(scalars_files.keys())
-        assert actual_steps == expected_steps, f"Expected {expected_steps}, got {actual_steps}"
+@pytest.fixture
+def rank0_events(sys_log_dir):
+    rank0_file = sorted(f for f in os.listdir(sys_log_dir) if "rank_0" in f)[0]
+    with open(os.path.join(sys_log_dir, rank0_file)) as f:
+        return [json.loads(line) for line in f if line.strip()]
 
-    def test_scalars_are_floats(self, scalars_files):
-        """All values in scalars should be Python floats."""
-        for step, scalars in scalars_files.items():
-            for key, val in scalars.items():
-                assert isinstance(val, (int, float)), (
-                    f"Step {step}, key {key}: expected numeric, got {type(val)}"
-                )
 
-    def test_scalars_have_loss_key(self, scalars_files):
-        """The 'loss' metric should be present."""
-        first_step = min(scalars_files.keys())
-        assert "loss" in scalars_files[first_step]
+class TestScheduleIntegration:
+    def test_system_jsonl_still_works(self, sys_log_dir):
+        files = [f for f in os.listdir(sys_log_dir) if f.endswith(".jsonl")]
+        assert len(files) == 4
 
-    def test_pr1_and_pr2_still_work(self):
-        """Previous PRs' outputs should still exist."""
-        if not os.path.exists(OUTPUT_DIR):
-            pytest.skip("Run toy_spmd.py first")
-        assert os.path.exists(os.path.join(OUTPUT_DIR, "system_logs")), "PR1 system_logs missing"
-        assert os.path.exists(os.path.join(OUTPUT_DIR, "losses.json")), "losses.json missing"
+    def test_record_event_fires_every_step(self, rank0_events):
+        """record_event fires every step (not gated by schedule)."""
+        metric_events = [
+            e for e in rank0_events
+            if e["normal"].get("log_type_name") == "metric_value"
+        ]
+        assert len(metric_events) > 0
+        steps = {e["int"]["step"] for e in metric_events if "step" in e["int"]}
+        assert len(steps) == 20, f"Expected 20 steps, got {len(steps)}: {sorted(steps)}"
+
+    def test_fwd_bwd_spans_every_step(self, rank0_events):
+        """record_span fires every step."""
+        fwd_bwd_starts = [
+            e for e in rank0_events if e["normal"].get("log_type_name") == "fwd_bwd_start"
+        ]
+        assert len(fwd_bwd_starts) == 20
+
+
+class TestScheduleUnit:
+    def test_every_n_steps_basic(self):
+        from torchtitan.observability import EveryNSteps
+        schedule = EveryNSteps(every_n=5)
+        assert schedule(5) is True
+        assert schedule(10) is True
+        assert schedule(3) is False
+
+    def test_every_n_steps_with_additional(self):
+        from torchtitan.observability import EveryNSteps
+        schedule = EveryNSteps(every_n=5, additional_steps={1})
+        assert schedule(1) is True
+        assert schedule(2) is False
+        assert schedule(5) is True
