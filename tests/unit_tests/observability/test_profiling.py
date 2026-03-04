@@ -18,7 +18,6 @@ from torchtitan.observability.profiling import (
     NSysProfiler,
     profile_annotation,
     Profiler,
-    ProfilerConfig,
     set_profiling_step,
     TriggerableSchedule,
     TriggerResult,
@@ -165,20 +164,20 @@ class TestFileBasedTriggerWatcher:
 
 
 # ---------------------------------------------------------------------------
-# ProfilerConfig
+# Profiler.Config
 # ---------------------------------------------------------------------------
 
 
 class TestProfilerConfig:
     def test_defaults(self):
-        cfg = ProfilerConfig()
+        cfg = Profiler.Config()
         assert cfg.enable_profiling is False
         assert cfg.profile_freq == 10
         assert cfg.profiler_warmup == 2
         assert cfg.profiler_active == 1
 
     def test_custom(self):
-        cfg = ProfilerConfig(enable_profiling=True, profile_freq=5)
+        cfg = Profiler.Config(enable_profiling=True, profile_freq=5)
         assert cfg.enable_profiling is True
         assert cfg.profile_freq == 5
 
@@ -189,36 +188,42 @@ class TestProfilerConfig:
 
 
 class TestProfiler:
+    def test_build_pattern(self):
+        """Profiler.Config().build() returns a Profiler instance."""
+        cfg = Profiler.Config()
+        profiler = cfg.build(output_dir="/tmp/test_profiler")
+        assert isinstance(profiler, Profiler)
+
     def test_context_manager(self):
-        cfg = ProfilerConfig()
-        profiler = Profiler(cfg=cfg, output_dir="/tmp/test_profiler")
+        cfg = Profiler.Config()
+        profiler = Profiler(config=cfg, output_dir="/tmp/test_profiler")
         with profiler:
             pass  # Should not raise
 
     def test_step_without_profiling(self):
-        cfg = ProfilerConfig()
-        profiler = Profiler(cfg=cfg, output_dir="/tmp/test_profiler")
+        cfg = Profiler.Config()
+        profiler = Profiler(config=cfg, output_dir="/tmp/test_profiler")
         with profiler:
             profiler.step(1)  # Should not raise (profiling disabled)
 
     def test_cleanup(self):
-        cfg = ProfilerConfig()
-        profiler = Profiler(cfg=cfg, output_dir="/tmp/test_profiler")
+        cfg = Profiler.Config()
+        profiler = Profiler(config=cfg, output_dir="/tmp/test_profiler")
         profiler.cleanup()  # Should not raise
 
     def test_nsys_and_torch_mutually_exclusive(self):
-        cfg = ProfilerConfig(enable_profiling=True, enable_nsys=True)
+        cfg = Profiler.Config(enable_profiling=True, enable_nsys=True)
         with pytest.raises(ValueError, match="cannot both"):
-            Profiler(cfg=cfg, output_dir="/tmp/test")
+            Profiler(config=cfg, output_dir="/tmp/test")
 
     def test_host_memory_profiler_enabled(self, tmp_path):
-        cfg = ProfilerConfig(enable_host_memory_profiler=True, host_memory_interval=5)
-        profiler = Profiler(cfg=cfg, output_dir=str(tmp_path))
+        cfg = Profiler.Config(enable_host_memory_profiler=True, host_memory_interval=5)
+        profiler = Profiler(config=cfg, output_dir=str(tmp_path))
         assert profiler._host_mem_profiler is not None
         profiler.cleanup()
 
     def test_memory_snapshot_enabled(self, tmp_path):
-        cfg = ProfilerConfig(enable_memory_snapshot=True)
-        profiler = Profiler(cfg=cfg, output_dir=str(tmp_path))
+        cfg = Profiler.Config(enable_memory_snapshot=True)
+        profiler = Profiler(config=cfg, output_dir=str(tmp_path))
         assert profiler._mem_profiler is not None
         profiler.cleanup()

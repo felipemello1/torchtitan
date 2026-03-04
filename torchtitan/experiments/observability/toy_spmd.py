@@ -205,9 +205,11 @@ class ToyTrainer:
         if cfg.enable_console:
             writers["console"] = LoggingSummaryWriter()
         if cfg.enable_tensorboard:
-            writers["tb"] = TensorBoardSummaryWriter(log_dir=os.path.join(self.output_dir, cfg.tb_log_dir))
+            writers["tb"] = TensorBoardSummaryWriter.Config(
+                log_dir=os.path.join(self.output_dir, cfg.tb_log_dir),
+            ).build()
         if cfg.enable_wandb:
-            writers["wandb"] = WandbSummaryWriter()
+            writers["wandb"] = WandbSummaryWriter.Config().build()
         if writers:
             self.writer = CompositeSummaryWriter(writers=writers)
             self.writer.open()
