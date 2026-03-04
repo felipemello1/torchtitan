@@ -474,3 +474,20 @@ class TestRecordSpan:
         with pytest.raises(ValueError, match="test error"):
             with record_span("Test", EventType.STEP):
                 raise ValueError("test error")
+
+    def test_rejects_start_end_event_types(self):
+        with pytest.raises(ValueError, match="not a START/END variant"):
+            record_span("Bad", EventType.FWD_BWD_START)
+        with pytest.raises(ValueError, match="not a START/END variant"):
+            record_span("Bad", EventType.FWD_BWD_END)
+
+    def test_rl_scoring_event_type(self, tmp_path, system_logger):
+        init_observability(rank=0, source="reward", output_dir=str(tmp_path))
+        set_step(1)
+        with record_span("Scoring", EventType.RL_SCORING):
+            pass
+        jsonl_path = os.path.join(str(tmp_path), "system_logs", "reward_rank_0_system.jsonl")
+        with open(jsonl_path) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
+        assert lines[0]["normal"]["log_type_name"] == str(EventType.RL_SCORING_START)
+        assert lines[1]["normal"]["log_type_name"] == str(EventType.RL_SCORING_END)
