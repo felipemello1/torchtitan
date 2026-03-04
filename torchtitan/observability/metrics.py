@@ -6,8 +6,16 @@
 
 """Non-tensor experiment metrics: record_metric → JSONL → DefaultAggregator → backends.
 
-record_metric is fire-and-forget. The formatter adds step (ContextVar) and
-rank/source (self attributes) automatically.
+Data flow:
+    record_metric("reward", MeanMetric(sum=r))     fire-and-forget to JSONL
+        → ExperimentJSONFormatter                   adds step/rank/source/caller
+        → ExperimentLoggingHandler                  writes to per-rank JSONL
+    DefaultAggregator.collect_and_aggregate(step)   reads new JSONL lines
+        → REDUCE_REGISTRY                           reduces by key
+        → dict[str, float]                          ready for SummaryWriter
+
+record_metric is fire-and-forget. The formatter adds step (from ContextVar) and
+rank/source (from formatter instance attributes) automatically.
 """
 
 import glob
@@ -131,10 +139,9 @@ REDUCE_REGISTRY: dict[str, type[MetricValue]] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Experiment logger plumbing
-# ---------------------------------------------------------------------------
-
+# Experiment logger — records are formatted as JSONL by ExperimentJSONFormatter
+# and written to per-rank files by ExperimentLoggingHandler. Both are attached
+# in init_observability() (structured_logging.py).
 _experiment_logger = logging.getLogger(EXPERIMENT_LOGGER_NAME)
 
 
