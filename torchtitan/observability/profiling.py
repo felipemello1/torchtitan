@@ -381,10 +381,7 @@ class MemSnapshotProfiler:
     def _dump_snapshot(self, suffix: str = ""):
         try:
             rank = dist.get_rank() if dist.is_initialized() else 0
-            try:
-                snapshot = torch.cuda.memory._snapshot(augment_with_fx_traces=True)
-            except TypeError:
-                snapshot = torch.cuda.memory._snapshot()
+            snapshot = torch.cuda.memory._snapshot(augment_with_fx_traces=True)
             step_dir = os.path.join(self.snapshot_dir, f"step_{self._step_num}")
             os.makedirs(step_dir, exist_ok=True)
             path = os.path.join(step_dir, f"rank_{rank}{suffix}.pickle")
@@ -622,6 +619,8 @@ class Profiler(Configurable):
         activities = [torch.profiler.ProfilerActivity.CPU]
         if torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
+        elif torch.xpu.is_available():
+            activities.append(torch.profiler.ProfilerActivity.XPU)
 
         prof = torch.profiler.profile(
             activities=activities,
