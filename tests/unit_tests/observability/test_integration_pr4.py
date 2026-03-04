@@ -45,7 +45,9 @@ class TestExperimentJSONLIntegration:
         assert len(lines) > 0, "Experiment JSONL is empty"
         keys = {entry.get("key") for entry in lines if "key" in entry}
         assert "learning_rate" in keys, f"Missing learning_rate. Keys: {keys}"
-        assert "step_time_ms" in keys, f"Missing step_time_ms. Keys: {keys}"
+        # Duration metrics are now auto-recorded by record_span(log_to_metrics=True)
+        duration_keys = [k for k in keys if k.startswith("time/")]
+        assert len(duration_keys) > 0, f"Missing time/*/duration_s metrics. Keys: {keys}"
 
     def test_experiment_jsonl_has_all_reduced(self, exp_log_dir):
         """log_reduced_metrics should produce entries with all_reduced=True."""
