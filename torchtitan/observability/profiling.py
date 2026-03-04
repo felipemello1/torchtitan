@@ -549,8 +549,7 @@ class Profiler(Configurable):
         global_rank: int = 0,
         role_rank: int = 0,
     ):
-        cfg = config  # local alias for __init__ body
-        self.cfg = cfg
+        self.config = config
         self.output_dir = output_dir
         self._within_context = False
         self._torch_profiler = None
@@ -565,39 +564,39 @@ class Profiler(Configurable):
 
         # Sub-profilers (created lazily or at init based on config)
         self._mem_profiler: MemSnapshotProfiler | None = None
-        if cfg.enable_memory_snapshot:
+        if config.enable_memory_snapshot:
             self._mem_profiler = MemSnapshotProfiler(
                 output_dir=output_dir,
-                max_entries=cfg.memory_snapshot_max_entries,
-                start_step=cfg.memory_snapshot_start_step,
-                stop_step=cfg.memory_snapshot_stop_step,
+                max_entries=config.memory_snapshot_max_entries,
+                start_step=config.memory_snapshot_start_step,
+                stop_step=config.memory_snapshot_stop_step,
             )
 
         self._host_mem_profiler: HostMemoryProfiler | None = None
-        if cfg.enable_host_memory_profiler:
+        if config.enable_host_memory_profiler:
             self._host_mem_profiler = HostMemoryProfiler(
                 output_dir=output_dir,
-                interval=cfg.host_memory_interval,
+                interval=config.host_memory_interval,
             )
 
         self._nsys_profiler: NSysProfiler | None = None
-        if cfg.enable_nsys:
-            if cfg.enable_profiling:
+        if config.enable_nsys:
+            if config.enable_profiling:
                 raise ValueError("NSys and torch profiling cannot both be enabled")
             self._nsys_profiler = NSysProfiler(
-                start_step=cfg.nsys_start_step,
-                stop_step=cfg.nsys_stop_step,
+                start_step=config.nsys_start_step,
+                stop_step=config.nsys_stop_step,
             )
 
     @property
     def torch_profiler(self):
         """Lazy creation of torch profiler."""
-        if self._torch_profiler is None and self.cfg.enable_profiling:
+        if self._torch_profiler is None and self.config.enable_profiling:
             self._torch_profiler = self._create_torch_profiler()
         return self._torch_profiler
 
     def _create_torch_profiler(self) -> torch.profiler.profile | None:
-        cfg = self.cfg
+        cfg = self.config
         trace_dir = os.path.join(self.output_dir, "profiling", "traces")
         os.makedirs(trace_dir, exist_ok=True)
 
