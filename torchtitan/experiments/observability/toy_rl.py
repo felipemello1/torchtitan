@@ -81,6 +81,10 @@ class TrainerActor(Actor):
     @endpoint
     async def train_step(self, tokens, labels, loss_mask, step) -> float:
         """Returns loss as a scalar. Metrics are logged to JSONL inside the trainer."""
+        # Controller sends CPU tensors; move to this actor's GPU
+        tokens = tokens.to(self.device)
+        labels = labels.to(self.device)
+        loss_mask = loss_mask.to(self.device)
         loss, _grad_norm, _dt_ms = self.trainer.train_step(tokens, labels, loss_mask, step)
         return loss.item()
 
