@@ -5,26 +5,25 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Toy SPMD Training Example — Observability Baseline (PR0)
+Toy SPMD Training Example — Observability Baseline
 
-Minimal SPMD training loop with no observability. Establishes the model
-and trainer patterns that later PRs will instrument.
+Minimal SPMD training loop. Establishes the model and trainer patterns
+that later commits will instrument with observability.
 
-ToyTrainer mirrors key TorchTitan patterns:
-- Per-layer torch.compile (models/llama3/parallelize.py)
+ToyTrainer follows key TorchTitan patterns:
+- Per-layer torch.compile
 - TP → compile → FSDP application order
 - 2D DeviceMesh (DP × TP) with DTensor parameters
-- clip_grad_norm_ from torchtitan
 
 The model (TinyModel) uses MLPBlock with multiple "heads" (parallel linear
-projections). This structure naturally supports three compile-safety
-scenarios for InvocationContext metrics (added in PR2):
+projections). This structure supports three compile-safety scenarios for
+tensor metric collection:
 - Scenario 1: per-layer metrics via for-loop in eager (over model.layers)
 - Scenario 2: per-head metrics via for-loop inside compile (over block.heads)
 - Scenario 3: merged metrics via same key without child_context
 
 Each rank gets a different number of valid tokens (via loss_mask) to exercise
-weighted metric reduction when tensor metrics are added in PR2.
+weighted metric reduction.
 
 Run:
     torchrun --nproc_per_node=4 -m torchtitan.experiments.observability.toy_spmd
@@ -66,8 +65,8 @@ class MLPBlock(nn.Module):
 
     Each head is an independent linear projection. Their outputs are summed and
     projected back to d_model. This gives us a natural for-loop over sub-modules
-    inside the compiled forward, which is needed to demonstrate per-head metrics
-    with child_context in PR2.
+    inside the compiled forward, which demonstrates per-head metrics with
+    child_context when observability is added.
     """
 
     def __init__(self, d_model: int, hidden_dim: int, n_heads: int = N_HEADS):
@@ -187,7 +186,7 @@ class ToyTrainer:
         """One training step. Returns (loss, grad_norm, dt_ms).
 
         loss_mask has different valid token counts per rank to exercise
-        weighted reduction when tensor metrics are added in PR2.
+        weighted metric reduction across ranks.
         """
         t0 = time.perf_counter()
         logits = self.model(tokens)
@@ -246,7 +245,7 @@ def main():
     tokens = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN), device=device)
     labels = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN), device=device)
 
-    # Different valid token counts per rank for weighted metric reduction (PR2).
+    # Different valid token counts per rank for weighted metric reduction.
     # Rank 0: 4 valid tokens, rank 1: 8, rank 2: 12, rank 3: all 16.
     valid_lengths = [4, 8, 12, SEQ_LEN]
     valid_len = valid_lengths[rank % len(valid_lengths)]
