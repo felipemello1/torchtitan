@@ -19,6 +19,7 @@ dependencies = [
     "safetensors",
 
     # Miscellaneous
+    "optree>=0.13.0",
     "fsspec",
     "tyro",
     "tensorboard",

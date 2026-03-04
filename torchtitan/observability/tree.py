@@ -15,10 +15,7 @@ from typing import Any, Callable, TypeVar
 import torch
 import torch.utils._pytree as pytree
 
-try:
-    import torch.utils._cxx_pytree as cxx_pytree
-except ImportError:
-    cxx_pytree = pytree  # type: ignore[misc]
+import torch.utils._cxx_pytree as cxx_pytree
 
 _T = TypeVar("_T")
 _S = TypeVar("_S")
