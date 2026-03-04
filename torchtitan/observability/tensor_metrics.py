@@ -18,8 +18,10 @@ from typing import Any, Self
 
 import torch
 from torch import Tensor
+from collections import defaultdict
+
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Partial
+from torch.distributed.tensor.placement_types import Partial, Replicate
 
 from torchtitan.observability import tree
 
@@ -610,8 +612,6 @@ def to_replicated_dtensor(x: Tensor | DTensor) -> Tensor | DTensor:
         If input is a regular Tensor, returns it unchanged.
     """
     if isinstance(x, DTensor):
-        from torch.distributed.tensor.placement_types import Replicate
-
         return x.redistribute(
             x.device_mesh,
             [Replicate() for _ in range(x.device_mesh.ndim)],
@@ -645,10 +645,6 @@ def replicate(x):
     Raises:
         ValueError: If any DTensor requires gradients.
     """
-    from collections import defaultdict
-
-    from torch.distributed.tensor.placement_types import Replicate
-
     # Step 1: Flatten the tree and collect DTensors that need reduction
     flat_values = tree.leaves(x)
     treespec = tree.structure(x)

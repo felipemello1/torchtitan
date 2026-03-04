@@ -39,6 +39,9 @@ class RolloutLogger:
     ):
         os.makedirs(output_dir, exist_ok=True)
         self._filepath = os.path.join(output_dir, filename)
+        # File kept open for the lifetime of the logger. Closing and reopening
+        # per flush would incur two OS syscalls per write and reset the kernel
+        # buffer. Data is durable after each flush() call regardless.
         self._file = open(self._filepath, "a")
         self._filter_fn = filter_fn
 

@@ -116,6 +116,17 @@ class TestFilterTopBottom:
         scores = [r["score"] for r in result]
         assert scores == [1, 3]
 
+    def test_single_element(self):
+        """len=1: k = min(1, 0) = 0 → returns full list (no duplication)."""
+        records = [{"reward": 5}]
+        result = filter_top_bottom(records, k=1)
+        assert len(result) == 1
+        assert result[0]["reward"] == 5
+
+    def test_empty_list(self):
+        result = filter_top_bottom([], k=1)
+        assert result == []
+
     def test_missing_key_defaults_to_zero(self):
         records = [{"reward": 5}, {"no_reward": True}, {"reward": 3}]
         result = filter_top_bottom(records, k=1)
