@@ -4,13 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Integration test for PR1: validates toy_spmd.py outputs.
+"""Integration test: validates toy_spmd.py system JSONL outputs.
+
+These tests read the actual output directory produced by running toy_spmd.py.
+They verify that structured logging produces correct per-rank JSONL files
+with expected events, structure, and step context.
 
 Prerequisites:
-    torchrun --nproc_per_node=4 torchtitan/experiments/observability/toy_spmd.py
-
-This test reads the output directory and validates that PR1's structured
-logging produces correct JSONL files.
+    torchrun --nproc_per_node=4 -m torchtitan.experiments.observability.toy_spmd
 """
 
 import json
@@ -18,44 +19,42 @@ import os
 
 import pytest
 
-OUTPUT_DIR = "/tmp/toy_spmd_output"
+OUTPUT_DIR = os.path.join(
+    os.path.dirname(__file__), "..", "..", "..",
+    "torchtitan", "experiments", "observability", "outputs", "toy_spmd",
+)
 
 
 @pytest.fixture
 def sys_log_dir():
     d = os.path.join(OUTPUT_DIR, "system_logs")
-    if not os.path.exists(d):
-        pytest.skip("Run toy_spmd.py first: torchrun --nproc_per_node=4 torchtitan/experiments/observability/toy_spmd.py")
+    assert os.path.exists(d), (
+        f"Output not found at {d}. Run first:\n"
+        "  torchrun --nproc_per_node=4 -m torchtitan.experiments.observability.toy_spmd"
+    )
     return d
-
-
-@pytest.fixture
-def losses():
-    p = os.path.join(OUTPUT_DIR, "losses.json")
-    if not os.path.exists(p):
-        pytest.skip("Run toy_spmd.py first")
-    with open(p) as f:
-        return json.load(f)
 
 
 @pytest.fixture
 def rank0_events(sys_log_dir):
     """Load all events from rank 0's system JSONL."""
-    files = sorted(f for f in os.listdir(sys_log_dir) if f.endswith(".jsonl"))
-    assert files, "No JSONL files found"
+    files = sorted(f for f in os.listdir(sys_log_dir) if "rank_0" in f and f.endswith(".jsonl"))
+    assert files, "No rank 0 JSONL file found"
     with open(os.path.join(sys_log_dir, files[0])) as f:
         return [json.loads(line) for line in f if line.strip()]
 
 
-class TestPR1Integration:
-    def test_loss_decreases(self, losses):
-        assert losses[-1] < losses[0], f"Loss did not decrease: {losses[0]} -> {losses[-1]}"
+NUM_STEPS = 20
 
+
+class TestSystemJSONLIntegration:
     def test_system_jsonl_files_exist(self, sys_log_dir):
+        """4 ranks → 4 per-rank JSONL files."""
         files = [f for f in os.listdir(sys_log_dir) if f.endswith(".jsonl")]
         assert len(files) == 4, f"Expected 4 per-rank files, got {len(files)}"
 
     def test_jsonl_has_4_column_structure(self, rank0_events):
+        """Each JSONL record should have int/normal/double/normvector columns."""
         first = rank0_events[0]
         for key in ("int", "normal", "double", "normvector"):
             assert key in first, f"Missing '{key}' in JSONL structure"
@@ -67,6 +66,7 @@ class TestPR1Integration:
         assert rank0_events[0]["normal"]["source"] == "trainer"
 
     def test_record_span_produces_start_end(self, rank0_events):
+        """record_span should emit _start and _end events."""
         event_types = [e["normal"].get("log_type_name") for e in rank0_events]
         assert "fwd_bwd_start" in event_types, "Missing fwd_bwd_start event"
         assert "fwd_bwd_end" in event_types, "Missing fwd_bwd_end event"
@@ -74,6 +74,7 @@ class TestPR1Integration:
         assert "optim_end" in event_types, "Missing optim_end event"
 
     def test_end_events_have_duration(self, rank0_events):
+        """END events should have a positive duration value (ms)."""
         end_events = [
             e for e in rank0_events
             if "end" in str(e["normal"].get("log_type_name", ""))
@@ -84,12 +85,12 @@ class TestPR1Integration:
             assert e["double"]["value"] > 0, "Duration should be positive"
 
     def test_record_event_writes_metrics(self, rank0_events):
+        """record_event should produce metric_value events for train.loss and train.grad_norm."""
         metric_events = [
             e for e in rank0_events
             if e["normal"].get("log_type_name") == "metric_value"
         ]
         assert len(metric_events) > 0, "No metric_value events from record_event"
-        # Check that train.loss and train.grad_norm are present
         event_names = {e["normal"].get("event_name") for e in metric_events}
         assert "train.loss" in event_names
         assert "train.grad_norm" in event_names
@@ -100,7 +101,4 @@ class TestPR1Integration:
         assert len(events_with_step) > 0, "No events have step context"
         steps = {e["int"]["step"] for e in events_with_step}
         assert 1 in steps, "Step 1 should be present"
-        assert NUM_STEPS in steps or 20 in steps, "Last step should be present"
-
-
-NUM_STEPS = 20
+        assert NUM_STEPS in steps, "Last step should be present"

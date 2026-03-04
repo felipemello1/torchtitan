@@ -4,18 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU experiment metrics: record_metric → JSONL → DefaultAggregator → backends.
+"""Non-tensor experiment metrics: record_metric → JSONL → DefaultAggregator → backends.
 
-Novel code (PR4). Mirrors the structured_logging.py pattern from PR1:
-- PR1: record_span → system logger → StructuredJSONFormatter → system JSONL
-- PR4: record_metric → experiment logger → ExperimentJSONFormatter → experiment JSONL
-
-Design: record_metric is fire-and-forget. The formatter adds step (ContextVar),
-rank/source (self) automatically — same pattern as PR1's StructuredJSONFormatter
-(decision_003).
+record_metric is fire-and-forget. The formatter adds step (ContextVar) and
+rank/source (self attributes) automatically.
 """
-
-from __future__ import annotations
 
 import glob
 import json
@@ -26,18 +19,16 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from typing import Any
 
-from torchtitan.observability.structured_logging import (
+from torchtitan.observability.common import (
+    _METRIC_ENTRY,
+    _REDUCED_METRICS,
     _STEP,
     EXPERIMENT_LOGGER_NAME,
 )
 
-# Sentinel keys in log record extras
-_METRIC_ENTRY = "_metric_entry"
-_REDUCED_METRICS = "_reduced_metrics"
-
 
 # ---------------------------------------------------------------------------
-# MetricValue classes (CPU, fire-and-forget — sister of PR2's TMetricValue)
+# Non-tensor metric types (fire-and-forget). For tensor metrics, use TMetricValue.
 # ---------------------------------------------------------------------------
 
 
@@ -59,28 +50,18 @@ class MetricValue(ABC):
 
 
 class MeanMetric(MetricValue):
-    """Weighted mean. Stores sum/weight, reduces as (Σsum)/(Σweight)."""
+    """Weighted mean. Stores sum AND weight, reduces as (Σsum)/(Σweight).
+
+    Example:
+        MeanMetric(sum=0.5)              # single value, weight=1
+        MeanMetric(sum=3.0, weight=6)    # weighted: mean = 3.0 / 6 = 0.5
+    """
 
     reduce_name = "MeanMetric"
 
-    def __init__(
-        self,
-        value: float | None = None,
-        *,
-        sum: float | None = None,  # noqa: A002
-        weight: float | None = None,
-    ) -> None:
-        if value is not None and sum is not None:
-            raise ValueError("Provide either 'value' or 'sum', not both.")
-        if value is not None:
-            w = weight if weight is not None else 1.0
-            self._sum = value * w
-            self._weight = w
-        elif sum is not None:
-            self._sum = sum
-            self._weight = weight if weight is not None else 1.0
-        else:
-            raise ValueError("Provide either 'value' or 'sum'.")
+    def __init__(self, *, sum: float, weight: float = 1.0) -> None:  # noqa: A002
+        self._sum = sum
+        self._weight = weight
 
     def get_state(self) -> dict[str, Any]:
         return {"reduce": self.reduce_name, "sum": self._sum, "weight": self._weight}
@@ -218,7 +199,7 @@ def log_reduced_metrics(metrics: dict[str, float]) -> None:
 class ExperimentJSONFormatter(logging.Formatter):
     """Formats experiment metric records as flat JSONL.
 
-    Same pattern as PR1's StructuredJSONFormatter (decision_003):
+    Rank/source from self (constants), step from ContextVar (per-task).
     rank/source on self (set once), step from ContextVar (per-task).
     Handles both record_metric entries and log_reduced_metrics entries.
     """

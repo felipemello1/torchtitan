@@ -3,28 +3,25 @@ To support rapid experimentation with torchtitan, we provide several extension p
 The extension points and protocols mentioned in this note are subject to change.
 
 
-### `TrainSpec`
+### `ModelSpec`
 
-[`TrainSpec`](../torchtitan/protocols/train_spec.py) supports configuring high-level components in model training, including
-- definitions of model class and model args config
+[`ModelSpec`](../torchtitan/protocols/model_spec.py) supports configuring high-level components in model training, including
+- definitions of model config and model class
 - model parallelization functions
 - loss functions
-- factory methods for creating dataloader / tokenizer / optimizer / learning rate scheduler / metrics processor
 
 The coarse level abstraction tries to hit a balance between flexible component swapping and a straightforward train script ([train.py](../torchtitan/train.py)).
-Note that among all training components, currently [`CheckpointManager`](../torchtitan/components/checkpoint.py) and [`FTManager`](../torchtitan/components/ft.py) are not configurable since we do not expect them to be customized, but we are open to requests.
 
-To register a `TrainSpec`, please follow the example of [Llama 3.1](../torchtitan/models/llama3/__init__.py) to `register_train_spec`. Please make sure the registration code is called before training initialization. In torchtitan, it is performed during  [module import](../torchtitan/__init__.py).
+To register a model, define a `model_registry(flavor)` function in your model's `__init__.py` that returns a `ModelSpec`. Then define training configs in a `config_registry.py` module. See [torchtitan/models/llama3](../torchtitan/models/llama3/) for an example.
 
 
 ### `ModelConverter`
 
-Originated from a [request](https://github.com/pytorch/torchtitan/issues/790) to unify quantization interface and supports dynamic registration,
 [`ModelConverter`](../torchtitan/protocols/model_converter.py) defines the following general interface:
-- `convert` is called after model definition and meta device initialization, but before model parallelization. It can perform general module rewrite, e.g. [Float8](../torchtitan/components/float8.py) module swapping, as long as it is compatible with other components.
-- `post_optimizer_hook`, as its name suggests, would be registered (via `torch.optim.Optimizer.register_step_post_hook`) to perform necessary post optimizer step operations. As an example, the [Float8](../torchtitan/components/float8.py) component in torchtitan uses this hook to issue a single all-reduce for all FSDP2 parameters (at once for better performance) to calculate the dynamic scale.
+- `convert` is called after model definition and meta device initialization, but before model parallelization. It can perform general module rewrite, e.g. [Float8](../torchtitan/components/quantization/float8.py) module swapping, as long as it is compatible with other components.
+- `post_optimizer_hook`, as its name suggests, would be registered (via `torch.optim.Optimizer.register_step_post_hook`) to perform necessary post optimizer step operations. As an example, the [Float8](../torchtitan/components/quantization/float8.py) component in torchtitan uses this hook to issue a single all-reduce for all FSDP2 parameters (at once for better performance) to calculate the dynamic scale.
 
-To register a `ModelConverter`, please follow the example of [Float8](../torchtitan/components/float8.py) to `register_model_converter`. Please make sure the registration code is called before training initialization. In torchtitan, it is performed during  [module import](../torchtitan/__init__.py).
+To add a `ModelConverter`, create a class inheriting from `Configurable` with a nested `Config(Configurable.Config)` dataclass. Add the Config object to `model_converters` in your config_registry function. See [Float8LinearConverter](../torchtitan/components/quantization/float8.py) for an example.
 
 
 ### Train script
@@ -34,53 +31,46 @@ To perform various tasks, from adding a new model (possibly with a new modality)
 This is an ongoing effort, and the level of grouping is subject to change.
 
 
-### Extending `JobConfig`
+### Extending `Trainer.Config`
 
-[`JobConfig`](../torchtitan/config/job_config.py) supports custom extension through the `--experimental.custom_args_module` flag.
-This lets you define a custom module that extends `JobConfig` with additional fields.
-
-When specified, your custom `JobConfig` is merged with the default:
-- If a field exists in both, the custom config’s value replaces the default.
-- Fields unique to either config are retained.
+To add custom configuration for an experiment, subclass `Trainer.Config` (or `Trainer` itself) and add new fields. Define config_registry functions that return your custom Config type.
 
 #### Example
 
-To add a custom `custom_args` section, define your own `JobConfig`:
+To add a custom config section for an experiment:
 
 ```python
-# torchtitan/experiments/your_folder/custom_args.py
+# torchtitan/experiments/your_folder/trainer.py
 from dataclasses import dataclass, field
+from torchtitan.trainer import Trainer
 
 @dataclass
-class CustomArgs:
+class CustomConfig:
     how_is_your_day: str = "good"
     """Just an example."""
 
-@dataclass
-class Training:
-    steps: int = 500
-    """Replaces the default value"""
-
-    my_mini_steps: int = 10000
-    """New field is added"""
-
-    ... # Original fields are preserved
-
-@dataclass
-class JobConfig:
-    custom_args: CustomArgs = field(default_factory=CustomArgs)
-    training: Training= field(default_factory=Training)
+class MyTrainer(Trainer):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Trainer.Config):
+        custom_config: CustomConfig = field(default_factory=CustomConfig)
 ```
 
-Then run your script with:
+Then in your `config_registry.py`:
+
+```python
+# torchtitan/experiments/your_folder/config_registry.py
+from .trainer import MyTrainer, CustomConfig
+
+def my_experiment_debugmodel() -> MyTrainer.Config:
+    return MyTrainer.Config(
+        custom_config=CustomConfig(how_is_your_day="great"),
+        training=TrainingConfig(steps=100),
+        # ... other fields
+    )
+```
+
+Then run with:
 
 ```bash
---experimental.custom_args_module=torchtitan.experiments.your_folder.custom_args
-```
-
-Or specify it in your `.toml` config:
-
-```toml
-[experimental]
-custom_args_module = "torchtitan.experiments.your_folder.custom_args"
+MODULE=your_folder CONFIG=my_experiment_debugmodel ./run_train.sh
 ```

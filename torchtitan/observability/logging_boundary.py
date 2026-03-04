@@ -4,18 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Logging boundary: schedule + re-export of replicate_to_host.
-
-Ported from reference schedule.py. Changes:
-  OSS_COMPAT — removed Node base class and Config inner class.
-"""
+"""Logging boundary: schedule for gating expensive metric operations."""
 
 
 class EveryNSteps:
     """Returns True every N steps, with optional additional steps.
 
     Step 0 is excluded by default — use additional_steps={0} to include it.
-    Ported from reference EveryNSteps with Node/Config removed.
 
     Args:
         every_n: Returns True if step > 0 and step % every_n == 0.
@@ -35,7 +30,3 @@ class EveryNSteps:
         return (step > 0 and step % self.every_n == 0) or (
             self.additional_steps is not None and step in self.additional_steps
         )
-
-
-# Re-export for convenience (PR2)
-from torchtitan.observability.tensor_metrics import replicate_to_host  # noqa: E402, F401

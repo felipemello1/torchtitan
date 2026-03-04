@@ -8,10 +8,19 @@ import einops as E
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention.flex_attention import and_masks, BlockMask
 
-from torchtitan.models.attention import build_attention, init_attention_mask
+from torchtitan.components.tokenizer import BaseTokenizer
+from torchtitan.models.common import trunc_normal_
+from torchtitan.models.common.attention import (
+    AttentionMasksType,
+    create_attention_mask,
+    FlexAttentionWrapper,
+    get_causal_mask_mod,
+    get_document_mask_mod,
+)
 
-from .args import Siglip2ModelArgs
+from .args import Siglip2Config
 
 
 def resize_positional_embeddings(
@@ -64,7 +73,7 @@ def resize_positional_embeddings(
 
 
 class VisionEmbeddings(nn.Module):
-    def __init__(self, args: Siglip2ModelArgs):
+    def __init__(self, args: Siglip2Config):
         super().__init__()
         self.patch_embedding = nn.Linear(
             in_features=args.n_channels * args.patch_size * args.patch_size,
@@ -74,7 +83,7 @@ class VisionEmbeddings(nn.Module):
         self.n_pos_embs = args.n_pos_embs
 
     def init_weights(self):
-        nn.init.trunc_normal_(self.patch_embedding.weight, mean=0.0, std=0.02)
+        trunc_normal_(self.patch_embedding.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.position_embedding.weight)
 
     def forward(self, pixels_NLD: torch.Tensor, grid_hw: torch.Tensor) -> torch.Tensor:
@@ -103,7 +112,7 @@ class Attention(nn.Module):
     Multi-head attention module.
 
     Args:
-        model_args (TransformerModelArgs): Model configuration arguments.
+        model_args (Transformer.Config): Model configuration arguments.
 
     Attributes:
         n_heads (int): Number of query heads.
@@ -115,7 +124,7 @@ class Attention(nn.Module):
 
     """
 
-    def __init__(self, args: Siglip2ModelArgs):
+    def __init__(self, args: Siglip2Config):
         super().__init__()
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
@@ -125,11 +134,9 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(self.dim, self.dim)
         self.out_proj = nn.Linear(self.dim, self.dim)
 
-        self.attn = build_attention(
-            use_flex_attn=True, attn_mask_type=args.attn_mask_type
-        )
+        self.inner_attention = FlexAttentionWrapper()
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, attention_masks: AttentionMasksType):
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         # Use self.head_dim instead of `n_heads` to infer the actual
@@ -139,18 +146,19 @@ class Attention(nn.Module):
         xk = E.rearrange(xk, "b l (h d) -> b h l d", d=self.head_dim)
         xv = E.rearrange(xv, "b l (h d) -> b h l d", d=self.head_dim)
 
-        output = self.attn(xq, xk, xv)
+        assert isinstance(attention_masks, BlockMask)
+        output = self.inner_attention(xq, xk, xv, block_mask=attention_masks)
         output = E.rearrange(output, "b h l d -> b l (h d)").contiguous()
 
         return self.out_proj(output)
 
     def init_weights(self):
         for linear in (self.q_proj, self.k_proj, self.v_proj, self.out_proj):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
+            trunc_normal_(linear.weight, mean=0.0, std=0.02)
 
 
 class FeedForward(nn.Module):
-    def __init__(self, args: Siglip2ModelArgs):
+    def __init__(self, args: Siglip2Config):
         super().__init__()
         self.fc1 = nn.Linear(args.dim, args.ffn_dim)
         self.fc2 = nn.Linear(args.ffn_dim, args.dim)
@@ -162,20 +170,22 @@ class FeedForward(nn.Module):
         return x
 
     def init_weights(self):
-        nn.init.trunc_normal_(self.fc1.weight, mean=0.0, std=0.02)
-        nn.init.trunc_normal_(self.fc2.weight, mean=0.0, std=0.02)
+        trunc_normal_(self.fc1.weight, mean=0.0, std=0.02)
+        trunc_normal_(self.fc2.weight, mean=0.0, std=0.02)
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, args: Siglip2ModelArgs):
+    def __init__(self, args: Siglip2Config):
         super().__init__()
         self.layer_norm1 = nn.LayerNorm(args.dim, eps=args.layer_norm_eps)
         self.self_attn = Attention(args)
         self.layer_norm2 = nn.LayerNorm(args.dim, eps=args.layer_norm_eps)
         self.mlp = FeedForward(args)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.self_attn(self.layer_norm1(x))
+    def forward(
+        self, x: torch.Tensor, attention_masks: AttentionMasksType
+    ) -> torch.Tensor:
+        x = x + self.self_attn(self.layer_norm1(x), attention_masks)
         x = x + self.mlp(self.layer_norm2(x))
         return x
 
@@ -187,7 +197,7 @@ class TransformerLayer(nn.Module):
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, args: Siglip2ModelArgs):
+    def __init__(self, args: Siglip2Config):
         super().__init__()
         self.args = args
         self.eos_id = 11
@@ -198,18 +208,46 @@ class VisionTransformer(nn.Module):
         )
         self.post_layernorm = nn.LayerNorm(args.dim, eps=args.layer_norm_eps)
 
+    def get_attention_masks(
+        self,
+        input_batch: torch.Tensor,
+        tokenizer: BaseTokenizer,
+        extra_inputs: dict[str, torch.Tensor] | None = None,
+    ) -> AttentionMasksType:
+
+        # TODO: this is duplicated in the main model forward.
+        # TODO: is this really required? Can we call this `get_attention_masks`
+        # inside the main model forward? At that time PP should already split the
+        # grid_thw correctly.
+        grid_hw = extra_inputs["grid_thw"][:, :, 1:]  # Siglip2 only support image hw
+        pixel_masks = E.reduce(grid_hw != -1, "n l hw -> n l", reduction="all")
+
+        mask_mods = [get_causal_mask_mod()]
+        match self.args.attn_mask_type:
+            case "causal":
+                B = 1
+            case "block_causal":
+                B = pixel_masks.shape[0]
+                mask_mods.append(get_document_mask_mod(pixel_masks, tokenizer.eos_id))
+            case _:
+                raise ValueError(
+                    f"Unknown attention mask type: {self.args.attn_mask_type}"
+                )
+        return create_attention_mask(
+            and_masks(*mask_mods), B, None, pixel_masks.shape[1], pixel_masks.shape[1]
+        )
+
     def forward(
         self,
         pixel_values_NLD: torch.FloatTensor,
         pixel_masks_NL: torch.BoolTensor,
         grid_hw: torch.LongTensor,
+        attention_masks: AttentionMasksType,
     ):
-        init_attention_mask(pixel_masks_NL, eos_id=self.eos_id)
-
         h = self.embeddings(pixel_values_NLD, grid_hw)
 
         for layer in self.layers.values():
-            h = layer(h)
+            h = layer(h, attention_masks)
         h = self.post_layernorm(h)
 
         return h
