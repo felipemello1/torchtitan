@@ -14,8 +14,10 @@ Data flow:
         → REDUCE_REGISTRY                           reduces by key
         → dict[str, float]                          ready for SummaryWriter
 
-record_metric is fire-and-forget. The formatter adds step (from ContextVar) and
-rank/source (from formatter instance attributes) automatically.
+record_metric is fire-and-forget. The formatter adds step (from ContextVar,
+set via ``set_step()``) and rank/source (from formatter instance attributes,
+set once in ``init_observability()``). ContextVars provide isolation between
+concurrent asyncio tasks on Monarch actors — see common.py module docstring.
 """
 
 import glob
@@ -36,18 +38,28 @@ from torchtitan.observability.common import (
 
 
 # ---------------------------------------------------------------------------
-# Non-tensor metric types (fire-and-forget). For tensor metrics, use TMetricValue.
+# Non-tensor metric types (fire-and-forget).
+# For tensor metrics inside torch.compile, use TMetricValue (tensor_metrics.py).
 # ---------------------------------------------------------------------------
 
 
 class MetricValue(ABC):
-    """Base for CPU metric types. Each knows its own state + reduction."""
+    """Base for non-tensor metric types. Each subclass knows its own state + reduction.
+
+    Subclasses define ``get_state()`` → dict for JSONL, and
+    ``get_reduced_value_from_states(states)`` → float for aggregation.
+
+    JSONL output example (from MeanMetric)::
+
+        {"key": "reward", "reduce": "MeanMetric", "sum": 7.2, "weight": 10,
+         "step": 42, "rank": 0, "source": "reward", ...}
+    """
 
     reduce_name: str
 
     @abstractmethod
     def get_state(self) -> dict[str, Any]:
-        """Return serializable state dict for JSONL. Must include 'reduce' key."""
+        """Return serializable state dict for JSONL logging. Must include 'reduce' key."""
         ...
 
     @classmethod
@@ -204,9 +216,20 @@ def log_reduced_metrics(metrics: dict[str, float]) -> None:
 class ExperimentJSONFormatter(logging.Formatter):
     """Formats experiment metric records as flat JSONL.
 
-    Rank/source from self (set once in init_observability). Step from ContextVar
-    (per-task, changes every step). Handles both record_metric entries and
-    log_reduced_metrics entries.
+    Rank/source from ``self`` (set once in ``init_observability``).
+    Step from ContextVar (set per-step via ``set_step()``).
+    ``source`` identifies the component (e.g., "trainer", "reward").
+
+    Handles two entry types:
+
+    record_metric entry → one JSON line::
+
+        {"key": "reward", "reduce": "MeanMetric", "sum": 7.2, "weight": 10,
+         "step": 42, "rank": 0, "source": "reward", "caller": "reward_actor.py:42", ...}
+
+    log_reduced_metrics entry → one JSON line per key::
+
+        {"key": "loss", "value": 2.34, "all_reduced": true, "step": 42, ...}
     """
 
     def __init__(self, rank: int, source: str):
@@ -274,14 +297,22 @@ class ExperimentLoggingHandler(logging.FileHandler):
 
 
 class DefaultAggregator:
-    """Buffered file-offset tracking aggregator.
+    """Reads experiment JSONL files and reduces metrics by step.
 
-    Reads all new lines from experiment JSONL files, buffers by step.
-    Handles two types of entries:
-    - all_reduced=True: pass through (tensor metrics from replicate_to_host)
-    - all_reduced absent/False: reduce via REDUCE_REGISTRY
+    Usage::
+
+        aggregator = DefaultAggregator(experiment_log_dir="output/experiment_logs")
+        # ... training writes JSONL via record_metric / log_reduced_metrics ...
+        scalars = aggregator.collect_and_aggregate(step=10)
+        # scalars = {"loss": 2.34, "reward": 0.72, ...}
+        writer(step=10, values=scalars)
+
+    Handles two entry types:
+    - ``all_reduced=True``: pass through (tensor metrics from replicate_to_host)
+    - ``all_reduced`` absent: reduce via REDUCE_REGISTRY (e.g., MeanMetric → Σsum/Σweight)
 
     On construction, skips to end of existing files (no historical data).
+    Stale steps (older than the requested step) are purged automatically.
     """
 
     def __init__(self, experiment_log_dir: str):
@@ -295,8 +326,13 @@ class DefaultAggregator:
     def collect_and_aggregate(self, step: int) -> dict[str, float]:
         """Read new JSONL lines, aggregate entries for the given step.
 
+        Reads all JSONL files in the log dir since the last call, groups entries
+        by step, then reduces entries for the requested step. Entries for older
+        steps are discarded (steps are monotonically increasing).
+
         Returns:
-            Dict of metric_key → reduced float value.
+            Dict of metric_key → reduced float value. Empty dict if no entries
+            for this step.
         """
         self._read_new_lines()
         entries = self._pending.pop(step, [])

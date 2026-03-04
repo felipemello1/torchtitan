@@ -443,6 +443,9 @@ def init_observability(
         handler.setFormatter(StructuredJSONFormatter(rank=rank, source=source))
         sys_logger.addHandler(handler)
         sys_logger.addHandler(InflightEventTrackingHandler())
+        # propagate=False prevents events from bubbling to the root logger
+        # (which would duplicate them in stderr). Level ensures INFO records
+        # are captured even if the root logger has a higher threshold.
         sys_logger.propagate = False
         if sys_logger.level == logging.NOTSET or sys_logger.level > logging.INFO:
             sys_logger.setLevel(logging.INFO)
