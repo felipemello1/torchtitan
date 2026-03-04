@@ -727,9 +727,8 @@ def _replicate_list(values: list) -> list:
 
 # ---------------------------------------------------------------------------
 # replicate_to_host
-# Based on reference metrics.py replicate_to_host. Preserves the batched
-# GPU→CPU transfer pattern. Returns dict[str, float] instead of
-# dict[str, TMetricValue] for convenience (callers always want scalars).
+# Batched GPU→CPU transfer. Groups DTensors by (mesh, placements, dtype, shape)
+# for one collective per group. Returns dict[str, float] (callers always want scalars).
 # ---------------------------------------------------------------------------
 
 

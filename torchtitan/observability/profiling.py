@@ -6,30 +6,29 @@
 
 """Profiling: GPU kernel tracing, CUDA memory snapshots, host memory, NSys.
 
-Ported from reference profiler.py, trigger_watcher.py, profiling_utils.py.
-Changes:
-  OSS_COMPAT — removed Node base class, Config inner classes, get_env() calls.
-               Replaced with explicit constructor args and dataclass configs.
-  META_REMOVAL — removed ODS/fb303 calls, torchx_run.sh reference.
-  set_profiling_step called AFTER step(), only during RECORD/RECORD_AND_SAVE.
-  dist.barrier() in stop() prevents NCCL timeout.
+Orchestrates multiple sub-profilers (TorchProfiler, MemSnapshot, HostMemory,
+NSys) via a single ``Profiler`` context manager. Supports periodic and
+on-demand triggering via file sentinels.
+
+Key design:
+- ``profile_annotation(name)`` wraps code with record_function + NVTX.
+  Always calls record_function (zero overhead when profiler is inactive).
+- ``set_profiling_step`` controls NVTX push/pop in profile_annotation.
+- ``dist.barrier()`` in cleanup prevents NCCL timeout when profiler stops.
 """
 
 
 
 import contextlib
 import copy
-import datetime
 import logging
 import os
 import pickle
 import time
 import tracemalloc
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from types import TracebackType
-from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -43,8 +42,7 @@ PROFILING_TRIGGER = "profiling"
 
 
 # ---------------------------------------------------------------------------
-# Profiling annotations (from reference profiling_utils.py)
-# Zero-cost when not profiling, record_function + NVTX when profiling.
+# Profiling annotations
 # ---------------------------------------------------------------------------
 
 _is_profiling_step: bool = False
@@ -92,7 +90,7 @@ def profile_annotation(name: str):
 
 
 # ---------------------------------------------------------------------------
-# TriggerResult + TriggerView (from reference trigger_watcher.py)
+# TriggerResult + TriggerView
 # ---------------------------------------------------------------------------
 
 
@@ -132,7 +130,7 @@ class TriggerView:
 
 
 # ---------------------------------------------------------------------------
-# FileBasedTriggerWatcher (from reference trigger_watcher.py)
+# FileBasedTriggerWatcher
 # ---------------------------------------------------------------------------
 
 
@@ -214,7 +212,7 @@ class FileBasedTriggerWatcher:
 
 
 # ---------------------------------------------------------------------------
-# TriggerableSchedule (from reference profiler.py:489-588)
+# TriggerableSchedule
 # ---------------------------------------------------------------------------
 
 
@@ -292,7 +290,7 @@ class TriggerableSchedule:
 
 
 # ---------------------------------------------------------------------------
-# ProfilerConfig (replaces Node.Config)
+# ProfilerConfig
 # ---------------------------------------------------------------------------
 
 
@@ -317,7 +315,7 @@ class ProfilerConfig:
 
 
 # ---------------------------------------------------------------------------
-# MemSnapshotProfiler (from reference CudaMemoryProfiler)
+# MemSnapshotProfiler
 # ---------------------------------------------------------------------------
 
 
@@ -407,7 +405,7 @@ class MemSnapshotProfiler:
 
 
 # ---------------------------------------------------------------------------
-# HostMemoryProfiler (from reference profiler.py:193-437)
+# HostMemoryProfiler
 # ---------------------------------------------------------------------------
 
 
@@ -473,7 +471,7 @@ class HostMemoryProfiler:
 
 
 # ---------------------------------------------------------------------------
-# NSysProfiler (from reference profiler.py:440-486)
+# NSysProfiler
 # ---------------------------------------------------------------------------
 
 
@@ -511,7 +509,7 @@ class NSysProfiler:
 
 
 # ---------------------------------------------------------------------------
-# Profiler orchestrator (from reference profiler.py:591-877)
+# Profiler orchestrator
 # ---------------------------------------------------------------------------
 
 

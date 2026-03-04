@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Tests for profiling.py (PR5)."""
+"""Tests for profiling.py."""
 
 import os
 from unittest.mock import MagicMock, patch

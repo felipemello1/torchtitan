@@ -11,7 +11,7 @@ InMemorySummaryWriter — all composed via CompositeSummaryWriter.
 
 Writer lifecycle follows TorchTitan's pattern: open() in setup, close()
 explicitly. No try/finally, no atexit. __enter__/__exit__ exist as
-convenience sugar from the reference for users who want context manager style.
+convenience sugar for users who want context manager style.
 """
 
 
@@ -224,7 +224,7 @@ def _replace_gfile(tb_writer) -> None:
     with a simple Python file: this replaces GFile, which closes and opens the file
     after appending each event (~50 bytes), which is fairly pathological for FUSE/NFS.
 
-    All three reference libraries have this identical function.
+    This is a common optimization for NFS/FUSE-backed TensorBoard writes.
     """
     try:
         from tensorboard.compat import tf
