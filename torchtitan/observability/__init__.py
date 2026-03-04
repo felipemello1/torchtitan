@@ -11,7 +11,7 @@ System metrics: init_observability, set_step, record_span, record_event, EventTy
 Tensor metrics: record_tensor_metric, TensorMetricContext, child_context, replicate_to_host
 Backends: EveryNSteps, CompositeSummaryWriter, TensorBoard, WandB
 CPU metrics: record_metric, log_reduced_metrics, DefaultAggregator, MeanMetric
-Profiling: Profiler, ProfilerConfig, profile_annotation
+Profiling: Profiler, Profiler.Config, profile_annotation
 """
 
 from torchtitan.observability.backends import (
@@ -24,7 +24,7 @@ from torchtitan.observability.metrics import (
     DefaultAggregator, log_reduced_metrics, MaxMetric, MeanMetric,
     MinMetric, record_metric, SumMetric,
 )
-from torchtitan.observability.profiling import Profiler, ProfilerConfig, profile_annotation
+from torchtitan.observability.profiling import Profiler, profile_annotation
 from torchtitan.observability.structured_logging import (
     EventType, init_observability, record_event, record_span,
 )
@@ -46,5 +46,5 @@ __all__ = [
     "LoggingSummaryWriter", "InMemorySummaryWriter",
     "record_metric", "log_reduced_metrics", "DefaultAggregator",
     "MeanMetric", "MaxMetric", "MinMetric", "SumMetric",
-    "Profiler", "ProfilerConfig", "profile_annotation",
+    "Profiler", "profile_annotation",
 ]

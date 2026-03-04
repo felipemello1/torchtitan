@@ -34,6 +34,7 @@ import torch
 import torch.distributed as dist
 from torch.profiler import ProfilerAction
 
+from torchtitan.config.configurable import Configurable
 from torchtitan.observability.logging_boundary import EveryNSteps
 
 logger = logging.getLogger(__name__)
@@ -299,34 +300,7 @@ class TriggerableSchedule:
         return ProfilerAction.NONE
 
 
-# ---------------------------------------------------------------------------
-# ProfilerConfig
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class ProfilerConfig:
-    """Configuration for the Profiler orchestrator.
-
-    Adapt to your use case. Example for periodic GPU kernel profiling::
-
-        ProfilerConfig(enable_profiling=True, profile_freq=100, profiler_warmup=2)
-    """
-
-    enable_profiling: bool = False
-    profile_freq: int = 10  # Profile every N steps
-    profiler_warmup: int = 2  # CUPTI warmup steps before recording
-    profiler_active: int = 1  # Steps to record per profiling cycle
-    with_stack: bool = False  # Capture Python call stacks (slower)
-    enable_memory_snapshot: bool = False
-    memory_snapshot_max_entries: int = 1000000
-    memory_snapshot_start_step: int = 3
-    memory_snapshot_stop_step: int = 5
-    enable_host_memory_profiler: bool = False
-    host_memory_interval: int = 120
-    enable_nsys: bool = False
-    nsys_start_step: int = 0
-    nsys_stop_step: int = 3
+# ProfilerConfig is defined as Profiler.Config below (Configurable pattern).
 
 
 # ---------------------------------------------------------------------------
@@ -496,9 +470,8 @@ class NSysProfiler:
     """NSys profiler wrapper.
 
     Controls cudaProfilerStart/Stop + NVTX ranges for nsys traces.
-    Mutually exclusive with TorchProfiler.
-
-    Run with: nsys profile --capture-range=cudaProfilerApi torchrun ...
+    Mutually exclusive with TorchProfiler. Enable via
+    ``ProfilerConfig(enable_nsys=True, nsys_start_step=0, nsys_stop_step=3)``.
     """
 
     def __init__(self, start_step: int = 0, stop_step: int = 3):
@@ -530,26 +503,53 @@ class NSysProfiler:
 # ---------------------------------------------------------------------------
 
 
-class Profiler:
+class Profiler(Configurable):
     """Orchestrator that composes all sub-profilers.
 
     Context manager for lifecycle. step() fans out to all sub-profilers.
     trigger_profiling() triggers on-demand profiling for all.
 
-    Args:
-        cfg: ProfilerConfig with enable flags and parameters.
-        output_dir: Root output directory for profiling artifacts.
-        global_rank: Global rank for this process.
-        role_rank: Role rank (only role_rank 0 checks file triggers).
+    Usage::
+
+        cfg = Profiler.Config(enable_profiling=True, profile_freq=100)
+        with cfg.build(output_dir="output", global_rank=rank) as prof:
+            for step in range(num_steps):
+                prof.step(step)
     """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        """Configuration for the Profiler orchestrator.
+
+        Adapt to your use case. Example for periodic GPU kernel profiling::
+
+            Profiler.Config(enable_profiling=True, profile_freq=100, profiler_warmup=2)
+        """
+
+        enable_profiling: bool = False
+        profile_freq: int = 10  # Profile every N steps
+        profiler_warmup: int = 2  # CUPTI warmup steps before recording
+        profiler_active: int = 1  # Steps to record per profiling cycle
+        with_stack: bool = False  # Capture Python call stacks (slower)
+        enable_memory_snapshot: bool = False
+        memory_snapshot_max_entries: int = 1000000
+        memory_snapshot_start_step: int = 3
+        memory_snapshot_stop_step: int = 5
+        enable_host_memory_profiler: bool = False
+        host_memory_interval: int = 120
+        enable_nsys: bool = False
+        nsys_start_step: int = 0
+        nsys_stop_step: int = 3
 
     def __init__(
         self,
-        cfg: ProfilerConfig,
+        config: Config,
+        *,
         output_dir: str,
         global_rank: int = 0,
         role_rank: int = 0,
     ):
+        cfg = config  # local alias for __init__ body
         self.cfg = cfg
         self.output_dir = output_dir
         self._within_context = False
