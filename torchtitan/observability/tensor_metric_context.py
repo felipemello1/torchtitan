@@ -174,9 +174,12 @@ def current_tensor_metric_context() -> TensorMetricContext | None:
     return _global_context_stack.stack[-1]
 
 
-# See Note [Lazily generating add_summary keys]
+# Keys are prefixed lazily on merge — the child context records bare keys
+# (e.g., "loss"), and the prefix (e.g., "layer_0/") is added when update()
+# merges the child into the parent. This means the compiled code never sees
+# the full path, avoiding Dynamo guard issues with dynamic strings.
 @contextmanager
-def child_context(context_name: str) -> None:
+def child_context(context_name: str):
     try:
         with TensorMetricContext() as ctx:
             yield
