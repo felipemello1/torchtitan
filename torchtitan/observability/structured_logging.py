@@ -40,6 +40,8 @@ from torchtitan.observability.common import (
 from torchtitan.observability.metrics import (
     ExperimentJSONFormatter,
     ExperimentLoggingHandler,
+    MeanMetric,
+    record_metric,
 )
 
 MAX_MESSAGE_SIZE: int = 1000
@@ -482,17 +484,30 @@ class record_span(ContextDecorator):
     """Context manager/decorator for timing phases.
 
     Logs START event on enter, END event (with duration) on exit.
+    When ``log_to_metrics=True`` (default), also records the duration as an
+    experiment metric via ``record_metric``, eliminating the need for manual
+    ``time.perf_counter()`` timing.
+
     Step is read from ContextVar.
+
+    Args:
+        description: Human-readable label (e.g., "Forward/Backward").
+        event_type: Base EventType (e.g., EventType.FWD_BWD). Must have
+            corresponding _START and _END variants.
+        log_to_metrics: If True, record ``time/{description}/duration_s`` as
+            a MeanMetric to experiment JSONL. Default True.
 
     Usage:
         with record_span("Forward/Backward", EventType.FWD_BWD):
             output = model(batch)
             loss.backward()
+        # duration auto-recorded to both system JSONL and experiment JSONL
     """
 
-    def __init__(self, description: str, event_type: EventType):
+    def __init__(self, description: str, event_type: EventType, *, log_to_metrics: bool = True):
         self.description = description
         self.event_type = event_type
+        self.log_to_metrics = log_to_metrics
         self.start_time: float | None = None
 
         # Derive START/END event types. Validate that the base event type
@@ -526,10 +541,13 @@ class record_span(ContextDecorator):
     def __exit__(self, exc_type, exc_val, exc_tb):
         end_time = timer()
         step = _STEP.get()
-        delta_ms = (end_time - self.start_time) * 1000
+        duration_s = end_time - self.start_time
+        delta_ms = duration_s * 1000
         _system_logger.info(
             f"[step {step if step is not None else 'N/A'}] {self.description} {self.end_event_type} took {delta_ms:.2f} ms",
             extra=event_extra(self.end_event_type, value=delta_ms, step=step),
             stacklevel=2,
         )
+        if self.log_to_metrics and step is not None:
+            record_metric(f"time/{self.description}/duration_s", MeanMetric(sum=duration_s))
         return False  # Don't suppress exceptions
