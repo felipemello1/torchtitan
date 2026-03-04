@@ -27,10 +27,14 @@ _STEP: ContextVar[int | None] = ContextVar("_STEP", default=None)
 _STEP_TAGS: ContextVar[tuple[str, ...]] = ContextVar("_STEP_TAGS", default=())
 
 # --- Logger names ---
+# Separate loggers so system events (phase timing) and experiment metrics
+# (loss, reward) go to independent JSONL files with independent formatters.
 SYSTEM_LOGGER_NAME = "torchtitan.observability.system"
 EXPERIMENT_LOGGER_NAME = "torchtitan.observability.experiment"
 
-# --- Metric entry markers (used by ExperimentJSONFormatter in metrics.py) ---
+# --- Metric entry markers ---
+# Keys set on LogRecord.extra to distinguish record_metric entries from
+# log_reduced_metrics entries in ExperimentJSONFormatter.
 _METRIC_ENTRY = "_metric_entry"
 _REDUCED_METRICS = "_reduced_metrics"
 

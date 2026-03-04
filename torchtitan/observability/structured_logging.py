@@ -263,8 +263,10 @@ class StructuredJSONFormatter(logging.Formatter):
     def _log_dict(self, record: logging.LogRecord) -> dict[str, Any]:
         """Build the flat dict that to_structured_json splits into 4 columns.
 
-        Adds: rank, source, step, step_tags, timing, log_type, event_name,
-        value, message, caller info, seq_id.
+        Example output (before to_structured_json splits by type)::
+
+            {"rank": 0, "source": "trainer", "step": 5,
+             "log_type_name": "fwd_bwd_end", "value": 12.5, ...}
         """
         log_dict: dict[str, Any] = {}
 

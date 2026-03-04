@@ -95,8 +95,12 @@ class TensorMetricContext:
     def add_summary(self, name: str, value: TMetricValue) -> None:
         """Adds a summary to the context.
 
-        The summary will be returned by `summaries()`. If a summary with the same name already
-        exists, the values are merged using `TMetricValue.merge_()`.
+        Duplicate keys are merged via ``merge_()``, so calling this twice with
+        the same name accumulates values (e.g., summing loss across micro-batches).
+
+        Example::
+
+            ctx.add_summary("loss", MeanTMetric(sum=loss_sum, weight=token_count))
 
         Args:
             name: The name of the summary.
