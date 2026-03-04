@@ -6,9 +6,8 @@
 
 """Pytree utilities for observability metrics.
 
-Reference: sixlib/tree.py. Changes:
-  OSS_COMPAT — Nested[_T] type alias replaced with Any (sixlib-specific type).
-  OSS_COMPAT — cxx_pytree import guarded with try/except fallback.
+Wraps PyTorch's pytree API with compile-safe dispatching: uses cxx_pytree
+for eager execution and regular pytree when Dynamo is tracing.
 """
 
 from typing import Any, Callable, TypeVar
@@ -16,7 +15,6 @@ from typing import Any, Callable, TypeVar
 import torch
 import torch.utils._pytree as pytree
 
-# OSS_COMPAT: try cxx_pytree, fall back to pytree (optree may not be installed)
 try:
     import torch.utils._cxx_pytree as cxx_pytree
 except ImportError:
@@ -27,12 +25,10 @@ _S = TypeVar("_S")
 TreeSpec = pytree.TreeSpec
 
 
-# VERBATIM from sixlib tree.py:24-25
 def path_str(kp: pytree.KeyPath) -> str:
     return pytree.keystr(kp)
 
 
-# CHANGED (OSS_COMPAT): Nested[_T] → Any (type annotation only, zero runtime impact)
 def map(
     fn: Callable[..., _S],
     tree: Any,
@@ -44,7 +40,6 @@ def map(
     return cxx_pytree.tree_map(fn, tree, *rest, is_leaf=is_leaf)
 
 
-# CHANGED (OSS_COMPAT): same annotation change
 def map_with_path(
     fn,
     tree: Any,
@@ -54,12 +49,10 @@ def map_with_path(
     return pytree.tree_map_with_path(fn, tree, *rest, is_leaf=is_leaf)
 
 
-# VERBATIM
 def structure(tree: Any, is_leaf: Callable[[Any], bool] | None = None):
     return cxx_pytree.tree_structure(tree, is_leaf=is_leaf)
 
 
-# CHANGED (OSS_COMPAT): same annotation change
 def leaves(
     tree: Any,
     is_leaf: Callable[[Any], bool] | None = None,
@@ -69,7 +62,6 @@ def leaves(
     return cxx_pytree.tree_leaves(tree, is_leaf=is_leaf)
 
 
-# VERBATIM from sixlib tree.py:122-151 (dedup guard included)
 def register_pytree_node(
     cls: type,
     flatten_fn: Callable[[Any], tuple[list, Any]],
@@ -78,11 +70,7 @@ def register_pytree_node(
     flatten_with_keys_fn: Callable | None = None,
     serialized_type_name: str | None = None,
 ) -> None:
-    """Register a class as a pytree node.
-
-    Registers with both Python pytree and C++ pytree implementations for
-    consistency across tracing and normal execution. Skips if already registered.
-    """
+    """Register a class as a pytree node. Skips if already registered."""
     if cls in pytree.SUPPORTED_NODES:
         return
     pytree.register_pytree_node(

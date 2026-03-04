@@ -38,11 +38,18 @@ def load_all_records(log_dir: str) -> list[dict]:
 
 
 def to_chrome_trace(log_dir: str, output_path: str) -> dict:
-    """Convert structured logs to Chrome Trace JSON format.
+    """Convert system_logs/*.jsonl (from record_span) to Chrome Trace JSON.
 
-    Each source file (e.g., trainer_rank_0_system) becomes a process.
-    Each rank becomes a thread within that process. Start/end events
-    become duration spans visible as a Gantt chart.
+    Reads system JSONL files only — NOT experiment JSONL. For experiment
+    metrics, use DefaultAggregator or read experiment_logs/*.jsonl directly.
+
+    Each source file becomes a process, each rank a thread. Start/end
+    events become duration spans visible as a Gantt chart in Perfetto
+    (https://ui.perfetto.dev) or chrome://tracing.
+
+    Args:
+        log_dir: Path to the system_logs/ directory.
+        output_path: Where to write the Chrome Trace JSON file.
 
     Returns:
         The trace dict (also written to output_path).
