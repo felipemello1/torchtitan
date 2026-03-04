@@ -6,8 +6,7 @@
 
 """Tests for profiling.py."""
 
-import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from torch.profiler import ProfilerAction

@@ -150,10 +150,10 @@ async def main():
     # Dummy completions for reward scoring (fixed vectors for overfitting)
     completions = [torch.arange(D_MODEL, dtype=torch.float32) * (i + 1) / D_MODEL for i in range(4)]
 
-    def _aggregate_and_write(agg, wrt, s):
-        aggregated = agg.collect_and_aggregate(step=s)
+    def _aggregate_and_write(aggregator, writer, step):
+        aggregated = aggregator.collect_and_aggregate(step=step)
         if aggregated:
-            wrt(step=s, values=aggregated)
+            writer(step=step, values=aggregated)
 
     # --- RL training loop ---
     for step in range(1, NUM_STEPS + 1):

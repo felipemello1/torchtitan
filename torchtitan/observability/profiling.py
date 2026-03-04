@@ -72,10 +72,6 @@ def profile_annotation(name: str):
     is not actively recording, and Dynamo traces through it natively (no graph
     break). NVTX is added only when profiling AND not compiling.
 
-    IMPORTANT: We do NOT branch on _is_profiling_step here. That global causes
-    Dynamo guard failures when it flips from False to True, forcing recompilation
-    of every compiled block. record_function is safe to always call.
-
     Args:
         name: The annotation name shown in traces.
     """
@@ -641,7 +637,8 @@ class Profiler:
         if self.torch_profiler:
             self.torch_profiler.step_num = step
             self.torch_profiler.step()
-            # FIX: set_profiling_step AFTER step(), only during RECORD/RECORD_AND_SAVE
+            # Set profiling flag AFTER step() so profile_annotation sees the
+            # correct state. Only active during RECORD/RECORD_AND_SAVE (not WARMUP).
             if self._torch_profiler_schedule:
                 action = self._torch_profiler_schedule.last_action
                 set_profiling_step(action in (ProfilerAction.RECORD, ProfilerAction.RECORD_AND_SAVE))
@@ -667,7 +664,8 @@ class Profiler:
         """Stop all profilers and release resources."""
         if self._torch_profiler is not None:
             try:
-                # FIX: barrier before stop prevents NCCL timeout
+                # Barrier before stop: all ranks must finish their profiled
+                # step before any rank calls stop(), or NCCL times out.
                 if dist.is_initialized():
                     dist.barrier()
                 self._torch_profiler.stop()

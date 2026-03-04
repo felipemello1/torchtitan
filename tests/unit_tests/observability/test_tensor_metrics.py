@@ -24,7 +24,7 @@ from torchtitan.observability.tensor_metrics import (
 
 
 # ---------------------------------------------------------------------------
-# MeanTMetric (was WeightedScalar)
+# MeanTMetric
 # ---------------------------------------------------------------------------
 
 

@@ -37,6 +37,10 @@ from torchtitan.observability.common import (
     EXPERIMENT_LOGGER_NAME,
     SYSTEM_LOGGER_NAME,
 )
+from torchtitan.observability.metrics import (
+    ExperimentJSONFormatter,
+    ExperimentLoggingHandler,
+)
 
 MAX_MESSAGE_SIZE: int = 1000
 
@@ -440,14 +444,6 @@ def init_observability(
             sys_logger.setLevel(logging.INFO)
 
     # --- Experiment handler ---
-    # Inline import: metrics.py imports from common.py (not this module),
-    # but ExperimentJSONFormatter/Handler live in metrics.py. This is the
-    # one justified inline import to avoid a circular dependency.
-    from torchtitan.observability.metrics import (
-        ExperimentJSONFormatter,
-        ExperimentLoggingHandler,
-    )
-
     exp_logger = logging.getLogger(EXPERIMENT_LOGGER_NAME)
     if not any(isinstance(h, ExperimentLoggingHandler) for h in exp_logger.handlers):
         exp_path = os.path.join(
