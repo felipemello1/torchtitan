@@ -5,19 +5,23 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Toy SPMD Training Example — PR0 + PR1
+Toy SPMD Training Example — Tensor Metrics
 
-ToyTrainer mirrors TorchTitan's Trainer pattern:
-- __init__: builds model, applies TP/compile/FSDP, creates optimizer
-- train_step: one step of forward/backward/optimizer
-- train: full training loop
-- close: cleanup
+SPMD training with system metrics (record_span) AND compile-safe tensor
+metrics (record_tensor_metric + TensorMetricContext).
+
+Demonstrates three compile-safety scenarios for TensorMetricContext:
+- Scenario 1: per-layer metrics via child_context in model.forward()
+- Scenario 2: per-head metrics via for-loop inside compile (block.heads)
+- Scenario 3: merged metrics via same key without child_context
+
+Each rank gets a different number of valid tokens (via loss_mask) to exercise
+weighted metric reduction across ranks.
 
 Run:
-    torchrun --nproc_per_node=4 torchtitan/experiments/observability/toy_spmd.py
+    torchrun --nproc_per_node=4 -m torchtitan.experiments.observability.toy_spmd
 """
 
-import json
 import os
 import shutil
 import time
@@ -28,55 +32,73 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor, Replicate
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
-    loss_parallel,
     RowwiseParallel,
     parallelize_module,
 )
 from torchtitan.distributed.utils import clip_grad_norm_
 
-# PR1: System metrics
 from torchtitan.observability import (
-    add_step_tag, clear_step_tags, EventType, init_observability,
-    record_event, record_span, set_step,
-)
-
-# PR2: Tensor metrics
-from torchtitan.observability import (
-    child_context, InvocationContext, MaxTMetric, MeanTMetric,
-    record_tensor_metric, replicate_to_host,
+    child_context,
+    clear_step_tags,
+    EventType,
+    init_observability,
+    MeanTMetric,
+    record_event,
+    record_span,
+    record_tensor_metric,
+    replicate_to_host,
+    set_step,
+    TensorMetricContext,
 )
 
 # ---- Config ----
 NUM_STEPS = 20
+LOG_FREQ = 5
 D_MODEL = 64
 HIDDEN_DIM = 128
+N_HEADS = 3
 VOCAB_SIZE = 32
 SEQ_LEN = 16
 BATCH_SIZE = 8
 LR = 1e-3
-OUTPUT_DIR = '/tmp/toy_spmd_output'
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs", "toy_spmd")
 
 
 # ---- Model ----
-class TransformerBlock(nn.Module):
-    """Minimal transformer block: attention-free, just MLP + norm + residual."""
+class MLPBlock(nn.Module):
+    """MLP block with multiple parallel projections (heads) + output projection.
 
-    def __init__(self, d_model: int, hidden_dim: int):
+    Demonstrates Scenarios 2 and 3 for compile-safe metrics:
+    - Scenario 2: for-loop over heads INSIDE compile with child_context per head
+    - Scenario 3: same "abs_mean" key WITHOUT child_context → merge_() accumulates
+    """
+
+    def __init__(self, d_model: int, hidden_dim: int, n_heads: int = N_HEADS):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
-        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, d_model, bias=False)
+        self.heads = nn.ModuleDict(
+            {str(i): nn.Linear(d_model, hidden_dim, bias=False) for i in range(n_heads)}
+        )
+        self.out_proj = nn.Linear(hidden_dim, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
-        h = F.silu(self.w1(h))
-        w2_out = self.w2(h)
-        # PR2: Partial DTensor metric — exercises deferred reduction
-        record_tensor_metric("w2_partial", MeanTMetric(sum=w2_out.abs().mean(), weight=1))
-        return x + w2_out
+
+        parts = []
+        for name, head in self.heads.items():
+            # Scenario 2: per-head metrics inside compile via child_context
+            with child_context(name):
+                out = F.silu(head(h))
+                record_tensor_metric("abs_mean", MeanTMetric(sum=out.abs().mean(), weight=1))
+                parts.append(out)
+
+            # Scenario 3: merged metric — OUTSIDE child_context, INSIDE loop
+            record_tensor_metric("abs_mean", MeanTMetric(sum=out.abs().mean(), weight=1))
+
+        return x + self.out_proj(sum(parts))
 
 
 class TinyModel(nn.Module):
@@ -92,22 +114,31 @@ class TinyModel(nn.Module):
         super().__init__()
         self.tok_embeddings = nn.Embedding(vocab_size, d_model)
         self.layers = nn.ModuleDict(
-            {str(i): TransformerBlock(d_model, hidden_dim) for i in range(n_layers)}
+            {str(i): MLPBlock(d_model, hidden_dim) for i in range(n_layers)}
         )
         self.norm = nn.LayerNorm(d_model)
         self.output = nn.Linear(d_model, vocab_size, bias=False)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         h = self.tok_embeddings(tokens)
-        for layer in self.layers.values():
-            h = layer(h)
+        # Scenario 1: per-layer child_context in eager loop.
+        # Each layer is compiled separately (from _apply_compile). The varying
+        # layer name stays in eager Python; inside the compiled forward(), all
+        # metric keys are constant strings.
+        for name, layer in self.layers.items():
+            with child_context(name):
+                h = layer(h)
         h = self.norm(h)
         return self.output(h)
 
 
-# ---- Trainer (mirrors TorchTitan Trainer pattern) ----
+# ---- Trainer ----
 class ToyTrainer:
-    """Minimal trainer with TP + compile + FSDP, matching TorchTitan's structure."""
+    """Minimal trainer with TP + compile + FSDP.
+
+    Parallelism application order follows TorchTitan (parallelize.py):
+    TP first, then per-layer compile, then FSDP2.
+    """
 
     def __init__(self, device, dp_mesh, tp_mesh, output_dir):
         self.device = device
@@ -123,7 +154,12 @@ class ToyTrainer:
 
     @staticmethod
     def _replicate_params(module: nn.Module, tp_mesh) -> None:
-        """Put params on the TP mesh as Replicate DTensors."""
+        """Wrap non-TP-parallelized params as Replicate DTensors on the TP mesh.
+
+        Needed in our simplified TP setup where LayerNorm and other
+        non-parallelized params must be DTensors on the same mesh so
+        FSDP2 sees a consistent parameter space.
+        """
         for p_name, param in module.named_parameters():
             replicated = nn.Parameter(
                 DTensor.from_local(param, tp_mesh, [Replicate()], run_check=False)
@@ -131,20 +167,25 @@ class ToyTrainer:
             module.register_parameter(p_name, replicated)
 
     def _apply_tp(self, model, tp_mesh):
-        """Apply TP to ALL params so they share the same 2D mesh."""
+        """Apply tensor parallelism."""
         parallelize_module(
             model, tp_mesh,
             {
                 "tok_embeddings": RowwiseParallel(input_layouts=Replicate(), use_local_output=False),
-                "output": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+                "output": ColwiseParallel(output_layouts=Replicate(), use_local_output=False),
             },
         )
         self._replicate_params(model.norm, tp_mesh)
         for layer in model.layers.values():
             parallelize_module(
                 layer, tp_mesh,
-                {"w1": ColwiseParallel(use_local_output=False), "w2": RowwiseParallel(use_local_output=False)},
+                {"out_proj": RowwiseParallel(use_local_output=False)},
             )
+            for head_name in layer.heads:
+                parallelize_module(
+                    layer, tp_mesh,
+                    {f"heads.{head_name}": ColwiseParallel(use_local_output=False)},
+                )
             self._replicate_params(layer.norm, tp_mesh)
 
     def _apply_compile(self, model):
@@ -153,60 +194,65 @@ class ToyTrainer:
             model.layers.register_module(layer_id, torch.compile(block, fullgraph=True))
 
     def _apply_fsdp(self, model, dp_mesh):
-        """FSDP2. Order: TP → compile → FSDP."""
+        """FSDP2 wrapping. Applied last (after TP and compile)."""
         fully_shard(model.tok_embeddings, mesh=dp_mesh)
         for layer in model.layers.values():
             fully_shard(layer, mesh=dp_mesh)
         fully_shard([model.norm, model.output], mesh=dp_mesh)
         fully_shard(model, mesh=dp_mesh)
 
-    def train_step(self, tokens, labels, step):
-        """One training step. Returns (loss, grad_norm, dt_ms)."""
+    def train_step(self, tokens, labels, loss_mask, step):
+        """One training step. Returns (loss, grad_norm, dt_ms, ctx)."""
         t0 = time.perf_counter()
         set_step(step)
         clear_step_tags()
-        with InvocationContext() as ctx:
+
+        with TensorMetricContext() as ctx:
             with record_span("Forward/Backward", EventType.FWD_BWD):
                 logits = self.model(tokens)
-                with loss_parallel():
-                    loss = F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten(0, 1))
-                    record_tensor_metric("loss", MeanTMetric(sum=loss, weight=torch.tensor(1.0, device=self.device)))
-                    self.optimizer.zero_grad()
-                    loss.backward()
+                if isinstance(logits, DTensor):
+                    logits = logits.full_tensor()
+                per_token_loss = F.cross_entropy(
+                    logits.flatten(0, 1).float(), labels.flatten(0, 1), reduction="none"
+                )
+                loss = (per_token_loss * loss_mask.flatten()).sum() / loss_mask.sum()
+                # Weighted loss: weight = valid tokens on this rank
+                record_tensor_metric(
+                    "loss", MeanTMetric(sum=loss * loss_mask.sum(), weight=loss_mask.sum())
+                )
+                self.optimizer.zero_grad()
+                loss.backward()
+
             with record_span("Optimizer", EventType.OPTIM):
                 grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
-            record_tensor_metric("grad_norm", MeanTMetric(mean=grad_norm, weight=torch.tensor(1.0, device=self.device)))
-            with child_context("layer_0"):
-                w1 = list(self.model.layers.values())[0].w1.weight
-                record_tensor_metric("w1_norm", MeanTMetric(mean=w1.float().norm(), weight=torch.tensor(1.0, device=self.device)))
-        dt_ms = (time.perf_counter() - t0) * 1000
-        return loss, grad_norm, dt_ms, ctx
 
-    def train(self, tokens, labels, num_steps):
-        """Full training loop."""
+        dt_ms = (time.perf_counter() - t0) * 1000
+
+        # System metrics: always log (every step, not gated)
+        record_event({"train.loss": loss.item(), "train.grad_norm": grad_norm.item()})
+
+        # Tensor metrics: batched all-reduce only on logging steps (expensive)
+        if step % LOG_FREQ == 0 or step == 1:
+            scalars = replicate_to_host(ctx.summaries())
+            if self.rank == 0 and scalars:
+                keys = ", ".join(f"{k}={v:.4f}" for k, v in sorted(scalars.items())[:5])
+                print(f"  [tensor metrics] {keys} ...")
+
+        return loss, grad_norm, dt_ms
+
+    def train(self, tokens, labels, loss_mask, num_steps):
+        """Full training loop (overfitting to a single batch)."""
         if self.rank == 0:
             print(f"{'Step':>4}  {'Loss':>10}  {'GradNorm':>10}  {'Time(ms)':>10}")
             print("-" * 50)
-        losses = []
         for step in range(1, num_steps + 1):
-            loss, grad_norm, dt_ms, ctx = self.train_step(tokens, labels, step)
-            losses.append(loss.item())
-            if step % 5 == 0 or step == 1:
-                add_step_tag("logging")
-                record_event({"train.loss": loss.item(), "train.grad_norm": grad_norm.item()})
-                scalars = replicate_to_host(ctx.summaries())
-                if self.rank == 0:
-                    with open(os.path.join(self.output_dir, f"scalars_step_{step}.json"), "w") as f:
-                        json.dump(scalars, f)
+            loss, grad_norm, dt_ms = self.train_step(tokens, labels, loss_mask, step)
             if self.rank == 0:
                 print(f"{step:>4}  {loss.item():>10.4f}  {grad_norm.item():>10.4f}  {dt_ms:>10.1f}")
-        if self.rank == 0:
-            with open(os.path.join(self.output_dir, "losses.json"), "w") as f:
-                json.dump(losses, f)
 
     def close(self):
-        """Cleanup. Override in subclasses to close writers."""
+        """Cleanup. Subclasses override to close writers, profilers, etc."""
         pass
 
 
@@ -221,6 +267,7 @@ def main():
     if rank == 0 and os.path.exists(OUTPUT_DIR):
         shutil.rmtree(OUTPUT_DIR)
     dist.barrier()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
     trainer = ToyTrainer(device, mesh["dp"], mesh["tp"], OUTPUT_DIR)
@@ -232,7 +279,13 @@ def main():
     tokens = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN), device=device)
     labels = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN), device=device)
 
-    trainer.train(tokens, labels, NUM_STEPS)
+    # Different valid token counts per rank for weighted metric reduction.
+    valid_lengths = [4, 8, 12, SEQ_LEN]
+    valid_len = valid_lengths[rank % len(valid_lengths)]
+    loss_mask = torch.zeros(BATCH_SIZE, SEQ_LEN, device=device)
+    loss_mask[:, :valid_len] = 1.0
+
+    trainer.train(tokens, labels, loss_mask, NUM_STEPS)
     trainer.close()
 
     if rank == 0:

@@ -1,10 +1,4 @@
-# DeepSeek-V3 in `torchtitan`
-
-DeepSeek-V3 is a Mixture-of-Experts (MoE) transformer model with Multi-head Latent Attention (MLA) architecture.
-
-## Setup
-
-### Download Tokenizer
+## Download Tokenizer
 
 ```bash
 # DeepSeek 671B tokenizer (automatically downloads tokenizer.json and tokenizer_config.json)
@@ -21,33 +15,20 @@ python scripts/download_hf_assets.py --repo_id deepseek-ai/deepseek-moe-16b-base
 
 ## Training
 
-### Debug Training
-
 ```bash
 # Quick debug run with small model
-CONFIG_FILE="./torchtitan/models/deepseek_v3/train_configs/debug_model.toml" ./run_train.sh
+MODEL=deepseek_v3 CONFIG=deepseek_v3_debugmodel ./run_train.sh
 ```
-
-### Full Model Training
 
 ```bash
 # 16B parameter model: adapted from older 16B parameter model from https://huggingface.co/deepseek-ai/deepseek-moe-16b-base
-CONFIG_FILE="./torchtitan/models/deepseek_v3/train_configs/deepseek_v3_16b.toml" ./run_train.sh
+MODEL=deepseek_v3 CONFIG=deepseek_v3_16b ./run_train.sh
 ```
 
 ```bash
 # 671B parameter model
-CONFIG_FILE="./torchtitan/models/deepseek_v3/train_configs/deepseek_v3_671b.toml" ./run_train.sh
+MODEL=deepseek_v3 CONFIG=deepseek_v3_671b ./run_train.sh
 ```
-
-
-## Supported Features
-- FSDP, HSDP
-- Activation checkpointing
-- Tensor Parallel (TP)
-- Expert Parallel (EP)
-- Pipeline Parallel (PP)
-- torch.compile
 
 
 ## HuggingFace -> DCP Checkpoint Conversion
@@ -58,16 +39,3 @@ Run the offline conversion script:
 ```bash
 python scripts/checkpoint_conversion/convert_from_hf.py <hf_checkpoints_dir> <dcp_output_dir> --model_name deepseek_v3 --model_flavor 671B
 ```
-
-Some limitations:
-1. It can't be used to convert HF checkpoint on the fly using GPU DTensor, because of sharding and quantized blocks may not be aligned well and causing silent numerfical incorrectness.
-2. It can't be used for weight sync to generate a state dict of bf16 because fake quantization to fp8 is applied.
-
-## To be added
-- Parallelism
-    - Context Parallel support for DeepSeek V3
-- Quantization
-- Testing
-    - loss converging tests (verified)
-    - perfomance (WIP)
-    - CI integration (WIP)

@@ -16,7 +16,3 @@
 # Module level global constants
 FP8_GROUP_ALIGNMENT_SIZE = 16
 MXFP8_GROUP_ALIGNMENT_SIZE = 32
-
-# Import to register quantization modules as ModelConverter
-import torchtitan.components.quantization.float8  # noqa: F401
-import torchtitan.components.quantization.mx  # noqa: F401

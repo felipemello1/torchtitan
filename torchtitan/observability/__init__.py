@@ -7,33 +7,28 @@
 """
 TorchTitan Observability Library
 
-PR1 — System metrics (phase timing, step context):
-    init_observability, set_step, add_step_tag, clear_step_tags,
-    record_span, record_event, EventType
-
-PR2 — Tensor experiment metrics (compile-safe):
-    record_tensor_metric, InvocationContext, replicate_to_host,
-    MeanTMetric, SumTMetric, MaxTMetric, MinTMetric, DerivedTMetric
+System metrics: init_observability, set_step, record_span, record_event, EventType
+Tensor metrics: record_tensor_metric, TensorMetricContext, child_context, replicate_to_host
 """
 
-from torchtitan.observability.invocation_context import (
-    child_context,
-    current_context,
-    InvocationContext,
-    record_tensor_metric,
-)
-from torchtitan.observability.structured_logging import (
+from torchtitan.observability.common import (
     add_step_tag,
     clear_step_tags,
+    set_step,
+)
+from torchtitan.observability.structured_logging import (
     EventType,
     init_observability,
     record_event,
     record_span,
-    set_step,
 )
-
+from torchtitan.observability.tensor_metric_context import (
+    child_context,
+    current_tensor_metric_context,
+    record_tensor_metric,
+    TensorMetricContext,
+)
 from torchtitan.observability.tensor_metrics import (
-    DerivedTMetric,
     MaxTMetric,
     MeanTMetric,
     MinTMetric,
@@ -43,7 +38,7 @@ from torchtitan.observability.tensor_metrics import (
 )
 
 __all__ = [
-    # PR1
+    # System metrics
     "init_observability",
     "set_step",
     "add_step_tag",
@@ -51,10 +46,10 @@ __all__ = [
     "record_span",
     "record_event",
     "EventType",
-    # PR2
+    # Tensor metrics
     "record_tensor_metric",
-    "InvocationContext",
-    "current_context",
+    "TensorMetricContext",
+    "current_tensor_metric_context",
     "child_context",
     "replicate_to_host",
     "TMetricValue",
@@ -62,5 +57,4 @@ __all__ = [
     "SumTMetric",
     "MaxTMetric",
     "MinTMetric",
-    "DerivedTMetric",
 ]
