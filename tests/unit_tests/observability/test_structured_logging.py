@@ -480,3 +480,32 @@ class TestRecordSpan:
             lines = [json.loads(line) for line in f if line.strip()]
         assert lines[0]["normal"]["log_type_name"] == str(EventType.RL_SCORING_START)
         assert lines[1]["normal"]["log_type_name"] == str(EventType.RL_SCORING_END)
+
+    def test_log_to_metrics_records_duration(self, tmp_path, system_logger):
+        """log_to_metrics=True (default) records duration as experiment metric."""
+        init_observability(rank=0, source="trainer", output_dir=str(tmp_path))
+        set_step(5)
+        with record_span("Forward/Backward", EventType.FWD_BWD):
+            time.sleep(0.01)
+        # Check experiment JSONL for the duration metric
+        exp_path = os.path.join(str(tmp_path), "experiment_logs", "trainer_rank_0_experiment.jsonl")
+        assert os.path.exists(exp_path), f"Experiment JSONL not created: {exp_path}"
+        with open(exp_path) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
+        duration_entries = [l for l in lines if l.get("key") == "time/Forward/Backward/duration_s"]
+        assert len(duration_entries) == 1, f"Expected 1 duration entry, got {len(duration_entries)}"
+        assert duration_entries[0]["sum"] > 0.01
+        assert duration_entries[0]["step"] == 5
+
+    def test_log_to_metrics_disabled(self, tmp_path, system_logger):
+        """log_to_metrics=False should NOT record duration as experiment metric."""
+        init_observability(rank=0, source="trainer", output_dir=str(tmp_path))
+        set_step(5)
+        with record_span("Optimizer", EventType.OPTIM, log_to_metrics=False):
+            pass
+        exp_path = os.path.join(str(tmp_path), "experiment_logs", "trainer_rank_0_experiment.jsonl")
+        if os.path.exists(exp_path):
+            with open(exp_path) as f:
+                lines = [json.loads(line) for line in f if line.strip()]
+            duration_entries = [l for l in lines if l.get("key", "").startswith("time/Optimizer")]
+            assert len(duration_entries) == 0, "log_to_metrics=False should not record duration"
