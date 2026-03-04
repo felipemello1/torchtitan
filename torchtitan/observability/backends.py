@@ -17,10 +17,12 @@ convenience sugar from the reference for users who want context manager style.
 
 import logging
 import os
+from dataclasses import dataclass
 from types import TracebackType
 from typing import Any
 
 import torch
+from torchtitan.config.configurable import Configurable
 from torchtitan.observability import tree
 from torchtitan.observability.tensor_metrics import TMetricValue
 
@@ -167,18 +169,24 @@ class SummaryWriter:
 # ---------------------------------------------------------------------------
 
 
-class TensorBoardSummaryWriter(SummaryWriter):
+class TensorBoardSummaryWriter(SummaryWriter, Configurable):
     """A SummaryWriter that logs to TensorBoard.
 
-    Args:
-        log_dir: Directory for TensorBoard event files.
-        max_queue: Maximum in-memory queue size for TensorBoard events.
+    Usage::
+
+        cfg = TensorBoardSummaryWriter.Config(log_dir="output/tb")
+        writer = cfg.build()
     """
 
-    def __init__(self, log_dir: str, max_queue: int = 10000) -> None:
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        log_dir: str = "tb"
+        max_queue: int = 10000
+
+    def __init__(self, config: Config, **kwargs) -> None:
         super().__init__()
-        self.log_dir = log_dir
-        self.max_queue = max_queue
+        self.log_dir = config.log_dir
+        self.max_queue = config.max_queue
         self._tb_writer = None
 
     def open(self) -> None:
@@ -252,28 +260,32 @@ def _replace_gfile(tb_writer) -> None:
 # ---------------------------------------------------------------------------
 
 
-class WandbSummaryWriter(SummaryWriter):
+class WandbSummaryWriter(SummaryWriter, Configurable):
     """A SummaryWriter that logs to Weights & Biases.
 
-    Args:
-        project: W&B project name.
-        entity: W&B entity (team or user).
-        config_dict: Training config to log as run config.
-        mode: W&B mode ("online", "offline", "disabled").
+    Usage::
+
+        cfg = WandbSummaryWriter.Config(project="my-project")
+        writer = cfg.build(config_dict={"lr": 1e-3})
     """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        project: str | None = None
+        entity: str | None = None
+        mode: str = "offline"
 
     def __init__(
         self,
-        project: str | None = None,
-        entity: str | None = None,
+        config: Config,
+        *,
         config_dict: dict | None = None,
-        mode: str = "offline",
     ) -> None:
         super().__init__()
-        self.project = project
-        self.entity = entity
+        self.project = config.project
+        self.entity = config.entity
         self.config_dict = config_dict
-        self.mode = mode
+        self.mode = config.mode
         self._run = None
 
     def open(self) -> None:
