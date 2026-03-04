@@ -96,18 +96,24 @@ def profile_annotation(name: str):
 
 @dataclass
 class TriggerResult:
+    """Result of checking a single trigger (e.g., "profiling" file sentinel)."""
+
     should_trigger: bool = False
     trigger_info: str = ""
 
 
 class TriggerView:
-    """Synchronize trigger states across distributed ranks via all_reduce."""
+    """Synchronize trigger states across distributed ranks.
+
+    Only role_rank 0 checks for file triggers. ``agree_across_ranks`` uses
+    all_reduce(MAX) so that if ANY rank detected a trigger, ALL ranks see it.
+    """
 
     @staticmethod
     def agree_across_ranks(
         local_view: dict[str, TriggerResult], group=None
     ) -> dict[str, TriggerResult]:
-        """Given local trigger states, agree on global view across ranks."""
+        """All-reduce local trigger states so all ranks agree."""
         trigger_indexes = {
             i: name for i, name in enumerate(sorted(local_view.keys()))
         }
@@ -219,9 +225,13 @@ class FileBasedTriggerWatcher:
 class TriggerableSchedule:
     """Custom profiler schedule with periodic + on-demand triggering.
 
-    When the policy returns True for a target step, warmup starts early
-    so profiling is ready at the target step. Also supports on-demand
-    triggering via the 'triggered' flag.
+    Warmup is needed because CUPTI (CUDA profiling API) needs a few steps to
+    stabilize before it produces accurate kernel timing. The schedule
+    automatically starts warmup early: if the policy says "profile at step 100"
+    and warmup=2, then step 98→WARMUP, 99→WARMUP, 100→RECORD_AND_SAVE.
+
+    On-demand triggering (via ``triggered=True``) starts a new warmup→record
+    cycle immediately, regardless of the policy.
     """
 
     def __init__(self, warmup: int, active: int, profile_policy):
@@ -296,13 +306,18 @@ class TriggerableSchedule:
 
 @dataclass
 class ProfilerConfig:
-    """Configuration for the Profiler orchestrator."""
+    """Configuration for the Profiler orchestrator.
+
+    Adapt to your use case. Example for periodic GPU kernel profiling::
+
+        ProfilerConfig(enable_profiling=True, profile_freq=100, profiler_warmup=2)
+    """
 
     enable_profiling: bool = False
-    profile_freq: int = 10
-    profiler_warmup: int = 2
-    profiler_active: int = 1
-    with_stack: bool = False
+    profile_freq: int = 10  # Profile every N steps
+    profiler_warmup: int = 2  # CUPTI warmup steps before recording
+    profiler_active: int = 1  # Steps to record per profiling cycle
+    with_stack: bool = False  # Capture Python call stacks (slower)
     enable_memory_snapshot: bool = False
     memory_snapshot_max_entries: int = 1000000
     memory_snapshot_start_step: int = 3
@@ -323,7 +338,9 @@ class MemSnapshotProfiler:
     """CUDA memory snapshot profiler.
 
     Records memory allocation history and dumps pickle files for offline
-    visualization. Includes OOM observer for automatic snapshots on OOM.
+    visualization via https://pytorch.org/memory_viz. Includes FX trace
+    augmentation for torch.compile memory debugging. An OOM observer is
+    attached automatically to capture a snapshot when GPU memory is exhausted.
     """
 
     def __init__(
