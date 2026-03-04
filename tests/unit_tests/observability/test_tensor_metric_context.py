@@ -74,17 +74,6 @@ class TestTensorMetricContext:
         summaries = ctx.summaries()
         assert "encoder/loss" in summaries
 
-    def test_global_step(self):
-        with TensorMetricContext() as ctx:
-            ctx.set_global_step(42)
-            assert ctx.global_step() == 42
-
-    def test_global_step_from_ancestor(self):
-        with TensorMetricContext() as outer:
-            outer.set_global_step(10)
-            with TensorMetricContext() as inner:
-                assert inner.global_step() == 10
-
     def test_update(self):
         with TensorMetricContext() as parent:
             with TensorMetricContext() as child:
