@@ -230,10 +230,21 @@ def to_structured_json(log_dict: dict[str, Any]) -> str:
 
 
 class StructuredJSONFormatter(logging.Formatter):
-    """Formats system log records as structured JSONL.
+    """Formats system log records as structured JSONL (4-column format).
 
-    Rank/source are instance attributes (constants, set once in init_observability).
-    Step/step_tags are read from ContextVars (per-task, mutable).
+    Each record becomes a JSON line with int/normal/double/normvector columns.
+    Rank and source are constants (set once). Step and step_tags come from
+    ContextVars so concurrent async tasks each see their own step.
+
+    Example output (one JSON line):
+        {"int": {"rank": 0, "step": 5, "time": 1709500000, "seq_id": 42},
+         "normal": {"source": "trainer", "log_type_name": "fwd_bwd_end", ...},
+         "double": {"value": 12.5, "delta_ms": 0.3},
+         "normvector": {}}
+
+    Usage:
+        formatter = StructuredJSONFormatter(rank=0, source="trainer")
+        handler.setFormatter(formatter)
     """
 
     _thread_local = threading.local()
@@ -248,6 +259,11 @@ class StructuredJSONFormatter(logging.Formatter):
         return to_structured_json(self._log_dict(record))
 
     def _log_dict(self, record: logging.LogRecord) -> dict[str, Any]:
+        """Build the flat dict that to_structured_json splits into 4 columns.
+
+        Adds: rank, source, step, step_tags, timing, log_type, event_name,
+        value, message, caller info, seq_id.
+        """
         log_dict: dict[str, Any] = {}
 
         log_dict["delta_ms"] = self._refresh_event_delta()
@@ -390,7 +406,8 @@ def init_observability(
     """Initialize structured logging. Called once per rank during process setup.
 
     Creates per-rank JSONL file handlers for system metrics (phase timing,
-    step events). Experiment metric handlers are added by PR4's metrics.py.
+    step events). Experiment metric handlers (for record_metric) are added
+    when metrics.py extends this function.
 
     Rank and source are baked into the formatter as constants — they never
     change for the lifetime of the process. Step is set per-step via set_step().

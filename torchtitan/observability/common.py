@@ -8,7 +8,7 @@
 Shared constants and ContextVars for the observability module.
 
 No dependencies on other observability submodules — this file exists to break
-circular imports between structured_logging.py and metrics.py (added in PR4).
+circular imports between structured_logging.py and metrics.py.
 
 ContextVars are used instead of globals because they provide isolation between
 concurrent asyncio tasks. In Monarch actor endpoints, each request runs as a
@@ -30,7 +30,7 @@ _STEP_TAGS: ContextVar[tuple[str, ...]] = ContextVar("_STEP_TAGS", default=())
 SYSTEM_LOGGER_NAME = "torchtitan.observability.system"
 EXPERIMENT_LOGGER_NAME = "torchtitan.observability.experiment"
 
-# --- Metric entry markers (used by PR4's ExperimentJSONFormatter) ---
+# --- Metric entry markers (used by ExperimentJSONFormatter in metrics.py) ---
 _METRIC_ENTRY = "_metric_entry"
 _REDUCED_METRICS = "_reduced_metrics"
 

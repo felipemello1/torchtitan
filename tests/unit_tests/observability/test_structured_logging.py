@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Tests for torchtitan.observability.structured_logging (PR1).
+"""Tests for torchtitan.observability.structured_logging.
 
 Coverage map:
 - set_step / add_step_tag / clear_step_tags: adapted from msl_tools context_test.py

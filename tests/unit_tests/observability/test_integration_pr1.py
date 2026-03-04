@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Integration test for PR1: validates toy_spmd.py JSONL outputs.
+"""Integration test: validates toy_spmd.py system JSONL outputs.
 
 These tests read the actual output directory produced by running toy_spmd.py.
 They verify that structured logging produces correct per-rank JSONL files
@@ -47,7 +47,7 @@ def rank0_events(sys_log_dir):
 NUM_STEPS = 20
 
 
-class TestPR1Integration:
+class TestSystemJSONLIntegration:
     def test_system_jsonl_files_exist(self, sys_log_dir):
         """4 ranks → 4 per-rank JSONL files."""
         files = [f for f in os.listdir(sys_log_dir) if f.endswith(".jsonl")]
