@@ -11,7 +11,7 @@ InMemorySummaryWriter — all composed via CompositeSummaryWriter.
 
 Writer lifecycle follows TorchTitan's pattern: open() in setup, close()
 explicitly. No try/finally, no atexit. __enter__/__exit__ exist as
-convenience sugar from the reference for users who want context manager style.
+convenience sugar for users who want context manager style.
 """
 
 
@@ -29,8 +29,6 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-
 
 def is_single_process_or_rank_zero() -> bool:
     """Returns True if not in a distributed setting or if this is rank 0."""
@@ -38,8 +36,6 @@ def is_single_process_or_rank_zero() -> bool:
         return True
     return torch.distributed.get_rank() == 0
 
-
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 
@@ -148,8 +144,9 @@ class SummaryWriter:
         if not self.should_write(step):
             return
 
-        # Convert all values to scalars before logging
-        # Treat TMetricValue and Tensor as leaves, not containers to traverse
+        # Convert all values to scalars before logging.
+        # TMetricValue and Tensor are the values we want to convert to scalars,
+        # not nested containers to recurse into — mark them as pytree leaves.
         def is_leaf(v):
             return isinstance(v, (TMetricValue, torch.Tensor))
 
@@ -219,8 +216,6 @@ class TensorBoardSummaryWriter(SummaryWriter):
 
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-
 
 def _replace_gfile(tb_writer) -> None:
     """Replace TensorBoard's GFile with regular Python file for better performance.
@@ -229,7 +224,7 @@ def _replace_gfile(tb_writer) -> None:
     with a simple Python file: this replaces GFile, which closes and opens the file
     after appending each event (~50 bytes), which is fairly pathological for FUSE/NFS.
 
-    All three reference libraries have this identical function.
+    This is a common optimization for NFS/FUSE-backed TensorBoard writes.
     """
     try:
         from tensorboard.compat import tf
@@ -369,8 +364,6 @@ class CompositeSummaryWriter(SummaryWriter):
 
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-
 
 class LoggingSummaryWriter(SummaryWriter):
     """A SummaryWriter that logs to Python logger.info. Useful for console output."""
@@ -378,8 +371,6 @@ class LoggingSummaryWriter(SummaryWriter):
     def _log(self, step: int, values: dict[str, Any]) -> None:
         logger.info("Summaries at step %d: %s", step, values)
 
-
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 

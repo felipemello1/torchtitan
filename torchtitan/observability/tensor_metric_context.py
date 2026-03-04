@@ -6,8 +6,23 @@
 
 """Invocation context for collecting tensor metrics during training steps.
 
-Collects tensor metrics during training steps, supporting hierarchical
-naming via child_context and deferred reduction via replicate_to_host.
+Provides a context manager that collects tensor-valued metrics emitted inside
+``torch.compile`` regions. Metrics are stored as tensor references (no I/O)
+and reduced lazily via ``replicate_to_host()`` outside compile.
+
+Hierarchical naming via ``child_context("layer_0")`` builds paths like
+``layer_0/loss``. Merging (``merge_()``) accumulates metrics with the same key
+across multiple calls (e.g., summing loss across micro-batches).
+
+Note [On Deferred Reduction of Partial DTensors]
+
+    When using Tensor Parallel (TP), model outputs may be Partial DTensors
+    whose values are only valid after an all-reduce. Rather than reducing each
+    metric individually (N NCCL calls), ``replicate_to_host()`` groups them by
+    (mesh, placements, dtype, shape) and performs one collective per group.
+
+    On non-logging steps, the context is simply dropped — no all-reduce happens.
+    This gives zero overhead except on the steps where you actually read metrics.
 
 Usage:
     with TensorMetricContext() as ctx:
@@ -43,9 +58,25 @@ _global_context_stack = _ContextStack(thread_id=threading.get_ident())
 
 
 class TensorMetricContext:
+    """Collects tensor metrics during a training step.
+
+    Acts as a "collection bag" for metrics emitted inside ``torch.compile``.
+    Metrics are stored as live tensor references — no I/O or all-reduce happens
+    until you explicitly call ``replicate_to_host(ctx.summaries())``.
+
+    Lifecycle:
+        1. ``with TensorMetricContext() as ctx:`` — pushes onto thread-local stack
+        2. ``record_tensor_metric(key, value)`` — stores tensor refs in the context
+        3. ``child_context("name")`` — creates a nested scope that prefixes keys
+        4. Context ``__exit__`` — pops from stack
+        5. ``replicate_to_host(ctx.summaries())`` — batched all-reduce + GPU→CPU
+
+    On non-logging steps, simply don't create the context — ``record_tensor_metric``
+    becomes a no-op (returns immediately when no context is active).
+    """
+
     def __init__(self) -> None:
         self._summaries: dict[str, TMetricValue] = {}
-        self._global_step: int | None = None
 
     def __enter__(self) -> "TensorMetricContext":
         _global_context_stack.stack.append(self)
@@ -106,45 +137,6 @@ class TensorMetricContext:
         """
         return self._summaries.copy()
 
-    def set_global_step(self, step: int) -> None:
-        """Sets the global training step.
-
-        Args:
-            step: The global training step.
-        """
-        self._global_step = step
-
-    def global_step(self) -> int | None:
-        """Returns the global training step.
-
-        If the current context doesn't have global_step set, searches up the
-        context stack to find the nearest ancestor with global_step set.
-
-        Returns:
-            The global training step, or None if not set in any ancestor context.
-        """
-        if self._global_step is not None:
-            return self._global_step
-
-        # Search up the context stack for global_step (ancestors only)
-        if not _global_context_stack.stack:
-            return None
-
-        # Find the index of self in the stack
-        try:
-            self_index = _global_context_stack.stack.index(self)
-        except ValueError:
-            # self is not in the stack, can't search ancestors
-            return None
-
-        # Search ancestors (contexts before self in the stack) in reverse order
-        for i in range(self_index - 1, -1, -1):
-            context = _global_context_stack.stack[i]
-            if context._global_step is not None:
-                return context._global_step
-
-        return None
-
     def update(self, other: "TensorMetricContext", prefix: str | None) -> None:
         """Merge another context's summaries into this one.
 
@@ -201,9 +193,6 @@ pytree.register_pytree_node(
     TensorMetricContext.__unflatten__,
 )
 
-
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 
 
 def record_tensor_metric(key: str, value: TMetricValue) -> None:

@@ -126,10 +126,8 @@ class SumMetric(MetricValue):
 # ---------------------------------------------------------------------------
 
 REDUCE_REGISTRY: dict[str, type[MetricValue]] = {
-    "MeanMetric": MeanMetric,
-    "MaxMetric": MaxMetric,
-    "MinMetric": MinMetric,
-    "SumMetric": SumMetric,
+    cls.reduce_name: cls
+    for cls in (MeanMetric, MaxMetric, MinMetric, SumMetric)
 }
 
 
@@ -199,9 +197,9 @@ def log_reduced_metrics(metrics: dict[str, float]) -> None:
 class ExperimentJSONFormatter(logging.Formatter):
     """Formats experiment metric records as flat JSONL.
 
-    Rank/source from self (constants), step from ContextVar (per-task).
-    rank/source on self (set once), step from ContextVar (per-task).
-    Handles both record_metric entries and log_reduced_metrics entries.
+    Rank/source from self (set once in init_observability). Step from ContextVar
+    (per-task, changes every step). Handles both record_metric entries and
+    log_reduced_metrics entries.
     """
 
     def __init__(self, rank: int, source: str):
