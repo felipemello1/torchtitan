@@ -23,7 +23,18 @@ from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhausted
 from torchtitan.components.loss import IGNORE_INDEX, LossFunction
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
-from torchtitan.observability.metrics import MaxMetric, MeanMetric, record_metric, SumMetric
+from torchtitan.observability.metrics import (
+    log_reduced_metrics,
+    MaxMetric,
+    MeanMetric,
+    record_metric,
+    SumMetric,
+)
+from torchtitan.observability.tensor_metric_context import (
+    record_tensor_metric,
+    TensorMetricContext,
+)
+from torchtitan.observability.tensor_metrics import MeanTMetric, replicate_to_host
 from torchtitan.components.optimizer import (
     OptimizersContainer,
     OptimizersInBackwardContainer,
@@ -713,22 +724,32 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         else:
             global_valid_tokens = local_valid_tokens.float()
 
-        # Process each microbatch: move to GPU, forward/backward, then free
-        accumulated_losses = []
-        for input_dict, labels in microbatches:
-            # Move tensors to GPU
-            for k, v in input_dict.items():
-                if isinstance(v, torch.Tensor):
-                    input_dict[k] = v.to(self.device)
-            labels = labels.to(self.device)
+        # Forward/backward with tensor metric collection.
+        with TensorMetricContext() as ctx:
+            accumulated_losses = []
+            for input_dict, labels in microbatches:
+                for k, v in input_dict.items():
+                    if isinstance(v, torch.Tensor):
+                        input_dict[k] = v.to(self.device)
+                labels = labels.to(self.device)
 
-            loss = self.forward_backward_step(
-                input_dict=input_dict,
-                labels=labels,
-                # pyrefly: ignore [bad-argument-type]
-                global_valid_tokens=global_valid_tokens,
-            )
-            accumulated_losses.append(loss.detach())
+                loss = self.forward_backward_step(
+                    input_dict=input_dict,
+                    labels=labels,
+                    # pyrefly: ignore [bad-argument-type]
+                    global_valid_tokens=global_valid_tokens,
+                )
+                accumulated_losses.append(loss.detach())
+
+        # Loss: explicit all-reduce (TensorMetricContext is for model-internal metrics).
+        loss = torch.sum(torch.stack(accumulated_losses))
+        if parallel_dims.dp_cp_enabled:
+            loss = loss.detach()
+            loss_mesh = parallel_dims.get_optional_mesh("loss")
+            global_avg_loss = dist_utils.dist_sum(loss, loss_mesh)
+        else:
+            global_avg_loss = loss.detach().item()
+        record_metric("trainer/loss_mean", MeanMetric(sum=float(global_avg_loss)))
 
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.model_parts for p in m.parameters()],
@@ -740,16 +761,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()
         self.lr_schedulers.step()
-
-        # ---- Loss (keep explicit all-reduce, record as CPU metric) ----
-        loss = torch.sum(torch.stack(accumulated_losses))
-        if parallel_dims.dp_cp_enabled:
-            loss = loss.detach()
-            loss_mesh = parallel_dims.get_optional_mesh("loss")
-            global_avg_loss = dist_utils.dist_sum(loss, loss_mesh)
-        else:
-            global_avg_loss = loss.detach().item()
-        record_metric("trainer/loss_mean", MeanMetric(sum=float(global_avg_loss)))
 
         # ---- CPU metrics (every step -> JSONL) ----
         record_metric("trainer/grad_norm_max", MaxMetric(value=grad_norm.item()))
@@ -767,6 +778,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # ---- Derived metrics (every step -> JSONL) ----
         self.metrics_processor.record_throughput()
         self.metrics_processor.record_memory()
+
+        # ---- Tensor reduction (gated — expensive all-reduce) ----
+        if self.metrics_processor.should_log_tensors(self.step):
+            scalars = replicate_to_host(ctx.summaries())
+            if torch.distributed.get_rank() == 0:
+                log_reduced_metrics(scalars)
 
     @record
     def train(self):
