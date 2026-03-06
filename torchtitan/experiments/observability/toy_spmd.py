@@ -7,22 +7,15 @@
 """
 Toy SPMD Training Example — Observability Baseline
 
-Minimal SPMD training loop with TP + compile + FSDP2. Serves as a testbed
-for the observability library — small enough to run on 4 GPUs in seconds.
+Minimal SPMD training loop with:
+- TP
+- per layer compile
+- FSDP2. 
 
-ToyTrainer follows key TorchTitan patterns:
-- Per-layer torch.compile
-- TP → compile → FSDP application order
-- 2D DeviceMesh (DP × TP) with DTensor parameters
-- batch_generator wraps a dataloader (mirrors Trainer.batch_generator)
-- train() owns the training loop; train_step() does one step
+Serves as a testbed for the new observability features.
 
-The model (TinyModel) uses MLPBlock with multiple "heads" (parallel linear
-projections). This structure supports three compile-safety scenarios for
-tensor metric collection:
-- Scenario 1: per-layer metrics via for-loop in eager (over model.layers)
-- Scenario 2: per-head metrics via for-loop inside compile (over block.heads)
-- Scenario 3: merged metrics via same key without child_context
+The model (TinyModel) is just some dummy MLPBlock with multiple "heads" so
+we can test logging heads and layers within compiled regions.
 
 Each rank gets a different number of valid tokens (via loss_mask) to exercise
 weighted metric reduction.
@@ -65,10 +58,7 @@ OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs", "toy_spmd")
 
 # ---- Data ----
 class RepeatDataset:
-    """Yields the same batch every step. Mirrors a dataloader for the toy.
-
-    In the real trainer, the dataloader yields different batches each step.
-    Here we overfit to a single batch to verify training correctness.
+    """Yields the same batch every step so we can overfit and se loss decrease.
     """
 
     def __init__(self, tokens: torch.Tensor, labels: torch.Tensor, loss_mask: torch.Tensor):
@@ -83,13 +73,8 @@ class RepeatDataset:
 
 # ---- Model ----
 class MLPBlock(nn.Module):
-    """MLP block with multiple parallel projections (heads) + output projection.
-
-    Each head is an independent linear projection. Their outputs are summed and
-    projected back to d_model. This gives us a natural for-loop over sub-modules
-    inside the compiled forward, which demonstrates per-head metrics with
-    child_context when observability is added.
-    """
+    """Dummy MLP block with multiple projections (heads) so we can test
+    logging on ModuleDict"""
 
     def __init__(self, d_model: int, hidden_dim: int, n_heads: int = N_HEADS):
         super().__init__()
@@ -108,7 +93,7 @@ class MLPBlock(nn.Module):
 
 
 class TinyModel(nn.Module):
-    """3-layer model with embedding and output head."""
+    """Dummy 3-layer model with embedding and output head."""
 
     def __init__(
         self,
@@ -137,10 +122,7 @@ class TinyModel(nn.Module):
 class ToyTrainer:
     """Minimal trainer with TP + compile + FSDP.
 
-    Parallelism application order follows TorchTitan (parallelize.py):
-    TP first, then per-layer compile, then FSDP2.
-
-    Structure mirrors Trainer in torchtitan/trainer.py:
+    Structure tries to mirrors Trainer in torchtitan/trainer.py:
     - __init__: build model, apply parallelism, create optimizer
     - batch_generator: wraps dataloader, yields batches
     - train_step: one forward/backward/optimizer step
@@ -163,13 +145,8 @@ class ToyTrainer:
 
     @staticmethod
     def _replicate_params(module: nn.Module, tp_mesh) -> None:
-        """Wrap non-TP-parallelized params as Replicate DTensors on the TP mesh.
-
-        This is needed in our simplified TP setup where LayerNorm and other
-        non-parallelized params must still be DTensors on the same mesh so
-        FSDP2 sees a consistent parameter space. TorchTitan's full TP plan
-        handles this via the model-specific parallelize functions.
-        """
+        """Wrap non-TP-parallelized params (LayerNorm) as Replicate DTensors
+        on the TP mesh so it works with FSDP"""
         for p_name, param in module.named_parameters():
             replicated = nn.Parameter(
                 DTensor.from_local(param, tp_mesh, [Replicate()], run_check=False)
@@ -200,7 +177,7 @@ class ToyTrainer:
             self._replicate_params(layer.norm, tp_mesh)
 
     def _apply_compile(self, model):
-        """Per-layer torch.compile (same as TorchTitan default)."""
+        """Per-layer torch.compile"""
         for layer_id, block in model.layers.named_children():
             model.layers.register_module(layer_id, torch.compile(block, fullgraph=True))
 
@@ -213,13 +190,13 @@ class ToyTrainer:
         fully_shard(model, mesh=dp_mesh)
 
     def batch_generator(self, data_iterable):
-        """Wraps a dataloader into an iterator. Mirrors Trainer.batch_generator."""
+        """Wraps a dataloader into an iterator."""
         data_iterator = iter(data_iterable)
         while True:
             yield next(data_iterator)
 
     def compute_loss(self, logits, labels, loss_mask):
-        """Compute loss using loss_parallel + ignore_index (matches TorchTitan).
+        """Compute loss using loss_parallel + ignore_index.
 
         Returns (loss_sum, valid_tokens). The caller divides for backward.
         """
@@ -239,6 +216,8 @@ class ToyTrainer:
         with loss_parallel():
             logits = self.model(tokens)
             loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
+            #TODO: to get the correct loss, dont we need to do * local_valid_tokens / global_valid_tokens?
+            #i think that we need to do an all_reduce here for valid tokens
             loss = loss_sum / valid_tokens
             self.optimizer.zero_grad()
             loss.backward()
@@ -250,6 +229,7 @@ class ToyTrainer:
         """Full training loop. Mirrors Trainer.train structure."""
         data_iterator = self.batch_generator(self.dataloader)
 
+        # header of prints
         if self.rank == 0:
             print(f"{'Step':>4}  {'Loss':>10}  {'GradNorm':>10}  {'Time(ms)':>10}")
             print("-" * 50)
@@ -287,11 +267,11 @@ def main():
     dp_rank = mesh["dp"].get_local_rank()
 
     if rank == 0:
-        print(f"Toy SPMD: {world_size} GPUs, 2DP×2TP, {NUM_STEPS} steps")
+        print(f"Toy SPMD: {world_size} GPUs, 2DPx2TP, {NUM_STEPS} steps")
 
-    # Fixed data for overfitting (same batch every step, like SPMD testbed).
-    # Seed by dp_rank so TP peers get identical data (TP splits the model, not data).
-    # DP peers get different data (different dp_rank → different seed).
+    # --- setup data ---
+    # Fixed data for overfitting.
+    # Seed by dp_rank so TP peers get identical data
     torch.manual_seed(42 + dp_rank)
     tokens = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN), device=device)
     labels = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN), device=device)
@@ -306,6 +286,8 @@ def main():
     loss_mask[:, :valid_len] = 1.0
 
     dataloader = RepeatDataset(tokens, labels, loss_mask)
+
+    # --- train ---
     trainer = ToyTrainer(device, mesh["dp"], mesh["tp"], OUTPUT_DIR, dataloader)
 
     trainer.train(NUM_STEPS)
