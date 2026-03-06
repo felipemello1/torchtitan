@@ -5,25 +5,17 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Toy SPMD Training Example — System + Tensor Metrics
+Toy SPMD Training Example
 
-Minimal SPMD training loop with TP + compile + FSDP2, structured logging,
-and compile-safe tensor metrics. MetricsProcessor manages step context and
-tensor reduction schedule. Small enough to run on 4 GPUs in seconds.
+Minimal SPMD training loop with:
+- TP
+- per layer compile
+- FSDP2.
 
-ToyTrainer follows key TorchTitan patterns:
-- Per-layer torch.compile
-- TP → compile → FSDP application order
-- 2D DeviceMesh (DP × TP) with DTensor parameters
-- batch_generator wraps a dataloader (mirrors Trainer.batch_generator)
-- train() owns the training loop; train_step() does one step
+Serves as a testbed for the new observability features.
 
-The model (TinyModel) uses MLPBlock with multiple "heads" (parallel linear
-projections). This structure supports three compile-safety scenarios for
-tensor metric collection:
-- Scenario 1: per-layer metrics via for-loop in eager (over model.layers)
-- Scenario 2: per-head metrics via for-loop inside compile (over block.heads)
-- Scenario 3: merged metrics via same key without child_context
+The model (TinyModel) is just some dummy MLPBlock with multiple "heads" so
+we can test logging heads and layers within compiled regions.
 
 Each rank gets a different number of valid tokens (via loss_mask) to exercise
 weighted metric reduction.
@@ -32,6 +24,7 @@ Run:
     torchrun --nproc_per_node=4 -m torchtitan.experiments.observability.toy_spmd
 """
 
+import logging
 import os
 import shutil
 import time
@@ -46,12 +39,10 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     loss_parallel,
-    RowwiseParallel,
     parallelize_module,
+    RowwiseParallel,
 )
 from torchtitan.distributed.utils import clip_grad_norm_
-import logging
-
 from torchtitan.observability import (
     child_context,
     EventType,
@@ -85,13 +76,11 @@ OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs", "toy_spmd")
 
 # ---- Data ----
 class RepeatDataset:
-    """Yields the same batch every step. Mirrors a dataloader for the toy.
+    """Yields the same batch every step so we can overfit and se loss decrease."""
 
-    In the real trainer, the dataloader yields different batches each step.
-    Here we overfit to a single batch to verify training correctness.
-    """
-
-    def __init__(self, tokens: torch.Tensor, labels: torch.Tensor, loss_mask: torch.Tensor):
+    def __init__(
+        self, tokens: torch.Tensor, labels: torch.Tensor, loss_mask: torch.Tensor
+    ):
         self.tokens = tokens
         self.labels = labels
         self.loss_mask = loss_mask
@@ -103,13 +92,8 @@ class RepeatDataset:
 
 # ---- Model ----
 class MLPBlock(nn.Module):
-    """MLP block with multiple parallel projections (heads) + output projection.
-
-    Each head is an independent linear projection. Their outputs are summed and
-    projected back to d_model. This gives us a natural for-loop over sub-modules
-    inside the compiled forward, which demonstrates per-head metrics with
-    child_context when observability is added.
-    """
+    """Dummy MLP block with multiple projections (heads) so we can test
+    logging on ModuleDict"""
 
     def __init__(self, d_model: int, hidden_dim: int, n_heads: int = N_HEADS):
         super().__init__()
@@ -125,14 +109,18 @@ class MLPBlock(nn.Module):
         for name, head in self.heads.items():
             with child_context(name):
                 out = F.silu(head(h))
-                record_tensor_metric("abs_mean", MeanTMetric(sum=out.abs().mean(), weight=1))
+                record_tensor_metric(
+                    "abs_mean", MeanTMetric(sum=out.abs().mean(), weight=1)
+                )
                 parts.append(out)
-            record_tensor_metric("abs_mean", MeanTMetric(sum=out.abs().mean(), weight=1))
+            record_tensor_metric(
+                "abs_mean", MeanTMetric(sum=out.abs().mean(), weight=1)
+            )
         return x + self.out_proj(sum(parts))
 
 
 class TinyModel(nn.Module):
-    """3-layer model with embedding and output head."""
+    """Dummy 3-layer model with embedding and output head."""
 
     def __init__(
         self,
@@ -162,10 +150,7 @@ class TinyModel(nn.Module):
 class ToyTrainer:
     """Minimal trainer with TP + compile + FSDP.
 
-    Parallelism application order follows TorchTitan (parallelize.py):
-    TP first, then per-layer compile, then FSDP2.
-
-    Structure mirrors Trainer in torchtitan/trainer.py:
+    Structure tries to mirrors Trainer in torchtitan/trainer.py:
     - __init__: build model, apply parallelism, create optimizer
     - batch_generator: wraps dataloader, yields batches
     - train_step: one forward/backward/optimizer step
@@ -196,13 +181,8 @@ class ToyTrainer:
 
     @staticmethod
     def _replicate_params(module: nn.Module, tp_mesh) -> None:
-        """Wrap non-TP-parallelized params as Replicate DTensors on the TP mesh.
-
-        This is needed in our simplified TP setup where LayerNorm and other
-        non-parallelized params must still be DTensors on the same mesh so
-        FSDP2 sees a consistent parameter space. TorchTitan's full TP plan
-        handles this via the model-specific parallelize functions.
-        """
+        """Wrap non-TP-parallelized params (LayerNorm) as Replicate DTensors
+        on the TP mesh so it works with FSDP"""
         for p_name, param in module.named_parameters():
             replicated = nn.Parameter(
                 DTensor.from_local(param, tp_mesh, [Replicate()], run_check=False)
@@ -213,27 +193,34 @@ class ToyTrainer:
         """Apply tensor parallelism. Embeddings and output use TP plans;
         remaining params are wrapped as Replicate DTensors."""
         parallelize_module(
-            model, tp_mesh,
+            model,
+            tp_mesh,
             {
-                "tok_embeddings": RowwiseParallel(input_layouts=Replicate(), use_local_output=False),
-                "output": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+                "tok_embeddings": RowwiseParallel(
+                    input_layouts=Replicate(), use_local_output=False
+                ),
+                "output": ColwiseParallel(
+                    output_layouts=Shard(-1), use_local_output=False
+                ),
             },
         )
         self._replicate_params(model.norm, tp_mesh)
         for layer in model.layers.values():
             parallelize_module(
-                layer, tp_mesh,
+                layer,
+                tp_mesh,
                 {"out_proj": RowwiseParallel(use_local_output=False)},
             )
             for head_name in layer.heads:
                 parallelize_module(
-                    layer, tp_mesh,
+                    layer,
+                    tp_mesh,
                     {f"heads.{head_name}": ColwiseParallel(use_local_output=False)},
                 )
             self._replicate_params(layer.norm, tp_mesh)
 
     def _apply_compile(self, model):
-        """Per-layer torch.compile (same as TorchTitan default)."""
+        """Per-layer torch.compile"""
         for layer_id, block in model.layers.named_children():
             model.layers.register_module(layer_id, torch.compile(block, fullgraph=True))
 
@@ -246,13 +233,13 @@ class ToyTrainer:
         fully_shard(model, mesh=dp_mesh)
 
     def batch_generator(self, data_iterable):
-        """Wraps a dataloader into an iterator. Mirrors Trainer.batch_generator."""
+        """Wraps a dataloader into an iterator."""
         data_iterator = iter(data_iterable)
         while True:
             yield next(data_iterator)
 
     def compute_loss(self, logits, labels, loss_mask):
-        """Compute loss using loss_parallel + ignore_index (matches TorchTitan).
+        """Compute loss using loss_parallel + ignore_index.
 
         Returns (loss_sum, valid_tokens). The caller divides for backward.
         """
@@ -273,9 +260,12 @@ class ToyTrainer:
             with loss_parallel():
                 with record_span("Forward/Backward", EventType.FWD_BWD):
                     logits = self.model(tokens)
-                    loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
+                    loss_sum, valid_tokens = self.compute_loss(
+                        logits, labels, loss_mask
+                    )
                     record_tensor_metric(
-                        "trainer/loss_mean", MeanTMetric(sum=loss_sum.detach(), weight=valid_tokens)
+                        "trainer/loss_mean",
+                        MeanTMetric(sum=loss_sum.detach(), weight=valid_tokens),
                     )
                     loss = loss_sum / valid_tokens
                     self.optimizer.zero_grad()
@@ -297,6 +287,7 @@ class ToyTrainer:
         """Full training loop. Mirrors Trainer.train structure."""
         data_iterator = self.batch_generator(self.dataloader)
 
+        # header of prints
         if self.rank == 0:
             print(f"{'Step':>4}  {'Loss':>10}  {'GradNorm':>10}  {'Time(ms)':>10}")
             print("-" * 50)
@@ -311,10 +302,14 @@ class ToyTrainer:
             dt_ms = (time.perf_counter() - t0) * 1000
 
             # System metrics: point-in-time scalars logged to system JSONL
-            record_event({"train.loss": loss.item(), "train.grad_norm": grad_norm.item()})
+            record_event(
+                {"train.loss": loss.item(), "train.grad_norm": grad_norm.item()}
+            )
 
             if self.rank == 0:
-                print(f"{step:>4}  {loss.item():>10.4f}  {grad_norm.item():>10.4f}  {dt_ms:>10.1f}")
+                print(
+                    f"{step:>4}  {loss.item():>10.4f}  {grad_norm.item():>10.4f}  {dt_ms:>10.1f}"
+                )
 
     def close(self):
         self.metrics_processor.close()
@@ -337,11 +332,11 @@ def main():
     dp_rank = mesh["dp"].get_local_rank()
 
     if rank == 0:
-        print(f"Toy SPMD: {world_size} GPUs, 2DP×2TP, {NUM_STEPS} steps")
+        print(f"Toy SPMD: {world_size} GPUs, 2DPx2TP, {NUM_STEPS} steps")
 
-    # Fixed data for overfitting (same batch every step, like SPMD testbed).
-    # Seed by dp_rank so TP peers get identical data (TP splits the model, not data).
-    # DP peers get different data (different dp_rank → different seed).
+    # --- setup data ---
+    # Fixed data for overfitting.
+    # Seed by dp_rank so TP peers get identical data
     torch.manual_seed(42 + dp_rank)
     tokens = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN), device=device)
     labels = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN), device=device)
@@ -356,6 +351,8 @@ def main():
     loss_mask[:, :valid_len] = 1.0
 
     dataloader = RepeatDataset(tokens, labels, loss_mask)
+
+    # --- train ---
     trainer = ToyTrainer(device, mesh["dp"], mesh["tp"], OUTPUT_DIR, dataloader)
 
     trainer.train(NUM_STEPS)
