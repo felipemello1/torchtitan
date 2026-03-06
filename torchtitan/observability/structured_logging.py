@@ -15,8 +15,6 @@ Public API:
     record_span(name, event_type)  — context manager for timing phases
     record_event(metrics_dict)     — point-in-time scalar events
     init_observability(...)        — one-time setup (creates file handlers)
-
-Step context (set_step, add_step_tag, clear_step_tags) is in common.py.
 """
 
 import enum
@@ -58,6 +56,7 @@ class EventType(StrEnum):
     Each phase has a base event plus _START and _END variants.
     record_span auto-derives _START/_END from the base.
     """
+
     BINARY_START = "binary_start"
     TORCH_DISTRIBUTED_INIT = "torch_distributed_init"
     TORCH_DISTRIBUTED_INIT_START = "torch_distributed_init_start"
@@ -140,12 +139,14 @@ class EventType(StrEnum):
 
 class LogType(StrEnum):
     """Distinguishes event records from free-text log records in JSONL."""
+
     EVENT = "event"
     TEXT = "text"
 
 
 class ExtraFields(StrEnum):
     """Keys for the `extra` dict passed to logging calls."""
+
     LOG_TYPE = "log_type"
     LOG_TYPE_NAME = "log_type_name"
     EVENT_NAME = "event_name"
@@ -188,7 +189,6 @@ def event_extra(
         str(ExtraFields.VALUE): value,
         str(ExtraFields.CONTEXT): dict_to_str_list(context),
     }
-
 
 
 # ---------------------------------------------------------------------------
@@ -307,9 +307,7 @@ class StructuredJSONFormatter(logging.Formatter):
         if relative_step is not None:
             log_dict["relative_step"] = relative_step
 
-        log_dict["event_name"] = getattr(
-            record, str(ExtraFields.EVENT_NAME), None
-        )
+        log_dict["event_name"] = getattr(record, str(ExtraFields.EVENT_NAME), None)
 
         value = getattr(record, str(ExtraFields.VALUE), None)
         if isinstance(value, (float, int)):
@@ -404,21 +402,13 @@ class InflightEventTrackingHandler(logging.Handler):
 _system_logger = logging.getLogger(SYSTEM_LOGGER_NAME)
 
 
-def init_observability(
-    source: str, output_dir: str, rank: int | None = None
-) -> None:
+def init_observability(source: str, output_dir: str, rank: int | None = None) -> None:
     """Initialize structured logging. Called once per rank during process setup.
 
-    Creates per-rank JSONL file handlers for system metrics (phase timing,
-    step events). Experiment metric handlers (for record_metric) are added
-    when metrics.py extends this function.
+    Creates per-rank JSONL file handlers for metric handling.
 
     Rank and source are baked into the formatter as constants — they never
     change for the lifetime of the process. Step is set per-step via set_step().
-
-    Idempotent: safe to call multiple times (skips if handler already exists).
-    Can be called before torch.distributed init — rank defaults to the RANK
-    environment variable (set by torchrun/MAST).
 
     Args:
         source: Component name (e.g., "trainer", "generator").
@@ -429,6 +419,7 @@ def init_observability(
     if rank is None:
         rank = int(os.environ.get("RANK", 0))
 
+    # if handler already exists, skip
     if any(isinstance(h, StructuredLoggingHandler) for h in _system_logger.handlers):
         return
 
@@ -465,7 +456,9 @@ def record_event(metrics: dict[str, float | int]) -> None:
     for name, value in metrics.items():
         _system_logger.info(
             f"[step {step if step is not None else 'N/A'}] {name}={value}",
-            extra=event_extra(EventType.METRIC_VALUE, event_name=name, value=value, step=step),
+            extra=event_extra(
+                EventType.METRIC_VALUE, event_name=name, value=value, step=step
+            ),
             stacklevel=2,
         )
 

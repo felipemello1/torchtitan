@@ -4,13 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""
-MetricsProcessor — observability pipeline for training metrics.
-
-Manages step context for structured JSONL logging.
-Caller must call init_observability() before constructing MetricsProcessor.
-"""
-
 from torchtitan.observability.common import clear_step_tags, set_step
 
 
@@ -24,12 +17,14 @@ class MetricsProcessor:
     class Config:
         pass
 
-    def __init__(self, config: "MetricsProcessor.Config", *, dump_folder: str, rank: int = 0):
+    def __init__(
+        self, config: "MetricsProcessor.Config", *, dump_folder: str, rank: int = 0
+    ):
         # Assumes init_observability() was already called by the caller.
         self._config = config
 
     def set_step(self, step: int) -> None:
-        """Set current step. Call before train_step().
+        """Set current training step. Call before train_step().
 
         Sets the ContextVar so all subsequent record_span/record_event calls
         are tagged with this step in JSONL.

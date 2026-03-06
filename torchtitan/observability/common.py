@@ -7,13 +7,12 @@
 """
 Shared constants and ContextVars for the observability module.
 
-No dependencies on other observability submodules — this file exists to break
-circular imports between structured_logging.py and metrics.py.
+When producing JSONL logs, we want to embed information in them through handlers,
+such as the current training step. This info normally can be stored in **global variables** for SPMD jobs.
 
-ContextVars are used instead of globals because they provide isolation between
-concurrent asyncio tasks. In Monarch actor endpoints, each request runs as a
-separate asyncio task — global variables would be shared and overwritten
-across concurrent requests. ContextVars give each task its own copy.
+However, in Monarch actor endpoints, each request can run as a separate
+asyncio task. This means that global variables would be shared and overwritten
+across concurrent requests. To solve it, we use ContextVars, that give each task its own copy.
 
 For SPMD (single-process-per-rank), ContextVars behave identically to globals.
 """
@@ -27,8 +26,8 @@ _STEP: ContextVar[int | None] = ContextVar("_STEP", default=None)
 _STEP_TAGS: ContextVar[tuple[str, ...]] = ContextVar("_STEP_TAGS", default=())
 
 # --- Logger names ---
-# Separate loggers so system events (phase timing) and experiment metrics
-# (loss, reward) go to independent JSONL files with independent formatters.
+# Separate loggers so system events (e.g. phase timing) and experiment metrics
+# (e.g. loss, reward) go to independent JSONL files with independent formatters.
 SYSTEM_LOGGER_NAME = "torchtitan.observability.system"
 EXPERIMENT_LOGGER_NAME = "torchtitan.observability.experiment"
 
@@ -40,21 +39,13 @@ _REDUCED_METRICS = "_reduced_metrics"
 
 
 def set_step(step: int) -> None:
-    """Set the current training step.
-
-    Called once per step (SPMD) or once per endpoint call (Monarch actors).
-    The step is embedded in every JSONL record by the formatter.
-    """
+    """Set the current training step into the context, so it can be embedded in JSONL records."""
     _STEP.set(step)
 
 
 def add_step_tag(tag: str) -> None:
     """Add a tag to the current step (e.g., "gc_collect", "profiling", "eval").
-
-    Tags are embedded in JSONL records for filtering. Uses tuple (immutable)
-    instead of list to avoid the ContextVar mutable-reference footgun:
-    ContextVar.set() copies the reference, so a mutable list would leak
-    mutations across asyncio tasks.
+    Tags are embedded in JSONL records for filtering.
 
     Example:
         add_step_tag("profiling")  # mark this step as profiled
