@@ -259,62 +259,72 @@ def _get_metrics_rank(
 
 
 class MetricsProcessor(Configurable):
-    """Metrics processor to processes the metrics and log metrics.
+    """Observability pipeline for training metrics.
 
-    The current MetricsProcessor log some metrics to STDOUT and some metrics to
-    TensorBoard or WandB.
+    Manages step context, metric schedules, derived metrics (throughput, memory),
+    and flushing aggregated metrics to TB/WandB + console.
 
-    Args:
-        config (Config): Metrics configuration.
-        parallel_dims (ParallelDims): Parallel dimensions.
-        dump_folder (str): Base folder for log output.
-        pp_schedule (str): Pipeline parallel schedule name.
-        ft_enable (bool): Whether fault tolerance is enabled.
-        ft_replica_id (int): Fault tolerance replica ID.
-        config_dict (dict | None): Full job config dict for WandB logging.
-        tag (str | None): Tag to use for TensorBoard or WandB. Defaults to None.
+    Caller must call init_observability() before constructing MetricsProcessor.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         log_freq: int = 10
-        """How often to log metrics to TensorBoard, in iterations"""
+        """How often to flush metrics to TB/WandB and print console."""
+
+        log_tensor_metrics_freq: int = 10
+        """How often to reduce tensor metrics (expensive all-reduce).
+        Must be a multiple of log_freq."""
 
         enable_tensorboard: bool = False
-        """Whether to log metrics to TensorBoard"""
+        """Whether to log metrics to TensorBoard."""
 
         disable_color_printing: bool = False
-        """Whether to disable color printing in logs"""
+        """Whether to disable color printing in logs."""
 
         save_tb_folder: str = "tb"
-        """Folder to dump TensorBoard states"""
+        """Folder to dump TensorBoard states."""
 
         save_for_all_ranks: bool = False
-        """
-        Whether to save TensorBoard/Wandb metrics only for rank 0 or for all ranks.
-        When this option is False and pipeline_parallel_degree is > 1, the metrics
-        component uses the 0th rank of the last stage pipeline group, which is the
-        only stage that computes loss metrics.
-        """
+        """Raises NotImplementedError if True. All ranks write to JSONL;
+        rank 0 aggregates and writes to TB/WandB."""
 
         enable_wandb: bool = False
-        """Whether to log metrics to Weights & Biases"""
+        """Whether to log metrics to Weights & Biases."""
 
+        def __post_init__(self):
+            if self.save_for_all_ranks:
+                raise NotImplementedError(
+                    "save_for_all_ranks is not supported. "
+                    "All ranks write to JSONL; rank 0 aggregates and writes to TB/WandB."
+                )
+            if self.log_tensor_metrics_freq % self.log_freq != 0:
+                old = self.log_tensor_metrics_freq
+                self.log_tensor_metrics_freq = (
+                    (self.log_tensor_metrics_freq + self.log_freq - 1)
+                    // self.log_freq
+                    * self.log_freq
+                )
+                logger.warning(
+                    f"log_tensor_metrics_freq ({old}) is not a multiple of "
+                    f"log_freq ({self.log_freq}). Snapped to {self.log_tensor_metrics_freq}."
+                )
+
+    # ---- Type annotations for public attributes set by trainer ----
     config: Config
-    logger: BaseLogger
     parallel_dims: ParallelDims
     device_memory_monitor: DeviceMemoryMonitor
     color: utils.NoColor | utils.Color
-
-    gpu_peak_flops: float
     ntokens_since_last_log: int
-    data_loading_times: list[float]
-    time_last_log: float
-
     num_flops_per_token: int
+    data_loading_times: list[float]
+    validation_ntokens: int
+    validation_time: float
+
+    # Kept for backward compat (set by trainer, never read by MP)
     optimizers: OptimizersContainer | None
-    lr_schedulers: LRSchedulersContainer | None
     model_parts: list[torch.nn.Module] | None
+    lr_schedulers: LRSchedulersContainer | None
 
     def __init__(
         self,
@@ -328,7 +338,18 @@ class MetricsProcessor(Configurable):
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
     ):
-        self.logger = self._build_metric_logger(
+        # Assumes init_observability() was already called by the caller.
+        from torchtitan.observability.aggregation import FileWatcher
+        from torchtitan.observability.common import clear_step_tags, set_step
+        from torchtitan.observability.logging_boundary import EveryNSteps
+
+        self.config = config
+        self.parallel_dims = parallel_dims
+        self._set_step = set_step
+        self._clear_step_tags = clear_step_tags
+
+        # Logging backends (TB/WandB).
+        self._logger = self._build_metric_logger(
             config=config,
             parallel_dims=parallel_dims,
             dump_folder=dump_folder,
@@ -338,28 +359,194 @@ class MetricsProcessor(Configurable):
             config_dict=config_dict,
             tag=tag,
         )
-        self.parallel_dims = parallel_dims
-        self.config = config
-        self.device_memory_monitor = build_device_memory_monitor()
-        # used for colorful printing
-        self.color = utils.NoColor() if config.disable_color_printing else utils.Color()
 
-        self.gpu_peak_flops = utils.get_peak_flops(
+        # Background thread tails experiment JSONL files.
+        exp_log_dir = os.path.join(dump_folder, "experiment_logs")
+        self._watcher = FileWatcher(log_dir=exp_log_dir)
+
+        # Schedules.
+        self._tensor_metrics_schedule = EveryNSteps(
+            every_n=config.log_tensor_metrics_freq, additional_steps={1}
+        )
+        self._log_schedule = EveryNSteps(every_n=config.log_freq, additional_steps={1})
+
+        # Training state.
+        self.device_memory_monitor = build_device_memory_monitor()
+        self.color = utils.NoColor() if config.disable_color_printing else utils.Color()
+        self._gpu_peak_flops = utils.get_peak_flops(
             self.device_memory_monitor.device_name
         )
+        self._time_last_log = time.perf_counter()
         self.ntokens_since_last_log = 0
         self.data_loading_times = []
-        self.time_last_log = time.perf_counter()
-        self.device_memory_monitor.reset_peak_stats()
-
-        # These variables have to be set later as they depend on other components or model.
         self.num_flops_per_token = -1
+
+        # Validation state (separate from training to avoid counter corruption).
+        self.validation_ntokens = 0
+        self.validation_time = time.perf_counter()
+
+        # Kept for backward compat (set by trainer, never read by MP).
         self.optimizers = None
-        self.lr_schedulers = None
         self.model_parts = None
+        self.lr_schedulers = None
+
+    # ----------------------------------------------------------------
+    # Step management
+    # ----------------------------------------------------------------
+
+    def set_step(self, step: int) -> None:
+        """Set current step. Call before train_step()."""
+        self._step = step
+        self._set_step(step)
+        self._clear_step_tags()
+
+    # ----------------------------------------------------------------
+    # Schedule queries
+    # ----------------------------------------------------------------
 
     def should_log(self, step: int) -> bool:
-        return step == 1 or step % self.config.log_freq == 0
+        """Returns True on log steps. Caller uses this to gate log()."""
+        return self._log_schedule(step)
+
+    def should_log_tensors(self, step: int) -> bool:
+        """Returns True on tensor reduction steps."""
+        return self._tensor_metrics_schedule(step)
+
+    # ----------------------------------------------------------------
+    # Derived metrics (called every step, outside should_log gate)
+    # ----------------------------------------------------------------
+
+    def record_throughput(self) -> None:
+        """Compute and record throughput from accumulated tokens since last log reset."""
+        from torchtitan.observability.metrics import MeanMetric, record_metric
+
+        time_delta = time.perf_counter() - self._time_last_log
+        non_dp = self.parallel_dims.non_data_parallel_size
+        tps = self.ntokens_since_last_log / (time_delta * non_dp) if time_delta > 0 else 0
+        tflops = self.num_flops_per_token * tps / 1e12 if self.num_flops_per_token > 0 else 0
+        mfu = (
+            100 * self.num_flops_per_token * tps / self._gpu_peak_flops
+            if self._gpu_peak_flops > 0 and self.num_flops_per_token > 0
+            else 0
+        )
+        record_metric("trainer/throughput/tps_mean", MeanMetric(sum=tps))
+        record_metric("trainer/throughput/tflops_mean", MeanMetric(sum=tflops))
+        record_metric("trainer/throughput/mfu_pct_mean", MeanMetric(sum=mfu))
+
+    def record_memory(self) -> None:
+        """Record device memory peak stats since last log reset."""
+        from torchtitan.observability.metrics import MaxMetric, record_metric
+
+        mem = self.device_memory_monitor.get_peak_stats()
+        record_metric("trainer/memory/max_reserved_gib_max", MaxMetric(value=mem.max_reserved_gib))
+        record_metric("trainer/memory/max_reserved_pct_max", MaxMetric(value=mem.max_reserved_pct))
+        record_metric("trainer/memory/max_active_gib_max", MaxMetric(value=mem.max_active_gib))
+        record_metric("trainer/memory/max_active_pct_max", MaxMetric(value=mem.max_active_pct))
+        record_metric("trainer/memory/num_alloc_retries_sum", MaxMetric(value=mem.num_alloc_retries))
+        record_metric("trainer/memory/num_ooms_sum", MaxMetric(value=mem.num_ooms))
+
+    # ----------------------------------------------------------------
+    # Flush (called by train() on log steps or after validation)
+    # ----------------------------------------------------------------
+
+    def log(self, step: int) -> None:
+        """Pure flush: barrier -> drain -> aggregate -> write -> console -> reset."""
+        from torchtitan.observability.aggregation import aggregate
+
+        torch.distributed.barrier()
+        if torch.distributed.get_rank() == 0:
+            entries = self._watcher.drain(step)
+            aggregated = aggregate(entries)
+            if aggregated:
+                self._logger.log(aggregated, step)
+                self._log_to_console(step, aggregated)
+
+        # Reset training accumulators.
+        self.ntokens_since_last_log = 0
+        self.data_loading_times.clear()
+        self._time_last_log = time.perf_counter()
+        self.device_memory_monitor.reset_peak_stats()
+
+    # ----------------------------------------------------------------
+    # Validation logging
+    # ----------------------------------------------------------------
+
+    def log_validation(
+        self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
+    ) -> None:
+        """Record validation metrics to JSONL. No console, no flush — log() handles those."""
+        from torchtitan.observability.metrics import MaxMetric, MeanMetric, record_metric
+
+        time_delta = time.perf_counter() - self.validation_time
+        device_mem_stats = self.device_memory_monitor.get_peak_stats()
+        tps = (
+            self.validation_ntokens
+            / (time_delta * self.parallel_dims.non_data_parallel_size)
+            if time_delta > 0
+            else 0
+        )
+
+        record_metric("validator/loss_mean", MeanMetric(sum=float(loss)))
+        record_metric("validator/throughput/tps_mean", MeanMetric(sum=tps))
+        record_metric(
+            "validator/memory/max_reserved_gib_max",
+            MaxMetric(value=device_mem_stats.max_reserved_gib),
+        )
+        record_metric(
+            "validator/memory/max_active_gib_max",
+            MaxMetric(value=device_mem_stats.max_active_gib),
+        )
+        if extra_metrics:
+            for k, v in extra_metrics.items():
+                record_metric(f"validator/{k}", MeanMetric(sum=float(v)))
+
+        # Reset validation accumulators (NOT training accumulators).
+        self.validation_ntokens = 0
+        self.validation_time = time.perf_counter()
+
+    # ----------------------------------------------------------------
+    # Console output
+    # ----------------------------------------------------------------
+
+    def _log_to_console(self, step: int, aggregated: dict[str, float]) -> None:
+        c = self.color
+        loss = aggregated.get("trainer/loss_mean", "--")
+        grad_norm = aggregated.get("trainer/grad_norm_max", "--")
+        mem_gib = aggregated.get("trainer/memory/max_reserved_gib_max", "--")
+        mem_pct = aggregated.get("trainer/memory/max_reserved_pct_max", "--")
+        tps = aggregated.get("trainer/throughput/tps_mean", "--")
+        tflops = aggregated.get("trainer/throughput/tflops_mean", "--")
+        mfu = aggregated.get("trainer/throughput/mfu_pct_mean", "--")
+
+        def fmt(val, spec):
+            return f"{val:{spec}}" if isinstance(val, (int, float)) else f"{val:>8}"
+
+        logger.info(
+            f"{c.red}step: {step:2}  "
+            f"{c.green}loss: {fmt(loss, '8.5f')}  "
+            f"{c.orange}grad_norm: {fmt(grad_norm, '7.4f')}  "
+            f"{c.turquoise}memory: {fmt(mem_gib, '5.2f')}GiB"
+            f"({fmt(mem_pct, '.2f')}%)  "
+            f"{c.blue}tps: {fmt(tps, ',')}  "
+            f"{c.cyan}tflops: {fmt(tflops, ',.2f')}  "
+            f"{c.magenta}mfu: {fmt(mfu, '.2f')}%{c.reset}"
+        )
+
+        # Validation line (only present on validation steps).
+        val_loss = aggregated.get("validator/loss_mean")
+        if val_loss is not None:
+            val_tps = aggregated.get("validator/throughput/tps_mean", "--")
+            val_mem = aggregated.get("validator/memory/max_reserved_gib_max", "--")
+            logger.info(
+                f"{c.yellow}validate step: {step:2}  "
+                f"{c.green}loss: {fmt(val_loss, '7.4f')}  "
+                f"{c.turquoise}memory: {fmt(val_mem, '5.2f')}GiB  "
+                f"{c.blue}tps: {fmt(val_tps, ',')}{c.reset}"
+            )
+
+    # ----------------------------------------------------------------
+    # Logger setup
+    # ----------------------------------------------------------------
 
     def _build_metric_logger(
         self,
@@ -373,35 +560,19 @@ class MetricsProcessor(Configurable):
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
     ) -> BaseLogger:
-        """
-        Build an appropriate metric logger based on configuration.
-        """
-        # Log initial config state
-        logger.debug(
-            f"Building logger with config: wandb={config.enable_wandb}, "
-            f"tensorboard={config.enable_tensorboard}"
-        )
-
-        # Check if any logging backend is enabled
+        """Build TB/WandB loggers based on config and rank."""
         has_logging_enabled = config.enable_tensorboard or config.enable_wandb
 
-        # Determine if this rank should log
         should_log = has_logging_enabled
-        if (not config.save_for_all_ranks) and should_log:
+        if should_log:
             metrics_rank = _get_metrics_rank(
                 parallel_dims=parallel_dims, pp_schedule=pp_schedule
             )
             should_log = torch.distributed.get_rank() == metrics_rank
 
-        logger.debug(
-            f"Logging decision: has_logging_enabled={has_logging_enabled}, should_log={should_log}"
-        )
-
         if not should_log:
-            logger.debug("Returning BaseLogger due to should_log=False")
             return BaseLogger()
 
-        # Setup logging directory
         base_log_dir = os.path.join(
             dump_folder,
             config.save_tb_folder,
@@ -409,163 +580,29 @@ class MetricsProcessor(Configurable):
         )
 
         if ft_enable:
-            base_log_dir = os.path.join(
-                base_log_dir,
-                f"replica_{ft_replica_id}",
-            )
+            base_log_dir = os.path.join(base_log_dir, f"replica_{ft_replica_id}")
 
-        if config.save_for_all_ranks:
-            base_log_dir = os.path.join(
-                base_log_dir, f"rank_{torch.distributed.get_rank()}"
-            )
-
-        # Create logger container
         logger_container = LoggerContainer()
 
-        # Create loggers in priority order
         if config.enable_wandb:
-            logger.debug("Attempting to create WandB logger")
             try:
                 wandb_logger = WandBLogger(
                     base_log_dir, config_dict=config_dict, tag=tag
                 )
                 logger_container.add_logger(wandb_logger)
             except Exception as e:
-                if "No module named 'wandb'" in str(e):
-                    logger.error(
-                        "Failed to create WandB logger: No module named 'wandb'. Please install it using 'pip install wandb'."
-                    )
-                else:
-                    logger.error(f"Failed to create WandB logger: {e}")
+                logger.error(f"Failed to create WandB logger: {e}")
 
         if config.enable_tensorboard:
-            logger.debug("Creating TensorBoard logger")
             tensorboard_logger = TensorBoardLogger(base_log_dir, tag)
             logger_container.add_logger(tensorboard_logger)
 
-        if logger_container.number_of_loggers == 0:
-            logger.debug("No loggers enabled, returning an empty LoggerContainer")
         return logger_container
 
-    def log(
-        self,
-        step: int,
-        global_avg_loss: float,
-        global_max_loss: float,
-        grad_norm: float,
-        extra_metrics: dict[str, Any] | None = None,
-    ):
-        """
-        Log training metrics including loss, throughput, and memory statistics.
+    # ----------------------------------------------------------------
+    # Lifecycle
+    # ----------------------------------------------------------------
 
-        Args:
-            step: Current training step
-            global_avg_loss: Global average loss across all valid tokens on all ranks
-                Defined as global_loss_sum / global_valid_tokens
-            global_max_loss: Maximum local loss across all ranks
-                Defined as max(local_loss_sum / local_valid_tokens)
-            grad_norm: Gradient norm after clipping
-            extra_metrics: Optional additional metrics to log
-
-        """
-        assert self.num_flops_per_token > 0, "num_flops_per_token must be set"
-
-        time_delta = time.perf_counter() - self.time_last_log
-
-        # tokens per second per device, abbreviated as tps
-        tps = self.ntokens_since_last_log / (
-            time_delta * self.parallel_dims.non_data_parallel_size
-        )
-        # model FLOPS utilization
-        # For its definition and calculation, please refer to the PaLM paper:
-        # https://arxiv.org/abs/2204.02311
-        mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
-        tflops = self.num_flops_per_token * tps / 1e12
-
-        time_end_to_end = time_delta / self.config.log_freq
-        time_data_loading = sum(self.data_loading_times) / len(self.data_loading_times)
-        time_data_loading_pct = 100 * sum(self.data_loading_times) / time_delta
-
-        device_mem_stats = self.device_memory_monitor.get_peak_stats()
-
-        metrics = {
-            "loss_metrics/global_avg_loss": global_avg_loss,
-            "loss_metrics/global_max_loss": global_max_loss,
-            "grad_norm": grad_norm,
-            "throughput(tps)": tps,
-            "tflops": tflops,
-            "mfu(%)": mfu,
-            "time_metrics/end_to_end(s)": time_end_to_end,
-            "time_metrics/data_loading(s)": time_data_loading,
-            "time_metrics/data_loading(%)": time_data_loading_pct,
-            "memory/max_active(GiB)": device_mem_stats.max_active_gib,
-            "memory/max_active(%)": device_mem_stats.max_active_pct,
-            "memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
-            "memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
-            "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
-            "memory/num_ooms": device_mem_stats.num_ooms,
-        }
-
-        if extra_metrics:
-            metrics.update(extra_metrics)
-
-        self.logger.log(metrics, step)
-
-        color = self.color
-        logger.info(
-            f"{color.red}step: {step:2}  "
-            f"{color.green}loss: {global_avg_loss:8.5f}  "
-            f"{color.orange}grad_norm: {grad_norm:7.4f}  "
-            f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
-            f"({device_mem_stats.max_reserved_pct:.2f}%)  "
-            f"{color.blue}tps: {round(tps):,}  "
-            f"{color.cyan}tflops: {tflops:,.2f}  "
-            f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
-        )
-
-        self.ntokens_since_last_log = 0
-        self.data_loading_times.clear()
-        self.time_last_log = time.perf_counter()
-        self.device_memory_monitor.reset_peak_stats()
-
-    def log_validation(
-        self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
-    ):
-        time_delta = time.perf_counter() - self.time_last_log
-
-        device_mem_stats = self.device_memory_monitor.get_peak_stats()
-
-        # tokens per second per device, abbreviated as tps
-        tps = self.ntokens_since_last_log / (
-            time_delta * self.parallel_dims.non_data_parallel_size
-        )
-
-        metrics = {
-            "validation_metrics/loss": loss,
-            "validation_metrics/throughput(tps)": tps,
-            "validation_metrics/memory/max_active(GiB)": device_mem_stats.max_active_gib,
-            "validation_metrics/memory/max_active(%)": device_mem_stats.max_active_pct,
-            "validation_metrics/memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
-            "validation_metrics/memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
-        }
-
-        if extra_metrics:
-            metrics.update(extra_metrics)
-
-        self.logger.log(metrics, step)
-
-        color = self.color
-        logger.info(
-            f"{color.yellow}validate step: {step:2}  "
-            f"{color.green}loss: {loss:7.4f}  "
-            f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
-            f"({device_mem_stats.max_reserved_pct:.2f}%)  "
-            f"{color.blue}tps: {round(tps):,}{color.reset}"
-        )
-
-        self.ntokens_since_last_log = 0
-        self.time_last_log = time.perf_counter()
-        self.device_memory_monitor.reset_peak_stats()
-
-    def close(self):
-        self.logger.close()
+    def close(self) -> None:
+        self._watcher.close()
+        self._logger.close()

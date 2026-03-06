@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
 
@@ -160,6 +161,10 @@ class FluxValidator(Validator):
         device_type = dist_utils.device_type
         num_steps = 0
 
+        # Separate validation token counter (does not touch training counter).
+        self.metrics_processor.validation_ntokens = 0
+        self.metrics_processor.validation_time = time.perf_counter()
+
         for input_dict, labels in self.validation_dataloader:
             if self.config.steps != -1 and num_steps >= self.config.steps:
                 break
@@ -227,7 +232,7 @@ class FluxValidator(Validator):
                 stratified_timesteps = input_dict.pop("timestep")
 
             # Note the tps may be inaccurate due to the generating image step not being counted
-            self.metrics_processor.ntokens_since_last_log += labels.numel()
+            self.metrics_processor.validation_ntokens += labels.numel()
 
             # Apply timesteps here and update our bsz to efficiently compute all timesteps and samples in a single forward pass
             with torch.no_grad(), torch.device(self.device):

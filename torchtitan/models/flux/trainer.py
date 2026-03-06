@@ -11,6 +11,7 @@ import torch
 
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import utils as dist_utils
+from torchtitan.observability.metrics import MaxMetric, MeanMetric, record_metric, SumMetric
 from torchtitan.models.flux.configs import Encoder, Inference, Validation
 from torchtitan.models.flux.model.autoencoder import load_ae
 from torchtitan.models.flux.model.hf_embedder import FluxEmbedder
@@ -249,37 +250,29 @@ class FluxTrainer(Trainer):
         self.optimizers.step()
         self.lr_schedulers.step()
 
-        # log metrics
-        if not self.metrics_processor.should_log(self.step):
-            return
-
+        # ---- Loss (keep explicit all-reduce, record as CPU metric) ----
         if parallel_dims.dp_cp_enabled:
             loss = loss.detach()
             loss_mesh = parallel_dims.get_optional_mesh("loss")
 
-            # NOTE: the loss returned by train
-            global_avg_loss, global_max_loss, global_ntokens_seen = (
-                dist_utils.dist_sum(loss, loss_mesh),
-                dist_utils.dist_max(loss, loss_mesh),
-                dist_utils.dist_sum(
-                    torch.tensor(
-                        self.ntokens_seen, dtype=torch.int64, device=self.device
-                    ),
-                    loss_mesh,
-                ),
-            )
+            global_avg_loss = dist_utils.dist_sum(loss, loss_mesh)
         else:
-            global_avg_loss = global_max_loss = loss.detach().item()
-            global_ntokens_seen = self.ntokens_seen
+            global_avg_loss = loss.detach().item()
+        record_metric("trainer/loss_mean", MeanMetric(sum=float(global_avg_loss)))
 
-        extra_metrics = {
-            "n_tokens_seen": global_ntokens_seen,
-            "lr": lr,
-        }
-        self.metrics_processor.log(
-            self.step,
-            global_avg_loss,
-            global_max_loss,
-            grad_norm.item(),
-            extra_metrics=extra_metrics,
-        )
+        # ---- CPU metrics (every step -> JSONL) ----
+        record_metric("trainer/grad_norm_max", MaxMetric(value=grad_norm.item()))
+        record_metric("trainer/learning_rate_mean", MeanMetric(sum=lr))
+        record_metric("trainer/n_tokens_seen_sum", SumMetric(value=float(self.ntokens_seen)))
+
+        # ---- Data loading stats ----
+        if self.metrics_processor.data_loading_times:
+            avg_dl = (
+                sum(self.metrics_processor.data_loading_times)
+                / len(self.metrics_processor.data_loading_times)
+            )
+            record_metric("trainer/time/data_loading_s_mean", MeanMetric(sum=avg_dl))
+
+        # ---- Derived metrics (every step -> JSONL) ----
+        self.metrics_processor.record_throughput()
+        self.metrics_processor.record_memory()

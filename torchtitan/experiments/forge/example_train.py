@@ -20,6 +20,7 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.components.validate import Validator
 from torchtitan.config import ConfigManager
 from torchtitan.distributed import utils as dist_utils
+from torchtitan.observability.metrics import MaxMetric, MeanMetric, record_metric
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
@@ -70,6 +71,11 @@ class Trainer(ForgeEngine):
         logger.info(
             f"Built {config.model_spec.name} {config.model_spec.flavor} with {model_args}"
         )
+
+        # Initialize observability before MetricsProcessor.
+        from torchtitan.observability import init_observability
+
+        init_observability(source="trainer", output_dir=config.dump_folder)
 
         # metrics logging
         self.metrics_processor = config.metrics.build(
@@ -267,6 +273,8 @@ class Trainer(ForgeEngine):
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
         self.optimizers.zero_grad()
+        # Save the current step learning rate for logging
+        lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
@@ -317,28 +325,30 @@ class Trainer(ForgeEngine):
         self.optimizers.step()
         self.lr_schedulers.step()
 
-        # Reduce the data collected over gradient accumulation steps.
+        # ---- Loss (keep explicit all-reduce, record as CPU metric) ----
         loss = torch.sum(torch.stack(accumulated_losses))
-
-        # log metrics
-        if not self.metrics_processor.should_log(self.step):
-            return
-
         if parallel_dims.dp_cp_enabled:
             loss = loss.detach()
-            global_avg_loss, global_max_loss = (
-                dist_utils.dist_sum(loss, parallel_dims.get_optional_mesh("loss")),
-                dist_utils.dist_max(loss, parallel_dims.get_optional_mesh("loss")),
-            )
+            global_avg_loss = dist_utils.dist_sum(loss, parallel_dims.get_optional_mesh("loss"))
         else:
-            global_avg_loss = global_max_loss = loss.detach().item()
+            global_avg_loss = loss.detach().item()
+        record_metric("trainer/loss_mean", MeanMetric(sum=float(global_avg_loss)))
 
-        self.metrics_processor.log(
-            self.step,
-            global_avg_loss,
-            global_max_loss,
-            grad_norm.item(),
-        )
+        # ---- CPU metrics (every step -> JSONL) ----
+        record_metric("trainer/grad_norm_max", MaxMetric(value=grad_norm.item()))
+        record_metric("trainer/learning_rate_mean", MeanMetric(sum=lr))
+
+        # ---- Data loading stats ----
+        if self.metrics_processor.data_loading_times:
+            avg_dl = (
+                sum(self.metrics_processor.data_loading_times)
+                / len(self.metrics_processor.data_loading_times)
+            )
+            record_metric("trainer/time/data_loading_s_mean", MeanMetric(sum=avg_dl))
+
+        # ---- Derived metrics (every step -> JSONL) ----
+        self.metrics_processor.record_throughput()
+        self.metrics_processor.record_memory()
 
     @record
     def train(self):
@@ -362,6 +372,8 @@ class Trainer(ForgeEngine):
             data_iterator = self.batch_generator(self.dataloader)
             while self.step < config.training.steps:
                 self.step += 1
+                self.metrics_processor.set_step(self.step)
+
                 self.gc_handler.run(self.step)
                 try:
                     self.train_step(data_iterator)
@@ -369,15 +381,21 @@ class Trainer(ForgeEngine):
                     logger.warning("Ran out of data; last step was canceled.")
                     break
 
-                # Run validation if validator is available
-                if config.validator.enable and self.validator.should_validate(
-                    self.step
-                ):
-                    self.validator.validate(self.model_parts, self.step)
-
                 self.checkpointer.save(
                     self.step, last_step=(self.step == config.training.steps)
                 )
+
+                # Validation
+                is_validation = (
+                    config.validator.enable
+                    and self.validator.should_validate(self.step)
+                )
+                if is_validation:
+                    self.validator.validate(self.model_parts, self.step)
+
+                # Single flush: picks up training + validation metrics
+                if self.metrics_processor.should_log(self.step) or is_validation:
+                    self.metrics_processor.log(self.step)
 
                 # signal the profiler that the next profiling step has started
                 if torch_profiler:

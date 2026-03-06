@@ -20,6 +20,7 @@ from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.observability.metrics import MaxMetric, MeanMetric, record_metric, SumMetric
 from torchtitan.experiments.ft.config.job_config import FaultTolerance
 from torchtitan.experiments.ft.manager import FTManager, maybe_semi_sync_training
 from torchtitan.experiments.ft.optimizer import FTOptimizersContainer
@@ -129,6 +130,11 @@ class FaultTolerantTrainer(Trainer):
             model_compile_enabled=model_compile_enabled,
         )
         model_converters.convert(model)
+
+        # Initialize observability before MetricsProcessor.
+        from torchtitan.observability import init_observability
+
+        init_observability(source="trainer", output_dir=config.dump_folder)
 
         # metrics logging (FT addition: ft_enable, ft_replica_id)
         self.metrics_processor = config.metrics.build(
@@ -465,52 +471,34 @@ class FaultTolerantTrainer(Trainer):
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 
-        # log metrics
-        if not self.metrics_processor.should_log(self.step):
-            return
-
+        # ---- Loss (keep explicit all-reduce with FT sync, record as CPU metric) ----
         if parallel_dims.dp_cp_enabled:
             loss = loss.detach()
             # FT addition: use ft_manager.loss_sync_pg for extra process group
             ft_pg = self.ft_manager.loss_sync_pg
             loss_mesh = parallel_dims.get_optional_mesh("loss")
 
-            # For global_avg_loss, we want the average loss across all ranks:
-            # loss = local_loss_sum / global_valid_tokens
-            # global_avg_loss = sum(local_loss_sum) / global_valid_tokens
-            #                 = sum(loss)
-            #
-            # For global_max_loss, we want the max of local average losses across ranks:
-            # local_avg_loss = local_loss_sum / local_valid_tokens
-            #                = (loss * global_valid_tokens) / local_valid_tokens
-            # global_max_loss = max(local_avg_loss)
-            local_avg_loss = loss * global_valid_tokens / local_valid_tokens
-            global_avg_loss, global_max_loss, global_ntokens_seen = (
-                dist_utils.dist_sum(loss, loss_mesh, ft_pg),
-                dist_utils.dist_max(local_avg_loss, loss_mesh, ft_pg),
-                dist_utils.dist_sum(
-                    torch.tensor(
-                        self.ntokens_seen, dtype=torch.int64, device=self.device
-                    ),
-                    loss_mesh,
-                    ft_pg,
-                ),
-            )
+            global_avg_loss = dist_utils.dist_sum(loss, loss_mesh, ft_pg)
         else:
-            global_avg_loss = global_max_loss = loss.detach().item()
-            global_ntokens_seen = self.ntokens_seen
+            global_avg_loss = loss.detach().item()
+        record_metric("trainer/loss_mean", MeanMetric(sum=float(global_avg_loss)))
 
-        extra_metrics = {
-            "n_tokens_seen": global_ntokens_seen,
-            "lr": lr,
-        }
-        self.metrics_processor.log(
-            self.step,
-            global_avg_loss,
-            global_max_loss,
-            grad_norm.item(),
-            extra_metrics=extra_metrics,
-        )
+        # ---- CPU metrics (every step -> JSONL) ----
+        record_metric("trainer/grad_norm_max", MaxMetric(value=grad_norm.item()))
+        record_metric("trainer/learning_rate_mean", MeanMetric(sum=lr))
+        record_metric("trainer/n_tokens_seen_sum", SumMetric(value=float(self.ntokens_seen)))
+
+        # ---- Data loading stats ----
+        if self.metrics_processor.data_loading_times:
+            avg_dl = (
+                sum(self.metrics_processor.data_loading_times)
+                / len(self.metrics_processor.data_loading_times)
+            )
+            record_metric("trainer/time/data_loading_s_mean", MeanMetric(sum=avg_dl))
+
+        # ---- Derived metrics (every step -> JSONL) ----
+        self.metrics_processor.record_throughput()
+        self.metrics_processor.record_memory()
 
     @record
     def train(self):
@@ -559,6 +547,8 @@ class FaultTolerantTrainer(Trainer):
             data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
                 self.step += 1
+                self.metrics_processor.set_step(self.step)
+
                 self.gc_handler.run(self.step)
                 try:
                     self.train_step(data_iterator)
@@ -570,11 +560,17 @@ class FaultTolerantTrainer(Trainer):
                     self.step, last_step=(self.step == config.training.steps)
                 )
 
-                # Run validation if validator is available
-                if self.config.validator.enable and self.validator.should_validate(
-                    self.step
-                ):
+                # Validation
+                is_validation = (
+                    self.config.validator.enable
+                    and self.validator.should_validate(self.step)
+                )
+                if is_validation:
                     self.validator.validate(self.model_parts, self.step)
+
+                # Single flush: picks up training + validation metrics
+                if self.metrics_processor.should_log(self.step) or is_validation:
+                    self.metrics_processor.log(self.step)
 
                 # signal the profiler that the next profiling step has started
                 if torch_profiler:

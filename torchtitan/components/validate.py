@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
@@ -225,12 +226,16 @@ class Validator(BaseValidator):
         device_type = utils.device_type
         num_steps = 0
 
+        # Separate validation token counter (does not touch training counter).
+        self.metrics_processor.validation_ntokens = 0
+        self.metrics_processor.validation_time = time.perf_counter()
+
         for input_dict, labels in self.validation_dataloader:
             # pyrefly: ignore [missing-attribute, unsupported-operation]
             if self.config.steps != -1 and num_steps >= self.config.steps:
                 break
 
-            self.metrics_processor.ntokens_since_last_log += labels.numel()
+            self.metrics_processor.validation_ntokens += labels.numel()
             for k, v in input_dict.items():
                 input_dict[k] = v.to(device_type)
             labels = labels.to(device_type)
