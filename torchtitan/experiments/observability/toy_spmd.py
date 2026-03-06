@@ -307,10 +307,14 @@ class ToyTrainer:
             if self.rank == 0:
                 log_reduced_metrics(scalars)
 
+        # Flush: drain JSONL -> aggregate -> TB/WandB + console.
+        if self.metrics_processor.should_log(self.step):
+            self.metrics_processor.log(self.step)
+
         return loss, grad_norm
 
     def train(self, num_steps):
-        """Full training loop. Mirrors Trainer.train structure."""
+        """Full training loop. Used in SPMD mode (not in RL actor mode)."""
         data_iterator = self.batch_generator(self.dataloader)
 
         for step in range(1, num_steps + 1):
@@ -322,10 +326,6 @@ class ToyTrainer:
 
             # System metrics: point-in-time scalars to system JSONL.
             record_event({"train.loss": loss.item(), "train.grad_norm": grad_norm.item()})
-
-            # Flush: drain JSONL -> aggregate -> TB/WandB + console.
-            if self.metrics_processor.should_log(step):
-                self.metrics_processor.log(step)
 
     def close(self):
         self.metrics_processor.close()

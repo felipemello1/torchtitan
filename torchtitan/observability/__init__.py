@@ -31,6 +31,7 @@ from torchtitan.observability.metrics import (
 )
 from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.observability.profiling import Profiler, profile_annotation
+from torchtitan.observability.rollout_logger import filter_top_bottom, RolloutLogger
 from torchtitan.observability.structured_logging import (
     EventType,
     init_observability,
@@ -82,4 +83,6 @@ __all__ = [
     "aggregate",
     "Profiler",
     "profile_annotation",
+    "RolloutLogger",
+    "filter_top_bottom",
 ]
