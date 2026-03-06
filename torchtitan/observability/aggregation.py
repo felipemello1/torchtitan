@@ -21,12 +21,17 @@ from typing import IO
 
 from torchtitan.observability.metrics import REDUCE_REGISTRY
 
+# How often the poll thread re-globs for new files (in number of poll ticks).
+# At 50ms poll interval, 100 ticks = ~5 seconds.
+_REGLOB_EVERY_N_POLLS = 100
+
 
 class FileWatcher:
     """Background thread tails JSONL files, buffers entries by step.
 
-    The poll thread reads continuously during training. drain(step) does a final
-    catch-up read under the lock to get entries written just before barrier.
+    The poll thread reads known file handles every tick (cheap).
+    New files are discovered via glob periodically (~5s) and on drain().
+    drain(step) does a catch-up read to get entries written just before barrier.
     """
 
     def __init__(self, log_dir: str, poll_interval: float = 0.05):
@@ -38,7 +43,7 @@ class FileWatcher:
         self._lock = Lock()
         self._running = True
 
-        # Skip historical data.
+        # Skip historical data by recording end-of-file offsets for existing files.
         for fp in glob.glob(os.path.join(log_dir, "*.jsonl")):
             self._offsets[fp] = os.path.getsize(fp)
 
@@ -46,13 +51,18 @@ class FileWatcher:
         self._thread.start()
 
     def _poll(self):
+        polls_since_glob = 0
         while self._running:
             with self._lock:
-                self._read_new()
+                if polls_since_glob >= _REGLOB_EVERY_N_POLLS:
+                    self._discover_new_files()
+                    polls_since_glob = 0
+                self._read_known_handles()
+                polls_since_glob += 1
             time.sleep(self._poll_interval)
 
-    def _read_new(self):
-        """Tail all JSONL files. Must be called under self._lock."""
+    def _discover_new_files(self):
+        """Glob for new JSONL files and open them. Must be called under self._lock."""
         for fp in glob.glob(os.path.join(self._log_dir, "*.jsonl")):
             if fp not in self._handles:
                 try:
@@ -61,7 +71,14 @@ class FileWatcher:
                     self._handles[fp] = f
                 except FileNotFoundError:
                     continue
-            f = self._handles[fp]
+                # If this is a brand-new file we haven't seen before, skip to end
+                # (historical data). If we have an offset, seek was already done.
+                if fp not in self._offsets:
+                    self._offsets[fp] = f.tell()
+
+    def _read_known_handles(self):
+        """Read new lines from all open file handles. Must be called under self._lock."""
+        for fp, f in self._handles.items():
             for line in f:
                 line = line.strip()
                 if not line:
@@ -76,9 +93,10 @@ class FileWatcher:
             self._offsets[fp] = f.tell()
 
     def drain(self, step: int) -> list[dict]:
-        """Return entries for step. Catch-up read + purge stale."""
+        """Return entries for step. Discovers new files, catch-up reads, purges stale."""
         with self._lock:
-            self._read_new()
+            self._discover_new_files()
+            self._read_known_handles()
             entries = self._buffer.pop(step, [])
             for s in [s for s in self._buffer if s < step]:
                 del self._buffer[s]
