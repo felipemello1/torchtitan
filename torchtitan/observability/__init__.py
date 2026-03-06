@@ -30,6 +30,7 @@ from torchtitan.observability.metrics import (
     SumMetric,
 )
 from torchtitan.observability.metrics_processor import MetricsProcessor
+from torchtitan.observability.profiling import Profiler, profile_annotation
 from torchtitan.observability.structured_logging import (
     EventType,
     init_observability,
@@ -79,4 +80,6 @@ __all__ = [
     "SumMetric",
     "FileWatcher",
     "aggregate",
+    "Profiler",
+    "profile_annotation",
 ]

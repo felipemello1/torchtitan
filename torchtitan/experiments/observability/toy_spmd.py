@@ -61,6 +61,7 @@ from torchtitan.observability import (
     MeanMetric,
     MeanTMetric,
     MetricsProcessor,
+    profile_annotation,
     record_event,
     record_metric,
     record_span,
@@ -285,8 +286,9 @@ class ToyTrainer:
                     )
                     loss = loss_sum / valid_tokens
                     self.optimizer.zero_grad()
-                    loss.backward()
-                with record_span("Optimizer", EventType.OPTIM):
+                    with profile_annotation("backward"):
+                        loss.backward()
+                with record_span("Optimizer", EventType.OPTIM), profile_annotation("optimizer"):
                     grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.optimizer.step()
 
