@@ -7,12 +7,10 @@
 """
 TorchTitan Observability Library
 
-System metrics (phase timing, step context):
-    init_observability, set_step, add_step_tag, clear_step_tags,
-    record_span, record_event, EventType
-
-MetricsProcessor:
-    Built progressively across PRs. PR1: skeleton with set_step.
+System metrics: init_observability, set_step, record_span, record_event, EventType
+Tensor metrics: record_tensor_metric, TensorMetricContext, child_context, replicate_to_host
+Schedules: EveryNSteps
+MetricsProcessor: step context, metric schedules, logging pipeline
 """
 
 from torchtitan.observability.common import (
@@ -20,12 +18,27 @@ from torchtitan.observability.common import (
     clear_step_tags,
     set_step,
 )
+from torchtitan.observability.logging_boundary import EveryNSteps
 from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.observability.structured_logging import (
     EventType,
     init_observability,
     record_event,
     record_span,
+)
+from torchtitan.observability.tensor_metric_context import (
+    child_context,
+    current_tensor_metric_context,
+    record_tensor_metric,
+    TensorMetricContext,
+)
+from torchtitan.observability.tensor_metrics import (
+    MaxTMetric,
+    MeanTMetric,
+    MinTMetric,
+    replicate_to_host,
+    SumTMetric,
+    TMetricValue,
 )
 
 __all__ = [
@@ -37,4 +50,15 @@ __all__ = [
     "record_event",
     "EventType",
     "MetricsProcessor",
+    "record_tensor_metric",
+    "TensorMetricContext",
+    "current_tensor_metric_context",
+    "child_context",
+    "replicate_to_host",
+    "TMetricValue",
+    "MeanTMetric",
+    "SumTMetric",
+    "MaxTMetric",
+    "MinTMetric",
+    "EveryNSteps",
 ]

@@ -5,11 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Toy SPMD Training Example — System Metrics
+Toy SPMD Training Example — System + Tensor Metrics
 
-Minimal SPMD training loop with TP + compile + FSDP2 and structured logging.
-MetricsProcessor manages step context; record_span times phases to system JSONL.
-Small enough to run on 4 GPUs in seconds.
+Minimal SPMD training loop with TP + compile + FSDP2, structured logging,
+and compile-safe tensor metrics. MetricsProcessor manages step context and
+tensor reduction schedule. Small enough to run on 4 GPUs in seconds.
 
 ToyTrainer follows key TorchTitan patterns:
 - Per-layer torch.compile
@@ -50,13 +50,25 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torchtitan.distributed.utils import clip_grad_norm_
+import logging
+
 from torchtitan.observability import (
+    child_context,
     EventType,
     init_observability,
+    MeanTMetric,
     MetricsProcessor,
     record_event,
     record_span,
+    record_tensor_metric,
+    replicate_to_host,
+    TensorMetricContext,
 )
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    logger.addHandler(logging.StreamHandler())
 
 # ---- Config ----
 NUM_STEPS = 20
@@ -110,8 +122,12 @@ class MLPBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
         parts = []
-        for head in self.heads.values():
-            parts.append(F.silu(head(h)))
+        for name, head in self.heads.items():
+            with child_context(name):
+                out = F.silu(head(h))
+                record_tensor_metric("abs_mean", MeanTMetric(sum=out.abs().mean(), weight=1))
+                parts.append(out)
+            record_tensor_metric("abs_mean", MeanTMetric(sum=out.abs().mean(), weight=1))
         return x + self.out_proj(sum(parts))
 
 
@@ -135,8 +151,9 @@ class TinyModel(nn.Module):
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         h = self.tok_embeddings(tokens)
-        for layer in self.layers.values():
-            h = layer(h)
+        for name, layer in self.layers.items():
+            with child_context(name):
+                h = layer(h)
         h = self.norm(h)
         return self.output(h)
 
@@ -165,7 +182,9 @@ class ToyTrainer:
         # Initialize observability (JSONL file handlers) before MetricsProcessor.
         init_observability(source="trainer", output_dir=output_dir, rank=self.rank)
         self.metrics_processor = MetricsProcessor(
-            MetricsProcessor.Config(), dump_folder=output_dir, rank=self.rank
+            MetricsProcessor.Config(log_tensor_metrics_freq=5),
+            dump_folder=output_dir,
+            rank=self.rank,
         )
 
         model = TinyModel().to(device)
@@ -250,16 +269,28 @@ class ToyTrainer:
 
     def train_step(self, tokens, labels, loss_mask):
         """One training step. Returns (loss, grad_norm)."""
-        with loss_parallel():
-            with record_span("Forward/Backward", EventType.FWD_BWD):
-                logits = self.model(tokens)
-                loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
-                loss = loss_sum / valid_tokens
-                self.optimizer.zero_grad()
-                loss.backward()
-            with record_span("Optimizer", EventType.OPTIM):
-                grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
+        with TensorMetricContext() as ctx:
+            with loss_parallel():
+                with record_span("Forward/Backward", EventType.FWD_BWD):
+                    logits = self.model(tokens)
+                    loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
+                    record_tensor_metric(
+                        "trainer/loss_mean", MeanTMetric(sum=loss_sum.detach(), weight=valid_tokens)
+                    )
+                    loss = loss_sum / valid_tokens
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                with record_span("Optimizer", EventType.OPTIM):
+                    grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+
+        # Tensor reduction (gated — expensive all-reduce)
+        if self.metrics_processor.should_log_tensors(self.step):
+            scalars = replicate_to_host(ctx.summaries())
+            if self.rank == 0:
+                loss_val = scalars.get("trainer/loss_mean", "--")
+                logger.info(f"step: {self.step}  loss: {loss_val:.5f}")
+
         return loss, grad_norm
 
     def train(self, num_steps):
