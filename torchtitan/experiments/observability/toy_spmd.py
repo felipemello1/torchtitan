@@ -5,10 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Toy SPMD Training Example — Logging Boundary + Loggers
+Toy SPMD Training Example — Full Pipeline
 
-Minimal SPMD training loop with TP + compile + FSDP2, structured logging,
-compile-safe tensor metrics, and logging backends (TB/WandB via MetricsProcessor).
+Minimal SPMD training loop with TP + compile + FSDP2 and the full observability
+pipeline: record_metric -> JSONL -> FileWatcher -> aggregate -> TB/WandB + console.
 Small enough to run on 4 GPUs in seconds.
 
 ToyTrainer follows key TorchTitan patterns:
@@ -56,9 +56,13 @@ from torchtitan.observability import (
     child_context,
     EventType,
     init_observability,
+    log_reduced_metrics,
+    MaxMetric,
+    MeanMetric,
     MeanTMetric,
     MetricsProcessor,
     record_event,
+    record_metric,
     record_span,
     record_tensor_metric,
     replicate_to_host,
@@ -249,7 +253,9 @@ class ToyTrainer:
         """Wraps a dataloader into an iterator. Mirrors Trainer.batch_generator."""
         data_iterator = iter(data_iterable)
         while True:
-            yield next(data_iterator)
+            tokens, labels, loss_mask = next(data_iterator)
+            self.metrics_processor.ntokens_since_last_log += labels.numel()
+            yield tokens, labels, loss_mask
 
     def compute_loss(self, logits, labels, loss_mask):
         """Compute loss using loss_parallel + ignore_index (matches TorchTitan).
@@ -284,11 +290,20 @@ class ToyTrainer:
                     grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.optimizer.step()
 
-        # Tensor reduction + log (both gated)
+        # CPU metrics (every step -> experiment JSONL).
+        record_metric("trainer/grad_norm_max", MaxMetric(value=grad_norm.item()))
+        record_metric("trainer/learning_rate_mean", MeanMetric(sum=LR))
+
+        # Derived metrics (every step).
+        self.metrics_processor.record_throughput()
+        self.metrics_processor.record_memory()
+
+        # Tensor reduction (gated — expensive all-reduce).
         if self.metrics_processor.should_log_tensors(self.step):
             scalars = replicate_to_host(ctx.summaries())
-            if self.metrics_processor.should_log(self.step):
-                self.metrics_processor.log(self.step, scalars)
+            # Rank 0 writes reduced tensors to JSONL for aggregation.
+            if self.rank == 0:
+                log_reduced_metrics(scalars)
 
         return loss, grad_norm
 
@@ -296,24 +311,19 @@ class ToyTrainer:
         """Full training loop. Mirrors Trainer.train structure."""
         data_iterator = self.batch_generator(self.dataloader)
 
-        if self.rank == 0:
-            print(f"{'Step':>4}  {'Loss':>10}  {'GradNorm':>10}  {'Time(ms)':>10}")
-            print("-" * 50)
-
         for step in range(1, num_steps + 1):
             self.step = step
             self.metrics_processor.set_step(step)
 
-            t0 = time.perf_counter()
             tokens, labels, loss_mask = next(data_iterator)
             loss, grad_norm = self.train_step(tokens, labels, loss_mask)
-            dt_ms = (time.perf_counter() - t0) * 1000
 
-            # System metrics: point-in-time scalars logged to system JSONL
+            # System metrics: point-in-time scalars to system JSONL.
             record_event({"train.loss": loss.item(), "train.grad_norm": grad_norm.item()})
 
-            if self.rank == 0:
-                print(f"{step:>4}  {loss.item():>10.4f}  {grad_norm.item():>10.4f}  {dt_ms:>10.1f}")
+            # Flush: drain JSONL -> aggregate -> TB/WandB + console.
+            if self.metrics_processor.should_log(step):
+                self.metrics_processor.log(step)
 
     def close(self):
         self.metrics_processor.close()

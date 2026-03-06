@@ -37,6 +37,12 @@ from torchtitan.observability.common import (
     EXPERIMENT_LOGGER_NAME,
     SYSTEM_LOGGER_NAME,
 )
+from torchtitan.observability.metrics import (
+    ExperimentJSONFormatter,
+    ExperimentLoggingHandler,
+    MeanMetric,
+    record_metric,
+)
 
 MAX_MESSAGE_SIZE: int = 1000
 
@@ -409,9 +415,8 @@ def init_observability(
 ) -> None:
     """Initialize structured logging. Called once per rank during process setup.
 
-    Creates per-rank JSONL file handlers for system metrics (phase timing,
-    step events). Experiment metric handlers (for record_metric) are added
-    when metrics.py extends this function.
+    Creates per-rank JSONL file handlers for both system metrics (phase timing,
+    step events) and experiment metrics (record_metric entries).
 
     Rank and source are baked into the formatter as constants — they never
     change for the lifetime of the process. Step is set per-step via set_step().
@@ -422,32 +427,42 @@ def init_observability(
 
     Args:
         source: Component name (e.g., "trainer", "generator").
-        output_dir: Root output directory. System logs go to
-            {output_dir}/system_logs/{source}_rank_{rank}_system.jsonl
+        output_dir: Root output directory.
         rank: Global rank. If None, reads from RANK env var (default 0).
     """
     if rank is None:
         rank = int(os.environ.get("RANK", 0))
 
-    if any(isinstance(h, StructuredLoggingHandler) for h in _system_logger.handlers):
-        return
+    # --- System handler ---
+    sys_logger = logging.getLogger(SYSTEM_LOGGER_NAME)
+    if not any(isinstance(h, StructuredLoggingHandler) for h in sys_logger.handlers):
+        sys_path = os.path.join(
+            output_dir, "system_logs", f"{source}_rank_{rank}_system.jsonl"
+        )
+        handler = StructuredLoggingHandler(filepath=sys_path)
+        handler.setFormatter(StructuredJSONFormatter(rank=rank, source=source))
+        sys_logger.addHandler(handler)
+        sys_logger.addHandler(InflightEventTrackingHandler())
+        # propagate=False prevents events from bubbling to the root logger
+        # (which would duplicate them in stderr). Level ensures INFO records
+        # are captured even if the root logger has a higher threshold.
+        sys_logger.propagate = False
+        if sys_logger.level == logging.NOTSET or sys_logger.level > logging.INFO:
+            sys_logger.setLevel(logging.INFO)
 
-    sys_path = os.path.join(
-        output_dir, "system_logs", f"{source}_rank_{rank}_system.jsonl"
-    )
-    handler = StructuredLoggingHandler(filepath=sys_path)
-    handler.setFormatter(StructuredJSONFormatter(rank=rank, source=source))
-    _system_logger.addHandler(handler)
-
-    # Also add inflight tracking for crash forensics
-    _system_logger.addHandler(InflightEventTrackingHandler())
-
-    # propagate=False prevents events from bubbling to the root logger
-    # (which would duplicate them in stderr). Level ensures INFO records
-    # are captured even if the root logger has a higher threshold.
-    _system_logger.propagate = False
-    if _system_logger.level == logging.NOTSET or _system_logger.level > logging.INFO:
-        _system_logger.setLevel(logging.INFO)
+    # --- Experiment handler ---
+    exp_logger = logging.getLogger(EXPERIMENT_LOGGER_NAME)
+    if not any(isinstance(h, ExperimentLoggingHandler) for h in exp_logger.handlers):
+        exp_path = os.path.join(
+            output_dir, "experiment_logs",
+            f"{source}_rank_{rank}_experiment.jsonl",
+        )
+        handler = ExperimentLoggingHandler(filepath=exp_path)
+        handler.setFormatter(ExperimentJSONFormatter(rank=rank, source=source))
+        exp_logger.addHandler(handler)
+    exp_logger.propagate = False
+    if exp_logger.level == logging.NOTSET or exp_logger.level > logging.INFO:
+        exp_logger.setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------------------
@@ -474,17 +489,30 @@ class record_span(ContextDecorator):
     """Context manager/decorator for timing phases.
 
     Logs START event on enter, END event (with duration) on exit.
+    When ``log_to_metrics=True`` (default), also records the duration as an
+    experiment metric via ``record_metric``, eliminating the need for manual
+    ``time.perf_counter()`` timing.
+
     Step is read from ContextVar.
+
+    Args:
+        description: Human-readable label (e.g., "Forward/Backward").
+        event_type: Base EventType (e.g., EventType.FWD_BWD). Must have
+            corresponding _START and _END variants.
+        log_to_metrics: If True, record ``time/{description}/duration_s`` as
+            a MeanMetric to experiment JSONL. Default True.
 
     Usage:
         with record_span("Forward/Backward", EventType.FWD_BWD):
             output = model(batch)
             loss.backward()
+        # duration auto-recorded to both system JSONL and experiment JSONL
     """
 
-    def __init__(self, description: str, event_type: EventType):
+    def __init__(self, description: str, event_type: EventType, *, log_to_metrics: bool = True):
         self.description = description
         self.event_type = event_type
+        self.log_to_metrics = log_to_metrics
         self.start_time: float | None = None
 
         # Derive START/END event types. Validate that the base event type
@@ -518,10 +546,13 @@ class record_span(ContextDecorator):
     def __exit__(self, exc_type, exc_val, exc_tb):
         end_time = timer()
         step = _STEP.get()
-        delta_ms = (end_time - self.start_time) * 1000
+        duration_s = end_time - self.start_time
+        delta_ms = duration_s * 1000
         _system_logger.info(
             f"[step {step if step is not None else 'N/A'}] {self.description} {self.end_event_type} took {delta_ms:.2f} ms",
             extra=event_extra(self.end_event_type, value=delta_ms, step=step),
             stacklevel=2,
         )
+        if self.log_to_metrics and step is not None:
+            record_metric(f"time/{self.description}/duration_s", MeanMetric(sum=duration_s))
         return False  # Don't suppress exceptions

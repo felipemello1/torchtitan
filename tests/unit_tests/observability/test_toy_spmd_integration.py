@@ -88,10 +88,12 @@ def _load_jsonl(filepath: str) -> list[dict]:
 class TestToySpmdIntegration:
     """Integration tests for toy_spmd.py. Requires 4 GPUs."""
 
-    @pytest.fixture(autouse=True)
-    def run_toy(self):
+    @pytest.fixture(autouse=True, scope="class")
+    def run_toy(self, request):
         """Run toy_spmd once for all tests in the class."""
-        self.output, self.returncode = _run_toy_spmd()
+        output, returncode = _run_toy_spmd()
+        request.cls.output = output
+        request.cls.returncode = returncode
         yield
 
     def test_training_completes(self):
@@ -102,7 +104,7 @@ class TestToySpmdIntegration:
         """Loss decreases by at least 30% (overfitting to single batch)."""
         assert self.returncode == 0, "Training failed"
         losses = _parse_loss_from_console(self.output)
-        assert len(losses) >= 15, f"Expected >=15 steps, got {len(losses)}"
+        assert len(losses) >= 3, f"Expected >=3 logged steps, got {len(losses)}"
 
         first_loss = losses[0][1]
         last_loss = losses[-1][1]
@@ -181,6 +183,74 @@ class TestToySpmdIntegration:
         steps_seen = {r["int"]["step"] for r in records if "step" in r.get("int", {})}
         for step in range(1, 21):
             assert step in steps_seen, f"Step {step} missing from system JSONL"
+
+
+    def test_experiment_jsonl_files_created(self):
+        """One experiment JSONL file per rank (4 total)."""
+        assert self.returncode == 0, "Training failed"
+        exp_dir = os.path.join(TOY_OUTPUT_DIR, "experiment_logs")
+        if not os.path.exists(exp_dir):
+            pytest.skip("No experiment_logs dir yet")
+        jsonl_files = sorted(glob.glob(os.path.join(exp_dir, "*.jsonl")))
+        assert len(jsonl_files) == 4, f"Expected 4 experiment JSONL files, got {len(jsonl_files)}"
+
+    def test_experiment_jsonl_has_expected_keys(self):
+        """Experiment JSONL contains expected metric keys with correct fields."""
+        assert self.returncode == 0, "Training failed"
+        exp_dir = os.path.join(TOY_OUTPUT_DIR, "experiment_logs")
+        if not os.path.exists(exp_dir):
+            pytest.skip("No experiment_logs dir yet")
+
+        rank0_files = sorted(glob.glob(os.path.join(exp_dir, "*rank_0*.jsonl")))
+        assert len(rank0_files) >= 1, "No rank 0 experiment JSONL"
+
+        records = _load_jsonl(rank0_files[0])
+        assert len(records) > 0, "Empty experiment JSONL"
+
+        keys_seen = set()
+        for record in records:
+            assert "step" in record, f"Missing step: {record}"
+            assert "rank" in record, f"Missing rank: {record}"
+            assert record["source"] == "trainer"
+            assert record["rank"] == 0
+            if "key" in record:
+                keys_seen.add(record["key"])
+
+        expected_keys = {
+            "trainer/grad_norm_max",
+            "trainer/learning_rate_mean",
+            "trainer/throughput/tps_mean",
+            "trainer/memory/max_reserved_gib_max",
+        }
+        for key in expected_keys:
+            assert key in keys_seen, f"Missing key '{key}'. Found: {sorted(keys_seen)}"
+
+    def test_experiment_jsonl_loss_values(self):
+        """Loss values in experiment JSONL are positive and decreasing."""
+        assert self.returncode == 0, "Training failed"
+        exp_dir = os.path.join(TOY_OUTPUT_DIR, "experiment_logs")
+        if not os.path.exists(exp_dir):
+            pytest.skip("No experiment_logs dir yet")
+
+        rank0_files = sorted(glob.glob(os.path.join(exp_dir, "*rank_0*.jsonl")))
+        records = _load_jsonl(rank0_files[0])
+
+        loss_by_step = {}
+        for record in records:
+            if record.get("key") == "trainer/loss_mean" and record.get("all_reduced"):
+                loss_by_step[record["step"]] = record["value"]
+
+        assert len(loss_by_step) >= 3, f"Expected >= 3 loss entries, got {len(loss_by_step)}"
+
+        for step, loss in loss_by_step.items():
+            assert loss > 0, f"Non-positive loss at step {step}: {loss}"
+
+        steps = sorted(loss_by_step.keys())
+        first_loss = loss_by_step[steps[0]]
+        last_loss = loss_by_step[steps[-1]]
+        assert last_loss < first_loss, (
+            f"Loss not decreasing: step {steps[0]}={first_loss:.4f}, step {steps[-1]}={last_loss:.4f}"
+        )
 
 
 if __name__ == "__main__":

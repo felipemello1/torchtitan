@@ -9,16 +9,26 @@ TorchTitan Observability Library
 
 System metrics: init_observability, set_step, record_span, record_event, EventType
 Tensor metrics: record_tensor_metric, TensorMetricContext, child_context, replicate_to_host
-Schedules: EveryNSteps
-MetricsProcessor: step context, metric schedules, logging pipeline
+CPU metrics: record_metric, log_reduced_metrics, MeanMetric, MaxMetric, MinMetric, SumMetric
+Aggregation: FileWatcher, aggregate
+MetricsProcessor: step context, metric schedules, derived metrics, flush pipeline
 """
 
+from torchtitan.observability.aggregation import aggregate, FileWatcher
 from torchtitan.observability.common import (
     add_step_tag,
     clear_step_tags,
     set_step,
 )
 from torchtitan.observability.logging_boundary import EveryNSteps
+from torchtitan.observability.metrics import (
+    log_reduced_metrics,
+    MaxMetric,
+    MeanMetric,
+    MinMetric,
+    record_metric,
+    SumMetric,
+)
 from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.observability.structured_logging import (
     EventType,
@@ -61,4 +71,12 @@ __all__ = [
     "MaxTMetric",
     "MinTMetric",
     "EveryNSteps",
+    "record_metric",
+    "log_reduced_metrics",
+    "MeanMetric",
+    "MaxMetric",
+    "MinMetric",
+    "SumMetric",
+    "FileWatcher",
+    "aggregate",
 ]

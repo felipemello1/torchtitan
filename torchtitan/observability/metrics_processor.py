@@ -7,25 +7,37 @@
 """
 MetricsProcessor — observability pipeline for training metrics.
 
-Manages step context, metric schedules, and logging backends (TB/WandB).
+Manages step context, metric schedules, derived metrics (throughput, memory),
+and flushing aggregated metrics to TB/WandB + console.
+
 Caller must call init_observability() before constructing MetricsProcessor.
 """
 
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+import torch.distributed as dist
+
 from torchtitan.components.metrics import (
     BaseLogger,
+    build_device_memory_monitor,
     LoggerContainer,
     TensorBoardLogger,
     WandBLogger,
 )
+from torchtitan.observability.aggregation import aggregate, FileWatcher
 from torchtitan.observability.common import clear_step_tags, set_step
 from torchtitan.observability.logging_boundary import EveryNSteps
+from torchtitan.observability.metrics import (
+    MaxMetric,
+    MeanMetric,
+    record_metric,
+)
 from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import Color, NoColor
+from torchtitan.tools.utils import Color, get_peak_flops, NoColor
 
 
 class MetricsProcessor:
@@ -34,7 +46,8 @@ class MetricsProcessor:
     Provides:
     - Step context management (set_step)
     - Schedule queries (should_log, should_log_tensors)
-    - Logging: write scalars to TB/WandB + console (log)
+    - Derived metrics (record_throughput, record_memory)
+    - Flush: drain JSONL -> aggregate -> TB/WandB + console (log)
     """
 
     @dataclass
@@ -87,7 +100,7 @@ class MetricsProcessor:
         self._config = config
         self._rank = rank
 
-        # Logging backends (TB/WandB) — reuses Titan's existing logger classes.
+        # Logging backends (TB/WandB).
         self._logger = self._build_metric_logger(
             config=config,
             dump_folder=dump_folder,
@@ -96,14 +109,27 @@ class MetricsProcessor:
             tag=tag,
         )
 
-        # Schedules
+        # Background thread tails experiment JSONL files.
+        exp_log_dir = os.path.join(dump_folder, "experiment_logs")
+        self._watcher = FileWatcher(log_dir=exp_log_dir)
+
+        # Schedules.
         self._tensor_metrics_schedule = EveryNSteps(
             every_n=config.log_tensor_metrics_freq, additional_steps={1}
         )
         self._log_schedule = EveryNSteps(every_n=config.log_freq, additional_steps={1})
 
-        # Console color
+        # Training state.
+        self.device_memory_monitor = build_device_memory_monitor()
         self.color = NoColor() if config.disable_color_printing else Color()
+        self._gpu_peak_flops = get_peak_flops(self.device_memory_monitor.device_name)
+        self._time_last_log = time.perf_counter()
+        self.ntokens_since_last_log = 0
+        self.num_flops_per_token = -1
+
+    # ----------------------------------------------------------------
+    # Step management
+    # ----------------------------------------------------------------
 
     def set_step(self, step: int) -> None:
         """Set current step. Call before train_step()."""
@@ -111,34 +137,89 @@ class MetricsProcessor:
         set_step(step)
         clear_step_tags()
 
+    # ----------------------------------------------------------------
+    # Schedule queries
+    # ----------------------------------------------------------------
+
     def should_log(self, step: int) -> bool:
         """Returns True on log steps. Caller uses this to gate log()."""
         return self._log_schedule(step)
 
     def should_log_tensors(self, step: int) -> bool:
-        """Returns True on tensor reduction steps. Caller uses this to gate replicate_to_host."""
+        """Returns True on tensor reduction steps."""
         return self._tensor_metrics_schedule(step)
 
-    def log(self, step: int, scalars: dict[str, float]) -> None:
-        """Write pre-reduced scalars to TB/WandB + console.
+    # ----------------------------------------------------------------
+    # Derived metrics (called every step, outside should_log gate)
+    # ----------------------------------------------------------------
 
-        Scalars are already final values from replicate_to_host.
-        """
+    def record_throughput(self) -> None:
+        """Compute and record throughput from accumulated tokens since last log reset."""
+        time_delta = time.perf_counter() - self._time_last_log
+        non_dp = 1  # No pipeline or expert parallelism in the toy.
+        tps = self.ntokens_since_last_log / (time_delta * non_dp) if time_delta > 0 else 0
+        tflops = self.num_flops_per_token * tps / 1e12 if self.num_flops_per_token > 0 else 0
+        mfu = (
+            100 * self.num_flops_per_token * tps / self._gpu_peak_flops
+            if self._gpu_peak_flops > 0 and self.num_flops_per_token > 0
+            else 0
+        )
+        record_metric("trainer/throughput/tps_mean", MeanMetric(sum=tps))
+        record_metric("trainer/throughput/tflops_mean", MeanMetric(sum=tflops))
+        record_metric("trainer/throughput/mfu_pct_mean", MeanMetric(sum=mfu))
+
+    def record_memory(self) -> None:
+        """Record device memory peak stats since last log reset."""
+        mem = self.device_memory_monitor.get_peak_stats()
+        record_metric("trainer/memory/max_reserved_gib_max", MaxMetric(value=mem.max_reserved_gib))
+        record_metric("trainer/memory/max_active_gib_max", MaxMetric(value=mem.max_active_gib))
+
+    # ----------------------------------------------------------------
+    # Flush (called by train() on log steps)
+    # ----------------------------------------------------------------
+
+    def log(self, step: int) -> None:
+        """Pure flush: barrier -> drain -> aggregate -> write -> console -> reset."""
+        dist.barrier()
         if self._rank == 0:
-            self._logger.log(scalars, step)
-            self._log_to_console(step, scalars)
+            entries = self._watcher.drain(step)
+            aggregated = aggregate(entries)
+            if aggregated:
+                self._logger.log(aggregated, step)
+                self._log_to_console(step, aggregated)
 
-    def _log_to_console(self, step: int, scalars: dict[str, float]) -> None:
+        # Reset training accumulators.
+        self.ntokens_since_last_log = 0
+        self._time_last_log = time.perf_counter()
+        self.device_memory_monitor.reset_peak_stats()
+
+    # ----------------------------------------------------------------
+    # Console output
+    # ----------------------------------------------------------------
+
+    def _log_to_console(self, step: int, aggregated: dict[str, float]) -> None:
         c = self.color
-        loss = scalars.get("trainer/loss_mean", "--")
+        loss = aggregated.get("trainer/loss_mean", "--")
+        grad_norm = aggregated.get("trainer/grad_norm_max", "--")
+        mem_gib = aggregated.get("trainer/memory/max_reserved_gib_max", "--")
+        tps = aggregated.get("trainer/throughput/tps_mean", "--")
+        mfu = aggregated.get("trainer/throughput/mfu_pct_mean", "--")
 
         def fmt(val, spec):
             return f"{val:{spec}}" if isinstance(val, (int, float)) else f"{val:>8}"
 
         logger.info(
             f"{c.red}step: {step:2}  "
-            f"{c.green}loss: {fmt(loss, '8.5f')}{c.reset}"
+            f"{c.green}loss: {fmt(loss, '8.5f')}  "
+            f"{c.orange}grad_norm: {fmt(grad_norm, '7.4f')}  "
+            f"{c.turquoise}memory: {fmt(mem_gib, '5.2f')}GiB  "
+            f"{c.blue}tps: {fmt(tps, ',')}  "
+            f"{c.magenta}mfu: {fmt(mfu, '.2f')}%{c.reset}"
         )
+
+    # ----------------------------------------------------------------
+    # Logger setup
+    # ----------------------------------------------------------------
 
     def _build_metric_logger(
         self,
@@ -176,5 +257,10 @@ class MetricsProcessor:
 
         return logger_container
 
+    # ----------------------------------------------------------------
+    # Lifecycle
+    # ----------------------------------------------------------------
+
     def close(self) -> None:
+        self._watcher.close()
         self._logger.close()
