@@ -7,8 +7,8 @@
 """
 Toy SPMD Training Example — Observability Baseline
 
-Minimal SPMD training loop. Establishes the model and trainer patterns
-that later PRs will instrument with observability.
+Minimal SPMD training loop with TP + compile + FSDP2. Serves as a testbed
+for the observability library — small enough to run on 4 GPUs in seconds.
 
 ToyTrainer follows key TorchTitan patterns:
 - Per-layer torch.compile
@@ -213,10 +213,7 @@ class ToyTrainer:
         fully_shard(model, mesh=dp_mesh)
 
     def batch_generator(self, data_iterable):
-        """Wraps a dataloader into an iterator. Mirrors Trainer.batch_generator.
-
-        In later PRs, this will accumulate ntokens and record data loading times.
-        """
+        """Wraps a dataloader into an iterator. Mirrors Trainer.batch_generator."""
         data_iterator = iter(data_iterable)
         while True:
             yield next(data_iterator)
@@ -224,9 +221,7 @@ class ToyTrainer:
     def compute_loss(self, logits, labels, loss_mask):
         """Compute loss using loss_parallel + ignore_index (matches TorchTitan).
 
-        Returns (loss_sum, valid_tokens) — NOT loss_sum/valid_tokens.
-        The division happens after, for backward. For metrics, MeanTMetric
-        handles the division during reduction.
+        Returns (loss_sum, valid_tokens). The caller divides for backward.
         """
         masked_labels = labels.clone().flatten()
         masked_labels[loss_mask.flatten() == 0] = IGNORE_INDEX
@@ -240,11 +235,7 @@ class ToyTrainer:
         return loss_sum, valid_tokens
 
     def train_step(self, tokens, labels, loss_mask):
-        """One training step. Returns (loss, grad_norm).
-
-        loss_mask has different valid token counts per rank to exercise
-        weighted metric reduction across ranks.
-        """
+        """One training step. Returns (loss, grad_norm)."""
         with loss_parallel():
             logits = self.model(tokens)
             loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
