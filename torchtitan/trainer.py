@@ -23,6 +23,7 @@ from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhausted
 from torchtitan.components.loss import IGNORE_INDEX, LossFunction
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
+from torchtitan.observability import add_step_tag, EventType, record_span
 from torchtitan.observability.metrics import (
     log_reduced_metrics,
     MaxMetric,
@@ -542,22 +543,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         data_iterator = iter(data_iterable)
 
         while True:
-            data_load_start = time.perf_counter()
-            try:
-                batch = next(data_iterator)
-            except StopIteration as ex:
-                # If data runs out during gradient accumulation, that
-                # entire step will not be executed.
-                raise DataloaderExhaustedError() from ex
+            with record_span("trainer/data_loading", EventType.FETCHING_BATCH):
+                try:
+                    batch = next(data_iterator)
+                except StopIteration as ex:
+                    raise DataloaderExhaustedError() from ex
             input_dict, labels = batch
             ntokens_batch = labels.numel()
             self.ntokens_seen += ntokens_batch
             self.metrics_processor.ntokens_since_last_log += ntokens_batch
-            self.metrics_processor.data_loading_times.append(
-                time.perf_counter() - data_load_start
-            )
 
-            # Tensors stay on CPU; moved to GPU per-microbatch during training
             yield input_dict, labels
 
     def post_dataloading_process(
@@ -726,22 +721,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # Forward/backward with tensor metric collection.
         with TensorMetricContext() as ctx:
-            accumulated_losses = []
-            for input_dict, labels in microbatches:
-                for k, v in input_dict.items():
-                    if isinstance(v, torch.Tensor):
-                        input_dict[k] = v.to(self.device)
-                labels = labels.to(self.device)
+            with record_span("trainer/forward_backward", EventType.FWD_BWD):
+                accumulated_losses = []
+                for input_dict, labels in microbatches:
+                    for k, v in input_dict.items():
+                        if isinstance(v, torch.Tensor):
+                            input_dict[k] = v.to(self.device)
+                    labels = labels.to(self.device)
 
-                loss = self.forward_backward_step(
-                    input_dict=input_dict,
-                    labels=labels,
-                    # pyrefly: ignore [bad-argument-type]
-                    global_valid_tokens=global_valid_tokens,
-                )
-                accumulated_losses.append(loss.detach())
+                    loss = self.forward_backward_step(
+                        input_dict=input_dict,
+                        labels=labels,
+                        # pyrefly: ignore [bad-argument-type]
+                        global_valid_tokens=global_valid_tokens,
+                    )
+                    accumulated_losses.append(loss.detach())
 
-        # Loss: explicit all-reduce (TensorMetricContext is for model-internal metrics).
+        # Loss: explicit all-reduce.
         loss = torch.sum(torch.stack(accumulated_losses))
         if parallel_dims.dp_cp_enabled:
             loss = loss.detach()
@@ -751,29 +747,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             global_avg_loss = loss.detach().item()
         record_metric("trainer/loss_mean", MeanMetric(sum=float(global_avg_loss)))
 
-        grad_norm = dist_utils.clip_grad_norm_(
-            [p for m in self.model_parts for p in m.parameters()],
-            self.config.training.max_norm,
-            foreach=True,
-            pp_mesh=parallel_dims.get_optional_mesh("pp"),
-            ep_enabled=parallel_dims.ep_enabled,
-        )
-        self.checkpointer.maybe_wait_for_staging()
-        self.optimizers.step()
-        self.lr_schedulers.step()
+        with record_span("trainer/optimizer", EventType.OPTIM):
+            grad_norm = dist_utils.clip_grad_norm_(
+                [p for m in self.model_parts for p in m.parameters()],
+                self.config.training.max_norm,
+                foreach=True,
+                pp_mesh=parallel_dims.get_optional_mesh("pp"),
+                ep_enabled=parallel_dims.ep_enabled,
+            )
+            self.checkpointer.maybe_wait_for_staging()
+            self.optimizers.step()
+            self.lr_schedulers.step()
 
         # ---- CPU metrics (every step -> JSONL) ----
         record_metric("trainer/grad_norm_max", MaxMetric(value=grad_norm.item()))
         record_metric("trainer/learning_rate_mean", MeanMetric(sum=lr))
         record_metric("trainer/n_tokens_seen_sum", SumMetric(value=float(self.ntokens_seen)))
-
-        # ---- Data loading stats ----
-        if self.metrics_processor.data_loading_times:
-            avg_dl = (
-                sum(self.metrics_processor.data_loading_times)
-                / len(self.metrics_processor.data_loading_times)
-            )
-            record_metric("trainer/time/data_loading_s_mean", MeanMetric(sum=avg_dl))
 
         # ---- Derived metrics (every step -> JSONL) ----
         self.metrics_processor.record_throughput()
@@ -809,16 +798,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 self.step += 1
                 self.metrics_processor.set_step(self.step)
 
-                self.gc_handler.run(self.step)
-                try:
-                    self.train_step(data_iterator)
-                except DataloaderExhaustedError:
-                    logger.warning("Ran out of data; last step was canceled.")
-                    break
+                if self.gc_handler.run(self.step):
+                    add_step_tag("gc")
 
-                self.checkpointer.save(
-                    self.step, last_step=(self.step == config.training.steps)
-                )
+                with record_span("trainer/step", EventType.STEP):
+                    try:
+                        self.train_step(data_iterator)
+                    except DataloaderExhaustedError:
+                        logger.warning("Ran out of data; last step was canceled.")
+                        break
+
+                with record_span("trainer/checkpoint", EventType.CHECKPOINT):
+                    self.checkpointer.save(
+                        self.step, last_step=(self.step == config.training.steps)
+                    )
 
                 # Validation
                 is_validation = (
@@ -826,7 +819,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     and self.validator.should_validate(self.step)
                 )
                 if is_validation:
-                    self.validator.validate(self.model_parts, self.step)
+                    add_step_tag("eval")
+                    with record_span("trainer/validation", EventType.EVAL):
+                        self.validator.validate(self.model_parts, self.step)
 
                 # Single flush: picks up training + validation metrics
                 if self.metrics_processor.should_log(self.step) or is_validation:

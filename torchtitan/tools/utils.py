@@ -56,15 +56,19 @@ class GarbageCollection:
             if torch.distributed.get_rank() == 0:
                 warn_tensor_cycles()
 
-    def run(self, step_count: int):
+    def run(self, step_count: int) -> bool:
+        """Run GC if needed. Returns True if collection was performed."""
         if self.debug:
             self.collect(
                 "Force GC to perform collection to obtain debug information",
                 generation=2,
             )
             gc.collect()
+            return True
         elif step_count > 1 and step_count % self.gc_freq == 0:
             self.collect("Performing periodic GC collection")
+            return True
+        return False
 
     @staticmethod
     def collect(reason: str, generation: int = 1):
