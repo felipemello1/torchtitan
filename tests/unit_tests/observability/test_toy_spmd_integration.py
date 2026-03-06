@@ -51,15 +51,22 @@ def _run_toy_spmd() -> tuple[str, int]:
 
 
 def _parse_loss_from_console(output: str) -> list[tuple[int, float]]:
-    """Parse (step, loss) pairs from the console table output."""
-    pattern = r"(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)"
+    """Parse (step, loss) pairs from console output.
+
+    Handles both plain table format and ANSI-colored MetricsProcessor format.
+    """
     results = []
     for line in output.split("\n"):
-        m = re.search(pattern, line)
+        # Plain table: "   1      3.6902      1.1520      3695.5"
+        m = re.search(r"^\s*(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*$", line)
         if m:
-            step = int(m.group(1))
-            loss = float(m.group(2))
-            results.append((step, loss))
+            results.append((int(m.group(1)), float(m.group(2))))
+            continue
+        # ANSI-colored: "step:  1  loss:  3.69016  ..."
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", line)
+        m = re.search(r"step:\s*(\d+)\s+loss:\s+([\d.]+)", clean)
+        if m:
+            results.append((int(m.group(1)), float(m.group(2))))
     return results
 
 

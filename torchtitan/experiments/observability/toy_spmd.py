@@ -5,11 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Toy SPMD Training Example — System + Tensor Metrics
+Toy SPMD Training Example — Logging Boundary + Loggers
 
 Minimal SPMD training loop with TP + compile + FSDP2, structured logging,
-and compile-safe tensor metrics. MetricsProcessor manages step context and
-tensor reduction schedule. Small enough to run on 4 GPUs in seconds.
+compile-safe tensor metrics, and logging backends (TB/WandB via MetricsProcessor).
+Small enough to run on 4 GPUs in seconds.
 
 ToyTrainer follows key TorchTitan patterns:
 - Per-layer torch.compile
@@ -182,7 +182,7 @@ class ToyTrainer:
         # Initialize observability (JSONL file handlers) before MetricsProcessor.
         init_observability(source="trainer", output_dir=output_dir, rank=self.rank)
         self.metrics_processor = MetricsProcessor(
-            MetricsProcessor.Config(log_tensor_metrics_freq=5),
+            MetricsProcessor.Config(log_freq=5, log_tensor_metrics_freq=5),
             dump_folder=output_dir,
             rank=self.rank,
         )
@@ -284,12 +284,11 @@ class ToyTrainer:
                     grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.optimizer.step()
 
-        # Tensor reduction (gated — expensive all-reduce)
+        # Tensor reduction + log (both gated)
         if self.metrics_processor.should_log_tensors(self.step):
             scalars = replicate_to_host(ctx.summaries())
-            if self.rank == 0:
-                loss_val = scalars.get("trainer/loss_mean", "--")
-                logger.info(f"step: {self.step}  loss: {loss_val:.5f}")
+            if self.metrics_processor.should_log(self.step):
+                self.metrics_processor.log(self.step, scalars)
 
         return loss, grad_norm
 
@@ -321,6 +320,9 @@ class ToyTrainer:
 
 
 def main():
+    from torchtitan.tools.logging import init_logger
+
+    init_logger()
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
