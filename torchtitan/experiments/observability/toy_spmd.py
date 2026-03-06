@@ -238,8 +238,6 @@ class ToyTrainer:
             with record_span("Forward/Backward", EventType.FWD_BWD):
                 logits = self.model(tokens)
                 loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
-                # TODO: to get the correct loss, dont we need to do * local_valid_tokens / global_valid_tokens?
-                # i think that we need to do an all_reduce here for valid tokens
                 loss = loss_sum / valid_tokens
                 self.optimizer.zero_grad()
                 loss.backward()
