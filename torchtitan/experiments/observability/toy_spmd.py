@@ -10,7 +10,7 @@ Toy SPMD Training Example — Observability Baseline
 Minimal SPMD training loop with:
 - TP
 - per layer compile
-- FSDP2. 
+- FSDP2.
 
 Serves as a testbed for the new observability features.
 
@@ -38,8 +38,8 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     loss_parallel,
-    RowwiseParallel,
     parallelize_module,
+    RowwiseParallel,
 )
 from torchtitan.distributed.utils import clip_grad_norm_
 
@@ -58,10 +58,11 @@ OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs", "toy_spmd")
 
 # ---- Data ----
 class RepeatDataset:
-    """Yields the same batch every step so we can overfit and se loss decrease.
-    """
+    """Yields the same batch every step so we can overfit and se loss decrease."""
 
-    def __init__(self, tokens: torch.Tensor, labels: torch.Tensor, loss_mask: torch.Tensor):
+    def __init__(
+        self, tokens: torch.Tensor, labels: torch.Tensor, loss_mask: torch.Tensor
+    ):
         self.tokens = tokens
         self.labels = labels
         self.loss_mask = loss_mask
@@ -157,21 +158,28 @@ class ToyTrainer:
         """Apply tensor parallelism. Embeddings and output use TP plans;
         remaining params are wrapped as Replicate DTensors."""
         parallelize_module(
-            model, tp_mesh,
+            model,
+            tp_mesh,
             {
-                "tok_embeddings": RowwiseParallel(input_layouts=Replicate(), use_local_output=False),
-                "output": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+                "tok_embeddings": RowwiseParallel(
+                    input_layouts=Replicate(), use_local_output=False
+                ),
+                "output": ColwiseParallel(
+                    output_layouts=Shard(-1), use_local_output=False
+                ),
             },
         )
         self._replicate_params(model.norm, tp_mesh)
         for layer in model.layers.values():
             parallelize_module(
-                layer, tp_mesh,
+                layer,
+                tp_mesh,
                 {"out_proj": RowwiseParallel(use_local_output=False)},
             )
             for head_name in layer.heads:
                 parallelize_module(
-                    layer, tp_mesh,
+                    layer,
+                    tp_mesh,
                     {f"heads.{head_name}": ColwiseParallel(use_local_output=False)},
                 )
             self._replicate_params(layer.norm, tp_mesh)
@@ -216,8 +224,6 @@ class ToyTrainer:
         with loss_parallel():
             logits = self.model(tokens)
             loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
-            #TODO: to get the correct loss, dont we need to do * local_valid_tokens / global_valid_tokens?
-            #i think that we need to do an all_reduce here for valid tokens
             loss = loss_sum / valid_tokens
             self.optimizer.zero_grad()
             loss.backward()
@@ -243,7 +249,9 @@ class ToyTrainer:
             dt_ms = (time.perf_counter() - t0) * 1000
 
             if self.rank == 0:
-                print(f"{step:>4}  {loss.item():>10.4f}  {grad_norm.item():>10.4f}  {dt_ms:>10.1f}")
+                print(
+                    f"{step:>4}  {loss.item():>10.4f}  {grad_norm.item():>10.4f}  {dt_ms:>10.1f}"
+                )
 
     def close(self):
         """Cleanup. Subclasses override to close writers, profilers, etc."""
