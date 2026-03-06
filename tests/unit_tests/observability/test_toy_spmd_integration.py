@@ -185,6 +185,40 @@ class TestToySpmdIntegration:
             assert step in steps_seen, f"Step {step} missing from system JSONL"
 
 
+    def _parse_mp_console_losses(self):
+        """Parse loss values from MetricsProcessor colored console output."""
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", self.output)
+        losses = []
+        for line in clean.split("\n"):
+            m = re.search(r"step:\s*(\d+)\s+loss:\s+([\d.]+)", line)
+            if m:
+                losses.append((int(m.group(1)), float(m.group(2))))
+        return losses
+
+    def test_tensor_metric_loss_logged(self):
+        """Tensor metric reduction produces loss values on log steps."""
+        assert self.returncode == 0, "Training failed"
+        tensor_losses = self._parse_mp_console_losses()
+        assert len(tensor_losses) >= 3, (
+            f"Expected >= 3 tensor metric loss entries, got {len(tensor_losses)}"
+        )
+        for step, loss in tensor_losses:
+            assert loss > 0, f"Non-positive tensor loss at step {step}: {loss}"
+        assert tensor_losses[-1][1] < tensor_losses[0][1], (
+            f"Tensor loss not decreasing: {tensor_losses[0]} -> {tensor_losses[-1]}"
+        )
+
+    def test_mp_console_output_matches_table(self):
+        """MetricsProcessor console loss matches the per-step table loss."""
+        assert self.returncode == 0, "Training failed"
+        mp_losses = dict(self._parse_mp_console_losses())
+        table_losses = dict(_parse_loss_from_console(self.output))
+        for step, mp_loss in mp_losses.items():
+            if step in table_losses:
+                assert abs(mp_loss - table_losses[step]) < 0.01, (
+                    f"Step {step}: MP loss {mp_loss:.5f} != table loss {table_losses[step]:.5f}"
+                )
+
     def test_experiment_jsonl_files_created(self):
         """One experiment JSONL file per rank (4 total)."""
         assert self.returncode == 0, "Training failed"
@@ -251,7 +285,6 @@ class TestToySpmdIntegration:
         assert last_loss < first_loss, (
             f"Loss not decreasing: step {steps[0]}={first_loss:.4f}, step {steps[-1]}={last_loss:.4f}"
         )
-
 
 if __name__ == "__main__":
     pytest.main([__file__, "-vv"])
