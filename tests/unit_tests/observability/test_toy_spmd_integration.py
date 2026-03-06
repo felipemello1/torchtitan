@@ -183,5 +183,28 @@ class TestToySpmdIntegration:
             assert step in steps_seen, f"Step {step} missing from system JSONL"
 
 
+    def test_tensor_metric_loss_logged(self):
+        """Tensor metric reduction produces loss values on log steps."""
+        assert self.returncode == 0, "Training failed"
+        # PR2 logs "step: N  loss: X.XXXXX" via logger.info on rank 0.
+        # Strip ANSI codes and find these lines.
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", self.output)
+        tensor_losses = []
+        for line in clean.split("\n"):
+            m = re.search(r"step:\s*(\d+)\s+loss:\s+([\d.]+)", line)
+            if m:
+                tensor_losses.append((int(m.group(1)), float(m.group(2))))
+
+        assert len(tensor_losses) >= 3, (
+            f"Expected >= 3 tensor metric loss entries, got {len(tensor_losses)}"
+        )
+        # Loss values must be positive and decreasing.
+        for step, loss in tensor_losses:
+            assert loss > 0, f"Non-positive tensor loss at step {step}: {loss}"
+        assert tensor_losses[-1][1] < tensor_losses[0][1], (
+            f"Tensor loss not decreasing: {tensor_losses[0]} -> {tensor_losses[-1]}"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-vv"])
