@@ -293,19 +293,24 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
+    dp_rank = mesh["dp"].get_local_rank()
 
     if rank == 0:
         print(f"Toy SPMD: {world_size} GPUs, 2DP×2TP, {NUM_STEPS} steps")
 
-    # Fixed data for overfitting (same batch every step, like SPMD testbed)
-    torch.manual_seed(42 + rank)
+    # Fixed data for overfitting (same batch every step, like SPMD testbed).
+    # Seed by dp_rank so TP peers get identical data (TP splits the model, not data).
+    # DP peers get different data (different dp_rank → different seed).
+    torch.manual_seed(42 + dp_rank)
     tokens = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN), device=device)
     labels = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN), device=device)
 
-    # Different valid token counts per rank for weighted metric reduction.
-    # Rank 0: 4 valid tokens, rank 1: 8, rank 2: 12, rank 3: all 16.
-    valid_lengths = [4, 8, 12, SEQ_LEN]
-    valid_len = valid_lengths[rank % len(valid_lengths)]
+    # Different valid token counts per DP group for weighted metric reduction.
+    # DP group 0 (rank 0, 1): 4 valid tokens per sequence.
+    # DP group 1 (rank 2, 3): 12 valid tokens per sequence.
+    # TP peers within a group get the same loss_mask.
+    valid_lengths = [4, 12]
+    valid_len = valid_lengths[dp_rank % len(valid_lengths)]
     loss_mask = torch.zeros(BATCH_SIZE, SEQ_LEN, device=device)
     loss_mask[:, :valid_len] = 1.0
 
