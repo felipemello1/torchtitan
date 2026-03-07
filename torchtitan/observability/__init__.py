@@ -29,7 +29,6 @@ from torchtitan.observability.metrics import (
     record_metric,
     SumMetric,
 )
-from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.observability.profiling import Profiler, profile_annotation
 from torchtitan.observability.rollout_logger import filter_top_bottom, RolloutLogger
 from torchtitan.observability.structured_logging import (
@@ -61,7 +60,6 @@ __all__ = [
     "record_span",
     "record_event",
     "EventType",
-    "MetricsProcessor",
     "record_tensor_metric",
     "TensorMetricContext",
     "current_tensor_metric_context",
