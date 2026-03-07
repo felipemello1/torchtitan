@@ -29,10 +29,7 @@ from torchtitan.models.common.decoder import Decoder
 from torchtitan.protocols import BaseModel
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
-from torchtitan.tools.profiling import (
-    maybe_enable_memory_snapshot,
-    maybe_enable_profiling,
-)
+from torchtitan.observability.profiling import is_profiling_step, Profiler
 from torchtitan.trainer import Trainer
 
 
@@ -147,6 +144,12 @@ class FaultTolerantTrainer(Trainer):
             config_dict=config.to_dict(),
         )
         color = self.metrics_processor.color
+
+        self._profiler = config.profiler.build(
+            output_dir=config.dump_folder,
+            global_rank=torch.distributed.get_rank(),
+            role_rank=torch.distributed.get_rank(),
+        )
 
         # calculate model size and flops per token
         (
@@ -500,25 +503,8 @@ class FaultTolerantTrainer(Trainer):
         self.checkpointer.load(step=config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}")
 
-        # FT addition: per-replica profiling leaf folder
-        leaf_folder = (
-            ""
-            if not self.ft_manager.enabled
-            else f"replica_{self.ft_manager.replica_id}"
-        )
         with (
-            maybe_enable_profiling(
-                config.profiling,
-                global_step=self.step,
-                base_folder=config.dump_folder,
-                leaf_folder=leaf_folder,
-            ) as torch_profiler,
-            maybe_enable_memory_snapshot(
-                config.profiling,
-                global_step=self.step,
-                base_folder=config.dump_folder,
-                leaf_folder=leaf_folder,
-            ) as memory_profiler,
+            self._profiler,
             # FT addition: maybe_semi_sync_training context manager
             maybe_semi_sync_training(
                 config.fault_tolerance,
@@ -571,11 +557,9 @@ class FaultTolerantTrainer(Trainer):
                 if self.metrics_processor.should_log(self.step) or is_validation:
                     self.metrics_processor.log(self.step)
 
-                # signal the profiler that the next profiling step has started
-                if torch_profiler:
-                    torch_profiler.step()
-                if memory_profiler:
-                    memory_profiler.step()
+                self._profiler.step(self.step)
+                if is_profiling_step():
+                    add_step_tag("profiling")
 
                 # reduce timeout after first train step for faster signal
                 # (assuming lazy init and compilation are finished)

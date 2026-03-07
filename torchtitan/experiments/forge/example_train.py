@@ -25,10 +25,7 @@ from torchtitan.observability.metrics import MaxMetric, MeanMetric, record_metri
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
-from torchtitan.tools.profiling import (
-    maybe_enable_memory_snapshot,
-    maybe_enable_profiling,
-)
+from torchtitan.observability.profiling import is_profiling_step, Profiler
 from torchtitan.trainer import Trainer as TitanTrainer
 
 from .engine import ForgeEngine
@@ -88,6 +85,12 @@ class Trainer(ForgeEngine):
         color = self.metrics_processor.color
 
         self.metrics_processor.num_flops_per_token = self.num_flops_per_token
+
+        self._profiler = config.profiler.build(
+            output_dir=config.dump_folder,
+            global_rank=torch.distributed.get_rank(),
+            role_rank=torch.distributed.get_rank(),
+        )
 
         logger.info(
             f"{color.blue}Model {config.model_spec.name} {config.model_spec.flavor} "
@@ -348,18 +351,7 @@ class Trainer(ForgeEngine):
         self.checkpointer.load(step=config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}.")
 
-        with (
-            maybe_enable_profiling(
-                config.profiling,
-                global_step=self.step,
-                base_folder=config.dump_folder,
-            ) as torch_profiler,
-            maybe_enable_memory_snapshot(
-                config.profiling,
-                global_step=self.step,
-                base_folder=config.dump_folder,
-            ) as memory_profiler,
-        ):
+        with self._profiler:
             data_iterator = self.batch_generator(self.dataloader)
             while self.step < config.training.steps:
                 self.step += 1
@@ -394,11 +386,9 @@ class Trainer(ForgeEngine):
                 if self.metrics_processor.should_log(self.step) or is_validation:
                     self.metrics_processor.log(self.step)
 
-                # signal the profiler that the next profiling step has started
-                if torch_profiler:
-                    torch_profiler.step()
-                if memory_profiler:
-                    memory_profiler.step()
+                self._profiler.step(self.step)
+                if is_profiling_step():
+                    add_step_tag("profiling")
 
                 # reduce timeout after first train step for faster signal
                 # (assuming lazy init and compilation are finished)

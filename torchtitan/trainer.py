@@ -59,11 +59,7 @@ from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
-from torchtitan.tools.profiling import (
-    maybe_enable_memory_snapshot,
-    maybe_enable_profiling,
-    ProfilingConfig,
-)
+from torchtitan.observability.profiling import is_profiling_step, Profiler, profile_annotation
 
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
@@ -87,7 +83,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         dump_folder: str = "./outputs"
         """Folder to dump job outputs"""
 
-        profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+        profiler: Profiler.Config = field(default_factory=Profiler.Config)
         metrics: MetricsProcessor.Config = field(
             default_factory=MetricsProcessor.Config
         )
@@ -298,6 +294,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             config_dict=config.to_dict(),
         )
         color = self.metrics_processor.color
+
+        # Build profiler orchestrator.
+        self._profiler = config.profiler.build(
+            output_dir=config.dump_folder,
+            global_rank=torch.distributed.get_rank(),
+            role_rank=torch.distributed.get_rank(),
+        )
 
         # calculate model size and flops per token
         (
@@ -721,7 +724,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # Forward/backward with tensor metric collection.
         with TensorMetricContext() as ctx:
-            with record_span("trainer/forward_backward", EventType.FWD_BWD):
+            with record_span("trainer/forward_backward", EventType.FWD_BWD), profile_annotation("forward_backward"):
                 accumulated_losses = []
                 for input_dict, labels in microbatches:
                     for k, v in input_dict.items():
@@ -747,7 +750,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             global_avg_loss = loss.detach().item()
         record_metric("trainer/loss_mean", MeanMetric(sum=float(global_avg_loss)))
 
-        with record_span("trainer/optimizer", EventType.OPTIM):
+        with record_span("trainer/optimizer", EventType.OPTIM), profile_annotation("optimizer"):
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.model_parts for p in m.parameters()],
                 self.config.training.max_norm,
@@ -781,18 +784,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.checkpointer.load(step=config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}")
 
-        with (
-            maybe_enable_profiling(
-                config.profiling,
-                global_step=self.step,
-                base_folder=config.dump_folder,
-            ) as torch_profiler,
-            maybe_enable_memory_snapshot(
-                config.profiling,
-                global_step=self.step,
-                base_folder=config.dump_folder,
-            ) as memory_profiler,
-        ):
+        with self._profiler:
             data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
                 self.step += 1
@@ -827,10 +819,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 if self.metrics_processor.should_log(self.step) or is_validation:
                     self.metrics_processor.log(self.step)
 
-                if torch_profiler:
-                    torch_profiler.step()
-                if memory_profiler:
-                    memory_profiler.step()
+                self._profiler.step(self.step)
+                if is_profiling_step():
+                    add_step_tag("profiling")
 
                 if self.step == 1:
                     dist_utils.set_pg_timeouts(
