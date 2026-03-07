@@ -265,14 +265,6 @@ class FluxTrainer(Trainer):
         record_metric("trainer/learning_rate_mean", MeanMetric(sum=lr))
         record_metric("trainer/n_tokens_seen_sum", SumMetric(value=float(self.ntokens_seen)))
 
-        # ---- Data loading stats ----
-        if self.metrics_processor.data_loading_times:
-            avg_dl = (
-                sum(self.metrics_processor.data_loading_times)
-                / len(self.metrics_processor.data_loading_times)
-            )
-            record_metric("trainer/time/data_loading_s_mean", MeanMetric(sum=avg_dl))
-
         # ---- Derived metrics (every step -> JSONL) ----
         self.metrics_processor.record_throughput()
         self.metrics_processor.record_memory()

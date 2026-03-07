@@ -326,7 +326,6 @@ class MetricsProcessor(Configurable):
     color: utils.NoColor | utils.Color
     ntokens_since_last_log: int
     num_flops_per_token: int
-    data_loading_times: list[float]
     validation_ntokens: int
     validation_time: float
 
@@ -381,7 +380,6 @@ class MetricsProcessor(Configurable):
         )
         self._time_last_log = time.perf_counter()
         self.ntokens_since_last_log = 0
-        self.data_loading_times = []
         self.num_flops_per_token = -1
 
         # Validation state (separate from training to avoid counter corruption).
@@ -460,7 +458,6 @@ class MetricsProcessor(Configurable):
 
         # Reset training accumulators.
         self.ntokens_since_last_log = 0
-        self.data_loading_times.clear()
         self._time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
 

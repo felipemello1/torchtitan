@@ -20,6 +20,7 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.components.validate import Validator
 from torchtitan.config import ConfigManager
 from torchtitan.distributed import utils as dist_utils
+from torchtitan.observability import add_step_tag, EventType, record_span
 from torchtitan.observability.metrics import MaxMetric, MeanMetric, record_metric, SumMetric
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.tools import utils
@@ -154,24 +155,18 @@ class Trainer(ForgeEngine):
         self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ) -> Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]:
         """Returns an iterator that processes batches from the data iterator."""
-        device_type = utils.device_type
         data_iterator = iter(data_iterable)
 
         while True:
-            try:
-                batch = next(data_iterator)
-            except StopIteration as ex:
-                # If data runs out during gradient accumulation, that
-                # entire step will not be executed.
-                raise DataloaderExhaustedError() from ex
-            data_load_start = time.perf_counter()
+            with record_span("trainer/data_loading", EventType.FETCHING_BATCH):
+                try:
+                    batch = next(data_iterator)
+                except StopIteration as ex:
+                    raise DataloaderExhaustedError() from ex
             input_dict, labels = batch
             ntokens_batch = labels.numel()
             self.ntokens_seen += ntokens_batch
             self.metrics_processor.ntokens_since_last_log += ntokens_batch
-            self.metrics_processor.data_loading_times.append(
-                time.perf_counter() - data_load_start
-            )
 
             # Tensors stay on CPU; moved to GPU per-microbatch during training
             yield input_dict, labels
@@ -342,14 +337,6 @@ class Trainer(ForgeEngine):
         record_metric("trainer/learning_rate_mean", MeanMetric(sum=lr))
         record_metric("trainer/n_tokens_seen_sum", SumMetric(value=float(self.ntokens_seen)))
 
-        # ---- Data loading stats ----
-        if self.metrics_processor.data_loading_times:
-            avg_dl = (
-                sum(self.metrics_processor.data_loading_times)
-                / len(self.metrics_processor.data_loading_times)
-            )
-            record_metric("trainer/time/data_loading_s_mean", MeanMetric(sum=avg_dl))
-
         # ---- Derived metrics (every step -> JSONL) ----
         self.metrics_processor.record_throughput()
         self.metrics_processor.record_memory()
@@ -378,16 +365,20 @@ class Trainer(ForgeEngine):
                 self.step += 1
                 self.metrics_processor.set_step(self.step)
 
-                self.gc_handler.run(self.step)
-                try:
-                    self.train_step(data_iterator)
-                except DataloaderExhaustedError:
-                    logger.warning("Ran out of data; last step was canceled.")
-                    break
+                if self.gc_handler.run(self.step):
+                    add_step_tag("gc")
 
-                self.checkpointer.save(
-                    self.step, last_step=(self.step == config.training.steps)
-                )
+                with record_span("trainer/step", EventType.STEP):
+                    try:
+                        self.train_step(data_iterator)
+                    except DataloaderExhaustedError:
+                        logger.warning("Ran out of data; last step was canceled.")
+                        break
+
+                with record_span("trainer/checkpoint", EventType.CHECKPOINT):
+                    self.checkpointer.save(
+                        self.step, last_step=(self.step == config.training.steps)
+                    )
 
                 # Validation
                 is_validation = (
@@ -395,7 +386,9 @@ class Trainer(ForgeEngine):
                     and self.validator.should_validate(self.step)
                 )
                 if is_validation:
-                    self.validator.validate(self.model_parts, self.step)
+                    add_step_tag("eval")
+                    with record_span("trainer/validation", EventType.EVAL):
+                        self.validator.validate(self.model_parts, self.step)
 
                 # Single flush: picks up training + validation metrics
                 if self.metrics_processor.should_log(self.step) or is_validation:

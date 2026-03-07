@@ -20,6 +20,7 @@ from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.observability import add_step_tag, EventType, record_span
 from torchtitan.observability.metrics import MaxMetric, MeanMetric, record_metric, SumMetric
 from torchtitan.experiments.ft.config.job_config import FaultTolerance
 from torchtitan.experiments.ft.manager import FTManager, maybe_semi_sync_training
@@ -488,14 +489,6 @@ class FaultTolerantTrainer(Trainer):
         record_metric("trainer/learning_rate_mean", MeanMetric(sum=lr))
         record_metric("trainer/n_tokens_seen_sum", SumMetric(value=float(self.ntokens_seen)))
 
-        # ---- Data loading stats ----
-        if self.metrics_processor.data_loading_times:
-            avg_dl = (
-                sum(self.metrics_processor.data_loading_times)
-                / len(self.metrics_processor.data_loading_times)
-            )
-            record_metric("trainer/time/data_loading_s_mean", MeanMetric(sum=avg_dl))
-
         # ---- Derived metrics (every step -> JSONL) ----
         self.metrics_processor.record_throughput()
         self.metrics_processor.record_memory()
@@ -549,16 +542,20 @@ class FaultTolerantTrainer(Trainer):
                 self.step += 1
                 self.metrics_processor.set_step(self.step)
 
-                self.gc_handler.run(self.step)
-                try:
-                    self.train_step(data_iterator)
-                except DataloaderExhaustedError:
-                    logger.warning("Ran out of data; last step was canceled.")
-                    break
+                if self.gc_handler.run(self.step):
+                    add_step_tag("gc")
 
-                self.checkpointer.save(
-                    self.step, last_step=(self.step == config.training.steps)
-                )
+                with record_span("trainer/step", EventType.STEP):
+                    try:
+                        self.train_step(data_iterator)
+                    except DataloaderExhaustedError:
+                        logger.warning("Ran out of data; last step was canceled.")
+                        break
+
+                with record_span("trainer/checkpoint", EventType.CHECKPOINT):
+                    self.checkpointer.save(
+                        self.step, last_step=(self.step == config.training.steps)
+                    )
 
                 # Validation
                 is_validation = (
@@ -566,7 +563,9 @@ class FaultTolerantTrainer(Trainer):
                     and self.validator.should_validate(self.step)
                 )
                 if is_validation:
-                    self.validator.validate(self.model_parts, self.step)
+                    add_step_tag("eval")
+                    with record_span("trainer/validation", EventType.EVAL):
+                        self.validator.validate(self.model_parts, self.step)
 
                 # Single flush: picks up training + validation metrics
                 if self.metrics_processor.should_log(self.step) or is_validation:
