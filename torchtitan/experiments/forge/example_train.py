@@ -20,7 +20,7 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.components.validate import Validator
 from torchtitan.config import ConfigManager
 from torchtitan.distributed import utils as dist_utils
-from torchtitan.observability.metrics import MaxMetric, MeanMetric, record_metric
+from torchtitan.observability.metrics import MaxMetric, MeanMetric, record_metric, SumMetric
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
@@ -109,6 +109,7 @@ class Trainer(ForgeEngine):
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
+        self.ntokens_seen = 0
 
         # Build validator if validation is configured
         if config.validator.enable:
@@ -165,7 +166,9 @@ class Trainer(ForgeEngine):
                 raise DataloaderExhaustedError() from ex
             data_load_start = time.perf_counter()
             input_dict, labels = batch
-            self.metrics_processor.ntokens_since_last_log += labels.numel()
+            ntokens_batch = labels.numel()
+            self.ntokens_seen += ntokens_batch
+            self.metrics_processor.ntokens_since_last_log += ntokens_batch
             self.metrics_processor.data_loading_times.append(
                 time.perf_counter() - data_load_start
             )
@@ -337,6 +340,7 @@ class Trainer(ForgeEngine):
         # ---- CPU metrics (every step -> JSONL) ----
         record_metric("trainer/grad_norm_max", MaxMetric(value=grad_norm.item()))
         record_metric("trainer/learning_rate_mean", MeanMetric(sum=lr))
+        record_metric("trainer/n_tokens_seen_sum", SumMetric(value=float(self.ntokens_seen)))
 
         # ---- Data loading stats ----
         if self.metrics_processor.data_loading_times:
@@ -418,10 +422,11 @@ class Trainer(ForgeEngine):
         logger.info("Training completed")
 
     def state_dict(self) -> dict[str, Any]:
-        return {"step": self.step}
+        return {"step": self.step, "ntokens_seen": self.ntokens_seen}
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         self.step = state_dict["step"]
+        self.ntokens_seen = state_dict.get("ntokens_seen", 0)
 
     def close(self) -> None:
         if self.metrics_processor:

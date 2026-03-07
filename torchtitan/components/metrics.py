@@ -19,6 +19,15 @@ from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
+from torchtitan.observability.aggregation import aggregate, FileWatcher
+from torchtitan.observability.common import clear_step_tags, set_step
+from torchtitan.observability.logging_boundary import EveryNSteps
+from torchtitan.observability.metrics import (
+    MaxMetric,
+    MeanMetric,
+    record_metric,
+    SumMetric,
+)
 from torchtitan.tools.utils import Color, device_module, device_type, NoColor
 
 
@@ -339,14 +348,8 @@ class MetricsProcessor(Configurable):
         tag: str | None = None,
     ):
         # Assumes init_observability() was already called by the caller.
-        from torchtitan.observability.aggregation import FileWatcher
-        from torchtitan.observability.common import clear_step_tags, set_step
-        from torchtitan.observability.logging_boundary import EveryNSteps
-
         self.config = config
         self.parallel_dims = parallel_dims
-        self._set_step = set_step
-        self._clear_step_tags = clear_step_tags
 
         # Logging backends (TB/WandB).
         self._logger = self._build_metric_logger(
@@ -397,8 +400,8 @@ class MetricsProcessor(Configurable):
     def set_step(self, step: int) -> None:
         """Set current step. Call before train_step()."""
         self._step = step
-        self._set_step(step)
-        self._clear_step_tags()
+        set_step(step)
+        clear_step_tags()
 
     # ----------------------------------------------------------------
     # Schedule queries
@@ -418,8 +421,6 @@ class MetricsProcessor(Configurable):
 
     def record_throughput(self) -> None:
         """Compute and record throughput from accumulated tokens since last log reset."""
-        from torchtitan.observability.metrics import MeanMetric, record_metric
-
         time_delta = time.perf_counter() - self._time_last_log
         non_dp = self.parallel_dims.non_data_parallel_size
         tps = self.ntokens_since_last_log / (time_delta * non_dp) if time_delta > 0 else 0
@@ -435,15 +436,13 @@ class MetricsProcessor(Configurable):
 
     def record_memory(self) -> None:
         """Record device memory peak stats since last log reset."""
-        from torchtitan.observability.metrics import MaxMetric, record_metric
-
         mem = self.device_memory_monitor.get_peak_stats()
         record_metric("trainer/memory/max_reserved_gib_max", MaxMetric(value=mem.max_reserved_gib))
         record_metric("trainer/memory/max_reserved_pct_max", MaxMetric(value=mem.max_reserved_pct))
         record_metric("trainer/memory/max_active_gib_max", MaxMetric(value=mem.max_active_gib))
         record_metric("trainer/memory/max_active_pct_max", MaxMetric(value=mem.max_active_pct))
-        record_metric("trainer/memory/num_alloc_retries_sum", MaxMetric(value=mem.num_alloc_retries))
-        record_metric("trainer/memory/num_ooms_sum", MaxMetric(value=mem.num_ooms))
+        record_metric("trainer/memory/num_alloc_retries_sum", SumMetric(value=mem.num_alloc_retries))
+        record_metric("trainer/memory/num_ooms_sum", SumMetric(value=mem.num_ooms))
 
     # ----------------------------------------------------------------
     # Flush (called by train() on log steps or after validation)
@@ -451,8 +450,6 @@ class MetricsProcessor(Configurable):
 
     def log(self, step: int) -> None:
         """Pure flush: barrier -> drain -> aggregate -> write -> console -> reset."""
-        from torchtitan.observability.aggregation import aggregate
-
         torch.distributed.barrier()
         if torch.distributed.get_rank() == 0:
             entries = self._watcher.drain(step)
@@ -475,8 +472,6 @@ class MetricsProcessor(Configurable):
         self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
     ) -> None:
         """Record validation metrics to JSONL. No console, no flush — log() handles those."""
-        from torchtitan.observability.metrics import MaxMetric, MeanMetric, record_metric
-
         time_delta = time.perf_counter() - self.validation_time
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
         tps = (

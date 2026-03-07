@@ -60,7 +60,6 @@ from torchtitan.observability import (
     MaxMetric,
     MeanMetric,
     MeanTMetric,
-    MetricsProcessor,
     profile_annotation,
     record_event,
     record_metric,
@@ -69,6 +68,7 @@ from torchtitan.observability import (
     replicate_to_host,
     TensorMetricContext,
 )
+from torchtitan.observability.metrics_processor import MetricsProcessor
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
