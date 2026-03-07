@@ -211,8 +211,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
 
+        # Initialize observability before init_distributed so we can
+        # wrap init_distributed in record_span. RANK env var is set by
+        # torchrun before the process starts.
+        from torchtitan.observability import init_observability
+
+        init_observability(source="trainer", output_dir=config.dump_folder)
+
         # init distributed and build meshes
-        self.parallel_dims = parallel_dims = self.init_distributed()
+        with record_span("trainer/init_distributed", EventType.TORCH_DISTRIBUTED_INIT):
+            self.parallel_dims = parallel_dims = self.init_distributed()
 
         # Logging needs to happen after distributed initialized
         config.maybe_log()
@@ -280,11 +288,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             model_compile_enabled=model_compile_enabled,
         )
         model_converters.convert(model)
-
-        # Initialize observability (JSONL file handlers) before MetricsProcessor.
-        from torchtitan.observability import init_observability
-
-        init_observability(source="trainer", output_dir=config.dump_folder)
 
         # metrics logging
         self.metrics_processor = config.metrics.build(
