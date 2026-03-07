@@ -42,12 +42,12 @@ from torchtitan.observability import (
     init_observability,
     MaxMetric,
     MeanMetric,
-    MetricsProcessor,
     record_event,
     record_metric,
     record_span,
     set_step,
 )
+from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.observability.rollout_logger import filter_top_bottom, RolloutLogger
 
 logger = logging.getLogger(__name__)
