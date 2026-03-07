@@ -27,6 +27,8 @@ from torchtitan.models.common.rope import (
     apply_rotary_emb_cos_sin,
 )
 from torchtitan.models.common.utils import trunc_normal_
+from torchtitan.observability.tensor_metric_context import record_tensor_metric
+from torchtitan.observability.tensor_metrics import MeanTMetric
 from torchtitan.protocols.module import Module
 
 
@@ -467,6 +469,10 @@ class GQAttention(BaseAttention):
     ) -> torch.Tensor:
         bs, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        record_tensor_metric("attention/q/abs_mean", MeanTMetric(sum=xq.detach().abs().mean(), weight=1))
+        record_tensor_metric("attention/k/abs_mean", MeanTMetric(sum=xk.detach().abs().mean(), weight=1))
+        record_tensor_metric("attention/v/abs_mean", MeanTMetric(sum=xv.detach().abs().mean(), weight=1))
 
         # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
         # local heads from sizes of xq, xk, and xv as TP may have sharded them

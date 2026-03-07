@@ -23,6 +23,8 @@ from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.moe.moe import MoE
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.common.utils import trunc_normal_
+from torchtitan.observability.tensor_metric_context import child_context, record_tensor_metric
+from torchtitan.observability.tensor_metrics import MeanTMetric
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module
 
@@ -131,8 +133,13 @@ class Decoder(BaseModel):
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
 
-        for layer in self.layers.values():
-            h = layer(h, self.freqs_cis, attention_masks, positions)
+        for name, layer in self.layers.items():
+            with child_context(name):
+                h = layer(h, self.freqs_cis, attention_masks, positions)
+                record_tensor_metric(
+                    "residual/abs_mean",
+                    MeanTMetric(sum=h.detach().abs().mean(), weight=1),
+                )
 
         h = self.norm(h) if self.norm is not None else h
         output = self.output(h) if self.output is not None else h

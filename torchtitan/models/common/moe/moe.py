@@ -14,6 +14,8 @@ from torch.distributed.tensor import DTensor
 
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.utils import trunc_normal_
+from torchtitan.observability.tensor_metric_context import record_tensor_metric
+from torchtitan.observability.tensor_metrics import MeanTMetric
 from torchtitan.protocols.module import Module
 
 from .utils import indices_padding_wrapper
@@ -463,6 +465,10 @@ class MoE(Module):
             selected_experts_indices,
             num_tokens_per_expert,
         ) = self.router(x, self.expert_bias)
+
+        record_tensor_metric(
+            "router/scores/mean", MeanTMetric(sum=top_scores.detach().mean(), weight=1)
+        )
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # and also to count the expert usage
