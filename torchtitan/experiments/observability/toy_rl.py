@@ -35,7 +35,6 @@ from torchtitan.experiments.observability.toy_spmd import (
     VOCAB_SIZE,
 )
 from torchtitan.observability import (
-    clear_step_tags,
     EventType,
     init_observability,
     record_event,
@@ -170,13 +169,12 @@ async def main():
     async def run_training():
         for step in range(1, NUM_STEPS + 1):
             set_step(step)
-            clear_step_tags()
             for actor in actors:
                 await actor.set_step.call(step)
 
-            # Generate completions.
-            gen_results = await generator.generate.call(prompts)
-            tokens, labels, loss_mask = next(iter(gen_results.values()))
+            with record_span("rl_time/generate_s", EventType.FETCHING_BATCH):
+                gen_results = await generator.generate.call(prompts)
+                tokens, labels, loss_mask = next(iter(gen_results.values()))
 
             # Score is not used anywhere. This is a dummy call to demonstrate
             # multi-actor observability.

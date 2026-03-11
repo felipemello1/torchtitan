@@ -7,7 +7,7 @@
 """Toy MetricsProcessor for the observability experiment."""
 
 from torchtitan.observability import record_event
-from torchtitan.observability.step_state import clear_step_tags, set_step
+from torchtitan.observability.step_state import set_step
 
 
 class MetricsProcessor:
@@ -24,7 +24,6 @@ class MetricsProcessor:
         """Set the current training step."""
         self._step = step
         set_step(step)
-        clear_step_tags()
         record_event({"train.step": step})
 
     def close(self) -> None:

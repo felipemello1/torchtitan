@@ -16,7 +16,7 @@ _STEP_TAGS: ContextVar[tuple[str, ...]] = ContextVar("_STEP_TAGS", default=())
 
 def set_step(step: int) -> None:
     """Set the current training step. All subsequent JSONL records will
-    include this step number.
+    include this step number. Clears step tags from the previous step.
 
     Example::
 
@@ -25,6 +25,7 @@ def set_step(step: int) -> None:
             train_step(...)
     """
     _STEP.set(step)
+    _STEP_TAGS.set(())
 
 
 def add_step_tag(tag: str) -> None:
