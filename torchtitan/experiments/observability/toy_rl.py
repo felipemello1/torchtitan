@@ -121,7 +121,6 @@ class RewardActor(Actor):
 
     @endpoint
     async def setup(self):
-        self.target = torch.ones(SEQ_LEN)
         rank = current_rank().rank
         init_observability(source="reward", output_dir=OUTPUT_DIR, rank=rank)
 
@@ -132,9 +131,9 @@ class RewardActor(Actor):
 
     @endpoint
     async def score(self, completions: list[torch.Tensor]) -> list[float]:
-        """Score completions against a target. Returns list of rewards."""
+        """Score completions. Returns dummy constant rewards."""
         with record_span("rl_time/scoring_s", EventType.RL_SCORING):
-            rewards = [-((c - self.target) ** 2).mean().item() for c in completions]
+            rewards = [1.0] * len(completions)
         return rewards
 
 
