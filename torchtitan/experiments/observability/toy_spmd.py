@@ -5,8 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-This is not a suggestion or a real SFT workflow. It is just dummy incomplete
-code to demonstrate observability APIs.
+This is not a production training recipe. It is just dummy incomplete code
+to demonstrate observability APIs.
 
 Toy SPMD training with TP + FSDP2 + per-layer compile on 4 GPUs.
 Each rank gets different valid token counts (via loss_mask) to exercise
@@ -75,25 +75,21 @@ class RepeatDataset:
 
 
 def setup_data(
-    device: torch.device,
-    dp_rank: int,
+    device: torch.device = torch.device("cpu"),
     *,
     batch_size: int = BATCH_SIZE,
     seq_len: int = SEQ_LEN,
     vocab_size: int = VOCAB_SIZE,
-    valid_lengths: tuple[int, ...] = (4, 12),
 ) -> RepeatDataset:
     """Create fixed training data for overfitting.
 
-    Seeds by dp_rank so TP peers get identical data. Different valid token
-    counts per DP group exercise weighted metric reduction.
+    Random loss_mask gives each sequence a different number of valid tokens,
+    exercising weighted metric reduction across DP ranks.
     """
-    torch.manual_seed(42 + dp_rank)
+    torch.manual_seed(42)
     tokens = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
     labels = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-    valid_len = valid_lengths[dp_rank % len(valid_lengths)]
-    loss_mask = torch.zeros(batch_size, seq_len, device=device)
-    loss_mask[:, :valid_len] = 1.0
+    loss_mask = torch.randint(0, 2, (batch_size, seq_len), device=device).float()
     return RepeatDataset(tokens, labels, loss_mask)
 
 
@@ -156,15 +152,15 @@ class ToyTrainer:
     - train: owns the training loop
     """
 
-    def __init__(self, device, dp_mesh, tp_mesh, output_dir, dataloader=None):
+    def __init__(self, device, dp_mesh, tp_mesh, output_dir):
         self.device = device
         self.rank = dist.get_rank()
         self.output_dir = output_dir
-        self.dataloader = dataloader
         self.step = 0
 
         self.metrics_processor = MetricsProcessor()
-
+        
+        torch.manual_seed(0)
         model = TinyModel().to(device)
         self._apply_tp(model, tp_mesh)
         self._apply_compile(model)
@@ -276,7 +272,8 @@ class ToyTrainer:
 
     def train(self, num_steps):
         """Full training loop. Mirrors Trainer.train structure."""
-        data_iterator = self.batch_generator(self.dataloader)
+        dataloader = setup_data(self.device)
+        data_iterator = self.batch_generator(dataloader)
 
         if self.rank == 0:
             print(f"{'Step':>4}  {'Loss':>10}  {'GradNorm':>10}")
@@ -327,13 +324,11 @@ def main():
     init_observability(source="trainer", output_dir=OUTPUT_DIR, rank=rank)
 
     mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
-    dp_rank = mesh["dp"].get_local_rank()
 
     if rank == 0:
         print(f"Toy SPMD: {world_size} GPUs, 2DPx2TP, {NUM_STEPS} steps")
 
-    dataloader = setup_data(device, dp_rank)
-    trainer = ToyTrainer(device, mesh["dp"], mesh["tp"], OUTPUT_DIR, dataloader)
+    trainer = ToyTrainer(device, mesh["dp"], mesh["tp"], OUTPUT_DIR)
     trainer.train(NUM_STEPS)
     trainer.close()
 

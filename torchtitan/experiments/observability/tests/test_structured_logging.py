@@ -28,7 +28,9 @@ def system_logs_dir():
     """Path to system_logs from a prior toy_spmd run."""
     path = os.path.join(OUTPUT_DIR, "system_logs")
     if not os.path.isdir(path):
-        pytest.skip(f"No system_logs at {path} — run toy_spmd first")
+        pytest.fail(
+            f"No system_logs at {path}. Run toy_spmd first to generate outputs."
+        )
     return path
 
 
@@ -87,7 +89,7 @@ class TestChromeTrace:
     def test_trace_json_exists(self):
         trace_path = os.path.join(OUTPUT_DIR, "trace.json")
         if not os.path.exists(trace_path):
-            pytest.skip("No trace.json — run toy_spmd first")
+            pytest.fail("No trace.json. Run toy_spmd first to generate outputs.")
         with open(trace_path) as f:
             trace = json.load(f)
         assert "traceEvents" in trace

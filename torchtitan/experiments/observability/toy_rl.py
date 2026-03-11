@@ -5,8 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-This is not a suggestion or a real RL workflow. It is just dummy incomplete
-code to demonstrate observability APIs.
+This is not a production training recipe. It is just dummy incomplete code
+to demonstrate observability APIs.
 
 Toy RL with Monarch actors: GeneratorActor produces completions,
 RewardActor scores them, TrainerActor trains on them. Controller
@@ -31,6 +31,7 @@ from torchtitan.experiments.observability.toy_spmd import (
     BATCH_SIZE,
     D_MODEL,
     SEQ_LEN,
+    setup_data,
     ToyTrainer,
     VOCAB_SIZE,
 )
@@ -57,12 +58,10 @@ class GeneratorActor(Actor):
 
     @endpoint
     async def setup(self):
-        rank = current_rank().rank
-        init_observability(source="generator", output_dir=OUTPUT_DIR, rank=rank)
-        torch.manual_seed(42)
-        self.tokens = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN))
-        self.labels = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN))
-        self.loss_mask = torch.ones(BATCH_SIZE, SEQ_LEN)
+        dataset = setup_data()
+        self.tokens = dataset.tokens
+        self.labels = dataset.labels
+        self.loss_mask = dataset.loss_mask
 
     @endpoint
     async def set_step(self, step: int):
@@ -122,7 +121,7 @@ class RewardActor(Actor):
 
     @endpoint
     async def setup(self):
-        self.target = torch.ones(D_MODEL)
+        self.target = torch.ones(SEQ_LEN)
         rank = current_rank().rank
         init_observability(source="reward", output_dir=OUTPUT_DIR, rank=rank)
 
@@ -183,15 +182,17 @@ async def main():
 
             # Score is not used anywhere. This is a dummy call to demonstrate
             # multi-actor observability.
-            completions = [torch.randn(D_MODEL) for _ in range(min(4, len(tokens)))]
             with record_span("rl_time/scoring_s", EventType.RL_SCORING):
-                reward_results = await reward_actor.score.call(completions)
-            rewards = next(iter(reward_results.values()))
+                reward_results = await reward_actor.score.call(
+                    [tokens[i].float() for i in range(4)]
+                )
+                rewards = next(iter(reward_results.values()))
 
-            # Train on generated completions.
             with record_span("rl_time/training_s", EventType.FWD_BWD):
-                loss_results = await trainer.train_step.call(tokens, labels, loss_mask)
-            loss = next(iter(loss_results.values()))
+                loss_results = await trainer.train_step.call(
+                    tokens, labels, loss_mask
+                )
+                loss = next(iter(loss_results.values()))
 
             reward_mean = sum(rewards) / len(rewards)
             record_event({"train.loss": loss, "reward_mean": reward_mean})
