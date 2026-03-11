@@ -19,7 +19,16 @@ from contextlib import ContextDecorator
 from timeit import default_timer as timer
 from typing import Any
 
-from torchtitan.observability._constants import SYSTEM_LOGGER_NAME
+from torchtitan.observability._constants import (
+    EXPERIMENT_LOGGER_NAME,
+    SYSTEM_LOGGER_NAME,
+)
+from torchtitan.observability.metrics import (
+    ExperimentJSONFormatter,
+    ExperimentLoggingHandler,
+    MeanMetric,
+    record_metric,
+)
 from torchtitan.observability.step_state import _STEP, _STEP_TAGS
 
 MAX_MESSAGE_SIZE: int = 1000
@@ -457,6 +466,21 @@ def init_observability(source: str, output_dir: str, rank: int | None = None) ->
         if sys_logger.level == logging.NOTSET or sys_logger.level > logging.INFO:
             sys_logger.setLevel(logging.INFO)
 
+    # --- Experiment handler ---
+    exp_logger = logging.getLogger(EXPERIMENT_LOGGER_NAME)
+    if not any(isinstance(h, ExperimentLoggingHandler) for h in exp_logger.handlers):
+        exp_path = os.path.join(
+            output_dir,
+            "experiment_logs",
+            f"{source}_rank_{rank}_experiment.jsonl",
+        )
+        handler = ExperimentLoggingHandler(filepath=exp_path)
+        handler.setFormatter(ExperimentJSONFormatter(rank=rank, source=source))
+        exp_logger.addHandler(handler)
+    exp_logger.propagate = False
+    if exp_logger.level == logging.NOTSET or exp_logger.level > logging.INFO:
+        exp_logger.setLevel(logging.INFO)
+
 
 # ---------------------------------------------------------------------------
 # Public API: record_event, record_span
@@ -488,25 +512,38 @@ def record_event(metrics: dict[str, float | int]) -> None:
 class record_span(ContextDecorator):  # noqa: N801
     """Context manager/decorator for timing phases.
 
-    Logs START event on enter, END event (with duration) on exit to system
-    JSONL. Step is read from ContextVar.
+    Logs START/END events to system JSONL. When ``log_to_metrics=True``
+    (default), also records the duration as a MeanMetric (seconds) to
+    experiment JSONL via ``record_metric``.
 
     Args:
-        description: Human-readable label and metric name (e.g.,
-            "trainer_time/forward_backward_s"). Used as-is for system JSONL
-            messages.
+        description: Metric name (e.g., "trainer_time/forward_backward_s").
+            Used as-is for both system JSONL and experiment metric key.
         event_type: Base EventType (e.g., EventType.FWD_BWD). Must have
             corresponding _START and _END variants.
+        log_to_metrics: If True, record duration to experiment JSONL.
+            Set to False for spans where step is None or where separate
+            metrics are recorded (e.g., validation).
 
-    Usage:
+    Usage::
+
         with record_span("trainer_time/forward_backward_s", EventType.FWD_BWD):
             output = model(batch)
             loss.backward()
+        # → system JSONL: fwd_bwd_start/end events
+        # → experiment JSONL: MeanMetric with duration in seconds
     """
 
-    def __init__(self, description: str, event_type: EventType):
+    def __init__(
+        self,
+        description: str,
+        event_type: EventType,
+        *,
+        log_to_metrics: bool = True,
+    ):
         self.description = description
         self.event_type = event_type
+        self.log_to_metrics = log_to_metrics
         self.start_time: float = 0.0
 
         # Derive START/END event types. Validate that the base event type
@@ -547,4 +584,6 @@ class record_span(ContextDecorator):  # noqa: N801
             extra=event_extra(self.end_event_type, value=delta_ms, step=step),
             stacklevel=2,
         )
+        if self.log_to_metrics and step is not None:
+            record_metric(self.description, MeanMetric(sum=duration_s), _stacklevel=3)
         return False  # Don't suppress exceptions

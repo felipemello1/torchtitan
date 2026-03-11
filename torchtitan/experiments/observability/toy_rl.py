@@ -37,7 +37,9 @@ from torchtitan.experiments.observability.toy_spmd import (
 from torchtitan.observability import (
     EventType,
     init_observability,
+    MeanMetric,
     record_event,
+    record_metric,
     record_span,
     set_step,
 )
@@ -132,6 +134,10 @@ class RewardActor(Actor):
         """Score completions. Returns dummy constant rewards."""
         with record_span("rl_time/scoring_s", EventType.RL_SCORING):
             rewards = [1.0] * len(completions)
+        record_metric(
+            "rl_reward/mean",
+            MeanMetric(sum=sum(rewards), weight=len(rewards)),
+        )
         return rewards
 
 
@@ -185,9 +191,7 @@ async def main():
                 rewards = next(iter(reward_results.values()))
 
             with record_span("rl_time/training_s", EventType.FWD_BWD):
-                loss_results = await trainer.train_step.call(
-                    tokens, labels, loss_mask
-                )
+                loss_results = await trainer.train_step.call(tokens, labels, loss_mask)
                 loss = next(iter(loss_results.values()))
 
             reward_mean = sum(rewards) / len(rewards)

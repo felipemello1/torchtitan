@@ -39,7 +39,11 @@ from torchtitan.observability import (
     add_step_tag,
     EventType,
     init_observability,
+    MaxMetric,
+    MeanMetric,
+    NoOpMetric,
     record_event,
+    record_metric,
     record_span,
 )
 from torchtitan.observability.analysis import to_chrome_trace
@@ -152,19 +156,24 @@ class ToyTrainer:
     - train: owns the training loop
     """
 
-    def __init__(self, device, dp_mesh, tp_mesh, output_dir):
+    def __init__(self, device, dp_mesh, tp_mesh, output_dir, *, enable_wandb=False):
         self.device = device
         self.rank = dist.get_rank()
         self.output_dir = output_dir
         self.step = 0
 
-        self.metrics_processor = MetricsProcessor()
-        
+        self.metrics_processor = MetricsProcessor(
+            dump_folder=output_dir,
+            rank=self.rank,
+            enable_wandb=enable_wandb,
+        )
+
         torch.manual_seed(0)
-        model = TinyModel().to(device)
-        self._apply_tp(model, tp_mesh)
-        self._apply_compile(model)
-        self._apply_fsdp(model, dp_mesh)
+        with record_span("setup/model_build", EventType.BUILD_MODEL):
+            model = TinyModel().to(device)
+            self._apply_tp(model, tp_mesh)
+            self._apply_compile(model)
+            self._apply_fsdp(model, dp_mesh)
         self.model = model
         self.optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
@@ -259,6 +268,10 @@ class ToyTrainer:
             grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
+        record_metric("toy_trainer/loss_mean", MeanMetric(sum=loss.item()))
+        record_metric("toy_trainer/grad_norm_max", MaxMetric(value=grad_norm.item()))
+        record_metric("toy_trainer/lr", NoOpMetric(value=LR))
+
         return loss, grad_norm
 
     def validate(self, tokens, labels, loss_mask):
@@ -267,17 +280,12 @@ class ToyTrainer:
             logits = self.model(tokens)
             loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
             val_loss = loss_sum / valid_tokens
-        if self.rank == 0:
-            print(f"  val loss: {val_loss.item():.4f}")
+        record_metric("toy_trainer/val_loss_mean", MeanMetric(sum=val_loss.item()))
 
     def train(self, num_steps):
         """Full training loop. Mirrors Trainer.train structure."""
         dataloader = setup_data(self.device)
         data_iterator = self.batch_generator(dataloader)
-
-        if self.rank == 0:
-            print(f"{'Step':>4}  {'Loss':>10}  {'GradNorm':>10}")
-            print("-" * 40)
 
         for step in range(1, num_steps + 1):
             self.step = step
@@ -295,13 +303,14 @@ class ToyTrainer:
                 {"train.loss": loss.item(), "train.grad_norm": grad_norm.item()}
             )
 
-            if self.rank == 0:
-                print(f"{step:>4}  {loss.item():>10.4f}  {grad_norm.item():>10.4f}")
-
             if step % EVAL_FREQ == 0:
                 add_step_tag("eval")
-                with record_span("trainer/validation", EventType.EVAL):
+                with record_span(
+                    "trainer/validation", EventType.EVAL, log_to_metrics=False
+                ):
                     self.validate(tokens, labels, loss_mask)
+
+            self.metrics_processor.log(step)
 
     def close(self):
         """Cleanup."""
@@ -328,7 +337,10 @@ def main():
     if rank == 0:
         print(f"Toy SPMD: {world_size} GPUs, 2DPx2TP, {NUM_STEPS} steps")
 
-    trainer = ToyTrainer(device, mesh["dp"], mesh["tp"], OUTPUT_DIR)
+    enable_wandb = os.environ.get("WANDB_ENABLED", "0") == "1"
+    trainer = ToyTrainer(
+        device, mesh["dp"], mesh["tp"], OUTPUT_DIR, enable_wandb=enable_wandb
+    )
     trainer.train(NUM_STEPS)
     trainer.close()
 
