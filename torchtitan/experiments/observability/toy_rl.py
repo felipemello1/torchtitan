@@ -29,7 +29,6 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from torchtitan.experiments.observability.toy_spmd import (
     BATCH_SIZE,
-    D_MODEL,
     SEQ_LEN,
     setup_data,
     ToyTrainer,
