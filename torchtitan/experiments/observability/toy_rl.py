@@ -110,7 +110,7 @@ class RewardActor(Actor):
 
     @endpoint
     async def setup(self):
-        self.target = torch.ones(SEQ_LEN)
+        pass
 
     @endpoint
     async def set_step(self, step: int):
@@ -119,8 +119,8 @@ class RewardActor(Actor):
 
     @endpoint
     async def score(self, completions: list[torch.Tensor]) -> list[float]:
-        """Score completions against a target. Returns list of rewards."""
-        return [-((c - self.target) ** 2).mean().item() for c in completions]
+        """Score completions. Returns dummy constant rewards."""
+        return [1.0] * len(completions)
 
 
 async def main():
