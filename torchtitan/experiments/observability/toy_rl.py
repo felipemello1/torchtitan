@@ -34,6 +34,14 @@ from torchtitan.experiments.observability.toy_spmd import (
     ToyTrainer,
     VOCAB_SIZE,
 )
+from torchtitan.observability import (
+    clear_step_tags,
+    EventType,
+    init_observability,
+    record_event,
+    record_span,
+    set_step,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -49,6 +57,8 @@ class GeneratorActor(Actor):
 
     @endpoint
     async def setup(self):
+        rank = current_rank().rank
+        init_observability(source="generator", output_dir=OUTPUT_DIR, rank=rank)
         torch.manual_seed(42)
         self.tokens = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN))
         self.labels = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN))
@@ -57,7 +67,7 @@ class GeneratorActor(Actor):
     @endpoint
     async def set_step(self, step: int):
         """Receive step from controller."""
-        pass
+        set_step(step)
 
     @endpoint
     async def generate(
@@ -80,13 +90,15 @@ class TrainerActor(Actor):
             torch.distributed.init_process_group(
                 backend="nccl", rank=rank, world_size=world_size
             )
+        init_observability(source="trainer", output_dir=OUTPUT_DIR, rank=rank)
         mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
         self.trainer = ToyTrainer(self.device, mesh["dp"], mesh["tp"], OUTPUT_DIR)
 
     @endpoint
     async def set_step(self, step: int):
-        """Receive step from controller."""
+        """Receive step from controller. Sets step on trainer + ContextVar."""
         self.trainer.step = step
+        self.trainer.metrics_processor.set_step(step)
 
     @endpoint
     async def train_step(self, tokens, labels, loss_mask) -> float:
@@ -111,16 +123,20 @@ class RewardActor(Actor):
     @endpoint
     async def setup(self):
         self.target = torch.ones(D_MODEL)
+        rank = current_rank().rank
+        init_observability(source="reward", output_dir=OUTPUT_DIR, rank=rank)
 
     @endpoint
     async def set_step(self, step: int):
         """Receive step from controller."""
-        pass
+        set_step(step)
 
     @endpoint
     async def score(self, completions: list[torch.Tensor]) -> list[float]:
         """Score completions against a target. Returns list of rewards."""
-        return [-((c - self.target) ** 2).mean().item() for c in completions]
+        with record_span("rl_time/scoring_s", EventType.RL_SCORING):
+            rewards = [-((c - self.target) ** 2).mean().item() for c in completions]
+        return rewards
 
 
 async def main():
@@ -129,6 +145,8 @@ async def main():
     if os.path.exists(OUTPUT_DIR):
         shutil.rmtree(OUTPUT_DIR)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    init_observability(source="controller", output_dir=OUTPUT_DIR, rank=0)
 
     # ---- Setup ----
     host = this_host()
@@ -154,6 +172,8 @@ async def main():
     # ---- Training loop ----
     async def run_training():
         for step in range(1, NUM_STEPS + 1):
+            set_step(step)
+            clear_step_tags()
             for actor in actors:
                 await actor.set_step.call(step)
 
@@ -163,17 +183,18 @@ async def main():
 
             # Score is not used anywhere. This is a dummy call to demonstrate
             # multi-actor observability.
-            completions = [
-                torch.randn(D_MODEL) for _ in range(min(4, len(tokens)))
-            ]
-            reward_results = await reward_actor.score.call(completions)
+            completions = [torch.randn(D_MODEL) for _ in range(min(4, len(tokens)))]
+            with record_span("rl_time/scoring_s", EventType.RL_SCORING):
+                reward_results = await reward_actor.score.call(completions)
             rewards = next(iter(reward_results.values()))
 
             # Train on generated completions.
-            loss_results = await trainer.train_step.call(tokens, labels, loss_mask)
+            with record_span("rl_time/training_s", EventType.FWD_BWD):
+                loss_results = await trainer.train_step.call(tokens, labels, loss_mask)
             loss = next(iter(loss_results.values()))
 
             reward_mean = sum(rewards) / len(rewards)
+            record_event({"train.loss": loss, "reward_mean": reward_mean})
             logger.info(
                 f"step: {step}  loss: {loss:8.5f}  reward_mean: {reward_mean:8.5f}"
             )
