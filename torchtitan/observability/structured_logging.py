@@ -517,13 +517,16 @@ class record_span(ContextDecorator):  # noqa: N801
     experiment JSONL via ``record_metric``.
 
     Args:
-        description: Metric name (e.g., "trainer_time/forward_backward_s").
-            Used as-is for both system JSONL and experiment metric key.
-        event_type: Base EventType (e.g., EventType.FWD_BWD). Must have
-            corresponding _START and _END variants.
+        description: Human-readable label for log messages and metric key.
+            Free-form string (e.g., "trainer_time/forward_backward_s").
+            Appears in system JSONL messages and, when metrics are enabled,
+            as the experiment metric key.
+        event_type: Categorization for post-processing and visualization
+            tools (Perfetto, DuckDB). Must have corresponding _START and
+            _END variants in ``EventType`` (e.g., ``EventType.FWD_BWD``
+            requires ``FWD_BWD_START`` and ``FWD_BWD_END``).
         log_to_metrics: If True, record duration to experiment JSONL.
-            Set to False for spans where step is None or where separate
-            metrics are recorded (e.g., validation).
+            Default True.
 
     Usage::
 
@@ -585,5 +588,7 @@ class record_span(ContextDecorator):  # noqa: N801
             stacklevel=2,
         )
         if self.log_to_metrics and step is not None:
+            # stacklevel=3: skip __exit__ → record_metric → logger, so the
+            # logged call site shows the user's `with record_span(...)` line.
             record_metric(self.description, MeanMetric(sum=duration_s), _stacklevel=3)
         return False  # Don't suppress exceptions
