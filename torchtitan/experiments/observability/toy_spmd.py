@@ -161,10 +161,11 @@ class ToyTrainer:
         self.metrics_processor = MetricsProcessor()
         
         torch.manual_seed(0)
-        model = TinyModel().to(device)
-        self._apply_tp(model, tp_mesh)
-        self._apply_compile(model)
-        self._apply_fsdp(model, dp_mesh)
+        with record_span("setup/model_build", EventType.BUILD_MODEL):
+            model = TinyModel().to(device)
+            self._apply_tp(model, tp_mesh)
+            self._apply_compile(model)
+            self._apply_fsdp(model, dp_mesh)
         self.model = model
         self.optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
