@@ -1,0 +1,42 @@
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+/home/felipemello/.conda/envs/titan/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+[rank0]:[W311 11:47:57.348702885 ProcessGroupNCCL.cpp:5223] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
+NCCL version 2.28.9+cuda12.9
+Toy SPMD: 4 GPUs, 2DPx2TP, 20 steps
+NCCL version 2.28.9+cuda12.9
+Step        Loss    GradNorm    Time(ms)
+--------------------------------------------------
+NCCL version 2.28.9+cuda12.9
+[rank1]:W0311 11:48:03.589000 30728 site-packages/torch/distributed/tensor/_redistribute.py:347] While redistributing from (_NormPartial(2.0), _NormPartial(2.0)) to (Replicate(), Replicate()), 2 sequential all_reduce operations will be performed. This is suboptimal: multiple collective operations have higher latency (separate kernel launches and synchronization points) and may give inconsistent results between ranks due to different reduction orders. To optimize, flatten mesh dimensions ["dp", "tp"] so DTensor can use a single operation instead.
+[rank3]:W0311 11:48:03.592000 30730 site-packages/torch/distributed/tensor/_redistribute.py:347] While redistributing from (_NormPartial(2.0), _NormPartial(2.0)) to (Replicate(), Replicate()), 2 sequential all_reduce operations will be performed. This is suboptimal: multiple collective operations have higher latency (separate kernel launches and synchronization points) and may give inconsistent results between ranks due to different reduction orders. To optimize, flatten mesh dimensions ["dp", "tp"] so DTensor can use a single operation instead.
+[rank0]:W0311 11:48:03.593000 30727 site-packages/torch/distributed/tensor/_redistribute.py:347] While redistributing from (_NormPartial(2.0), _NormPartial(2.0)) to (Replicate(), Replicate()), 2 sequential all_reduce operations will be performed. This is suboptimal: multiple collective operations have higher latency (separate kernel launches and synchronization points) and may give inconsistent results between ranks due to different reduction orders. To optimize, flatten mesh dimensions ["dp", "tp"] so DTensor can use a single operation instead.
+[rank2]:W0311 11:48:03.594000 30729 site-packages/torch/distributed/tensor/_redistribute.py:347] While redistributing from (_NormPartial(2.0), _NormPartial(2.0)) to (Replicate(), Replicate()), 2 sequential all_reduce operations will be performed. This is suboptimal: multiple collective operations have higher latency (separate kernel launches and synchronization points) and may give inconsistent results between ranks due to different reduction orders. To optimize, flatten mesh dimensions ["dp", "tp"] so DTensor can use a single operation instead.
+   1      3.6902      1.1520
+   2      3.4212      1.1009
+   3      3.1687      1.0480
+   4      2.9347      0.9953
+   5      2.7195      0.9442
+   6      2.5231      0.8949
+   7      2.3446      0.8475
+   8      2.1829      0.8017
+   9      2.0371      0.7576
+  10      1.9060      0.7156
+  11      1.7887      0.6761
+  12      1.6843      0.6395
+  13      1.5918      0.6058
+  14      1.5105      0.5749
+  15      1.4393      0.5467
+  16      1.3776      0.5211
+  17      1.3245      0.4979
+  18      1.2795      0.4770
+  19      1.2418      0.4586
+  20      1.2107      0.4424
+Chrome Trace: /home/felipemello/torchtitan/torchtitan/experiments/observability/outputs/toy_spmd/trace.json
+  164 events from 4 sources
+  View in: chrome://tracing or https://ui.perfetto.dev
+
+Done. Output: /home/felipemello/torchtitan/torchtitan/experiments/observability/outputs/toy_spmd

@@ -156,30 +156,29 @@ class MetricsProcessor(Configurable):
             prefix = self._TRAIN_PREFIX
 
         tps = ntokens / time_delta if time_delta > 0 else 0
-        record_metric(f"{prefix}/tps_mean", MeanMetric(sum=tps))
+        record_metric(f"{prefix}_throughput/tps_mean", MeanMetric(sum=tps))
 
-        # TFLOPS and MFU (only when flops are known)
         if self.num_flops_per_token > 0:
             tflops = self.num_flops_per_token * tps / 1e12
-            record_metric(f"{prefix}/tflops_mean", MeanMetric(sum=tflops))
+            record_metric(f"{prefix}_throughput/tflops_mean", MeanMetric(sum=tflops))
             if self._gpu_peak_flops > 0:
                 mfu = 100 * self.num_flops_per_token * tps / self._gpu_peak_flops
-                record_metric(f"{prefix}/mfu_pct_mean", MeanMetric(sum=mfu))
+                record_metric(f"{prefix}_throughput/mfu_pct_mean", MeanMetric(sum=mfu))
 
     def record_memory(self, is_validation: bool = False) -> None:
         """Record GPU memory peak stats since last reset."""
         prefix = self._VAL_PREFIX if is_validation else self._TRAIN_PREFIX
         mem = self.device_memory_monitor.get_peak_stats()
         record_metric(
-            f"{prefix}/memory_reserved_gib_max",
+            f"{prefix}_memory/reserved_gib_max",
             MaxMetric(value=mem.max_reserved_gib),
         )
         record_metric(
-            f"{prefix}/memory_active_gib_max",
+            f"{prefix}_memory/active_gib_max",
             MaxMetric(value=mem.max_active_gib),
         )
         record_metric(
-            f"{prefix}/memory_alloc_retries_sum",
+            f"{prefix}_memory/alloc_retries_sum",
             SumMetric(value=mem.num_alloc_retries),
         )
 

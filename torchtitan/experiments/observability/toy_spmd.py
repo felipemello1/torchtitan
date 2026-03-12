@@ -273,7 +273,7 @@ class ToyTrainer:
         # Derived metrics recorded every step (cheap, outside should_log gate)
         self.metrics_processor.record_throughput()
         self.metrics_processor.record_memory()
-        record_metric("trainer/lr", NoOpMetric(value=LR))
+        record_metric("training/lr", NoOpMetric(value=LR))
 
         # Loss/grad_norm only on log steps (.item() triggers GPU→CPU sync)
         if self.metrics_processor.should_log(self.step):
@@ -282,8 +282,8 @@ class ToyTrainer:
             dist.all_reduce(loss_scalar, op=dist.ReduceOp.AVG)
             loss_val = loss_scalar.item()
             grad_norm_val = grad_norm.item()
-            record_metric("trainer/loss_mean", NoOpMetric(value=loss_val))
-            record_metric("trainer/grad_norm_max", MaxMetric(value=grad_norm_val))
+            record_metric("training/loss_mean", NoOpMetric(value=loss_val))
+            record_metric("training/grad_norm_max", MaxMetric(value=grad_norm_val))
             record_event({"train.loss": loss_val, "train.grad_norm": grad_norm_val})
 
         return loss, grad_norm
@@ -298,7 +298,7 @@ class ToyTrainer:
             loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
             val_loss = loss_sum / valid_tokens
 
-        record_metric("validator/loss_mean", MeanMetric(sum=val_loss.item()))
+        record_metric("validation/loss_mean", MeanMetric(sum=val_loss.item()))
         self.metrics_processor.record_throughput(is_validation=True)
         self.metrics_processor.record_memory(is_validation=True)
 
@@ -357,15 +357,15 @@ def main():
         log_freq=5,
         enable_wandb=ENABLE_WANDB,
         console_log_metric_keys=[
-            "trainer/loss_mean",
-            "trainer/grad_norm_max",
-            "trainer/memory_reserved_gib_max",
-            "trainer/tps_mean",
+            "training/loss_mean",
+            "training/grad_norm_max",
+            "trainer_memory/reserved_gib_max",
+            "trainer_throughput/tps_mean",
         ],
         console_log_validation_keys=[
-            "validator/loss_mean",
-            "validator/memory_reserved_gib_max",
-            "validator/tps_mean",
+            "validation/loss_mean",
+            "validator_memory/reserved_gib_max",
+            "validator_throughput/tps_mean",
         ],
     )
     trainer = ToyTrainer(

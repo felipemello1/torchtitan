@@ -110,6 +110,7 @@ class TrainerActor(Actor):
     @endpoint
     async def train_step(self, tokens, labels, loss_mask) -> float:
         """Train one step on generated completions. Returns loss value."""
+        self.trainer.metrics_processor.reset_training_counters()
         tokens = tokens.to(self.device)
         labels = labels.to(self.device)
         loss_mask = loss_mask.to(self.device)
@@ -163,11 +164,11 @@ async def main():
         kwargs={
             "enable_wandb": True,
             "console_log_metric_keys": [
-                "trainer/loss_mean",
-                "trainer/grad_norm_max",
-                "trainer/lr",
-                "trainer/tps_mean",
-                "trainer/memory_reserved_gib_max",
+                "training/loss_mean",
+                "training/grad_norm_max",
+                "training/lr",
+                "trainer_throughput/tps_mean",
+                "trainer_memory/reserved_gib_max",
             ],
         },
         daemon=True,

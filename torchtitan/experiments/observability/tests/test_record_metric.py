@@ -48,9 +48,9 @@ class TestExperimentJSONL:
                     record = json.loads(line)
                     keys.add(record.get("key"))
 
-        assert "trainer/loss_mean" in keys, f"Missing loss metric. Found: {keys}"
-        assert "trainer/grad_norm_max" in keys, f"Missing grad_norm. Found: {keys}"
-        assert "trainer/lr" in keys, f"Missing lr. Found: {keys}"
+        assert "training/loss_mean" in keys, f"Missing loss metric. Found: {keys}"
+        assert "training/grad_norm_max" in keys, f"Missing grad_norm. Found: {keys}"
+        assert "training/lr" in keys, f"Missing lr. Found: {keys}"
 
     def test_experiment_jsonl_has_required_fields(self, experiment_logs_dir):
         files = glob(os.path.join(experiment_logs_dir, "*.jsonl"))
@@ -81,10 +81,10 @@ class TestExperimentJSONL:
                     record = json.loads(line)
                     reduce_by_key[record["key"]] = record["reduce"]
 
-        assert reduce_by_key.get("trainer/loss_mean") == "NoOpMetric"
-        assert reduce_by_key.get("trainer/grad_norm_max") == "MaxMetric"
-        assert reduce_by_key.get("trainer/lr") == "NoOpMetric"
-        assert reduce_by_key.get("trainer/tps_mean") == "MeanMetric"
+        assert reduce_by_key.get("training/loss_mean") == "NoOpMetric"
+        assert reduce_by_key.get("training/grad_norm_max") == "MaxMetric"
+        assert reduce_by_key.get("training/lr") == "NoOpMetric"
+        assert reduce_by_key.get("trainer_throughput/tps_mean") == "MeanMetric"
 
     def test_validation_metrics_have_validator_prefix(self, experiment_logs_dir):
         files = glob(os.path.join(experiment_logs_dir, "*.jsonl"))
@@ -97,7 +97,7 @@ class TestExperimentJSONL:
                         continue
                     record = json.loads(line)
                     keys.add(record.get("key"))
-        assert "validator/loss_mean" in keys, f"Missing validator loss. Found: {keys}"
+        assert "validation/loss_mean" in keys, f"Missing validation loss. Found: {keys}"
 
     def test_log_frequency_not_every_step(self, experiment_logs_dir):
         """With log_freq=5, loss should not appear on every step."""
@@ -110,7 +110,7 @@ class TestExperimentJSONL:
                     if not line:
                         continue
                     record = json.loads(line)
-                    if record.get("key") == "trainer/loss_mean":
+                    if record.get("key") == "training/loss_mean":
                         loss_steps.add(record["step"])
         # With log_freq=5 and 20 steps, loss appears on steps {1, 5, 10, 15, 20}
         assert loss_steps, "No loss entries found"
