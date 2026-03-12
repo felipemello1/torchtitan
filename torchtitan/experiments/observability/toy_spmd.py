@@ -274,12 +274,13 @@ class ToyTrainer:
         self.metrics_processor.record_memory()
         record_metric("toy_trainer/lr", NoOpMetric(value=LR))
 
-        # Loss metrics only on log steps (gated by should_log in train())
+        # Loss/grad_norm only on log steps (.item() triggers GPU→CPU sync)
         if self.metrics_processor.should_log(self.step):
-            record_metric("toy_trainer/loss_mean", MeanMetric(sum=loss.item()))
-            record_metric(
-                "toy_trainer/grad_norm_max", MaxMetric(value=grad_norm.item())
-            )
+            loss_val = loss.item()
+            grad_norm_val = grad_norm.item()
+            record_metric("toy_trainer/loss_mean", MeanMetric(sum=loss_val))
+            record_metric("toy_trainer/grad_norm_max", MaxMetric(value=grad_norm_val))
+            record_event({"train.loss": loss_val, "train.grad_norm": grad_norm_val})
 
         return loss, grad_norm
 
@@ -314,10 +315,6 @@ class ToyTrainer:
             with record_span("trainer_time/step_s", EventType.STEP):
                 tokens, labels, loss_mask = next(data_iterator)
                 loss, grad_norm = self.train_step(tokens, labels, loss_mask)
-
-            record_event(
-                {"train.loss": loss.item(), "train.grad_norm": grad_norm.item()}
-            )
 
             if is_validation:
                 add_step_tag("eval")

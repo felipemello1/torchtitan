@@ -166,6 +166,8 @@ async def main():
                 "toy_trainer/loss_mean",
                 "toy_trainer/grad_norm_max",
                 "toy_trainer/lr",
+                "toy_trainer/tps_mean",
+                "toy_trainer/memory_reserved_gib_max",
             ],
         },
         daemon=True,
