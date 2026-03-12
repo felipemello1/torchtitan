@@ -466,8 +466,9 @@ def init_observability(source: str, output_dir: str, rank: int | None = None) ->
         if sys_logger.level == logging.NOTSET or sys_logger.level > logging.INFO:
             sys_logger.setLevel(logging.INFO)
 
-    # --- Experiment handler ---
+    # --- Experiment handler (record_metric → per-rank JSONL) ---
     exp_logger = logging.getLogger(EXPERIMENT_LOGGER_NAME)
+    # Skip if already initialized (idempotent)
     if not any(isinstance(h, ExperimentLoggingHandler) for h in exp_logger.handlers):
         exp_path = os.path.join(
             output_dir,
@@ -477,6 +478,7 @@ def init_observability(source: str, output_dir: str, rank: int | None = None) ->
         handler = ExperimentLoggingHandler(filepath=exp_path)
         handler.setFormatter(ExperimentJSONFormatter(rank=rank, source=source))
         exp_logger.addHandler(handler)
+    # Don't propagate to root logger (avoids duplicate console output)
     exp_logger.propagate = False
     if exp_logger.level == logging.NOTSET or exp_logger.level > logging.INFO:
         exp_logger.setLevel(logging.INFO)

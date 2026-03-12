@@ -336,7 +336,7 @@ def main():
 
     mp_config = MetricsProcessor.Config(
         enable_wandb=ENABLE_WANDB,
-        console_keys=[
+        console_log_metric_keys=[
             "toy_trainer/loss_mean",
             "toy_trainer/grad_norm_max",
             "toy_trainer/lr",

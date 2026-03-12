@@ -28,19 +28,24 @@ class MetricsProcessor(Configurable):
     class Config(Configurable.Config):
         enable_wandb: bool = True
         enable_tensorboard: bool = False
-        enable_logging_subprocess: bool = True
-        console_keys: list[str] = field(default_factory=list)
+        console_log_metric_keys: list[str] = field(default_factory=list)
 
     def __init__(self, config: Config, *, dump_folder: str, rank: int):
         self._step: int = 0
         self._rank = rank
 
+        # Spawn the logging subprocess if any output is enabled.
         # logging_worker reads experiment JSONL from all ranks, aggregates
         # metrics, and flushes to WandB/TB/console. Runs in a separate
         # process so it never blocks training.
+        needs_subprocess = (
+            config.enable_wandb
+            or config.enable_tensorboard
+            or config.console_log_metric_keys
+        )
         self._log_queue: multiprocessing.Queue | None = None
         self._log_process: multiprocessing.Process | None = None
-        if rank == 0 and config.enable_logging_subprocess:
+        if rank == 0 and needs_subprocess:
             self._log_queue = multiprocessing.Queue()
             self._log_process = multiprocessing.Process(
                 target=logging_worker,
@@ -48,7 +53,7 @@ class MetricsProcessor(Configurable):
                 kwargs={
                     "enable_wandb": config.enable_wandb,
                     "enable_tensorboard": config.enable_tensorboard,
-                    "console_keys": config.console_keys,
+                    "console_log_metric_keys": config.console_log_metric_keys,
                 },
                 daemon=True,
             )
@@ -67,8 +72,9 @@ class MetricsProcessor(Configurable):
         all JSONL files. Non-blocking after barrier (~0.1ms).
         """
         torch.distributed.barrier()
+        is_validation = False
         if self._log_queue is not None:
-            self._log_queue.put((step, False))
+            self._log_queue.put((step, is_validation))
 
     def close(self) -> None:
         """Shut down the logging subprocess."""

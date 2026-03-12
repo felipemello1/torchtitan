@@ -16,6 +16,8 @@ from typing import Any
 from torchtitan.observability._constants import _METRIC_ENTRY, EXPERIMENT_LOGGER_NAME
 from torchtitan.observability.step_state import get_step
 
+_experiment_logger = logging.getLogger(EXPERIMENT_LOGGER_NAME)
+
 
 # ---------------------------------------------------------------------------
 # MetricValue types
@@ -23,12 +25,17 @@ from torchtitan.observability.step_state import get_step
 
 
 class MetricValue(ABC):
-    """Base for metric types. Each subclass defines serialization + reduction.
+    """Base for metric types.
 
-    Example JSONL output (from MeanMetric)::
+    Each subclass defines how to serialize its state to JSONL (``get_state``)
+    and how the aggregator should combine entries from multiple ranks
+    (``get_reduced_value_from_states``).
 
-        {"key": "reward", "reduce": "MeanMetric", "sum": 7.2, "weight": 10,
-         "step": 42, "rank": 0, "source": "reward", ...}
+    Example: ``MeanMetric(sum=7.2, weight=10)`` serializes to JSONL as::
+
+        {"key": "reward", "reduce": "MeanMetric", "sum": 7.2, "weight": 10, ...}
+
+    and aggregates as ``(Σsum) / (Σweight)`` across ranks.
     """
 
     reduce_name: str
@@ -48,10 +55,12 @@ class MetricValue(ABC):
 class MeanMetric(MetricValue):
     """Weighted mean: (Σsum) / (Σweight).
 
-    Example::
+    When aggregating entries from multiple ranks, sums and weights are
+    accumulated separately, then divided::
 
-        MeanMetric(sum=0.5)              # single value, weight=1
-        MeanMetric(sum=3.0, weight=6)    # weighted: mean = 3.0 / 6 = 0.5
+        # Rank 0: MeanMetric(sum=6.0, weight=3.0)
+        # Rank 1: MeanMetric(sum=4.0, weight=2.0)
+        # Aggregated: (6.0 + 4.0) / (3.0 + 2.0) = 2.0
     """
 
     reduce_name = "MeanMetric"
@@ -119,12 +128,14 @@ class SumMetric(MetricValue):
 
 
 class NoOpMetric(MetricValue):
-    """Passthrough for already-reduced values (e.g., loss after dist_sum, lr).
+    """No reduction — value is used as-is. For values that are already
+    reduced (e.g., loss after ``dist_sum``) or identical across ranks
+    (e.g., learning rate).
 
     Example::
 
+        # Loss was already all-reduced via dist_sum — just pass it through
         record_metric("loss/trainer_loss_mean", NoOpMetric(value=0.038))
-        record_metric("trainer_schedule/lr", NoOpMetric(value=3e-4))
     """
 
     reduce_name = "NoOpMetric"
@@ -150,9 +161,6 @@ REDUCE_REGISTRY: dict[str, type[MetricValue]] = {
 }
 
 
-_experiment_logger = logging.getLogger(EXPERIMENT_LOGGER_NAME)
-
-
 # ---------------------------------------------------------------------------
 # record_metric — fire-and-forget public API
 # ---------------------------------------------------------------------------
@@ -161,7 +169,8 @@ _experiment_logger = logging.getLogger(EXPERIMENT_LOGGER_NAME)
 def record_metric(key: str, value: MetricValue, _stacklevel: int = 2) -> None:
     """Record a metric to experiment JSONL.
 
-    Formatter adds step, rank, and source automatically.
+    Step, rank, source, caller, and timestamp are added automatically by
+    the JSONL handler configured in ``init_observability``.
 
     Example::
 
@@ -170,11 +179,17 @@ def record_metric(key: str, value: MetricValue, _stacklevel: int = 2) -> None:
     Args:
         key: Metric name (e.g., "loss/trainer_loss_mean").
         value: MetricValue instance (MeanMetric, MaxMetric, NoOpMetric, etc.).
-        _stacklevel: For internal callers (e.g., record_span) to report the
-            correct caller location. Default 2 (direct caller).
+        _stacklevel: Controls which call site appears in the ``caller`` field.
+            Default 2 (the direct caller). If a utility function wraps
+            record_metric, pass 3 so the logged caller shows the utility's
+            caller instead (e.g., record_span uses _stacklevel=3 so the
+            caller shows the user's ``with record_span(...)`` line).
     """
     if get_step() is None:
         raise ValueError("No step in context. Call set_step() before record_metric().")
+
+    # Serialize all metric state (sum, weight, value, etc.) so the JSONL
+    # handler can write it and the aggregator can reconstruct the reduction.
     state = value.get_state()
     state["key"] = key
     _experiment_logger.info(
@@ -192,7 +207,12 @@ def record_metric(key: str, value: MetricValue, _stacklevel: int = 2) -> None:
 class ExperimentJSONFormatter(logging.Formatter):
     """Formats experiment metric records as flat JSONL.
 
-    Example output::
+    Input (from record_metric via LogRecord.extra)::
+
+        LogRecord with extra={"_metric_entry": {"key": "reward", "reduce": "MeanMetric",
+                                                 "sum": 7.2, "weight": 10}}
+
+    Output (one JSON line per record)::
 
         {"key": "reward", "reduce": "MeanMetric", "sum": 7.2, "weight": 10,
          "step": 42, "rank": 0, "source": "reward",
@@ -217,9 +237,9 @@ class ExperimentJSONFormatter(logging.Formatter):
             state["step"] = step
             state["rank"] = self.rank
             state["source"] = self.source
-            state[
-                "caller"
-            ] = f"{os.path.relpath(record.pathname)}:{record.lineno}:{record.funcName}"
+            state["caller"] = (
+                f"{os.path.relpath(record.pathname)}:{record.lineno}:{record.funcName}"
+            )
             state["timestamp"] = time.time()
             return json.dumps(state)
 

@@ -94,8 +94,8 @@ class TrainerActor(Actor):
             )
         init_observability(source="trainer", output_dir=OUTPUT_DIR, rank=rank)
         mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
-        # Controller owns the logging subprocess — disable in trainer.
-        mp_config = MetricsProcessor.Config(enable_logging_subprocess=False)
+        # Controller owns the logging subprocess — trainer has no backends/console.
+        mp_config = MetricsProcessor.Config(enable_wandb=False)
         self.trainer = ToyTrainer(
             self.device, mesh["dp"], mesh["tp"], OUTPUT_DIR, mp_config=mp_config
         )
@@ -161,7 +161,7 @@ async def main():
         args=(log_queue, OUTPUT_DIR),
         kwargs={
             "enable_wandb": True,
-            "console_keys": [
+            "console_log_metric_keys": [
                 "toy_trainer/loss_mean",
                 "toy_trainer/grad_norm_max",
                 "toy_trainer/lr",
@@ -217,10 +217,8 @@ async def main():
 
             reward_mean = sum(rewards) / len(rewards)
             record_event({"train.loss": loss, "reward_mean": reward_mean})
-            log_queue.put((step, False))
-            logger.info(
-                f"step: {step}  loss: {loss:8.5f}  reward_mean: {reward_mean:8.5f}"
-            )
+            is_validation = False
+            log_queue.put((step, is_validation))
 
     await run_training()
 

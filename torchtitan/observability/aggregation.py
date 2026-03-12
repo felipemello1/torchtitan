@@ -31,8 +31,13 @@ logger = logging.getLogger(__name__)
 _QUEUE_TIMEOUT_S = 600  # 10 minutes — if no signal, assume training crashed
 
 
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+
+
 def aggregate(entries: list[dict]) -> dict[str, float]:
-    """Reduce a list of metric entries to a single dict. Pure function.
+    """Reduce a list of metric entries to a single dict.
 
     Groups entries by key and delegates to REDUCE_REGISTRY.
 
@@ -46,14 +51,23 @@ def aggregate(entries: list[dict]) -> dict[str, float]:
     """
     if not entries:
         return {}
-    result: dict[str, float] = {}
+
+    # Group entries by metric key
     by_key: dict[str, list[dict]] = defaultdict(list)
     for entry in entries:
         by_key[entry["key"]].append(entry)
+
+    # Reduce each key using its registered reduce type
+    result: dict[str, float] = {}
     for key, key_entries in by_key.items():
         cls = REDUCE_REGISTRY[key_entries[0]["reduce"]]
         result[key] = cls.get_reduced_value_from_states(key_entries)
     return result
+
+
+# ---------------------------------------------------------------------------
+# JSONL reader
+# ---------------------------------------------------------------------------
 
 
 def _read_new_lines(
@@ -61,10 +75,9 @@ def _read_new_lines(
     offsets: dict[str, int],
     buffer: dict[int, list[dict]],
 ) -> None:
-    """Read all new JSONL lines into buffer, grouped by step.
+    """Read new JSONL lines into buffer, grouped by step.
 
-    Opens files fresh each time (NFS-friendly — forces cache invalidation).
-    Tracks offsets to avoid re-reading old lines.
+    Tracks file offsets to avoid re-reading old lines.
     """
     for fp in sorted(glob.glob(os.path.join(log_dir, "*.jsonl"))):
         with open(fp) as f:
@@ -83,20 +96,23 @@ def _read_new_lines(
             offsets[fp] = f.tell()
 
 
+# ---------------------------------------------------------------------------
+# Flush: aggregate + write to backends + console
+# ---------------------------------------------------------------------------
+
+
 def _flush_step(
     step: int,
     buffer: dict[int, list[dict]],
     is_validation: bool,
     logger_backend: BaseLogger,
-    console_keys: list[str],
+    console_log_metric_keys: list[str],
 ) -> tuple[dict[str, float], int]:
-    """Pop entries for step, aggregate, write to backends + console.
+    """Aggregate entries for ``step``, write to backends, print to console.
 
-    Purges entries for steps older than the requested step.
-
-    Returns:
-        (aggregated_dict, num_entries)
+    Also purges entries for older steps to prevent memory leaks.
     """
+    # Pop this step's entries and discard older steps
     entries = buffer.pop(step, [])
     for s in [s for s in buffer if s < step]:
         del buffer[s]
@@ -104,66 +120,85 @@ def _flush_step(
     aggregated = aggregate(entries)
 
     if aggregated:
+        # Write all metrics to WandB/TensorBoard
         logger_backend.log(aggregated, step)
-        if console_keys:
-            _log_to_console(step, aggregated, console_keys)
+
+        # Print selected metrics to console
+        if console_log_metric_keys:
+            _log_to_console(step, aggregated, console_log_metric_keys)
 
     return aggregated, len(entries)
 
 
-# Colors cycle for console columns (assigned by position in the key list).
+# ---------------------------------------------------------------------------
+# Console output
+# ---------------------------------------------------------------------------
+
+# Colors cycle by position in the key list.
 _COLORS = ["green", "yellow", "cyan", "blue", "magenta", "red"]
 
 
-def _fmt_value(value: float) -> str:
-    """Format a number showing first 2 non-zero digits after '.', up to 5 decimals.
+def _fmt_value(value: Any) -> str:
+    """Format a value for console display.
+
+    Numbers: show at least 2 non-zero decimals, up to 5 decimal places.
+    Other types (bool, str): converted to string as-is.
 
     Examples::
 
-        _fmt_value(3.67060)   → '3.6706'
+        _fmt_value(3.67060)   → '3.67'
         _fmt_value(0.00123)   → '0.0012'
         _fmt_value(1234.5)    → '1234.5'
-        _fmt_value(0.5603)    → '0.5603'
+        _fmt_value(True)      → 'True'
     """
+    if not isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, bool):
+        return str(value)
     if value == 0:
         return "0"
-    # Find how many decimals needed to show 2 non-zero digits
-    abs_frac = abs(value) - int(abs(value))
-    if abs_frac == 0 or abs(value) >= 100:
+    if isinstance(value, int) or abs(value) >= 100:
         return f"{value:.1f}"
-    decimals = 0
-    non_zero_seen = 0
-    temp = abs_frac
-    while decimals < 5 and non_zero_seen < 2:
-        decimals += 1
+
+    # Count decimals needed to show 2 non-zero digits
+    frac = abs(value) - int(abs(value))
+    if frac == 0:
+        return f"{value:.1f}"
+    n_decimals, n_nonzero = 0, 0
+    temp = frac
+    while n_decimals < 5 and n_nonzero < 2:
+        n_decimals += 1
         temp *= 10
-        digit = int(temp) % 10
-        if digit != 0 or non_zero_seen > 0:
-            non_zero_seen += 1
-    decimals = max(decimals, 2)
-    return f"{value:.{decimals}f}"
+        if int(temp) % 10 != 0 or n_nonzero > 0:
+            n_nonzero += 1
+    return f"{value:.{max(n_decimals, 2)}f}"
 
 
 def _log_to_console(
-    step: int, aggregated: dict[str, float], console_keys: list[str]
+    step: int,
+    aggregated: dict[str, float],
+    console_log_metric_keys: list[str],
 ) -> None:
     """Print one console line with the configured metric keys.
 
-    Colors are assigned by position in the key list and cycle through
-    _COLORS. Missing metrics show '--'.
+    Colors cycle by position in the key list. Missing metrics show '--'.
     """
     color = Color()
     parts = [f"{color.red}step: {step:2}"]
-    for i, key in enumerate(console_keys):
+    for i, key in enumerate(console_log_metric_keys):
         c = getattr(color, _COLORS[i % len(_COLORS)])
-        label = key.rsplit("/", 1)[-1]  # e.g., "toy_trainer/loss_mean" → "loss_mean"
         val = aggregated.get(key)
         if val is None:
-            parts.append(f"{c}{label}: --")
+            parts.append(f"{c}{key}: --")
         else:
-            parts.append(f"{c}{label}: {_fmt_value(val)}")
+            parts.append(f"{c}{key}: {_fmt_value(val)}")
     parts.append(color.reset)
     logger.info("  ".join(parts))
+
+
+# ---------------------------------------------------------------------------
+# Backend logger builder
+# ---------------------------------------------------------------------------
 
 
 def _build_metric_logger(
@@ -189,6 +224,11 @@ def _build_metric_logger(
     return container
 
 
+# ---------------------------------------------------------------------------
+# Logging subprocess
+# ---------------------------------------------------------------------------
+
+
 def logging_worker(
     queue: multiprocessing.Queue,
     dump_folder: str,
@@ -198,26 +238,29 @@ def logging_worker(
     save_tb_folder: str = "tb",
     config_dict: dict[str, Any] | None = None,
     tag: str | None = None,
-    console_keys: list[str] | None = None,
+    console_log_metric_keys: list[str] | None = None,
     queue_timeout_s: float = _QUEUE_TIMEOUT_S,
 ) -> None:
-    """Logging subprocess entry point.
+    """Background process that reads experiment JSONL, aggregates across
+    ranks, and writes to WandB/TB/console.
 
-    Reads experiment JSONL, aggregates, writes to WandB/TB/console.
-    Receives ``(step, is_validation)`` tuples via queue.
-    Shuts down on ``None`` sentinel or queue timeout (crash recovery).
+    The training process signals this worker via ``queue.put((step, is_validation))``
+    after each log step. The worker reads all JSONL files, aggregates, and
+    flushes. Shuts down on ``None`` sentinel or queue timeout.
 
     Args:
-        queue: Receives (step, is_validation) or None to shut down.
-        dump_folder: Root output directory containing experiment_logs/.
+        queue: Receives ``(step, is_validation)`` tuples, or ``None`` to
+            shut down.
+        dump_folder: Root output directory containing ``experiment_logs/``.
         enable_wandb: Whether to log to WandB.
         enable_tensorboard: Whether to log to TensorBoard.
         save_tb_folder: Subfolder for TensorBoard files.
-        config_dict: Full config for wandb.init(config=...).
+        config_dict: Full config for ``wandb.init(config=...)``.
         tag: Prefix for TB/WandB scalar keys.
-        console_keys: Metric keys to print to console. Empty list disables.
-        queue_timeout_s: Seconds to wait before assuming training crashed.
-            Default 600 (10 min). Set to 1 for unit tests.
+        console_log_metric_keys: Metric keys to print to console each step.
+            If empty or None, console output is disabled.
+        queue_timeout_s: Seconds to wait for a signal before assuming
+            training crashed. Default 600 (10 min).
     """
     init_observability(source="logging_worker", output_dir=dump_folder, rank=0)
 
@@ -229,6 +272,7 @@ def logging_worker(
     for fp in glob.glob(os.path.join(log_dir, "*.jsonl")):
         offsets[fp] = os.path.getsize(fp)
 
+    # Build backend loggers (WandB, TensorBoard)
     logger_backend = _build_metric_logger(
         dump_folder,
         enable_wandb=enable_wandb,
@@ -239,6 +283,7 @@ def logging_worker(
     )
     logger.info("[logging process] started, reading from %s", log_dir)
 
+    # Main loop: wait for signals, read JSONL, aggregate, flush
     while True:
         try:
             msg = queue.get(timeout=queue_timeout_s)
@@ -255,12 +300,18 @@ def logging_worker(
         step, is_validation = msg
         time.sleep(0.02)  # let filesystem propagate writes
 
+        # Read new JSONL lines from all rank files
         t_read_start = time.perf_counter()
         _read_new_lines(log_dir, offsets, buffer)
         t_read_end = time.perf_counter()
 
+        # Aggregate and flush to backends + console
         aggregated, num_entries = _flush_step(
-            step, buffer, is_validation, logger_backend, console_keys or []
+            step,
+            buffer,
+            is_validation,
+            logger_backend,
+            console_log_metric_keys or [],
         )
 
         logger.debug(
