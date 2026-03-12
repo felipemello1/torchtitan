@@ -334,7 +334,14 @@ def main():
     if rank == 0:
         print(f"Toy SPMD: {world_size} GPUs, 2DPx2TP, {NUM_STEPS} steps")
 
-    mp_config = MetricsProcessor.Config(enable_wandb=ENABLE_WANDB)
+    mp_config = MetricsProcessor.Config(
+        enable_wandb=ENABLE_WANDB,
+        console_keys=[
+            "toy_trainer/loss_mean",
+            "toy_trainer/grad_norm_max",
+            "toy_trainer/lr",
+        ],
+    )
     trainer = ToyTrainer(
         device, mesh["dp"], mesh["tp"], OUTPUT_DIR, mp_config=mp_config
     )

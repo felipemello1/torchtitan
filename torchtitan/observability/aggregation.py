@@ -88,6 +88,7 @@ def _flush_step(
     buffer: dict[int, list[dict]],
     is_validation: bool,
     logger_backend: BaseLogger,
+    console_keys: list[str],
 ) -> tuple[dict[str, float], int]:
     """Pop entries for step, aggregate, write to backends + console.
 
@@ -104,36 +105,65 @@ def _flush_step(
 
     if aggregated:
         logger_backend.log(aggregated, step)
-        _log_to_console(step, aggregated, is_validation)
+        if console_keys:
+            _log_to_console(step, aggregated, console_keys)
 
     return aggregated, len(entries)
 
 
-def _log_to_console(
-    step: int, aggregated: dict[str, float], is_validation: bool
-) -> None:
-    """Print training console line."""
-    color = Color()
-    loss = aggregated.get("loss/trainer_loss_mean")
-    if loss is None:
-        loss = aggregated.get("toy_trainer/loss_mean")
-    if loss is None:
-        return
-    grad_norm = aggregated.get("trainer_gradient/norm_max", 0)
-    if grad_norm == 0:
-        grad_norm = aggregated.get("toy_trainer/grad_norm_max", 0)
-    mem_gib = aggregated.get("trainer_memory/reserved_gib_max", 0)
-    tps = aggregated.get("trainer_throughput/tps_mean", 0)
-    mfu = aggregated.get("trainer_throughput/mfu_pct_mean", 0)
+# Colors cycle for console columns (assigned by position in the key list).
+_COLORS = ["green", "yellow", "cyan", "blue", "magenta", "red"]
 
-    logger.info(
-        f"{color.red}step: {step:2}  "
-        f"{color.green}loss: {loss:8.5f}  "
-        f"{color.yellow}grad_norm: {grad_norm:7.4f}  "
-        f"{color.cyan}memory: {mem_gib:5.2f}GiB  "
-        f"{color.blue}tps: {round(tps):,}  "
-        f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
-    )
+
+def _fmt_value(value: float) -> str:
+    """Format a number showing first 2 non-zero digits after '.', up to 5 decimals.
+
+    Examples::
+
+        _fmt_value(3.67060)   → '3.6706'
+        _fmt_value(0.00123)   → '0.0012'
+        _fmt_value(1234.5)    → '1234.5'
+        _fmt_value(0.5603)    → '0.5603'
+    """
+    if value == 0:
+        return "0"
+    # Find how many decimals needed to show 2 non-zero digits
+    abs_frac = abs(value) - int(abs(value))
+    if abs_frac == 0 or abs(value) >= 100:
+        return f"{value:.1f}"
+    decimals = 0
+    non_zero_seen = 0
+    temp = abs_frac
+    while decimals < 5 and non_zero_seen < 2:
+        decimals += 1
+        temp *= 10
+        digit = int(temp) % 10
+        if digit != 0 or non_zero_seen > 0:
+            non_zero_seen += 1
+    decimals = max(decimals, 2)
+    return f"{value:.{decimals}f}"
+
+
+def _log_to_console(
+    step: int, aggregated: dict[str, float], console_keys: list[str]
+) -> None:
+    """Print one console line with the configured metric keys.
+
+    Colors are assigned by position in the key list and cycle through
+    _COLORS. Missing metrics show '--'.
+    """
+    color = Color()
+    parts = [f"{color.red}step: {step:2}"]
+    for i, key in enumerate(console_keys):
+        c = getattr(color, _COLORS[i % len(_COLORS)])
+        label = key.rsplit("/", 1)[-1]  # e.g., "toy_trainer/loss_mean" → "loss_mean"
+        val = aggregated.get(key)
+        if val is None:
+            parts.append(f"{c}{label}: --")
+        else:
+            parts.append(f"{c}{label}: {_fmt_value(val)}")
+    parts.append(color.reset)
+    logger.info("  ".join(parts))
 
 
 def _build_metric_logger(
@@ -168,6 +198,7 @@ def logging_worker(
     save_tb_folder: str = "tb",
     config_dict: dict[str, Any] | None = None,
     tag: str | None = None,
+    console_keys: list[str] | None = None,
     queue_timeout_s: float = _QUEUE_TIMEOUT_S,
 ) -> None:
     """Logging subprocess entry point.
@@ -184,6 +215,7 @@ def logging_worker(
         save_tb_folder: Subfolder for TensorBoard files.
         config_dict: Full config for wandb.init(config=...).
         tag: Prefix for TB/WandB scalar keys.
+        console_keys: Metric keys to print to console. Empty list disables.
         queue_timeout_s: Seconds to wait before assuming training crashed.
             Default 600 (10 min). Set to 1 for unit tests.
     """
@@ -228,7 +260,7 @@ def logging_worker(
         t_read_end = time.perf_counter()
 
         aggregated, num_entries = _flush_step(
-            step, buffer, is_validation, logger_backend
+            step, buffer, is_validation, logger_backend, console_keys or []
         )
 
         logger.debug(

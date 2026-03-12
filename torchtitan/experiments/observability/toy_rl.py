@@ -159,7 +159,14 @@ async def main():
     log_process = multiprocessing.Process(
         target=logging_worker,
         args=(log_queue, OUTPUT_DIR),
-        kwargs={"enable_wandb": True},
+        kwargs={
+            "enable_wandb": True,
+            "console_keys": [
+                "toy_trainer/loss_mean",
+                "toy_trainer/grad_norm_max",
+                "toy_trainer/lr",
+            ],
+        },
         daemon=True,
     )
     log_process.start()

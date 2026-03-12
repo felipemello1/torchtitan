@@ -7,7 +7,7 @@
 """Toy MetricsProcessor for the observability experiment."""
 
 import multiprocessing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -29,6 +29,7 @@ class MetricsProcessor(Configurable):
         enable_wandb: bool = True
         enable_tensorboard: bool = False
         enable_logging_subprocess: bool = True
+        console_keys: list[str] = field(default_factory=list)
 
     def __init__(self, config: Config, *, dump_folder: str, rank: int):
         self._step: int = 0
@@ -47,6 +48,7 @@ class MetricsProcessor(Configurable):
                 kwargs={
                     "enable_wandb": config.enable_wandb,
                     "enable_tensorboard": config.enable_tensorboard,
+                    "console_keys": config.console_keys,
                 },
                 daemon=True,
             )
