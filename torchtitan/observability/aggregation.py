@@ -125,13 +125,13 @@ def _flush_step(
         # Write all metrics to WandB/TensorBoard
         logger_backend.log(aggregated, step)
 
-        # Print training console line
+        # Log training console line
         if console_log_metric_keys:
             _log_to_console(
                 step, aggregated, console_log_metric_keys, disable_color_printing
             )
 
-        # Print validation console line (only on validation steps)
+        # Log validation console line (only on validation steps)
         if is_validation and console_log_validation_keys:
             _log_to_console(
                 step,

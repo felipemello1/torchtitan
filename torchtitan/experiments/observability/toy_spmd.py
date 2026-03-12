@@ -272,14 +272,14 @@ class ToyTrainer:
         # Derived metrics recorded every step (cheap, outside should_log gate)
         self.metrics_processor.record_throughput()
         self.metrics_processor.record_memory()
-        record_metric("toy_trainer/lr", NoOpMetric(value=LR))
+        record_metric("trainer/lr", NoOpMetric(value=LR))
 
         # Loss/grad_norm only on log steps (.item() triggers GPU→CPU sync)
         if self.metrics_processor.should_log(self.step):
             loss_val = loss.item()
             grad_norm_val = grad_norm.item()
-            record_metric("toy_trainer/loss_mean", MeanMetric(sum=loss_val))
-            record_metric("toy_trainer/grad_norm_max", MaxMetric(value=grad_norm_val))
+            record_metric("trainer/loss_mean", MeanMetric(sum=loss_val))
+            record_metric("trainer/grad_norm_max", MaxMetric(value=grad_norm_val))
             record_event({"train.loss": loss_val, "train.grad_norm": grad_norm_val})
 
         return loss, grad_norm
@@ -294,7 +294,7 @@ class ToyTrainer:
             loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
             val_loss = loss_sum / valid_tokens
 
-        record_metric("toy_validator/loss_mean", MeanMetric(sum=val_loss.item()))
+        record_metric("validator/loss_mean", MeanMetric(sum=val_loss.item()))
         self.metrics_processor.record_throughput(is_val=True)
         self.metrics_processor.record_memory(is_val=True)
 
@@ -353,16 +353,16 @@ def main():
         log_freq=5,
         enable_wandb=ENABLE_WANDB,
         console_log_metric_keys=[
-            "toy_trainer/loss_mean",
-            "toy_trainer/grad_norm_max",
-            "toy_trainer/lr",
-            "toy_trainer/tps_mean",
-            "toy_trainer/memory_reserved_gib_max",
+            "trainer/loss_mean",
+            "trainer/grad_norm_max",
+            "trainer/lr",
+            "trainer/tps_mean",
+            "trainer/memory_reserved_gib_max",
         ],
         console_log_validation_keys=[
-            "toy_validator/loss_mean",
-            "toy_validator/tps_mean",
-            "toy_validator/memory_reserved_gib_max",
+            "validator/loss_mean",
+            "validator/tps_mean",
+            "validator/memory_reserved_gib_max",
         ],
     )
     trainer = ToyTrainer(

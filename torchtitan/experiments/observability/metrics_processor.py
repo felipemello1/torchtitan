@@ -31,8 +31,8 @@ class MetricsProcessor(Configurable):
     so the toy and production versions are easy to compare.
     """
 
-    _TRAIN_PREFIX = "toy_trainer"
-    _VAL_PREFIX = "toy_validator"
+    _TRAIN_PREFIX = "trainer"
+    _VAL_PREFIX = "validator"
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
