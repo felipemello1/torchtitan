@@ -255,7 +255,7 @@ class ToyTrainer:
                 loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
                 # Globally-normalized loss: each token contributes equally to
                 # gradients regardless of which DP rank it's on (matches titan).
-                global_valid_tokens = valid_tokens.full_tensor().detach().clone().float()
+                global_valid_tokens = valid_tokens.detach().clone().float()
                 dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
                 loss = loss_sum / global_valid_tokens
                 self.optimizer.zero_grad()
@@ -272,7 +272,7 @@ class ToyTrainer:
         with torch.no_grad(), loss_parallel():
             logits = self.model(tokens)
             loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
-            global_valid_tokens = valid_tokens.full_tensor().detach().clone().float()
+            global_valid_tokens = valid_tokens.detach().clone().float()
             dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
             val_loss = loss_sum / global_valid_tokens
         if self.rank == 0:
