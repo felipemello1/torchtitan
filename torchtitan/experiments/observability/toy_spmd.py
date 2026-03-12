@@ -301,7 +301,7 @@ class ToyTrainer:
 
             if step % EVAL_FREQ == 0:
                 add_step_tag("eval")
-                with record_span("trainer/validation", EventType.EVAL):
+                with record_span("trainer_time/validation_s", EventType.EVAL):
                     self.validate(tokens, labels, loss_mask)
 
     def close(self):
