@@ -85,6 +85,7 @@ class TestExperimentJSONL:
         assert reduce_by_key.get("training/grad_norm_max") == "MaxMetric"
         assert reduce_by_key.get("training/lr") == "NoOpMetric"
         assert reduce_by_key.get("trainer_throughput/tps_mean") == "MeanMetric"
+        assert reduce_by_key.get("validation/loss_mean") == "NoOpMetric"
 
     def test_validation_metrics_have_validator_prefix(self, experiment_logs_dir):
         files = glob(os.path.join(experiment_logs_dir, "*.jsonl"))

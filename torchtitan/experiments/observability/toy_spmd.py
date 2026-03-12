@@ -303,8 +303,9 @@ class ToyTrainer:
             global_valid_tokens = valid_tokens.full_tensor().detach().clone().float()
             dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
             val_loss = loss_sum / global_valid_tokens
-
-        record_metric("validation/loss_mean", MeanMetric(sum=val_loss.item()))
+        val_loss_scalar = val_loss.detach().full_tensor().clone()
+        dist.all_reduce(val_loss_scalar, op=dist.ReduceOp.SUM)
+        record_metric("validation/loss_mean", NoOpMetric(value=val_loss_scalar.item()))
         self.metrics_processor.record_throughput(is_validation=True)
         self.metrics_processor.record_memory(is_validation=True)
 
