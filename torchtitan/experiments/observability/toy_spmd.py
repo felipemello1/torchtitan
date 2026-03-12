@@ -277,9 +277,12 @@ class ToyTrainer:
 
         # Loss/grad_norm only on log steps (.item() triggers GPU→CPU sync)
         if self.metrics_processor.should_log(self.step):
-            loss_val = loss.item()
+            # All-reduce loss across ranks (matches titan's dist_sum pattern)
+            loss_scalar = loss.detach().full_tensor().clone()
+            dist.all_reduce(loss_scalar, op=dist.ReduceOp.AVG)
+            loss_val = loss_scalar.item()
             grad_norm_val = grad_norm.item()
-            record_metric("trainer/loss_mean", MeanMetric(sum=loss_val))
+            record_metric("trainer/loss_mean", NoOpMetric(value=loss_val))
             record_metric("trainer/grad_norm_max", MaxMetric(value=grad_norm_val))
             record_event({"train.loss": loss_val, "train.grad_norm": grad_norm_val})
 
@@ -356,14 +359,13 @@ def main():
         console_log_metric_keys=[
             "trainer/loss_mean",
             "trainer/grad_norm_max",
-            "trainer/lr",
-            "trainer/tps_mean",
             "trainer/memory_reserved_gib_max",
+            "trainer/tps_mean",
         ],
         console_log_validation_keys=[
             "validator/loss_mean",
-            "validator/tps_mean",
             "validator/memory_reserved_gib_max",
+            "validator/tps_mean",
         ],
     )
     trainer = ToyTrainer(
