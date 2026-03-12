@@ -158,7 +158,7 @@ def _fmt_value(value: Any) -> str:
     if isinstance(value, int) or abs(value) >= 100:
         return f"{value:.1f}"
 
-    # e.g. value=0.00123 → frac=0.00123
+    # e.g. value=3.67 → frac=0.67
     frac = abs(value) - int(abs(value))
     if frac == 0:
         return f"{value:.1f}"
