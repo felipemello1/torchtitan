@@ -122,7 +122,7 @@ def _flush_step(
         # Write all metrics to WandB/TensorBoard
         logger_backend.log(aggregated, step)
 
-        # Print selected metrics to console
+        # Log selected metrics to console
         if console_log_metric_keys:
             _log_to_console(step, aggregated, console_log_metric_keys)
 
@@ -179,7 +179,7 @@ def _log_to_console(
     aggregated: dict[str, float],
     console_log_metric_keys: list[str],
 ) -> None:
-    """Print one console line with the configured metric keys.
+    """Log one console line with the configured metric keys.
 
     Colors cycle by position in the key list. Missing metrics show '--'.
     """

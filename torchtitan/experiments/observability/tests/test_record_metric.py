@@ -48,9 +48,9 @@ class TestExperimentJSONL:
                     record = json.loads(line)
                     keys.add(record.get("key"))
 
-        assert "toy_trainer/loss_mean" in keys, f"Missing loss metric. Found: {keys}"
-        assert "toy_trainer/grad_norm_max" in keys, f"Missing grad_norm. Found: {keys}"
-        assert "toy_trainer/lr" in keys, f"Missing lr. Found: {keys}"
+        assert "trainer/loss_mean" in keys, f"Missing loss metric. Found: {keys}"
+        assert "trainer/grad_norm_max" in keys, f"Missing grad_norm. Found: {keys}"
+        assert "trainer/lr" in keys, f"Missing lr. Found: {keys}"
 
     def test_experiment_jsonl_has_required_fields(self, experiment_logs_dir):
         files = glob(os.path.join(experiment_logs_dir, "*.jsonl"))
@@ -81,6 +81,6 @@ class TestExperimentJSONL:
                     record = json.loads(line)
                     reduce_by_key[record["key"]] = record["reduce"]
 
-        assert reduce_by_key.get("toy_trainer/loss_mean") == "MeanMetric"
-        assert reduce_by_key.get("toy_trainer/grad_norm_max") == "MaxMetric"
-        assert reduce_by_key.get("toy_trainer/lr") == "NoOpMetric"
+        assert reduce_by_key.get("trainer/loss_mean") == "MeanMetric"
+        assert reduce_by_key.get("trainer/grad_norm_max") == "MaxMetric"
+        assert reduce_by_key.get("trainer/lr") == "NoOpMetric"
