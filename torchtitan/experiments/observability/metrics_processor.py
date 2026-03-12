@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from torchtitan.components.metrics import build_device_memory_monitor
 from torchtitan.config import Configurable
 from torchtitan.observability import record_event
 from torchtitan.observability.aggregation import logging_worker
@@ -20,8 +21,10 @@ from torchtitan.observability.metrics import (
     MaxMetric,
     MeanMetric,
     record_metric,
+    SumMetric,
 )
 from torchtitan.observability.step_state import set_step
+from torchtitan.tools import utils
 
 
 class MetricsProcessor(Configurable):
@@ -41,7 +44,6 @@ class MetricsProcessor(Configurable):
         metrics computation (.item(), collectives)."""
         enable_wandb: bool = True
         enable_tensorboard: bool = False
-        disable_color_printing: bool = False
         console_log_metric_keys: list[str] = field(default_factory=list)
         console_log_validation_keys: list[str] = field(default_factory=list)
 
@@ -52,15 +54,26 @@ class MetricsProcessor(Configurable):
         self._force_log = False
 
         # Schedule: log on step 1 + every log_freq steps
-        self._log_schedule = EveryNSteps(every_n=config.log_freq, additional_steps={1})
+        self._log_schedule = EveryNSteps(
+            every_n=config.log_freq, additional_steps={1}
+        )
 
-        # Training measurement window
-        self._time_last_log = time.perf_counter()
-        self.ntokens_since_last_log: int = 0
+        # Throughput state (reset per step via reset_training_counters)
+        self._time_at_reset: float = time.perf_counter()
+        self.ntokens_since_reset: int = 0
 
-        # Validation measurement window (reset at the start of each validate())
-        self._val_time_last_log: float = 0.0
-        self.val_ntokens_since_last_log: int = 0
+        # Validation state (reset via reset_val_counters)
+        self._val_time_at_reset: float = 0.0
+        self.val_ntokens_since_reset: int = 0
+
+        # Device memory monitor (same as titan's components/metrics.py)
+        self.device_memory_monitor = build_device_memory_monitor()
+
+        # TFLOPS/MFU: set by trainer after construction (0 = skip)
+        self.num_flops_per_token: int = 0
+        self._gpu_peak_flops = utils.get_peak_flops(
+            self.device_memory_monitor.device_name
+        )
 
         # Spawn the logging subprocess if any output is enabled.
         # logging_worker reads experiment JSONL from all ranks, aggregates
@@ -83,7 +96,6 @@ class MetricsProcessor(Configurable):
                     "enable_tensorboard": config.enable_tensorboard,
                     "console_log_metric_keys": config.console_log_metric_keys,
                     "console_log_validation_keys": config.console_log_validation_keys,
-                    "disable_color_printing": config.disable_color_printing,
                 },
                 daemon=True,
             )
@@ -96,8 +108,8 @@ class MetricsProcessor(Configurable):
     def set_step(self, step: int, force_log: bool = False) -> None:
         """Set current step. Call before train_step().
 
-        force_log: when True, should_log() returns True regardless of
-        schedule. Used to ensure loss is computed on validation steps.
+        force_log: For example, can be used to ensure loss is computed
+        on validation steps.
         """
         self._step = step
         self._force_log = force_log
@@ -113,51 +125,63 @@ class MetricsProcessor(Configurable):
         return self._log_schedule(step) or self._force_log
 
     # ----------------------------------------------------------------
-    # Counter resets (measurement window boundaries)
+    # Counter resets
     # ----------------------------------------------------------------
 
-    def reset_counters(self, is_val: bool = False) -> None:
-        """Reset throughput/memory counters at measurement window boundaries.
+    def reset_training_counters(self) -> None:
+        """Reset throughput/memory counters for a new training measurement."""
+        self._time_at_reset = time.perf_counter()
+        self.ntokens_since_reset = 0
+        self.device_memory_monitor.reset_peak_stats()
 
-        Training: called by log() after flush — starts the next window.
-        Validation: called by validate() at the top — starts a clean window.
-        """
-        if is_val:
-            self.val_ntokens_since_last_log = 0
-            self._val_time_last_log = time.perf_counter()
-        else:
-            self.ntokens_since_last_log = 0
-            self._time_last_log = time.perf_counter()
-        torch.cuda.reset_peak_memory_stats()
+    def reset_val_counters(self) -> None:
+        """Reset throughput/memory counters for a new validation measurement."""
+        self._val_time_at_reset = time.perf_counter()
+        self.val_ntokens_since_reset = 0
+        self.device_memory_monitor.reset_peak_stats()
 
     # ----------------------------------------------------------------
     # Derived metrics (called every step, outside should_log gate)
     # ----------------------------------------------------------------
 
-    def record_throughput(self, is_val: bool = False) -> None:
-        """Compute and record throughput from accumulated tokens."""
-        if is_val:
-            time_delta = time.perf_counter() - self._val_time_last_log
-            ntokens = self.val_ntokens_since_last_log
+    def record_throughput(self, is_validation: bool = False) -> None:
+        """Compute and record throughput from tokens since last reset."""
+        if is_validation:
+            time_delta = time.perf_counter() - self._val_time_at_reset
+            ntokens = self.val_ntokens_since_reset
             prefix = self._VAL_PREFIX
         else:
-            time_delta = time.perf_counter() - self._time_last_log
-            ntokens = self.ntokens_since_last_log
+            time_delta = time.perf_counter() - self._time_at_reset
+            ntokens = self.ntokens_since_reset
             prefix = self._TRAIN_PREFIX
 
         tps = ntokens / time_delta if time_delta > 0 else 0
         record_metric(f"{prefix}/tps_mean", MeanMetric(sum=tps))
 
-    def record_memory(self, is_val: bool = False) -> None:
+        # TFLOPS and MFU (only when flops are known)
+        if self.num_flops_per_token > 0:
+            tflops = self.num_flops_per_token * tps / 1e12
+            record_metric(f"{prefix}/tflops_mean", MeanMetric(sum=tflops))
+            if self._gpu_peak_flops > 0:
+                mfu = 100 * self.num_flops_per_token * tps / self._gpu_peak_flops
+                record_metric(f"{prefix}/mfu_pct_mean", MeanMetric(sum=mfu))
+
+    def record_memory(self, is_validation: bool = False) -> None:
         """Record GPU memory peak stats since last reset."""
-        prefix = self._VAL_PREFIX if is_val else self._TRAIN_PREFIX
-        if torch.cuda.is_available():
-            device = torch.device(f"cuda:{self._rank % torch.cuda.device_count()}")
-            reserved_gib = torch.cuda.max_memory_reserved(device) / (1024**3)
-            record_metric(
-                f"{prefix}/memory_reserved_gib_max",
-                MaxMetric(value=reserved_gib),
-            )
+        prefix = self._VAL_PREFIX if is_validation else self._TRAIN_PREFIX
+        mem = self.device_memory_monitor.get_peak_stats()
+        record_metric(
+            f"{prefix}/memory_reserved_gib_max",
+            MaxMetric(value=mem.max_reserved_gib),
+        )
+        record_metric(
+            f"{prefix}/memory_active_gib_max",
+            MaxMetric(value=mem.max_active_gib),
+        )
+        record_metric(
+            f"{prefix}/memory_alloc_retries_sum",
+            SumMetric(value=mem.num_alloc_retries),
+        )
 
     # ----------------------------------------------------------------
     # Flush (called by train() when should_log returns True)
@@ -172,7 +196,6 @@ class MetricsProcessor(Configurable):
         torch.distributed.barrier()
         if self._log_queue is not None:
             self._log_queue.put((step, is_validation))
-        self.reset_counters(is_val=False)
 
     # ----------------------------------------------------------------
     # Lifecycle

@@ -95,7 +95,7 @@ class TrainerActor(Actor):
         init_observability(source="trainer", output_dir=OUTPUT_DIR, rank=rank)
         mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
         # Controller handles flushing — trainer has no backends/console.
-        # log_freq=1: compute loss every step.
+        # log_freq=1 also determines freq to call metrics that need .item() or collectives
         mp_config = MetricsProcessor.Config(log_freq=1, enable_wandb=False)
         self.trainer = ToyTrainer(
             self.device, mesh["dp"], mesh["tp"], OUTPUT_DIR, mp_config=mp_config

@@ -255,7 +255,8 @@ class ToyTrainer:
 
     def train_step(self, tokens, labels, loss_mask):
         """One training step. Returns (loss, grad_norm)."""
-        self.metrics_processor.ntokens_since_last_log += labels.numel()
+        self.metrics_processor.reset_training_counters()
+        self.metrics_processor.ntokens_since_reset += labels.numel()
 
         with record_span("trainer_time/forward_backward_s", EventType.FWD_BWD):
             with loss_parallel():
@@ -286,8 +287,8 @@ class ToyTrainer:
 
     def validate(self, tokens, labels, loss_mask):
         """Run one forward pass for validation (no backward)."""
-        self.metrics_processor.reset_counters(is_val=True)
-        self.metrics_processor.val_ntokens_since_last_log += labels.numel()
+        self.metrics_processor.reset_val_counters()
+        self.metrics_processor.val_ntokens_since_reset += labels.numel()
 
         with torch.no_grad(), loss_parallel():
             logits = self.model(tokens)
@@ -295,8 +296,8 @@ class ToyTrainer:
             val_loss = loss_sum / valid_tokens
 
         record_metric("validator/loss_mean", MeanMetric(sum=val_loss.item()))
-        self.metrics_processor.record_throughput(is_val=True)
-        self.metrics_processor.record_memory(is_val=True)
+        self.metrics_processor.record_throughput(is_validation=True)
+        self.metrics_processor.record_memory(is_validation=True)
 
     def train(self, num_steps):
         """Full training loop. Mirrors Trainer.train structure."""

@@ -11,6 +11,7 @@ import json
 import logging
 import multiprocessing
 import os
+import sys
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -108,7 +109,6 @@ def _flush_step(
     logger_backend: BaseLogger,
     console_log_metric_keys: list[str],
     console_log_validation_keys: list[str],
-    disable_color_printing: bool,
 ) -> tuple[dict[str, float], int]:
     """Aggregate entries for ``step``, write to backends, print to console.
 
@@ -127,18 +127,12 @@ def _flush_step(
 
         # Log training console line
         if console_log_metric_keys:
-            _log_to_console(
-                step, aggregated, console_log_metric_keys, disable_color_printing
-            )
+            _log_to_console(step, aggregated, console_log_metric_keys)
 
         # Log validation console line (only on validation steps)
         if is_validation and console_log_validation_keys:
             _log_to_console(
-                step,
-                aggregated,
-                console_log_validation_keys,
-                disable_color_printing,
-                prefix="validate ",
+                step, aggregated, console_log_validation_keys, prefix="validate "
             )
 
     return aggregated, len(entries)
@@ -197,14 +191,14 @@ def _log_to_console(
     step: int,
     aggregated: dict[str, float],
     keys: list[str],
-    disable_color_printing: bool = False,
     prefix: str = "",
 ) -> None:
-    """Print one console line with the configured metric keys.
+    """Log one console line with the configured metric keys.
 
     Colors cycle by position in the key list. Missing metrics show '--'.
+    Color is auto-detected (disabled when stdout is piped to file/CI).
     """
-    color = NoColor() if disable_color_printing else Color()
+    color = Color() if sys.stdout.isatty() else NoColor()
     parts = [f"{color.red}{prefix}step: {step:2}"]
     for i, key in enumerate(keys):
         c = getattr(color, _COLORS[i % len(_COLORS)])
@@ -261,7 +255,6 @@ def logging_worker(
     tag: str | None = None,
     console_log_metric_keys: list[str] | None = None,
     console_log_validation_keys: list[str] | None = None,
-    disable_color_printing: bool = False,
     queue_timeout_s: float = _QUEUE_TIMEOUT_S,
 ) -> None:
     """Background process that reads experiment JSONL, aggregates across
@@ -283,7 +276,6 @@ def logging_worker(
         console_log_metric_keys: Training metric keys for console each step.
         console_log_validation_keys: Validation metric keys for console
             (only printed on validation steps).
-        disable_color_printing: If True, use NoColor instead of Color.
         queue_timeout_s: Seconds to wait for a signal before assuming
             training crashed. Default 600 (10 min).
     """
@@ -338,7 +330,6 @@ def logging_worker(
             logger_backend,
             console_log_metric_keys or [],
             console_log_validation_keys or [],
-            disable_color_printing,
         )
 
         logger.debug(
