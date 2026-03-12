@@ -492,13 +492,17 @@ class record_span(ContextDecorator):  # noqa: N801
     JSONL. Step is read from the global set by ``set_step()``.
 
     Args:
-        description: Human-readable label and metric name (e.g.,
-            "trainer_time/forward_backward_s"). Used as-is for system JSONL
-            messages.
-        event_type: Base EventType (e.g., EventType.FWD_BWD). Must have
-            corresponding _START and _END variants.
+        description: Human-readable label for log messages and metric key.
+            Free-form string (e.g., "trainer_time/forward_backward_s").
+            Appears in system JSONL messages and, when metrics are enabled,
+            as the experiment metric key.
+        event_type: Categorization for post-processing and visualization
+            tools (Perfetto, DuckDB). Must have corresponding _START and
+            _END variants in ``EventType`` (e.g., ``EventType.FWD_BWD``
+            requires ``FWD_BWD_START`` and ``FWD_BWD_END``).
 
-    Usage:
+    Usage::
+
         with record_span("trainer_time/forward_backward_s", EventType.FWD_BWD):
             output = model(batch)
             loss.backward()

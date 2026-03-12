@@ -93,7 +93,7 @@ class TrainerActor(Actor):
 
     @endpoint
     async def set_step(self, step: int):
-        """Receive step from controller. Sets step on trainer + ContextVar."""
+        """Receive step from controller. Sets step on trainer."""
         self.trainer.step = step
         self.trainer.metrics_processor.set_step(step)
 
