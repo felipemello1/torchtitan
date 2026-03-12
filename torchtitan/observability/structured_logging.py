@@ -29,7 +29,7 @@ from torchtitan.observability.metrics import (
     MeanMetric,
     record_metric,
 )
-from torchtitan.observability.step_state import _STEP, _STEP_TAGS
+from torchtitan.observability.step_state import get_step, get_step_tags
 
 MAX_MESSAGE_SIZE: int = 1000
 
@@ -231,7 +231,7 @@ class StructuredJSONFormatter(logging.Formatter):
 
     Each record becomes a JSON line with int/normal/double/normvector columns.
     Rank and source are constants (set once). Step and step_tags come from
-    ContextVars so concurrent async tasks each see their own step.
+    globals so each process has its own step.
 
     Example output (one JSON line):
         {"int": {"rank": 0, "step": 5, "time": 1709500000, "seq_id": 42},
@@ -275,11 +275,11 @@ class StructuredJSONFormatter(logging.Formatter):
         log_dict["host_name"] = socket.gethostname()
         log_dict["pid"] = os.getpid()
 
-        # Step/step_tags from ContextVar (mutable, changes every step)
-        step = _STEP.get()
+        # Step/step_tags from step_state globals (mutable, changes every step)
+        step = get_step()
         if step is not None:
             log_dict["step"] = step
-        step_tags = _STEP_TAGS.get()
+        step_tags = get_step_tags()
         if step_tags:
             log_dict["step_tags"] = list(step_tags)
 
@@ -491,14 +491,14 @@ def record_event(metrics: dict[str, float | int]) -> None:
     """Log point-in-time scalars to system JSONL.
 
     Each key-value pair becomes a separate METRIC_VALUE event.
-    Step is read from the ContextVar set by ``set_step()``.
+    Step is read from the global set by ``set_step()``.
 
     Example::
 
         record_event({"train.loss": 2.5, "train.tflops": 45.6})
         # system JSONL: {"normal": {"event_name": "train.loss"}, "double": {"value": 2.5}, ...}
     """
-    step = _STEP.get()
+    step = get_step()
     for name, value in metrics.items():
         _system_logger.info(
             f"[step {step if step is not None else 'N/A'}] {name}={value}",
@@ -566,7 +566,7 @@ class record_span(ContextDecorator):  # noqa: N801
 
     def __enter__(self):
         self.start_time = timer()
-        step = _STEP.get()
+        step = get_step()
         _system_logger.info(
             f"[step {step if step is not None else 'N/A'}] {self.description} {self.start_event_type}",
             extra=event_extra(self.start_event_type, step=step),
@@ -576,7 +576,7 @@ class record_span(ContextDecorator):  # noqa: N801
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         end_time = timer()
-        step = _STEP.get()
+        step = get_step()
         duration_s = end_time - self.start_time
         delta_ms = duration_s * 1000
         _system_logger.info(

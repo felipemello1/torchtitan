@@ -14,7 +14,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from torchtitan.observability._constants import _METRIC_ENTRY, EXPERIMENT_LOGGER_NAME
-from torchtitan.observability.step_state import _STEP
+from torchtitan.observability.step_state import get_step
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +161,7 @@ _experiment_logger = logging.getLogger(EXPERIMENT_LOGGER_NAME)
 def record_metric(key: str, value: MetricValue, _stacklevel: int = 2) -> None:
     """Record a metric to experiment JSONL.
 
-    Formatter adds step (ContextVar), rank/source automatically.
+    Formatter adds step, rank, and source automatically.
 
     Example::
 
@@ -173,7 +173,7 @@ def record_metric(key: str, value: MetricValue, _stacklevel: int = 2) -> None:
         _stacklevel: For internal callers (e.g., record_span) to report the
             correct caller location. Default 2 (direct caller).
     """
-    if _STEP.get() is None:
+    if get_step() is None:
         raise ValueError("No step in context. Call set_step() before record_metric().")
     state = value.get_state()
     state["key"] = key
@@ -205,7 +205,7 @@ class ExperimentJSONFormatter(logging.Formatter):
         self.source = source
 
     def format(self, record: logging.LogRecord) -> str:
-        step = _STEP.get()
+        step = get_step()
         if step is None:
             raise ValueError(
                 "No step in context. Call set_step() before record_metric()."

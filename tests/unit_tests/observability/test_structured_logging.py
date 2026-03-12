@@ -17,11 +17,12 @@ from torchtitan.observability._constants import (
     EXPERIMENT_LOGGER_NAME,
     SYSTEM_LOGGER_NAME,
 )
+from torchtitan.observability import step_state
 from torchtitan.observability.step_state import (
-    _STEP,
-    _STEP_TAGS,
     add_step_tag,
     clear_step_tags,
+    get_step,
+    get_step_tags,
     set_step,
 )
 from torchtitan.observability.structured_logging import (
@@ -49,12 +50,12 @@ from torchtitan.observability.structured_logging import (
 
 @pytest.fixture(autouse=True)
 def reset_context():
-    """Reset ContextVars before each test."""
-    _STEP.set(None)
-    _STEP_TAGS.set(())
+    """Reset step state before each test."""
+    step_state._STEP = None
+    step_state._STEP_TAGS = ()
     yield
-    _STEP.set(None)
-    _STEP_TAGS.set(())
+    step_state._STEP = None
+    step_state._STEP_TAGS = ()
 
 
 @pytest.fixture
@@ -77,48 +78,48 @@ def system_logger():
 class TestSetStep:
     def test_set_step_stores_value(self):
         set_step(42)
-        assert _STEP.get() == 42
+        assert get_step() == 42
 
     def test_set_step_overwrites(self):
         set_step(1)
         set_step(2)
-        assert _STEP.get() == 2
+        assert get_step() == 2
 
     def test_step_default_is_none(self):
-        assert _STEP.get() is None
+        assert get_step() is None
 
 
 class TestStepTags:
     def test_add_step_tag_adds_tag(self):
         set_step(1)
         add_step_tag("gc")
-        assert _STEP_TAGS.get() == ("gc",)
+        assert get_step_tags() == ("gc",)
 
     def test_add_step_tag_deduplicates(self):
         add_step_tag("gc")
         add_step_tag("gc")
-        assert _STEP_TAGS.get() == ("gc",)
+        assert get_step_tags() == ("gc",)
 
     def test_add_step_tag_multiple_tags(self):
         add_step_tag("gc")
         add_step_tag("profiling")
         add_step_tag("checkpoint")
-        assert _STEP_TAGS.get() == ("gc", "profiling", "checkpoint")
+        assert get_step_tags() == ("gc", "profiling", "checkpoint")
 
     def test_clear_step_tags_clears_all(self):
         add_step_tag("gc")
         add_step_tag("profiling")
         clear_step_tags()
-        assert _STEP_TAGS.get() == ()
+        assert get_step_tags() == ()
 
     def test_clear_step_tags_on_empty(self):
         clear_step_tags()
-        assert _STEP_TAGS.get() == ()
+        assert get_step_tags() == ()
 
     def test_step_tags_are_tuples(self):
-        """ContextVar safety: tuples are immutable, lists would leak across tasks."""
+        """Step tags are tuples (immutable) to avoid shared-reference issues."""
         add_step_tag("a")
-        tags = _STEP_TAGS.get()
+        tags = get_step_tags()
         assert isinstance(tags, tuple)
 
 
@@ -245,7 +246,7 @@ class TestStructuredJSONFormatter:
         assert parsed["int"]["rank"] == 3
         assert parsed["normal"]["source"] == "generator"
 
-    def test_step_from_contextvar(self):
+    def test_step_from_global(self):
         fmt = StructuredJSONFormatter(rank=0, source="test")
         set_step(42)
         record = logging.LogRecord(

@@ -25,15 +25,16 @@ from torchtitan.observability.metrics import (
     REDUCE_REGISTRY,
     SumMetric,
 )
-from torchtitan.observability.step_state import _STEP, set_step
+from torchtitan.observability import step_state
+from torchtitan.observability.step_state import set_step
 from torchtitan.observability.structured_logging import init_observability
 
 
 @pytest.fixture(autouse=True)
 def reset_step():
-    _STEP.set(None)
+    step_state._STEP = None
     yield
-    _STEP.set(None)
+    step_state._STEP = None
 
 
 @pytest.fixture

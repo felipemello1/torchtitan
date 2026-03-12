@@ -102,15 +102,13 @@ class TrainerActor(Actor):
 
     @endpoint
     async def set_step(self, step: int):
-        """Receive step from controller. Sets step on trainer + ContextVar."""
+        """Receive step from controller. Sets step on trainer."""
         self.trainer.step = step
         self.trainer.metrics_processor.set_step(step)
 
     @endpoint
     async def train_step(self, tokens, labels, loss_mask) -> float:
         """Train one step on generated completions. Returns loss value."""
-        # TODO: ContextVar workaround — re-set step for this asyncio task
-        set_step(self.trainer.step)
         tokens = tokens.to(self.device)
         labels = labels.to(self.device)
         loss_mask = loss_mask.to(self.device)

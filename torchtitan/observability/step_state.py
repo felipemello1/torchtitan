@@ -6,12 +6,8 @@
 
 """Per-step context: current step number and step tags."""
 
-from contextvars import ContextVar
-
-# ContextVars for async-safe per-task isolation (Monarch actors).
-# In SPMD, these behave identically to globals.
-_STEP: ContextVar[int | None] = ContextVar("_STEP", default=None)
-_STEP_TAGS: ContextVar[tuple[str, ...]] = ContextVar("_STEP_TAGS", default=())
+_STEP: int | None = None
+_STEP_TAGS: tuple[str, ...] = ()
 
 
 def set_step(step: int) -> None:
@@ -24,8 +20,19 @@ def set_step(step: int) -> None:
             set_step(step)
             train_step(...)
     """
-    _STEP.set(step)
-    _STEP_TAGS.set(())
+    global _STEP, _STEP_TAGS
+    _STEP = step
+    _STEP_TAGS = ()
+
+
+def get_step() -> int | None:
+    """Return the current step, or None if not set."""
+    return _STEP
+
+
+def get_step_tags() -> tuple[str, ...]:
+    """Return the current step tags."""
+    return _STEP_TAGS
 
 
 def add_step_tag(tag: str) -> None:
@@ -39,11 +46,12 @@ def add_step_tag(tag: str) -> None:
             add_step_tag("eval")
         # system JSONL: {"normvector": {"step_tags": ["gc", "eval"]}}
     """
-    current = _STEP_TAGS.get()
-    if tag not in current:
-        _STEP_TAGS.set(current + (tag,))
+    global _STEP_TAGS
+    if tag not in _STEP_TAGS:
+        _STEP_TAGS = _STEP_TAGS + (tag,)
 
 
 def clear_step_tags() -> None:
-    """Reset step tags. Call at the start of each step."""
-    _STEP_TAGS.set(())
+    """Reset step tags."""
+    global _STEP_TAGS
+    _STEP_TAGS = ()
