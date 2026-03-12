@@ -284,7 +284,7 @@ class ToyTrainer:
             # Each DP rank has local_loss_sum / global_valid_tokens.
             # SUM across DP ranks gives global_loss_sum / global_valid_tokens.
             loss_scalar = loss.detach().full_tensor().clone()
-            dist.all_reduce(loss_scalar, op=dist.ReduceOp.SUM)
+            dist.all_reduce(loss_scalar, op=dist.ReduceOp.SUM, group=self.dp_mesh.get_group())
             loss_val = loss_scalar.item()
             grad_norm_val = grad_norm.item()
             record_metric("training/loss_mean", NoOpMetric(value=loss_val))
@@ -304,7 +304,7 @@ class ToyTrainer:
             dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
             val_loss = loss_sum / global_valid_tokens
         val_loss_scalar = val_loss.detach().full_tensor().clone()
-        dist.all_reduce(val_loss_scalar, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_loss_scalar, op=dist.ReduceOp.SUM, group=self.dp_mesh.get_group())
         record_metric("validation/loss_mean", NoOpMetric(value=val_loss_scalar.item()))
         self.metrics_processor.record_throughput(is_validation=True)
         self.metrics_processor.record_memory(is_validation=True)
