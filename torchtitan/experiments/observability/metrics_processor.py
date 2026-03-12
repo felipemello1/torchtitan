@@ -53,27 +53,22 @@ class MetricsProcessor(Configurable):
         self._rank = rank
         self._force_log = False
 
-        # Schedule: log on step 1 + every log_freq steps
+        # Schedule
         self._log_schedule = EveryNSteps(
             every_n=config.log_freq, additional_steps={1}
         )
 
-        # Throughput state (reset per step via reset_training_counters)
-        self._time_at_reset: float = time.perf_counter()
-        self.ntokens_since_reset: int = 0
-
-        # Validation state (reset via reset_val_counters)
-        self._val_time_at_reset: float = 0.0
-        self.val_ntokens_since_reset: int = 0
-
-        # Device memory monitor (same as titan's components/metrics.py)
+        # Device memory monitor
         self.device_memory_monitor = build_device_memory_monitor()
 
-        # TFLOPS/MFU: set by trainer after construction (0 = skip)
-        self.num_flops_per_token: int = 0
+        # TFLOPS/MFU: set by trainer after construction (-1 = skip)
+        self.num_flops_per_token: int = -1
         self._gpu_peak_flops = utils.get_peak_flops(
             self.device_memory_monitor.device_name
         )
+
+        self.reset_training_counters()
+        self.reset_val_counters()
 
         # Spawn the logging subprocess if any output is enabled.
         # logging_worker reads experiment JSONL from all ranks, aggregates
@@ -101,9 +96,9 @@ class MetricsProcessor(Configurable):
             )
             self._log_process.start()
 
-    # ----------------------------------------------------------------
+    # ----
     # Step management
-    # ----------------------------------------------------------------
+    # ----
 
     def set_step(self, step: int, force_log: bool = False) -> None:
         """Set current step. Call before train_step().
@@ -116,17 +111,17 @@ class MetricsProcessor(Configurable):
         set_step(step)
         record_event({"train.step": step})
 
-    # ----------------------------------------------------------------
+    # ----
     # Schedule queries
-    # ----------------------------------------------------------------
+    # ----
 
     def should_log(self, step: int) -> bool:
         """Returns True on log steps or when force_log was set."""
         return self._log_schedule(step) or self._force_log
 
-    # ----------------------------------------------------------------
+    # ----
     # Counter resets
-    # ----------------------------------------------------------------
+    # ----
 
     def reset_training_counters(self) -> None:
         """Reset throughput/memory counters for a new training measurement."""
@@ -140,9 +135,9 @@ class MetricsProcessor(Configurable):
         self.val_ntokens_since_reset = 0
         self.device_memory_monitor.reset_peak_stats()
 
-    # ----------------------------------------------------------------
+    # ----
     # Derived metrics (called every step, outside should_log gate)
-    # ----------------------------------------------------------------
+    # ----
 
     def record_throughput(self, is_validation: bool = False) -> None:
         """Compute and record throughput from tokens since last reset."""
@@ -182,9 +177,9 @@ class MetricsProcessor(Configurable):
             SumMetric(value=mem.num_alloc_retries),
         )
 
-    # ----------------------------------------------------------------
-    # Flush (called by train() when should_log returns True)
-    # ----------------------------------------------------------------
+    # ----
+    # Flush
+    # ----
 
     def log(self, step: int, is_validation: bool = False) -> None:
         """Signal the logging subprocess to aggregate and write.
@@ -195,10 +190,6 @@ class MetricsProcessor(Configurable):
         torch.distributed.barrier()
         if self._log_queue is not None:
             self._log_queue.put((step, is_validation))
-
-    # ----------------------------------------------------------------
-    # Lifecycle
-    # ----------------------------------------------------------------
 
     def close(self) -> None:
         """Shut down the logging subprocess."""
