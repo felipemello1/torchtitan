@@ -317,11 +317,11 @@ class ToyTrainer:
 
 
 def main():
-    dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    rank = int(os.environ.get("RANK", 0))
     device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
     torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
+    world_size = dist.get_world_size()
     assert world_size == 4, f"Requires 4 GPUs, got {world_size}"
 
     if rank == 0 and os.path.exists(OUTPUT_DIR):
