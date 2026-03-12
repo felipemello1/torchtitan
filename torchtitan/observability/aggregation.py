@@ -13,9 +13,18 @@ import multiprocessing
 import os
 import time
 from collections import defaultdict
+from datetime import datetime
 from typing import Any
 
+from torchtitan.components.metrics import (
+    BaseLogger,
+    LoggerContainer,
+    TensorBoardLogger,
+    WandBLogger,
+)
 from torchtitan.observability.metrics import REDUCE_REGISTRY
+from torchtitan.observability.structured_logging import init_observability
+from torchtitan.tools.utils import Color
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +87,7 @@ def _flush_step(
     step: int,
     buffer: dict[int, list[dict]],
     is_validation: bool,
-    logger_backend: Any = None,
+    logger_backend: BaseLogger,
 ) -> tuple[dict[str, float], int]:
     """Pop entries for step, aggregate, write to backends + console.
 
@@ -94,27 +103,17 @@ def _flush_step(
     aggregated = aggregate(entries)
 
     if aggregated:
-        if logger_backend is not None:
-            logger_backend.log(aggregated, step)
+        logger_backend.log(aggregated, step)
         _log_to_console(step, aggregated, is_validation)
 
     return aggregated, len(entries)
 
 
-# ANSI colors for console output
-_RED = "\033[91m"
-_GREEN = "\033[92m"
-_ORANGE = "\033[93m"
-_BLUE = "\033[94m"
-_CYAN = "\033[96m"
-_MAGENTA = "\033[95m"
-_RESET = "\033[0m"
-
-
 def _log_to_console(
     step: int, aggregated: dict[str, float], is_validation: bool
 ) -> None:
-    """Print training + optional validation console line."""
+    """Print training console line."""
+    color = Color()
     loss = aggregated.get("loss/trainer_loss_mean")
     if loss is None:
         loss = aggregated.get("toy_trainer/loss_mean")
@@ -128,12 +127,12 @@ def _log_to_console(
     mfu = aggregated.get("trainer_throughput/mfu_pct_mean", 0)
 
     logger.info(
-        f"{_RED}step: {step:2}  "
-        f"{_GREEN}loss: {loss:8.5f}  "
-        f"{_ORANGE}grad_norm: {grad_norm:7.4f}  "
-        f"{_CYAN}memory: {mem_gib:5.2f}GiB  "
-        f"{_BLUE}tps: {round(tps):,}  "
-        f"{_MAGENTA}mfu: {mfu:.2f}%{_RESET}"
+        f"{color.red}step: {step:2}  "
+        f"{color.green}loss: {loss:8.5f}  "
+        f"{color.yellow}grad_norm: {grad_norm:7.4f}  "
+        f"{color.cyan}memory: {mem_gib:5.2f}GiB  "
+        f"{color.blue}tps: {round(tps):,}  "
+        f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
     )
 
 
@@ -145,60 +144,19 @@ def _build_metric_logger(
     save_tb_folder: str = "tb",
     config_dict: dict[str, Any] | None = None,
     tag: str | None = None,
-) -> Any:
-    """Build WandB/TB logger for the logging subprocess.
-
-    Returns a simple object with log(metrics, step) and close() methods.
-    """
-
-    class _LoggerContainer:
-        def __init__(self):
-            self._tb_writer = None
-            self._wandb_enabled = False
-
-            if enable_tensorboard:
-                from datetime import datetime
-
-                from torch.utils.tensorboard import SummaryWriter
-
-                tb_dir = os.path.join(
-                    dump_folder, save_tb_folder, datetime.now().strftime("%Y%m%d-%H%M")
-                )
-                self._tb_writer = SummaryWriter(tb_dir, max_queue=1000)
-                logger.info("[logging process] TensorBoard: %s", tb_dir)
-
-            if enable_wandb:
-                import wandb
-
-                wandb.init(
-                    project=os.getenv("WANDB_PROJECT", "torchtitan"),
-                    name=os.getenv("WANDB_RUN_NAME", None),
-                    dir=dump_folder,
-                    config=config_dict,
-                )
-                self._wandb_enabled = True
-                logger.info("[logging process] WandB initialized")
-
-        def log(self, metrics: dict[str, float], step: int) -> None:
-            if self._tb_writer is not None:
-                for k, v in metrics.items():
-                    self._tb_writer.add_scalar(
-                        k if tag is None else f"{tag}/{k}", v, step
-                    )
-            if self._wandb_enabled:
-                import wandb
-
-                wandb.log(metrics, step=step)
-
-        def close(self) -> None:
-            if self._tb_writer is not None:
-                self._tb_writer.close()
-            if self._wandb_enabled:
-                import wandb
-
-                wandb.finish()
-
-    return _LoggerContainer()
+) -> BaseLogger:
+    """Build WandB/TB logger for the logging subprocess."""
+    container = LoggerContainer()
+    if enable_tensorboard:
+        tb_dir = os.path.join(
+            dump_folder, save_tb_folder, datetime.now().strftime("%Y%m%d-%H%M")
+        )
+        container.add_logger(TensorBoardLogger(log_dir=tb_dir, tag=tag))
+    if enable_wandb:
+        container.add_logger(
+            WandBLogger(log_dir=dump_folder, config_dict=config_dict, tag=tag)
+        )
+    return container
 
 
 def logging_worker(
@@ -229,9 +187,7 @@ def logging_worker(
         queue_timeout_s: Seconds to wait before assuming training crashed.
             Default 600 (10 min). Set to 1 for unit tests.
     """
-    from torchtitan.observability import init_observability
-
-    init_observability(source="logging", output_dir=dump_folder, rank=0)
+    init_observability(source="logging_worker", output_dir=dump_folder, rank=0)
 
     log_dir = os.path.join(dump_folder, "experiment_logs")
     buffer: dict[int, list[dict]] = defaultdict(list)

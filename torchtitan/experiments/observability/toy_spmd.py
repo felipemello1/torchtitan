@@ -59,6 +59,7 @@ SEQ_LEN = 16
 BATCH_SIZE = 8
 LR = 1e-3
 IGNORE_INDEX = -100
+ENABLE_WANDB = True
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs", "toy_spmd")
 
 
@@ -169,11 +170,10 @@ class ToyTrainer:
         )
 
         torch.manual_seed(0)
-        with record_span("setup/model_build", EventType.BUILD_MODEL):
-            model = TinyModel().to(device)
-            self._apply_tp(model, tp_mesh)
-            self._apply_compile(model)
-            self._apply_fsdp(model, dp_mesh)
+        model = TinyModel().to(device)
+        self._apply_tp(model, tp_mesh)
+        self._apply_compile(model)
+        self._apply_fsdp(model, dp_mesh)
         self.model = model
         self.optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
@@ -305,9 +305,7 @@ class ToyTrainer:
 
             if step % EVAL_FREQ == 0:
                 add_step_tag("eval")
-                with record_span(
-                    "trainer/validation", EventType.EVAL, log_to_metrics=False
-                ):
+                with record_span("trainer/validation", EventType.EVAL):
                     self.validate(tokens, labels, loss_mask)
 
             self.metrics_processor.log(step)
@@ -337,9 +335,8 @@ def main():
     if rank == 0:
         print(f"Toy SPMD: {world_size} GPUs, 2DPx2TP, {NUM_STEPS} steps")
 
-    enable_wandb = os.environ.get("WANDB_ENABLED", "0") == "1"
     trainer = ToyTrainer(
-        device, mesh["dp"], mesh["tp"], OUTPUT_DIR, enable_wandb=enable_wandb
+        device, mesh["dp"], mesh["tp"], OUTPUT_DIR, enable_wandb=ENABLE_WANDB
     )
     trainer.train(NUM_STEPS)
     trainer.close()

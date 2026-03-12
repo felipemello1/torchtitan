@@ -42,6 +42,7 @@ from torchtitan.observability import (
     record_metric,
     record_span,
     set_step,
+    SumMetric,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,10 @@ class GeneratorActor(Actor):
         self, prompts: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Generate completions from prompts. Returns (tokens, labels, loss_mask)."""
+        record_metric(
+            "rl_generator/tokens_generated",
+            SumMetric(value=float(self.tokens.numel())),
+        )
         return self.tokens, self.labels, self.loss_mask
 
 
