@@ -136,13 +136,13 @@ class NoOpMetric(MetricValue):
 
     Example:
 
+        record_metric("loss/trainer_loss_mean", NoOpMetric(value=0.038))
         # 4 ranks all record the same all-reduced loss:
         # Rank 0: NoOpMetric(value=0.038)
         # Rank 1: NoOpMetric(value=0.038)
         # Rank 2: NoOpMetric(value=0.038)
         # Rank 3: NoOpMetric(value=0.038)
         # Aggregated: 0.038 (entries[0], rest ignored)
-        record_metric("loss/trainer_loss_mean", NoOpMetric(value=0.038))
     """
 
     reduce_name = "NoOpMetric"
@@ -201,7 +201,7 @@ def record_metric(key: str, value: MetricValue, _stacklevel: int = 2) -> None:
     state["key"] = key
     _experiment_logger.info(
         "experiment_metric",
-        extra={_METRIC_ENTRY: state},
+        extra={_METRIC_ENTRY: state},  # marker to distinguish metrics from stdout
         stacklevel=_stacklevel,
     )
 

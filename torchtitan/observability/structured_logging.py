@@ -590,7 +590,6 @@ class record_span(ContextDecorator):  # noqa: N801
             stacklevel=2,
         )
         if self.log_to_metrics and step is not None:
-            # stacklevel=3: skip __exit__ → record_metric → logger, so the
-            # logged call site shows the user's `with record_span(...)` line.
+            # stacklevel=3 adds to the metadata the actual call site, e.g. trainer.py:537
             record_metric(self.description, MeanMetric(sum=duration_s), _stacklevel=3)
         return False  # Don't suppress exceptions

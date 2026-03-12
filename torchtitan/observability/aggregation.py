@@ -134,8 +134,8 @@ def _flush_step(
 # Console output
 # ---------------------------------------------------------------------------
 
-# Colors cycle by position in the key list.
-_COLORS = ["green", "yellow", "cyan", "blue", "magenta", "red"]
+# Available colors from Color, excluding reset/black/white.
+_COLORS = [k for k in vars(Color) if not k.startswith("_") and k not in ("reset", "black", "white")]
 
 
 def _fmt_value(value: Any) -> str:
@@ -151,24 +151,25 @@ def _fmt_value(value: Any) -> str:
         _fmt_value(1234.5)    → '1234.5'
         _fmt_value(True)      → 'True'
     """
-    if not isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, bool):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         return str(value)
     if value == 0:
         return "0"
     if isinstance(value, int) or abs(value) >= 100:
         return f"{value:.1f}"
 
-    # Count decimals needed to show 2 non-zero digits
+    # e.g. value=0.00123 → frac=0.00123
     frac = abs(value) - int(abs(value))
     if frac == 0:
         return f"{value:.1f}"
+
+    # Walk decimal digits until we've seen 2 non-zero ones.
+    # e.g. 0.00123: digit 1→0, digit 2→0, digit 3→1(first!), digit 4→2(second!) → 4 decimals
     n_decimals, n_nonzero = 0, 0
     temp = frac
     while n_decimals < 5 and n_nonzero < 2:
         n_decimals += 1
-        temp *= 10
+        temp *= 10  # e.g. 0.00123 → 0.0123 → 0.123 → 1.23
         if int(temp) % 10 != 0 or n_nonzero > 0:
             n_nonzero += 1
     return f"{value:.{max(n_decimals, 2)}f}"
