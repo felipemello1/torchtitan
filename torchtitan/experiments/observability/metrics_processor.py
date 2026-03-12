@@ -37,6 +37,8 @@ class MetricsProcessor(Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         log_freq: int = 10
+        """How often to log to backends (e.g. wandb). Also gates expensive
+        metrics computation (.item(), collectives)."""
         enable_wandb: bool = True
         enable_tensorboard: bool = False
         disable_color_printing: bool = False
