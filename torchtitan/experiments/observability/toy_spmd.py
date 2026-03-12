@@ -272,7 +272,11 @@ class ToyTrainer:
             grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-        record_metric("training/loss_mean", MeanMetric(sum=loss.item()))
+        # All-reduce loss for logging: each DP rank has local_loss_sum /
+        # global_valid_tokens. SUM gives global_loss_sum / global_valid_tokens.
+        loss_scalar = loss.detach().full_tensor().clone()
+        dist.all_reduce(loss_scalar, op=dist.ReduceOp.SUM)
+        record_metric("training/loss_mean", NoOpMetric(value=loss_scalar.item()))
         record_metric("training/grad_norm_max", MaxMetric(value=grad_norm.item()))
         record_metric("training/lr", NoOpMetric(value=LR))
 
@@ -286,7 +290,9 @@ class ToyTrainer:
             global_valid_tokens = valid_tokens.full_tensor().detach().clone().float()
             dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
             val_loss = loss_sum / global_valid_tokens
-        record_metric("validation/loss_mean", MeanMetric(sum=val_loss.item()))
+        val_loss_scalar = val_loss.detach().full_tensor().clone()
+        dist.all_reduce(val_loss_scalar, op=dist.ReduceOp.SUM)
+        record_metric("validation/loss_mean", NoOpMetric(value=val_loss_scalar.item()))
 
     def train(self, num_steps):
         """Full training loop. Mirrors Trainer.train structure."""
