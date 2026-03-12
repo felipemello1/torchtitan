@@ -13,11 +13,11 @@ import time
 
 import pytest
 
+from torchtitan.observability import step_state
 from torchtitan.observability._constants import (
     EXPERIMENT_LOGGER_NAME,
     SYSTEM_LOGGER_NAME,
 )
-from torchtitan.observability import step_state
 from torchtitan.observability.step_state import (
     add_step_tag,
     clear_step_tags,
