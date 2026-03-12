@@ -72,9 +72,8 @@ class MetricsProcessor(Configurable):
         all JSONL files. Non-blocking after barrier (~0.1ms).
         """
         torch.distributed.barrier()
-        is_validation = False
         if self._log_queue is not None:
-            self._log_queue.put((step, is_validation))
+            self._log_queue.put(step)
 
     def close(self) -> None:
         """Shut down the logging subprocess."""

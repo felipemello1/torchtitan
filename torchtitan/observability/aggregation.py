@@ -104,7 +104,6 @@ def _read_new_lines(
 def _flush_step(
     step: int,
     buffer: dict[int, list[dict]],
-    is_validation: bool,
     logger_backend: BaseLogger,
     console_log_metric_keys: list[str],
 ) -> tuple[dict[str, float], int]:
@@ -245,13 +244,12 @@ def logging_worker(
     """Background process that reads experiment JSONL, aggregates across
     ranks, and writes to WandB/TB/console.
 
-    The training process signals this worker via ``queue.put((step, is_validation))``
+    The training process signals this worker via ``queue.put(step)``
     after each log step. The worker reads all JSONL files, aggregates, and
     flushes. Shuts down on ``None`` sentinel or queue timeout.
 
     Args:
-        queue: Receives ``(step, is_validation)`` tuples, or ``None`` to
-            shut down.
+        queue: Receives ``step`` (int), or ``None`` to shut down.
         dump_folder: Root output directory containing ``experiment_logs/``.
         enable_wandb: Whether to log to WandB.
         enable_tensorboard: Whether to log to TensorBoard.
@@ -298,7 +296,7 @@ def logging_worker(
         if msg is None:
             break
 
-        step, is_validation = msg
+        step = msg
         time.sleep(0.02)  # let filesystem propagate writes
 
         # Read new JSONL lines from all rank files
@@ -310,7 +308,6 @@ def logging_worker(
         aggregated, num_entries = _flush_step(
             step,
             buffer,
-            is_validation,
             logger_backend,
             console_log_metric_keys or [],
         )

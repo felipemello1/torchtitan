@@ -217,8 +217,7 @@ async def main():
 
             reward_mean = sum(rewards) / len(rewards)
             record_event({"train.loss": loss, "reward_mean": reward_mean})
-            is_validation = False
-            log_queue.put((step, is_validation))
+            log_queue.put(step)
 
     await run_training()
 
