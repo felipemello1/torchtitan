@@ -267,9 +267,9 @@ class ToyTrainer:
             grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-        record_metric("trainer/loss_mean", MeanMetric(sum=loss.item()))
-        record_metric("trainer/grad_norm_max", MaxMetric(value=grad_norm.item()))
-        record_metric("trainer/lr", NoOpMetric(value=LR))
+        record_metric("training/loss_mean", MeanMetric(sum=loss.item()))
+        record_metric("training/grad_norm_max", MaxMetric(value=grad_norm.item()))
+        record_metric("training/lr", NoOpMetric(value=LR))
 
         return loss, grad_norm
 
@@ -279,7 +279,7 @@ class ToyTrainer:
             logits = self.model(tokens)
             loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
             val_loss = loss_sum / valid_tokens
-        record_metric("trainer/val_loss_mean", MeanMetric(sum=val_loss.item()))
+        record_metric("validation/loss_mean", MeanMetric(sum=val_loss.item()))
 
     def train(self, num_steps):
         """Full training loop. Mirrors Trainer.train structure."""
@@ -337,9 +337,9 @@ def main():
     mp_config = MetricsProcessor.Config(
         enable_wandb=ENABLE_WANDB,
         console_log_metric_keys=[
-            "trainer/loss_mean",
-            "trainer/grad_norm_max",
-            "trainer/lr",
+            "training/loss_mean",
+            "training/grad_norm_max",
+            "training/lr",
         ],
     )
     trainer = ToyTrainer(

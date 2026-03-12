@@ -162,9 +162,9 @@ async def main():
         kwargs={
             "enable_wandb": True,
             "console_log_metric_keys": [
-                "trainer/loss_mean",
-                "trainer/grad_norm_max",
-                "trainer/lr",
+                "training/loss_mean",
+                "training/grad_norm_max",
+                "training/lr",
             ],
         },
         daemon=True,
