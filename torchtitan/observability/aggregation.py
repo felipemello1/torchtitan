@@ -24,7 +24,7 @@ from torchtitan.components.metrics import (
 )
 from torchtitan.observability.metrics import REDUCE_REGISTRY
 from torchtitan.observability.structured_logging import init_observability
-from torchtitan.tools.utils import Color
+from torchtitan.tools.utils import Color, NoColor
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +104,11 @@ def _read_new_lines(
 def _flush_step(
     step: int,
     buffer: dict[int, list[dict]],
+    is_validation: bool,
     logger_backend: BaseLogger,
     console_log_metric_keys: list[str],
+    console_log_validation_keys: list[str],
+    disable_color_printing: bool,
 ) -> tuple[dict[str, float], int]:
     """Aggregate entries for ``step``, write to backends, print to console.
 
@@ -122,9 +125,21 @@ def _flush_step(
         # Write all metrics to WandB/TensorBoard
         logger_backend.log(aggregated, step)
 
-        # Print selected metrics to console
+        # Print training console line
         if console_log_metric_keys:
-            _log_to_console(step, aggregated, console_log_metric_keys)
+            _log_to_console(
+                step, aggregated, console_log_metric_keys, disable_color_printing
+            )
+
+        # Print validation console line (only on validation steps)
+        if is_validation and console_log_validation_keys:
+            _log_to_console(
+                step,
+                aggregated,
+                console_log_validation_keys,
+                disable_color_printing,
+                prefix="validate ",
+            )
 
     return aggregated, len(entries)
 
@@ -134,7 +149,11 @@ def _flush_step(
 # ---------------------------------------------------------------------------
 
 # Available colors from Color, excluding reset/black/white.
-_COLORS = [k for k in vars(Color) if not k.startswith("_") and k not in ("reset", "black", "white")]
+_COLORS = [
+    k
+    for k in vars(Color)
+    if not k.startswith("_") and k not in ("reset", "black", "white")
+]
 
 
 def _fmt_value(value: Any) -> str:
@@ -177,15 +196,17 @@ def _fmt_value(value: Any) -> str:
 def _log_to_console(
     step: int,
     aggregated: dict[str, float],
-    console_log_metric_keys: list[str],
+    keys: list[str],
+    disable_color_printing: bool = False,
+    prefix: str = "",
 ) -> None:
     """Print one console line with the configured metric keys.
 
     Colors cycle by position in the key list. Missing metrics show '--'.
     """
-    color = Color()
-    parts = [f"{color.red}step: {step:2}"]
-    for i, key in enumerate(console_log_metric_keys):
+    color = NoColor() if disable_color_printing else Color()
+    parts = [f"{color.red}{prefix}step: {step:2}"]
+    for i, key in enumerate(keys):
         c = getattr(color, _COLORS[i % len(_COLORS)])
         val = aggregated.get(key)
         if val is None:
@@ -239,25 +260,30 @@ def logging_worker(
     config_dict: dict[str, Any] | None = None,
     tag: str | None = None,
     console_log_metric_keys: list[str] | None = None,
+    console_log_validation_keys: list[str] | None = None,
+    disable_color_printing: bool = False,
     queue_timeout_s: float = _QUEUE_TIMEOUT_S,
 ) -> None:
     """Background process that reads experiment JSONL, aggregates across
     ranks, and writes to WandB/TB/console.
 
-    The training process signals this worker via ``queue.put(step)``
+    The training process signals this worker via ``queue.put((step, is_validation))``
     after each log step. The worker reads all JSONL files, aggregates, and
     flushes. Shuts down on ``None`` sentinel or queue timeout.
 
     Args:
-        queue: Receives ``step`` (int), or ``None`` to shut down.
+        queue: Receives ``(step, is_validation)`` tuple, or ``None`` to
+            shut down.
         dump_folder: Root output directory containing ``experiment_logs/``.
         enable_wandb: Whether to log to WandB.
         enable_tensorboard: Whether to log to TensorBoard.
         save_tb_folder: Subfolder for TensorBoard files.
         config_dict: Full config for ``wandb.init(config=...)``.
         tag: Prefix for TB/WandB scalar keys.
-        console_log_metric_keys: Metric keys to print to console each step.
-            If empty or None, console output is disabled.
+        console_log_metric_keys: Training metric keys for console each step.
+        console_log_validation_keys: Validation metric keys for console
+            (only printed on validation steps).
+        disable_color_printing: If True, use NoColor instead of Color.
         queue_timeout_s: Seconds to wait for a signal before assuming
             training crashed. Default 600 (10 min).
     """
@@ -296,7 +322,7 @@ def logging_worker(
         if msg is None:
             break
 
-        step = msg
+        step, is_validation = msg
         time.sleep(0.02)  # let filesystem propagate writes
 
         # Read new JSONL lines from all rank files
@@ -308,8 +334,11 @@ def logging_worker(
         aggregated, num_entries = _flush_step(
             step,
             buffer,
+            is_validation,
             logger_backend,
             console_log_metric_keys or [],
+            console_log_validation_keys or [],
+            disable_color_printing,
         )
 
         logger.debug(
