@@ -31,7 +31,7 @@ class MetricValue(ABC):
     and how the aggregator should combine entries from multiple ranks
     (``get_reduced_value_from_states``).
 
-    Example: ``MeanMetric(sum=7.2, weight=10)`` serializes to JSONL as::
+    Example: ``MeanMetric(sum=7.2, weight=10)`` serializes to JSONL as:
 
         {"key": "reward", "reduce": "MeanMetric", "sum": 7.2, "weight": 10, ...}
 
@@ -56,7 +56,7 @@ class MeanMetric(MetricValue):
     """Weighted mean: (Σsum) / (Σweight).
 
     When aggregating entries from multiple ranks, sums and weights are
-    accumulated separately, then divided::
+    accumulated separately, then divided:
 
         # Rank 0: MeanMetric(sum=6.0, weight=3.0)
         # Rank 1: MeanMetric(sum=4.0, weight=2.0)
@@ -128,13 +128,20 @@ class SumMetric(MetricValue):
 
 
 class NoOpMetric(MetricValue):
-    """No reduction — value is used as-is. For values that are already
-    reduced (e.g., loss after ``dist_sum``) or identical across ranks
-    (e.g., learning rate).
+    """No reduction — returns the first entry's value, ignoring the rest.
 
-    Example::
+    Use for values that are already reduced (e.g., loss after ``dist_sum``)
+    or identical across ranks (e.g., learning rate). The aggregator receives
+    N entries (one per rank) but only uses ``entries[0]["value"]``.
 
-        # Loss was already all-reduced via dist_sum — just pass it through
+    Example:
+
+        # 4 ranks all record the same all-reduced loss:
+        # Rank 0: NoOpMetric(value=0.038)
+        # Rank 1: NoOpMetric(value=0.038)
+        # Rank 2: NoOpMetric(value=0.038)
+        # Rank 3: NoOpMetric(value=0.038)
+        # Aggregated: 0.038 (entries[0], rest ignored)
         record_metric("loss/trainer_loss_mean", NoOpMetric(value=0.038))
     """
 
@@ -172,7 +179,7 @@ def record_metric(key: str, value: MetricValue, _stacklevel: int = 2) -> None:
     Step, rank, source, caller, and timestamp are added automatically by
     the JSONL handler configured in ``init_observability``.
 
-    Example::
+    Example:
 
         record_metric("trainer_gradient/norm_max", MaxMetric(value=12.3))
 
@@ -207,12 +214,12 @@ def record_metric(key: str, value: MetricValue, _stacklevel: int = 2) -> None:
 class ExperimentJSONFormatter(logging.Formatter):
     """Formats experiment metric records as flat JSONL.
 
-    Input (from record_metric via LogRecord.extra)::
+    Input (from record_metric via LogRecord.extra):
 
         LogRecord with extra={"_metric_entry": {"key": "reward", "reduce": "MeanMetric",
                                                  "sum": 7.2, "weight": 10}}
 
-    Output (one JSON line per record)::
+    Output (one JSON line per record):
 
         {"key": "reward", "reduce": "MeanMetric", "sum": 7.2, "weight": 10,
          "step": 42, "rank": 0, "source": "reward",

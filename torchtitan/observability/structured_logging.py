@@ -376,7 +376,7 @@ class StructuredLoggingHandler(logging.FileHandler):
 class InflightEventTrackingHandler(logging.Handler):
     """Tracks the last structured event for crash forensics.
 
-    On crash, ``handler.last_event`` tells you what phase the process was in::
+    On crash, ``handler.last_event`` tells you what phase the process was in:
 
         handler = InflightEventTrackingHandler()
         sys_logger.addHandler(handler)
@@ -417,7 +417,7 @@ def init_observability(source: str, output_dir: str, rank: int | None = None) ->
     Can be called before torch.distributed init — rank defaults to the
     RANK environment variable (set by torchrun).
 
-    Example::
+    Example:
 
         init_observability(source="trainer", output_dir="./outputs")
         # Creates: ./outputs/system_logs/trainer_rank_0_system.jsonl
@@ -495,7 +495,7 @@ def record_event(metrics: dict[str, float | int]) -> None:
     Each key-value pair becomes a separate METRIC_VALUE event.
     Step is read from the global set by ``set_step()``.
 
-    Example::
+    Example:
 
         record_event({"train.loss": 2.5, "train.tflops": 45.6})
         # system JSONL: {"normal": {"event_name": "train.loss"}, "double": {"value": 2.5}, ...}
@@ -530,7 +530,7 @@ class record_span(ContextDecorator):  # noqa: N801
         log_to_metrics: If True, record duration to experiment JSONL.
             Default True.
 
-    Usage::
+    Usage:
 
         with record_span("trainer_time/forward_backward_s", EventType.FWD_BWD):
             output = model(batch)

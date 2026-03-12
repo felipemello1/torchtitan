@@ -41,7 +41,7 @@ def aggregate(entries: list[dict]) -> dict[str, float]:
 
     Groups entries by key and delegates to REDUCE_REGISTRY.
 
-    Example::
+    Example:
 
         entries = [
             {"key": "loss", "reduce": "MeanMetric", "sum": 6.0, "weight": 3.0},
@@ -144,7 +144,7 @@ def _fmt_value(value: Any) -> str:
     Numbers: show at least 2 non-zero decimals, up to 5 decimal places.
     Other types (bool, str): converted to string as-is.
 
-    Examples::
+    Examples:
 
         _fmt_value(3.67060)   → '3.67'
         _fmt_value(0.00123)   → '0.0012'
