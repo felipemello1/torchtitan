@@ -146,6 +146,7 @@ class ToyTrainer:
 
     def __init__(self, device, dp_mesh, tp_mesh, output_dir):
         self.device = device
+        self.dp_mesh = dp_mesh
         self.rank = dist.get_rank()
         self.output_dir = output_dir
         self.step = 0
@@ -238,7 +239,11 @@ class ToyTrainer:
         with loss_parallel():
             logits = self.model(tokens)
             loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
-            loss = loss_sum / valid_tokens
+            # Globally-normalized loss: each token contributes equally to
+            # gradients regardless of which DP rank it's on (matches titan).
+            global_valid_tokens = valid_tokens.full_tensor().detach().clone().float()
+            dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
+            loss = loss_sum / global_valid_tokens
             self.optimizer.zero_grad()
             loss.backward()
         grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -250,7 +255,9 @@ class ToyTrainer:
         with torch.no_grad(), loss_parallel():
             logits = self.model(tokens)
             loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
-            val_loss = loss_sum / valid_tokens
+            global_valid_tokens = valid_tokens.full_tensor().detach().clone().float()
+            dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
+            val_loss = loss_sum / global_valid_tokens
         if self.rank == 0:
             print(f"  val loss: {val_loss.item():.4f}")
 
