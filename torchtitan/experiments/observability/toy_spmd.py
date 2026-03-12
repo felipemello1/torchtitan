@@ -159,6 +159,7 @@ class ToyTrainer:
 
     def __init__(self, device, dp_mesh, tp_mesh, output_dir, *, mp_config=None):
         self.device = device
+        self.dp_mesh = dp_mesh
         self.rank = dist.get_rank()
         self.output_dir = output_dir
         self.step = 0
@@ -261,7 +262,11 @@ class ToyTrainer:
             with loss_parallel():
                 logits = self.model(tokens)
                 loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
-                loss = loss_sum / valid_tokens
+                # Globally-normalized loss: each token contributes equally to
+                # gradients regardless of which DP rank it's on (matches titan).
+                global_valid_tokens = valid_tokens.full_tensor().detach().clone().float()
+                dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
+                loss = loss_sum / global_valid_tokens
                 self.optimizer.zero_grad()
                 loss.backward()
 
@@ -276,9 +281,10 @@ class ToyTrainer:
 
         # Loss/grad_norm only on log steps (.item() triggers GPU→CPU sync)
         if self.metrics_processor.should_log(self.step):
-            # All-reduce loss across ranks (matches titan's dist_sum pattern)
+            # Each DP rank has local_loss_sum / global_valid_tokens.
+            # SUM across DP ranks gives global_loss_sum / global_valid_tokens.
             loss_scalar = loss.detach().full_tensor().clone()
-            dist.all_reduce(loss_scalar, op=dist.ReduceOp.AVG)
+            dist.all_reduce(loss_scalar, op=dist.ReduceOp.SUM)
             loss_val = loss_scalar.item()
             grad_norm_val = grad_norm.item()
             record_metric("training/loss_mean", NoOpMetric(value=loss_val))
@@ -294,7 +300,9 @@ class ToyTrainer:
         with torch.no_grad(), loss_parallel():
             logits = self.model(tokens)
             loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
-            val_loss = loss_sum / valid_tokens
+            global_valid_tokens = valid_tokens.full_tensor().detach().clone().float()
+            dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
+            val_loss = loss_sum / global_valid_tokens
 
         record_metric("validation/loss_mean", MeanMetric(sum=val_loss.item()))
         self.metrics_processor.record_throughput(is_validation=True)
@@ -323,7 +331,7 @@ class ToyTrainer:
             if is_validation:
                 add_step_tag("eval")
                 self.metrics_processor.reset_val_counters()
-                with record_span("trainer/validation", EventType.EVAL):
+                with record_span("trainer_time/validation_s", EventType.EVAL):
                     self.validate(tokens, labels, loss_mask)
 
             if self.metrics_processor.should_log(step):
