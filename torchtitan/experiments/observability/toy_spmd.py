@@ -157,17 +157,15 @@ class ToyTrainer:
     - train: owns the training loop
     """
 
-    def __init__(self, device, dp_mesh, tp_mesh, output_dir, *, enable_wandb=False):
+    def __init__(self, device, dp_mesh, tp_mesh, output_dir, *, mp_config=None):
         self.device = device
         self.rank = dist.get_rank()
         self.output_dir = output_dir
         self.step = 0
 
-        self.metrics_processor = MetricsProcessor(
-            dump_folder=output_dir,
-            rank=self.rank,
-            enable_wandb=enable_wandb,
-        )
+        if mp_config is None:
+            mp_config = MetricsProcessor.Config()
+        self.metrics_processor = mp_config.build(dump_folder=output_dir, rank=self.rank)
 
         torch.manual_seed(0)
         with record_span("setup/model_build", EventType.BUILD_MODEL):
@@ -336,8 +334,9 @@ def main():
     if rank == 0:
         print(f"Toy SPMD: {world_size} GPUs, 2DPx2TP, {NUM_STEPS} steps")
 
+    mp_config = MetricsProcessor.Config(enable_wandb=ENABLE_WANDB)
     trainer = ToyTrainer(
-        device, mesh["dp"], mesh["tp"], OUTPUT_DIR, enable_wandb=ENABLE_WANDB
+        device, mesh["dp"], mesh["tp"], OUTPUT_DIR, mp_config=mp_config
     )
     trainer.train(NUM_STEPS)
     trainer.close()

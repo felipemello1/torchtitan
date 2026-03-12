@@ -18,6 +18,7 @@ Run (requires 4 GPUs):
 
 import asyncio
 import logging
+import multiprocessing
 import os
 import shutil
 import socket
@@ -27,6 +28,7 @@ import torch
 from monarch.actor import Actor, current_rank, endpoint, this_host
 from torch.distributed.device_mesh import init_device_mesh
 
+from torchtitan.experiments.observability.metrics_processor import MetricsProcessor
 from torchtitan.experiments.observability.toy_spmd import (
     BATCH_SIZE,
     SEQ_LEN,
@@ -37,12 +39,10 @@ from torchtitan.experiments.observability.toy_spmd import (
 from torchtitan.observability import (
     EventType,
     init_observability,
-    MeanMetric,
+    logging_worker,
     record_event,
-    record_metric,
     record_span,
     set_step,
-    SumMetric,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,8 @@ class GeneratorActor(Actor):
 
     @endpoint
     async def setup(self):
+        rank = current_rank().rank
+        init_observability(source="generator", output_dir=OUTPUT_DIR, rank=rank)
         dataset = setup_data()
         self.tokens = dataset.tokens
         self.labels = dataset.labels
@@ -74,10 +76,6 @@ class GeneratorActor(Actor):
         self, prompts: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Generate completions from prompts. Returns (tokens, labels, loss_mask)."""
-        record_metric(
-            "rl_generator/tokens_generated",
-            SumMetric(value=float(self.tokens.numel())),
-        )
         return self.tokens, self.labels, self.loss_mask
 
 
@@ -96,7 +94,11 @@ class TrainerActor(Actor):
             )
         init_observability(source="trainer", output_dir=OUTPUT_DIR, rank=rank)
         mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
-        self.trainer = ToyTrainer(self.device, mesh["dp"], mesh["tp"], OUTPUT_DIR)
+        # Controller owns the logging subprocess — disable in trainer.
+        mp_config = MetricsProcessor.Config(enable_logging_subprocess=False)
+        self.trainer = ToyTrainer(
+            self.device, mesh["dp"], mesh["tp"], OUTPUT_DIR, mp_config=mp_config
+        )
 
     @endpoint
     async def set_step(self, step: int):
@@ -107,6 +109,8 @@ class TrainerActor(Actor):
     @endpoint
     async def train_step(self, tokens, labels, loss_mask) -> float:
         """Train one step on generated completions. Returns loss value."""
+        # TODO: ContextVar workaround — re-set step for this asyncio task
+        set_step(self.trainer.step)
         tokens = tokens.to(self.device)
         labels = labels.to(self.device)
         loss_mask = loss_mask.to(self.device)
@@ -139,10 +143,6 @@ class RewardActor(Actor):
         """Score completions. Returns dummy constant rewards."""
         with record_span("rl_time/scoring_s", EventType.RL_SCORING):
             rewards = [1.0] * len(completions)
-        record_metric(
-            "rl_reward/mean",
-            MeanMetric(sum=sum(rewards), weight=len(rewards)),
-        )
         return rewards
 
 
@@ -154,6 +154,17 @@ async def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     init_observability(source="controller", output_dir=OUTPUT_DIR, rank=0)
+
+    # logging_worker reads experiment JSONL from all actors, aggregates
+    # metrics, and flushes to WandB/TB/console. Runs in a separate process.
+    log_queue = multiprocessing.Queue()
+    log_process = multiprocessing.Process(
+        target=logging_worker,
+        args=(log_queue, OUTPUT_DIR),
+        kwargs={"enable_wandb": True},
+        daemon=True,
+    )
+    log_process.start()
 
     # ---- Setup ----
     host = this_host()
@@ -201,6 +212,7 @@ async def main():
 
             reward_mean = sum(rewards) / len(rewards)
             record_event({"train.loss": loss, "reward_mean": reward_mean})
+            log_queue.put((step, False))
             logger.info(
                 f"step: {step}  loss: {loss:8.5f}  reward_mean: {reward_mean:8.5f}"
             )
@@ -208,6 +220,8 @@ async def main():
     await run_training()
 
     # ---- Cleanup ----
+    log_queue.put(None)
+    log_process.join(timeout=10)
     await trainer.teardown.call()
     logger.info(f"Done in {time.time() - t0:.1f}s. Output: {OUTPUT_DIR}")
 

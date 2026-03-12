@@ -7,43 +7,46 @@
 """Toy MetricsProcessor for the observability experiment."""
 
 import multiprocessing
+from dataclasses import dataclass
 
 import torch
 
+from torchtitan.config import Configurable
 from torchtitan.observability import record_event
 from torchtitan.observability.aggregation import logging_worker
 from torchtitan.observability.step_state import set_step
 
 
-class MetricsProcessor:
+class MetricsProcessor(Configurable):
     """Step context and logging subprocess for the toy trainer.
 
     Mirrors the method order of components/metrics.py MetricsProcessor
     so the toy and production versions are easy to compare.
     """
 
-    def __init__(
-        self,
-        dump_folder: str,
-        rank: int,
-        *,
-        enable_wandb: bool = False,
-        enable_tensorboard: bool = False,
-    ):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        enable_wandb: bool = True
+        enable_tensorboard: bool = False
+        enable_logging_subprocess: bool = True
+
+    def __init__(self, config: Config, *, dump_folder: str, rank: int):
         self._step: int = 0
         self._rank = rank
 
-        # Logging subprocess (rank 0 only).
+        # logging_worker reads experiment JSONL from all ranks, aggregates
+        # metrics, and flushes to WandB/TB/console. Runs in a separate
+        # process so it never blocks training.
         self._log_queue: multiprocessing.Queue | None = None
         self._log_process: multiprocessing.Process | None = None
-        if rank == 0:
+        if rank == 0 and config.enable_logging_subprocess:
             self._log_queue = multiprocessing.Queue()
             self._log_process = multiprocessing.Process(
                 target=logging_worker,
                 args=(self._log_queue, dump_folder),
                 kwargs={
-                    "enable_wandb": enable_wandb,
-                    "enable_tensorboard": enable_tensorboard,
+                    "enable_wandb": config.enable_wandb,
+                    "enable_tensorboard": config.enable_tensorboard,
                 },
                 daemon=True,
             )
