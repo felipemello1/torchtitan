@@ -42,6 +42,7 @@ from torchtitan.observability import (
     MaxMetric,
     MeanMetric,
     NoOpMetric,
+    Profiler,
     profile_annotation,
     record_event,
     record_metric,
@@ -160,7 +161,9 @@ class ToyTrainer:
     - train: owns the training loop
     """
 
-    def __init__(self, device, dp_mesh, tp_mesh, output_dir, *, mp_config=None):
+    def __init__(
+        self, device, dp_mesh, tp_mesh, output_dir, *, mp_config=None, profiler_config=None
+    ):
         self.device = device
         self.dp_mesh = dp_mesh
         self.rank = dist.get_rank()
@@ -170,6 +173,12 @@ class ToyTrainer:
         if mp_config is None:
             mp_config = MetricsProcessor.Config()
         self.metrics_processor = mp_config.build(dump_folder=output_dir, rank=self.rank)
+
+        if profiler_config is None:
+            profiler_config = Profiler.Config()
+        self.profiler = profiler_config.build(
+            output_dir=output_dir, global_rank=self.rank, role_rank=self.rank
+        )
 
         torch.manual_seed(0)
         with record_span("setup/model_build", EventType.BUILD_MODEL):
@@ -323,29 +332,32 @@ class ToyTrainer:
         dataloader = setup_data(self.device, dp_rank=dp_rank)
         data_iterator = self.batch_generator(dataloader)
 
-        for step in range(1, num_steps + 1):
-            self.step = step
-            is_validation = step % EVAL_FREQ == 0
-            self.metrics_processor.set_step(step, force_log=is_validation)
+        with self.profiler:
+            for step in range(1, num_steps + 1):
+                self.step = step
+                is_validation = step % EVAL_FREQ == 0
+                self.metrics_processor.set_step(step, force_log=is_validation)
 
-            # Simulate GC on every 5th step (mirrors gc_handler.run)
-            if step % 5 == 0:
-                add_step_tag("gc")
+                # Simulate GC on every 5th step (mirrors gc_handler.run)
+                if step % 5 == 0:
+                    add_step_tag("gc")
 
-            self.metrics_processor.reset_training_counters()
+                self.metrics_processor.reset_training_counters()
 
-            with record_span("trainer_time/step_s", EventType.STEP):
-                tokens, labels, loss_mask = next(data_iterator)
-                loss, grad_norm = self.train_step(tokens, labels, loss_mask)
+                with record_span("trainer_time/step_s", EventType.STEP):
+                    tokens, labels, loss_mask = next(data_iterator)
+                    loss, grad_norm = self.train_step(tokens, labels, loss_mask)
 
-            if is_validation:
-                add_step_tag("eval")
-                self.metrics_processor.reset_val_counters()
-                with record_span("trainer_time/validation_s", EventType.EVAL):
-                    self.validate(tokens, labels, loss_mask)
+                if is_validation:
+                    add_step_tag("eval")
+                    self.metrics_processor.reset_val_counters()
+                    with record_span("trainer_time/validation_s", EventType.EVAL):
+                        self.validate(tokens, labels, loss_mask)
 
-            if self.metrics_processor.should_log(step):
-                self.metrics_processor.log(step, is_validation=is_validation)
+                if self.metrics_processor.should_log(step):
+                    self.metrics_processor.log(step, is_validation=is_validation)
+
+                self.profiler.step(step)
 
     def close(self):
         """Cleanup."""
@@ -387,8 +399,20 @@ def main():
             "validator_throughput/tps_mean",
         ],
     )
+    profiler_config = Profiler.Config(
+        enable_profiling=True,
+        profile_freq=10,
+        profiler_warmup=2,
+        profiler_active=1,
+        enable_memory_snapshot=True,
+        memory_snapshot_start_step=3,
+        memory_snapshot_stop_step=5,
+        enable_host_memory_profiler=True,
+        host_memory_interval=10,
+    )
     trainer = ToyTrainer(
-        device, mesh["dp"], mesh["tp"], OUTPUT_DIR, mp_config=mp_config
+        device, mesh["dp"], mesh["tp"], OUTPUT_DIR,
+        mp_config=mp_config, profiler_config=profiler_config,
     )
     trainer.train(NUM_STEPS)
     trainer.close()
