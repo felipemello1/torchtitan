@@ -73,6 +73,10 @@ def to_chrome_trace(log_dir: str, output_path: str) -> dict:
             }
         )
 
+    # Collect start events to pair with their end events for "X" (complete) format.
+    # Key: (name, pid, tid) → start timestamp
+    pending_starts: dict[tuple, dict] = {}
+
     for r in records:
         normal = r.get("normal", {})
         event_type = normal.get("log_type_name", "")
@@ -83,25 +87,20 @@ def to_chrome_trace(log_dir: str, output_path: str) -> dict:
         step = r.get("int", {}).get("step")
 
         if event_type.endswith("_start"):
-            name = event_type.replace("_start", "")
-            events.append(
-                {
-                    "name": name,
-                    "ph": "B",
-                    "ts": time_us,
-                    "pid": pid,
-                    "tid": rank,
-                    "args": {"step": step},
-                }
-            )
+            name = event_type.removesuffix("_start")
+            pending_starts[(name, pid, rank)] = {"ts": time_us, "step": step}
         elif event_type.endswith("_end"):
-            name = event_type.replace("_end", "")
+            name = event_type.removesuffix("_end")
             duration_ms = r.get("double", {}).get("value", 0)
+            duration_us = duration_ms * 1000
+            start = pending_starts.pop((name, pid, rank), None)
+            start_ts = start["ts"] if start else time_us
             events.append(
                 {
                     "name": name,
-                    "ph": "E",
-                    "ts": time_us,
+                    "ph": "X",
+                    "ts": start_ts,
+                    "dur": duration_us,
                     "pid": pid,
                     "tid": rank,
                     "args": {"step": step, "duration_ms": f"{duration_ms:.2f}"},
