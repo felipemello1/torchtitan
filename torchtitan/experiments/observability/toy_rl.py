@@ -110,6 +110,8 @@ class RollouterActor(Actor):
 
     @endpoint
     async def setup(self):
+        rank = current_rank().rank
+        init_observability(source="rollouter", output_dir=OUTPUT_DIR, rank=rank)
         dataset = setup_data(batch_size=DP_SIZE * BATCH_SIZE)
         self.dataset = dataset
 
