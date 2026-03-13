@@ -48,6 +48,7 @@ from torchtitan.observability import (
     record_metric,
     record_span,
 )
+from torchtitan.observability.profiling import is_profiling_step
 from torchtitan.observability.analysis import to_chrome_trace
 
 # ---- Config ----
@@ -116,11 +117,12 @@ class MLPBlock(nn.Module):
         self.out_proj = nn.Linear(hidden_dim, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.norm(x)
-        parts = []
-        for head in self.heads.values():
-            parts.append(F.silu(head(h)))
-        return x + self.out_proj(sum(parts))
+        with profile_annotation("FFN"):
+            h = self.norm(x)
+            parts = []
+            for head in self.heads.values():
+                parts.append(F.silu(head(h)))
+            return x + self.out_proj(sum(parts))
 
 
 class TinyModel(nn.Module):
@@ -142,11 +144,13 @@ class TinyModel(nn.Module):
         self.output = nn.Linear(d_model, vocab_size, bias=False)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        h = self.tok_embeddings(tokens)
+        with profile_annotation("Embedding"):
+            h = self.tok_embeddings(tokens)
         for layer in self.layers.values():
             h = layer(h)
-        h = self.norm(h)
-        return self.output(h)
+        with profile_annotation("OutputHead"):
+            h = self.norm(h)
+            return self.output(h)
 
 
 # ---- Trainer ----
@@ -337,6 +341,9 @@ class ToyTrainer:
                 self.step = step
                 is_validation = step % EVAL_FREQ == 0
                 self.metrics_processor.set_step(step, force_log=is_validation)
+                self.profiler.step(step)
+                if is_profiling_step():
+                    add_step_tag("profiling")
 
                 # Simulate GC on every 5th step (mirrors gc_handler.run)
                 if step % 5 == 0:
@@ -356,8 +363,6 @@ class ToyTrainer:
 
                 if self.metrics_processor.should_log(step):
                     self.metrics_processor.log(step, is_validation=is_validation)
-
-                self.profiler.step(step)
 
     def close(self):
         """Cleanup."""
