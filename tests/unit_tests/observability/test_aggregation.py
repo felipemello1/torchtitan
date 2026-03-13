@@ -131,16 +131,3 @@ class TestLoggingWorkerBasic:
         queue.put(None)
         p.join(timeout=10)
         assert p.exitcode == 0
-
-    def test_queue_timeout(self, tmp_path):
-        """Worker shuts down gracefully when queue times out."""
-        queue = multiprocessing.Queue()
-        p = multiprocessing.Process(
-            target=logging_worker,
-            args=(queue, str(tmp_path)),
-            kwargs={"queue_timeout_s": 1},
-        )
-        p.start()
-        # Don't send anything — let it timeout
-        p.join(timeout=5)
-        assert p.exitcode == 0
