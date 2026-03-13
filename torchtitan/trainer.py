@@ -22,7 +22,17 @@ from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX, LossFunction
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
+from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.observability import (
+    EventType,
+    init_observability,
+    MaxMetric,
+    NoOpMetric,
+    record_event,
+    record_metric,
+    record_span,
+    SumMetric,
+)
 from torchtitan.components.optimizer import (
     OptimizersContainer,
     OptimizersInBackwardContainer,
@@ -205,6 +215,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # init distributed and build meshes
         self.parallel_dims = parallel_dims = self.init_distributed()
 
+        # Initialize observability: adds JSONL file handlers for system
+        # and experiment metrics. Console handler is already set up by init_logger.
+        init_observability(
+            source="trainer",
+            output_dir=config.dump_folder,
+            rank=torch.distributed.get_rank(),
+        )
+
         # Logging needs to happen after distributed initialized
         config.maybe_log()
 
@@ -279,14 +297,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             pp_schedule=config.parallelism.pipeline_parallel_schedule,
             config_dict=config.to_dict(),
         )
-        color = self.metrics_processor.color
-
         # calculate model size and flops per token
         (
             model_param_count,
             self.metrics_processor.num_flops_per_token,
         ) = model_config.get_nparams_and_flops(model, config.training.seq_len)
 
+        color = utils.Color()
         logger.info(
             f"{color.blue}Model {model_spec.name} {model_spec.flavor} "
             f"{color.red}size: {model_param_count:,} total parameters{color.reset}"
@@ -367,12 +384,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     cast(Decoder, m).init_weights(buffer_device=buffer_device)
                 m.train()
 
-            # confirm that user will be able to view loss metrics on the console
-            ensure_pp_loss_visible(
-                parallel_dims=parallel_dims,
-                pp_schedule=config.parallelism.pipeline_parallel_schedule,
-                color=color,
-            )
         else:
             # apply Tensor/Context/Expert Parallel, activation checkpointing, torch.compile, Data Parallel
             model = model_spec.parallelize_fn(
@@ -422,9 +433,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 self.model_parts
             )
         )
-        self.metrics_processor.optimizers = self.optimizers
-        self.metrics_processor.model_parts = self.model_parts
-
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
@@ -525,22 +533,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         data_iterator = iter(data_iterable)
 
         while True:
-            data_load_start = time.perf_counter()
-            try:
-                batch = next(data_iterator)
-            except StopIteration as ex:
-                # If data runs out during gradient accumulation, that
-                # entire step will not be executed.
-                raise DataloaderExhaustedError() from ex
+            with record_span(
+                "trainer_time/data_loading_s", EventType.FETCHING_BATCH
+            ):
+                try:
+                    batch = next(data_iterator)
+                except StopIteration as ex:
+                    raise DataloaderExhaustedError() from ex
             input_dict, labels = batch
             ntokens_batch = labels.numel()
             self.ntokens_seen += ntokens_batch
-            self.metrics_processor.ntokens_since_last_log += ntokens_batch
-            self.metrics_processor.data_loading_times.append(
-                time.perf_counter() - data_load_start
-            )
+            self.metrics_processor.ntokens_since_reset += ntokens_batch
 
-            # Tensors stay on CPU; moved to GPU per-microbatch during training
             yield input_dict, labels
 
     def post_dataloading_process(
@@ -738,49 +742,40 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 
-        # log metrics
+        # Derived metrics recorded every step (cheap, outside should_log gate)
+        self.metrics_processor.record_throughput()
+        self.metrics_processor.record_memory()
+        record_metric("training/lr", NoOpMetric(value=lr))
+
+        # Loss/grad_norm only on log steps (.item() triggers GPU→CPU sync)
         if not self.metrics_processor.should_log(self.step):
             return
 
-        if parallel_dims.dp_cp_enabled:
-            loss = loss.detach()
-            loss_mesh = parallel_dims.get_optional_mesh("loss")
+        with record_span(
+            "trainer_time/collect_dist_metrics_s", EventType.SUMMARY_WRITER
+        ):
+            if parallel_dims.dp_cp_enabled:
+                loss = loss.detach()
+                loss_mesh = parallel_dims.get_optional_mesh("loss")
 
-            # For global_avg_loss, we want the average loss across all ranks:
-            # loss = local_loss_sum / global_valid_tokens
-            # global_avg_loss = sum(local_loss_sum) / global_valid_tokens
-            #                 = sum(loss)
-            #
-            # For global_max_loss, we want the max of local average losses across ranks:
-            # local_avg_loss = local_loss_sum / local_valid_tokens
-            #                = (loss * global_valid_tokens) / local_valid_tokens
-            # global_max_loss = max(local_avg_loss)
-            local_avg_loss = loss * global_valid_tokens / local_valid_tokens
-            global_avg_loss, global_max_loss, global_ntokens_seen = (
-                dist_utils.dist_sum(loss, loss_mesh),
-                dist_utils.dist_max(local_avg_loss, loss_mesh),
-                dist_utils.dist_sum(
+                # global_avg_loss = sum(local_loss_sum / global_valid_tokens)
+                global_avg_loss = dist_utils.dist_sum(loss, loss_mesh)
+                global_ntokens_seen = dist_utils.dist_sum(
                     torch.tensor(
                         self.ntokens_seen, dtype=torch.int64, device=self.device
                     ),
                     loss_mesh,
-                ),
-            )
-        else:
-            global_avg_loss = global_max_loss = loss.detach().item()
-            global_ntokens_seen = self.ntokens_seen
+                )
+            else:
+                global_avg_loss = loss.detach().item()
+                global_ntokens_seen = self.ntokens_seen
 
-        extra_metrics = {
-            "n_tokens_seen": global_ntokens_seen,
-            "lr": lr,
-        }
-        self.metrics_processor.log(
-            self.step,
-            global_avg_loss,
-            global_max_loss,
-            grad_norm.item(),
-            extra_metrics=extra_metrics,
-        )
+            record_metric("training/loss_mean", NoOpMetric(value=global_avg_loss))
+            record_metric("training/grad_norm_max", MaxMetric(value=grad_norm.item()))
+            record_metric("training/n_tokens_sum", SumMetric(value=global_ntokens_seen))
+            record_event(
+                {"train.loss": global_avg_loss, "train.grad_norm": grad_norm.item()}
+            )
 
     @record
     def train(self):
@@ -804,6 +799,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
                 self.step += 1
+                is_validation = (
+                    self.config.validator.enable
+                    and self.validator.should_validate(self.step)
+                )
+                self.metrics_processor.set_step(
+                    self.step, force_log=is_validation
+                )
+                self.metrics_processor.reset_training_counters()
+
                 self.gc_handler.run(self.step)
                 try:
                     self.train_step(data_iterator)
@@ -815,11 +819,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     self.step, last_step=(self.step == config.training.steps)
                 )
 
-                # Run validation if validator is available
-                if self.config.validator.enable and self.validator.should_validate(
-                    self.step
-                ):
+                if is_validation:
+                    self.metrics_processor.reset_val_counters()
                     self.validator.validate(self.model_parts, self.step)
+
+                if self.metrics_processor.should_log(self.step):
+                    self.metrics_processor.log(
+                        self.step, is_validation=is_validation
+                    )
 
                 # signal the profiler that the next profiling step has started
                 if torch_profiler:

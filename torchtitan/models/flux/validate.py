@@ -227,7 +227,7 @@ class FluxValidator(Validator):
                 stratified_timesteps = input_dict.pop("timestep")
 
             # Note the tps may be inaccurate due to the generating image step not being counted
-            self.metrics_processor.ntokens_since_last_log += labels.numel()
+            self.metrics_processor.val_ntokens_since_reset += labels.numel()
 
             # Apply timesteps here and update our bsz to efficiently compute all timesteps and samples in a single forward pass
             with torch.no_grad(), torch.device(self.device):
@@ -296,7 +296,11 @@ class FluxValidator(Validator):
         else:
             global_avg_loss = loss.item()
 
-        self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
+        from torchtitan.observability import NoOpMetric, record_metric
+
+        record_metric("validation/loss_mean", NoOpMetric(value=global_avg_loss))
+        self.metrics_processor.record_throughput(is_validation=True)
+        self.metrics_processor.record_memory(is_validation=True)
 
         # Set model back to train mode
         model.train()
