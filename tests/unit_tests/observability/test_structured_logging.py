@@ -555,3 +555,71 @@ class TestRecordSpan:
             lines = [json.loads(line) for line in f if line.strip()]
         assert lines[0]["normal"]["log_type_name"] == "rl_grading_start"
         assert lines[1]["normal"]["log_type_name"] == "rl_grading_end"
+
+    def test_event_name_field_populated(self, tmp_path, system_logger):
+        """record_span stores description in event_name field."""
+        init_observability(rank=0, source="trainer", output_dir=str(tmp_path))
+        set_step(1)
+        with record_span("trainer_time/forward_backward_s", EventType.FWD_BWD):
+            pass
+        jsonl_path = os.path.join(
+            str(tmp_path), "system_logs", "trainer_rank_0_system.jsonl"
+        )
+        with open(jsonl_path) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
+        # event_name should be the description, not the EventType
+        assert lines[0]["normal"]["event_name"] == "trainer_time/forward_backward_s"
+        assert lines[1]["normal"]["event_name"] == "trainer_time/forward_backward_s"
+
+
+class TestChromeTrace:
+    """Tests for to_chrome_trace in analysis.py."""
+
+    def test_same_event_type_different_descriptions(self, tmp_path, system_logger):
+        """Two sequential spans with the same EventType but different
+        descriptions must both appear in the chrome trace with their
+        respective description names (not the shared EventType name).
+
+        This is a regression test: previously, pending_starts used
+        EventType as the key, so the second span's start overwrote the
+        first, losing one span from the output.
+        """
+        from torchtitan.observability.analysis import to_chrome_trace
+
+        init_observability(rank=0, source="controller", output_dir=str(tmp_path))
+        set_step(1)
+        with record_span("rl_time/training_s", EventType.FWD_BWD):
+            pass
+        with record_span("rl_time/rollouts_to_train_batch_s"):
+            pass
+        with record_span("rl_time/scoring_s", EventType.FWD_BWD):
+            pass
+
+        log_dir = os.path.join(str(tmp_path), "system_logs")
+        trace_path = os.path.join(str(tmp_path), "trace.json")
+        trace = to_chrome_trace(log_dir, trace_path)
+
+        span_names = [
+            e["name"] for e in trace["traceEvents"] if e.get("ph") == "X"
+        ]
+        assert "rl_time/training_s" in span_names
+        assert "rl_time/rollouts_to_train_batch_s" in span_names
+        assert "rl_time/scoring_s" in span_names
+
+    def test_no_event_type_uses_description_in_trace(self, tmp_path, system_logger):
+        """Spans without EventType use description as the trace name."""
+        from torchtitan.observability.analysis import to_chrome_trace
+
+        init_observability(rank=0, source="test", output_dir=str(tmp_path))
+        set_step(1)
+        with record_span("my_custom/span_s"):
+            pass
+
+        log_dir = os.path.join(str(tmp_path), "system_logs")
+        trace_path = os.path.join(str(tmp_path), "trace.json")
+        trace = to_chrome_trace(log_dir, trace_path)
+
+        span_names = [
+            e["name"] for e in trace["traceEvents"] if e.get("ph") == "X"
+        ]
+        assert "my_custom/span_s" in span_names
