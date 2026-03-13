@@ -43,13 +43,11 @@ from torchtitan.observability import (
     filter_top_bottom,
     init_observability,
     logging_worker,
-    Profiler,
     record_event,
     record_span,
     RolloutLogger,
     set_step,
 )
-from torchtitan.observability.profiling import is_profiling_step
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -104,30 +102,16 @@ class TrainerActor(Actor):
         # Controller handles flushing — trainer has no backends/console.
         # log_freq=1 also determines freq to call metrics that need .item() or collectives
         mp_config = MetricsProcessor.Config(log_freq=1, enable_wandb=False)
-        profiler_config = Profiler.Config(
-            enable_profiling=True,
-            profile_freq=3,
-            profiler_warmup=1,
-            profiler_active=1,
-            enable_memory_snapshot=True,
-            memory_snapshot_start_step=2,
-            memory_snapshot_stop_step=4,
-            enable_host_memory_profiler=True,
-            host_memory_interval=3,
-        )
         self.trainer = ToyTrainer(
             self.device, mesh["dp"], mesh["tp"], OUTPUT_DIR,
-            mp_config=mp_config, profiler_config=profiler_config,
+            mp_config=mp_config,
         )
-        self.trainer.profiler.start()
 
     @endpoint
     async def set_step(self, step: int):
         """Receive step from controller. Sets step on trainer."""
         self.trainer.step = step
         self.trainer.metrics_processor.set_step(step)
-        if is_profiling_step():
-            add_step_tag("profiling")
 
     @endpoint
     async def train_step(self, tokens, labels, loss_mask) -> float:
@@ -140,7 +124,6 @@ class TrainerActor(Actor):
         labels = labels[start:end].to(self.device)
         loss_mask = loss_mask[start:end].to(self.device)
         loss, _grad_norm = self.trainer.train_step(tokens, labels, loss_mask)
-        self.trainer.profiler.step(self.trainer.step)
         return loss.item()
 
     @endpoint
