@@ -42,6 +42,7 @@ from torchtitan.observability import (
     MaxMetric,
     MeanMetric,
     NoOpMetric,
+    profile_annotation,
     record_event,
     record_metric,
     record_span,
@@ -261,20 +262,22 @@ class ToyTrainer:
         self.metrics_processor.ntokens_since_reset += labels.numel()
 
         with record_span("trainer_time/forward_backward_s", EventType.FWD_BWD):
-            with loss_parallel():
-                logits = self.model(tokens)
-                loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
-                # Globally-normalized loss: each token contributes equally to
-                # gradients regardless of which DP rank it's on (matches titan).
-                global_valid_tokens = valid_tokens.detach().clone().float()
-                dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
-                loss = loss_sum / global_valid_tokens
-                self.optimizer.zero_grad()
-                loss.backward()
+            with profile_annotation("forward_backward"):
+                with loss_parallel():
+                    logits = self.model(tokens)
+                    loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
+                    # Globally-normalized loss: each token contributes equally to
+                    # gradients regardless of which DP rank it's on (matches titan).
+                    global_valid_tokens = valid_tokens.detach().clone().float()
+                    dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
+                    loss = loss_sum / global_valid_tokens
+                    self.optimizer.zero_grad()
+                    loss.backward()
 
         with record_span("trainer_time/optimizer_s", EventType.OPTIM):
-            grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+            with profile_annotation("optimizer"):
+                grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
 
         # Derived metrics recorded every step (cheap, outside should_log gate)
         self.metrics_processor.record_throughput()
