@@ -512,7 +512,7 @@ class record_span(ContextDecorator):  # noqa: N801
         step = get_step()
         _system_logger.info(
             f"[step {step if step is not None else 'N/A'}] {self.description} {self.start_type_name}",
-            extra=event_extra(self.start_type_name, step=step),
+            extra=event_extra(self.start_type_name, event_name=self.description, step=step),
             stacklevel=2,
         )
         return self
@@ -524,7 +524,7 @@ class record_span(ContextDecorator):  # noqa: N801
         delta_ms = duration_s * 1000
         _system_logger.info(
             f"[step {step if step is not None else 'N/A'}] {self.description} {self.end_type_name} took {delta_ms:.2f} ms",
-            extra=event_extra(self.end_type_name, value=delta_ms, step=step),
+            extra=event_extra(self.end_type_name, event_name=self.description, value=delta_ms, step=step),
             stacklevel=2,
         )
         if self.log_to_metrics and step is not None:
