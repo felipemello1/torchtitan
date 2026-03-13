@@ -482,7 +482,10 @@ class MetricsProcessor(Configurable):
             ntokens = self.ntokens_since_reset
             prefix = self._TRAIN_PREFIX
 
-        tps = ntokens / time_delta if time_delta > 0 else 0
+        # Normalize by non_data_parallel_size (CP * TP * PP) to get
+        # per-device TPS, matching titan's existing throughput definition.
+        ndp = self.parallel_dims.non_data_parallel_size
+        tps = ntokens / (time_delta * ndp) if time_delta > 0 else 0
         record_metric(f"{prefix}_throughput/tps_mean", MeanMetric(sum=tps))
 
         if self.num_flops_per_token > 0:
