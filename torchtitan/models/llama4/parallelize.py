@@ -31,7 +31,7 @@ from torchtitan.config import (
     TORCH_DTYPE_MAP,
     TrainingConfig,
 )
-from torchtitan.distributed import NoParallel, ParallelDims
+from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import apply_ac
 from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
 from torchtitan.distributed.dual_pipe_v import (
@@ -46,10 +46,15 @@ from torchtitan.distributed.expert_parallel import (
     ReordererSequenceParallel,
     TensorParallel,
 )
-from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
+from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
+from torchtitan.distributed.tensor_parallel import (
+    ColwiseParallelWithGradPlacement,
+    maybe_enable_async_tp,
+    NoParallel,
+)
 from torchtitan.models.common.moe import moe as moe_module
 from torchtitan.models.llama3.parallelize import (
-    apply_ddp,
+    apply_replicate,
     disable_fsdp_gradient_division,
 )
 from torchtitan.models.llama4.model import Llama4Model
@@ -59,6 +64,7 @@ from torchtitan.tools.logging import logger
 # for selective op activation checkpointing
 _op_sac_save_list = {
     torch.ops.aten.mm.default,
+    torch.ops.aten.linear.default,
     torch.ops.aten._scaled_dot_product_efficient_attention.default,
     torch.ops.aten._scaled_dot_product_flash_attention.default,
     torch.ops.aten._scaled_dot_product_cudnn_attention.default,
@@ -126,29 +132,30 @@ def parallelize_llama(
         )
         maybe_enable_async_tp(parallelism, compile_config, tp_mesh)
 
-    # Check if using DeepEP for MoE communication
-    if parallelism.expert_parallel_comm_backend == "deepep":
+    # Check if using DeepEP/HybridEP for MoE communication
+    comm_backend = parallelism.expert_parallel_comm_backend
+    if comm_backend in ("deepep", "hybridep"):
         if not parallel_dims.ep_enabled:
             raise ValueError(
-                "DeepEP requires expert parallelism (ep_degree > 1). "
-                "The DeepEP MoE model code does not support EP=1. "
+                f"{comm_backend.upper()} requires expert parallelism (ep_degree > 1). "
                 "Please set expert_parallel_degree > 1 or use standard communication backend."
             )
         if parallel_dims.etp_enabled:
             raise NotImplementedError(
-                "DeepEP with Expert Tensor Parallelism (ETP) is not supported yet. "
+                f"{comm_backend.upper()} with Expert Tensor Parallelism (ETP) is not supported yet. "
                 "Please set expert_tensor_parallel_degree=1 or use standard communication backend."
             )
 
-        use_deepep = True
+        if comm_backend == "hybridep":
+            from torchtitan.distributed.deepep import hybridep  # noqa: F401
 
-        # Import deepep module to register custom ops before accessing them
-        import torchtitan.distributed.deepep  # noqa: F401 - registers torch.ops.deepep
+            _op_sac_save_list.add(torch.ops.hybridep.dispatch.default)
+            _op_sac_save_list.add(torch.ops.hybridep.combine.default)
+        else:
+            import torchtitan.distributed.deepep  # noqa: F401
 
-        _op_sac_save_list.add(torch.ops.deepep.dispatch.default)
-        _op_sac_save_list.add(torch.ops.deepep.combine.default)
-    else:
-        use_deepep = False
+            _op_sac_save_list.add(torch.ops.deepep.dispatch.default)
+            _op_sac_save_list.add(torch.ops.deepep.combine.default)
 
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
         dual_pipe_v = get_dual_pipe_v_flag(
@@ -162,7 +169,8 @@ def parallelize_llama(
             etp_mesh=parallel_dims.get_optional_mesh("etp"),
             ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
             dual_pipe_v=dual_pipe_v,
-            use_deepep=use_deepep,
+            comm_backend=comm_backend,
+            hybridep_non_blocking_expert_capacity_factor=parallelism.hybridep_non_blocking_expert_capacity_factor,
         )
 
     attn_backend = model.config.layer.attention.attn_backend
@@ -232,13 +240,11 @@ def parallelize_llama(
         if training.enable_cpu_offload:
             logger.info("Applied CPU Offloading to the model")
     elif parallel_dims.dp_replicate_enabled:
-        dp_mesh = parallel_dims.get_mesh("dp_replicate")
-        if parallel_dims.world_size != dp_mesh.size():
-            raise RuntimeError("DDP has not supported > 1D parallelism")
-        apply_ddp(
+        apply_replicate(
             model,
-            dp_mesh,
-            enable_compile=model_compile_enabled,
+            parallel_dims.get_mesh("dp_replicate"),
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
         )
 
     return model
@@ -374,27 +380,37 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    match reshard_after_forward_policy:
-        case "always":
-            reshard_after_forward = True
-        case "never":
-            reshard_after_forward = False
-        case "default":
-            # For PP, by default do not reshard after forward to avoid per-microbatch
-            # all-gathers, which can be expensive and non-overlapped
-            reshard_after_forward = not pp_enabled
-        case _:
-            raise ValueError(
-                f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
-            )
+    reshard_after_forward = get_fsdp_reshard_after_forward_policy(
+        reshard_after_forward_policy, pp_enabled
+    )
 
-    if model.tok_embeddings is not None:
+    if getattr(model, "enable_weight_tying", False):
+        modules = [
+            m for m in (model.tok_embeddings, model.norm, model.output) if m is not None
+        ]
         # pyrefly: ignore [no-matching-overload]
         fully_shard(
-            model.tok_embeddings,
+            modules,
             **fsdp_config,
-            reshard_after_forward=reshard_after_forward,
+            reshard_after_forward=reshard_after_forward_policy == "always",
         )
+    else:
+        if model.tok_embeddings is not None:
+            # pyrefly: ignore [no-matching-overload]
+            fully_shard(
+                model.tok_embeddings,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+            )
+        if model.norm is not None and model.output is not None:
+            # As an optimization, do not reshard_after_forward the last layers by default
+            # since FSDP would prefetch them immediately after the forward pass
+            # pyrefly: ignore [no-matching-overload]
+            fully_shard(
+                [model.norm, model.output],
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward_policy == "always",
+            )
 
     # pyrefly: ignore [missing-attribute]
     for layer_id, transformer_block in model.layers.items():
@@ -431,16 +447,6 @@ def apply_fsdp(
             transformer_block,
             **fsdp_config,
             reshard_after_forward=reshard_after_forward,
-        )
-
-    # As an optimization, do not reshard_after_forward the last layers by default
-    # since FSDP would prefetch them immediately after the forward pass
-    if model.norm is not None and model.output is not None:
-        # pyrefly: ignore [no-matching-overload]
-        fully_shard(
-            [model.norm, model.output],
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward_policy == "always",
         )
 
     fully_shard(model, **fsdp_config)
@@ -523,7 +529,8 @@ def apply_moe_ep_tp(
     etp_mesh: DeviceMesh | None,
     ep_etp_mesh: DeviceMesh | None,
     dual_pipe_v: bool = False,
-    use_deepep: bool = False,
+    comm_backend: str = "standard",
+    hybridep_non_blocking_expert_capacity_factor: float | None = None,
 ):
     assert ep_mesh is not None or tp_mesh is not None
 
@@ -540,12 +547,15 @@ def apply_moe_ep_tp(
                 "moe": PrepareModuleInputOutput(
                     input_layouts=(Shard(1),),
                     desired_input_layouts=(Replicate(),),
-                    use_local_input=True,
+                    # Keep input as a DTensor from SequenceParallel, do not wrap with to_local.
+                    use_local_input=False,
                     output_layouts=(Partial(),),
                     desired_output_layouts=(Shard(1),),
                 ),
                 # replicate computation for the router
-                "moe.router.gate": NoParallel(),
+                "moe.router.gate": NoParallel(
+                    local_output_grad_placements=(Partial(),),
+                ),
             }
             if ep_mesh is not None and etp_mesh is None:
                 # If TP is borrowed for EP, then split the tokens across TP ranks so that
@@ -555,15 +565,24 @@ def apply_moe_ep_tp(
                 moe_layer_plan.update({"moe.reorderer": ReordererSequenceParallel()})
             # pyrefly: ignore [missing-attribute]
             if transformer_block.moe.shared_experts is not None:
-                # input Replicate, output Partial
+                # Use ColwiseParallelWithGradPlacement to keep d_x as Partial in
+                # backward (avoids the all-reduce that from_local(Replicate)
+                # would otherwise trigger). For w2, output_layouts=Partial()
+                # skips the Partial→Replicate all-reduce in forward. The
+                # reduction happens once at the MoE output boundary
+                # (PrepareModuleInputOutput).
                 # pyrefly: ignore [no-matching-overload]
                 moe_layer_plan.update(
                     {
-                        "moe.shared_experts.w1": ColwiseParallel(),
-                        "moe.shared_experts.w2": RowwiseParallel(
-                            output_layouts=Partial()
+                        "moe.shared_experts.w1": ColwiseParallelWithGradPlacement(
+                            local_input_grad_placements=(Partial(),)
                         ),
-                        "moe.shared_experts.w3": ColwiseParallel(),
+                        "moe.shared_experts.w2": RowwiseParallel(
+                            output_layouts=Partial(),
+                        ),
+                        "moe.shared_experts.w3": ColwiseParallelWithGradPlacement(
+                            local_input_grad_placements=(Partial(),)
+                        ),
                     }
                 )
             parallelize_module(
@@ -583,14 +602,16 @@ def apply_moe_ep_tp(
         elif tp_mesh is None or etp_mesh is None:
             assert ep_etp_mesh is None
             experts_mesh = ep_mesh
-            if use_deepep:
+            if comm_backend in ("deepep", "hybridep"):
                 # pyrefly: ignore [missing-attribute]
                 score_before_experts = transformer_block.moe.score_before_experts
 
                 experts_plan = DeepEPExpertParallel(
                     score_before_experts=score_before_experts,
+                    comm_backend=comm_backend,
+                    hybridep_non_blocking_expert_capacity_factor=hybridep_non_blocking_expert_capacity_factor,
                 )
-                logger.info("Applying DeepEP to MoE layer")
+                logger.info(f"Applying {comm_backend.upper()} to MoE layer")
             else:
                 # input / output sharding on the batch / tokens dim
                 experts_plan = ExpertParallel()
