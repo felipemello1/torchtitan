@@ -87,9 +87,9 @@ class TestSystemJSONL:
 
 class TestChromeTrace:
     def test_trace_json_exists(self):
-        trace_path = os.path.join(OUTPUT_DIR, "trace.json")
+        trace_path = os.path.join(OUTPUT_DIR, "analysis", "system_metrics_gantt.json")
         if not os.path.exists(trace_path):
-            pytest.fail("No trace.json. Run toy_spmd first to generate outputs.")
+            pytest.fail("No analysis/system_metrics_gantt.json. Run toy_spmd first.")
         with open(trace_path) as f:
             trace = json.load(f)
         assert "traceEvents" in trace
