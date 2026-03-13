@@ -117,12 +117,11 @@ class MLPBlock(nn.Module):
         self.out_proj = nn.Linear(hidden_dim, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        with profile_annotation("FFN"):
-            h = self.norm(x)
-            parts = []
-            for head in self.heads.values():
-                parts.append(F.silu(head(h)))
-            return x + self.out_proj(sum(parts))
+        h = self.norm(x)
+        parts = []
+        for head in self.heads.values():
+            parts.append(F.silu(head(h)))
+        return x + self.out_proj(sum(parts))
 
 
 class TinyModel(nn.Module):
@@ -336,36 +335,38 @@ class ToyTrainer:
         dataloader = setup_data(self.device, dp_rank=dp_rank)
         data_iterator = self.batch_generator(dataloader)
 
-        with self.profiler:
-            for step in range(1, num_steps + 1):
-                self.step = step
-                is_validation = step % EVAL_FREQ == 0
-                self.metrics_processor.set_step(step, force_log=is_validation)
-                self.profiler.step(step)
-                if is_profiling_step():
-                    add_step_tag("profiling")
+        self.profiler.start()
+        for step in range(1, num_steps + 1):
+            self.step = step
+            is_validation = step % EVAL_FREQ == 0
+            self.metrics_processor.set_step(step, force_log=is_validation)
+            if is_profiling_step():
+                add_step_tag("profiling")
 
-                # Simulate GC on every 5th step (mirrors gc_handler.run)
-                if step % 5 == 0:
-                    add_step_tag("gc")
+            # Simulate GC on every 5th step (mirrors gc_handler.run)
+            if step % 5 == 0:
+                add_step_tag("gc")
 
-                self.metrics_processor.reset_training_counters()
+            self.metrics_processor.reset_training_counters()
 
-                with record_span("trainer_time/step_s", EventType.STEP):
-                    tokens, labels, loss_mask = next(data_iterator)
-                    loss, grad_norm = self.train_step(tokens, labels, loss_mask)
+            with record_span("trainer_time/step_s", EventType.STEP):
+                tokens, labels, loss_mask = next(data_iterator)
+                loss, grad_norm = self.train_step(tokens, labels, loss_mask)
 
-                if is_validation:
-                    add_step_tag("eval")
-                    self.metrics_processor.reset_val_counters()
-                    with record_span("trainer_time/validation_s", EventType.EVAL):
-                        self.validate(tokens, labels, loss_mask)
+            if is_validation:
+                add_step_tag("eval")
+                self.metrics_processor.reset_val_counters()
+                with record_span("trainer_time/validation_s", EventType.EVAL):
+                    self.validate(tokens, labels, loss_mask)
 
-                if self.metrics_processor.should_log(step):
-                    self.metrics_processor.log(step, is_validation=is_validation)
+            if self.metrics_processor.should_log(step):
+                self.metrics_processor.log(step, is_validation=is_validation)
+
+            self.profiler.step(step)
 
     def close(self):
         """Cleanup."""
+        self.profiler.stop()
         self.metrics_processor.close()
 
 

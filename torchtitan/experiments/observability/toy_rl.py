@@ -115,7 +115,7 @@ class TrainerActor(Actor):
             self.device, mesh["dp"], mesh["tp"], OUTPUT_DIR,
             mp_config=mp_config, profiler_config=profiler_config,
         )
-        self.trainer.profiler.__enter__()
+        self.trainer.profiler.start()
 
     @endpoint
     async def set_step(self, step: int):
@@ -139,7 +139,6 @@ class TrainerActor(Actor):
 
     @endpoint
     async def teardown(self):
-        self.trainer.profiler.__exit__(None, None, None)
         self.trainer.close()
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()

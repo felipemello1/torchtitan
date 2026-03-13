@@ -13,7 +13,7 @@ on-demand triggering via file sentinels.
 Key design:
 - ``profile_annotation(name)`` wraps code with record_function + NVTX.
   Always calls record_function (zero overhead when profiler is inactive).
-- ``set_profiling_step`` controls NVTX push/pop in profile_annotation.
+- ``is_profiling_step`` exposes whether the current step is being profiled.
 - ``dist.barrier()`` in cleanup prevents NCCL timeout when profiler stops.
 """
 
@@ -67,25 +67,23 @@ def is_profiling_step() -> bool:
 def profile_annotation(name: str):
     """Context manager for profiling annotations.
 
-    Always wraps with record_function — it is zero-overhead when torch.profiler
-    is not actively recording, and Dynamo traces through it natively (no graph
-    break). NVTX is added only when profiling AND not compiling.
+    Wraps code with record_function (for torch.profiler traces) and
+    NVTX range (for NSys). Safe inside torch.compile: Dynamo traces
+    the compile path (record_function only), eager path adds NVTX.
 
-    IMPORTANT: We do NOT branch on _is_profiling_step here. That global causes
-    Dynamo guard failures when it flips from False to True, forcing recompilation
-    of every compiled block. record_function is safe to always call.
+    record_function is zero-overhead when torch.profiler is not
+    actively recording. NVTX range is zero-overhead when not running
+    under nsys.
 
     Args:
         name: The annotation name shown in traces.
     """
-    with torch.profiler.record_function(name):
-        if _is_profiling_step and not torch._dynamo.is_compiling():
-            torch.cuda.nvtx.range_push(name)
-        try:
+    if torch._dynamo.is_compiling():
+        with torch.profiler.record_function(name):
             yield
-        finally:
-            if _is_profiling_step and not torch._dynamo.is_compiling():
-                torch.cuda.nvtx.range_pop()
+    else:
+        with torch.profiler.record_function(name), torch.cuda.nvtx.range(name):
+            yield
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +320,14 @@ class MemSnapshotProfiler:
         start_step: int = 0,
         stop_step: int = 3,
     ):
+        """
+        Args:
+            output_dir: Root output directory.
+            max_entries: Max allocation/free ops to record.
+            start_step: Step to begin recording. First snapshot is dumped
+                at start_step + 1.
+            stop_step: Step to stop recording and dump final snapshot.
+        """
         self.output_dir = output_dir
         self.max_entries = max_entries
         self.start_step = start_step
@@ -631,15 +637,24 @@ class Profiler(Configurable):
         logger.info(f"Torch profiler started. Traces: {trace_dir}")
         return prof
 
-    def __enter__(self):
+    def start(self) -> None:
+        """Start the profiler. Call before the training loop."""
         if self._within_context:
-            raise RuntimeError("Already in profiler context.")
+            raise RuntimeError("Profiler already started.")
         self._within_context = True
+
+    def stop(self) -> None:
+        """Stop the profiler and release resources."""
+        if self._within_context:
+            self.cleanup()
+            self._within_context = False
+
+    def __enter__(self):
+        self.start()
         return self
 
     def __exit__(self, exc_type, exc, traceback):
-        self.cleanup()
-        self._within_context = False
+        self.stop()
 
     def step(self, step: int) -> None:
         """Advance all profilers by one step."""
