@@ -38,6 +38,7 @@ from torchtitan.experiments.observability.toy_spmd import (
     VOCAB_SIZE,
 )
 from torchtitan.observability import (
+    add_step_tag,
     EventType,
     init_observability,
     logging_worker,
@@ -46,6 +47,7 @@ from torchtitan.observability import (
     record_span,
     set_step,
 )
+from torchtitan.observability.profiling import is_profiling_step
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -122,6 +124,8 @@ class TrainerActor(Actor):
         """Receive step from controller. Sets step on trainer."""
         self.trainer.step = step
         self.trainer.metrics_processor.set_step(step)
+        if is_profiling_step():
+            add_step_tag("profiling")
 
     @endpoint
     async def train_step(self, tokens, labels, loss_mask) -> float:

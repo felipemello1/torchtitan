@@ -65,15 +65,28 @@ def is_profiling_step() -> bool:
 
 @contextlib.contextmanager
 def profile_annotation(name: str):
-    """Context manager for profiling annotations.
+    """Annotate a code region for profiler traces (torch.profiler + NSys).
 
-    Wraps code with record_function (for torch.profiler traces) and
-    NVTX range (for NSys). Safe inside torch.compile: Dynamo traces
-    the compile path (record_function only), eager path adds NVTX.
+    Visible in traces when used outside torch.compile regions. Inside
+    compiled regions, inductor strips record_function ops, so the
+    annotation won't appear.
 
-    record_function is zero-overhead when torch.profiler is not
-    actively recording. NVTX range is zero-overhead when not running
-    under nsys.
+    record_function is zero-overhead when torch.profiler is not actively
+    recording. NVTX range is zero-overhead when not running under nsys.
+
+    Example:
+
+        @torch.compile
+        def my_model(x):
+            # Won't appear in traces (inductor strips record_function)
+            with profile_annotation("linear"):
+                x = self.linear(x)
+            return x
+
+        # Will appear in traces (outside compiled region)
+        with profile_annotation("forward_backward"):
+            output = my_model(batch)
+            loss.backward()
 
     Args:
         name: The annotation name shown in traces.
@@ -102,8 +115,9 @@ class TriggerResult:
 class TriggerView:
     """Synchronize trigger states across distributed ranks.
 
-    Only role_rank 0 checks for file triggers. ``agree_across_ranks`` uses
-    all_reduce(MAX) so that if ANY rank detected a trigger, ALL ranks see it.
+    Ensures all ranks start/stop profiling simultaneously, even though only
+    rank 0 checks the filesystem for trigger files. Uses all_reduce(MAX) so
+    that if ANY rank detected a trigger, ALL ranks see it.
     """
 
     @staticmethod
@@ -140,11 +154,13 @@ class TriggerView:
 class FileBasedTriggerWatcher:
     """Watches for trigger sentinel files in a filesystem directory.
 
+    Enables on-demand profiling without restarting the job:
+    ``touch {output_dir}/triggers/profiling`` starts a profiling cycle
+    on the next step.
+
     Only role_rank 0 reads filesystem (avoids N ranks hammering NFS).
     Uses POSIX atomic rename for race-free ownership claim.
     Background ThreadPoolExecutor(1) for non-blocking file detection.
-
-    Usage: touch {output_dir}/triggers/profiling
     """
 
     def __init__(
@@ -203,6 +219,7 @@ class FileBasedTriggerWatcher:
             if name in all_files:
                 trigger_path = self.trigger_parent_path / name
                 try:
+                    # Atomic rename claims the file — prevents re-detection
                     renamed = trigger_path.with_suffix(f".{self.global_rank}")
                     trigger_path.replace(renamed)
                     with open(renamed) as f:
@@ -263,6 +280,7 @@ class TriggerableSchedule:
         if step < 0:
             return ProfilerAction.NONE
 
+        # Active cycle: advance through warmup → record → record_and_save
         if self._cycle_start_step is not None:
             self.triggered = False
             relative = step - self._cycle_start_step
@@ -280,12 +298,14 @@ class TriggerableSchedule:
             self.last_action = action
             return action
 
+        # On-demand trigger: start immediate cycle
         if self.triggered:
             self.triggered = False
             action = self._start_cycle(step)
             self.last_action = action
             return action
 
+        # Look ahead: start warmup early so recording lands on the target step
         target_step = step + self.warmup
         if self.profile_policy(target_step):
             action = self._start_cycle(step)
@@ -295,8 +315,6 @@ class TriggerableSchedule:
         self.last_action = ProfilerAction.NONE
         return ProfilerAction.NONE
 
-
-# ProfilerConfig is defined as Profiler.Config below (Configurable pattern).
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +370,11 @@ class MemSnapshotProfiler:
             logger.warning(f"Failed to dump OOM snapshot: {e}")
 
     def step(self, step_num: int | None = None):
-        """Advance profiler by one step."""
+        """Advance profiler by one step.
+
+        Starts recording at start_step, dumps a snapshot each step while
+        recording, and stops at stop_step.
+        """
         if step_num is not None:
             self._step_num = step_num
 
@@ -507,15 +529,25 @@ class NSysProfiler:
 class Profiler(Configurable):
     """Orchestrator that composes all sub-profilers.
 
-    Context manager for lifecycle. step() fans out to all sub-profilers.
-    trigger_profiling() triggers on-demand profiling for all.
+    Manages lifecycle via start()/stop(). step() fans out to all
+    sub-profilers. trigger_profiling() triggers on-demand profiling.
 
     Usage:
 
-        cfg = Profiler.Config(enable_profiling=True, profile_freq=100)
-        with cfg.build(output_dir="output", global_rank=rank) as prof:
+        profiler = Profiler.Config(enable_profiling=True).build(
+            output_dir="output", global_rank=rank,
+        )
+        profiler.start()
+        for step in range(num_steps):
+            train_step(...)
+            profiler.step(step)
+        profiler.stop()
+
+    Also usable as a context manager (calls start/stop automatically):
+
+        with profiler:
             for step in range(num_steps):
-                prof.step(step)
+                ...
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -604,6 +636,7 @@ class Profiler(Configurable):
         rank = dist.get_rank() if dist.is_initialized() else 0
 
         def trace_handler(prof):
+            # step_num was incremented by torch.profiler.step() before this fires
             actual_step = prof.step_num - 1
             curr_dir = os.path.join(trace_dir, f"iteration_{actual_step}")
             os.makedirs(curr_dir, exist_ok=True)
@@ -669,7 +702,9 @@ class Profiler(Configurable):
         if self.torch_profiler:
             self.torch_profiler.step_num = step
             self.torch_profiler.step()
-            # Enable NVTX in profile_annotation only during RECORD/RECORD_AND_SAVE
+            # last_action reflects the schedule's decision for the NEXT training
+            # step (step_num was incremented internally). Expose via is_profiling_step()
+            # so callers can tag the step or gate expensive profiling operations.
             if self._torch_profiler_schedule:
                 action = self._torch_profiler_schedule.last_action
                 set_profiling_step(action in (ProfilerAction.RECORD, ProfilerAction.RECORD_AND_SAVE))
