@@ -288,7 +288,7 @@ class ToyTrainer:
         # Loss/grad_norm only on log steps (.item() triggers GPU→CPU sync)
         if self.metrics_processor.should_log(self.step):
             with record_span(
-                "trainer_time/collect_dist_metrics_s", EventType.SUMMARY_WRITER
+                "trainer_time/collect_dist_metrics_s"
             ):
                 # Each DP rank has local_loss_sum / global_valid_tokens.
                 # SUM across DP ranks gives global_loss_sum / global_valid_tokens.
