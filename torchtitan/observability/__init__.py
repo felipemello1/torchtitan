@@ -9,6 +9,7 @@
 from torchtitan.observability.aggregation import aggregate, logging_worker
 from torchtitan.observability.logging_boundary import EveryNSteps
 from torchtitan.observability.profiling import Profiler, profile_annotation
+from torchtitan.observability.rollout_logger import filter_top_bottom, RolloutLogger
 from torchtitan.observability.metrics import (
     MaxMetric,
     MeanMetric,
@@ -44,4 +45,6 @@ __all__ = [
     "EveryNSteps",
     "Profiler",
     "profile_annotation",
+    "RolloutLogger",
+    "filter_top_bottom",
 ]

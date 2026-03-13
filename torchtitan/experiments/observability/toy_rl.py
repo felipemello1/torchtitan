@@ -40,11 +40,13 @@ from torchtitan.experiments.observability.toy_spmd import (
 from torchtitan.observability import (
     add_step_tag,
     EventType,
+    filter_top_bottom,
     init_observability,
     logging_worker,
     Profiler,
     record_event,
     record_span,
+    RolloutLogger,
     set_step,
 )
 from torchtitan.observability.profiling import is_profiling_step
@@ -217,6 +219,12 @@ async def main():
     actors = [generator, trainer, reward_actor]
     logger.info("Actors spawned.")
 
+    rollout_dir = os.path.join(OUTPUT_DIR, "rollouts")
+    rollout_logger = RolloutLogger(
+        output_dir=rollout_dir,
+        filter_fn=lambda records: filter_top_bottom(records, key="reward", k=2),
+    )
+
     # Dummy prompts for the generator.
     prompts = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN))
 
@@ -239,6 +247,12 @@ async def main():
                 )
                 rewards = next(iter(reward_results.values()))
 
+            # Log rollout data (prompts + rewards) for offline analysis.
+            rollout_logger.log(
+                [{"reward": r} for r in rewards],
+                step=step,
+            )
+
             with record_span("rl_time/training_s", EventType.FWD_BWD):
                 loss_results = await trainer.train_step.call(tokens, labels, loss_mask)
                 loss = next(iter(loss_results.values()))
@@ -251,6 +265,7 @@ async def main():
     await run_training()
 
     # ---- Cleanup ----
+    rollout_logger.close()
     log_queue.put(None)
     log_process.join(timeout=10)
     await trainer.teardown.call()
