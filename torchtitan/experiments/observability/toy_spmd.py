@@ -45,6 +45,7 @@ N_HEADS = 3
 VOCAB_SIZE = 32
 SEQ_LEN = 16
 BATCH_SIZE = 8
+DP_SIZE = 2
 LR = 1e-3
 IGNORE_INDEX = -100
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs", "toy_spmd")

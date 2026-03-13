@@ -29,6 +29,7 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from torchtitan.experiments.observability.toy_spmd import (
     BATCH_SIZE,
+    DP_SIZE,
     SEQ_LEN,
     setup_data,
     ToyTrainer,
@@ -49,7 +50,7 @@ class GeneratorActor(Actor):
 
     @endpoint
     async def setup(self):
-        dataset = setup_data()
+        dataset = setup_data(batch_size=DP_SIZE * BATCH_SIZE)
         self.tokens = dataset.tokens
         self.labels = dataset.labels
         self.loss_mask = dataset.loss_mask
@@ -81,6 +82,7 @@ class TrainerActor(Actor):
                 backend="nccl", rank=rank, world_size=world_size
             )
         mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
+        self.dp_rank = mesh["dp"].get_local_rank()
         self.trainer = ToyTrainer(self.device, mesh["dp"], mesh["tp"], OUTPUT_DIR)
 
     @endpoint
@@ -91,9 +93,12 @@ class TrainerActor(Actor):
     @endpoint
     async def train_step(self, tokens, labels, loss_mask) -> float:
         """Train one step on generated completions. Returns loss value."""
-        tokens = tokens.to(self.device)
-        labels = labels.to(self.device)
-        loss_mask = loss_mask.to(self.device)
+        # Slice this DP rank's shard from the full batch.
+        start = self.dp_rank * BATCH_SIZE
+        end = start + BATCH_SIZE
+        tokens = tokens[start:end].to(self.device)
+        labels = labels[start:end].to(self.device)
+        loss_mask = loss_mask[start:end].to(self.device)
         loss, _grad_norm = self.trainer.train_step(tokens, labels, loss_mask)
         return loss.item()
 
