@@ -366,7 +366,7 @@ def main():
 
     if rank == 0:
         sys_logs = os.path.join(OUTPUT_DIR, "system_logs")
-        trace_path = os.path.join(OUTPUT_DIR, "trace.json")
+        trace_path = os.path.join(OUTPUT_DIR, "analysis", "system_metrics_gantt.json")
         to_chrome_trace(sys_logs, trace_path)
         print(f"\nDone. Output: {OUTPUT_DIR}")
     dist.destroy_process_group()
