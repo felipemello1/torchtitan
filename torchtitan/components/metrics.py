@@ -361,6 +361,7 @@ class MetricsProcessor(Configurable):
         ft_replica_id: int = 0,
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
+        **kwargs,
     ):
         _ensure_observability_imports()
         self.config = config

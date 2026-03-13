@@ -308,7 +308,9 @@ class Validator(BaseValidator):
         else:
             global_avg_loss = loss.item()
 
-        record_metric("validation/loss_mean", NoOpMetric(value=global_avg_loss))
+        # Only record loss on ranks that computed it (last PP stage).
+        if not self.parallel_dims.pp_enabled or self.pp_has_last_stage:
+            record_metric("validation/loss_mean", NoOpMetric(value=global_avg_loss))
         self.metrics_processor.record_throughput(is_validation=True)
         self.metrics_processor.record_memory(is_validation=True)
 

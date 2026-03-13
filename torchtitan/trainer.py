@@ -780,7 +780,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 global_avg_loss = loss.detach().item()
                 global_ntokens_seen = self.ntokens_seen
 
-            record_metric("training/loss_mean", NoOpMetric(value=global_avg_loss))
+            # Only record loss on ranks that computed it (last PP stage has
+            # the real loss; other PP stages have a -1/-2 sentinel).
+            if not parallel_dims.pp_enabled or self.pp_has_last_stage:
+                record_metric("training/loss_mean", NoOpMetric(value=global_avg_loss))
             record_metric("training/grad_norm_max", MaxMetric(value=grad_norm.item()))
             record_metric("training/n_tokens_sum", SumMetric(value=global_ntokens_seen))
             record_event(
