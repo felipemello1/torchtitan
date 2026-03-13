@@ -8,7 +8,7 @@
 This is not a production training recipe. It is just dummy incomplete code
 to demonstrate observability APIs.
 
-Toy RL with Monarch actors: GeneratorActor produces completions,
+Toy RL with Monarch actors: RollouterActor produces completions,
 RewardActor scores them, TrainerActor trains on them. Controller
 orchestrates the loop.
 
@@ -23,6 +23,7 @@ import os
 import shutil
 import socket
 import time
+from dataclasses import dataclass
 
 import torch
 from monarch.actor import Actor, current_rank, endpoint, this_host
@@ -38,15 +39,14 @@ from torchtitan.experiments.observability.toy_spmd import (
     VOCAB_SIZE,
 )
 from torchtitan.observability import (
-    add_step_tag,
     EventType,
-    filter_top_bottom,
     init_observability,
     logging_worker,
+    MeanMetric,
     record_event,
+    record_metric,
     record_span,
     RolloutLogger,
-    RolloutOutput,
     set_step,
 )
 
@@ -59,17 +59,81 @@ NUM_STEPS = 6
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs", "toy_rl")
 
 
-class GeneratorActor(Actor):
-    """Dummy generator that returns fixed tokens as if they were generated."""
+# ---------------------------------------------------------------------------
+# RolloutOutput
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RolloutOutput:
+    """One prompt+completion pair from a rollout.
+
+    Token fields and training tensors are used for training.
+    Text fields are for logging and human inspection only — in a real
+    pipeline they would be populated by tokenizer.decode().
+    """
+
+    prompt_tokens: list[int]
+    completion_tokens: list[int]
+    prompt_text: str
+    completion_text: str
+    reward: float | None = None
+    # Training tensors (one sample, not batched)
+    tokens: torch.Tensor | None = None
+    labels: torch.Tensor | None = None
+    loss_mask: torch.Tensor | None = None
+
+    def to_logging_dict(self) -> dict:
+        """Convert to a dict for logging. Only text + reward."""
+        d = {"prompt": self.prompt_text, "completion": self.completion_text}
+        if self.reward is not None:
+            d["reward"] = self.reward
+        return d
+
+
+def rollouts_to_train_batch(
+    rollouts: list[RolloutOutput],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stack individual rollout tensors into a training batch.
+
+    Returns:
+        (tokens, labels, loss_mask), each of shape (batch_size, seq_len).
+    """
+    return (
+        torch.stack([r.tokens for r in rollouts]),
+        torch.stack([r.labels for r in rollouts]),
+        torch.stack([r.loss_mask for r in rollouts]),
+    )
+
+
+def filter_top_bottom(
+    records: list[dict], key: str = "reward", k: int = 1
+) -> list[dict]:
+    """Keep top-k and bottom-k records by a key.
+
+    If fewer than 2*k records, returns all records.
+    """
+    sorted_recs = sorted(records, key=lambda r: r.get(key, 0))
+    k = min(k, len(sorted_recs) // 2) if sorted_recs else 0
+    if k == 0:
+        return sorted_recs
+    return sorted_recs[:k] + sorted_recs[-k:]
+
+
+# ---------------------------------------------------------------------------
+# Actors
+# ---------------------------------------------------------------------------
+
+
+class RollouterActor(Actor):
+    """Dummy rollouter that returns fixed data as if it were generated."""
 
     @endpoint
     async def setup(self):
         rank = current_rank().rank
         init_observability(source="generator", output_dir=OUTPUT_DIR, rank=rank)
         dataset = setup_data(batch_size=DP_SIZE * BATCH_SIZE)
-        self.tokens = dataset.tokens
-        self.labels = dataset.labels
-        self.loss_mask = dataset.loss_mask
+        self.dataset = dataset
 
     @endpoint
     async def set_step(self, step: int):
@@ -77,11 +141,28 @@ class GeneratorActor(Actor):
         set_step(step)
 
     @endpoint
-    async def generate(
-        self, prompts: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Generate completions from prompts. Returns (tokens, labels, loss_mask)."""
-        return self.tokens, self.labels, self.loss_mask
+    async def do_rollouts(self, prompts: torch.Tensor) -> list[RolloutOutput]:
+        """Produce rollouts. Each carries one sample's tensors and dummy text.
+
+        This is a dummy — not a real generation loop. In a real pipeline,
+        the model would generate completions and the tokenizer would
+        decode them into text.
+        """
+        rollouts = [
+            RolloutOutput(
+                prompt_tokens=self.dataset.tokens[i].tolist(),
+                completion_tokens=self.dataset.tokens[i].tolist(),
+                prompt_text=f"What is {i}+{i}?",
+                completion_text=f"The answer is {i + i}.",
+                tokens=self.dataset.tokens[i],
+                labels=self.dataset.labels[i],
+                loss_mask=self.dataset.loss_mask[i],
+            )
+            for i in range(len(self.dataset.tokens))
+        ]
+        mean_completion_len = sum(len(r.completion_text) for r in rollouts) / len(rollouts)
+        record_metric("rl/completion_len_mean", MeanMetric(value=mean_completion_len, count=len(rollouts)))
+        return rollouts
 
 
 class TrainerActor(Actor):
@@ -101,7 +182,7 @@ class TrainerActor(Actor):
         mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
         self.dp_rank = mesh["dp"].get_local_rank()
         # Controller handles flushing — trainer has no backends/console.
-        # log_freq=1 also determines freq to call metrics that need .item() or collectives
+        # log_freq=1 is set because it determines freq to call metrics that need .item() or collectives
         mp_config = MetricsProcessor.Config(log_freq=1, enable_wandb=False)
         self.trainer = ToyTrainer(
             self.device, mesh["dp"], mesh["tp"], OUTPUT_DIR,
@@ -124,6 +205,8 @@ class TrainerActor(Actor):
         tokens = tokens[start:end].to(self.device)
         labels = labels[start:end].to(self.device)
         loss_mask = loss_mask[start:end].to(self.device)
+
+        # Train step
         loss, _grad_norm = self.trainer.train_step(tokens, labels, loss_mask)
         return loss.item()
 
@@ -149,11 +232,19 @@ class RewardActor(Actor):
         set_step(step)
 
     @endpoint
-    async def score(self, completions: list[torch.Tensor]) -> list[float]:
-        """Score completions. Returns dummy constant rewards."""
+    async def score(self, rollouts: list[RolloutOutput]) -> list[RolloutOutput]:
+        """Score rollouts. Fills in reward field and returns them."""
         with record_span("rl_time/scoring_s", EventType.RL_SCORING):
-            rewards = [1.0] * len(completions)
-        return rewards
+            for rollout in rollouts:
+                rollout.reward = 1.0  # dummy constant reward
+        reward_mean = sum(r.reward for r in rollouts) / len(rollouts)
+        record_metric("rl/reward_mean", MeanMetric(value=reward_mean, count=len(rollouts)))
+        return rollouts
+
+
+# ---------------------------------------------------------------------------
+# Controller
+# ---------------------------------------------------------------------------
 
 
 async def main():
@@ -179,6 +270,8 @@ async def main():
                 "training/lr",
                 "trainer_throughput/tps_mean",
                 "trainer_memory/reserved_gib_max",
+                "rl/reward_mean",
+                "rl/completion_len_mean",
             ],
         },
         daemon=True,
@@ -188,9 +281,9 @@ async def main():
     # ---- Setup ----
     host = this_host()
 
-    generator_mesh = host.spawn_procs(per_host={"procs": 1}, name="generator")
-    generator = generator_mesh.spawn("generator", GeneratorActor)
-    await generator.setup.call()
+    rollouter_mesh = host.spawn_procs(per_host={"procs": 1}, name="rollouter")
+    rollouter = rollouter_mesh.spawn("rollouter", RollouterActor)
+    await rollouter.setup.call()
 
     trainer_mesh = host.spawn_procs(per_host={"gpus": 4}, name="trainer")
     trainer = trainer_mesh.spawn("trainer", TrainerActor)
@@ -200,7 +293,7 @@ async def main():
     reward_actor = reward_mesh.spawn("reward", RewardActor)
     await reward_actor.setup.call()
 
-    actors = [generator, trainer, reward_actor]
+    actors = [rollouter, trainer, reward_actor]
     logger.info("Actors spawned.")
 
     rollout_dir = os.path.join(OUTPUT_DIR, "rollouts")
@@ -209,7 +302,7 @@ async def main():
         filter_fn=lambda records: filter_top_bottom(records, key="reward", k=2),
     )
 
-    # Dummy prompts for the generator.
+    # Dummy prompts for the rollouter.
     prompts = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN))
 
     # ---- Training loop ----
@@ -219,34 +312,13 @@ async def main():
             for actor in actors:
                 await actor.set_step.call(step)
 
-            with record_span("rl_time/generate_s", EventType.FETCHING_BATCH):
-                gen_results = await generator.generate.call(prompts)
-                tokens, labels, loss_mask = next(iter(gen_results.values()))
+            with record_span("rl_time/rollout_s", EventType.FETCHING_BATCH):
+                result = await rollouter.do_rollouts.call(prompts)
+                rollouts = next(iter(result.values()))
 
-            # Dummy rollout records for logging. In a real pipeline, the
-            # generator would populate prompt_text/completion_text via
-            # tokenizer.decode().
-            batch_size = len(tokens)
-            rollouts = [
-                RolloutOutput(
-                    prompt_tokens=tokens[i].tolist(),
-                    completion_tokens=tokens[i].tolist(),
-                    prompt_text=f"What is {i}+{i}?",
-                    completion_text=f"The answer is {i + i}.",
-                )
-                for i in range(batch_size)
-            ]
-
-            # Score is not used for training. This is a dummy call to
-            # demonstrate multi-actor observability.
             with record_span("rl_time/scoring_s", EventType.RL_SCORING):
-                reward_results = await reward_actor.score.call(
-                    [tokens[i].float() for i in range(len(tokens))]
-                )
-                rewards = next(iter(reward_results.values()))
-
-            for rollout, r in zip(rollouts, rewards):
-                rollout.reward = r
+                result = await reward_actor.score.call(rollouts)
+                rollouts = next(iter(result.values()))
 
             # Logging is synchronous here but could be overlapped with
             # the train_step call below since it's just file I/O.
@@ -255,12 +327,14 @@ async def main():
                 metadata={"step": step},
             )
 
-            with record_span("rl_time/training_s", EventType.FWD_BWD):
-                loss_results = await trainer.train_step.call(tokens, labels, loss_mask)
-                loss = next(iter(loss_results.values()))
+            with record_span("rl_time/rollouts_to_train_batch_s", EventType.FWD_BWD):
+                tokens, labels, loss_mask = rollouts_to_train_batch(rollouts)
 
-            reward_mean = sum(rewards) / len(rewards)
-            record_event({"train.loss": loss, "reward_mean": reward_mean})
+            with record_span("rl_time/training_s", EventType.FWD_BWD):
+                result = await trainer.train_step.call(tokens, labels, loss_mask)
+                loss = next(iter(result.values()))
+
+            record_event({"train.loss": loss})
             is_validation = False
             log_queue.put((step, is_validation))
 
