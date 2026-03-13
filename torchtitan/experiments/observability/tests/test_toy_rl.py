@@ -73,10 +73,11 @@ class TestRolloutLogger:
                     if not line:
                         continue
                     record = json.loads(line)
-                    assert "step" in record, f"Missing step in rollout: {record}"
                     assert "reward" in record, f"Missing reward in rollout: {record}"
                     assert "prompt" in record, f"Missing prompt in rollout: {record}"
                     assert "completion" in record, f"Missing completion in rollout: {record}"
+                    assert "__metadata__" in record, f"Missing __metadata__ in rollout: {record}"
+                    assert "step" in record["__metadata__"], f"Missing step in __metadata__: {record}"
                     return  # One record is enough
 
     def test_rollout_filter_applied(self, rollout_dir):
@@ -90,7 +91,7 @@ class TestRolloutLogger:
                     if not line:
                         continue
                     record = json.loads(line)
-                    step = record["step"]
+                    step = record["__metadata__"]["step"]
                     records_per_step[step] = records_per_step.get(step, 0) + 1
 
         for step, count in records_per_step.items():
