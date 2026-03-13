@@ -265,7 +265,7 @@ async def main():
             for actor in actors:
                 await actor.set_step.call(step)
 
-            with record_span("rl_time/generate_s", EventType.FETCHING_BATCH):
+            with record_span("rl_time/rollout_s", EventType.FETCHING_BATCH):
                 result = await rollouter.do_rollouts.call(prompts)
                 rollouts = next(iter(result.values()))
 
@@ -273,16 +273,14 @@ async def main():
                 result = await reward_actor.score.call(rollouts)
                 rollouts = next(iter(result.values()))
 
-            tokens, labels, loss_mask = rollouts_to_train_batch(rollouts)
+            with record_span("rl_time/rollouts_to_train_batch_s", EventType.FWD_BWD):
+                tokens, labels, loss_mask = rollouts_to_train_batch(rollouts)
 
             with record_span("rl_time/training_s", EventType.FWD_BWD):
                 result = await trainer.train_step.call(tokens, labels, loss_mask)
                 loss = next(iter(result.values()))
 
             record_event({"train.loss": loss})
-            logger.info(
-                f"step: {step}  loss: {loss:8.5f}  reward_mean: {reward_mean:8.5f}"
-            )
 
     await run_training()
 
