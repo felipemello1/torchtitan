@@ -42,13 +42,10 @@ from torchtitan.observability import (
     MaxMetric,
     MeanMetric,
     NoOpMetric,
-    Profiler,
-    profile_annotation,
     record_event,
     record_metric,
     record_span,
 )
-from torchtitan.observability.profiling import is_profiling_step
 from torchtitan.observability.analysis import to_chrome_trace
 
 # ---- Config ----
@@ -143,13 +140,11 @@ class TinyModel(nn.Module):
         self.output = nn.Linear(d_model, vocab_size, bias=False)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        with profile_annotation("Embedding"):
-            h = self.tok_embeddings(tokens)
+        h = self.tok_embeddings(tokens)
         for layer in self.layers.values():
             h = layer(h)
-        with profile_annotation("OutputHead"):
-            h = self.norm(h)
-            return self.output(h)
+        h = self.norm(h)
+        return self.output(h)
 
 
 # ---- Trainer ----
@@ -164,9 +159,7 @@ class ToyTrainer:
     - train: owns the training loop
     """
 
-    def __init__(
-        self, device, dp_mesh, tp_mesh, output_dir, *, mp_config=None, profiler_config=None
-    ):
+    def __init__(self, device, dp_mesh, tp_mesh, output_dir, *, mp_config=None):
         self.device = device
         self.dp_mesh = dp_mesh
         self.rank = dist.get_rank()
@@ -179,12 +172,6 @@ class ToyTrainer:
             dump_folder=output_dir,
             rank=self.rank,
             non_data_parallel_size=tp_mesh.size(),
-        )
-
-        if profiler_config is None:
-            profiler_config = Profiler.Config()
-        self.profiler = profiler_config.build(
-            output_dir=output_dir, global_rank=self.rank, role_rank=self.rank
         )
 
         torch.manual_seed(0)
@@ -278,22 +265,20 @@ class ToyTrainer:
         self.metrics_processor.ntokens_since_reset += labels.numel()
 
         with record_span("trainer_time/forward_backward_s", EventType.FWD_BWD):
-            with profile_annotation("forward_backward"):
-                with loss_parallel():
-                    logits = self.model(tokens)
-                    loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
-                    # Globally-normalized loss: each token contributes equally to
-                    # gradients regardless of which DP rank it's on (matches titan).
-                    global_valid_tokens = valid_tokens.detach().clone().float()
-                    dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
-                    loss = loss_sum / global_valid_tokens
-                    self.optimizer.zero_grad()
-                    loss.backward()
+            with loss_parallel():
+                logits = self.model(tokens)
+                loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
+                # Globally-normalized loss: each token contributes equally to
+                # gradients regardless of which DP rank it's on (matches titan).
+                global_valid_tokens = valid_tokens.detach().clone().float()
+                dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
+                loss = loss_sum / global_valid_tokens
+                self.optimizer.zero_grad()
+                loss.backward()
 
         with record_span("trainer_time/optimizer_s", EventType.OPTIM):
-            with profile_annotation("optimizer"):
-                grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
+            grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
 
         # Derived metrics recorded every step (cheap, outside should_log gate)
         self.metrics_processor.record_throughput()
@@ -339,13 +324,10 @@ class ToyTrainer:
         dataloader = setup_data(self.device, dp_rank=dp_rank)
         data_iterator = self.batch_generator(dataloader)
 
-        self.profiler.start()
         for step in range(1, num_steps + 1):
             self.step = step
             is_validation = step % EVAL_FREQ == 0
             self.metrics_processor.set_step(step, force_log=is_validation)
-            if is_profiling_step():
-                add_step_tag("profiling")
 
             # Simulate GC on every 5th step (mirrors gc_handler.run)
             if step % 5 == 0:
@@ -366,11 +348,8 @@ class ToyTrainer:
             if self.metrics_processor.should_log(step):
                 self.metrics_processor.log(step, is_validation=is_validation)
 
-            self.profiler.step(step)
-
     def close(self):
         """Cleanup."""
-        self.profiler.stop()
         self.metrics_processor.close()
 
 
@@ -409,20 +388,8 @@ def main():
             "validator_throughput/tps_mean",
         ],
     )
-    profiler_config = Profiler.Config(
-        enable_profiling=True,
-        profile_freq=10,
-        profiler_warmup=2,
-        profiler_active=1,
-        enable_memory_snapshot=True,
-        memory_snapshot_start_step=3,
-        memory_snapshot_stop_step=5,
-        enable_host_memory_profiler=True,
-        host_memory_interval=10,
-    )
     trainer = ToyTrainer(
-        device, mesh["dp"], mesh["tp"], OUTPUT_DIR,
-        mp_config=mp_config, profiler_config=profiler_config,
+        device, mesh["dp"], mesh["tp"], OUTPUT_DIR, mp_config=mp_config
     )
     trainer.train(NUM_STEPS)
     trainer.close()
