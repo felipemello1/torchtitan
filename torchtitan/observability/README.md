@@ -226,42 +226,7 @@ None of this blocks training. Training pays only the signal cost (~0.1ms).
 For shared file systems, we expect 'read' to be more expensive, but it can be mitigated
 with multithreading.
 
-## 7. Profiling
-
-```python
-from torchtitan.observability.profiling import Profiler, profile_annotation
-
-profiler = config.profiler.build(output_dir=..., global_rank=..., role_rank=...)
-
-with profiler:
-    for step in range(num_steps):
-        with profile_annotation("forward_backward"):
-            loss = model(batch)
-            loss.backward()
-        with profile_annotation("optimizer"):
-            optimizer.step()
-        profiler.step(step)
-```
-
-`Profiler` orchestrates multiple instruments that share a triggering schedule:
-- **TorchProfiler** — torch.profiler kernel traces
-- **MemSnapshotProfiler** — CUDA memory snapshots
-- **HostMemoryProfiler** — CPU/host RAM via `tracemalloc`
-- **NSysProfiler** — NVIDIA NSys ranges (`cudaProfilerStart/Stop`)
-
-On-demand activation (no restart needed):
-
-```bash
-touch /path/to/output/triggers/profiling
-```
-
-`profile_annotation` labels code regions in traces. Zero overhead when
-profiling is inactive. Safe inside `torch.compile`.
-
-Profiling is independent of the JSONL metrics pipeline — it produces its own
-trace files and memory snapshots.
-
-## 8. File Layout
+## 7. File Layout
 
 ```
 observability/
@@ -272,7 +237,6 @@ observability/
     metrics.py              # Experiment pipeline: record_metric, MetricValue types, REDUCE_REGISTRY
     aggregation.py          # aggregate() + logging_worker subprocess + JSONL readers
     logging_boundary.py     # EveryNSteps schedule
-    profiling.py            # Profiler, profile_annotation, TriggerableSchedule
     rollout_logger.py       # RL: RolloutLogger, filter_top_bottom
     analysis.py             # Post-training: to_chrome_trace (Gantt chart from system JSONL)
     README.md               # This file
