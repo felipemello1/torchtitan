@@ -136,18 +136,19 @@ class RollouterActor(Actor):
         the model would generate completions and the tokenizer would
         decode them into text.
         """
-        rollouts = [
-            RolloutOutput(
-                prompt_tokens=self.dataset.tokens[i].tolist(),
-                completion_tokens=self.dataset.tokens[i].tolist(),
-                prompt_text=f"What is {i}+{i}?",
-                completion_text=f"The answer is {i + i}.",
-                tokens=self.dataset.tokens[i],
-                labels=self.dataset.labels[i],
-                loss_mask=self.dataset.loss_mask[i],
-            )
-            for i in range(len(self.dataset.tokens))
-        ]
+        with record_span("rollouter_time/generate_s"):
+            rollouts = [
+                RolloutOutput(
+                    prompt_tokens=self.dataset.tokens[i].tolist(),
+                    completion_tokens=self.dataset.tokens[i].tolist(),
+                    prompt_text=f"What is {i}+{i}?",
+                    completion_text=f"The answer is {i + i}.",
+                    tokens=self.dataset.tokens[i],
+                    labels=self.dataset.labels[i],
+                    loss_mask=self.dataset.loss_mask[i],
+                )
+                for i in range(len(self.dataset.tokens))
+            ]
         total_completion_len = sum(len(r.completion_text) for r in rollouts)
         record_metric("rl/completion_len_mean", MeanMetric(sum=total_completion_len, weight=len(rollouts)))
         return rollouts
@@ -218,8 +219,9 @@ class RewardActor(Actor):
     @endpoint
     async def score(self, rollouts: list[RolloutOutput]) -> list[RolloutOutput]:
         """Score rollouts. Fills in reward field and returns them."""
-        for rollout in rollouts:
-            rollout.reward = 1.0  # dummy constant reward
+        with record_span("reward_time/scoring_s"):
+            for rollout in rollouts:
+                rollout.reward = 1.0  # dummy constant reward
         reward_sum = sum(r.reward for r in rollouts)
         record_metric("rl/reward_mean", MeanMetric(sum=reward_sum, weight=len(rollouts)))
         return rollouts
