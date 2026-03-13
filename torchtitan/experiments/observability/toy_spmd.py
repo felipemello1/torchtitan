@@ -175,7 +175,11 @@ class ToyTrainer:
 
         if mp_config is None:
             mp_config = MetricsProcessor.Config()
-        self.metrics_processor = mp_config.build(dump_folder=output_dir, rank=self.rank)
+        self.metrics_processor = mp_config.build(
+            dump_folder=output_dir,
+            rank=self.rank,
+            non_data_parallel_size=tp_mesh.size(),
+        )
 
         if profiler_config is None:
             profiler_config = Profiler.Config()

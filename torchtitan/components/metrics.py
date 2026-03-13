@@ -361,10 +361,11 @@ class MetricsProcessor(Configurable):
         ft_replica_id: int = 0,
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
-        **kwargs,
+        has_quantization: bool = False,
     ):
         _ensure_observability_imports()
         self.config = config
+        self._has_quantization = has_quantization
         self.parallel_dims = parallel_dims
         self._force_log = False
 
@@ -491,7 +492,9 @@ class MetricsProcessor(Configurable):
         if self.num_flops_per_token > 0:
             tflops = self.num_flops_per_token * tps / 1e12
             record_metric(f"{prefix}_throughput/tflops_mean", MeanMetric(sum=tflops))
-            if self._gpu_peak_flops > 0:
+            # MFU is based on BF16 peak FLOPS — misleading when quantization
+            # (FP8/MX) is active, so skip it in that case.
+            if self._gpu_peak_flops > 0 and not self._has_quantization:
                 mfu = 100 * self.num_flops_per_token * tps / self._gpu_peak_flops
                 record_metric(f"{prefix}_throughput/mfu_pct_mean", MeanMetric(sum=mfu))
 

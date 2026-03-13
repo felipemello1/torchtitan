@@ -47,11 +47,12 @@ class MetricsProcessor(Configurable):
         console_log_metric_keys: list[str] = field(default_factory=list)
         console_log_validation_keys: list[str] = field(default_factory=list)
 
-    def __init__(self, config: Config, *, dump_folder: str, rank: int):
+    def __init__(self, config: Config, *, dump_folder: str, rank: int, non_data_parallel_size: int = 1):
         self.config = config
         self._step: int = 0
         self._rank = rank
         self._force_log = False
+        self._non_data_parallel_size = non_data_parallel_size
 
         # Schedule
         self._log_schedule = EveryNSteps(
@@ -150,7 +151,8 @@ class MetricsProcessor(Configurable):
             ntokens = self.ntokens_since_reset
             prefix = self._TRAIN_PREFIX
 
-        tps = ntokens / time_delta if time_delta > 0 else 0
+        ndp = self._non_data_parallel_size
+        tps = ntokens / (time_delta * ndp) if time_delta > 0 else 0
         record_metric(f"{prefix}_throughput/tps_mean", MeanMetric(sum=tps))
 
         if self.num_flops_per_token > 0:
