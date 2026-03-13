@@ -30,7 +30,6 @@ from dataclasses import dataclass
 import torch
 from monarch.actor import Actor, current_rank, endpoint, this_host
 from torch.distributed.device_mesh import init_device_mesh
-
 from torchtitan.experiments.observability.toy_spmd import (
     BATCH_SIZE,
     DP_SIZE,
@@ -209,9 +208,8 @@ class RewardActor(Actor):
     @endpoint
     async def score(self, rollouts: list[RolloutOutput]) -> list[RolloutOutput]:
         """Score rollouts. Fills in reward field and returns them."""
-        with record_span("rl_time/scoring_s", EventType.RL_SCORING):
-            for rollout in rollouts:
-                rollout.reward = 1.0  # dummy constant reward
+        for rollout in rollouts:
+            rollout.reward = 1.0  # dummy constant reward
         return rollouts
 
 
@@ -257,15 +255,15 @@ async def main():
             for actor in actors:
                 await actor.set_step.call(step)
 
-            with record_span("rl_time/rollout_s", EventType.FETCHING_BATCH):
+            with record_span("rl_time/rollout_s", EventType.RL_ROLLOUT):
                 result = await rollouter.do_rollouts.call(prompts)
                 rollouts = next(iter(result.values()))
 
-            with record_span("rl_time/scoring_s", EventType.RL_SCORING):
+            with record_span("rl_time/scoring_s", EventType.RL_GRADING):
                 result = await reward_actor.score.call(rollouts)
                 rollouts = next(iter(result.values()))
 
-            with record_span("rl_time/rollouts_to_train_batch_s", EventType.FWD_BWD):
+            with record_span("rl_time/rollouts_to_train_batch_s"):
                 tokens, labels, loss_mask = rollouts_to_train_batch(rollouts)
 
             with record_span("rl_time/training_s", EventType.FWD_BWD):
