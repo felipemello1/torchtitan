@@ -64,7 +64,7 @@ class TestRolloutLogger:
         files = glob(os.path.join(rollout_dir, "*.jsonl"))
         assert len(files) >= 1, f"No rollout JSONL files in {rollout_dir}"
 
-    def test_rollout_has_step_and_reward(self, rollout_dir):
+    def test_rollout_has_expected_fields(self, rollout_dir):
         files = glob(os.path.join(rollout_dir, "*.jsonl"))
         for fp in files:
             with open(fp) as f:
@@ -75,6 +75,8 @@ class TestRolloutLogger:
                     record = json.loads(line)
                     assert "step" in record, f"Missing step in rollout: {record}"
                     assert "reward" in record, f"Missing reward in rollout: {record}"
+                    assert "prompt" in record, f"Missing prompt in rollout: {record}"
+                    assert "completion" in record, f"Missing completion in rollout: {record}"
                     return  # One record is enough
 
     def test_rollout_filter_applied(self, rollout_dir):
