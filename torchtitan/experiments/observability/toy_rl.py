@@ -226,14 +226,15 @@ async def main():
             # Dummy rollout records for logging. In a real pipeline, the
             # generator would populate prompt_text/completion_text via
             # tokenizer.decode().
+            batch_size = len(tokens)
             rollouts = [
                 RolloutOutput(
-                    prompt_tokens=prompts[i].tolist(),
+                    prompt_tokens=tokens[i].tolist(),
                     completion_tokens=tokens[i].tolist(),
                     prompt_text=f"What is {i}+{i}?",
                     completion_text=f"The answer is {i + i}.",
                 )
-                for i in range(len(tokens))
+                for i in range(batch_size)
             ]
 
             # Score is not used for training. This is a dummy call to
