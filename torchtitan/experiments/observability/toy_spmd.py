@@ -57,6 +57,7 @@ N_HEADS = 3
 VOCAB_SIZE = 32
 SEQ_LEN = 16
 BATCH_SIZE = 8
+DP_SIZE = 2
 LR = 1e-3
 IGNORE_INDEX = -100
 ENABLE_WANDB = True
@@ -82,16 +83,17 @@ class RepeatDataset:
 def setup_data(
     device: torch.device = torch.device("cpu"),
     *,
+    dp_rank: int = 0,
     batch_size: int = BATCH_SIZE,
     seq_len: int = SEQ_LEN,
     vocab_size: int = VOCAB_SIZE,
 ) -> RepeatDataset:
     """Create fixed training data for overfitting.
 
-    Random loss_mask gives each sequence a different number of valid tokens,
-    exercising weighted metric reduction across DP ranks.
+    Each DP rank gets a different seed so loss_mask (and thus valid token
+    count) differs across ranks, exercising weighted metric reduction.
     """
-    torch.manual_seed(42)
+    torch.manual_seed(42 + dp_rank)
     tokens = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
     labels = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
     loss_mask = torch.randint(0, 2, (batch_size, seq_len), device=device).float()
@@ -311,7 +313,8 @@ class ToyTrainer:
 
     def train(self, num_steps):
         """Full training loop. Mirrors Trainer.train structure."""
-        dataloader = setup_data(self.device)
+        dp_rank = self.dp_mesh.get_local_rank()
+        dataloader = setup_data(self.device, dp_rank=dp_rank)
         data_iterator = self.batch_generator(dataloader)
 
         for step in range(1, num_steps + 1):
@@ -344,11 +347,11 @@ class ToyTrainer:
 
 
 def main():
-    dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    rank = int(os.environ.get("RANK", 0))
     device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
     torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
+    world_size = dist.get_world_size()
     assert world_size == 4, f"Requires 4 GPUs, got {world_size}"
 
     if rank == 0 and os.path.exists(OUTPUT_DIR):
