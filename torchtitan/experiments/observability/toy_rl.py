@@ -131,18 +131,19 @@ class RollouterActor(Actor):
         the model would generate completions and the tokenizer would
         decode them into text.
         """
-        rollouts = [
-            RolloutOutput(
-                prompt_tokens=self.dataset.tokens[i].tolist(),
-                completion_tokens=self.dataset.tokens[i].tolist(),
-                prompt_text=f"What is {i}+{i}?",
-                completion_text=f"The answer is {i + i}.",
-                tokens=self.dataset.tokens[i],
-                labels=self.dataset.labels[i],
-                loss_mask=self.dataset.loss_mask[i],
-            )
-            for i in range(len(self.dataset.tokens))
-        ]
+        with record_span("rollouter_time/generate_s"):
+            rollouts = [
+                RolloutOutput(
+                    prompt_tokens=self.dataset.tokens[i].tolist(),
+                    completion_tokens=self.dataset.tokens[i].tolist(),
+                    prompt_text=f"What is {i}+{i}?",
+                    completion_text=f"The answer is {i + i}.",
+                    tokens=self.dataset.tokens[i],
+                    labels=self.dataset.labels[i],
+                    loss_mask=self.dataset.loss_mask[i],
+                )
+                for i in range(len(self.dataset.tokens))
+            ]
         return rollouts
 
 
@@ -207,8 +208,9 @@ class RewardActor(Actor):
     @endpoint
     async def score(self, rollouts: list[RolloutOutput]) -> list[RolloutOutput]:
         """Score rollouts. Fills in reward field and returns them."""
-        for rollout in rollouts:
-            rollout.reward = 1.0  # dummy constant reward
+        with record_span("reward_time/scoring_s"):
+            for rollout in rollouts:
+                rollout.reward = 1.0  # dummy constant reward
         return rollouts
 
 

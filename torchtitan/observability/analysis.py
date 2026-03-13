@@ -87,17 +87,21 @@ def to_chrome_trace(log_dir: str, output_path: str) -> dict:
         step = r.get("int", {}).get("step")
 
         if event_type.endswith("_start"):
-            name = event_type.removesuffix("_start")
-            pending_starts[(name, pid, rank)] = {"ts": time_us, "step": step}
+            type_name = event_type.removesuffix("_start")
+            display_name = normal.get("event_name") or type_name
+            pending_starts[(type_name, pid, rank)] = {
+                "ts": time_us, "step": step, "display_name": display_name,
+            }
         elif event_type.endswith("_end"):
-            name = event_type.removesuffix("_end")
+            type_name = event_type.removesuffix("_end")
             duration_ms = r.get("double", {}).get("value", 0)
             duration_us = duration_ms * 1000
-            start = pending_starts.pop((name, pid, rank), None)
+            start = pending_starts.pop((type_name, pid, rank), None)
             start_ts = start["ts"] if start else time_us
+            display_name = (start or {}).get("display_name", type_name)
             events.append(
                 {
-                    "name": name,
+                    "name": display_name,
                     "ph": "X",
                     "ts": start_ts,
                     "dur": duration_us,
