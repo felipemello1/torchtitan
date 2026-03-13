@@ -257,7 +257,7 @@ class ToyTrainer:
         return loss_sum, valid_tokens
 
     def train_step(self, tokens, labels, loss_mask):
-        """One training step. Returns (loss, grad_norm)."""
+        """One training step."""
         with record_span("trainer_time/forward_backward_s", EventType.FWD_BWD):
             with loss_parallel():
                 logits = self.model(tokens)
@@ -274,15 +274,14 @@ class ToyTrainer:
             grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-        # All-reduce loss for logging: each DP rank has local_loss_sum /
-        # global_valid_tokens. SUM gives global_loss_sum / global_valid_tokens.
+        # Report globally-reduced loss. Each DP rank has
+        # local_loss_sum / global_valid_tokens; SUM gives the global loss.
         loss_scalar = loss.detach().full_tensor().clone()
         dist.all_reduce(loss_scalar, op=dist.ReduceOp.SUM, group=self.dp_mesh.get_group())
         record_metric("training/loss_mean", NoOpMetric(value=loss_scalar.item()))
         record_metric("training/grad_norm_max", MaxMetric(value=grad_norm.item()))
         record_metric("training/lr", NoOpMetric(value=LR))
-
-        return loss, grad_norm
+        record_event({"train.loss": loss_scalar.item(), "train.grad_norm": grad_norm.item()})
 
     def validate(self, tokens, labels, loss_mask):
         """Run one forward pass for validation (no backward)."""
@@ -312,11 +311,7 @@ class ToyTrainer:
 
             with record_span("trainer_time/step_s", EventType.STEP):
                 tokens, labels, loss_mask = next(data_iterator)
-                loss, grad_norm = self.train_step(tokens, labels, loss_mask)
-
-            record_event(
-                {"train.loss": loss.item(), "train.grad_norm": grad_norm.item()}
-            )
+                self.train_step(tokens, labels, loss_mask)
 
             if step % EVAL_FREQ == 0:
                 add_step_tag("eval")
