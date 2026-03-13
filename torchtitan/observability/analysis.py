@@ -125,7 +125,7 @@ def to_chrome_trace(log_dir: str, output_path: str) -> dict:
     trace = {"traceEvents": events}
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w") as f:
-        json.dump(trace, f)
+        json.dump(trace, f, indent=2)
 
     print(f"Chrome Trace: {output_path}")
     print(f"  {len(events)} events from {len(sources)} sources")

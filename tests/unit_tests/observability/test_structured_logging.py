@@ -217,7 +217,7 @@ class TestStructuredJSONFormatter:
             exc_info=None,
         )
         # Add event extra fields
-        for k, v in event_extra(EventType.FWD_BWD_START, step=5).items():
+        for k, v in event_extra(str(EventType.FWD_BWD) + "_start", step=5).items():
             setattr(record, k, v)
 
         output = fmt.format(record)
@@ -379,9 +379,9 @@ class TestInflightEventTrackingHandler:
             args=None,
             exc_info=None,
         )
-        setattr(record, str(ExtraFields.LOG_TYPE_NAME), str(EventType.FWD_BWD_START))
+        setattr(record, str(ExtraFields.LOG_TYPE_NAME), str(EventType.FWD_BWD) + "_start")
         handler.emit(record)
-        assert handler.last_event == str(EventType.FWD_BWD_START)
+        assert handler.last_event == str(EventType.FWD_BWD) + "_start"
         assert handler.last_event_time is not None
 
     def test_ignores_non_event_records(self):
@@ -492,8 +492,8 @@ class TestRecordSpan:
             lines = [json.loads(line) for line in f if line.strip()]
 
         assert len(lines) == 2
-        assert lines[0]["normal"]["log_type_name"] == str(EventType.FWD_BWD_START)
-        assert lines[1]["normal"]["log_type_name"] == str(EventType.FWD_BWD_END)
+        assert lines[0]["normal"]["log_type_name"] == str(EventType.FWD_BWD) + "_start"
+        assert lines[1]["normal"]["log_type_name"] == str(EventType.FWD_BWD) + "_end"
         # End event should have duration in value
         assert lines[1]["double"]["value"] > 0
         # Both events should have step=5
@@ -517,8 +517,8 @@ class TestRecordSpan:
             lines = [json.loads(line) for line in f if line.strip()]
 
         assert len(lines) == 2
-        assert lines[0]["normal"]["log_type_name"] == str(EventType.OPTIM_START)
-        assert lines[1]["normal"]["log_type_name"] == str(EventType.OPTIM_END)
+        assert lines[0]["normal"]["log_type_name"] == str(EventType.OPTIM) + "_start"
+        assert lines[1]["normal"]["log_type_name"] == str(EventType.OPTIM) + "_end"
 
     def test_does_not_suppress_exceptions(self, tmp_path, system_logger):
         init_observability(rank=0, source="trainer", output_dir=str(tmp_path))
@@ -528,21 +528,30 @@ class TestRecordSpan:
             with record_span("Test", EventType.STEP):
                 raise ValueError("test error")
 
-    def test_rejects_start_end_event_types(self):
-        with pytest.raises(ValueError, match="not a START/END variant"):
-            record_span("Bad", EventType.FWD_BWD_START)
-        with pytest.raises(ValueError, match="not a START/END variant"):
-            record_span("Bad", EventType.FWD_BWD_END)
-
-    def test_rl_scoring_event_type(self, tmp_path, system_logger):
+    def test_no_event_type_uses_description(self, tmp_path, system_logger):
+        """When event_type is omitted, description is used as the base name."""
         init_observability(rank=0, source="reward", output_dir=str(tmp_path))
         set_step(1)
-        with record_span("Scoring", EventType.RL_SCORING):
+        with record_span("rl_time/scoring_s"):
             pass
         jsonl_path = os.path.join(
             str(tmp_path), "system_logs", "reward_rank_0_system.jsonl"
         )
         with open(jsonl_path) as f:
             lines = [json.loads(line) for line in f if line.strip()]
-        assert lines[0]["normal"]["log_type_name"] == str(EventType.RL_SCORING_START)
-        assert lines[1]["normal"]["log_type_name"] == str(EventType.RL_SCORING_END)
+        assert lines[0]["normal"]["log_type_name"] == "rl_time/scoring_s_start"
+        assert lines[1]["normal"]["log_type_name"] == "rl_time/scoring_s_end"
+
+    def test_string_event_type(self, tmp_path, system_logger):
+        """event_type can be a plain string."""
+        init_observability(rank=0, source="reward", output_dir=str(tmp_path))
+        set_step(1)
+        with record_span("Grading", "rl_grading"):
+            pass
+        jsonl_path = os.path.join(
+            str(tmp_path), "system_logs", "reward_rank_0_system.jsonl"
+        )
+        with open(jsonl_path) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
+        assert lines[0]["normal"]["log_type_name"] == "rl_grading_start"
+        assert lines[1]["normal"]["log_type_name"] == "rl_grading_end"
