@@ -106,6 +106,20 @@ def rollouts_to_train_batch(
     )
 
 
+def filter_top_bottom(
+    records: list[dict], key: str = "reward", k: int = 1
+) -> list[dict]:
+    """Keep top-k and bottom-k records by a key.
+
+    If fewer than 2*k records, returns all records.
+    """
+    sorted_recs = sorted(records, key=lambda r: r.get(key, 0))
+    k = min(k, len(sorted_recs) // 2) if sorted_recs else 0
+    if k == 0:
+        return sorted_recs
+    return sorted_recs[:k] + sorted_recs[-k:]
+
+
 # ---------------------------------------------------------------------------
 # Actors
 # ---------------------------------------------------------------------------
