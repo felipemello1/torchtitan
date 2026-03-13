@@ -42,7 +42,9 @@ from torchtitan.observability import (
     EventType,
     init_observability,
     logging_worker,
+    MeanMetric,
     record_event,
+    record_metric,
     record_span,
     set_step,
 )
@@ -157,6 +159,8 @@ class RollouterActor(Actor):
             )
             for i in range(len(self.dataset.tokens))
         ]
+        mean_completion_len = sum(len(r.completion_text) for r in rollouts) / len(rollouts)
+        record_metric("rl/completion_len_mean", MeanMetric(value=mean_completion_len, count=len(rollouts)))
         return rollouts
 
 
@@ -231,6 +235,8 @@ class RewardActor(Actor):
         with record_span("rl_time/scoring_s", EventType.RL_SCORING):
             for rollout in rollouts:
                 rollout.reward = 1.0  # dummy constant reward
+        reward_mean = sum(r.reward for r in rollouts) / len(rollouts)
+        record_metric("rl/reward_mean", MeanMetric(value=reward_mean, count=len(rollouts)))
         return rollouts
 
 
@@ -262,6 +268,8 @@ async def main():
                 "training/lr",
                 "trainer_throughput/tps_mean",
                 "trainer_memory/reserved_gib_max",
+                "rl/reward_mean",
+                "rl/completion_len_mean",
             ],
         },
         daemon=True,
