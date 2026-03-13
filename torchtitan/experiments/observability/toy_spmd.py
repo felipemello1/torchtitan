@@ -237,7 +237,7 @@ class ToyTrainer:
         return loss_sum, valid_tokens
 
     def train_step(self, tokens, labels, loss_mask):
-        """One training step. Returns (loss, grad_norm)."""
+        """One training step."""
         with loss_parallel():
             logits = self.model(tokens)
             loss_sum, valid_tokens = self.compute_loss(logits, labels, loss_mask)
@@ -251,7 +251,16 @@ class ToyTrainer:
             loss.backward()
         grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
-        return loss, grad_norm
+
+        # Report globally-reduced loss. Each DP rank has
+        # local_loss_sum / global_valid_tokens; SUM gives the global loss.
+        loss_scalar = loss.detach().full_tensor().clone()
+        dist.all_reduce(loss_scalar, op=dist.ReduceOp.SUM, group=self.dp_mesh.get_group())
+        if self.rank == 0:
+            print(
+                f"step: {self.step}  loss: {loss_scalar.item():.5f}  "
+                f"grad_norm: {grad_norm.item():.5f}"
+            )
 
     def validate(self, tokens, labels, loss_mask):
         """Run one forward pass for validation (no backward)."""
@@ -261,8 +270,10 @@ class ToyTrainer:
             global_valid_tokens = valid_tokens.detach().clone().float()
             dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
             val_loss = loss_sum / global_valid_tokens
+        val_loss_scalar = val_loss.detach().full_tensor().clone()
+        dist.all_reduce(val_loss_scalar, op=dist.ReduceOp.SUM, group=self.dp_mesh.get_group())
         if self.rank == 0:
-            print(f"  val loss: {val_loss.item():.4f}")
+            print(f"  val loss: {val_loss_scalar.item():.4f}")
 
     def train(self, num_steps):
         """Full training loop. Mirrors Trainer.train structure."""
@@ -270,23 +281,10 @@ class ToyTrainer:
         dataloader = setup_data(self.device, dp_rank=dp_rank)
         data_iterator = self.batch_generator(dataloader)
 
-        if self.rank == 0:
-            print(f"{'Step':>4}  {'Loss':>10}  {'GradNorm':>10}  {'Time(ms)':>10}")
-            print("-" * 50)
-
         for step in range(1, num_steps + 1):
             self.step = step
-
-            t0 = time.perf_counter()
             tokens, labels, loss_mask = next(data_iterator)
-            loss, grad_norm = self.train_step(tokens, labels, loss_mask)
-            dt_ms = (time.perf_counter() - t0) * 1000
-
-            if self.rank == 0:
-                print(
-                    f"{step:>4}  {loss.item():>10.4f}  "
-                    f"{grad_norm.item():>10.4f}  {dt_ms:>10.1f}"
-                )
+            self.train_step(tokens, labels, loss_mask)
 
             if step % EVAL_FREQ == 0:
                 self.validate(tokens, labels, loss_mask)
@@ -319,7 +317,7 @@ def main():
     trainer.close()
 
     if rank == 0:
-        print(f"\nDone. Output: {OUTPUT_DIR}")
+        print(f"Done. Output: {OUTPUT_DIR}")
     dist.destroy_process_group()
 
 

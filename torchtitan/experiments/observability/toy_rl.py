@@ -160,8 +160,8 @@ class TrainerActor(Actor):
         self.trainer.step = step
 
     @endpoint
-    async def train_step(self, tokens, labels, loss_mask) -> float:
-        """Train one step on generated completions. Returns loss value."""
+    async def train_step(self, tokens, labels, loss_mask):
+        """Train one step on generated completions."""
         # Slice this DP rank's shard from the full batch.
         start = self.dp_rank * BATCH_SIZE
         end = start + BATCH_SIZE
@@ -169,9 +169,8 @@ class TrainerActor(Actor):
         labels = labels[start:end].to(self.device)
         loss_mask = loss_mask[start:end].to(self.device)
 
-        # Train step
-        loss, _grad_norm = self.trainer.train_step(tokens, labels, loss_mask)
-        return loss.item()
+        # Train step (loss is logged inside via logger.info)
+        self.trainer.train_step(tokens, labels, loss_mask)
 
     @endpoint
     async def teardown(self):
@@ -248,14 +247,11 @@ async def main():
 
             tokens, labels, loss_mask = rollouts_to_train_batch(rollouts)
 
-            result = await trainer.train_step.call(tokens, labels, loss_mask)
-            loss = next(iter(result.values()))
+            await trainer.train_step.call(tokens, labels, loss_mask)
 
             rewards = [r.reward for r in rollouts]
             reward_mean = sum(rewards) / len(rewards)
-            logger.info(
-                f"step: {step}  loss: {loss:8.5f}  reward_mean: {reward_mean:8.5f}"
-            )
+            logger.info(f"step: {step}  reward_mean: {reward_mean:.5f}")
 
     await run_training()
 
