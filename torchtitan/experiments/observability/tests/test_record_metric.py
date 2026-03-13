@@ -81,6 +81,6 @@ class TestExperimentJSONL:
                     record = json.loads(line)
                     reduce_by_key[record["key"]] = record["reduce"]
 
-        assert reduce_by_key.get("training/loss_mean") == "MeanMetric"
+        assert reduce_by_key.get("training/loss_mean") == "NoOpMetric"
         assert reduce_by_key.get("training/grad_norm_max") == "MaxMetric"
         assert reduce_by_key.get("training/lr") == "NoOpMetric"

@@ -132,7 +132,6 @@ class TestLoggingWorkerBasic:
         p.join(timeout=10)
         assert p.exitcode == 0
 
-    @pytest.mark.slow
     def test_queue_timeout(self, tmp_path):
         """Worker shuts down gracefully when queue times out."""
         queue = multiprocessing.Queue()
