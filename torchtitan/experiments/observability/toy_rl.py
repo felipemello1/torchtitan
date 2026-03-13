@@ -14,6 +14,9 @@ orchestrates the loop.
 
 Run (requires 4 GPUs):
     python -m torchtitan.experiments.observability.toy_rl
+
+Do NOT use torch.distributed.run / torchrun — the controller is a single
+process that spawns GPU workers via Monarch's this_host().spawn_procs().
 """
 
 import asyncio
