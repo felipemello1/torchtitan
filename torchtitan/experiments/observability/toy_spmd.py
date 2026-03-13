@@ -261,7 +261,7 @@ class ToyTrainer:
         return loss_sum, valid_tokens
 
     def train_step(self, tokens, labels, loss_mask):
-        """One training step. Returns (loss, grad_norm)."""
+        """One training step."""
         self.metrics_processor.ntokens_since_reset += labels.numel()
 
         with record_span("trainer_time/forward_backward_s", EventType.FWD_BWD):
@@ -300,8 +300,6 @@ class ToyTrainer:
                 record_metric("training/grad_norm_max", MaxMetric(value=grad_norm_val))
                 record_event({"train.loss": loss_val, "train.grad_norm": grad_norm_val})
 
-        return loss, grad_norm
-
     def validate(self, tokens, labels, loss_mask):
         """Run one forward pass for validation (no backward)."""
         self.metrics_processor.val_ntokens_since_reset += labels.numel()
@@ -337,7 +335,7 @@ class ToyTrainer:
 
             with record_span("trainer_time/step_s", EventType.STEP):
                 tokens, labels, loss_mask = next(data_iterator)
-                loss, grad_norm = self.train_step(tokens, labels, loss_mask)
+                self.train_step(tokens, labels, loss_mask)
 
             if is_validation:
                 add_step_tag("eval")
