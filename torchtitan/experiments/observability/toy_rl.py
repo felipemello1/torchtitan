@@ -52,6 +52,7 @@ from torchtitan.observability import (
     RolloutLogger,
     set_step,
 )
+from torchtitan.observability.analysis import to_chrome_trace
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -354,6 +355,11 @@ async def main():
     log_queue.put(None)
     log_process.join(timeout=10)
     await trainer.teardown.call()
+
+    sys_logs = os.path.join(OUTPUT_DIR, "system_logs")
+    trace_path = os.path.join(OUTPUT_DIR, "analysis", "system_metrics_gantt.json")
+    to_chrome_trace(sys_logs, trace_path)
+
     logger.info(f"Done in {time.time() - t0:.1f}s. Output: {OUTPUT_DIR}")
 
 
