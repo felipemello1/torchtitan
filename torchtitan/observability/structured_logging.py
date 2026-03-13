@@ -46,90 +46,42 @@ class StrEnum(enum.Enum):
 
 
 class EventType(StrEnum):
-    """Phase identifiers for structured JSONL events.
-
-    Each phase has a base event plus _START and _END variants.
-    record_span auto-derives _START/_END from the base.
+    """Standardized phase identifiers for structured JSONL events.
+    Used for categorization and analysis.
     """
 
-    BINARY_START = "binary_start"
     TORCH_DISTRIBUTED_INIT = "torch_distributed_init"
-    TORCH_DISTRIBUTED_INIT_START = "torch_distributed_init_start"
-    TORCH_DISTRIBUTED_INIT_END = "torch_distributed_init_end"
     TORCH_DISTRIBUTED_TEARDOWN = "torch_distributed_teardown"
-    TORCH_DISTRIBUTED_TEARDOWN_START = "torch_distributed_teardown_start"
-    TORCH_DISTRIBUTED_TEARDOWN_END = "torch_distributed_teardown_end"
     MODEL_PARALLELISM_INIT = "model_parallelism_init"
-    MODEL_PARALLELISM_INIT_START = "model_parallelism_init_start"
-    MODEL_PARALLELISM_INIT_END = "model_parallelism_init_end"
     TOKENIZER_INIT = "tokenizer_init"
-    TOKENIZER_INIT_START = "tokenizer_init_start"
-    TOKENIZER_INIT_END = "tokenizer_init_end"
     DATA_ITERATOR_INIT = "data_iterator_init"
-    DATA_ITERATOR_INIT_START = "data_iterator_init_start"
-    DATA_ITERATOR_INIT_END = "data_iterator_init_end"
     RELOAD_DATA_LOADER_STATE = "reload_data_loader_state"
-    RELOAD_DATA_LOADER_STATE_START = "reload_data_loader_state_start"
-    RELOAD_DATA_LOADER_STATE_END = "reload_data_loader_state_end"
     BUILD_MODEL = "build_model"
-    BUILD_MODEL_START = "build_model_start"
-    BUILD_MODEL_END = "build_model_end"
     BUILD_LEARNER = "build_learner"
-    BUILD_LEARNER_START = "build_learner_start"
-    BUILD_LEARNER_END = "build_learner_end"
     OPTIMIZER_INIT = "optimizer_init"
-    OPTIMIZER_INIT_START = "optimizer_init_start"
-    OPTIMIZER_INIT_END = "optimizer_init_end"
     TRAINING_START = "training_start"
     STEP = "step"
-    STEP_START = "step_start"
-    STEP_END = "step_end"
     FETCHING_BATCH = "fetching_batch"
-    FETCHING_BATCH_START = "fetching_batch_start"
-    FETCHING_BATCH_END = "fetching_batch_end"
     FWD_BWD = "fwd_bwd"
-    FWD_BWD_START = "fwd_bwd_start"
-    FWD_BWD_END = "fwd_bwd_end"
     OPTIM = "optim"
-    OPTIM_START = "optim_start"
-    OPTIM_END = "optim_end"
     CHECKPOINT = "checkpoint"
     CHECKPOINT_INIT = "checkpoint_init"
-    CHECKPOINT_INIT_START = "checkpoint_init_start"
-    CHECKPOINT_INIT_END = "checkpoint_init_end"
-    CHECKPOINT_START = "checkpoint_start"
-    CHECKPOINT_END = "checkpoint_end"
     CHECKPOINT_STAGE = "checkpoint_stage"
-    CHECKPOINT_STAGE_START = "checkpoint_stage_start"
-    CHECKPOINT_STAGE_END = "checkpoint_stage_end"
     CHECKPOINT_LOAD = "checkpoint_load"
-    CHECKPOINT_LOAD_START = "checkpoint_load_start"
-    CHECKPOINT_LOAD_END = "checkpoint_load_end"
     EVAL_LAUNCH = "eval_launch"
-    EVAL_LAUNCH_START = "eval_launch_start"
-    EVAL_LAUNCH_END = "eval_launch_end"
     EVAL = "eval"
-    EVAL_START = "eval_start"
-    EVAL_END = "eval_end"
-    RL_SCORING = "rl_scoring"
-    RL_SCORING_START = "rl_scoring_start"
-    RL_SCORING_END = "rl_scoring_end"
     SUMMARY_WRITER = "summary_writer"
-    SUMMARY_WRITER_START = "summary_writer_start"
-    SUMMARY_WRITER_END = "summary_writer_end"
     TORCH_MEMORY_BREAKDOWN = "torch_memory_breakdown"
-    TORCH_MEMORY_BREAKDOWN_START = "torch_memory_breakdown_start"
-    TORCH_MEMORY_BREAKDOWN_END = "torch_memory_breakdown_end"
     GC_COLLECT = "gc_collect"
-    GC_COLLECT_START = "gc_collect_start"
-    GC_COLLECT_END = "gc_collect_end"
     METRIC_VALUE = "metric_value"
     STATE_DICT_INIT = "state_dict_init"
-    STATE_DICT_INIT_START = "state_dict_init_start"
-    STATE_DICT_INIT_END = "state_dict_init_end"
     STATE_DICT_LOAD = "state_dict_load"
-    STATE_DICT_LOAD_START = "state_dict_load_start"
-    STATE_DICT_LOAD_END = "state_dict_load_end"
+
+    # RL
+    RL_GRADING = "rl_grading"
+    RL_ROLLOUT = "rl_rollout"
+    RL_GENERATE = "rl_generate"
+    RL_ENV = "rl_env"
 
 
 class LogType(StrEnum):
@@ -167,7 +119,7 @@ def dict_to_str_list(d: dict[str, str] | None) -> list[str] | None:
 
 
 def event_extra(
-    event_type: EventType,
+    event_type: EventType | str,
     event_name: str | None = None,
     step: int | None = None,
     relative_step: int | None = None,
@@ -314,9 +266,9 @@ class StructuredJSONFormatter(logging.Formatter):
             log_dict["context"] = record_context
 
         # Caller field for source traceability (file:line:function)
-        log_dict[
-            "caller"
-        ] = f"{os.path.relpath(record.pathname)}:{record.lineno}:{record.funcName}"
+        log_dict["caller"] = (
+            f"{os.path.relpath(record.pathname)}:{record.lineno}:{record.funcName}"
+        )
         log_dict["log_file"] = record.filename
         log_dict["log_function"] = record.funcName
         log_dict["log_level"] = record.levelname
@@ -519,62 +471,48 @@ class record_span(ContextDecorator):  # noqa: N801
     experiment JSONL via ``record_metric``.
 
     Args:
-        description: Human-readable label for log messages and metric key.
+        description (str): Human-readable label for log messages and metric key.
             Free-form string (e.g., "trainer_time/forward_backward_s").
             Appears in system JSONL messages and, when metrics are enabled,
             as the experiment metric key.
-        event_type: Categorization for post-processing and visualization
-            tools (Perfetto, DuckDB). Must have corresponding _START and
-            _END variants in ``EventType`` (e.g., ``EventType.FWD_BWD``
-            requires ``FWD_BWD_START`` and ``FWD_BWD_END``).
+        event_type Optional([EventType,str]): Optional categorization for analysis tools. Can be an
+            ``EventType`` enum for standardized phases, or any string.
+            When omitted, the description is used as the event type.
         log_to_metrics: If True, record duration to experiment JSONL.
             Default True.
 
-    Usage:
-
+    Usage::
         with record_span("trainer_time/forward_backward_s", EventType.FWD_BWD):
             output = model(batch)
             loss.backward()
-        # → system JSONL: fwd_bwd_start/end events
-        # → experiment JSONL: MeanMetric with duration in seconds
+
+        # Without EventType (description used as event type):
+        with record_span("rl_time/rollout_s"):
+            rollouts = generate(prompts)
     """
 
     def __init__(
         self,
         description: str,
-        event_type: EventType,
+        event_type: EventType | str | None = None,
         *,
         log_to_metrics: bool = True,
     ):
         self.description = description
-        self.event_type = event_type
         self.log_to_metrics = log_to_metrics
         self.start_time: float = 0.0
 
-        # Derive START/END event types. Validate that the base event type
-        # is not itself a _START or _END variant — those cannot be used as
-        # span types because there's no _start_start or _end_end.
-        base_name = str(event_type)
-        if base_name.endswith("_start") or base_name.endswith("_end"):
-            raise ValueError(
-                f"record_span requires a base EventType (e.g., EventType.FWD_BWD), "
-                f"not a START/END variant. Got: {event_type}"
-            )
-        try:
-            self.start_event_type = EventType(base_name + "_start")
-            self.end_event_type = EventType(base_name + "_end")
-        except ValueError as e:
-            raise ValueError(
-                f"EventType {event_type} has no _START/_END variants. "
-                f"Add {base_name}_start and {base_name}_end to EventType."
-            ) from e
+        # Derive _start/_end type names from event_type or description.
+        base_name = str(event_type) if event_type is not None else description
+        self.start_type_name = base_name + "_start"
+        self.end_type_name = base_name + "_end"
 
     def __enter__(self):
         self.start_time = timer()
         step = get_step()
         _system_logger.info(
-            f"[step {step if step is not None else 'N/A'}] {self.description} {self.start_event_type}",
-            extra=event_extra(self.start_event_type, step=step),
+            f"[step {step if step is not None else 'N/A'}] {self.description} {self.start_type_name}",
+            extra=event_extra(self.start_type_name, step=step),
             stacklevel=2,
         )
         return self
@@ -585,8 +523,8 @@ class record_span(ContextDecorator):  # noqa: N801
         duration_s = end_time - self.start_time
         delta_ms = duration_s * 1000
         _system_logger.info(
-            f"[step {step if step is not None else 'N/A'}] {self.description} {self.end_event_type} took {delta_ms:.2f} ms",
-            extra=event_extra(self.end_event_type, value=delta_ms, step=step),
+            f"[step {step if step is not None else 'N/A'}] {self.description} {self.end_type_name} took {delta_ms:.2f} ms",
+            extra=event_extra(self.end_type_name, value=delta_ms, step=step),
             stacklevel=2,
         )
         if self.log_to_metrics and step is not None:
