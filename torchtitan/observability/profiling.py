@@ -14,7 +14,6 @@ Key design:
 - ``profile_annotation(name)`` wraps code with record_function + NVTX.
   Always calls record_function (zero overhead when profiler is inactive).
 - ``is_profiling_step`` exposes whether the current step is being profiled.
-- ``dist.barrier()`` in cleanup prevents NCCL timeout when profiler stops.
 """
 
 import contextlib
@@ -730,9 +729,6 @@ class Profiler(Configurable):
         """Stop all profilers and release resources."""
         if self._torch_profiler is not None:
             try:
-                # Barrier before stop prevents NCCL timeout
-                if dist.is_initialized():
-                    dist.barrier()
                 self._torch_profiler.stop()
                 logger.info("Torch profiler stopped")
             except Exception as e:
