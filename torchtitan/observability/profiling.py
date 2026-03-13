@@ -10,10 +10,9 @@ Orchestrates multiple sub-profilers (TorchProfiler, MemSnapshot, HostMemory,
 NSys) via a single ``Profiler`` context manager. Supports periodic and
 on-demand triggering via file sentinels.
 
-Key design:
 - ``profile_annotation(name)`` wraps code with record_function + NVTX.
-  Always calls record_function (zero overhead when profiler is inactive).
-- ``is_profiling_step`` exposes whether the current step is being profiled.
+  Zero overhead when profiler is inactive.
+- ``is_profiling_step()`` exposes whether the current step is being profiled.
 """
 
 import contextlib
