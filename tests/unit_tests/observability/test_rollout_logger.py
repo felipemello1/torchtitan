@@ -14,7 +14,43 @@ import pytest
 from torchtitan.observability.rollout_logger import (
     filter_top_bottom,
     RolloutLogger,
+    RolloutOutput,
 )
+
+
+class TestRolloutOutput:
+    def test_to_logging_dict_with_reward(self):
+        r = RolloutOutput(
+            prompt_tokens=[1, 2, 3],
+            completion_tokens=[4, 5, 6],
+            prompt_text="What is 2+2?",
+            completion_text="The answer is 4.",
+            reward=1.0,
+        )
+        d = r.to_logging_dict()
+        assert d == {"prompt": "What is 2+2?", "completion": "The answer is 4.", "reward": 1.0}
+
+    def test_to_logging_dict_without_reward(self):
+        r = RolloutOutput(
+            prompt_tokens=[1, 2],
+            completion_tokens=[3, 4],
+            prompt_text="hello",
+            completion_text="world",
+        )
+        d = r.to_logging_dict()
+        assert d == {"prompt": "hello", "completion": "world"}
+        assert "reward" not in d
+
+    def test_reward_can_be_set_after_init(self):
+        r = RolloutOutput(
+            prompt_tokens=[1],
+            completion_tokens=[2],
+            prompt_text="p",
+            completion_text="c",
+        )
+        assert r.reward is None
+        r.reward = 0.5
+        assert r.to_logging_dict()["reward"] == 0.5
 
 
 class TestRolloutLogger:
@@ -22,9 +58,8 @@ class TestRolloutLogger:
         logger = RolloutLogger(output_dir=str(tmp_path))
         logger.log(
             [{"prompt": "hello", "reward": 0.5}, {"prompt": "world", "reward": 0.3}],
-            step=1,
+            metadata={"step": 1},
         )
-        logger.flush()
         logger.close()
 
         with open(tmp_path / "rollouts.jsonl") as f:
@@ -33,20 +68,29 @@ class TestRolloutLogger:
         assert lines[0]["prompt"] == "hello"
         assert lines[0]["step"] == 1
 
-    def test_step_added_to_records(self, tmp_path):
+    def test_metadata_merged_into_records(self, tmp_path):
         logger = RolloutLogger(output_dir=str(tmp_path))
-        logger.log([{"x": 1}], step=42)
-        logger.flush()
+        logger.log([{"x": 1}], metadata={"step": 42, "epoch": 3})
         logger.close()
 
         with open(tmp_path / "rollouts.jsonl") as f:
             record = json.loads(f.readline())
         assert record["step"] == 42
+        assert record["epoch"] == 3
+        assert record["x"] == 1
+
+    def test_no_metadata(self, tmp_path):
+        logger = RolloutLogger(output_dir=str(tmp_path))
+        logger.log([{"x": 1}])
+        logger.close()
+
+        with open(tmp_path / "rollouts.jsonl") as f:
+            record = json.loads(f.readline())
+        assert record == {"x": 1}
 
     def test_empty_records_noop(self, tmp_path):
         logger = RolloutLogger(output_dir=str(tmp_path))
-        logger.log([], step=1)
-        logger.flush()
+        logger.log([], metadata={"step": 1})
         logger.close()
 
         filepath = tmp_path / "rollouts.jsonl"
@@ -55,8 +99,7 @@ class TestRolloutLogger:
     def test_filter_fn_applied(self, tmp_path):
         logger = RolloutLogger(output_dir=str(tmp_path))
         records = [{"id": i, "reward": i * 0.1} for i in range(10)]
-        logger.log(records, step=1, filter_fn=lambda r: r[:3])
-        logger.flush()
+        logger.log(records, metadata={"step": 1}, filter_fn=lambda r: r[:3])
         logger.close()
 
         with open(tmp_path / "rollouts.jsonl") as f:
@@ -65,17 +108,15 @@ class TestRolloutLogger:
 
     def test_custom_filename(self, tmp_path):
         logger = RolloutLogger(output_dir=str(tmp_path), filename="custom.jsonl")
-        logger.log([{"x": 1}], step=1)
-        logger.flush()
+        logger.log([{"x": 1}], metadata={"step": 1})
         logger.close()
 
         assert os.path.exists(tmp_path / "custom.jsonl")
 
     def test_append_across_calls(self, tmp_path):
         logger = RolloutLogger(output_dir=str(tmp_path))
-        logger.log([{"step_data": "a"}], step=1)
-        logger.log([{"step_data": "b"}], step=2)
-        logger.flush()
+        logger.log([{"step_data": "a"}], metadata={"step": 1})
+        logger.log([{"step_data": "b"}], metadata={"step": 2})
         logger.close()
 
         with open(tmp_path / "rollouts.jsonl") as f:
@@ -90,10 +131,9 @@ class TestFilterTopBottom:
         rewards = [r["reward"] for r in result]
         assert rewards == [0, 1, 8, 9]
 
-    def test_small_list_no_duplicates(self):
+    def test_small_list_returns_all(self):
         records = [{"reward": 1}, {"reward": 2}]
         result = filter_top_bottom(records, k=5)
-        # k > len/2, so returns all without duplicates
         assert len(result) == 2
 
     def test_k_equals_half(self):
@@ -117,7 +157,6 @@ class TestFilterTopBottom:
         assert scores == [1, 3]
 
     def test_single_element(self):
-        """len=1: k = min(1, 0) = 0 → returns full list (no duplication)."""
         records = [{"reward": 5}]
         result = filter_top_bottom(records, k=1)
         assert len(result) == 1

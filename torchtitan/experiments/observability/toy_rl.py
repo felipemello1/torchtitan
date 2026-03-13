@@ -46,6 +46,7 @@ from torchtitan.observability import (
     record_event,
     record_span,
     RolloutLogger,
+    RolloutOutput,
     set_step,
 )
 
@@ -222,18 +223,35 @@ async def main():
                 gen_results = await generator.generate.call(prompts)
                 tokens, labels, loss_mask = next(iter(gen_results.values()))
 
-            # Score is not used anywhere. This is a dummy call to demonstrate
-            # multi-actor observability.
+            # Dummy rollout records for logging. In a real pipeline, the
+            # generator would populate prompt_text/completion_text via
+            # tokenizer.decode().
+            rollouts = [
+                RolloutOutput(
+                    prompt_tokens=prompts[i].tolist(),
+                    completion_tokens=tokens[i].tolist(),
+                    prompt_text=f"What is {i}+{i}?",
+                    completion_text=f"The answer is {i + i}.",
+                )
+                for i in range(len(tokens))
+            ]
+
+            # Score is not used for training. This is a dummy call to
+            # demonstrate multi-actor observability.
             with record_span("rl_time/scoring_s", EventType.RL_SCORING):
                 reward_results = await reward_actor.score.call(
-                    [tokens[i].float() for i in range(4)]
+                    [tokens[i].float() for i in range(len(tokens))]
                 )
                 rewards = next(iter(reward_results.values()))
 
-            # Log rollout data (prompts + rewards) for offline analysis.
+            for rollout, r in zip(rollouts, rewards):
+                rollout.reward = r
+
+            # Logging is synchronous here but could be overlapped with
+            # the train_step call below since it's just file I/O.
             rollout_logger.log(
-                [{"reward": r} for r in rewards],
-                step=step,
+                [r.to_logging_dict() for r in rollouts],
+                metadata={"step": step},
             )
 
             with record_span("rl_time/training_s", EventType.FWD_BWD):
