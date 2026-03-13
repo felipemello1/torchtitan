@@ -312,6 +312,12 @@ async def main():
             is_validation = False
             log_queue.put((step, is_validation))
 
+            rewards = [r.reward for r in rollouts]
+            reward_mean = sum(rewards) / len(rewards)
+            logger.info(
+                f"step: {step}  loss: {loss:8.5f}  reward_mean: {reward_mean:8.5f}"
+            )
+
     await run_training()
 
     # ---- Cleanup ----
