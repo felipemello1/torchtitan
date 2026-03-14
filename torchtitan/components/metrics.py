@@ -10,10 +10,8 @@ from typing import Any
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
-from torchtitan.distributed import ParallelDims
-from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import Color, device_module, device_type, NoColor
+from torchtitan.tools.utils import device_module, device_type
 
 
 # named tuple for passing device memory stats for logging
@@ -189,64 +187,3 @@ class LoggerContainer(BaseLogger):
     def close(self) -> None:
         for logger_instance in self._loggers:
             logger_instance.close()
-
-
-def ensure_pp_loss_visible(
-    *, parallel_dims: ParallelDims, pp_schedule: str, color: Color | NoColor
-) -> None:
-    """
-    Ensures that the loss is visible on the console for pipeline-parallel training.
-
-    For pipeline-parallel training, the loss is only visible on the last pipeline stage.
-    This function checks if the appropriate rank is included in the LOG_RANK environment
-    variable and warns if it's not.
-    """
-
-    # V Block Schedules return loss on rank 0
-    if pp_schedule == "ZBVZeroBubble":
-        return
-
-    # Calculate the rank where loss is visible (first rank of the last pipeline stage)
-    world_size = parallel_dims.world_size
-    pp_size = parallel_dims.pp
-    loss_visible_rank = (world_size // pp_size) * (pp_size - 1)
-
-    # Check if the loss-visible rank is included in LOG_RANK environment variable
-    env_logged_ranks = os.environ.get("LOG_RANK", "").split(",")
-    if env_logged_ranks == [""]:
-        env_logged_ranks = []
-
-    if str(loss_visible_rank) not in env_logged_ranks:
-        logger.warning(
-            f"{color.red}Pipeline Parallel loss is not visible. "
-            f"Please add {color.yellow}rank {loss_visible_rank}{color.red} "
-            f"to LOG_RANK environment variable in run_train.sh.{color.reset}"
-        )
-
-
-def _get_metrics_rank(
-    *,
-    parallel_dims: ParallelDims,
-    pp_schedule: str,
-) -> int:
-    """
-    Determines which rank should log metrics.
-
-    Returns:
-       int: The rank responsible for logging metrics:
-            - Rank 0 for non-pipeline-parallel configs
-            - Rank 0 for pipeline-parallel 'ZBVZeroBubble' schedule
-            - The first rank of the last pipeline stage for other pipeline-parallel schedules
-    """
-    # Early return for non-pipeline-parallel configurations
-    if not parallel_dims.pp_enabled:
-        return 0
-
-    # V Block Schedules return loss on rank 0
-    if pp_schedule == "ZBVZeroBubble":
-        return 0
-
-    # Calculate first rank of the last pipeline stage
-    world_size = parallel_dims.world_size
-    pp_size = parallel_dims.pp
-    return (world_size // pp_size) * (pp_size - 1)

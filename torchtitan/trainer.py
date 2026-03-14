@@ -43,7 +43,6 @@ from torchtitan.distributed.context_parallel import prepare_context_parallel_inp
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.observability import (
     EventType,
-    init_observability,
     NoOpMetric,
     record_event,
     record_metric,
@@ -216,15 +215,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # init distributed and build meshes
         self.parallel_dims = parallel_dims = self.init_distributed()
 
-        # Initialize observability: adds JSONL file handlers for system
-        # and experiment metrics. Console handler is already set up by init_logger.
-        # TODO: init_observability should replace init_logger (called in train.py)
-        init_observability(
-            source="trainer",
-            output_dir=config.dump_folder,
-            rank=torch.distributed.get_rank(),
-        )
-
         # Logging needs to happen after distributed initialized
         config.maybe_log()
 
@@ -302,7 +292,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.metrics_processor = config.metrics.build(
             parallel_dims=parallel_dims,
             dump_folder=config.dump_folder,
-            pp_schedule=config.parallelism.pipeline_parallel_schedule,
             config_dict=config.to_dict(),
             has_quantization=has_quantization,
         )
@@ -750,59 +739,63 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 
-        # Derived metrics recorded every step (cheap, outside should_log gate)
-        self.metrics_processor.record_throughput()
-        self.metrics_processor.record_memory()
+        if self.metrics_processor.should_log(self.step):
+            with record_span("trainer_time/collect_dist_metrics_s"):
+                if parallel_dims.dp_cp_enabled:
+                    loss = loss.detach()
+                    loss_mesh = parallel_dims.get_optional_mesh("loss")
 
-        # Loss/grad_norm only on log steps (.item() triggers GPU→CPU sync)
-        if not self.metrics_processor.should_log(self.step):
-            return
-
-        with record_span("trainer_time/collect_dist_metrics_s"):
-            if parallel_dims.dp_cp_enabled:
-                loss = loss.detach()
-                loss_mesh = parallel_dims.get_optional_mesh("loss")
-
-                # For global_avg_loss, we want the average loss across all ranks:
-                # loss = local_loss_sum / global_valid_tokens
-                # global_avg_loss = sum(local_loss_sum) / global_valid_tokens
-                #                 = sum(loss)
-                #
-                # For global_max_loss, we want the max of local average losses across ranks:
-                # local_avg_loss = local_loss_sum / local_valid_tokens
-                #                = (loss * global_valid_tokens) / local_valid_tokens
-                # global_max_loss = max(local_avg_loss)
-                local_avg_loss = loss * global_valid_tokens / local_valid_tokens
-                global_avg_loss, global_max_loss, global_ntokens_seen = (
-                    dist_utils.dist_sum(loss, loss_mesh),
-                    dist_utils.dist_max(local_avg_loss, loss_mesh),
-                    dist_utils.dist_sum(
-                        torch.tensor(
-                            self.ntokens_seen, dtype=torch.int64, device=self.device
+                    # For global_avg_loss, we want the average loss across all ranks:
+                    # loss = local_loss_sum / global_valid_tokens
+                    # global_avg_loss = sum(local_loss_sum) / global_valid_tokens
+                    #                 = sum(loss)
+                    #
+                    # For global_max_loss, we want the max of local average losses:
+                    # local_avg_loss = local_loss_sum / local_valid_tokens
+                    #                = (loss * global_valid_tokens) / local_valid_tokens
+                    # global_max_loss = max(local_avg_loss)
+                    local_avg_loss = loss * global_valid_tokens / local_valid_tokens
+                    global_avg_loss, global_max_loss, global_ntokens_seen = (
+                        dist_utils.dist_sum(loss, loss_mesh),
+                        dist_utils.dist_max(local_avg_loss, loss_mesh),
+                        dist_utils.dist_sum(
+                            torch.tensor(
+                                self.ntokens_seen,
+                                dtype=torch.int64,
+                                device=self.device,
+                            ),
+                            loss_mesh,
                         ),
-                        loss_mesh,
-                    ),
-                )
-            else:
-                global_avg_loss = global_max_loss = loss.detach().item()
-                global_ntokens_seen = self.ntokens_seen
+                    )
+                else:
+                    global_avg_loss = global_max_loss = loss.detach().item()
+                    global_ntokens_seen = self.ntokens_seen
 
-            # Only record loss on ranks that computed it (last PP stage has
-            # the real loss; other PP stages have a -1/-2 sentinel).
-            if not parallel_dims.pp_enabled or self.pp_has_last_stage:
-                record_metric("training/loss_mean", NoOpMetric(value=global_avg_loss))
-                record_metric("training/loss_max", NoOpMetric(value=global_max_loss))
-            record_metric("training/grad_norm_max", NoOpMetric(value=grad_norm.item()))
-            record_metric(
-                "training/n_tokens_sum", NoOpMetric(value=global_ntokens_seen)
-            )
-            record_event(
-                {
-                    "train.loss": global_avg_loss,
-                    "train.max_loss": global_max_loss,
-                    "train.grad_norm": grad_norm.item(),
-                }
-            )
+                # Only record loss on ranks that computed it (last PP stage has
+                # the real loss; other PP stages have a -1/-2 sentinel).
+                if not parallel_dims.pp_enabled or self.pp_has_last_stage:
+                    record_metric(
+                        "training/loss_mean", NoOpMetric(value=global_avg_loss)
+                    )
+                    record_metric(
+                        "training/loss_max", NoOpMetric(value=global_max_loss)
+                    )
+                record_metric(
+                    "training/grad_norm_max", NoOpMetric(value=grad_norm.item())
+                )
+                record_metric(
+                    "training/n_tokens_sum", NoOpMetric(value=global_ntokens_seen)
+                )
+                record_event(
+                    {
+                        "train.loss": global_avg_loss,
+                        "train.max_loss": global_max_loss,
+                        "train.grad_norm": grad_norm.item(),
+                    }
+                )
+
+        self.metrics_processor.record_memory()
+        self.metrics_processor.record_throughput()
 
     @record
     def train(self):
