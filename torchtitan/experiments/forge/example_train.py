@@ -15,12 +15,18 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.components.validate import Validator
 from torchtitan.config import ConfigManager
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+from torchtitan.observability import (
+    NoOpMetric,
+    record_event,
+    record_metric,
+    record_span,
+)
+from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.profiling import (
@@ -75,13 +81,12 @@ class Trainer(ForgeEngine):
         self.metrics_processor = config.metrics.build(
             parallel_dims=self.parallel_dims,
             dump_folder=config.dump_folder,
-            pp_schedule=config.parallelism.pipeline_parallel_schedule,
             config_dict=config.to_dict(),
         )
-        color = self.metrics_processor.color
 
         self.metrics_processor.num_flops_per_token = self.num_flops_per_token
 
+        color = utils.Color()
         logger.info(
             f"{color.blue}Model {config.model_spec.name} {config.model_spec.flavor} "
             f"{color.red}size: {self.model_param_count:,} total parameters{color.reset}"
@@ -98,11 +103,10 @@ class Trainer(ForgeEngine):
             f"({device_mem_stats.max_reserved_pct:.2f}%)"
         )
 
-        self.metrics_processor.optimizers = self.optimizers
-
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
+        self.ntokens_seen = 0
 
         # Build validator if validation is configured
         if config.validator.enable:
@@ -157,14 +161,11 @@ class Trainer(ForgeEngine):
                 # If data runs out during gradient accumulation, that
                 # entire step will not be executed.
                 raise DataloaderExhaustedError() from ex
-            data_load_start = time.perf_counter()
             input_dict, labels = batch
-            self.metrics_processor.ntokens_since_last_log += labels.numel()
-            self.metrics_processor.data_loading_times.append(
-                time.perf_counter() - data_load_start
-            )
+            ntokens_batch = labels.numel()
+            self.ntokens_seen += ntokens_batch
+            self.metrics_processor.ntokens_since_reset += ntokens_batch
 
-            # Tensors stay on CPU; moved to GPU per-microbatch during training
             yield input_dict, labels
 
     def post_dataloading_process(
@@ -267,13 +268,12 @@ class Trainer(ForgeEngine):
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
         self.optimizers.zero_grad()
+        lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
+        record_metric("training/lr", NoOpMetric(value=lr))
 
-        # Keep these variables local to shorten the code as these are
-        # the major variables that are used in the training loop.
         parallel_dims = self.parallel_dims
 
         # Collect all microbatches on CPU and count total valid tokens
-        # Here we assume the inputs/labels are on GPU
         microbatches = []
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
         for _microbatch in range(self.gradient_accumulation_steps):
@@ -282,7 +282,6 @@ class Trainer(ForgeEngine):
             microbatches.append((input_dict, labels))
 
         # All-reduce to get global token count across DP ranks
-        # Move to GPU for distributed communication
         local_valid_tokens = local_valid_tokens.to(self.device)
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
@@ -293,7 +292,6 @@ class Trainer(ForgeEngine):
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
         for input_dict, labels in microbatches:
-            # Move tensors to GPU
             for k, v in input_dict.items():
                 if isinstance(v, torch.Tensor):
                     input_dict[k] = v.to(self.device)
@@ -320,25 +318,51 @@ class Trainer(ForgeEngine):
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 
-        # log metrics
-        if not self.metrics_processor.should_log(self.step):
-            return
+        if self.metrics_processor.should_log(self.step):
+            with record_span("trainer_time/collect_dist_metrics_s"):
+                if parallel_dims.dp_cp_enabled:
+                    loss = loss.detach()
+                    loss_mesh = parallel_dims.get_optional_mesh("loss")
+                    local_avg_loss = loss * global_valid_tokens / local_valid_tokens
+                    global_avg_loss, global_max_loss, global_ntokens_seen = (
+                        dist_utils.dist_sum(loss, loss_mesh),
+                        dist_utils.dist_max(local_avg_loss, loss_mesh),
+                        dist_utils.dist_sum(
+                            torch.tensor(
+                                self.ntokens_seen,
+                                dtype=torch.int64,
+                                device=self.device,
+                            ),
+                            loss_mesh,
+                        ),
+                    )
+                else:
+                    global_avg_loss = global_max_loss = loss.detach().item()
+                    global_ntokens_seen = self.ntokens_seen
 
-        if parallel_dims.dp_cp_enabled:
-            loss = loss.detach()
-            global_avg_loss, global_max_loss = (
-                dist_utils.dist_sum(loss, parallel_dims.get_optional_mesh("loss")),
-                dist_utils.dist_max(loss, parallel_dims.get_optional_mesh("loss")),
-            )
-        else:
-            global_avg_loss = global_max_loss = loss.detach().item()
+                if not parallel_dims.pp_enabled or self.pp_has_last_stage:
+                    record_metric(
+                        "training/loss_mean", NoOpMetric(value=global_avg_loss)
+                    )
+                    record_metric(
+                        "training/loss_max", NoOpMetric(value=global_max_loss)
+                    )
+                record_metric(
+                    "training/grad_norm_max", NoOpMetric(value=grad_norm.item())
+                )
+                record_metric(
+                    "training/n_tokens_sum", NoOpMetric(value=global_ntokens_seen)
+                )
+                record_event(
+                    {
+                        "train.loss": global_avg_loss,
+                        "train.max_loss": global_max_loss,
+                        "train.grad_norm": grad_norm.item(),
+                    }
+                )
 
-        self.metrics_processor.log(
-            self.step,
-            global_avg_loss,
-            global_max_loss,
-            grad_norm.item(),
-        )
+        self.metrics_processor.record_memory()
+        self.metrics_processor.record_throughput()
 
     @record
     def train(self):
@@ -362,6 +386,13 @@ class Trainer(ForgeEngine):
             data_iterator = self.batch_generator(self.dataloader)
             while self.step < config.training.steps:
                 self.step += 1
+                is_validation = (
+                    config.validator.enable
+                    and self.validator.should_validate(self.step)
+                )
+                self.metrics_processor.set_step(self.step, force_log=is_validation)
+                self.metrics_processor.reset_training_counters()
+
                 self.gc_handler.run(self.step)
                 try:
                     self.train_step(data_iterator)
@@ -369,15 +400,16 @@ class Trainer(ForgeEngine):
                     logger.warning("Ran out of data; last step was canceled.")
                     break
 
-                # Run validation if validator is available
-                if config.validator.enable and self.validator.should_validate(
-                    self.step
-                ):
-                    self.validator.validate(self.model_parts, self.step)
-
                 self.checkpointer.save(
                     self.step, last_step=(self.step == config.training.steps)
                 )
+
+                if is_validation:
+                    self.metrics_processor.reset_val_counters()
+                    self.validator.validate(self.model_parts, self.step)
+
+                if self.metrics_processor.should_log(self.step):
+                    self.metrics_processor.log(self.step, is_validation=is_validation)
 
                 # signal the profiler that the next profiling step has started
                 if torch_profiler:
@@ -400,10 +432,11 @@ class Trainer(ForgeEngine):
         logger.info("Training completed")
 
     def state_dict(self) -> dict[str, Any]:
-        return {"step": self.step}
+        return {"step": self.step, "ntokens_seen": self.ntokens_seen}
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         self.step = state_dict["step"]
+        self.ntokens_seen = state_dict.get("ntokens_seen", 0)
 
     def close(self) -> None:
         if self.metrics_processor:
