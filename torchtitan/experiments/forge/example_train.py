@@ -15,7 +15,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.components.validate import Validator
 from torchtitan.config import ConfigManager

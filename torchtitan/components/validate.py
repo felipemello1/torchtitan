@@ -14,7 +14,7 @@ import torch.nn as nn
 from torch.distributed.pipelining.schedules import _PipelineSchedule
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.loss import IGNORE_INDEX, LossFunction
-from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.observability import NoOpMetric, record_metric
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.config import Configurable, ParallelismConfig
