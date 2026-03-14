@@ -575,9 +575,9 @@ class TestChromeTrace:
     """Tests for to_chrome_trace in analysis.py."""
 
     def test_same_event_type_different_descriptions(self, tmp_path, system_logger):
-        """Two sequential spans with the same EventType but different
-        descriptions must both appear in the chrome trace with their
-        respective description names (not the shared EventType name).
+        """Two sequential spans with the same EventType must both appear
+        in the chrome trace (no key collision). Display name shows
+        EventType when provided, description otherwise.
 
         This is a regression test: previously, pending_starts used
         EventType as the key, so the second span's start overwrote the
@@ -601,9 +601,10 @@ class TestChromeTrace:
         span_names = [
             e["name"] for e in trace["traceEvents"] if e.get("ph") == "X"
         ]
-        assert "rl_time/training_s" in span_names
+        # Spans with EventType show the EventType name; without show description
+        assert span_names.count("fwd_bwd") == 2
         assert "rl_time/rollouts_to_train_batch_s" in span_names
-        assert "rl_time/scoring_s" in span_names
+        assert len(span_names) == 3
 
     def test_no_event_type_uses_description_in_trace(self, tmp_path, system_logger):
         """Spans without EventType use description as the trace name."""
