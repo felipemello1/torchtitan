@@ -147,6 +147,8 @@ class MetricsProcessor(Configurable):
                     "tag": tag,
                     "console_log_metric_keys": config.console_log_metric_keys,
                     "console_log_validation_keys": config.console_log_validation_keys,
+                    "ft_enable": ft_enable,
+                    "ft_replica_id": ft_replica_id,
                 },
                 daemon=True,
             )
@@ -232,6 +234,14 @@ class MetricsProcessor(Configurable):
         record_metric(
             f"{prefix}_memory/ooms_sum",
             SumMetric(value=mem.num_ooms),
+        )
+        record_metric(
+            f"{prefix}_memory/reserved_pct_max",
+            MaxMetric(value=mem.max_reserved_pct),
+        )
+        record_metric(
+            f"{prefix}_memory/active_pct_max",
+            MaxMetric(value=mem.max_active_pct),
         )
 
     # ----
