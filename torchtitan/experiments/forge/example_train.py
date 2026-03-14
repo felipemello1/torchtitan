@@ -23,6 +23,7 @@ from torchtitan.distributed.context_parallel import prepare_context_parallel_inp
 from torchtitan.observability import (
     add_step_tag,
     EventType,
+    init_observability,
     NoOpMetric,
     record_event,
     record_metric,
@@ -30,7 +31,7 @@ from torchtitan.observability import (
 )
 from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.tools import utils
-from torchtitan.tools.logging import init_logger, logger
+from torchtitan.tools.logging import logger
 from torchtitan.tools.profiling import (
     maybe_enable_memory_snapshot,
     maybe_enable_profiling,
@@ -459,7 +460,11 @@ class Trainer(ForgeEngine):
 
 def main(custom_trainer_class: type[Trainer] | None = None) -> None:
     """Main entry point for training."""
-    init_logger()
+    config_manager = ConfigManager()
+    config = config_manager.parse_args()
+
+    # pyrefly: ignore [missing-attribute]
+    init_observability(source="forge", output_dir=config.dump_folder)
 
     import torchtitan
 
@@ -467,9 +472,6 @@ def main(custom_trainer_class: type[Trainer] | None = None) -> None:
         "torchtitan version: %s (0.0.0 means __version__ is not defined correctly).",
         torchtitan.__version__,
     )
-
-    config_manager = ConfigManager()
-    config = config_manager.parse_args()
     trainer: Trainer | None = None
 
     try:
