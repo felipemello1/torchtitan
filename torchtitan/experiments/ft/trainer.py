@@ -23,6 +23,14 @@ from torchtitan.experiments.ft.config.job_config import FaultTolerance
 from torchtitan.experiments.ft.manager import FTManager, maybe_semi_sync_training
 from torchtitan.experiments.ft.optimizer import FTOptimizersContainer
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.observability import (
+    add_step_tag,
+    EventType,
+    NoOpMetric,
+    record_event,
+    record_metric,
+    record_span,
+)
 from torchtitan.protocols import BaseModel
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
@@ -133,12 +141,10 @@ class FaultTolerantTrainer(Trainer):
         self.metrics_processor = config.metrics.build(
             parallel_dims=parallel_dims,
             dump_folder=config.dump_folder,
-            pp_schedule=config.parallelism.pipeline_parallel_schedule,
             ft_enable=config.fault_tolerance.enable,
             ft_replica_id=config.fault_tolerance.replica_id,
             config_dict=config.to_dict(),
         )
-        color = self.metrics_processor.color
 
         # calculate model size and flops per token
         (
@@ -146,6 +152,7 @@ class FaultTolerantTrainer(Trainer):
             self.metrics_processor.num_flops_per_token,
         ) = model_config.get_nparams_and_flops(model, config.training.seq_len)
 
+        color = utils.Color()
         logger.info(
             f"{color.blue}Model {model_spec.name} {model_spec.flavor} "
             f"{color.red}size: {model_param_count:,} total parameters{color.reset}"
@@ -191,8 +198,6 @@ class FaultTolerantTrainer(Trainer):
 
         # apply parallelisms and initialization
         if parallel_dims.pp_enabled:
-            from torchtitan.components.metrics import ensure_pp_loss_visible
-
             if not model_spec.pipelining_fn:
                 raise RuntimeError(
                     f"Pipeline Parallel is enabled but {model_spec.name} "
@@ -229,12 +234,6 @@ class FaultTolerantTrainer(Trainer):
                     cast(Decoder, m).init_weights(buffer_device=buffer_device)
                 m.train()
 
-            # confirm that user will be able to view loss metrics on the console
-            ensure_pp_loss_visible(
-                parallel_dims=parallel_dims,
-                pp_schedule=config.parallelism.pipeline_parallel_schedule,
-                color=color,
-            )
         else:
             # apply PT-D Tensor Parallel, activation checkpointing, torch.compile, Data Parallel
             model = model_spec.parallelize_fn(
@@ -293,9 +292,6 @@ class FaultTolerantTrainer(Trainer):
                 self.model_parts
             )
         )
-        self.metrics_processor.optimizers = self.optimizers
-        self.metrics_processor.model_parts = self.model_parts
-
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
@@ -409,11 +405,9 @@ class FaultTolerantTrainer(Trainer):
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
         self.optimizers.zero_grad()
-        # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
+        record_metric("training/lr", NoOpMetric(value=lr))
 
-        # Keep these variables local to shorten the code as these are
-        # the major variables that are used in the training loop.
         parallel_dims = self.parallel_dims
 
         # Collect all microbatches on CPU and count total valid tokens
@@ -425,7 +419,6 @@ class FaultTolerantTrainer(Trainer):
             microbatches.append((input_dict, labels))
 
         # All-reduce to get global token count across DP ranks
-        # Move to GPU for distributed communication
         local_valid_tokens = local_valid_tokens.to(self.device)
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
@@ -434,82 +427,86 @@ class FaultTolerantTrainer(Trainer):
             global_valid_tokens = local_valid_tokens.float()
 
         # Process each microbatch: move to GPU, forward/backward, then free
-        accumulated_losses = []
-        for input_dict, labels in microbatches:
-            # Move tensors to GPU
-            for k, v in input_dict.items():
-                if isinstance(v, torch.Tensor):
-                    input_dict[k] = v.to(self.device)
-            labels = labels.to(self.device)
+        with record_span("trainer_time/forward_backward_s", EventType.FWD_BWD):
+            accumulated_losses = []
+            for input_dict, labels in microbatches:
+                for k, v in input_dict.items():
+                    if isinstance(v, torch.Tensor):
+                        input_dict[k] = v.to(self.device)
+                labels = labels.to(self.device)
 
-            loss = self.forward_backward_step(
-                input_dict=input_dict,
-                labels=labels,
-                # pyrefly: ignore [bad-argument-type]
-                global_valid_tokens=global_valid_tokens,
+                loss = self.forward_backward_step(
+                    input_dict=input_dict,
+                    labels=labels,
+                    # pyrefly: ignore [bad-argument-type]
+                    global_valid_tokens=global_valid_tokens,
+                )
+                accumulated_losses.append(loss.detach())
+
+        with record_span("trainer_time/optimizer_s", EventType.OPTIM):
+            grad_norm = dist_utils.clip_grad_norm_(
+                [p for m in self.model_parts for p in m.parameters()],
+                self.config.training.max_norm,
+                foreach=True,
+                pp_mesh=parallel_dims.get_optional_mesh("pp"),
+                ep_enabled=parallel_dims.ep_enabled,
             )
-            accumulated_losses.append(loss.detach())
-
-        grad_norm = dist_utils.clip_grad_norm_(
-            [p for m in self.model_parts for p in m.parameters()],
-            self.config.training.max_norm,
-            foreach=True,
-            pp_mesh=parallel_dims.get_optional_mesh("pp"),
-            ep_enabled=parallel_dims.ep_enabled,
-        )
-        self.checkpointer.maybe_wait_for_staging()
-        self.optimizers.step()
-        self.lr_schedulers.step()
+            self.checkpointer.maybe_wait_for_staging()
+            self.optimizers.step()
+            self.lr_schedulers.step()
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 
-        # log metrics
-        if not self.metrics_processor.should_log(self.step):
-            return
+        if self.metrics_processor.should_log(self.step):
+            with record_span("trainer_time/collect_dist_metrics_s"):
+                if parallel_dims.dp_cp_enabled:
+                    loss = loss.detach()
+                    # FT addition: use ft_manager.loss_sync_pg
+                    ft_pg = self.ft_manager.loss_sync_pg
+                    loss_mesh = parallel_dims.get_optional_mesh("loss")
 
-        if parallel_dims.dp_cp_enabled:
-            loss = loss.detach()
-            # FT addition: use ft_manager.loss_sync_pg for extra process group
-            ft_pg = self.ft_manager.loss_sync_pg
-            loss_mesh = parallel_dims.get_optional_mesh("loss")
+                    local_avg_loss = loss * global_valid_tokens / local_valid_tokens
+                    global_avg_loss, global_max_loss, global_ntokens_seen = (
+                        dist_utils.dist_sum(loss, loss_mesh, ft_pg),
+                        dist_utils.dist_max(local_avg_loss, loss_mesh, ft_pg),
+                        dist_utils.dist_sum(
+                            torch.tensor(
+                                self.ntokens_seen,
+                                dtype=torch.int64,
+                                device=self.device,
+                            ),
+                            loss_mesh,
+                            ft_pg,
+                        ),
+                    )
+                else:
+                    global_avg_loss = global_max_loss = loss.detach().item()
+                    global_ntokens_seen = self.ntokens_seen
 
-            # For global_avg_loss, we want the average loss across all ranks:
-            # loss = local_loss_sum / global_valid_tokens
-            # global_avg_loss = sum(local_loss_sum) / global_valid_tokens
-            #                 = sum(loss)
-            #
-            # For global_max_loss, we want the max of local average losses across ranks:
-            # local_avg_loss = local_loss_sum / local_valid_tokens
-            #                = (loss * global_valid_tokens) / local_valid_tokens
-            # global_max_loss = max(local_avg_loss)
-            local_avg_loss = loss * global_valid_tokens / local_valid_tokens
-            global_avg_loss, global_max_loss, global_ntokens_seen = (
-                dist_utils.dist_sum(loss, loss_mesh, ft_pg),
-                dist_utils.dist_max(local_avg_loss, loss_mesh, ft_pg),
-                dist_utils.dist_sum(
-                    torch.tensor(
-                        self.ntokens_seen, dtype=torch.int64, device=self.device
-                    ),
-                    loss_mesh,
-                    ft_pg,
-                ),
-            )
-        else:
-            global_avg_loss = global_max_loss = loss.detach().item()
-            global_ntokens_seen = self.ntokens_seen
+                if not parallel_dims.pp_enabled or self.pp_has_last_stage:
+                    record_metric(
+                        "training/loss_mean", NoOpMetric(value=global_avg_loss)
+                    )
+                    record_metric(
+                        "training/loss_max", NoOpMetric(value=global_max_loss)
+                    )
+                record_metric(
+                    "training/grad_norm_max", NoOpMetric(value=grad_norm.item())
+                )
+                record_metric(
+                    "training/n_tokens_sum", NoOpMetric(value=global_ntokens_seen)
+                )
+                record_event(
+                    {
+                        "train.loss": global_avg_loss,
+                        "train.max_loss": global_max_loss,
+                        "train.grad_norm": grad_norm.item(),
+                    }
+                )
 
-        extra_metrics = {
-            "n_tokens_seen": global_ntokens_seen,
-            "lr": lr,
-        }
-        self.metrics_processor.log(
-            self.step,
-            global_avg_loss,
-            global_max_loss,
-            grad_norm.item(),
-            extra_metrics=extra_metrics,
-        )
+        self.metrics_processor.record_memory()
+        self.metrics_processor.record_throughput()
 
     @record
     def train(self):
@@ -558,22 +555,39 @@ class FaultTolerantTrainer(Trainer):
             data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
                 self.step += 1
-                self.gc_handler.run(self.step)
-                try:
-                    self.train_step(data_iterator)
-                except DataloaderExhaustedError:
-                    logger.warning("Ran out of data; last step was canceled.")
-                    break
-
-                self.checkpointer.save(
-                    self.step, last_step=(self.step == config.training.steps)
+                is_validation = (
+                    self.config.validator.enable
+                    and self.validator.should_validate(self.step)
                 )
+                self.metrics_processor.set_step(self.step, force_log=is_validation)
+                self.metrics_processor.reset_training_counters()
 
-                # Run validation if validator is available
-                if self.config.validator.enable and self.validator.should_validate(
-                    self.step
-                ):
-                    self.validator.validate(self.model_parts, self.step)
+                with record_span("trainer_time/gc_collect_s", EventType.GC_COLLECT):
+                    if self.gc_handler.run(self.step):
+                        add_step_tag("gc")
+
+                with record_span("trainer_time/step_s", EventType.STEP):
+                    try:
+                        self.train_step(data_iterator)
+                    except DataloaderExhaustedError:
+                        logger.warning("Ran out of data; last step was canceled.")
+                        break
+
+                with record_span("trainer_time/checkpoint_s", EventType.CHECKPOINT):
+                    saved = self.checkpointer.save(
+                        self.step, last_step=(self.step == config.training.steps)
+                    )
+                    if saved:
+                        add_step_tag("checkpoint")
+
+                if is_validation:
+                    add_step_tag("eval")
+                    self.metrics_processor.reset_val_counters()
+                    with record_span("trainer_time/validation_s", EventType.EVAL):
+                        self.validator.validate(self.model_parts, self.step)
+
+                if self.metrics_processor.should_log(self.step):
+                    self.metrics_processor.log(self.step, is_validation=is_validation)
 
                 # signal the profiler that the next profiling step has started
                 if torch_profiler:

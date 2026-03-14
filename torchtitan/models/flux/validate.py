@@ -14,11 +14,12 @@ from torch.distributed.pipelining.schedules import _PipelineSchedule
 
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.loss import LossFunction
-from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.components.validate import ValidationContext, Validator
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.observability import NoOpMetric, record_metric
+from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.tools.logging import logger
 
 from .flux_datasets import FluxDataLoader
@@ -295,8 +296,6 @@ class FluxValidator(Validator):
             )
         else:
             global_avg_loss = loss.item()
-
-        from torchtitan.observability import NoOpMetric, record_metric
 
         record_metric("validation/loss_mean", NoOpMetric(value=global_avg_loss))
         self.metrics_processor.record_throughput(is_validation=True)

@@ -20,6 +20,13 @@ from torchtitan.models.flux.utils import (
     pack_latents,
     preprocess_data,
 )
+from torchtitan.observability import (
+    EventType,
+    NoOpMetric,
+    record_event,
+    record_metric,
+    record_span,
+)
 from torchtitan.trainer import Trainer
 
 
@@ -223,11 +230,9 @@ class FluxTrainer(Trainer):
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
         self.optimizers.zero_grad()
-        # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
+        record_metric("training/lr", NoOpMetric(value=lr))
 
-        # Keep these variables local to shorten the code as these are
-        # the major variables that are used in the training loop.
         parallel_dims = self.parallel_dims
 
         if self.gradient_accumulation_steps > 1:
@@ -236,50 +241,58 @@ class FluxTrainer(Trainer):
         # pyrefly: ignore [no-matching-overload]
         input_dict, labels = next(data_iterator)
 
-        loss = self.forward_backward_step(input_dict=input_dict, labels=labels)
+        with record_span("trainer_time/forward_backward_s", EventType.FWD_BWD):
+            loss = self.forward_backward_step(input_dict=input_dict, labels=labels)
 
-        grad_norm = dist_utils.clip_grad_norm_(
-            [p for m in self.model_parts for p in m.parameters()],
-            self.config.training.max_norm,
-            foreach=True,
-            pp_mesh=parallel_dims.get_optional_mesh("pp"),
-            ep_enabled=parallel_dims.ep_enabled,
-        )
-        self.checkpointer.maybe_wait_for_staging()
-        self.optimizers.step()
-        self.lr_schedulers.step()
-
-        # log metrics
-        if not self.metrics_processor.should_log(self.step):
-            return
-
-        if parallel_dims.dp_cp_enabled:
-            loss = loss.detach()
-            loss_mesh = parallel_dims.get_optional_mesh("loss")
-
-            # NOTE: the loss returned by train
-            global_avg_loss, global_max_loss, global_ntokens_seen = (
-                dist_utils.dist_sum(loss, loss_mesh),
-                dist_utils.dist_max(loss, loss_mesh),
-                dist_utils.dist_sum(
-                    torch.tensor(
-                        self.ntokens_seen, dtype=torch.int64, device=self.device
-                    ),
-                    loss_mesh,
-                ),
+        with record_span("trainer_time/optimizer_s", EventType.OPTIM):
+            grad_norm = dist_utils.clip_grad_norm_(
+                [p for m in self.model_parts for p in m.parameters()],
+                self.config.training.max_norm,
+                foreach=True,
+                pp_mesh=parallel_dims.get_optional_mesh("pp"),
+                ep_enabled=parallel_dims.ep_enabled,
             )
-        else:
-            global_avg_loss = global_max_loss = loss.detach().item()
-            global_ntokens_seen = self.ntokens_seen
+            self.checkpointer.maybe_wait_for_staging()
+            self.optimizers.step()
+            self.lr_schedulers.step()
 
-        extra_metrics = {
-            "n_tokens_seen": global_ntokens_seen,
-            "lr": lr,
-        }
-        self.metrics_processor.log(
-            self.step,
-            global_avg_loss,
-            global_max_loss,
-            grad_norm.item(),
-            extra_metrics=extra_metrics,
-        )
+        if self.metrics_processor.should_log(self.step):
+            with record_span("trainer_time/collect_dist_metrics_s"):
+                if parallel_dims.dp_cp_enabled:
+                    loss = loss.detach()
+                    loss_mesh = parallel_dims.get_optional_mesh("loss")
+
+                    global_avg_loss, global_max_loss, global_ntokens_seen = (
+                        dist_utils.dist_sum(loss, loss_mesh),
+                        dist_utils.dist_max(loss, loss_mesh),
+                        dist_utils.dist_sum(
+                            torch.tensor(
+                                self.ntokens_seen,
+                                dtype=torch.int64,
+                                device=self.device,
+                            ),
+                            loss_mesh,
+                        ),
+                    )
+                else:
+                    global_avg_loss = global_max_loss = loss.detach().item()
+                    global_ntokens_seen = self.ntokens_seen
+
+                record_metric("training/loss_mean", NoOpMetric(value=global_avg_loss))
+                record_metric("training/loss_max", NoOpMetric(value=global_max_loss))
+                record_metric(
+                    "training/grad_norm_max", NoOpMetric(value=grad_norm.item())
+                )
+                record_metric(
+                    "training/n_tokens_sum", NoOpMetric(value=global_ntokens_seen)
+                )
+                record_event(
+                    {
+                        "train.loss": global_avg_loss,
+                        "train.max_loss": global_max_loss,
+                        "train.grad_norm": grad_norm.item(),
+                    }
+                )
+
+        self.metrics_processor.record_memory()
+        self.metrics_processor.record_throughput()

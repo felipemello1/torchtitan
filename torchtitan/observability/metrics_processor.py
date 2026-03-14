@@ -13,11 +13,7 @@ from typing import Any
 
 import torch
 
-from torchtitan.components.metrics import (
-    _get_metrics_rank,
-    build_device_memory_monitor,
-    ensure_pp_loss_visible,
-)
+from torchtitan.components.metrics import build_device_memory_monitor
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
 from torchtitan.observability.aggregation import logging_worker
@@ -31,7 +27,6 @@ from torchtitan.observability.metrics import (
 from torchtitan.observability.step_state import set_step
 from torchtitan.observability.structured_logging import record_event
 from torchtitan.tools import utils
-from torchtitan.tools.utils import Color
 
 
 class MetricsProcessor(Configurable):
@@ -88,7 +83,6 @@ class MetricsProcessor(Configurable):
         *,
         parallel_dims: ParallelDims,
         dump_folder: str = "./outputs",
-        pp_schedule: str = "1F1B",
         ft_enable: bool = False,
         ft_replica_id: int = 0,
         config_dict: dict[str, Any] | None = None,
@@ -116,17 +110,8 @@ class MetricsProcessor(Configurable):
         self.reset_training_counters()
         self.reset_val_counters()
 
-        # Determine which rank runs the logging subprocess
-        self._metrics_rank = _get_metrics_rank(
-            parallel_dims=parallel_dims, pp_schedule=pp_schedule
-        )
-        ensure_pp_loss_visible(
-            parallel_dims=parallel_dims,
-            pp_schedule=pp_schedule,
-            color=Color(),
-        )
-
-        # Spawn the logging subprocess on the metrics rank.
+        # Rank 0 runs a background process that reads experiment JSONL
+        # from all ranks, reduces metrics, and logs to WandB/TB/console.
         needs_subprocess = (
             config.enable_wandb
             or config.enable_tensorboard
@@ -134,7 +119,7 @@ class MetricsProcessor(Configurable):
         )
         self._log_queue: multiprocessing.Queue | None = None
         self._log_process: multiprocessing.Process | None = None
-        if torch.distributed.get_rank() == self._metrics_rank and needs_subprocess:
+        if torch.distributed.get_rank() == 0 and needs_subprocess:
             self._log_queue = multiprocessing.Queue()
             self._log_process = multiprocessing.Process(
                 target=logging_worker,
@@ -159,7 +144,13 @@ class MetricsProcessor(Configurable):
     # ----
 
     def set_step(self, step: int, force_log: bool = False) -> None:
-        """Set current step. Call at the top of each training iteration."""
+        """Set current step. Call before train_step().
+
+        Args:
+            step: Current training step number.
+            force_log: When True, should_log() returns True regardless of
+                schedule. Used to ensure loss is computed on validation steps.
+        """
         self._step = step
         self._force_log = force_log
         set_step(step)
@@ -190,7 +181,7 @@ class MetricsProcessor(Configurable):
         self.device_memory_monitor.reset_peak_stats()
 
     # ----
-    # Derived metrics (called every step, outside should_log gate)
+    # Derived metrics
     # ----
 
     def record_throughput(self, is_validation: bool = False) -> None:
@@ -249,7 +240,11 @@ class MetricsProcessor(Configurable):
     # ----
 
     def log(self, step: int, is_validation: bool = False) -> None:
-        """Signal the logging subprocess to aggregate and write."""
+        """Signal the logging subprocess to aggregate and write.
+
+        All ranks participate in the barrier so the subprocess can read
+        all JSONL files. Non-blocking after barrier (~0.1ms).
+        """
         torch.distributed.barrier()
         if self._log_queue is not None:
             self._log_queue.put((step, is_validation))
