@@ -22,6 +22,7 @@ from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX, LossFunction
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.metrics import ensure_pp_loss_visible
 from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.observability import (
     EventType,
@@ -218,6 +219,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # Initialize observability: adds JSONL file handlers for system
         # and experiment metrics. Console handler is already set up by init_logger.
+        # TODO: init_observability should replace init_logger (called in train.py)
         init_observability(
             source="trainer",
             output_dir=config.dump_folder,
@@ -392,6 +394,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     cast(Decoder, m).init_weights(buffer_device=buffer_device)
                 m.train()
 
+            # TODO: should we remove this?
+            # confirm that user will be able to view loss metrics on the console
+            ensure_pp_loss_visible(
+                parallel_dims=parallel_dims,
+                pp_schedule=config.parallelism.pipeline_parallel_schedule,
+                color=color,
+            )
         else:
             # apply Tensor/Context/Expert Parallel, activation checkpointing, torch.compile, Data Parallel
             model = model_spec.parallelize_fn(
@@ -441,6 +450,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 self.model_parts
             )
         )
+        self.metrics_processor.optimizers = self.optimizers
+        self.metrics_processor.model_parts = self.model_parts
+
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
@@ -697,6 +709,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.optimizers.zero_grad()
         # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
+        record_metric("training/lr", NoOpMetric(value=lr))
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
@@ -753,20 +766,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Derived metrics recorded every step (cheap, outside should_log gate)
         self.metrics_processor.record_throughput()
         self.metrics_processor.record_memory()
-        record_metric("training/lr", NoOpMetric(value=lr))
 
         # Loss/grad_norm only on log steps (.item() triggers GPU→CPU sync)
         if not self.metrics_processor.should_log(self.step):
             return
 
-        with record_span(
-            "trainer_time/collect_dist_metrics_s", EventType.SUMMARY_WRITER
-        ):
+        with record_span("trainer_time/collect_dist_metrics_s"):
             if parallel_dims.dp_cp_enabled:
                 loss = loss.detach()
                 loss_mesh = parallel_dims.get_optional_mesh("loss")
 
-                # global_avg_loss = sum(local_loss_sum / global_valid_tokens)
+                # For global_avg_loss, we want the average loss across all ranks:
+                # loss = local_loss_sum / global_valid_tokens
+                # global_avg_loss = sum(local_loss_sum) / global_valid_tokens
+                #                 = sum(loss)
                 global_avg_loss = dist_utils.dist_sum(loss, loss_mesh)
                 global_ntokens_seen = dist_utils.dist_sum(
                     torch.tensor(
