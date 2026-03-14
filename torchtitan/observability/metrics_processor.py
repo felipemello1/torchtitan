@@ -25,7 +25,6 @@ from torchtitan.observability.logging_boundary import EveryNSteps
 from torchtitan.observability.metrics import (
     MaxMetric,
     MeanMetric,
-    NoOpMetric,
     record_metric,
     SumMetric,
 )
@@ -99,6 +98,7 @@ class MetricsProcessor(Configurable):
         self.config = config
         self._has_quantization = has_quantization
         self.parallel_dims = parallel_dims
+        self._step = 0
         self._force_log = False
 
         # Schedule: log on step 1 + every log_freq steps
