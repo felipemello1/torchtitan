@@ -88,7 +88,7 @@ def to_chrome_trace(log_dir: str, output_path: str) -> dict:
 
         if event_type.endswith("_start"):
             type_name = event_type.removesuffix("_start")
-            display_name = normal.get("event_name") or type_name
+            display_name = type_name or normal.get("event_name", type_name)
             pending_starts[(type_name, pid, rank)] = {
                 "ts": time_us, "step": step, "display_name": display_name,
             }
@@ -132,7 +132,7 @@ def to_chrome_trace(log_dir: str, output_path: str) -> dict:
 
     print(f"Chrome Trace: {output_path}")
     print(f"  {len(events)} events from {len(sources)} sources")
-    print(f"  View in: chrome://tracing or https://ui.perfetto.dev")
+    print("  View in: chrome://tracing or https://ui.perfetto.dev")
     return trace
 
 
