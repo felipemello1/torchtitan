@@ -29,7 +29,7 @@ from torchtitan.observability import (
 )
 from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.tools import utils
-from torchtitan.tools.logging import logger
+from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.profiling import (
     maybe_enable_memory_snapshot,
     maybe_enable_profiling,
@@ -327,6 +327,7 @@ class Trainer(ForgeEngine):
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 
+        # log metrics
         if self.metrics_processor.should_log(self.step):
             with record_span("trainer_time/collect_dist_metrics_s"):
                 if parallel_dims.dp_cp_enabled:
@@ -405,6 +406,8 @@ class Trainer(ForgeEngine):
             data_iterator = self.batch_generator(self.dataloader)
             while self.step < config.training.steps:
                 self.step += 1
+                # Reset metric training counters and force logging
+                # this step if validation step
                 is_validation = (
                     config.validator.enable
                     and self.validator.should_validate(self.step)
@@ -465,6 +468,8 @@ class Trainer(ForgeEngine):
 
 def main(custom_trainer_class: type[Trainer] | None = None) -> None:
     """Main entry point for training."""
+    init_logger()
+
     config_manager = ConfigManager()
     config = config_manager.parse_args()
 

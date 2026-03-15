@@ -743,6 +743,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 
+        # log metrics
         if self.metrics_processor.should_log(self.step):
             with record_span("trainer_time/collect_dist_metrics_s"):
                 if parallel_dims.dp_cp_enabled:
@@ -823,6 +824,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
                 self.step += 1
+                # Reset metric training counters and force logging
+                # this step if validation step
                 is_validation = (
                     self.config.validator.enable
                     and self.validator.should_validate(self.step)

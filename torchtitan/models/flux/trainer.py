@@ -253,6 +253,7 @@ class FluxTrainer(Trainer):
         self.optimizers.step()
         self.lr_schedulers.step()
 
+        # log metrics
         if self.metrics_processor.should_log(self.step):
             with record_span("trainer_time/collect_dist_metrics_s"):
                 if parallel_dims.dp_cp_enabled:

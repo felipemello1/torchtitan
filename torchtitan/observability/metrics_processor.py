@@ -33,9 +33,8 @@ class MetricsProcessor(Configurable):
     """Metrics recording, derived metrics, and logging subprocess.
 
     Records training/validation metrics to experiment JSONL via record_metric.
-    A background subprocess reads JSONL, aggregates across ranks, and writes
-    to WandB/TB/console. The training process only pays ~0.1ms per log step
-    (queue.put cost).
+    A non-blocking background subprocess reads JSONL, aggregates across ranks,
+    and writes to WandB/TB/console.
     """
 
     _TRAIN_PREFIX = "trainer"
