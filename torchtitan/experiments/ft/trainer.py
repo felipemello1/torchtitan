@@ -405,9 +405,12 @@ class FaultTolerantTrainer(Trainer):
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
         self.optimizers.zero_grad()
+        # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
         record_metric("training/lr", NoOpMetric(value=lr))
 
+        # Keep these variables local to shorten the code as these are
+        # the major variables that are used in the training loop.
         parallel_dims = self.parallel_dims
 
         # Collect all microbatches on CPU and count total valid tokens
@@ -419,6 +422,7 @@ class FaultTolerantTrainer(Trainer):
             microbatches.append((input_dict, labels))
 
         # All-reduce to get global token count across DP ranks
+        # Move to GPU for distributed communication
         local_valid_tokens = local_valid_tokens.to(self.device)
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
@@ -430,6 +434,7 @@ class FaultTolerantTrainer(Trainer):
         with record_span("trainer_time/forward_backward_s", EventType.FWD_BWD):
             accumulated_losses = []
             for input_dict, labels in microbatches:
+                # Move tensors to GPU
                 for k, v in input_dict.items():
                     if isinstance(v, torch.Tensor):
                         input_dict[k] = v.to(self.device)
@@ -466,6 +471,15 @@ class FaultTolerantTrainer(Trainer):
                     ft_pg = self.ft_manager.loss_sync_pg
                     loss_mesh = parallel_dims.get_optional_mesh("loss")
 
+                    # For global_avg_loss, we want the average loss across all ranks:
+                    # loss = local_loss_sum / global_valid_tokens
+                    # global_avg_loss = sum(local_loss_sum) / global_valid_tokens
+                    #                 = sum(loss)
+                    #
+                    # For global_max_loss, we want the max of local average losses:
+                    # local_avg_loss = local_loss_sum / local_valid_tokens
+                    #                = (loss * global_valid_tokens) / local_valid_tokens
+                    # global_max_loss = max(local_avg_loss)
                     local_avg_loss = loss * global_valid_tokens / local_valid_tokens
                     global_avg_loss, global_max_loss, global_ntokens_seen = (
                         dist_utils.dist_sum(loss, loss_mesh, ft_pg),
