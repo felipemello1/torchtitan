@@ -33,7 +33,7 @@ def load_all_records(log_dir: str) -> list[dict]:
     return records
 
 
-def to_chrome_trace(log_dir: str, output_path: str) -> dict:
+def generate_gantt_trace(log_dir: str, output_path: str) -> dict:
     """Convert system_logs/*.jsonl (from record_span) to Chrome Trace JSON.
 
     Reads system JSONL files only — NOT experiment JSONL. For experiment
@@ -141,4 +141,4 @@ if __name__ == "__main__":
     if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(1)
-    to_chrome_trace(sys.argv[1], sys.argv[2])
+    generate_gantt_trace(sys.argv[1], sys.argv[2])
