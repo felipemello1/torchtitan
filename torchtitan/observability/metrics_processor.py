@@ -92,6 +92,7 @@ class MetricsProcessor(Configurable):
         self.config = config
         self._has_quantization = has_quantization
         self.parallel_dims = parallel_dims
+        self._step = 0
         self._force_log = False
 
         # Schedule: log on step 1 + every log_freq steps
