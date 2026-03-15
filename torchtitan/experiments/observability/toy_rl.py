@@ -46,6 +46,7 @@ from torchtitan.observability import (
     set_step,
 )
 from torchtitan.observability.analysis import to_chrome_trace
+from torchtitan.tools.logging import init_logger
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -114,6 +115,7 @@ class RollouterActor(Actor):
     @endpoint
     async def setup(self):
         rank = current_rank().rank
+        init_logger()
         init_observability(source="rollouter", output_dir=OUTPUT_DIR, rank=rank)
         dataset = setup_data(batch_size=DP_SIZE * BATCH_SIZE)
         self.dataset = dataset
@@ -160,6 +162,7 @@ class TrainerActor(Actor):
             torch.distributed.init_process_group(
                 backend="nccl", rank=rank, world_size=world_size
             )
+        init_logger()
         init_observability(source="trainer", output_dir=OUTPUT_DIR, rank=rank)
         mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
         self.dp_rank = mesh["dp"].get_local_rank()
@@ -198,6 +201,7 @@ class RewardActor(Actor):
     @endpoint
     async def setup(self):
         rank = current_rank().rank
+        init_logger()
         init_observability(source="reward", output_dir=OUTPUT_DIR, rank=rank)
 
     @endpoint
@@ -226,6 +230,7 @@ async def main():
         shutil.rmtree(OUTPUT_DIR)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    init_logger()
     init_observability(source="controller", output_dir=OUTPUT_DIR, rank=0)
 
     # ---- Setup ----

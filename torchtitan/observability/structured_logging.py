@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import socket
-import sys
 import threading
 import time
 from contextlib import ContextDecorator
@@ -352,17 +351,19 @@ _system_logger = logging.getLogger(SYSTEM_LOGGER_NAME)
 
 
 def init_observability(source: str, output_dir: str, rank: int | None = None) -> None:
-    """Initialize observability: console logging + JSONL file handlers.
+    """Initialize observability JSONL file handlers.
 
-    Sets up the root logger with a console StreamHandler and per-rank
-    system JSONL file handlers. Call once per process before any logging.
+    Adds per-rank system and experiment JSONL handlers for structured
+    logging. Does NOT set up console logging — call ``init_logger()``
+    from ``torchtitan.tools.logging`` for that.
 
-    Idempotent: safe to call multiple times (skips if already initialized).
+    Idempotent: safe to call multiple times (skips existing handlers).
     Can be called before torch.distributed init — rank defaults to the
     RANK environment variable (set by torchrun).
 
     Example::
 
+        init_logger()  # console
         init_observability(source="trainer", output_dir="./outputs")
         # Creates: ./outputs/system_logs/trainer_rank_0_system.jsonl
 
@@ -373,25 +374,6 @@ def init_observability(source: str, output_dir: str, rank: int | None = None) ->
     """
     if rank is None:
         rank = int(os.environ.get("RANK", 0))
-
-    # --- Console handler ---
-    root_logger = logging.getLogger()
-    if not any(
-        isinstance(h, logging.StreamHandler)
-        and getattr(h, "stream", None) is sys.stdout
-        for h in root_logger.handlers
-    ):
-        root_logger.setLevel(logging.INFO)
-        root_logger.handlers.clear()
-        ch = logging.StreamHandler(sys.stdout)
-        ch.setLevel(logging.INFO)
-        formatter = logging.Formatter(
-            "[titan] %(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-        ch.setFormatter(formatter)
-        root_logger.addHandler(ch)
-        # Suppress verbose torch.profiler logging
-        os.environ["KINETO_LOG_LEVEL"] = "5"
 
     # --- System handler ---
     sys_logger = logging.getLogger(SYSTEM_LOGGER_NAME)

@@ -43,6 +43,7 @@ from torchtitan.observability import (
     record_span,
 )
 from torchtitan.observability.analysis import to_chrome_trace
+from torchtitan.tools.logging import init_logger
 
 # ---- Config ----
 NUM_STEPS = 20
@@ -162,7 +163,7 @@ class ToyTrainer:
         self.step = 0
 
         self.metrics_processor = MetricsProcessor()
-        
+
         torch.manual_seed(0)
         with record_span("setup/model_build", EventType.BUILD_MODEL):
             model = TinyModel().to(device)
@@ -332,6 +333,7 @@ def main():
     dist.barrier()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    init_logger()
     init_observability(source="trainer", output_dir=OUTPUT_DIR, rank=rank)
 
     mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
