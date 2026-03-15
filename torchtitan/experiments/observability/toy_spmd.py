@@ -46,7 +46,7 @@ from torchtitan.observability import (
     record_metric,
     record_span,
 )
-from torchtitan.observability.analysis import to_chrome_trace
+from torchtitan.observability.analysis import generate_gantt_trace
 from torchtitan.tools.logging import init_logger
 
 # ---- Config ----
@@ -364,7 +364,7 @@ def main():
     if rank == 0:
         sys_logs = os.path.join(OUTPUT_DIR, "system_logs")
         trace_path = os.path.join(OUTPUT_DIR, "analysis", "system_metrics_gantt.json")
-        to_chrome_trace(sys_logs, trace_path)
+        generate_gantt_trace(sys_logs, trace_path)
         print(f"\nDone. Output: {OUTPUT_DIR}")
     dist.destroy_process_group()
 
