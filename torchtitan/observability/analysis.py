@@ -80,8 +80,9 @@ def to_chrome_trace(log_dir: str, output_path: str) -> dict:
     for r in records:
         normal = r.get("normal", {})
         event_type = normal.get("log_type_name", "")
-        time_ms = r.get("int", {}).get("time_ms", 0)
-        time_us = time_ms * 1000  # Chrome Trace uses microseconds
+        # Prefer microsecond timestamps; fall back to milliseconds for older logs
+        int_fields = r.get("int", {})
+        time_us = int_fields.get("time_us", int_fields.get("time_ms", 0) * 1000)
         pid = source_to_pid[r["_source_file"]]
         rank = r.get("int", {}).get("rank", 0)
         step = r.get("int", {}).get("step")
