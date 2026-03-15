@@ -573,7 +573,7 @@ class TestRecordSpan:
 
 
 class TestChromeTrace:
-    """Tests for to_chrome_trace in analysis.py."""
+    """Tests for generate_gantt_trace in analysis.py."""
 
     def test_same_event_type_different_descriptions(self, tmp_path, system_logger):
         """Two sequential spans with the same EventType must both appear
@@ -584,7 +584,7 @@ class TestChromeTrace:
         EventType as the key, so the second span's start overwrote the
         first, losing one span from the output.
         """
-        from torchtitan.observability.analysis import to_chrome_trace
+        from torchtitan.observability.analysis import generate_gantt_trace
 
         init_observability(rank=0, source="controller", output_dir=str(tmp_path))
         set_step(1)
@@ -597,7 +597,7 @@ class TestChromeTrace:
 
         log_dir = os.path.join(str(tmp_path), "system_logs")
         trace_path = os.path.join(str(tmp_path), "trace.json")
-        trace = to_chrome_trace(log_dir, trace_path)
+        trace = generate_gantt_trace(log_dir, trace_path)
 
         span_names = [
             e["name"] for e in trace["traceEvents"] if e.get("ph") == "X"
@@ -609,7 +609,7 @@ class TestChromeTrace:
 
     def test_no_event_type_uses_description_in_trace(self, tmp_path, system_logger):
         """Spans without EventType use description as the trace name."""
-        from torchtitan.observability.analysis import to_chrome_trace
+        from torchtitan.observability.analysis import generate_gantt_trace
 
         init_observability(rank=0, source="test", output_dir=str(tmp_path))
         set_step(1)
@@ -618,7 +618,7 @@ class TestChromeTrace:
 
         log_dir = os.path.join(str(tmp_path), "system_logs")
         trace_path = os.path.join(str(tmp_path), "trace.json")
-        trace = to_chrome_trace(log_dir, trace_path)
+        trace = generate_gantt_trace(log_dir, trace_path)
 
         span_names = [
             e["name"] for e in trace["traceEvents"] if e.get("ph") == "X"
