@@ -38,6 +38,7 @@ from torchtitan.observability.structured_logging import (
     StructuredLoggingHandler,
     to_structured_json,
 )
+from torchtitan.observability.analysis import generate_gantt_trace
 
 
 # ---------------------------------------------------------------------------
@@ -583,8 +584,6 @@ class TestChromeTrace:
         EventType as the key, so the second span's start overwrote the
         first, losing one span from the output.
         """
-        from torchtitan.observability.analysis import generate_gantt_trace
-
         init_observability(rank=0, source="controller", output_dir=str(tmp_path))
         set_step(1)
         with record_span("rl_time/training_s", EventType.FWD_BWD):
@@ -608,8 +607,6 @@ class TestChromeTrace:
 
     def test_no_event_type_uses_description_in_trace(self, tmp_path, system_logger):
         """Spans without EventType use description as the trace name."""
-        from torchtitan.observability.analysis import generate_gantt_trace
-
         init_observability(rank=0, source="test", output_dir=str(tmp_path))
         set_step(1)
         with record_span("my_custom/span_s"):

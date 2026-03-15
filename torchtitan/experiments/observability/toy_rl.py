@@ -41,7 +41,6 @@ from torchtitan.experiments.observability.toy_spmd import (
 from torchtitan.observability import (
     EventType,
     init_observability,
-    record_event,
     record_span,
     set_step,
 )
