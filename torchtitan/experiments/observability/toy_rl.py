@@ -45,7 +45,6 @@ from torchtitan.observability import (
     init_observability,
     logging_worker,
     MeanMetric,
-    record_event,
     record_metric,
     record_span,
     RolloutLogger,
