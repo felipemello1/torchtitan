@@ -228,6 +228,7 @@ class StructuredJSONFormatter(logging.Formatter):
 
         log_dict["time"] = int(record.created)
         log_dict["time_ms"] = int(record.created * 1000)
+        log_dict["time_us"] = int(record.created * 1_000_000)
 
         log_dict["log_type"] = getattr(
             record, str(ExtraFields.LOG_TYPE), str(LogType.TEXT)
