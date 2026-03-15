@@ -47,6 +47,7 @@ from torchtitan.observability import (
     record_span,
 )
 from torchtitan.observability.analysis import to_chrome_trace
+from torchtitan.tools.logging import init_logger
 
 # ---- Config ----
 NUM_STEPS = 20
@@ -338,6 +339,7 @@ def main():
     dist.barrier()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    init_logger()
     init_observability(source="trainer", output_dir=OUTPUT_DIR, rank=rank)
 
     mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
