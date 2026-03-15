@@ -10,17 +10,19 @@ import torch
 
 from torchtitan.config import ConfigManager
 from torchtitan.observability import EventType, init_observability, record_span
-from torchtitan.tools.logging import logger
+from torchtitan.tools.logging import init_logger, logger
 from torchtitan.trainer import Trainer
 
 
 def main() -> None:
     """Main entry point for training."""
+    init_logger()
+
     config_manager = ConfigManager()
     config = config_manager.parse_args()
 
-    # Console + JSONL logging. Called before Trainer so record_span
-    # works during initialization. Rank is read from RANK env var.
+    # JSONL file handlers for structured logging. Called before Trainer
+    # so record_span works during initialization.
     # pyrefly: ignore [missing-attribute]
     init_observability(source="trainer", output_dir=config.dump_folder)
 
