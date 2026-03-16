@@ -115,4 +115,6 @@ class TestExperimentJSONL:
                         loss_steps.add(record["step"])
         # With log_freq=5 and 20 steps, loss appears on steps {1, 5, 10, 15, 20}
         assert loss_steps, "No loss entries found"
-        assert 2 not in loss_steps, f"Step 2 should not have loss (log_freq=5). Steps: {loss_steps}"
+        assert (
+            2 not in loss_steps
+        ), f"Step 2 should not have loss (log_freq=5). Steps: {loss_steps}"

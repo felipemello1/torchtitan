@@ -16,6 +16,7 @@ import json
 import os
 import sys
 from glob import glob
+from typing import Any
 
 
 def load_all_records(log_dir: str) -> list[dict]:
@@ -59,7 +60,7 @@ def generate_gantt_trace(log_dir: str, output_path: str) -> dict:
     sources = sorted(set(r["_source_file"] for r in records))
     source_to_pid = {s: i for i, s in enumerate(sources)}
 
-    events = []
+    events: list[dict[str, Any]] = []
 
     # Process name metadata
     for source, pid in source_to_pid.items():
@@ -110,7 +111,10 @@ def generate_gantt_trace(log_dir: str, output_path: str) -> dict:
                     "dur": duration_us,
                     "pid": pid,
                     "tid": rank,
-                    "args": {"step": step, "duration_ms": f"{duration_ms:.2f}"},
+                    "args": {
+                        **({"step": step} if step is not None else {}),
+                        "duration_ms": f"{duration_ms:.2f}",
+                    },
                 }
             )
         elif event_type == "metric_value":

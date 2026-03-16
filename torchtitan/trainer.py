@@ -697,7 +697,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.optimizers.zero_grad()
         # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
-        record_metric("training/lr", NoOpMetric(value=lr))
+        record_metric("training/lr", NoOpMetric(value=float(lr)))
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.

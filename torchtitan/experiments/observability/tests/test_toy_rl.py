@@ -34,9 +34,7 @@ def experiment_logs_dir():
 def rollout_dir():
     path = os.path.join(OUTPUT_DIR, "rollouts")
     if not os.path.isdir(path):
-        pytest.fail(
-            f"No rollouts at {path}. Run toy_rl first to generate outputs."
-        )
+        pytest.fail(f"No rollouts at {path}. Run toy_rl first to generate outputs.")
     return path
 
 
@@ -75,9 +73,15 @@ class TestRolloutLogger:
                     record = json.loads(line)
                     assert "reward" in record, f"Missing reward in rollout: {record}"
                     assert "prompt" in record, f"Missing prompt in rollout: {record}"
-                    assert "completion" in record, f"Missing completion in rollout: {record}"
-                    assert "__metadata__" in record, f"Missing __metadata__ in rollout: {record}"
-                    assert "step" in record["__metadata__"], f"Missing step in __metadata__: {record}"
+                    assert (
+                        "completion" in record
+                    ), f"Missing completion in rollout: {record}"
+                    assert (
+                        "__metadata__" in record
+                    ), f"Missing __metadata__ in rollout: {record}"
+                    assert (
+                        "step" in record["__metadata__"]
+                    ), f"Missing step in __metadata__: {record}"
                     return  # One record is enough
 
     def test_rollout_filter_applied(self, rollout_dir):
@@ -95,4 +99,6 @@ class TestRolloutLogger:
                     records_per_step[step] = records_per_step.get(step, 0) + 1
 
         for step, count in records_per_step.items():
-            assert count <= 4, f"Step {step} has {count} records (expected <=4 with k=2)"
+            assert (
+                count <= 4
+            ), f"Step {step} has {count} records (expected <=4 with k=2)"
