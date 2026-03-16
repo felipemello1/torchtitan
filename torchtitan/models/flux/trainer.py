@@ -230,7 +230,7 @@ class FluxTrainer(Trainer):
     ):
         self.optimizers.zero_grad()
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
-        record_metric("training/lr", NoOpMetric(value=lr))
+        record_metric("training/lr", NoOpMetric(value=float(lr)))
 
         parallel_dims = self.parallel_dims
 
