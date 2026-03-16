@@ -91,33 +91,7 @@ automatically includes `rank`, `source`, `caller` (file:line:function), and
 
 
 
-<<<<<<< Updated upstream
-set_step(42)              # stamps all subsequent JSONL entries with step=42
-add_step_tag("gc")        # annotate: GC ran this step
-add_step_tag("eval")      # annotate: validation ran this step
-clear_step_tags()         # reset tags (called at the start of each step)
-```
-
-Step and tags are stored as module-level globals — one value per process.
-These tags and steps could be used for custom aggregation, e.g. in RL
-aggregate scores per policy version.
-
-## 4. Experiment Metrics: record_metric
-
-```python
-from torchtitan.observability.metrics import (
-    record_metric, MeanMetric, MaxMetric, SumMetric, MinMetric, NoOpMetric,
-)
-
-record_metric("trainer_throughput/tps_mean", MeanMetric(sum=1234.5, weight=262))
-record_metric("trainer_gradient/norm_max", MaxMetric(value=12.3))
-record_metric("trainer_memory/ooms_sum", SumMetric(value=0))
-record_metric("loss/trainer_loss_mean", NoOpMetric(value=0.038))  # already all_reduced
-record_metric("trainer_schedule/lr", NoOpMetric(value=3e-4))      # same on all ranks
-```
-=======
 ## Experiment Metrics: record_metric
->>>>>>> Stashed changes
 
 Each call serializes to experiment JSONL immediately. Step comes from
 `set_step()`. Rank, source, caller, and timestamp are added automatically.
@@ -338,19 +312,6 @@ Open in `chrome://tracing` or Perfetto to see a Gantt chart of every
 Example output from toy_rl (view in chrome://tracing or https://ui.perfetto.dev):
 
 ```
-<<<<<<< Updated upstream
-observability/
-    __init__.py             # Public API re-exports
-    step_state.py           # Globals: _STEP, _STEP_TAGS, set_step, add_step_tag, clear_step_tags
-    _constants.py           # Logger names, metric entry markers (import cycle breaker)
-    structured_logging.py   # System pipeline: init_observability, record_span, record_event, EventType
-    metrics.py              # Experiment pipeline: record_metric, MetricValue types, REDUCE_REGISTRY
-    aggregation.py          # aggregate() + logging_worker subprocess + JSONL readers
-    logging_boundary.py     # EveryNSteps schedule
-    rollout_logger.py       # RL: RolloutLogger, filter_top_bottom
-    analysis.py             # Post-training: generate_gantt_trace (Gantt chart from system JSONL)
-    README.md               # This file
-=======
                        step 1                              step 2
                   ┌──────────────────────────┐       ┌───────────────────────────┐
 trainer rank 0    │ ▓▓ fwd_bwd ▓▓  ▓ optim ▓ │       │ ▓ fwd_bwd ▓▓ ▓▓ optim ▓   │
@@ -422,5 +383,4 @@ in each record to avoid key collisions.
 ├── analysis/
 │   └── system_metrics_gantt.json      ← analysis.py:generate_gantt_trace output
 └── tb/                                ← TensorBoard logs (when enabled)
->>>>>>> Stashed changes
 ```
