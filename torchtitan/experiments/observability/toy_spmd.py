@@ -23,7 +23,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.parallel import (
@@ -33,8 +32,8 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
 )
 
+from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.utils import clip_grad_norm_
-from torchtitan.experiments.observability.metrics_processor import MetricsProcessor
 from torchtitan.observability import (
     add_step_tag,
     EventType,
@@ -46,6 +45,7 @@ from torchtitan.observability import (
     record_span,
 )
 from torchtitan.observability.analysis import generate_gantt_trace
+from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.tools.logging import init_logger
 
 # ---- Config ----
@@ -159,8 +159,13 @@ class ToyTrainer:
     - train: owns the training loop
     """
 
-    def __init__(self, device, dp_mesh, tp_mesh, output_dir, *, mp_config=None):
+    def __init__(
+        self, device, parallel_dims: ParallelDims, output_dir, *, mp_config=None
+    ):
         self.device = device
+        self.parallel_dims = parallel_dims
+        dp_mesh = parallel_dims.get_mesh("fsdp")
+        tp_mesh = parallel_dims.get_mesh("tp")
         self.dp_mesh = dp_mesh
         self.rank = dist.get_rank()
         self.output_dir = output_dir
@@ -169,9 +174,7 @@ class ToyTrainer:
         if mp_config is None:
             mp_config = MetricsProcessor.Config()
         self.metrics_processor = mp_config.build(
-            dump_folder=output_dir,
-            rank=self.rank,
-            non_data_parallel_size=tp_mesh.size(),
+            parallel_dims=parallel_dims, dump_folder=output_dir
         )
 
         torch.manual_seed(0)
@@ -281,8 +284,8 @@ class ToyTrainer:
             self.optimizer.step()
 
         # Derived metrics recorded every step (cheap, outside should_log gate)
-        self.metrics_processor.record_throughput()
         self.metrics_processor.record_memory()
+        self.metrics_processor.record_throughput()
         record_metric("training/lr", NoOpMetric(value=LR))
 
         # Loss/grad_norm only on log steps (.item() triggers GPU→CPU sync)
@@ -315,8 +318,8 @@ class ToyTrainer:
             val_loss_scalar, op=dist.ReduceOp.SUM, group=self.dp_mesh.get_group()
         )
         record_metric("validation/loss_mean", NoOpMetric(value=val_loss_scalar.item()))
-        self.metrics_processor.record_throughput(is_validation=True)
         self.metrics_processor.record_memory(is_validation=True)
+        self.metrics_processor.record_throughput(is_validation=True)
 
     def train(self, num_steps):
         """Full training loop. Mirrors Trainer.train structure."""
@@ -369,7 +372,17 @@ def main():
     init_logger()
     init_observability(source="trainer", output_dir=OUTPUT_DIR, rank=rank)
 
-    mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
+    parallel_dims = ParallelDims(
+        dp_replicate=1,
+        dp_shard=DP_SIZE,
+        cp=1,
+        tp=world_size // DP_SIZE,
+        pp=1,
+        ep=1,
+        etp=1,
+        world_size=world_size,
+    )
+    parallel_dims.build_mesh()
 
     if rank == 0:
         print(f"Toy SPMD: {world_size} GPUs, 2DPx2TP, {NUM_STEPS} steps")
@@ -389,9 +402,7 @@ def main():
             "validator_throughput/tps_mean",
         ],
     )
-    trainer = ToyTrainer(
-        device, mesh["dp"], mesh["tp"], OUTPUT_DIR, mp_config=mp_config
-    )
+    trainer = ToyTrainer(device, parallel_dims, OUTPUT_DIR, mp_config=mp_config)
     trainer.train(NUM_STEPS)
     trainer.close()
 

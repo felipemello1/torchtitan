@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Toy MetricsProcessor for the observability experiment."""
+"""MetricsProcessor: step context, derived metrics, and logging subprocess."""
 
 import multiprocessing
 import time
@@ -14,7 +14,7 @@ import torch
 
 from torchtitan.components.metrics import build_device_memory_monitor
 from torchtitan.config import Configurable
-from torchtitan.observability import record_event
+from torchtitan.distributed import ParallelDims
 from torchtitan.observability.aggregation import logging_worker
 from torchtitan.observability.logging_boundary import EveryNSteps
 from torchtitan.observability.metrics import (
@@ -24,14 +24,16 @@ from torchtitan.observability.metrics import (
     SumMetric,
 )
 from torchtitan.observability.step_state import set_step
+from torchtitan.observability.structured_logging import record_event
 from torchtitan.tools import utils
 
 
 class MetricsProcessor(Configurable):
-    """Step context, derived metrics, and logging subprocess for the toy trainer.
+    """Step context, derived metrics, and logging subprocess.
 
-    Mirrors the method order of components/metrics.py MetricsProcessor
-    so the toy and production versions are easy to compare.
+    Records training metrics to experiment JSONL via record_metric.
+    A non-blocking background subprocess reads JSONL, aggregates across ranks,
+    and writes to WandB/TB/console.
     """
 
     _TRAIN_PREFIX = "trainer"
@@ -51,17 +53,15 @@ class MetricsProcessor(Configurable):
         self,
         config: Config,
         *,
+        parallel_dims: ParallelDims,
         dump_folder: str,
-        rank: int,
-        non_data_parallel_size: int = 1,
     ):
         self.config = config
         self._step: int = 0
-        self._rank = rank
+        self.parallel_dims = parallel_dims
         self._force_log = False
-        self._non_data_parallel_size = non_data_parallel_size
 
-        # Schedule
+        # Schedule: log on step 1 + every log_freq steps
         self._log_schedule = EveryNSteps(every_n=config.log_freq, additional_steps={1})
 
         # Device memory monitor
@@ -76,10 +76,8 @@ class MetricsProcessor(Configurable):
         self.reset_training_counters()
         self.reset_val_counters()
 
-        # Spawn the logging subprocess if any output is enabled.
-        # logging_worker reads experiment JSONL from all ranks, aggregates
-        # metrics, and flushes to WandB/TB/console. Runs in a separate
-        # process so it never blocks training.
+        # Rank 0 runs a background process that reads experiment JSONL
+        # from all ranks, reduces metrics, and logs to WandB/TB/console.
         needs_subprocess = (
             config.enable_wandb
             or config.enable_tensorboard
@@ -87,7 +85,7 @@ class MetricsProcessor(Configurable):
         )
         self._log_queue: multiprocessing.Queue | None = None
         self._log_process: multiprocessing.Process | None = None
-        if rank == 0 and needs_subprocess:
+        if torch.distributed.get_rank() == 0 and needs_subprocess:
             self._log_queue = multiprocessing.Queue()
             self._log_process = multiprocessing.Process(
                 target=logging_worker,
@@ -156,7 +154,7 @@ class MetricsProcessor(Configurable):
             ntokens = self.ntokens_since_reset
             prefix = self._TRAIN_PREFIX
 
-        ndp = self._non_data_parallel_size
+        ndp = self.parallel_dims.non_data_parallel_size
         tps = ntokens / (time_delta * ndp) if time_delta > 0 else 0
         record_metric(f"{prefix}_throughput/tps_mean", MeanMetric(sum=tps))
 
