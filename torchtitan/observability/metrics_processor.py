@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""MetricsProcessor: recording, derived metrics, and logging subprocess."""
-
 import multiprocessing
 import time
 from dataclasses import dataclass, field
@@ -37,6 +35,7 @@ class MetricsProcessor(Configurable):
     and writes to WandB/TB/console.
     """
 
+    # Prefix for throughput and memory metric keys (e.g., "trainer_memory/...")
     _TRAIN_PREFIX = "trainer"
     _VAL_PREFIX = "validator"
 

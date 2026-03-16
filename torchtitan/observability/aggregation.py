@@ -203,6 +203,12 @@ def _log_to_console(
     Colors cycle by position in the key list. Missing metrics show '--'.
     Color is auto-detected (disabled when stdout is piped to file/CI).
 
+    Args:
+        step: Training step number.
+        aggregated: All aggregated metrics for this step.
+        keys: Which metric keys to print (in order).
+        prefix: Optional label before "step:" (e.g., "validate ").
+
     Example:
 
         aggregated = {"training/loss": 2.5, "training/lr": 0.001, "memory/peak": 14.2}
@@ -345,6 +351,7 @@ def logging_worker(
         if msg is None:
             break
 
+        # Training process sends (step, is_validation) after barrier
         step, is_validation = msg
         time.sleep(0.02)  # let filesystem propagate writes
 
