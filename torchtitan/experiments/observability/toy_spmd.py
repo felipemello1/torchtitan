@@ -274,7 +274,9 @@ class ToyTrainer:
         dist.all_reduce(
             loss_scalar, op=dist.ReduceOp.SUM, group=self.dp_mesh.get_group()
         )
-        record_event({"train.loss": loss_scalar.item(), "train.grad_norm": grad_norm.item()})
+        record_event(
+            {"train.loss": loss_scalar.item(), "train.grad_norm": grad_norm.item()}
+        )
         if self.rank == 0:
             print(
                 f"step: {self.step}  loss: {loss_scalar.item():.5f}  "
