@@ -93,6 +93,11 @@ def _read_new_lines(
                 step = entry.get("step")
                 if step is not None:
                     buffer[step].append(entry)
+                else:
+                    logger.warning(
+                        "Skipping experiment entry without step: %s",
+                        entry.get("key", "?"),
+                    )
             offsets[fp] = f.tell()
 
 
@@ -186,6 +191,13 @@ def _log_to_console(
     """Log one console line with the configured metric keys.
 
     Colors cycle by position in the key list. Missing metrics show '--'.
+
+    Example:
+
+        aggregated = {"training/loss": 2.5, "training/lr": 0.001, "memory/peak": 14.2}
+        _log_to_console(step=5, aggregated=aggregated,
+                        console_log_metric_keys=["training/loss", "memory/peak"])
+        # Output: "step:  5  training/loss: 2.5  memory/peak: 14.2"
     """
     color = Color()
     parts = [f"{color.red}step: {step:2}"]
@@ -214,7 +226,7 @@ def _build_metric_logger(
     config_dict: dict[str, Any] | None = None,
     tag: str | None = None,
 ) -> BaseLogger:
-    """Build WandB/TB logger for the logging subprocess."""
+    """Build WandB/TB logger."""
     container = LoggerContainer()
     if enable_tensorboard:
         tb_dir = os.path.join(
@@ -246,11 +258,20 @@ def logging_worker(
     queue_timeout_s: float = _QUEUE_TIMEOUT_S,
 ) -> None:
     """Background process that reads experiment JSONL, aggregates across
-    ranks, and writes to WandB/TB/console.
+    ranks, and writes to WandB/TB/console. Shuts down on ``None`` sentinel
+    or queue timeout.
 
-    The training process signals this worker via ``queue.put(step)``
-    after each log step. The worker reads all JSONL files, aggregates, and
-    flushes. Shuts down on ``None`` sentinel or queue timeout.
+    Example:
+
+        queue = multiprocessing.Queue()
+        p = multiprocessing.Process(
+            target=logging_worker,
+            args=(queue, "./outputs"),
+            kwargs={"enable_wandb": True, "console_log_metric_keys": ["training/loss"]},
+        )
+        p.start()
+        queue.put(step)   # signal to read + aggregate + flush
+        queue.put(None)   # shutdown
 
     Args:
         queue: Receives ``step`` (int), or ``None`` to shut down.
