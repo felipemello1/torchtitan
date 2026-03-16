@@ -227,7 +227,7 @@ class ToyTrainer:
         fully_shard(model, mesh=dp_mesh)
 
     def batch_generator(self, data_iterable):
-        """Wraps a dataloader into an iterator with data loading timing."""
+        """Wraps a dataloader into an iterator."""
         data_iterator = iter(data_iterable)
         while True:
             with record_span("trainer_time/data_loading_s", EventType.FETCHING_BATCH):

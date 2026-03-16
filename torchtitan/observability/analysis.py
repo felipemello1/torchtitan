@@ -4,19 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Post-training analysis: Chrome Trace (Gantt chart) from system JSONL.
-
-Usage:
-    python -m torchtitan.observability.analysis <system_logs_dir> <output_trace.json>
-
-    View: open the output in chrome://tracing or https://ui.perfetto.dev
-"""
+"""Post-training analysis tools for system JSONL."""
 
 import json
 import os
-import sys
 from glob import glob
 from typing import Any
+
+from torchtitan.tools.logging import logger
 
 
 def load_all_records(log_dir: str) -> list[dict]:
@@ -53,7 +48,7 @@ def generate_gantt_trace(log_dir: str, output_path: str) -> dict:
     """
     records = load_all_records(log_dir)
     if not records:
-        print(f"No records found in {log_dir}")
+        logger.info(f"No records found in {log_dir}")
         return {"traceEvents": []}
 
     # Map source files to process IDs
@@ -137,14 +132,7 @@ def generate_gantt_trace(log_dir: str, output_path: str) -> dict:
     with open(output_path, "w") as f:
         json.dump(trace, f, indent=2)
 
-    print(f"Chrome Trace: {output_path}")
-    print(f"  {len(events)} events from {len(sources)} sources")
-    print("  View in: chrome://tracing or https://ui.perfetto.dev")
+    logger.info(f"Chrome Trace: {output_path}")
+    logger.info(f"  {len(events)} events from {len(sources)} sources")
+    logger.info("  View in: chrome://tracing or https://ui.perfetto.dev")
     return trace
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print(__doc__)
-        sys.exit(1)
-    generate_gantt_trace(sys.argv[1], sys.argv[2])

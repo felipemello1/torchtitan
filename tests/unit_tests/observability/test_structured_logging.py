@@ -24,7 +24,6 @@ from torchtitan.observability.step_state import (
     set_step,
 )
 from torchtitan.observability.structured_logging import (
-    dict_to_str_list,
     event_extra,
     EventsOnlyFilter,
     EventType,
@@ -124,23 +123,6 @@ class TestStepTags:
 
 
 # ---------------------------------------------------------------------------
-# dict_to_str_list
-# ---------------------------------------------------------------------------
-
-
-class TestDictToListSafe:
-    def test_none_returns_none(self):
-        assert dict_to_str_list(None) is None
-
-    def test_empty_dict_returns_empty_list(self):
-        assert dict_to_str_list({}) == []
-
-    def test_normal_dict(self):
-        result = dict_to_str_list({"a": "1", "b": "2"})
-        assert set(result) == {"a:1", "b:2"}
-
-
-# ---------------------------------------------------------------------------
 # event_extra
 # ---------------------------------------------------------------------------
 
@@ -155,10 +137,6 @@ class TestEventExtra:
         extra = event_extra(EventType.STEP, step=10, value=42.0)
         assert extra[str(ExtraFields.STEP)] == 10
         assert extra[str(ExtraFields.VALUE)] == 42.0
-
-    def test_with_context(self):
-        extra = event_extra(EventType.STEP, context={"key": "val"})
-        assert extra[str(ExtraFields.CONTEXT)] == ["key:val"]
 
 
 # ---------------------------------------------------------------------------

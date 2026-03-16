@@ -20,9 +20,9 @@ def set_step(step: int) -> None:
             set_step(step)
             train_step(...)
     """
-    global _STEP, _STEP_TAGS
+    global _STEP
     _STEP = step
-    _STEP_TAGS = ()
+    clear_step_tags()
 
 
 def get_step() -> int | None:

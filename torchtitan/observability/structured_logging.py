@@ -88,8 +88,6 @@ class ExtraFields(StrEnum):
     LOG_TYPE_NAME = "log_type_name"
     EVENT_NAME = "event_name"
     STEP = "step"
-    RELATIVE_STEP = "relative_step"
-    CONTEXT = "context"
     VALUE = "value"
 
 
@@ -98,23 +96,11 @@ class ExtraFields(StrEnum):
 # ---------------------------------------------------------------------------
 
 
-def dict_to_str_list(d: dict[str, str] | None) -> list[str] | None:
-    """Convert a dict to a list of "key:value" strings for JSONL normvector field."""
-    if d is None:
-        return None
-    try:
-        return [f"{k}:{v}" for k, v in d.items()]
-    except Exception:
-        return None
-
-
 def event_extra(
     event_type: EventType | str,
     event_name: str | None = None,
     step: int | None = None,
-    relative_step: int | None = None,
     value: float | int | None = None,
-    context: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build the extra dict for a structured JSONL event record."""
     return {
@@ -122,9 +108,7 @@ def event_extra(
         str(ExtraFields.LOG_TYPE_NAME): str(event_type),
         str(ExtraFields.EVENT_NAME): event_name,
         str(ExtraFields.STEP): step,
-        str(ExtraFields.RELATIVE_STEP): relative_step,
         str(ExtraFields.VALUE): value,
-        str(ExtraFields.CONTEXT): dict_to_str_list(context),
     }
 
 
@@ -241,20 +225,11 @@ class StructuredJSONFormatter(logging.Formatter):
         if record_step is not None:
             log_dict["step"] = record_step
 
-        relative_step = getattr(record, str(ExtraFields.RELATIVE_STEP), None)
-        if relative_step is not None:
-            log_dict["relative_step"] = relative_step
-
         log_dict["event_name"] = getattr(record, str(ExtraFields.EVENT_NAME), None)
 
         value = getattr(record, str(ExtraFields.VALUE), None)
         if isinstance(value, (float, int)):
             log_dict["value"] = float(value)
-
-        # Per-record context normvector
-        record_context = getattr(record, str(ExtraFields.CONTEXT), None)
-        if record_context:
-            log_dict["context"] = record_context
 
         # Caller field for source traceability (file:line:function)
         log_dict[
@@ -361,7 +336,7 @@ def init_observability(source: str, output_dir: str, rank: int | None = None) ->
     Can be called before torch.distributed init — rank defaults to the
     RANK environment variable (set by torchrun).
 
-    Example::
+    Example:
 
         init_logger()  # console
         init_observability(source="trainer", output_dir="./outputs")
@@ -404,7 +379,7 @@ def record_event(metrics: dict[str, float | int]) -> None:
     Each key-value pair becomes a separate METRIC_VALUE event.
     Step is read from the global set by ``set_step()``.
 
-    Example::
+    Example:
 
         record_event({"train.loss": 2.5, "train.tflops": 45.6})
         # system JSONL: {"normal": {"event_name": "train.loss"}, "double": {"value": 2.5}, ...}
