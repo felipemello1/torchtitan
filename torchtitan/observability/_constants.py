@@ -4,7 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Logger names and markers for the observability module."""
+"""Logger names and markers shared by multiple functions in observability.
+Added here to avoid circular dependencies."""
 
 # Separate loggers so system events (phase timing) and experiment metrics
 # (loss, reward) go to independent JSONL files with independent formatters.
