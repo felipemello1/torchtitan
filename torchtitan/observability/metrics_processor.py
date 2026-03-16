@@ -37,6 +37,7 @@ class MetricsProcessor(Configurable):
     and writes to WandB/TB/console.
     """
 
+    # Prefix for throughput and memory metric keys (e.g., "trainer_memory/...")
     _TRAIN_PREFIX = "trainer"
     _VAL_PREFIX = "validator"
 

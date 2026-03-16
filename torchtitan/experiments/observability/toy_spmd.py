@@ -283,9 +283,6 @@ class ToyTrainer:
             grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-        # Derived metrics recorded every step (cheap, outside should_log gate)
-        self.metrics_processor.record_memory()
-        self.metrics_processor.record_throughput()
         record_metric("training/lr", NoOpMetric(value=LR))
 
         # Loss/grad_norm only on log steps (.item() triggers GPU→CPU sync)
@@ -302,6 +299,9 @@ class ToyTrainer:
                 record_metric("training/loss_mean", NoOpMetric(value=loss_val))
                 record_metric("training/grad_norm_max", MaxMetric(value=grad_norm_val))
                 record_event({"train.loss": loss_val, "train.grad_norm": grad_norm_val})
+
+        self.metrics_processor.record_memory()
+        self.metrics_processor.record_throughput()
 
     def validate(self, tokens, labels, loss_mask):
         """Run one forward pass for validation (no backward)."""
