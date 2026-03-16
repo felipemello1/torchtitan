@@ -10,6 +10,7 @@ import json
 import logging
 
 import pytest
+from torchtitan.observability import step_state
 
 from torchtitan.observability._constants import (
     EXPERIMENT_LOGGER_NAME,
@@ -25,7 +26,6 @@ from torchtitan.observability.metrics import (
     REDUCE_REGISTRY,
     SumMetric,
 )
-from torchtitan.observability import step_state
 from torchtitan.observability.step_state import set_step
 from torchtitan.observability.structured_logging import init_observability
 

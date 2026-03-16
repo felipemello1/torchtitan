@@ -52,9 +52,7 @@ class RolloutLogger:
         if fn is not None:
             records = fn(records)
         extra = {"__metadata__": metadata} if metadata else {}
-        self._file.write(
-            "\n".join(json.dumps({**r, **extra}) for r in records) + "\n"
-        )
+        self._file.write("\n".join(json.dumps({**r, **extra}) for r in records) + "\n")
         self._file.flush()
 
     def close(self) -> None:

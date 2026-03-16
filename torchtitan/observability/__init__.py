@@ -8,7 +8,6 @@
 
 from torchtitan.observability.aggregation import aggregate, logging_worker
 from torchtitan.observability.logging_boundary import EveryNSteps
-from torchtitan.observability.rollout_logger import RolloutLogger
 from torchtitan.observability.metrics import (
     MaxMetric,
     MeanMetric,
@@ -17,6 +16,7 @@ from torchtitan.observability.metrics import (
     record_metric,
     SumMetric,
 )
+from torchtitan.observability.rollout_logger import RolloutLogger
 from torchtitan.observability.step_state import add_step_tag, clear_step_tags, set_step
 from torchtitan.observability.structured_logging import (
     EventType,

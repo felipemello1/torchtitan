@@ -47,7 +47,14 @@ class MetricsProcessor(Configurable):
         console_log_metric_keys: list[str] = field(default_factory=list)
         console_log_validation_keys: list[str] = field(default_factory=list)
 
-    def __init__(self, config: Config, *, dump_folder: str, rank: int, non_data_parallel_size: int = 1):
+    def __init__(
+        self,
+        config: Config,
+        *,
+        dump_folder: str,
+        rank: int,
+        non_data_parallel_size: int = 1,
+    ):
         self.config = config
         self._step: int = 0
         self._rank = rank
@@ -55,9 +62,7 @@ class MetricsProcessor(Configurable):
         self._non_data_parallel_size = non_data_parallel_size
 
         # Schedule
-        self._log_schedule = EveryNSteps(
-            every_n=config.log_freq, additional_steps={1}
-        )
+        self._log_schedule = EveryNSteps(every_n=config.log_freq, additional_steps={1})
 
         # Device memory monitor
         self.device_memory_monitor = build_device_memory_monitor()

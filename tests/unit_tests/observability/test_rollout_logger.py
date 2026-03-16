@@ -9,8 +9,6 @@
 import json
 import os
 
-import pytest
-
 from torchtitan.observability.rollout_logger import RolloutLogger
 
 
