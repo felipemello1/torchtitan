@@ -18,7 +18,6 @@ Run:
 
 import os
 import shutil
-import time
 
 import torch
 import torch.distributed as dist
@@ -255,7 +254,9 @@ class ToyTrainer:
         # Report globally-reduced loss. Each DP rank has
         # local_loss_sum / global_valid_tokens; SUM gives the global loss.
         loss_scalar = loss.detach().full_tensor().clone()
-        dist.all_reduce(loss_scalar, op=dist.ReduceOp.SUM, group=self.dp_mesh.get_group())
+        dist.all_reduce(
+            loss_scalar, op=dist.ReduceOp.SUM, group=self.dp_mesh.get_group()
+        )
         if self.rank == 0:
             print(
                 f"step: {self.step}  loss: {loss_scalar.item():.5f}  "
@@ -271,7 +272,9 @@ class ToyTrainer:
             dist.all_reduce(global_valid_tokens, group=self.dp_mesh.get_group())
             val_loss = loss_sum / global_valid_tokens
         val_loss_scalar = val_loss.detach().full_tensor().clone()
-        dist.all_reduce(val_loss_scalar, op=dist.ReduceOp.SUM, group=self.dp_mesh.get_group())
+        dist.all_reduce(
+            val_loss_scalar, op=dist.ReduceOp.SUM, group=self.dp_mesh.get_group()
+        )
         if self.rank == 0:
             print(f"  val loss: {val_loss_scalar.item():.4f}")
 
