@@ -287,13 +287,13 @@ class ToyTrainer:
 
         # Loss/grad_norm only on log steps (.item() triggers GPU→CPU sync)
         if self.metrics_processor.should_log(self.step):
-            with record_span(
-                "trainer_time/collect_dist_metrics_s"
-            ):
+            with record_span("trainer_time/collect_dist_metrics_s"):
                 # Each DP rank has local_loss_sum / global_valid_tokens.
                 # SUM across DP ranks gives global_loss_sum / global_valid_tokens.
                 loss_scalar = loss.detach().full_tensor().clone()
-                dist.all_reduce(loss_scalar, op=dist.ReduceOp.SUM, group=self.dp_mesh.get_group())
+                dist.all_reduce(
+                    loss_scalar, op=dist.ReduceOp.SUM, group=self.dp_mesh.get_group()
+                )
                 loss_val = loss_scalar.item()
                 grad_norm_val = grad_norm.item()
                 record_metric("training/loss_mean", NoOpMetric(value=loss_val))
