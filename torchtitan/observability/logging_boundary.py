@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Logging boundary: schedule for gating expensive metric operations."""
-
 
 class EveryNSteps:
     """Returns True every N steps, with optional additional steps.
