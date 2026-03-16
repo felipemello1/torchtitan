@@ -196,7 +196,10 @@ class TrainerActor(Actor):
         # log_freq=1 is set because it determines freq to call metrics that need .item() or collectives
         mp_config = MetricsProcessor.Config(log_freq=1, enable_wandb=False)
         self.trainer = ToyTrainer(
-            self.device, mesh["dp"], mesh["tp"], OUTPUT_DIR,
+            self.device,
+            mesh["dp"],
+            mesh["tp"],
+            OUTPUT_DIR,
             mp_config=mp_config,
         )
 
