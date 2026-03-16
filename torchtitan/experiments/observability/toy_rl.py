@@ -29,8 +29,8 @@ from dataclasses import dataclass
 
 import torch
 from monarch.actor import Actor, current_rank, endpoint, this_host
-from torch.distributed.device_mesh import init_device_mesh
 
+from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.observability.toy_spmd import (
     BATCH_SIZE,
     DP_SIZE,
@@ -164,9 +164,19 @@ class TrainerActor(Actor):
             )
         init_logger()
         init_observability(source="trainer", output_dir=OUTPUT_DIR, rank=rank)
-        mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
-        self.dp_rank = mesh["dp"].get_local_rank()
-        self.trainer = ToyTrainer(self.device, mesh["dp"], mesh["tp"], OUTPUT_DIR)
+        parallel_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=DP_SIZE,
+            cp=1,
+            tp=world_size // DP_SIZE,
+            pp=1,
+            ep=1,
+            etp=1,
+            world_size=world_size,
+        )
+        parallel_dims.build_mesh()
+        self.dp_rank = parallel_dims.get_mesh("fsdp").get_local_rank()
+        self.trainer = ToyTrainer(self.device, parallel_dims, OUTPUT_DIR)
 
     @endpoint
     async def set_step(self, step: int):
