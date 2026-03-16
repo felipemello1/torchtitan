@@ -14,10 +14,15 @@ import time
 import pytest
 
 from torchtitan.observability import step_state
+<<<<<<< HEAD
 from torchtitan.observability._constants import (
     EXPERIMENT_LOGGER_NAME,
     SYSTEM_LOGGER_NAME,
 )
+=======
+from torchtitan.observability._constants import SYSTEM_LOGGER_NAME
+from torchtitan.observability.analysis import generate_gantt_trace
+>>>>>>> obs-pr1-v3
 from torchtitan.observability.step_state import (
     add_step_tag,
     clear_step_tags,
@@ -41,7 +46,6 @@ from torchtitan.observability.structured_logging import (
     StructuredLoggingHandler,
     to_structured_json,
 )
-from torchtitan.observability.analysis import generate_gantt_trace
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +384,9 @@ class TestInflightEventTrackingHandler:
             args=None,
             exc_info=None,
         )
-        setattr(record, str(ExtraFields.LOG_TYPE_NAME), str(EventType.FWD_BWD) + "_start")
+        setattr(
+            record, str(ExtraFields.LOG_TYPE_NAME), str(EventType.FWD_BWD) + "_start"
+        )
         handler.emit(record)
         assert handler.last_event == str(EventType.FWD_BWD) + "_start"
         assert handler.last_event_time is not None
@@ -598,9 +604,7 @@ class TestChromeTrace:
         trace_path = os.path.join(str(tmp_path), "trace.json")
         trace = generate_gantt_trace(log_dir, trace_path)
 
-        span_names = [
-            e["name"] for e in trace["traceEvents"] if e.get("ph") == "X"
-        ]
+        span_names = [e["name"] for e in trace["traceEvents"] if e.get("ph") == "X"]
         # Spans with EventType show the EventType name; without show description
         assert span_names.count("fwd_bwd") == 2
         assert "rl_time/rollouts_to_train_batch_s" in span_names
@@ -617,7 +621,5 @@ class TestChromeTrace:
         trace_path = os.path.join(str(tmp_path), "trace.json")
         trace = generate_gantt_trace(log_dir, trace_path)
 
-        span_names = [
-            e["name"] for e in trace["traceEvents"] if e.get("ph") == "X"
-        ]
+        span_names = [e["name"] for e in trace["traceEvents"] if e.get("ph") == "X"]
         assert "my_custom/span_s" in span_names

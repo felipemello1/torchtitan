@@ -283,7 +283,9 @@ class ToyTrainer:
         record_metric("training/loss_mean", NoOpMetric(value=loss_scalar.item()))
         record_metric("training/grad_norm_max", MaxMetric(value=grad_norm.item()))
         record_metric("training/lr", NoOpMetric(value=LR))
-        record_event({"train.loss": loss_scalar.item(), "train.grad_norm": grad_norm.item()})
+        record_event(
+            {"train.loss": loss_scalar.item(), "train.grad_norm": grad_norm.item()}
+        )
 
     def validate(self, tokens, labels, loss_mask):
         """Run one forward pass for validation (no backward)."""
