@@ -28,11 +28,43 @@ from torchtitan.tools import utils
 
 
 class MetricsProcessor(Configurable):
-    """Metrics recording, derived metrics, and logging subprocess.
+    """Metrics lifecycle for distributed training.
 
-    Records training/validation metrics to experiment JSONL via record_metric.
-    A non-blocking background subprocess reads JSONL, aggregates across ranks,
-    and writes to WandB/TB/console.
+    Handles three responsibilities:
+    1. Step tracking and log scheduling (every N steps + validation steps).
+    2. Derived metrics: GPU memory peak stats and throughput (TPS, TFLOPS, MFU).
+    3. Background logging subprocess on rank 0 that reads per-rank experiment
+       JSONL, aggregates across ranks, and writes to WandB/TB/console.
+
+    The trainer calls methods in this order each step:
+        set_step → reset_training_counters → [train_step] → record_memory →
+        record_throughput → should_log → log
+
+    Args:
+        config: Controls log frequency, backend selection, and console keys.
+        parallel_dims: Mesh topology. Used for throughput normalization
+            (non_data_parallel_size) and rank-0 detection.
+        dump_folder: Root output directory for JSONL and backend logs.
+        ft_enable: Whether fault-tolerant training is enabled.
+        ft_replica_id: FT replica ID, used to partition TB directories.
+        config_dict: Passed to ``wandb.init(config=...)``.
+        tag: Optional prefix for metric names in WandB/TB.
+        has_quantization: Skip MFU when quantization changes effective FLOPS.
+
+    Example:
+        mp = MetricsProcessor.Config(log_freq=10, enable_wandb=True).build(
+            parallel_dims=parallel_dims, dump_folder="./outputs",
+        )
+        mp.num_flops_per_token = model_num_flops
+        for step in range(1, num_steps + 1):
+            mp.set_step(step)
+            mp.reset_training_counters()
+            train_step(...)
+            mp.record_memory()
+            mp.record_throughput()
+            if mp.should_log(step):
+                mp.log(step)
+        mp.close()
     """
 
     # Prefix for throughput and memory metric keys (e.g., "trainer_memory/...")
