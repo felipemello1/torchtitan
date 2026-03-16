@@ -14,15 +14,11 @@ import time
 import pytest
 
 from torchtitan.observability import step_state
-<<<<<<< HEAD
 from torchtitan.observability._constants import (
     EXPERIMENT_LOGGER_NAME,
     SYSTEM_LOGGER_NAME,
 )
-=======
-from torchtitan.observability._constants import SYSTEM_LOGGER_NAME
 from torchtitan.observability.analysis import generate_gantt_trace
->>>>>>> obs-pr1-v3
 from torchtitan.observability.step_state import (
     add_step_tag,
     clear_step_tags,

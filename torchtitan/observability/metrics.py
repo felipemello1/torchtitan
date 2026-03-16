@@ -238,15 +238,15 @@ class ExperimentJSONFormatter(logging.Formatter):
                 "No step in context. Call set_step() before record_metric()."
             )
 
-        state = getattr(record, _METRIC_ENTRY, None)
-        if state is not None:
-            state = dict(state)
+        raw_state = getattr(record, _METRIC_ENTRY, None)
+        if raw_state is not None:
+            state: dict[str, Any] = dict(raw_state)
             state["step"] = step
             state["rank"] = self.rank
             state["source"] = self.source
-            state["caller"] = (
-                f"{os.path.relpath(record.pathname)}:{record.lineno}:{record.funcName}"
-            )
+            state[
+                "caller"
+            ] = f"{os.path.relpath(record.pathname)}:{record.lineno}:{record.funcName}"
             state["timestamp"] = time.time()
             return json.dumps(state)
 

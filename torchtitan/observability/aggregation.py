@@ -134,7 +134,11 @@ def _flush_step(
 # ---------------------------------------------------------------------------
 
 # Available colors from Color, excluding reset/black/white.
-_COLORS = [k for k in vars(Color) if not k.startswith("_") and k not in ("reset", "black", "white")]
+_COLORS = [
+    k
+    for k in vars(Color)
+    if not k.startswith("_") and k not in ("reset", "black", "white")
+]
 
 
 def _fmt_value(value: Any) -> str:
