@@ -1,7 +1,13 @@
 # TorchTitan Observability
 
-Structured logging and metrics for distributed training. Works for both
-SPMD pretraining and RL with multiple actors (no shared process group).
+Structured logging and metrics for distributed training. Works for both SPMD pretraining and RL with multiple actors (no shared process group).
+
+Design principles:
+- Is LLM-friendly and emits structured, per-rank data that can be queried during and after the fact
+- Handles both SPMD pretraining (one process group, `dist.all_reduce`) and RL (multiple independent actors, no shared process group)
+- Is invisible to users. No need to pass metric dictionaries around and manage them.
+- Doesn't block training.
+- Works in compiled regions without graph breaks (work in progress).
 
 ## Overview
 
