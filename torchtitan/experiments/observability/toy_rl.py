@@ -30,9 +30,8 @@ from dataclasses import dataclass
 
 import torch
 from monarch.actor import Actor, current_rank, endpoint, this_host
-from torch.distributed.device_mesh import init_device_mesh
 
-from torchtitan.experiments.observability.metrics_processor import MetricsProcessor
+from torchtitan.distributed import ParallelDims
 
 from torchtitan.experiments.observability.toy_spmd import (
     BATCH_SIZE,
@@ -53,6 +52,7 @@ from torchtitan.observability import (
     set_step,
 )
 from torchtitan.observability.analysis import generate_gantt_trace
+from torchtitan.observability.metrics_processor import MetricsProcessor
 from torchtitan.tools.logging import init_logger
 
 logger = logging.getLogger(__name__)
@@ -190,17 +190,23 @@ class TrainerActor(Actor):
             )
         init_logger()
         init_observability(source="trainer", output_dir=OUTPUT_DIR, rank=rank)
-        mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
-        self.dp_rank = mesh["dp"].get_local_rank()
+        parallel_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=DP_SIZE,
+            cp=1,
+            tp=world_size // DP_SIZE,
+            pp=1,
+            ep=1,
+            etp=1,
+            world_size=world_size,
+        )
+        parallel_dims.build_mesh()
+        self.dp_rank = parallel_dims.get_mesh("fsdp").get_local_rank()
         # Controller handles flushing — trainer has no backends/console.
         # log_freq=1 is set because it determines freq to call metrics that need .item() or collectives
         mp_config = MetricsProcessor.Config(log_freq=1, enable_wandb=False)
         self.trainer = ToyTrainer(
-            self.device,
-            mesh["dp"],
-            mesh["tp"],
-            OUTPUT_DIR,
-            mp_config=mp_config,
+            self.device, parallel_dims, OUTPUT_DIR, mp_config=mp_config
         )
 
     @endpoint

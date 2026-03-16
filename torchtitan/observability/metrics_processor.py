@@ -4,12 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""MetricsProcessor: recording, derived metrics, and logging subprocess."""
+"""MetricsProcessor: step context, derived metrics, and logging subprocess."""
 
 import multiprocessing
 import time
 from dataclasses import dataclass, field
-from typing import Any
 
 import torch
 
@@ -30,9 +29,9 @@ from torchtitan.tools import utils
 
 
 class MetricsProcessor(Configurable):
-    """Metrics recording, derived metrics, and logging subprocess.
+    """Step context, derived metrics, and logging subprocess.
 
-    Records training/validation metrics to experiment JSONL via record_metric.
+    Records training metrics to experiment JSONL via record_metric.
     A non-blocking background subprocess reads JSONL, aggregates across ranks,
     and writes to WandB/TB/console.
     """
@@ -45,53 +44,21 @@ class MetricsProcessor(Configurable):
         log_freq: int = 10
         """How often to log to backends (e.g. wandb). Also gates expensive
         metrics computation (.item(), collectives)."""
-
+        enable_wandb: bool = True
         enable_tensorboard: bool = False
-        """Whether to log metrics to TensorBoard"""
-
-        save_tb_folder: str = "tb"
-        """Folder to dump TensorBoard states"""
-
-        enable_wandb: bool = False
-        """Whether to log metrics to Weights & Biases"""
-
-        console_log_metric_keys: list[str] = field(
-            default_factory=lambda: [
-                "training/loss_mean",
-                "training/grad_norm_max",
-                "trainer_memory/reserved_gib_max",
-                "trainer_throughput/tps_mean",
-                "trainer_throughput/tflops_mean",
-                "trainer_throughput/mfu_pct_mean",
-            ]
-        )
-        """Training metric keys to print to console each log step."""
-
-        console_log_validation_keys: list[str] = field(
-            default_factory=lambda: [
-                "validation/loss_mean",
-                "validator_memory/reserved_gib_max",
-                "validator_throughput/tps_mean",
-            ]
-        )
-        """Validation metric keys to print to console."""
+        console_log_metric_keys: list[str] = field(default_factory=list)
+        console_log_validation_keys: list[str] = field(default_factory=list)
 
     def __init__(
         self,
         config: Config,
         *,
         parallel_dims: ParallelDims,
-        dump_folder: str = "./outputs",
-        ft_enable: bool = False,
-        ft_replica_id: int = 0,
-        config_dict: dict[str, Any] | None = None,
-        tag: str | None = None,
-        has_quantization: bool = False,
+        dump_folder: str,
     ):
         self.config = config
-        self._has_quantization = has_quantization
+        self._step: int = 0
         self.parallel_dims = parallel_dims
-        self._step = 0
         self._force_log = False
 
         # Schedule: log on step 1 + every log_freq steps
@@ -126,13 +93,8 @@ class MetricsProcessor(Configurable):
                 kwargs={
                     "enable_wandb": config.enable_wandb,
                     "enable_tensorboard": config.enable_tensorboard,
-                    "save_tb_folder": config.save_tb_folder,
-                    "config_dict": config_dict,
-                    "tag": tag,
                     "console_log_metric_keys": config.console_log_metric_keys,
                     "console_log_validation_keys": config.console_log_validation_keys,
-                    "ft_enable": ft_enable,
-                    "ft_replica_id": ft_replica_id,
                 },
                 daemon=True,
             )
@@ -145,10 +107,8 @@ class MetricsProcessor(Configurable):
     def set_step(self, step: int, force_log: bool = False) -> None:
         """Set current step. Call before train_step().
 
-        Args:
-            step: Current training step number.
-            force_log: When True, should_log() returns True regardless of
-                schedule. Used to ensure loss is computed on validation steps.
+        force_log: For example, can be used to ensure loss is computed
+        on validation steps.
         """
         self._step = step
         self._force_log = force_log
@@ -180,7 +140,7 @@ class MetricsProcessor(Configurable):
         self.device_memory_monitor.reset_peak_stats()
 
     # ----
-    # Derived metrics
+    # Derived metrics (called every step, outside should_log gate)
     # ----
 
     def record_throughput(self, is_validation: bool = False) -> None:
@@ -201,7 +161,7 @@ class MetricsProcessor(Configurable):
         if self.num_flops_per_token > 0:
             tflops = self.num_flops_per_token * tps / 1e12
             record_metric(f"{prefix}_throughput/tflops_mean", MeanMetric(sum=tflops))
-            if self._gpu_peak_flops > 0 and not self._has_quantization:
+            if self._gpu_peak_flops > 0:
                 mfu = 100 * self.num_flops_per_token * tps / self._gpu_peak_flops
                 record_metric(f"{prefix}_throughput/mfu_pct_mean", MeanMetric(sum=mfu))
 
@@ -220,18 +180,6 @@ class MetricsProcessor(Configurable):
         record_metric(
             f"{prefix}_memory/alloc_retries_sum",
             SumMetric(value=mem.num_alloc_retries),
-        )
-        record_metric(
-            f"{prefix}_memory/ooms_sum",
-            SumMetric(value=mem.num_ooms),
-        )
-        record_metric(
-            f"{prefix}_memory/reserved_pct_max",
-            MaxMetric(value=mem.max_reserved_pct),
-        )
-        record_metric(
-            f"{prefix}_memory/active_pct_max",
-            MaxMetric(value=mem.max_active_pct),
         )
 
     # ----

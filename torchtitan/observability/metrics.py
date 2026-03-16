@@ -131,17 +131,13 @@ class NoOpMetric(MetricValue):
     """No reduction — returns the first entry's value, ignoring the rest.
 
     Use for values that are already reduced (e.g., loss after ``dist_sum``)
-    or identical across ranks (e.g., learning rate). The aggregator receives
-    N entries (one per rank) but only uses ``entries[0]["value"]``.
+    or identical across ranks (e.g., learning rate).
 
     Example:
 
-        record_metric("loss/trainer_loss_mean", NoOpMetric(value=0.038))
-        # 4 ranks all record the same all-reduced loss:
+        record_metric("training/loss_mean", NoOpMetric(value=0.038))
         # Rank 0: NoOpMetric(value=0.038)
         # Rank 1: NoOpMetric(value=0.038)
-        # Rank 2: NoOpMetric(value=0.038)
-        # Rank 3: NoOpMetric(value=0.038)
         # Aggregated: 0.038 (entries[0], rest ignored)
     """
 
@@ -186,11 +182,10 @@ def record_metric(key: str, value: MetricValue, _stacklevel: int = 2) -> None:
     Args:
         key: Metric name (e.g., "loss/trainer_loss_mean").
         value: MetricValue instance (MeanMetric, MaxMetric, NoOpMetric, etc.).
-        _stacklevel: Controls which call site appears in the ``caller`` field.
-            Default 2 (the direct caller). If a utility function wraps
-            record_metric, pass 3 so the logged caller shows the utility's
-            caller instead (e.g., record_span uses _stacklevel=3 so the
-            caller shows the user's ``with record_span(...)`` line).
+        _stacklevel: Controls which call site appears in the ``caller``
+            field (e.g., "trainer.py:541:train_step"). Default 2 (the
+            direct caller). Pass 3 from wrapper functions so the logged
+            caller shows the wrapper's caller instead.
     """
     if get_step() is None:
         raise ValueError("No step in context. Call set_step() before record_metric().")
