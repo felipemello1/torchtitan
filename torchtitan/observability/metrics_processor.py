@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Toy MetricsProcessor for the observability experiment."""
+"""MetricsProcessor: step context, derived metrics, and logging subprocess."""
 
 import multiprocessing
 from dataclasses import dataclass, field
@@ -12,16 +12,18 @@ from dataclasses import dataclass, field
 import torch
 
 from torchtitan.config import Configurable
-from torchtitan.observability import record_event
+from torchtitan.distributed import ParallelDims
 from torchtitan.observability.aggregation import logging_worker
 from torchtitan.observability.step_state import set_step
+from torchtitan.observability.structured_logging import record_event
 
 
 class MetricsProcessor(Configurable):
-    """Step context and logging subprocess for the toy trainer.
+    """Step context and logging subprocess.
 
-    Mirrors the method order of components/metrics.py MetricsProcessor
-    so the toy and production versions are easy to compare.
+    Records training metrics to experiment JSONL via record_metric.
+    A non-blocking background subprocess reads JSONL, aggregates across ranks,
+    and writes to WandB/TB/console.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -30,14 +32,18 @@ class MetricsProcessor(Configurable):
         enable_tensorboard: bool = False
         console_log_metric_keys: list[str] = field(default_factory=list)
 
-    def __init__(self, config: Config, *, dump_folder: str, rank: int):
+    def __init__(
+        self,
+        config: Config,
+        *,
+        parallel_dims: ParallelDims,
+        dump_folder: str,
+    ):
         self._step: int = 0
-        self._rank = rank
+        self.parallel_dims = parallel_dims
 
-        # Spawn the logging subprocess if any output is enabled.
-        # logging_worker reads experiment JSONL from all ranks, aggregates
-        # metrics, and flushes to WandB/TB/console. Runs in a separate
-        # process so it never blocks training.
+        # Rank 0 runs a background process that reads experiment JSONL
+        # from all ranks, reduces metrics, and logs to WandB/TB/console.
         needs_subprocess = (
             config.enable_wandb
             or config.enable_tensorboard
@@ -45,7 +51,7 @@ class MetricsProcessor(Configurable):
         )
         self._log_queue: multiprocessing.Queue | None = None
         self._log_process: multiprocessing.Process | None = None
-        if rank == 0 and needs_subprocess:
+        if torch.distributed.get_rank() == 0 and needs_subprocess:
             self._log_queue = multiprocessing.Queue()
             self._log_process = multiprocessing.Process(
                 target=logging_worker,
