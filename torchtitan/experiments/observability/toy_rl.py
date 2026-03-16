@@ -31,7 +31,9 @@ from dataclasses import dataclass
 import torch
 from monarch.actor import Actor, current_rank, endpoint, this_host
 from torch.distributed.device_mesh import init_device_mesh
+
 from torchtitan.experiments.observability.metrics_processor import MetricsProcessor
+
 from torchtitan.experiments.observability.toy_spmd import (
     BATCH_SIZE,
     DP_SIZE,
@@ -151,7 +153,10 @@ class RollouterActor(Actor):
                 for i in range(len(self.dataset.tokens))
             ]
         total_completion_len = sum(len(r.completion_text) for r in rollouts)
-        record_metric("rl/completion_len_mean", MeanMetric(sum=total_completion_len, weight=len(rollouts)))
+        record_metric(
+            "rl/completion_len_mean",
+            MeanMetric(sum=total_completion_len, weight=len(rollouts)),
+        )
         return rollouts
 
 
@@ -228,7 +233,9 @@ class RewardActor(Actor):
             for rollout in rollouts:
                 rollout.reward = 1.0  # dummy constant reward
         reward_sum = sum(r.reward for r in rollouts)
-        record_metric("rl/reward_mean", MeanMetric(sum=reward_sum, weight=len(rollouts)))
+        record_metric(
+            "rl/reward_mean", MeanMetric(sum=reward_sum, weight=len(rollouts))
+        )
         return rollouts
 
 
