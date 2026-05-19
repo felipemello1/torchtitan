@@ -306,6 +306,9 @@ class VLLMGenerator(Actor, Configurable):
             ),
             # Enables RequestOutput.metrics, so generator metrics can be returned
             disable_log_stats=False,
+            # Return logprobs after sampling-temperature processing, so trainer
+            # policy logprobs and behavior logprobs live in the same space.
+            logprobs_mode="processed_logprobs",
         )
         engine_kwargs["max_num_seqs"] = self._max_num_seqs
         # FA2 requires block_size to be a multiple of 256

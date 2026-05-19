@@ -74,7 +74,7 @@ def _alphabet_sort_config(
     generator_max_tokens: int = 256,
     generator_gpu_memory_limit: float = 0.75,
     generator_temperature: float = 0.8,
-    generator_top_p: float = 0.95,
+    generator_top_p: float = 1.0,
     compile_config: CompileConfig | None = None,
     trainer_max_microbatch_samples: int | None = 8,
     loss: GRPOLoss.Config | DAPOLoss.Config | None = None,
@@ -110,7 +110,7 @@ def _alphabet_sort_config(
             optimizer=OptimizersContainer.Config(lr=lr),
             max_microbatch_samples=trainer_max_microbatch_samples,
             lr_scheduler=LRSchedulersContainer.Config(
-                warmup_steps=5,
+                warmup_steps=0,
                 decay_type="linear",
             ),
             training=TrainingConfig(dtype="bfloat16"),
@@ -243,7 +243,7 @@ def _sum_digits_smoke_config(
             sampling=SamplingConfig(
                 n=1,
                 temperature=0.8,
-                top_p=0.95,
+                top_p=1.0,
                 max_tokens=100,
             ),
             **generator_kwargs,
@@ -308,6 +308,26 @@ def rl_grpo_qwen3_1_7b_alphabet_sort() -> RLTrainer.Config:
         num_validation_samples=16,
         compile_config=CompileConfig(enable=False),
         trainer_max_microbatch_samples=4,
+    )
+
+
+def rl_dapo_qwen3_1_7b_alphabet_sort_2gpu() -> RLTrainer.Config:
+    """Two-GPU AlphabetSort DAPO config for Qwen3-1.7B (1 gen + 1 train)."""
+    return _alphabet_sort_config(
+        model_size="1.7B",
+        hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-1.7B",
+        lr=1e-6,
+        num_steps=50,
+        num_prompts_per_step=4,
+        num_validation_samples=16,
+        trainer_tensor_parallel_degree=1,
+        generator_tensor_parallel_degree=1,
+        async_rollout_groups=4,
+        replay_buffer_groups=8,
+        generator_max_tokens=512,
+        compile_config=CompileConfig(enable=False),
+        trainer_max_microbatch_samples=4,
+        loss=_dapo_loss(),
     )
 
 

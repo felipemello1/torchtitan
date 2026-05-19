@@ -333,6 +333,8 @@ class PolicyTrainer(Actor, Configurable):
         train_data: list[TrainingBatch],
         *,
         num_global_valid_tokens: int,
+        sampling_temperature: float = 1.0,
+        sampling_top_p: float = 1.0,
     ) -> dict[str, float]:
         """Run forward pass, compute loss, call backward, and reduce metrics.
 
@@ -342,10 +344,25 @@ class PolicyTrainer(Actor, Configurable):
             num_global_valid_tokens: Total trainable response tokens across all DP
                 ranks for this step. The controller computes this before
                 sharding replay samples.
+            sampling_temperature: Temperature used when sampling behavior-policy
+                rollouts. Trainer logprobs are computed under the same
+                temperature so importance ratios compare matching policies.
+            sampling_top_p: Nucleus sampling threshold used by the generator.
+                Values below 1.0 are not yet supported on the trainer loss path.
 
         Returns:
             dict[str, float]: Globally-reduced metrics.
         """
+        if sampling_temperature <= 0.0:
+            raise ValueError(
+                "sampling_temperature must be positive for policy-gradient "
+                f"training, got {sampling_temperature}"
+            )
+        if sampling_top_p != 1.0:
+            raise NotImplementedError(
+                "trainer policy logprobs currently support top_p=1.0 only; "
+                f"got {sampling_top_p}"
+            )
         logger.debug(
             f"{os.getpid()=} PolicyTrainer forward_backward "
             f"step {self.policy_version}"
@@ -422,7 +439,11 @@ class PolicyTrainer(Actor, Configurable):
                         attention_masks=attention_masks,
                         positions=positions,
                     )
-                all_policy_logprobs = compute_logprobs(logits, token_ids)
+                all_policy_logprobs = compute_logprobs(
+                    logits,
+                    token_ids,
+                    temperature=sampling_temperature,
+                )
                 masked = extract_masked_logprobs(
                     all_policy_logprobs,
                     loss_mask=loss_mask,

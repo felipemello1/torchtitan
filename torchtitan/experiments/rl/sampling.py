@@ -19,7 +19,7 @@ class SamplingConfig:
     temperature: float = 0.8
     """Sampling temperature. 0.0 = greedy, higher = more random."""
 
-    top_p: float = 0.95
+    top_p: float = 1.0
     """Nucleus sampling threshold."""
 
     max_tokens: int = 100

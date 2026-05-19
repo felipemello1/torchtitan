@@ -1259,6 +1259,10 @@ class RLTrainer(Configurable):
                         self.trainer.forward_backward.call(
                             batches,
                             num_global_valid_tokens=num_global_valid_tokens,
+                            sampling_temperature=(
+                                self.config.generator.sampling.temperature
+                            ),
+                            sampling_top_p=self.config.generator.sampling.top_p,
                         )
                     )
                 skip_metrics = self._forward_backward_skip_metrics(

@@ -70,12 +70,20 @@ def cuda_memory_stats(device: torch.device | None = None) -> dict[str, float]:
 
 
 @sl.log_trace_span("compute_logprobs")
-def compute_logprobs(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+def compute_logprobs(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+) -> torch.Tensor:
     """Compute per-token logprobs from logits.
 
     Returns logprobs for positions 1..N (the predicted tokens).
     Output shape is ``[batch, seq_len - 1]``.
     """
+    if temperature <= 0.0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+
     from torch.distributed.tensor import DTensor
 
     # Config-based TP returns logits as a Replicate DTensor. Downstream RL
@@ -85,7 +93,7 @@ def compute_logprobs(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Ten
         # TODO: pass `grad_placements=[Replicate(), ...]` to make the autograd
         # contract explicit (see .claude/rules/distributed.md).
         logits = logits.to_local()
-    shift_logits = logits[:, :-1, :].float()
+    shift_logits = logits[:, :-1, :].float() / temperature
     shift_targets = token_ids[:, 1:]
     logprobs = F.log_softmax(shift_logits, dim=-1)
     return logprobs.gather(2, shift_targets.unsqueeze(-1)).squeeze(-1)

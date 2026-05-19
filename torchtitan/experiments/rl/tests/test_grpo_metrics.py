@@ -14,7 +14,10 @@ import pytest
 import torch
 
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
-from torchtitan.experiments.rl.actors.utils import verify_logprob_identity
+from torchtitan.experiments.rl.actors.utils import (
+    compute_logprobs,
+    verify_logprob_identity,
+)
 from torchtitan.experiments.rl.envs import EnvExample, EnvStep
 from torchtitan.experiments.rl.envs.token_env import PromptState, TokenEnv, TokenStep
 from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
@@ -71,6 +74,27 @@ from torchtitan.experiments.rl.types import (
 
 def test_sampling_config_default_is_one_completion():
     assert SamplingConfig().n == 1
+    assert SamplingConfig().top_p == 1.0
+
+
+def test_compute_logprobs_applies_sampling_temperature():
+    logits = torch.tensor([[[0.0, 2.0], [3.0, 1.0], [0.5, 0.5]]])
+    token_ids = torch.tensor([[0, 1, 0]])
+
+    actual = compute_logprobs(logits, token_ids, temperature=2.0)
+    expected = torch.log_softmax(logits[:, :-1, :].float() / 2.0, dim=-1)
+    expected = expected.gather(2, token_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_compute_logprobs_rejects_nonpositive_temperature():
+    with pytest.raises(ValueError, match="temperature must be positive"):
+        compute_logprobs(
+            torch.zeros(1, 2, 3),
+            torch.zeros(1, 2, dtype=torch.long),
+            temperature=0.0,
+        )
 
 
 def test_grpo_loss_clamps_log_ratio_before_exp():
