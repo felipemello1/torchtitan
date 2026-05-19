@@ -16,7 +16,7 @@ import torch
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.actors.utils import (
     compute_logprobs,
-    compute_logprob_drift,
+    verify_logprob_identity,
 )
 from torchtitan.experiments.rl.envs import EnvExample, EnvStep
 from torchtitan.experiments.rl.envs.token_env import (
@@ -264,7 +264,7 @@ def test_dapo_loss_empty_selected_tokens_is_finite_zero():
 
 
 def test_logprob_drift_reports_nonfinite_without_nan_metrics():
-    drift = compute_logprob_drift(
+    drift = verify_logprob_identity(
         generator_token_logprobs=torch.tensor([0.0, float("-inf"), 1.0, float("nan")]),
         trainer_token_logprobs=torch.tensor([0.1, 0.0, 2.0, float("nan")]),
         num_global_valid_tokens=torch.tensor(4.0),
@@ -273,11 +273,11 @@ def test_logprob_drift_reports_nonfinite_without_nan_metrics():
 
     assert torch.isfinite(drift.logprob_diff_mean)
     assert torch.isfinite(drift.logprob_diff_max)
-    assert torch.isfinite(drift.tokens_different_frac)
+    assert torch.isfinite(drift.ratio_tokens_different)
     assert torch.isfinite(drift.nonfinite_logprob_frac)
     assert drift.logprob_diff_mean.item() == pytest.approx(1.1 / 4)
     assert drift.logprob_diff_max.item() == pytest.approx(1.0)
-    assert drift.tokens_different_frac.item() == pytest.approx(2 / 4)
+    assert drift.ratio_tokens_different.item() == pytest.approx(2 / 4)
     assert drift.nonfinite_logprob_frac.item() == pytest.approx(2 / 4)
 
 
@@ -287,7 +287,7 @@ def _required_fwd_bwd_metrics(**overrides):
         "loss/ratio/nonfinite_frac": 0.0,
         "loss/logprob/policy_nonfinite_frac": 0.0,
         "loss/logprob/behavior_nonfinite_frac": 0.0,
-        "logprob_drift/nonfinite_frac": 0.0,
+        "bit_wise/nonfinite_logprob_frac": 0.0,
     }
     metrics.update(overrides)
     return metrics
@@ -470,11 +470,11 @@ def test_metric_accumulator_uses_same_keys_for_inactive_values():
         "loss/ratio/mean": torch.tensor(2.0),
     }
     drift_metrics = {
-        "logprob_drift/diff/mean": torch.tensor(3.0),
-        "logprob_drift/tokens_different_frac": torch.tensor(4.0),
+        "bit_wise/logprob_diff/mean": torch.tensor(3.0),
+        "bit_wise/ratio_tokens_different/mean": torch.tensor(4.0),
     }
     max_metrics = {
-        "logprob_drift/diff/max": torch.tensor(5.0),
+        "bit_wise/logprob_diff/max": torch.tensor(5.0),
         "train/microbatch_tokens/max": torch.tensor(6.0),
         "train/microbatch_samples/max": torch.tensor(7.0),
     }
@@ -1424,7 +1424,7 @@ def test_train_step_metric_builder_emits_replay_timing_and_trace_scalars():
         "loss/ratio/nonfinite_frac": 0.0,
         "loss/logprob/policy_nonfinite_frac": 0.1,
         "loss/logprob/behavior_nonfinite_frac": 0.2,
-        "logprob_drift/nonfinite_frac": 0.3,
+        "bit_wise/nonfinite_logprob_frac": 0.3,
     }
     optimizer_metrics = {"train/lr": 1e-6}
     timings = _TrainStepTimings(
@@ -1486,7 +1486,7 @@ def test_train_step_metric_builder_emits_replay_timing_and_trace_scalars():
     assert trace_scalars["loss.ratio.nonfinite_frac"] == 0.0
     assert trace_scalars["loss.logprob.policy_nonfinite_frac"] == 0.1
     assert trace_scalars["loss.logprob.behavior_nonfinite_frac"] == 0.2
-    assert trace_scalars["logprob_drift.nonfinite_frac"] == 0.3
+    assert trace_scalars["bit_wise.nonfinite_logprob_frac"] == 0.3
 
 
 def test_train_step_metric_builder_handles_zero_step_duration():
@@ -1544,7 +1544,7 @@ def test_train_step_metric_builder_handles_zero_step_duration():
             "loss/ratio/nonfinite_frac": 0.0,
             "loss/logprob/policy_nonfinite_frac": 0.0,
             "loss/logprob/behavior_nonfinite_frac": 0.0,
-            "logprob_drift/nonfinite_frac": 0.0,
+            "bit_wise/nonfinite_logprob_frac": 0.0,
         },
         optimizer_metrics={},
         checkpoint_saved=False,

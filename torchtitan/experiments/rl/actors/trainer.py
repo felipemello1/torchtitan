@@ -31,11 +31,11 @@ from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.experiments.rl.actors.utils import (
     compute_logprobs,
-    compute_logprob_drift,
     cuda_memory_stats,
     extract_masked_logprobs,
-    LogprobDrift,
+    PartialLogprobDrift,
     reset_cuda_peak_memory_stats,
+    verify_logprob_identity,
 )
 from torchtitan.experiments.rl.sampling import TrainingLogprobConfig
 from torchtitan.experiments.rl.trainer_microbatch import (
@@ -450,7 +450,7 @@ class PolicyTrainer(Actor, Configurable):
                 with sl.log_trace_span("model_backward"):
                     loss.backward()
 
-                drift: LogprobDrift = compute_logprob_drift(
+                verification: PartialLogprobDrift = verify_logprob_identity(
                     generator_token_logprobs=masked.behavior_logprobs,
                     trainer_token_logprobs=masked.policy_logprobs,
                     num_global_valid_tokens=num_global_valid_tokens,
@@ -460,17 +460,19 @@ class PolicyTrainer(Actor, Configurable):
                 metric_accumulator.add_sum(
                     {
                         **loss_metrics,
-                        "logprob_drift/diff/mean": drift.logprob_diff_mean,
-                        "logprob_drift/tokens_different_frac": (
-                            drift.tokens_different_frac
+                        "bit_wise/logprob_diff/mean": verification.logprob_diff_mean,
+                        "bit_wise/ratio_tokens_different/mean": (
+                            verification.ratio_tokens_different
                         ),
-                        "logprob_drift/nonfinite_frac": drift.nonfinite_logprob_frac,
+                        "bit_wise/nonfinite_logprob_frac": (
+                            verification.nonfinite_logprob_frac
+                        ),
                     },
                     active=is_real,
                 )
                 metric_accumulator.add_max(
                     {
-                        "logprob_drift/diff/max": drift.logprob_diff_max,
+                        "bit_wise/logprob_diff/max": verification.logprob_diff_max,
                         "train/microbatch_tokens/max": torch.tensor(
                             float(sum(seq_lens)),
                             device=device,

@@ -137,31 +137,31 @@ def extract_masked_logprobs(
 
 
 @dataclass(frozen=True, slots=True)
-class LogprobDrift:
+class PartialLogprobDrift:
     """Per-rank generator-vs-trainer logprob drift awaiting reduction across the loss-mesh.
 
     Args:
         logprob_diff_mean: Scalar tensor; To be sum-reduced.
         logprob_diff_max: Scalar tensor; To be max-reduced.
-        tokens_different_frac: Scalar tensor; To be sum-reduced.
+        ratio_tokens_different: Scalar tensor; To be sum-reduced.
         nonfinite_logprob_frac: Scalar tensor; To be sum-reduced.
     """
 
     logprob_diff_mean: torch.Tensor
     logprob_diff_max: torch.Tensor
-    tokens_different_frac: torch.Tensor
+    ratio_tokens_different: torch.Tensor
     nonfinite_logprob_frac: torch.Tensor
 
 
 @torch.no_grad()
-@sl.log_trace_span("compute_logprob_drift")
-def compute_logprob_drift(
+@sl.log_trace_span("verify_logprob_identity")
+def verify_logprob_identity(
     generator_token_logprobs: torch.Tensor,
     trainer_token_logprobs: torch.Tensor,
     *,
     num_global_valid_tokens: torch.Tensor,
     device: torch.device,
-) -> LogprobDrift:
+) -> PartialLogprobDrift:
     """Compute per-rank drift between generator and trainer logprobs.
 
     Args:
@@ -175,14 +175,14 @@ def compute_logprob_drift(
             reduction across loss_mesh.
 
     Returns:
-        LogprobDrift.
+        PartialLogprobDrift.
     """
     generator_flat = generator_token_logprobs.to(device=device, dtype=torch.float32)
     trainer_flat = trainer_token_logprobs.to(device=device, dtype=torch.float32)
 
     if generator_flat.numel() == 0:
         zero = torch.zeros((), dtype=torch.float32, device=device)
-        return LogprobDrift(zero, zero, zero, zero)
+        return PartialLogprobDrift(zero, zero, zero, zero)
 
     # 1e-6 threshold ignores bf16-quantization-level diffs
     finite_mask = torch.isfinite(generator_flat) & torch.isfinite(trainer_flat)
@@ -197,9 +197,9 @@ def compute_logprob_drift(
         if bool(finite_mask.any().item())
         else torch.zeros((), dtype=torch.float32, device=device)
     )
-    return LogprobDrift(
+    return PartialLogprobDrift(
         logprob_diff_mean=diff.sum() / num_global_valid_tokens,
         logprob_diff_max=logprob_diff_max,
-        tokens_different_frac=(diff.abs() > 1e-6).sum() / num_global_valid_tokens,
+        ratio_tokens_different=(diff.abs() > 1e-6).sum() / num_global_valid_tokens,
         nonfinite_logprob_frac=(~finite_mask).sum() / num_global_valid_tokens,
     )
