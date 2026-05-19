@@ -656,6 +656,23 @@ class TestMetricsProcessorBuild:
         assert cfg.console_log_keys_train == [r"^loss/mean$"]
         assert cfg.console_log_keys_validation == [r"^validation/reward$"]
 
+    def test_default_console_log_keys_include_cuda_peak_memory(self) -> None:
+        cfg = m.MetricsProcessor.Config()
+
+        assert cfg.console_log_keys_train is not None
+        assert "train/cuda_memory/fwd_bwd/peak_allocated_gib" in (
+            cfg.console_log_keys_train
+        )
+        assert "train/cuda_memory/fwd_bwd/peak_reserved_gib" in (
+            cfg.console_log_keys_train
+        )
+        assert "generator/live/cuda_memory/peak_allocated_gib" in (
+            cfg.console_log_keys_train
+        )
+        assert "generator/live/cuda_memory/peak_reserved_gib" in (
+            cfg.console_log_keys_train
+        )
+
     def test_wandb_project_default_titan_rl(self, tmp_path, monkeypatch) -> None:
         """When `WANDB_PROJECT` is unset and `wandb_project` is at the
         default, the build should write `titan_rl` to the env var."""

@@ -223,6 +223,7 @@ def build_train_step_metrics(
     dropped_empty_groups: int,
     dropped_zero_advantage_groups: int,
     train_version: int,
+    drop_metrics: Sequence[m.Metric] = (),
 ) -> tuple[list[m.Metric], dict[str, float]]:
     """Build metric records and structured scalars for one train step."""
     total_tokens = sum(len(sample.token_ids) for sample in samples)
@@ -247,6 +248,7 @@ def build_train_step_metrics(
         dropped_empty_groups=dropped_empty_groups,
         dropped_zero_advantage_groups=dropped_zero_advantage_groups,
     )
+    metrics += list(drop_metrics)
     metrics += [
         m.Metric("replay/policy_version/train", m.NoReduce(float(train_version))),
         m.Metric(

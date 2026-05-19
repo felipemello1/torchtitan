@@ -500,12 +500,6 @@ class PolicyTrainer(Actor, Configurable):
                     for key, value in memory_stats.items()
                 }
             )
-            sl.log_trace_scalar(
-                {
-                    f"train.cuda_memory.fwd_bwd.{key}": value
-                    for key, value in memory_stats.items()
-                }
-            )
 
         return self._reduce_forward_backward_metrics(
             sum_reduced_metrics=metric_accumulator.sum_reduced_metrics,
@@ -579,10 +573,6 @@ class PolicyTrainer(Actor, Configurable):
                 cuda_memory_stats(device).items() if device is not None else ()
             )
         }
-        if memory_metrics:
-            sl.log_trace_scalar(
-                {key.replace("/", "."): value for key, value in memory_metrics.items()}
-            )
 
         return OptimStepOutput(
             policy_version=self.policy_version,

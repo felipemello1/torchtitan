@@ -1240,6 +1240,19 @@ def test_rollout_drop_counters_reset_after_admitted_group():
     assert counters.consecutive_zero_advantage_groups == 1
 
 
+def test_rollout_drop_counters_emit_zero_advantage_reward_metrics():
+    counters = _RolloutDropCounters(max_no_signal_groups=None)
+
+    counters.record_zero_advantage([0.25, 0.75])
+    stats = counters.pop()
+    aggregate = m.MetricsProcessor._aggregate_metrics(stats.metrics)
+
+    assert stats.empty_groups == 0
+    assert stats.zero_advantage_groups == 1
+    assert aggregate["rollout/dropped_zero_advantage_reward/_mean"] == 0.5
+    assert aggregate["rollout/dropped_zero_advantage_reward/_max"] == 0.75
+
+
 def test_replay_wait_surfaces_no_signal_producer_error():
     async def run() -> None:
         buffer = ReplayBuffer(max_groups=1)
@@ -1336,6 +1349,12 @@ def test_train_step_metric_builder_emits_replay_timing_and_trace_scalars():
         ),
         dropped_empty_groups=1,
         dropped_zero_advantage_groups=2,
+        drop_metrics=[
+            m.Metric(
+                "rollout/dropped_zero_advantage_reward",
+                m.SummaryStats.from_list([0.25, 0.75]),
+            )
+        ],
         train_version=7,
     )
     aggregate = m.MetricsProcessor._aggregate_metrics(metrics)
@@ -1347,6 +1366,8 @@ def test_train_step_metric_builder_emits_replay_timing_and_trace_scalars():
     assert aggregate["replay/policy_version/behavior_min"] == 2.0
     assert aggregate["replay/policy_version/behavior_max"] == 3.0
     assert aggregate["generator/live/tokens"] == 4.0
+    assert aggregate["rollout/dropped_zero_advantage_reward/_mean"] == 0.5
+    assert aggregate["rollout/dropped_zero_advantage_reward/_max"] == 0.75
     assert trace_scalars["replay.buffer_depth_groups"] == 2
     assert trace_scalars["rollout.dropped_zero_advantage_groups"] == 2
     assert trace_scalars["timing.weight_sync_pull_ms"] == 600.0

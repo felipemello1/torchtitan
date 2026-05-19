@@ -539,13 +539,6 @@ class VLLMGenerator(Actor, Configurable):
                             metric_cls(value),
                         )
                     )
-                if memory_stats:
-                    sl.log_trace_scalar(
-                        {
-                            f"{metrics_prefix}.cuda_memory.{key}": value
-                            for key, value in memory_stats.items()
-                        }
-                    )
 
             logger.debug(
                 f"{os.getpid()=} Generating finish generate "

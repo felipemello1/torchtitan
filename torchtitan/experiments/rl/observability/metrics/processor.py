@@ -61,6 +61,8 @@ class MetricsProcessor(Configurable):
                 "reward/zero_std_frac",
                 "rollout/response_length/max",
                 "rollout/dropped_zero_advantage_groups",
+                "rollout/dropped_zero_advantage_reward/_mean",
+                "rollout/dropped_zero_advantage_reward/_max",
                 "train/grad_norm/mean",
                 "train/lr",
                 "train/skipped_nonfinite_loss",
@@ -77,6 +79,9 @@ class MetricsProcessor(Configurable):
                 "generator/cuda_memory/peak_allocated_gib",
                 "generator/cuda_memory/peak_reserved_gib",
                 "generator/cuda_memory/driver_used_pct",
+                "generator/live/cuda_memory/peak_allocated_gib",
+                "generator/live/cuda_memory/peak_reserved_gib",
+                "generator/live/cuda_memory/driver_used_pct",
                 "perf/tokens_per_second",
                 "timing/step",
             ]
@@ -90,6 +95,8 @@ class MetricsProcessor(Configurable):
                 "validation/reward/_mean",
                 "validation/reward/_max",
                 "validation/response_length/mean",
+                "validation/generator/cuda_memory/peak_allocated_gib",
+                "validation/generator/cuda_memory/peak_reserved_gib",
                 "timing/validate",
             ]
         )

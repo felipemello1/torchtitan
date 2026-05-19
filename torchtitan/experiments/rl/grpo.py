@@ -187,6 +187,15 @@ async def _raise_rollout_task_errors(
 
 
 @dataclass(slots=True)
+class _RolloutDropStats:
+    """Rollout drops and associated metrics accumulated between train steps."""
+
+    empty_groups: int
+    zero_advantage_groups: int
+    metrics: list[m.Metric]
+
+
+@dataclass(slots=True)
 class _RolloutDropCounters:
     """Producer-side rollout drops accumulated between optimizer steps."""
 
@@ -196,11 +205,25 @@ class _RolloutDropCounters:
     consecutive_dropped_groups: int = 0
     consecutive_empty_groups: int = 0
     consecutive_zero_advantage_groups: int = 0
+    zero_advantage_rewards: list[float] = field(default_factory=list)
 
-    def pop(self) -> tuple[int, int]:
-        values = (self.empty_groups, self.zero_advantage_groups)
+    def pop(self) -> _RolloutDropStats:
+        metrics: list[m.Metric] = []
+        if self.zero_advantage_rewards:
+            metrics.append(
+                m.Metric(
+                    "rollout/dropped_zero_advantage_reward",
+                    m.SummaryStats.from_list(self.zero_advantage_rewards),
+                )
+            )
+        values = _RolloutDropStats(
+            empty_groups=self.empty_groups,
+            zero_advantage_groups=self.zero_advantage_groups,
+            metrics=metrics,
+        )
         self.empty_groups = 0
         self.zero_advantage_groups = 0
+        self.zero_advantage_rewards.clear()
         return values
 
     def record_empty(self) -> None:
@@ -208,9 +231,11 @@ class _RolloutDropCounters:
         self.consecutive_empty_groups += 1
         self._record_drop()
 
-    def record_zero_advantage(self) -> None:
+    def record_zero_advantage(self, rewards: list[float] | None = None) -> None:
         self.zero_advantage_groups += 1
         self.consecutive_zero_advantage_groups += 1
+        if rewards:
+            self.zero_advantage_rewards.extend(rewards)
         self._record_drop()
 
     def record_admitted(self) -> None:
@@ -872,6 +897,7 @@ class RLTrainer(Configurable):
         timings: _TrainStepTimings,
         dropped_empty_groups: int,
         dropped_zero_advantage_groups: int,
+        drop_metrics: list[m.Metric],
         train_version: int,
     ) -> None:
         """Build, trace, and emit train-step metrics."""
@@ -894,6 +920,7 @@ class RLTrainer(Configurable):
             timings=timings,
             dropped_empty_groups=dropped_empty_groups,
             dropped_zero_advantage_groups=dropped_zero_advantage_groups,
+            drop_metrics=drop_metrics,
             train_version=train_version,
         )
         for key in (
@@ -1031,19 +1058,11 @@ class RLTrainer(Configurable):
                         for rollout in group_rollouts
                         if rollout.reward is not None
                     ]
-                    drop_counters.record_zero_advantage()
+                    drop_counters.record_zero_advantage(dropped_rewards)
                     sl.log_trace_scalar(
                         {
                             "rollout.dropped_zero_advantage_groups": 1,
                             "rollout.sample_step": example.sample_step,
-                            "rollout.dropped_zero_advantage_reward.mean": (
-                                sum(dropped_rewards) / len(dropped_rewards)
-                                if dropped_rewards
-                                else 0.0
-                            ),
-                            "rollout.dropped_zero_advantage_reward.max": (
-                                max(dropped_rewards) if dropped_rewards else 0.0
-                            ),
                         }
                     )
                     continue
@@ -1209,10 +1228,7 @@ class RLTrainer(Configurable):
                 t_buffer_wait_s = time.perf_counter() - t_buffer_start
                 await _raise_rollout_task_errors(rollout_tasks)
 
-                (
-                    dropped_empty_groups,
-                    dropped_zero_advantage_groups,
-                ) = drop_counters.pop()
+                drop_stats = drop_counters.pop()
                 samples = replay_batch.samples
                 rollouts = [
                     rollout
@@ -1274,8 +1290,9 @@ class RLTrainer(Configurable):
                             checkpoint_s=0.0,
                             weight_sync=_zero_weight_sync_timings(),
                         ),
-                        dropped_empty_groups=dropped_empty_groups,
-                        dropped_zero_advantage_groups=dropped_zero_advantage_groups,
+                        dropped_empty_groups=drop_stats.empty_groups,
+                        dropped_zero_advantage_groups=drop_stats.zero_advantage_groups,
+                        drop_metrics=drop_stats.metrics,
                         train_version=batch_train_version,
                     )
                     continue
@@ -1316,8 +1333,9 @@ class RLTrainer(Configurable):
                             checkpoint_s=0.0,
                             weight_sync=_zero_weight_sync_timings(),
                         ),
-                        dropped_empty_groups=dropped_empty_groups,
-                        dropped_zero_advantage_groups=dropped_zero_advantage_groups,
+                        dropped_empty_groups=drop_stats.empty_groups,
+                        dropped_zero_advantage_groups=drop_stats.zero_advantage_groups,
+                        drop_metrics=drop_stats.metrics,
                         train_version=batch_train_version,
                     )
                     continue
@@ -1355,8 +1373,9 @@ class RLTrainer(Configurable):
                         checkpoint_s=t_checkpoint_s,
                         weight_sync=weight_sync_timings,
                     ),
-                    dropped_empty_groups=dropped_empty_groups,
-                    dropped_zero_advantage_groups=dropped_zero_advantage_groups,
+                    dropped_empty_groups=drop_stats.empty_groups,
+                    dropped_zero_advantage_groups=drop_stats.zero_advantage_groups,
+                    drop_metrics=drop_stats.metrics,
                     train_version=batch_train_version,
                 )
         finally:
