@@ -75,7 +75,7 @@ def test_alphabet_sort_dataset_and_builder_have_separate_roles():
         max_names_per_turn=1,
     ).build()
     builder = AlphabetSortBuilder.Config().build()
-    example = dataset.sample_group(step=2, group_idx=7)
+    example = dataset.sample_group(sample_step=2, group_idx=7)
 
     env = builder.build(example=example)
 
@@ -93,7 +93,7 @@ def test_alphabet_sort_builder_rejects_wrong_payload_type():
 
     stale_dict = EnvExample(
         group_id="bad",
-        step=0,
+        sample_step=0,
         group_idx=0,
         payload={
             "initial_prompt": "",
@@ -105,7 +105,7 @@ def test_alphabet_sort_builder_rejects_wrong_payload_type():
     )
     cross_task = EnvExample(
         group_id="bad",
-        step=0,
+        sample_step=0,
         group_idx=1,
         payload=SumDigitsExample(values=(1, 2), target=3),
     )

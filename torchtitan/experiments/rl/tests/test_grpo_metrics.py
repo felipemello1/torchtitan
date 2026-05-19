@@ -19,15 +19,16 @@ from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
 from torchtitan.experiments.rl.grpo import (
     _raise_rollout_task_errors,
     _RolloutDropCounters,
-    _TrainStepTimings,
-    _WeightSyncTimings,
     GRPOLoss,
     Provisioner,
     RLTrainer,
 )
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.observability.metrics.rl import (
+    _TrainStepTimings,
+    _WeightSyncTimings,
     build_rollout_metrics,
+    build_train_step_metrics,
     rename_metric_prefix,
 )
 from torchtitan.experiments.rl.replay import (
@@ -377,6 +378,7 @@ def test_max_turn_truncation_does_not_train_on_nonterminal_reward():
 
     async def run() -> None:
         async def completion_fn(
+            *,
             prompt_token_ids: list[int],
             sampling: SamplingConfig,
             request_id: str,
@@ -449,7 +451,7 @@ def test_sum_digits_dataset_and_builder_have_separate_roles():
         correctness_reward=2.0,
         format_reward=0.5,
     ).build()
-    example = dataset.sample_group(step=2, group_idx=7)
+    example = dataset.sample_group(sample_step=2, group_idx=7)
 
     async def run() -> None:
         env = builder.build(example=example)
@@ -470,7 +472,7 @@ def test_sum_digits_builder_rejects_stale_dict_payload():
     builder = SumDigitsBuilder.Config().build()
     example = EnvExample(
         group_id="bad",
-        step=0,
+        sample_step=0,
         group_idx=0,
         payload={"values": [12, 34], "target": 10},
     )
@@ -510,7 +512,7 @@ def test_run_rollout_group_closes_partially_built_envs_on_build_failure():
         with pytest.raises(RuntimeError, match="build failed"):
             await run_rollout_group(
                 env_builder=builder,
-                example=EnvExample(group_id="g0", step=0, group_idx=0),
+                example=EnvExample(group_id="g0", sample_step=0, group_idx=0),
                 group_size=2,
                 renderer=None,
                 completion_fn=None,
@@ -602,8 +604,10 @@ def test_generation_scheduler_coalesces_same_tick_requests():
         assert aggregate["generation_scheduler/batch_size/max"] == 2
         assert aggregate["generation_scheduler/pending_depth/mean"] == 0
         assert aggregate["generation_scheduler/pending_depth/max"] == 0
-        assert aggregate["generation_scheduler/active_requests/mean"] == 2
-        assert aggregate["generation_scheduler/active_requests/max"] == 2
+        assert aggregate["generation_scheduler/active_prompts/mean"] == 2
+        assert aggregate["generation_scheduler/active_prompts/max"] == 2
+        assert aggregate["generation_scheduler/queue_wait_seconds/mean"] >= 0
+        assert aggregate["generation_scheduler/queue_wait_seconds/max"] >= 0
 
     asyncio.run(run())
 
@@ -952,7 +956,7 @@ def test_replay_wait_surfaces_no_signal_producer_error():
                 raise
 
         task = asyncio.create_task(producer())
-        batch = await buffer.get_batch(min_samples=1, train_version=0)
+        batch = await buffer.get_batch(min_groups=1, train_version=0)
 
         assert not batch.samples
         with pytest.raises(RuntimeError, match="no trainable rollout groups"):
@@ -1007,7 +1011,7 @@ def test_train_step_metric_builder_emits_replay_timing_and_trace_scalars():
         ),
     )
 
-    metrics, trace_scalars = RLTrainer._build_train_step_metrics(
+    metrics, trace_scalars = build_train_step_metrics(
         samples=[sample],
         replay_batch=batch,
         rollouts=[rollout],
@@ -1077,7 +1081,7 @@ def test_train_step_metric_builder_handles_zero_step_duration():
         ),
     )
 
-    metrics, _ = RLTrainer._build_train_step_metrics(
+    metrics, _ = build_train_step_metrics(
         samples=[sample],
         replay_batch=batch,
         rollouts=[],
@@ -1214,11 +1218,91 @@ def test_replay_buffer_blocks_until_batch_is_ready():
             await buffer.close()
 
         producer_task = asyncio.create_task(producer())
-        batch = await buffer.get_batch(min_samples=2, train_version=0)
+        batch = await buffer.get_batch(min_groups=2, train_version=0)
         await producer_task
 
         assert [sample.group_id for sample in batch.samples] == ["g0", "g1"]
         assert batch.stats.num_groups == 2
         assert batch.stats.num_loss_tokens == 2
+
+    asyncio.run(run())
+
+
+def test_replay_buffer_batches_by_group_count_not_sample_count():
+    async def run() -> None:
+        buffer = ReplayBuffer(max_groups=2)
+
+        def sample(idx: int) -> ReplaySample:
+            return ReplaySample(
+                token_ids=[idx, idx + 10],
+                loss_mask=[0, 1],
+                behavior_logprobs=[0.0, -0.1],
+                advantage=1.0,
+                group_id=f"g{idx}",
+                sample_idx=idx,
+                behavior_version=0,
+                reward=1.0,
+            )
+
+        await buffer.put(
+            ReplayGroup(
+                group_id="g0",
+                samples=[sample(0), sample(1), sample(2)],
+                rollouts=[],
+                behavior_version=0,
+                max_behavior_version=0,
+            )
+        )
+        await buffer.put(
+            ReplayGroup(
+                group_id="g1",
+                samples=[sample(3)],
+                rollouts=[],
+                behavior_version=0,
+                max_behavior_version=0,
+            )
+        )
+
+        batch = await buffer.get_batch(min_groups=2, train_version=0)
+
+        assert [group.group_id for group in batch.groups] == ["g0", "g1"]
+        assert batch.stats.num_groups == 2
+        assert batch.stats.num_samples == 4
+
+    asyncio.run(run())
+
+
+def test_replay_buffer_drops_stale_groups_and_continues():
+    async def run() -> None:
+        buffer = ReplayBuffer(max_groups=2, max_age_steps=1)
+
+        def group(group_id: str, behavior_version: int) -> ReplayGroup:
+            sample = ReplaySample(
+                token_ids=[1, 2],
+                loss_mask=[0, 1],
+                behavior_logprobs=[0.0, -0.1],
+                advantage=1.0,
+                group_id=group_id,
+                sample_idx=0,
+                behavior_version=behavior_version,
+                reward=1.0,
+            )
+            return ReplayGroup(
+                group_id=group_id,
+                samples=[sample],
+                rollouts=[],
+                behavior_version=behavior_version,
+                max_behavior_version=behavior_version,
+            )
+
+        await buffer.put(group("stale", behavior_version=0))
+        await buffer.put(group("fresh", behavior_version=3))
+
+        batch = await buffer.get_batch(min_groups=1, train_version=3)
+
+        assert [group.group_id for group in batch.groups] == ["fresh"]
+        assert batch.stats.num_dropped_stale_groups == 1
+        assert batch.stats.max_observed_age_steps == 3
+        assert batch.stats.depth_groups == 0
 
     asyncio.run(run())

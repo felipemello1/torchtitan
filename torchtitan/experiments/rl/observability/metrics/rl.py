@@ -11,10 +11,42 @@ from __future__ import annotations
 import statistics
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from torchtitan.experiments.rl.observability import metrics as m
-from torchtitan.experiments.rl.replay import ReplayBufferStats
+from torchtitan.experiments.rl.replay import ReplayBatch, ReplayBufferStats
 from torchtitan.experiments.rl.types import ReplaySample, RolloutOutput, RolloutStatus
+
+
+@dataclass(frozen=True, slots=True)
+class _WeightSyncTimings:
+    """Wall-clock timing for one trainer-to-generator weight sync."""
+
+    admission_drain_s: float
+    push_s: float
+    pull_s: float
+    total_s: float
+
+
+@dataclass(frozen=True, slots=True)
+class _TrainStepTimings:
+    """Wall-clock timings logged for one training step."""
+
+    step_s: float
+    replay_wait_s: float
+    train_s: float
+    checkpoint_s: float
+    weight_sync: _WeightSyncTimings
+
+
+def _zero_weight_sync_timings() -> _WeightSyncTimings:
+    """Zero timings for train steps that do not publish new weights."""
+    return _WeightSyncTimings(
+        admission_drain_s=0.0,
+        push_s=0.0,
+        pull_s=0.0,
+        total_s=0.0,
+    )
 
 
 def rename_metric_prefix(
@@ -154,3 +186,92 @@ def _prepare_reward_metrics(
         m.Metric(f"{prefix}/{name}", m.Mean.from_list(values))
         for name, values in sorted(values_by_name.items())
     ]
+
+
+def build_train_step_metrics(
+    *,
+    samples: list[ReplaySample],
+    replay_batch: ReplayBatch,
+    rollouts: list[RolloutOutput],
+    live_generation_metrics: list[m.Metric],
+    fwd_bwd_metrics: dict[str, float],
+    optimizer_metrics: dict[str, float],
+    checkpoint_saved: bool,
+    timings: _TrainStepTimings,
+    dropped_empty_groups: int,
+    dropped_zero_advantage_groups: int,
+    train_version: int,
+) -> tuple[list[m.Metric], dict[str, float]]:
+    """Build metric records and structured scalars for one train step."""
+    total_tokens = sum(len(sample.token_ids) for sample in samples)
+    tokens_per_second = total_tokens / timings.step_s if timings.step_s > 0.0 else 0.0
+    behavior_versions = [group.behavior_version for group in replay_batch.groups]
+    max_behavior_versions = [
+        group.max_behavior_version for group in replay_batch.groups
+    ]
+    behavior_version_min = min(behavior_versions) if behavior_versions else 0
+    behavior_version_max = max(max_behavior_versions) if max_behavior_versions else 0
+
+    metrics: list[m.Metric] = []
+    metrics += build_rollout_metrics(
+        rollouts,
+        generation_metrics=[],
+        prefix="rollout",
+    )
+    metrics += live_generation_metrics
+    metrics += build_replay_metrics(
+        samples,
+        replay_batch.stats,
+        dropped_empty_groups=dropped_empty_groups,
+        dropped_zero_advantage_groups=dropped_zero_advantage_groups,
+    )
+    metrics += [
+        m.Metric("replay/policy_version/train", m.NoReduce(float(train_version))),
+        m.Metric(
+            "replay/policy_version/behavior_min",
+            m.NoReduce(float(behavior_version_min)),
+        ),
+        m.Metric(
+            "replay/policy_version/behavior_max",
+            m.NoReduce(float(behavior_version_max)),
+        ),
+    ]
+    metrics += [m.Metric(k, m.NoReduce(v)) for k, v in fwd_bwd_metrics.items()]
+    metrics += [m.Metric(k, m.NoReduce(v)) for k, v in optimizer_metrics.items()]
+    metrics.append(m.Metric("checkpoint/saved", m.NoReduce(float(checkpoint_saved))))
+    for key, value in [
+        ("timing/step", timings.step_s),
+        ("timing/replay_wait", timings.replay_wait_s),
+        ("timing/train", timings.train_s),
+        ("timing/weight_sync/admission_drain", timings.weight_sync.admission_drain_s),
+        ("timing/weight_sync/push", timings.weight_sync.push_s),
+        ("timing/weight_sync/pull", timings.weight_sync.pull_s),
+        ("timing/weight_sync/total", timings.weight_sync.total_s),
+        ("timing/checkpoint", timings.checkpoint_s),
+    ]:
+        metrics.append(m.Metric(key, m.NoReduce(value)))
+    metrics.append(
+        m.Metric(
+            "perf/tokens_per_second",
+            m.NoReduce(tokens_per_second),
+        )
+    )
+
+    trace_scalars = {
+        "replay.buffer_depth_groups": replay_batch.stats.depth_groups,
+        "replay.dropped_stale_groups": replay_batch.stats.num_dropped_stale_groups,
+        "rollout.dropped_empty_groups": dropped_empty_groups,
+        "rollout.dropped_zero_advantage_groups": dropped_zero_advantage_groups,
+        "replay.train_version": train_version,
+        "replay.behavior_version_min": behavior_version_min,
+        "replay.behavior_version_max": behavior_version_max,
+        "timing.replay_wait_ms": timings.replay_wait_s * 1000,
+        "timing.weight_sync_admission_drain_ms": (
+            timings.weight_sync.admission_drain_s * 1000
+        ),
+        "timing.weight_sync_push_ms": timings.weight_sync.push_s * 1000,
+        "timing.weight_sync_pull_ms": timings.weight_sync.pull_s * 1000,
+        "timing.checkpoint_ms": timings.checkpoint_s * 1000,
+        "checkpoint.saved": float(checkpoint_saved),
+    }
+    return metrics, trace_scalars

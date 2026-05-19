@@ -87,8 +87,8 @@ class RolloutOutput:
 
     group_id: str
     sample_idx: int
-    turns: list[RolloutTurn] = field(default_factory=list)
-    status: RolloutStatus = RolloutStatus.COMPLETED
+    turns: list[RolloutTurn]
+    status: RolloutStatus
     reward: float | None = None
     reward_components: dict[str, float] = field(default_factory=dict)
 

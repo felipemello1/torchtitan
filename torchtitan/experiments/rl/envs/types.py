@@ -22,14 +22,14 @@ class EnvExample:
 
     Args:
         group_id: Stable ID for logging and advantage centering.
-        step: Trainer step that sampled the row.
-        group_idx: Position within the step batch.
+        sample_step: Dataset sampling step used for deterministic row selection.
+        group_idx: Position within the sample-step batch.
         payload: Task-specific data consumed by an env builder. The controller
             treats this opaquely.
     """
 
     group_id: str
-    step: int
+    sample_step: int
     group_idx: int
     payload: object | None = None
 
@@ -89,9 +89,9 @@ class EnvDataset(Protocol):
 
     The controller owns ``group_idx`` so async producers cannot accidentally
     sample the same deterministic row. Dataset implementations should use
-    ``(step, group_idx)`` as part of their reproducibility seed and stamp the
-    same values onto the returned :class:`EnvExample`.
+    ``(sample_step, group_idx)`` as part of their reproducibility seed and stamp
+    the same values onto the returned :class:`EnvExample`.
     """
 
-    def sample_group(self, *, step: int, group_idx: int) -> EnvExample:
+    def sample_group(self, *, sample_step: int, group_idx: int) -> EnvExample:
         ...

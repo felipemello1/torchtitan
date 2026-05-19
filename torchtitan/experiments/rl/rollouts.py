@@ -9,8 +9,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable
+from typing import Protocol
 
 from renderers import Renderer
 
@@ -27,16 +27,17 @@ from torchtitan.experiments.rl.types import (
 )
 
 
-CompletionFn = Callable[[list[int], SamplingConfig, str], Awaitable[Completion]]
+class CompletionFn(Protocol):
+    """Async policy callable used by rollout drivers."""
 
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class RolloutGroupResult:
-    """Completed rollout group plus behavior-version summary."""
-
-    rollouts: list[RolloutOutput]
-    behavior_version: int | None
-    max_behavior_version: int | None
+    def __call__(
+        self,
+        *,
+        prompt_token_ids: list[int],
+        sampling: SamplingConfig,
+        request_id: str,
+    ) -> Awaitable[Completion]:
+        ...
 
 
 async def do_single_rollout(
@@ -68,7 +69,11 @@ async def do_single_rollout(
 
     for turn_idx in range(max_turns):
         request_id = f"{group_id}:sample={sample_idx}:turn={turn_idx}"
-        completion = await completion_fn(prompt.token_ids, sampling, request_id)
+        completion = await completion_fn(
+            prompt_token_ids=prompt.token_ids,
+            sampling=sampling,
+            request_id=request_id,
+        )
         token_step = await token_env.step(completion)
         env_step = token_step.env_step
 
@@ -125,7 +130,7 @@ async def run_rollout_group(
     sampling: SamplingConfig,
     max_turns: int,
     token_env_config: TokenEnvConfig,
-) -> RolloutGroupResult:
+) -> list[RolloutOutput]:
     """Run one GRPO group from a concrete dataset example."""
     envs: list[MessageEnv] = []
     try:
@@ -138,7 +143,7 @@ async def run_rollout_group(
         )
         raise
 
-    rollouts = await _run_env_rollouts(
+    return await _run_env_rollouts(
         envs=envs,
         renderer=renderer,
         completion_fn=completion_fn,
@@ -146,22 +151,6 @@ async def run_rollout_group(
         group_id=example.group_id,
         max_turns=max_turns,
         token_env_config=token_env_config,
-    )
-    versioned_rollouts = [rollout for rollout in rollouts if rollout.turns]
-    behavior_version = (
-        min(rollout.behavior_version for rollout in versioned_rollouts)
-        if versioned_rollouts
-        else None
-    )
-    max_behavior_version = (
-        max(rollout.max_behavior_version for rollout in versioned_rollouts)
-        if versioned_rollouts
-        else None
-    )
-    return RolloutGroupResult(
-        rollouts=rollouts,
-        behavior_version=behavior_version,
-        max_behavior_version=max_behavior_version,
     )
 
 

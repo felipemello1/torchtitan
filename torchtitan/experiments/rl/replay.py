@@ -32,6 +32,30 @@ class ReplayGroup:
     behavior_version: int
     max_behavior_version: int
 
+    @classmethod
+    def from_rollouts(
+        cls,
+        *,
+        group_id: str,
+        samples: list[ReplaySample],
+        rollouts: list[RolloutOutput],
+    ) -> "ReplayGroup":
+        """Build a replay group and derive behavior-version bounds once."""
+        versioned_rollouts = [rollout for rollout in rollouts if rollout.turns]
+        if not versioned_rollouts:
+            raise ValueError(f"replay group {group_id!r} has no versioned rollouts")
+        return cls(
+            group_id=group_id,
+            samples=samples,
+            rollouts=rollouts,
+            behavior_version=min(
+                rollout.behavior_version for rollout in versioned_rollouts
+            ),
+            max_behavior_version=max(
+                rollout.max_behavior_version for rollout in versioned_rollouts
+            ),
+        )
+
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class ReplayBufferStats:
@@ -186,28 +210,28 @@ class ReplayBuffer:
     async def get_batch(
         self,
         *,
-        min_samples: int,
+        min_groups: int,
         train_version: int,
     ) -> ReplayBatch:
-        """Pop FIFO groups until at least ``min_samples`` are available.
+        """Pop FIFO groups until at least ``min_groups`` are available.
 
-        If the buffer is closed before enough samples arrive, this returns the
-        valid samples consumed so far. Callers that require a full batch should
+        If the buffer is closed before enough groups arrive, this returns the
+        valid groups consumed so far. Callers that require a full batch should
         enforce that postcondition.
         """
-        if min_samples <= 0:
-            raise ValueError(f"min_samples must be positive, got {min_samples}")
+        if min_groups <= 0:
+            raise ValueError(f"min_groups must be positive, got {min_groups}")
 
         return await self._consume(
             train_version=train_version,
-            min_samples=min_samples,
+            min_groups=min_groups,
         )
 
     async def _consume(
         self,
         *,
         train_version: int,
-        min_samples: int,
+        min_groups: int,
     ) -> ReplayBatch:
         groups: list[ReplayGroup] = []
         samples: list[ReplaySample] = []
@@ -216,7 +240,7 @@ class ReplayBuffer:
 
         async with self._condition:
             while True:
-                if len(samples) >= min_samples:
+                if len(groups) >= min_groups:
                     break
                 while not self._closed and not self._groups:
                     await self._condition.wait()

@@ -76,15 +76,15 @@ class SumDigitsDataset(Configurable):
     def __init__(self, config: Config):
         self.config = config
 
-    def sample_group(self, *, step: int, group_idx: int) -> EnvExample:
+    def sample_group(self, *, sample_step: int, group_idx: int) -> EnvExample:
         cfg = self.config
-        rng = random.Random(f"{cfg.seed}:{step}:{group_idx}")
+        rng = random.Random(f"{cfg.seed}:{sample_step}:{group_idx}")
         num_values = rng.randint(cfg.min_values, cfg.max_values)
         values = [rng.randint(cfg.min_value, cfg.max_value) for _ in range(num_values)]
         target = sum(int(digit) for value in values for digit in str(abs(value)))
         return EnvExample(
-            group_id=f"sum_digits/step={step}/group={group_idx}",
-            step=step,
+            group_id=f"sum_digits/step={sample_step}/group={group_idx}",
+            sample_step=sample_step,
             group_idx=group_idx,
             payload=SumDigitsExample(values=tuple(values), target=target),
         )

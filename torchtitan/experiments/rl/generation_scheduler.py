@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ class _PendingGeneration:
     sampling: SamplingConfig
     request_id: str
     future: asyncio.Future[Completion]
+    submitted_at_s: float
 
 
 def _sampling_key(
@@ -54,6 +56,9 @@ class GenerationScheduler:
     admission at request boundaries: active generator calls drain, new rollout
     turns queue on the controller, and generation resumes after fresh weights
     are loaded.
+
+    This is controller-side tick batching for vLLM ``external_launcher``
+    determinism. It is not continuous admission into a live vLLM scheduler.
     """
 
     def __init__(self, generate_batch: GenerateBatchFn):
@@ -63,7 +68,7 @@ class GenerationScheduler:
         self._metrics: list[m.Metric] = []
         self._condition = asyncio.Condition()
         self._loading_weights = False
-        self._active_requests = 0
+        self._active_prompts = 0
         self._closed = False
 
     def pop_metrics(self) -> list[m.Metric]:
@@ -102,6 +107,7 @@ class GenerationScheduler:
                     sampling=sampling,
                     request_id=request_id,
                     future=future,
+                    submitted_at_s=time.perf_counter(),
                 )
             )
             if self._flush_task is None or self._flush_task.done():
@@ -151,12 +157,16 @@ class GenerationScheduler:
             ]
             if not pending_group:
                 return
-            self._active_requests += len(pending_group)
+            self._active_prompts += len(pending_group)
             batch_size = len(pending_group)
             pending_depth = len(self._pending)
-            active_requests = self._active_requests
+            active_prompts = self._active_prompts
 
         try:
+            queue_wait_s = [
+                time.perf_counter() - pending.submitted_at_s
+                for pending in pending_group
+            ]
             self._metrics.extend(
                 [
                     m.Metric("generation_scheduler/batch_size", m.Mean(batch_size)),
@@ -170,14 +180,30 @@ class GenerationScheduler:
                         m.Max(pending_depth),
                     ),
                     m.Metric(
-                        "generation_scheduler/active_requests",
-                        m.Mean(active_requests),
+                        "generation_scheduler/active_prompts",
+                        m.Mean(active_prompts),
                     ),
                     m.Metric(
-                        "generation_scheduler/active_requests",
-                        m.Max(active_requests),
+                        "generation_scheduler/active_prompts",
+                        m.Max(active_prompts),
+                    ),
+                    m.Metric(
+                        "generation_scheduler/queue_wait_seconds",
+                        m.Mean.from_list(queue_wait_s),
+                    ),
+                    m.Metric(
+                        "generation_scheduler/queue_wait_seconds",
+                        m.Max.from_list(queue_wait_s),
                     ),
                 ]
+            )
+            sl.log_trace_scalar(
+                {
+                    "generation_scheduler.batch_size": batch_size,
+                    "generation_scheduler.pending_depth": pending_depth,
+                    "generation_scheduler.active_prompts": active_prompts,
+                    "generation_scheduler.queue_wait_ms.max": max(queue_wait_s) * 1000,
+                }
             )
             with sl.log_trace_span("generation_scheduler_flush"):
                 completions, metrics = await self._generate_batch(
@@ -205,7 +231,7 @@ class GenerationScheduler:
                     pending.future.set_exception(exc)
         finally:
             async with self._condition:
-                self._active_requests -= len(pending_group)
+                self._active_prompts -= len(pending_group)
                 self._condition.notify_all()
 
     async def pause_for_weight_sync(self) -> None:
@@ -216,7 +242,7 @@ class GenerationScheduler:
             if self._closed:
                 raise self._closed_error()
             self._loading_weights = True
-            await self._condition.wait_for(lambda: self._active_requests == 0)
+            await self._condition.wait_for(lambda: self._active_prompts == 0)
 
     async def resume_after_weight_sync(self) -> None:
         async with self._condition:
@@ -237,4 +263,4 @@ class GenerationScheduler:
             await task
 
         async with self._condition:
-            await self._condition.wait_for(lambda: self._active_requests == 0)
+            await self._condition.wait_for(lambda: self._active_prompts == 0)

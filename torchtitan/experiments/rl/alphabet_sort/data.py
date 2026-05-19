@@ -325,10 +325,10 @@ class AlphabetSortDataset(Configurable):
     def __init__(self, config: Config):
         self.config = config
 
-    def sample_group(self, *, step: int, group_idx: int) -> EnvExample:
+    def sample_group(self, *, sample_step: int, group_idx: int) -> EnvExample:
         episode = build_example(
             seed=self.config.seed,
-            step=step,
+            step=sample_step,
             group_idx=group_idx,
             min_turns=self.config.min_turns,
             max_turns=self.config.max_turns,
@@ -336,8 +336,8 @@ class AlphabetSortDataset(Configurable):
             max_names_per_turn=self.config.max_names_per_turn,
         )
         return EnvExample(
-            group_id=f"alphabet_sort/step={step}/group={group_idx}",
-            step=step,
+            group_id=f"alphabet_sort/step={sample_step}/group={group_idx}",
+            sample_step=sample_step,
             group_idx=group_idx,
             payload=episode,
         )

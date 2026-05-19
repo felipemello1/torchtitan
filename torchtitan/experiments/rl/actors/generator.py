@@ -557,24 +557,25 @@ class VLLMGenerator(Actor, Configurable):
         the nested worker shutdown method, so process-group teardown is left to
         ``mesh.stop`` on the controller side.
         """
-        if self._engine is not None:
-            renderer = getattr(self._engine, "renderer", None)
-            try:
+        async with self._engine_lock:
+            if self._engine is not None:
+                renderer = getattr(self._engine, "renderer", None)
                 try:
-                    if renderer is not None:
-                        renderer.shutdown()
-                finally:
                     try:
-                        self._engine.engine_core.shutdown()
-                    except AttributeError as exc:
-                        if "shutdown" not in str(exc):
-                            raise
-                        logger.warning(
-                            "vLLM engine_core.shutdown skipped because this vLLM "
-                            "build is missing a nested shutdown method: %s",
-                            exc,
-                        )
-            finally:
-                self._engine = None
+                        if renderer is not None:
+                            renderer.shutdown()
+                    finally:
+                        try:
+                            self._engine.engine_core.shutdown()
+                        except AttributeError as exc:
+                            if "shutdown" not in str(exc):
+                                raise
+                            logger.warning(
+                                "vLLM engine_core.shutdown skipped because this vLLM "
+                                "build is missing a nested shutdown method: %s",
+                                exc,
+                            )
+                finally:
+                    self._engine = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

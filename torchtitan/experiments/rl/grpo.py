@@ -55,8 +55,11 @@ from torchtitan.experiments.rl.envs import (
 from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.observability.metrics.rl import (
-    build_replay_metrics,
+    _TrainStepTimings,
+    _WeightSyncTimings,
+    _zero_weight_sync_timings,
     build_rollout_metrics,
+    build_train_step_metrics,
     rename_metric_prefix,
 )
 from torchtitan.experiments.rl.renderer import RendererConfig
@@ -68,7 +71,7 @@ from torchtitan.experiments.rl.replay import (
     rollouts_to_replay_samples,
 )
 from torchtitan.experiments.rl.rollout_logging import RolloutSampleLogger
-from torchtitan.experiments.rl.rollouts import RolloutGroupResult, run_rollout_group
+from torchtitan.experiments.rl.rollouts import run_rollout_group
 from torchtitan.experiments.rl.sampling import SamplingConfig
 from torchtitan.experiments.rl.types import (
     Completion,
@@ -293,27 +296,6 @@ class _RolloutDropCounters:
                 "try a harder task, higher sampling temperature, or "
                 "--no-drop-zero-advantage-groups for debugging."
             )
-
-
-@dataclass(frozen=True, slots=True)
-class _WeightSyncTimings:
-    """Wall-clock timing for one trainer-to-generator weight sync."""
-
-    admission_drain_s: float
-    push_s: float
-    pull_s: float
-    total_s: float
-
-
-@dataclass(frozen=True, slots=True)
-class _TrainStepTimings:
-    """Wall-clock timings logged for one completed training step."""
-
-    step_s: float
-    replay_wait_s: float
-    train_s: float
-    checkpoint_s: float
-    weight_sync: _WeightSyncTimings
 
 
 class RLTrainer(Configurable):
@@ -861,29 +843,18 @@ class RLTrainer(Configurable):
 
         return GenerationScheduler(generate_batch)
 
-    def _make_completion_fn(
-        self,
-        *,
-        generation_scheduler: GenerationScheduler,
-    ):
-        async def completion_fn(
-            prompt_token_ids: list[int],
-            turn_sampling: SamplingConfig,
-            request_id: str,
-        ) -> Completion:
-            return await generation_scheduler.submit(
-                prompt_token_ids=prompt_token_ids,
-                sampling=turn_sampling,
-                request_id=request_id,
-            )
-
-        return completion_fn
-
     def _sampling_with_stop_token_ids(self, sampling: SamplingConfig) -> SamplingConfig:
         stop_token_ids = list(self._stop_token_ids)
         if list(sampling.stop_token_ids) == stop_token_ids:
             return sampling
         return dataclasses.replace(sampling, stop_token_ids=stop_token_ids)
+
+    def _token_env_config_for(self, sampling: SamplingConfig) -> TokenEnvConfig:
+        return TokenEnvConfig(
+            max_trajectory_tokens=self.config.max_trajectory_tokens,
+            max_generation_tokens=sampling.max_tokens,
+            step_timeout_s=self.config.step_timeout_s,
+        )
 
     async def _sync_generator_weights(
         self,
@@ -919,104 +890,6 @@ class RLTrainer(Configurable):
         )
 
     @staticmethod
-    def _build_train_step_metrics(
-        *,
-        samples: list[ReplaySample],
-        replay_batch: ReplayBatch,
-        rollouts: list[RolloutOutput],
-        live_generation_metrics: list[m.Metric],
-        fwd_bwd_metrics: dict[str, float],
-        optimizer_metrics: dict[str, float],
-        checkpoint_saved: bool,
-        timings: _TrainStepTimings,
-        dropped_empty_groups: int,
-        dropped_zero_advantage_groups: int,
-        train_version: int,
-    ) -> tuple[list[m.Metric], dict[str, float]]:
-        """Build metric records and structured scalars for one train step."""
-        total_tokens = sum(len(sample.token_ids) for sample in samples)
-        tokens_per_second = (
-            total_tokens / timings.step_s if timings.step_s > 0.0 else 0.0
-        )
-        behavior_versions = [group.behavior_version for group in replay_batch.groups]
-        max_behavior_versions = [
-            group.max_behavior_version for group in replay_batch.groups
-        ]
-        behavior_version_min = min(behavior_versions) if behavior_versions else 0
-        behavior_version_max = (
-            max(max_behavior_versions) if max_behavior_versions else 0
-        )
-
-        metrics: list[m.Metric] = []
-        metrics += build_rollout_metrics(
-            rollouts,
-            generation_metrics=[],
-            prefix="rollout",
-        )
-        metrics += live_generation_metrics
-        metrics += build_replay_metrics(
-            samples,
-            replay_batch.stats,
-            dropped_empty_groups=dropped_empty_groups,
-            dropped_zero_advantage_groups=dropped_zero_advantage_groups,
-        )
-        metrics += [
-            m.Metric("replay/policy_version/train", m.NoReduce(float(train_version))),
-            m.Metric(
-                "replay/policy_version/behavior_min",
-                m.NoReduce(float(behavior_version_min)),
-            ),
-            m.Metric(
-                "replay/policy_version/behavior_max",
-                m.NoReduce(float(behavior_version_max)),
-            ),
-        ]
-        metrics += [m.Metric(k, m.NoReduce(v)) for k, v in fwd_bwd_metrics.items()]
-        metrics += [m.Metric(k, m.NoReduce(v)) for k, v in optimizer_metrics.items()]
-        metrics.append(
-            m.Metric("checkpoint/saved", m.NoReduce(float(checkpoint_saved)))
-        )
-        for key, value in [
-            ("timing/step", timings.step_s),
-            ("timing/replay_wait", timings.replay_wait_s),
-            ("timing/train", timings.train_s),
-            (
-                "timing/weight_sync/admission_drain",
-                timings.weight_sync.admission_drain_s,
-            ),
-            ("timing/weight_sync/push", timings.weight_sync.push_s),
-            ("timing/weight_sync/pull", timings.weight_sync.pull_s),
-            ("timing/weight_sync/total", timings.weight_sync.total_s),
-            ("timing/checkpoint", timings.checkpoint_s),
-        ]:
-            metrics.append(m.Metric(key, m.NoReduce(value)))
-        metrics.append(
-            m.Metric(
-                "perf/tokens_per_second",
-                m.NoReduce(tokens_per_second),
-            )
-        )
-
-        trace_scalars = {
-            "replay.buffer_depth_groups": replay_batch.stats.depth_groups,
-            "replay.dropped_stale_groups": replay_batch.stats.num_dropped_stale_groups,
-            "rollout.dropped_empty_groups": dropped_empty_groups,
-            "rollout.dropped_zero_advantage_groups": dropped_zero_advantage_groups,
-            "replay.train_version": train_version,
-            "replay.behavior_version_min": behavior_version_min,
-            "replay.behavior_version_max": behavior_version_max,
-            "timing.replay_wait_ms": timings.replay_wait_s * 1000,
-            "timing.weight_sync_admission_drain_ms": (
-                timings.weight_sync.admission_drain_s * 1000
-            ),
-            "timing.weight_sync_push_ms": timings.weight_sync.push_s * 1000,
-            "timing.weight_sync_pull_ms": timings.weight_sync.pull_s * 1000,
-            "timing.checkpoint_ms": timings.checkpoint_s * 1000,
-            "checkpoint.saved": float(checkpoint_saved),
-        }
-        return metrics, trace_scalars
-
-    @staticmethod
     def _forward_backward_skip_metrics(
         fwd_bwd_metrics: dict[str, float],
         *,
@@ -1048,16 +921,6 @@ class RLTrainer(Configurable):
             or optim_output.metrics.get("train/skipped_nonfinite_grad_norm", 0.0) > 0.0
         )
 
-    @staticmethod
-    def _zero_weight_sync_timings() -> _WeightSyncTimings:
-        """Zero timings for train steps that do not publish new weights."""
-        return _WeightSyncTimings(
-            admission_drain_s=0.0,
-            push_s=0.0,
-            pull_s=0.0,
-            total_s=0.0,
-        )
-
     def _log_train_step(
         self,
         *,
@@ -1083,7 +946,7 @@ class RLTrainer(Configurable):
             )
             for metric in generation_scheduler.pop_metrics()
         ]
-        step_metrics, trace_scalars = self._build_train_step_metrics(
+        step_metrics, trace_scalars = build_train_step_metrics(
             samples=samples,
             replay_batch=replay_batch,
             rollouts=rollouts,
@@ -1108,35 +971,28 @@ class RLTrainer(Configurable):
             is_validation=False,
         )
 
-    async def _collect_validation_rollouts(
+    async def _collect_finite_rollouts(
         self,
         *,
         env_dataset: EnvDataset,
         env_builder: EnvBuilder,
         num_groups: int,
         group_size: int,
-        step: int,
+        sample_step: int,
         sampling: SamplingConfig,
         metrics_prefix: str = "generator",
     ) -> tuple[list[RolloutOutput], list[m.Metric]]:
-        """Collect a finite set of validation rollout groups."""
+        """Collect a finite set of rollout groups."""
         sampling = self._sampling_with_stop_token_ids(sampling)
         generation_scheduler = self._make_generation_scheduler(
             metrics_prefix=metrics_prefix,
         )
-        completion_fn = self._make_completion_fn(
-            generation_scheduler=generation_scheduler,
-        )
-        token_env_config = TokenEnvConfig(
-            max_trajectory_tokens=self.config.max_trajectory_tokens,
-            max_generation_tokens=sampling.max_tokens,
-            step_timeout_s=self.config.step_timeout_s,
-        )
+        token_env_config = self._token_env_config_for(sampling)
         examples = [
-            env_dataset.sample_group(step=step, group_idx=group_idx)
+            env_dataset.sample_group(sample_step=sample_step, group_idx=group_idx)
             for group_idx in range(num_groups)
         ]
-        pending: set[asyncio.Task[RolloutGroupResult]] = set()
+        pending: set[asyncio.Task[list[RolloutOutput]]] = set()
         rollouts: list[RolloutOutput] = []
         next_idx = 0
         max_inflight = max(self.config.async_rollout_groups, 1)
@@ -1152,7 +1008,7 @@ class RLTrainer(Configurable):
                                 example=example,
                                 group_size=group_size,
                                 renderer=self.renderer,
-                                completion_fn=completion_fn,
+                                completion_fn=generation_scheduler.submit,
                                 sampling=sampling,
                                 max_turns=self.config.max_rollout_turns,
                                 token_env_config=token_env_config,
@@ -1166,7 +1022,7 @@ class RLTrainer(Configurable):
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in done:
-                    rollouts.extend(task.result().rollouts)
+                    rollouts.extend(task.result())
         except BaseException:
             for task in pending:
                 task.cancel()
@@ -1195,34 +1051,26 @@ class RLTrainer(Configurable):
         """Produce rollout groups until training finishes or a producer fails."""
         sampling = self._sampling_with_stop_token_ids(self.config.generator.sampling)
         group_size = self.config.rollout_group_size
-        completion_fn = self._make_completion_fn(
-            generation_scheduler=generation_scheduler,
-        )
-        token_env_config = TokenEnvConfig(
-            max_trajectory_tokens=self.config.max_trajectory_tokens,
-            max_generation_tokens=sampling.max_tokens,
-            step_timeout_s=self.config.step_timeout_s,
-        )
+        token_env_config = self._token_env_config_for(sampling)
 
         try:
             while not shutdown.is_set():
                 example = await next_example()
                 with sl.log_trace_span("rollout_group"):
-                    result = await run_rollout_group(
+                    group_rollouts = await run_rollout_group(
                         env_builder=self.train_env_builder,
                         example=example,
                         group_size=group_size,
                         renderer=self.renderer,
-                        completion_fn=completion_fn,
+                        completion_fn=generation_scheduler.submit,
                         sampling=sampling,
                         max_turns=self.config.max_rollout_turns,
                         token_env_config=token_env_config,
                     )
-                group_rollouts = result.rollouts
 
                 if self.rollout_sample_logger is not None:
                     self.rollout_sample_logger.write(
-                        step=example.step,
+                        step=example.sample_step,
                         phase="train_rollout",
                         rollouts=group_rollouts,
                     )
@@ -1235,7 +1083,7 @@ class RLTrainer(Configurable):
                     sl.log_trace_scalar(
                         {
                             "rollout.dropped_empty_groups": 1,
-                            "rollout.sample_step": example.step,
+                            "rollout.sample_step": example.sample_step,
                         }
                     )
                     continue
@@ -1245,44 +1093,29 @@ class RLTrainer(Configurable):
                     sl.log_trace_scalar(
                         {
                             "rollout.dropped_zero_advantage_groups": 1,
-                            "rollout.sample_step": example.step,
+                            "rollout.sample_step": example.sample_step,
                         }
                     )
                     continue
 
-                if (
-                    result.behavior_version is None
-                    or result.max_behavior_version is None
-                ):
-                    drop_counters.record_empty()
-                    sl.log_trace_scalar(
-                        {
-                            "rollout.dropped_empty_groups": 1,
-                            "rollout.sample_step": example.step,
-                        }
-                    )
-                    continue
-                behavior_version = result.behavior_version
-                max_behavior_version = result.max_behavior_version
+                replay_group = ReplayGroup.from_rollouts(
+                    group_id=example.group_id,
+                    samples=samples,
+                    rollouts=group_rollouts,
+                )
                 sl.log_trace_scalar(
                     {
-                        "rollout.behavior_version": behavior_version,
-                        "rollout.max_behavior_version": max_behavior_version,
-                        "rollout.sample_step": example.step,
+                        "rollout.behavior_version": replay_group.behavior_version,
+                        "rollout.max_behavior_version": (
+                            replay_group.max_behavior_version
+                        ),
+                        "rollout.sample_step": example.sample_step,
                         "rollout.num_samples": len(samples),
                     }
                 )
                 drop_counters.record_admitted()
                 with sl.log_trace_span("replay_buffer_put"):
-                    await replay_buffer.put(
-                        ReplayGroup(
-                            group_id=example.group_id,
-                            samples=samples,
-                            rollouts=group_rollouts,
-                            behavior_version=behavior_version,
-                            max_behavior_version=max_behavior_version,
-                        )
-                    )
+                    await replay_buffer.put(replay_group)
         except asyncio.CancelledError:
             raise
         except RuntimeError:
@@ -1302,12 +1135,13 @@ class RLTrainer(Configurable):
     async def validate(
         self,
         *,
-        step: int = 0,
+        log_step: int = 0,
         phase: str = "validation",
     ) -> list[m.Metric]:
         """Run finite greedy rollout collection for validation."""
         t_validate_start = time.perf_counter()
         num_samples = self.config.num_validation_samples
+        validation_sample_step = 0
         greedy = SamplingConfig(
             n=1,
             temperature=0.0,
@@ -1315,12 +1149,12 @@ class RLTrainer(Configurable):
             max_tokens=self.config.generator.sampling.max_tokens,
             stop_token_ids=list(self._stop_token_ids),
         )
-        rollouts, validation_metrics = await self._collect_validation_rollouts(
+        rollouts, validation_metrics = await self._collect_finite_rollouts(
             env_dataset=self.validation_dataset,
             env_builder=self.validation_env_builder,
             num_groups=num_samples,
             group_size=1,
-            step=0,
+            sample_step=validation_sample_step,
             sampling=greedy,
             metrics_prefix="validation/generator",
         )
@@ -1329,7 +1163,7 @@ class RLTrainer(Configurable):
             _log_samples(rollouts)
         if self.rollout_sample_logger is not None:
             self.rollout_sample_logger.write(
-                step=step,
+                step=log_step,
                 phase=phase,
                 rollouts=rollouts,
             )
@@ -1351,7 +1185,10 @@ class RLTrainer(Configurable):
         num_steps = self.config.num_steps
         logger.info(f"Pre-training validation; then {num_steps} steps of RL training")
 
-        pre_validation_metrics = await self.validate(step=0, phase="pre_validation")
+        pre_validation_metrics = await self.validate(
+            log_step=0,
+            phase="pre_validation",
+        )
         self.metrics_processor.log(
             step=0,
             metrics=pre_validation_metrics,
@@ -1387,7 +1224,7 @@ class RLTrainer(Configurable):
                 max(self.config.num_prompts_per_step, 1),
             )
             return self.train_dataset.sample_group(
-                step=sample_step,
+                sample_step=sample_step,
                 group_idx=group_idx,
             )
 
@@ -1415,12 +1252,9 @@ class RLTrainer(Configurable):
                 t_step_start = time.perf_counter()
                 t_buffer_start = time.perf_counter()
                 batch_train_version = policy_version
-                batch_min_samples = (
-                    self.config.num_prompts_per_step * self.config.rollout_group_size
-                )
                 with sl.log_trace_span("replay_buffer_get_batch"):
                     replay_batch = await replay_buffer.get_batch(
-                        min_samples=batch_min_samples,
+                        min_groups=self.config.num_prompts_per_step,
                         train_version=batch_train_version,
                     )
                 t_buffer_wait_s = time.perf_counter() - t_buffer_start
@@ -1489,7 +1323,7 @@ class RLTrainer(Configurable):
                             replay_wait_s=t_buffer_wait_s,
                             train_s=t_train_s,
                             checkpoint_s=0.0,
-                            weight_sync=self._zero_weight_sync_timings(),
+                            weight_sync=_zero_weight_sync_timings(),
                         ),
                         dropped_empty_groups=dropped_empty_groups,
                         dropped_zero_advantage_groups=dropped_zero_advantage_groups,
@@ -1531,7 +1365,7 @@ class RLTrainer(Configurable):
                             replay_wait_s=t_buffer_wait_s,
                             train_s=t_train_s,
                             checkpoint_s=0.0,
-                            weight_sync=self._zero_weight_sync_timings(),
+                            weight_sync=_zero_weight_sync_timings(),
                         ),
                         dropped_empty_groups=dropped_empty_groups,
                         dropped_zero_advantage_groups=dropped_zero_advantage_groups,
@@ -1585,7 +1419,7 @@ class RLTrainer(Configurable):
             await asyncio.gather(*rollout_tasks, return_exceptions=True)
 
         post_validation_metrics = await self.validate(
-            step=num_steps,
+            log_step=num_steps,
             phase="post_validation",
         )
         self.metrics_processor.log(
