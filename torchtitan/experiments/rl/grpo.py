@@ -72,6 +72,7 @@ from torchtitan.experiments.rl.rollouts import RolloutGroupResult, run_rollout_g
 from torchtitan.experiments.rl.sampling import SamplingConfig
 from torchtitan.experiments.rl.types import (
     Completion,
+    OptimStepOutput,
     ReplaySample,
     RolloutOutput,
     TrainingBatch,
@@ -114,8 +115,16 @@ class GRPOLoss(Configurable):
         num_global_valid_tokens: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         raw_log_ratio = policy_logprobs - behavior_logprobs
-        log_ratio = torch.clamp(
+        # Keep the scalar loss finite enough to report metrics, but any
+        # non-finite selected-token ratio is still a no-step health signal.
+        sanitized_log_ratio = torch.nan_to_num(
             raw_log_ratio,
+            nan=0.0,
+            posinf=self.max_log_ratio,
+            neginf=-self.max_log_ratio,
+        )
+        log_ratio = torch.clamp(
+            sanitized_log_ratio,
             min=-self.max_log_ratio,
             max=self.max_log_ratio,
         )
@@ -127,12 +136,15 @@ class GRPOLoss(Configurable):
 
         with torch.no_grad():
             clipped_frac = (torch.abs(ratio - clipped_ratio) > 1e-6).to(ratio.dtype)
+            nonfinite_frac = (~torch.isfinite(raw_log_ratio)).to(ratio.dtype)
             log_ratio_clipped_frac = (raw_log_ratio != log_ratio).to(ratio.dtype)
             loss_metrics = {
                 "loss/mean": pg_loss.detach(),
                 "loss/ratio/mean": ratio.sum() / num_global_valid_tokens,
                 "loss/ratio/clipped_frac": clipped_frac.sum() / num_global_valid_tokens,
                 "loss/ratio/log_clipped_frac": log_ratio_clipped_frac.sum()
+                / num_global_valid_tokens,
+                "loss/ratio/nonfinite_frac": nonfinite_frac.sum()
                 / num_global_valid_tokens,
             }
 
@@ -1004,6 +1016,98 @@ class RLTrainer(Configurable):
         }
         return metrics, trace_scalars
 
+    @staticmethod
+    def _forward_backward_skip_metrics(
+        fwd_bwd_metrics: dict[str, float],
+        *,
+        policy_version: int,
+    ) -> dict[str, float] | None:
+        """Return optimizer metrics for a forward/backward result to skip."""
+        loss_mean = fwd_bwd_metrics.get("loss/mean", float("nan"))
+        nonfinite_log_ratio_frac = fwd_bwd_metrics.get(
+            "loss/ratio/nonfinite_frac",
+            0.0,
+        )
+        if math.isfinite(loss_mean) and nonfinite_log_ratio_frac <= 0.0:
+            return None
+        return {
+            "train/policy_version": float(policy_version),
+            "train/skipped_nonfinite_loss": 1.0,
+            "train/skipped_nonfinite_grad_norm": 0.0,
+        }
+
+    @staticmethod
+    def _optimizer_step_skipped(
+        optim_output: OptimStepOutput,
+        *,
+        previous_policy_version: int,
+    ) -> bool:
+        """Return whether ``optim_step`` declined to update weights."""
+        return (
+            optim_output.policy_version == previous_policy_version
+            or optim_output.metrics.get("train/skipped_nonfinite_grad_norm", 0.0) > 0.0
+        )
+
+    @staticmethod
+    def _zero_weight_sync_timings() -> _WeightSyncTimings:
+        """Zero timings for train steps that do not publish new weights."""
+        return _WeightSyncTimings(
+            admission_drain_s=0.0,
+            push_s=0.0,
+            pull_s=0.0,
+            total_s=0.0,
+        )
+
+    def _log_train_step(
+        self,
+        *,
+        step: int,
+        samples: list[ReplaySample],
+        replay_batch: ReplayBatch,
+        rollouts: list[RolloutOutput],
+        generation_scheduler: GenerationScheduler,
+        fwd_bwd_metrics: dict[str, float],
+        optimizer_metrics: dict[str, float],
+        checkpoint_saved: bool,
+        timings: _TrainStepTimings,
+        dropped_empty_groups: int,
+        dropped_zero_advantage_groups: int,
+        train_version: int,
+    ) -> None:
+        """Build, trace, and emit train-step metrics."""
+        live_generation_metrics = [
+            rename_metric_prefix(
+                metric,
+                old_prefix="generator/",
+                new_prefix="generator/live/",
+            )
+            for metric in generation_scheduler.pop_metrics()
+        ]
+        step_metrics, trace_scalars = self._build_train_step_metrics(
+            samples=samples,
+            replay_batch=replay_batch,
+            rollouts=rollouts,
+            live_generation_metrics=live_generation_metrics,
+            fwd_bwd_metrics=fwd_bwd_metrics,
+            optimizer_metrics=optimizer_metrics,
+            checkpoint_saved=checkpoint_saved,
+            timings=timings,
+            dropped_empty_groups=dropped_empty_groups,
+            dropped_zero_advantage_groups=dropped_zero_advantage_groups,
+            train_version=train_version,
+        )
+        for key in (
+            "train/skipped_nonfinite_loss",
+            "train/skipped_nonfinite_grad_norm",
+        ):
+            trace_scalars[key.replace("/", ".")] = optimizer_metrics.get(key, 0.0)
+        sl.log_trace_scalar(trace_scalars)
+        self.metrics_processor.log(
+            step=step,
+            metrics=step_metrics,
+            is_validation=False,
+        )
+
     async def _collect_validation_rollouts(
         self,
         *,
@@ -1358,23 +1462,88 @@ class RLTrainer(Configurable):
                             num_global_valid_tokens=num_global_valid_tokens,
                         )
                     )
+                skip_metrics = self._forward_backward_skip_metrics(
+                    fwd_bwd_metrics,
+                    policy_version=policy_version,
+                )
+                if skip_metrics is not None:
+                    t_train_s = time.perf_counter() - t_train_start
+                    t_step_s = time.perf_counter() - t_step_start
+                    logger.warning(
+                        "Step %d skipped optimizer step because "
+                        "forward/backward metrics were not usable: %s",
+                        step,
+                        fwd_bwd_metrics,
+                    )
+                    self._log_train_step(
+                        step=step,
+                        samples=samples,
+                        replay_batch=replay_batch,
+                        rollouts=rollouts,
+                        fwd_bwd_metrics=fwd_bwd_metrics,
+                        optimizer_metrics=skip_metrics,
+                        checkpoint_saved=False,
+                        generation_scheduler=generation_scheduler,
+                        timings=_TrainStepTimings(
+                            step_s=t_step_s,
+                            replay_wait_s=t_buffer_wait_s,
+                            train_s=t_train_s,
+                            checkpoint_s=0.0,
+                            weight_sync=self._zero_weight_sync_timings(),
+                        ),
+                        dropped_empty_groups=dropped_empty_groups,
+                        dropped_zero_advantage_groups=dropped_zero_advantage_groups,
+                        train_version=batch_train_version,
+                    )
+                    continue
                 with sl.log_trace_span("trainer_optim_step_call"):
                     optim_output = await self._await_rank_0(
                         self.trainer.optim_step.call()
                     )
                 trainer_policy_version = optim_output.policy_version
-                optimizer_metrics = optim_output.metrics
+                optimizer_metrics = {
+                    **optim_output.metrics,
+                    "train/skipped_nonfinite_loss": 0.0,
+                }
                 t_train_s = time.perf_counter() - t_train_start
+
+                if self._optimizer_step_skipped(
+                    optim_output,
+                    previous_policy_version=policy_version,
+                ):
+                    t_step_s = time.perf_counter() - t_step_start
+                    logger.warning(
+                        "Step %d skipped weight sync and checkpoint because "
+                        "optimizer step did not publish a new policy version",
+                        step,
+                    )
+                    self._log_train_step(
+                        step=step,
+                        samples=samples,
+                        replay_batch=replay_batch,
+                        rollouts=rollouts,
+                        generation_scheduler=generation_scheduler,
+                        fwd_bwd_metrics=fwd_bwd_metrics,
+                        optimizer_metrics=optimizer_metrics,
+                        checkpoint_saved=False,
+                        timings=_TrainStepTimings(
+                            step_s=t_step_s,
+                            replay_wait_s=t_buffer_wait_s,
+                            train_s=t_train_s,
+                            checkpoint_s=0.0,
+                            weight_sync=self._zero_weight_sync_timings(),
+                        ),
+                        dropped_empty_groups=dropped_empty_groups,
+                        dropped_zero_advantage_groups=dropped_zero_advantage_groups,
+                        train_version=batch_train_version,
+                    )
+                    continue
 
                 weight_sync_timings = await self._sync_generator_weights(
                     generation_scheduler=generation_scheduler,
                     policy_version=trainer_policy_version,
                 )
                 policy_version = trainer_policy_version
-
-                if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
-                    logger.error("Loss is NaN/Inf; training diverged")
-                    break
 
                 t_checkpoint_start = time.perf_counter()
                 with sl.log_trace_span("trainer_save_checkpoint_call"):
@@ -1387,22 +1556,15 @@ class RLTrainer(Configurable):
                 t_checkpoint_s = time.perf_counter() - t_checkpoint_start
                 t_step_s = time.perf_counter() - t_step_start
 
-                live_generation_metrics = [
-                    rename_metric_prefix(
-                        metric,
-                        old_prefix="generator/",
-                        new_prefix="generator/live/",
-                    )
-                    for metric in generation_scheduler.pop_metrics()
-                ]
-                step_metrics, trace_scalars = self._build_train_step_metrics(
+                self._log_train_step(
+                    step=step,
                     samples=samples,
                     replay_batch=replay_batch,
                     rollouts=rollouts,
-                    live_generation_metrics=live_generation_metrics,
                     fwd_bwd_metrics=fwd_bwd_metrics,
                     optimizer_metrics=optimizer_metrics,
                     checkpoint_saved=checkpoint_saved,
+                    generation_scheduler=generation_scheduler,
                     timings=_TrainStepTimings(
                         step_s=t_step_s,
                         replay_wait_s=t_buffer_wait_s,
@@ -1413,13 +1575,6 @@ class RLTrainer(Configurable):
                     dropped_empty_groups=dropped_empty_groups,
                     dropped_zero_advantage_groups=dropped_zero_advantage_groups,
                     train_version=batch_train_version,
-                )
-                sl.log_trace_scalar(trace_scalars)
-
-                self.metrics_processor.log(
-                    step=step,
-                    metrics=step_metrics,
-                    is_validation=False,
                 )
         finally:
             shutdown.set()

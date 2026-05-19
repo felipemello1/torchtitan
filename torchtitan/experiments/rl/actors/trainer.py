@@ -509,6 +509,23 @@ class PolicyTrainer(Actor, Configurable):
                 foreach=True,
                 pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
             )
+        grad_norm_value = float(grad_norm.item())
+
+        if not bool(torch.isfinite(grad_norm).item()):
+            logger.warning(
+                "Skipping optimizer step because gradient norm is non-finite: %s",
+                grad_norm_value,
+            )
+            self.optimizers.zero_grad()
+            return OptimStepOutput(
+                policy_version=self.policy_version,
+                metrics={
+                    "train/grad_norm/mean": grad_norm_value,
+                    "train/lr": current_lr,
+                    "train/policy_version": float(self.policy_version),
+                    "train/skipped_nonfinite_grad_norm": 1.0,
+                },
+            )
 
         with sl.log_trace_span("optim"):
             self.optimizers.step()
@@ -524,9 +541,10 @@ class PolicyTrainer(Actor, Configurable):
         return OptimStepOutput(
             policy_version=self.policy_version,
             metrics={
-                "train/grad_norm/mean": float(grad_norm.item()),
+                "train/grad_norm/mean": grad_norm_value,
                 "train/lr": current_lr,
                 "train/policy_version": float(self.policy_version),
+                "train/skipped_nonfinite_grad_norm": 0.0,
             },
         )
 

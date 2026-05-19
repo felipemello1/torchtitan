@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.envs import EnvExample, EnvStep
 from torchtitan.experiments.rl.envs.token_env import PromptState, TokenEnv, TokenStep
 from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
@@ -56,6 +57,7 @@ from torchtitan.experiments.rl.trainer_microbatch import (
 )
 from torchtitan.experiments.rl.types import (
     Completion,
+    OptimStepOutput,
     ReplaySample,
     RolloutOutput,
     RolloutStatus,
@@ -81,6 +83,56 @@ def test_grpo_loss_clamps_log_ratio_before_exp():
     assert torch.isfinite(loss)
     assert torch.isfinite(metrics["loss/ratio/mean"])
     assert metrics["loss/ratio/log_clipped_frac"].item() == 1.0
+
+
+def test_grpo_loss_sanitizes_nonfinite_log_ratios():
+    loss_fn = GRPOLoss(GRPOLoss.Config(max_log_ratio=5.0))
+
+    loss, metrics = loss_fn(
+        policy_logprobs=torch.tensor([float("inf"), float("-inf"), float("-inf")]),
+        behavior_logprobs=torch.tensor([0.0, 0.0, float("-inf")]),
+        advantages=torch.tensor([0.5, -0.25, 0.75]),
+        num_global_valid_tokens=torch.tensor(3.0),
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["loss/ratio/mean"])
+    assert metrics["loss/ratio/nonfinite_frac"].item() == 1.0
+
+
+def test_forward_backward_skip_metrics_reject_nonfinite_loss_signal():
+    assert (
+        RLTrainer._forward_backward_skip_metrics(
+            {
+                "loss/mean": 0.0,
+                "loss/ratio/nonfinite_frac": 0.0,
+            },
+            policy_version=3,
+        )
+        is None
+    )
+
+    loss_skip = RLTrainer._forward_backward_skip_metrics(
+        {
+            "loss/mean": float("nan"),
+            "loss/ratio/nonfinite_frac": 0.0,
+        },
+        policy_version=3,
+    )
+    assert loss_skip == {
+        "train/policy_version": 3.0,
+        "train/skipped_nonfinite_loss": 1.0,
+        "train/skipped_nonfinite_grad_norm": 0.0,
+    }
+
+    ratio_skip = RLTrainer._forward_backward_skip_metrics(
+        {
+            "loss/mean": 0.0,
+            "loss/ratio/nonfinite_frac": 0.25,
+        },
+        policy_version=3,
+    )
+    assert ratio_skip == loss_skip
 
 
 def test_grpo_loss_microbatch_sum_matches_full_batch_with_global_denominator():
@@ -1052,6 +1104,76 @@ def test_train_step_metric_builder_handles_zero_step_duration():
     aggregate = m.MetricsProcessor._aggregate_metrics(metrics)
 
     assert aggregate["perf/tokens_per_second"] == 0.0
+
+
+def test_optimizer_step_skipped_detects_no_new_policy_version():
+    assert RLTrainer._optimizer_step_skipped(
+        OptimStepOutput(
+            policy_version=2,
+            metrics={"train/skipped_nonfinite_grad_norm": 0.0},
+        ),
+        previous_policy_version=2,
+    )
+
+
+def test_policy_trainer_optim_step_skips_nonfinite_grad_norm():
+    class FakeOptimizer:
+        def __init__(self) -> None:
+            self.stepped = False
+            self.zeroed = False
+
+        def step(self) -> None:
+            self.stepped = True
+
+        def zero_grad(self) -> None:
+            self.zeroed = True
+
+    class FakeScheduler:
+        def __init__(self) -> None:
+            self.stepped = False
+
+        def get_last_lr(self) -> list[float]:
+            return [1e-6]
+
+        def step(self) -> None:
+            self.stepped = True
+
+    async def run() -> None:
+        trainer = PolicyTrainer.__new__(PolicyTrainer)
+        param = torch.nn.Parameter(torch.tensor([1.0]))
+        param.grad = torch.tensor([float("nan")])
+        optimizer = FakeOptimizer()
+        scheduler = FakeScheduler()
+        trainer.model_parts = [SimpleNamespace(parameters=lambda: [param])]
+        trainer.config = SimpleNamespace(training=SimpleNamespace(max_norm=1.0))
+        trainer.parallel_dims = SimpleNamespace(get_optional_mesh=lambda name: None)
+        trainer.optimizers = optimizer
+        trainer.lr_schedulers = SimpleNamespace(schedulers=[scheduler])
+        trainer.policy_version = 7
+
+        result = await PolicyTrainer.optim_step.__dict__["_method"](trainer)
+
+        assert result.policy_version == 7
+        assert result.metrics["train/skipped_nonfinite_grad_norm"] == 1.0
+        assert not optimizer.stepped
+        assert optimizer.zeroed
+        assert not scheduler.stepped
+
+    asyncio.run(run())
+    assert RLTrainer._optimizer_step_skipped(
+        OptimStepOutput(
+            policy_version=3,
+            metrics={"train/skipped_nonfinite_grad_norm": 1.0},
+        ),
+        previous_policy_version=2,
+    )
+    assert not RLTrainer._optimizer_step_skipped(
+        OptimStepOutput(
+            policy_version=3,
+            metrics={"train/skipped_nonfinite_grad_norm": 0.0},
+        ),
+        previous_policy_version=2,
+    )
 
 
 def test_replay_buffer_blocks_until_batch_is_ready():
