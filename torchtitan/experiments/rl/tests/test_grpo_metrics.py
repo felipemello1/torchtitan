@@ -1051,7 +1051,13 @@ def test_train_step_metric_builder_emits_replay_timing_and_trace_scalars():
         replay_batch=batch,
         rollouts=[rollout],
         live_generation_metrics=[m.Metric("generator/live/tokens", m.NoReduce(4.0))],
-        fwd_bwd_metrics={"loss/mean": 0.25},
+        fwd_bwd_metrics={
+            "loss/mean": 0.25,
+            "loss/ratio/nonfinite_frac": 0.0,
+            "loss/logprob/policy_nonfinite_frac": 0.1,
+            "loss/logprob/behavior_nonfinite_frac": 0.2,
+            "bit_wise/nonfinite_logprob_frac": 0.3,
+        },
         optimizer_metrics={"train/lr": 1e-6},
         checkpoint_saved=True,
         timings=_TrainStepTimings(
@@ -1082,6 +1088,10 @@ def test_train_step_metric_builder_emits_replay_timing_and_trace_scalars():
     assert trace_scalars["replay.buffer_depth_groups"] == 2
     assert trace_scalars["rollout.dropped_zero_advantage_groups"] == 2
     assert trace_scalars["timing.weight_sync_pull_ms"] == 600.0
+    assert trace_scalars["loss.ratio.nonfinite_frac"] == 0.0
+    assert trace_scalars["loss.logprob.policy_nonfinite_frac"] == 0.1
+    assert trace_scalars["loss.logprob.behavior_nonfinite_frac"] == 0.2
+    assert trace_scalars["bit_wise.nonfinite_logprob_frac"] == 0.3
 
 
 def test_train_step_metric_builder_handles_zero_step_duration():
@@ -1116,26 +1126,34 @@ def test_train_step_metric_builder_handles_zero_step_duration():
         ),
     )
 
+    zero_timings = _TrainStepTimings(
+        step_s=0.0,
+        replay_wait_s=0.0,
+        train_s=0.0,
+        checkpoint_s=0.0,
+        weight_sync=_WeightSyncTimings(
+            admission_drain_s=0.0,
+            push_s=0.0,
+            pull_s=0.0,
+            total_s=0.0,
+        ),
+    )
+
     metrics, _ = build_train_step_metrics(
         samples=[sample],
         replay_batch=batch,
         rollouts=[],
         live_generation_metrics=[],
-        fwd_bwd_metrics={"loss/mean": 0.0},
+        fwd_bwd_metrics={
+            "loss/mean": 0.0,
+            "loss/ratio/nonfinite_frac": 0.0,
+            "loss/logprob/policy_nonfinite_frac": 0.0,
+            "loss/logprob/behavior_nonfinite_frac": 0.0,
+            "bit_wise/nonfinite_logprob_frac": 0.0,
+        },
         optimizer_metrics={},
         checkpoint_saved=False,
-        timings=_TrainStepTimings(
-            step_s=0.0,
-            replay_wait_s=0.0,
-            train_s=0.0,
-            checkpoint_s=0.0,
-            weight_sync=_WeightSyncTimings(
-                admission_drain_s=0.0,
-                push_s=0.0,
-                pull_s=0.0,
-                total_s=0.0,
-            ),
-        ),
+        timings=zero_timings,
         dropped_empty_groups=0,
         dropped_zero_advantage_groups=0,
         train_version=0,
@@ -1143,6 +1161,21 @@ def test_train_step_metric_builder_handles_zero_step_duration():
     aggregate = m.MetricsProcessor._aggregate_metrics(metrics)
 
     assert aggregate["perf/tokens_per_second"] == 0.0
+
+    with pytest.raises(KeyError, match="loss/ratio/nonfinite_frac"):
+        build_train_step_metrics(
+            samples=[sample],
+            replay_batch=batch,
+            rollouts=[],
+            live_generation_metrics=[],
+            fwd_bwd_metrics={"loss/mean": 0.0},
+            optimizer_metrics={},
+            checkpoint_saved=False,
+            timings=zero_timings,
+            dropped_empty_groups=0,
+            dropped_zero_advantage_groups=0,
+            train_version=0,
+        )
 
 
 def test_optimizer_step_skipped_detects_no_new_policy_version():
