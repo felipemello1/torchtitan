@@ -9,11 +9,14 @@
 from __future__ import annotations
 
 import asyncio
+import statistics
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 from torchtitan.experiments.rl.types import ReplaySample, RolloutOutput
+
+_ADVANTAGE_STD_EPS = 1e-6
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -102,15 +105,19 @@ def rollouts_to_replay_samples(rollouts: list[RolloutOutput]) -> list[ReplaySamp
     if not rewards:
         return []
     group_mean = sum(rewards) / len(rewards)
+    group_std = statistics.pstdev(rewards) if len(rewards) > 1 else 0.0
 
     samples: list[ReplaySample] = []
     for rollout in rollouts:
         if rollout.reward is None:
             continue
+        advantage = 0.0
+        if group_std > _ADVANTAGE_STD_EPS:
+            advantage = (float(rollout.reward) - group_mean) / group_std
         samples.extend(
             _rollout_to_replay_samples(
                 rollout,
-                advantage=float(rollout.reward) - group_mean,
+                advantage=advantage,
             )
         )
     return samples

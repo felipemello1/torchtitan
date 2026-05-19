@@ -6,6 +6,7 @@
 
 from torchtitan.experiments.rl.config_registry import (
     rl_dapo_qwen3_4b_alphabet_sort,
+    rl_dapo_qwen3_4b_alphabet_sort_2gpu,
     rl_grpo_qwen3_0_6b_alphabet_sort,
     rl_grpo_qwen3_1_7b,
     rl_grpo_qwen3_1_7b_alphabet_sort,
@@ -28,6 +29,8 @@ def test_alphabet_sort_0_6b_defaults_keep_compile_and_disable_thinking():
     assert cfg.renderer.name == "qwen3"
     assert cfg.renderer.enable_thinking is False
     assert cfg.trainer.max_microbatch_samples == 8
+    assert cfg.train_dataset.max_turns == 3
+    assert cfg.train_dataset.max_names_per_turn == 4
 
 
 def test_alphabet_sort_4b_uses_8_gpu_async_recipe():
@@ -37,6 +40,9 @@ def test_alphabet_sort_4b_uses_8_gpu_async_recipe():
         cfg.hf_assets_path
         == "torchtitan/experiments/rl/example_checkpoint/Qwen3-4B-Instruct-2507"
     )
+    assert cfg.model_spec.flavor == "4B-Instruct-2507"
+    assert cfg.model_spec.model.rope.max_seq_len == 262144
+    assert cfg.model_spec.model.rope.theta == 5000000.0
     assert not cfg.compile.enable
     assert cfg.num_steps == 100
     assert cfg.num_prompts_per_step == 16
@@ -50,6 +56,8 @@ def test_alphabet_sort_4b_uses_8_gpu_async_recipe():
     assert cfg.trainer.parallelism.tensor_parallel_degree == 4
     assert cfg.generator.parallelism.tensor_parallel_degree == 4
     assert cfg.generator.gpu_memory_limit == 0.85
+    assert cfg.generator.sampling.temperature == 1.0
+    assert cfg.generator.sampling.top_p == 1.0
     assert cfg.generator.sampling.max_tokens == 768
 
 
@@ -61,3 +69,17 @@ def test_alphabet_sort_4b_dapo_uses_clip_high_recipe():
     assert cfg.trainer.loss.clip_low == 0.2
     assert cfg.trainer.loss.clip_high == 0.28
     assert cfg.trainer.loss.dual_clip_c == 3.0
+
+
+def test_alphabet_sort_4b_dapo_2gpu_config_stays_on_two_gpus():
+    cfg = rl_dapo_qwen3_4b_alphabet_sort_2gpu()
+
+    assert cfg.model_spec.flavor == "4B-Instruct-2507"
+    assert cfg.num_steps == 25
+    assert cfg.num_prompts_per_step == 4
+    assert cfg.async_rollout_groups == 4
+    assert cfg.replay_buffer_groups == 8
+    assert cfg.trainer.parallelism.tensor_parallel_degree == 1
+    assert cfg.generator.parallelism.tensor_parallel_degree == 1
+    assert cfg.generator.sampling.temperature == 1.0
+    assert cfg.generator.sampling.top_p == 1.0

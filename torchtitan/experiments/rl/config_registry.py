@@ -40,9 +40,9 @@ def _alphabet_sort_dataset(seed: int) -> AlphabetSortDataset.Config:
     return AlphabetSortDataset.Config(
         seed=seed,
         min_turns=3,
-        max_turns=5,
+        max_turns=3,
         min_names_per_turn=1,
-        max_names_per_turn=5,
+        max_names_per_turn=4,
     )
 
 
@@ -73,6 +73,8 @@ def _alphabet_sort_config(
     replay_buffer_groups: int | None = None,
     generator_max_tokens: int = 256,
     generator_gpu_memory_limit: float = 0.75,
+    generator_temperature: float = 0.8,
+    generator_top_p: float = 0.95,
     compile_config: CompileConfig | None = None,
     trainer_max_microbatch_samples: int | None = 8,
     loss: GRPOLoss.Config | DAPOLoss.Config | None = None,
@@ -138,8 +140,8 @@ def _alphabet_sort_config(
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
                 n=1,
-                temperature=0.8,
-                top_p=0.95,
+                temperature=generator_temperature,
+                top_p=generator_top_p,
                 max_tokens=generator_max_tokens,
             ),
         ),
@@ -314,7 +316,7 @@ def _alphabet_sort_4b_config(
 ) -> RLTrainer.Config:
     """Production AlphabetSort config for Qwen3-4B (8 GPUs: 4 gen + 4 train)."""
     return _alphabet_sort_config(
-        model_size="4B",
+        model_size="4B-Instruct-2507",
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-4B-Instruct-2507",
         lr=5e-7,
         num_steps=100,
@@ -326,6 +328,8 @@ def _alphabet_sort_4b_config(
         replay_buffer_groups=32,
         generator_max_tokens=768,
         generator_gpu_memory_limit=0.85,
+        generator_temperature=1.0,
+        generator_top_p=1.0,
         compile_config=CompileConfig(enable=False),
         trainer_max_microbatch_samples=1,
         loss=loss,
@@ -340,6 +344,29 @@ def rl_grpo_qwen3_4b_alphabet_sort() -> RLTrainer.Config:
 def rl_dapo_qwen3_4b_alphabet_sort() -> RLTrainer.Config:
     """Production AlphabetSort DAPO config for Qwen3-4B (8 GPUs: 4 gen + 4 train)."""
     return _alphabet_sort_4b_config(loss=_dapo_loss())
+
+
+def rl_dapo_qwen3_4b_alphabet_sort_2gpu() -> RLTrainer.Config:
+    """Two-GPU AlphabetSort DAPO config for Qwen3-4B (1 gen + 1 train)."""
+    return _alphabet_sort_config(
+        model_size="4B-Instruct-2507",
+        hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-4B-Instruct-2507",
+        lr=3e-7,
+        num_steps=25,
+        num_prompts_per_step=4,
+        num_validation_samples=16,
+        trainer_tensor_parallel_degree=1,
+        generator_tensor_parallel_degree=1,
+        async_rollout_groups=4,
+        replay_buffer_groups=8,
+        generator_max_tokens=768,
+        generator_gpu_memory_limit=0.80,
+        generator_temperature=1.0,
+        generator_top_p=1.0,
+        compile_config=CompileConfig(enable=False),
+        trainer_max_microbatch_samples=1,
+        loss=_dapo_loss(),
+    )
 
 
 def rl_grpo_qwen3_14b() -> RLTrainer.Config:

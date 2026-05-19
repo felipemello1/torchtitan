@@ -31,8 +31,10 @@ from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.experiments.rl.actors.utils import (
     compute_logprobs,
+    cuda_memory_stats,
     extract_masked_logprobs,
     PartialLogprobDrift,
+    reset_cuda_peak_memory_stats,
     verify_logprob_identity,
 )
 from torchtitan.experiments.rl.trainer_microbatch import (
@@ -360,6 +362,7 @@ class PolicyTrainer(Actor, Configurable):
         model = self.model_parts[0]
 
         device = self.device
+        reset_cuda_peak_memory_stats(device)
 
         schedule = schedule_training_microbatches(
             train_data,
@@ -485,6 +488,25 @@ class PolicyTrainer(Actor, Configurable):
                     positions,
                 )
 
+        memory_stats = cuda_memory_stats(device)
+        if memory_stats:
+            metric_accumulator.add_max(
+                {
+                    f"train/cuda_memory/fwd_bwd/{key}": torch.tensor(
+                        value,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    for key, value in memory_stats.items()
+                }
+            )
+            sl.log_trace_scalar(
+                {
+                    f"train.cuda_memory.fwd_bwd.{key}": value
+                    for key, value in memory_stats.items()
+                }
+            )
+
         return self._reduce_forward_backward_metrics(
             sum_reduced_metrics=metric_accumulator.sum_reduced_metrics,
             max_reduced_metrics=metric_accumulator.max_reduced_metrics,
@@ -498,6 +520,9 @@ class PolicyTrainer(Actor, Configurable):
         # to allow controller-owned schedules (see Tinker API).
 
         # capture LR before step
+        device = getattr(self, "device", None)
+        if device is not None:
+            reset_cuda_peak_memory_stats(device)
         current_lrs = self.lr_schedulers.schedulers[0].get_last_lr()
         if len(current_lrs) != 1:
             raise ValueError(
@@ -521,6 +546,12 @@ class PolicyTrainer(Actor, Configurable):
                 grad_norm_value,
             )
             self.optimizers.zero_grad()
+            memory_metrics = {
+                f"train/cuda_memory/optim/{key}": value
+                for key, value in (
+                    cuda_memory_stats(device).items() if device is not None else ()
+                )
+            }
             return OptimStepOutput(
                 policy_version=self.policy_version,
                 metrics={
@@ -528,6 +559,7 @@ class PolicyTrainer(Actor, Configurable):
                     "train/lr": current_lr,
                     "train/policy_version": float(self.policy_version),
                     "train/skipped_nonfinite_grad_norm": 1.0,
+                    **memory_metrics,
                 },
             )
 
@@ -541,6 +573,16 @@ class PolicyTrainer(Actor, Configurable):
             f"{os.getpid()=} PolicyTrainer optim_step done, "
             f"policy_version={self.policy_version}"
         )
+        memory_metrics = {
+            f"train/cuda_memory/optim/{key}": value
+            for key, value in (
+                cuda_memory_stats(device).items() if device is not None else ()
+            )
+        }
+        if memory_metrics:
+            sl.log_trace_scalar(
+                {key.replace("/", "."): value for key, value in memory_metrics.items()}
+            )
 
         return OptimStepOutput(
             policy_version=self.policy_version,
@@ -549,6 +591,7 @@ class PolicyTrainer(Actor, Configurable):
                 "train/lr": current_lr,
                 "train/policy_version": float(self.policy_version),
                 "train/skipped_nonfinite_grad_norm": 0.0,
+                **memory_metrics,
             },
         )
 

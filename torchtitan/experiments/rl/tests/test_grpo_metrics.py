@@ -504,6 +504,29 @@ def test_rollout_to_replay_sample_masks_multiturn_prefix_continuation():
     assert sample.token_ids == [10, 11, 20, 12, 21, 22]
     assert sample.loss_mask == [0, 0, 1, 0, 1, 1]
     assert sample.behavior_logprobs == [0.0, 0.0, -0.2, 0.0, -0.3, -0.4]
+    assert sample.advantage == 0.0
+
+
+def test_rollout_to_replay_samples_normalizes_advantages_by_group_std():
+    def rollout(sample_idx: int, reward: float) -> RolloutOutput:
+        return RolloutOutput(
+            group_id="g0",
+            sample_idx=sample_idx,
+            status=RolloutStatus.COMPLETED,
+            reward=reward,
+            turns=[
+                RolloutTurn(
+                    prompt_token_ids=[10],
+                    response_token_ids=[20 + sample_idx],
+                    response_logprobs=[-0.1],
+                    policy_version=0,
+                )
+            ],
+        )
+
+    samples = rollouts_to_replay_samples([rollout(0, 0.0), rollout(1, 1.0)])
+
+    assert [sample.advantage for sample in samples] == pytest.approx([-1.0, 1.0])
 
 
 def test_replay_group_derives_and_validates_group_id():

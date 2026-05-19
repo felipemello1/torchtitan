@@ -21,6 +21,10 @@ from torchtitan.config import (
     ParallelismConfig,
 )
 from torchtitan.distributed.utils import set_batch_invariance
+from torchtitan.experiments.rl.actors.utils import (
+    cuda_memory_stats,
+    reset_cuda_peak_memory_stats,
+)
 from torchtitan.experiments.rl.models.vllm_registry import (
     registry_to_vllm,
     TORCHTITAN_CONFIG_FORMAT,
@@ -449,6 +453,7 @@ class VLLMGenerator(Actor, Configurable):
 
         async with self._engine_lock:
             admitted_policy_version = self.policy_version
+            reset_cuda_peak_memory_stats()
             logger.debug(
                 f"{os.getpid()=} Generating start generate "
                 f"(policy v{admitted_policy_version})..."
@@ -525,6 +530,22 @@ class VLLMGenerator(Actor, Configurable):
                         m.Sum.from_list(output_token_counts),
                     )
                 )
+                memory_stats = cuda_memory_stats()
+                for key, value in memory_stats.items():
+                    metric_cls = m.Min if key.startswith("driver_free") else m.Max
+                    generation_metrics.append(
+                        m.Metric(
+                            f"{metrics_prefix}/cuda_memory/{key}",
+                            metric_cls(value),
+                        )
+                    )
+                if memory_stats:
+                    sl.log_trace_scalar(
+                        {
+                            f"{metrics_prefix}.cuda_memory.{key}": value
+                            for key, value in memory_stats.items()
+                        }
+                    )
 
             logger.debug(
                 f"{os.getpid()=} Generating finish generate "

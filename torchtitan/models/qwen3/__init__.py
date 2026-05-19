@@ -370,6 +370,17 @@ def _4b(attn_backend: str) -> Qwen3Model.Config:
     )
 
 
+def _4b_instruct_2507(attn_backend: str) -> Qwen3Model.Config:
+    config = _4b(attn_backend)
+    config.rope = RoPE.Config(
+        dim=128,
+        max_seq_len=262144,
+        theta=5000000.0,
+        backend="cos_sin",
+    )
+    return config
+
+
 def _8b(attn_backend: str) -> Qwen3Model.Config:
     dim = 4096
     head_dim = 128
@@ -607,6 +618,7 @@ qwen3_configs = {
     "0.6B": _0_6b,
     "1.7B": _1_7b,
     "4B": _4b,
+    "4B-Instruct-2507": _4b_instruct_2507,
     "8B": _8b,
     "14B": _14b,
     "32B": _32b,

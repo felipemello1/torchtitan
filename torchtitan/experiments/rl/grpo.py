@@ -1026,11 +1026,24 @@ class RLTrainer(Configurable):
                     continue
                 has_signal = has_advantage_signal(samples, eps=_ZERO_ADVANTAGE_EPS)
                 if self.config.drop_zero_advantage_groups and not has_signal:
+                    dropped_rewards = [
+                        float(rollout.reward)
+                        for rollout in group_rollouts
+                        if rollout.reward is not None
+                    ]
                     drop_counters.record_zero_advantage()
                     sl.log_trace_scalar(
                         {
                             "rollout.dropped_zero_advantage_groups": 1,
                             "rollout.sample_step": example.sample_step,
+                            "rollout.dropped_zero_advantage_reward.mean": (
+                                sum(dropped_rewards) / len(dropped_rewards)
+                                if dropped_rewards
+                                else 0.0
+                            ),
+                            "rollout.dropped_zero_advantage_reward.max": (
+                                max(dropped_rewards) if dropped_rewards else 0.0
+                            ),
                         }
                     )
                     continue

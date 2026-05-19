@@ -12,6 +12,62 @@ import torch
 import torch.nn.functional as F
 from torchtitan.observability import structured_logger as sl
 
+_GIB = 1024**3
+
+
+def _bytes_to_gib(value: float) -> float:
+    return float(value) / _GIB
+
+
+def reset_cuda_peak_memory_stats(device: torch.device | None = None) -> None:
+    """Reset CUDA allocator peak stats when CUDA is available."""
+    if not torch.cuda.is_available():
+        return
+    if device is not None and device.type != "cuda":
+        return
+    torch.cuda.reset_peak_memory_stats(device)
+
+
+def cuda_memory_stats(device: torch.device | None = None) -> dict[str, float]:
+    """Return current and peak CUDA memory stats for the visible device."""
+    if not torch.cuda.is_available():
+        return {}
+    if device is not None and device.type != "cuda":
+        return {}
+
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    torch.cuda.synchronize(device)
+    props = torch.cuda.get_device_properties(device)
+    capacity = float(props.total_memory)
+    free, total = torch.cuda.mem_get_info(device)
+    driver_used = float(total - free)
+    stats = torch.cuda.memory_stats(device)
+    active_peak = float(
+        stats.get("active_bytes.all.peak", torch.cuda.max_memory_allocated(device))
+    )
+    reserved_peak = float(
+        stats.get("reserved_bytes.all.peak", torch.cuda.max_memory_reserved(device))
+    )
+    allocated = float(torch.cuda.memory_allocated(device))
+    reserved = float(torch.cuda.memory_reserved(device))
+    return {
+        "allocated_gib": _bytes_to_gib(allocated),
+        "allocated_pct": 100.0 * allocated / capacity,
+        "reserved_gib": _bytes_to_gib(reserved),
+        "reserved_pct": 100.0 * reserved / capacity,
+        "peak_allocated_gib": _bytes_to_gib(active_peak),
+        "peak_allocated_pct": 100.0 * active_peak / capacity,
+        "peak_reserved_gib": _bytes_to_gib(reserved_peak),
+        "peak_reserved_pct": 100.0 * reserved_peak / capacity,
+        "driver_used_gib": _bytes_to_gib(driver_used),
+        "driver_used_pct": 100.0 * driver_used / capacity,
+        "driver_free_gib": _bytes_to_gib(float(free)),
+        "driver_free_pct": 100.0 * float(free) / capacity,
+        "alloc_retries": float(stats.get("num_alloc_retries", 0)),
+        "ooms": float(stats.get("num_ooms", 0)),
+    }
+
 
 @sl.log_trace_span("compute_logprobs")
 def compute_logprobs(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
