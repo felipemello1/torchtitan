@@ -62,6 +62,9 @@ class MetricsProcessor(Configurable):
                 "rollout/dropped_zero_advantage_groups",
                 "train/grad_norm/mean",
                 "train/lr",
+                "train/microbatches/max",
+                "train/microbatch_samples/max",
+                "train/microbatch_tokens/max",
                 "perf/tokens_per_second",
                 "timing/step",
             ]

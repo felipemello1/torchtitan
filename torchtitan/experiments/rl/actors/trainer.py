@@ -81,6 +81,12 @@ class PolicyTrainer(Actor, Configurable):
         checkpoint: CheckpointManager.Config = field(
             default_factory=CheckpointManager.Config
         )
+        max_microbatch_samples: int | None = None
+        """Maximum replay samples per forward/backward microbatch."""
+
+        max_microbatch_tokens: int | None = None
+        """Target packed tokens per microbatch; individual samples stay intact."""
+
         dump_folder: str = ""
         """Folder for AC debug dumps when using memory_budget mode."""
 
@@ -105,6 +111,22 @@ class PolicyTrainer(Actor, Configurable):
 
         self.config = config
         self.compile_config = compile_config
+        if (
+            config.max_microbatch_samples is not None
+            and config.max_microbatch_samples <= 0
+        ):
+            raise ValueError(
+                "max_microbatch_samples must be positive or None, got "
+                f"{config.max_microbatch_samples}"
+            )
+        if (
+            config.max_microbatch_tokens is not None
+            and config.max_microbatch_tokens <= 0
+        ):
+            raise ValueError(
+                "max_microbatch_tokens must be positive or None, got "
+                f"{config.max_microbatch_tokens}"
+            )
         self.loss_fn = config.loss.build()
 
         # Only cast if generator dtype differs from training dtype, otherwise
@@ -298,6 +320,110 @@ class PolicyTrainer(Actor, Configurable):
                 out[key] = float(value)
         return out
 
+    @staticmethod
+    def _slice_training_batch(
+        batch: TrainingBatch,
+        *,
+        start_sample: int,
+        end_sample: int,
+        start_token: int,
+        end_token: int,
+    ) -> TrainingBatch:
+        return TrainingBatch(
+            token_ids=batch.token_ids[:, start_token:end_token].contiguous(),
+            seq_lens=list(batch.seq_lens[start_sample:end_sample]),
+            loss_mask=batch.loss_mask[:, start_token:end_token].contiguous(),
+            behavior_logprobs=batch.behavior_logprobs[
+                :, start_token:end_token
+            ].contiguous(),
+            advantages=batch.advantages[:, start_token:end_token].contiguous(),
+        )
+
+    @staticmethod
+    def _split_training_batch(
+        batch: TrainingBatch,
+        *,
+        max_samples: int | None,
+        max_tokens: int | None,
+    ) -> list[TrainingBatch]:
+        """Split a packed rank-local batch on replay-sample boundaries."""
+        if max_samples is None and max_tokens is None:
+            return [batch]
+
+        splits: list[TrainingBatch] = []
+        start_sample = 0
+        start_token = 0
+        current_tokens = 0
+
+        for end_sample, seq_len in enumerate(batch.seq_lens):
+            if seq_len <= 0:
+                raise ValueError(f"seq_lens must be positive, got {seq_len}")
+            current_samples = end_sample - start_sample
+            should_flush = current_samples > 0 and (
+                (max_samples is not None and current_samples >= max_samples)
+                or (max_tokens is not None and current_tokens + seq_len > max_tokens)
+            )
+            if should_flush:
+                end_token = start_token + current_tokens
+                splits.append(
+                    PolicyTrainer._slice_training_batch(
+                        batch,
+                        start_sample=start_sample,
+                        end_sample=end_sample,
+                        start_token=start_token,
+                        end_token=end_token,
+                    )
+                )
+                start_sample = end_sample
+                start_token = end_token
+                current_tokens = 0
+            current_tokens += seq_len
+
+        splits.append(
+            PolicyTrainer._slice_training_batch(
+                batch,
+                start_sample=start_sample,
+                end_sample=len(batch.seq_lens),
+                start_token=start_token,
+                end_token=start_token + current_tokens,
+            )
+        )
+        return splits
+
+    @classmethod
+    def _split_training_batches_by_rank(
+        cls,
+        batches: list[TrainingBatch],
+        *,
+        max_samples: int | None,
+        max_tokens: int | None,
+    ) -> tuple[list[list[TrainingBatch]], int]:
+        splits_by_rank = [
+            cls._split_training_batch(
+                batch,
+                max_samples=max_samples,
+                max_tokens=max_tokens,
+            )
+            for batch in batches
+        ]
+        max_microbatches = max(len(splits) for splits in splits_by_rank)
+        return splits_by_rank, max_microbatches
+
+    @staticmethod
+    def _has_loss_tokens(batch: TrainingBatch) -> bool:
+        return bool(batch.loss_mask.any().item())
+
+    @staticmethod
+    def _zero_gradient_training_batch() -> TrainingBatch:
+        """One-token-loss batch that drives collectives but contributes no gradient."""
+        return TrainingBatch(
+            token_ids=torch.zeros((1, 2), dtype=torch.long),
+            seq_lens=[2],
+            loss_mask=torch.tensor([[False, True]], dtype=torch.bool),
+            behavior_logprobs=torch.zeros((1, 2), dtype=torch.float32),
+            advantages=torch.zeros((1, 2), dtype=torch.float32),
+        )
+
     @endpoint
     @sl.log_trace_span("forward_backward")
     async def forward_backward(
@@ -333,16 +459,19 @@ class PolicyTrainer(Actor, Configurable):
             )
         model = self.model_parts[0]
 
-        local_batch = train_data[self.dp_rank]
         device = self.device
 
-        token_ids = local_batch.token_ids.to(device)
-        seq_lens = local_batch.seq_lens
-        loss_mask = local_batch.loss_mask.to(device)
-        behavior_logprobs = local_batch.behavior_logprobs.to(device)
-        advantages = local_batch.advantages.to(device)
+        splits_by_rank, max_microbatches = self._split_training_batches_by_rank(
+            train_data,
+            max_samples=self.config.max_microbatch_samples,
+            max_tokens=self.config.max_microbatch_tokens,
+        )
+        microbatches = splits_by_rank[self.dp_rank]
 
-        max_seq_len = max(seq_lens)
+        max_seq_len = max(
+            2,
+            max(max(microbatch.seq_lens) for microbatch in microbatches),
+        )
         rope_cache_len = self.model.freqs_cis.shape[0]
         if max_seq_len > rope_cache_len:
             raise ValueError(
@@ -357,52 +486,118 @@ class PolicyTrainer(Actor, Configurable):
             dtype=torch.float32,
         )
 
-        positions = torch.cat(
-            [torch.arange(l, device=device) for l in seq_lens]
-        ).unsqueeze(0)
-        attention_masks = create_varlen_metadata_for_document(positions)
-
-        with sl.log_trace_span("model_forward"):
-            logits = model(
-                token_ids, attention_masks=attention_masks, positions=positions
-            )
-        all_policy_logprobs = compute_logprobs(logits, token_ids)
-        masked = extract_masked_logprobs(
-            all_policy_logprobs,
-            loss_mask=loss_mask,
-            behavior_logprobs=behavior_logprobs,
-            advantages=advantages,
-        )
-
-        with sl.log_trace_span("loss_fn"):
-            loss, loss_metrics = self.loss_fn(
-                policy_logprobs=masked.policy_logprobs,
-                behavior_logprobs=masked.behavior_logprobs,
-                advantages=masked.advantages,
-                num_global_valid_tokens=num_global_valid_tokens,
-            )
-
         self.optimizers.zero_grad()
-        with sl.log_trace_span("model_backward"):
-            loss.backward()
 
-        # Metrics for bitwise verification of policy logprobs.
-        verification: PartialLogprobDrift = verify_logprob_identity(
-            generator_token_logprobs=masked.behavior_logprobs,
-            trainer_token_logprobs=masked.policy_logprobs,
-            num_global_valid_tokens=num_global_valid_tokens,
-            device=device,
-        )
+        sum_reduced_metrics: dict[str, torch.Tensor] = {}
+        max_reduced_metrics: dict[str, torch.Tensor] = {
+            "train/microbatches/max": torch.tensor(
+                float(max_microbatches),
+                device=device,
+                dtype=torch.float32,
+            ),
+        }
 
-        # Per-rank pre-normalized metrics, so SUM-reducing reconstructs the global.
-        sum_reduced_metrics = {
-            **loss_metrics,
-            "bit_wise/logprob_diff/mean": verification.logprob_diff_mean,
-            "bit_wise/ratio_tokens_different/mean": verification.ratio_tokens_different,
-        }
-        max_reduced_metrics = {
-            "bit_wise/logprob_diff/max": verification.logprob_diff_max,
-        }
+        dummy_microbatch = self._zero_gradient_training_batch()
+        for microbatch_idx in range(max_microbatches):
+            real_microbatch = microbatch_idx < len(microbatches)
+            microbatch = (
+                microbatches[microbatch_idx] if real_microbatch else dummy_microbatch
+            )
+            if not self._has_loss_tokens(microbatch):
+                real_microbatch = False
+                microbatch = dummy_microbatch
+
+            with sl.log_trace_span("forward_backward_microbatch"):
+                token_ids = microbatch.token_ids.to(device)
+                seq_lens = microbatch.seq_lens
+                loss_mask = microbatch.loss_mask.to(device)
+                behavior_logprobs = microbatch.behavior_logprobs.to(device)
+                advantages = microbatch.advantages.to(device)
+
+                positions = torch.cat(
+                    [torch.arange(l, device=device) for l in seq_lens]
+                ).unsqueeze(0)
+                attention_masks = create_varlen_metadata_for_document(positions)
+
+                with sl.log_trace_span("model_forward"):
+                    logits = model(
+                        token_ids,
+                        attention_masks=attention_masks,
+                        positions=positions,
+                    )
+                all_policy_logprobs = compute_logprobs(logits, token_ids)
+                masked = extract_masked_logprobs(
+                    all_policy_logprobs,
+                    loss_mask=loss_mask,
+                    behavior_logprobs=behavior_logprobs,
+                    advantages=advantages,
+                )
+
+                with sl.log_trace_span("loss_fn"):
+                    loss, loss_metrics = self.loss_fn(
+                        policy_logprobs=masked.policy_logprobs,
+                        behavior_logprobs=masked.behavior_logprobs,
+                        advantages=masked.advantages,
+                        num_global_valid_tokens=num_global_valid_tokens,
+                    )
+
+                with sl.log_trace_span("model_backward"):
+                    loss.backward()
+
+                # Metrics for bitwise verification of policy logprobs.
+                verification: PartialLogprobDrift = verify_logprob_identity(
+                    generator_token_logprobs=masked.behavior_logprobs,
+                    trainer_token_logprobs=masked.policy_logprobs,
+                    num_global_valid_tokens=num_global_valid_tokens,
+                    device=device,
+                )
+
+                # Per-rank pre-normalized metrics, so SUM-reducing reconstructs
+                # the global values across ranks and microbatches.
+                for key, value in {
+                    **loss_metrics,
+                    "bit_wise/logprob_diff/mean": verification.logprob_diff_mean,
+                    "bit_wise/ratio_tokens_different/mean": (
+                        verification.ratio_tokens_different
+                    ),
+                }.items():
+                    zero = torch.zeros((), dtype=value.dtype, device=value.device)
+                    sum_reduced_metrics[key] = sum_reduced_metrics.get(key, zero) + (
+                        value if real_microbatch else zero
+                    )
+
+                microbatch_tokens = sum(seq_lens) if real_microbatch else 0
+                microbatch_samples = len(seq_lens) if real_microbatch else 0
+                for key, value in {
+                    "bit_wise/logprob_diff/max": (
+                        verification.logprob_diff_max
+                        if real_microbatch
+                        else torch.zeros((), device=device, dtype=torch.float32)
+                    ),
+                    "train/microbatch_tokens/max": torch.tensor(
+                        float(microbatch_tokens),
+                        device=device,
+                        dtype=torch.float32,
+                    ),
+                    "train/microbatch_samples/max": torch.tensor(
+                        float(microbatch_samples),
+                        device=device,
+                        dtype=torch.float32,
+                    ),
+                }.items():
+                    previous = max_reduced_metrics.get(key)
+                    max_reduced_metrics[key] = (
+                        value if previous is None else torch.maximum(previous, value)
+                    )
+
+                del (
+                    all_policy_logprobs,
+                    attention_masks,
+                    logits,
+                    loss,
+                    masked,
+                    positions,
+                )
 
         return self._reduce_forward_backward_metrics(
             sum_reduced_metrics=sum_reduced_metrics,

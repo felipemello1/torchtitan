@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.envs import EnvExample, EnvStep
 from torchtitan.experiments.rl.envs.token_env import PromptState, TokenEnv, TokenStep
 from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
@@ -51,6 +52,7 @@ from torchtitan.experiments.rl.types import (
     RolloutOutput,
     RolloutStatus,
     RolloutTurn,
+    TrainingBatch,
 )
 
 
@@ -71,6 +73,142 @@ def test_grpo_loss_clamps_log_ratio_before_exp():
     assert torch.isfinite(loss)
     assert torch.isfinite(metrics["loss/ratio/mean"])
     assert metrics["loss/ratio/log_clipped_frac"].item() == 1.0
+
+
+def test_grpo_loss_microbatch_sum_matches_full_batch_with_global_denominator():
+    loss_fn = GRPOLoss(GRPOLoss.Config())
+    policy_logprobs = torch.tensor([-0.1, -0.2, -0.3, -0.4])
+    behavior_logprobs = torch.tensor([-0.2, -0.1, -0.35, -0.45])
+    advantages = torch.tensor([0.5, -0.25, 0.75, -1.0])
+    num_global_valid_tokens = torch.tensor(4.0)
+
+    full_loss, full_metrics = loss_fn(
+        policy_logprobs=policy_logprobs,
+        behavior_logprobs=behavior_logprobs,
+        advantages=advantages,
+        num_global_valid_tokens=num_global_valid_tokens,
+    )
+    first_loss, first_metrics = loss_fn(
+        policy_logprobs=policy_logprobs[:2],
+        behavior_logprobs=behavior_logprobs[:2],
+        advantages=advantages[:2],
+        num_global_valid_tokens=num_global_valid_tokens,
+    )
+    second_loss, second_metrics = loss_fn(
+        policy_logprobs=policy_logprobs[2:],
+        behavior_logprobs=behavior_logprobs[2:],
+        advantages=advantages[2:],
+        num_global_valid_tokens=num_global_valid_tokens,
+    )
+
+    assert torch.allclose(first_loss + second_loss, full_loss)
+    for key, value in full_metrics.items():
+        assert torch.allclose(first_metrics[key] + second_metrics[key], value)
+
+
+def test_policy_trainer_splits_microbatches_on_sample_boundaries():
+    batch = TrainingBatch(
+        token_ids=torch.arange(9).view(1, 9),
+        seq_lens=[2, 3, 4],
+        loss_mask=torch.ones((1, 9), dtype=torch.bool),
+        behavior_logprobs=torch.arange(9, dtype=torch.float32).view(1, 9),
+        advantages=torch.arange(9, dtype=torch.float32).view(1, 9),
+    )
+
+    parts = PolicyTrainer._split_training_batch(
+        batch,
+        max_samples=2,
+        max_tokens=None,
+    )
+
+    assert [part.seq_lens for part in parts] == [[2, 3], [4]]
+    assert parts[0].token_ids.tolist() == [[0, 1, 2, 3, 4]]
+    assert parts[1].token_ids.tolist() == [[5, 6, 7, 8]]
+
+    token_limited_parts = PolicyTrainer._split_training_batch(
+        batch,
+        max_samples=None,
+        max_tokens=3,
+    )
+
+    assert [part.seq_lens for part in token_limited_parts] == [[2], [3], [4]]
+
+
+def test_policy_trainer_splits_all_ranks_to_global_microstep_count():
+    rank0 = TrainingBatch(
+        token_ids=torch.arange(5).view(1, 5),
+        seq_lens=[2, 3],
+        loss_mask=torch.ones((1, 5), dtype=torch.bool),
+        behavior_logprobs=torch.zeros((1, 5)),
+        advantages=torch.zeros((1, 5)),
+    )
+    rank1 = TrainingBatch(
+        token_ids=torch.arange(9).view(1, 9),
+        seq_lens=[2, 3, 4],
+        loss_mask=torch.ones((1, 9), dtype=torch.bool),
+        behavior_logprobs=torch.zeros((1, 9)),
+        advantages=torch.zeros((1, 9)),
+    )
+
+    splits_by_rank, max_microbatches = PolicyTrainer._split_training_batches_by_rank(
+        [rank0, rank1],
+        max_samples=1,
+        max_tokens=None,
+    )
+
+    assert max_microbatches == 3
+    assert [len(splits) for splits in splits_by_rank] == [2, 3]
+    assert [part.seq_lens for part in splits_by_rank[0]] == [[2], [3]]
+    assert [part.seq_lens for part in splits_by_rank[1]] == [[2], [3], [4]]
+
+
+def test_policy_trainer_dummy_microbatch_has_zero_gradient_signal():
+    dummy = PolicyTrainer._zero_gradient_training_batch()
+
+    assert PolicyTrainer._has_loss_tokens(dummy)
+    assert dummy.token_ids.shape == (1, 2)
+    assert dummy.loss_mask.tolist() == [[False, True]]
+    assert dummy.advantages.sum().item() == 0
+
+
+def test_policy_trainer_metric_reduction_uses_same_keys_for_zero_values():
+    real_metrics: dict[str, torch.Tensor] = {}
+    dummy_metrics: dict[str, torch.Tensor] = {}
+    real_max_metrics: dict[str, torch.Tensor] = {}
+    dummy_max_metrics: dict[str, torch.Tensor] = {}
+    loss_metrics = {
+        "loss/mean": torch.tensor(1.0),
+        "loss/ratio/mean": torch.tensor(2.0),
+    }
+    drift_metrics = {
+        "bit_wise/logprob_diff/mean": torch.tensor(3.0),
+        "bit_wise/ratio_tokens_different/mean": torch.tensor(4.0),
+    }
+
+    for real_microbatch, target in [
+        (True, real_metrics),
+        (False, dummy_metrics),
+    ]:
+        for key, value in {**loss_metrics, **drift_metrics}.items():
+            zero = torch.zeros((), dtype=value.dtype, device=value.device)
+            target[key] = target.get(key, zero) + (value if real_microbatch else zero)
+        for key, value in {
+            "bit_wise/logprob_diff/max": torch.tensor(5.0),
+            "train/microbatch_tokens/max": torch.tensor(6.0),
+            "train/microbatch_samples/max": torch.tensor(7.0),
+        }.items():
+            zero = torch.zeros((), dtype=value.dtype, device=value.device)
+            target_max = real_max_metrics if real_microbatch else dummy_max_metrics
+            target_max[key] = target_max.get(key, zero) + (
+                value if real_microbatch else zero
+            )
+
+    assert list(real_metrics) == list(dummy_metrics)
+    assert list(real_max_metrics) == list(dummy_max_metrics)
+    assert sum(value.item() for value in real_metrics.values()) == 10.0
+    assert sum(value.item() for value in dummy_metrics.values()) == 0.0
+    assert sum(value.item() for value in real_max_metrics.values()) == 18.0
+    assert sum(value.item() for value in dummy_max_metrics.values()) == 0.0
 
 
 def test_provisioner_respects_parent_cuda_visible_devices(monkeypatch):

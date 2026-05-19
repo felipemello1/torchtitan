@@ -13,7 +13,9 @@ from torchtitan.experiments.rl.config_registry import (
 
 def test_1_7b_configs_disable_compile():
     assert not rl_grpo_qwen3_1_7b().compile.enable
-    assert not rl_grpo_qwen3_1_7b_alphabet_sort().compile.enable
+    cfg = rl_grpo_qwen3_1_7b_alphabet_sort()
+    assert not cfg.compile.enable
+    assert cfg.trainer.max_microbatch_samples == 4
 
 
 def test_alphabet_sort_0_6b_defaults_keep_compile_and_disable_thinking():
@@ -22,3 +24,4 @@ def test_alphabet_sort_0_6b_defaults_keep_compile_and_disable_thinking():
     assert cfg.compile.enable
     assert cfg.renderer.name == "qwen3"
     assert cfg.renderer.enable_thinking is False
+    assert cfg.trainer.max_microbatch_samples == 8

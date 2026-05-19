@@ -61,6 +61,7 @@ def _alphabet_sort_4gpu_config(
     num_prompts_per_step: int,
     num_validation_samples: int,
     compile_config: CompileConfig | None = None,
+    trainer_max_microbatch_samples: int | None = 8,
 ) -> RLTrainer.Config:
     """Four-GPU AlphabetSort config: 2 GPUs generator + 2 GPUs trainer."""
     group_size = 8
@@ -89,6 +90,7 @@ def _alphabet_sort_4gpu_config(
         metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(
             optimizer=OptimizersContainer.Config(lr=lr),
+            max_microbatch_samples=trainer_max_microbatch_samples,
             lr_scheduler=LRSchedulersContainer.Config(
                 warmup_steps=5,
                 decay_type="linear",
@@ -275,6 +277,7 @@ def rl_grpo_qwen3_1_7b_alphabet_sort() -> RLTrainer.Config:
         num_prompts_per_step=4,
         num_validation_samples=16,
         compile_config=CompileConfig(enable=False),
+        trainer_max_microbatch_samples=4,
     )
 
 
