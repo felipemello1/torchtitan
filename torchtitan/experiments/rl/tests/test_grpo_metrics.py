@@ -12,7 +12,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.envs import EnvExample, EnvStep
 from torchtitan.experiments.rl.envs.token_env import PromptState, TokenEnv, TokenStep
 from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
@@ -45,6 +44,15 @@ from torchtitan.experiments.rl.sum_digits import (
     SumDigitsBuilder,
     SumDigitsDataset,
     SumDigitsExample,
+)
+
+from torchtitan.experiments.rl.trainer_microbatch import (
+    has_loss_tokens,
+    MetricAccumulator,
+    schedule_training_microbatches,
+    split_training_batch,
+    split_training_batches_by_rank,
+    zero_gradient_training_batch_like,
 )
 from torchtitan.experiments.rl.types import (
     Completion,
@@ -106,7 +114,7 @@ def test_grpo_loss_microbatch_sum_matches_full_batch_with_global_denominator():
         assert torch.allclose(first_metrics[key] + second_metrics[key], value)
 
 
-def test_policy_trainer_splits_microbatches_on_sample_boundaries():
+def test_split_training_batch_keeps_sample_boundaries():
     batch = TrainingBatch(
         token_ids=torch.arange(9).view(1, 9),
         seq_lens=[2, 3, 4],
@@ -115,7 +123,7 @@ def test_policy_trainer_splits_microbatches_on_sample_boundaries():
         advantages=torch.arange(9, dtype=torch.float32).view(1, 9),
     )
 
-    parts = PolicyTrainer._split_training_batch(
+    parts = split_training_batch(
         batch,
         max_samples=2,
         max_tokens=None,
@@ -125,7 +133,7 @@ def test_policy_trainer_splits_microbatches_on_sample_boundaries():
     assert parts[0].token_ids.tolist() == [[0, 1, 2, 3, 4]]
     assert parts[1].token_ids.tolist() == [[5, 6, 7, 8]]
 
-    token_limited_parts = PolicyTrainer._split_training_batch(
+    token_limited_parts = split_training_batch(
         batch,
         max_samples=None,
         max_tokens=3,
@@ -134,7 +142,7 @@ def test_policy_trainer_splits_microbatches_on_sample_boundaries():
     assert [part.seq_lens for part in token_limited_parts] == [[2], [3], [4]]
 
 
-def test_policy_trainer_splits_all_ranks_to_global_microstep_count():
+def test_split_training_batches_returns_global_microstep_count():
     rank0 = TrainingBatch(
         token_ids=torch.arange(5).view(1, 5),
         seq_lens=[2, 3],
@@ -150,7 +158,7 @@ def test_policy_trainer_splits_all_ranks_to_global_microstep_count():
         advantages=torch.zeros((1, 9)),
     )
 
-    splits_by_rank, max_microbatches = PolicyTrainer._split_training_batches_by_rank(
+    splits_by_rank, max_microbatches = split_training_batches_by_rank(
         [rank0, rank1],
         max_samples=1,
         max_tokens=None,
@@ -162,20 +170,59 @@ def test_policy_trainer_splits_all_ranks_to_global_microstep_count():
     assert [part.seq_lens for part in splits_by_rank[1]] == [[2], [3], [4]]
 
 
-def test_policy_trainer_dummy_microbatch_has_zero_gradient_signal():
-    dummy = PolicyTrainer._zero_gradient_training_batch()
+def test_trainer_schedule_pads_shorter_rank_with_dummy_microbatch():
+    rank0 = TrainingBatch(
+        token_ids=torch.arange(5).view(1, 5),
+        seq_lens=[2, 3],
+        loss_mask=torch.ones((1, 5), dtype=torch.bool),
+        behavior_logprobs=torch.zeros((1, 5)),
+        advantages=torch.zeros((1, 5)),
+    )
+    rank1 = TrainingBatch(
+        token_ids=torch.arange(9).view(1, 9),
+        seq_lens=[2, 3, 4],
+        loss_mask=torch.ones((1, 9), dtype=torch.bool),
+        behavior_logprobs=torch.zeros((1, 9)),
+        advantages=torch.zeros((1, 9)),
+    )
 
-    assert PolicyTrainer._has_loss_tokens(dummy)
+    schedule = schedule_training_microbatches(
+        [rank0, rank1],
+        dp_rank=0,
+        max_samples=1,
+        max_tokens=None,
+    )
+
+    assert schedule.max_microbatches == 3
+    assert [item.is_real for item in schedule.microbatches] == [True, True, False]
+    assert schedule.microbatches[-1].batch.seq_lens == [2]
+    assert schedule.max_seq_len == 3
+
+
+def test_zero_gradient_microbatch_matches_reference_tensor_metadata():
+    reference = TrainingBatch(
+        token_ids=torch.arange(5, dtype=torch.long).view(1, 5),
+        seq_lens=[2, 3],
+        loss_mask=torch.ones((1, 5), dtype=torch.bool),
+        behavior_logprobs=torch.zeros((1, 5), dtype=torch.float64),
+        advantages=torch.zeros((1, 5), dtype=torch.float16),
+    )
+
+    dummy = zero_gradient_training_batch_like(reference)
+
+    assert has_loss_tokens(dummy)
     assert dummy.token_ids.shape == (1, 2)
     assert dummy.loss_mask.tolist() == [[False, True]]
+    assert dummy.token_ids.dtype == reference.token_ids.dtype
+    assert dummy.loss_mask.dtype == reference.loss_mask.dtype
+    assert dummy.behavior_logprobs.dtype == reference.behavior_logprobs.dtype
+    assert dummy.advantages.dtype == reference.advantages.dtype
     assert dummy.advantages.sum().item() == 0
 
 
-def test_policy_trainer_metric_reduction_uses_same_keys_for_zero_values():
-    real_metrics: dict[str, torch.Tensor] = {}
-    dummy_metrics: dict[str, torch.Tensor] = {}
-    real_max_metrics: dict[str, torch.Tensor] = {}
-    dummy_max_metrics: dict[str, torch.Tensor] = {}
+def test_metric_accumulator_uses_same_keys_for_inactive_values():
+    real_accumulator = MetricAccumulator()
+    dummy_accumulator = MetricAccumulator()
     loss_metrics = {
         "loss/mean": torch.tensor(1.0),
         "loss/ratio/mean": torch.tensor(2.0),
@@ -184,31 +231,41 @@ def test_policy_trainer_metric_reduction_uses_same_keys_for_zero_values():
         "bit_wise/logprob_diff/mean": torch.tensor(3.0),
         "bit_wise/ratio_tokens_different/mean": torch.tensor(4.0),
     }
+    max_metrics = {
+        "bit_wise/logprob_diff/max": torch.tensor(5.0),
+        "train/microbatch_tokens/max": torch.tensor(6.0),
+        "train/microbatch_samples/max": torch.tensor(7.0),
+    }
 
-    for real_microbatch, target in [
-        (True, real_metrics),
-        (False, dummy_metrics),
+    for active, accumulator in [
+        (True, real_accumulator),
+        (False, dummy_accumulator),
     ]:
-        for key, value in {**loss_metrics, **drift_metrics}.items():
-            zero = torch.zeros((), dtype=value.dtype, device=value.device)
-            target[key] = target.get(key, zero) + (value if real_microbatch else zero)
-        for key, value in {
-            "bit_wise/logprob_diff/max": torch.tensor(5.0),
-            "train/microbatch_tokens/max": torch.tensor(6.0),
-            "train/microbatch_samples/max": torch.tensor(7.0),
-        }.items():
-            zero = torch.zeros((), dtype=value.dtype, device=value.device)
-            target_max = real_max_metrics if real_microbatch else dummy_max_metrics
-            target_max[key] = target_max.get(key, zero) + (
-                value if real_microbatch else zero
-            )
+        accumulator.add_sum({**loss_metrics, **drift_metrics}, active=active)
+        accumulator.add_max(max_metrics, active=active)
 
-    assert list(real_metrics) == list(dummy_metrics)
-    assert list(real_max_metrics) == list(dummy_max_metrics)
-    assert sum(value.item() for value in real_metrics.values()) == 10.0
-    assert sum(value.item() for value in dummy_metrics.values()) == 0.0
-    assert sum(value.item() for value in real_max_metrics.values()) == 18.0
-    assert sum(value.item() for value in dummy_max_metrics.values()) == 0.0
+    assert list(real_accumulator.sum_reduced_metrics) == list(
+        dummy_accumulator.sum_reduced_metrics
+    )
+    assert list(real_accumulator.max_reduced_metrics) == list(
+        dummy_accumulator.max_reduced_metrics
+    )
+    assert (
+        sum(value.item() for value in real_accumulator.sum_reduced_metrics.values())
+        == 10.0
+    )
+    assert (
+        sum(value.item() for value in dummy_accumulator.sum_reduced_metrics.values())
+        == 0.0
+    )
+    assert (
+        sum(value.item() for value in real_accumulator.max_reduced_metrics.values())
+        == 18.0
+    )
+    assert (
+        sum(value.item() for value in dummy_accumulator.max_reduced_metrics.values())
+        == 0.0
+    )
 
 
 def test_provisioner_respects_parent_cuda_visible_devices(monkeypatch):
