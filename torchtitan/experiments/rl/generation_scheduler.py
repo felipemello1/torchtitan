@@ -52,13 +52,13 @@ class GenerationScheduler:
     """Ordered controller-side admission and draining for token generation.
 
     The controller owns batching so every tensor-parallel generator rank receives
-    ordered ``generate`` calls from the same controller tick. Mixed sampling
-    configs are partitioned into separate sub-batches, and submission order is
-    preserved within each sampling bucket. Weight sync pauses admission at
-    request boundaries: active generator calls drain, new rollout turns queue on
-    the controller, and generation resumes after fresh weights are loaded.
-    Flush tasks may overlap so later rollout turns can be admitted to the
-    generator actor while earlier turns are still decoding.
+    deterministic ``generate`` calls from the same controller tick. Mixed
+    sampling configs are partitioned into separate sub-batches, and result
+    futures preserve each request's prompt/completion association. Weight sync
+    pauses admission at request boundaries: active generator calls drain, new
+    rollout turns queue on the controller, and generation resumes after fresh
+    weights are loaded. Flush tasks may overlap, so later rollout turns can be
+    admitted to the generator actor while earlier turns are still decoding.
     ``max_admitted_prompts`` bounds controller-admitted prompts whose generator
     calls have started and not returned yet; extra flushed chunks remain queued.
     """

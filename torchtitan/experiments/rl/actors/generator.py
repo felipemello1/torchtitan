@@ -512,7 +512,14 @@ class VLLMGenerator(Actor, Configurable):
         sampling_config: SamplingConfig,
         loop: asyncio.AbstractEventLoop,
     ) -> tuple[list[str], list[asyncio.Future[RequestOutput]], int]:
-        """Admit a generate batch while holding ``_engine_lock``."""
+        """Admit a generate batch while holding ``_engine_lock``.
+
+        Request IDs must be unique among active vLLM requests. Futures are
+        registered before ``add_request`` so the engine driver can resolve
+        outputs immediately after admission. If vLLM partially accepts a batch
+        and then raises, already-added request IDs are aborted before the local
+        pending map is cleared.
+        """
         admitted_policy_version = self.policy_version
         if request_ids is None:
             start_id = self._next_request_id
@@ -547,6 +554,7 @@ class VLLMGenerator(Actor, Configurable):
             [{"prompt_token_ids": ids} for ids in prompt_token_ids_batch]
         )
         request_futures: list[asyncio.Future[RequestOutput]] = []
+        added_request_ids: list[str] = []
         try:
             for request_id, engine_input in zip(
                 _request_ids,
@@ -561,7 +569,10 @@ class VLLMGenerator(Actor, Configurable):
                     prompt=engine_input,
                     params=sampling_params,
                 )
+                added_request_ids.append(request_id)
         except Exception:
+            if added_request_ids:
+                self._engine.abort_request(added_request_ids, internal=True)
             for request_id in _request_ids:
                 future = self._pending_outputs.pop(request_id, None)
                 if future is not None and not future.done():
@@ -619,13 +630,15 @@ class VLLMGenerator(Actor, Configurable):
 
         loop = asyncio.get_running_loop()
         async with self._engine_lock:
-            _request_ids, request_futures, admitted_policy_version = (
-                self._admit_requests_locked(
-                    prompt_token_ids_batch,
-                    request_ids=request_ids,
-                    sampling_config=_sampling_config,
-                    loop=loop,
-                )
+            (
+                _request_ids,
+                request_futures,
+                admitted_policy_version,
+            ) = self._admit_requests_locked(
+                prompt_token_ids_batch,
+                request_ids=request_ids,
+                sampling_config=_sampling_config,
+                loop=loop,
             )
 
         all_outputs = await asyncio.gather(*request_futures)
