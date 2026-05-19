@@ -920,10 +920,10 @@ def test_generation_scheduler_coalesces_same_tick_requests():
         aggregate = m.MetricsProcessor._aggregate_metrics(scheduler.pop_metrics())
         assert aggregate["generation_scheduler/batch_size/mean"] == 2
         assert aggregate["generation_scheduler/batch_size/max"] == 2
-        assert aggregate["generation_scheduler/pending_depth/mean"] == 0
-        assert aggregate["generation_scheduler/pending_depth/max"] == 0
-        assert aggregate["generation_scheduler/active_prompts/mean"] == 2
-        assert aggregate["generation_scheduler/active_prompts/max"] == 2
+        assert aggregate["generation_scheduler/queued_prompts/mean"] == 0
+        assert aggregate["generation_scheduler/queued_prompts/max"] == 0
+        assert aggregate["generation_scheduler/admitted_prompts/mean"] == 2
+        assert aggregate["generation_scheduler/admitted_prompts/max"] == 2
         assert aggregate["generation_scheduler/queue_wait_seconds/mean"] >= 0
         assert aggregate["generation_scheduler/queue_wait_seconds/max"] >= 0
 
@@ -994,8 +994,8 @@ def test_generation_scheduler_partitions_mixed_sampling_requests():
 def test_generation_scheduler_pauses_new_admission_until_resume():
     async def run() -> None:
         calls: list[list[list[int]]] = []
-        active_started = asyncio.Event()
-        finish_active = asyncio.Event()
+        admitted_started = asyncio.Event()
+        finish_admitted = asyncio.Event()
         version = 0
 
         async def generate_batch(
@@ -1005,8 +1005,8 @@ def test_generation_scheduler_pauses_new_admission_until_resume():
         ) -> tuple[list[Completion], list[m.Metric]]:
             calls.append([list(prompt) for prompt in prompts])
             if prompts == [[1]]:
-                active_started.set()
-                await finish_active.wait()
+                admitted_started.set()
+                await finish_admitted.wait()
             return (
                 [
                     Completion(
@@ -1029,7 +1029,7 @@ def test_generation_scheduler_pauses_new_admission_until_resume():
                 request_id="first",
             )
         )
-        await active_started.wait()
+        await admitted_started.wait()
 
         pause = asyncio.create_task(scheduler.pause_for_weight_sync())
         await asyncio.sleep(0)
@@ -1046,7 +1046,7 @@ def test_generation_scheduler_pauses_new_admission_until_resume():
         assert calls == [[[1]]]
         assert not second.done()
 
-        finish_active.set()
+        finish_admitted.set()
         await pause
         assert not second.done()
 
@@ -1120,7 +1120,7 @@ def test_generation_scheduler_flushes_new_tick_while_prior_generation_active():
     asyncio.run(run())
 
 
-def test_generation_scheduler_bounds_active_prompts():
+def test_generation_scheduler_bounds_admitted_prompts():
     async def run() -> None:
         calls: list[list[list[int]]] = []
         first_started = asyncio.Event()
@@ -1151,7 +1151,7 @@ def test_generation_scheduler_bounds_active_prompts():
                 [],
             )
 
-        scheduler = GenerationScheduler(generate_batch, max_active_prompts=2)
+        scheduler = GenerationScheduler(generate_batch, max_admitted_prompts=2)
         sampling = SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4)
         tasks = [
             asyncio.create_task(
@@ -1180,7 +1180,8 @@ def test_generation_scheduler_bounds_active_prompts():
             [4],
         ]
         aggregate = m.MetricsProcessor._aggregate_metrics(scheduler.pop_metrics())
-        assert aggregate["generation_scheduler/active_prompts/max"] == 2
+        assert aggregate["generation_scheduler/admitted_prompts/max"] == 2
+        assert aggregate["generation_scheduler/queued_prompts/max"] == 2
         await scheduler.close()
 
     asyncio.run(run())

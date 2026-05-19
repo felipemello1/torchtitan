@@ -504,6 +504,75 @@ class VLLMGenerator(Actor, Configurable):
                 if not future.done():
                     future.set_exception(exc)
 
+    def _admit_requests_locked(
+        self,
+        prompt_token_ids_batch: list[list[int]],
+        *,
+        request_ids: list[str] | None,
+        sampling_config: SamplingConfig,
+        loop: asyncio.AbstractEventLoop,
+    ) -> tuple[list[str], list[asyncio.Future[RequestOutput]], int]:
+        """Admit a generate batch while holding ``_engine_lock``."""
+        admitted_policy_version = self.policy_version
+        if request_ids is None:
+            start_id = self._next_request_id
+            self._next_request_id += len(prompt_token_ids_batch)
+            _request_ids = [
+                str(start_id + idx) for idx in range(len(prompt_token_ids_batch))
+            ]
+        else:
+            _request_ids = list(request_ids)
+        logger.debug(
+            f"{os.getpid()=} Generating start generate "
+            f"(policy v{admitted_policy_version})..."
+        )
+
+        active_duplicates = [
+            request_id
+            for request_id in _request_ids
+            if request_id in self._pending_outputs
+        ]
+        if active_duplicates:
+            raise ValueError(
+                "request_ids are already active in the vLLM engine: "
+                f"{active_duplicates}"
+            )
+
+        sampling_params = self._build_sampling_params(sampling_config)
+        # render_cmpl is vLLM's input-pipeline entry.
+        # The tokenize step is a no-op for already-tokenized prompts. The
+        # lower-level alternative is vllm.inputs.tokens_input; we use the
+        # high-level API to stay resilient to vLLM internal changes.
+        engine_inputs = self._engine.renderer.render_cmpl(
+            [{"prompt_token_ids": ids} for ids in prompt_token_ids_batch]
+        )
+        request_futures: list[asyncio.Future[RequestOutput]] = []
+        try:
+            for request_id, engine_input in zip(
+                _request_ids,
+                engine_inputs,
+                strict=True,
+            ):
+                future = loop.create_future()
+                self._pending_outputs[request_id] = future
+                request_futures.append(future)
+                self._engine.add_request(
+                    request_id=request_id,
+                    prompt=engine_input,
+                    params=sampling_params,
+                )
+        except Exception:
+            for request_id in _request_ids:
+                future = self._pending_outputs.pop(request_id, None)
+                if future is not None and not future.done():
+                    future.cancel()
+            raise
+
+        if request_futures:
+            self._ensure_engine_driver_locked()
+
+        return _request_ids, request_futures, admitted_policy_version
+
     @endpoint
     @sl.log_trace_span("generate")
     async def generate(
@@ -549,65 +618,15 @@ class VLLMGenerator(Actor, Configurable):
             raise ValueError(f"request_ids must be unique, got {request_ids}")
 
         loop = asyncio.get_running_loop()
-        request_futures: list[asyncio.Future[RequestOutput]] = []
         async with self._engine_lock:
-            admitted_policy_version = self.policy_version
-            if request_ids is None:
-                start_id = self._next_request_id
-                self._next_request_id += len(prompt_token_ids_batch)
-                _request_ids = [
-                    str(start_id + idx) for idx in range(len(prompt_token_ids_batch))
-                ]
-            else:
-                _request_ids = list(request_ids)
-            logger.debug(
-                f"{os.getpid()=} Generating start generate "
-                f"(policy v{admitted_policy_version})..."
-            )
-
-            active_duplicates = [
-                request_id
-                for request_id in _request_ids
-                if request_id in self._pending_outputs
-            ]
-            if active_duplicates:
-                raise ValueError(
-                    "request_ids are already active in the vLLM engine: "
-                    f"{active_duplicates}"
+            _request_ids, request_futures, admitted_policy_version = (
+                self._admit_requests_locked(
+                    prompt_token_ids_batch,
+                    request_ids=request_ids,
+                    sampling_config=_sampling_config,
+                    loop=loop,
                 )
-
-            sampling_params = self._build_sampling_params(_sampling_config)
-
-            # render_cmpl is vLLM's input-pipeline entry.
-            # The tokenize step is a no-op for already-tokenized prompts. The
-            # lower-level alternative is vllm.inputs.tokens_input; we use the
-            # high-level API to stay resilient to vLLM internal changes.
-            engine_inputs = self._engine.renderer.render_cmpl(
-                [{"prompt_token_ids": ids} for ids in prompt_token_ids_batch]
             )
-            try:
-                for request_id, engine_input in zip(
-                    _request_ids,
-                    engine_inputs,
-                    strict=True,
-                ):
-                    future = loop.create_future()
-                    self._pending_outputs[request_id] = future
-                    request_futures.append(future)
-                    self._engine.add_request(
-                        request_id=request_id,
-                        prompt=engine_input,
-                        params=sampling_params,
-                    )
-            except Exception:
-                for request_id in _request_ids:
-                    future = self._pending_outputs.pop(request_id, None)
-                    if future is not None and not future.done():
-                        future.cancel()
-                raise
-
-            if request_futures:
-                self._ensure_engine_driver_locked()
 
         all_outputs = await asyncio.gather(*request_futures)
 

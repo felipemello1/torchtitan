@@ -59,28 +59,31 @@ class GenerationScheduler:
     the controller, and generation resumes after fresh weights are loaded.
     Flush tasks may overlap so later rollout turns can be admitted to the
     generator actor while earlier turns are still decoding.
+    ``max_admitted_prompts`` bounds controller-admitted prompts whose generator
+    calls have started and not returned yet; extra flushed chunks remain queued.
     """
 
     def __init__(
         self,
         generate_batch: GenerateBatchFn,
         *,
-        max_active_prompts: int | None = None,
+        max_admitted_prompts: int | None = None,
     ):
-        if max_active_prompts is not None and max_active_prompts <= 0:
+        if max_admitted_prompts is not None and max_admitted_prompts <= 0:
             raise ValueError(
-                "max_active_prompts must be positive or None, "
-                f"got {max_active_prompts}"
+                "max_admitted_prompts must be positive or None, "
+                f"got {max_admitted_prompts}"
             )
         self._generate_batch = generate_batch
-        self._max_active_prompts = max_active_prompts
+        self._max_admitted_prompts = max_admitted_prompts
         self._pending: list[_PendingGeneration] = []
         self._flush_task: asyncio.Task[None] | None = None
         self._active_flush_tasks: set[asyncio.Task[None]] = set()
         self._metrics: list[m.Metric] = []
         self._condition = asyncio.Condition()
         self._loading_weights = False
-        self._active_prompts = 0
+        self._admitted_prompts = 0
+        self._queued_flush_prompts = 0
         self._closed = False
 
     def pop_metrics(self) -> list[m.Metric]:
@@ -145,43 +148,63 @@ class GenerationScheduler:
             for pending in batch:
                 pending_by_sampling[_sampling_key(pending.sampling)].append(pending)
 
-            for pending_group in pending_by_sampling.values():
-                for chunk in self._flush_chunks(pending_group):
-                    task = asyncio.create_task(self._flush_group(chunk))
-                    self._active_flush_tasks.add(task)
-                    task.add_done_callback(self._active_flush_tasks.discard)
+            chunks = [
+                chunk
+                for pending_group in pending_by_sampling.values()
+                for chunk in self._flush_chunks(pending_group)
+            ]
+            async with self._condition:
+                self._queued_flush_prompts += sum(len(chunk) for chunk in chunks)
+                self._condition.notify_all()
+
+            for chunk in chunks:
+                task = asyncio.create_task(self._flush_group(chunk))
+                self._active_flush_tasks.add(task)
+                task.add_done_callback(self._active_flush_tasks.discard)
             await asyncio.sleep(0)
 
     def _flush_chunks(
         self, pending_group: list[_PendingGeneration]
     ) -> list[list[_PendingGeneration]]:
-        max_active_prompts = self._max_active_prompts
-        if max_active_prompts is None or len(pending_group) <= max_active_prompts:
+        max_admitted_prompts = self._max_admitted_prompts
+        if max_admitted_prompts is None or len(pending_group) <= max_admitted_prompts:
             return [pending_group]
         return [
-            pending_group[start : start + max_active_prompts]
-            for start in range(0, len(pending_group), max_active_prompts)
+            pending_group[start : start + max_admitted_prompts]
+            for start in range(0, len(pending_group), max_admitted_prompts)
         ]
 
     def _can_admit(self, batch_size: int) -> bool:
         return (
-            self._max_active_prompts is None
-            or self._active_prompts + batch_size <= self._max_active_prompts
+            self._max_admitted_prompts is None
+            or self._admitted_prompts + batch_size <= self._max_admitted_prompts
         )
 
     async def _flush_group(self, pending_group: list[_PendingGeneration]) -> None:
+        queued_count = len(pending_group)
+        admitted_count = 0
         pending_group = [
             pending for pending in pending_group if not pending.future.done()
         ]
         if not pending_group:
+            async with self._condition:
+                self._queued_flush_prompts -= queued_count
+                self._condition.notify_all()
             return
 
         sampling = pending_group[0].sampling
         async with self._condition:
-            await self._condition.wait_for(
-                lambda: self._closed
-                or (not self._loading_weights and self._can_admit(len(pending_group)))
-            )
+            try:
+                await self._condition.wait_for(
+                    lambda: self._closed
+                    or (
+                        not self._loading_weights
+                        and self._can_admit(len(pending_group))
+                    )
+                )
+            finally:
+                self._queued_flush_prompts -= queued_count
+                queued_count = 0
             if self._closed:
                 self._fail_pending(pending_group)
                 return
@@ -190,10 +213,11 @@ class GenerationScheduler:
             ]
             if not pending_group:
                 return
-            self._active_prompts += len(pending_group)
+            self._admitted_prompts += len(pending_group)
+            admitted_count = len(pending_group)
             batch_size = len(pending_group)
-            pending_depth = len(self._pending)
-            active_prompts = self._active_prompts
+            queued_prompts = len(self._pending) + self._queued_flush_prompts
+            admitted_prompts = self._admitted_prompts
 
         try:
             queue_wait_s = [
@@ -205,20 +229,20 @@ class GenerationScheduler:
                     m.Metric("generation_scheduler/batch_size", m.Mean(batch_size)),
                     m.Metric("generation_scheduler/batch_size", m.Max(batch_size)),
                     m.Metric(
-                        "generation_scheduler/pending_depth",
-                        m.Mean(pending_depth),
+                        "generation_scheduler/queued_prompts",
+                        m.Mean(queued_prompts),
                     ),
                     m.Metric(
-                        "generation_scheduler/pending_depth",
-                        m.Max(pending_depth),
+                        "generation_scheduler/queued_prompts",
+                        m.Max(queued_prompts),
                     ),
                     m.Metric(
-                        "generation_scheduler/active_prompts",
-                        m.Mean(active_prompts),
+                        "generation_scheduler/admitted_prompts",
+                        m.Mean(admitted_prompts),
                     ),
                     m.Metric(
-                        "generation_scheduler/active_prompts",
-                        m.Max(active_prompts),
+                        "generation_scheduler/admitted_prompts",
+                        m.Max(admitted_prompts),
                     ),
                     m.Metric(
                         "generation_scheduler/queue_wait_seconds",
@@ -233,8 +257,8 @@ class GenerationScheduler:
             sl.log_trace_scalar(
                 {
                     "generation_scheduler.batch_size": batch_size,
-                    "generation_scheduler.pending_depth": pending_depth,
-                    "generation_scheduler.active_prompts": active_prompts,
+                    "generation_scheduler.queued_prompts": queued_prompts,
+                    "generation_scheduler.admitted_prompts": admitted_prompts,
                     "generation_scheduler.queue_wait_ms.max": max(queue_wait_s) * 1000,
                 }
             )
@@ -265,7 +289,9 @@ class GenerationScheduler:
                     pending.future.set_exception(exc)
         finally:
             async with self._condition:
-                self._active_prompts -= len(pending_group)
+                if queued_count:
+                    self._queued_flush_prompts -= queued_count
+                self._admitted_prompts -= admitted_count
                 self._condition.notify_all()
 
     async def pause_for_weight_sync(self) -> None:
@@ -276,7 +302,7 @@ class GenerationScheduler:
             if self._closed:
                 raise self._closed_error()
             self._loading_weights = True
-            await self._condition.wait_for(lambda: self._active_prompts == 0)
+            await self._condition.wait_for(lambda: self._admitted_prompts == 0)
 
     async def resume_after_weight_sync(self) -> None:
         async with self._condition:
@@ -303,4 +329,4 @@ class GenerationScheduler:
             await asyncio.gather(*active_flush_tasks, return_exceptions=True)
 
         async with self._condition:
-            await self._condition.wait_for(lambda: self._active_prompts == 0)
+            await self._condition.wait_for(lambda: self._admitted_prompts == 0)

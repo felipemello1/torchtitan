@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from torchtitan.experiments.rl.actors import generator as generator_module
 from torchtitan.experiments.rl.actors.generator import VLLMGenerator
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.sampling import SamplingConfig
@@ -365,5 +366,81 @@ def test_generate_admits_new_request_while_prior_request_is_decoding():
         assert first_result[0][0].token_ids == [1]
         assert second_result[0][0].token_ids == [2]
         assert generator._engine.max_pending_during_step == 2
+
+    asyncio.run(run())
+
+
+def test_pull_model_state_dict_rejects_while_generation_is_pending(monkeypatch):
+    async def run() -> None:
+        first_step_seen = asyncio.Event()
+        allow_finish = asyncio.Event()
+        get_state_dict_calls = []
+
+        class ContinuousFakeEngine(_FakeEngine):
+            def __init__(self):
+                super().__init__(outputs=[])
+                self.pending_request_ids: list[str] = []
+                self.reset_prefix_cache_calls = 0
+
+            def add_request(self, *args, **kwargs):
+                super().add_request(*args, **kwargs)
+                self.pending_request_ids.append(kwargs["request_id"])
+
+            def has_unfinished_requests(self):
+                return bool(self.pending_request_ids)
+
+            def step(self):
+                first_step_seen.set()
+                if not allow_finish.is_set():
+                    return []
+                request_id = self.pending_request_ids.pop(0)
+                return [
+                    _request_output(
+                        request_id=request_id,
+                        outputs=[_sample(token_ids=(int(request_id),))],
+                    )
+                ]
+
+            def reset_prefix_cache(self):
+                self.reset_prefix_cache_calls += 1
+
+        async def fake_get_state_dict(*args, **kwargs):
+            get_state_dict_calls.append((args, kwargs))
+
+        generator = _generator([])
+        generator._engine = ContinuousFakeEngine()
+        generator._get_model = lambda: SimpleNamespace(
+            model=SimpleNamespace(state_dict=lambda: {})
+        )
+        monkeypatch.setattr(
+            generator_module.ts,
+            "get_state_dict",
+            fake_get_state_dict,
+        )
+        import monarch.rdma as rdma
+
+        monkeypatch.setattr(rdma, "is_rdma_available", lambda: False)
+
+        generate_task = asyncio.create_task(
+            VLLMGenerator.generate._method(
+                generator,
+                [[1]],
+                request_ids=["1"],
+            )
+        )
+        await first_step_seen.wait()
+
+        with pytest.raises(RuntimeError, match="generation requests are active"):
+            await VLLMGenerator.pull_model_state_dict._method(generator, version=8)
+
+        allow_finish.set()
+        completions, _metrics = await generate_task
+        assert completions[0].token_ids == [1]
+
+        await VLLMGenerator.pull_model_state_dict._method(generator, version=8)
+
+        assert generator.policy_version == 8
+        assert generator._engine.reset_prefix_cache_calls == 1
+        assert len(get_state_dict_calls) == 1
 
     asyncio.run(run())

@@ -884,7 +884,7 @@ class RLTrainer(Configurable):
 
         return GenerationScheduler(
             generate_batch,
-            max_active_prompts=max_admitted_prompts,
+            max_admitted_prompts=max_admitted_prompts,
         )
 
     def _sampling_with_stop_token_ids(self, sampling: SamplingConfig) -> SamplingConfig:
