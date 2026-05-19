@@ -13,9 +13,9 @@ from collections.abc import Awaitable, Callable
 
 from renderers import Renderer
 
-from torchtitan.experiments.rl.actors.generator import SamplingConfig
 from torchtitan.experiments.rl.envs.token_env import TokenEnv, TokenEnvConfig
-from torchtitan.experiments.rl.envs.types import EnvExample, MessageEnv
+from torchtitan.experiments.rl.envs.types import MessageEnv
+from torchtitan.experiments.rl.sampling import SamplingConfig
 from torchtitan.experiments.rl.types import (
     Completion,
     RolloutOutput,
@@ -54,7 +54,6 @@ async def do_single_rollout(
     reward: float | None = None
     reward_components: dict[str, float] = {}
     status = RolloutStatus.TRUNCATED
-    metrics: dict[str, float] = {}
 
     for turn_idx in range(max_turns):
         request_id = f"{group_id}:sample={sample_idx}:turn={turn_idx}"
@@ -65,7 +64,6 @@ async def do_single_rollout(
         if env_step.done and env_step.reward is not None:
             reward = float(env_step.reward)
             reward_components = dict(env_step.reward_components)
-        metrics.update(env_step.metrics)
 
         turn_status = env_step.status or RolloutStatus.COMPLETED
         turns.append(
@@ -78,9 +76,6 @@ async def do_single_rollout(
                 policy_version=completion.policy_version,
                 finish_reason=completion.finish_reason,
                 status=turn_status,
-                reward_components=dict(env_step.reward_components),
-                metrics=dict(env_step.metrics),
-                logs=dict(env_step.logs),
             )
         )
 
@@ -105,7 +100,6 @@ async def do_single_rollout(
         status=status,
         reward=reward,
         reward_components=reward_components,
-        metrics=metrics,
     )
     validate_rollout_output(output)
     return output
@@ -117,7 +111,7 @@ async def do_rollout_group(
     renderer: Renderer,
     completion_fn: CompletionFn,
     sampling: SamplingConfig,
-    example: EnvExample,
+    group_id: str,
     max_turns: int,
     token_env_config: TokenEnvConfig,
 ) -> list[RolloutOutput]:
@@ -132,8 +126,8 @@ async def do_rollout_group(
             do_single_rollout(
                 token_env=token_env,
                 completion_fn=completion_fn,
-                sampling=example.sampling or sampling,
-                group_id=example.group_id,
+                sampling=sampling,
+                group_id=group_id,
                 sample_idx=sample_idx,
                 max_turns=max_turns,
             )

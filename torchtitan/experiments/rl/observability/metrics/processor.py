@@ -59,6 +59,7 @@ class MetricsProcessor(Configurable):
                 "reward/_max",
                 "reward/zero_std_frac",
                 "rollout/response_length/max",
+                "rollout/dropped_zero_advantage_groups",
                 "train/grad_norm/mean",
                 "train/lr",
                 "perf/tokens_per_second",

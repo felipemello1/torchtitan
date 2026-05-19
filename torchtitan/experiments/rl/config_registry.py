@@ -20,11 +20,12 @@ from torchtitan.config import (
     ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
+from torchtitan.experiments.rl.actors.generator import VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.alphabet_sort import AlphabetSortEnv
 from torchtitan.experiments.rl.grpo import GRPOLoss, RLTrainer
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
+from torchtitan.experiments.rl.sampling import SamplingConfig
 from torchtitan.experiments.rl.sum_digits import SumDigitsEnv
 from torchtitan.models.qwen3 import model_registry
 
@@ -34,10 +35,11 @@ def _alphabet_sort_env(seed: int) -> AlphabetSortEnv.Config:
     return AlphabetSortEnv.Config(
         seed=seed,
         min_turns=3,
-        max_turns=3,
+        max_turns=5,
         min_names_per_turn=1,
-        max_names_per_turn=4,
+        max_names_per_turn=5,
         similarity_power=8,
+        power_per_turn=False,
     )
 
 
@@ -56,11 +58,12 @@ def _alphabet_sort_4gpu_config(
         hf_assets_path=hf_assets_path,
         num_steps=50,
         num_prompts_per_step=num_prompts_per_step,
+        rollout_group_size=group_size,
         num_validation_samples=num_validation_samples,
-        max_rollout_turns=3,
+        max_rollout_turns=5,
         max_trajectory_tokens=2048,
         async_rollout_groups=2,
-        rollout_queue_groups=num_prompts_per_step,
+        replay_buffer_groups=num_prompts_per_step,
         max_offpolicy_steps=1,
         compile=CompileConfig(enable=True, backend="aot_eager"),
         env=_alphabet_sort_env(seed=142857),
@@ -97,7 +100,7 @@ def _alphabet_sort_4gpu_config(
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
-                n=group_size,
+                n=1,
                 temperature=0.8,
                 top_p=0.95,
                 max_tokens=512,
@@ -114,6 +117,7 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
         num_steps=10,
         num_prompts_per_step=5,
+        rollout_group_size=group_size,
         num_validation_samples=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
         env=SumDigitsEnv.Config(seed=42, correctness_reward=1.0, format_reward=0.3),
@@ -151,7 +155,7 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
-                n=group_size,
+                n=1,
                 temperature=0.8,
                 top_p=0.95,
                 max_tokens=100,
@@ -179,6 +183,7 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-1.7B",
         num_steps=10,
         num_prompts_per_step=5,
+        rollout_group_size=group_size,
         num_validation_samples=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
         env=SumDigitsEnv.Config(seed=42, correctness_reward=1.0, format_reward=0.3),
@@ -217,7 +222,7 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
-                n=group_size,
+                n=1,
                 temperature=0.8,
                 top_p=0.95,
                 max_tokens=100,
@@ -245,6 +250,7 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-14B",
         num_steps=10,
         num_prompts_per_step=5,
+        rollout_group_size=group_size,
         num_validation_samples=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
         env=SumDigitsEnv.Config(seed=42, correctness_reward=1.0, format_reward=0.3),
@@ -282,7 +288,7 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
-                n=group_size,
+                n=1,
                 temperature=0.8,
                 top_p=0.95,
                 max_tokens=100,
@@ -303,6 +309,7 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
         num_steps=10,
         num_prompts_per_step=5,
+        rollout_group_size=group_size,
         num_validation_samples=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
         env=SumDigitsEnv.Config(seed=42, correctness_reward=1.0, format_reward=0.3),
@@ -344,7 +351,7 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
-                n=group_size,
+                n=1,
                 temperature=0.8,
                 top_p=0.95,
                 max_tokens=100,

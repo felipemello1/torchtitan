@@ -51,7 +51,6 @@ Sum all digits: 1 + 2 + 3 + 4 + 5 + 6 + 7 = 28
         example: EnvExample | None = None,
         step: int = 0,
         group_idx: int = 0,
-        sample_idx: int = 0,
     ):
         self._config = config
         if example is not None:
@@ -77,7 +76,6 @@ Sum all digits: 1 + 2 + 3 + 4 + 5 + 6 + 7 = 28
         else:
             self._target = sum(int(digit) for value in values for digit in str(value))
         self._question = f"What is the total digit sum of {values}?"
-        self._sample_idx = sample_idx
 
     async def reset(self) -> EnvReset:
         return EnvReset(
@@ -85,7 +83,6 @@ Sum all digits: 1 + 2 + 3 + 4 + 5 + 6 + 7 = 28
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {"role": "user", "content": self._question},
             ],
-            metadata={"sample_idx": self._sample_idx},
         )
 
     async def step(self, assistant_message: Message) -> EnvStep:

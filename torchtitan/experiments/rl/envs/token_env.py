@@ -25,14 +25,14 @@ class TokenEnvConfig:
     """Operational policy for :class:`TokenEnv`.
 
     Args:
-        failed_parse_reward: Reward used when renderer parsing fails.
+        error_reward: Reward used when parsing or env stepping fails.
         context_overflow_reward: Reward used on generation length stop or context cap.
         max_trajectory_tokens: Optional prompt-token cap before the next generation.
         max_generation_tokens: Reserve included in context-cap checks.
         step_timeout_s: Optional timeout for one ``MessageEnv.step`` call.
     """
 
-    failed_parse_reward: float = 0.0
+    error_reward: float = 0.0
     context_overflow_reward: float = 0.0
     max_trajectory_tokens: int | None = None
     max_generation_tokens: int | None = None
@@ -90,15 +90,15 @@ class TokenEnv:
     async def step(self, completion: Completion) -> TokenStep:
         """Parse completion tokens, step the env, and render the next prompt."""
         if completion.finish_reason == "length":
+            response_messages = self._parse_response_messages(completion)
             return TokenStep(
                 env_step=EnvStep(
                     reward=self._config.context_overflow_reward,
                     reward_components={"context_overflow": 1.0},
                     done=True,
                     status=RolloutStatus.TRUNCATED,
-                    metadata={"reason": "length"},
                 ),
-                response_messages=[],
+                response_messages=response_messages,
             )
 
         try:
@@ -107,14 +107,10 @@ class TokenEnv:
             logger.warning("renderer.parse_response failed: %s", exc, exc_info=False)
             return TokenStep(
                 env_step=EnvStep(
-                    reward=self._config.failed_parse_reward,
+                    reward=self._config.error_reward,
                     reward_components={"parse_error": 1.0},
                     done=True,
                     status=RolloutStatus.ERROR,
-                    metadata={
-                        "reason": "parse_error",
-                        "error_type": type(exc).__name__,
-                    },
                 ),
                 response_messages=[],
             )
@@ -143,9 +139,6 @@ class TokenEnv:
                     },
                     done=True,
                     status=RolloutStatus.TRUNCATED,
-                    metrics=dict(env_step.metrics),
-                    logs=dict(env_step.logs),
-                    metadata={**env_step.metadata, "reason": "context_overflow"},
                 ),
                 response_messages=response_messages,
             )
@@ -168,12 +161,22 @@ class TokenEnv:
             )
         except asyncio.TimeoutError:
             return EnvStep(
-                reward=self._config.failed_parse_reward,
+                reward=self._config.error_reward,
                 reward_components={"step_timeout": 1.0},
                 done=True,
                 status=RolloutStatus.ERROR,
-                metadata={"reason": "step_timeout"},
             )
+
+    def _parse_response_messages(self, completion: Completion) -> list[Message]:
+        try:
+            return [
+                _assistant_message_from(
+                    self._renderer.parse_response(completion.token_ids)
+                )
+            ]
+        except Exception as exc:
+            logger.warning("renderer.parse_response failed: %s", exc, exc_info=False)
+            return []
 
     async def _render_prompt(self) -> list[int]:
         rendered = await asyncio.to_thread(

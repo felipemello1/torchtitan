@@ -17,8 +17,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
+from torchtitan.experiments.rl.actors.generator import VLLMGenerator
 from torchtitan.experiments.rl.observability import metrics as m
+from torchtitan.experiments.rl.sampling import SamplingConfig
 
 
 class _FakeRenderer:
@@ -58,12 +59,16 @@ class _FakeEngine:
         return self.outputs
 
 
-def _sample(*, index=0, token_ids=(10, 11), finish_reason="stop"):
+def _sample(*, index=0, token_ids=(10, 11), finish_reason="stop", logprobs=None):
     return SimpleNamespace(
         index=index,
         text="ok",
         token_ids=list(token_ids),
-        logprobs=[{tok: SimpleNamespace(logprob=-0.1)} for tok in token_ids],
+        logprobs=(
+            logprobs
+            if logprobs is not None
+            else [{tok: SimpleNamespace(logprob=-0.1)} for tok in token_ids]
+        ),
         finish_reason=finish_reason,
     )
 
@@ -94,6 +99,7 @@ def _request_output(
 def _generator(outputs):
     generator = VLLMGenerator.__new__(VLLMGenerator)
     generator._engine = _FakeEngine(outputs)
+    generator._engine_lock = asyncio.Lock()
     generator.policy_version = 7
     generator.config = SimpleNamespace(
         sampling=SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4),
@@ -138,6 +144,7 @@ def test_generate_carries_finish_reason_and_metrics():
     completions, generation_metrics = _run_generate(generator, [[1, 2]])
 
     assert [c.finish_reason for c in completions] == ["length", "stop"]
+    assert [c.policy_version for c in completions] == [7, 7]
     assert not hasattr(completions[0], "metrics")
     aggregate = m.MetricsProcessor._aggregate_metrics(generation_metrics)
     assert aggregate["generator/output_tokens/sum"] == 3
@@ -154,6 +161,27 @@ def test_generate_carries_finish_reason_and_metrics():
     assert aggregate["generator/inter_token_latency_ms/mean"] == pytest.approx(10)
     assert aggregate["generator/inter_token_latency_ms/max"] == pytest.approx(10)
     assert "generator/e2e_latency_ms/mean" not in aggregate
+
+
+def test_generate_uses_sampled_token_logprob_not_first_dict_entry():
+    output = _request_output(
+        outputs=[
+            _sample(
+                token_ids=(10,),
+                logprobs=[
+                    {
+                        9: SimpleNamespace(logprob=-9.0),
+                        10: SimpleNamespace(logprob=-0.25),
+                    }
+                ],
+            )
+        ]
+    )
+    generator = _generator([output])
+
+    [completion], _ = _run_generate(generator, [[1, 2]])
+
+    assert completion.token_logprobs == [-0.25]
 
 
 def test_generate_metrics_prefix_override_namespaces_keys():
@@ -188,3 +216,17 @@ def test_decode_metrics_are_absent_for_single_generated_token():
     assert "generator/prefill_time_ms" in metric_keys
     assert "generator/decode_time_ms" not in metric_keys
     assert "generator/inter_token_latency_ms" not in metric_keys
+
+
+def test_generate_detects_policy_version_change_during_request():
+    generator = _generator([_request_output()])
+    step = generator._engine.step
+
+    def mutate_version_during_step():
+        generator.policy_version += 1
+        return step()
+
+    generator._engine.step = mutate_version_during_step
+
+    with pytest.raises(RuntimeError, match="policy_version changed"):
+        _run_generate(generator, [[1, 2]])

@@ -13,7 +13,6 @@ from typing import Protocol, runtime_checkable, TypeAlias
 
 from renderers import Message, ToolSpec
 
-from torchtitan.experiments.rl.actors.generator import SamplingConfig
 from torchtitan.experiments.rl.types import RolloutStatus
 
 
@@ -30,16 +29,12 @@ class EnvExample:
         step: Trainer step that sampled the row.
         group_idx: Position within the step batch.
         payload: JSON-serializable task data consumed by an env builder.
-        sampling: Optional row-specific sampling override.
-        tags: Logging tags such as ``("alphabet_sort", "train")``.
     """
 
     group_id: str
     step: int
     group_idx: int
     payload: dict[str, JsonValue] = field(default_factory=dict)
-    sampling: SamplingConfig | None = None
-    tags: tuple[str, ...] = ()
 
 
 @dataclass(kw_only=True, slots=True)
@@ -48,7 +43,6 @@ class EnvReset:
 
     messages: list[Message]
     tools: list[ToolSpec] = field(default_factory=list)
-    metadata: dict[str, JsonValue] = field(default_factory=dict)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -64,9 +58,6 @@ class EnvStep:
     reward_components: dict[str, float] = field(default_factory=dict)
     done: bool = False
     status: RolloutStatus | None = None
-    metrics: dict[str, float] = field(default_factory=dict)
-    logs: dict[str, JsonValue] = field(default_factory=dict)
-    metadata: dict[str, JsonValue] = field(default_factory=dict)
 
 
 @runtime_checkable
@@ -87,18 +78,9 @@ class MessageEnv(Protocol):
         ...
 
 
-class EnvDataset(Protocol):
-    """Dataset that yields one example per rollout group."""
-
-    def sample_groups(self, *, step: int, num_groups: int) -> list[EnvExample]:
-        ...
-
-
+@runtime_checkable
 class EnvBuilder(Protocol):
-    """Builds one single-use env for a sampled example and sibling index."""
+    """Builds one single-use env for a rollout group example."""
 
-    def build(self, *, example: EnvExample, sample_idx: int) -> MessageEnv:
-        ...
-
-    def logging_tags(self) -> tuple[str, ...]:
+    def build(self, *, example: EnvExample) -> MessageEnv:
         ...

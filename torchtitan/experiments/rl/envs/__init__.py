@@ -6,6 +6,7 @@
 
 from torchtitan.experiments.rl.envs.token_env import TokenEnv, TokenEnvConfig
 from torchtitan.experiments.rl.envs.types import (
+    EnvBuilder,
     EnvExample,
     EnvReset,
     EnvStep,
@@ -14,6 +15,7 @@ from torchtitan.experiments.rl.envs.types import (
 )
 
 __all__ = [
+    "EnvBuilder",
     "EnvExample",
     "EnvReset",
     "EnvStep",

@@ -4,37 +4,54 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Replay conversion and FIFO queue for async rollout training."""
+"""Replay conversion and buffering for async rollout training."""
 
 from __future__ import annotations
 
 import asyncio
 from collections import deque
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 from torchtitan.experiments.rl.types import ReplaySample, RolloutOutput
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class ReplayGroup:
-    """Replay samples produced from one rollout group."""
+    """Replay samples produced from one rollout group.
+
+    ``behavior_version`` is the minimum policy version observed in the group
+    and is used for conservative stale-drop decisions. ``max_behavior_version``
+    keeps request-level weight-sync behavior visible when a multiturn group
+    spans a policy update.
+    """
 
     group_id: str
     samples: list[ReplaySample]
+    rollouts: list[RolloutOutput]
     behavior_version: int
-    train_step: int
-    metrics: dict[str, float] = field(default_factory=dict)
+    max_behavior_version: int
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
-class QueueStats:
-    """Counters returned when the trainer consumes the rollout queue."""
+class ReplayBufferStats:
+    """Counters returned with each replay batch."""
 
     num_groups: int
     num_samples: int
     num_loss_tokens: int
     num_dropped_stale_groups: int
-    max_age_steps: int
+    max_observed_age_steps: int
+    depth_groups: int
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class ReplayBatch:
+    """Replay rows consumed by one optimizer step."""
+
+    groups: list[ReplayGroup]
+    samples: list[ReplaySample]
+    stats: ReplayBufferStats
 
 
 def rollouts_to_replay_samples(rollouts: list[RolloutOutput]) -> list[ReplaySample]:
@@ -57,6 +74,15 @@ def rollouts_to_replay_samples(rollouts: list[RolloutOutput]) -> list[ReplaySamp
     return samples
 
 
+def has_advantage_signal(
+    samples: Sequence[ReplaySample],
+    *,
+    eps: float = 1e-12,
+) -> bool:
+    """Return true when a replay group can produce a non-zero GRPO update."""
+    return any(abs(sample.advantage) > eps for sample in samples)
+
+
 def _rollout_to_replay_samples(
     rollout: RolloutOutput,
     *,
@@ -66,28 +92,26 @@ def _rollout_to_replay_samples(
     token_ids: list[int] = []
     loss_mask: list[int] = []
     behavior_logprobs: list[float] = []
-    advantages: list[float] = []
 
     def flush() -> None:
-        nonlocal token_ids, loss_mask, behavior_logprobs, advantages
+        nonlocal token_ids, loss_mask, behavior_logprobs
         if not token_ids or not any(loss_mask):
-            token_ids, loss_mask, behavior_logprobs, advantages = [], [], [], []
+            token_ids, loss_mask, behavior_logprobs = [], [], []
             return
         rows.append(
             ReplaySample(
                 token_ids=list(token_ids),
                 loss_mask=list(loss_mask),
                 behavior_logprobs=list(behavior_logprobs),
-                advantages=list(advantages),
+                advantage=advantage,
                 group_id=rollout.group_id,
                 sample_idx=rollout.sample_idx,
                 behavior_version=rollout.behavior_version,
                 reward=float(rollout.reward),
                 reward_components=dict(rollout.reward_components),
-                metrics=dict(rollout.metrics),
             )
         )
-        token_ids, loss_mask, behavior_logprobs, advantages = [], [], [], []
+        token_ids, loss_mask, behavior_logprobs = [], [], []
 
     for turn in rollout.turns:
         if not token_ids:
@@ -95,7 +119,6 @@ def _rollout_to_replay_samples(
                 token_ids,
                 loss_mask,
                 behavior_logprobs,
-                advantages,
                 turn.prompt_token_ids,
             )
         elif _is_prefix(token_ids, turn.prompt_token_ids):
@@ -104,7 +127,6 @@ def _rollout_to_replay_samples(
                 token_ids,
                 loss_mask,
                 behavior_logprobs,
-                advantages,
                 prompt_tail,
             )
         else:
@@ -113,14 +135,12 @@ def _rollout_to_replay_samples(
                 token_ids,
                 loss_mask,
                 behavior_logprobs,
-                advantages,
                 turn.prompt_token_ids,
             )
 
         token_ids.extend(turn.response_token_ids)
         loss_mask.extend([1] * len(turn.response_token_ids))
         behavior_logprobs.extend(turn.response_logprobs)
-        advantages.extend([advantage] * len(turn.response_token_ids))
 
     flush()
     return rows
@@ -130,21 +150,19 @@ def _append_prompt(
     token_ids: list[int],
     loss_mask: list[int],
     behavior_logprobs: list[float],
-    advantages: list[float],
     prompt_token_ids: list[int],
 ) -> None:
     token_ids.extend(prompt_token_ids)
     loss_mask.extend([0] * len(prompt_token_ids))
     behavior_logprobs.extend([0.0] * len(prompt_token_ids))
-    advantages.extend([0.0] * len(prompt_token_ids))
 
 
 def _is_prefix(prefix: list[int], values: list[int]) -> bool:
     return values[: len(prefix)] == prefix
 
 
-class RolloutQueue:
-    """Bounded FIFO queue of completed rollout groups."""
+class ReplayBuffer:
+    """Bounded FIFO buffer of completed rollout groups."""
 
     def __init__(self, *, max_groups: int, max_age_steps: int | None = None):
         if max_groups <= 0:
@@ -155,16 +173,13 @@ class RolloutQueue:
         self._condition = asyncio.Condition()
         self._closed = False
 
-    def qsize(self) -> int:
-        return len(self._groups)
-
     async def put(self, group: ReplayGroup) -> None:
         """Append a group, blocking while the FIFO is full."""
         async with self._condition:
             while not self._closed and len(self._groups) >= self._max_groups:
                 await self._condition.wait()
             if self._closed:
-                raise RuntimeError("cannot put into a closed RolloutQueue")
+                raise RuntimeError("cannot put into a closed ReplayBuffer")
             self._groups.append(group)
             self._condition.notify_all()
 
@@ -173,10 +188,10 @@ class RolloutQueue:
         *,
         min_samples: int,
         train_version: int,
-    ) -> tuple[list[ReplaySample], QueueStats]:
+    ) -> ReplayBatch:
         """Pop FIFO groups until at least ``min_samples`` are available.
 
-        If the queue is closed before enough samples arrive, this returns the
+        If the buffer is closed before enough samples arrive, this returns the
         valid samples consumed so far. Callers that require a full batch should
         enforce that postcondition.
         """
@@ -186,37 +201,22 @@ class RolloutQueue:
         return await self._consume(
             train_version=train_version,
             min_samples=min_samples,
-            until_closed=False,
-        )
-
-    async def get_all(
-        self,
-        *,
-        train_version: int,
-    ) -> tuple[list[ReplaySample], QueueStats]:
-        """Pop FIFO groups until producers close the queue."""
-        return await self._consume(
-            train_version=train_version,
-            min_samples=None,
-            until_closed=True,
         )
 
     async def _consume(
         self,
         *,
         train_version: int,
-        min_samples: int | None,
-        until_closed: bool,
-    ) -> tuple[list[ReplaySample], QueueStats]:
+        min_samples: int,
+    ) -> ReplayBatch:
+        groups: list[ReplayGroup] = []
         samples: list[ReplaySample] = []
-        num_groups = 0
         num_dropped_stale_groups = 0
         max_age = 0
 
         async with self._condition:
             while True:
-                target_met = min_samples is not None and len(samples) >= min_samples
-                if target_met and not until_closed:
+                if len(samples) >= min_samples:
                     break
                 while not self._closed and not self._groups:
                     await self._condition.wait()
@@ -231,17 +231,22 @@ class RolloutQueue:
                     self._condition.notify_all()
                     continue
                 samples.extend(group.samples)
-                num_groups += 1
+                groups.append(group)
                 self._condition.notify_all()
 
             self._condition.notify_all()
 
-        return samples, QueueStats(
-            num_groups=num_groups,
-            num_samples=len(samples),
-            num_loss_tokens=sum(sample.num_loss_tokens for sample in samples),
-            num_dropped_stale_groups=num_dropped_stale_groups,
-            max_age_steps=max_age,
+        return ReplayBatch(
+            groups=groups,
+            samples=samples,
+            stats=ReplayBufferStats(
+                num_groups=len(groups),
+                num_samples=len(samples),
+                num_loss_tokens=sum(sample.num_loss_tokens for sample in samples),
+                num_dropped_stale_groups=num_dropped_stale_groups,
+                max_observed_age_steps=max_age,
+                depth_groups=len(self._groups),
+            ),
         )
 
     async def close(self) -> None:

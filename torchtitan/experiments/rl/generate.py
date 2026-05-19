@@ -42,8 +42,8 @@ from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.logger import init_logger
 
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.experiments.rl.actors.generator import SamplingConfig
 from torchtitan.experiments.rl.renderer import RendererConfig
+from torchtitan.experiments.rl.sampling import SamplingConfig
 
 logger = init_logger(__name__)
 
