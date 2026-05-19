@@ -604,14 +604,14 @@ class PolicyTrainer(Actor, Configurable):
     async def push_model_state_dict(self) -> None:
         """Publish model weights for generator consumption via TorchStore.
 
-        When `direct_rdma=True`, weights are transferred directly from
+        When ``direct_rdma=True``, weights are transferred directly from
         GPU to GPU via one-sided RDMA reads, bypassing StorageVolumes
-        entirely. When `False`, data goes through StorageVolumes
+        entirely. When ``False``, data goes through StorageVolumes
         (which may themselves use RDMA as a transport internally).
 
-        Note: we couple `is_rdma_available()` with `direct_rdma` here,
+        Note: we couple ``is_rdma_available()`` with ``direct_rdma`` here,
         but the two concepts are not identical -- StorageVolumes can also
-        use RDMA as their transport layer. `direct_rdma` specifically
+        use RDMA as their transport layer. ``direct_rdma`` specifically
         means "skip StorageVolumes and let the destination read directly
         from the source's GPU memory".
 
