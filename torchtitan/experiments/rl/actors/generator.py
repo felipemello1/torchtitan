@@ -30,7 +30,10 @@ from torchtitan.experiments.rl.models.vllm_registry import (
     TORCHTITAN_CONFIG_FORMAT,
 )
 from torchtitan.experiments.rl.observability import metrics as m
-from torchtitan.experiments.rl.sampling import SamplingConfig
+from torchtitan.experiments.rl.sampling import (
+    SamplingConfig,
+    TRAINING_VLLM_LOGPROBS_MODE,
+)
 from torchtitan.experiments.rl.types import Completion
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.model_spec import ModelSpec
@@ -308,7 +311,7 @@ class VLLMGenerator(Actor, Configurable):
             disable_log_stats=False,
             # Return logprobs after sampling-temperature processing, so trainer
             # policy logprobs and behavior logprobs live in the same space.
-            logprobs_mode="processed_logprobs",
+            logprobs_mode=TRAINING_VLLM_LOGPROBS_MODE,
         )
         engine_kwargs["max_num_seqs"] = self._max_num_seqs
         # FA2 requires block_size to be a multiple of 256

@@ -75,7 +75,7 @@ from torchtitan.experiments.rl.replay import (
 )
 from torchtitan.experiments.rl.rollout_logging import RolloutSampleLogger
 from torchtitan.experiments.rl.rollouts import run_rollout_group
-from torchtitan.experiments.rl.sampling import SamplingConfig
+from torchtitan.experiments.rl.sampling import SamplingConfig, TrainingLogprobConfig
 from torchtitan.experiments.rl.types import (
     Completion,
     OptimStepOutput,
@@ -473,12 +473,7 @@ class RLTrainer(Configurable):
                     "generator.sampling.n must stay 1 so each rollout turn "
                     f"produces exactly one completion, got {self.generator.sampling.n}"
                 )
-            if self.generator.sampling.top_p != 1.0:
-                raise ValueError(
-                    "RLTrainer currently supports trainer logprob correction only "
-                    "for generator.sampling.top_p=1.0; "
-                    f"got {self.generator.sampling.top_p}"
-                )
+            TrainingLogprobConfig.from_sampling(self.generator.sampling)
             if self.replay_buffer_groups <= 0:
                 raise ValueError(
                     "replay_buffer_groups must be positive, "
@@ -1211,6 +1206,9 @@ class RLTrainer(Configurable):
 
     async def train(self):
         num_steps = self.config.num_steps
+        logprob_config = TrainingLogprobConfig.from_sampling(
+            self.config.generator.sampling
+        )
         logger.info(f"Pre-training validation; then {num_steps} steps of RL training")
 
         pre_validation_metrics = await self.validate(
@@ -1319,10 +1317,7 @@ class RLTrainer(Configurable):
                         self.trainer.forward_backward.call(
                             batches,
                             num_global_valid_tokens=num_global_valid_tokens,
-                            sampling_temperature=(
-                                self.config.generator.sampling.temperature
-                            ),
-                            sampling_top_p=self.config.generator.sampling.top_p,
+                            logprob_config=logprob_config,
                         )
                     )
                 skip_metrics = self._forward_backward_skip_metrics(

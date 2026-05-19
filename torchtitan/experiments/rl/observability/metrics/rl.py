@@ -22,7 +22,7 @@ REQUIRED_TRAIN_STEP_HEALTH_KEYS = (
     "loss/ratio/nonfinite_frac",
     "loss/logprob/policy_nonfinite_frac",
     "loss/logprob/behavior_nonfinite_frac",
-    "bit_wise/nonfinite_logprob_frac",
+    "logprob_drift/nonfinite_frac",
 )
 
 

@@ -31,12 +31,13 @@ from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.experiments.rl.actors.utils import (
     compute_logprobs,
+    compute_logprob_drift,
     cuda_memory_stats,
     extract_masked_logprobs,
-    PartialLogprobDrift,
+    LogprobDrift,
     reset_cuda_peak_memory_stats,
-    verify_logprob_identity,
 )
+from torchtitan.experiments.rl.sampling import TrainingLogprobConfig
 from torchtitan.experiments.rl.trainer_microbatch import (
     MetricAccumulator,
     schedule_training_microbatches,
@@ -333,8 +334,7 @@ class PolicyTrainer(Actor, Configurable):
         train_data: list[TrainingBatch],
         *,
         num_global_valid_tokens: int,
-        sampling_temperature: float = 1.0,
-        sampling_top_p: float = 1.0,
+        logprob_config: TrainingLogprobConfig | None = None,
     ) -> dict[str, float]:
         """Run forward pass, compute loss, call backward, and reduce metrics.
 
@@ -344,25 +344,14 @@ class PolicyTrainer(Actor, Configurable):
             num_global_valid_tokens: Total trainable response tokens across all DP
                 ranks for this step. The controller computes this before
                 sharding replay samples.
-            sampling_temperature: Temperature used when sampling behavior-policy
-                rollouts. Trainer logprobs are computed under the same
-                temperature so importance ratios compare matching policies.
-            sampling_top_p: Nucleus sampling threshold used by the generator.
-                Values below 1.0 are not yet supported on the trainer loss path.
+            logprob_config: Validated behavior-logprob contract. Trainer
+                logprobs are computed under the same sampling-temperature
+                transform as the generator behavior logprobs.
 
         Returns:
             dict[str, float]: Globally-reduced metrics.
         """
-        if sampling_temperature <= 0.0:
-            raise ValueError(
-                "sampling_temperature must be positive for policy-gradient "
-                f"training, got {sampling_temperature}"
-            )
-        if sampling_top_p != 1.0:
-            raise NotImplementedError(
-                "trainer policy logprobs currently support top_p=1.0 only; "
-                f"got {sampling_top_p}"
-            )
+        logprob_config = logprob_config or TrainingLogprobConfig(temperature=1.0)
         logger.debug(
             f"{os.getpid()=} PolicyTrainer forward_backward "
             f"step {self.policy_version}"
@@ -442,7 +431,7 @@ class PolicyTrainer(Actor, Configurable):
                 all_policy_logprobs = compute_logprobs(
                     logits,
                     token_ids,
-                    temperature=sampling_temperature,
+                    temperature=logprob_config.temperature,
                 )
                 masked = extract_masked_logprobs(
                     all_policy_logprobs,
@@ -462,8 +451,7 @@ class PolicyTrainer(Actor, Configurable):
                 with sl.log_trace_span("model_backward"):
                     loss.backward()
 
-                # Metrics for bitwise verification of policy logprobs.
-                verification: PartialLogprobDrift = verify_logprob_identity(
+                drift: LogprobDrift = compute_logprob_drift(
                     generator_token_logprobs=masked.behavior_logprobs,
                     trainer_token_logprobs=masked.policy_logprobs,
                     num_global_valid_tokens=num_global_valid_tokens,
@@ -473,19 +461,17 @@ class PolicyTrainer(Actor, Configurable):
                 metric_accumulator.add_sum(
                     {
                         **loss_metrics,
-                        "bit_wise/logprob_diff/mean": verification.logprob_diff_mean,
-                        "bit_wise/ratio_tokens_different/mean": (
-                            verification.ratio_tokens_different
+                        "logprob_drift/diff/mean": drift.logprob_diff_mean,
+                        "logprob_drift/ratio_tokens_different/mean": (
+                            drift.ratio_tokens_different
                         ),
-                        "bit_wise/nonfinite_logprob_frac": (
-                            verification.nonfinite_logprob_frac
-                        ),
+                        "logprob_drift/nonfinite_frac": drift.nonfinite_logprob_frac,
                     },
                     active=is_real,
                 )
                 metric_accumulator.add_max(
                     {
-                        "bit_wise/logprob_diff/max": verification.logprob_diff_max,
+                        "logprob_drift/diff/max": drift.logprob_diff_max,
                         "train/microbatch_tokens/max": torch.tensor(
                             float(sum(seq_lens)),
                             device=device,

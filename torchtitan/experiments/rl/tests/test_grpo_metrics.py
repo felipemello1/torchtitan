@@ -16,7 +16,7 @@ import torch
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.actors.utils import (
     compute_logprobs,
-    verify_logprob_identity,
+    compute_logprob_drift,
 )
 from torchtitan.experiments.rl.envs import EnvExample, EnvStep
 from torchtitan.experiments.rl.envs.token_env import PromptState, TokenEnv, TokenStep
@@ -47,7 +47,7 @@ from torchtitan.experiments.rl.replay import (
 )
 from torchtitan.experiments.rl.rollout_logging import RolloutSampleLogger
 from torchtitan.experiments.rl.rollouts import do_single_rollout, run_rollout_group
-from torchtitan.experiments.rl.sampling import SamplingConfig
+from torchtitan.experiments.rl.sampling import SamplingConfig, TrainingLogprobConfig
 from torchtitan.experiments.rl.sum_digits import (
     SumDigitsBuilder,
     SumDigitsDataset,
@@ -76,6 +76,19 @@ from torchtitan.experiments.rl.types import (
 def test_sampling_config_default_is_one_completion():
     assert SamplingConfig().n == 1
     assert SamplingConfig().top_p == 1.0
+
+
+def test_training_logprob_config_validates_sampling_contract():
+    cfg = TrainingLogprobConfig.from_sampling(
+        SamplingConfig(temperature=0.7, top_p=1.0)
+    )
+
+    assert cfg.temperature == 0.7
+
+    with pytest.raises(ValueError, match="top_p=1.0"):
+        TrainingLogprobConfig.from_sampling(SamplingConfig(top_p=0.95))
+    with pytest.raises(ValueError, match="temperature must be positive"):
+        TrainingLogprobConfig.from_sampling(SamplingConfig(temperature=0.0))
 
 
 def test_compute_logprobs_applies_sampling_temperature():
@@ -246,7 +259,7 @@ def test_dapo_loss_empty_selected_tokens_is_finite_zero():
 
 
 def test_logprob_drift_reports_nonfinite_without_nan_metrics():
-    drift = verify_logprob_identity(
+    drift = compute_logprob_drift(
         generator_token_logprobs=torch.tensor([0.0, float("-inf"), 1.0, float("nan")]),
         trainer_token_logprobs=torch.tensor([0.1, 0.0, 2.0, float("nan")]),
         num_global_valid_tokens=torch.tensor(4.0),
@@ -269,7 +282,7 @@ def _required_fwd_bwd_metrics(**overrides):
         "loss/ratio/nonfinite_frac": 0.0,
         "loss/logprob/policy_nonfinite_frac": 0.0,
         "loss/logprob/behavior_nonfinite_frac": 0.0,
-        "bit_wise/nonfinite_logprob_frac": 0.0,
+        "logprob_drift/nonfinite_frac": 0.0,
     }
     metrics.update(overrides)
     return metrics
@@ -452,11 +465,11 @@ def test_metric_accumulator_uses_same_keys_for_inactive_values():
         "loss/ratio/mean": torch.tensor(2.0),
     }
     drift_metrics = {
-        "bit_wise/logprob_diff/mean": torch.tensor(3.0),
-        "bit_wise/ratio_tokens_different/mean": torch.tensor(4.0),
+        "logprob_drift/diff/mean": torch.tensor(3.0),
+        "logprob_drift/ratio_tokens_different/mean": torch.tensor(4.0),
     }
     max_metrics = {
-        "bit_wise/logprob_diff/max": torch.tensor(5.0),
+        "logprob_drift/diff/max": torch.tensor(5.0),
         "train/microbatch_tokens/max": torch.tensor(6.0),
         "train/microbatch_samples/max": torch.tensor(7.0),
     }
@@ -1351,7 +1364,7 @@ def test_train_step_metric_builder_emits_replay_timing_and_trace_scalars():
         "loss/ratio/nonfinite_frac": 0.0,
         "loss/logprob/policy_nonfinite_frac": 0.1,
         "loss/logprob/behavior_nonfinite_frac": 0.2,
-        "bit_wise/nonfinite_logprob_frac": 0.3,
+        "logprob_drift/nonfinite_frac": 0.3,
     }
     optimizer_metrics = {"train/lr": 1e-6}
     timings = _TrainStepTimings(
@@ -1413,7 +1426,7 @@ def test_train_step_metric_builder_emits_replay_timing_and_trace_scalars():
     assert trace_scalars["loss.ratio.nonfinite_frac"] == 0.0
     assert trace_scalars["loss.logprob.policy_nonfinite_frac"] == 0.1
     assert trace_scalars["loss.logprob.behavior_nonfinite_frac"] == 0.2
-    assert trace_scalars["bit_wise.nonfinite_logprob_frac"] == 0.3
+    assert trace_scalars["logprob_drift.nonfinite_frac"] == 0.3
 
 
 def test_train_step_metric_builder_handles_zero_step_duration():
@@ -1471,7 +1484,7 @@ def test_train_step_metric_builder_handles_zero_step_duration():
             "loss/ratio/nonfinite_frac": 0.0,
             "loss/logprob/policy_nonfinite_frac": 0.0,
             "loss/logprob/behavior_nonfinite_frac": 0.0,
-            "bit_wise/nonfinite_logprob_frac": 0.0,
+            "logprob_drift/nonfinite_frac": 0.0,
         },
         optimizer_metrics={},
         checkpoint_saved=False,

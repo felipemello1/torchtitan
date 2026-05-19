@@ -137,7 +137,7 @@ def extract_masked_logprobs(
 
 
 @dataclass(frozen=True, slots=True)
-class PartialLogprobDrift:
+class LogprobDrift:
     """Per-rank generator-vs-trainer logprob drift awaiting reduction across the loss-mesh.
 
     Args:
@@ -154,14 +154,14 @@ class PartialLogprobDrift:
 
 
 @torch.no_grad()
-@sl.log_trace_span("verify_logprob_identity")
-def verify_logprob_identity(
+@sl.log_trace_span("compute_logprob_drift")
+def compute_logprob_drift(
     generator_token_logprobs: torch.Tensor,
     trainer_token_logprobs: torch.Tensor,
     *,
     num_global_valid_tokens: torch.Tensor,
     device: torch.device,
-) -> PartialLogprobDrift:
+) -> LogprobDrift:
     """Compute per-rank drift between generator and trainer logprobs.
 
     Args:
@@ -175,14 +175,14 @@ def verify_logprob_identity(
             reduction across loss_mesh.
 
     Returns:
-        PartialLogprobDrift.
+        LogprobDrift.
     """
     generator_flat = generator_token_logprobs.to(device=device, dtype=torch.float32)
     trainer_flat = trainer_token_logprobs.to(device=device, dtype=torch.float32)
 
     if generator_flat.numel() == 0:
         zero = torch.zeros((), dtype=torch.float32, device=device)
-        return PartialLogprobDrift(zero, zero, zero, zero)
+        return LogprobDrift(zero, zero, zero, zero)
 
     # 1e-6 threshold ignores bf16-quantization-level diffs
     finite_mask = torch.isfinite(generator_flat) & torch.isfinite(trainer_flat)
@@ -197,7 +197,7 @@ def verify_logprob_identity(
         if bool(finite_mask.any().item())
         else torch.zeros((), dtype=torch.float32, device=device)
     )
-    return PartialLogprobDrift(
+    return LogprobDrift(
         logprob_diff_mean=diff.sum() / num_global_valid_tokens,
         logprob_diff_max=logprob_diff_max,
         ratio_tokens_different=(diff.abs() > 1e-6).sum() / num_global_valid_tokens,

@@ -128,3 +128,14 @@ def test_alphabet_sort_configs_reject_unsupported_top_p():
 
     with pytest.raises(ValueError, match="top_p=1.0"):
         dataclasses.replace(cfg, generator=generator)
+
+
+def test_alphabet_sort_configs_reject_zero_training_temperature():
+    cfg = rl_dapo_qwen3_1_7b_alphabet_sort_2gpu()
+    generator = dataclasses.replace(
+        cfg.generator,
+        sampling=dataclasses.replace(cfg.generator.sampling, temperature=0.0),
+    )
+
+    with pytest.raises(ValueError, match="temperature must be positive"):
+        dataclasses.replace(cfg, generator=generator)
