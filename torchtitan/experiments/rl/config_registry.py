@@ -140,7 +140,6 @@ def _alphabet_sort_config(
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
-                n=1,
                 temperature=generator_temperature,
                 top_p=generator_top_p,
                 max_tokens=generator_max_tokens,
@@ -242,7 +241,6 @@ def _sum_digits_smoke_config(
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
-                n=1,
                 temperature=0.8,
                 top_p=1.0,
                 max_tokens=100,
@@ -367,7 +365,7 @@ def rl_dapo_qwen3_4b_alphabet_sort() -> RLTrainer.Config:
     return _alphabet_sort_4b_config(loss=_dapo_loss())
 
 
-def rl_dapo_qwen3_4b_alphabet_sort_2gpu() -> RLTrainer.Config:
+def diagnostic_rl_dapo_qwen3_4b_alphabet_sort_2gpu() -> RLTrainer.Config:
     """Diagnostic Qwen3-4B DAPO config.
 
     This is known to hit a direct-sync timeout on this devserver. Keep it for

@@ -20,7 +20,7 @@ up the full RL controller.
 
 Example::
 
-    python torchtitan/experiments/rl/generate.py \\
+    python -m torchtitan.experiments.rl.generate \\
         --config rl_grpo_qwen3_0_6b \\
         --message "system:You are concise." \\
         --message "user:What is 2+2?"
@@ -41,7 +41,9 @@ from vllm import LLMEngine, SamplingParams
 from vllm.logger import init_logger
 
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.experiments.rl.actors.generator import VLLMGenerator
+from torchtitan.experiments.rl.actors.generator import (
+    _build_torchtitan_vllm_engine_args,
+)
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.sampling import SamplingConfig
 
@@ -100,9 +102,7 @@ def _build_engine(config) -> LLMEngine:
     gen_config = config.generator
     model_path = config.hf_assets_path
 
-    os.environ["VLLM_ATTENTION_BACKEND"] = "CUSTOM"
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
-    engine_args = VLLMGenerator.build_engine_args(
+    engine_args = _build_torchtitan_vllm_engine_args(
         config=gen_config,
         model_spec=config.model_spec,
         model_path=model_path,

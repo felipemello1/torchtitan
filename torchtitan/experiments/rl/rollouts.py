@@ -55,8 +55,8 @@ async def do_single_rollout(
         token_env: Single-use token env wrapping a message env.
         completion_fn: Awaitable policy call. It receives prompt token IDs,
             sampling config, and a required request ID.
-        sampling: Sampling parameters for each turn. Multiturn rollout calls
-            use ``n=1``; group fanout owns sibling sampling.
+        sampling: Sampling parameters for each turn. Group fanout owns sibling
+            sampling; each policy call returns one completion.
         group_id: Stable group ID used for GRPO advantage centering.
         sample_idx: Sibling index inside the group.
         max_turns: Hard cap on assistant turns.

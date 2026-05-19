@@ -106,7 +106,7 @@ def _generator(outputs):
     generator._next_request_id = 0
     generator.policy_version = 7
     generator.config = SimpleNamespace(
-        sampling=SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4),
+        sampling=SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4),
         debug=SimpleNamespace(seed=None),
     )
     return generator
@@ -174,13 +174,14 @@ def test_generate_validates_request_ids():
         _run_generate(generator, [[1], [2]], request_ids=["dup", "dup"])
 
 
-def test_generate_rejects_multiple_samples_per_prompt():
+def test_generate_uses_one_vllm_sample_per_prompt():
     generator = _generator([_request_output()])
 
-    with pytest.raises(ValueError, match="sampling.n=1"):
-        _run_generate(generator, [[1]], sampling_config=SamplingConfig(n=2))
+    sampling_params = generator._build_sampling_params(
+        SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4)
+    )
 
-    assert generator._engine.add_requests == []
+    assert sampling_params.n == 1
 
 
 def test_generate_rejects_unknown_returned_request_id():

@@ -149,6 +149,70 @@ class VLLMCudagraphConfig:
         )
 
 
+def _build_torchtitan_vllm_engine_args(
+    *,
+    config,
+    model_spec: ModelSpec,
+    model_path: str,
+    compile_config: CompileConfig,
+    checkpoint_config: CheckpointManager.Config,
+    max_num_seqs: int,
+) -> EngineArgs:
+    """Configure vLLM's TorchTitan wrapper path and build EngineArgs.
+
+    Side effects: sets vLLM env vars and registers TorchTitan's model/config
+    parser with vLLM before returning the engine construction arguments.
+    """
+    os.environ["VLLM_ATTENTION_BACKEND"] = "CUSTOM"
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    registry_to_vllm(
+        model_spec,
+        parallelism=config.parallelism,
+        compile_config=compile_config,
+        checkpoint_config=checkpoint_config,
+    )
+    engine_kwargs = dict(
+        # ``model`` is the path to the HF checkpoint directory. The
+        # config is sourced from torchtitan's ModelSpec via
+        # ``config_format=TORCHTITAN_CONFIG_FORMAT`` (no config.json
+        # read), but vLLM still uses this path to locate the
+        # tokenizer assets and the safetensors weight shards.
+        model=model_path,
+        trust_remote_code=True,
+        # Use the torchtitan custom config parser (registered by
+        # registry_to_vllm above). It builds PretrainedConfig from
+        # ModelSpec instead of reading config.json from disk.
+        config_format=TORCHTITAN_CONFIG_FORMAT,
+        dtype=config.model_dtype,
+        tensor_parallel_size=config.parallelism.tensor_parallel_degree,
+        # Monarch already spawned TP workers via proc mesh. "external_launcher"
+        # tells vLLM to run one worker per process (no subprocess spawning)
+        distributed_executor_backend="external_launcher",
+        gpu_memory_utilization=config.gpu_memory_limit,
+        enforce_eager=not config.cudagraph.enable,
+        attention_config=AttentionConfig(
+            backend=AttentionBackendEnum.CUSTOM,
+        ),
+        # Enables RequestOutput.metrics, so generator metrics can be returned
+        disable_log_stats=False,
+        # Return logprobs after sampling-temperature processing, so trainer
+        # policy logprobs and behavior logprobs live in the same space.
+        logprobs_mode=TRAINING_VLLM_LOGPROBS_MODE,
+    )
+    engine_kwargs["max_num_seqs"] = max_num_seqs
+    # FA2 requires block_size to be a multiple of 256
+    if not has_cuda_capability(9, 0):
+        engine_kwargs["block_size"] = 256
+    vllm_compilation_config = config.cudagraph.get_vllm_compilation_config(
+        max_num_seqs=max_num_seqs,
+    )
+    if vllm_compilation_config is not None:
+        engine_kwargs["compilation_config"] = vllm_compilation_config
+    if config.debug.seed is not None:
+        engine_kwargs["seed"] = config.debug.seed
+    return EngineArgs(**engine_kwargs)
+
+
 class VLLMGenerator(Actor, Configurable):
     """
     Generates rollouts using vLLM engine.
@@ -259,17 +323,13 @@ class VLLMGenerator(Actor, Configurable):
         # from its rollout and validation concurrency.
         self._max_num_seqs = max_num_seqs
 
-        # Set vLLM environment variables from config before any vLLM initialization
-        os.environ["VLLM_ATTENTION_BACKEND"] = "CUSTOM"
-        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
-
         set_batch_invariance(config.debug.batch_invariant)
 
         self._set_determinism(config.debug)
 
         self.model_path = model_path
 
-        engine_args = self.build_engine_args(
+        engine_args = _build_torchtitan_vllm_engine_args(
             config=config,
             model_spec=model_spec,
             model_path=model_path,
@@ -290,64 +350,6 @@ class VLLMGenerator(Actor, Configurable):
         self.policy_version = 0
 
         logger.info("Generator initialized with vLLM engine")
-
-    @staticmethod
-    def build_engine_args(
-        *,
-        config: Config,
-        model_spec: ModelSpec,
-        model_path: str,
-        compile_config: CompileConfig,
-        checkpoint_config: CheckpointManager.Config,
-        max_num_seqs: int,
-    ) -> EngineArgs:
-        """Build EngineArgs for the RL vLLM wrapper path."""
-        registry_to_vllm(
-            model_spec,
-            parallelism=config.parallelism,
-            compile_config=compile_config,
-            checkpoint_config=checkpoint_config,
-        )
-        engine_kwargs = dict(
-            # ``model`` is the path to the HF checkpoint directory. The
-            # config is sourced from torchtitan's ModelSpec via
-            # ``config_format=TORCHTITAN_CONFIG_FORMAT`` (no config.json
-            # read), but vLLM still uses this path to locate the
-            # tokenizer assets and the safetensors weight shards.
-            model=model_path,
-            trust_remote_code=True,
-            # Use the torchtitan custom config parser (registered by
-            # registry_to_vllm above). It builds PretrainedConfig from
-            # ModelSpec instead of reading config.json from disk.
-            config_format=TORCHTITAN_CONFIG_FORMAT,
-            dtype=config.model_dtype,
-            tensor_parallel_size=config.parallelism.tensor_parallel_degree,
-            # Monarch already spawned TP workers via proc mesh. "external_launcher"
-            # tells vLLM to run one worker per process (no subprocess spawning)
-            distributed_executor_backend="external_launcher",
-            gpu_memory_utilization=config.gpu_memory_limit,
-            enforce_eager=not config.cudagraph.enable,
-            attention_config=AttentionConfig(
-                backend=AttentionBackendEnum.CUSTOM,
-            ),
-            # Enables RequestOutput.metrics, so generator metrics can be returned
-            disable_log_stats=False,
-            # Return logprobs after sampling-temperature processing, so trainer
-            # policy logprobs and behavior logprobs live in the same space.
-            logprobs_mode=TRAINING_VLLM_LOGPROBS_MODE,
-        )
-        engine_kwargs["max_num_seqs"] = max_num_seqs
-        # FA2 requires block_size to be a multiple of 256
-        if not has_cuda_capability(9, 0):
-            engine_kwargs["block_size"] = 256
-        vllm_compilation_config = config.cudagraph.get_vllm_compilation_config(
-            max_num_seqs=max_num_seqs,
-        )
-        if vllm_compilation_config is not None:
-            engine_kwargs["compilation_config"] = vllm_compilation_config
-        if config.debug.seed is not None:
-            engine_kwargs["seed"] = config.debug.seed
-        return EngineArgs(**engine_kwargs)
 
     @staticmethod
     def _set_determinism(debug: DebugConfig) -> None:
@@ -383,7 +385,7 @@ class VLLMGenerator(Actor, Configurable):
             temperature=sampling_config.temperature,
             top_p=sampling_config.top_p,
             max_tokens=sampling_config.max_tokens,
-            n=sampling_config.n,
+            n=1,
             logprobs=1,
             output_kind=RequestOutputKind.FINAL_ONLY,
             stop_token_ids=list(sampling_config.stop_token_ids),
@@ -607,8 +609,7 @@ class VLLMGenerator(Actor, Configurable):
 
         Takes ``prompt_token_ids_batch`` as ``[num_prompts][prompt_tokens]``.
         Returns one completion per prompt plus generator metrics. GRPO sibling
-        sampling is owned by ``rollout_group_size``; this endpoint intentionally
-        requires ``SamplingConfig.n == 1``.
+        sampling is owned by ``rollout_group_size``.
 
         Args:
             prompt_token_ids_batch: Tokenized prompts shaped
@@ -628,12 +629,6 @@ class VLLMGenerator(Actor, Configurable):
         _sampling_config = (
             sampling_config if sampling_config is not None else self.config.sampling
         )
-        if _sampling_config.n != 1:
-            raise ValueError(
-                "VLLMGenerator.generate requires sampling.n=1; use "
-                "rollout_group_size for sibling sampling, got "
-                f"{_sampling_config.n}"
-            )
         if request_ids is not None and len(request_ids) != len(prompt_token_ids_batch):
             raise ValueError(
                 "request_ids length must match prompt_token_ids_batch: "

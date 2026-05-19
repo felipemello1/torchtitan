@@ -17,9 +17,6 @@ TRAINING_VLLM_LOGPROBS_MODE = "processed_logprobs"
 class SamplingConfig:
     """Sampling parameters passed to vLLM's ``SamplingParams``."""
 
-    n: int = 1
-    """Number of completions to generate per prompt (vLLM SamplingParams.n)."""
-
     temperature: float = 0.8
     """Sampling temperature. 0.0 = greedy, higher = more random."""
 

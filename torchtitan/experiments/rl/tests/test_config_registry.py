@@ -9,9 +9,9 @@ import dataclasses
 import pytest
 
 from torchtitan.experiments.rl.config_registry import (
+    diagnostic_rl_dapo_qwen3_4b_alphabet_sort_2gpu,
     rl_dapo_qwen3_1_7b_alphabet_sort_2gpu,
     rl_dapo_qwen3_4b_alphabet_sort,
-    rl_dapo_qwen3_4b_alphabet_sort_2gpu,
     rl_grpo_qwen3_0_6b_alphabet_sort,
     rl_grpo_qwen3_1_7b,
     rl_grpo_qwen3_1_7b_alphabet_sort,
@@ -104,7 +104,7 @@ def test_alphabet_sort_4b_dapo_uses_clip_high_recipe():
 
 
 def test_alphabet_sort_4b_dapo_2gpu_config_is_diagnostic_only():
-    cfg = rl_dapo_qwen3_4b_alphabet_sort_2gpu()
+    cfg = diagnostic_rl_dapo_qwen3_4b_alphabet_sort_2gpu()
 
     assert cfg.model_spec.flavor == "4B-Instruct-2507"
     assert cfg.num_steps == 25

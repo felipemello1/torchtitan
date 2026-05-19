@@ -78,8 +78,7 @@ from torchtitan.experiments.rl.types import (
 )
 
 
-def test_sampling_config_default_is_one_completion():
-    assert SamplingConfig().n == 1
+def test_sampling_config_defaults():
     assert SamplingConfig().top_p == 1.0
 
 
@@ -652,7 +651,7 @@ def test_max_turn_truncation_does_not_train_on_nonterminal_reward():
         rollout = await do_single_rollout(
             token_env=TokenEnvStub(),
             completion_fn=completion_fn,
-            sampling=SamplingConfig(n=1),
+            sampling=SamplingConfig(),
             group_id="g0",
             sample_idx=0,
             max_turns=1,
@@ -830,7 +829,7 @@ def test_run_rollout_group_closes_partially_built_envs_on_build_failure():
                 group_size=2,
                 renderer=None,
                 completion_fn=None,
-                sampling=SamplingConfig(n=1),
+                sampling=SamplingConfig(),
                 max_turns=1,
                 token_env_config=None,
             )
@@ -899,7 +898,7 @@ def test_generation_scheduler_coalesces_same_tick_requests():
             )
 
         scheduler = GenerationScheduler(generate_batch)
-        sampling = SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4)
+        sampling = SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4)
 
         completions = await asyncio.gather(
             scheduler.submit(
@@ -960,8 +959,8 @@ def test_generation_scheduler_partitions_mixed_sampling_requests():
             )
 
         scheduler = GenerationScheduler(generate_batch)
-        greedy = SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4)
-        sampled = SamplingConfig(n=1, temperature=0.7, top_p=1.0, max_tokens=4)
+        greedy = SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4)
+        sampled = SamplingConfig(temperature=0.7, top_p=1.0, max_tokens=4)
 
         completions = await asyncio.gather(
             scheduler.submit(
@@ -1021,7 +1020,7 @@ def test_generation_scheduler_pauses_new_admission_until_resume():
             )
 
         scheduler = GenerationScheduler(generate_batch)
-        sampling = SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4)
+        sampling = SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4)
         first = asyncio.create_task(
             scheduler.submit(
                 prompt_token_ids=[1],
@@ -1092,7 +1091,7 @@ def test_generation_scheduler_flushes_new_tick_while_prior_generation_active():
             )
 
         scheduler = GenerationScheduler(generate_batch)
-        sampling = SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4)
+        sampling = SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4)
         first = asyncio.create_task(
             scheduler.submit(
                 prompt_token_ids=[1],
@@ -1152,7 +1151,7 @@ def test_generation_scheduler_bounds_admitted_prompts():
             )
 
         scheduler = GenerationScheduler(generate_batch, max_admitted_prompts=2)
-        sampling = SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4)
+        sampling = SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4)
         tasks = [
             asyncio.create_task(
                 scheduler.submit(
@@ -1211,7 +1210,7 @@ def test_generation_scheduler_close_drops_cancelled_queued_request():
             )
 
         scheduler = GenerationScheduler(generate_batch)
-        sampling = SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4)
+        sampling = SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4)
         request = asyncio.create_task(
             scheduler.submit(
                 prompt_token_ids=[1],
@@ -1259,7 +1258,7 @@ def test_generation_scheduler_close_waits_for_active_generation():
             )
 
         scheduler = GenerationScheduler(generate_batch)
-        sampling = SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4)
+        sampling = SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4)
         request = asyncio.create_task(
             scheduler.submit(
                 prompt_token_ids=[1],
@@ -1298,7 +1297,7 @@ def test_generation_scheduler_propagates_generator_exception_to_pending_batch():
             raise ValueError(f"bad batch: {prompts}")
 
         scheduler = GenerationScheduler(generate_batch)
-        sampling = SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4)
+        sampling = SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4)
         first = asyncio.create_task(
             scheduler.submit(
                 prompt_token_ids=[1],

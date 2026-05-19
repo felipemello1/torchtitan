@@ -108,9 +108,6 @@ class GenerationScheduler:
         sampling: SamplingConfig,
         request_id: str,
     ) -> Completion:
-        if sampling.n != 1:
-            raise ValueError(f"GenerationScheduler requires n=1, got {sampling.n}")
-
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Completion] = loop.create_future()
         async with self._condition:

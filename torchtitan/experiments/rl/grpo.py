@@ -61,8 +61,8 @@ from torchtitan.experiments.rl.observability.metrics.rl import (
     _zero_weight_sync_timings,
     build_rollout_metrics,
     build_train_step_metrics,
-    REQUIRED_TRAIN_STEP_HEALTH_KEYS,
     rename_metric_prefix,
+    REQUIRED_TRAIN_STEP_HEALTH_KEYS,
     validate_train_step_fwd_bwd_metrics,
 )
 from torchtitan.experiments.rl.renderer import RendererConfig
@@ -341,7 +341,7 @@ class RLTrainer(Configurable):
         """Number of sampled siblings per prompt for GRPO advantage centering."""
 
         num_validation_samples: int = 20
-        """Number of held-out prompts scored greedily (temp=0, n=1) per validation pass."""
+        """Number of held-out prompts scored greedily per validation pass."""
 
         train_dataset: Configurable.Config = field(default=None)  # type: ignore[assignment]
         """Dataset config for training rollout groups."""
@@ -489,12 +489,6 @@ class RLTrainer(Configurable):
                 raise ValueError(
                     "rollout_group_size must be positive, "
                     f"got {self.rollout_group_size}"
-                )
-            if self.generator.sampling.n != 1:
-                raise ValueError(
-                    "RLTrainer uses rollout_group_size for GRPO sibling fanout; "
-                    "generator.sampling.n must stay 1 so each rollout turn "
-                    f"produces exactly one completion, got {self.generator.sampling.n}"
                 )
             TrainingLogprobConfig.from_sampling(self.generator.sampling)
             if self.replay_buffer_groups <= 0:
@@ -1196,7 +1190,6 @@ class RLTrainer(Configurable):
         num_samples = self.config.num_validation_samples
         validation_sample_step = 0
         greedy = SamplingConfig(
-            n=1,
             temperature=0.0,
             top_p=1.0,
             max_tokens=self.config.generator.sampling.max_tokens,
