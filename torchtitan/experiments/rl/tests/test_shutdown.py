@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,7 +14,7 @@ from torchtitan.experiments.rl.actors.generator import VLLMGenerator
 
 
 class _FakeConfigManager:
-    config = object()
+    config = None
 
     def parse_args(self):
         return self.config
@@ -27,7 +28,7 @@ class _FakeRLTrainer:
         self.events = []
         self.instances.append(self)
 
-    async def setup(self):
+    async def setup_async(self):
         self.events.append("setup")
         if getattr(self.config, "fail_setup", False):
             raise RuntimeError("setup failed")
@@ -43,8 +44,32 @@ class _FakeRLTrainer:
         self.events.append("close")
 
 
+class _StubMetricsProcessor:
+    def close(self):
+        pass
+
+
+def _fake_config(**kwargs):
+    return SimpleNamespace(
+        dump_folder="/tmp/torchtitan_rl_test_shutdown",
+        trainer=SimpleNamespace(
+            debug=SimpleNamespace(enable_structured_logging=False),
+        ),
+        **kwargs,
+    )
+
+
+def _rl_trainer_for_close_tests():
+    trainer = grpo.RLTrainer.__new__(grpo.RLTrainer)
+    trainer.trainer = None
+    trainer.generator = None
+    trainer._proc_meshes = []
+    trainer.metrics_processor = _StubMetricsProcessor()
+    return trainer
+
+
 def test_main_shuts_down_after_success(monkeypatch):
-    _FakeConfigManager.config = object()
+    _FakeConfigManager.config = _fake_config()
     _FakeRLTrainer.instances = []
     monkeypatch.setattr(grpo, "ConfigManager", _FakeConfigManager)
     monkeypatch.setattr(grpo, "RLTrainer", _FakeRLTrainer)
@@ -55,10 +80,7 @@ def test_main_shuts_down_after_success(monkeypatch):
 
 
 def test_main_shuts_down_after_train_failure(monkeypatch):
-    class FailingConfig:
-        fail_train = True
-
-    _FakeConfigManager.config = FailingConfig()
+    _FakeConfigManager.config = _fake_config(fail_train=True)
     _FakeRLTrainer.instances = []
     monkeypatch.setattr(grpo, "ConfigManager", _FakeConfigManager)
     monkeypatch.setattr(grpo, "RLTrainer", _FakeRLTrainer)
@@ -70,10 +92,7 @@ def test_main_shuts_down_after_train_failure(monkeypatch):
 
 
 def test_main_shuts_down_after_setup_failure(monkeypatch):
-    class FailingConfig:
-        fail_setup = True
-
-    _FakeConfigManager.config = FailingConfig()
+    _FakeConfigManager.config = _fake_config(fail_setup=True)
     _FakeRLTrainer.instances = []
     monkeypatch.setattr(grpo, "ConfigManager", _FakeConfigManager)
     monkeypatch.setattr(grpo, "RLTrainer", _FakeRLTrainer)
@@ -85,7 +104,7 @@ def test_main_shuts_down_after_setup_failure(monkeypatch):
 
 
 def test_rl_trainer_shutdown_is_noop_before_meshes_spawn():
-    trainer = grpo.RLTrainer(object())
+    trainer = _rl_trainer_for_close_tests()
 
     asyncio.run(trainer.close())
 
@@ -100,10 +119,7 @@ def test_main_swallows_cancellation_after_shutdown(monkeypatch):
     ``except`` clause swallows the interrupt so the process exits 0
     without a traceback."""
 
-    class CancelledConfig:
-        cancel_train = True
-
-    _FakeConfigManager.config = CancelledConfig()
+    _FakeConfigManager.config = _fake_config(cancel_train=True)
     _FakeRLTrainer.instances = []
     monkeypatch.setattr(grpo, "ConfigManager", _FakeConfigManager)
     monkeypatch.setattr(grpo, "RLTrainer", _FakeRLTrainer)
@@ -146,7 +162,7 @@ class _StubMesh:
 
 def test_shutdown_calls_actor_close_before_mesh_stop():
     events: list[str] = []
-    rl_trainer = grpo.RLTrainer(object())
+    rl_trainer = _rl_trainer_for_close_tests()
     rl_trainer.trainer = _StubActor("trainer.close", events)
     rl_trainer.generator = _StubActor("generator.close", events)
     rl_trainer._proc_meshes = [
@@ -167,7 +183,7 @@ def test_shutdown_calls_actor_close_before_mesh_stop():
 
 def test_shutdown_continues_after_actor_close_failure():
     events: list[str] = []
-    rl_trainer = grpo.RLTrainer(object())
+    rl_trainer = _rl_trainer_for_close_tests()
     rl_trainer.trainer = _StubActor("trainer.close", events, raises=True)
     rl_trainer.generator = _StubActor("generator.close", events)
     rl_trainer._proc_meshes = [_StubMesh("mesh.stop[0]", events)]

@@ -10,18 +10,15 @@ import random
 import re
 from dataclasses import dataclass
 
+from renderers import Message
+
 from torchtitan.config import Configurable
-from torchtitan.experiments.rl.types import Step
+from torchtitan.experiments.rl.envs import EnvExample, EnvReset, EnvStep
+from torchtitan.experiments.rl.types import RolloutStatus
 
 
 class SumDigitsEnv(Configurable):
-    """Single-turn, single-use env for one sum-of-digits problem.
-
-    Construct via ``SumDigitsEnv.Config(seed=...).build(step=<s>, group_idx=<i>)``.
-    The problem is a pure function of ``(config.seed, step, group_idx)``: same
-    inputs always produce the same prompt and target. No RNG state is shared
-    between envs.
-    """
+    """Single-turn, single-use sum-of-digits task."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
@@ -32,7 +29,7 @@ class SumDigitsEnv(Configurable):
         """Reward bonus for any ``[ANSWER] <number>`` tag in the response."""
 
         seed: int = 42
-        """Seed mixed with ``(step, group_idx)`` to deterministically generate problems."""
+        """Seed mixed with ``(step, group_idx)`` to generate deterministic tasks."""
 
     SYSTEM_PROMPT = """\
 You are a helpful assistant. Solve the problem step by step.
@@ -41,29 +38,71 @@ When you have your final answer, state it as [ANSWER] <number>.
 Example:
 User: What is the total digit sum of [12, 345, 67]?
 Assistant: Break each number into digits:
-12 → 1, 2
-345 → 3, 4, 5
-67 → 6, 7
+12 -> 1, 2
+345 -> 3, 4, 5
+67 -> 6, 7
 Sum all digits: 1 + 2 + 3 + 4 + 5 + 6 + 7 = 28
 [ANSWER] 28"""
 
-    def __init__(self, config: Config, *, step: int = 0, group_idx: int = 0):
+    def __init__(
+        self,
+        config: Config,
+        *,
+        example: EnvExample | None = None,
+        step: int = 0,
+        group_idx: int = 0,
+        sample_idx: int = 0,
+    ):
         self._config = config
+        if example is not None:
+            step = example.step
+            group_idx = example.group_idx
         rng = random.Random(f"{config.seed}:{step}:{group_idx}")
-        n = rng.randint(2, 4)
-        numbers = [rng.randint(10, 99) for _ in range(n)]
-        self._target = sum(int(d) for num in numbers for d in str(num))
-        question = f"What is the total digit sum of {numbers}?"
-        self.prompt = f"{self.SYSTEM_PROMPT}\n\n{question}"
-
-    def step(self, completion: str) -> Step:
-        return Step(
-            rewards={
-                "correctness": self._correctness_reward(completion),
-                "format": self._format_reward(completion),
-            },
-            done=True,
+        values_from_payload = (
+            example.payload.get("values") if example is not None else None
         )
+        if isinstance(values_from_payload, list) and all(
+            isinstance(value, int) for value in values_from_payload
+        ):
+            values = values_from_payload
+        else:
+            num_values = rng.randint(2, 4)
+            values = [rng.randint(10, 99) for _ in range(num_values)]
+
+        target_from_payload = (
+            example.payload.get("target") if example is not None else None
+        )
+        if isinstance(target_from_payload, int):
+            self._target = target_from_payload
+        else:
+            self._target = sum(int(digit) for value in values for digit in str(value))
+        self._question = f"What is the total digit sum of {values}?"
+        self._sample_idx = sample_idx
+
+    async def reset(self) -> EnvReset:
+        return EnvReset(
+            messages=[
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "user", "content": self._question},
+            ],
+            metadata={"sample_idx": self._sample_idx},
+        )
+
+    async def step(self, assistant_message: Message) -> EnvStep:
+        completion = str(assistant_message.get("content") or "")
+        reward_components = {
+            "correctness": self._correctness_reward(completion),
+            "format": self._format_reward(completion),
+        }
+        return EnvStep(
+            reward=sum(reward_components.values()),
+            reward_components=reward_components,
+            done=True,
+            status=RolloutStatus.COMPLETED,
+        )
+
+    async def close(self) -> None:
+        return None
 
     def _correctness_reward(self, completion: str) -> float:
         matches = re.findall(r"\[ANSWER\]\s*(-?\d+)", completion)

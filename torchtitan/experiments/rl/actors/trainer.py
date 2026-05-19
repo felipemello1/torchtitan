@@ -31,7 +31,7 @@ from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.experiments.rl.actors.utils import (
     compute_logprobs,
-    extract_response_logprobs,
+    extract_masked_logprobs,
     PartialLogprobDrift,
     verify_logprob_identity,
 )
@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 
 class PolicyTrainer(Actor, Configurable):
-    """Updates policy based on collected Episode using TorchTitan components.
+    """Updates policy from token-aligned RL replay batches.
 
     Exposes separate `forward_backward` and `optim_step` endpoints, called
     explicitly by the controller.
@@ -56,7 +56,7 @@ class PolicyTrainer(Actor, Configurable):
         model_spec: TorchTitan model specification.
         hf_assets_path: Path to HF assets folder for checkpoint loading.
             Shared with the generator (both load from the same HF checkpoint).
-        generator_dtype: Generator dtype (e.g. "bfloat16"). Needed to cast weights to generator dtype
+            generator_dtype: Generator dtype used when publishing weights.
             if generator dtype differs from training dtype. If None, no cast is performed.
     """
 
@@ -311,9 +311,9 @@ class PolicyTrainer(Actor, Configurable):
         Args:
             train_data: List of TrainingBatch, one per DP rank. Local rank
                 picks train_data[self.dp_rank].
-            num_global_valid_tokens: Total response tokens across all DP
+            num_global_valid_tokens: Total trainable response tokens across all DP
                 ranks for this step. The controller computes this before
-                sharding episodes.
+                sharding replay samples.
 
         Returns:
             dict[str, float]: Globally-reduced metrics.
@@ -338,15 +338,15 @@ class PolicyTrainer(Actor, Configurable):
 
         token_ids = local_batch.token_ids.to(device)
         seq_lens = local_batch.seq_lens
-        prompt_lens = local_batch.prompt_lens
-        response_lens = local_batch.response_lens
+        loss_mask = local_batch.loss_mask.to(device)
+        behavior_logprobs = local_batch.behavior_logprobs.to(device)
         advantages = local_batch.advantages.to(device)
 
         max_seq_len = max(seq_lens)
         rope_cache_len = self.model.freqs_cis.shape[0]
         if max_seq_len > rope_cache_len:
             raise ValueError(
-                f"Episode length {max_seq_len} exceeds rope cache size "
+                f"Replay sample length {max_seq_len} exceeds rope cache size "
                 f"{rope_cache_len}. Increase model max_seq_len or reduce "
                 f"generation max_tokens."
             )
@@ -367,14 +367,18 @@ class PolicyTrainer(Actor, Configurable):
                 token_ids, attention_masks=attention_masks, positions=positions
             )
         all_policy_logprobs = compute_logprobs(logits, token_ids)
-        policy_logprobs = extract_response_logprobs(
-            all_policy_logprobs, seq_lens, prompt_lens, response_lens
+        masked = extract_masked_logprobs(
+            all_policy_logprobs,
+            loss_mask=loss_mask,
+            behavior_logprobs=behavior_logprobs,
+            advantages=advantages,
         )
 
         with sl.log_trace_span("loss_fn"):
             loss, loss_metrics = self.loss_fn(
-                policy_logprobs=policy_logprobs,
-                advantages=advantages,
+                policy_logprobs=masked.policy_logprobs,
+                behavior_logprobs=masked.behavior_logprobs,
+                advantages=masked.advantages,
                 num_global_valid_tokens=num_global_valid_tokens,
             )
 
@@ -384,8 +388,8 @@ class PolicyTrainer(Actor, Configurable):
 
         # Metrics for bitwise verification of policy logprobs.
         verification: PartialLogprobDrift = verify_logprob_identity(
-            generator_token_logprobs=local_batch.token_logprobs,
-            trainer_token_logprobs=policy_logprobs,
+            generator_token_logprobs=masked.behavior_logprobs,
+            trainer_token_logprobs=masked.policy_logprobs,
             num_global_valid_tokens=num_global_valid_tokens,
             device=device,
         )

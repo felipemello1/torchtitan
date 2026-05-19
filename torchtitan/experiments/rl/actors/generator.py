@@ -164,6 +164,9 @@ class SamplingConfig:
     max_tokens: int = 100
     """Maximum number of tokens to generate per completion."""
 
+    stop_token_ids: list[int] = field(default_factory=list)
+    """Token IDs that stop generation at the assistant-turn boundary."""
+
 
 class VLLMGenerator(Actor, Configurable):
     """
@@ -193,7 +196,7 @@ class VLLMGenerator(Actor, Configurable):
         """Default sampling parameters for generation."""
 
         model_dtype: str = "bfloat16"
-        """Data type for model weights, passed directly to vLLM (auto, float16, bfloat16, float32)."""
+        """Model weight dtype passed to vLLM."""
 
         gpu_memory_limit: float = 0.9
         """Fraction of GPU memory to use for the vLLM engine (0.0 to 1.0)."""
@@ -373,6 +376,39 @@ class VLLMGenerator(Actor, Configurable):
         """Sync the structured-logger step counter from the controller."""
         sl.set_step(step, relative_step=relative_step)
 
+    def _build_sampling_params(self, sampling_config: SamplingConfig) -> SamplingParams:
+        return SamplingParams(
+            temperature=sampling_config.temperature,
+            top_p=sampling_config.top_p,
+            max_tokens=sampling_config.max_tokens,
+            n=sampling_config.n,
+            seed=self.config.debug.seed,
+            logprobs=1,
+            output_kind=RequestOutputKind.FINAL_ONLY,
+            stop_token_ids=list(sampling_config.stop_token_ids),
+        )
+
+    @staticmethod
+    def _completion_from_sample(
+        *,
+        output: RequestOutput,
+        prompt_idx: int,
+        sample_idx: int,
+        policy_version: int,
+    ) -> Completion:
+        sample = output.outputs[sample_idx]
+        per_token_logprobs = [
+            list(logprob_dict.values())[0].logprob for logprob_dict in sample.logprobs
+        ]
+        return Completion(
+            policy_version=policy_version,
+            prompt_idx=prompt_idx,
+            text=sample.text,
+            token_ids=sample.token_ids,
+            token_logprobs=per_token_logprobs,
+            finish_reason=sample.finish_reason,
+        )
+
     @endpoint
     @sl.log_trace_span("generate")
     async def generate(
@@ -406,15 +442,7 @@ class VLLMGenerator(Actor, Configurable):
         )
 
         with torch.no_grad():
-            sampling_params = SamplingParams(
-                temperature=_sampling_config.temperature,
-                top_p=_sampling_config.top_p,
-                max_tokens=_sampling_config.max_tokens,
-                n=_sampling_config.n,
-                seed=self.config.debug.seed,
-                logprobs=1,
-                output_kind=RequestOutputKind.FINAL_ONLY,
-            )
+            sampling_params = self._build_sampling_params(_sampling_config)
 
             # render_cmpl is vLLM's input-pipeline entry.
             # The tokenize step is a no-op for already-tokenized prompts. The
@@ -447,20 +475,14 @@ class VLLMGenerator(Actor, Configurable):
                 generation_metrics.extend(
                     _prepare_generation_request_metrics(output, prefix=metrics_prefix)
                 )
-                for sample in output.outputs:
-                    per_token_logprobs = [
-                        list(logprob_dict.values())[0].logprob
-                        for logprob_dict in sample.logprobs
-                    ]
+                for sample_idx, sample in enumerate(output.outputs):
                     output_token_counts.append(len(sample.token_ids))
                     completions.append(
-                        Completion(
-                            policy_version=self.policy_version,
+                        self._completion_from_sample(
+                            output=output,
                             prompt_idx=prompt_idx,
-                            text=sample.text,
-                            token_ids=sample.token_ids,
-                            token_logprobs=per_token_logprobs,
-                            finish_reason=sample.finish_reason,
+                            sample_idx=sample_idx,
+                            policy_version=self.policy_version,
                         )
                     )
             generation_metrics.append(
@@ -474,10 +496,6 @@ class VLLMGenerator(Actor, Configurable):
             f"{os.getpid()=} Generating finish generate (policy v{self.policy_version})..."
         )
 
-        # TODO: consider passing metrics as an arg to Completion and Trajectory,
-        # e.g. Completion(metrics=generation_metrics), so when we log the rollouts
-        # to a json or database,  we can associate each rollout with its metrics
-        # I am keeping like this for now for simplicity.
         return completions, generation_metrics
 
     @endpoint
@@ -497,6 +515,10 @@ class VLLMGenerator(Actor, Configurable):
         """
         from monarch.rdma import is_rdma_available
 
+        if self._engine.has_unfinished_requests():
+            raise RuntimeError(
+                "cannot pull new generator weights while generation requests are active"
+            )
         model_sd = self._get_model().model.state_dict()
         await ts.get_state_dict(
             "model_state_dict",
@@ -538,5 +560,14 @@ class VLLMGenerator(Actor, Configurable):
                 if renderer is not None:
                     renderer.shutdown()
             finally:
-                self._engine.engine_core.shutdown()
+                try:
+                    self._engine.engine_core.shutdown()
+                except AttributeError as exc:
+                    if "shutdown" not in str(exc):
+                        raise
+                    logger.warning(
+                        "vLLM engine_core.shutdown skipped because this vLLM "
+                        "build is missing a nested shutdown method: %s",
+                        exc,
+                    )
         cleanup_dist_env_and_memory()

@@ -22,13 +22,14 @@ python3 torchtitan/experiments/rl/grpo.py \
 """
 
 import asyncio
+import dataclasses
 import logging
 import math
 import os
 import statistics
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 # must run before torch import
@@ -39,7 +40,6 @@ import torchstore as ts
 from monarch.actor import this_host
 from monarch.spmd import setup_torch_elastic_env_async
 
-from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import (
     CompileConfig,
     ConfigManager,
@@ -48,12 +48,22 @@ from torchtitan.config import (
 )
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
+from torchtitan.experiments.rl.envs import EnvExample, TokenEnvConfig
 from torchtitan.experiments.rl.observability import metrics as m
+from torchtitan.experiments.rl.renderer import RendererConfig
+from torchtitan.experiments.rl.replay import (
+    QueueStats,
+    ReplayGroup,
+    RolloutQueue,
+    rollouts_to_replay_samples,
+)
+from torchtitan.experiments.rl.rollouts import do_rollout_group
 from torchtitan.experiments.rl.types import (
     Completion,
-    Episode,
+    ReplaySample,
+    RolloutOutput,
+    RolloutStatus,
     TrainingBatch,
-    Trajectory,
 )
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.model_spec import ModelSpec
@@ -61,27 +71,10 @@ from torchtitan.protocols.model_spec import ModelSpec
 logger = logging.getLogger(__name__)
 
 
-def _token_weighted_mean(
-    values: torch.Tensor,
-    *,
-    num_tokens_by_sample: torch.Tensor,
-    num_global_valid_tokens: torch.Tensor,
-) -> torch.Tensor:
-    """Each rank's share of the global token-weighted mean of `values`.
-
-    Computed as `sum(values * num_tokens_by_sample) / num_global_valid_tokens`.
-    SUM-reducing this share across the loss mesh reconstructs the global mean.
-    """
-    return (
-        values * num_tokens_by_sample.to(values.dtype)
-    ).sum() / num_global_valid_tokens
-
-
 class GRPOLoss(Configurable):
     """Clipped GRPO surrogate loss.
 
-    Takes per-sample response logprobs (already extracted from whatever
-    packing or padding format the trainer uses).
+    Takes token-selected policy logprobs, behavior logprobs, and advantages.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -94,44 +87,23 @@ class GRPOLoss(Configurable):
 
     def __call__(
         self,
-        policy_logprobs: list[torch.Tensor],
+        policy_logprobs: torch.Tensor,
+        behavior_logprobs: torch.Tensor,
         advantages: torch.Tensor,
         num_global_valid_tokens: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        response_lens = torch.tensor(
-            [sample_logprobs.numel() for sample_logprobs in policy_logprobs],
-            device=advantages.device,
-            dtype=advantages.dtype,
-        )
-
-        per_sample_mean_logprobs = torch.stack(
-            [sample_logprobs.mean() for sample_logprobs in policy_logprobs]
-        )
-        ratio = torch.exp(per_sample_mean_logprobs)
+        ratio = torch.exp(policy_logprobs - behavior_logprobs)
         clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
         # pg = policy gradient.
-        sample_pg_losses = -torch.min(ratio * advantages, clipped_ratio * advantages)
-
-        pg_loss = _token_weighted_mean(
-            sample_pg_losses,
-            num_tokens_by_sample=response_lens,
-            num_global_valid_tokens=num_global_valid_tokens,
-        )
+        token_pg_losses = -torch.min(ratio * advantages, clipped_ratio * advantages)
+        pg_loss = token_pg_losses.sum() / num_global_valid_tokens
 
         with torch.no_grad():
             clipped_frac = (torch.abs(ratio - clipped_ratio) > 1e-6).to(ratio.dtype)
             loss_metrics = {
                 "loss/mean": pg_loss.detach(),
-                "loss/ratio/mean": _token_weighted_mean(
-                    ratio,
-                    num_tokens_by_sample=response_lens,
-                    num_global_valid_tokens=num_global_valid_tokens,
-                ),
-                "loss/ratio/clipped_frac": _token_weighted_mean(
-                    clipped_frac,
-                    num_tokens_by_sample=response_lens,
-                    num_global_valid_tokens=num_global_valid_tokens,
-                ),
+                "loss/ratio/mean": ratio.sum() / num_global_valid_tokens,
+                "loss/ratio/clipped_frac": clipped_frac.sum() / num_global_valid_tokens,
             }
 
         return pg_loss, loss_metrics
@@ -173,53 +145,175 @@ class Provisioner:
         return _bootstrap
 
 
-def _log_samples(items: list[Episode] | list[Completion]) -> None:
-    """Log the first sample per prompt for debugging."""
-    seen_prompts: set[int] = set()
-    for item in items:
-        if item.prompt_idx in seen_prompts:
+def _log_samples(rollouts: list[RolloutOutput]) -> None:
+    """Log the first response per rollout group."""
+    seen_groups: set[str] = set()
+    for rollout in rollouts:
+        if rollout.group_id in seen_groups:
             continue
-        seen_prompts.add(item.prompt_idx)
-        reward_str = f" reward={item.reward:+.1f}" if hasattr(item, "reward") else ""
-        logger.info(f"  [prompt {item.prompt_idx}]{reward_str}")
-        logger.info(f"       A: {item.text[:300].replace(chr(10), ' ').strip()}")
+        seen_groups.add(rollout.group_id)
+        reward_str = (
+            f" reward={rollout.reward:+.3f}" if rollout.reward is not None else ""
+        )
+        logger.info(f"  [group {rollout.group_id}]{reward_str}")
+        for turn in rollout.turns[:1]:
+            text = next(
+                (
+                    str(message.get("content") or "")
+                    for message in turn.response_messages
+                    if message.get("role") == "assistant"
+                ),
+                "",
+            )
+            logger.info(f"       A: {text[:300].replace(chr(10), ' ').strip()}")
 
 
 def _prepare_reward_metrics(
     prefix: str,
-    trajectories: list[Trajectory],
+    rollouts: list[RolloutOutput],
 ) -> list[m.Metric]:
-    """One ``Mean`` metric per observed reward component across trajectories.
+    """One ``Mean`` metric per observed reward component across rollouts.
 
     Example::
 
-        trajectories = [
-            Trajectory(
-                sample_idx=0,
-                prompt_token_ids=p0,
-                transitions=[(c0, Step(rewards={"correctness": 1.0, "format": 0.5}, done=True))],
-            ),
-            Trajectory(
-                sample_idx=1,
-                prompt_token_ids=p1,
-                transitions=[(c1, Step(rewards={"correctness": 0.0}, done=True))],
-            ),
+        rollouts = [
+            RolloutOutput(group_id="g0", sample_idx=0, reward=1.5,
+                          reward_components={"correctness": 1.0, "format": 0.5}),
+            RolloutOutput(group_id="g1", sample_idx=0, reward=0.0,
+                          reward_components={"correctness": 0.0}),
         ]
-        _prepare_reward_metrics("reward/component", trajectories)
+        _prepare_reward_metrics("reward/component", rollouts)
         # -> [
-        #      Metric("reward/component/correctness", Mean(sum=1.0, count=2)),  # 0.5
-        #      Metric("reward/component/format",      Mean(sum=0.5, count=1)),  # 0.5 - "format" only in trajectory 0
+        #      Metric("reward/component/correctness", Mean(sum=1.0, count=2)),
+        #      Metric("reward/component/format",      Mean(sum=0.5, count=1)),
         #    ]
     """
     values_by_name: dict[str, list[float]] = defaultdict(list)
-    for trajectory in trajectories:
-        for _completion, step in trajectory.transitions:
-            for name, value in step.rewards.items():
-                values_by_name[name].append(float(value))
+    for rollout in rollouts:
+        for name, value in rollout.reward_components.items():
+            values_by_name[name].append(float(value))
     return [
         m.Metric(f"{prefix}/{name}", m.Mean.from_list(values))
         for name, values in sorted(values_by_name.items())
     ]
+
+
+def _rename_metric(metric: m.Metric, *, old_prefix: str, new_prefix: str) -> m.Metric:
+    """Replace a metric key prefix while preserving its value object."""
+    if metric.key.startswith(old_prefix):
+        return m.Metric(new_prefix + metric.key[len(old_prefix) :], metric.value)
+    if metric.key == "reward":
+        return m.Metric(f"{new_prefix.rstrip('/')}/reward", metric.value)
+    if metric.key.startswith("reward/"):
+        return m.Metric(f"{new_prefix.rstrip('/')}/{metric.key}", metric.value)
+    return metric
+
+
+@dataclass(slots=True)
+class _PendingCompletion:
+    """One controller-side generation request awaiting a batched flush."""
+
+    prompt_token_ids: list[int]
+    sampling: SamplingConfig
+    request_id: str
+    future: asyncio.Future[Completion]
+
+
+def _sampling_key(
+    sampling: SamplingConfig,
+) -> tuple[float, float, int, tuple[int, ...]]:
+    return (
+        sampling.temperature,
+        sampling.top_p,
+        sampling.max_tokens,
+        tuple(sampling.stop_token_ids),
+    )
+
+
+class _CompletionBatcher:
+    """Coalesce concurrent rollout requests into batched generator calls.
+
+    The controller owns batching so the generator actor receives one ordered
+    ``generate`` call per flush on every TP rank. That avoids relying on
+    concurrent Monarch endpoint delivery order while still letting rollout
+    tasks await completions independently.
+    """
+
+    def __init__(
+        self,
+        generate_batch: Callable[
+            [list[list[int]], SamplingConfig],
+            Awaitable[list[Completion]],
+        ],
+    ):
+        self._generate_batch = generate_batch
+        self._pending: list[_PendingCompletion] = []
+        self._flush_task: asyncio.Task[None] | None = None
+
+    async def submit(
+        self,
+        *,
+        prompt_token_ids: list[int],
+        sampling: SamplingConfig,
+        request_id: str,
+    ) -> Completion:
+        if sampling.n != 1:
+            raise ValueError(f"_CompletionBatcher requires n=1, got {sampling.n}")
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Completion] = loop.create_future()
+        self._pending.append(
+            _PendingCompletion(
+                prompt_token_ids=list(prompt_token_ids),
+                sampling=sampling,
+                request_id=request_id,
+                future=future,
+            )
+        )
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._flush_loop())
+        return await future
+
+    async def _flush_loop(self) -> None:
+        await asyncio.sleep(0)
+        while self._pending:
+            batch = self._pending
+            self._pending = []
+            pending_by_sampling: dict[
+                tuple[float, float, int, tuple[int, ...]],
+                list[_PendingCompletion],
+            ] = defaultdict(list)
+            for pending in batch:
+                pending_by_sampling[_sampling_key(pending.sampling)].append(pending)
+
+            for pending_group in pending_by_sampling.values():
+                await self._flush_group(pending_group)
+            await asyncio.sleep(0)
+
+    async def _flush_group(self, pending_group: list[_PendingCompletion]) -> None:
+        sampling = pending_group[0].sampling
+        try:
+            completions = await self._generate_batch(
+                [pending.prompt_token_ids for pending in pending_group],
+                sampling,
+            )
+            if len(completions) != len(pending_group):
+                raise RuntimeError(
+                    "generator returned "
+                    f"{len(completions)} completions for "
+                    f"{len(pending_group)} requests"
+                )
+            for pending, completion in zip(
+                pending_group,
+                completions,
+                strict=True,
+            ):
+                if not pending.future.done():
+                    pending.future.set_result(completion)
+        except Exception as exc:
+            for pending in pending_group:
+                if not pending.future.done():
+                    pending.future.set_exception(exc)
 
 
 class RLTrainer(Configurable):
@@ -245,7 +339,7 @@ class RLTrainer(Configurable):
         num_prompts_per_step: int = 5
         """Number of distinct prompts (= GRPO groups) drawn per training step.
 
-        The total episodes per step is `num_prompts_per_step` * `group_size`,
+        The total samples per step is `num_prompts_per_step` * `group_size`,
         where `group_size` is `generator.sampling.n` (completions per prompt).
         """
 
@@ -271,6 +365,27 @@ class RLTrainer(Configurable):
 
         generator: VLLMGenerator.Config = field(default_factory=VLLMGenerator.Config)
         """VLLMGenerator actor configuration (vLLM engine, sampling)."""
+
+        renderer: RendererConfig = field(default_factory=RendererConfig)
+        """Renderer used for message/token conversion on the controller."""
+
+        max_rollout_turns: int = 1
+        """Maximum assistant turns per rollout."""
+
+        step_timeout_s: float | None = 1800.0
+        """Timeout for one env step. ``None`` disables timeout."""
+
+        max_trajectory_tokens: int | None = None
+        """Optional prompt plus generation-token cap enforced by the controller."""
+
+        async_rollout_groups: int = 1
+        """Number of rollout groups kept in flight by the async producer."""
+
+        rollout_queue_groups: int = 2
+        """Maximum completed rollout groups buffered before training consumes them."""
+
+        max_offpolicy_steps: int | None = 1
+        """Drop queued groups older than this many policy versions. ``None`` keeps all."""
 
         metrics: m.MetricsProcessor.Config = field(
             default_factory=m.MetricsProcessor.Config
@@ -305,6 +420,20 @@ class RLTrainer(Configurable):
                         "SP uses reduce-scatter which only supports Ring in NCCL "
                         "and has not been validated for determinism."
                     )
+            if self.max_rollout_turns <= 0:
+                raise ValueError(
+                    f"max_rollout_turns must be positive, got {self.max_rollout_turns}"
+                )
+            if self.async_rollout_groups <= 0:
+                raise ValueError(
+                    "async_rollout_groups must be positive, "
+                    f"got {self.async_rollout_groups}"
+                )
+            if self.rollout_queue_groups <= 0:
+                raise ValueError(
+                    "rollout_queue_groups must be positive, "
+                    f"got {self.rollout_queue_groups}"
+                )
 
     def __init__(self, config: Config):
         self.config = config
@@ -315,8 +444,8 @@ class RLTrainer(Configurable):
             log_dir=config.dump_folder,
             job_config=config.to_dict(),
         )
-        # TODO: Replace this single-turn tokenizer with renderer
-        self.tokenizer = HuggingFaceTokenizer(tokenizer_path=config.hf_assets_path)
+        self.renderer = config.renderer.build(model_path=config.hf_assets_path)
+        self._stop_token_ids = list(self.renderer.get_stop_token_ids())
 
     async def close(self):
         """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
@@ -371,36 +500,70 @@ class RLTrainer(Configurable):
             * p.context_parallel_degree
         )
 
-    def _shard_episodes(self, episodes: list[Episode]) -> list[list[Episode]]:
-        """Round-robin partition episodes across DP ranks."""
+    def _shard_samples(self, samples: list[ReplaySample]) -> list[list[ReplaySample]]:
+        """Round-robin partition replay samples across DP ranks."""
         return [
-            [episodes[i] for i in range(rank, len(episodes), self.trainer_dp_degree)]
+            [samples[i] for i in range(rank, len(samples), self.trainer_dp_degree)]
             for rank in range(self.trainer_dp_degree)
         ]
 
     @staticmethod
-    @sl.log_trace_span("_collate_episodes")
-    def _collate_episodes(episodes: list[Episode]) -> TrainingBatch:
-        """Pack episodes into a single varlen-packed TrainingBatch."""
-        all_ids: list[int] = []
-        prompt_lens: list[int] = []
-        response_lens: list[int] = []
+    @sl.log_trace_span("_collate_samples")
+    def _collate_samples(samples: list[ReplaySample]) -> TrainingBatch:
+        """Pack replay samples into a varlen token batch.
 
-        for ep in episodes:
-            all_ids.extend(ep.prompt_token_ids + ep.token_ids)
-            prompt_lens.append(len(ep.prompt_token_ids))
-            response_lens.append(len(ep.token_ids))
+        Example::
+
+            sample = ReplaySample(
+                token_ids=[10, 11, 20],
+                loss_mask=[0, 0, 1],
+                behavior_logprobs=[0.0, 0.0, -0.4],
+                advantages=[0.0, 0.0, 0.7],
+                group_id="g0",
+                sample_idx=0,
+                behavior_version=3,
+                reward=1.0,
+            )
+            batch = RLTrainer._collate_samples([sample])
+            # batch.seq_lens == [3]
+        """
+        all_ids: list[int] = []
+        all_masks: list[int] = []
+        all_behavior_logprobs: list[float] = []
+        all_advantages: list[float] = []
+
+        if not samples:
+            return TrainingBatch(
+                token_ids=torch.zeros((1, 1), dtype=torch.long),
+                seq_lens=[1],
+                loss_mask=torch.zeros((1, 1), dtype=torch.bool),
+                behavior_logprobs=torch.zeros((1, 1), dtype=torch.float32),
+                advantages=torch.zeros((1, 1), dtype=torch.float32),
+                behavior_versions=torch.zeros((0,), dtype=torch.int32),
+                rewards=torch.zeros((0,), dtype=torch.float32),
+            )
+
+        for sample in samples:
+            all_ids.extend(sample.token_ids)
+            all_masks.extend(sample.loss_mask)
+            all_behavior_logprobs.extend(sample.behavior_logprobs)
+            all_advantages.extend(sample.advantages)
 
         return TrainingBatch(
             token_ids=torch.tensor([all_ids], dtype=torch.long),
-            prompt_lens=prompt_lens,
-            response_lens=response_lens,
-            seq_lens=[p + r for p, r in zip(prompt_lens, response_lens, strict=True)],
-            advantages=torch.tensor(
-                [ep.advantage for ep in episodes],
-                dtype=torch.float32,
+            seq_lens=[len(sample.token_ids) for sample in samples],
+            loss_mask=torch.tensor([all_masks], dtype=torch.bool),
+            behavior_logprobs=torch.tensor(
+                [all_behavior_logprobs], dtype=torch.float32
             ),
-            token_logprobs=[ep.token_logprobs for ep in episodes],
+            advantages=torch.tensor([all_advantages], dtype=torch.float32),
+            behavior_versions=torch.tensor(
+                [sample.behavior_version for sample in samples],
+                dtype=torch.int32,
+            ),
+            rewards=torch.tensor(
+                [sample.reward for sample in samples], dtype=torch.float32
+            ),
         )
 
     @sl.log_trace_span("setup_async")
@@ -564,187 +727,384 @@ class RLTrainer(Configurable):
         with sl.log_trace_span("generator_pull_model_state_dict"):
             self.generator.pull_model_state_dict.call(0).get()
 
-    @sl.log_trace_span("_collect_rollouts")
-    def _collect_rollouts(
+    async def _await_rank_0(self, actor_call):
+        """Await a Monarch call without blocking the controller event loop."""
+        if hasattr(actor_call, "get"):
+            result = await asyncio.to_thread(actor_call.get)
+        else:
+            result = await actor_call
+        return self._get_rank_0_value(result)
+
+    def _make_completion_batcher(
         self,
+        *,
+        metrics_prefix: str,
+        generation_metrics: list[m.Metric],
+    ) -> _CompletionBatcher:
+        async def generate_batch(
+            tokenized_prompts: list[list[int]],
+            sampling: SamplingConfig,
+        ) -> list[Completion]:
+            completions, metrics = await self._await_rank_0(
+                self.generator.generate.call(
+                    tokenized_prompts,
+                    sampling_config=sampling,
+                    metrics_prefix=metrics_prefix,
+                )
+            )
+            generation_metrics.extend(metrics)
+            return completions
+
+        return _CompletionBatcher(generate_batch)
+
+    def _make_completion_fn(
+        self,
+        *,
+        completion_batcher: _CompletionBatcher,
+    ):
+        async def completion_fn(
+            prompt_token_ids: list[int],
+            turn_sampling: SamplingConfig,
+            request_id: str,
+        ) -> Completion:
+            per_turn_sampling = dataclasses.replace(
+                turn_sampling,
+                n=1,
+                stop_token_ids=list(self._stop_token_ids),
+            )
+            return await completion_batcher.submit(
+                prompt_token_ids=prompt_token_ids,
+                sampling=per_turn_sampling,
+                request_id=request_id,
+            )
+
+        return completion_fn
+
+    def _build_envs(
+        self,
+        *,
+        env_config: Configurable.Config,
+        example: EnvExample,
+        group_size: int,
+    ):
+        return [
+            env_config.build(example=example, sample_idx=sample_idx)
+            for sample_idx in range(group_size)
+        ]
+
+    async def _rollout_one_group(
+        self,
+        *,
+        env_config: Configurable.Config,
+        example: EnvExample,
+        group_size: int,
+        sampling: SamplingConfig,
+        completion_batcher: _CompletionBatcher,
+    ) -> list[RolloutOutput]:
+        envs = self._build_envs(
+            env_config=env_config,
+            example=example,
+            group_size=group_size,
+        )
+        completion_fn = self._make_completion_fn(
+            completion_batcher=completion_batcher,
+        )
+        return await do_rollout_group(
+            envs=envs,
+            renderer=self.renderer,
+            completion_fn=completion_fn,
+            sampling=sampling,
+            example=example,
+            max_turns=self.config.max_rollout_turns,
+            token_env_config=TokenEnvConfig(
+                max_trajectory_tokens=self.config.max_trajectory_tokens,
+                max_generation_tokens=sampling.max_tokens,
+                step_timeout_s=self.config.step_timeout_s,
+            ),
+        )
+
+    def _make_examples(self, *, step: int, num_groups: int) -> list[EnvExample]:
+        return [
+            EnvExample(
+                group_id=f"step={step}/group={group_idx}",
+                step=step,
+                group_idx=group_idx,
+            )
+            for group_idx in range(num_groups)
+        ]
+
+    async def _collect_rollouts(
+        self,
+        *,
+        env_config: Configurable.Config,
+        num_groups: int,
+        group_size: int,
+        step: int,
+        sampling: SamplingConfig,
+        metrics_prefix: str = "generator",
+    ) -> tuple[list[RolloutOutput], list[m.Metric]]:
+        """Collect rollout groups with bounded async fanout."""
+        generation_metrics: list[m.Metric] = []
+        completion_batcher = self._make_completion_batcher(
+            metrics_prefix=metrics_prefix,
+            generation_metrics=generation_metrics,
+        )
+        examples = self._make_examples(step=step, num_groups=num_groups)
+        pending: set[asyncio.Task[list[RolloutOutput]]] = set()
+        rollouts: list[RolloutOutput] = []
+        next_idx = 0
+        max_inflight = max(self.config.async_rollout_groups, 1)
+
+        try:
+            while next_idx < len(examples) or pending:
+                while next_idx < len(examples) and len(pending) < max_inflight:
+                    pending.add(
+                        asyncio.create_task(
+                            self._rollout_one_group(
+                                env_config=env_config,
+                                example=examples[next_idx],
+                                group_size=group_size,
+                                sampling=sampling,
+                                completion_batcher=completion_batcher,
+                            )
+                        )
+                    )
+                    next_idx += 1
+
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    rollouts.extend(task.result())
+        except BaseException:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            raise
+
+        rollout_metrics = self._build_rollout_metrics(
+            rollouts,
+            generation_metrics=generation_metrics,
+            prefix="rollout",
+        )
+        return rollouts, rollout_metrics
+
+    async def _collect_replay_samples(
+        self,
+        *,
         num_groups: int,
         step: int,
-    ) -> tuple[list[Trajectory], list[m.Metric]]:
-        """Collect group rollouts and emit completion-shape rollout metrics."""
-        envs = [
-            self.config.env.build(step=step, group_idx=i) for i in range(num_groups)
-        ]
-        # TODO: Add a check max_tokens = min(max_tokens, context_window - model_input.length)
-        # and pass max_tokens to the generator call or skip the call if max_tokens<=0.
-        # Do the same for validation.
-        tokenized_prompts = [
-            self.tokenizer.encode(env.prompt, add_bos=True, add_eos=False)
-            for env in envs
-        ]
-        completions, generation_metrics = self._get_rank_0_value(
-            self.generator.generate.call(tokenized_prompts).get()
+        train_version: int,
+    ) -> tuple[list[RolloutOutput], list[ReplaySample], list[m.Metric]]:
+        """Collect rollouts into a FIFO queue, then consume replay samples."""
+        sampling = self.config.generator.sampling
+        group_size = sampling.n
+        generation_metrics: list[m.Metric] = []
+        completion_batcher = self._make_completion_batcher(
+            metrics_prefix="generator",
+            generation_metrics=generation_metrics,
         )
+        queue = RolloutQueue(
+            max_groups=max(self.config.rollout_queue_groups, 1),
+            max_age_steps=self.config.max_offpolicy_steps,
+        )
+        examples = self._make_examples(step=step, num_groups=num_groups)
+        pending: set[asyncio.Task[tuple[list[RolloutOutput], ReplayGroup]]] = set()
+        rollouts: list[RolloutOutput] = []
+        next_idx = 0
+        max_inflight = max(self.config.async_rollout_groups, 1)
 
-        trajectories: list[Trajectory] = []
-        with sl.log_trace_span("score"):
-            for c in completions:
-                step_result = envs[c.prompt_idx].step(c.text)
-                trajectories.append(
-                    Trajectory(
-                        sample_idx=c.prompt_idx,
-                        prompt_token_ids=tokenized_prompts[c.prompt_idx],
-                        transitions=[(c, step_result)],
+        async def produce(
+            example: EnvExample,
+        ) -> tuple[list[RolloutOutput], ReplayGroup]:
+            group_rollouts = await self._rollout_one_group(
+                env_config=self.config.env,
+                example=example,
+                group_size=group_size,
+                sampling=sampling,
+                completion_batcher=completion_batcher,
+            )
+            samples = rollouts_to_replay_samples(group_rollouts)
+            return group_rollouts, ReplayGroup(
+                group_id=example.group_id,
+                samples=samples,
+                behavior_version=min(
+                    (r.behavior_version for r in group_rollouts),
+                    default=0,
+                ),
+                train_step=step,
+            )
+
+        async def produce_all() -> None:
+            nonlocal next_idx, pending
+            try:
+                while next_idx < len(examples) or pending:
+                    while next_idx < len(examples) and len(pending) < max_inflight:
+                        pending.add(asyncio.create_task(produce(examples[next_idx])))
+                        next_idx += 1
+                    done, pending = await asyncio.wait(
+                        pending,
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
-                )
+                    for task in done:
+                        group_rollouts, replay_group = task.result()
+                        rollouts.extend(group_rollouts)
+                        await queue.put(replay_group)
+            except BaseException:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                raise
+            finally:
+                await queue.close()
 
-        # Metrics
-        response_lens = [len(c.token_ids) for c in completions]
-        prompt_lens = [len(t.prompt_token_ids) for t in trajectories]
-        total_lens = [p + r for p, r in zip(prompt_lens, response_lens, strict=True)]
-        truncated = [c.finish_reason == "length" for c in completions]
-        rollout_metrics: list[m.Metric] = [
-            m.Metric("rollout/response_length", m.Mean.from_list(response_lens)),
-            m.Metric("rollout/response_length", m.Max.from_list(response_lens)),
-            m.Metric("rollout/prompt_length", m.Mean.from_list(prompt_lens)),
-            m.Metric("rollout/prompt_length", m.Max.from_list(prompt_lens)),
-            m.Metric("rollout/total_length", m.Max.from_list(total_lens)),
-            m.Metric("rollout/truncation_rate", m.Mean.from_list(truncated)),
-        ]
-        rollout_metrics += generation_metrics
-        rollout_metrics += _prepare_reward_metrics(
-            prefix="reward/component", trajectories=trajectories
+        producer_task = asyncio.create_task(produce_all())
+        try:
+            samples, queue_stats = await queue.get_all(train_version=train_version)
+            await producer_task
+        except BaseException:
+            producer_task.cancel()
+            await queue.close()
+            await asyncio.gather(producer_task, return_exceptions=True)
+            raise
+
+        metrics = self._build_rollout_metrics(
+            rollouts,
+            generation_metrics=generation_metrics,
+            prefix="rollout",
         )
-        return trajectories, rollout_metrics
+        metrics += self._build_replay_metrics(samples, queue_stats)
+        return rollouts, samples, metrics
 
     @staticmethod
-    @sl.log_trace_span("_build_episodes")
-    def _build_episodes(
-        trajectories: list[Trajectory],
-    ) -> tuple[list[Episode], list[m.Metric]]:
-        """Group trajectories by sample, apply mean-baseline advantage, emit metrics."""
-        groups: dict[int, list[Trajectory]] = {}
-        for t in trajectories:
-            groups.setdefault(t.sample_idx, []).append(t)
-
-        episodes: list[Episode] = []
-        group_stds: list[float] = []
-        for sample_idx, group in groups.items():
-            rewards = [t.total_reward for t in group]
-            group_mean = sum(rewards) / len(rewards)
-            # Population standard deviation; NaN for an empty group.
-            group_stds.append(statistics.pstdev(float(r) for r in rewards))
-            for t in group:
-                # Single-turn: exactly one (completion, step) per trajectory.
-                c, _ = t.transitions[0]
-                episodes.append(
-                    Episode(
-                        policy_version=c.policy_version,
-                        prompt_idx=sample_idx,
-                        prompt_token_ids=t.prompt_token_ids,
-                        text=c.text,
-                        token_ids=c.token_ids,
-                        token_logprobs=c.token_logprobs,
-                        reward=t.total_reward,
-                        advantage=t.total_reward - group_mean,
-                    )
-                )
-
-        num_groups = len(groups)
-        zero_std_frac = (
-            sum(1 for s in group_stds if s == 0.0) / num_groups if num_groups else 0.0
-        )
-        episode_metrics: list[m.Metric] = [
+    def _build_replay_metrics(
+        samples: list[ReplaySample],
+        queue_stats: QueueStats,
+    ) -> list[m.Metric]:
+        advantages = [
+            value
+            for sample in samples
+            for mask, value in zip(sample.loss_mask, sample.advantages, strict=True)
+            if mask
+        ]
+        return [
+            m.Metric("replay/num_samples", m.NoReduce(float(len(samples)))),
             m.Metric(
-                "reward",
-                m.SummaryStats.from_list([ep.reward for ep in episodes]),
+                "replay/num_loss_tokens", m.NoReduce(float(queue_stats.num_loss_tokens))
+            ),
+            m.Metric("replay/queue/groups", m.NoReduce(float(queue_stats.num_groups))),
+            m.Metric(
+                "replay/queue/dropped_stale_groups",
+                m.NoReduce(float(queue_stats.num_dropped_stale_groups)),
             ),
             m.Metric(
-                "advantage",
-                m.SummaryStats.from_list([ep.advantage for ep in episodes]),
+                "replay/queue/max_age_steps",
+                m.NoReduce(float(queue_stats.max_age_steps)),
             ),
-            m.Metric("reward/group_std", m.Mean.from_list(group_stds)),
-            m.Metric("reward/group_std", m.Max.from_list(group_stds)),
-            m.Metric("reward/zero_std_frac", m.NoReduce(zero_std_frac)),
+            m.Metric("advantage", m.SummaryStats.from_list(advantages)),
         ]
 
-        # Per-rollout policy versions. We log max/min in case episodes come
-        # from multiple rollout versions.
-        policy_versions = [episode.policy_version for episode in episodes]
-        if policy_versions:
-            episode_metrics.extend(
+    @staticmethod
+    def _build_rollout_metrics(
+        rollouts: list[RolloutOutput],
+        *,
+        generation_metrics: list[m.Metric],
+        prefix: str,
+    ) -> list[m.Metric]:
+        response_lens = [
+            len(turn.response_token_ids)
+            for rollout in rollouts
+            for turn in rollout.turns
+        ]
+        prompt_lens = [
+            len(turn.prompt_token_ids) for rollout in rollouts for turn in rollout.turns
+        ]
+        total_lens = [
+            len(turn.prompt_token_ids) + len(turn.response_token_ids)
+            for rollout in rollouts
+            for turn in rollout.turns
+        ]
+        rewards = [
+            float(rollout.reward) for rollout in rollouts if rollout.reward is not None
+        ]
+        truncated = [rollout.status == RolloutStatus.TRUNCATED for rollout in rollouts]
+        errored = [rollout.status == RolloutStatus.ERROR for rollout in rollouts]
+
+        metrics: list[m.Metric] = [
+            m.Metric(f"{prefix}/response_length", m.Mean.from_list(response_lens)),
+            m.Metric(f"{prefix}/response_length", m.Max.from_list(response_lens)),
+            m.Metric(f"{prefix}/prompt_length", m.Mean.from_list(prompt_lens)),
+            m.Metric(f"{prefix}/prompt_length", m.Max.from_list(prompt_lens)),
+            m.Metric(f"{prefix}/total_length", m.Max.from_list(total_lens)),
+            m.Metric(f"{prefix}/truncation_rate", m.Mean.from_list(truncated)),
+            m.Metric(f"{prefix}/error_rate", m.Mean.from_list(errored)),
+            m.Metric("reward", m.SummaryStats.from_list(rewards)),
+        ]
+        if rewards:
+            by_group: dict[str, list[float]] = defaultdict(list)
+            for rollout in rollouts:
+                if rollout.reward is not None:
+                    by_group[rollout.group_id].append(float(rollout.reward))
+            group_stds = [
+                statistics.pstdev(group_rewards)
+                for group_rewards in by_group.values()
+                if group_rewards
+            ]
+            metrics.extend(
                 [
+                    m.Metric("reward/group_std", m.Mean.from_list(group_stds)),
+                    m.Metric("reward/group_std", m.Max.from_list(group_stds)),
                     m.Metric(
-                        "rollout/policy_version", m.Min.from_list(policy_versions)
-                    ),
-                    m.Metric(
-                        "rollout/policy_version", m.Max.from_list(policy_versions)
+                        "reward/zero_std_frac",
+                        m.NoReduce(
+                            sum(1 for value in group_stds if value == 0.0)
+                            / len(group_stds)
+                            if group_stds
+                            else 0.0
+                        ),
                     ),
                 ]
             )
-        return episodes, episode_metrics
+        metrics += generation_metrics
+        metrics += _prepare_reward_metrics(
+            prefix=f"{prefix}/reward/component",
+            rollouts=rollouts,
+        )
+        return metrics
 
     @sl.log_trace_span("validate")
     async def validate(self) -> list[m.Metric]:
-        """Run validation on held-out prompts using greedy sampling.
-
-        TODO: investigate using pass@k.
-        """
+        """Run validation through the same rollout loop as training."""
         t_validate_start = time.perf_counter()
         num_samples = self.config.num_validation_samples
-        envs = [
-            self.config.validation_env.build(step=0, group_idx=i)
-            for i in range(num_samples)
-        ]
         greedy = SamplingConfig(
             n=1,
             temperature=0.0,
             top_p=1.0,
             max_tokens=self.config.generator.sampling.max_tokens,
+            stop_token_ids=list(self._stop_token_ids),
         )
-
-        tokenized_prompts: list[list[int]] = [
-            self.tokenizer.encode(env.prompt, add_bos=True, add_eos=False)
-            for env in envs
-        ]
-        completions, generation_metrics = self._get_rank_0_value(
-            self.generator.generate.call(
-                tokenized_prompts,
-                sampling_config=greedy,
-                metrics_prefix="validation_generator",
-            ).get()
+        rollouts, validation_metrics = await self._collect_rollouts(
+            env_config=self.config.validation_env,
+            num_groups=num_samples,
+            group_size=1,
+            step=0,
+            sampling=greedy,
+            metrics_prefix="validation/generator",
         )
-
-        trajectories = [
-            Trajectory(
-                sample_idx=i,
-                prompt_token_ids=tokenized_prompts[i],
-                transitions=[(c, envs[i].step(c.text))],
-            )
-            for i, c in enumerate(completions)
-        ]
 
         if self.config.log_samples:
-            _log_samples(completions)
-
-        validation_metrics: list[m.Metric] = [
-            m.Metric(
-                "validation/reward",
-                m.SummaryStats.from_list([t.total_reward for t in trajectories]),
-            ),
-            m.Metric(
-                "validation/response_length",
-                m.Mean.from_list([len(c.token_ids) for c in completions]),
-            ),
-            m.Metric("validation/num_samples", m.NoReduce(float(len(trajectories)))),
-        ]
-        validation_metrics += generation_metrics
-        validation_metrics += _prepare_reward_metrics(
-            prefix="validation/reward/component", trajectories=trajectories
-        )
+            _log_samples(rollouts)
 
         t_validate_s = time.perf_counter() - t_validate_start
-        validation_metrics.append(m.Metric("timing/validate", m.NoReduce(t_validate_s)))
-        return validation_metrics
+        return [
+            _rename_metric(metric, old_prefix="rollout/", new_prefix="validation/")
+            for metric in validation_metrics
+        ] + [
+            m.Metric("validation/num_samples", m.NoReduce(float(len(rollouts)))),
+            m.Metric("timing/validate", m.NoReduce(t_validate_s)),
+        ]
 
     async def train(self):
         num_steps = self.config.num_steps
@@ -780,24 +1140,29 @@ class RLTrainer(Configurable):
 
             # --- rollouts ---
             t_rollout_start = time.perf_counter()
-            trajectories, rollout_metrics = self._collect_rollouts(
-                num_groups, step=step
+            rollouts, samples, rollout_metrics = await self._collect_replay_samples(
+                num_groups=num_groups,
+                step=step,
+                train_version=step - 1,
             )
-            episodes, episode_metrics = self._build_episodes(trajectories)
             t_rollout_s = time.perf_counter() - t_rollout_start
 
             if self.config.log_samples:
-                _log_samples(episodes)
+                _log_samples(rollouts)
+            if not samples:
+                raise RuntimeError(
+                    "rollout collection produced no trainable replay samples"
+                )
 
             # --- train ---
             t_train_start = time.perf_counter()
             batches = [
-                self._collate_episodes(per_rank_episodes)
-                for per_rank_episodes in self._shard_episodes(episodes)
+                self._collate_samples(per_rank_samples)
+                for per_rank_samples in self._shard_samples(samples)
             ]
-            # Controller has all episodes pre-shard, so it computes
-            # the global response-token count instead of an all-reduce.
-            num_global_valid_tokens = sum(len(ep.token_ids) for ep in episodes)
+            # Controller has all replay rows pre-shard, so it computes the
+            # global trainable-token count instead of an all-reduce.
+            num_global_valid_tokens = sum(sample.num_loss_tokens for sample in samples)
             with sl.log_trace_span("trainer_forward_backward_call"):
                 fwd_bwd_metrics = self._get_rank_0_value(
                     self.trainer.forward_backward.call(
@@ -830,14 +1195,11 @@ class RLTrainer(Configurable):
                 break
 
             # --- Prepare metrics ---
-            total_tokens = sum(
-                len(ep.prompt_token_ids) + len(ep.token_ids) for ep in episodes
-            )
+            total_tokens = sum(len(sample.token_ids) for sample in samples)
 
             step_metrics: list[m.Metric] = []
 
             step_metrics += rollout_metrics
-            step_metrics += episode_metrics
 
             # Actor metrics are already globally reduced; NoReduce passes them through.
             step_metrics += [

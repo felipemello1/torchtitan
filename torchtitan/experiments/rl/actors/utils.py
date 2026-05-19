@@ -35,25 +35,41 @@ def compute_logprobs(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Ten
     return logprobs.gather(2, shift_targets.unsqueeze(-1)).squeeze(-1)
 
 
-@sl.log_trace_span("extract_response_logprobs")
-def extract_response_logprobs(
+@dataclass(frozen=True, slots=True)
+class MaskedLogprobs:
+    """Token-selected tensors consumed by GRPO loss and drift metrics."""
+
+    policy_logprobs: torch.Tensor
+    behavior_logprobs: torch.Tensor
+    advantages: torch.Tensor
+
+
+@sl.log_trace_span("extract_masked_logprobs")
+def extract_masked_logprobs(
     packed_logprobs: torch.Tensor,
-    seq_lens: list[int],
-    prompt_lens: list[int],
-    response_lens: list[int],
-) -> list[torch.Tensor]:
-    """Extract per-sample response logprobs from packed logprobs."""
-    seq_start = 0
-    result = []
-    for i in range(len(seq_lens)):
-        # Logprobs are shifted: position j holds logprob of token j+1,
-        # so response start (seq_start + prompt_len) maps to index
-        # (seq_start + prompt_len - 1) in the logprobs tensor.
-        s = seq_start + prompt_lens[i] - 1
-        e = s + response_lens[i]
-        result.append(packed_logprobs[0, s:e])
-        seq_start += seq_lens[i]
-    return result
+    loss_mask: torch.Tensor,
+    behavior_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+) -> MaskedLogprobs:
+    """Select loss-token logprobs from packed next-token predictions.
+
+    ``packed_logprobs[:, i]`` predicts ``token_ids[:, i + 1]``. The inputs
+    are token-aligned, so we drop position 0 from masks and auxiliary tensors
+    before selecting loss tokens.
+
+    Example::
+
+        token_ids          = [[10, 11, 20, 21]]
+        loss_mask          = [[ 0,  0,  1,  1]]
+        packed_logprobs    = [[p11, p20, p21]]
+        selected policy    = [p20, p21]
+    """
+    shifted_mask = loss_mask[:, 1:].bool()
+    return MaskedLogprobs(
+        policy_logprobs=packed_logprobs[shifted_mask],
+        behavior_logprobs=behavior_logprobs[:, 1:][shifted_mask],
+        advantages=advantages[:, 1:][shifted_mask],
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,8 +90,8 @@ class PartialLogprobDrift:
 @torch.no_grad()
 @sl.log_trace_span("verify_logprob_identity")
 def verify_logprob_identity(
-    generator_token_logprobs: list[list[float]],
-    trainer_token_logprobs: list[torch.Tensor],
+    generator_token_logprobs: torch.Tensor,
+    trainer_token_logprobs: torch.Tensor,
     *,
     num_global_valid_tokens: torch.Tensor,
     device: torch.device,
@@ -83,10 +99,10 @@ def verify_logprob_identity(
     """Compute per-rank drift between generator and trainer logprobs.
 
     Args:
-        generator_token_logprobs (list[list[float]]): generator-side per-token logprobs, shaped
-            `[num_episodes_local][response_len_i]`.
-        trainer_token_logprobs (list[torch.Tensor]): Trainer-side per-token logprobs, one
-            GPU tensor per episode, each of shape `[response_len_i]`.
+        generator_token_logprobs: Generator-side per-token logprobs, shaped
+            ``[num_loss_tokens]``.
+        trainer_token_logprobs: Trainer-side per-token logprobs, shaped
+            ``[num_loss_tokens]``.
         num_global_valid_tokens (torch.Tensor): Scalar tensor holding global token count
              across DP ranks. Used to normalize the output metrics.
         device: Device to use for tensor allocation, so metrics are ready for
@@ -95,15 +111,8 @@ def verify_logprob_identity(
     Returns:
         PartialLogprobDrift.
     """
-    # Each tensor has a different number of tokens, so we flatten them.
-    generator_flat = torch.as_tensor(
-        [v for sample in generator_token_logprobs for v in sample],
-        dtype=torch.float32,
-        device=device,
-    )
-    trainer_flat = torch.cat(trainer_token_logprobs).to(
-        device=device, dtype=torch.float32
-    )
+    generator_flat = generator_token_logprobs.to(device=device, dtype=torch.float32)
+    trainer_flat = trainer_token_logprobs.to(device=device, dtype=torch.float32)
 
     if generator_flat.numel() == 0:
         zero = torch.zeros((), dtype=torch.float32, device=device)
