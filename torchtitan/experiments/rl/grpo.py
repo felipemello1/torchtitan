@@ -140,6 +140,10 @@ class GRPOLoss(Configurable):
         with torch.no_grad():
             clipped_frac = (torch.abs(ratio - clipped_ratio) > 1e-6).to(ratio.dtype)
             nonfinite_frac = (~torch.isfinite(raw_log_ratio)).to(ratio.dtype)
+            policy_nonfinite_frac = (~torch.isfinite(policy_logprobs)).to(ratio.dtype)
+            behavior_nonfinite_frac = (~torch.isfinite(behavior_logprobs)).to(
+                ratio.dtype
+            )
             log_ratio_clipped_frac = (raw_log_ratio != log_ratio).to(ratio.dtype)
             loss_metrics = {
                 "loss/mean": pg_loss.detach(),
@@ -148,6 +152,10 @@ class GRPOLoss(Configurable):
                 "loss/ratio/log_clipped_frac": log_ratio_clipped_frac.sum()
                 / num_global_valid_tokens,
                 "loss/ratio/nonfinite_frac": nonfinite_frac.sum()
+                / num_global_valid_tokens,
+                "loss/logprob/policy_nonfinite_frac": policy_nonfinite_frac.sum()
+                / num_global_valid_tokens,
+                "loss/logprob/behavior_nonfinite_frac": behavior_nonfinite_frac.sum()
                 / num_global_valid_tokens,
             }
 

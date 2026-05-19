@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -105,12 +106,27 @@ def _rollout_record(
                 "finish_reason": turn.finish_reason,
                 "prompt_token_count": len(turn.prompt_token_ids),
                 "response_token_count": len(turn.response_token_ids),
+                **_logprob_stats(turn.response_logprobs),
                 "messages": _messages_for_json(
                     [*turn.prompt_messages, *turn.response_messages]
                 ),
             }
             for turn_idx, turn in enumerate(rollout.turns)
         ],
+    }
+
+
+def _logprob_stats(logprobs: list[float]) -> dict[str, Any]:
+    finite_logprobs = [value for value in logprobs if math.isfinite(value)]
+    return {
+        "response_logprob_count": len(logprobs),
+        "response_logprob_nonfinite_count": len(logprobs) - len(finite_logprobs),
+        "response_logprob_finite_min": (
+            min(finite_logprobs) if finite_logprobs else None
+        ),
+        "response_logprob_finite_max": (
+            max(finite_logprobs) if finite_logprobs else None
+        ),
     }
 
 

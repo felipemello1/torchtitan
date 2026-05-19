@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
+from torchtitan.experiments.rl.actors.utils import verify_logprob_identity
 from torchtitan.experiments.rl.envs import EnvExample, EnvStep
 from torchtitan.experiments.rl.envs.token_env import PromptState, TokenEnv, TokenStep
 from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
@@ -99,6 +100,28 @@ def test_grpo_loss_sanitizes_nonfinite_log_ratios():
     assert torch.isfinite(loss)
     assert torch.isfinite(metrics["loss/ratio/mean"])
     assert metrics["loss/ratio/nonfinite_frac"].item() == 1.0
+    assert metrics["loss/logprob/policy_nonfinite_frac"].item() == 1.0
+    assert metrics["loss/logprob/behavior_nonfinite_frac"].item() == pytest.approx(
+        1 / 3
+    )
+
+
+def test_logprob_drift_reports_nonfinite_without_nan_metrics():
+    drift = verify_logprob_identity(
+        generator_token_logprobs=torch.tensor([0.0, float("-inf"), 1.0, float("nan")]),
+        trainer_token_logprobs=torch.tensor([0.1, 0.0, 2.0, float("nan")]),
+        num_global_valid_tokens=torch.tensor(4.0),
+        device=torch.device("cpu"),
+    )
+
+    assert torch.isfinite(drift.logprob_diff_mean)
+    assert torch.isfinite(drift.logprob_diff_max)
+    assert torch.isfinite(drift.ratio_tokens_different)
+    assert torch.isfinite(drift.nonfinite_logprob_frac)
+    assert drift.logprob_diff_mean.item() == pytest.approx(1.1 / 4)
+    assert drift.logprob_diff_max.item() == pytest.approx(1.0)
+    assert drift.ratio_tokens_different.item() == pytest.approx(2 / 4)
+    assert drift.nonfinite_logprob_frac.item() == pytest.approx(2 / 4)
 
 
 def test_forward_backward_skip_metrics_reject_nonfinite_loss_signal():
@@ -870,8 +893,12 @@ def test_rollout_sample_logger_caps_groups_per_step(tmp_path):
             turns=[
                 RolloutTurn(
                     prompt_token_ids=[1, 2],
-                    response_token_ids=[3],
-                    response_logprobs=[-0.1],
+                    response_token_ids=([3] if sample_idx == 0 else [3, 4, 5]),
+                    response_logprobs=(
+                        [-0.1]
+                        if sample_idx == 0
+                        else [-0.3, float("inf"), float("nan")]
+                    ),
                     policy_version=sample_idx,
                     prompt_messages=[{"role": "user", "content": "sort"}],
                     response_messages=[{"role": "assistant", "content": "done"}],
@@ -903,6 +930,14 @@ def test_rollout_sample_logger_caps_groups_per_step(tmp_path):
         "role": "user",
         "content": "sort",
     }
+    assert records[0]["turns"][0]["response_logprob_count"] == 1
+    assert records[0]["turns"][0]["response_logprob_nonfinite_count"] == 0
+    assert records[0]["turns"][0]["response_logprob_finite_min"] == pytest.approx(-0.1)
+    assert records[0]["turns"][0]["response_logprob_finite_max"] == pytest.approx(-0.1)
+    assert records[1]["turns"][0]["response_logprob_count"] == 3
+    assert records[1]["turns"][0]["response_logprob_nonfinite_count"] == 2
+    assert records[1]["turns"][0]["response_logprob_finite_min"] == pytest.approx(-0.3)
+    assert records[1]["turns"][0]["response_logprob_finite_max"] == pytest.approx(-0.3)
 
 
 def test_has_advantage_signal_detects_nonzero_group_signal():

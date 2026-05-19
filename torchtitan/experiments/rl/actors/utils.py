@@ -80,11 +80,13 @@ class PartialLogprobDrift:
         logprob_diff_mean: Scalar tensor; To be sum-reduced.
         logprob_diff_max: Scalar tensor; To be max-reduced.
         ratio_tokens_different: Scalar tensor; To be sum-reduced.
+        nonfinite_logprob_frac: Scalar tensor; To be sum-reduced.
     """
 
     logprob_diff_mean: torch.Tensor
     logprob_diff_max: torch.Tensor
     ratio_tokens_different: torch.Tensor
+    nonfinite_logprob_frac: torch.Tensor
 
 
 @torch.no_grad()
@@ -116,12 +118,24 @@ def verify_logprob_identity(
 
     if generator_flat.numel() == 0:
         zero = torch.zeros((), dtype=torch.float32, device=device)
-        return PartialLogprobDrift(zero, zero, zero)
+        return PartialLogprobDrift(zero, zero, zero, zero)
 
     # 1e-6 threshold ignores bf16-quantization-level diffs
-    diff = trainer_flat - generator_flat
+    finite_mask = torch.isfinite(generator_flat) & torch.isfinite(trainer_flat)
+    diff = torch.where(
+        finite_mask,
+        trainer_flat - generator_flat,
+        torch.zeros_like(trainer_flat),
+    )
+    abs_diff = diff.abs()
+    logprob_diff_max = (
+        abs_diff[finite_mask].max()
+        if bool(finite_mask.any().item())
+        else torch.zeros((), dtype=torch.float32, device=device)
+    )
     return PartialLogprobDrift(
         logprob_diff_mean=diff.sum() / num_global_valid_tokens,
-        logprob_diff_max=diff.abs().max(),
+        logprob_diff_max=logprob_diff_max,
         ratio_tokens_different=(diff.abs() > 1e-6).sum() / num_global_valid_tokens,
+        nonfinite_logprob_frac=(~finite_mask).sum() / num_global_valid_tokens,
     )

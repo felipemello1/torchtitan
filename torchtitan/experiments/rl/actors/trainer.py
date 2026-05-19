@@ -452,6 +452,9 @@ class PolicyTrainer(Actor, Configurable):
                         "bit_wise/ratio_tokens_different/mean": (
                             verification.ratio_tokens_different
                         ),
+                        "bit_wise/nonfinite_logprob_frac": (
+                            verification.nonfinite_logprob_frac
+                        ),
                     },
                     active=is_real,
                 )
