@@ -143,13 +143,13 @@ class LogprobDrift:
     Args:
         logprob_diff_mean: Scalar tensor; To be sum-reduced.
         logprob_diff_max: Scalar tensor; To be max-reduced.
-        ratio_tokens_different: Scalar tensor; To be sum-reduced.
+        tokens_different_frac: Scalar tensor; To be sum-reduced.
         nonfinite_logprob_frac: Scalar tensor; To be sum-reduced.
     """
 
     logprob_diff_mean: torch.Tensor
     logprob_diff_max: torch.Tensor
-    ratio_tokens_different: torch.Tensor
+    tokens_different_frac: torch.Tensor
     nonfinite_logprob_frac: torch.Tensor
 
 
@@ -200,6 +200,6 @@ def compute_logprob_drift(
     return LogprobDrift(
         logprob_diff_mean=diff.sum() / num_global_valid_tokens,
         logprob_diff_max=logprob_diff_max,
-        ratio_tokens_different=(diff.abs() > 1e-6).sum() / num_global_valid_tokens,
+        tokens_different_frac=(diff.abs() > 1e-6).sum() / num_global_valid_tokens,
         nonfinite_logprob_frac=(~finite_mask).sum() / num_global_valid_tokens,
     )

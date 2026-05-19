@@ -273,11 +273,11 @@ def test_logprob_drift_reports_nonfinite_without_nan_metrics():
 
     assert torch.isfinite(drift.logprob_diff_mean)
     assert torch.isfinite(drift.logprob_diff_max)
-    assert torch.isfinite(drift.ratio_tokens_different)
+    assert torch.isfinite(drift.tokens_different_frac)
     assert torch.isfinite(drift.nonfinite_logprob_frac)
     assert drift.logprob_diff_mean.item() == pytest.approx(1.1 / 4)
     assert drift.logprob_diff_max.item() == pytest.approx(1.0)
-    assert drift.ratio_tokens_different.item() == pytest.approx(2 / 4)
+    assert drift.tokens_different_frac.item() == pytest.approx(2 / 4)
     assert drift.nonfinite_logprob_frac.item() == pytest.approx(2 / 4)
 
 
@@ -471,7 +471,7 @@ def test_metric_accumulator_uses_same_keys_for_inactive_values():
     }
     drift_metrics = {
         "logprob_drift/diff/mean": torch.tensor(3.0),
-        "logprob_drift/ratio_tokens_different/mean": torch.tensor(4.0),
+        "logprob_drift/tokens_different_frac": torch.tensor(4.0),
     }
     max_metrics = {
         "logprob_drift/diff/max": torch.tensor(5.0),

@@ -103,7 +103,7 @@ def test_alphabet_sort_4b_dapo_uses_clip_high_recipe():
     assert cfg.trainer.loss.dual_clip_c == 3.0
 
 
-def test_alphabet_sort_4b_dapo_2gpu_config_stays_on_two_gpus():
+def test_alphabet_sort_4b_dapo_2gpu_config_is_diagnostic_only():
     cfg = rl_dapo_qwen3_4b_alphabet_sort_2gpu()
 
     assert cfg.model_spec.flavor == "4B-Instruct-2507"

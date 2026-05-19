@@ -334,7 +334,7 @@ class PolicyTrainer(Actor, Configurable):
         train_data: list[TrainingBatch],
         *,
         num_global_valid_tokens: int,
-        logprob_config: TrainingLogprobConfig | None = None,
+        logprob_config: TrainingLogprobConfig,
     ) -> dict[str, float]:
         """Run forward pass, compute loss, call backward, and reduce metrics.
 
@@ -351,7 +351,6 @@ class PolicyTrainer(Actor, Configurable):
         Returns:
             dict[str, float]: Globally-reduced metrics.
         """
-        logprob_config = logprob_config or TrainingLogprobConfig(temperature=1.0)
         logger.debug(
             f"{os.getpid()=} PolicyTrainer forward_backward "
             f"step {self.policy_version}"
@@ -462,8 +461,8 @@ class PolicyTrainer(Actor, Configurable):
                     {
                         **loss_metrics,
                         "logprob_drift/diff/mean": drift.logprob_diff_mean,
-                        "logprob_drift/ratio_tokens_different/mean": (
-                            drift.ratio_tokens_different
+                        "logprob_drift/tokens_different_frac": (
+                            drift.tokens_different_frac
                         ),
                         "logprob_drift/nonfinite_frac": drift.nonfinite_logprob_frac,
                     },

@@ -186,7 +186,7 @@ class VLLMGenerator(Actor, Configurable):
         """Model weight dtype passed to vLLM."""
 
         gpu_memory_limit: float = 0.9
-        """Fraction of GPU memory to use for the vLLM engine (0.0 to 1.0)."""
+        """vLLM ``gpu_memory_utilization`` fraction (0.0 to 1.0)."""
 
         cudagraph: VLLMCudagraphConfig = field(default_factory=VLLMCudagraphConfig)
         """CUDA graph capture settings for the vLLM engine."""

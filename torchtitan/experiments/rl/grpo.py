@@ -330,9 +330,11 @@ class RLTrainer(Configurable):
         """Root output folder for RL artifacts (temp weights, logs, etc.)."""
 
         num_prompts_per_step: int = 5
-        """Number of distinct prompts (= GRPO groups) drawn per training step.
+        """Completed GRPO groups consumed by each optimizer step.
 
         The total samples per step is ``num_prompts_per_step * rollout_group_size``.
+        Async producers may generate these groups before the optimizer step
+        that consumes them.
         """
 
         rollout_group_size: int = 8
@@ -386,13 +388,13 @@ class RLTrainer(Configurable):
         """Optional prompt plus generation-token cap enforced by the controller."""
 
         async_rollout_groups: int = 1
-        """Number of rollout groups kept in flight by the async producer."""
+        """Number of long-lived async rollout producer tasks."""
 
         replay_buffer_groups: int = 2
-        """Maximum completed rollout groups buffered for async training."""
+        """Maximum completed GRPO groups buffered before trainer consumption."""
 
         max_offpolicy_steps: int | None = 1
-        """Drop queued groups older than this many policy versions. ``None`` keeps all."""
+        """Drop replay groups older than this policy-version lag. ``None`` keeps all."""
 
         drop_zero_advantage_groups: bool = True
         """Drop constant-reward rollout groups before replay admission.

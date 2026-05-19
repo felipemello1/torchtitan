@@ -368,7 +368,11 @@ def rl_dapo_qwen3_4b_alphabet_sort() -> RLTrainer.Config:
 
 
 def rl_dapo_qwen3_4b_alphabet_sort_2gpu() -> RLTrainer.Config:
-    """Two-GPU AlphabetSort DAPO config for Qwen3-4B (1 gen + 1 train)."""
+    """Diagnostic Qwen3-4B DAPO config.
+
+    This is known to hit a direct-sync timeout on this devserver. Keep it for
+    model-sync investigation, not as the accepted runnable recipe.
+    """
     return _alphabet_sort_config(
         model_size="4B-Instruct-2507",
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-4B-Instruct-2507",
