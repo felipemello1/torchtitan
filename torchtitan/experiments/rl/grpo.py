@@ -53,6 +53,7 @@ from torchtitan.experiments.rl.envs import (
     TokenEnvConfig,
 )
 from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
+from torchtitan.experiments.rl.loss import GRPOLoss
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.observability.metrics.rl import (
     _TrainStepTimings,
@@ -87,80 +88,6 @@ from torchtitan.protocols.model_spec import ModelSpec
 logger = logging.getLogger(__name__)
 
 _ZERO_ADVANTAGE_EPS = 1e-12
-
-
-class GRPOLoss(Configurable):
-    """Clipped GRPO surrogate loss.
-
-    Takes token-selected policy logprobs, behavior logprobs, and advantages.
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Configurable.Config):
-        clip_eps: float = 0.2
-        """PPO clipping epsilon for the probability ratio."""
-
-        max_log_ratio: float = 10.0
-        """Clamp ``policy_logprob - behavior_logprob`` before exponentiating."""
-
-    def __init__(self, config: Config):
-        if config.max_log_ratio <= 0:
-            raise ValueError(
-                f"max_log_ratio must be positive, got {config.max_log_ratio}"
-            )
-        self.clip_eps = config.clip_eps
-        self.max_log_ratio = config.max_log_ratio
-
-    def __call__(
-        self,
-        policy_logprobs: torch.Tensor,
-        behavior_logprobs: torch.Tensor,
-        advantages: torch.Tensor,
-        num_global_valid_tokens: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        raw_log_ratio = policy_logprobs - behavior_logprobs
-        # Keep the scalar loss finite enough to report metrics, but any
-        # non-finite selected-token ratio is still a no-step health signal.
-        sanitized_log_ratio = torch.nan_to_num(
-            raw_log_ratio,
-            nan=0.0,
-            posinf=self.max_log_ratio,
-            neginf=-self.max_log_ratio,
-        )
-        log_ratio = torch.clamp(
-            sanitized_log_ratio,
-            min=-self.max_log_ratio,
-            max=self.max_log_ratio,
-        )
-        ratio = torch.exp(log_ratio)
-        clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
-        # pg = policy gradient.
-        token_pg_losses = -torch.min(ratio * advantages, clipped_ratio * advantages)
-        pg_loss = token_pg_losses.sum() / num_global_valid_tokens
-
-        with torch.no_grad():
-            clipped_frac = (torch.abs(ratio - clipped_ratio) > 1e-6).to(ratio.dtype)
-            nonfinite_frac = (~torch.isfinite(raw_log_ratio)).to(ratio.dtype)
-            policy_nonfinite_frac = (~torch.isfinite(policy_logprobs)).to(ratio.dtype)
-            behavior_nonfinite_frac = (~torch.isfinite(behavior_logprobs)).to(
-                ratio.dtype
-            )
-            log_ratio_clipped_frac = (raw_log_ratio != log_ratio).to(ratio.dtype)
-            loss_metrics = {
-                "loss/mean": pg_loss.detach(),
-                "loss/ratio/mean": ratio.sum() / num_global_valid_tokens,
-                "loss/ratio/clipped_frac": clipped_frac.sum() / num_global_valid_tokens,
-                "loss/ratio/log_clipped_frac": log_ratio_clipped_frac.sum()
-                / num_global_valid_tokens,
-                "loss/ratio/nonfinite_frac": nonfinite_frac.sum()
-                / num_global_valid_tokens,
-                "loss/logprob/policy_nonfinite_frac": policy_nonfinite_frac.sum()
-                / num_global_valid_tokens,
-                "loss/logprob/behavior_nonfinite_frac": behavior_nonfinite_frac.sum()
-                / num_global_valid_tokens,
-            }
-
-        return pg_loss, loss_metrics
 
 
 class Provisioner:

@@ -26,7 +26,8 @@ from torchtitan.experiments.rl.alphabet_sort import (
     AlphabetSortBuilder,
     AlphabetSortDataset,
 )
-from torchtitan.experiments.rl.grpo import GRPOLoss, RLTrainer
+from torchtitan.experiments.rl.grpo import RLTrainer
+from torchtitan.experiments.rl.loss import DAPOLoss, GRPOLoss
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.sampling import SamplingConfig
@@ -53,29 +54,44 @@ def _alphabet_sort_builder() -> AlphabetSortBuilder.Config:
     )
 
 
-def _alphabet_sort_4gpu_config(
+def _dapo_loss() -> DAPOLoss.Config:
+    """DAPO clip-higher and dual-clip settings used by explicit DAPO configs."""
+    return DAPOLoss.Config(clip_low=0.2, clip_high=0.28, dual_clip_c=3.0)
+
+
+def _alphabet_sort_config(
     *,
     model_size: str,
     hf_assets_path: str,
     lr: float,
     num_prompts_per_step: int,
     num_validation_samples: int,
+    num_steps: int = 50,
+    trainer_tensor_parallel_degree: int = 2,
+    generator_tensor_parallel_degree: int = 2,
+    async_rollout_groups: int = 2,
+    replay_buffer_groups: int | None = None,
+    generator_max_tokens: int = 256,
+    generator_gpu_memory_limit: float = 0.75,
     compile_config: CompileConfig | None = None,
     trainer_max_microbatch_samples: int | None = 8,
+    loss: GRPOLoss.Config | DAPOLoss.Config | None = None,
 ) -> RLTrainer.Config:
-    """Four-GPU AlphabetSort config: 2 GPUs generator + 2 GPUs trainer."""
+    """Shared AlphabetSort config with explicit trainer/generator TP sizing."""
     group_size = 8
+    if replay_buffer_groups is None:
+        replay_buffer_groups = num_prompts_per_step
     return RLTrainer.Config(
         model_spec=model_registry(model_size, attn_backend="varlen"),
         hf_assets_path=hf_assets_path,
-        num_steps=50,
+        num_steps=num_steps,
         num_prompts_per_step=num_prompts_per_step,
         rollout_group_size=group_size,
         num_validation_samples=num_validation_samples,
         max_rollout_turns=5,
         max_trajectory_tokens=2048,
-        async_rollout_groups=2,
-        replay_buffer_groups=num_prompts_per_step,
+        async_rollout_groups=async_rollout_groups,
+        replay_buffer_groups=replay_buffer_groups,
         max_offpolicy_steps=1,
         compile=(
             compile_config
@@ -98,7 +114,7 @@ def _alphabet_sort_4gpu_config(
             training=TrainingConfig(dtype="bfloat16"),
             parallelism=ParallelismConfig(
                 data_parallel_shard_degree=1,
-                tensor_parallel_degree=2,
+                tensor_parallel_degree=trainer_tensor_parallel_degree,
                 enable_sequence_parallel=False,
                 disable_loss_parallel=True,
             ),
@@ -108,13 +124,13 @@ def _alphabet_sort_4gpu_config(
                 interval=25,
                 last_save_model_only=False,
             ),
-            loss=GRPOLoss.Config(),
+            loss=loss if loss is not None else GRPOLoss.Config(),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
-            gpu_memory_limit=0.75,
+            gpu_memory_limit=generator_gpu_memory_limit,
             parallelism=ParallelismConfig(
-                tensor_parallel_degree=2,
+                tensor_parallel_degree=generator_tensor_parallel_degree,
                 data_parallel_replicate_degree=1,
                 enable_sequence_parallel=False,
                 disable_loss_parallel=True,
@@ -124,7 +140,7 @@ def _alphabet_sort_4gpu_config(
                 n=1,
                 temperature=0.8,
                 top_p=0.95,
-                max_tokens=256,
+                max_tokens=generator_max_tokens,
             ),
         ),
     )
@@ -246,12 +262,24 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
 
 def rl_grpo_qwen3_0_6b_alphabet_sort() -> RLTrainer.Config:
     """Multi-turn AlphabetSort GRPO config for Qwen3-0.6B (4 GPUs)."""
-    return _alphabet_sort_4gpu_config(
+    return _alphabet_sort_config(
         model_size="0.6B",
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
         lr=1e-6,
         num_prompts_per_step=8,
         num_validation_samples=32,
+    )
+
+
+def rl_dapo_qwen3_0_6b_alphabet_sort() -> RLTrainer.Config:
+    """Multi-turn AlphabetSort DAPO config for Qwen3-0.6B (4 GPUs)."""
+    return _alphabet_sort_config(
+        model_size="0.6B",
+        hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
+        lr=1e-6,
+        num_prompts_per_step=8,
+        num_validation_samples=32,
+        loss=_dapo_loss(),
     )
 
 
@@ -270,7 +298,7 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
 
 def rl_grpo_qwen3_1_7b_alphabet_sort() -> RLTrainer.Config:
     """Multi-turn AlphabetSort GRPO config for Qwen3-1.7B (4 GPUs)."""
-    return _alphabet_sort_4gpu_config(
+    return _alphabet_sort_config(
         model_size="1.7B",
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-1.7B",
         lr=1e-6,
@@ -279,6 +307,39 @@ def rl_grpo_qwen3_1_7b_alphabet_sort() -> RLTrainer.Config:
         compile_config=CompileConfig(enable=False),
         trainer_max_microbatch_samples=4,
     )
+
+
+def _alphabet_sort_4b_config(
+    *, loss: GRPOLoss.Config | DAPOLoss.Config | None = None
+) -> RLTrainer.Config:
+    """Production AlphabetSort config for Qwen3-4B (8 GPUs: 4 gen + 4 train)."""
+    return _alphabet_sort_config(
+        model_size="4B",
+        hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-4B-Instruct-2507",
+        lr=5e-7,
+        num_steps=100,
+        num_prompts_per_step=16,
+        num_validation_samples=64,
+        trainer_tensor_parallel_degree=4,
+        generator_tensor_parallel_degree=4,
+        async_rollout_groups=16,
+        replay_buffer_groups=32,
+        generator_max_tokens=768,
+        generator_gpu_memory_limit=0.85,
+        compile_config=CompileConfig(enable=False),
+        trainer_max_microbatch_samples=1,
+        loss=loss,
+    )
+
+
+def rl_grpo_qwen3_4b_alphabet_sort() -> RLTrainer.Config:
+    """Production AlphabetSort GRPO config for Qwen3-4B (8 GPUs: 4 gen + 4 train)."""
+    return _alphabet_sort_4b_config()
+
+
+def rl_dapo_qwen3_4b_alphabet_sort() -> RLTrainer.Config:
+    """Production AlphabetSort DAPO config for Qwen3-4B (8 GPUs: 4 gen + 4 train)."""
+    return _alphabet_sort_4b_config(loss=_dapo_loss())
 
 
 def rl_grpo_qwen3_14b() -> RLTrainer.Config:

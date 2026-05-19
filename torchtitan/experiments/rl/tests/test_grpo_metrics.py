@@ -21,10 +21,10 @@ from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
 from torchtitan.experiments.rl.grpo import (
     _raise_rollout_task_errors,
     _RolloutDropCounters,
-    GRPOLoss,
     Provisioner,
     RLTrainer,
 )
+from torchtitan.experiments.rl.loss import DAPOLoss, GRPOLoss
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.observability.metrics.rl import (
     _TrainStepTimings,
@@ -105,6 +105,119 @@ def test_grpo_loss_sanitizes_nonfinite_log_ratios():
     assert metrics["loss/logprob/behavior_nonfinite_frac"].item() == pytest.approx(
         1 / 3
     )
+
+
+def test_dapo_loss_uses_asymmetric_clip_high():
+    policy_logprobs = torch.log(torch.tensor([1.25, 0.7]))
+    behavior_logprobs = torch.zeros(2)
+    advantages = torch.tensor([1.0, -1.0])
+    num_global_valid_tokens = torch.tensor(2.0)
+
+    symmetric_loss, symmetric_metrics = GRPOLoss(GRPOLoss.Config(clip_eps=0.2))(
+        policy_logprobs=policy_logprobs,
+        behavior_logprobs=behavior_logprobs,
+        advantages=advantages,
+        num_global_valid_tokens=num_global_valid_tokens,
+    )
+    dapo_loss, dapo_metrics = DAPOLoss(DAPOLoss.Config(clip_low=0.2, clip_high=0.3))(
+        policy_logprobs=policy_logprobs,
+        behavior_logprobs=behavior_logprobs,
+        advantages=advantages,
+        num_global_valid_tokens=num_global_valid_tokens,
+    )
+
+    assert symmetric_loss.item() == pytest.approx(-0.2)
+    assert dapo_loss.item() == pytest.approx(-0.225)
+    assert dapo_loss < symmetric_loss
+    assert symmetric_metrics["loss/ratio/clipped_high_frac"].item() == pytest.approx(
+        0.5
+    )
+    assert dapo_metrics["loss/ratio/clipped_high_frac"].item() == 0.0
+    assert dapo_metrics["loss/ratio/clipped_low_frac"].item() == pytest.approx(0.5)
+
+
+def test_dapo_loss_clips_only_active_advantage_directions():
+    ratios = torch.tensor([1.30, 1.25, 0.70, 0.75, 1.30, 0.70])
+    advantages = torch.tensor([1.0, 1.0, -1.0, -1.0, -1.0, 1.0])
+    loss_fn = DAPOLoss(DAPOLoss.Config(clip_low=0.2, clip_high=0.28))
+
+    loss, metrics = loss_fn(
+        policy_logprobs=torch.log(ratios),
+        behavior_logprobs=torch.zeros_like(ratios),
+        advantages=advantages,
+        num_global_valid_tokens=torch.tensor(float(ratios.numel())),
+    )
+
+    # Mirrors Forge's pg_ppo_clip semantics: upper clipping applies to positive
+    # advantages, lower clipping applies to negative advantages.
+    expected_token_losses = torch.tensor([-1.28, -1.25, 0.8, 0.8, 1.3, -0.7])
+    assert loss.item() == pytest.approx(expected_token_losses.mean().item())
+    assert metrics["loss/ratio/clipped_high_frac"].item() == pytest.approx(1 / 6)
+    assert metrics["loss/ratio/clipped_low_frac"].item() == pytest.approx(2 / 6)
+    assert metrics["loss/ratio/clipped_frac"].item() == pytest.approx(3 / 6)
+
+
+def test_dapo_loss_supports_forge_dual_clip():
+    ratios = torch.tensor([10.0, 2.0, 0.5])
+    advantages = torch.tensor([-1.0, -1.0, 1.0])
+    loose_dual_loss, loose_dual_metrics = DAPOLoss(
+        DAPOLoss.Config(clip_low=0.2, clip_high=0.28, dual_clip_c=100.0)
+    )(
+        policy_logprobs=torch.log(ratios),
+        behavior_logprobs=torch.zeros_like(ratios),
+        advantages=advantages,
+        num_global_valid_tokens=torch.tensor(float(ratios.numel())),
+    )
+
+    dual_loss, dual_metrics = DAPOLoss(
+        DAPOLoss.Config(clip_low=0.2, clip_high=0.28, dual_clip_c=3.0)
+    )(
+        policy_logprobs=torch.log(ratios),
+        behavior_logprobs=torch.zeros_like(ratios),
+        advantages=advantages,
+        num_global_valid_tokens=torch.tensor(float(ratios.numel())),
+    )
+
+    expected_dual_token_losses = torch.tensor([3.0, 2.0, -0.5])
+    assert dual_loss.item() == pytest.approx(expected_dual_token_losses.mean().item())
+    assert dual_loss < loose_dual_loss
+    assert loose_dual_metrics["loss/dual_clip/clipped_frac"].item() == 0.0
+    assert dual_metrics["loss/dual_clip/clipped_frac"].item() == pytest.approx(1 / 3)
+
+
+def test_dapo_loss_rejects_invalid_dual_clip_constant():
+    with pytest.raises(ValueError, match="dual_clip_c must be greater than 1"):
+        DAPOLoss(DAPOLoss.Config(dual_clip_c=1.0))
+
+
+def test_dapo_loss_zero_advantages_are_finite():
+    loss_fn = DAPOLoss(DAPOLoss.Config(clip_low=0.2, clip_high=0.28))
+
+    loss, metrics = loss_fn(
+        policy_logprobs=torch.tensor([10.0, -10.0]),
+        behavior_logprobs=torch.tensor([0.0, 0.0]),
+        advantages=torch.zeros(2),
+        num_global_valid_tokens=torch.tensor(2.0),
+    )
+
+    assert loss.item() == 0.0
+    assert torch.isfinite(metrics["loss/ratio/mean"])
+    assert metrics["loss/ratio/clipped_frac"].item() == 0.0
+
+
+def test_dapo_loss_empty_selected_tokens_is_finite_zero():
+    loss_fn = DAPOLoss(DAPOLoss.Config(clip_low=0.2, clip_high=0.28))
+
+    loss, metrics = loss_fn(
+        policy_logprobs=torch.empty(0),
+        behavior_logprobs=torch.empty(0),
+        advantages=torch.empty(0),
+        num_global_valid_tokens=torch.tensor(1.0),
+    )
+
+    assert loss.item() == 0.0
+    for value in metrics.values():
+        assert torch.isfinite(value)
 
 
 def test_logprob_drift_reports_nonfinite_without_nan_metrics():
