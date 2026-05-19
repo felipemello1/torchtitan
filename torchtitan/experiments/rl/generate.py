@@ -15,9 +15,8 @@ Two modes:
    parsed back into a structured ``ParsedResponse``.
 
 The script talks to ``vLLM.LLMEngine`` directly (no Monarch actor), so it is
-the cheapest way to verify the renderer ↔ generator wiring without spinning
-up the full RL controller. The Monarch-actor path lands in PR3 with the env
-migration.
+the cheapest way to verify the renderer -> generator wiring without spinning
+up the full RL controller.
 
 Example::
 
@@ -60,7 +59,7 @@ def generate_from_messages(
 
     The renderer's stop token IDs are passed to ``SamplingParams`` so generation
     halts at the assistant turn boundary (e.g. ``<|im_end|>`` on Qwen3),
-    matching what the controller does in PR3 once it owns the rendering path.
+    matching the controller rollout path.
 
     Returns the renderer's structured ``ParsedResponse`` (text + tool calls +
     reasoning chunks).

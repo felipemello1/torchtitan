@@ -207,7 +207,8 @@ class Provisioner:
 
         def _bootstrap():
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
-            # TODO: Remove once Monarch/PyTorch fixes concurrent import during unpickling.
+            # Import torch after CUDA_VISIBLE_DEVICES is scoped to this actor.
+            # This avoids concurrent import during Monarch worker unpickling.
             import torch  # noqa: F401
 
         return _bootstrap

@@ -395,7 +395,8 @@ class PolicyTrainer(Actor, Configurable):
             }
         )
 
-        # TODO: evaluate FSDP2 no-sync support for non-final microbatches.
+        # Keep synchronization explicit for each microbatch; this path must work
+        # across the trainer parallelisms used by the RL experiment.
         for scheduled_microbatch in schedule.microbatches:
             microbatch = scheduled_microbatch.batch
             is_real = scheduled_microbatch.is_real

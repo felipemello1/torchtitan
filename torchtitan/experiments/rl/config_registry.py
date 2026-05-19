@@ -305,8 +305,8 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
         lr=2e-6,
         trainer_tensor_parallel_degree=2,
         generator_tensor_parallel_degree=2,
-        # bfloat16 is needed for trainer to align with generator dtype.
-        # TODO: replace bfloat16 enablement with FSDP2+TP2.
+        # bfloat16 keeps trainer and generator dtype behavior aligned for this
+        # batch-invariant debugging config.
         trainer_dtype="bfloat16",
         trainer_enable_sequence_parallel=False,
         trainer_debug=batch_invariant_config,
