@@ -111,6 +111,7 @@ def _alphabet_sort_config(
             max_microbatch_samples=trainer_max_microbatch_samples,
             lr_scheduler=LRSchedulersContainer.Config(
                 warmup_steps=0,
+                decay_ratio=0.0,
                 decay_type="linear",
             ),
             training=TrainingConfig(dtype="bfloat16"),
@@ -334,7 +335,7 @@ def rl_dapo_qwen3_1_7b_alphabet_sort_2gpu() -> RLTrainer.Config:
 def _alphabet_sort_4b_config(
     *, loss: GRPOLoss.Config | DAPOLoss.Config | None = None
 ) -> RLTrainer.Config:
-    """Production AlphabetSort config for Qwen3-4B (8 GPUs: 4 gen + 4 train)."""
+    """Eight-GPU AlphabetSort config for Qwen3-4B (4 gen + 4 train)."""
     return _alphabet_sort_config(
         model_size="4B-Instruct-2507",
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-4B-Instruct-2507",
@@ -357,12 +358,12 @@ def _alphabet_sort_4b_config(
 
 
 def rl_grpo_qwen3_4b_alphabet_sort() -> RLTrainer.Config:
-    """Production AlphabetSort GRPO config for Qwen3-4B (8 GPUs: 4 gen + 4 train)."""
+    """Eight-GPU AlphabetSort GRPO config for Qwen3-4B (4 gen + 4 train)."""
     return _alphabet_sort_4b_config()
 
 
 def rl_dapo_qwen3_4b_alphabet_sort() -> RLTrainer.Config:
-    """Production AlphabetSort DAPO config for Qwen3-4B (8 GPUs: 4 gen + 4 train)."""
+    """Eight-GPU AlphabetSort DAPO config for Qwen3-4B (4 gen + 4 train)."""
     return _alphabet_sort_4b_config(loss=_dapo_loss())
 
 

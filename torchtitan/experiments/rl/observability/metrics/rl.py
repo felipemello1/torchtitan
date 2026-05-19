@@ -18,7 +18,7 @@ from torchtitan.experiments.rl.replay import ReplayBatch, ReplayBufferStats
 from torchtitan.experiments.rl.types import ReplaySample, RolloutOutput, RolloutStatus
 
 
-_TRACE_FWD_BWD_KEYS = (
+REQUIRED_TRAIN_STEP_HEALTH_KEYS = (
     "loss/ratio/nonfinite_frac",
     "loss/logprob/policy_nonfinite_frac",
     "loss/logprob/behavior_nonfinite_frac",
@@ -31,7 +31,7 @@ def validate_train_step_fwd_bwd_metrics(
 ) -> None:
     """Raise if train-step health metrics required by the controller are absent."""
     missing_trace_metrics = [
-        key for key in _TRACE_FWD_BWD_KEYS if key not in fwd_bwd_metrics
+        key for key in REQUIRED_TRAIN_STEP_HEALTH_KEYS if key not in fwd_bwd_metrics
     ]
     if missing_trace_metrics:
         raise KeyError(
@@ -224,8 +224,8 @@ def build_train_step_metrics(
     dropped_zero_advantage_groups: int,
     train_version: int,
     drop_metrics: Sequence[m.Metric] = (),
-) -> tuple[list[m.Metric], dict[str, float]]:
-    """Build metric records and structured scalars for one train step."""
+) -> list[m.Metric]:
+    """Build typed metric records for one train step."""
     total_tokens = sum(len(sample.token_ids) for sample in samples)
     tokens_per_second = total_tokens / timings.step_s if timings.step_s > 0.0 else 0.0
     behavior_versions = [group.behavior_version for group in replay_batch.groups]
@@ -281,24 +281,5 @@ def build_train_step_metrics(
         )
     )
 
-    trace_scalars = {
-        "replay.buffer_depth_groups": replay_batch.stats.depth_groups,
-        "replay.dropped_stale_groups": replay_batch.stats.num_dropped_stale_groups,
-        "rollout.dropped_empty_groups": dropped_empty_groups,
-        "rollout.dropped_zero_advantage_groups": dropped_zero_advantage_groups,
-        "replay.train_version": train_version,
-        "replay.behavior_version_min": behavior_version_min,
-        "replay.behavior_version_max": behavior_version_max,
-        "timing.replay_wait_ms": timings.replay_wait_s * 1000,
-        "timing.weight_sync_admission_drain_ms": (
-            timings.weight_sync.admission_drain_s * 1000
-        ),
-        "timing.weight_sync_push_ms": timings.weight_sync.push_s * 1000,
-        "timing.weight_sync_pull_ms": timings.weight_sync.pull_s * 1000,
-        "timing.checkpoint_ms": timings.checkpoint_s * 1000,
-        "checkpoint.saved": float(checkpoint_saved),
-    }
     validate_train_step_fwd_bwd_metrics(fwd_bwd_metrics)
-    for key in _TRACE_FWD_BWD_KEYS:
-        trace_scalars[key.replace("/", ".")] = fwd_bwd_metrics[key]
-    return metrics, trace_scalars
+    return metrics

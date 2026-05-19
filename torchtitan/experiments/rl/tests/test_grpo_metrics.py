@@ -22,6 +22,7 @@ from torchtitan.experiments.rl.envs import EnvExample, EnvStep
 from torchtitan.experiments.rl.envs.token_env import PromptState, TokenEnv, TokenStep
 from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
 from torchtitan.experiments.rl.grpo import (
+    _build_train_step_trace_scalars,
     _raise_rollout_task_errors,
     _RolloutDropCounters,
     Provisioner,
@@ -1345,32 +1346,36 @@ def test_train_step_metric_builder_emits_replay_timing_and_trace_scalars():
         ),
     )
 
-    metrics, trace_scalars = build_train_step_metrics(
+    fwd_bwd_metrics = {
+        "loss/mean": 0.25,
+        "loss/ratio/nonfinite_frac": 0.0,
+        "loss/logprob/policy_nonfinite_frac": 0.1,
+        "loss/logprob/behavior_nonfinite_frac": 0.2,
+        "bit_wise/nonfinite_logprob_frac": 0.3,
+    }
+    optimizer_metrics = {"train/lr": 1e-6}
+    timings = _TrainStepTimings(
+        step_s=2.0,
+        replay_wait_s=0.1,
+        train_s=0.2,
+        checkpoint_s=0.3,
+        weight_sync=_WeightSyncTimings(
+            admission_drain_s=0.4,
+            push_s=0.5,
+            pull_s=0.6,
+            total_s=1.5,
+        ),
+    )
+
+    metrics = build_train_step_metrics(
         samples=[sample],
         replay_batch=batch,
         rollouts=[rollout],
         live_generation_metrics=[m.Metric("generator/live/tokens", m.NoReduce(4.0))],
-        fwd_bwd_metrics={
-            "loss/mean": 0.25,
-            "loss/ratio/nonfinite_frac": 0.0,
-            "loss/logprob/policy_nonfinite_frac": 0.1,
-            "loss/logprob/behavior_nonfinite_frac": 0.2,
-            "bit_wise/nonfinite_logprob_frac": 0.3,
-        },
-        optimizer_metrics={"train/lr": 1e-6},
+        fwd_bwd_metrics=fwd_bwd_metrics,
+        optimizer_metrics=optimizer_metrics,
         checkpoint_saved=True,
-        timings=_TrainStepTimings(
-            step_s=2.0,
-            replay_wait_s=0.1,
-            train_s=0.2,
-            checkpoint_s=0.3,
-            weight_sync=_WeightSyncTimings(
-                admission_drain_s=0.4,
-                push_s=0.5,
-                pull_s=0.6,
-                total_s=1.5,
-            ),
-        ),
+        timings=timings,
         dropped_empty_groups=1,
         dropped_zero_advantage_groups=2,
         drop_metrics=[
@@ -1379,6 +1384,16 @@ def test_train_step_metric_builder_emits_replay_timing_and_trace_scalars():
                 m.SummaryStats.from_list([0.25, 0.75]),
             )
         ],
+        train_version=7,
+    )
+    trace_scalars = _build_train_step_trace_scalars(
+        replay_batch=batch,
+        fwd_bwd_metrics=fwd_bwd_metrics,
+        optimizer_metrics=optimizer_metrics,
+        checkpoint_saved=True,
+        timings=timings,
+        dropped_empty_groups=1,
+        dropped_zero_advantage_groups=2,
         train_version=7,
     )
     aggregate = m.MetricsProcessor._aggregate_metrics(metrics)
@@ -1446,7 +1461,7 @@ def test_train_step_metric_builder_handles_zero_step_duration():
         ),
     )
 
-    metrics, _ = build_train_step_metrics(
+    metrics = build_train_step_metrics(
         samples=[sample],
         replay_batch=batch,
         rollouts=[],

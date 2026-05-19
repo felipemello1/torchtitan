@@ -61,6 +61,7 @@ from torchtitan.experiments.rl.observability.metrics.rl import (
     _zero_weight_sync_timings,
     build_rollout_metrics,
     build_train_step_metrics,
+    REQUIRED_TRAIN_STEP_HEALTH_KEYS,
     rename_metric_prefix,
     validate_train_step_fwd_bwd_metrics,
 )
@@ -88,6 +89,54 @@ from torchtitan.protocols.model_spec import ModelSpec
 logger = logging.getLogger(__name__)
 
 _ZERO_ADVANTAGE_EPS = 1e-12
+
+
+def _build_train_step_trace_scalars(
+    *,
+    replay_batch: ReplayBatch,
+    fwd_bwd_metrics: dict[str, float],
+    optimizer_metrics: dict[str, float],
+    checkpoint_saved: bool,
+    timings: _TrainStepTimings,
+    dropped_empty_groups: int,
+    dropped_zero_advantage_groups: int,
+    train_version: int,
+) -> dict[str, float]:
+    """Build structured-logger scalar breadcrumbs for one train step."""
+    validate_train_step_fwd_bwd_metrics(fwd_bwd_metrics)
+    behavior_versions = [group.behavior_version for group in replay_batch.groups]
+    max_behavior_versions = [
+        group.max_behavior_version for group in replay_batch.groups
+    ]
+    trace_scalars = {
+        "replay.buffer_depth_groups": replay_batch.stats.depth_groups,
+        "replay.dropped_stale_groups": replay_batch.stats.num_dropped_stale_groups,
+        "rollout.dropped_empty_groups": dropped_empty_groups,
+        "rollout.dropped_zero_advantage_groups": dropped_zero_advantage_groups,
+        "replay.train_version": train_version,
+        "replay.behavior_version_min": (
+            min(behavior_versions) if behavior_versions else 0
+        ),
+        "replay.behavior_version_max": (
+            max(max_behavior_versions) if max_behavior_versions else 0
+        ),
+        "timing.replay_wait_ms": timings.replay_wait_s * 1000,
+        "timing.weight_sync_admission_drain_ms": (
+            timings.weight_sync.admission_drain_s * 1000
+        ),
+        "timing.weight_sync_push_ms": timings.weight_sync.push_s * 1000,
+        "timing.weight_sync_pull_ms": timings.weight_sync.pull_s * 1000,
+        "timing.checkpoint_ms": timings.checkpoint_s * 1000,
+        "checkpoint.saved": float(checkpoint_saved),
+    }
+    for key in REQUIRED_TRAIN_STEP_HEALTH_KEYS:
+        trace_scalars[key.replace("/", ".")] = fwd_bwd_metrics[key]
+    for key in (
+        "train/skipped_nonfinite_loss",
+        "train/skipped_nonfinite_grad_norm",
+    ):
+        trace_scalars[key.replace("/", ".")] = optimizer_metrics.get(key, 0.0)
+    return trace_scalars
 
 
 class Provisioner:
@@ -423,6 +472,12 @@ class RLTrainer(Configurable):
                     "RLTrainer uses rollout_group_size for GRPO sibling fanout; "
                     "generator.sampling.n must stay 1 so each rollout turn "
                     f"produces exactly one completion, got {self.generator.sampling.n}"
+                )
+            if self.generator.sampling.top_p != 1.0:
+                raise ValueError(
+                    "RLTrainer currently supports trainer logprob correction only "
+                    "for generator.sampling.top_p=1.0; "
+                    f"got {self.generator.sampling.top_p}"
                 )
             if self.replay_buffer_groups <= 0:
                 raise ValueError(
@@ -909,7 +964,7 @@ class RLTrainer(Configurable):
             )
             for metric in generation_scheduler.pop_metrics()
         ]
-        step_metrics, trace_scalars = build_train_step_metrics(
+        step_metrics = build_train_step_metrics(
             samples=samples,
             replay_batch=replay_batch,
             rollouts=rollouts,
@@ -923,11 +978,16 @@ class RLTrainer(Configurable):
             drop_metrics=drop_metrics,
             train_version=train_version,
         )
-        for key in (
-            "train/skipped_nonfinite_loss",
-            "train/skipped_nonfinite_grad_norm",
-        ):
-            trace_scalars[key.replace("/", ".")] = optimizer_metrics.get(key, 0.0)
+        trace_scalars = _build_train_step_trace_scalars(
+            replay_batch=replay_batch,
+            fwd_bwd_metrics=fwd_bwd_metrics,
+            optimizer_metrics=optimizer_metrics,
+            checkpoint_saved=checkpoint_saved,
+            timings=timings,
+            dropped_empty_groups=dropped_empty_groups,
+            dropped_zero_advantage_groups=dropped_zero_advantage_groups,
+            train_version=train_version,
+        )
         sl.log_trace_scalar(trace_scalars)
         self.metrics_processor.log(
             step=step,

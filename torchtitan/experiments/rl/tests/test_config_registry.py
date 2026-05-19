@@ -4,6 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
+
+import pytest
+
 from torchtitan.experiments.rl.config_registry import (
     rl_dapo_qwen3_1_7b_alphabet_sort_2gpu,
     rl_dapo_qwen3_4b_alphabet_sort,
@@ -22,6 +26,7 @@ def test_1_7b_configs_disable_compile():
     assert not cfg.compile.enable
     assert cfg.trainer.max_microbatch_samples == 4
     assert cfg.trainer.lr_scheduler.warmup_steps == 0
+    assert cfg.trainer.lr_scheduler.decay_ratio == 0.0
     assert cfg.generator.sampling.top_p == 1.0
 
 
@@ -39,6 +44,7 @@ def test_alphabet_sort_1_7b_dapo_2gpu_config_stays_on_two_gpus():
     assert not cfg.compile.enable
     assert cfg.trainer.max_microbatch_samples == 4
     assert cfg.trainer.lr_scheduler.warmup_steps == 0
+    assert cfg.trainer.lr_scheduler.decay_ratio == 0.0
     assert cfg.generator.sampling.top_p == 1.0
     assert isinstance(cfg.trainer.loss, DAPOLoss.Config)
 
@@ -52,6 +58,7 @@ def test_alphabet_sort_0_6b_defaults_keep_compile_and_disable_thinking():
     assert cfg.generator.sampling.top_p == 1.0
     assert cfg.trainer.max_microbatch_samples == 8
     assert cfg.trainer.lr_scheduler.warmup_steps == 0
+    assert cfg.trainer.lr_scheduler.decay_ratio == 0.0
     assert cfg.train_dataset.max_turns == 3
     assert cfg.train_dataset.max_names_per_turn == 4
 
@@ -77,6 +84,7 @@ def test_alphabet_sort_4b_uses_8_gpu_async_recipe():
     assert cfg.trainer.optimizer.lr == 5e-7
     assert cfg.trainer.max_microbatch_samples == 1
     assert cfg.trainer.lr_scheduler.warmup_steps == 0
+    assert cfg.trainer.lr_scheduler.decay_ratio == 0.0
     assert cfg.trainer.parallelism.tensor_parallel_degree == 4
     assert cfg.generator.parallelism.tensor_parallel_degree == 4
     assert cfg.generator.gpu_memory_limit == 0.85
@@ -106,5 +114,17 @@ def test_alphabet_sort_4b_dapo_2gpu_config_stays_on_two_gpus():
     assert cfg.trainer.parallelism.tensor_parallel_degree == 1
     assert cfg.generator.parallelism.tensor_parallel_degree == 1
     assert cfg.trainer.lr_scheduler.warmup_steps == 0
+    assert cfg.trainer.lr_scheduler.decay_ratio == 0.0
     assert cfg.generator.sampling.temperature == 1.0
     assert cfg.generator.sampling.top_p == 1.0
+
+
+def test_alphabet_sort_configs_reject_unsupported_top_p():
+    cfg = rl_dapo_qwen3_1_7b_alphabet_sort_2gpu()
+    generator = dataclasses.replace(
+        cfg.generator,
+        sampling=dataclasses.replace(cfg.generator.sampling, top_p=0.95),
+    )
+
+    with pytest.raises(ValueError, match="top_p=1.0"):
+        dataclasses.replace(cfg, generator=generator)
