@@ -29,7 +29,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from importlib import import_module
+from pathlib import Path
+
+if __package__ in (None, ""):
+    # Keep path-style smoke commands using this worktree's package instead of
+    # an editable torchtitan install from the active environment.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 # Must set spawn method before any CUDA operations or vLLM imports
 # CUDA cannot be re-initialized in forked subprocesses
@@ -41,8 +48,8 @@ from vllm import LLMEngine, SamplingParams
 from vllm.logger import init_logger
 
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.experiments.rl.actors.generator import (
-    _build_torchtitan_vllm_engine_args,
+from torchtitan.experiments.rl.models.vllm_engine import (
+    build_torchtitan_vllm_engine_args,
 )
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.sampling import SamplingConfig
@@ -102,7 +109,7 @@ def _build_engine(config) -> LLMEngine:
     gen_config = config.generator
     model_path = config.hf_assets_path
 
-    engine_args = _build_torchtitan_vllm_engine_args(
+    engine_args = build_torchtitan_vllm_engine_args(
         config=gen_config,
         model_spec=config.model_spec,
         model_path=model_path,

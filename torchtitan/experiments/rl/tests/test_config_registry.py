@@ -11,6 +11,7 @@ import pytest
 from torchtitan.experiments.rl.config_registry import (
     diagnostic_rl_dapo_qwen3_4b_alphabet_sort_2gpu,
     rl_dapo_qwen3_1_7b_alphabet_sort_2gpu,
+    rl_dapo_qwen3_1_7b_alphabet_sort_2gpu_acceptance,
     rl_dapo_qwen3_4b_alphabet_sort,
     rl_grpo_qwen3_0_6b_alphabet_sort,
     rl_grpo_qwen3_1_7b,
@@ -46,6 +47,24 @@ def test_alphabet_sort_1_7b_dapo_2gpu_config_stays_on_two_gpus():
     assert cfg.trainer.lr_scheduler.warmup_steps == 0
     assert cfg.trainer.lr_scheduler.decay_ratio == 0.0
     assert cfg.generator.sampling.top_p == 1.0
+    assert isinstance(cfg.trainer.loss, DAPOLoss.Config)
+
+
+def test_alphabet_sort_1_7b_dapo_2gpu_acceptance_config():
+    cfg = rl_dapo_qwen3_1_7b_alphabet_sort_2gpu_acceptance()
+
+    assert cfg.model_spec.flavor == "1.7B"
+    assert cfg.num_steps == 100
+    assert cfg.num_prompts_per_step == 32
+    assert cfg.num_validation_samples == 64
+    assert cfg.async_rollout_groups == 32
+    assert cfg.replay_buffer_groups == 64
+    assert cfg.trainer.optimizer.lr == 2e-6
+    assert cfg.trainer.parallelism.tensor_parallel_degree == 1
+    assert cfg.generator.parallelism.tensor_parallel_degree == 1
+    assert cfg.generator.sampling.max_tokens == 512
+    assert cfg.metrics.enable_wandb
+    assert not cfg.compile.enable
     assert isinstance(cfg.trainer.loss, DAPOLoss.Config)
 
 

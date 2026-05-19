@@ -26,25 +26,19 @@ from torchtitan.experiments.rl.actors.utils import (
     cuda_memory_stats,
     reset_cuda_peak_memory_stats,
 )
-from torchtitan.experiments.rl.models.vllm_registry import (
-    registry_to_vllm,
-    TORCHTITAN_CONFIG_FORMAT,
+from torchtitan.experiments.rl.models.vllm_engine import (
+    build_torchtitan_vllm_engine_args,
 )
 from torchtitan.experiments.rl.observability import metrics as m
-from torchtitan.experiments.rl.sampling import (
-    SamplingConfig,
-    TRAINING_VLLM_LOGPROBS_MODE,
-)
+from torchtitan.experiments.rl.sampling import SamplingConfig
 from torchtitan.experiments.rl.types import Completion
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import init_logger
-from torchtitan.tools.utils import has_cuda_capability
-from vllm import EngineArgs, LLMEngine, SamplingParams
-from vllm.config import AttentionConfig, CompilationConfig
+from vllm import LLMEngine, SamplingParams
+from vllm.config import CompilationConfig
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = logging.getLogger(__name__)
 
@@ -147,70 +141,6 @@ class VLLMCudagraphConfig:
             mode=0,
             cudagraph_capture_sizes=sorted(sizes),
         )
-
-
-def _build_torchtitan_vllm_engine_args(
-    *,
-    config,
-    model_spec: ModelSpec,
-    model_path: str,
-    compile_config: CompileConfig,
-    checkpoint_config: CheckpointManager.Config,
-    max_num_seqs: int,
-) -> EngineArgs:
-    """Configure vLLM's TorchTitan wrapper path and build EngineArgs.
-
-    Side effects: sets vLLM env vars and registers TorchTitan's model/config
-    parser with vLLM before returning the engine construction arguments.
-    """
-    os.environ["VLLM_ATTENTION_BACKEND"] = "CUSTOM"
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
-    registry_to_vllm(
-        model_spec,
-        parallelism=config.parallelism,
-        compile_config=compile_config,
-        checkpoint_config=checkpoint_config,
-    )
-    engine_kwargs = dict(
-        # ``model`` is the path to the HF checkpoint directory. The
-        # config is sourced from torchtitan's ModelSpec via
-        # ``config_format=TORCHTITAN_CONFIG_FORMAT`` (no config.json
-        # read), but vLLM still uses this path to locate the
-        # tokenizer assets and the safetensors weight shards.
-        model=model_path,
-        trust_remote_code=True,
-        # Use the torchtitan custom config parser (registered by
-        # registry_to_vllm above). It builds PretrainedConfig from
-        # ModelSpec instead of reading config.json from disk.
-        config_format=TORCHTITAN_CONFIG_FORMAT,
-        dtype=config.model_dtype,
-        tensor_parallel_size=config.parallelism.tensor_parallel_degree,
-        # Monarch already spawned TP workers via proc mesh. "external_launcher"
-        # tells vLLM to run one worker per process (no subprocess spawning)
-        distributed_executor_backend="external_launcher",
-        gpu_memory_utilization=config.gpu_memory_limit,
-        enforce_eager=not config.cudagraph.enable,
-        attention_config=AttentionConfig(
-            backend=AttentionBackendEnum.CUSTOM,
-        ),
-        # Enables RequestOutput.metrics, so generator metrics can be returned
-        disable_log_stats=False,
-        # Return logprobs after sampling-temperature processing, so trainer
-        # policy logprobs and behavior logprobs live in the same space.
-        logprobs_mode=TRAINING_VLLM_LOGPROBS_MODE,
-    )
-    engine_kwargs["max_num_seqs"] = max_num_seqs
-    # FA2 requires block_size to be a multiple of 256
-    if not has_cuda_capability(9, 0):
-        engine_kwargs["block_size"] = 256
-    vllm_compilation_config = config.cudagraph.get_vllm_compilation_config(
-        max_num_seqs=max_num_seqs,
-    )
-    if vllm_compilation_config is not None:
-        engine_kwargs["compilation_config"] = vllm_compilation_config
-    if config.debug.seed is not None:
-        engine_kwargs["seed"] = config.debug.seed
-    return EngineArgs(**engine_kwargs)
 
 
 class VLLMGenerator(Actor, Configurable):
@@ -329,7 +259,7 @@ class VLLMGenerator(Actor, Configurable):
 
         self.model_path = model_path
 
-        engine_args = _build_torchtitan_vllm_engine_args(
+        engine_args = build_torchtitan_vllm_engine_args(
             config=config,
             model_spec=model_spec,
             model_path=model_path,

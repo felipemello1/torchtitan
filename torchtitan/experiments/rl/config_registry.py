@@ -330,6 +330,26 @@ def rl_dapo_qwen3_1_7b_alphabet_sort_2gpu() -> RLTrainer.Config:
     )
 
 
+def rl_dapo_qwen3_1_7b_alphabet_sort_2gpu_acceptance() -> RLTrainer.Config:
+    """Reward-up acceptance recipe for Qwen3-1.7B AlphabetSort on 2 GPUs."""
+    return _alphabet_sort_config(
+        model_size="1.7B",
+        hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-1.7B",
+        lr=2e-6,
+        num_steps=100,
+        num_prompts_per_step=32,
+        num_validation_samples=64,
+        trainer_tensor_parallel_degree=1,
+        generator_tensor_parallel_degree=1,
+        async_rollout_groups=32,
+        replay_buffer_groups=64,
+        generator_max_tokens=512,
+        compile_config=CompileConfig(enable=False),
+        trainer_max_microbatch_samples=4,
+        loss=_dapo_loss(),
+    )
+
+
 def _alphabet_sort_4b_config(
     *, loss: GRPOLoss.Config | DAPOLoss.Config | None = None
 ) -> RLTrainer.Config:
