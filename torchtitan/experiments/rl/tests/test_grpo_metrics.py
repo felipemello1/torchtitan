@@ -862,6 +862,10 @@ def test_validation_metric_rename_handles_reward_summary_keys():
         generation_metrics=[],
         prefix="rollout",
     )
+    train_aggregate = m.MetricsProcessor._aggregate_metrics(metrics)
+    assert train_aggregate["reward/_mean"] == 1.0
+    assert "rollout/reward/_mean" not in train_aggregate
+
     renamed = [
         rename_metric_prefix(metric, old_prefix="rollout/", new_prefix="validation/")
         for metric in metrics

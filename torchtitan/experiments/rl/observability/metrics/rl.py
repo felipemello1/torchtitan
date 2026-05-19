@@ -77,7 +77,12 @@ def rename_metric_prefix(
     old_prefix: str,
     new_prefix: str,
 ) -> m.Metric:
-    """Replace a metric key prefix while preserving its value object."""
+    """Replace a metric key prefix while preserving its value object.
+
+    Reward summary metrics are intentionally bare in train logs
+    (``reward/...``), so validation uses this helper to move them under
+    ``validation/reward/...`` alongside validation-only rollout metrics.
+    """
     if metric.key.startswith(old_prefix):
         return m.Metric(new_prefix + metric.key[len(old_prefix) :], metric.value)
     if metric.key == "reward":
@@ -136,7 +141,13 @@ def build_rollout_metrics(
     generation_metrics: Sequence[m.Metric],
     prefix: str,
 ) -> list[m.Metric]:
-    """Build rollout, reward, and generator metrics for a rollout set."""
+    """Build rollout, reward, and generator metrics for a rollout set.
+
+    ``prefix`` namespaces rollout shape/status metrics. Reward summaries stay
+    top-level as ``reward/...`` for train console readability; validation
+    callers move them under ``validation/reward/...`` with
+    ``rename_metric_prefix``.
+    """
     response_lens = [
         len(turn.response_token_ids) for rollout in rollouts for turn in rollout.turns
     ]
