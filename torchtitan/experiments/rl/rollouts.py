@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from renderers import Renderer
 
+from torchtitan.experiments.rl.envs import EnvBuilder, EnvExample
 from torchtitan.experiments.rl.envs.token_env import TokenEnv, TokenEnvConfig
 from torchtitan.experiments.rl.envs.types import MessageEnv
 from torchtitan.experiments.rl.sampling import SamplingConfig
@@ -26,6 +28,15 @@ from torchtitan.experiments.rl.types import (
 
 
 CompletionFn = Callable[[list[int], SamplingConfig, str], Awaitable[Completion]]
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class RolloutGroupResult:
+    """Completed rollout group plus behavior-version summary."""
+
+    rollouts: list[RolloutOutput]
+    behavior_version: int | None
+    max_behavior_version: int | None
 
 
 async def do_single_rollout(
@@ -104,7 +115,57 @@ async def do_single_rollout(
     return output
 
 
-async def do_rollout_group(
+async def run_rollout_group(
+    *,
+    env_builder: EnvBuilder,
+    example: EnvExample,
+    group_size: int,
+    renderer: Renderer,
+    completion_fn: CompletionFn,
+    sampling: SamplingConfig,
+    max_turns: int,
+    token_env_config: TokenEnvConfig,
+) -> RolloutGroupResult:
+    """Run one GRPO group from a concrete dataset example."""
+    envs: list[MessageEnv] = []
+    try:
+        for _ in range(group_size):
+            envs.append(env_builder.build(example=example))
+    except BaseException:
+        await asyncio.gather(
+            *(env.close() for env in envs),
+            return_exceptions=True,
+        )
+        raise
+
+    rollouts = await _run_env_rollouts(
+        envs=envs,
+        renderer=renderer,
+        completion_fn=completion_fn,
+        sampling=sampling,
+        group_id=example.group_id,
+        max_turns=max_turns,
+        token_env_config=token_env_config,
+    )
+    versioned_rollouts = [rollout for rollout in rollouts if rollout.turns]
+    behavior_version = (
+        min(rollout.behavior_version for rollout in versioned_rollouts)
+        if versioned_rollouts
+        else None
+    )
+    max_behavior_version = (
+        max(rollout.max_behavior_version for rollout in versioned_rollouts)
+        if versioned_rollouts
+        else None
+    )
+    return RolloutGroupResult(
+        rollouts=rollouts,
+        behavior_version=behavior_version,
+        max_behavior_version=max_behavior_version,
+    )
+
+
+async def _run_env_rollouts(
     *,
     envs: list[MessageEnv],
     renderer: Renderer,
@@ -114,11 +175,7 @@ async def do_rollout_group(
     max_turns: int,
     token_env_config: TokenEnvConfig,
 ) -> list[RolloutOutput]:
-    """Run one GRPO group concurrently and close every env.
-
-    The caller owns env construction so config-based envs, dataset builders,
-    and future remote-env proxies all use the same group rollout path.
-    """
+    """Run one GRPO group concurrently and close every env."""
     token_envs = [TokenEnv(env, renderer, token_env_config) for env in envs]
     tasks = [
         asyncio.create_task(

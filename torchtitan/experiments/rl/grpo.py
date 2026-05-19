@@ -67,10 +67,7 @@ from torchtitan.experiments.rl.replay import (
     rollouts_to_replay_samples,
 )
 from torchtitan.experiments.rl.rollout_logging import RolloutSampleLogger
-from torchtitan.experiments.rl.rollout_runner import (
-    RolloutGroupResult,
-    run_rollout_group,
-)
+from torchtitan.experiments.rl.rollouts import RolloutGroupResult, run_rollout_group
 from torchtitan.experiments.rl.sampling import SamplingConfig
 from torchtitan.experiments.rl.types import (
     Completion,
@@ -197,8 +194,21 @@ def _log_samples(rollouts: list[RolloutOutput]) -> None:
             logger.info(f"       A: {text[:300].replace(chr(10), ' ').strip()}")
 
 
-def _raise_rollout_task_errors(tasks: list[asyncio.Task[None]]) -> None:
+async def _raise_rollout_task_errors(
+    tasks: list[asyncio.Task[None]],
+    *,
+    timeout_s: float = 0.0,
+) -> None:
     """Surface background rollout producer failures on the trainer path."""
+    if timeout_s > 0.0:
+        await asyncio.wait(
+            tasks,
+            timeout=timeout_s,
+            return_when=asyncio.FIRST_EXCEPTION,
+        )
+    else:
+        await asyncio.sleep(0)
+
     for task in tasks:
         if task.done() and not task.cancelled():
             exc = task.exception()
@@ -210,14 +220,59 @@ def _raise_rollout_task_errors(tasks: list[asyncio.Task[None]]) -> None:
 class _RolloutDropCounters:
     """Producer-side rollout drops accumulated between optimizer steps."""
 
+    max_no_signal_groups: int | None
     empty_groups: int = 0
     zero_advantage_groups: int = 0
+    consecutive_dropped_groups: int = 0
+    consecutive_empty_groups: int = 0
+    consecutive_zero_advantage_groups: int = 0
 
     def pop(self) -> tuple[int, int]:
         values = (self.empty_groups, self.zero_advantage_groups)
         self.empty_groups = 0
         self.zero_advantage_groups = 0
         return values
+
+    def record_empty(self) -> None:
+        self.empty_groups += 1
+        self.consecutive_empty_groups += 1
+        self._record_drop()
+
+    def record_zero_advantage(self) -> None:
+        self.zero_advantage_groups += 1
+        self.consecutive_zero_advantage_groups += 1
+        self._record_drop()
+
+    def record_admitted(self) -> None:
+        self.consecutive_dropped_groups = 0
+        self.consecutive_empty_groups = 0
+        self.consecutive_zero_advantage_groups = 0
+
+    def _record_drop(self) -> None:
+        self.consecutive_dropped_groups += 1
+        if (
+            self.max_no_signal_groups is not None
+            and self.consecutive_dropped_groups >= self.max_no_signal_groups
+        ):
+            raise RuntimeError(
+                "no trainable rollout groups admitted after "
+                f"{self.consecutive_dropped_groups} consecutive drops "
+                f"({self.consecutive_empty_groups} empty, "
+                f"{self.consecutive_zero_advantage_groups} zero-advantage). "
+                "The task may have no reward variation for the current model; "
+                "try a harder task, higher sampling temperature, or "
+                "--no-drop-zero-advantage-groups for debugging."
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class _WeightSyncTimings:
+    """Wall-clock timing for one trainer-to-generator weight sync."""
+
+    admission_drain_s: float
+    push_s: float
+    pull_s: float
+    total_s: float
 
 
 class RLTrainer(Configurable):
@@ -313,6 +368,13 @@ class RLTrainer(Configurable):
         the model produces no reward variation.
         """
 
+        max_no_signal_groups: int | None = 100
+        """Fail after this many consecutive producer-side dropped groups.
+
+        Prevents saturated or broken tasks from waiting forever on replay
+        admission. ``None`` disables the guard.
+        """
+
         metrics: m.MetricsProcessor.Config = field(
             default_factory=m.MetricsProcessor.Config
         )
@@ -383,6 +445,11 @@ class RLTrainer(Configurable):
                 raise ValueError(
                     "max_rollout_sample_groups must be non-negative, "
                     f"got {self.max_rollout_sample_groups}"
+                )
+            if self.max_no_signal_groups is not None and self.max_no_signal_groups <= 0:
+                raise ValueError(
+                    "max_no_signal_groups must be positive or None, got "
+                    f"{self.max_no_signal_groups}"
                 )
 
     def __init__(self, config: Config):
@@ -746,6 +813,39 @@ class RLTrainer(Configurable):
             return sampling
         return dataclasses.replace(sampling, stop_token_ids=stop_token_ids)
 
+    async def _sync_generator_weights(
+        self,
+        *,
+        generation_scheduler: GenerationScheduler,
+        policy_version: int,
+    ) -> _WeightSyncTimings:
+        t_weight_sync_start = time.perf_counter()
+        with sl.log_trace_span("weight_sync_admission_drain"):
+            await generation_scheduler.pause_for_weight_sync()
+        t_weight_sync_drain_s = time.perf_counter() - t_weight_sync_start
+
+        try:
+            t_weight_sync_push_start = time.perf_counter()
+            with sl.log_trace_span("trainer_push_model_state_dict"):
+                await self._await_call(self.trainer.push_model_state_dict.call())
+            t_weight_sync_push_s = time.perf_counter() - t_weight_sync_push_start
+
+            t_weight_sync_pull_start = time.perf_counter()
+            with sl.log_trace_span("generator_pull_model_state_dict"):
+                await self._await_call(
+                    self.generator.pull_model_state_dict.call(policy_version)
+                )
+            t_weight_sync_pull_s = time.perf_counter() - t_weight_sync_pull_start
+        finally:
+            await generation_scheduler.resume_after_weight_sync()
+
+        return _WeightSyncTimings(
+            admission_drain_s=t_weight_sync_drain_s,
+            push_s=t_weight_sync_push_s,
+            pull_s=t_weight_sync_pull_s,
+            total_s=time.perf_counter() - t_weight_sync_start,
+        )
+
     async def _collect_validation_rollouts(
         self,
         *,
@@ -869,7 +969,7 @@ class RLTrainer(Configurable):
                 if shutdown.is_set():
                     return
                 if not samples:
-                    drop_counters.empty_groups += 1
+                    drop_counters.record_empty()
                     sl.log_trace_scalar(
                         {
                             "rollout.dropped_empty_groups": 1,
@@ -879,7 +979,7 @@ class RLTrainer(Configurable):
                     continue
                 has_signal = has_advantage_signal(samples, eps=_ZERO_ADVANTAGE_EPS)
                 if self.config.drop_zero_advantage_groups and not has_signal:
-                    drop_counters.zero_advantage_groups += 1
+                    drop_counters.record_zero_advantage()
                     sl.log_trace_scalar(
                         {
                             "rollout.dropped_zero_advantage_groups": 1,
@@ -892,7 +992,7 @@ class RLTrainer(Configurable):
                     result.behavior_version is None
                     or result.max_behavior_version is None
                 ):
-                    drop_counters.empty_groups += 1
+                    drop_counters.record_empty()
                     sl.log_trace_scalar(
                         {
                             "rollout.dropped_empty_groups": 1,
@@ -910,6 +1010,7 @@ class RLTrainer(Configurable):
                         "rollout.num_samples": len(samples),
                     }
                 )
+                drop_counters.record_admitted()
                 with sl.log_trace_span("replay_buffer_put"):
                     await replay_buffer.put(
                         ReplayGroup(
@@ -1007,7 +1108,9 @@ class RLTrainer(Configurable):
         generation_scheduler = self._make_generation_scheduler(
             metrics_prefix="generator",
         )
-        drop_counters = _RolloutDropCounters()
+        drop_counters = _RolloutDropCounters(
+            max_no_signal_groups=self.config.max_no_signal_groups,
+        )
         shutdown = asyncio.Event()
         next_group_idx = 0
         next_group_lock = asyncio.Lock()
@@ -1059,7 +1162,7 @@ class RLTrainer(Configurable):
                         train_version=batch_train_version,
                     )
                 t_buffer_wait_s = time.perf_counter() - t_buffer_start
-                _raise_rollout_task_errors(rollout_tasks)
+                await _raise_rollout_task_errors(rollout_tasks)
 
                 (
                     dropped_empty_groups,
@@ -1074,6 +1177,10 @@ class RLTrainer(Configurable):
                 if self.config.log_samples:
                     _log_samples(rollouts)
                 if not samples:
+                    await _raise_rollout_task_errors(
+                        rollout_tasks,
+                        timeout_s=1.0,
+                    )
                     raise RuntimeError(
                         "replay buffer closed before producing trainable samples"
                     )
@@ -1101,33 +1208,11 @@ class RLTrainer(Configurable):
                 optimizer_metrics = optim_output.metrics
                 t_train_s = time.perf_counter() - t_train_start
 
-                t_weight_sync_start = time.perf_counter()
-                with sl.log_trace_span("weight_sync_admission_drain"):
-                    await generation_scheduler.pause_for_weight_sync()
-                t_weight_sync_drain_s = time.perf_counter() - t_weight_sync_start
-                try:
-                    t_weight_sync_push_start = time.perf_counter()
-                    with sl.log_trace_span("trainer_push_model_state_dict"):
-                        await self._await_call(
-                            self.trainer.push_model_state_dict.call()
-                        )
-                    t_weight_sync_push_s = (
-                        time.perf_counter() - t_weight_sync_push_start
-                    )
-                    t_weight_sync_pull_start = time.perf_counter()
-                    with sl.log_trace_span("generator_pull_model_state_dict"):
-                        await self._await_call(
-                            self.generator.pull_model_state_dict.call(
-                                trainer_policy_version
-                            )
-                        )
-                    t_weight_sync_pull_s = (
-                        time.perf_counter() - t_weight_sync_pull_start
-                    )
-                finally:
-                    await generation_scheduler.resume_after_weight_sync()
+                weight_sync_timings = await self._sync_generator_weights(
+                    generation_scheduler=generation_scheduler,
+                    policy_version=trainer_policy_version,
+                )
                 policy_version = trainer_policy_version
-                t_weight_sync_total_s = time.perf_counter() - t_weight_sync_start
 
                 if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
                     logger.error("Loss is NaN/Inf; training diverged")
@@ -1207,10 +1292,13 @@ class RLTrainer(Configurable):
                     ("timing/step", t_step_s),
                     ("timing/replay_wait", t_buffer_wait_s),
                     ("timing/train", t_train_s),
-                    ("timing/weight_sync/admission_drain", t_weight_sync_drain_s),
-                    ("timing/weight_sync/push", t_weight_sync_push_s),
-                    ("timing/weight_sync/pull", t_weight_sync_pull_s),
-                    ("timing/weight_sync/total", t_weight_sync_total_s),
+                    (
+                        "timing/weight_sync/admission_drain",
+                        weight_sync_timings.admission_drain_s,
+                    ),
+                    ("timing/weight_sync/push", weight_sync_timings.push_s),
+                    ("timing/weight_sync/pull", weight_sync_timings.pull_s),
+                    ("timing/weight_sync/total", weight_sync_timings.total_s),
                     ("timing/checkpoint", t_checkpoint_s),
                 ]:
                     step_metrics.append(m.Metric(key, m.NoReduce(value)))
@@ -1235,10 +1323,14 @@ class RLTrainer(Configurable):
                         "replay.behavior_version_max": behavior_version_max,
                         "timing.replay_wait_ms": t_buffer_wait_s * 1000,
                         "timing.weight_sync_admission_drain_ms": (
-                            t_weight_sync_drain_s * 1000
+                            weight_sync_timings.admission_drain_s * 1000
                         ),
-                        "timing.weight_sync_push_ms": t_weight_sync_push_s * 1000,
-                        "timing.weight_sync_pull_ms": t_weight_sync_pull_s * 1000,
+                        "timing.weight_sync_push_ms": (
+                            weight_sync_timings.push_s * 1000
+                        ),
+                        "timing.weight_sync_pull_ms": (
+                            weight_sync_timings.pull_s * 1000
+                        ),
                         "timing.checkpoint_ms": t_checkpoint_s * 1000,
                         "checkpoint.saved": float(checkpoint_saved),
                     }

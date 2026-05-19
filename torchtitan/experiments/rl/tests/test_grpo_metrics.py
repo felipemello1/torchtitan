@@ -11,10 +11,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from torchtitan.experiments.rl.envs import EnvStep
+from torchtitan.experiments.rl.envs import EnvExample, EnvStep
 from torchtitan.experiments.rl.envs.token_env import PromptState, TokenEnv, TokenStep
 from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
-from torchtitan.experiments.rl.grpo import Provisioner, RLTrainer
+from torchtitan.experiments.rl.grpo import (
+    _raise_rollout_task_errors,
+    _RolloutDropCounters,
+    Provisioner,
+    RLTrainer,
+)
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.observability.metrics.rl import (
     build_rollout_metrics,
@@ -27,7 +32,7 @@ from torchtitan.experiments.rl.replay import (
     rollouts_to_replay_samples,
 )
 from torchtitan.experiments.rl.rollout_logging import RolloutSampleLogger
-from torchtitan.experiments.rl.rollouts import do_single_rollout
+from torchtitan.experiments.rl.rollouts import do_single_rollout, run_rollout_group
 from torchtitan.experiments.rl.sampling import SamplingConfig
 from torchtitan.experiments.rl.sum_digits import SumDigitsBuilder, SumDigitsDataset
 from torchtitan.experiments.rl.types import (
@@ -184,6 +189,51 @@ def test_sum_digits_dataset_and_builder_have_separate_roles():
         assert isinstance(example.payload["target"], int)
         assert reset.messages[0]["role"] == "system"
         assert reset.messages[1]["role"] == "user"
+
+    asyncio.run(run())
+
+
+def test_run_rollout_group_closes_partially_built_envs_on_build_failure():
+    class EnvStub:
+        def __init__(self):
+            self.closed = False
+
+        async def reset(self):
+            raise AssertionError("rollout should not start after build failure")
+
+        async def step(self, assistant_message):
+            raise AssertionError("rollout should not start after build failure")
+
+        async def close(self):
+            self.closed = True
+
+    class BuilderStub:
+        def __init__(self):
+            self.first_env = EnvStub()
+            self.calls = 0
+
+        def build(self, *, example: EnvExample):
+            self.calls += 1
+            if self.calls == 1:
+                return self.first_env
+            raise RuntimeError("build failed")
+
+    async def run() -> None:
+        builder = BuilderStub()
+
+        with pytest.raises(RuntimeError, match="build failed"):
+            await run_rollout_group(
+                env_builder=builder,
+                example=EnvExample(group_id="g0", step=0, group_idx=0),
+                group_size=2,
+                renderer=None,
+                completion_fn=None,
+                sampling=SamplingConfig(n=1),
+                max_turns=1,
+                token_env_config=None,
+            )
+
+        assert builder.first_env.closed
 
     asyncio.run(run())
 
@@ -535,6 +585,49 @@ def test_has_advantage_signal_detects_nonzero_group_signal():
 
     assert not has_advantage_signal([sample("zero", 0.0)])
     assert has_advantage_signal([sample("signal", 0.0), sample("signal", 0.5)])
+
+
+def test_rollout_drop_counters_fail_after_consecutive_no_signal_groups():
+    counters = _RolloutDropCounters(max_no_signal_groups=3)
+
+    counters.record_empty()
+    counters.record_zero_advantage()
+    with pytest.raises(RuntimeError, match="no trainable rollout groups admitted"):
+        counters.record_zero_advantage()
+
+
+def test_rollout_drop_counters_reset_after_admitted_group():
+    counters = _RolloutDropCounters(max_no_signal_groups=3)
+
+    counters.record_empty()
+    counters.record_zero_advantage()
+    counters.record_admitted()
+    counters.record_zero_advantage()
+    assert counters.consecutive_dropped_groups == 1
+    assert counters.consecutive_empty_groups == 0
+    assert counters.consecutive_zero_advantage_groups == 1
+
+
+def test_replay_wait_surfaces_no_signal_producer_error():
+    async def run() -> None:
+        buffer = ReplayBuffer(max_groups=1)
+        counters = _RolloutDropCounters(max_no_signal_groups=1)
+
+        async def producer() -> None:
+            try:
+                counters.record_zero_advantage()
+            except RuntimeError:
+                await buffer.close()
+                raise
+
+        task = asyncio.create_task(producer())
+        batch = await buffer.get_batch(min_samples=1, train_version=0)
+
+        assert not batch.samples
+        with pytest.raises(RuntimeError, match="no trainable rollout groups"):
+            await _raise_rollout_task_errors([task], timeout_s=1.0)
+
+    asyncio.run(run())
 
 
 def test_replay_buffer_blocks_until_batch_is_ready():
