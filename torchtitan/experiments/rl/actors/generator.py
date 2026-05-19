@@ -57,14 +57,6 @@ def _prepare_generation_request_metrics(
     For `[num_prompts]` submitted prompts, vLLM returns `[num_prompts]`
     per parent `RequestOutput`s (one per `add_request` call), each carrying
     a single `RequestStateStats` on `.metrics`.
-
-    Caveat under `SamplingParams.n > 1`: vLLM stores one `RequestStateStats`
-    per child request; the parent output exposes the **last-finishing**
-    child's timeline. `arrival_time` is shared across siblings, but
-    [`queued_ts`, `scheduled_ts`, `first_token_ts`, `last_token_ts`,
-    `num_generation_tokens`] describe one specific child — not an aggregate,
-    not the first sibling's. The other `n-1` siblings' stats are dropped by
-    vLLM at ``output_processor._finish_request``.
     """
 
     # TODO: Per-request fields here come from RequestOutput.metrics
@@ -267,14 +259,6 @@ class VLLMGenerator(Actor, Configurable):
         # from its rollout and validation concurrency.
         self._max_num_seqs = max_num_seqs
 
-        # Register TorchTitan model + parser with vLLM
-        registry_to_vllm(
-            model_spec,
-            parallelism=config.parallelism,
-            compile_config=compile_config,
-            checkpoint_config=config.checkpoint,
-        )
-
         # Set vLLM environment variables from config before any vLLM initialization
         os.environ["VLLM_ATTENTION_BACKEND"] = "CUSTOM"
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
@@ -285,7 +269,45 @@ class VLLMGenerator(Actor, Configurable):
 
         self.model_path = model_path
 
-        # Build vLLM engine
+        engine_args = self.build_engine_args(
+            config=config,
+            model_spec=model_spec,
+            model_path=model_path,
+            compile_config=compile_config,
+            checkpoint_config=config.checkpoint,
+            max_num_seqs=self._max_num_seqs,
+        )
+
+        with sl.log_trace_span("vllm_init"):
+            logger.info("Initializing LLMEngine from EngineArgs...")
+            self._engine = LLMEngine.from_engine_args(engine_args)
+            logger.info("vLLM rollout engine initialized")
+
+        self._engine_lock = asyncio.Lock()
+        self._pending_outputs: dict[str, asyncio.Future[RequestOutput]] = {}
+        self._engine_driver_task: asyncio.Task[None] | None = None
+        self._next_request_id = 0
+        self.policy_version = 0
+
+        logger.info("Generator initialized with vLLM engine")
+
+    @staticmethod
+    def build_engine_args(
+        *,
+        config: Config,
+        model_spec: ModelSpec,
+        model_path: str,
+        compile_config: CompileConfig,
+        checkpoint_config: CheckpointManager.Config,
+        max_num_seqs: int,
+    ) -> EngineArgs:
+        """Build EngineArgs for the RL vLLM wrapper path."""
+        registry_to_vllm(
+            model_spec,
+            parallelism=config.parallelism,
+            compile_config=compile_config,
+            checkpoint_config=checkpoint_config,
+        )
         engine_kwargs = dict(
             # ``model`` is the path to the HF checkpoint directory. The
             # config is sourced from torchtitan's ModelSpec via
@@ -314,31 +336,18 @@ class VLLMGenerator(Actor, Configurable):
             # policy logprobs and behavior logprobs live in the same space.
             logprobs_mode=TRAINING_VLLM_LOGPROBS_MODE,
         )
-        engine_kwargs["max_num_seqs"] = self._max_num_seqs
+        engine_kwargs["max_num_seqs"] = max_num_seqs
         # FA2 requires block_size to be a multiple of 256
         if not has_cuda_capability(9, 0):
             engine_kwargs["block_size"] = 256
         vllm_compilation_config = config.cudagraph.get_vllm_compilation_config(
-            max_num_seqs=self._max_num_seqs,
+            max_num_seqs=max_num_seqs,
         )
         if vllm_compilation_config is not None:
             engine_kwargs["compilation_config"] = vllm_compilation_config
         if config.debug.seed is not None:
             engine_kwargs["seed"] = config.debug.seed
-        engine_args = EngineArgs(**engine_kwargs)
-
-        with sl.log_trace_span("vllm_init"):
-            logger.info("Initializing LLMEngine from EngineArgs...")
-            self._engine = LLMEngine.from_engine_args(engine_args)
-            logger.info("vLLM rollout engine initialized")
-
-        self._engine_lock = asyncio.Lock()
-        self._pending_outputs: dict[str, asyncio.Future[RequestOutput]] = {}
-        self._engine_driver_task: asyncio.Task[None] | None = None
-        self._next_request_id = 0
-        self.policy_version = 0
-
-        logger.info("Generator initialized with vLLM engine")
+        return EngineArgs(**engine_kwargs)
 
     @staticmethod
     def _set_determinism(debug: DebugConfig) -> None:
@@ -597,10 +606,9 @@ class VLLMGenerator(Actor, Configurable):
         """Generate completions and generator metrics for tokenized prompts.
 
         Takes ``prompt_token_ids_batch`` as ``[num_prompts][prompt_tokens]``.
-        Returns completions as ``[num_prompts * n]`` plus generator metrics,
-        where ``n`` is the resolved ``SamplingConfig.n`` completions per prompt.
-        In the RL loop, the controller scheduler owns concurrent TP-safe
-        admission and calls this endpoint with ordered batches.
+        Returns one completion per prompt plus generator metrics. GRPO sibling
+        sampling is owned by ``rollout_group_size``; this endpoint intentionally
+        requires ``SamplingConfig.n == 1``.
 
         Args:
             prompt_token_ids_batch: Tokenized prompts shaped
@@ -620,6 +628,12 @@ class VLLMGenerator(Actor, Configurable):
         _sampling_config = (
             sampling_config if sampling_config is not None else self.config.sampling
         )
+        if _sampling_config.n != 1:
+            raise ValueError(
+                "VLLMGenerator.generate requires sampling.n=1; use "
+                "rollout_group_size for sibling sampling, got "
+                f"{_sampling_config.n}"
+            )
         if request_ids is not None and len(request_ids) != len(prompt_token_ids_batch):
             raise ValueError(
                 "request_ids length must match prompt_token_ids_batch: "

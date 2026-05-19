@@ -174,6 +174,15 @@ def test_generate_validates_request_ids():
         _run_generate(generator, [[1], [2]], request_ids=["dup", "dup"])
 
 
+def test_generate_rejects_multiple_samples_per_prompt():
+    generator = _generator([_request_output()])
+
+    with pytest.raises(ValueError, match="sampling.n=1"):
+        _run_generate(generator, [[1]], sampling_config=SamplingConfig(n=2))
+
+    assert generator._engine.add_requests == []
+
+
 def test_generate_rejects_unknown_returned_request_id():
     generator = _generator([_request_output(request_id="unexpected")])
 

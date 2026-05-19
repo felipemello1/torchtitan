@@ -37,10 +37,11 @@ from importlib import import_module
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 from renderers import Message, ParsedResponse, Renderer
-from vllm import EngineArgs, LLMEngine, SamplingParams
+from vllm import LLMEngine, SamplingParams
 from vllm.logger import init_logger
 
 from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.experiments.rl.actors.generator import VLLMGenerator
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.sampling import SamplingConfig
 
@@ -99,42 +100,21 @@ def _build_engine(config) -> LLMEngine:
     gen_config = config.generator
     model_path = config.hf_assets_path
 
-    from torchtitan.experiments.rl.models.vllm_registry import (
-        registry_to_vllm,
-        VLLM_MODEL_NAME,
-    )
-
-    registry_to_vllm(
-        config.model_spec,
-        parallelism=gen_config.parallelism,
+    os.environ["VLLM_ATTENTION_BACKEND"] = "CUSTOM"
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    engine_args = VLLMGenerator.build_engine_args(
+        config=gen_config,
+        model_spec=config.model_spec,
+        model_path=model_path,
         compile_config=config.compile,
         checkpoint_config=CheckpointManager.Config(
             enable=True,
             initial_load_in_hf=True,
             initial_load_path=model_path,
         ),
+        max_num_seqs=max(config.num_prompts_per_step, 1),
     )
-
-    engine_kwargs = dict(
-        model=model_path,
-        trust_remote_code=True,
-        dtype=gen_config.model_dtype,
-        tensor_parallel_size=gen_config.parallelism.tensor_parallel_degree,
-        distributed_executor_backend="external_launcher",
-        gpu_memory_utilization=gen_config.gpu_memory_limit,
-        enforce_eager=not gen_config.cudagraph.enable,
-        hf_overrides={"architectures": [VLLM_MODEL_NAME]},
-        attention_backend="CUSTOM",
-        max_num_seqs=max(config.num_prompts_per_step * gen_config.sampling.n, 1),
-    )
-    vllm_compilation_config = gen_config.cudagraph.get_vllm_compilation_config(
-        max_num_seqs=engine_kwargs["max_num_seqs"],
-    )
-    if vllm_compilation_config is not None:
-        engine_kwargs["compilation_config"] = vllm_compilation_config
-    if gen_config.debug.seed is not None:
-        engine_kwargs["seed"] = gen_config.debug.seed
-    return LLMEngine.from_engine_args(EngineArgs(**engine_kwargs))
+    return LLMEngine.from_engine_args(engine_args)
 
 
 def main() -> None:
