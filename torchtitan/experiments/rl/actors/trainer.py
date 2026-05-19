@@ -261,7 +261,7 @@ class PolicyTrainer(Actor, Configurable):
         """Sync the structured-logger step counter from the controller."""
         sl.set_step(step, relative_step=relative_step)
 
-    def reduce_forward_backward_metrics(
+    def _reduce_forward_backward_metrics(
         self,
         *,
         sum_reduced_metrics: dict[str, torch.Tensor],
@@ -404,7 +404,7 @@ class PolicyTrainer(Actor, Configurable):
             "bit_wise/logprob_diff/max": verification.logprob_diff_max,
         }
 
-        return self.reduce_forward_backward_metrics(
+        return self._reduce_forward_backward_metrics(
             sum_reduced_metrics=sum_reduced_metrics,
             max_reduced_metrics=max_reduced_metrics,
         )

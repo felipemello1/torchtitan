@@ -16,7 +16,7 @@ from renderers import Message
 
 
 class RolloutStatus(StrEnum):
-    """Terminal status for one turn or one rollout."""
+    """Terminal status for one rollout."""
 
     COMPLETED = "completed"
     TRUNCATED = "truncated"
@@ -58,7 +58,6 @@ class RolloutTurn:
     prompt_messages: list[Message] = field(default_factory=list)  # [M_p]
     response_messages: list[Message] = field(default_factory=list)  # [M_r]
     finish_reason: str | None = None
-    status: RolloutStatus = RolloutStatus.COMPLETED
 
 
 @dataclass(kw_only=True, slots=True)

@@ -11,6 +11,9 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 
+from torchtitan.config import Configurable
+from torchtitan.experiments.rl.envs import EnvExample
+
 
 NAMES: tuple[str, ...] = (
     "EnginDurgun",
@@ -281,6 +284,69 @@ Sort the COMPLETE cumulative list alphabetically by {sort_key} name.
         turn_names=turn_names,
         sort_by_first=sort_by_first,
     )
+
+
+class AlphabetSortDataset(Configurable):
+    """Deterministic local dataset of concrete AlphabetSort episodes."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        seed: int = 1337420
+        min_turns: int = 3
+        max_turns: int = 3
+        min_names_per_turn: int = 1
+        max_names_per_turn: int = 4
+
+        def __post_init__(self) -> None:
+            if self.min_turns <= 0:
+                raise ValueError(f"min_turns must be positive, got {self.min_turns}")
+            if self.max_turns < self.min_turns:
+                raise ValueError(
+                    "max_turns must be greater than or equal to "
+                    f"min_turns, got {self.max_turns} < {self.min_turns}"
+                )
+            if self.min_names_per_turn <= 0:
+                raise ValueError(
+                    "min_names_per_turn must be positive, "
+                    f"got {self.min_names_per_turn}"
+                )
+            if self.max_names_per_turn < self.min_names_per_turn:
+                raise ValueError(
+                    "max_names_per_turn must be greater than or equal to "
+                    "min_names_per_turn, got "
+                    f"{self.max_names_per_turn} < {self.min_names_per_turn}"
+                )
+            if self.max_turns * self.max_names_per_turn > len(NAMES):
+                raise ValueError(
+                    "max_turns * max_names_per_turn must not exceed the "
+                    f"{len(NAMES)} local names"
+                )
+
+    def __init__(self, config: Config):
+        self.config = config
+
+    def sample_group(self, *, step: int, group_idx: int) -> EnvExample:
+        episode = build_example(
+            seed=self.config.seed,
+            step=step,
+            group_idx=group_idx,
+            min_turns=self.config.min_turns,
+            max_turns=self.config.max_turns,
+            min_names_per_turn=self.config.min_names_per_turn,
+            max_names_per_turn=self.config.max_names_per_turn,
+        )
+        return EnvExample(
+            group_id=f"alphabet_sort/step={step}/group={group_idx}",
+            step=step,
+            group_idx=group_idx,
+            payload={
+                "initial_prompt": episode.initial_prompt,
+                "follow_ups": list(episode.follow_ups),
+                "ground_truths": [list(row) for row in episode.ground_truths],
+                "turn_names": [list(row) for row in episode.turn_names],
+                "sort_by_first": episode.sort_by_first,
+            },
+        )
 
 
 def _extract_first_name(name: str) -> str:

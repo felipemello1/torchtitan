@@ -13,19 +13,16 @@ from dataclasses import dataclass
 from renderers import Renderer
 
 from torchtitan.experiments.rl.envs import EnvBuilder, EnvExample, TokenEnvConfig
-from torchtitan.experiments.rl.replay import rollouts_to_replay_samples
 from torchtitan.experiments.rl.rollouts import CompletionFn, do_rollout_group
 from torchtitan.experiments.rl.sampling import SamplingConfig
-from torchtitan.experiments.rl.types import ReplaySample, RolloutOutput
+from torchtitan.experiments.rl.types import RolloutOutput
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class RolloutGroupResult:
-    """Completed rollout group plus replay rows derived from it."""
+    """Completed rollout group plus behavior-version summary."""
 
-    example: EnvExample
     rollouts: list[RolloutOutput]
-    samples: list[ReplaySample]
     behavior_version: int | None
     max_behavior_version: int | None
 
@@ -41,7 +38,7 @@ async def run_rollout_group(
     max_turns: int,
     token_env_config: TokenEnvConfig,
 ) -> RolloutGroupResult:
-    """Run one GRPO group and convert it into replay-ready rows."""
+    """Run one GRPO group."""
     rollouts = await do_rollout_group(
         envs=[env_builder.build(example=example) for _ in range(group_size)],
         renderer=renderer,
@@ -51,7 +48,6 @@ async def run_rollout_group(
         max_turns=max_turns,
         token_env_config=token_env_config,
     )
-    samples = rollouts_to_replay_samples(rollouts)
     versioned_rollouts = [rollout for rollout in rollouts if rollout.turns]
     behavior_version = (
         min(rollout.behavior_version for rollout in versioned_rollouts)
@@ -64,9 +60,7 @@ async def run_rollout_group(
         else None
     )
     return RolloutGroupResult(
-        example=example,
         rollouts=rollouts,
-        samples=samples,
         behavior_version=behavior_version,
         max_behavior_version=max_behavior_version,
     )

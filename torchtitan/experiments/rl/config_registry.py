@@ -22,22 +22,31 @@ from torchtitan.config import (
 )
 from torchtitan.experiments.rl.actors.generator import VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
-from torchtitan.experiments.rl.alphabet_sort import AlphabetSortEnv
+from torchtitan.experiments.rl.alphabet_sort import (
+    AlphabetSortBuilder,
+    AlphabetSortDataset,
+)
 from torchtitan.experiments.rl.grpo import GRPOLoss, RLTrainer
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
 from torchtitan.experiments.rl.sampling import SamplingConfig
-from torchtitan.experiments.rl.sum_digits import SumDigitsEnv
+from torchtitan.experiments.rl.sum_digits import SumDigitsBuilder, SumDigitsDataset
 from torchtitan.models.qwen3 import model_registry
 
 
-def _alphabet_sort_env(seed: int) -> AlphabetSortEnv.Config:
+def _alphabet_sort_dataset(seed: int) -> AlphabetSortDataset.Config:
     """Shared AlphabetSort task parameters for train/validation splits."""
-    return AlphabetSortEnv.Config(
+    return AlphabetSortDataset.Config(
         seed=seed,
         min_turns=3,
         max_turns=5,
         min_names_per_turn=1,
         max_names_per_turn=5,
+    )
+
+
+def _alphabet_sort_builder() -> AlphabetSortBuilder.Config:
+    """Shared AlphabetSort scoring parameters."""
+    return AlphabetSortBuilder.Config(
         similarity_power=8,
         power_per_turn=False,
     )
@@ -66,8 +75,10 @@ def _alphabet_sort_4gpu_config(
         replay_buffer_groups=num_prompts_per_step,
         max_offpolicy_steps=1,
         compile=CompileConfig(enable=True, backend="aot_eager"),
-        env=_alphabet_sort_env(seed=142857),
-        validation_env=_alphabet_sort_env(seed=314159),
+        train_dataset=_alphabet_sort_dataset(seed=142857),
+        train_env_builder=_alphabet_sort_builder(),
+        validation_dataset=_alphabet_sort_dataset(seed=314159),
+        validation_env_builder=_alphabet_sort_builder(),
         metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(
             optimizer=OptimizersContainer.Config(lr=lr),
@@ -120,9 +131,15 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
         rollout_group_size=group_size,
         num_validation_samples=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
-        env=SumDigitsEnv.Config(seed=42, correctness_reward=1.0, format_reward=0.3),
-        validation_env=SumDigitsEnv.Config(
-            seed=99, correctness_reward=1.0, format_reward=0.3
+        train_dataset=SumDigitsDataset.Config(seed=42),
+        train_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0,
+            format_reward=0.3,
+        ),
+        validation_dataset=SumDigitsDataset.Config(seed=99),
+        validation_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0,
+            format_reward=0.3,
         ),
         metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(
@@ -186,9 +203,15 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
         rollout_group_size=group_size,
         num_validation_samples=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
-        env=SumDigitsEnv.Config(seed=42, correctness_reward=1.0, format_reward=0.3),
-        validation_env=SumDigitsEnv.Config(
-            seed=99, correctness_reward=1.0, format_reward=0.3
+        train_dataset=SumDigitsDataset.Config(seed=42),
+        train_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0,
+            format_reward=0.3,
+        ),
+        validation_dataset=SumDigitsDataset.Config(seed=99),
+        validation_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0,
+            format_reward=0.3,
         ),
         metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(
@@ -253,9 +276,15 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
         rollout_group_size=group_size,
         num_validation_samples=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
-        env=SumDigitsEnv.Config(seed=42, correctness_reward=1.0, format_reward=0.3),
-        validation_env=SumDigitsEnv.Config(
-            seed=99, correctness_reward=1.0, format_reward=0.3
+        train_dataset=SumDigitsDataset.Config(seed=42),
+        train_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0,
+            format_reward=0.3,
+        ),
+        validation_dataset=SumDigitsDataset.Config(seed=99),
+        validation_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0,
+            format_reward=0.3,
         ),
         metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(
@@ -312,9 +341,15 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
         rollout_group_size=group_size,
         num_validation_samples=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
-        env=SumDigitsEnv.Config(seed=42, correctness_reward=1.0, format_reward=0.3),
-        validation_env=SumDigitsEnv.Config(
-            seed=99, correctness_reward=1.0, format_reward=0.3
+        train_dataset=SumDigitsDataset.Config(seed=42),
+        train_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0,
+            format_reward=0.3,
+        ),
+        validation_dataset=SumDigitsDataset.Config(seed=99),
+        validation_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0,
+            format_reward=0.3,
         ),
         metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(

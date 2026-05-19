@@ -55,19 +55,22 @@ class RolloutSampleLogger:
         if remaining <= 0:
             return
 
-        selected: list[RolloutOutput] = []
+        selected_group_ids: list[str] = []
         seen_groups: set[str] = set()
         for rollout in rollouts:
             if rollout.group_id in seen_groups:
                 continue
-            selected.append(rollout)
+            selected_group_ids.append(rollout.group_id)
             seen_groups.add(rollout.group_id)
-            if len(selected) >= remaining:
+            if len(selected_group_ids) >= remaining:
                 break
-        self._counts[key] = self._counts.get(key, 0) + len(selected)
+        self._counts[key] = self._counts.get(key, 0) + len(selected_group_ids)
+        selected_group_set = set(selected_group_ids)
 
         with self._path.open("a", encoding="utf-8") as handle:
-            for rollout in selected:
+            for rollout in rollouts:
+                if rollout.group_id not in selected_group_set:
+                    continue
                 handle.write(
                     json.dumps(
                         _rollout_record(step=step, phase=phase, rollout=rollout),

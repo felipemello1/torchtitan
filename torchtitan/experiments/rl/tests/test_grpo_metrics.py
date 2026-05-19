@@ -29,6 +29,7 @@ from torchtitan.experiments.rl.replay import (
 from torchtitan.experiments.rl.rollout_logging import RolloutSampleLogger
 from torchtitan.experiments.rl.rollouts import do_single_rollout
 from torchtitan.experiments.rl.sampling import SamplingConfig
+from torchtitan.experiments.rl.sum_digits import SumDigitsBuilder, SumDigitsDataset
 from torchtitan.experiments.rl.types import (
     Completion,
     ReplaySample,
@@ -157,9 +158,32 @@ def test_token_env_keeps_truncated_response_message_for_logging():
         )
 
         assert token_step.env_step.status == RolloutStatus.TRUNCATED
+        assert token_step.env_step.reward_components == {"length_stop": 1.0}
         assert token_step.response_messages == [
             {"role": "assistant", "content": "partial answer"}
         ]
+
+    asyncio.run(run())
+
+
+def test_sum_digits_dataset_and_builder_have_separate_roles():
+    dataset = SumDigitsDataset.Config(seed=123).build()
+    builder = SumDigitsBuilder.Config(
+        correctness_reward=2.0,
+        format_reward=0.5,
+    ).build()
+    example = dataset.sample_group(step=2, group_idx=7)
+
+    async def run() -> None:
+        env = builder.build(example=example)
+        reset = await env.reset()
+        await env.close()
+
+        assert example.group_id == "sum_digits/step=2/group=7"
+        assert "values" in example.payload
+        assert isinstance(example.payload["target"], int)
+        assert reset.messages[0]["role"] == "system"
+        assert reset.messages[1]["role"] == "user"
 
     asyncio.run(run())
 
@@ -454,8 +478,8 @@ def test_rollout_sample_logger_caps_groups_per_step(tmp_path):
     logger = RolloutSampleLogger(str(tmp_path), max_groups_per_step=1)
     rollouts = [
         RolloutOutput(
-            group_id=f"g{idx}",
-            sample_idx=0,
+            group_id=group_id,
+            sample_idx=sample_idx,
             status=RolloutStatus.COMPLETED,
             reward=1.0,
             turns=[
@@ -463,13 +487,13 @@ def test_rollout_sample_logger_caps_groups_per_step(tmp_path):
                     prompt_token_ids=[1, 2],
                     response_token_ids=[3],
                     response_logprobs=[-0.1],
-                    policy_version=idx,
+                    policy_version=sample_idx,
                     prompt_messages=[{"role": "user", "content": "sort"}],
                     response_messages=[{"role": "assistant", "content": "done"}],
                 )
             ],
         )
-        for idx in range(2)
+        for group_id, sample_idx in [("g0", 0), ("g0", 1), ("g1", 0)]
     ]
 
     logger.write(step=3, phase="train", rollouts=rollouts)
@@ -481,9 +505,14 @@ def test_rollout_sample_logger_caps_groups_per_step(tmp_path):
         for line in (tmp_path / "rollout_samples.jsonl").read_text().splitlines()
     ]
 
-    assert [(record["phase"], record["group_id"]) for record in records] == [
-        ("train", "g0"),
-        ("validation", "g0"),
+    assert [
+        (record["phase"], record["group_id"], record["sample_idx"])
+        for record in records
+    ] == [
+        ("train", "g0", 0),
+        ("train", "g0", 1),
+        ("validation", "g0", 0),
+        ("validation", "g0", 1),
     ]
     assert records[0]["turns"][0]["messages"][0] == {
         "role": "user",

@@ -46,7 +46,12 @@ from torchtitan.config import (
 )
 from torchtitan.experiments.rl.actors.generator import VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
-from torchtitan.experiments.rl.envs import EnvBuilder, EnvExample, TokenEnvConfig
+from torchtitan.experiments.rl.envs import (
+    EnvBuilder,
+    EnvDataset,
+    EnvExample,
+    TokenEnvConfig,
+)
 from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.observability.metrics.rl import (
@@ -59,6 +64,7 @@ from torchtitan.experiments.rl.replay import (
     has_advantage_signal,
     ReplayBuffer,
     ReplayGroup,
+    rollouts_to_replay_samples,
 )
 from torchtitan.experiments.rl.rollout_logging import RolloutSampleLogger
 from torchtitan.experiments.rl.rollout_runner import (
@@ -246,11 +252,17 @@ class RLTrainer(Configurable):
         num_validation_samples: int = 20
         """Number of held-out prompts scored greedily (temp=0, n=1) per validation pass."""
 
-        env: Configurable.Config = field(default=None)  # type: ignore[assignment]
-        """Env config for training rollouts."""
+        train_dataset: Configurable.Config = field(default=None)  # type: ignore[assignment]
+        """Dataset config for training rollout groups."""
 
-        validation_env: Configurable.Config = field(default=None)  # type: ignore[assignment]
-        """Env config for validation rollouts."""
+        train_env_builder: Configurable.Config = field(default=None)  # type: ignore[assignment]
+        """Env builder config for training rollout groups."""
+
+        validation_dataset: Configurable.Config = field(default=None)  # type: ignore[assignment]
+        """Dataset config for validation rollout groups."""
+
+        validation_env_builder: Configurable.Config = field(default=None)  # type: ignore[assignment]
+        """Env builder config for validation rollout groups."""
 
         log_samples: bool = False
         """Log first completion per episode during training and validation."""
@@ -334,10 +346,14 @@ class RLTrainer(Configurable):
                         "SP uses reduce-scatter which only supports Ring in NCCL "
                         "and has not been validated for determinism."
                     )
-            if self.env is None:
-                raise ValueError("env must be set")
-            if self.validation_env is None:
-                raise ValueError("validation_env must be set")
+            for name in (
+                "train_dataset",
+                "train_env_builder",
+                "validation_dataset",
+                "validation_env_builder",
+            ):
+                if getattr(self, name) is None:
+                    raise ValueError(f"{name} must be set")
             if self.max_rollout_turns <= 0:
                 raise ValueError(
                     f"max_rollout_turns must be positive, got {self.max_rollout_turns}"
@@ -386,6 +402,10 @@ class RLTrainer(Configurable):
             if config.save_rollout_samples
             else None
         )
+        self.train_dataset: EnvDataset = config.train_dataset.build()
+        self.train_env_builder: EnvBuilder = config.train_env_builder.build()
+        self.validation_dataset: EnvDataset = config.validation_dataset.build()
+        self.validation_env_builder: EnvBuilder = config.validation_env_builder.build()
         self.renderer = config.renderer.build(model_path=config.hf_assets_path)
         self._stop_token_ids = list(self.renderer.get_stop_token_ids())
 
@@ -726,20 +746,11 @@ class RLTrainer(Configurable):
             return sampling
         return dataclasses.replace(sampling, stop_token_ids=stop_token_ids)
 
-    def _make_examples(self, *, step: int, num_groups: int) -> list[EnvExample]:
-        return [
-            EnvExample(
-                group_id=f"step={step}/group={group_idx}",
-                step=step,
-                group_idx=group_idx,
-            )
-            for group_idx in range(num_groups)
-        ]
-
     async def _collect_validation_rollouts(
         self,
         *,
-        env_config: EnvBuilder,
+        env_dataset: EnvDataset,
+        env_builder: EnvBuilder,
         num_groups: int,
         group_size: int,
         step: int,
@@ -759,7 +770,10 @@ class RLTrainer(Configurable):
             max_generation_tokens=sampling.max_tokens,
             step_timeout_s=self.config.step_timeout_s,
         )
-        examples = self._make_examples(step=step, num_groups=num_groups)
+        examples = [
+            env_dataset.sample_group(step=step, group_idx=group_idx)
+            for group_idx in range(num_groups)
+        ]
         pending: set[asyncio.Task[RolloutGroupResult]] = set()
         rollouts: list[RolloutOutput] = []
         next_idx = 0
@@ -772,7 +786,7 @@ class RLTrainer(Configurable):
                     pending.add(
                         asyncio.create_task(
                             run_rollout_group(
-                                env_builder=env_config,
+                                env_builder=env_builder,
                                 example=example,
                                 group_size=group_size,
                                 renderer=self.renderer,
@@ -833,7 +847,7 @@ class RLTrainer(Configurable):
                 example = await next_example()
                 with sl.log_trace_span("rollout_group"):
                     result = await run_rollout_group(
-                        env_builder=self.config.env,
+                        env_builder=self.train_env_builder,
                         example=example,
                         group_size=group_size,
                         renderer=self.renderer,
@@ -851,7 +865,7 @@ class RLTrainer(Configurable):
                         rollouts=group_rollouts,
                     )
 
-                samples = result.samples
+                samples = rollouts_to_replay_samples(group_rollouts)
                 if shutdown.is_set():
                     return
                 if not samples:
@@ -939,7 +953,8 @@ class RLTrainer(Configurable):
             stop_token_ids=list(self._stop_token_ids),
         )
         rollouts, validation_metrics = await self._collect_validation_rollouts(
-            env_config=self.config.validation_env,
+            env_dataset=self.validation_dataset,
+            env_builder=self.validation_env_builder,
             num_groups=num_samples,
             group_size=1,
             step=0,
@@ -1000,11 +1015,13 @@ class RLTrainer(Configurable):
         async def next_example() -> EnvExample:
             nonlocal next_group_idx
             async with next_group_lock:
-                group_idx = next_group_idx
+                absolute_group_idx = next_group_idx
                 next_group_idx += 1
-            sample_step = group_idx // max(self.config.num_prompts_per_step, 1)
-            return EnvExample(
-                group_id=f"sample_step={sample_step}/group={group_idx}",
+            sample_step, group_idx = divmod(
+                absolute_group_idx,
+                max(self.config.num_prompts_per_step, 1),
+            )
+            return self.train_dataset.sample_group(
                 step=sample_step,
                 group_idx=group_idx,
             )
@@ -1111,11 +1128,21 @@ class RLTrainer(Configurable):
                     await generation_scheduler.resume_after_weight_sync()
                 policy_version = trainer_policy_version
                 t_weight_sync_total_s = time.perf_counter() - t_weight_sync_start
-                t_step_s = time.perf_counter() - t_step_start
 
                 if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
                     logger.error("Loss is NaN/Inf; training diverged")
                     break
+
+                t_checkpoint_start = time.perf_counter()
+                with sl.log_trace_span("trainer_save_checkpoint_call"):
+                    checkpoint_saved = await self._await_rank_0(
+                        self.trainer.save_checkpoint.call(
+                            step,
+                            last_step=step == num_steps,
+                        )
+                    )
+                t_checkpoint_s = time.perf_counter() - t_checkpoint_start
+                t_step_s = time.perf_counter() - t_step_start
 
                 total_tokens = sum(len(sample.token_ids) for sample in samples)
                 live_generation_metrics = [
@@ -1173,6 +1200,9 @@ class RLTrainer(Configurable):
                 step_metrics += [
                     m.Metric(k, m.NoReduce(v)) for k, v in optimizer_metrics.items()
                 ]
+                step_metrics.append(
+                    m.Metric("checkpoint/saved", m.NoReduce(float(checkpoint_saved)))
+                )
                 for key, value in [
                     ("timing/step", t_step_s),
                     ("timing/replay_wait", t_buffer_wait_s),
@@ -1181,6 +1211,7 @@ class RLTrainer(Configurable):
                     ("timing/weight_sync/push", t_weight_sync_push_s),
                     ("timing/weight_sync/pull", t_weight_sync_pull_s),
                     ("timing/weight_sync/total", t_weight_sync_total_s),
+                    ("timing/checkpoint", t_checkpoint_s),
                 ]:
                     step_metrics.append(m.Metric(key, m.NoReduce(value)))
                 step_metrics.append(
@@ -1208,6 +1239,8 @@ class RLTrainer(Configurable):
                         ),
                         "timing.weight_sync_push_ms": t_weight_sync_push_s * 1000,
                         "timing.weight_sync_pull_ms": t_weight_sync_pull_s * 1000,
+                        "timing.checkpoint_ms": t_checkpoint_s * 1000,
+                        "checkpoint.saved": float(checkpoint_saved),
                     }
                 )
 

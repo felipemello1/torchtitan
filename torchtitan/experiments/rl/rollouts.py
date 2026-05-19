@@ -65,7 +65,7 @@ async def do_single_rollout(
             reward = float(env_step.reward)
             reward_components = dict(env_step.reward_components)
 
-        turn_status = env_step.status or RolloutStatus.COMPLETED
+        step_status = env_step.status or RolloutStatus.COMPLETED
         turns.append(
             RolloutTurn(
                 prompt_token_ids=list(prompt.token_ids),
@@ -75,12 +75,11 @@ async def do_single_rollout(
                 response_messages=list(token_step.response_messages),
                 policy_version=completion.policy_version,
                 finish_reason=completion.finish_reason,
-                status=turn_status,
             )
         )
 
         if env_step.done:
-            status = turn_status
+            status = step_status
             break
         if token_step.next_prompt is None:
             raise ValueError(

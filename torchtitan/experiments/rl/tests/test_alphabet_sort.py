@@ -6,7 +6,10 @@
 
 import pytest
 
-from torchtitan.experiments.rl.alphabet_sort.env import AlphabetSortEnv
+from torchtitan.experiments.rl.alphabet_sort import (
+    AlphabetSortBuilder,
+    AlphabetSortDataset,
+)
 from torchtitan.experiments.rl.alphabet_sort.grading import (
     aggregate_turn_scores,
     extract_names,
@@ -54,4 +57,26 @@ Name1
 
 def test_alphabet_sort_config_validates_ranges():
     with pytest.raises(ValueError, match="max_turns"):
-        AlphabetSortEnv.Config(min_turns=4, max_turns=3)
+        AlphabetSortDataset.Config(min_turns=4, max_turns=3)
+
+    with pytest.raises(ValueError, match="similarity_power"):
+        AlphabetSortBuilder.Config(similarity_power=0)
+
+
+def test_alphabet_sort_dataset_and_builder_have_separate_roles():
+    dataset = AlphabetSortDataset.Config(
+        seed=123,
+        min_turns=2,
+        max_turns=2,
+        min_names_per_turn=1,
+        max_names_per_turn=1,
+    ).build()
+    builder = AlphabetSortBuilder.Config().build()
+    example = dataset.sample_group(step=2, group_idx=7)
+
+    env = builder.build(example=example)
+
+    assert example.group_id == "alphabet_sort/step=2/group=7"
+    assert example.payload["initial_prompt"]
+    assert example.payload["ground_truths"]
+    assert env is not None

@@ -26,14 +26,14 @@ class TokenEnvConfig:
 
     Args:
         error_reward: Reward used when parsing or env stepping fails.
-        context_overflow_reward: Reward used on generation length stop or context cap.
+        truncation_reward: Reward used on generation length stop or context cap.
         max_trajectory_tokens: Optional prompt-token cap before the next generation.
         max_generation_tokens: Reserve included in context-cap checks.
         step_timeout_s: Optional timeout for one ``MessageEnv.step`` call.
     """
 
     error_reward: float = 0.0
-    context_overflow_reward: float = 0.0
+    truncation_reward: float = 0.0
     max_trajectory_tokens: int | None = None
     max_generation_tokens: int | None = None
     step_timeout_s: float | None = 1800.0
@@ -93,8 +93,8 @@ class TokenEnv:
             response_messages = self._parse_response_messages(completion)
             return TokenStep(
                 env_step=EnvStep(
-                    reward=self._config.context_overflow_reward,
-                    reward_components={"context_overflow": 1.0},
+                    reward=self._config.truncation_reward,
+                    reward_components={"length_stop": 1.0},
                     done=True,
                     status=RolloutStatus.TRUNCATED,
                 ),
@@ -132,7 +132,7 @@ class TokenEnv:
         if self._context_exceeded(next_prompt):
             return TokenStep(
                 env_step=EnvStep(
-                    reward=self._config.context_overflow_reward,
+                    reward=self._config.truncation_reward,
                     reward_components={
                         **env_step.reward_components,
                         "context_overflow": 1.0,

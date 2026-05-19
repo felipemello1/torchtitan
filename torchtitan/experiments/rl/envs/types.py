@@ -84,3 +84,17 @@ class EnvBuilder(Protocol):
 
     def build(self, *, example: EnvExample) -> MessageEnv:
         ...
+
+
+@runtime_checkable
+class EnvDataset(Protocol):
+    """Samples concrete task rows for rollout groups.
+
+    The controller owns ``group_idx`` so async producers cannot accidentally
+    sample the same deterministic row. Dataset implementations should use
+    ``(step, group_idx)`` as part of their reproducibility seed and stamp the
+    same values onto the returned :class:`EnvExample`.
+    """
+
+    def sample_group(self, *, step: int, group_idx: int) -> EnvExample:
+        ...
