@@ -21,7 +21,7 @@ from torchtitan.observability import structured_logger as sl
 
 
 GenerateBatchFn = Callable[
-    [list[list[int]], SamplingConfig],
+    [list[list[int]], list[str], SamplingConfig],
     Awaitable[tuple[list[Completion], list[m.Metric]]],
 ]
 
@@ -51,11 +51,12 @@ def _sampling_key(
 class GenerationScheduler:
     """Ordered controller-side admission and draining for token generation.
 
-    The controller owns batching so every tensor-parallel generator rank
-    receives one ordered ``generate`` call per flush. Weight sync pauses
-    admission at request boundaries: active generator calls drain, new rollout
-    turns queue on the controller, and generation resumes after fresh weights
-    are loaded.
+    The controller owns batching so every tensor-parallel generator rank receives
+    ordered ``generate`` calls from the same controller tick. Mixed sampling
+    configs are partitioned into separate sub-batches, and submission order is
+    preserved within each sampling bucket. Weight sync pauses admission at
+    request boundaries: active generator calls drain, new rollout turns queue on
+    the controller, and generation resumes after fresh weights are loaded.
 
     This is controller-side tick batching for vLLM ``external_launcher``
     determinism. It is not continuous admission into a live vLLM scheduler.
@@ -208,6 +209,7 @@ class GenerationScheduler:
             with sl.log_trace_span("generation_scheduler_flush"):
                 completions, metrics = await self._generate_batch(
                     [pending.prompt_token_ids for pending in pending_group],
+                    [pending.request_id for pending in pending_group],
                     sampling,
                 )
             self._metrics.extend(metrics)

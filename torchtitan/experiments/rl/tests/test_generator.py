@@ -132,6 +132,51 @@ def test_generate_passes_token_prompt_to_vllm():
     assert "arrival_time" in kwargs["prompt"]
 
 
+def test_generate_passes_request_ids_and_restores_input_order():
+    generator = _generator(
+        [
+            _request_output(
+                request_id="group:b",
+                prompt_token_ids=[4],
+                outputs=[_sample(token_ids=(40,))],
+            ),
+            _request_output(
+                request_id="group:a",
+                prompt_token_ids=[3],
+                outputs=[_sample(token_ids=(30,))],
+            ),
+        ]
+    )
+
+    completions, _ = _run_generate(
+        generator,
+        [[3], [4]],
+        request_ids=["group:a", "group:b"],
+    )
+
+    assert [
+        kwargs["request_id"] for _args, kwargs in generator._engine.add_requests
+    ] == ["group:a", "group:b"]
+    assert [completion.token_ids for completion in completions] == [[30], [40]]
+
+
+def test_generate_validates_request_ids():
+    generator = _generator([_request_output()])
+
+    with pytest.raises(ValueError, match="length must match"):
+        _run_generate(generator, [[1], [2]], request_ids=["only-one"])
+
+    with pytest.raises(ValueError, match="must be unique"):
+        _run_generate(generator, [[1], [2]], request_ids=["dup", "dup"])
+
+
+def test_generate_rejects_unknown_returned_request_id():
+    generator = _generator([_request_output(request_id="unexpected")])
+
+    with pytest.raises(RuntimeError, match="unknown request_id"):
+        _run_generate(generator, [[1]], request_ids=["expected"])
+
+
 def test_generate_carries_finish_reason_and_metrics():
     output = _request_output(
         outputs=[

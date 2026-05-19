@@ -404,6 +404,7 @@ class VLLMGenerator(Actor, Configurable):
         self,
         prompt_token_ids_batch: list[list[int]],
         *,
+        request_ids: list[str] | None = None,
         sampling_config: SamplingConfig | None = None,
         metrics_prefix: str = "generator",
     ) -> tuple[list[Completion], list[m.Metric]]:
@@ -418,6 +419,10 @@ class VLLMGenerator(Actor, Configurable):
         Args:
             prompt_token_ids_batch: Tokenized prompts shaped
                 ``[num_prompts][prompt_tokens]``.
+            request_ids: Optional vLLM request IDs matching
+                ``prompt_token_ids_batch``. The controller scheduler passes
+                rollout provenance IDs for structured debugging; direct callers
+                can omit this and get stable numeric IDs.
             sampling_config: Optional per-call override for the generator's
                 default SamplingConfig. The vLLM engine seed comes from
                 ``config.debug.seed``; per-request sampling params do not
@@ -429,6 +434,18 @@ class VLLMGenerator(Actor, Configurable):
         _sampling_config = (
             sampling_config if sampling_config is not None else self.config.sampling
         )
+        _request_ids = (
+            [str(i) for i in range(len(prompt_token_ids_batch))]
+            if request_ids is None
+            else list(request_ids)
+        )
+        if len(_request_ids) != len(prompt_token_ids_batch):
+            raise ValueError(
+                "request_ids length must match prompt_token_ids_batch: "
+                f"{len(_request_ids)} != {len(prompt_token_ids_batch)}"
+            )
+        if len(set(_request_ids)) != len(_request_ids):
+            raise ValueError(f"request_ids must be unique, got {_request_ids}")
 
         async with self._engine_lock:
             admitted_policy_version = self.policy_version
@@ -447,9 +464,13 @@ class VLLMGenerator(Actor, Configurable):
                 engine_inputs = self._engine.renderer.render_cmpl(
                     [{"prompt_token_ids": ids} for ids in prompt_token_ids_batch]
                 )
-                for i, engine_input in enumerate(engine_inputs):
+                for request_id, engine_input in zip(
+                    _request_ids,
+                    engine_inputs,
+                    strict=True,
+                ):
                     self._engine.add_request(
-                        request_id=str(i),
+                        request_id=request_id,
                         prompt=engine_input,
                         params=sampling_params,
                     )
@@ -465,9 +486,20 @@ class VLLMGenerator(Actor, Configurable):
                         "generate call; weight sync admission is broken"
                     )
 
-                # vLLM may return requests out of order; sort by the integer
-                # request_id we assigned so outputs line up with the input.
-                all_outputs.sort(key=lambda o: int(o.request_id))
+                # vLLM may return requests out of order; sort by the request IDs
+                # we admitted so outputs line up with the input batch.
+                request_order = {
+                    request_id: idx for idx, request_id in enumerate(_request_ids)
+                }
+                try:
+                    all_outputs.sort(
+                        key=lambda output: request_order[str(output.request_id)]
+                    )
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"vLLM returned unknown request_id {exc.args[0]!r}; "
+                        f"expected one of {_request_ids}"
+                    ) from exc
 
                 completions: list[Completion] = []
                 generation_metrics: list[m.Metric] = []

@@ -61,6 +61,7 @@ from torchtitan.experiments.rl.observability.metrics.rl import (
     build_rollout_metrics,
     build_train_step_metrics,
     rename_metric_prefix,
+    validate_train_step_fwd_bwd_metrics,
 )
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.replay import (
@@ -838,11 +839,13 @@ class RLTrainer(Configurable):
     ) -> GenerationScheduler:
         async def generate_batch(
             prompt_token_ids_batch: list[list[int]],
+            request_ids: list[str],
             sampling: SamplingConfig,
         ) -> tuple[list[Completion], list[m.Metric]]:
             completions, metrics = await self._await_rank_0(
                 self.generator.generate.call(
                     prompt_token_ids_batch,
+                    request_ids=request_ids,
                     sampling_config=sampling,
                     metrics_prefix=metrics_prefix,
                 )
@@ -904,11 +907,9 @@ class RLTrainer(Configurable):
         policy_version: int,
     ) -> dict[str, float] | None:
         """Return optimizer metrics for a forward/backward result to skip."""
+        validate_train_step_fwd_bwd_metrics(fwd_bwd_metrics)
         loss_mean = fwd_bwd_metrics.get("loss/mean", float("nan"))
-        nonfinite_log_ratio_frac = fwd_bwd_metrics.get(
-            "loss/ratio/nonfinite_frac",
-            0.0,
-        )
+        nonfinite_log_ratio_frac = fwd_bwd_metrics["loss/ratio/nonfinite_frac"]
         if math.isfinite(loss_mean) and nonfinite_log_ratio_frac <= 0.0:
             return None
         return {
@@ -1107,7 +1108,6 @@ class RLTrainer(Configurable):
                     continue
 
                 replay_group = ReplayGroup.from_rollouts(
-                    group_id=example.group_id,
                     samples=samples,
                     rollouts=group_rollouts,
                 )

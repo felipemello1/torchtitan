@@ -36,11 +36,29 @@ class ReplayGroup:
     def from_rollouts(
         cls,
         *,
-        group_id: str,
         samples: list[ReplaySample],
         rollouts: list[RolloutOutput],
     ) -> "ReplayGroup":
         """Build a replay group and derive behavior-version bounds once."""
+        if not rollouts:
+            raise ValueError("replay group has no rollouts")
+        group_id = rollouts[0].group_id
+        mismatched_rollout_ids = sorted(
+            {rollout.group_id for rollout in rollouts if rollout.group_id != group_id}
+        )
+        if mismatched_rollout_ids:
+            raise ValueError(
+                f"replay group {group_id!r} contains rollout group_ids "
+                f"{mismatched_rollout_ids}"
+            )
+        mismatched_sample_ids = sorted(
+            {sample.group_id for sample in samples if sample.group_id != group_id}
+        )
+        if mismatched_sample_ids:
+            raise ValueError(
+                f"replay group {group_id!r} contains sample group_ids "
+                f"{mismatched_sample_ids}"
+            )
         versioned_rollouts = [rollout for rollout in rollouts if rollout.turns]
         if not versioned_rollouts:
             raise ValueError(f"replay group {group_id!r} has no versioned rollouts")

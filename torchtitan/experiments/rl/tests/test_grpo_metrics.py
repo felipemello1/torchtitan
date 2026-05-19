@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import dataclasses
 import json
 import os
 from types import SimpleNamespace
@@ -124,23 +125,29 @@ def test_logprob_drift_reports_nonfinite_without_nan_metrics():
     assert drift.nonfinite_logprob_frac.item() == pytest.approx(2 / 4)
 
 
+def _required_fwd_bwd_metrics(**overrides):
+    metrics = {
+        "loss/mean": 0.0,
+        "loss/ratio/nonfinite_frac": 0.0,
+        "loss/logprob/policy_nonfinite_frac": 0.0,
+        "loss/logprob/behavior_nonfinite_frac": 0.0,
+        "bit_wise/nonfinite_logprob_frac": 0.0,
+    }
+    metrics.update(overrides)
+    return metrics
+
+
 def test_forward_backward_skip_metrics_reject_nonfinite_loss_signal():
     assert (
         RLTrainer._forward_backward_skip_metrics(
-            {
-                "loss/mean": 0.0,
-                "loss/ratio/nonfinite_frac": 0.0,
-            },
+            _required_fwd_bwd_metrics(),
             policy_version=3,
         )
         is None
     )
 
     loss_skip = RLTrainer._forward_backward_skip_metrics(
-        {
-            "loss/mean": float("nan"),
-            "loss/ratio/nonfinite_frac": 0.0,
-        },
+        _required_fwd_bwd_metrics(**{"loss/mean": float("nan")}),
         policy_version=3,
     )
     assert loss_skip == {
@@ -150,13 +157,16 @@ def test_forward_backward_skip_metrics_reject_nonfinite_loss_signal():
     }
 
     ratio_skip = RLTrainer._forward_backward_skip_metrics(
-        {
-            "loss/mean": 0.0,
-            "loss/ratio/nonfinite_frac": 0.25,
-        },
+        _required_fwd_bwd_metrics(**{"loss/ratio/nonfinite_frac": 0.25}),
         policy_version=3,
     )
     assert ratio_skip == loss_skip
+
+    with pytest.raises(KeyError, match="loss/ratio/nonfinite_frac"):
+        RLTrainer._forward_backward_skip_metrics(
+            {"loss/mean": 0.0},
+            policy_version=3,
+        )
 
 
 def test_grpo_loss_microbatch_sum_matches_full_batch_with_global_denominator():
@@ -383,6 +393,53 @@ def test_rollout_to_replay_sample_masks_multiturn_prefix_continuation():
     assert sample.behavior_logprobs == [0.0, 0.0, -0.2, 0.0, -0.3, -0.4]
 
 
+def test_replay_group_derives_and_validates_group_id():
+    rollout = RolloutOutput(
+        group_id="g0",
+        sample_idx=0,
+        status=RolloutStatus.COMPLETED,
+        reward=1.0,
+        turns=[
+            RolloutTurn(
+                prompt_token_ids=[1],
+                response_token_ids=[2],
+                response_logprobs=[-0.1],
+                policy_version=4,
+            )
+        ],
+    )
+    sample = ReplaySample(
+        token_ids=[1, 2],
+        loss_mask=[0, 1],
+        behavior_logprobs=[0.0, -0.1],
+        advantage=0.5,
+        group_id="g0",
+        sample_idx=0,
+        behavior_version=4,
+        reward=1.0,
+    )
+
+    group = ReplayGroup.from_rollouts(samples=[sample], rollouts=[rollout])
+
+    assert group.group_id == "g0"
+    assert group.behavior_version == 4
+    assert group.max_behavior_version == 4
+
+    mismatched_rollout = dataclasses.replace(rollout, group_id="g1")
+    with pytest.raises(ValueError, match="rollout group_ids"):
+        ReplayGroup.from_rollouts(
+            samples=[sample],
+            rollouts=[rollout, mismatched_rollout],
+        )
+
+    mismatched_sample = dataclasses.replace(sample, group_id="g1")
+    with pytest.raises(ValueError, match="sample group_ids"):
+        ReplayGroup.from_rollouts(
+            samples=[mismatched_sample],
+            rollouts=[rollout],
+        )
+
+
 def test_max_turn_truncation_does_not_train_on_nonterminal_reward():
     class TokenEnvStub:
         async def initial_prompt(self) -> PromptState:
@@ -585,12 +642,15 @@ def test_validation_metric_rename_handles_reward_summary_keys():
 def test_generation_scheduler_coalesces_same_tick_requests():
     async def run() -> None:
         calls: list[list[list[int]]] = []
+        request_id_calls: list[list[str]] = []
 
         async def generate_batch(
             prompts: list[list[int]],
+            request_ids: list[str],
             sampling: SamplingConfig,
         ) -> tuple[list[Completion], list[m.Metric]]:
             calls.append([list(prompt) for prompt in prompts])
+            request_id_calls.append(list(request_ids))
             return (
                 [
                     Completion(
@@ -621,6 +681,7 @@ def test_generation_scheduler_coalesces_same_tick_requests():
         )
 
         assert calls == [[[1], [2]]]
+        assert request_id_calls == [["a", "b"]]
         assert [completion.token_ids for completion in completions] == [[0], [1]]
         aggregate = m.MetricsProcessor._aggregate_metrics(scheduler.pop_metrics())
         assert aggregate["generation_scheduler/batch_size/mean"] == 2
@@ -635,6 +696,67 @@ def test_generation_scheduler_coalesces_same_tick_requests():
     asyncio.run(run())
 
 
+def test_generation_scheduler_partitions_mixed_sampling_requests():
+    async def run() -> None:
+        calls: list[tuple[list[list[int]], list[str], float]] = []
+
+        async def generate_batch(
+            prompts: list[list[int]],
+            request_ids: list[str],
+            sampling: SamplingConfig,
+        ) -> tuple[list[Completion], list[m.Metric]]:
+            calls.append(
+                (
+                    [list(prompt) for prompt in prompts],
+                    list(request_ids),
+                    sampling.temperature,
+                )
+            )
+            return (
+                [
+                    Completion(
+                        policy_version=0,
+                        token_ids=[prompt[0]],
+                        token_logprobs=[-0.1],
+                        finish_reason="stop",
+                    )
+                    for prompt in prompts
+                ],
+                [],
+            )
+
+        scheduler = GenerationScheduler(generate_batch)
+        greedy = SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4)
+        sampled = SamplingConfig(n=1, temperature=0.7, top_p=1.0, max_tokens=4)
+
+        completions = await asyncio.gather(
+            scheduler.submit(
+                prompt_token_ids=[1],
+                sampling=greedy,
+                request_id="greedy-a",
+            ),
+            scheduler.submit(
+                prompt_token_ids=[2],
+                sampling=sampled,
+                request_id="sampled",
+            ),
+            scheduler.submit(
+                prompt_token_ids=[3],
+                sampling=greedy,
+                request_id="greedy-b",
+            ),
+        )
+
+        assert calls == [
+            ([[1], [3]], ["greedy-a", "greedy-b"], 0.0),
+            ([[2]], ["sampled"], 0.7),
+        ]
+        assert [completion.token_ids for completion in completions] == [[1], [2], [3]]
+        await scheduler.close()
+
+    asyncio.run(run())
+
+
 def test_generation_scheduler_pauses_new_admission_until_resume():
     async def run() -> None:
         calls: list[list[list[int]]] = []
@@ -644,6 +766,7 @@ def test_generation_scheduler_pauses_new_admission_until_resume():
 
         async def generate_batch(
             prompts: list[list[int]],
+            request_ids: list[str],
             sampling: SamplingConfig,
         ) -> tuple[list[Completion], list[m.Metric]]:
             calls.append([list(prompt) for prompt in prompts])
@@ -709,6 +832,7 @@ def test_generation_scheduler_close_drops_cancelled_queued_request():
 
         async def generate_batch(
             prompts: list[list[int]],
+            request_ids: list[str],
             sampling: SamplingConfig,
         ) -> tuple[list[Completion], list[m.Metric]]:
             calls.append([list(prompt) for prompt in prompts])
@@ -754,6 +878,7 @@ def test_generation_scheduler_close_waits_for_active_generation():
 
         async def generate_batch(
             prompts: list[list[int]],
+            request_ids: list[str],
             sampling: SamplingConfig,
         ) -> tuple[list[Completion], list[m.Metric]]:
             calls.append([list(prompt) for prompt in prompts])
@@ -806,6 +931,7 @@ def test_generation_scheduler_propagates_generator_exception_to_pending_batch():
     async def run() -> None:
         async def generate_batch(
             prompts: list[list[int]],
+            request_ids: list[str],
             sampling: SamplingConfig,
         ) -> tuple[list[Completion], list[m.Metric]]:
             raise ValueError(f"bad batch: {prompts}")

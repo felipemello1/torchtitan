@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import statistics
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from torchtitan.experiments.rl.observability import metrics as m
@@ -24,6 +24,20 @@ _TRACE_FWD_BWD_KEYS = (
     "loss/logprob/behavior_nonfinite_frac",
     "bit_wise/nonfinite_logprob_frac",
 )
+
+
+def validate_train_step_fwd_bwd_metrics(
+    fwd_bwd_metrics: Mapping[str, float],
+) -> None:
+    """Raise if train-step health metrics required by the controller are absent."""
+    missing_trace_metrics = [
+        key for key in _TRACE_FWD_BWD_KEYS if key not in fwd_bwd_metrics
+    ]
+    if missing_trace_metrics:
+        raise KeyError(
+            "fwd_bwd_metrics missing required train-step metrics: "
+            f"{missing_trace_metrics}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,14 +296,7 @@ def build_train_step_metrics(
         "timing.checkpoint_ms": timings.checkpoint_s * 1000,
         "checkpoint.saved": float(checkpoint_saved),
     }
-    missing_trace_metrics = [
-        key for key in _TRACE_FWD_BWD_KEYS if key not in fwd_bwd_metrics
-    ]
-    if missing_trace_metrics:
-        raise KeyError(
-            "fwd_bwd_metrics missing required trace metrics: "
-            f"{missing_trace_metrics}"
-        )
+    validate_train_step_fwd_bwd_metrics(fwd_bwd_metrics)
     for key in _TRACE_FWD_BWD_KEYS:
         trace_scalars[key.replace("/", ".")] = fwd_bwd_metrics[key]
     return metrics, trace_scalars
