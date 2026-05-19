@@ -28,6 +28,7 @@ from torchtitan.experiments.rl.alphabet_sort import (
 )
 from torchtitan.experiments.rl.grpo import GRPOLoss, RLTrainer
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
+from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.sampling import SamplingConfig
 from torchtitan.experiments.rl.sum_digits import SumDigitsBuilder, SumDigitsDataset
 from torchtitan.models.qwen3 import model_registry
@@ -59,6 +60,7 @@ def _alphabet_sort_4gpu_config(
     lr: float,
     num_prompts_per_step: int,
     num_validation_samples: int,
+    compile_config: CompileConfig | None = None,
 ) -> RLTrainer.Config:
     """Four-GPU AlphabetSort config: 2 GPUs generator + 2 GPUs trainer."""
     group_size = 8
@@ -74,11 +76,16 @@ def _alphabet_sort_4gpu_config(
         async_rollout_groups=2,
         replay_buffer_groups=num_prompts_per_step,
         max_offpolicy_steps=1,
-        compile=CompileConfig(enable=True, backend="aot_eager"),
+        compile=(
+            compile_config
+            if compile_config is not None
+            else CompileConfig(enable=True, backend="aot_eager")
+        ),
         train_dataset=_alphabet_sort_dataset(seed=142857),
         train_env_builder=_alphabet_sort_builder(),
         validation_dataset=_alphabet_sort_dataset(seed=314159),
         validation_env_builder=_alphabet_sort_builder(),
+        renderer=RendererConfig(name="qwen3", enable_thinking=False),
         metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(
             optimizer=OptimizersContainer.Config(lr=lr),
@@ -103,6 +110,7 @@ def _alphabet_sort_4gpu_config(
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
+            gpu_memory_limit=0.75,
             parallelism=ParallelismConfig(
                 tensor_parallel_degree=2,
                 data_parallel_replicate_degree=1,
@@ -114,7 +122,7 @@ def _alphabet_sort_4gpu_config(
                 n=1,
                 temperature=0.8,
                 top_p=0.95,
-                max_tokens=512,
+                max_tokens=256,
             ),
         ),
     )
@@ -132,6 +140,7 @@ def _sum_digits_smoke_config(
     trainer_debug: DebugConfig | None = None,
     generator_debug: DebugConfig | None = None,
     generator_data_parallel_shard_degree: int | None = None,
+    compile_config: CompileConfig | None = None,
 ) -> RLTrainer.Config:
     """Shared 10-step SumDigits smoke config."""
     group_size = 8
@@ -159,7 +168,11 @@ def _sum_digits_smoke_config(
         num_prompts_per_step=5,
         rollout_group_size=group_size,
         num_validation_samples=20,
-        compile=CompileConfig(enable=True, backend="aot_eager"),
+        compile=(
+            compile_config
+            if compile_config is not None
+            else CompileConfig(enable=True, backend="aot_eager")
+        ),
         train_dataset=SumDigitsDataset.Config(seed=42),
         train_env_builder=SumDigitsBuilder.Config(
             correctness_reward=1.0,
@@ -234,7 +247,7 @@ def rl_grpo_qwen3_0_6b_alphabet_sort() -> RLTrainer.Config:
     return _alphabet_sort_4gpu_config(
         model_size="0.6B",
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
-        lr=2e-6,
+        lr=1e-6,
         num_prompts_per_step=8,
         num_validation_samples=32,
     )
@@ -249,6 +262,7 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
         trainer_tensor_parallel_degree=2,
         generator_tensor_parallel_degree=4,
         generator_data_parallel_shard_degree=1,
+        compile_config=CompileConfig(enable=False),
     )
 
 
@@ -260,6 +274,7 @@ def rl_grpo_qwen3_1_7b_alphabet_sort() -> RLTrainer.Config:
         lr=1e-6,
         num_prompts_per_step=4,
         num_validation_samples=16,
+        compile_config=CompileConfig(enable=False),
     )
 
 

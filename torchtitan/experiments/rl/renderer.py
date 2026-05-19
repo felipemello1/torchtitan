@@ -52,7 +52,7 @@ class RendererConfig(Configurable.Config):
 
     ``"auto"`` lets ``create_renderer`` pick the renderer that matches the
     tokenizer's chat template. Pass a concrete name (e.g. ``"qwen3"``,
-    ``"deepseek_v3"``, ``"gpt_oss"``) to override.
+    ``"deepseek-v3"``, ``"gpt-oss"``) to override.
     """
 
     tool_parser: str | None = None
@@ -60,6 +60,19 @@ class RendererConfig(Configurable.Config):
 
     reasoning_parser: str | None = None
     """Reasoning parser used by ``DefaultRenderer``. Ignored by model-specific renderers."""
+
+    enable_thinking: bool | None = None
+    """Qwen3 thinking-mode override.
+
+    ``None`` keeps the renderer default. Set to ``False`` for RL tasks where
+    long hidden reasoning would dominate context length and trainer memory.
+    """
+
+    preserve_all_thinking: bool = False
+    """Forward historical assistant reasoning back into future prompts."""
+
+    preserve_thinking_between_tool_calls: bool = False
+    """Keep assistant reasoning during active tool-call loops."""
 
     def build(
         self,
@@ -89,9 +102,32 @@ class RendererConfig(Configurable.Config):
                 trust_remote_code=True,
             )
 
+        preserve_kwargs = {
+            "preserve_all_thinking": self.preserve_all_thinking,
+            "preserve_thinking_between_tool_calls": (
+                self.preserve_thinking_between_tool_calls
+            ),
+        }
+
+        if self.enable_thinking is not None:
+            if self.name != "qwen3":
+                raise ValueError(
+                    "RendererConfig.enable_thinking is only supported when "
+                    "`name='qwen3'`; use the renderer's native config for "
+                    f"{self.name!r}"
+                )
+            from renderers.qwen3 import Qwen3Renderer
+
+            return Qwen3Renderer(
+                tokenizer,
+                enable_thinking=self.enable_thinking,
+                **preserve_kwargs,
+            )
+
         return create_renderer(
             tokenizer,
             renderer=self.name,
             tool_parser=self.tool_parser,
             reasoning_parser=self.reasoning_parser,
+            **preserve_kwargs,
         )

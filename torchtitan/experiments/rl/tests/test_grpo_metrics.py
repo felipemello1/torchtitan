@@ -10,6 +10,7 @@ import os
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from torchtitan.experiments.rl.envs import EnvExample, EnvStep
 from torchtitan.experiments.rl.envs.token_env import PromptState, TokenEnv, TokenStep
@@ -19,6 +20,7 @@ from torchtitan.experiments.rl.grpo import (
     _RolloutDropCounters,
     _TrainStepTimings,
     _WeightSyncTimings,
+    GRPOLoss,
     Provisioner,
     RLTrainer,
 )
@@ -54,6 +56,21 @@ from torchtitan.experiments.rl.types import (
 
 def test_sampling_config_default_is_one_completion():
     assert SamplingConfig().n == 1
+
+
+def test_grpo_loss_clamps_log_ratio_before_exp():
+    loss_fn = GRPOLoss(GRPOLoss.Config(max_log_ratio=5.0))
+
+    loss, metrics = loss_fn(
+        policy_logprobs=torch.tensor([1000.0, -1000.0]),
+        behavior_logprobs=torch.tensor([0.0, 0.0]),
+        advantages=torch.tensor([-1.0, 1.0]),
+        num_global_valid_tokens=torch.tensor(2.0),
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["loss/ratio/mean"])
+    assert metrics["loss/ratio/log_clipped_frac"].item() == 1.0
 
 
 def test_provisioner_respects_parent_cuda_visible_devices(monkeypatch):
@@ -333,6 +350,13 @@ def test_generation_scheduler_coalesces_same_tick_requests():
 
         assert calls == [[[1], [2]]]
         assert [completion.token_ids for completion in completions] == [[0], [1]]
+        aggregate = m.MetricsProcessor._aggregate_metrics(scheduler.pop_metrics())
+        assert aggregate["generation_scheduler/batch_size/mean"] == 2
+        assert aggregate["generation_scheduler/batch_size/max"] == 2
+        assert aggregate["generation_scheduler/pending_depth/mean"] == 0
+        assert aggregate["generation_scheduler/pending_depth/max"] == 0
+        assert aggregate["generation_scheduler/active_requests/mean"] == 2
+        assert aggregate["generation_scheduler/active_requests/max"] == 2
 
     asyncio.run(run())
 
@@ -534,6 +558,44 @@ def test_generation_scheduler_propagates_generator_exception_to_pending_batch():
         with pytest.raises(ValueError, match="bad batch"):
             await second
         await scheduler.close()
+
+    asyncio.run(run())
+
+
+def test_rltrainer_close_times_out_hung_actor_and_stops_mesh():
+    async def run() -> None:
+        class HungClose:
+            def call(self):
+                return asyncio.sleep(3600)
+
+        class FakeMesh:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            async def stop(self) -> None:
+                self.stopped = True
+
+        class FakeMetrics:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        mesh = FakeMesh()
+        metrics = FakeMetrics()
+        trainer = RLTrainer.__new__(RLTrainer)
+        trainer.config = SimpleNamespace(actor_close_timeout_s=0.01)
+        trainer.trainer = SimpleNamespace(close=HungClose())
+        trainer.generator = None
+        trainer.metrics_processor = metrics
+        trainer._proc_meshes = [mesh]
+
+        await trainer.close()
+
+        assert metrics.closed
+        assert mesh.stopped
+        assert trainer._proc_meshes == []
 
     asyncio.run(run())
 

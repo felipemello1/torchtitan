@@ -70,9 +70,79 @@ def test_renderer_parse_response_extracts_content():
 
 
 @needs_assets
+def test_renderer_qwen3_can_disable_thinking():
+    """Qwen3 no-thinking mode emits the empty think block expected by Qwen."""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(QWEN3_0_6B_ASSETS), trust_remote_code=True
+    )
+    renderer = RendererConfig(name="qwen3", enable_thinking=False).build(
+        tokenizer=tokenizer
+    )
+    token_ids = list(
+        renderer.render_ids(
+            [{"role": "user", "content": "answer briefly"}],
+            add_generation_prompt=True,
+        )
+    )
+    rendered = tokenizer.decode(token_ids)
+    assert "<think>\n\n</think>" in rendered
+
+
+def test_renderer_qwen3_thinking_override_uses_native_renderer(monkeypatch):
+    """The Qwen3 thinking knob is wired without requiring tokenizer assets."""
+    import renderers.qwen3 as qwen3
+
+    class FakeQwen3Renderer:
+        __slots__ = (
+            "enable_thinking",
+            "preserve_all_thinking",
+            "preserve_thinking_between_tool_calls",
+            "tokenizer",
+        )
+
+        def __init__(
+            self,
+            tokenizer,
+            *,
+            enable_thinking: bool,
+            preserve_all_thinking: bool,
+            preserve_thinking_between_tool_calls: bool,
+        ) -> None:
+            self.tokenizer = tokenizer
+            self.enable_thinking = enable_thinking
+            self.preserve_all_thinking = preserve_all_thinking
+            self.preserve_thinking_between_tool_calls = (
+                preserve_thinking_between_tool_calls
+            )
+
+    monkeypatch.setattr(qwen3, "Qwen3Renderer", FakeQwen3Renderer)
+
+    tokenizer = object()
+    renderer = RendererConfig(
+        name="qwen3",
+        enable_thinking=False,
+        preserve_all_thinking=True,
+        preserve_thinking_between_tool_calls=True,
+    ).build(tokenizer=tokenizer)
+
+    assert isinstance(renderer, FakeQwen3Renderer)
+    assert renderer.tokenizer is tokenizer
+    assert renderer.enable_thinking is False
+    assert renderer.preserve_all_thinking is True
+    assert renderer.preserve_thinking_between_tool_calls is True
+
+
+@needs_assets
 def test_renderer_config_requires_exactly_one_of_path_or_tokenizer():
     cfg = RendererConfig(name="auto")
     with pytest.raises(ValueError, match="exactly one of"):
         cfg.build()
     with pytest.raises(ValueError, match="exactly one of"):
         cfg.build(model_path="x", tokenizer=object())
+
+
+def test_renderer_thinking_override_requires_qwen3_renderer():
+    with pytest.raises(ValueError, match="enable_thinking"):
+        RendererConfig(name="auto", enable_thinking=False).build(tokenizer=object())

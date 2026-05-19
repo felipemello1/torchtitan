@@ -152,8 +152,33 @@ class GenerationScheduler:
             if not pending_group:
                 return
             self._active_requests += len(pending_group)
+            batch_size = len(pending_group)
+            pending_depth = len(self._pending)
+            active_requests = self._active_requests
 
         try:
+            self._metrics.extend(
+                [
+                    m.Metric("generation_scheduler/batch_size", m.Mean(batch_size)),
+                    m.Metric("generation_scheduler/batch_size", m.Max(batch_size)),
+                    m.Metric(
+                        "generation_scheduler/pending_depth",
+                        m.Mean(pending_depth),
+                    ),
+                    m.Metric(
+                        "generation_scheduler/pending_depth",
+                        m.Max(pending_depth),
+                    ),
+                    m.Metric(
+                        "generation_scheduler/active_requests",
+                        m.Mean(active_requests),
+                    ),
+                    m.Metric(
+                        "generation_scheduler/active_requests",
+                        m.Max(active_requests),
+                    ),
+                ]
+            )
             with sl.log_trace_span("generation_scheduler_flush"):
                 completions, metrics = await self._generate_batch(
                     [pending.prompt_token_ids for pending in pending_group],

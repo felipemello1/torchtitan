@@ -95,8 +95,16 @@ class GRPOLoss(Configurable):
         clip_eps: float = 0.2
         """PPO clipping epsilon for the probability ratio."""
 
+        max_log_ratio: float = 10.0
+        """Clamp ``policy_logprob - behavior_logprob`` before exponentiating."""
+
     def __init__(self, config: Config):
+        if config.max_log_ratio <= 0:
+            raise ValueError(
+                f"max_log_ratio must be positive, got {config.max_log_ratio}"
+            )
         self.clip_eps = config.clip_eps
+        self.max_log_ratio = config.max_log_ratio
 
     def __call__(
         self,
@@ -105,7 +113,13 @@ class GRPOLoss(Configurable):
         advantages: torch.Tensor,
         num_global_valid_tokens: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        ratio = torch.exp(policy_logprobs - behavior_logprobs)
+        raw_log_ratio = policy_logprobs - behavior_logprobs
+        log_ratio = torch.clamp(
+            raw_log_ratio,
+            min=-self.max_log_ratio,
+            max=self.max_log_ratio,
+        )
+        ratio = torch.exp(log_ratio)
         clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
         # pg = policy gradient.
         token_pg_losses = -torch.min(ratio * advantages, clipped_ratio * advantages)
@@ -113,10 +127,13 @@ class GRPOLoss(Configurable):
 
         with torch.no_grad():
             clipped_frac = (torch.abs(ratio - clipped_ratio) > 1e-6).to(ratio.dtype)
+            log_ratio_clipped_frac = (raw_log_ratio != log_ratio).to(ratio.dtype)
             loss_metrics = {
                 "loss/mean": pg_loss.detach(),
                 "loss/ratio/mean": ratio.sum() / num_global_valid_tokens,
                 "loss/ratio/clipped_frac": clipped_frac.sum() / num_global_valid_tokens,
+                "loss/ratio/log_clipped_frac": log_ratio_clipped_frac.sum()
+                / num_global_valid_tokens,
             }
 
         return pg_loss, loss_metrics
@@ -387,6 +404,9 @@ class RLTrainer(Configurable):
         admission. ``None`` disables the guard.
         """
 
+        actor_close_timeout_s: float = 30.0
+        """Best-effort timeout for actor close endpoints and mesh shutdown."""
+
         metrics: m.MetricsProcessor.Config = field(
             default_factory=m.MetricsProcessor.Config
         )
@@ -463,6 +483,11 @@ class RLTrainer(Configurable):
                     "max_no_signal_groups must be positive or None, got "
                     f"{self.max_no_signal_groups}"
                 )
+            if self.actor_close_timeout_s <= 0:
+                raise ValueError(
+                    "actor_close_timeout_s must be positive, "
+                    f"got {self.actor_close_timeout_s}"
+                )
 
     def __init__(self, config: Config):
         self.config = config
@@ -491,6 +516,11 @@ class RLTrainer(Configurable):
     async def close(self):
         """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
         logger.info("Closing: tearing down actors and process meshes.")
+        close_timeout_s = getattr(
+            getattr(self, "config", None),
+            "actor_close_timeout_s",
+            30.0,
+        )
         for actor_name, actor in (
             ("trainer", self.trainer),
             ("generator", self.generator),
@@ -498,7 +528,16 @@ class RLTrainer(Configurable):
             if actor is None:
                 continue
             try:
-                await actor.close.call()
+                await asyncio.wait_for(
+                    actor.close.call(),
+                    timeout=close_timeout_s,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "%s.close timed out after %.1fs; stopping proc meshes",
+                    actor_name,
+                    close_timeout_s,
+                )
             except Exception:
                 logger.exception("%s.close failed", actor_name)
 
@@ -509,7 +548,16 @@ class RLTrainer(Configurable):
 
         for i, mesh in enumerate(self._proc_meshes):
             try:
-                await mesh.stop()
+                await asyncio.wait_for(
+                    mesh.stop(),
+                    timeout=close_timeout_s,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "mesh.stop[%d] timed out after %.1fs",
+                    i,
+                    close_timeout_s,
+                )
             except Exception:
                 logger.exception("mesh.stop[%d] failed", i)
         self._proc_meshes = []

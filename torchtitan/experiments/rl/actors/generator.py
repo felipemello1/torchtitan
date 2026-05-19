@@ -34,7 +34,6 @@ from torchtitan.tools.logging import init_logger
 from torchtitan.tools.utils import has_cuda_capability
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, CompilationConfig
-from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -546,34 +545,36 @@ class VLLMGenerator(Actor, Configurable):
 
         vLLM's sync ``LLMEngine`` (what we use) has no public ``shutdown``
         method; only the async ``AsyncLLM`` does. We tear it down by
-        plumbing through its components in the same order ``AsyncLLM``
-        uses internally:
+        releasing the pieces that are available in this vLLM build:
 
         1. ``renderer.shutdown()`` — closes thread pools and the
            multimodal-processor cache.
-        2. ``engine_core.shutdown()`` — stops the model worker and the
-           scheduler.
-        3. ``cleanup_dist_env_and_memory()`` — destroys NCCL / model-
-           parallel process groups, runs ``gc.collect``, empties the
-           accelerator cache.
+        2. ``engine_core.shutdown()`` when present.
 
-        Each step runs in a ``try/finally`` so a failure in one step
-        does not skip the next.
+        The Monarch proc mesh owns the process lifetime after this endpoint
+        returns. Calling vLLM's global ``cleanup_dist_env_and_memory`` from the
+        actor can hang under ``external_launcher`` when this vLLM build lacks
+        the nested worker shutdown method, so process-group teardown is left to
+        ``mesh.stop`` on the controller side.
         """
         if self._engine is not None:
             renderer = getattr(self._engine, "renderer", None)
             try:
-                if renderer is not None:
-                    renderer.shutdown()
-            finally:
                 try:
-                    self._engine.engine_core.shutdown()
-                except AttributeError as exc:
-                    if "shutdown" not in str(exc):
-                        raise
-                    logger.warning(
-                        "vLLM engine_core.shutdown skipped because this vLLM "
-                        "build is missing a nested shutdown method: %s",
-                        exc,
-                    )
-        cleanup_dist_env_and_memory()
+                    if renderer is not None:
+                        renderer.shutdown()
+                finally:
+                    try:
+                        self._engine.engine_core.shutdown()
+                    except AttributeError as exc:
+                        if "shutdown" not in str(exc):
+                            raise
+                        logger.warning(
+                            "vLLM engine_core.shutdown skipped because this vLLM "
+                            "build is missing a nested shutdown method: %s",
+                            exc,
+                        )
+            finally:
+                self._engine = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
