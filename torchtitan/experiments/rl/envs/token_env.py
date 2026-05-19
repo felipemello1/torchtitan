@@ -89,18 +89,6 @@ class TokenEnv:
 
     async def step(self, completion: Completion) -> TokenStep:
         """Parse completion tokens, step the env, and render the next prompt."""
-        if completion.finish_reason == "length":
-            response_messages = self._parse_response_messages(completion)
-            return TokenStep(
-                env_step=EnvStep(
-                    reward=self._config.truncation_reward,
-                    reward_components={"length_stop": 1.0},
-                    done=True,
-                    status=RolloutStatus.TRUNCATED,
-                ),
-                response_messages=response_messages,
-            )
-
         try:
             parsed: ParsedResponse = self._renderer.parse_response(completion.token_ids)
         except Exception as exc:
@@ -120,6 +108,28 @@ class TokenEnv:
         response_messages = [assistant_message, *env_step.messages]
         self._messages.extend(response_messages)
         self._previous_completion_ids = list(completion.token_ids)
+
+        if completion.finish_reason == "length":
+            reward = (
+                env_step.reward
+                if env_step.reward is not None
+                else self._config.truncation_reward
+            )
+            reward_components = (
+                dict(env_step.reward_components)
+                if env_step.reward is not None
+                else {**env_step.reward_components, "length_stop": 1.0}
+            )
+            return TokenStep(
+                env_step=EnvStep(
+                    messages=env_step.messages,
+                    reward=reward,
+                    reward_components=reward_components,
+                    done=True,
+                    status=RolloutStatus.TRUNCATED,
+                ),
+                response_messages=response_messages,
+            )
 
         if env_step.done:
             return TokenStep(env_step=env_step, response_messages=response_messages)
@@ -166,17 +176,6 @@ class TokenEnv:
                 done=True,
                 status=RolloutStatus.ERROR,
             )
-
-    def _parse_response_messages(self, completion: Completion) -> list[Message]:
-        try:
-            return [
-                _assistant_message_from(
-                    self._renderer.parse_response(completion.token_ids)
-                )
-            ]
-        except Exception as exc:
-            logger.warning("renderer.parse_response failed: %s", exc, exc_info=False)
-            return []
 
     async def _render_prompt(self) -> list[int]:
         rendered = await asyncio.to_thread(

@@ -19,7 +19,12 @@ from torchtitan.experiments.rl.actors.utils import (
     compute_logprob_drift,
 )
 from torchtitan.experiments.rl.envs import EnvExample, EnvStep
-from torchtitan.experiments.rl.envs.token_env import PromptState, TokenEnv, TokenStep
+from torchtitan.experiments.rl.envs.token_env import (
+    PromptState,
+    TokenEnv,
+    TokenEnvConfig,
+    TokenStep,
+)
 from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
 from torchtitan.experiments.rl.grpo import (
     _build_train_step_trace_scalars,
@@ -660,13 +665,22 @@ def test_max_turn_truncation_does_not_train_on_nonterminal_reward():
     asyncio.run(run())
 
 
-def test_token_env_keeps_truncated_response_message_for_logging():
+def test_token_env_scores_length_stopped_response():
     class EnvStub:
+        def __init__(self):
+            self.messages = []
+
         async def reset(self):
             raise AssertionError("reset is not needed for a length-stop step")
 
         async def step(self, assistant_message):
-            raise AssertionError("length-stop responses should not step the env")
+            self.messages.append(assistant_message)
+            return EnvStep(
+                reward=0.75,
+                reward_components={"task_score": 0.75},
+                done=True,
+                status=RolloutStatus.COMPLETED,
+            )
 
         async def close(self):
             pass
@@ -681,7 +695,8 @@ def test_token_env_keeps_truncated_response_message_for_logging():
             )
 
     async def run() -> None:
-        token_step = await TokenEnv(EnvStub(), RendererStub()).step(
+        env = EnvStub()
+        token_step = await TokenEnv(env, RendererStub()).step(
             Completion(
                 policy_version=0,
                 token_ids=[10, 11],
@@ -691,10 +706,55 @@ def test_token_env_keeps_truncated_response_message_for_logging():
         )
 
         assert token_step.env_step.status == RolloutStatus.TRUNCATED
-        assert token_step.env_step.reward_components == {"length_stop": 1.0}
+        assert token_step.env_step.reward == 0.75
+        assert token_step.env_step.reward_components == {"task_score": 0.75}
+        assert env.messages == [{"role": "assistant", "content": "partial answer"}]
         assert token_step.response_messages == [
             {"role": "assistant", "content": "partial answer"}
         ]
+
+    asyncio.run(run())
+
+
+def test_token_env_length_stop_falls_back_to_truncation_reward():
+    class EnvStub:
+        async def reset(self):
+            raise AssertionError("reset is not needed for a length-stop step")
+
+        async def step(self, assistant_message):
+            return EnvStep(done=False, reward_components={"partial": 1.0})
+
+        async def close(self):
+            pass
+
+    class RendererStub:
+        def parse_response(self, token_ids):
+            return SimpleNamespace(
+                content="partial intermediate",
+                reasoning_content=None,
+                tool_calls=None,
+            )
+
+    async def run() -> None:
+        token_step = await TokenEnv(
+            EnvStub(),
+            RendererStub(),
+            TokenEnvConfig(truncation_reward=-0.25),
+        ).step(
+            Completion(
+                policy_version=0,
+                token_ids=[10],
+                token_logprobs=[-0.1],
+                finish_reason="length",
+            )
+        )
+
+        assert token_step.env_step.status == RolloutStatus.TRUNCATED
+        assert token_step.env_step.reward == -0.25
+        assert token_step.env_step.reward_components == {
+            "partial": 1.0,
+            "length_stop": 1.0,
+        }
 
     asyncio.run(run())
 
