@@ -1060,6 +1060,132 @@ def test_generation_scheduler_pauses_new_admission_until_resume():
     asyncio.run(run())
 
 
+def test_generation_scheduler_flushes_new_tick_while_prior_generation_active():
+    async def run() -> None:
+        calls: list[list[list[int]]] = []
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        finish_first = asyncio.Event()
+
+        async def generate_batch(
+            prompts: list[list[int]],
+            request_ids: list[str],
+            sampling: SamplingConfig,
+        ) -> tuple[list[Completion], list[m.Metric]]:
+            calls.append([list(prompt) for prompt in prompts])
+            if prompts == [[1]]:
+                first_started.set()
+                await finish_first.wait()
+            if prompts == [[2]]:
+                second_started.set()
+            return (
+                [
+                    Completion(
+                        policy_version=0,
+                        token_ids=[prompt[0]],
+                        token_logprobs=[-0.1],
+                        finish_reason="stop",
+                    )
+                    for prompt in prompts
+                ],
+                [],
+            )
+
+        scheduler = GenerationScheduler(generate_batch)
+        sampling = SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4)
+        first = asyncio.create_task(
+            scheduler.submit(
+                prompt_token_ids=[1],
+                sampling=sampling,
+                request_id="first",
+            )
+        )
+        await first_started.wait()
+
+        second = asyncio.create_task(
+            scheduler.submit(
+                prompt_token_ids=[2],
+                sampling=sampling,
+                request_id="second",
+            )
+        )
+        await asyncio.wait_for(second_started.wait(), timeout=1.0)
+        assert calls == [[[1]], [[2]]]
+
+        finish_first.set()
+        assert (await first).token_ids == [1]
+        assert (await second).token_ids == [2]
+        await scheduler.close()
+
+    asyncio.run(run())
+
+
+def test_generation_scheduler_bounds_active_prompts():
+    async def run() -> None:
+        calls: list[list[list[int]]] = []
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        finish_first = asyncio.Event()
+
+        async def generate_batch(
+            prompts: list[list[int]],
+            request_ids: list[str],
+            sampling: SamplingConfig,
+        ) -> tuple[list[Completion], list[m.Metric]]:
+            calls.append([list(prompt) for prompt in prompts])
+            if prompts == [[1], [2]]:
+                first_started.set()
+                await finish_first.wait()
+            if prompts == [[3], [4]]:
+                second_started.set()
+            return (
+                [
+                    Completion(
+                        policy_version=0,
+                        token_ids=[prompt[0]],
+                        token_logprobs=[-0.1],
+                        finish_reason="stop",
+                    )
+                    for prompt in prompts
+                ],
+                [],
+            )
+
+        scheduler = GenerationScheduler(generate_batch, max_active_prompts=2)
+        sampling = SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4)
+        tasks = [
+            asyncio.create_task(
+                scheduler.submit(
+                    prompt_token_ids=[idx],
+                    sampling=sampling,
+                    request_id=f"request-{idx}",
+                )
+            )
+            for idx in range(1, 5)
+        ]
+        await first_started.wait()
+        await asyncio.sleep(0)
+        assert calls == [[[1], [2]]]
+        assert not second_started.is_set()
+
+        finish_first.set()
+        await asyncio.wait_for(second_started.wait(), timeout=1.0)
+        completions = await asyncio.gather(*tasks)
+
+        assert calls == [[[1], [2]], [[3], [4]]]
+        assert [completion.token_ids for completion in completions] == [
+            [1],
+            [2],
+            [3],
+            [4],
+        ]
+        aggregate = m.MetricsProcessor._aggregate_metrics(scheduler.pop_metrics())
+        assert aggregate["generation_scheduler/active_prompts/max"] == 2
+        await scheduler.close()
+
+    asyncio.run(run())
+
+
 def test_generation_scheduler_close_drops_cancelled_queued_request():
     async def run() -> None:
         calls: list[list[list[int]]] = []

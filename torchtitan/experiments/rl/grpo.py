@@ -390,6 +390,14 @@ class RLTrainer(Configurable):
         async_rollout_groups: int = 1
         """Number of long-lived async rollout producer tasks."""
 
+        max_admitted_generation_prompts: int | None = None
+        """Maximum prompts admitted to the generator and awaiting completion.
+
+        ``None`` uses twice the vLLM running-sequence cap, which keeps the
+        waiting queue bounded while still letting multi-turn rollouts enqueue
+        their next turns before the previous wave fully drains.
+        """
+
         replay_buffer_groups: int = 2
         """Completed-group FIFO capacity for async rollout producers.
 
@@ -468,6 +476,14 @@ class RLTrainer(Configurable):
                 raise ValueError(
                     "async_rollout_groups must be positive, "
                     f"got {self.async_rollout_groups}"
+                )
+            if (
+                self.max_admitted_generation_prompts is not None
+                and self.max_admitted_generation_prompts <= 0
+            ):
+                raise ValueError(
+                    "max_admitted_generation_prompts must be positive or None, "
+                    f"got {self.max_admitted_generation_prompts}"
                 )
             if self.rollout_group_size <= 0:
                 raise ValueError(
@@ -604,7 +620,7 @@ class RLTrainer(Configurable):
 
     @staticmethod
     def _max_generator_num_seqs(config: Config) -> int:
-        """Upper-bound one controller scheduler flush into the vLLM engine."""
+        """Cap vLLM running sequences, not total admitted scheduler prompts."""
         train_fanout = max(config.async_rollout_groups, 1) * config.rollout_group_size
         validation_fanout = min(
             max(config.num_validation_samples, 1),
@@ -862,7 +878,14 @@ class RLTrainer(Configurable):
             )
             return completions, metrics
 
-        return GenerationScheduler(generate_batch)
+        max_admitted_prompts = self.config.max_admitted_generation_prompts
+        if max_admitted_prompts is None:
+            max_admitted_prompts = 2 * self._max_generator_num_seqs(self.config)
+
+        return GenerationScheduler(
+            generate_batch,
+            max_active_prompts=max_admitted_prompts,
+        )
 
     def _sampling_with_stop_token_ids(self, sampling: SamplingConfig) -> SamplingConfig:
         stop_token_ids = list(self._stop_token_ids)

@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import contextlib
 import logging
 import math
 import os
@@ -332,6 +333,9 @@ class VLLMGenerator(Actor, Configurable):
             logger.info("vLLM rollout engine initialized")
 
         self._engine_lock = asyncio.Lock()
+        self._pending_outputs: dict[str, asyncio.Future[RequestOutput]] = {}
+        self._engine_driver_task: asyncio.Task[None] | None = None
+        self._next_request_id = 0
         self.policy_version = 0
 
         logger.info("Generator initialized with vLLM engine")
@@ -408,6 +412,98 @@ class VLLMGenerator(Actor, Configurable):
             finish_reason=sample.finish_reason,
         )
 
+    def _ensure_engine_driver_locked(self) -> None:
+        """Start the vLLM step driver while holding ``_engine_lock``."""
+        task = self._engine_driver_task
+        if task is None or task.done():
+            reset_cuda_peak_memory_stats()
+            self._engine_driver_task = asyncio.create_task(self._drive_engine())
+
+    async def _drive_engine(self) -> None:
+        """Step vLLM until all admitted requests finish.
+
+        vLLM's sync ``LLMEngine`` needs one caller to drive ``step()``. Keeping
+        that loop separate from request admission lets later ``generate`` calls
+        add requests while earlier ones are still decoding, so vLLM can use its
+        own continuous batching scheduler.
+        """
+        try:
+            with sl.log_trace_span("engine_driver"):
+                while True:
+                    ready_outputs: list[
+                        tuple[asyncio.Future[RequestOutput], RequestOutput]
+                    ]
+                    ready_outputs = []
+                    pending_error: RuntimeError | None = None
+                    pending_futures: list[asyncio.Future[RequestOutput]] = []
+
+                    async with self._engine_lock:
+                        if self._engine is None:
+                            pending_error = RuntimeError(
+                                "vLLM engine closed while generation requests "
+                                "were active"
+                            )
+                            pending_futures = list(self._pending_outputs.values())
+                            self._pending_outputs.clear()
+                            self._engine_driver_task = None
+                        elif self._engine.has_unfinished_requests():
+                            with torch.no_grad():
+                                step_outputs = self._engine.step()
+                            for output in step_outputs:
+                                future = self._pending_outputs.pop(
+                                    str(output.request_id),
+                                    None,
+                                )
+                                if future is None:
+                                    pending_error = RuntimeError(
+                                        "vLLM returned unknown request_id "
+                                        f"{output.request_id!r}; expected one of "
+                                        f"{sorted(self._pending_outputs)}"
+                                    )
+                                    pending_futures = [
+                                        ready_future
+                                        for ready_future, _ready_output in ready_outputs
+                                    ]
+                                    pending_futures.extend(
+                                        self._pending_outputs.values()
+                                    )
+                                    self._pending_outputs.clear()
+                                    self._engine_driver_task = None
+                                    break
+                                ready_outputs.append((future, output))
+                        elif self._pending_outputs:
+                            pending_error = RuntimeError(
+                                "vLLM engine became idle with pending request_ids "
+                                f"{sorted(self._pending_outputs)}"
+                            )
+                            pending_futures = list(self._pending_outputs.values())
+                            self._pending_outputs.clear()
+                            self._engine_driver_task = None
+                        else:
+                            self._engine_driver_task = None
+                            return
+
+                    if pending_error is not None:
+                        for future in pending_futures:
+                            if not future.done():
+                                future.set_exception(pending_error)
+                        return
+
+                    for future, output in ready_outputs:
+                        if not future.done():
+                            future.set_result(output)
+
+                    await asyncio.sleep(0)
+        except Exception as exc:
+            logger.exception("vLLM engine driver failed")
+            async with self._engine_lock:
+                pending_futures = list(self._pending_outputs.values())
+                self._pending_outputs.clear()
+                self._engine_driver_task = None
+            for future in pending_futures:
+                if not future.done():
+                    future.set_exception(exc)
+
     @endpoint
     @sl.log_trace_span("generate")
     async def generate(
@@ -444,114 +540,132 @@ class VLLMGenerator(Actor, Configurable):
         _sampling_config = (
             sampling_config if sampling_config is not None else self.config.sampling
         )
-        _request_ids = (
-            [str(i) for i in range(len(prompt_token_ids_batch))]
-            if request_ids is None
-            else list(request_ids)
-        )
-        if len(_request_ids) != len(prompt_token_ids_batch):
+        if request_ids is not None and len(request_ids) != len(prompt_token_ids_batch):
             raise ValueError(
                 "request_ids length must match prompt_token_ids_batch: "
-                f"{len(_request_ids)} != {len(prompt_token_ids_batch)}"
+                f"{len(request_ids)} != {len(prompt_token_ids_batch)}"
             )
-        if len(set(_request_ids)) != len(_request_ids):
-            raise ValueError(f"request_ids must be unique, got {_request_ids}")
+        if request_ids is not None and len(set(request_ids)) != len(request_ids):
+            raise ValueError(f"request_ids must be unique, got {request_ids}")
 
+        loop = asyncio.get_running_loop()
+        request_futures: list[asyncio.Future[RequestOutput]] = []
         async with self._engine_lock:
             admitted_policy_version = self.policy_version
-            reset_cuda_peak_memory_stats()
+            if request_ids is None:
+                start_id = self._next_request_id
+                self._next_request_id += len(prompt_token_ids_batch)
+                _request_ids = [
+                    str(start_id + idx) for idx in range(len(prompt_token_ids_batch))
+                ]
+            else:
+                _request_ids = list(request_ids)
             logger.debug(
                 f"{os.getpid()=} Generating start generate "
                 f"(policy v{admitted_policy_version})..."
             )
 
-            with torch.no_grad():
-                sampling_params = self._build_sampling_params(_sampling_config)
-
-                # render_cmpl is vLLM's input-pipeline entry.
-                # The tokenize step is a no-op for already-tokenized prompts. The
-                # lower-level alternative is vllm.inputs.tokens_input; we use the
-                # high-level API to stay resilient to vLLM internal changes.
-                engine_inputs = self._engine.renderer.render_cmpl(
-                    [{"prompt_token_ids": ids} for ids in prompt_token_ids_batch]
+            active_duplicates = [
+                request_id
+                for request_id in _request_ids
+                if request_id in self._pending_outputs
+            ]
+            if active_duplicates:
+                raise ValueError(
+                    "request_ids are already active in the vLLM engine: "
+                    f"{active_duplicates}"
                 )
+
+            sampling_params = self._build_sampling_params(_sampling_config)
+
+            # render_cmpl is vLLM's input-pipeline entry.
+            # The tokenize step is a no-op for already-tokenized prompts. The
+            # lower-level alternative is vllm.inputs.tokens_input; we use the
+            # high-level API to stay resilient to vLLM internal changes.
+            engine_inputs = self._engine.renderer.render_cmpl(
+                [{"prompt_token_ids": ids} for ids in prompt_token_ids_batch]
+            )
+            try:
                 for request_id, engine_input in zip(
                     _request_ids,
                     engine_inputs,
                     strict=True,
                 ):
+                    future = loop.create_future()
+                    self._pending_outputs[request_id] = future
+                    request_futures.append(future)
                     self._engine.add_request(
                         request_id=request_id,
                         prompt=engine_input,
                         params=sampling_params,
                     )
+            except Exception:
+                for request_id in _request_ids:
+                    future = self._pending_outputs.pop(request_id, None)
+                    if future is not None and not future.done():
+                        future.cancel()
+                raise
 
-                all_outputs = []
-                with sl.log_trace_span("engine_steps"):
-                    while self._engine.has_unfinished_requests():
-                        all_outputs.extend(self._engine.step())
+            if request_futures:
+                self._ensure_engine_driver_locked()
 
-                if self.policy_version != admitted_policy_version:
-                    raise RuntimeError(
-                        "generator policy_version changed during an active "
-                        "generate call; weight sync admission is broken"
-                    )
+        all_outputs = await asyncio.gather(*request_futures)
 
-                # vLLM may return requests out of order; sort by the request IDs
-                # we admitted so outputs line up with the input batch.
-                request_order = {
-                    request_id: idx for idx, request_id in enumerate(_request_ids)
-                }
-                try:
-                    all_outputs.sort(
-                        key=lambda output: request_order[str(output.request_id)]
-                    )
-                except KeyError as exc:
-                    raise RuntimeError(
-                        f"vLLM returned unknown request_id {exc.args[0]!r}; "
-                        f"expected one of {_request_ids}"
-                    ) from exc
-
-                completions: list[Completion] = []
-                generation_metrics: list[m.Metric] = []
-                output_token_counts: list[int] = []
-                for output in all_outputs:
-                    generation_metrics.extend(
-                        _prepare_generation_request_metrics(
-                            output, prefix=metrics_prefix
-                        )
-                    )
-                    for sample_idx, sample in enumerate(output.outputs):
-                        output_token_counts.append(len(sample.token_ids))
-                        completions.append(
-                            self._completion_from_sample(
-                                output=output,
-                                sample_idx=sample_idx,
-                                policy_version=admitted_policy_version,
-                            )
-                        )
-                generation_metrics.append(
-                    m.Metric(
-                        f"{metrics_prefix}/output_tokens",
-                        m.Sum.from_list(output_token_counts),
-                    )
-                )
-                memory_stats = cuda_memory_stats()
-                for key, value in memory_stats.items():
-                    metric_cls = m.Min if key.startswith("driver_free") else m.Max
-                    generation_metrics.append(
-                        m.Metric(
-                            f"{metrics_prefix}/cuda_memory/{key}",
-                            metric_cls(value),
-                        )
-                    )
-
-            logger.debug(
-                f"{os.getpid()=} Generating finish generate "
-                f"(policy v{admitted_policy_version})..."
+        if self.policy_version != admitted_policy_version:
+            raise RuntimeError(
+                "generator policy_version changed during an active "
+                "generate call; weight sync admission is broken"
             )
 
-            return completions, generation_metrics
+        # vLLM may return requests out of order; sort by the request IDs we
+        # admitted so outputs line up with the input batch.
+        request_order = {request_id: idx for idx, request_id in enumerate(_request_ids)}
+        try:
+            all_outputs.sort(key=lambda output: request_order[str(output.request_id)])
+        except KeyError as exc:
+            raise RuntimeError(
+                f"vLLM returned unknown request_id {exc.args[0]!r}; "
+                f"expected one of {_request_ids}"
+            ) from exc
+
+        completions: list[Completion] = []
+        generation_metrics: list[m.Metric] = []
+        output_token_counts: list[int] = []
+        for output in all_outputs:
+            generation_metrics.extend(
+                _prepare_generation_request_metrics(output, prefix=metrics_prefix)
+            )
+            for sample_idx, sample in enumerate(output.outputs):
+                output_token_counts.append(len(sample.token_ids))
+                completions.append(
+                    self._completion_from_sample(
+                        output=output,
+                        sample_idx=sample_idx,
+                        policy_version=admitted_policy_version,
+                    )
+                )
+        generation_metrics.append(
+            m.Metric(
+                f"{metrics_prefix}/output_tokens",
+                m.Sum.from_list(output_token_counts),
+            )
+        )
+        memory_stats = cuda_memory_stats()
+        for key, value in memory_stats.items():
+            metric_cls = m.Min if key.startswith("driver_free") else m.Max
+            generation_metrics.append(
+                m.Metric(
+                    f"{metrics_prefix}/cuda_memory/{key}",
+                    metric_cls(value),
+                )
+            )
+
+        logger.debug(
+            f"{os.getpid()=} Generating finish generate "
+            f"(policy v{admitted_policy_version})..."
+        )
+
+        return completions, generation_metrics
 
     @endpoint
     @sl.log_trace_span("pull_model_state_dict")
@@ -571,7 +685,7 @@ class VLLMGenerator(Actor, Configurable):
         from monarch.rdma import is_rdma_available
 
         async with self._engine_lock:
-            if self._engine.has_unfinished_requests():
+            if self._pending_outputs or self._engine.has_unfinished_requests():
                 raise RuntimeError(
                     "cannot pull new generator weights while generation requests "
                     "are active"
@@ -609,7 +723,18 @@ class VLLMGenerator(Actor, Configurable):
         the nested worker shutdown method, so process-group teardown is left to
         ``mesh.stop`` on the controller side.
         """
+        driver_task = self._engine_driver_task
+        if driver_task is not None and not driver_task.done():
+            driver_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await driver_task
+
         async with self._engine_lock:
+            close_error = RuntimeError("generator closed with active requests")
+            for future in self._pending_outputs.values():
+                if not future.done():
+                    future.set_exception(close_error)
+            self._pending_outputs.clear()
             if self._engine is not None:
                 renderer = getattr(self._engine, "renderer", None)
                 try:

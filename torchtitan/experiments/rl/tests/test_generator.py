@@ -100,6 +100,9 @@ def _generator(outputs):
     generator = VLLMGenerator.__new__(VLLMGenerator)
     generator._engine = _FakeEngine(outputs)
     generator._engine_lock = asyncio.Lock()
+    generator._pending_outputs = {}
+    generator._engine_driver_task = None
+    generator._next_request_id = 0
     generator.policy_version = 7
     generator.config = SimpleNamespace(
         sampling=SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4),
@@ -175,6 +178,28 @@ def test_generate_rejects_unknown_returned_request_id():
 
     with pytest.raises(RuntimeError, match="unknown request_id"):
         _run_generate(generator, [[1]], request_ids=["expected"])
+
+
+def test_generate_rejects_unknown_returned_request_id_without_hanging_ready_output():
+    async def run() -> None:
+        generator = _generator(
+            [
+                _request_output(request_id="expected"),
+                _request_output(request_id="unexpected"),
+            ]
+        )
+
+        with pytest.raises(RuntimeError, match="unknown request_id"):
+            await asyncio.wait_for(
+                VLLMGenerator.generate._method(
+                    generator,
+                    [[1], [2]],
+                    request_ids=["expected", "other"],
+                ),
+                timeout=1,
+            )
+
+    asyncio.run(run())
 
 
 def test_generate_carries_finish_reason_and_metrics():
@@ -275,3 +300,70 @@ def test_generate_detects_policy_version_change_during_request():
 
     with pytest.raises(RuntimeError, match="policy_version changed"):
         _run_generate(generator, [[1, 2]])
+
+
+def test_generate_admits_new_request_while_prior_request_is_decoding():
+    async def run() -> None:
+        first_step_seen = asyncio.Event()
+        allow_finish = asyncio.Event()
+
+        class ContinuousFakeEngine(_FakeEngine):
+            def __init__(self):
+                super().__init__(outputs=[])
+                self.pending_request_ids: list[str] = []
+                self.max_pending_during_step = 0
+
+            def add_request(self, *args, **kwargs):
+                super().add_request(*args, **kwargs)
+                self.pending_request_ids.append(kwargs["request_id"])
+
+            def has_unfinished_requests(self):
+                return bool(self.pending_request_ids)
+
+            def step(self):
+                first_step_seen.set()
+                self.max_pending_during_step = max(
+                    self.max_pending_during_step,
+                    len(self.pending_request_ids),
+                )
+                if not allow_finish.is_set():
+                    return []
+                request_id = self.pending_request_ids.pop(0)
+                return [
+                    _request_output(
+                        request_id=request_id,
+                        outputs=[_sample(token_ids=(int(request_id),))],
+                    )
+                ]
+
+        generator = _generator([])
+        generator._engine = ContinuousFakeEngine()
+
+        first = asyncio.create_task(
+            VLLMGenerator.generate._method(
+                generator,
+                [[1]],
+                request_ids=["1"],
+            )
+        )
+        await first_step_seen.wait()
+
+        second = asyncio.create_task(
+            VLLMGenerator.generate._method(
+                generator,
+                [[2]],
+                request_ids=["2"],
+            )
+        )
+        while len(generator._engine.add_requests) < 2:
+            await asyncio.sleep(0)
+        assert generator._engine.pending_request_ids == ["1", "2"]
+
+        allow_finish.set()
+        first_result, second_result = await asyncio.gather(first, second)
+
+        assert first_result[0][0].token_ids == [1]
+        assert second_result[0][0].token_ids == [2]
+        assert generator._engine.max_pending_during_step == 2
+
+    asyncio.run(run())

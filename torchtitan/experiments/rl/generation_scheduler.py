@@ -57,15 +57,26 @@ class GenerationScheduler:
     preserved within each sampling bucket. Weight sync pauses admission at
     request boundaries: active generator calls drain, new rollout turns queue on
     the controller, and generation resumes after fresh weights are loaded.
-
-    This is controller-side tick batching for vLLM ``external_launcher``
-    determinism. It is not continuous admission into a live vLLM scheduler.
+    Flush tasks may overlap so later rollout turns can be admitted to the
+    generator actor while earlier turns are still decoding.
     """
 
-    def __init__(self, generate_batch: GenerateBatchFn):
+    def __init__(
+        self,
+        generate_batch: GenerateBatchFn,
+        *,
+        max_active_prompts: int | None = None,
+    ):
+        if max_active_prompts is not None and max_active_prompts <= 0:
+            raise ValueError(
+                "max_active_prompts must be positive or None, "
+                f"got {max_active_prompts}"
+            )
         self._generate_batch = generate_batch
+        self._max_active_prompts = max_active_prompts
         self._pending: list[_PendingGeneration] = []
         self._flush_task: asyncio.Task[None] | None = None
+        self._active_flush_tasks: set[asyncio.Task[None]] = set()
         self._metrics: list[m.Metric] = []
         self._condition = asyncio.Condition()
         self._loading_weights = False
@@ -135,8 +146,28 @@ class GenerationScheduler:
                 pending_by_sampling[_sampling_key(pending.sampling)].append(pending)
 
             for pending_group in pending_by_sampling.values():
-                await self._flush_group(pending_group)
+                for chunk in self._flush_chunks(pending_group):
+                    task = asyncio.create_task(self._flush_group(chunk))
+                    self._active_flush_tasks.add(task)
+                    task.add_done_callback(self._active_flush_tasks.discard)
             await asyncio.sleep(0)
+
+    def _flush_chunks(
+        self, pending_group: list[_PendingGeneration]
+    ) -> list[list[_PendingGeneration]]:
+        max_active_prompts = self._max_active_prompts
+        if max_active_prompts is None or len(pending_group) <= max_active_prompts:
+            return [pending_group]
+        return [
+            pending_group[start : start + max_active_prompts]
+            for start in range(0, len(pending_group), max_active_prompts)
+        ]
+
+    def _can_admit(self, batch_size: int) -> bool:
+        return (
+            self._max_active_prompts is None
+            or self._active_prompts + batch_size <= self._max_active_prompts
+        )
 
     async def _flush_group(self, pending_group: list[_PendingGeneration]) -> None:
         pending_group = [
@@ -148,7 +179,8 @@ class GenerationScheduler:
         sampling = pending_group[0].sampling
         async with self._condition:
             await self._condition.wait_for(
-                lambda: self._closed or not self._loading_weights
+                lambda: self._closed
+                or (not self._loading_weights and self._can_admit(len(pending_group)))
             )
             if self._closed:
                 self._fail_pending(pending_group)
@@ -253,6 +285,7 @@ class GenerationScheduler:
 
     async def close(self) -> None:
         task: asyncio.Task[None] | None
+        active_flush_tasks: list[asyncio.Task[None]]
         async with self._condition:
             self._closed = True
             self._loading_weights = False
@@ -263,6 +296,11 @@ class GenerationScheduler:
 
         if task is not None and task is not asyncio.current_task():
             await task
+
+        async with self._condition:
+            active_flush_tasks = list(self._active_flush_tasks)
+        if active_flush_tasks:
+            await asyncio.gather(*active_flush_tasks, return_exceptions=True)
 
         async with self._condition:
             await self._condition.wait_for(lambda: self._active_prompts == 0)
