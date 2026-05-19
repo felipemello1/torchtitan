@@ -35,9 +35,9 @@ def test_alphabet_sort_1_7b_dapo_2gpu_config_stays_on_two_gpus():
 
     assert cfg.model_spec.flavor == "1.7B"
     assert cfg.num_steps == 50
-    assert cfg.num_prompts_per_step == 4
-    assert cfg.async_rollout_groups == 4
-    assert cfg.replay_buffer_groups == 8
+    assert cfg.num_prompts_per_step == 16
+    assert cfg.async_rollout_groups == 16
+    assert cfg.replay_buffer_groups == 32
     assert cfg.trainer.parallelism.tensor_parallel_degree == 1
     assert cfg.generator.parallelism.tensor_parallel_degree == 1
     assert cfg.generator.sampling.max_tokens == 512

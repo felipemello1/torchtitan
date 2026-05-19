@@ -26,7 +26,8 @@ class TokenEnvConfig:
 
     Args:
         error_reward: Reward used when parsing or env stepping fails.
-        truncation_reward: Reward used on generation length stop or context cap.
+        truncation_reward: Fallback reward for generation length stops when
+            the env did not stamp a reward, and for controller-side context caps.
         max_trajectory_tokens: Optional prompt-token cap before the next generation.
         max_generation_tokens: Reserve included in context-cap checks.
         step_timeout_s: Optional timeout for one ``MessageEnv.step`` call.

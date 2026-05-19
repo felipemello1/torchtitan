@@ -391,7 +391,12 @@ class RLTrainer(Configurable):
         """Number of long-lived async rollout producer tasks."""
 
         replay_buffer_groups: int = 2
-        """Maximum completed GRPO groups buffered before trainer consumption."""
+        """Completed-group FIFO capacity for async rollout producers.
+
+        The trainer still consumes ``num_prompts_per_step`` groups per
+        optimizer step. This value only controls how far completed rollouts can
+        queue ahead before producers block.
+        """
 
         max_offpolicy_steps: int | None = 1
         """Drop replay groups older than this policy-version lag. ``None`` keeps all."""
