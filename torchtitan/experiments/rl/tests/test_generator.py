@@ -307,23 +307,35 @@ def test_generate_aborts_partially_admitted_requests_after_add_failure():
     class PartiallyFailingEngine(_FakeEngine):
         def __init__(self):
             super().__init__(outputs=[])
-            self.active_request_ids: list[str] = []
+            self.external_to_internal_request_ids: dict[str, str] = {}
+            self.active_internal_request_ids: set[str] = set()
             self.abort_requests: list[tuple[list[str], bool]] = []
 
         def add_request(self, *args, **kwargs):
+            external_request_id = kwargs["request_id"]
+            internal_request_id = f"{external_request_id}-internal"
+            self.external_to_internal_request_ids[
+                external_request_id
+            ] = internal_request_id
+            self.active_internal_request_ids.add(internal_request_id)
             if kwargs["request_id"] == "bad":
                 raise RuntimeError("add failed")
             super().add_request(*args, **kwargs)
-            self.active_request_ids.append(kwargs["request_id"])
 
         def abort_request(self, request_ids, internal=False):
             request_ids = list(request_ids)
             self.abort_requests.append((request_ids, internal))
             for request_id in request_ids:
-                self.active_request_ids.remove(request_id)
+                internal_request_id = (
+                    request_id
+                    if internal
+                    else self.external_to_internal_request_ids.pop(request_id, None)
+                )
+                if internal_request_id is not None:
+                    self.active_internal_request_ids.discard(internal_request_id)
 
         def has_unfinished_requests(self):
-            return bool(self.active_request_ids)
+            return bool(self.active_internal_request_ids)
 
     generator = _generator([])
     generator._engine = PartiallyFailingEngine()
@@ -331,8 +343,8 @@ def test_generate_aborts_partially_admitted_requests_after_add_failure():
     with pytest.raises(RuntimeError, match="add failed"):
         _run_generate(generator, [[1], [2]], request_ids=["ok", "bad"])
 
-    assert generator._engine.abort_requests == [(["ok"], True)]
-    assert generator._engine.active_request_ids == []
+    assert generator._engine.abort_requests == [(["ok", "bad"], False)]
+    assert generator._engine.active_internal_request_ids == set()
     assert generator._pending_outputs == {}
     assert generator._engine_driver_task is None
 
