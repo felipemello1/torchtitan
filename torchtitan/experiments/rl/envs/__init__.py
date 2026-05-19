@@ -11,7 +11,6 @@ from torchtitan.experiments.rl.envs.types import (
     EnvExample,
     EnvReset,
     EnvStep,
-    JsonValue,
     MessageEnv,
 )
 
@@ -21,7 +20,6 @@ __all__ = [
     "EnvExample",
     "EnvReset",
     "EnvStep",
-    "JsonValue",
     "MessageEnv",
     "TokenEnv",
     "TokenEnvConfig",

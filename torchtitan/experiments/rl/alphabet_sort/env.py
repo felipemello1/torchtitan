@@ -40,53 +40,17 @@ class AlphabetSortBuilder(Configurable):
         self.config = config
 
     def build(self, *, example: EnvExample) -> "AlphabetSortEnv":
+        payload = example.payload
+        if not isinstance(payload, AlphabetSortExample):
+            raise ValueError(
+                "AlphabetSort example payload must be AlphabetSortExample, "
+                f"got {type(payload).__name__}"
+            )
         return AlphabetSortEnv(
-            episode=_episode_from_payload(example),
+            episode=payload,
             similarity_power=self.config.similarity_power,
             power_per_turn=self.config.power_per_turn,
         )
-
-
-def _episode_from_payload(example: EnvExample) -> AlphabetSortExample:
-    payload = example.payload
-    initial_prompt = payload.get("initial_prompt")
-    follow_ups = payload.get("follow_ups")
-    ground_truths = payload.get("ground_truths")
-    turn_names = payload.get("turn_names")
-    sort_by_first = payload.get("sort_by_first")
-
-    if not isinstance(initial_prompt, str):
-        raise ValueError("AlphabetSort payload must contain string 'initial_prompt'")
-    if not (
-        isinstance(follow_ups, list)
-        and all(isinstance(item, str) for item in follow_ups)
-    ):
-        raise ValueError("AlphabetSort payload must contain list[str] 'follow_ups'")
-    if not _is_list_of_string_lists(ground_truths):
-        raise ValueError(
-            "AlphabetSort payload must contain list[list[str]] 'ground_truths'"
-        )
-    if not _is_list_of_string_lists(turn_names):
-        raise ValueError(
-            "AlphabetSort payload must contain list[list[str]] 'turn_names'"
-        )
-    if not isinstance(sort_by_first, bool):
-        raise ValueError("AlphabetSort payload must contain bool 'sort_by_first'")
-
-    return AlphabetSortExample(
-        initial_prompt=initial_prompt,
-        follow_ups=list(follow_ups),
-        ground_truths=[list(row) for row in ground_truths],
-        turn_names=[list(row) for row in turn_names],
-        sort_by_first=sort_by_first,
-    )
-
-
-def _is_list_of_string_lists(value: object) -> bool:
-    return isinstance(value, list) and all(
-        isinstance(row, list) and all(isinstance(item, str) for item in row)
-        for row in value
-    )
 
 
 class AlphabetSortEnv:

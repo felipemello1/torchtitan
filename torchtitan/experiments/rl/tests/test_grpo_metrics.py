@@ -38,7 +38,11 @@ from torchtitan.experiments.rl.replay import (
 from torchtitan.experiments.rl.rollout_logging import RolloutSampleLogger
 from torchtitan.experiments.rl.rollouts import do_single_rollout, run_rollout_group
 from torchtitan.experiments.rl.sampling import SamplingConfig
-from torchtitan.experiments.rl.sum_digits import SumDigitsBuilder, SumDigitsDataset
+from torchtitan.experiments.rl.sum_digits import (
+    SumDigitsBuilder,
+    SumDigitsDataset,
+    SumDigitsExample,
+)
 from torchtitan.experiments.rl.types import (
     Completion,
     ReplaySample,
@@ -189,12 +193,26 @@ def test_sum_digits_dataset_and_builder_have_separate_roles():
         await env.close()
 
         assert example.group_id == "sum_digits/step=2/group=7"
-        assert "values" in example.payload
-        assert isinstance(example.payload["target"], int)
+        assert isinstance(example.payload, SumDigitsExample)
+        assert example.payload.values
+        assert isinstance(example.payload.target, int)
         assert reset.messages[0]["role"] == "system"
         assert reset.messages[1]["role"] == "user"
 
     asyncio.run(run())
+
+
+def test_sum_digits_builder_rejects_stale_dict_payload():
+    builder = SumDigitsBuilder.Config().build()
+    example = EnvExample(
+        group_id="bad",
+        step=0,
+        group_idx=0,
+        payload={"values": [12, 34], "target": 10},
+    )
+
+    with pytest.raises(ValueError, match="SumDigitsExample"):
+        builder.build(example=example)
 
 
 def test_run_rollout_group_closes_partially_built_envs_on_build_failure():

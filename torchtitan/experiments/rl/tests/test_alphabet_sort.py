@@ -9,12 +9,15 @@ import pytest
 from torchtitan.experiments.rl.alphabet_sort import (
     AlphabetSortBuilder,
     AlphabetSortDataset,
+    AlphabetSortExample,
 )
 from torchtitan.experiments.rl.alphabet_sort.grading import (
     aggregate_turn_scores,
     extract_names,
     score_turn_similarity,
 )
+from torchtitan.experiments.rl.envs import EnvExample
+from torchtitan.experiments.rl.sum_digits import SumDigitsExample
 
 
 def test_score_turn_similarity_returns_raw_similarity():
@@ -77,6 +80,37 @@ def test_alphabet_sort_dataset_and_builder_have_separate_roles():
     env = builder.build(example=example)
 
     assert example.group_id == "alphabet_sort/step=2/group=7"
-    assert example.payload["initial_prompt"]
-    assert example.payload["ground_truths"]
+    assert isinstance(example.payload, AlphabetSortExample)
+    assert example.payload.initial_prompt
+    assert example.payload.ground_truths
+    assert isinstance(example.payload.follow_ups, tuple)
+    assert isinstance(example.payload.ground_truths[0], tuple)
     assert env is not None
+
+
+def test_alphabet_sort_builder_rejects_wrong_payload_type():
+    builder = AlphabetSortBuilder.Config().build()
+
+    stale_dict = EnvExample(
+        group_id="bad",
+        step=0,
+        group_idx=0,
+        payload={
+            "initial_prompt": "",
+            "follow_ups": [],
+            "ground_truths": [],
+            "turn_names": [],
+            "sort_by_first": True,
+        },
+    )
+    cross_task = EnvExample(
+        group_id="bad",
+        step=0,
+        group_idx=1,
+        payload=SumDigitsExample(values=(1, 2), target=3),
+    )
+
+    with pytest.raises(ValueError, match="AlphabetSortExample"):
+        builder.build(example=stale_dict)
+    with pytest.raises(ValueError, match="AlphabetSortExample"):
+        builder.build(example=cross_task)

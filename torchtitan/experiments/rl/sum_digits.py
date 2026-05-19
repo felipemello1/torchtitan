@@ -31,6 +31,14 @@ Sum all digits: 1 + 2 + 3 + 4 + 5 + 6 + 7 = 28
 [ANSWER] 28"""
 
 
+@dataclass(frozen=True, slots=True)
+class SumDigitsExample:
+    """Concrete digit-sum task data for one rollout group."""
+
+    values: tuple[int, ...]
+    target: int
+
+
 class SumDigitsDataset(Configurable):
     """Deterministic synthetic dataset for single-turn digit-sum tasks."""
 
@@ -78,7 +86,7 @@ class SumDigitsDataset(Configurable):
             group_id=f"sum_digits/step={step}/group={group_idx}",
             step=step,
             group_idx=group_idx,
-            payload={"values": values, "target": target},
+            payload=SumDigitsExample(values=tuple(values), target=target),
         )
 
 
@@ -100,22 +108,24 @@ class SumDigitsBuilder(Configurable):
         self.config = config
 
     def build(self, *, example: EnvExample) -> "SumDigitsEnv":
-        values = example.payload.get("values")
-        if not (
-            isinstance(values, list) and all(isinstance(value, int) for value in values)
-        ):
+        payload = example.payload
+        if not isinstance(payload, SumDigitsExample):
             raise ValueError(
-                f"SumDigits example payload must contain list[int] 'values', "
-                f"got {values!r}"
+                "SumDigits example payload must be SumDigitsExample, "
+                f"got {type(payload).__name__}"
             )
-        target = example.payload.get("target")
-        if not isinstance(target, int):
+        values = list(payload.values)
+        if not all(isinstance(value, int) for value in values):
             raise ValueError(
-                f"SumDigits example payload must contain int 'target', got {target!r}"
+                f"SumDigitsExample.values must contain only ints, got {values!r}"
+            )
+        if not isinstance(payload.target, int):
+            raise ValueError(
+                f"SumDigitsExample.target must be an int, got {payload.target!r}"
             )
         return SumDigitsEnv(
             values=values,
-            target=target,
+            target=payload.target,
             correctness_reward=self.config.correctness_reward,
             format_reward=self.config.format_reward,
             system_prompt=self.config.system_prompt,

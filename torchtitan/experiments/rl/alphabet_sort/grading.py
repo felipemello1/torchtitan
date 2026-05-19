@@ -11,6 +11,8 @@ from __future__ import annotations
 import difflib
 import re
 
+from collections.abc import Sequence
+
 
 _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*]\s+|\d+[\).\s]+)")
 _PLACEHOLDER_RE = re.compile(r"^name\s*\d+(?:\s*//.*)?$", re.IGNORECASE)
@@ -19,7 +21,7 @@ _PLACEHOLDER_RE = re.compile(r"^name\s*\d+(?:\s*//.*)?$", re.IGNORECASE)
 def score_turn_similarity(
     completion: str,
     *,
-    expected: list[str],
+    expected: Sequence[str],
     turn_idx: int,
 ) -> float:
     """Raw sequence similarity for one AlphabetSort turn."""
@@ -32,7 +34,7 @@ def score_turn_similarity(
 
 
 def aggregate_turn_scores(
-    similarities: list[float],
+    similarities: Sequence[float],
     *,
     similarity_power: int,
     power_per_turn: bool,

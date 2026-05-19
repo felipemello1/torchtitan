@@ -9,15 +9,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable, TypeAlias
+from typing import Protocol, runtime_checkable
 
 from renderers import Message, ToolSpec
 
 from torchtitan.experiments.rl.types import RolloutStatus
-
-
-JsonScalar: TypeAlias = str | int | float | bool | None
-JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -28,13 +24,14 @@ class EnvExample:
         group_id: Stable ID for logging and advantage centering.
         step: Trainer step that sampled the row.
         group_idx: Position within the step batch.
-        payload: JSON-serializable task data consumed by an env builder.
+        payload: Task-specific data consumed by an env builder. The controller
+            treats this opaquely.
     """
 
     group_id: str
     step: int
     group_idx: int
-    payload: dict[str, JsonValue] = field(default_factory=dict)
+    payload: object | None = None
 
 
 @dataclass(kw_only=True, slots=True)

@@ -179,9 +179,9 @@ class AlphabetSortExample:
     """One multi-turn AlphabetSort episode."""
 
     initial_prompt: str
-    follow_ups: list[str]
-    ground_truths: list[list[str]]
-    turn_names: list[list[str]]
+    follow_ups: tuple[str, ...]
+    ground_truths: tuple[tuple[str, ...], ...]
+    turn_names: tuple[tuple[str, ...], ...]
     sort_by_first: bool
 
     @property
@@ -279,9 +279,9 @@ Sort the COMPLETE cumulative list alphabetically by {sort_key} name.
 
     return AlphabetSortExample(
         initial_prompt=initial_prompt,
-        follow_ups=follow_ups,
-        ground_truths=ground_truths,
-        turn_names=turn_names,
+        follow_ups=tuple(follow_ups),
+        ground_truths=tuple(tuple(row) for row in ground_truths),
+        turn_names=tuple(tuple(row) for row in turn_names),
         sort_by_first=sort_by_first,
     )
 
@@ -339,13 +339,7 @@ class AlphabetSortDataset(Configurable):
             group_id=f"alphabet_sort/step={step}/group={group_idx}",
             step=step,
             group_idx=group_idx,
-            payload={
-                "initial_prompt": episode.initial_prompt,
-                "follow_ups": list(episode.follow_ups),
-                "ground_truths": [list(row) for row in episode.ground_truths],
-                "turn_names": [list(row) for row in episode.turn_names],
-                "sort_by_first": episode.sort_by_first,
-            },
+            payload=episode,
         )
 
 
