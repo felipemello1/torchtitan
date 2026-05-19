@@ -19,8 +19,19 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import torch
+import torch.nn as nn
 
-from torchtitan.experiments.rl.grpo import _prepare_reward_metrics, GRPOLoss, RLTrainer
+from torchtitan.components.loss import ChunkedCELoss, selected_token_logprobs
+from torchtitan.experiments.rl.actors.utils import (
+    build_packed_policy_loss_inputs,
+    extract_response_logprobs,
+)
+from torchtitan.experiments.rl.grpo import (
+    _prepare_reward_metrics,
+    GRPOLoss,
+    GSPOLoss,
+    RLTrainer,
+)
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.types import Completion, Step, Trajectory
 
@@ -470,6 +481,128 @@ class TestGRPOLossBridge:
         assert not math.isclose(
             loss.item(), unweighted_sample_mean, rel_tol=1e-4, abs_tol=1e-6
         )
+
+    def test_token_loss_uses_generator_logprobs(self) -> None:
+        loss_fn = GRPOLoss(GRPOLoss.Config(clip_eps=0.2))
+        policy_logprobs = [
+            torch.tensor([0.1, 0.0], requires_grad=True),
+            torch.tensor([-0.2, 0.3, 0.4], requires_grad=True),
+        ]
+        generator_logprobs = [[0.0, 0.0], [0.1, 0.1, 0.1]]
+        advantages = torch.tensor([1.0, -0.5])
+        num_global_valid_tokens = torch.tensor(5.0)
+
+        loss, metrics = loss_fn(
+            policy_logprobs=policy_logprobs,
+            advantages=advantages,
+            num_global_valid_tokens=num_global_valid_tokens,
+            generator_token_logprobs=generator_logprobs,
+        )
+        loss.backward()
+
+        assert loss.requires_grad
+        assert all(sample.grad is not None for sample in policy_logprobs)
+        assert metrics["loss/mean"].item() == pytest.approx(loss.detach().item())
+
+    def test_token_reducer_matches_dense_loss_and_gradients(self) -> None:
+        torch.manual_seed(123)
+        B, L, D, V = 1, 8, 11, 17
+        seq_lens = [5, 4]
+        prompt_lens = [2, 1]
+        response_lens = [3, 3]
+        token_ids = torch.randint(0, V, (B, L + 1))
+        labels = token_ids[:, 1:]
+        advantages = torch.tensor([0.7, -1.1])
+        num_global_valid_tokens = torch.tensor(float(sum(response_lens)))
+
+        lm_head_dense = nn.Linear(D, V, bias=False)
+        lm_head_chunked = nn.Linear(D, V, bias=False)
+        lm_head_chunked.load_state_dict(lm_head_dense.state_dict())
+        hidden = torch.randn(B, L, D)
+        hidden_dense = hidden.detach().clone().requires_grad_(True)
+        hidden_chunked = hidden.detach().clone().requires_grad_(True)
+
+        dense_all_logprobs = selected_token_logprobs(
+            lm_head_dense(hidden_dense),
+            labels,
+        )
+        dense_policy_logprobs = extract_response_logprobs(
+            dense_all_logprobs,
+            seq_lens,
+            prompt_lens,
+            response_lens,
+        )
+        generator_logprobs = [
+            sample.detach().tolist() for sample in dense_policy_logprobs
+        ]
+        loss_fn = GRPOLoss(GRPOLoss.Config(clip_eps=0.2))
+        dense_loss, _dense_metrics = loss_fn(
+            policy_logprobs=dense_policy_logprobs,
+            advantages=advantages,
+            num_global_valid_tokens=num_global_valid_tokens,
+            generator_token_logprobs=generator_logprobs,
+        )
+        dense_loss.backward()
+
+        packed_inputs = build_packed_policy_loss_inputs(
+            num_shift_tokens=L,
+            seq_lens=seq_lens,
+            prompt_lens=prompt_lens,
+            response_lens=response_lens,
+            generator_logprobs=generator_logprobs,
+            advantages=advantages,
+            num_global_valid_tokens=num_global_valid_tokens,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        reducer = loss_fn.make_token_reducer(packed_inputs)
+        chunked_ce_loss = ChunkedCELoss(ChunkedCELoss.Config(num_chunks=4))
+        chunked_ce_loss.set_lm_head(lm_head_chunked)
+        chunked_loss = chunked_ce_loss.reduce_selected_token_logprobs(
+            hidden_chunked,
+            labels,
+            reducer.chunk_loss,
+        )
+        chunked_loss.backward()
+
+        torch.testing.assert_close(chunked_loss.detach(), dense_loss.detach())
+        torch.testing.assert_close(hidden_chunked.grad, hidden_dense.grad)
+        torch.testing.assert_close(
+            lm_head_chunked.weight.grad,
+            lm_head_dense.weight.grad,
+        )
+        diff_sum, diff_max, diff_count = reducer.logprob_drift()
+        torch.testing.assert_close(
+            diff_sum, torch.zeros_like(diff_sum), atol=1e-6, rtol=0
+        )
+        torch.testing.assert_close(
+            diff_max, torch.zeros_like(diff_max), atol=1e-6, rtol=0
+        )
+        torch.testing.assert_close(
+            diff_count,
+            torch.zeros_like(diff_count),
+            atol=0,
+            rtol=0,
+        )
+
+    def test_gspo_sequence_loss_runs_on_selected_logprobs(self) -> None:
+        loss_fn = GSPOLoss(GSPOLoss.Config(clip_eps=0.2))
+        policy_logprobs = [
+            torch.tensor([0.1, 0.2], requires_grad=True),
+            torch.tensor([0.0, -0.1, 0.3], requires_grad=True),
+        ]
+        generator_logprobs = [[0.0, 0.0], [0.0, 0.0, 0.0]]
+        loss, metrics = loss_fn(
+            policy_logprobs=policy_logprobs,
+            advantages=torch.tensor([1.0, -1.0]),
+            num_global_valid_tokens=torch.tensor(5.0),
+            generator_token_logprobs=generator_logprobs,
+        )
+
+        assert loss.requires_grad
+        loss.backward()
+        assert all(sample.grad is not None for sample in policy_logprobs)
+        assert "loss/ratio/mean" in metrics
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ from torchtitan.components.loss import (
     cross_entropy_loss,
     GradAccumulator,
     IGNORE_INDEX,
+    selected_token_logprobs,
 )
 
 
@@ -207,6 +208,101 @@ class _FakeDecoder(nn.Module):
         if skip_lm_head:
             return tokens  # return hidden states directly
         return self.output(tokens)
+
+
+class TestSelectedTokenLogprobs(unittest.TestCase):
+    def test_selected_token_logprobs_matches_log_softmax_gather(self):
+        torch.manual_seed(42)
+        B, L, V = 2, 5, 7
+        logits = torch.randn(B, L, V)
+        labels = torch.randint(0, V, (B, L))
+        labels[0, 2] = IGNORE_INDEX
+
+        gather_labels = labels.clamp_min(0)
+        expected = (
+            torch.nn.functional.log_softmax(logits.float(), dim=-1)
+            .gather(2, gather_labels.unsqueeze(-1))
+            .squeeze(-1)
+        )
+        expected = torch.where(
+            labels == IGNORE_INDEX, torch.zeros_like(expected), expected
+        )
+
+        torch.testing.assert_close(selected_token_logprobs(logits, labels), expected)
+
+    def test_chunked_selected_token_logprobs_matches_dense_gradients(self):
+        torch.manual_seed(123)
+        B, L, D, V = 2, 7, 11, 17
+        lm_head_dense = nn.Linear(D, V, bias=False)
+        lm_head_chunked = nn.Linear(D, V, bias=False)
+        lm_head_chunked.load_state_dict(lm_head_dense.state_dict())
+
+        hidden = torch.randn(B, L, D)
+        hidden_dense = hidden.detach().clone().requires_grad_(True)
+        hidden_chunked = hidden.detach().clone().requires_grad_(True)
+        labels = torch.randint(0, V, (B, L))
+        labels[0, 2] = IGNORE_INDEX
+        weights = torch.randn(B, L)
+
+        dense_logprobs = selected_token_logprobs(lm_head_dense(hidden_dense), labels)
+        dense_loss = (dense_logprobs.exp() * weights).sum()
+        dense_loss.backward()
+
+        chunked_loss_fn = ChunkedCELoss(ChunkedCELoss.Config(num_chunks=4))
+        chunked_loss_fn.set_lm_head(lm_head_chunked)
+        chunked_logprobs = chunked_loss_fn.selected_token_logprobs(
+            hidden_chunked,
+            labels,
+        )
+        chunked_loss = (chunked_logprobs.exp() * weights).sum()
+        chunked_loss.backward()
+
+        torch.testing.assert_close(chunked_logprobs, dense_logprobs)
+        torch.testing.assert_close(hidden_chunked.grad, hidden_dense.grad)
+        torch.testing.assert_close(
+            lm_head_chunked.weight.grad, lm_head_dense.weight.grad
+        )
+
+    def test_chunked_token_loss_matches_dense_scalar_and_gradients(self):
+        torch.manual_seed(123)
+        B, L, D, V = 2, 7, 11, 17
+        loss_scale = 2.5
+        lm_head_dense = nn.Linear(D, V, bias=False)
+        lm_head_chunked = nn.Linear(D, V, bias=False)
+        lm_head_chunked.load_state_dict(lm_head_dense.state_dict())
+
+        hidden = torch.randn(B, L, D)
+        hidden_dense = hidden.detach().clone().requires_grad_(True)
+        hidden_chunked = hidden.detach().clone().requires_grad_(True)
+        labels = torch.randint(0, V, (B, L))
+        labels[0, 2] = IGNORE_INDEX
+        weights = torch.randn(B, L)
+
+        dense_logprobs = selected_token_logprobs(lm_head_dense(hidden_dense), labels)
+        dense_loss = (dense_logprobs * weights).sum()
+        (dense_loss * loss_scale).backward()
+
+        def chunk_loss_fn(
+            logprobs: torch.Tensor,
+            _labels: torch.Tensor,
+            token_slice: slice,
+        ) -> torch.Tensor:
+            return (logprobs * weights[:, token_slice]).sum()
+
+        chunked_loss_fn = ChunkedCELoss(ChunkedCELoss.Config(num_chunks=4))
+        chunked_loss_fn.set_lm_head(lm_head_chunked)
+        chunked_loss = chunked_loss_fn.reduce_selected_token_logprobs(
+            hidden_chunked,
+            labels,
+            chunk_loss_fn,
+        )
+        (chunked_loss * loss_scale).backward()
+
+        torch.testing.assert_close(chunked_loss.detach(), dense_loss.detach())
+        torch.testing.assert_close(hidden_chunked.grad, hidden_dense.grad)
+        torch.testing.assert_close(
+            lm_head_chunked.weight.grad, lm_head_dense.weight.grad
+        )
 
 
 class TestChunkedCELoss(unittest.TestCase):
