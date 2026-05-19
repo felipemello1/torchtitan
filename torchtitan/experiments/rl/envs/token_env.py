@@ -188,15 +188,16 @@ class TokenEnv:
         self._previous_prompt_ids = list(rendered)
         return list(rendered)
 
-    async def _render_next_prompt(self, new_messages: list[Message]) -> list[int]:
+    async def _render_next_prompt(self, response_messages: list[Message]) -> list[int]:
         if (
             self._previous_prompt_ids is not None
             and self._previous_completion_ids is not None
         ):
+            env_messages = response_messages[1:]
             bridged = self._renderer.bridge_to_next_turn(
                 self._previous_prompt_ids,
                 self._previous_completion_ids,
-                new_messages[1:],
+                env_messages,
                 tools=self._tools or None,
             )
             if bridged is not None:

@@ -30,6 +30,7 @@ from torchtitan.experiments.rl.grpo import (
     _build_train_step_trace_scalars,
     _raise_rollout_task_errors,
     _RolloutDropCounters,
+    compute_generator_max_num_seqs,
     Provisioner,
     RLTrainer,
 )
@@ -933,6 +934,17 @@ def test_generation_scheduler_coalesces_same_tick_requests():
     asyncio.run(run())
 
 
+def test_compute_generator_max_num_seqs_uses_train_fanout():
+    assert (
+        compute_generator_max_num_seqs(
+            async_rollout_groups=32,
+            rollout_group_size=8,
+            num_validation_samples=64,
+        )
+        == 256
+    )
+
+
 def test_generation_scheduler_partitions_mixed_sampling_requests():
     async def run() -> None:
         calls: list[tuple[list[list[int]], list[str], float]] = []
@@ -1321,6 +1333,54 @@ def test_generation_scheduler_propagates_generator_exception_to_pending_batch():
             await first
         with pytest.raises(ValueError, match="bad batch"):
             await second
+        await scheduler.close()
+
+    asyncio.run(run())
+
+
+def test_generation_scheduler_cancelled_flush_cancels_pending_request():
+    async def run() -> None:
+        active_started = asyncio.Event()
+        finish_active = asyncio.Event()
+
+        async def generate_batch(
+            prompts: list[list[int]],
+            request_ids: list[str],
+            sampling: SamplingConfig,
+        ) -> tuple[list[Completion], list[m.Metric]]:
+            active_started.set()
+            await finish_active.wait()
+            return (
+                [
+                    Completion(
+                        policy_version=0,
+                        token_ids=[prompt[0]],
+                        token_logprobs=[-0.1],
+                        finish_reason="stop",
+                    )
+                    for prompt in prompts
+                ],
+                [],
+            )
+
+        scheduler = GenerationScheduler(generate_batch)
+        sampling = SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4)
+        request = asyncio.create_task(
+            scheduler.submit(
+                prompt_token_ids=[1],
+                sampling=sampling,
+                request_id="cancelled",
+            )
+        )
+        await active_started.wait()
+
+        (flush_task,) = tuple(scheduler._active_flush_tasks)
+        flush_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        with pytest.raises(asyncio.CancelledError):
+            await flush_task
         await scheduler.close()
 
     asyncio.run(run())

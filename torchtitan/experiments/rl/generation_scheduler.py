@@ -280,6 +280,11 @@ class GenerationScheduler:
             ):
                 if not pending.future.done():
                     pending.future.set_result(completion)
+        except asyncio.CancelledError:
+            for pending in pending_group:
+                if not pending.future.done():
+                    pending.future.cancel()
+            raise
         except Exception as exc:
             for pending in pending_group:
                 if not pending.future.done():

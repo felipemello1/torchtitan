@@ -143,28 +143,6 @@ async def run_rollout_group(
         )
         raise
 
-    return await _run_env_rollouts(
-        envs=envs,
-        renderer=renderer,
-        completion_fn=completion_fn,
-        sampling=sampling,
-        group_id=example.group_id,
-        max_turns=max_turns,
-        token_env_config=token_env_config,
-    )
-
-
-async def _run_env_rollouts(
-    *,
-    envs: list[MessageEnv],
-    renderer: Renderer,
-    completion_fn: CompletionFn,
-    sampling: SamplingConfig,
-    group_id: str,
-    max_turns: int,
-    token_env_config: TokenEnvConfig,
-) -> list[RolloutOutput]:
-    """Run one GRPO group concurrently and close every env."""
     token_envs = [TokenEnv(env, renderer, token_env_config) for env in envs]
     tasks = [
         asyncio.create_task(
@@ -172,7 +150,7 @@ async def _run_env_rollouts(
                 token_env=token_env,
                 completion_fn=completion_fn,
                 sampling=sampling,
-                group_id=group_id,
+                group_id=example.group_id,
                 sample_idx=sample_idx,
                 max_turns=max_turns,
             )

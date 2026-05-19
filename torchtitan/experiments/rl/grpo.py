@@ -91,6 +91,21 @@ logger = logging.getLogger(__name__)
 _ZERO_ADVANTAGE_EPS = 1e-12
 
 
+def compute_generator_max_num_seqs(
+    *,
+    async_rollout_groups: int,
+    rollout_group_size: int,
+    num_validation_samples: int,
+) -> int:
+    """Compute the vLLM running-sequence cap from rollout fanout."""
+    train_fanout = max(async_rollout_groups, 1) * rollout_group_size
+    validation_fanout = min(
+        max(num_validation_samples, 1),
+        max(async_rollout_groups, 1),
+    )
+    return max(train_fanout, validation_fanout, 1)
+
+
 def _build_train_step_trace_scalars(
     *,
     replay_batch: ReplayBatch,
@@ -388,7 +403,15 @@ class RLTrainer(Configurable):
         """Optional prompt plus generation-token cap enforced by the controller."""
 
         async_rollout_groups: int = 1
-        """Number of long-lived async rollout producer tasks."""
+        """Number of long-lived async rollout producer tasks.
+
+        Capacity model: each producer owns one rollout group and fans out
+        ``rollout_group_size`` sibling samples. The derived vLLM
+        ``max_num_seqs`` caps running sequences, while
+        ``max_admitted_generation_prompts`` caps controller-admitted prompts
+        that have not completed yet. ``replay_buffer_groups`` caps completed
+        groups waiting for the trainer.
+        """
 
         max_admitted_generation_prompts: int | None = None
         """Maximum prompts admitted to the generator and awaiting completion.
@@ -612,16 +635,6 @@ class RLTrainer(Configurable):
             * p.context_parallel_degree
         )
 
-    @staticmethod
-    def _max_generator_num_seqs(config: Config) -> int:
-        """Cap vLLM running sequences, not total admitted scheduler prompts."""
-        train_fanout = max(config.async_rollout_groups, 1) * config.rollout_group_size
-        validation_fanout = min(
-            max(config.num_validation_samples, 1),
-            max(config.async_rollout_groups, 1),
-        )
-        return max(train_fanout, validation_fanout, 1)
-
     def _spawn_role_meshes(
         self,
         *,
@@ -696,7 +709,11 @@ class RLTrainer(Configurable):
             model_spec=config.model_spec,
             model_path=config.hf_assets_path,
             compile_config=config.compile,
-            max_num_seqs=self._max_generator_num_seqs(config),
+            max_num_seqs=compute_generator_max_num_seqs(
+                async_rollout_groups=config.async_rollout_groups,
+                rollout_group_size=config.rollout_group_size,
+                num_validation_samples=config.num_validation_samples,
+            ),
             output_dir=config.dump_folder,
         )
 
@@ -874,7 +891,11 @@ class RLTrainer(Configurable):
 
         max_admitted_prompts = self.config.max_admitted_generation_prompts
         if max_admitted_prompts is None:
-            max_admitted_prompts = 2 * self._max_generator_num_seqs(self.config)
+            max_admitted_prompts = 2 * compute_generator_max_num_seqs(
+                async_rollout_groups=self.config.async_rollout_groups,
+                rollout_group_size=self.config.rollout_group_size,
+                num_validation_samples=self.config.num_validation_samples,
+            )
 
         return GenerationScheduler(
             generate_batch,
