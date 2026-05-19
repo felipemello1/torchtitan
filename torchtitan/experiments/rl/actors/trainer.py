@@ -4,6 +4,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""Policy trainer actor.
+
+Consumes :class:`TrainBatch` (varlen-packed with ``loss_mask``) and
+calls the configured loss function. Loss is computed per token; the
+mask selects loss positions (response tokens) and zeroes everything
+else. Compatible with multi-turn rollouts (prefix-break-aware
+:class:`ReplaySample`s) without any prompt/response boundary
+arithmetic in the trainer.
+"""
+
+from __future__ import annotations
+
 import logging
 import os
 from dataclasses import dataclass, field
@@ -14,6 +26,7 @@ import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
 import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
+
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
@@ -31,11 +44,10 @@ from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.experiments.rl.actors.utils import (
     compute_logprobs,
-    extract_response_logprobs,
     PartialLogprobDrift,
     verify_logprob_identity,
 )
-from torchtitan.experiments.rl.types import OptimStepOutput, TrainingBatch
+from torchtitan.experiments.rl.types import OptimStepOutput, TrainBatch
 from torchtitan.models.common.attention import create_varlen_metadata_for_document
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.model_spec import ModelSpec
@@ -45,25 +57,55 @@ from torchtitan.tools.logging import init_logger
 logger = logging.getLogger(__name__)
 
 
+_TIED_WEIGHT_ALIASES = (
+    # (preferred_key, alias_to_drop) — when both are in the state_dict
+    # and share the same backing storage, drop ``alias_to_drop``. The
+    # receiver re-ties via ``init_weights`` so dropping is semantics-safe.
+    ("tok_embeddings.weight", "lm_head.weight"),
+)
+
+
+def _dedup_tied_tensors(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Drop known tied-weight aliases when they actually share storage.
+
+    Qwen3 ties ``tok_embeddings.weight`` and ``lm_head.weight`` when
+    ``enable_weight_tying=True`` — both are the same buffer. Emitting
+    both into the RDMA transfer plan registers the same memory twice
+    and ~doubles the per-rank read budget.
+
+    Tested by checking ``data_ptr`` equality on the specific pair —
+    we DON'T iterate and drop every shared-data_ptr entry, because
+    DTensor/FSDP-managed tensors can legitimately share a flat
+    backing buffer across distinct params and we'd silently strip the
+    state_dict.
+    """
+    out = dict(state_dict)
+    for preferred, alias in _TIED_WEIGHT_ALIASES:
+        if preferred in out and alias in out:
+            try:
+                same_storage = out[preferred].data_ptr() == out[alias].data_ptr()
+            except Exception:
+                same_storage = False
+            if same_storage:
+                logger.debug(
+                    "Dropping tied-weight alias %s (shares storage with %s)",
+                    alias,
+                    preferred,
+                )
+                del out[alias]
+    return out
+
+
 class PolicyTrainer(Actor, Configurable):
-    """Updates policy based on collected Episode using TorchTitan components.
+    """Updates policy weights from :class:`TrainBatch`es.
 
-    Exposes separate `forward_backward` and `optim_step` endpoints, called
-    explicitly by the controller.
-
-    Args:
-        config: PolicyTrainer.Config with all model/optimizer/parallelism settings.
-        model_spec: TorchTitan model specification.
-        hf_assets_path: Path to HF assets folder for checkpoint loading.
-            Shared with the generator (both load from the same HF checkpoint).
-        generator_dtype: Generator dtype (e.g. "bfloat16"). Needed to cast weights to generator dtype
-            if generator dtype differs from training dtype. If None, no cast is performed.
+    Exposes ``forward_backward`` + ``optim_step`` as separate endpoints
+    so the controller can interleave weight-sync work (push to
+    torchstore, signal generator to pull) between them.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        """PolicyTrainer configuration for optimizer, training, and parallelism."""
-
         optimizer: OptimizersContainer.Config = field(
             default_factory=OptimizersContainer.Config
         )
@@ -75,6 +117,7 @@ class PolicyTrainer(Actor, Configurable):
         comm: CommConfig = field(default_factory=CommConfig)
         debug: DebugConfig = field(default_factory=DebugConfig)
         loss: Configurable.Config = field(default_factory=Configurable.Config)
+        """Loss function config (typically :class:`DAPOLoss.Config`)."""
         ac_config: ActivationCheckpointConfig = field(
             default_factory=lambda: ActivationCheckpointConfig(mode="none")
         )
@@ -93,7 +136,7 @@ class PolicyTrainer(Actor, Configurable):
         hf_assets_path: str = "",
         generator_dtype: str = "",
         output_dir: str,
-    ):
+    ) -> None:
         init_logger()
         sl.init_structured_logger(
             source="rl_trainer",
@@ -107,26 +150,21 @@ class PolicyTrainer(Actor, Configurable):
         self.compile_config = compile_config
         self.loss_fn = config.loss.build()
 
-        # Only cast if generator dtype differs from training dtype, otherwise
-        # staging buffers would be allocated for a no-op cast.
         training_dtype = TORCH_DTYPE_MAP[config.training.dtype]
         gen_dtype = TORCH_DTYPE_MAP[generator_dtype] if generator_dtype else None
         self._transfer_dtype = gen_dtype if gen_dtype != training_dtype else None
 
-        # Device setup
         device_module, device_type = utils.device_module, utils.device_type
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
         device_module.set_device(self.device)
 
-        # Enable batch-invariant mode BEFORE init_distributed
+        # Enable batch-invariant mode BEFORE init_distributed.
         set_batch_invariance(config.debug.batch_invariant)
 
         with sl.log_trace_span("torch_distributed_init"):
             world_size = dist_utils.init_distributed(config.comm)
 
         self.parallel_dims = ParallelDims.from_config(config.parallelism, world_size)
-
-        # Set determinism flags and seed via core torchtitan utility
         dist_utils.set_determinism(
             self.parallel_dims,
             self.device,
@@ -134,7 +172,6 @@ class PolicyTrainer(Actor, Configurable):
             distinct_seed_mesh_dims=["pp"],
         )
 
-        # Initialize state dict adapter for HF checkpoint loading
         if model_spec.state_dict_adapter is not None:
             self.sd_adapter = model_spec.state_dict_adapter(
                 model_spec.model, hf_assets_path
@@ -142,13 +179,11 @@ class PolicyTrainer(Actor, Configurable):
         else:
             self.sd_adapter = None
 
-        # Create training policy model
         model = self._build_model(model_spec, config, device_type)
         model.train()
         self.model = model
         self.model_parts = [model]
 
-        # Build optimizer and LR scheduler
         self.optimizers = config.optimizer.build(model_parts=self.model_parts)
         self.lr_schedulers = config.lr_scheduler.build(
             optimizers=self.optimizers,
@@ -157,8 +192,6 @@ class PolicyTrainer(Actor, Configurable):
 
         self.policy_version = 0
 
-        # Always build CheckpointManager; enable is a field on the config.
-        # When enable=False (CI/debug), load() is a no-op and random init stands.
         self.checkpointer = config.checkpoint.build(
             dataloader=None,
             model_parts=self.model_parts,
@@ -171,13 +204,10 @@ class PolicyTrainer(Actor, Configurable):
         self.checkpointer.load()
         if not self.checkpointer.enable:
             logger.warning(
-                "Checkpoint disabled, skip weight loading and use random-initialized weights. "
+                "Checkpoint disabled; using random-initialized weights. "
                 "Set checkpoint.enable=True to load from a checkpoint."
             )
 
-        self.generator: Any | None = None
-
-        # Data parallelism: mesh is available after _build_model triggers build_mesh
         self.dp_enabled = self.parallel_dims.dp_enabled
         batch_mesh = self.parallel_dims.get_optional_mesh("batch")
         if batch_mesh is not None:
@@ -188,7 +218,9 @@ class PolicyTrainer(Actor, Configurable):
             self.dp_rank = 0
 
         logger.debug(
-            f"PolicyTrainer initialized (dp_rank={self.dp_rank}, dp_size={self.dp_size})"
+            "PolicyTrainer initialized (dp_rank=%d, dp_size=%d)",
+            self.dp_rank,
+            self.dp_size,
         )
 
     def state_dict(self) -> dict[str, Any]:
@@ -199,7 +231,6 @@ class PolicyTrainer(Actor, Configurable):
 
     @endpoint
     async def close(self) -> None:
-        """Destroy the worker's torch.distributed process group."""
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
 
@@ -210,32 +241,15 @@ class PolicyTrainer(Actor, Configurable):
         config: Config,
         device_type: str,
     ):
-        """Build, parallelize, and initialize a model with random weights.
-
-        Checkpoint loading (e.g. from HF) is handled separately by
-        CheckpointManager after model and optimizer construction.
-
-        Args:
-            model_spec: Model specification for building and parallelizing.
-            config: Trainer config (used for dtype, parallelism, etc.).
-            device_type: Device type string (e.g. "cuda").
-
-        Returns:
-            Model with random-initialized weights.
-        """
-
-        # TODO: Also support flex attention backend later.
+        """Build, parallelize, and initialize a model with random weights."""
         from torchtitan.models.common.attention import VarlenAttention
 
         assert isinstance(
-            model_spec.model.layers[0].attention.inner_attention, VarlenAttention.Config
+            model_spec.model.layers[0].attention.inner_attention,
+            VarlenAttention.Config,
         ), "Only varlen attention backend is allowed."
 
-        # Fill sharding configs on the config BEFORE build via the
-        # model-agnostic `update_from_config` hook (RL's trainer bypasses
-        # `torchtitan.Trainer's` call, so we invoke it directly).
         model_spec.model.update_from_config(trainer_config=config)
-
         with torch.device("meta"):
             with utils.set_default_dtype(TORCH_DTYPE_MAP[config.training.dtype]):
                 model = model_spec.model.build()
@@ -249,40 +263,19 @@ class PolicyTrainer(Actor, Configurable):
             ac_config=config.ac_config,
             dump_folder=config.dump_folder,
         )
-
         model.to_empty(device=device_type)
         with torch.no_grad():
             model.init_weights(buffer_device=None)
-
         return model
 
-    @endpoint
-    async def sync_log_step(self, step: int, relative_step: int | None = None) -> None:
-        """Sync the structured-logger step counter from the controller."""
-        sl.set_step(step, relative_step=relative_step)
-
-    def reduce_forward_backward_metrics(
+    def _reduce_forward_backward_metrics(
         self,
         *,
         sum_reduced_metrics: dict[str, torch.Tensor],
         max_reduced_metrics: dict[str, torch.Tensor],
     ) -> dict[str, float]:
-        """Reduce forward/backward metrics across the loss mesh.
-
-        Args:
-            sum_reduced_metrics: Per-rank shares to be SUM-reduced. Each
-                value must be pre-normalized so that summing across ranks
-                reconstructs the global metric.
-            max_reduced_metrics: Per-rank values to be MAX-reduced.
-
-        Returns:
-            {key: float} after collective reduction.
-        """
-        # TODO: switch from plain tensors to DTensor / spmd_types so the
-        # reduction op is encoded in the placement instead of split across
-        # `sum_reduced_metrics` / `max_reduced_metrics` dicts.
+        """Sum- or max-reduce per-rank metrics across the loss mesh."""
         loss_mesh = self.parallel_dims.get_optional_mesh("loss")
-
         out: dict[str, float] = {}
         for values_by_key, op in [
             (sum_reduced_metrics, c10d.ReduceOp.SUM),
@@ -291,7 +284,7 @@ class PolicyTrainer(Actor, Configurable):
             if not values_by_key:
                 continue
             keys = list(values_by_key)
-            stacked = torch.stack([values_by_key[key].detach() for key in keys])
+            stacked = torch.stack([values_by_key[k].detach() for k in keys])
             if loss_mesh is not None:
                 stacked = funcol.all_reduce(stacked, reduceOp=op.name, group=loss_mesh)
             for key, value in zip(keys, stacked.cpu().tolist(), strict=True):
@@ -302,63 +295,56 @@ class PolicyTrainer(Actor, Configurable):
     @sl.log_trace_span("forward_backward")
     async def forward_backward(
         self,
-        train_data: list[TrainingBatch],
+        train_data: list[TrainBatch],
         *,
         num_global_valid_tokens: int,
+        sampling_temperature: float = 1.0,
     ) -> dict[str, float]:
-        """Run forward pass, compute loss, call backward, and reduce metrics.
+        """Forward, loss, backward — all per-token + mask.
 
         Args:
-            train_data: List of TrainingBatch, one per DP rank. Local rank
-                picks train_data[self.dp_rank].
-            num_global_valid_tokens: Total response tokens across all DP
-                ranks for this step. The controller computes this before
-                sharding episodes.
-
-        Returns:
-            dict[str, float]: Globally-reduced metrics.
+            train_data: one :class:`TrainBatch` per DP rank.
+            num_global_valid_tokens: total ``loss_mask`` sum across all
+                DP ranks. Normalizes the DAPO global-token-mean loss so
+                gradients are independent of how the batch is sharded.
+            sampling_temperature: the generator's ``SamplingConfig.temperature``.
+                Trainer divides logits by this before ``log_softmax``
+                so policy logprobs are computed on the same softmax-
+                shape the generator sampled from — without this, the
+                importance ratio is biased even with identical weights.
         """
-        logger.debug(
-            f"{os.getpid()=} PolicyTrainer forward_backward "
-            f"step {self.policy_version}"
-        )
-
-        # RL does not support pipeline parallelism yet, so the trainer
-        # owns one model part.
         if len(self.model_parts) != 1:
             raise ValueError(
                 f"PolicyTrainer expects exactly one model part, got "
-                f"{len(self.model_parts)} (pipeline parallelism is not yet "
-                "supported in RL)."
+                f"{len(self.model_parts)} (pipeline parallelism not supported)."
             )
         model = self.model_parts[0]
-
-        local_batch = train_data[self.dp_rank]
         device = self.device
 
-        token_ids = local_batch.token_ids.to(device)
+        local_batch = train_data[self.dp_rank]
+        token_ids = local_batch.token_ids.to(device)  # [1, T_total]
         seq_lens = local_batch.seq_lens
-        prompt_lens = local_batch.prompt_lens
-        response_lens = local_batch.response_lens
-        advantages = local_batch.advantages.to(device)
+        loss_mask = local_batch.loss_mask.to(device)  # [1, T-1]
+        behavior_logprobs = local_batch.behavior_logprobs.to(device)  # [1, T-1]
+        advantages_per_token = local_batch.advantages_per_token.to(device)
 
-        max_seq_len = max(seq_lens)
+        max_seq_len = max(seq_lens) if seq_lens else 0
         rope_cache_len = self.model.freqs_cis.shape[0]
         if max_seq_len > rope_cache_len:
             raise ValueError(
-                f"Episode length {max_seq_len} exceeds rope cache size "
-                f"{rope_cache_len}. Increase model max_seq_len or reduce "
-                f"generation max_tokens."
+                f"Sample length {max_seq_len} exceeds rope cache {rope_cache_len}. "
+                "Increase model max_seq_len or reduce generation max_tokens."
             )
 
-        num_global_valid_tokens: torch.Tensor = torch.tensor(
+        num_global_valid_tokens_t = torch.tensor(
             float(max(num_global_valid_tokens, 1)),
             device=device,
             dtype=torch.float32,
         )
 
+        # Varlen positions: per-sample arange concatenated.
         positions = torch.cat(
-            [torch.arange(l, device=device) for l in seq_lens]
+            [torch.arange(L, device=device) for L in seq_lens]
         ).unsqueeze(0)
         attention_masks = create_varlen_metadata_for_document(positions)
 
@@ -366,41 +352,85 @@ class PolicyTrainer(Actor, Configurable):
             logits = model(
                 token_ids, attention_masks=attention_masks, positions=positions
             )
-        all_policy_logprobs = compute_logprobs(logits, token_ids)
-        policy_logprobs = extract_response_logprobs(
-            all_policy_logprobs, seq_lens, prompt_lens, response_lens
-        )
+        policy_logprobs = compute_logprobs(
+            logits, token_ids, temperature=sampling_temperature
+        )  # [1, T-1]
+
+        # TODO(nan-debug): remove once AlphabetSort 4B is reliably stable.
+        # Pinpoint which input is non-finite when the loss explodes.
+        if (
+            logger.isEnabledFor(logging.DEBUG)
+            or not torch.isfinite(policy_logprobs).all()
+        ):
+            with torch.no_grad():
+                logger.warning(
+                    "nan-debug: logits finite=%s min=%s max=%s | "
+                    "policy_logprobs finite=%s min=%s max=%s | "
+                    "behavior_logprobs finite=%s min=%s max=%s | "
+                    "advantages_per_token finite=%s min=%s max=%s | "
+                    "loss_mask sum=%d | seq_lens[0:3]=%s max_seq_len=%d",
+                    torch.isfinite(logits).all().item(),
+                    float(logits.min()),
+                    float(logits.max()),
+                    torch.isfinite(policy_logprobs).all().item(),
+                    float(policy_logprobs.min()),
+                    float(policy_logprobs.max()),
+                    torch.isfinite(behavior_logprobs).all().item(),
+                    float(behavior_logprobs.min()),
+                    float(behavior_logprobs.max()),
+                    torch.isfinite(advantages_per_token).all().item(),
+                    float(advantages_per_token.min()),
+                    float(advantages_per_token.max()),
+                    int(loss_mask.sum().item()),
+                    seq_lens[:3],
+                    max_seq_len,
+                )
 
         with sl.log_trace_span("loss_fn"):
-            loss, loss_metrics = self.loss_fn(
+            loss_out = self.loss_fn(
                 policy_logprobs=policy_logprobs,
-                advantages=advantages,
-                num_global_valid_tokens=num_global_valid_tokens,
+                behavior_logprobs=behavior_logprobs,
+                advantages_per_token=advantages_per_token,
+                loss_mask=loss_mask,
+                num_global_valid_tokens=num_global_valid_tokens_t,
             )
 
         self.optimizers.zero_grad()
         with sl.log_trace_span("model_backward"):
-            loss.backward()
+            loss_out.loss.backward()
 
-        # Metrics for bitwise verification of policy logprobs.
-        verification: PartialLogprobDrift = verify_logprob_identity(
-            generator_token_logprobs=local_batch.token_logprobs,
-            trainer_token_logprobs=policy_logprobs,
-            num_global_valid_tokens=num_global_valid_tokens,
-            device=device,
+        drift: PartialLogprobDrift = verify_logprob_identity(
+            behavior_logprobs=behavior_logprobs,
+            policy_logprobs=policy_logprobs,
+            loss_mask=loss_mask,
+            num_global_valid_tokens=num_global_valid_tokens_t,
         )
 
-        # Per-rank pre-normalized metrics, so SUM-reducing reconstructs the global.
+        # Peak memory after forward+backward — useful to size batch.
+        mem_alloc_gb = torch.tensor(
+            torch.cuda.max_memory_allocated(device) / 1e9,
+            device=device,
+            dtype=torch.float32,
+        )
+        mem_reserved_gb = torch.tensor(
+            torch.cuda.max_memory_reserved(device) / 1e9,
+            device=device,
+            dtype=torch.float32,
+        )
+        torch.cuda.reset_peak_memory_stats(device)
+
         sum_reduced_metrics = {
-            **loss_metrics,
-            "bit_wise/logprob_diff/mean": verification.logprob_diff_mean,
-            "bit_wise/ratio_tokens_different/mean": verification.ratio_tokens_different,
+            **loss_out.sum_metrics,
+            "bit_wise/logprob_diff/mean": drift.logprob_diff_mean,
+            "bit_wise/ratio_tokens_different/mean": drift.ratio_tokens_different,
         }
         max_reduced_metrics = {
-            "bit_wise/logprob_diff/max": verification.logprob_diff_max,
+            **loss_out.max_metrics,
+            "bit_wise/logprob_diff/max": drift.logprob_diff_max,
+            "memory/trainer/peak_allocated_gb": mem_alloc_gb,
+            "memory/trainer/peak_reserved_gb": mem_reserved_gb,
         }
-
-        return self.reduce_forward_backward_metrics(
+        return self._reduce_forward_backward_metrics(
             sum_reduced_metrics=sum_reduced_metrics,
             max_reduced_metrics=max_reduced_metrics,
         )
@@ -408,22 +438,18 @@ class PolicyTrainer(Actor, Configurable):
     @endpoint
     @sl.log_trace_span("optim_step")
     async def optim_step(self) -> OptimStepOutput:
-        """Clip gradients, step optimizer + LR scheduler, return updated state."""
-        # TODO: Accept optional optimizer params (e.g. learning rate)
-        # to allow controller-owned schedules (see Tinker API).
-
-        # capture LR before step
+        """Grad clip + optimizer step + LR scheduler step."""
         current_lrs = self.lr_schedulers.schedulers[0].get_last_lr()
         if len(current_lrs) != 1:
             raise ValueError(
-                "RL metrics only support a single optimizer LR for "
-                f"train/lr; got {current_lrs}"
+                "RL metrics only support a single optimizer LR for train/lr; "
+                f"got {current_lrs}"
             )
         current_lr = float(current_lrs[0])
 
         with sl.log_trace_span("grad_clip"):
             grad_norm = dist_utils.clip_grad_norm_(
-                [p for m in self.model_parts for p in m.parameters()],
+                [p for mp in self.model_parts for p in mp.parameters()],
                 self.config.training.max_norm,
                 foreach=True,
                 pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
@@ -434,12 +460,6 @@ class PolicyTrainer(Actor, Configurable):
             self.lr_schedulers.step()
 
         self.policy_version += 1
-
-        logger.debug(
-            f"{os.getpid()=} PolicyTrainer optim_step done, "
-            f"policy_version={self.policy_version}"
-        )
-
         return OptimStepOutput(
             policy_version=self.policy_version,
             metrics={
@@ -450,40 +470,22 @@ class PolicyTrainer(Actor, Configurable):
         )
 
     @endpoint
-    @sl.log_trace_span("save_checkpoint")
-    async def save_checkpoint(self, step: int, last_step: bool = False) -> bool:
-        """Save checkpoint via CheckpointManager.
-
-        Args:
-            step: Current training step number.
-            last_step: Whether this is the final step of training.
-
-        Returns:
-            True if a checkpoint was saved.
-        """
-        return self.checkpointer.save(step, last_step=last_step)
-
-    @endpoint
     @sl.log_trace_span("push_model_state_dict")
     async def push_model_state_dict(self) -> None:
-        """Publish model weights for generator consumption via TorchStore.
+        """Publish weights for generator consumption via TorchStore.
 
-        When `direct_rdma=True`, weights are transferred directly from
-        GPU to GPU via one-sided RDMA reads, bypassing StorageVolumes
-        entirely. When `False`, data goes through StorageVolumes
-        (which may themselves use RDMA as a transport internally).
-
-        Note: we couple `is_rdma_available()` with `direct_rdma` here,
-        but the two concepts are not identical -- StorageVolumes can also
-        use RDMA as their transport layer. `direct_rdma` specifically
-        means "skip StorageVolumes and let the destination read directly
-        from the source's GPU memory".
-
+        Deduplicates tensors that share a ``data_ptr`` (e.g. tied
+        embeddings: ``tok_embeddings.weight`` and ``lm_head.weight``
+        in Qwen3 when ``enable_weight_tying=True``). Without dedup the
+        torchstore source registers the same memory under two
+        ``RDMABuffer``s, doubling the RDMA op count and exposing a
+        per-buffer timeout on big tensors over TCP fallback. The
+        receiver re-ties on its end via ``init_weights``.
         """
         from monarch.rdma import is_rdma_available
 
         await ts.put_state_dict(
-            self.model.state_dict(),
+            _dedup_tied_tensors(self.model.state_dict()),
             "model_state_dict",
             direct_rdma=is_rdma_available(),
             transfer_dtype=self._transfer_dtype,
