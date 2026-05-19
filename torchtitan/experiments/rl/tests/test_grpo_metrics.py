@@ -17,6 +17,8 @@ from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
 from torchtitan.experiments.rl.grpo import (
     _raise_rollout_task_errors,
     _RolloutDropCounters,
+    _TrainStepTimings,
+    _WeightSyncTimings,
     Provisioner,
     RLTrainer,
 )
@@ -27,7 +29,9 @@ from torchtitan.experiments.rl.observability.metrics.rl import (
 )
 from torchtitan.experiments.rl.replay import (
     has_advantage_signal,
+    ReplayBatch,
     ReplayBuffer,
+    ReplayBufferStats,
     ReplayGroup,
     rollouts_to_replay_samples,
 )
@@ -628,6 +632,151 @@ def test_replay_wait_surfaces_no_signal_producer_error():
             await _raise_rollout_task_errors([task], timeout_s=1.0)
 
     asyncio.run(run())
+
+
+def test_train_step_metric_builder_emits_replay_timing_and_trace_scalars():
+    sample = ReplaySample(
+        token_ids=[1, 2],
+        loss_mask=[0, 1],
+        behavior_logprobs=[0.0, -0.1],
+        advantage=0.5,
+        group_id="g0",
+        sample_idx=0,
+        behavior_version=2,
+        reward=1.0,
+    )
+    rollout = RolloutOutput(
+        group_id="g0",
+        sample_idx=0,
+        status=RolloutStatus.COMPLETED,
+        reward=1.0,
+        turns=[
+            RolloutTurn(
+                prompt_token_ids=[1],
+                response_token_ids=[2],
+                response_logprobs=[-0.1],
+                policy_version=2,
+            )
+        ],
+    )
+    batch = ReplayBatch(
+        groups=[
+            ReplayGroup(
+                group_id="g0",
+                samples=[sample],
+                rollouts=[rollout],
+                behavior_version=2,
+                max_behavior_version=3,
+            )
+        ],
+        samples=[sample],
+        stats=ReplayBufferStats(
+            num_groups=1,
+            num_samples=1,
+            num_loss_tokens=1,
+            num_dropped_stale_groups=0,
+            max_observed_age_steps=1,
+            depth_groups=2,
+        ),
+    )
+
+    metrics, trace_scalars = RLTrainer._build_train_step_metrics(
+        samples=[sample],
+        replay_batch=batch,
+        rollouts=[rollout],
+        live_generation_metrics=[m.Metric("generator/live/tokens", m.NoReduce(4.0))],
+        fwd_bwd_metrics={"loss/mean": 0.25},
+        optimizer_metrics={"train/lr": 1e-6},
+        checkpoint_saved=True,
+        timings=_TrainStepTimings(
+            step_s=2.0,
+            replay_wait_s=0.1,
+            train_s=0.2,
+            checkpoint_s=0.3,
+            weight_sync=_WeightSyncTimings(
+                admission_drain_s=0.4,
+                push_s=0.5,
+                pull_s=0.6,
+                total_s=1.5,
+            ),
+        ),
+        dropped_empty_groups=1,
+        dropped_zero_advantage_groups=2,
+        train_version=7,
+    )
+    aggregate = m.MetricsProcessor._aggregate_metrics(metrics)
+
+    assert aggregate["loss/mean"] == 0.25
+    assert aggregate["checkpoint/saved"] == 1.0
+    assert aggregate["perf/tokens_per_second"] == 1.0
+    assert aggregate["replay/policy_version/train"] == 7.0
+    assert aggregate["replay/policy_version/behavior_min"] == 2.0
+    assert aggregate["replay/policy_version/behavior_max"] == 3.0
+    assert aggregate["generator/live/tokens"] == 4.0
+    assert trace_scalars["replay.buffer_depth_groups"] == 2
+    assert trace_scalars["rollout.dropped_zero_advantage_groups"] == 2
+    assert trace_scalars["timing.weight_sync_pull_ms"] == 600.0
+
+
+def test_train_step_metric_builder_handles_zero_step_duration():
+    sample = ReplaySample(
+        token_ids=[1, 2],
+        loss_mask=[0, 1],
+        behavior_logprobs=[0.0, -0.1],
+        advantage=0.5,
+        group_id="g0",
+        sample_idx=0,
+        behavior_version=0,
+        reward=1.0,
+    )
+    batch = ReplayBatch(
+        groups=[
+            ReplayGroup(
+                group_id="g0",
+                samples=[sample],
+                rollouts=[],
+                behavior_version=0,
+                max_behavior_version=0,
+            )
+        ],
+        samples=[sample],
+        stats=ReplayBufferStats(
+            num_groups=1,
+            num_samples=1,
+            num_loss_tokens=1,
+            num_dropped_stale_groups=0,
+            max_observed_age_steps=0,
+            depth_groups=0,
+        ),
+    )
+
+    metrics, _ = RLTrainer._build_train_step_metrics(
+        samples=[sample],
+        replay_batch=batch,
+        rollouts=[],
+        live_generation_metrics=[],
+        fwd_bwd_metrics={"loss/mean": 0.0},
+        optimizer_metrics={},
+        checkpoint_saved=False,
+        timings=_TrainStepTimings(
+            step_s=0.0,
+            replay_wait_s=0.0,
+            train_s=0.0,
+            checkpoint_s=0.0,
+            weight_sync=_WeightSyncTimings(
+                admission_drain_s=0.0,
+                push_s=0.0,
+                pull_s=0.0,
+                total_s=0.0,
+            ),
+        ),
+        dropped_empty_groups=0,
+        dropped_zero_advantage_groups=0,
+        train_version=0,
+    )
+    aggregate = m.MetricsProcessor._aggregate_metrics(metrics)
+
+    assert aggregate["perf/tokens_per_second"] == 0.0
 
 
 def test_replay_buffer_blocks_until_batch_is_ready():

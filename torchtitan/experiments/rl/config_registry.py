@@ -120,12 +120,41 @@ def _alphabet_sort_4gpu_config(
     )
 
 
-def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
-    """GRPO training config for Qwen3-0.6B (6 GPUs: 4 gen + 2 train)."""
+def _sum_digits_smoke_config(
+    *,
+    model_size: str,
+    hf_assets_path: str,
+    lr: float,
+    trainer_tensor_parallel_degree: int,
+    generator_tensor_parallel_degree: int,
+    trainer_dtype: str | None = None,
+    trainer_enable_sequence_parallel: bool | None = None,
+    trainer_debug: DebugConfig | None = None,
+    generator_debug: DebugConfig | None = None,
+    generator_data_parallel_shard_degree: int | None = None,
+) -> RLTrainer.Config:
+    """Shared 10-step SumDigits smoke config."""
     group_size = 8
+    trainer_parallelism_kwargs = {}
+    if trainer_enable_sequence_parallel is not None:
+        trainer_parallelism_kwargs[
+            "enable_sequence_parallel"
+        ] = trainer_enable_sequence_parallel
+    generator_parallelism_kwargs = {}
+    if generator_data_parallel_shard_degree is not None:
+        generator_parallelism_kwargs[
+            "data_parallel_shard_degree"
+        ] = generator_data_parallel_shard_degree
+    trainer_kwargs = {}
+    if trainer_debug is not None:
+        trainer_kwargs["debug"] = trainer_debug
+    generator_kwargs = {}
+    if generator_debug is not None:
+        generator_kwargs["debug"] = generator_debug
+
     return RLTrainer.Config(
-        model_spec=model_registry("0.6B", attn_backend="varlen"),
-        hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
+        model_spec=model_registry(model_size, attn_backend="varlen"),
+        hf_assets_path=hf_assets_path,
         num_steps=10,
         num_prompts_per_step=5,
         rollout_group_size=group_size,
@@ -143,16 +172,21 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
         ),
         metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(
-            optimizer=OptimizersContainer.Config(lr=2e-6),
+            optimizer=OptimizersContainer.Config(lr=lr),
             lr_scheduler=LRSchedulersContainer.Config(
                 warmup_steps=2,
                 decay_type="linear",
             ),
-            training=TrainingConfig(),
+            training=(
+                TrainingConfig(dtype=trainer_dtype)
+                if trainer_dtype is not None
+                else TrainingConfig()
+            ),
             parallelism=ParallelismConfig(
                 data_parallel_shard_degree=1,
-                tensor_parallel_degree=2,
+                tensor_parallel_degree=trainer_tensor_parallel_degree,
                 disable_loss_parallel=True,
+                **trainer_parallelism_kwargs,
             ),
             checkpoint=CheckpointManager.Config(
                 enable=True,
@@ -161,14 +195,16 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
                 last_save_model_only=False,
             ),
             loss=GRPOLoss.Config(),
+            **trainer_kwargs,
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
             parallelism=ParallelismConfig(
-                tensor_parallel_degree=4,
+                tensor_parallel_degree=generator_tensor_parallel_degree,
                 data_parallel_replicate_degree=1,
                 enable_sequence_parallel=False,
                 disable_loss_parallel=True,
+                **generator_parallelism_kwargs,
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
@@ -177,7 +213,19 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
                 top_p=0.95,
                 max_tokens=100,
             ),
+            **generator_kwargs,
         ),
+    )
+
+
+def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
+    """GRPO training config for Qwen3-0.6B (6 GPUs: 4 gen + 2 train)."""
+    return _sum_digits_smoke_config(
+        model_size="0.6B",
+        hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
+        lr=2e-6,
+        trainer_tensor_parallel_degree=2,
+        generator_tensor_parallel_degree=4,
     )
 
 
@@ -194,63 +242,13 @@ def rl_grpo_qwen3_0_6b_alphabet_sort() -> RLTrainer.Config:
 
 def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
     """GRPO training config for Qwen3-1.7B (6 GPUs: 4 gen + 2 train)."""
-    group_size = 8
-    return RLTrainer.Config(
-        model_spec=model_registry("1.7B", attn_backend="varlen"),
+    return _sum_digits_smoke_config(
+        model_size="1.7B",
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-1.7B",
-        num_steps=10,
-        num_prompts_per_step=5,
-        rollout_group_size=group_size,
-        num_validation_samples=20,
-        compile=CompileConfig(enable=True, backend="aot_eager"),
-        train_dataset=SumDigitsDataset.Config(seed=42),
-        train_env_builder=SumDigitsBuilder.Config(
-            correctness_reward=1.0,
-            format_reward=0.3,
-        ),
-        validation_dataset=SumDigitsDataset.Config(seed=99),
-        validation_env_builder=SumDigitsBuilder.Config(
-            correctness_reward=1.0,
-            format_reward=0.3,
-        ),
-        metrics=MetricsProcessor.Config(enable_wandb=True),
-        trainer=PolicyTrainer.Config(
-            optimizer=OptimizersContainer.Config(lr=2e-6),
-            lr_scheduler=LRSchedulersContainer.Config(
-                warmup_steps=2,
-                decay_type="linear",
-            ),
-            training=TrainingConfig(),
-            parallelism=ParallelismConfig(
-                data_parallel_shard_degree=1,
-                tensor_parallel_degree=2,
-                disable_loss_parallel=True,
-            ),
-            checkpoint=CheckpointManager.Config(
-                enable=True,
-                initial_load_in_hf=True,
-                interval=10,
-                last_save_model_only=False,
-            ),
-            loss=GRPOLoss.Config(),
-        ),
-        generator=VLLMGenerator.Config(
-            model_dtype="bfloat16",
-            parallelism=ParallelismConfig(
-                data_parallel_shard_degree=1,
-                tensor_parallel_degree=4,
-                data_parallel_replicate_degree=1,
-                enable_sequence_parallel=False,
-                disable_loss_parallel=True,
-            ),
-            checkpoint=CheckpointManager.Config(enable=False),
-            sampling=SamplingConfig(
-                n=1,
-                temperature=0.8,
-                top_p=0.95,
-                max_tokens=100,
-            ),
-        ),
+        lr=2e-6,
+        trainer_tensor_parallel_degree=2,
+        generator_tensor_parallel_degree=4,
+        generator_data_parallel_shard_degree=1,
     )
 
 
@@ -267,62 +265,13 @@ def rl_grpo_qwen3_1_7b_alphabet_sort() -> RLTrainer.Config:
 
 def rl_grpo_qwen3_14b() -> RLTrainer.Config:
     """GRPO training config for Qwen3-14B (16 GPUs: 8 gen + 8 train)."""
-    group_size = 8
-    return RLTrainer.Config(
-        model_spec=model_registry("14B", attn_backend="varlen"),
+    return _sum_digits_smoke_config(
+        model_size="14B",
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-14B",
-        num_steps=10,
-        num_prompts_per_step=5,
-        rollout_group_size=group_size,
-        num_validation_samples=20,
-        compile=CompileConfig(enable=True, backend="aot_eager"),
-        train_dataset=SumDigitsDataset.Config(seed=42),
-        train_env_builder=SumDigitsBuilder.Config(
-            correctness_reward=1.0,
-            format_reward=0.3,
-        ),
-        validation_dataset=SumDigitsDataset.Config(seed=99),
-        validation_env_builder=SumDigitsBuilder.Config(
-            correctness_reward=1.0,
-            format_reward=0.3,
-        ),
-        metrics=MetricsProcessor.Config(enable_wandb=True),
-        trainer=PolicyTrainer.Config(
-            optimizer=OptimizersContainer.Config(lr=1e-6),
-            lr_scheduler=LRSchedulersContainer.Config(
-                warmup_steps=2,
-                decay_type="linear",
-            ),
-            training=TrainingConfig(dtype="bfloat16"),
-            parallelism=ParallelismConfig(
-                data_parallel_shard_degree=1,
-                tensor_parallel_degree=8,
-                disable_loss_parallel=True,
-            ),
-            checkpoint=CheckpointManager.Config(
-                enable=True,
-                initial_load_in_hf=True,
-                interval=10,
-                last_save_model_only=False,
-            ),
-            loss=GRPOLoss.Config(),
-        ),
-        generator=VLLMGenerator.Config(
-            model_dtype="bfloat16",
-            parallelism=ParallelismConfig(
-                tensor_parallel_degree=8,
-                data_parallel_replicate_degree=1,
-                enable_sequence_parallel=False,
-                disable_loss_parallel=True,
-            ),
-            checkpoint=CheckpointManager.Config(enable=False),
-            sampling=SamplingConfig(
-                n=1,
-                temperature=0.8,
-                top_p=0.95,
-                max_tokens=100,
-            ),
-        ),
+        lr=1e-6,
+        trainer_tensor_parallel_degree=8,
+        generator_tensor_parallel_degree=8,
+        trainer_dtype="bfloat16",
     )
 
 
@@ -332,65 +281,16 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
     Enables deterministic + batch-invariant mode for true on-policy RL training.
     """
     batch_invariant_config = DebugConfig(batch_invariant=True, deterministic=True)
-    group_size = 8
-    return RLTrainer.Config(
-        model_spec=model_registry("0.6B", attn_backend="varlen"),
+    return _sum_digits_smoke_config(
+        model_size="0.6B",
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
-        num_steps=10,
-        num_prompts_per_step=5,
-        rollout_group_size=group_size,
-        num_validation_samples=20,
-        compile=CompileConfig(enable=True, backend="aot_eager"),
-        train_dataset=SumDigitsDataset.Config(seed=42),
-        train_env_builder=SumDigitsBuilder.Config(
-            correctness_reward=1.0,
-            format_reward=0.3,
-        ),
-        validation_dataset=SumDigitsDataset.Config(seed=99),
-        validation_env_builder=SumDigitsBuilder.Config(
-            correctness_reward=1.0,
-            format_reward=0.3,
-        ),
-        metrics=MetricsProcessor.Config(enable_wandb=True),
-        trainer=PolicyTrainer.Config(
-            optimizer=OptimizersContainer.Config(lr=2e-6),
-            lr_scheduler=LRSchedulersContainer.Config(
-                warmup_steps=2,
-                decay_type="linear",
-            ),
-            # bfloat16 is needed for trainer to align with generator dtype
-            # TODO: replace bfloat16 enablement with FSDP2+TP2
-            training=TrainingConfig(dtype="bfloat16"),
-            parallelism=ParallelismConfig(
-                data_parallel_shard_degree=1,
-                tensor_parallel_degree=2,
-                enable_sequence_parallel=False,
-                disable_loss_parallel=True,
-            ),
-            checkpoint=CheckpointManager.Config(
-                enable=True,
-                initial_load_in_hf=True,
-                interval=10,
-                last_save_model_only=False,
-            ),
-            debug=batch_invariant_config,
-            loss=GRPOLoss.Config(),
-        ),
-        generator=VLLMGenerator.Config(
-            model_dtype="bfloat16",
-            parallelism=ParallelismConfig(
-                tensor_parallel_degree=2,
-                data_parallel_replicate_degree=1,
-                enable_sequence_parallel=False,
-                disable_loss_parallel=True,
-            ),
-            checkpoint=CheckpointManager.Config(enable=False),
-            sampling=SamplingConfig(
-                n=1,
-                temperature=0.8,
-                top_p=0.95,
-                max_tokens=100,
-            ),
-            debug=batch_invariant_config,
-        ),
+        lr=2e-6,
+        trainer_tensor_parallel_degree=2,
+        generator_tensor_parallel_degree=2,
+        # bfloat16 is needed for trainer to align with generator dtype.
+        # TODO: replace bfloat16 enablement with FSDP2+TP2.
+        trainer_dtype="bfloat16",
+        trainer_enable_sequence_parallel=False,
+        trainer_debug=batch_invariant_config,
+        generator_debug=batch_invariant_config,
     )
