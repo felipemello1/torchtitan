@@ -430,6 +430,22 @@ class RLTrainer(Configurable):
         instead of a stream of size-1 admissions.
         """
 
+        num_generator_instances: int = 1
+        """Number of independent generator actor meshes to spawn.
+
+        Each instance holds its own vLLM engine on its own GPU shard of
+        size ``generator.parallelism.tensor_parallel_degree``. With N>1,
+        the controller round-robins ``generate`` calls across instances
+        and pushes weights once / pulls N times per sync. Multi-turn
+        prefix-cache stickiness across instances is NOT implemented in
+        this revision (a request's turn k may land on a different
+        instance from turn k-1), so expect a cold prefix cache on
+        multi-turn calls. Set to 1 for the single-mesh path that mirrors
+        prior behavior bit-for-bit.
+
+        Total GPU usage: trainer_world_size + N * generator_tp_degree.
+        """
+
         replay_buffer_groups: int = 2
         """Completed-group FIFO capacity for async rollout producers.
 
@@ -522,6 +538,11 @@ class RLTrainer(Configurable):
                     "generation_flush_window_s must be non-negative, "
                     f"got {self.generation_flush_window_s}"
                 )
+            if self.num_generator_instances <= 0:
+                raise ValueError(
+                    "num_generator_instances must be positive, "
+                    f"got {self.num_generator_instances}"
+                )
             training_seq_len = self.trainer.training.seq_len
             if (
                 self.max_trajectory_tokens is not None
@@ -564,7 +585,8 @@ class RLTrainer(Configurable):
     def __init__(self, config: Config):
         self.config = config
         self.trainer = None
-        self.generator = None
+        self.generators: list = []
+        self._generate_round_robin = 0
         self._proc_meshes = []
         self.metrics_processor: m.MetricsProcessor = config.metrics.build(
             log_dir=config.dump_folder,
@@ -593,12 +615,12 @@ class RLTrainer(Configurable):
             "actor_close_timeout_s",
             30.0,
         )
-        for actor_name, actor in (
-            ("trainer", self.trainer),
-            ("generator", self.generator),
-        ):
-            if actor is None:
-                continue
+        actors_to_close: list[tuple[str, object]] = []
+        if self.trainer is not None:
+            actors_to_close.append(("trainer", self.trainer))
+        for idx, gen in enumerate(self.generators):
+            actors_to_close.append((f"generator_{idx}", gen))
+        for actor_name, actor in actors_to_close:
             try:
                 await asyncio.wait_for(
                     actor.close.call(),
@@ -675,17 +697,33 @@ class RLTrainer(Configurable):
         gpus_per_node: int | None,
         total_gpus: int,
     ):
+        num_generator_instances = self.config.num_generator_instances
         if host_mesh is None:
             provisioner = Provisioner(total_gpus=total_gpus)
             trainer_mesh = this_host().spawn_procs(
                 per_host={"gpus": self.trainer_world_size},
                 bootstrap=provisioner.allocate(self.trainer_world_size),
             )
-            generator_mesh = this_host().spawn_procs(
-                per_host={"gpus": self.generator_world_size},
-                bootstrap=provisioner.allocate(self.generator_world_size),
+            generator_meshes = []
+            for idx in range(num_generator_instances):
+                mesh = this_host().spawn_procs(
+                    per_host={"gpus": self.generator_world_size},
+                    bootstrap=provisioner.allocate(self.generator_world_size),
+                    name=(
+                        "generator"
+                        if num_generator_instances == 1
+                        else f"generator_{idx}"
+                    ),
+                )
+                generator_meshes.append(mesh)
+            return trainer_mesh, generator_meshes
+
+        if num_generator_instances != 1:
+            raise NotImplementedError(
+                "num_generator_instances > 1 is only supported in single-host "
+                f"mode (host_mesh=None); got num_generator_instances="
+                f"{num_generator_instances} with host_mesh provided"
             )
-            return trainer_mesh, generator_mesh
 
         if trainer_nodes is None or generator_nodes is None or gpus_per_node is None:
             raise ValueError(
@@ -719,9 +757,9 @@ class RLTrainer(Configurable):
             per_host={"gpus": generator_gpus_per_node},
             bootstrap=generator_provisioner.allocate(generator_gpus_per_node),
         )
-        return trainer_mesh, generator_mesh
+        return trainer_mesh, [generator_mesh]
 
-    def _spawn_actors(self, *, trainer_mesh, generator_mesh) -> None:
+    def _spawn_actors(self, *, trainer_mesh, generator_meshes) -> None:
         config = self.config
         self.trainer = trainer_mesh.spawn(
             "trainer",
@@ -733,20 +771,24 @@ class RLTrainer(Configurable):
             compile_config=config.compile,
             output_dir=config.dump_folder,
         )
-        self.generator = generator_mesh.spawn(
-            "generator",
-            VLLMGenerator,
-            config.generator,
-            model_spec=config.model_spec,
-            model_path=config.hf_assets_path,
-            compile_config=config.compile,
-            max_num_seqs=compute_generator_max_num_seqs(
-                async_rollout_groups=config.async_rollout_groups,
-                rollout_group_size=config.rollout_group_size,
-                num_validation_samples=config.num_validation_samples,
-            ),
-            output_dir=config.dump_folder,
+        max_num_seqs = compute_generator_max_num_seqs(
+            async_rollout_groups=config.async_rollout_groups,
+            rollout_group_size=config.rollout_group_size,
+            num_validation_samples=config.num_validation_samples,
         )
+        self.generators = [
+            mesh.spawn(
+                "generator" if len(generator_meshes) == 1 else f"generator_{idx}",
+                VLLMGenerator,
+                config.generator,
+                model_spec=config.model_spec,
+                model_path=config.hf_assets_path,
+                compile_config=config.compile,
+                max_num_seqs=max_num_seqs,
+                output_dir=config.dump_folder,
+            )
+            for idx, mesh in enumerate(generator_meshes)
+        ]
 
     def _shard_samples(self, samples: list[ReplaySample]) -> list[list[ReplaySample]]:
         """Round-robin partition replay samples across DP ranks."""
@@ -856,27 +898,39 @@ class RLTrainer(Configurable):
             trainer_parallelism.data_parallel_replicate_degree * dp_shard
         )
 
-        total_gpus = self.trainer_world_size + self.generator_world_size
-        logger.info(
-            f"{self.generator_world_size} generator GPUs + "
-            f"{self.trainer_world_size} trainer GPUs = {total_gpus} total"
-        )
+        num_gen = self.config.num_generator_instances
+        total_generator_gpus = self.generator_world_size * num_gen
+        total_gpus = self.trainer_world_size + total_generator_gpus
+        if num_gen == 1:
+            logger.info(
+                f"{self.generator_world_size} generator GPUs + "
+                f"{self.trainer_world_size} trainer GPUs = {total_gpus} total"
+            )
+        else:
+            logger.info(
+                f"{num_gen} generator instances x {self.generator_world_size} GPUs "
+                f"= {total_generator_gpus} generator GPUs + "
+                f"{self.trainer_world_size} trainer GPUs = {total_gpus} total"
+            )
 
         self._multi_node = host_mesh is not None
 
         with sl.log_trace_span("mesh_spawn"):
-            trainer_mesh, generator_mesh = self._spawn_role_meshes(
+            trainer_mesh, generator_meshes = self._spawn_role_meshes(
                 host_mesh=host_mesh,
                 trainer_nodes=trainer_nodes,
                 generator_nodes=generator_nodes,
                 gpus_per_node=gpus_per_node,
                 total_gpus=total_gpus,
             )
-            self._proc_meshes = [trainer_mesh, generator_mesh]
+            self._proc_meshes = [trainer_mesh, *generator_meshes]
 
             await setup_torch_elastic_env_async(trainer_mesh)
-            await setup_torch_elastic_env_async(generator_mesh)
-            self._spawn_actors(trainer_mesh=trainer_mesh, generator_mesh=generator_mesh)
+            for mesh in generator_meshes:
+                await setup_torch_elastic_env_async(mesh)
+            self._spawn_actors(
+                trainer_mesh=trainer_mesh, generator_meshes=generator_meshes
+            )
 
         # Initialize TorchStore for weight sync between trainer and generator.
         # StorageVolumes are spawned on the trainer mesh so they are colocated
@@ -887,11 +941,13 @@ class RLTrainer(Configurable):
         with sl.log_trace_span("torchstore_init"):
             await ts.initialize(mesh=trainer_mesh, strategy=ts.LocalRankStrategy())
 
-        # Initial weight sync from trainer to generator
+        # Initial weight sync from trainer to generator(s). Push once,
+        # then each generator instance pulls the same payload.
         with sl.log_trace_span("trainer_push_model_state_dict"):
             await self._await_call(self.trainer.push_model_state_dict.call())
         with sl.log_trace_span("generator_pull_model_state_dict"):
-            await self._await_call(self.generator.pull_model_state_dict.call(0))
+            for gen in self.generators:
+                await self._await_call(gen.pull_model_state_dict.call(0))
 
     async def _await_rank_0(self, actor_call):
         """Await a Monarch call without blocking the controller event loop."""
@@ -915,8 +971,17 @@ class RLTrainer(Configurable):
             request_ids: list[str],
             sampling: SamplingConfig,
         ) -> tuple[list[Completion], list[m.Metric]]:
+            # Round-robin across generator instances. For
+            # num_generator_instances=1 this is bit-identical to the
+            # single-generator path. NOTE: no session_id stickiness yet,
+            # so multi-turn rollouts may bounce between instances and
+            # miss prefix-cache hits on later turns. SessionRouter is
+            # tracked as future work (RFC §10).
+            idx = self._generate_round_robin % len(self.generators)
+            self._generate_round_robin += 1
+            gen = self.generators[idx]
             completions, metrics = await self._await_rank_0(
-                self.generator.generate.call(
+                gen.generate.call(
                     prompt_token_ids_batch,
                     request_ids=request_ids,
                     sampling_config=sampling,
@@ -971,9 +1036,13 @@ class RLTrainer(Configurable):
 
             t_weight_sync_pull_start = time.perf_counter()
             with sl.log_trace_span("generator_pull_model_state_dict"):
-                await self._await_call(
-                    self.generator.pull_model_state_dict.call(policy_version)
-                )
+                # Sequential pulls keep ordering predictable; switch to
+                # ``asyncio.gather`` if sync wall time becomes a bottleneck
+                # at large num_generator_instances.
+                for gen in self.generators:
+                    await self._await_call(
+                        gen.pull_model_state_dict.call(policy_version)
+                    )
             t_weight_sync_pull_s = time.perf_counter() - t_weight_sync_pull_start
         finally:
             await generation_scheduler.resume_after_weight_sync()
@@ -1354,7 +1423,8 @@ class RLTrainer(Configurable):
             for step in range(1, num_steps + 1):
                 sl.set_step(step)
                 await self._await_call(self.trainer.sync_log_step.call(step))
-                await self._await_call(self.generator.sync_log_step.call(step))
+                for gen in self.generators:
+                    await self._await_call(gen.sync_log_step.call(step))
 
                 t_step_start = time.perf_counter()
                 t_buffer_start = time.perf_counter()
