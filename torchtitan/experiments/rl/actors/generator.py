@@ -4,20 +4,22 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# UNTESTED -- REVIEW BEFORE LANDING.
-# What changed vs experiments/rl/actors/generator.py @ v7 head:
-#   1. Replaced the long-lived `_engine_driver_task` + `_engine_lock` race
-#      with an in-coroutine step loop guarded by an `asyncio.Lock`
-#      ("busy semaphore"), exactly one `generate` in flight per rank.
-#   2. Every admission is preceded by a CPU broadcast of the prompt
-#      payload over a gloo `_world_group` (TBR sampler_base.py:708-721),
-#      so all TP ranks call `engine.add_request` with bit-identical args.
-#   3. Non-rank-0 ranks return `([], [])`; the controller already drops
-#      non-zero ranks via `_get_rank_0_value(result, gpus=0)`.
-#   4. Public endpoint signatures unchanged. `pull_model_state_dict`,
-#      `sync_log_step`, `close` keep their contracts.
-#   5. Removed `_pending_outputs`, `_engine_driver_task`,
-#      `_ensure_engine_driver_locked`, `_drive_engine`.
+"""vLLM Monarch actor with a TBR-style continuous engine loop.
+
+Public contract:
+
+    generate(prompt_token_ids_batch, *, request_ids, sampling_config,
+             metrics_prefix) -> (list[Completion], list[Metric])
+
+One background ``_engine_loop`` per actor rank owns the vLLM engine.
+``generate(...)`` enqueues per-request :class:`asyncio.Future` objects on
+rank 0 and awaits them; the loop coalesces pending submits, broadcasts
+the admission set to every TP rank, admits locally, then runs bounded
+``engine.step()`` bursts and resolves request futures as outputs finish.
+Continuous batching across ``generate`` calls falls out for free.
+"""
+
+from __future__ import annotations
 
 import asyncio
 import contextlib
@@ -26,9 +28,9 @@ import logging
 import math
 import os
 import pickle
-import struct
 import time
 from dataclasses import dataclass, field
+from typing import Literal
 
 import torch
 import torch.distributed as dist
@@ -70,10 +72,7 @@ logger = logging.getLogger(__name__)
 def _prepare_generation_request_metrics(
     output: RequestOutput, *, prefix: str
 ) -> list[m.Metric]:
-    """vLLM per-request metrics from a single `RequestOutput`.
-
-    Identical to the v7 helper; only formatted here for completeness.
-    """
+    """vLLM per-request metrics from a single ``RequestOutput``."""
     metric_values: dict[str, float] = {}
     if output.num_cached_tokens is not None:
         metric_values[f"{prefix}/num_cached_tokens"] = output.num_cached_tokens
@@ -106,10 +105,7 @@ def _prepare_generation_request_metrics(
 
 @dataclass(kw_only=True, slots=True)
 class VLLMCudagraphConfig:
-    """CUDA graph capture settings for the vLLM inference engine.
-
-    Identical to the v7 dataclass. Kept here so the file is a drop-in.
-    """
+    """CUDA graph capture settings for the vLLM inference engine."""
 
     enable: bool = True
     """Whether to enable CUDA graph capture (vLLM "full" mode)."""
@@ -131,13 +127,10 @@ class VLLMCudagraphConfig:
         )
 
 
-# --- admission payload broadcast (TBR sampler_base.py:636-775 analog) --------
+# --- admission + lifecycle payloads (broadcast across TP ranks) --------------
 
 
-# Header is (num_prompts, payload_size_bytes); payload is one pickled tuple
-# (prompt_token_ids_batch, request_ids, sampling_params_dict, metrics_prefix).
-_ADMIT_HEADER_FMT = "<II"
-_ADMIT_HEADER_SIZE = struct.calcsize(_ADMIT_HEADER_FMT)
+_DEFAULT_MAX_STEPS_PER_ITERATION = 8
 
 
 @dataclass(slots=True)
@@ -150,73 +143,68 @@ class _Admission:
     one value keeps ranks in lockstep if the policy ever changes.
     """
 
-    prompt_token_ids_batch: list[list[int]]
-    request_ids: list[str]
+    prompt_token_ids_batch: list[list[int]]  # [num_prompts][prompt_tokens]
+    request_ids: list[str]  # [num_prompts]
     sampling_params: SamplingParams
     arrival_time: float
     metrics_prefix: str
 
 
-def _encode_admission(
-    *,
-    prompt_token_ids_batch: list[list[int]],
-    request_ids: list[str],
-    sampling_params: SamplingParams,
-    arrival_time: float,
-    metrics_prefix: str,
-) -> bytes:
-    """Serialize an admission payload for broadcast.
+@dataclass(slots=True)
+class _PendingRequest:
+    """One ``generate`` request awaiting admission and a completion.
 
-    Mirrors the TBR `_RequestWithDpRanks.broadcast_requests` shape but
-    without the per-DP-rank routing fields (we have a single DP group).
+    The owning ``generate(...)`` coroutine holds ``future`` and the shared
+    ``metrics_sink`` list; the engine loop populates them when this request
+    finishes inside vLLM.
     """
-    payload = pickle.dumps(
-        (
-            [list(p) for p in prompt_token_ids_batch],
-            list(request_ids),
-            sampling_params,
-            arrival_time,
-            metrics_prefix,
-        ),
-        protocol=pickle.HIGHEST_PROTOCOL,
-    )
-    return payload
+
+    request_id: str
+    prompt_token_ids: list[int]  # [prompt_tokens]
+    sampling_params: SamplingParams
+    future: asyncio.Future[Completion]
+    metrics_prefix: str
+    metrics_sink: list[m.Metric]
+    admitted_policy_version: int = 0  # stamped at admission time on rank 0
 
 
-def _decode_admission(buf: bytes) -> _Admission:
-    prompts, request_ids, sampling_params, arrival_time, metrics_prefix = pickle.loads(
-        buf
-    )
-    return _Admission(
-        prompt_token_ids_batch=prompts,
-        request_ids=request_ids,
-        sampling_params=sampling_params,
-        arrival_time=arrival_time,
-        metrics_prefix=metrics_prefix,
-    )
+@dataclass(slots=True)
+class _EngineMessage:
+    """One lifecycle directive broadcast from rank 0 to every TP rank.
+
+    The engine loop only proceeds collectively, so admit, quiesce, resume,
+    and shutdown all travel through the same gloo broadcast that ranks 1+
+    are blocked on.
+    """
+
+    kind: Literal["admit", "quiesce", "resume", "shutdown"]
+    admission: _Admission | None = None
 
 
-def _broadcast_admission_bytes(
+def _encode_engine_message(msg: _EngineMessage) -> bytes:
+    """Serialize an engine-loop message for cross-rank broadcast."""
+    return pickle.dumps(msg, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _decode_engine_message(buf: bytes) -> _EngineMessage:
+    return pickle.loads(buf)
+
+
+def _broadcast_engine_message_bytes(
     *,
     payload: bytes | None,
     rank: int,
     world_group: dist.ProcessGroup,
 ) -> bytes:
-    """Broadcast an admission payload from rank 0 to all ranks.
+    """Broadcast a pickled engine message from rank 0 to all ranks.
 
-    Two-step protocol matches TBR `start_broadcast_requests`
-    (sampler_base.py:708-721): a uint64 size header followed by the
-    payload bytes. We use gloo so this never contends with the NCCL
-    stream that runs the model forward.
-
-    Args:
-        payload: pickled admission bytes on rank 0; ``None`` on other ranks.
-        rank: this process's rank within ``world_group``.
-        world_group: gloo `ProcessGroup` covering every TP rank.
+    Two-step protocol: a uint64 size header followed by the payload. Uses
+    gloo so this never contends with the NCCL stream that runs the model
+    forward.
     """
     device = torch.device("cpu")
     if rank == 0:
-        assert payload is not None, "rank 0 must provide an admission payload"
+        assert payload is not None, "rank 0 must provide a payload"
         size_tensor = torch.tensor([len(payload)], dtype=torch.int64, device=device)
         buf_tensor = torch.frombuffer(bytearray(payload), dtype=torch.uint8).clone()
     else:
@@ -238,32 +226,27 @@ def _broadcast_admission_bytes(
 
 
 class VLLMGenerator(Actor, Configurable):
-    """
-    Generates rollouts using vLLM, with TBR-style cross-rank admission.
+    """Generates rollouts using vLLM with a continuous TBR-style engine loop.
 
-    Public contract is identical to v7's VLLMGenerator:
-
-      generate(prompt_token_ids_batch, *, request_ids, sampling_config,
-               metrics_prefix) -> (list[Completion], list[Metric])
-
-    Internally, every TP rank holds a gloo broadcast group at startup;
-    each ``generate`` call first ships the admission payload over that
-    group, then every rank calls ``engine.add_request`` with the same
-    decoded payload and runs ``engine.step()`` in lockstep until rank-0
-    has all outputs.
+    A background ``_engine_loop`` runs on every TP rank from the first
+    ``generate(...)`` until ``close()``. ``generate`` enqueues request
+    futures on rank 0; the loop coalesces pending submits inside the
+    actor, broadcasts the admission set, admits locally on every rank,
+    and runs bounded ``engine.step()`` bursts. Outputs are dispatched
+    back to per-request futures as they finish.
 
     Args:
         config: Generator-specific configuration.
         model_spec: TorchTitan model specification.
         model_path: Path to the HF model checkpoint.
-        compile_config: Per-layer torch.compile config shared with trainer.
+        compile_config: Per-layer ``torch.compile`` config shared with trainer.
         max_num_seqs: vLLM batch dim, sized by the controller.
-        output_dir: structured-logger output directory.
+        output_dir: Structured-logger output directory.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        """Generator actor configuration (unchanged from v7)."""
+        """Generator actor configuration."""
 
         parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
         sampling: SamplingConfig = field(default_factory=SamplingConfig)
@@ -274,6 +257,12 @@ class VLLMGenerator(Actor, Configurable):
             default_factory=CheckpointManager.Config
         )
         debug: DebugConfig = field(default_factory=DebugConfig)
+        max_steps_per_iteration: int = _DEFAULT_MAX_STEPS_PER_ITERATION
+        """Max ``engine.step()`` calls per engine-loop iteration.
+
+        Bounds how long the loop runs the engine before checking for new
+        admissions. Matches TBR's ``one_step`` cap (sample_method.py:537-558).
+        """
 
         def __post_init__(self):
             p = self.parallelism
@@ -303,6 +292,11 @@ class VLLMGenerator(Actor, Configurable):
                 raise ValueError(
                     "Generator requires disable_loss_parallel=True, "
                     f"got disable_loss_parallel={p.disable_loss_parallel}"
+                )
+            if self.max_steps_per_iteration <= 0:
+                raise ValueError(
+                    "max_steps_per_iteration must be positive, "
+                    f"got {self.max_steps_per_iteration}"
                 )
 
     def __init__(
@@ -343,15 +337,9 @@ class VLLMGenerator(Actor, Configurable):
 
         with sl.log_trace_span("vllm_init"):
             logger.info("Initializing LLMEngine from EngineArgs...")
-            # vLLM external_launcher initializes torch.distributed across all
-            # TP ranks during this call (vllm_engine.py:62-65). After it
-            # returns, dist.is_initialized() is True on every rank.
             self._engine = LLMEngine.from_engine_args(engine_args)
             logger.info("vLLM rollout engine initialized")
 
-        # Establish the TBR-style gloo world group.
-        # TBR sampler_base.py:820-833 -- gloo so request fan-out never
-        # contends with NCCL traffic that runs the model forward.
         if not dist.is_initialized():
             raise RuntimeError(
                 "vLLM external_launcher did not initialize torch.distributed; "
@@ -366,34 +354,36 @@ class VLLMGenerator(Actor, Configurable):
                 f"tensor_parallel_degree="
                 f"{self.config.parallelism.tensor_parallel_degree}"
             )
-        # TODO: if NCCL_EAGER_INIT is on, use dist.split_group on the default
-        # PG instead of new_group to avoid an extra rendezvous (mirrors
-        # sampler_base.py:822-827). Skipped for now -- new_group is simpler
-        # and our world size is small.
+        # Gloo PG: dedicated CPU process group for engine-loop messages so
+        # broadcasts never contend with the NCCL stream running the model
+        # forward (TBR sampler_base.py:820-833).
         self._world_group: dist.ProcessGroup = dist.new_group(backend="gloo")
 
-        # FCFS scheduling is required: any other policy (e.g. priority)
-        # uses ``arrival_time`` as a tiebreaker, and ``arrival_time`` is
-        # populated from ``time.time()`` per rank inside
-        # ``renderer.render_cmpl`` (vllm/renderers/base.py:927), which
-        # diverges across ranks and would re-introduce the
-        # admission-shape divergence this refactor exists to prevent.
+        # TP ranks must admit requests in the same order. FCFS ignores
+        # arrival_time and follows broadcast order. Priority scheduling
+        # uses arrival_time as a heap key, so it needs a separate
+        # deterministic ordering audit before enabling.
         scheduler_policy = getattr(
             self._engine.vllm_config.scheduler_config, "policy", "fcfs"
         )
         if scheduler_policy != "fcfs":
             raise RuntimeError(
-                "TBR-style generator requires FCFS scheduling; got "
-                f"scheduler_policy={scheduler_policy!r}. Other policies "
-                "use per-rank arrival_time as a tiebreaker and break the "
-                "lockstep admission invariant."
+                "VLLMGenerator currently supports only FCFS scheduling; got "
+                f"scheduler_policy={scheduler_policy!r}."
             )
 
-        # At-most-one generate in flight on THIS rank. Combined with the
-        # collective broadcast in `generate`, this implies at-most-one
-        # generate in flight across ALL ranks (no rank can move past the
-        # broadcast without every rank participating).
-        self._busy = asyncio.Lock()
+        # Engine-loop state. The loop is single-threaded per rank; rank 0
+        # owns the message source (CV) while workers wait on the broadcast.
+        self._cv = asyncio.Condition()
+        self._pending_requests: list[_PendingRequest] = []
+        self._pending_by_request_id: dict[str, _PendingRequest] = {}
+        self._engine_loop_task: asyncio.Task[None] | None = None
+        self._engine_loop_started = asyncio.Event()
+        self._shutdown_requested = False
+        self._quiesce_requested = False
+        self._resume_requested = False
+        self._quiesced_event = asyncio.Event()
+        self._max_steps_per_iteration = config.max_steps_per_iteration
 
         self._next_request_id = 0
         self.policy_version = 0
@@ -403,7 +393,7 @@ class VLLMGenerator(Actor, Configurable):
             f"tp_world_size={self._tp_world_size}"
         )
 
-    # --- determinism & helpers (unchanged from v7) --------------------------
+    # --- determinism & helpers ---------------------------------------------
 
     @staticmethod
     def _set_determinism(debug: DebugConfig) -> None:
@@ -465,86 +455,24 @@ class VLLMGenerator(Actor, Configurable):
             finish_reason=sample.finish_reason,
         )
 
-    # --- admission ---------------------------------------------------------
+    # --- engine-loop infrastructure ---------------------------------------
 
-    def _prepare_admission_payload(
-        self,
-        prompt_token_ids_batch: list[list[int]],
-        *,
-        request_ids: list[str] | None,
-        sampling_config: SamplingConfig,
-        metrics_prefix: str,
-    ) -> tuple[bytes, list[str], SamplingParams]:
-        """Rank-0-only: prepare the bytes broadcast to every TP rank.
+    async def _ensure_engine_loop(self) -> None:
+        """Start the single per-rank engine loop on first call."""
+        if self._engine_loop_task is None:
+            self._engine_loop_task = asyncio.create_task(self._engine_loop())
+            self._engine_loop_started.set()
 
-        Side effect: advances `self._next_request_id` if request_ids is
-        ``None``, mirroring the v7 numbering. Worker ranks rebuild
-        request_ids from the broadcast payload, so the counter is
-        rank-0 authoritative -- this is fine because rank 0 is the
-        only side that emits external IDs.
-        """
-        assert self._tp_rank == 0
-        if request_ids is None:
-            start_id = self._next_request_id
-            self._next_request_id += len(prompt_token_ids_batch)
-            request_ids = [
-                str(start_id + idx) for idx in range(len(prompt_token_ids_batch))
-            ]
-        else:
-            if len(request_ids) != len(prompt_token_ids_batch):
-                raise ValueError(
-                    "request_ids length must match prompt_token_ids_batch: "
-                    f"{len(request_ids)} != {len(prompt_token_ids_batch)}"
-                )
-            if len(set(request_ids)) != len(request_ids):
-                raise ValueError(f"request_ids must be unique, got {request_ids}")
-
-        # TODO: pre-validate prompt lengths here, matching TBR
-        # sample_method.py:923-955. Drop oversized prompts on rank 0
-        # before broadcast so we never hand a doomed request to workers.
-
-        sampling_params = self._build_sampling_params(sampling_config)
-        payload = _encode_admission(
-            prompt_token_ids_batch=prompt_token_ids_batch,
-            request_ids=request_ids,
-            sampling_params=sampling_params,
-            arrival_time=time.time(),
-            metrics_prefix=metrics_prefix,
-        )
-        return payload, request_ids, sampling_params
-
-    def _broadcast_admission(self, payload: bytes | None) -> _Admission:
-        """Collective: send the admission payload from rank 0 to all ranks.
-
-        Mirrors TBR `_RequestWithDpRanks.broadcast_requests`
-        (sampler_base.py:636-775). Every rank emerges with the same
-        decoded admission.
-        """
-        payload_bytes = _broadcast_admission_bytes(
-            payload=payload,
-            rank=self._tp_rank,
-            world_group=self._world_group,
-        )
-        return _decode_admission(payload_bytes)
-
-    def _admit_locally(
-        self,
-        admission: _Admission,
-    ) -> None:
-        """Run vLLM `add_request` for every prompt in the broadcast set.
+    def _admit_locally(self, admission: _Admission) -> None:
+        """Run ``engine.add_request`` for every prompt in the admission set.
 
         Every rank executes this with bit-identical inputs (admission
-        was just broadcast). vLLM's per-worker scheduler will therefore
-        admit the same set on every rank, so the next `step()` produces
-        matching all-reduce shapes. Passing ``tokens_input`` skips
-        ``engine.renderer.render_cmpl`` (which stamps a per-rank
-        ``arrival_time`` from ``time.time()``); rank 0 stamps one
-        ``arrival_time`` and broadcasts it for all ranks.
+        was just broadcast). vLLM's per-worker scheduler therefore
+        admits the same set on every rank, so the next ``step()`` keeps
+        TP ranks in lockstep.
 
-        Note: vLLM's request processor mutates ``SamplingParams`` in
-        place to attach ``_target_sampling_params``. Pass a fresh deep
-        copy per request so the broadcast-cached instance survives
-        clean for the next ``generate`` call on rank 0.
+        Note: vLLM mutates ``SamplingParams`` in place to attach
+        ``_target_sampling_params``. Pass a fresh deep copy per request.
         """
         for request_id, prompt_token_ids in zip(
             admission.request_ids,
@@ -558,60 +486,193 @@ class VLLMGenerator(Actor, Configurable):
                 arrival_time=admission.arrival_time,
             )
 
-    # --- inline step loop --------------------------------------------------
+    async def _broadcast_message(self, payload: bytes | None) -> _EngineMessage:
+        """Collective broadcast of an engine message from rank 0.
 
-    async def _step_until_drained(
-        self,
-        *,
-        request_ids: list[str],
-    ) -> dict[str, RequestOutput]:
-        """Run `engine.step()` in lockstep until every admitted id finished.
-
-        Replaces the v7 `_drive_engine` background task. Because this
-        runs inside the held `_busy` semaphore (and the busy semaphore
-        is taken under a collective `_broadcast_admission`), every rank
-        enters this loop at the same logical point with the same
-        admitted set. vLLM per-worker schedulers therefore produce
-        matching collectives.
-
-        Yields to the asyncio loop between steps so other endpoints can
-        still be served (`sync_log_step`, `close`).
-
-        Returns:
-            dict mapping request_id -> final RequestOutput, populated
-            on every rank. Workers' dicts are discarded by the caller.
+        Runs the blocking CPU broadcast in a worker thread so the event
+        loop can keep serving other endpoints (``sync_log_step``,
+        ``close``) while the broadcast is in flight.
         """
-        outstanding = set(request_ids)
-        finished: dict[str, RequestOutput] = {}
+        received = await asyncio.to_thread(
+            _broadcast_engine_message_bytes,
+            payload=payload,
+            rank=self._tp_rank,
+            world_group=self._world_group,
+        )
+        return _decode_engine_message(received)
 
-        with sl.log_trace_span("engine_step_loop"):
-            while outstanding:
+    async def _next_rank0_message(self) -> _EngineMessage:
+        """Rank-0-only: choose the next engine message based on actor state.
+
+        Blocks on the condition variable until shutdown, quiesce, resume,
+        a pending submit, or an unfinished engine request exists. Empty
+        admits keep the workers stepping while requests are still in
+        flight inside vLLM.
+        """
+        async with self._cv:
+            await self._cv.wait_for(
+                lambda: (
+                    self._shutdown_requested
+                    or self._quiesce_requested
+                    or self._resume_requested
+                    or bool(self._pending_requests)
+                    or self._engine.has_unfinished_requests()
+                )
+            )
+            if self._shutdown_requested:
+                return _EngineMessage(kind="shutdown")
+            if self._quiesce_requested:
+                self._quiesce_requested = False
+                return _EngineMessage(kind="quiesce")
+            if self._resume_requested:
+                self._resume_requested = False
+                return _EngineMessage(kind="resume")
+            if not self._pending_requests:
+                return _EngineMessage(
+                    kind="admit", admission=self._empty_admission()
+                )
+
+            pending = self._pending_requests
+            self._pending_requests = []
+            for req in pending:
+                req.admitted_policy_version = self.policy_version
+                self._pending_by_request_id[req.request_id] = req
+
+        return _EngineMessage(
+            kind="admit", admission=self._build_admission_from_pending(pending)
+        )
+
+    def _empty_admission(self) -> _Admission:
+        # Used when rank 0 has unfinished requests but no new submits; the
+        # broadcast keeps workers in lockstep for the next step burst.
+        return _Admission(
+            prompt_token_ids_batch=[],
+            request_ids=[],
+            sampling_params=self._build_sampling_params(self.config.sampling),
+            arrival_time=time.time(),
+            metrics_prefix="generator",
+        )
+
+    def _build_admission_from_pending(
+        self, pending: list[_PendingRequest]
+    ) -> _Admission:
+        # Multiple ``generate(...)`` calls may have queued requests with
+        # different SamplingConfigs; for FCFS this is fine because each
+        # request carries its own params downstream. We ship the first
+        # request's params and rely on vLLM ignoring them at the engine
+        # level. (NOTE: We still pass per-request params via
+        # ``engine.add_request`` inside ``_admit_locally``; this field is
+        # only the broadcast carrier.)
+        assert pending, "empty pending list passed to _build_admission_from_pending"
+        return _Admission(
+            prompt_token_ids_batch=[req.prompt_token_ids for req in pending],
+            request_ids=[req.request_id for req in pending],
+            sampling_params=pending[0].sampling_params,
+            arrival_time=time.time(),
+            metrics_prefix=pending[0].metrics_prefix,
+        )
+
+    async def _step_burst(self) -> list[RequestOutput]:
+        """Run up to ``max_steps_per_iteration`` ``engine.step()`` calls.
+
+        Yields back to the asyncio loop after each step so other endpoints
+        can run between vLLM iterations. The loop body keeps stepping
+        until either the cap is reached or no requests remain in flight.
+        """
+        outputs: list[RequestOutput] = []
+        with sl.log_trace_span("engine_step_burst"):
+            for _ in range(self._max_steps_per_iteration):
                 if not self._engine.has_unfinished_requests():
-                    # TBR semantics: this should never happen because we
-                    # only enter the loop when we just admitted requests.
-                    # If we see it, surface a clear error rather than
-                    # spinning forever.
-                    raise RuntimeError(
-                        "vLLM engine became idle with outstanding "
-                        f"request_ids {sorted(outstanding)}"
-                    )
-
+                    break
                 with torch.no_grad():
                     step_outputs = self._engine.step()
-                for output in step_outputs:
-                    rid = str(output.request_id)
-                    if rid in outstanding:
-                        # vLLM only emits a RequestOutput for a given
-                        # request once finished (RequestOutputKind.FINAL_ONLY).
-                        finished[rid] = output
-                        outstanding.discard(rid)
+                outputs.extend(step_outputs)
+                await asyncio.sleep(0)
+        return outputs
 
-                # Yield so other actor endpoints can run between steps.
-                # Mirrors v7 `_drive_engine` line 437 but no other coroutine
-                # can interleave admission because we hold `_busy`.
+    def _resolve_finished_outputs(self, outputs: list[RequestOutput]) -> None:
+        """Rank-0-only: route finished outputs back to their request futures."""
+        for output in outputs:
+            rid = str(output.request_id)
+            pending = self._pending_by_request_id.pop(rid, None)
+            if pending is None:
+                # Output for a request we already resolved; ignore.
+                continue
+            pending.metrics_sink.extend(
+                _prepare_generation_request_metrics(
+                    output, prefix=pending.metrics_prefix
+                )
+            )
+            sample = output.outputs[0]
+            pending.metrics_sink.append(
+                m.Metric(
+                    f"{pending.metrics_prefix}/output_tokens",
+                    m.Sum(len(sample.token_ids)),
+                )
+            )
+            if pending.future.done():
+                continue
+            try:
+                completion = self._completion_from_sample(
+                    output=output,
+                    sample_idx=0,
+                    policy_version=pending.admitted_policy_version,
+                )
+            except Exception as exc:
+                pending.future.set_exception(exc)
+                continue
+            pending.future.set_result(completion)
+
+    async def _drain_engine_to_empty(self) -> None:
+        """Step the engine until every in-flight request has finished.
+
+        Used during quiesce so weight sync sees an idle engine. Finished
+        outputs still resolve their request futures during the drain, so
+        callers awaiting ``generate(...)`` see completions land before the
+        weight swap proceeds.
+        """
+        with sl.log_trace_span("engine_drain"):
+            while self._engine.has_unfinished_requests():
+                with torch.no_grad():
+                    step_outputs = self._engine.step()
+                if self._tp_rank == 0:
+                    self._resolve_finished_outputs(step_outputs)
                 await asyncio.sleep(0)
 
-        return finished
+    async def _engine_loop(self) -> None:
+        """Single per-rank engine driver. Runs until ``shutdown`` is broadcast.
+
+        Each iteration: rank 0 builds the next message and encodes it;
+        every rank broadcasts; every rank handles the message identically.
+        Lifecycle directives (quiesce/resume/shutdown) and admissions all
+        flow through this one stream so workers stay in lockstep.
+        """
+        with sl.log_trace_span("engine_loop"):
+            while True:
+                payload: bytes | None = None
+                if self._tp_rank == 0:
+                    msg = await self._next_rank0_message()
+                    payload = _encode_engine_message(msg)
+
+                msg = await self._broadcast_message(payload)
+
+                if msg.kind == "shutdown":
+                    return
+                if msg.kind == "quiesce":
+                    await self._drain_engine_to_empty()
+                    self._quiesced_event.set()
+                    continue
+                if msg.kind == "resume":
+                    self._quiesced_event.clear()
+                    continue
+
+                assert msg.kind == "admit"
+                if msg.admission is not None and msg.admission.request_ids:
+                    self._admit_locally(msg.admission)
+
+                outputs = await self._step_burst()
+                if self._tp_rank == 0:
+                    self._resolve_finished_outputs(outputs)
 
     # --- public endpoints --------------------------------------------------
 
@@ -627,212 +688,167 @@ class VLLMGenerator(Actor, Configurable):
     ) -> tuple[list[Completion], list[m.Metric]]:
         """Generate completions for tokenized prompts.
 
-        Contract unchanged from v7. Internally, the call is collective
-        across the generator TP mesh:
-
-          1. Acquire the per-rank busy semaphore.
-          2. Rank 0 encodes a pickled admission payload and broadcasts
-             it on the gloo `_world_group`. Other ranks receive bytes.
-          3. Every rank decodes the payload and calls `engine.add_request`
-             with bit-identical args, then runs `engine.step()` in
-             lockstep until rank 0's tracked request set drains.
-          4. Rank 0 builds Completion + metrics from final outputs.
-             Other ranks return ``([], [])`` -- the controller indexes
-             rank 0's `ValueMesh` entry via ``_get_rank_0_value``.
+        Rank 0 enqueues one :class:`_PendingRequest` per prompt and waits
+        on the per-request futures; the engine loop coalesces these with
+        sibling submits, broadcasts the admission, and dispatches outputs
+        back. Workers participate in the engine loop's collectives but
+        return empty lists -- the controller indexes rank 0's
+        ``ValueMesh`` entry via ``_get_rank_0_value``.
 
         Args:
             prompt_token_ids_batch: ``[num_prompts][prompt_tokens]``.
             request_ids: Optional vLLM request IDs (rank-0 supplied).
             sampling_config: Optional per-call sampling override.
-            metrics_prefix: Metric key namespace.
+            metrics_prefix: Metric key namespace for this call.
 
-        Example:
-            controller-side::
+        Example::
 
-                completions, metrics = await self._await_rank_0(
-                    generator.generate.call(
-                        prompts, request_ids=ids, sampling_config=sc
-                    )
+            completions, metrics = await self._await_rank_0(
+                generator.generate.call(
+                    prompts, request_ids=ids, sampling_config=sc
                 )
+            )
         """
-        _sampling_config = (
+        await self._ensure_engine_loop()
+        if self._tp_rank != 0:
+            return [], []
+
+        if request_ids is not None:
+            if len(request_ids) != len(prompt_token_ids_batch):
+                raise ValueError(
+                    "request_ids length must match prompt_token_ids_batch: "
+                    f"{len(request_ids)} != {len(prompt_token_ids_batch)}"
+                )
+            if len(set(request_ids)) != len(request_ids):
+                raise ValueError(f"request_ids must be unique, got {request_ids}")
+        else:
+            start_id = self._next_request_id
+            self._next_request_id += len(prompt_token_ids_batch)
+            request_ids = [
+                str(start_id + idx) for idx in range(len(prompt_token_ids_batch))
+            ]
+
+        sampling_cfg = (
             sampling_config if sampling_config is not None else self.config.sampling
         )
+        sampling_params = self._build_sampling_params(sampling_cfg)
 
-        async with self._busy:
-            admitted_policy_version = self.policy_version
-
-            if self._tp_rank == 0:
-                # Pre-validate everything that can fail locally before
-                # we broadcast bytes that workers would have to abort.
-                if request_ids is not None and len(request_ids) != len(
-                    prompt_token_ids_batch
-                ):
-                    raise ValueError(
-                        "request_ids length must match prompt_token_ids_batch: "
-                        f"{len(request_ids)} != {len(prompt_token_ids_batch)}"
-                    )
-                if request_ids is not None and len(set(request_ids)) != len(
-                    request_ids
-                ):
-                    raise ValueError(f"request_ids must be unique, got {request_ids}")
-                payload, resolved_request_ids, _ = self._prepare_admission_payload(
-                    prompt_token_ids_batch,
-                    request_ids=request_ids,
-                    sampling_config=_sampling_config,
+        loop = asyncio.get_running_loop()
+        metrics_sink: list[m.Metric] = []
+        pending: list[_PendingRequest] = []
+        for request_id, prompt_token_ids in zip(
+            request_ids, prompt_token_ids_batch, strict=True
+        ):
+            pending.append(
+                _PendingRequest(
+                    request_id=request_id,
+                    prompt_token_ids=list(prompt_token_ids),
+                    sampling_params=sampling_params,
+                    future=loop.create_future(),
                     metrics_prefix=metrics_prefix,
+                    metrics_sink=metrics_sink,
                 )
-            else:
-                payload = None
-                resolved_request_ids = []  # filled in from broadcast on workers
-
-            # Collective. Every rank must reach here for the broadcast
-            # to make progress. The gloo group means a stuck NCCL stream
-            # (e.g. from an unrelated hang) cannot block this step.
-            admission = self._broadcast_admission(payload)
-            if self._tp_rank == 0:
-                # Sanity: workers must see the same ids we sent.
-                if admission.request_ids != resolved_request_ids:
-                    raise RuntimeError(
-                        "request_ids broadcast round-trip mismatch: "
-                        f"sent={resolved_request_ids} "
-                        f"recv={admission.request_ids}"
-                    )
-            else:
-                resolved_request_ids = admission.request_ids
-
-            reset_cuda_peak_memory_stats()
-            with sl.log_trace_span("engine_add_request"):
-                self._admit_locally(admission)
-
-            finished = await self._step_until_drained(
-                request_ids=resolved_request_ids,
             )
 
-            if self.policy_version != admitted_policy_version:
-                raise RuntimeError(
-                    "generator policy_version changed during an active "
-                    "generate call; weight sync admission is broken"
-                )
+        reset_cuda_peak_memory_stats()
+        async with self._cv:
+            self._pending_requests.extend(pending)
+            self._cv.notify_all()
 
-            if self._tp_rank != 0:
-                # Workers contribute the collective; they don't shape outputs.
-                return [], []
+        completions = await asyncio.gather(*(req.future for req in pending))
 
-            # --- rank 0: build Completion + metrics ---
-            try:
-                all_outputs = [finished[rid] for rid in resolved_request_ids]
-            except KeyError as exc:
-                raise RuntimeError(
-                    f"vLLM did not return output for request_id {exc.args[0]!r}; "
-                    f"expected one of {resolved_request_ids}"
-                ) from exc
-
-            completions: list[Completion] = []
-            generation_metrics: list[m.Metric] = []
-            output_token_counts: list[int] = []
-            for output in all_outputs:
-                generation_metrics.extend(
-                    _prepare_generation_request_metrics(output, prefix=metrics_prefix)
-                )
-                for sample_idx, sample in enumerate(output.outputs):
-                    output_token_counts.append(len(sample.token_ids))
-                    completions.append(
-                        self._completion_from_sample(
-                            output=output,
-                            sample_idx=sample_idx,
-                            policy_version=admitted_policy_version,
-                        )
-                    )
-            generation_metrics.append(
+        memory_stats = cuda_memory_stats()
+        for key, value in memory_stats.items():
+            metric_cls = m.Min if key.startswith("driver_free") else m.Max
+            metrics_sink.append(
                 m.Metric(
-                    f"{metrics_prefix}/output_tokens",
-                    m.Sum.from_list(output_token_counts),
+                    f"{metrics_prefix}/cuda_memory/{key}",
+                    metric_cls(value),
                 )
             )
-            memory_stats = cuda_memory_stats()
-            for key, value in memory_stats.items():
-                metric_cls = m.Min if key.startswith("driver_free") else m.Max
-                generation_metrics.append(
-                    m.Metric(
-                        f"{metrics_prefix}/cuda_memory/{key}",
-                        metric_cls(value),
-                    )
-                )
 
-            return completions, generation_metrics
+        return list(completions), metrics_sink
 
     @endpoint
     @sl.log_trace_span("pull_model_state_dict")
     async def pull_model_state_dict(self, version: int) -> None:
-        """Pull latest weights from TorchStore.
+        """Pull latest weights from TorchStore after quiescing the engine.
 
-        Public contract preserved. Must be called while no `generate`
-        is in flight; we enforce this by taking `_busy`. The vLLM cache
-        resets happen on every rank because `pull_model_state_dict` is
-        already invoked via `generator.pull_model_state_dict.call(version)`
-        (mirrors TBR snapshot.py:200-223 where reset_prefix_cache runs
-        inside the GPU callback that loaded weights).
+        On rank 0, signals the engine loop to drain in-flight requests and
+        broadcast a quiesce; every rank waits for its local engine loop
+        to set ``_quiesced_event`` (rank 0 by its own request, workers by
+        receiving the broadcast). All ranks then collectively pull the new
+        weights, bump ``policy_version``, and reset the prefix cache. Rank
+        0 finally signals resume so the loop clears the event.
 
         Args:
             version: New policy version number.
         """
         from monarch.rdma import is_rdma_available
 
-        async with self._busy:
-            if self._engine.has_unfinished_requests():
-                raise RuntimeError(
-                    "cannot pull new generator weights while generation "
-                    "requests are active"
-                )
-            model_sd = self._get_model().model.state_dict()
-            await ts.get_state_dict(
-                "model_state_dict",
-                user_state_dict=model_sd,
-                strict=False,
-                direct_rdma=is_rdma_available(),
+        await self._ensure_engine_loop()
+
+        if self._tp_rank == 0:
+            async with self._cv:
+                self._quiesce_requested = True
+                self._cv.notify_all()
+
+        await self._quiesced_event.wait()
+        if self._engine.has_unfinished_requests():
+            raise RuntimeError(
+                "engine still has unfinished requests after quiesce drain"
             )
-            self.policy_version = version
-            # Drop the prefix cache so values computed with stale weights
-            # are never reused. Every rank runs this under the same
-            # external trigger (the controller's .call), matching TBR.
-            self._engine.reset_prefix_cache()
-            logger.debug(
-                f"{os.getpid()=} Generator pulled model state dict for v{version}"
-            )
+
+        model_sd = self._get_model().model.state_dict()
+        await ts.get_state_dict(
+            "model_state_dict",
+            user_state_dict=model_sd,
+            strict=False,
+            direct_rdma=is_rdma_available(),
+        )
+        self.policy_version = version
+        self._engine.reset_prefix_cache()
+
+        if self._tp_rank == 0:
+            async with self._cv:
+                self._resume_requested = True
+                self._cv.notify_all()
+        logger.debug(
+            f"{os.getpid()=} Generator pulled model state dict for v{version}"
+        )
 
     @endpoint
     async def close(self) -> None:
-        """Release the vLLM engine.
+        """Stop the engine loop and release the vLLM engine."""
+        if self._engine_loop_task is not None:
+            if self._tp_rank == 0:
+                async with self._cv:
+                    self._shutdown_requested = True
+                    self._cv.notify_all()
+            with contextlib.suppress(Exception):
+                await self._engine_loop_task
+            self._engine_loop_task = None
 
-        Unchanged from v7 except that we no longer have a long-lived
-        driver task to cancel. The Monarch proc mesh owns process
-        lifetime after this returns.
-        """
-        async with self._busy:
-            if self._engine is not None:
-                renderer = getattr(self._engine, "renderer", None)
+        if self._engine is not None:
+            renderer = getattr(self._engine, "renderer", None)
+            try:
                 try:
-                    try:
-                        if renderer is not None:
-                            renderer.shutdown()
-                    finally:
-                        try:
-                            self._engine.engine_core.shutdown()
-                        except AttributeError as exc:
-                            if "shutdown" not in str(exc):
-                                raise
-                            logger.warning(
-                                "vLLM engine_core.shutdown skipped on this "
-                                "vLLM build: %s",
-                                exc,
-                            )
+                    if renderer is not None:
+                        renderer.shutdown()
                 finally:
-                    self._engine = None
+                    try:
+                        self._engine.engine_core.shutdown()
+                    except AttributeError as exc:
+                        if "shutdown" not in str(exc):
+                            raise
+                        logger.warning(
+                            "vLLM engine_core.shutdown skipped on this "
+                            "vLLM build: %s",
+                            exc,
+                        )
+            finally:
+                self._engine = None
 
-        # Tear down our gloo group. Default PG is owned by vLLM external
-        # launcher and gets reclaimed when mesh.stop kills the process,
-        # mirroring the comment in v7 generator.close (lines 690-695).
         with contextlib.suppress(Exception):
             dist.destroy_process_group(self._world_group)
 
