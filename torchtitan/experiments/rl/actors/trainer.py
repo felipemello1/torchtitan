@@ -31,9 +31,15 @@ from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.experiments.rl.actors.utils import (
     compute_logprobs,
-    extract_response_logprobs,
+    cuda_memory_stats,
     PartialLogprobDrift,
+    reset_cuda_peak_memory_stats,
     verify_logprob_identity,
+)
+from torchtitan.experiments.rl.sampling import TrainingLogprobConfig
+from torchtitan.experiments.rl.trainer_microbatch import (
+    MetricAccumulator,
+    schedule_training_microbatches,
 )
 from torchtitan.experiments.rl.types import OptimStepOutput, TrainingBatch
 from torchtitan.models.common.attention import create_varlen_metadata_for_document
@@ -45,8 +51,47 @@ from torchtitan.tools.logging import init_logger
 logger = logging.getLogger(__name__)
 
 
+_TIED_WEIGHT_ALIASES = (
+    # (preferred_key, alias_to_drop) — when both are in the state_dict
+    # and share the same backing storage, drop the alias. The receiver
+    # re-ties via ``init_weights``, so dropping is semantics-safe.
+    ("tok_embeddings.weight", "lm_head.weight"),
+)
+
+
+def _dedup_tied_tensors(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Drop known tied-weight aliases when they actually share storage.
+
+    Qwen3 ties ``tok_embeddings.weight`` and ``lm_head.weight`` when
+    ``enable_weight_tying=True``; both are the same buffer. Emitting
+    both into the RDMA transfer plan registers the same memory twice
+    and roughly doubles the per-rank read budget.
+
+    We check ``data_ptr`` equality on the specific pair rather than
+    iterating and dropping every shared-storage entry, because
+    DTensor/FSDP-managed tensors can legitimately share a flat backing
+    buffer across distinct params; a generic dedup would silently strip
+    the state dict.
+    """
+    out = dict(state_dict)
+    for preferred, alias in _TIED_WEIGHT_ALIASES:
+        if preferred in out and alias in out:
+            try:
+                same_storage = out[preferred].data_ptr() == out[alias].data_ptr()
+            except Exception:
+                same_storage = False
+            if same_storage:
+                logger.debug(
+                    "Dropping tied-weight alias %s (shares storage with %s)",
+                    alias,
+                    preferred,
+                )
+                del out[alias]
+    return out
+
+
 class PolicyTrainer(Actor, Configurable):
-    """Updates policy based on collected Episode using TorchTitan components.
+    """Updates policy from token-aligned RL replay batches.
 
     Exposes separate `forward_backward` and `optim_step` endpoints, called
     explicitly by the controller.
@@ -56,7 +101,7 @@ class PolicyTrainer(Actor, Configurable):
         model_spec: TorchTitan model specification.
         hf_assets_path: Path to HF assets folder for checkpoint loading.
             Shared with the generator (both load from the same HF checkpoint).
-        generator_dtype: Generator dtype (e.g. "bfloat16"). Needed to cast weights to generator dtype
+            generator_dtype: Generator dtype used when publishing weights.
             if generator dtype differs from training dtype. If None, no cast is performed.
     """
 
@@ -81,6 +126,12 @@ class PolicyTrainer(Actor, Configurable):
         checkpoint: CheckpointManager.Config = field(
             default_factory=CheckpointManager.Config
         )
+        max_microbatch_samples: int | None = None
+        """Maximum replay samples per forward/backward microbatch."""
+
+        max_microbatch_tokens: int | None = None
+        """Target packed tokens per microbatch; individual samples stay intact."""
+
         dump_folder: str = ""
         """Folder for AC debug dumps when using memory_budget mode."""
 
@@ -105,6 +156,22 @@ class PolicyTrainer(Actor, Configurable):
 
         self.config = config
         self.compile_config = compile_config
+        if (
+            config.max_microbatch_samples is not None
+            and config.max_microbatch_samples <= 0
+        ):
+            raise ValueError(
+                "max_microbatch_samples must be positive or None, got "
+                f"{config.max_microbatch_samples}"
+            )
+        if (
+            config.max_microbatch_tokens is not None
+            and config.max_microbatch_tokens <= 0
+        ):
+            raise ValueError(
+                "max_microbatch_tokens must be positive or None, got "
+                f"{config.max_microbatch_tokens}"
+            )
         self.loss_fn = config.loss.build()
 
         # Only cast if generator dtype differs from training dtype, otherwise
@@ -261,7 +328,7 @@ class PolicyTrainer(Actor, Configurable):
         """Sync the structured-logger step counter from the controller."""
         sl.set_step(step, relative_step=relative_step)
 
-    def reduce_forward_backward_metrics(
+    def _reduce_forward_backward_metrics(
         self,
         *,
         sum_reduced_metrics: dict[str, torch.Tensor],
@@ -305,15 +372,19 @@ class PolicyTrainer(Actor, Configurable):
         train_data: list[TrainingBatch],
         *,
         num_global_valid_tokens: int,
+        logprob_config: TrainingLogprobConfig,
     ) -> dict[str, float]:
         """Run forward pass, compute loss, call backward, and reduce metrics.
 
         Args:
             train_data: List of TrainingBatch, one per DP rank. Local rank
                 picks train_data[self.dp_rank].
-            num_global_valid_tokens: Total response tokens across all DP
+            num_global_valid_tokens: Total trainable response tokens across all DP
                 ranks for this step. The controller computes this before
-                sharding episodes.
+                sharding replay samples.
+            logprob_config: Validated behavior-logprob contract. Trainer
+                logprobs are computed under the same sampling-temperature
+                transform as the generator behavior logprobs.
 
         Returns:
             dict[str, float]: Globally-reduced metrics.
@@ -333,22 +404,22 @@ class PolicyTrainer(Actor, Configurable):
             )
         model = self.model_parts[0]
 
-        local_batch = train_data[self.dp_rank]
         device = self.device
+        reset_cuda_peak_memory_stats(device)
 
-        token_ids = local_batch.token_ids.to(device)
-        seq_lens = local_batch.seq_lens
-        prompt_lens = local_batch.prompt_lens
-        response_lens = local_batch.response_lens
-        advantages = local_batch.advantages.to(device)
+        schedule = schedule_training_microbatches(
+            train_data,
+            dp_rank=self.dp_rank,
+            max_samples=self.config.max_microbatch_samples,
+            max_tokens=self.config.max_microbatch_tokens,
+        )
 
-        max_seq_len = max(seq_lens)
         rope_cache_len = self.model.freqs_cis.shape[0]
-        if max_seq_len > rope_cache_len:
+        if schedule.max_seq_len > rope_cache_len:
             raise ValueError(
-                f"Episode length {max_seq_len} exceeds rope cache size "
-                f"{rope_cache_len}. Increase model max_seq_len or reduce "
-                f"generation max_tokens."
+                f"Replay sample length {schedule.max_seq_len} exceeds rope "
+                f"cache size {rope_cache_len}. Increase model max_seq_len or "
+                "reduce generation max_tokens."
             )
 
         num_global_valid_tokens: torch.Tensor = torch.tensor(
@@ -357,52 +428,127 @@ class PolicyTrainer(Actor, Configurable):
             dtype=torch.float32,
         )
 
-        positions = torch.cat(
-            [torch.arange(l, device=device) for l in seq_lens]
-        ).unsqueeze(0)
-        attention_masks = create_varlen_metadata_for_document(positions)
-
-        with sl.log_trace_span("model_forward"):
-            logits = model(
-                token_ids, attention_masks=attention_masks, positions=positions
-            )
-        all_policy_logprobs = compute_logprobs(logits, token_ids)
-        policy_logprobs = extract_response_logprobs(
-            all_policy_logprobs, seq_lens, prompt_lens, response_lens
-        )
-
-        with sl.log_trace_span("loss_fn"):
-            loss, loss_metrics = self.loss_fn(
-                policy_logprobs=policy_logprobs,
-                advantages=advantages,
-                num_global_valid_tokens=num_global_valid_tokens,
-            )
-
         self.optimizers.zero_grad()
-        with sl.log_trace_span("model_backward"):
-            loss.backward()
 
-        # Metrics for bitwise verification of policy logprobs.
-        verification: PartialLogprobDrift = verify_logprob_identity(
-            generator_token_logprobs=local_batch.token_logprobs,
-            trainer_token_logprobs=policy_logprobs,
-            num_global_valid_tokens=num_global_valid_tokens,
-            device=device,
+        metric_accumulator = MetricAccumulator()
+        metric_accumulator.add_max(
+            {
+                "train/microbatches/max": torch.tensor(
+                    float(schedule.max_microbatches),
+                    device=device,
+                    dtype=torch.float32,
+                ),
+            }
         )
 
-        # Per-rank pre-normalized metrics, so SUM-reducing reconstructs the global.
-        sum_reduced_metrics = {
-            **loss_metrics,
-            "bit_wise/logprob_diff/mean": verification.logprob_diff_mean,
-            "bit_wise/ratio_tokens_different/mean": verification.ratio_tokens_different,
-        }
-        max_reduced_metrics = {
-            "bit_wise/logprob_diff/max": verification.logprob_diff_max,
-        }
+        # Keep synchronization explicit for each microbatch; this path must work
+        # across the trainer parallelisms used by the RL experiment.
+        for scheduled_microbatch in schedule.microbatches:
+            microbatch = scheduled_microbatch.batch
+            is_real = scheduled_microbatch.is_real
 
-        return self.reduce_forward_backward_metrics(
-            sum_reduced_metrics=sum_reduced_metrics,
-            max_reduced_metrics=max_reduced_metrics,
+            with sl.log_trace_span("forward_backward_microbatch"):
+                token_ids = microbatch.token_ids.to(device)  # [1, T]
+                seq_lens = microbatch.seq_lens
+                # The batch's loss tensors are length T (sample-aligned for the
+                # microbatch slicer); shift by one to align with the [1, T-1]
+                # predictions emitted by compute_logprobs. Cross-sample-boundary
+                # positions are always masked off because every sample's first
+                # token is a prompt token (mask=0).
+                loss_mask = microbatch.loss_mask.to(device)[:, 1:]  # [1, T-1]
+                behavior_logprobs = microbatch.behavior_logprobs.to(device)[
+                    :, 1:
+                ]  # [1, T-1]
+                advantages = microbatch.advantages.to(device)[:, 1:]  # [1, T-1]
+
+                positions = torch.cat(
+                    [torch.arange(l, device=device) for l in seq_lens]
+                ).unsqueeze(0)
+                attention_masks = create_varlen_metadata_for_document(positions)
+
+                with sl.log_trace_span("model_forward"):
+                    logits = model(
+                        token_ids,
+                        attention_masks=attention_masks,
+                        positions=positions,
+                    )
+                policy_logprobs = compute_logprobs(  # [1, T-1]
+                    logits,
+                    token_ids,
+                    temperature=logprob_config.temperature,
+                )
+
+                with sl.log_trace_span("loss_fn"):
+                    loss_out = self.loss_fn(
+                        policy_logprobs=policy_logprobs,
+                        behavior_logprobs=behavior_logprobs,
+                        advantages_per_token=advantages,
+                        loss_mask=loss_mask,
+                        num_global_valid_tokens=num_global_valid_tokens,
+                    )
+
+                with sl.log_trace_span("model_backward"):
+                    loss_out.loss.backward()
+
+                drift: PartialLogprobDrift = verify_logprob_identity(
+                    behavior_logprobs=behavior_logprobs,
+                    policy_logprobs=policy_logprobs,
+                    loss_mask=loss_mask,
+                    num_global_valid_tokens=num_global_valid_tokens,
+                )
+
+                metric_accumulator.add_sum(
+                    {
+                        **loss_out.sum_metrics,
+                        "bit_wise/logprob_diff/mean": drift.logprob_diff_mean,
+                        "bit_wise/ratio_tokens_different/mean": (
+                            drift.ratio_tokens_different
+                        ),
+                    },
+                    active=is_real,
+                )
+                metric_accumulator.add_max(
+                    {
+                        **loss_out.max_metrics,
+                        "bit_wise/logprob_diff/max": drift.logprob_diff_max,
+                        "train/microbatch_tokens/max": torch.tensor(
+                            float(sum(seq_lens)),
+                            device=device,
+                            dtype=torch.float32,
+                        ),
+                        "train/microbatch_samples/max": torch.tensor(
+                            float(len(seq_lens)),
+                            device=device,
+                            dtype=torch.float32,
+                        ),
+                    },
+                    active=is_real,
+                )
+
+                del (
+                    attention_masks,
+                    logits,
+                    loss_out,
+                    policy_logprobs,
+                    positions,
+                )
+
+        memory_stats = cuda_memory_stats(device)
+        if memory_stats:
+            metric_accumulator.add_max(
+                {
+                    f"train/cuda_memory/fwd_bwd/{key}": torch.tensor(
+                        value,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    for key, value in memory_stats.items()
+                }
+            )
+
+        return self._reduce_forward_backward_metrics(
+            sum_reduced_metrics=metric_accumulator.sum_reduced_metrics,
+            max_reduced_metrics=metric_accumulator.max_reduced_metrics,
         )
 
     @endpoint
@@ -413,6 +559,9 @@ class PolicyTrainer(Actor, Configurable):
         # to allow controller-owned schedules (see Tinker API).
 
         # capture LR before step
+        device = getattr(self, "device", None)
+        if device is not None:
+            reset_cuda_peak_memory_stats(device)
         current_lrs = self.lr_schedulers.schedulers[0].get_last_lr()
         if len(current_lrs) != 1:
             raise ValueError(
@@ -428,6 +577,30 @@ class PolicyTrainer(Actor, Configurable):
                 foreach=True,
                 pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
             )
+        grad_norm_value = float(grad_norm.item())
+
+        if not bool(torch.isfinite(grad_norm).item()):
+            logger.warning(
+                "Skipping optimizer step because gradient norm is non-finite: %s",
+                grad_norm_value,
+            )
+            self.optimizers.zero_grad()
+            memory_metrics = {
+                f"train/cuda_memory/optim/{key}": value
+                for key, value in (
+                    cuda_memory_stats(device).items() if device is not None else ()
+                )
+            }
+            return OptimStepOutput(
+                policy_version=self.policy_version,
+                metrics={
+                    "train/grad_norm/mean": grad_norm_value,
+                    "train/lr": current_lr,
+                    "train/policy_version": float(self.policy_version),
+                    "train/skipped_nonfinite_grad_norm": 1.0,
+                    **memory_metrics,
+                },
+            )
 
         with sl.log_trace_span("optim"):
             self.optimizers.step()
@@ -439,13 +612,21 @@ class PolicyTrainer(Actor, Configurable):
             f"{os.getpid()=} PolicyTrainer optim_step done, "
             f"policy_version={self.policy_version}"
         )
+        memory_metrics = {
+            f"train/cuda_memory/optim/{key}": value
+            for key, value in (
+                cuda_memory_stats(device).items() if device is not None else ()
+            )
+        }
 
         return OptimStepOutput(
             policy_version=self.policy_version,
             metrics={
-                "train/grad_norm/mean": float(grad_norm.item()),
+                "train/grad_norm/mean": grad_norm_value,
                 "train/lr": current_lr,
                 "train/policy_version": float(self.policy_version),
+                "train/skipped_nonfinite_grad_norm": 0.0,
+                **memory_metrics,
             },
         )
 
@@ -468,20 +649,29 @@ class PolicyTrainer(Actor, Configurable):
     async def push_model_state_dict(self) -> None:
         """Publish model weights for generator consumption via TorchStore.
 
-        When `direct_rdma=True`, weights are transferred directly from
+        When ``direct_rdma=True``, weights are transferred directly from
         GPU to GPU via one-sided RDMA reads, bypassing StorageVolumes
-        entirely. When `False`, data goes through StorageVolumes
+        entirely. When ``False``, data goes through StorageVolumes
         (which may themselves use RDMA as a transport internally).
 
-        Note: we couple `is_rdma_available()` with `direct_rdma` here,
+        Note: we couple ``is_rdma_available()`` with ``direct_rdma`` here,
         but the two concepts are not identical -- StorageVolumes can also
-        use RDMA as their transport layer. `direct_rdma` specifically
+        use RDMA as their transport layer. ``direct_rdma`` specifically
         means "skip StorageVolumes and let the destination read directly
         from the source's GPU memory".
 
         """
         from monarch.rdma import is_rdma_available
 
+        # Push the full state dict (matches upstream main behavior). The
+        # previous v7 wrapper ``_dedup_tied_tensors`` dropped
+        # ``lm_head.weight`` because it shares storage with
+        # ``tok_embeddings.weight`` under Qwen3 weight tying on the
+        # trainer side; that's safe at TP=1 generator (tying preserved
+        # there too), but at TP>1 the generator's parallelized DTensors
+        # don't share storage, so ``lm_head.weight`` stayed at random
+        # init -> LM head produced ~uniform logits -> gibberish output.
+        # See ``discussions/37_multiturn_v7/tbr_refactor/v7_vs_main_tp_diff.md``.
         await ts.put_state_dict(
             self.model.state_dict(),
             "model_state_dict",
