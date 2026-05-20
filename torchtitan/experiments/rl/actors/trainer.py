@@ -672,8 +672,14 @@ class PolicyTrainer(Actor, Configurable):
         # don't share storage, so ``lm_head.weight`` stayed at random
         # init -> LM head produced ~uniform logits -> gibberish output.
         # See ``discussions/37_multiturn_v7/tbr_refactor/v7_vs_main_tp_diff.md``.
+        state_dict = self.model.state_dict()
+        if not state_dict:
+            raise RuntimeError(
+                "trainer.model.state_dict() is empty; refusing to push "
+                "an empty weight payload to TorchStore"
+            )
         await ts.put_state_dict(
-            self.model.state_dict(),
+            state_dict,
             "model_state_dict",
             direct_rdma=is_rdma_available(),
             transfer_dtype=self._transfer_dtype,

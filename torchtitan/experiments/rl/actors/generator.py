@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import gc
 import logging
 import math
 import os
@@ -907,7 +908,32 @@ class VLLMGenerator(Actor, Configurable):
                 "engine still has unfinished requests after quiesce drain"
             )
 
+        # Catch the two failure modes most likely to be silent under
+        # ``ts.get_state_dict(strict=False)``:
+        #   1. Version regression / replay: the trainer must advance
+        #      ``policy_version`` between syncs. Equal versions are only
+        #      legal on the initial pull while the actor still has v0.
+        #   2. Empty source state dict: the model wrapper returns no
+        #      tensors -> we'd silently keep stale weights and not
+        #      notice (one of the bugs the v7 ``_dedup_tied_tensors``
+        #      story flagged; see actors/trainer.py:666-674).
+        if version < self.policy_version:
+            raise RuntimeError(
+                f"policy_version regression: actor at v{self.policy_version}, "
+                f"asked to pull v{version}"
+            )
+        if version == self.policy_version and self.policy_version != 0:
+            raise RuntimeError(
+                f"policy_version did not advance: actor at v{self.policy_version}, "
+                "asked to pull the same version twice"
+            )
+
         model_sd = self._get_model().model.state_dict()
+        if not model_sd:
+            raise RuntimeError(
+                "generator model returned an empty state_dict; cannot "
+                "perform weight sync"
+            )
         await ts.get_state_dict(
             "model_state_dict",
             user_state_dict=model_sd,
@@ -915,7 +941,7 @@ class VLLMGenerator(Actor, Configurable):
             direct_rdma=is_rdma_available(),
         )
         self.policy_version = version
-        self._engine.reset_prefix_cache()
+        self._reset_engine_caches_after_weight_sync()
 
         if self._tp_rank == 0:
             async with self._cv:
@@ -923,6 +949,33 @@ class VLLMGenerator(Actor, Configurable):
                 self._cv.notify_all()
         logger.debug(
             f"{os.getpid()=} Generator pulled model state dict for v{version}"
+        )
+
+    def _reset_engine_caches_after_weight_sync(self) -> None:
+        """Drop every vLLM cache that holds values computed under old weights.
+
+        After a weight swap, prefix-cached prefill KV, mm-cached vision
+        features, and encoder-cached hidden states are all stale. Reset
+        whatever this vLLM build exposes (``reset_mm_cache`` /
+        ``reset_encoder_cache`` are present on current builds but
+        ``getattr``-guarded for forward compatibility), then GC so the
+        freed allocations are released promptly.
+        """
+        self._engine.reset_prefix_cache()
+        reset_mm_cache = getattr(self._engine, "reset_mm_cache", None)
+        if reset_mm_cache is not None:
+            reset_mm_cache()
+        reset_encoder_cache = getattr(self._engine, "reset_encoder_cache", None)
+        if reset_encoder_cache is not None:
+            reset_encoder_cache()
+        collected = gc.collect(generation=2)
+        sl.log_trace_scalar(
+            {
+                "generator.weight_sync_cache_reset.gc_collected": collected,
+            }
+        )
+        logger.debug(
+            "generator cache reset after weight sync; gc_collected=%d", collected
         )
 
     @endpoint
