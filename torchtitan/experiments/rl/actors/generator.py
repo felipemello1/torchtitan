@@ -27,6 +27,7 @@ import math
 import os
 import pickle
 import struct
+import time
 from dataclasses import dataclass, field
 
 import torch
@@ -56,6 +57,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import init_logger
 from vllm import LLMEngine, SamplingParams
 from vllm.config import CompilationConfig
+from vllm.inputs import tokens_input
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
 
@@ -142,14 +144,16 @@ _ADMIT_HEADER_SIZE = struct.calcsize(_ADMIT_HEADER_FMT)
 class _Admission:
     """Decoded admission payload, identical on every TP rank.
 
-    ``sampling_params`` is the raw vLLM ``SamplingParams`` instance; the
-    name is preserved across encode/decode so call sites read like the
-    rest of the actor.
+    ``arrival_time`` is stamped once on rank 0 and broadcast so every TP
+    rank passes the same value to ``engine.add_request``. FCFS scheduling
+    ignores it, but priority scheduling uses it as a tiebreaker; sharing
+    one value keeps ranks in lockstep if the policy ever changes.
     """
 
     prompt_token_ids_batch: list[list[int]]
     request_ids: list[str]
     sampling_params: SamplingParams
+    arrival_time: float
     metrics_prefix: str
 
 
@@ -158,6 +162,7 @@ def _encode_admission(
     prompt_token_ids_batch: list[list[int]],
     request_ids: list[str],
     sampling_params: SamplingParams,
+    arrival_time: float,
     metrics_prefix: str,
 ) -> bytes:
     """Serialize an admission payload for broadcast.
@@ -169,9 +174,8 @@ def _encode_admission(
         (
             [list(p) for p in prompt_token_ids_batch],
             list(request_ids),
-            # TODO: confirm SamplingParams pickles cleanly under our vLLM
-            # version; fallback is to ship the original SamplingConfig.
             sampling_params,
+            arrival_time,
             metrics_prefix,
         ),
         protocol=pickle.HIGHEST_PROTOCOL,
@@ -180,11 +184,14 @@ def _encode_admission(
 
 
 def _decode_admission(buf: bytes) -> _Admission:
-    prompts, request_ids, sampling_params, metrics_prefix = pickle.loads(buf)
+    prompts, request_ids, sampling_params, arrival_time, metrics_prefix = pickle.loads(
+        buf
+    )
     return _Admission(
         prompt_token_ids_batch=prompts,
         request_ids=request_ids,
         sampling_params=sampling_params,
+        arrival_time=arrival_time,
         metrics_prefix=metrics_prefix,
     )
 
@@ -501,6 +508,7 @@ class VLLMGenerator(Actor, Configurable):
             prompt_token_ids_batch=prompt_token_ids_batch,
             request_ids=request_ids,
             sampling_params=sampling_params,
+            arrival_time=time.time(),
             metrics_prefix=metrics_prefix,
         )
         return payload, request_ids, sampling_params
@@ -528,24 +536,26 @@ class VLLMGenerator(Actor, Configurable):
         Every rank executes this with bit-identical inputs (admission
         was just broadcast). vLLM's per-worker scheduler will therefore
         admit the same set on every rank, so the next `step()` produces
-        matching all-reduce shapes.
+        matching all-reduce shapes. Passing ``tokens_input`` skips
+        ``engine.renderer.render_cmpl`` (which stamps a per-rank
+        ``arrival_time`` from ``time.time()``); rank 0 stamps one
+        ``arrival_time`` and broadcasts it for all ranks.
 
         Note: vLLM's request processor mutates ``SamplingParams`` in
-        place to attach ``_target_sampling_params`` (vllm
-        ``sampling_params.py:51-53``). Pass a fresh deep copy per
-        request so the broadcast-cached instance survives clean for
-        the next ``generate`` call on rank 0.
+        place to attach ``_target_sampling_params``. Pass a fresh deep
+        copy per request so the broadcast-cached instance survives
+        clean for the next ``generate`` call on rank 0.
         """
-        engine_inputs = self._engine.renderer.render_cmpl(
-            [{"prompt_token_ids": ids} for ids in admission.prompt_token_ids_batch]
-        )
-        for request_id, engine_input in zip(
-            admission.request_ids, engine_inputs, strict=True
+        for request_id, prompt_token_ids in zip(
+            admission.request_ids,
+            admission.prompt_token_ids_batch,
+            strict=True,
         ):
             self._engine.add_request(
                 request_id=request_id,
-                prompt=engine_input,
+                prompt=tokens_input(list(prompt_token_ids)),
                 params=copy.deepcopy(admission.sampling_params),
+                arrival_time=admission.arrival_time,
             )
 
     # --- inline step loop --------------------------------------------------
