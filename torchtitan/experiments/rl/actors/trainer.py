@@ -33,6 +33,7 @@ from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.experiments.rl.actors.utils import (
     build_packed_policy_loss_inputs,
     compute_logprobs,
+    direct_rdma_weight_sync_enabled,
     extract_response_logprobs,
     PartialLogprobDrift,
     verify_logprob_identity,
@@ -110,11 +111,10 @@ class PolicyTrainer(Actor, Configurable):
         self.config = config
         self.compile_config = compile_config
         self.loss_fn = config.loss.build()
-        self.chunked_loss_num_chunks = config.chunked_loss_num_chunks
         self.chunked_ce_loss: ChunkedCELoss | None = None
-        if self.chunked_loss_num_chunks > 1:
+        if config.chunked_loss_num_chunks > 1:
             self.chunked_ce_loss = ChunkedCELoss(
-                ChunkedCELoss.Config(num_chunks=self.chunked_loss_num_chunks),
+                ChunkedCELoss.Config(num_chunks=config.chunked_loss_num_chunks),
                 compile_config=compile_config,
             )
 
@@ -156,12 +156,11 @@ class PolicyTrainer(Actor, Configurable):
         # Create training policy model
         model = self._build_model(model_spec, config, device_type)
         model.train()
-        if self.chunked_loss_num_chunks > 1:
+        if self.chunked_ce_loss is not None:
             model._skip_lm_head = True
             lm_head = getattr(model, "lm_head", None)
             if lm_head is None:
                 raise ValueError("Chunked RL loss requires a model lm_head")
-            assert self.chunked_ce_loss is not None
             self.chunked_ce_loss.set_lm_head(lm_head)
         self.model = model
         self.model_parts = [model]
@@ -394,7 +393,7 @@ class PolicyTrainer(Actor, Configurable):
         with sl.log_trace_span("loss_fn"):
             loss_metrics: dict[str, torch.Tensor] = {}
             used_chunked_reducer = False
-            if self.chunked_loss_num_chunks > 1:
+            if self.chunked_ce_loss is not None:
                 packed_inputs = build_packed_policy_loss_inputs(
                     num_shift_tokens=token_ids.shape[1] - 1,
                     seq_lens=seq_lens,
@@ -413,7 +412,6 @@ class PolicyTrainer(Actor, Configurable):
                     else None
                 )
                 if reducer is not None:
-                    assert self.chunked_ce_loss is not None
                     loss = self.chunked_ce_loss.reduce_selected_token_logprobs(
                         model_output[:, :-1, :],
                         token_ids[:, 1:],
@@ -428,16 +426,17 @@ class PolicyTrainer(Actor, Configurable):
                     )
                     used_chunked_reducer = True
                 else:
-                    assert self.chunked_ce_loss is not None
-                    all_policy_logprobs = self.chunked_ce_loss.selected_token_logprobs(
-                        model_output[:, :-1, :],
-                        token_ids[:, 1:],
+                    all_policy_logprobs = (
+                        self.chunked_ce_loss.compute_selected_token_logprobs(
+                            model_output[:, :-1, :],
+                            token_ids[:, 1:],
+                        )
                     )
                     policy_logprobs = extract_response_logprobs(
                         all_policy_logprobs, seq_lens, prompt_lens, response_lens
                     )
 
-            if self.chunked_loss_num_chunks <= 1:
+            if self.chunked_ce_loss is None:
                 all_policy_logprobs = compute_logprobs(model_output, token_ids)
                 policy_logprobs = extract_response_logprobs(
                     all_policy_logprobs, seq_lens, prompt_lens, response_lens
@@ -562,11 +561,9 @@ class PolicyTrainer(Actor, Configurable):
         from the source's GPU memory".
 
         """
-        from monarch.rdma import is_rdma_available
-
         await ts.put_state_dict(
             self.model.state_dict(),
             "model_state_dict",
-            direct_rdma=is_rdma_available(),
+            direct_rdma=direct_rdma_weight_sync_enabled(),
             transfer_dtype=self._transfer_dtype,
         )

@@ -20,6 +20,7 @@ from torchtitan.config import (
     ParallelismConfig,
 )
 from torchtitan.distributed.utils import set_batch_invariance
+from torchtitan.experiments.rl.actors.utils import direct_rdma_weight_sync_enabled
 from torchtitan.experiments.rl.models.vllm_registry import (
     registry_to_vllm,
     TORCHTITAN_CONFIG_FORMAT,
@@ -495,14 +496,12 @@ class VLLMGenerator(Actor, Configurable):
         Args:
             version: New policy version number.
         """
-        from monarch.rdma import is_rdma_available
-
         model_sd = self._get_model().model.state_dict()
         await ts.get_state_dict(
             "model_state_dict",
             user_state_dict=model_sd,
             strict=False,
-            direct_rdma=is_rdma_available(),
+            direct_rdma=direct_rdma_weight_sync_enabled(),
         )
         self.policy_version = version
         # Invalidate the KV prefix cache so stale values computed with the

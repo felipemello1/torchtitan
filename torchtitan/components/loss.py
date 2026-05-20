@@ -739,7 +739,7 @@ class ChunkedCELoss(BaseLoss):
             raise ValueError("Set lm_head before calling ChunkedCELoss")
         return self.lm_head
 
-    def selected_token_logprobs(
+    def compute_selected_token_logprobs(
         self,
         pred: torch.Tensor,
         labels: torch.Tensor,
@@ -904,19 +904,18 @@ class ChunkedCELoss(BaseLoss):
         lm_head: nn.Module,
         fsdp_enabled: bool,
     ) -> torch.Tensor:
-        """Return a differentiable loss via _DecoderOutputGradientBackProp.
+        """Return a differentiable loss via _ChunkedLossWithParamGrads.
         When ``.backward()`` is called (by the trainer or PP schedule),
-        autograd calls ``_DecoderOutputGradientBackProp.backward`` which
-        returns ``accumulated_grad`` as the gradient for ``hidden_states``,
-        propagating through the decoder. Subclasses override to swap in a
-        different autograd Function.
+        autograd returns the accumulated hidden gradient and captured lm_head
+        parameter gradients, scaled by the upstream ``grad_output``.
         """
-        # TODO(chunked-rl): Move the existing SFT path to
-        # _ChunkedLossWithParamGrads after separate SFT parity tests. The new
-        # reducer paths already use that bridge so external loss scaling is
-        # preserved there.
-        return _DecoderOutputGradientBackProp.apply(
-            hidden_states, accumulated_grad, total_loss
+        return _ChunkedLossWithParamGrads.apply(
+            hidden_states,
+            accumulated_grad,
+            total_loss,
+            lm_head,
+            fsdp_enabled,
+            *lm_head.parameters(),
         )
 
 
@@ -1038,43 +1037,3 @@ class _ChunkedLossWithParamGrads(torch.autograd.Function):
                 for param_grad in param_grads
             ),
         )
-
-
-class _DecoderOutputGradientBackProp(torch.autograd.Function):
-    """Bridges chunked lm_head backward with decoder backward via autograd.
-
-    Forward takes hidden_states (connected to decoder graph), the accumulated
-    gradient from chunked lm_head backward, and the loss value. Returns a
-    detached loss with this Function as its grad_fn.
-
-    Backward returns accumulated_grad as the gradient for hidden_states.
-    Autograd then propagates this through the decoder layers automatically —
-    no explicit hidden_states.backward() needed.
-    """
-
-    @staticmethod
-    # pyrefly: ignore [bad-override]
-    def forward(
-        ctx,
-        hidden_states: torch.Tensor,
-        accumulated_grad: torch.Tensor,
-        loss: torch.Tensor,
-    ) -> torch.Tensor:
-        ctx.save_for_backward(accumulated_grad)
-        return loss.detach()
-
-    @staticmethod
-    def backward(  # pyrefly: ignore[bad-override]
-        ctx, grad_output: torch.Tensor
-    ) -> tuple[torch.Tensor, None, None]:
-        (accumulated_grad,) = ctx.saved_tensors
-        # Return accumulated_grad as the gradient for hidden_states.
-        # Autograd then propagates this through hidden_states' existing
-        # decoder graph — equivalent to hidden_states.backward(accumulated_grad)
-        # but expressed as a return value so autograd handles the traversal
-        # in a single pass (no "backward through graph twice" error).
-        # Note: this is not safe if downstream accidentally runs tensor ops after
-        # the loss returns, which would produce a non-trivial grad_output that we need
-        # to properly handle. The complicated part is that grad_output might not be
-        # on the same device mesh as accumlated_grad.
-        return accumulated_grad, None, None

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -33,6 +34,20 @@ def compute_logprobs(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Ten
     shift_targets = token_ids[:, 1:]
     logprobs = F.log_softmax(shift_logits, dim=-1)
     return logprobs.gather(2, shift_targets.unsqueeze(-1)).squeeze(-1)
+
+
+def direct_rdma_weight_sync_enabled() -> bool:
+    value = os.environ.get("TORCHTITAN_RL_DIRECT_RDMA", "1").lower()
+    if value in {"0", "false", "no", "off"}:
+        return False
+    if value not in {"1", "true", "yes", "on"}:
+        raise ValueError(
+            "TORCHTITAN_RL_DIRECT_RDMA must be one of 0/1, false/true, no/yes, or off/on"
+        )
+
+    from monarch.rdma import is_rdma_available
+
+    return is_rdma_available()
 
 
 @sl.log_trace_span("extract_response_logprobs")

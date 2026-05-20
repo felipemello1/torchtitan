@@ -24,6 +24,7 @@ import torch.nn as nn
 from torchtitan.components.loss import ChunkedCELoss, selected_token_logprobs
 from torchtitan.experiments.rl.actors.utils import (
     build_packed_policy_loss_inputs,
+    direct_rdma_weight_sync_enabled,
     extract_response_logprobs,
 )
 from torchtitan.experiments.rl.grpo import (
@@ -62,6 +63,15 @@ def _reward_trajectory(rewards: dict[str, float], sample_idx: int = 0) -> Trajec
 
 
 class TestBuildRewardMetrics:
+    def test_direct_rdma_weight_sync_env_disable(self, monkeypatch) -> None:
+        monkeypatch.setenv("TORCHTITAN_RL_DIRECT_RDMA", "0")
+        assert direct_rdma_weight_sync_enabled() is False
+
+    def test_direct_rdma_weight_sync_env_invalid(self, monkeypatch) -> None:
+        monkeypatch.setenv("TORCHTITAN_RL_DIRECT_RDMA", "maybe")
+        with pytest.raises(ValueError, match="TORCHTITAN_RL_DIRECT_RDMA"):
+            direct_rdma_weight_sync_enabled()
+
     def test_one_metric_per_observed_name(self) -> None:
         trajectories = [
             _reward_trajectory({"correctness": 1.0, "format": 0.5}, sample_idx=0),
@@ -603,6 +613,81 @@ class TestGRPOLossBridge:
         loss.backward()
         assert all(sample.grad is not None for sample in policy_logprobs)
         assert "loss/ratio/mean" in metrics
+
+    def test_gspo_selected_logprobs_matches_dense_loss_and_gradients(self) -> None:
+        torch.manual_seed(321)
+        B, L, D, V = 1, 8, 11, 17
+        seq_lens = [5, 4]
+        prompt_lens = [2, 1]
+        response_lens = [3, 3]
+        token_ids = torch.randint(0, V, (B, L + 1))
+        labels = token_ids[:, 1:]
+        advantages = torch.tensor([0.7, -1.1])
+        num_global_valid_tokens = torch.tensor(float(sum(response_lens)))
+
+        lm_head_dense = nn.Linear(D, V, bias=False)
+        lm_head_chunked = nn.Linear(D, V, bias=False)
+        lm_head_chunked.load_state_dict(lm_head_dense.state_dict())
+        hidden = torch.randn(B, L, D)
+        hidden_dense = hidden.detach().clone().requires_grad_(True)
+        hidden_chunked = hidden.detach().clone().requires_grad_(True)
+
+        dense_all_logprobs = selected_token_logprobs(
+            lm_head_dense(hidden_dense),
+            labels,
+        )
+        dense_policy_logprobs = extract_response_logprobs(
+            dense_all_logprobs,
+            seq_lens,
+            prompt_lens,
+            response_lens,
+        )
+        generator_logprobs = [
+            (sample.detach() - 0.05).tolist() for sample in dense_policy_logprobs
+        ]
+        dense_loss_fn = GSPOLoss(GSPOLoss.Config(clip_eps=0.2))
+        dense_loss, dense_metrics = dense_loss_fn(
+            policy_logprobs=dense_policy_logprobs,
+            advantages=advantages,
+            num_global_valid_tokens=num_global_valid_tokens,
+            generator_token_logprobs=generator_logprobs,
+        )
+        dense_loss.backward()
+
+        chunked_ce_loss = ChunkedCELoss(ChunkedCELoss.Config(num_chunks=4))
+        chunked_ce_loss.set_lm_head(lm_head_chunked)
+        chunked_all_logprobs = chunked_ce_loss.compute_selected_token_logprobs(
+            hidden_chunked,
+            labels,
+        )
+        chunked_policy_logprobs = extract_response_logprobs(
+            chunked_all_logprobs,
+            seq_lens,
+            prompt_lens,
+            response_lens,
+        )
+        chunked_loss_fn = GSPOLoss(GSPOLoss.Config(clip_eps=0.2))
+        chunked_loss, chunked_metrics = chunked_loss_fn(
+            policy_logprobs=chunked_policy_logprobs,
+            advantages=advantages,
+            num_global_valid_tokens=num_global_valid_tokens,
+            generator_token_logprobs=generator_logprobs,
+        )
+        chunked_loss.backward()
+
+        torch.testing.assert_close(chunked_all_logprobs, dense_all_logprobs)
+        torch.testing.assert_close(chunked_loss.detach(), dense_loss.detach())
+        torch.testing.assert_close(
+            hidden_chunked.grad,
+            hidden_dense.grad,
+        )
+        torch.testing.assert_close(
+            lm_head_chunked.weight.grad,
+            lm_head_dense.weight.grad,
+        )
+        assert chunked_metrics.keys() == dense_metrics.keys()
+        for key, dense_value in dense_metrics.items():
+            torch.testing.assert_close(chunked_metrics[key], dense_value)
 
 
 # ---------------------------------------------------------------------------
