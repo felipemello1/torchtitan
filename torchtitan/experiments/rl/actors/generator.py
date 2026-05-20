@@ -132,6 +132,10 @@ class VLLMCudagraphConfig:
 
 _DEFAULT_MAX_STEPS_PER_ITERATION = 8
 
+# vLLM finish reasons that mean the request did not produce usable output
+# (matches TBR's per-request error surface; see RFC \xa77).
+_FINISH_REASON_ERROR = frozenset({"error", "abort"})
+
 
 @dataclass(slots=True)
 class _Admission:
@@ -425,6 +429,43 @@ class VLLMGenerator(Actor, Configurable):
             stop_token_ids=list(sampling_config.stop_token_ids),
         )
 
+    def _validate_prompt_for_generation(
+        self, prompt_token_ids: list[int]
+    ) -> str | None:
+        """Return ``None`` if the prompt is acceptable, otherwise an error string.
+
+        Catches rank-independent failures (empty prompt, no room under
+        ``max_model_len``, out-of-vocabulary token id) so rank 0 can drop
+        them BEFORE the cross-rank broadcast. This matches TBR
+        ``sample_method.py:923-955`` and protects the lockstep invariant:
+        a broadcast that some ranks would reject in ``add_request`` would
+        leave the TP world out of sync.
+        """
+        if not prompt_token_ids:
+            return "decoder prompt cannot be empty"
+
+        max_model_len = self._engine.model_config.max_model_len
+        if len(prompt_token_ids) >= max_model_len:
+            return (
+                f"decoder prompt length {len(prompt_token_ids)} leaves no room "
+                f"for generation under max_model_len={max_model_len}"
+            )
+
+        tokenizer = getattr(self._engine.input_processor, "tokenizer", None)
+        if tokenizer is not None:
+            model_vocab_size = self._engine.model_config.get_vocab_size()
+            max_valid_token_id = max(
+                getattr(tokenizer, "max_token_id", model_vocab_size - 1),
+                model_vocab_size - 1,
+            )
+            max_input_id = max(prompt_token_ids)
+            if max_input_id > max_valid_token_id:
+                return (
+                    f"token id {max_input_id} is out of vocabulary "
+                    f"(max_valid_token_id={max_valid_token_id})"
+                )
+        return None
+
     @staticmethod
     def _completion_from_sample(
         *,
@@ -507,7 +548,8 @@ class VLLMGenerator(Actor, Configurable):
         Blocks on the condition variable until shutdown, quiesce, resume,
         a pending submit, or an unfinished engine request exists. Empty
         admits keep the workers stepping while requests are still in
-        flight inside vLLM.
+        flight inside vLLM. Invalid prompts (oversized, OOV) are resolved
+        with ``Completion.error`` here and never enter the broadcast.
         """
         async with self._cv:
             await self._cv.wait_for(
@@ -534,12 +576,49 @@ class VLLMGenerator(Actor, Configurable):
 
             pending = self._pending_requests
             self._pending_requests = []
-            for req in pending:
-                req.admitted_policy_version = self.policy_version
+            admitted_policy_version = self.policy_version
+
+        valid: list[_PendingRequest] = []
+        for req in pending:
+            error = self._validate_prompt_for_generation(req.prompt_token_ids)
+            if error is None:
+                req.admitted_policy_version = admitted_policy_version
                 self._pending_by_request_id[req.request_id] = req
+                valid.append(req)
+                continue
+            logger.warning(
+                "rejected prompt request_id=%s prompt_tokens=%d: %s",
+                req.request_id,
+                len(req.prompt_token_ids),
+                error,
+            )
+            sl.log_trace_scalar(
+                {
+                    "generator.prompt_validation_rejected": 1,
+                    "generator.prompt_validation_prompt_tokens": len(
+                        req.prompt_token_ids
+                    ),
+                }
+            )
+            req.metrics_sink.append(
+                m.Metric(
+                    f"{req.metrics_prefix}/prompt_validation_rejected",
+                    m.Sum(1),
+                )
+            )
+            if not req.future.done():
+                req.future.set_result(
+                    Completion(
+                        policy_version=admitted_policy_version,
+                        token_ids=[],
+                        token_logprobs=[],
+                        finish_reason=None,
+                        error=error,
+                    )
+                )
 
         return _EngineMessage(
-            kind="admit", admission=self._build_admission_from_pending(pending)
+            kind="admit", admission=self._build_admission_from_valid(valid)
         )
 
     def _empty_admission(self) -> _Admission:
@@ -553,23 +632,22 @@ class VLLMGenerator(Actor, Configurable):
             metrics_prefix="generator",
         )
 
-    def _build_admission_from_pending(
-        self, pending: list[_PendingRequest]
+    def _build_admission_from_valid(
+        self, valid: list[_PendingRequest]
     ) -> _Admission:
-        # Multiple ``generate(...)`` calls may have queued requests with
-        # different SamplingConfigs; for FCFS this is fine because each
-        # request carries its own params downstream. We ship the first
-        # request's params and rely on vLLM ignoring them at the engine
-        # level. (NOTE: We still pass per-request params via
-        # ``engine.add_request`` inside ``_admit_locally``; this field is
-        # only the broadcast carrier.)
-        assert pending, "empty pending list passed to _build_admission_from_pending"
+        # ``valid`` has already been filtered against
+        # ``_validate_prompt_for_generation``. An empty list is normal when
+        # every pending request failed validation; we still build (and the
+        # caller still broadcasts) an empty admission so workers stay in
+        # lockstep on the engine-loop iteration count.
+        if not valid:
+            return self._empty_admission()
         return _Admission(
-            prompt_token_ids_batch=[req.prompt_token_ids for req in pending],
-            request_ids=[req.request_id for req in pending],
-            sampling_params=pending[0].sampling_params,
+            prompt_token_ids_batch=[req.prompt_token_ids for req in valid],
+            request_ids=[req.request_id for req in valid],
+            sampling_params=valid[0].sampling_params,
             arrival_time=time.time(),
-            metrics_prefix=pending[0].metrics_prefix,
+            metrics_prefix=valid[0].metrics_prefix,
         )
 
     async def _step_burst(self) -> list[RequestOutput]:
@@ -591,7 +669,15 @@ class VLLMGenerator(Actor, Configurable):
         return outputs
 
     def _resolve_finished_outputs(self, outputs: list[RequestOutput]) -> None:
-        """Rank-0-only: route finished outputs back to their request futures."""
+        """Rank-0-only: route finished outputs back to their request futures.
+
+        vLLM may finish a request with ``finish_reason in {"error", "abort"}``
+        when the engine couldn't produce a usable answer; those land as
+        ``Completion.error`` so siblings keep running. Per-request decode
+        errors (missing logprobs, bad sample shape) also map to
+        ``Completion.error`` rather than raising into the engine loop --
+        otherwise one bad request would tear down the actor.
+        """
         for output in outputs:
             rid = str(output.request_id)
             pending = self._pending_by_request_id.pop(rid, None)
@@ -612,6 +698,20 @@ class VLLMGenerator(Actor, Configurable):
             )
             if pending.future.done():
                 continue
+            if sample.finish_reason in _FINISH_REASON_ERROR:
+                pending.future.set_result(
+                    Completion(
+                        policy_version=pending.admitted_policy_version,
+                        token_ids=list(sample.token_ids),
+                        token_logprobs=[],
+                        finish_reason=sample.finish_reason,
+                        error=(
+                            f"vLLM finished request_id={rid!r} with "
+                            f"finish_reason={sample.finish_reason!r}"
+                        ),
+                    )
+                )
+                continue
             try:
                 completion = self._completion_from_sample(
                     output=output,
@@ -619,7 +719,15 @@ class VLLMGenerator(Actor, Configurable):
                     policy_version=pending.admitted_policy_version,
                 )
             except Exception as exc:
-                pending.future.set_exception(exc)
+                pending.future.set_result(
+                    Completion(
+                        policy_version=pending.admitted_policy_version,
+                        token_ids=list(sample.token_ids),
+                        token_logprobs=[],
+                        finish_reason=sample.finish_reason,
+                        error=f"completion build failed: {exc}",
+                    )
+                )
                 continue
             pending.future.set_result(completion)
 

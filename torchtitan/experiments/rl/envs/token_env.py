@@ -90,6 +90,18 @@ class TokenEnv:
 
     async def step(self, completion: Completion) -> TokenStep:
         """Parse completion tokens, step the env, and render the next prompt."""
+        if completion.error is not None:
+            logger.warning("generation error: %s", completion.error)
+            return TokenStep(
+                env_step=EnvStep(
+                    reward=self._config.error_reward,
+                    reward_components={"generation_error": 1.0},
+                    done=True,
+                    status=RolloutStatus.ERROR,
+                ),
+                response_messages=[],
+            )
+
         try:
             parsed: ParsedResponse = self._renderer.parse_response(completion.token_ids)
         except Exception as exc:

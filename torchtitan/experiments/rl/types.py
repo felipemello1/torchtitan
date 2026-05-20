@@ -32,12 +32,16 @@ class Completion:
         token_ids: Generated token IDs, shaped ``[response_tokens]``.
         token_logprobs: Behavior-policy logprobs, shaped ``[response_tokens]``.
         finish_reason: vLLM stop reason, for example ``"stop"`` or ``"length"``.
+        error: Human-readable failure description when generation could not
+            produce a usable response (e.g. oversized prompt, vLLM-side
+            abort). ``None`` for successful generations.
     """
 
     policy_version: int
     token_ids: list[int]
     token_logprobs: list[float]
     finish_reason: str | None = None
+    error: str | None = None
 
 
 @dataclass(kw_only=True, slots=True)
