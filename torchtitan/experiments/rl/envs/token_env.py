@@ -16,6 +16,7 @@ from renderers import Message, ParsedResponse, Renderer, ToolSpec
 
 from torchtitan.experiments.rl.envs.types import EnvReset, EnvStep, MessageEnv
 from torchtitan.experiments.rl.types import Completion, RolloutStatus
+from torchtitan.observability import structured_logger as sl
 
 logger = logging.getLogger(__name__)
 
@@ -218,7 +219,32 @@ class TokenEnv:
         return await self._render_prompt()
 
     def _raise_if_context_exceeded(self, prompt: PromptState) -> None:
+        # TODO(step5-followup): consider replacing this raise with a
+        # synthesized list of N ERROR RolloutOutputs (one per group sample)
+        # with reward_components={"initial_prompt_oversized": 1.0}. Today
+        # this raise cancels the whole asyncio.gather in
+        # ``run_rollout_group`` and kills the run, so the failure is
+        # observable only via the Python traceback and this SL scalar.
+        # Modeling it as ERROR rollouts would let ``rollout/error_rate``
+        # and ``rollout/reward/component/initial_prompt_oversized`` show
+        # the failure in W&B naturally, and the run would survive (with
+        # one group contributing no useful data). Trade-off: stops
+        # crashing on a genuinely broken dataset, which may mask data
+        # bugs -- so we keep the raise for now.
         if self._context_exceeded(prompt):
+            reserve = self._config.max_generation_tokens or 0
+            sl.log_trace_scalar(
+                {
+                    "token_env.initial_prompt_oversized": 1,
+                    "token_env.initial_prompt_oversized_prompt_tokens": len(
+                        prompt.token_ids
+                    ),
+                    "token_env.initial_prompt_oversized_reserve": reserve,
+                    "token_env.initial_prompt_oversized_max_trajectory_tokens": (
+                        self._config.max_trajectory_tokens
+                    ),
+                }
+            )
             raise ValueError(
                 "initial prompt plus generation reserve exceeds "
                 f"max_trajectory_tokens={self._config.max_trajectory_tokens}"

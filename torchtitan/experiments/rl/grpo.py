@@ -522,6 +522,18 @@ class RLTrainer(Configurable):
                     "generation_flush_window_s must be non-negative, "
                     f"got {self.generation_flush_window_s}"
                 )
+            training_seq_len = self.trainer.training.seq_len
+            if (
+                self.max_trajectory_tokens is not None
+                and self.max_trajectory_tokens > training_seq_len
+            ):
+                raise ValueError(
+                    f"max_trajectory_tokens ({self.max_trajectory_tokens}) "
+                    f"exceeds trainer.training.seq_len ({training_seq_len}); "
+                    "the trainer rope cache is sized to training.seq_len and "
+                    "would reject the resulting replay samples. Lower "
+                    "max_trajectory_tokens or raise trainer.training.seq_len."
+                )
             if self.rollout_group_size <= 0:
                 raise ValueError(
                     "rollout_group_size must be positive, "
