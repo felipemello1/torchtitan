@@ -352,6 +352,13 @@ class VLLMGenerator(Actor, Configurable):
             )
         self._tp_world_size = dist.get_world_size()
         self._tp_rank = dist.get_rank()
+        if self._tp_world_size != self.config.parallelism.tensor_parallel_degree:
+            raise RuntimeError(
+                "vLLM distributed world size does not match configured "
+                f"tensor_parallel_degree: world_size={self._tp_world_size}, "
+                f"tensor_parallel_degree="
+                f"{self.config.parallelism.tensor_parallel_degree}"
+            )
         # TODO: if NCCL_EAGER_INIT is on, use dist.split_group on the default
         # PG instead of new_group to avoid an extra rendezvous (mirrors
         # sampler_base.py:822-827). Skipped for now -- new_group is simpler

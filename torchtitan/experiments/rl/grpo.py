@@ -622,18 +622,23 @@ class RLTrainer(Configurable):
                 logger.exception("mesh.stop[%d] failed", i)
         self._proc_meshes = []
 
-    def _get_rank_0_value(self, result, has_gpus: bool = True):
-        """Extract rank 0 result, handling both single and multi-node meshes.
+    def _get_rank_0_value(self, result, *, has_gpu_axis: bool = True):
+        """Return the global rank-0 value from a Monarch endpoint result.
 
-        Monarch actor endpoints return results from all ranks in the mesh.
-        This picks out rank 0's result by indexing into the host and GPU
-        dimensions as needed (multi-node meshes have an extra host dimension).
-        This should be used in cases where all ranks return the same result.
+        Monarch returns one value per mesh coordinate; this indexes the
+        ``hosts=0, gpus=0`` cell to recover the global rank-0 value.
+        ``has_gpu_axis=False`` drops the ``gpus`` index for meshes that
+        have no GPU dimension (e.g. CPU-only roles).
+
+        Example::
+
+            # Single-host generator mesh: item(gpus=0)
+            # Multi-host generator mesh: item(hosts=0, gpus=0)
         """
         kwargs = {}
         if self._multi_node:
             kwargs["hosts"] = 0
-        if has_gpus:
+        if has_gpu_axis:
             kwargs["gpus"] = 0
         return result.item(**kwargs)
 
