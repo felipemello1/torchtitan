@@ -421,6 +421,15 @@ class RLTrainer(Configurable):
         their next turns before the previous wave fully drains.
         """
 
+        generation_flush_window_s: float = 0.005
+        """Controller-side batching window for rollout-turn coalescing.
+
+        Sibling rollouts submit their next turn within a few hundred
+        microseconds of each other. A 5 ms window lets them collapse into a
+        single ``generate`` batch so vLLM sees continuous-batching opportunity
+        instead of a stream of size-1 admissions.
+        """
+
         replay_buffer_groups: int = 2
         """Completed-group FIFO capacity for async rollout producers.
 
@@ -507,6 +516,11 @@ class RLTrainer(Configurable):
                 raise ValueError(
                     "max_admitted_generation_prompts must be positive or None, "
                     f"got {self.max_admitted_generation_prompts}"
+                )
+            if self.generation_flush_window_s < 0:
+                raise ValueError(
+                    "generation_flush_window_s must be non-negative, "
+                    f"got {self.generation_flush_window_s}"
                 )
             if self.rollout_group_size <= 0:
                 raise ValueError(
@@ -905,6 +919,7 @@ class RLTrainer(Configurable):
         return GenerationScheduler(
             generate_batch,
             max_admitted_prompts=max_admitted_prompts,
+            flush_window_s=self.config.generation_flush_window_s,
         )
 
     def _sampling_with_stop_token_ids(self, sampling: SamplingConfig) -> SamplingConfig:

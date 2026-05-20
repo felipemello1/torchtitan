@@ -68,14 +68,20 @@ class GenerationScheduler:
         generate_batch: GenerateBatchFn,
         *,
         max_admitted_prompts: int | None = None,
+        flush_window_s: float = 0.0,
     ):
         if max_admitted_prompts is not None and max_admitted_prompts <= 0:
             raise ValueError(
                 "max_admitted_prompts must be positive or None, "
                 f"got {max_admitted_prompts}"
             )
+        if flush_window_s < 0:
+            raise ValueError(
+                f"flush_window_s must be non-negative, got {flush_window_s}"
+            )
         self._generate_batch = generate_batch
         self._max_admitted_prompts = max_admitted_prompts
+        self._flush_window_s = flush_window_s
         self._pending: list[_PendingGeneration] = []
         self._flush_task: asyncio.Task[None] | None = None
         self._active_flush_tasks: set[asyncio.Task[None]] = set()
@@ -127,7 +133,10 @@ class GenerationScheduler:
         return await future
 
     async def _flush_loop(self) -> None:
-        await asyncio.sleep(0)
+        # Coalesce sibling rollout submits arriving within `flush_window_s`
+        # so each batch admitted to the actor exercises vLLM continuous
+        # batching instead of shipping one prompt at a time.
+        await asyncio.sleep(self._flush_window_s)
         while True:
             async with self._condition:
                 if self._closed or not self._pending:
