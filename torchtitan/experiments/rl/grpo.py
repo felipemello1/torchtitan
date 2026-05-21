@@ -1036,9 +1036,14 @@ class RLTrainer(Configurable):
 
             t_weight_sync_pull_start = time.perf_counter()
             with sl.log_trace_span("generator_pull_model_state_dict"):
-                # Sequential pulls keep ordering predictable; switch to
-                # ``asyncio.gather`` if sync wall time becomes a bottleneck
-                # at large num_generator_instances.
+                # Sequential pulls. Naive `asyncio.gather` across all N
+                # generators fires N x 311 RDMA `read_into` ops at the
+                # single trainer-side endpoint; each has a hardcoded 3 s
+                # timeout (monarch/_src/rdma/rdma.py:351) and they all
+                # time out together. A `Semaphore(2)` workaround buys
+                # ~3% wall time -- not worth the complexity. Real fix
+                # is upstream (TorchStore or Monarch). Per-pull measured
+                # at 0.59 s median (n=357) so N pulls = ~N*0.6 s.
                 for gen in self.generators:
                     await self._await_call(
                         gen.pull_model_state_dict.call(policy_version)
