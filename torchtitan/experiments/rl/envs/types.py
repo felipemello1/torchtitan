@@ -1,0 +1,82 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Message-level environment protocol for RL rollouts."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Protocol, runtime_checkable
+
+from renderers import Message, ToolSpec
+
+from torchtitan.experiments.rl.types import RolloutStatus
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class EnvExample:
+    """One dataset row used to build a rollout group.
+
+    Args:
+        group_id: Stable ID for logging and advantage centering.
+        sample_step: Dataset sampling step used for deterministic row selection.
+        group_idx: Position within the sample-step batch.
+        payload: Task-specific data consumed by an env builder.
+    """
+
+    group_id: str
+    sample_step: int
+    group_idx: int
+    payload: object | None = None
+
+
+@dataclass(kw_only=True, slots=True)
+class EnvReset:
+    """Initial message state returned by `MessageEnv.reset`."""
+
+    messages: list[Message]
+    tools: list[ToolSpec] = field(default_factory=list)
+
+
+@dataclass(kw_only=True, slots=True)
+class EnvStep:
+    """Environment response to one assistant message."""
+
+    messages: list[Message] = field(default_factory=list)
+    reward: float | None = None
+    reward_components: dict[str, float] = field(default_factory=dict)
+    done: bool = False
+    status: RolloutStatus | None = None
+
+
+@runtime_checkable
+class MessageEnv(Protocol):
+    """Single-use message environment."""
+
+    async def reset(self) -> EnvReset:
+        ...
+
+    async def step(self, assistant_message: Message) -> EnvStep:
+        ...
+
+    async def close(self) -> None:
+        ...
+
+
+@runtime_checkable
+class EnvBuilder(Protocol):
+    """Builds one single-use env for a rollout group example."""
+
+    def build(self, *, example: EnvExample) -> MessageEnv:
+        ...
+
+
+@runtime_checkable
+class EnvDataset(Protocol):
+    """Samples concrete task rows for rollout groups."""
+
+    def sample_group(self, *, sample_step: int, group_idx: int) -> EnvExample:
+        ...

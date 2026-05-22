@@ -4,9 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Sampling configuration shared by the vLLM actor and downstream RL code."""
+"""Sampling configuration shared by RL rollouts and the vLLM actor."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 TRAINING_VLLM_LOGPROBS_MODE = "processed_logprobs"
@@ -17,6 +17,33 @@ Returns the logprob distribution after vLLM's sampling-temperature transform,
 so the trainer can recover the same distribution by dividing its own logits
 by the same temperature before `log_softmax`.
 """
+
+
+@dataclass(kw_only=True, slots=True)
+class SamplingConfig:
+    """Sampling parameters passed to vLLM's `SamplingParams`.
+
+    Example::
+
+        SamplingConfig(
+            temperature=0.8,
+            top_p=1.0,
+            max_tokens=100,
+            stop_token_ids=[151645],
+        )
+    """
+
+    temperature: float = 0.8
+    """Sampling temperature. 0.0 = greedy, higher = more random."""
+
+    top_p: float = 1.0
+    """Nucleus sampling threshold."""
+
+    max_tokens: int = 100
+    """Maximum number of tokens to generate per completion."""
+
+    stop_token_ids: list[int] = field(default_factory=list)
+    """Token IDs that stop generation at the assistant-turn boundary."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +61,7 @@ class TrainingLogprobConfig:
     Example::
 
         # Sampling at temperature=0.8 with no nucleus truncation.
-        sampling = SamplingConfig(n=8, temperature=0.8, top_p=1.0, max_tokens=100)
+        sampling = SamplingConfig(temperature=0.8, top_p=1.0, max_tokens=100)
         logprob_config = TrainingLogprobConfig.from_sampling(sampling)
         # logprob_config.temperature == 0.8
 
@@ -54,9 +81,7 @@ class TrainingLogprobConfig:
             )
 
     @classmethod
-    def from_sampling(
-        cls, sampling: "SamplingConfig"
-    ) -> "TrainingLogprobConfig":  # noqa: F821
+    def from_sampling(cls, sampling: SamplingConfig) -> "TrainingLogprobConfig":
         """Build a logprob-correction contract from the generator's sampling config.
 
         Currently restricted to `top_p == 1.0` because nucleus sampling
@@ -66,12 +91,12 @@ class TrainingLogprobConfig:
 
         Example::
 
-            sampling = SamplingConfig(n=4, temperature=0.7, top_p=1.0, max_tokens=128)
+            sampling = SamplingConfig(temperature=0.7, top_p=1.0, max_tokens=128)
             TrainingLogprobConfig.from_sampling(sampling)
             # -> TrainingLogprobConfig(temperature=0.7)
 
             TrainingLogprobConfig.from_sampling(
-                SamplingConfig(n=4, temperature=0.7, top_p=0.95, max_tokens=128)
+                SamplingConfig(temperature=0.7, top_p=0.95, max_tokens=128)
             )
             # -> ValueError: trainer logprob correction supports top_p=1.0 only ...
         """

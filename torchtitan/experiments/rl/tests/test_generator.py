@@ -4,16 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Unit tests for engine-loop dispatch invariants.
-
-End-to-end behavior is covered by the GPU smokes; these tests only pin
-the two new shapes the engine loop has to honor:
-
-- `SamplingParams.n > 1` returns every sibling completion, not just
-  `outputs[0]`;
-- vLLM `finish_reason in {"error", "abort"}` becomes `Completion.error`
-  so the controller can drop the sample.
-"""
+"""Unit tests for engine-loop dispatch invariants."""
 
 import asyncio
 from types import SimpleNamespace
@@ -21,9 +12,8 @@ from types import SimpleNamespace
 from torchtitan.experiments.rl.actors.generator import _PendingRequest, VLLMGenerator
 
 
-def _sample(*, token_ids=(10, 11), finish_reason="stop", text="ok"):
+def _sample(*, token_ids=(10, 11), finish_reason="stop"):
     return SimpleNamespace(
-        text=text,
         token_ids=list(token_ids),
         logprobs=[{tok: SimpleNamespace(logprob=-0.1)} for tok in token_ids],
         finish_reason=finish_reason,
@@ -31,8 +21,6 @@ def _sample(*, token_ids=(10, 11), finish_reason="stop", text="ok"):
 
 
 def _request_output(*, request_id, outputs):
-    # `metrics` is None to skip the timing emission path; these tests
-    # only care about which completions flow back to which futures.
     return SimpleNamespace(
         request_id=request_id,
         num_cached_tokens=None,
@@ -41,10 +29,9 @@ def _request_output(*, request_id, outputs):
     )
 
 
-def _pending(*, request_id, prompt_idx):
+def _pending(*, request_id):
     return _PendingRequest(
         request_id=request_id,
-        prompt_idx=prompt_idx,
         prompt_token_ids=[1, 2],
         sampling_params=SimpleNamespace(),
         future=asyncio.get_running_loop().create_future(),
@@ -54,69 +41,50 @@ def _pending(*, request_id, prompt_idx):
     )
 
 
-def test_resolve_finished_outputs_flattens_n_siblings_in_input_order():
-    """n=3 over 2 prompts must yield 6 completions.
-
-    Example::
-
-        p0.future -> [p0_s0, p0_s1, p0_s2]
-        p1.future -> [p1_s0, p1_s1, p1_s2]
-        flatten([p0.future, p1.future])
-        # prompt_idx == [0, 0, 0, 1, 1, 1]
-    """
+def test_resolve_finished_outputs_returns_one_completion_per_request_id():
+    """Two request IDs resolve to two completions in request-output order."""
 
     async def scenario():
         gen = VLLMGenerator.__new__(VLLMGenerator)
-        p0 = _pending(request_id="0", prompt_idx=0)
-        p1 = _pending(request_id="1", prompt_idx=1)
-        gen._pending_by_request_id = {"0": p0, "1": p1}
+        p0 = _pending(request_id="g0:s0:t0")
+        p1 = _pending(request_id="g0:s1:t0")
+        gen._pending_by_request_id = {p0.request_id: p0, p1.request_id: p1}
         gen._resolve_finished_outputs(
             [
                 _request_output(
-                    request_id="0",
-                    outputs=[
-                        _sample(token_ids=(10,), text="a"),
-                        _sample(token_ids=(11,), text="b"),
-                        _sample(token_ids=(12,), text="c"),
-                    ],
+                    request_id=p0.request_id,
+                    outputs=[_sample(token_ids=(10,))],
                 ),
                 _request_output(
-                    request_id="1",
-                    outputs=[
-                        _sample(token_ids=(20,), text="d"),
-                        _sample(token_ids=(21,), text="e"),
-                        _sample(token_ids=(22,), text="f"),
-                    ],
+                    request_id=p1.request_id,
+                    outputs=[_sample(token_ids=(20,))],
                 ),
             ]
         )
-        per_prompt = await asyncio.gather(p0.future, p1.future)
-        return [c for siblings in per_prompt for c in siblings]
+        return await asyncio.gather(p0.future, p1.future)
 
     completions = asyncio.run(scenario())
-    assert [c.prompt_idx for c in completions] == [0, 0, 0, 1, 1, 1]
-    assert [c.text for c in completions] == ["a", "b", "c", "d", "e", "f"]
+    assert [c.token_ids for c in completions] == [[10], [20]]
+    assert [c.policy_version for c in completions] == [7, 7]
 
 
 def test_resolve_finished_outputs_maps_abort_finish_reason_to_completion_error():
-    """vLLM `abort` becomes `Completion.error` so the controller drops
-    the sample instead of feeding empty text to the env."""
+    """vLLM `abort` becomes `Completion.error` so TokenEnv marks the rollout."""
 
     async def scenario():
         gen = VLLMGenerator.__new__(VLLMGenerator)
-        pending = _pending(request_id="42", prompt_idx=2)
+        pending = _pending(request_id="42")
         gen._pending_by_request_id = {"42": pending}
         gen._resolve_finished_outputs(
             [
                 _request_output(
                     request_id="42",
-                    outputs=[_sample(token_ids=(99,), finish_reason="abort", text="")],
+                    outputs=[_sample(token_ids=(99,), finish_reason="abort")],
                 )
             ]
         )
         return await pending.future
 
-    completions = asyncio.run(scenario())
-    assert len(completions) == 1
-    assert completions[0].error is not None
-    assert completions[0].prompt_idx == 2
+    completion = asyncio.run(scenario())
+    assert completion.error is not None
+    assert completion.token_ids == [99]
