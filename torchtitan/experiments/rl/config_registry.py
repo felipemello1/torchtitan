@@ -27,6 +27,7 @@ from torchtitan.experiments.rl.alphabet_sort import (
     AlphabetSortBuilder,
     AlphabetSortDataset,
 )
+from torchtitan.experiments.rl.config_derivation import AsyncPipelineConfig
 from torchtitan.experiments.rl.grpo import Batcher, RLTrainer
 from torchtitan.experiments.rl.loss import DAPOLoss
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
@@ -64,6 +65,8 @@ def _alphabet_sort_config(
     trainer_tensor_parallel_degree: int = 2,
     generator_tensor_parallel_degree: int = 2,
     group_size: int = 8,
+    max_offpolicy_steps: int = 1,
+    async_pipeline: AsyncPipelineConfig | None = None,
     compile: CompileConfig | None = None,
 ) -> RLTrainer.Config:
     return RLTrainer.Config(
@@ -75,6 +78,8 @@ def _alphabet_sort_config(
         max_rollout_turns=5,
         num_validation_samples=num_validation_samples,
         save_rollout_samples=True,
+        max_offpolicy_steps=max_offpolicy_steps,
+        async_pipeline=async_pipeline or AsyncPipelineConfig(),
         compile=compile
         if compile is not None
         else CompileConfig(enable=True, backend="aot_eager"),

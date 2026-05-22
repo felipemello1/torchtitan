@@ -10,10 +10,63 @@ from __future__ import annotations
 
 import statistics
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 from torchtitan.experiments.rl.observability import metrics as m
-from torchtitan.experiments.rl.types import RolloutOutput, RolloutStatus
+from torchtitan.experiments.rl.replay import ReplayBatch
+from torchtitan.experiments.rl.types import ReplaySample, RolloutOutput, RolloutStatus
+
+
+REQUIRED_TRAIN_STEP_HEALTH_KEYS = (
+    "health/loss/policy_logprob_nonfinite_frac",
+    "health/loss/ref_logprob_nonfinite_frac",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _WeightSyncTimings:
+    """Wall-clock timing for one trainer-to-generator weight sync."""
+
+    admission_drain_s: float
+    push_s: float
+    pull_s: float
+    total_s: float
+
+
+@dataclass(frozen=True, slots=True)
+class _TrainStepTimings:
+    """Wall-clock timings logged for one training step."""
+
+    step_s: float
+    replay_wait_s: float
+    rollout_s: float
+    train_s: float
+    checkpoint_s: float
+    weight_sync: _WeightSyncTimings
+
+
+def _zero_weight_sync_timings() -> _WeightSyncTimings:
+    """Zero timings for train steps that do not publish new weights."""
+    return _WeightSyncTimings(
+        admission_drain_s=0.0,
+        push_s=0.0,
+        pull_s=0.0,
+        total_s=0.0,
+    )
+
+
+def validate_train_step_fwd_bwd_metrics(
+    fwd_bwd_metrics: Mapping[str, float],
+) -> None:
+    """Raise if controller-required train-step health metrics are absent."""
+    missing = [
+        key for key in REQUIRED_TRAIN_STEP_HEALTH_KEYS if key not in fwd_bwd_metrics
+    ]
+    if missing:
+        raise KeyError(
+            "fwd_bwd_metrics missing required train-step metrics: " f"{missing}"
+        )
 
 
 def rename_metric_prefix(
@@ -109,6 +162,119 @@ def build_rollout_metrics(
         prefix=f"{prefix}/reward/component",
         rollouts=rollouts,
     )
+    return metrics
+
+
+def build_consumed_sample_metrics(
+    samples: Sequence[ReplaySample],
+    *,
+    dropped_empty_groups: int,
+    dropped_zero_advantage_groups: int,
+) -> list[m.Metric]:
+    """Build sample-derived metrics for one optimizer step."""
+    advantages = [
+        sample.advantage for sample in samples for _ in range(sample.num_loss_tokens)
+    ]
+    return [
+        m.Metric(
+            "rollout/dropped_empty_groups",
+            m.NoReduce(float(dropped_empty_groups)),
+        ),
+        m.Metric(
+            "rollout/dropped_zero_advantage_groups",
+            m.NoReduce(float(dropped_zero_advantage_groups)),
+        ),
+        m.Metric("advantage", m.SummaryStats.from_list(advantages)),
+    ]
+
+
+def build_train_step_metrics(
+    *,
+    samples: list[ReplaySample],
+    replay_batch: ReplayBatch,
+    rollouts: list[RolloutOutput],
+    live_generation_metrics: list[m.Metric],
+    fwd_bwd_metrics: dict[str, float],
+    optimizer_metrics: dict[str, float],
+    packing_metrics: dict[str, float],
+    checkpoint_saved: bool,
+    timings: _TrainStepTimings,
+    dropped_empty_groups: int,
+    dropped_zero_advantage_groups: int,
+    train_version: int,
+    drop_metrics: Sequence[m.Metric] = (),
+) -> list[m.Metric]:
+    """Build typed metrics for one async replay training step."""
+    total_tokens = sum(len(sample.token_ids) for sample in samples)
+    tokens_per_second = total_tokens / timings.step_s if timings.step_s > 0.0 else 0.0
+    behavior_versions = [sample.behavior_version for sample in samples]
+    behavior_version_min = min(behavior_versions) if behavior_versions else 0
+    behavior_version_max = max(behavior_versions) if behavior_versions else 0
+
+    metrics: list[m.Metric] = []
+    metrics += build_rollout_metrics("rollout", rollouts)
+    metrics += live_generation_metrics
+    metrics += list(replay_batch.metrics)
+    metrics += build_consumed_sample_metrics(
+        samples,
+        dropped_empty_groups=dropped_empty_groups,
+        dropped_zero_advantage_groups=dropped_zero_advantage_groups,
+    )
+    for sample in samples:
+        metrics.extend(sample.metrics)
+    metrics += list(drop_metrics)
+    metrics += [
+        m.Metric("replay/policy_version/train", m.NoReduce(float(train_version))),
+        m.Metric(
+            "replay/policy_version/behavior_min",
+            m.NoReduce(float(behavior_version_min)),
+        ),
+        m.Metric(
+            "replay/policy_version/behavior_max",
+            m.NoReduce(float(behavior_version_max)),
+        ),
+    ]
+    metrics += [m.Metric(k, m.NoReduce(v)) for k, v in fwd_bwd_metrics.items()]
+    metrics += [m.Metric(k, m.NoReduce(v)) for k, v in optimizer_metrics.items()]
+    metrics += [m.Metric(k, m.NoReduce(v)) for k, v in packing_metrics.items()]
+    metrics.append(m.Metric("checkpoint/saved", m.NoReduce(float(checkpoint_saved))))
+
+    step_s = timings.step_s
+    idle_ratio = timings.replay_wait_s / step_s if step_s > 0.0 else 0.0
+    weight_sync_overhead = timings.weight_sync.total_s / step_s if step_s > 0.0 else 0.0
+    for key, value in [
+        ("timing/step", step_s),
+        ("timing/replay_wait", timings.replay_wait_s),
+        ("timing/rollout", timings.rollout_s),
+        ("timing/train", timings.train_s),
+        ("timing/weight_sync/drain", timings.weight_sync.admission_drain_s),
+        ("timing/weight_sync/push", timings.weight_sync.push_s),
+        ("timing/weight_sync/pull", timings.weight_sync.pull_s),
+        ("timing/weight_sync/total", timings.weight_sync.total_s),
+        ("timing/weight_sync_overhead_ratio", weight_sync_overhead),
+        ("timing/checkpoint", timings.checkpoint_s),
+        ("trainer/idle_ratio", idle_ratio),
+        ("perf/tokens_per_second", tokens_per_second),
+        (
+            "throughput/train_samples_per_sec",
+            len(samples) / step_s if step_s > 0.0 else 0.0,
+        ),
+        ("throughput/train_tokens_per_sec", tokens_per_second),
+    ]:
+        metrics.append(m.Metric(key, m.NoReduce(value)))
+
+    stale_dropped = 0.0
+    for metric in replay_batch.metrics:
+        if metric.key == "replay/buffer/dropped_stale_samples":
+            stale_dropped = float(metric.value.value)
+            break
+    consumed_total = stale_dropped + float(len(samples))
+    stale_drop_rate = stale_dropped / consumed_total if consumed_total > 0 else 0.0
+    metrics.append(
+        m.Metric("replay/buffer/stale_drop_rate", m.NoReduce(stale_drop_rate))
+    )
+
+    validate_train_step_fwd_bwd_metrics(fwd_bwd_metrics)
     return metrics
 
 
