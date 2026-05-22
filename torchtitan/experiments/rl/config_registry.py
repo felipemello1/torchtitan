@@ -65,6 +65,7 @@ def _alphabet_sort_config(
     trainer_tensor_parallel_degree: int = 2,
     generator_tensor_parallel_degree: int = 2,
     group_size: int = 8,
+    num_generator_instances: int = 1,
     max_offpolicy_steps: int = 1,
     async_pipeline: AsyncPipelineConfig | None = None,
     compile: CompileConfig | None = None,
@@ -78,6 +79,7 @@ def _alphabet_sort_config(
         max_rollout_turns=5,
         num_validation_samples=num_validation_samples,
         save_rollout_samples=True,
+        num_generator_instances=num_generator_instances,
         max_offpolicy_steps=max_offpolicy_steps,
         async_pipeline=async_pipeline or AsyncPipelineConfig(),
         compile=compile
@@ -410,6 +412,21 @@ def rl_dapo_qwen3_1_7b_alphabet_sort_2gpu() -> RLTrainer.Config:
         num_validation_samples=16,
         trainer_tensor_parallel_degree=1,
         generator_tensor_parallel_degree=1,
+        compile=CompileConfig(enable=False),
+    )
+
+
+def rl_dapo_qwen3_1_7b_alphabet_sort_3gpu_multigen() -> RLTrainer.Config:
+    """Three-GPU AlphabetSort DAPO config with two generator instances."""
+    return _alphabet_sort_config(
+        model_size="1.7B",
+        hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-1.7B",
+        lr=1e-6,
+        batch=BatchConfig(local_batch_size=4, global_batch_size=128, seq_len=2048),
+        num_validation_samples=16,
+        trainer_tensor_parallel_degree=1,
+        generator_tensor_parallel_degree=1,
+        num_generator_instances=2,
         compile=CompileConfig(enable=False),
     )
 

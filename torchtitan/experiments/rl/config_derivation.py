@@ -47,9 +47,6 @@ class AsyncPipelineConfig:
     max_admitted_generation_prompts: int | None = None
     """Controller-side cap on generation prompts admitted to vLLM."""
 
-    num_generator_instances: int = 1
-    """Generator instance count. The current controller supports only ``1``."""
-
 
 @dataclass(frozen=True, slots=True)
 class DerivedRLConfig:
@@ -173,6 +170,7 @@ def format_resolved_config(cfg: "RLTrainer.Config") -> str:
             "max_admitted_generation_prompts",
             f"{derived.max_admitted_generation_prompts} prompts",
         ),
+        ("num_generator_instances", str(cfg.num_generator_instances)),
         ("max_offpolicy_steps", str(cfg.max_offpolicy_steps)),
     ]
 

@@ -29,6 +29,7 @@ def _cfg(
     max_offpolicy_steps: int = 1,
     async_pipeline: AsyncPipelineConfig | None = None,
     num_validation_samples: int = 8,
+    num_generator_instances: int = 1,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         batcher=SimpleNamespace(
@@ -40,6 +41,7 @@ def _cfg(
         max_offpolicy_steps=max_offpolicy_steps,
         async_pipeline=async_pipeline or AsyncPipelineConfig(),
         num_validation_samples=num_validation_samples,
+        num_generator_instances=num_generator_instances,
     )
 
 
