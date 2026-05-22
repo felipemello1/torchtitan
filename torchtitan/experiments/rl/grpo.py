@@ -304,6 +304,9 @@ class RLTrainer(Configurable):
         group_size: int = 8
         """Number of sampled completions per prompt group."""
 
+        max_rollout_turns: int = 1
+        """Maximum assistant turns per rollout."""
+
         num_validation_samples: int = 20
         """Number of held-out prompts scored greedily per validation pass."""
 
@@ -380,6 +383,10 @@ class RLTrainer(Configurable):
                     )
             if self.group_size <= 0:
                 raise ValueError(f"group_size must be positive, got {self.group_size}")
+            if self.max_rollout_turns <= 0:
+                raise ValueError(
+                    f"max_rollout_turns must be positive, got {self.max_rollout_turns}"
+                )
             if self.max_rollout_sample_groups < 0:
                 raise ValueError(
                     "max_rollout_sample_groups must be non-negative, "
@@ -696,7 +703,7 @@ class RLTrainer(Configurable):
                     renderer=self.renderer,
                     completion_fn=completion_fn,
                     sampling=sampling,
-                    max_turns=1,
+                    max_turns=self.config.max_rollout_turns,
                     token_env_config=token_env_config,
                 )
             )
@@ -764,7 +771,7 @@ class RLTrainer(Configurable):
                     renderer=self.renderer,
                     completion_fn=completion_fn,
                     sampling=greedy,
-                    max_turns=1,
+                    max_turns=self.config.max_rollout_turns,
                     token_env_config=token_env_config,
                 )
             )
