@@ -21,12 +21,14 @@ from torchtitan.config import (
     ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
+from torchtitan.experiments.rl.actors.generator import VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.grpo import Batcher, RLTrainer
 from torchtitan.experiments.rl.loss import DAPOLoss
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
-from torchtitan.experiments.rl.sum_digits import SumDigitsEnv
+from torchtitan.experiments.rl.renderer import RendererConfig
+from torchtitan.experiments.rl.sampling import SamplingConfig
+from torchtitan.experiments.rl.sum_digits import SumDigitsBuilder, SumDigitsDataset
 from torchtitan.models.qwen3 import model_registry
 
 
@@ -38,12 +40,18 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
         num_steps=10,
         num_prompts_per_step=5,
+        group_size=group_size,
         num_validation_samples=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
-        env=SumDigitsEnv.Config(seed=42, correctness_reward=1.0, format_reward=0.3),
-        validation_env=SumDigitsEnv.Config(
-            seed=99, correctness_reward=1.0, format_reward=0.3
+        train_dataset=SumDigitsDataset.Config(seed=42),
+        train_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0, format_reward=0.3
         ),
+        validation_dataset=SumDigitsDataset.Config(seed=99),
+        validation_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0, format_reward=0.3
+        ),
+        renderer=RendererConfig(name="qwen3", enable_thinking=False),
         metrics=MetricsProcessor.Config(enable_wandb=False),
         batcher=Batcher.Config(
             batch=BatchConfig(local_batch_size=2, global_batch_size=8, seq_len=2048),
@@ -78,7 +86,6 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
-                n=group_size,
                 temperature=0.8,
                 top_p=1.0,
                 max_tokens=100,
@@ -95,12 +102,18 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-1.7B",
         num_steps=10,
         num_prompts_per_step=5,
+        group_size=group_size,
         num_validation_samples=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
-        env=SumDigitsEnv.Config(seed=42, correctness_reward=1.0, format_reward=0.3),
-        validation_env=SumDigitsEnv.Config(
-            seed=99, correctness_reward=1.0, format_reward=0.3
+        train_dataset=SumDigitsDataset.Config(seed=42),
+        train_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0, format_reward=0.3
         ),
+        validation_dataset=SumDigitsDataset.Config(seed=99),
+        validation_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0, format_reward=0.3
+        ),
+        renderer=RendererConfig(name="qwen3", enable_thinking=False),
         metrics=MetricsProcessor.Config(enable_wandb=False),
         batcher=Batcher.Config(
             batch=BatchConfig(local_batch_size=2, global_batch_size=8, seq_len=2048),
@@ -136,7 +149,6 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
-                n=group_size,
                 temperature=0.8,
                 top_p=1.0,
                 max_tokens=100,
@@ -153,12 +165,18 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-14B",
         num_steps=10,
         num_prompts_per_step=5,
+        group_size=group_size,
         num_validation_samples=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
-        env=SumDigitsEnv.Config(seed=42, correctness_reward=1.0, format_reward=0.3),
-        validation_env=SumDigitsEnv.Config(
-            seed=99, correctness_reward=1.0, format_reward=0.3
+        train_dataset=SumDigitsDataset.Config(seed=42),
+        train_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0, format_reward=0.3
         ),
+        validation_dataset=SumDigitsDataset.Config(seed=99),
+        validation_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0, format_reward=0.3
+        ),
+        renderer=RendererConfig(name="qwen3", enable_thinking=False),
         metrics=MetricsProcessor.Config(enable_wandb=False),
         batcher=Batcher.Config(
             batch=BatchConfig(local_batch_size=2, global_batch_size=8, seq_len=2048),
@@ -193,7 +211,6 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
-                n=group_size,
                 temperature=0.8,
                 top_p=1.0,
                 max_tokens=100,
@@ -214,12 +231,18 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
         num_steps=10,
         num_prompts_per_step=5,
+        group_size=group_size,
         num_validation_samples=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
-        env=SumDigitsEnv.Config(seed=42, correctness_reward=1.0, format_reward=0.3),
-        validation_env=SumDigitsEnv.Config(
-            seed=99, correctness_reward=1.0, format_reward=0.3
+        train_dataset=SumDigitsDataset.Config(seed=42),
+        train_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0, format_reward=0.3
         ),
+        validation_dataset=SumDigitsDataset.Config(seed=99),
+        validation_env_builder=SumDigitsBuilder.Config(
+            correctness_reward=1.0, format_reward=0.3
+        ),
+        renderer=RendererConfig(name="qwen3", enable_thinking=False),
         metrics=MetricsProcessor.Config(enable_wandb=False),
         batcher=Batcher.Config(
             batch=BatchConfig(local_batch_size=2, global_batch_size=8, seq_len=2048),
@@ -258,7 +281,6 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
-                n=group_size,
                 temperature=0.8,
                 top_p=1.0,
                 max_tokens=100,

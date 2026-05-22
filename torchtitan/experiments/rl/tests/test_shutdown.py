@@ -66,19 +66,18 @@ class _FakeConfigManager:
 
 
 def _make_stub_rl_trainer():
-    """Create an RLTrainer with a minimal stub config (no VLLMGenerator validation)."""
-    from torchtitan.experiments.rl.observability import metrics as m
+    """Create an RLTrainer shell without spawning actors or building renderers."""
+    trainer = grpo.RLTrainer.__new__(grpo.RLTrainer)
+    trainer.trainer = None
+    trainer.generator = None
+    trainer._proc_meshes = []
+    trainer.metrics_processor = _StubMetricsProcessor()
+    return trainer
 
-    class _StubConfig:
-        batcher = grpo.Batcher.Config()
-        metrics = m.MetricsProcessor.Config()
-        dump_folder = "/tmp/test_rl"
-        hf_assets_path = "./tests/assets/tokenizer"
 
-        def to_dict(self):
-            return {}
-
-    return grpo.RLTrainer(_StubConfig())
+class _StubMetricsProcessor:
+    def close(self):
+        return None
 
 
 def test_main_shuts_down_after_success(monkeypatch):

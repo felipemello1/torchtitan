@@ -79,7 +79,7 @@ def generate():
         hf_overrides={"architectures": [VLLM_MODEL_NAME]},
         attention_backend="CUSTOM",
     )
-    max_num_seqs = config.num_prompts_per_step * gen_config.sampling.n
+    max_num_seqs = config.num_prompts_per_step * config.group_size
     engine_kwargs["max_num_seqs"] = max_num_seqs
     vllm_compilation_config = gen_config.cudagraph.get_vllm_compilation_config(
         max_num_seqs=max_num_seqs,
@@ -101,6 +101,8 @@ def generate():
         temperature=sampling.temperature,
         top_p=sampling.top_p,
         max_tokens=sampling.max_tokens,
+        n=1,
+        stop_token_ids=sampling.stop_token_ids,
     )
 
     logger.debug(

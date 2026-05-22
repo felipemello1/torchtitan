@@ -49,6 +49,7 @@ from torchtitan.experiments.rl.models.vllm_engine import (
     build_torchtitan_vllm_engine_args,
 )
 from torchtitan.experiments.rl.observability import metrics as m
+from torchtitan.experiments.rl.sampling import SamplingConfig
 from torchtitan.experiments.rl.types import Completion
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.model_spec import ModelSpec
@@ -136,9 +137,9 @@ def _prepare_generation_request_metrics(
 ) -> list[m.Metric]:
     """vLLM per-request timing metrics from a single `RequestOutput`.
 
-    vLLM returns one parent `RequestOutput` per `add_request` call. With
-    `SamplingParams.n > 1`, the parent exposes timing from the last child
-    request to finish; sibling timelines are not aggregated by vLLM.
+    vLLM returns one parent `RequestOutput` per `add_request` call. The
+    generator sets `SamplingParams.n=1`, so the parent timing maps to one
+    controller-owned sibling request.
 
     Example::
 
@@ -234,23 +235,6 @@ class VLLMCudagraphConfig:
         )
 
 
-@dataclass(kw_only=True, slots=True)
-class SamplingConfig:
-    """Sampling parameters passed to vLLM's `SamplingParams`."""
-
-    n: int = 8
-    """Number of completions to generate per prompt (`SamplingParams.n`)."""
-
-    temperature: float = 0.8
-    """Sampling temperature. 0.0 = greedy, higher = more random."""
-
-    top_p: float = 0.95
-    """Nucleus sampling threshold."""
-
-    max_tokens: int = 100
-    """Maximum number of tokens to generate per completion."""
-
-
 # --- admission + lifecycle payloads (broadcast across TP ranks) --------------
 
 
@@ -273,19 +257,17 @@ class _Admission:
 
 @dataclass(slots=True)
 class _PendingRequest:
-    """One `generate` request awaiting admission and its completion samples.
+    """One `generate` request awaiting admission and its completion.
 
     Example::
 
-        # One prompt with `SamplingConfig.n = 3`.
-        pending.future  # resolves to [sample0, sample1, sample2]
+        pending.future  # resolves to one Completion for this request_id.
     """
 
     request_id: str
-    prompt_idx: int  # position of this prompt in the caller's batch
     prompt_token_ids: list[int]  # [prompt_tokens]
     sampling_params: SamplingParams
-    future: asyncio.Future[list[Completion]]
+    future: asyncio.Future[Completion]
     metrics_prefix: str
     metrics_sink: list[m.Metric]
     admitted_policy_version: int = 0  # stamped at admission time on rank 0
@@ -362,9 +344,9 @@ class VLLMGenerator(Actor, Configurable):
 
         completions, metrics = await generator.generate.call(
             [[101, 102], [201]],
-            sampling_config=SamplingConfig(n=2, temperature=0.8, top_p=0.95),
+            sampling_config=SamplingConfig(temperature=0.8, top_p=1.0),
         ).get()
-        # [c.prompt_idx for c in completions] == [0, 0, 1, 1]
+        # len(completions) == 2
 
     Args:
         config: Generator-specific configuration.
@@ -372,7 +354,7 @@ class VLLMGenerator(Actor, Configurable):
         model_path: Path to the HF model checkpoint.
         compile_config: Per-layer `torch.compile` config shared with trainer.
         max_num_seqs: vLLM batch dim, sized by the controller as
-            `num_prompts_per_step * sampling.n`.
+            `num_prompts_per_step * group_size`.
         output_dir: Structured-logger output directory.
     """
 
@@ -480,7 +462,8 @@ class VLLMGenerator(Actor, Configurable):
         # max_num_seqs controls vLLM's maximum batch dimension: it sets
         # the upper bound for concurrent sequences, determines KV-cache
         # block allocation, and bounds CUDA graph capture sizes. The
-        # controller computes it as `num_prompts_per_step * sampling.n`.
+        # controller computes it from prompt groups and controller-owned
+        # group fanout.
         self._max_num_seqs = max_num_seqs
 
         set_batch_invariance(config.debug.batch_invariant)
@@ -587,17 +570,18 @@ class VLLMGenerator(Actor, Configurable):
         Example::
 
             params = self._build_sampling_params(SamplingConfig(
-                n=4, temperature=0.8, top_p=0.95, max_tokens=100
+                temperature=0.8, top_p=1.0, max_tokens=100
             ))
-            # params.n == 4
+            # params.n == 1
         """
         return SamplingParams(
             temperature=sampling_config.temperature,
             top_p=sampling_config.top_p,
             max_tokens=sampling_config.max_tokens,
-            n=sampling_config.n,
+            n=1,
             seed=self.config.debug.seed,
             logprobs=1,
+            stop_token_ids=sampling_config.stop_token_ids,
             output_kind=RequestOutputKind.FINAL_ONLY,
         )
 
@@ -648,7 +632,6 @@ class VLLMGenerator(Actor, Configurable):
         *,
         output: RequestOutput,
         sample_idx: int,
-        prompt_idx: int,
         policy_version: int,
     ) -> Completion:
         sample = output.outputs[sample_idx]
@@ -669,8 +652,6 @@ class VLLMGenerator(Actor, Configurable):
             per_token_logprobs.append(logprob_dict[token_id].logprob)
         return Completion(
             policy_version=policy_version,
-            prompt_idx=prompt_idx,
-            text=sample.text,
             token_ids=list(sample.token_ids),
             token_logprobs=per_token_logprobs,
             finish_reason=sample.finish_reason,
@@ -785,17 +766,13 @@ class VLLMGenerator(Actor, Configurable):
             )
             if not req.future.done():
                 req.future.set_result(
-                    [
-                        Completion(
-                            policy_version=admitted_policy_version,
-                            prompt_idx=req.prompt_idx,
-                            text="",
-                            token_ids=[],
-                            token_logprobs=[],
-                            finish_reason=None,
-                            error=error,
-                        )
-                    ]
+                    Completion(
+                        policy_version=admitted_policy_version,
+                        token_ids=[],
+                        token_logprobs=[],
+                        finish_reason=None,
+                        error=error,
+                    )
                 )
 
         return _EngineMessage(
@@ -852,15 +829,13 @@ class VLLMGenerator(Actor, Configurable):
         return outputs
 
     def _resolve_finished_outputs(self, outputs: list[RequestOutput]) -> None:
-        """Rank-0-only: resolve each pending request with all its child samples.
+        """Rank-0-only: resolve each pending request with its completion.
 
         Example::
 
-            # Two parent requests, each sampled with `SamplingParams.n = 3`.
             self._resolve_finished_outputs([p0_output, p1_output])
-            per_prompt = await asyncio.gather(p0.future, p1.future)
-            completions = [c for siblings in per_prompt for c in siblings]
-            # [c.prompt_idx for c in completions] == [0, 0, 0, 1, 1, 1]
+            completions = await asyncio.gather(p0.future, p1.future)
+            # len(completions) == 2
 
         vLLM `finish_reason in {"error", "abort"}` and per-sample decode
         failures become `Completion.error` so one bad request does not tear
@@ -886,65 +861,56 @@ class VLLMGenerator(Actor, Configurable):
             )
             if pending.future.done():
                 continue
-            completions = self._build_completions_for_pending(output, pending)
-            pending.future.set_result(completions)
+            completion = self._build_completion_for_pending(output, pending)
+            pending.future.set_result(completion)
 
     @staticmethod
-    def _completions_for_finish_error(
+    def _completion_for_finish_error(
         output: RequestOutput, pending: _PendingRequest
-    ) -> list[Completion]:
-        """Wrap every child sample's error finish_reason as `Completion.error`."""
-        results: list[Completion] = []
-        for sample in output.outputs:
-            results.append(
-                Completion(
-                    policy_version=pending.admitted_policy_version,
-                    prompt_idx=pending.prompt_idx,
-                    text=getattr(sample, "text", "") or "",
-                    token_ids=list(sample.token_ids),
-                    token_logprobs=[],
-                    finish_reason=sample.finish_reason,
-                    error=(
-                        f"vLLM finished request_id={pending.request_id!r} "
-                        f"with finish_reason={sample.finish_reason!r}"
-                    ),
-                )
-            )
-        return results
+    ) -> Completion:
+        """Wrap an error finish_reason as `Completion.error`."""
+        sample = output.outputs[0] if output.outputs else None
+        return Completion(
+            policy_version=pending.admitted_policy_version,
+            token_ids=list(sample.token_ids) if sample is not None else [],
+            token_logprobs=[],
+            finish_reason=sample.finish_reason if sample is not None else None,
+            error=(
+                f"vLLM finished request_id={pending.request_id!r} "
+                f"with finish_reason={getattr(sample, 'finish_reason', None)!r}"
+            ),
+        )
 
-    def _build_completions_for_pending(
+    def _build_completion_for_pending(
         self, output: RequestOutput, pending: _PendingRequest
-    ) -> list[Completion]:
+    ) -> Completion:
         # If the parent finished with an error/abort, vLLM stamps that on
         # the child sample's `finish_reason` too -- propagate as error
         # rather than trying to decode the (likely empty) logprobs.
         if any(
             sample.finish_reason in _FINISH_REASON_ERROR for sample in output.outputs
         ):
-            return self._completions_for_finish_error(output, pending)
+            return self._completion_for_finish_error(output, pending)
         try:
-            return [
-                self._completion_from_sample(
-                    output=output,
-                    sample_idx=i,
-                    prompt_idx=pending.prompt_idx,
-                    policy_version=pending.admitted_policy_version,
+            if len(output.outputs) != 1:
+                raise ValueError(
+                    f"expected one vLLM output for request_id={pending.request_id!r}, "
+                    f"got {len(output.outputs)}"
                 )
-                for i in range(len(output.outputs))
-            ]
+            return self._completion_from_sample(
+                output=output,
+                sample_idx=0,
+                policy_version=pending.admitted_policy_version,
+            )
         except Exception as exc:
             first = output.outputs[0] if output.outputs else None
-            return [
-                Completion(
-                    policy_version=pending.admitted_policy_version,
-                    prompt_idx=pending.prompt_idx,
-                    text="",
-                    token_ids=list(first.token_ids) if first is not None else [],
-                    token_logprobs=[],
-                    finish_reason=first.finish_reason if first is not None else None,
-                    error=f"completion build failed: {exc}",
-                )
-            ]
+            return Completion(
+                policy_version=pending.admitted_policy_version,
+                token_ids=list(first.token_ids) if first is not None else [],
+                token_logprobs=[],
+                finish_reason=first.finish_reason if first is not None else None,
+                error=f"completion build failed: {exc}",
+            )
 
     async def _drain_engine_to_empty(self) -> None:
         """Step the engine until every in-flight request has finished.
@@ -1011,11 +977,9 @@ class VLLMGenerator(Actor, Configurable):
     ) -> tuple[list[Completion], list[m.Metric]]:
         """Generate completions for `[num_prompts][prompt_tokens]`.
 
-        Returns a flat list of `[num_prompts * sampling.n]` completions,
-        ordered as `[p0_sample0, p0_sample1, ..., p1_sample0, ...]`.
-        `prompt_idx` on every completion identifies the source prompt
-        within the input batch, so controllers iterating the flat list
-        can still look up the originating prompt in O(1).
+        Returns one completion per prompt, ordered like the input batch.
+        Fanout for GRPO groups is controller-owned: call this endpoint once
+        per sibling request with a distinct `request_id`.
 
         Args:
             prompt_token_ids_batch: `[num_prompts][prompt_tokens]`.
@@ -1028,10 +992,11 @@ class VLLMGenerator(Actor, Configurable):
 
             completions, metrics = await generator.generate(
                 [[101, 102], [201]],
-                sampling_config=SamplingConfig(n=3),
+                request_ids=["g0:s0:t0", "g0:s1:t0"],
+                sampling_config=SamplingConfig(temperature=0.8, top_p=1.0),
             )
-            [c.prompt_idx for c in completions]
-            # [0, 0, 0, 1, 1, 1]
+            len(completions)
+            # 2
         """
         await self._ensure_engine_loop()
         if self._tp_rank != 0:
@@ -1060,13 +1025,12 @@ class VLLMGenerator(Actor, Configurable):
         loop = asyncio.get_running_loop()
         metrics_sink: list[m.Metric] = []
         pending: list[_PendingRequest] = []
-        for prompt_idx, (request_id, prompt_token_ids) in enumerate(
-            zip(request_ids, prompt_token_ids_batch, strict=True)
+        for request_id, prompt_token_ids in zip(
+            request_ids, prompt_token_ids_batch, strict=True
         ):
             pending.append(
                 _PendingRequest(
                     request_id=request_id,
-                    prompt_idx=prompt_idx,
                     prompt_token_ids=list(prompt_token_ids),
                     sampling_params=sampling_params,
                     future=loop.create_future(),
@@ -1080,14 +1044,9 @@ class VLLMGenerator(Actor, Configurable):
             self._pending_requests.extend(pending)
             self._cv.notify_all()
 
-        per_prompt_completions: list[list[Completion]] = await asyncio.gather(
+        completions: list[Completion] = await asyncio.gather(
             *(req.future for req in pending)
         )
-        # Flatten so callers see [p0_s0, p0_s1, ..., p1_s0, ...]; each
-        # completion still carries its prompt_idx for sibling grouping.
-        completions: list[Completion] = [
-            c for siblings in per_prompt_completions for c in siblings
-        ]
 
         memory_stats = cuda_memory_stats()
         for key, value in memory_stats.items():
