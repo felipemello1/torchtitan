@@ -22,6 +22,7 @@ python3 torchtitan/experiments/rl/grpo.py \
 """
 
 import asyncio
+import hashlib
 import logging
 import math
 import os
@@ -89,6 +90,38 @@ from torchtitan.protocols.model_spec import ModelSpec
 
 logger = logging.getLogger(__name__)
 _ZERO_ADVANTAGE_EPS = 1e-12
+
+
+def _generator_session_key(request_id: str) -> str:
+    """Return the stable rollout-session key encoded in a request ID."""
+    return request_id.rsplit(":turn=", 1)[0]
+
+
+def _generator_index_for_request_id(request_id: str, num_generators: int) -> int:
+    """Map a rollout session to a generator instance."""
+    if num_generators <= 0:
+        raise ValueError(f"num_generators must be positive, got {num_generators}")
+    digest = hashlib.blake2b(
+        _generator_session_key(request_id).encode("utf-8"),
+        digest_size=8,
+    ).digest()
+    return int.from_bytes(digest, byteorder="big") % num_generators
+
+
+def _group_request_positions_by_generator(
+    request_ids: Sequence[str],
+    *,
+    num_generators: int,
+) -> dict[int, list[int]]:
+    """Group batch positions by sticky generator assignment."""
+    by_generator: dict[int, list[int]] = {}
+    for position, request_id in enumerate(request_ids):
+        generator_idx = _generator_index_for_request_id(
+            request_id,
+            num_generators,
+        )
+        by_generator.setdefault(generator_idx, []).append(position)
+    return by_generator
 
 
 class Provisioner:
@@ -517,6 +550,9 @@ class RLTrainer(Configurable):
         generator: VLLMGenerator.Config = field(default_factory=VLLMGenerator.Config)
         """VLLMGenerator actor configuration (vLLM engine, sampling)."""
 
+        num_generator_instances: int = 1
+        """Number of independent generator actor meshes to spawn."""
+
         max_offpolicy_steps: int = 1
         """Drop replay samples older than this many policy-version steps."""
 
@@ -593,12 +629,12 @@ class RLTrainer(Configurable):
                     "max_no_signal_groups must be positive or None, "
                     f"got {self.max_no_signal_groups}"
                 )
-            pipeline = self.async_pipeline
-            if pipeline.num_generator_instances != 1:
+            if self.num_generator_instances <= 0:
                 raise ValueError(
-                    "this trainer supports exactly one generator instance; got "
-                    f"{pipeline.num_generator_instances}"
+                    "num_generator_instances must be positive, "
+                    f"got {self.num_generator_instances}"
                 )
+            pipeline = self.async_pipeline
             if (
                 pipeline.rollout_concurrency is not None
                 and pipeline.rollout_concurrency <= 0
@@ -636,6 +672,7 @@ class RLTrainer(Configurable):
         self.config = config
         self.trainer = None
         self.generator = None
+        self.generators: list = []
         self._proc_meshes = []
         self.metrics_processor: m.MetricsProcessor = config.metrics.build(
             log_dir=config.dump_folder,
@@ -665,10 +702,17 @@ class RLTrainer(Configurable):
     async def close(self):
         """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
         logger.info("Closing: tearing down actors and process meshes.")
-        for actor_name, actor in (
-            ("trainer", self.trainer),
-            ("generator", self.generator),
-        ):
+        actors_to_close = [("trainer", self.trainer)]
+        generators = self._generator_actors()
+        if generators:
+            actors_to_close.extend(
+                (f"generator_{idx}", generator)
+                for idx, generator in enumerate(generators)
+            )
+        else:
+            actors_to_close.append(("generator", self.generator))
+
+        for actor_name, actor in actors_to_close:
             if actor is None:
                 continue
             try:
@@ -688,6 +732,17 @@ class RLTrainer(Configurable):
                 logger.exception("mesh.stop[%d] failed", i)
         self._proc_meshes = []
 
+    def _generator_actors(self) -> list:
+        if getattr(self, "generators", []):
+            return list(self.generators)
+        generator = getattr(self, "generator", None)
+        return [] if generator is None else [generator]
+
+    async def _sync_actor_log_step(self, step: int) -> None:
+        await self._await_call(self.trainer.sync_log_step.call(step))
+        for generator in self._generator_actors():
+            await self._await_call(generator.sync_log_step.call(step))
+
     def _get_rank_0_value(self, result, has_gpus: bool = True):
         """Extract rank 0 result, handling both single and multi-node meshes.
 
@@ -702,6 +757,74 @@ class RLTrainer(Configurable):
         if has_gpus:
             kwargs["gpus"] = 0
         return result.item(**kwargs)
+
+    def _spawn_role_meshes(
+        self,
+        *,
+        host_mesh,
+        trainer_nodes: int | None,
+        generator_nodes: int | None,
+        gpus_per_node: int | None,
+        total_gpus: int,
+    ):
+        num_generators = self.config.num_generator_instances
+        if host_mesh is None:
+            provisioner = Provisioner(total_gpus=total_gpus)
+            trainer_mesh = this_host().spawn_procs(
+                per_host={"gpus": self.trainer_world_size},
+                bootstrap=provisioner.allocate(self.trainer_world_size),
+            )
+            generator_meshes = [
+                this_host().spawn_procs(
+                    per_host={"gpus": self.generator_world_size},
+                    bootstrap=provisioner.allocate(self.generator_world_size),
+                    name=(
+                        "generator"
+                        if num_generators == 1
+                        else f"generator_{generator_idx}"
+                    ),
+                )
+                for generator_idx in range(num_generators)
+            ]
+            return trainer_mesh, generator_meshes
+
+        if num_generators != 1:
+            raise ValueError(
+                "num_generator_instances > 1 is only supported when host_mesh is None"
+            )
+        if trainer_nodes is None or generator_nodes is None or gpus_per_node is None:
+            raise ValueError(
+                "trainer_nodes, generator_nodes, and gpus_per_node are "
+                "required when host_mesh is provided"
+            )
+        if self.trainer_world_size % trainer_nodes != 0:
+            raise ValueError(
+                f"trainer_world_size ({self.trainer_world_size}) must be "
+                f"evenly divisible by trainer_nodes ({trainer_nodes})"
+            )
+        if self.generator_world_size % generator_nodes != 0:
+            raise ValueError(
+                f"generator_world_size ({self.generator_world_size}) must be "
+                f"evenly divisible by generator_nodes ({generator_nodes})"
+            )
+
+        trainer_gpus_per_node = self.trainer_world_size // trainer_nodes
+        generator_gpus_per_node = self.generator_world_size // generator_nodes
+        trainer_host_mesh = host_mesh.slice(hosts=slice(0, trainer_nodes))
+        generator_host_mesh = host_mesh.slice(
+            hosts=slice(trainer_nodes, trainer_nodes + generator_nodes)
+        )
+        trainer_provisioner = Provisioner(total_gpus=gpus_per_node)
+        generator_provisioner = Provisioner(total_gpus=gpus_per_node)
+        trainer_mesh = trainer_host_mesh.spawn_procs(
+            per_host={"gpus": trainer_gpus_per_node},
+            bootstrap=trainer_provisioner.allocate(trainer_gpus_per_node),
+        )
+        generator_mesh = generator_host_mesh.spawn_procs(
+            per_host={"gpus": generator_gpus_per_node},
+            bootstrap=generator_provisioner.allocate(generator_gpus_per_node),
+        )
+        return trainer_mesh, [generator_mesh]
 
     @sl.log_trace_span("setup_async")
     async def setup_async(
@@ -745,81 +868,39 @@ class RLTrainer(Configurable):
             trainer_parallelism.data_parallel_replicate_degree * dp_shard
         )
 
-        total_gpus = self.trainer_world_size + self.generator_world_size
-        logger.info(
-            f"{self.generator_world_size} generator GPUs + "
-            f"{self.trainer_world_size} trainer GPUs = {total_gpus} total"
-        )
+        num_generators = config.num_generator_instances
+        total_generator_gpus = self.generator_world_size * num_generators
+        total_gpus = self.trainer_world_size + total_generator_gpus
+        if num_generators == 1:
+            logger.info(
+                f"{self.generator_world_size} generator GPUs + "
+                f"{self.trainer_world_size} trainer GPUs = {total_gpus} total"
+            )
+        else:
+            logger.info(
+                f"{num_generators} generator instances x "
+                f"{self.generator_world_size} GPUs = "
+                f"{total_generator_gpus} generator GPUs + "
+                f"{self.trainer_world_size} trainer GPUs = {total_gpus} total"
+            )
 
         self._multi_node = host_mesh is not None
 
-        # TODO(observability): the mesh_spawn span wraps ~80 LoC of branching
-        # provisioner logic. Pull a Provisioner.spawn_meshes(...) helper and
-        # shrink this span to a single call.
         with sl.log_trace_span("mesh_spawn"):
-            if host_mesh is not None:
-                # Multi-node mode: dedicate whole nodes to trainer vs generator
-                if (
-                    trainer_nodes is None
-                    or generator_nodes is None
-                    or gpus_per_node is None
-                ):
-                    raise ValueError(
-                        "trainer_nodes, generator_nodes, and gpus_per_node are "
-                        "required when host_mesh is provided"
-                    )
-                # Validate that world sizes are evenly divisible by node counts
-                assert self.trainer_world_size % trainer_nodes == 0, (
-                    f"trainer_world_size ({self.trainer_world_size}) must be "
-                    f"evenly divisible by trainer_nodes ({trainer_nodes})"
-                )
-                assert self.generator_world_size % generator_nodes == 0, (
-                    f"generator_world_size ({self.generator_world_size}) must be "
-                    f"evenly divisible by generator_nodes ({generator_nodes})"
-                )
-
-                # Compute GPUs per node for each role based on the config's
-                # world size and number of nodes allocated to that role
-                trainer_gpus_per_node = self.trainer_world_size // trainer_nodes
-                generator_gpus_per_node = self.generator_world_size // generator_nodes
-
-                trainer_host_mesh = host_mesh.slice(hosts=slice(0, trainer_nodes))
-                generator_host_mesh = host_mesh.slice(
-                    hosts=slice(trainer_nodes, trainer_nodes + generator_nodes)
-                )
-
-                # Use Provisioner to set CUDA_VISIBLE_DEVICES so each role
-                # only sees its own GPUs and doesn't conflict with other
-                # processes on the node
-                trainer_provisioner = Provisioner(total_gpus=gpus_per_node)
-                generator_provisioner = Provisioner(total_gpus=gpus_per_node)
-
-                trainer_mesh = trainer_host_mesh.spawn_procs(
-                    per_host={"gpus": trainer_gpus_per_node},
-                    bootstrap=trainer_provisioner.allocate(trainer_gpus_per_node),
-                )
-                generator_mesh = generator_host_mesh.spawn_procs(
-                    per_host={"gpus": generator_gpus_per_node},
-                    bootstrap=generator_provisioner.allocate(generator_gpus_per_node),
-                )
-            else:
-                # Single-node mode: partition GPUs on this_host() via
-                # CUDA_VISIBLE_DEVICES
-                provisioner = Provisioner(total_gpus=total_gpus)
-                trainer_mesh = this_host().spawn_procs(
-                    per_host={"gpus": self.trainer_world_size},
-                    bootstrap=provisioner.allocate(self.trainer_world_size),
-                )
-                generator_mesh = this_host().spawn_procs(
-                    per_host={"gpus": self.generator_world_size},
-                    bootstrap=provisioner.allocate(self.generator_world_size),
-                )
+            trainer_mesh, generator_meshes = self._spawn_role_meshes(
+                host_mesh=host_mesh,
+                trainer_nodes=trainer_nodes,
+                generator_nodes=generator_nodes,
+                gpus_per_node=gpus_per_node,
+                total_gpus=total_gpus,
+            )
 
             # Store proc meshes for cleanup
-            self._proc_meshes = [trainer_mesh, generator_mesh]
+            self._proc_meshes = [trainer_mesh, *generator_meshes]
 
             await setup_torch_elastic_env_async(trainer_mesh)
-            await setup_torch_elastic_env_async(generator_mesh)
+            for generator_mesh in generator_meshes:
+                await setup_torch_elastic_env_async(generator_mesh)
 
             # Spawn actors on their respective meshes
             self.trainer = trainer_mesh.spawn(
@@ -833,16 +914,22 @@ class RLTrainer(Configurable):
                 output_dir=config.dump_folder,
             )
 
-            self.generator = generator_mesh.spawn(
-                "generator",
-                VLLMGenerator,
-                config.generator,
-                model_spec=config.model_spec,
-                model_path=config.hf_assets_path,
-                compile_config=config.compile,
-                max_num_seqs=compute_generator_max_num_seqs(config),
-                output_dir=config.dump_folder,
-            )
+            self.generators = [
+                generator_mesh.spawn(
+                    "generator"
+                    if len(generator_meshes) == 1
+                    else f"generator_{generator_idx}",
+                    VLLMGenerator,
+                    config.generator,
+                    model_spec=config.model_spec,
+                    model_path=config.hf_assets_path,
+                    compile_config=config.compile,
+                    max_num_seqs=compute_generator_max_num_seqs(config),
+                    output_dir=config.dump_folder,
+                )
+                for generator_idx, generator_mesh in enumerate(generator_meshes)
+            ]
+            self.generator = self.generators[0]
 
         # Initialize TorchStore for weight sync between trainer and generator.
         # StorageVolumes are spawned on the trainer mesh so they are colocated
@@ -853,11 +940,12 @@ class RLTrainer(Configurable):
         with sl.log_trace_span("torchstore_init"):
             await ts.initialize(mesh=trainer_mesh, strategy=ts.LocalRankStrategy())
 
-        # Initial weight sync from trainer to generator
+        # Initial weight sync from trainer to every generator.
         with sl.log_trace_span("trainer_push_model_state_dict"):
             await self._await_call(self.trainer.push_model_state_dict.call())
         with sl.log_trace_span("generator_pull_model_state_dict"):
-            await self._await_call(self.generator.pull_model_state_dict.call(0))
+            for generator in self.generators:
+                await self._await_call(generator.pull_model_state_dict.call(0))
 
     @staticmethod
     async def _await_call(actor_call):
@@ -887,15 +975,54 @@ class RLTrainer(Configurable):
             request_ids: list[str],
             sampling: SamplingConfig,
         ) -> tuple[list[Completion], list[m.Metric]]:
-            completions, metrics = await self._await_rank_0(
-                self.generator.generate.call(
-                    prompt_token_ids_batch,
-                    request_ids=request_ids,
-                    sampling_config=sampling,
-                    metrics_prefix=metrics_prefix,
+            generators = self._generator_actors()
+            if not generators:
+                raise RuntimeError("generation scheduler has no generator actors")
+            if len(generators) == 1:
+                completions, metrics = await self._await_rank_0(
+                    generators[0].generate.call(
+                        prompt_token_ids_batch,
+                        request_ids=request_ids,
+                        sampling_config=sampling,
+                        metrics_prefix=metrics_prefix,
+                    )
                 )
+                return completions, metrics
+
+            by_generator = _group_request_positions_by_generator(
+                request_ids,
+                num_generators=len(generators),
             )
-            return completions, metrics
+            merged: list[Completion | None] = [None] * len(prompt_token_ids_batch)
+            merged_metrics: list[m.Metric] = []
+            for generator_idx in range(len(generators)):
+                positions = by_generator.get(generator_idx, [])
+                queue_depth_key = f"{metrics_prefix}/{generator_idx}/queue_depth"
+                merged_metrics.extend(
+                    [
+                        m.Metric(queue_depth_key, m.Mean(float(len(positions)))),
+                        m.Metric(queue_depth_key, m.Max(float(len(positions)))),
+                    ]
+                )
+            for generator_idx, positions in by_generator.items():
+                completions, metrics = await self._await_rank_0(
+                    generators[generator_idx].generate.call(
+                        [prompt_token_ids_batch[position] for position in positions],
+                        request_ids=[request_ids[position] for position in positions],
+                        sampling_config=sampling,
+                        metrics_prefix=f"{metrics_prefix}/{generator_idx}",
+                    )
+                )
+                for position, completion in zip(positions, completions, strict=True):
+                    merged[position] = completion
+                merged_metrics.extend(metrics)
+
+            if any(completion is None for completion in merged):
+                raise RuntimeError("generator routing failed to fill all completions")
+            return (
+                [completion for completion in merged if completion is not None],
+                merged_metrics,
+            )
 
         return GenerationScheduler(
             generate_batch,
@@ -920,9 +1047,10 @@ class RLTrainer(Configurable):
             t_weight_sync_push_s = time.perf_counter() - t_push_start
             t_pull_start = time.perf_counter()
             with sl.log_trace_span("generator_pull_model_state_dict"):
-                await self._await_call(
-                    self.generator.pull_model_state_dict.call(policy_version)
-                )
+                for generator in self._generator_actors():
+                    await self._await_call(
+                        generator.pull_model_state_dict.call(policy_version)
+                    )
             t_weight_sync_pull_s = time.perf_counter() - t_pull_start
         finally:
             await generation_scheduler.resume_after_weight_sync()
@@ -1271,8 +1399,7 @@ class RLTrainer(Configurable):
         try:
             for step in range(1, num_steps + 1):
                 sl.set_step(step)
-                await self._await_call(self.trainer.sync_log_step.call(step))
-                await self._await_call(self.generator.sync_log_step.call(step))
+                await self._sync_actor_log_step(step)
 
                 t_step_start = time.perf_counter()
                 t_replay_start = time.perf_counter()
