@@ -180,24 +180,6 @@ class ReplaySample:
 
 
 @dataclass(kw_only=True, slots=True)
-class Episode:
-    """Training sample: flattened trajectory + GRPO advantage.
-
-    Flat shape (rather than composition) because the trainer collate
-    path and logging read these fields directly.
-    """
-
-    policy_version: int
-    prompt_idx: int
-    prompt_token_ids: list[int]
-    text: str
-    token_ids: list[int]
-    token_logprobs: list[float]
-    reward: float
-    advantage: float
-
-
-@dataclass(kw_only=True, slots=True)
 class TrainingBatch:
     token_ids: torch.Tensor  # [B, L]
     positions: torch.Tensor  # [B, L]

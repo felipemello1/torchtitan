@@ -25,9 +25,7 @@ import asyncio
 import logging
 import math
 import os
-import statistics
 import time
-from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 
@@ -58,12 +56,12 @@ from torchtitan.experiments.rl.observability.metrics.rl import (
     rename_metric_prefix,
 )
 from torchtitan.experiments.rl.renderer import RendererConfig
+from torchtitan.experiments.rl.replay import rollouts_to_replay_samples
 from torchtitan.experiments.rl.rollout_logging import RolloutSampleLogger
 from torchtitan.experiments.rl.rollouts import run_rollout_group
 from torchtitan.experiments.rl.sampling import SamplingConfig, TrainingLogprobConfig
 from torchtitan.experiments.rl.types import (
     Completion,
-    Episode,
     ReplaySample,
     RolloutOutput,
     TrainingBatch,
@@ -131,58 +129,6 @@ def _log_samples(rollouts: list[RolloutOutput]) -> None:
         logger.info("       A: %s", text[:300].replace("\n", " ").strip())
 
 
-def _single_turn_rollouts_to_replay_samples(
-    rollouts: list[RolloutOutput],
-) -> list[ReplaySample]:
-    """Convert single-turn rollout groups into trainer replay rows.
-
-    Example::
-
-        # rewards [1.0, 0.0] in one group produce centered advantages
-        # [+1.0, -1.0] with population std normalization.
-    """
-    groups: dict[str, list[RolloutOutput]] = defaultdict(list)
-    for rollout in rollouts:
-        groups[rollout.group_id].append(rollout)
-
-    samples: list[ReplaySample] = []
-    for group_id, group in groups.items():
-        rewards = [float(r.reward) for r in group if r.reward is not None]
-        if not rewards:
-            continue
-        mean = statistics.fmean(rewards)
-        std = statistics.pstdev(rewards) if len(rewards) > 1 else 0.0
-        denom = std if std > 1e-6 else 1.0
-
-        for rollout in group:
-            if rollout.reward is None or not rollout.turns:
-                continue
-            turn = rollout.turns[0]
-            if not turn.response_token_ids:
-                continue
-            advantage = (float(rollout.reward) - mean) / denom if std > 1e-6 else 0.0
-            samples.append(
-                ReplaySample(
-                    token_ids=turn.prompt_token_ids + turn.response_token_ids,
-                    loss_mask=(
-                        [0] * len(turn.prompt_token_ids)
-                        + [1] * len(turn.response_token_ids)
-                    ),
-                    ref_logprobs=(
-                        [0.0] * len(turn.prompt_token_ids)
-                        + list(turn.response_logprobs)
-                    ),
-                    advantage=advantage,
-                    group_id=group_id,
-                    sample_idx=rollout.sample_idx,
-                    behavior_version=rollout.behavior_version,
-                    reward=float(rollout.reward),
-                    reward_components=dict(rollout.reward_components),
-                )
-            )
-    return samples
-
-
 class Batcher(Configurable):
     """Packs training samples into ``[B, seq_len]`` batches for the trainer.
 
@@ -209,7 +155,7 @@ class Batcher(Configurable):
 
     def batch(
         self,
-        samples: list[Episode] | list[ReplaySample],
+        samples: list[ReplaySample],
         *,
         dp_degree: int,
     ) -> tuple[list[list[TrainingBatch]], int, dict[str, float]]:
@@ -255,7 +201,7 @@ class Batcher(Configurable):
                 step_batches.append(self.collate(packed_rows[start:end]))
             microbatches.append(step_batches)
 
-        # TODO: Optimize rollout collection to reduce wasted episodes.
+        # TODO: Optimize rollout collection to reduce wasted samples.
         # Currently the controller estimates token counts without padded
         # tokens, which can overshoot because packing adds prompt tokens
         # and padding. Track packing metrics to monitor waste.
@@ -274,14 +220,11 @@ class Batcher(Configurable):
 
         return microbatches, num_global_valid_tokens, packing_metrics
 
-    def _iter_training_samples(
-        self, items: Sequence[Episode | ReplaySample]
-    ) -> Iterator[dict]:
+    def _iter_training_samples(self, items: Sequence[ReplaySample]) -> Iterator[dict]:
         """Yield one packing-ready dict per item.
 
-        `ReplaySample` carries token-aligned masks/logprobs. `Episode`
-        carries a prompt/response split, so this method broadcasts the
-        response advantage over generated tokens.
+        `ReplaySample` carries token-aligned masks/logprobs, so this method
+        only broadcasts the scalar advantage over masked response tokens.
 
         Example::
 
@@ -300,28 +243,14 @@ class Batcher(Configurable):
             #  "loss_mask":[0.0,1.0,1.0], "advantages":[0.0,0.5,0.5]}
         """
         for item in items:
-            if isinstance(item, ReplaySample):
-                yield {
-                    "input_ids": item.token_ids,
-                    "ref_logprobs": item.ref_logprobs,
-                    "loss_mask": [float(mask) for mask in item.loss_mask],
-                    "advantages": [
-                        item.advantage * float(mask) for mask in item.loss_mask
-                    ],
-                }
-                continue
-            prompt_len = len(item.prompt_token_ids)
-            response_len = len(item.token_ids)
             yield {
-                "input_ids": item.prompt_token_ids + item.token_ids,
-                "ref_logprobs": [0.0] * prompt_len + item.token_logprobs,
-                "loss_mask": [0.0] * prompt_len + [1.0] * response_len,
-                "advantages": [0.0] * prompt_len + [item.advantage] * response_len,
+                "input_ids": item.token_ids,
+                "ref_logprobs": item.ref_logprobs,
+                "loss_mask": [float(mask) for mask in item.loss_mask],
+                "advantages": [item.advantage * float(mask) for mask in item.loss_mask],
             }
 
-    def _pack_samples(
-        self, samples: list[Episode] | list[ReplaySample]
-    ) -> Iterator[dict]:
+    def _pack_samples(self, samples: list[ReplaySample]) -> Iterator[dict]:
         """Pack all samples into [1, seq_len] rows."""
         yield from pack(
             self._iter_training_samples(samples),
@@ -394,7 +323,7 @@ class RLTrainer(Configurable):
         """Renderer used for message <-> token conversion."""
 
         log_samples: bool = False
-        """Log first completion per episode during training and validation."""
+        """Log first rollout per group during training and validation."""
 
         save_rollout_samples: bool = False
         """Write a bounded rollout JSONL sample for smoke/debug runs."""
@@ -913,7 +842,7 @@ class RLTrainer(Configurable):
                 new_rollouts, new_metrics = await self._collect_rollouts(
                     num_groups, step=step, group_offset=group_offset
                 )
-                new_samples = _single_turn_rollouts_to_replay_samples(new_rollouts)
+                new_samples = rollouts_to_replay_samples(new_rollouts)
                 if not new_samples:
                     raise RuntimeError(
                         "rollout wave produced no trainable replay samples"
