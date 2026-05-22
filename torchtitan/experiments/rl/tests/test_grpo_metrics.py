@@ -14,14 +14,10 @@ import pytest
 import torch
 
 from torchtitan.config import BatchConfig
-from torchtitan.experiments.rl.grpo import (
-    _single_turn_rollouts_to_replay_samples,
-    Batcher,
-)
+from torchtitan.experiments.rl.grpo import Batcher
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.observability.metrics.rl import build_rollout_metrics
 from torchtitan.experiments.rl.types import (
-    Episode,
     ReplaySample,
     RolloutOutput,
     RolloutStatus,
@@ -102,35 +98,10 @@ def test_rollout_metrics_aggregate_across_collection_waves() -> None:
     assert agg["reward/zero_std_frac/mean"] == pytest.approx(0.5)
 
 
-def test_single_turn_rollouts_to_replay_samples_centers_by_group() -> None:
-    rollouts = [
-        _rollout(group_id="g0", sample_idx=0, reward=1.0),
-        _rollout(group_id="g0", sample_idx=1, reward=0.0),
-    ]
-
-    samples = _single_turn_rollouts_to_replay_samples(rollouts)
-
-    assert [sample.group_id for sample in samples] == ["g0", "g0"]
-    assert [sample.advantage for sample in samples] == pytest.approx([1.0, -1.0])
-    assert samples[0].token_ids == [5, 7, 8]
-    assert samples[0].loss_mask == [0, 1, 1]
-    assert samples[0].ref_logprobs == [0.0, -0.3, -0.4]
-
-
-def test_batcher_episode_and_replay_sample_paths_match() -> None:
+def test_batcher_replay_sample_path_masks_advantage() -> None:
     batcher = Batcher(
         Batcher.Config(batch=BatchConfig(local_batch_size=1, global_batch_size=1)),
         pad_id=0,
-    )
-    episode = Episode(
-        policy_version=3,
-        prompt_idx=0,
-        prompt_token_ids=[5],
-        text="answer",
-        token_ids=[7, 8],
-        token_logprobs=[-0.3, -0.4],
-        reward=1.0,
-        advantage=0.5,
     )
     sample = ReplaySample(
         token_ids=[5, 7, 8],
@@ -143,10 +114,14 @@ def test_batcher_episode_and_replay_sample_paths_match() -> None:
         reward=1.0,
     )
 
-    from_episode = list(batcher._iter_training_samples([episode]))[0]
-    from_sample = list(batcher._iter_training_samples([sample]))[0]
+    row = list(batcher._iter_training_samples([sample]))[0]
 
-    assert from_episode == from_sample
+    assert row == {
+        "input_ids": [5, 7, 8],
+        "ref_logprobs": [0.0, -0.3, -0.4],
+        "loss_mask": [0.0, 1.0, 1.0],
+        "advantages": [0.0, 0.5, 0.5],
+    }
 
 
 class TestRLTrainerConfigWiring:

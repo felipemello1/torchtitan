@@ -198,7 +198,7 @@ class MetricAccumulator:
 
 
 class PolicyTrainer(Actor, Configurable):
-    """Updates policy based on collected Episode using TorchTitan components.
+    """Updates policy from controller-built batches using TorchTitan components.
 
     Exposes separate `forward_backward` and `optim_step` endpoints, called
     explicitly by the controller.
