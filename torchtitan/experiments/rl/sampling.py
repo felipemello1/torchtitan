@@ -12,6 +12,5 @@ TRAINING_VLLM_LOGPROBS_MODE = "processed_logprobs"
 
 Returns the logprob distribution after vLLM's sampling-temperature transform,
 so the trainer can recover the same distribution by dividing its own logits
-by the same temperature before ``log_softmax`` (see
-:func:`torchtitan.experiments.rl.actors.utils.compute_logprobs`).
+by the same temperature before `log_softmax`.
 """

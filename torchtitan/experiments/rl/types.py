@@ -36,8 +36,15 @@ class Step:
 class Completion:
     """A single generated sequence from the generator.
 
-    Pure generation artifact - no reward, no advantage. ``prompt_idx``
-    is the position of the source prompt in the input ``prompts`` list.
+    Pure generation artifact - no reward, no advantage. `prompt_idx`
+    is the position of the source prompt in the input `prompts` list.
+
+    Example::
+
+        # Two prompts with `SamplingConfig.n = 2` produce a flat list:
+        # [prompt0_sample0, prompt0_sample1, prompt1_sample0, prompt1_sample1].
+        Completion(policy_version=3, prompt_idx=1, text="42",
+                   token_ids=[29871, 29946], token_logprobs=[-0.2, -0.1])
     """
 
     policy_version: int
@@ -48,13 +55,18 @@ class Completion:
     finish_reason: str | None = None
     """vLLM `CompletionOutput.finish_reason` ("stop" | "length" | "abort")"""
     error: str | None = None
-    """Generator-side failure reason. ``None`` for successful completions.
+    """Generator-side failure reason. `None` for successful completions.
 
-    Populated when vLLM finishes a request with ``finish_reason`` in
-    ``{"error", "abort"}``, when prompt validation rejects an admission
+    Populated when vLLM finishes a request with `finish_reason` in
+    `{"error", "abort"}`, when prompt validation rejects an admission
     (oversize prompt, OOV token), or when the completion-build path raises
-    on a malformed ``RequestOutput``. Controllers skip these rather than
+    on a malformed `RequestOutput`. Controllers skip these rather than
     feeding them through the env / reward path.
+
+    Example::
+
+        Completion(policy_version=3, prompt_idx=0, text="", token_ids=[],
+                   token_logprobs=[], error="decoder prompt cannot be empty")
     """
 
 

@@ -33,12 +33,21 @@ def build_torchtitan_vllm_engine_args(
     checkpoint_config: CheckpointManager.Config,
     max_num_seqs: int,
 ) -> EngineArgs:
-    """Register TorchTitan's vLLM wrappers and assemble ``EngineArgs``.
+    """Register TorchTitan's vLLM wrappers and assemble `EngineArgs`.
 
-    Sets ``VLLM_ATTENTION_BACKEND`` / ``VLLM_USE_V2_MODEL_RUNNER`` and calls
-    :func:`registry_to_vllm` before returning, so the engine is built
-    against TorchTitan's parallelism layout and config parser instead of
-    vLLM's defaults.
+    Sets `VLLM_ATTENTION_BACKEND` / `VLLM_USE_V2_MODEL_RUNNER` and calls
+    `registry_to_vllm` before returning.
+
+    Example::
+
+        args = build_torchtitan_vllm_engine_args(
+            config=generator_cfg,
+            model_spec=model_spec,
+            model_path="/path/to/hf/assets",
+            compile_config=compile_cfg,
+            checkpoint_config=generator_cfg.checkpoint,
+            max_num_seqs=40,
+        )
     """
     os.environ["VLLM_ATTENTION_BACKEND"] = "CUSTOM"
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
@@ -49,9 +58,9 @@ def build_torchtitan_vllm_engine_args(
         checkpoint_config=checkpoint_config,
     )
     engine_kwargs = dict(
-        # ``model`` is the path to the HF checkpoint directory. The
+        # `model` is the path to the HF checkpoint directory. The
         # config is sourced from torchtitan's ModelSpec via
-        # ``config_format=TORCHTITAN_CONFIG_FORMAT`` (no config.json
+        # `config_format=TORCHTITAN_CONFIG_FORMAT` (no config.json
         # read), but vLLM still uses this path to locate the
         # tokenizer assets and the safetensors weight shards.
         model=model_path,
@@ -59,7 +68,7 @@ def build_torchtitan_vllm_engine_args(
         config_format=TORCHTITAN_CONFIG_FORMAT,
         dtype=config.model_dtype,
         tensor_parallel_size=config.parallelism.tensor_parallel_degree,
-        # Monarch already spawned TP workers via proc mesh. ``external_launcher``
+        # Monarch already spawned TP workers via proc mesh. `external_launcher`
         # tells vLLM to run one worker per process (no subprocess spawning).
         distributed_executor_backend="external_launcher",
         gpu_memory_utilization=config.gpu_memory_limit,

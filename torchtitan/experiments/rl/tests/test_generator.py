@@ -4,24 +4,21 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Unit tests for the engine-loop dispatch invariants added in PR 1.
+"""Unit tests for engine-loop dispatch invariants.
 
 End-to-end behavior is covered by the GPU smokes; these tests only pin
 the two new shapes the engine loop has to honor:
 
-- ``SamplingParams.n > 1`` returns every sibling completion (RFC §6
-  cardinality), not just ``outputs[0]``;
-- vLLM ``finish_reason in {"error", "abort"}`` becomes
-  ``Completion.error`` so the controller can drop the sample.
+- `SamplingParams.n > 1` returns every sibling completion, not just
+  `outputs[0]`;
+- vLLM `finish_reason in {"error", "abort"}` becomes `Completion.error`
+  so the controller can drop the sample.
 """
 
 import asyncio
 from types import SimpleNamespace
 
-from torchtitan.experiments.rl.actors.generator import (
-    _PendingRequest,
-    VLLMGenerator,
-)
+from torchtitan.experiments.rl.actors.generator import _PendingRequest, VLLMGenerator
 
 
 def _sample(*, token_ids=(10, 11), finish_reason="stop", text="ok"):
@@ -34,7 +31,7 @@ def _sample(*, token_ids=(10, 11), finish_reason="stop", text="ok"):
 
 
 def _request_output(*, request_id, outputs):
-    # ``metrics`` is None to skip the timing emission path — these tests
+    # `metrics` is None to skip the timing emission path; these tests
     # only care about which completions flow back to which futures.
     return SimpleNamespace(
         request_id=request_id,
@@ -58,12 +55,14 @@ def _pending(*, request_id, prompt_idx):
 
 
 def test_resolve_finished_outputs_flattens_n_siblings_in_input_order():
-    """RFC §6 cardinality: n=3 over 2 prompts must yield 6 completions.
+    """n=3 over 2 prompts must yield 6 completions.
 
-    The scalar-future shape used by the reference branch's final form
-    silently dropped ``n - 1`` siblings per request when
-    ``SamplingParams.n > 1``; catching that regression is the whole
-    point of PR 1's temporary list-of-completions future.
+    Example::
+
+        p0.future -> [p0_s0, p0_s1, p0_s2]
+        p1.future -> [p1_s0, p1_s1, p1_s2]
+        flatten([p0.future, p1.future])
+        # prompt_idx == [0, 0, 0, 1, 1, 1]
     """
 
     async def scenario():
@@ -100,7 +99,7 @@ def test_resolve_finished_outputs_flattens_n_siblings_in_input_order():
 
 
 def test_resolve_finished_outputs_maps_abort_finish_reason_to_completion_error():
-    """vLLM ``abort`` becomes ``Completion.error`` so the controller drops
+    """vLLM `abort` becomes `Completion.error` so the controller drops
     the sample instead of feeding empty text to the env."""
 
     async def scenario():
@@ -111,9 +110,7 @@ def test_resolve_finished_outputs_maps_abort_finish_reason_to_completion_error()
             [
                 _request_output(
                     request_id="42",
-                    outputs=[
-                        _sample(token_ids=(99,), finish_reason="abort", text="")
-                    ],
+                    outputs=[_sample(token_ids=(99,), finish_reason="abort", text="")],
                 )
             ]
         )
