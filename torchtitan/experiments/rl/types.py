@@ -8,9 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 import torch
 from renderers import Message
+
+if TYPE_CHECKING:
+    from torchtitan.experiments.rl.observability.metrics import Metric
 
 
 class RolloutStatus(StrEnum):
@@ -162,6 +166,8 @@ class ReplaySample:
     behavior_version: int
     reward: float
     reward_components: dict[str, float] = field(default_factory=dict)
+    metrics: "tuple[Metric, ...]" = ()
+    """Typed metrics that should be emitted only if this sample is consumed."""
 
     def __post_init__(self) -> None:
         lengths = {

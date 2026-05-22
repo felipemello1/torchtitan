@@ -16,7 +16,14 @@ import torch
 from torchtitan.config import BatchConfig
 from torchtitan.experiments.rl.grpo import Batcher
 from torchtitan.experiments.rl.observability import metrics as m
-from torchtitan.experiments.rl.observability.metrics.rl import build_rollout_metrics
+from torchtitan.experiments.rl.observability.metrics.rl import (
+    _TrainStepTimings,
+    _WeightSyncTimings,
+    build_rollout_metrics,
+    build_train_step_metrics,
+    validate_train_step_fwd_bwd_metrics,
+)
+from torchtitan.experiments.rl.replay import ReplayBatch
 from torchtitan.experiments.rl.types import (
     ReplaySample,
     RolloutOutput,
@@ -122,6 +129,99 @@ def test_batcher_replay_sample_path_masks_advantage() -> None:
         "loss_mask": [0.0, 1.0, 1.0],
         "advantages": [0.0, 0.5, 0.5],
     }
+
+
+def _no_reduce_values(metrics: list[m.Metric]) -> dict[str, float]:
+    return {
+        metric.key: metric.value.value
+        for metric in metrics
+        if isinstance(metric.value, m.NoReduce)
+    }
+
+
+def test_train_step_metrics_validation_requires_health_metrics() -> None:
+    with pytest.raises(KeyError, match="ref_logprob_nonfinite_frac"):
+        validate_train_step_fwd_bwd_metrics(
+            {"health/loss/policy_logprob_nonfinite_frac": 0.0}
+        )
+
+
+def test_build_train_step_metrics_includes_replay_and_step_context() -> None:
+    samples = [
+        ReplaySample(
+            token_ids=[1, 2, 3],
+            loss_mask=[0, 1, 1],
+            ref_logprobs=[0.0, -0.1, -0.2],
+            advantage=0.5,
+            group_id="g0",
+            sample_idx=0,
+            behavior_version=4,
+            reward=1.0,
+            metrics=(m.Metric("sample/custom", m.NoReduce(9.0)),),
+        ),
+        ReplaySample(
+            token_ids=[4, 5],
+            loss_mask=[0, 1],
+            ref_logprobs=[0.0, -0.3],
+            advantage=-0.5,
+            group_id="g1",
+            sample_idx=0,
+            behavior_version=6,
+            reward=0.0,
+        ),
+    ]
+    replay_batch = ReplayBatch(
+        samples=samples,
+        metrics=[
+            m.Metric("replay/num_samples", m.NoReduce(2.0)),
+            m.Metric("replay/buffer/dropped_stale_samples", m.NoReduce(1.0)),
+        ],
+    )
+    timings = _TrainStepTimings(
+        step_s=2.0,
+        replay_wait_s=0.5,
+        rollout_s=0.25,
+        train_s=1.0,
+        checkpoint_s=0.1,
+        weight_sync=_WeightSyncTimings(
+            admission_drain_s=0.05,
+            push_s=0.06,
+            pull_s=0.07,
+            total_s=0.2,
+        ),
+    )
+
+    metrics = build_train_step_metrics(
+        samples=samples,
+        replay_batch=replay_batch,
+        rollouts=[_rollout(group_id="g0", sample_idx=0, reward=1.0)],
+        live_generation_metrics=[m.Metric("generator/live/queue", m.NoReduce(3.0))],
+        fwd_bwd_metrics={
+            "loss/mean": 1.5,
+            "health/loss/policy_logprob_nonfinite_frac": 0.0,
+            "health/loss/ref_logprob_nonfinite_frac": 0.0,
+        },
+        optimizer_metrics={"train/policy_version": 7.0},
+        packing_metrics={"packing/rows": 2.0},
+        checkpoint_saved=True,
+        timings=timings,
+        dropped_empty_groups=2,
+        dropped_zero_advantage_groups=1,
+        train_version=7,
+    )
+
+    values = _no_reduce_values(metrics)
+    assert values["replay/policy_version/train"] == 7.0
+    assert values["replay/policy_version/behavior_min"] == 4.0
+    assert values["replay/policy_version/behavior_max"] == 6.0
+    assert values["replay/buffer/stale_drop_rate"] == pytest.approx(1.0 / 3.0)
+    assert values["perf/tokens_per_second"] == pytest.approx(2.5)
+    assert values["trainer/idle_ratio"] == pytest.approx(0.25)
+    assert values["timing/weight_sync_overhead_ratio"] == pytest.approx(0.1)
+    assert values["checkpoint/saved"] == 1.0
+    assert values["sample/custom"] == 9.0
+    assert values["generator/live/queue"] == 3.0
+    assert values["loss/mean"] == 1.5
 
 
 class TestRLTrainerConfigWiring:

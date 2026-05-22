@@ -26,7 +26,7 @@ import logging
 import math
 import os
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 
 # must run before torch import
@@ -39,25 +39,42 @@ from monarch.spmd import setup_torch_elastic_env_async
 
 from torchtitan.components.dataloading.utils import pack
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
-from torchtitan.config import (
-    BatchConfig,
-    CompileConfig,
-    ConfigManager,
-    Configurable,
-    ParallelismConfig,
-)
+from torchtitan.config import BatchConfig, CompileConfig, ConfigManager, Configurable
 from torchtitan.experiments.rl.actors.generator import VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
-from torchtitan.experiments.rl.envs import EnvBuilder, EnvDataset, TokenEnvConfig
+from torchtitan.experiments.rl.config_derivation import (
+    AsyncPipelineConfig,
+    compute_generator_max_num_seqs,
+    compute_world_size,
+    derived_capacity,
+    DerivedRLConfig,
+)
+from torchtitan.experiments.rl.envs import (
+    EnvBuilder,
+    EnvDataset,
+    EnvExample,
+    TokenEnvConfig,
+)
 from torchtitan.experiments.rl.generation_scheduler import GenerationScheduler
 from torchtitan.experiments.rl.loss import DAPOLoss
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.observability.metrics.rl import (
+    _TrainStepTimings,
+    _WeightSyncTimings,
+    _zero_weight_sync_timings,
     build_rollout_metrics,
+    build_train_step_metrics,
     rename_metric_prefix,
+    REQUIRED_TRAIN_STEP_HEALTH_KEYS,
+    validate_train_step_fwd_bwd_metrics,
 )
 from torchtitan.experiments.rl.renderer import RendererConfig
-from torchtitan.experiments.rl.replay import rollouts_to_replay_samples
+from torchtitan.experiments.rl.replay import (
+    has_advantage_signal,
+    ReplayBatch,
+    ReplayBuffer,
+    rollouts_to_replay_samples,
+)
 from torchtitan.experiments.rl.rollout_logging import RolloutSampleLogger
 from torchtitan.experiments.rl.rollouts import run_rollout_group
 from torchtitan.experiments.rl.sampling import SamplingConfig, TrainingLogprobConfig
@@ -71,6 +88,7 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.model_spec import ModelSpec
 
 logger = logging.getLogger(__name__)
+_ZERO_ADVANTAGE_EPS = 1e-12
 
 
 class Provisioner:
@@ -130,6 +148,149 @@ def _log_samples(rollouts: list[RolloutOutput]) -> None:
         logger.info("       A: %s", text[:300].replace("\n", " ").strip())
 
 
+async def _raise_rollout_task_errors(
+    tasks: list[asyncio.Task[None]],
+    *,
+    timeout_s: float = 0.0,
+) -> None:
+    """Raise the first background rollout producer exception, if any."""
+    if timeout_s > 0.0:
+        await asyncio.wait(
+            tasks,
+            timeout=timeout_s,
+            return_when=asyncio.FIRST_EXCEPTION,
+        )
+    else:
+        await asyncio.sleep(0)
+
+    for task in tasks:
+        if task.done() and not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                raise exc
+
+
+@dataclass(slots=True)
+class _RolloutDropStats:
+    """Rollout drops accumulated between optimizer steps."""
+
+    empty_groups: int
+    zero_advantage_groups: int
+    metrics: list[m.Metric]
+
+
+@dataclass(slots=True)
+class _RolloutDropCounters:
+    """Producer-side rollout drops accumulated between optimizer steps."""
+
+    max_no_signal_groups: int | None
+    empty_groups: int = 0
+    zero_advantage_groups: int = 0
+    consecutive_dropped_groups: int = 0
+    consecutive_empty_groups: int = 0
+    consecutive_zero_advantage_groups: int = 0
+    zero_advantage_rewards: list[float] = field(default_factory=list)
+
+    def pop(self) -> _RolloutDropStats:
+        metrics: list[m.Metric] = []
+        if self.zero_advantage_rewards:
+            metrics.append(
+                m.Metric(
+                    "rollout/dropped_zero_advantage_reward",
+                    m.SummaryStats.from_list(self.zero_advantage_rewards),
+                )
+            )
+        values = _RolloutDropStats(
+            empty_groups=self.empty_groups,
+            zero_advantage_groups=self.zero_advantage_groups,
+            metrics=metrics,
+        )
+        self.empty_groups = 0
+        self.zero_advantage_groups = 0
+        self.zero_advantage_rewards.clear()
+        return values
+
+    def record_empty(self) -> None:
+        self.empty_groups += 1
+        self.consecutive_empty_groups += 1
+        self._record_drop()
+
+    def record_zero_advantage(self, rewards: list[float]) -> None:
+        self.zero_advantage_groups += 1
+        self.consecutive_zero_advantage_groups += 1
+        self.zero_advantage_rewards.extend(rewards)
+        self._record_drop()
+
+    def record_admitted(self) -> None:
+        self.consecutive_dropped_groups = 0
+        self.consecutive_empty_groups = 0
+        self.consecutive_zero_advantage_groups = 0
+
+    def _record_drop(self) -> None:
+        self.consecutive_dropped_groups += 1
+        if (
+            self.max_no_signal_groups is not None
+            and self.consecutive_dropped_groups >= self.max_no_signal_groups
+        ):
+            raise RuntimeError(
+                "no trainable rollout groups admitted after "
+                f"{self.consecutive_dropped_groups} consecutive drops "
+                f"({self.consecutive_empty_groups} empty, "
+                f"{self.consecutive_zero_advantage_groups} zero-advantage)"
+            )
+
+
+def _build_train_step_trace_scalars(
+    *,
+    samples: list[ReplaySample],
+    replay_batch: ReplayBatch,
+    fwd_bwd_metrics: dict[str, float],
+    optimizer_metrics: dict[str, float],
+    checkpoint_saved: bool,
+    timings: _TrainStepTimings,
+    dropped_empty_groups: int,
+    dropped_zero_advantage_groups: int,
+    train_version: int,
+) -> dict[str, float]:
+    """Build structured-logger scalars for one train step."""
+    validate_train_step_fwd_bwd_metrics(fwd_bwd_metrics)
+    behavior_versions = [sample.behavior_version for sample in samples]
+    buffer_depth_samples = 0.0
+    dropped_stale_samples = 0.0
+    for metric in replay_batch.metrics:
+        if metric.key == "replay/buffer/depth_samples_post_pull":
+            buffer_depth_samples = float(metric.value.value)
+        elif metric.key == "replay/buffer/dropped_stale_samples":
+            dropped_stale_samples = float(metric.value.value)
+
+    trace_scalars = {
+        "replay.buffer_depth_samples": buffer_depth_samples,
+        "replay.dropped_stale_samples": dropped_stale_samples,
+        "rollout.dropped_empty_groups": dropped_empty_groups,
+        "rollout.dropped_zero_advantage_groups": dropped_zero_advantage_groups,
+        "replay.train_version": train_version,
+        "replay.behavior_version_min": (
+            min(behavior_versions) if behavior_versions else 0
+        ),
+        "replay.behavior_version_max": (
+            max(behavior_versions) if behavior_versions else 0
+        ),
+        "timing.replay_wait_ms": timings.replay_wait_s * 1000,
+        "timing.weight_sync_admission_drain_ms": (
+            timings.weight_sync.admission_drain_s * 1000
+        ),
+        "timing.weight_sync_push_ms": timings.weight_sync.push_s * 1000,
+        "timing.weight_sync_pull_ms": timings.weight_sync.pull_s * 1000,
+        "timing.checkpoint_ms": timings.checkpoint_s * 1000,
+        "checkpoint.saved": float(checkpoint_saved),
+    }
+    for key in REQUIRED_TRAIN_STEP_HEALTH_KEYS:
+        trace_scalars[key.replace("/", ".")] = fwd_bwd_metrics[key]
+    key = "health/train/skipped_nonfinite_loss"
+    trace_scalars[key.replace("/", ".")] = optimizer_metrics.get(key, 0.0)
+    return trace_scalars
+
+
 class Batcher(Configurable):
     """Packs training samples into ``[B, seq_len]`` batches for the trainer.
 
@@ -144,9 +305,19 @@ class Batcher(Configurable):
     class Config(Configurable.Config):
         batch: BatchConfig = field(default_factory=BatchConfig)
 
-    def __init__(self, config: Config, *, pad_id: int):
+    def __init__(
+        self,
+        config: Config,
+        *,
+        pad_id: int,
+        global_batch_size: int | None = None,
+    ):
         self.local_batch_size = config.batch.local_batch_size
-        self.global_batch_size = config.batch.global_batch_size
+        self.global_batch_size = (
+            global_batch_size
+            if global_batch_size is not None
+            else config.batch.global_batch_size
+        )
         self.seq_len = config.batch.seq_len
         self.pad_id = pad_id
 
@@ -297,10 +468,7 @@ class RLTrainer(Configurable):
         """Root output folder for RL artifacts (temp weights, logs, etc.)."""
 
         num_prompts_per_step: int = 5
-        """Number of distinct prompts (= GRPO groups) drawn per training step.
-
-        The total rollouts per wave is `num_prompts_per_step * group_size`.
-        """
+        """Number of prompt groups per dataset sample step."""
 
         group_size: int = 8
         """Number of sampled completions per prompt group."""
@@ -349,6 +517,18 @@ class RLTrainer(Configurable):
         generator: VLLMGenerator.Config = field(default_factory=VLLMGenerator.Config)
         """VLLMGenerator actor configuration (vLLM engine, sampling)."""
 
+        max_offpolicy_steps: int = 1
+        """Drop replay samples older than this many policy-version steps."""
+
+        async_pipeline: AsyncPipelineConfig = field(default_factory=AsyncPipelineConfig)
+        """Capacity overrides for async rollout producers and replay."""
+
+        drop_zero_advantage_groups: bool = True
+        """Drop rollout groups whose normalized advantages are all zero."""
+
+        max_no_signal_groups: int | None = 100
+        """Fail after this many consecutive empty or zero-advantage groups."""
+
         metrics: m.MetricsProcessor.Config = field(
             default_factory=m.MetricsProcessor.Config
         )
@@ -393,7 +573,64 @@ class RLTrainer(Configurable):
                     "max_rollout_sample_groups must be non-negative, "
                     f"got {self.max_rollout_sample_groups}"
                 )
+            if self.num_prompts_per_step <= 0:
+                raise ValueError(
+                    "num_prompts_per_step must be positive, "
+                    f"got {self.num_prompts_per_step}"
+                )
+            if self.num_validation_samples <= 0:
+                raise ValueError(
+                    "num_validation_samples must be positive, "
+                    f"got {self.num_validation_samples}"
+                )
+            if self.max_offpolicy_steps < 0:
+                raise ValueError(
+                    "max_offpolicy_steps must be non-negative, "
+                    f"got {self.max_offpolicy_steps}"
+                )
+            if self.max_no_signal_groups is not None and self.max_no_signal_groups <= 0:
+                raise ValueError(
+                    "max_no_signal_groups must be positive or None, "
+                    f"got {self.max_no_signal_groups}"
+                )
+            pipeline = self.async_pipeline
+            if pipeline.num_generator_instances != 1:
+                raise ValueError(
+                    "this trainer supports exactly one generator instance; got "
+                    f"{pipeline.num_generator_instances}"
+                )
+            if (
+                pipeline.rollout_concurrency is not None
+                and pipeline.rollout_concurrency <= 0
+            ):
+                raise ValueError(
+                    "async_pipeline.rollout_concurrency must be positive "
+                    f"or None, got {pipeline.rollout_concurrency}"
+                )
+            if (
+                pipeline.replay_buffer_samples is not None
+                and pipeline.replay_buffer_samples <= 0
+            ):
+                raise ValueError(
+                    "async_pipeline.replay_buffer_samples must be positive "
+                    f"or None, got {pipeline.replay_buffer_samples}"
+                )
+            if (
+                pipeline.max_admitted_generation_prompts is not None
+                and pipeline.max_admitted_generation_prompts <= 0
+            ):
+                raise ValueError(
+                    "async_pipeline.max_admitted_generation_prompts must be "
+                    "positive or None, got "
+                    f"{pipeline.max_admitted_generation_prompts}"
+                )
             TrainingLogprobConfig.from_sampling(self.generator.sampling)
+            _ = self.derived
+
+        @property
+        def derived(self) -> DerivedRLConfig:
+            """Resolved async replay capacity view."""
+            return derived_capacity(self)
 
     def __init__(self, config: Config):
         self.config = config
@@ -419,7 +656,11 @@ class RLTrainer(Configurable):
         self.renderer = config.renderer.build(model_path=config.hf_assets_path)
         self._stop_token_ids = list(self.renderer.get_stop_token_ids())
         tokenizer = HuggingFaceTokenizer(tokenizer_path=config.hf_assets_path)
-        self.batcher = Batcher(config.batcher, pad_id=tokenizer.eos_id)
+        self.batcher = Batcher(
+            config.batcher,
+            pad_id=tokenizer.eos_id,
+            global_batch_size=config.derived.global_batch_rows,
+        )
 
     async def close(self):
         """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
@@ -462,18 +703,6 @@ class RLTrainer(Configurable):
             kwargs["gpus"] = 0
         return result.item(**kwargs)
 
-    @staticmethod
-    def _compute_world_size(p: ParallelismConfig) -> int:
-        """Compute world size from all parallel dimensions."""
-        dp_shard = max(p.data_parallel_shard_degree, 1)
-        return (
-            p.data_parallel_replicate_degree
-            * dp_shard
-            * p.tensor_parallel_degree
-            * p.pipeline_parallel_degree
-            * p.context_parallel_degree
-        )
-
     @sl.log_trace_span("setup_async")
     async def setup_async(
         self,
@@ -508,10 +737,8 @@ class RLTrainer(Configurable):
         """
         config = self.config
 
-        self.trainer_world_size = self._compute_world_size(config.trainer.parallelism)
-        self.generator_world_size = self._compute_world_size(
-            config.generator.parallelism
-        )
+        self.trainer_world_size = compute_world_size(config.trainer.parallelism)
+        self.generator_world_size = compute_world_size(config.generator.parallelism)
         trainer_parallelism = config.trainer.parallelism
         dp_shard = max(trainer_parallelism.data_parallel_shard_degree, 1)
         self.trainer_dp_degree = (
@@ -613,10 +840,7 @@ class RLTrainer(Configurable):
                 model_spec=config.model_spec,
                 model_path=config.hf_assets_path,
                 compile_config=config.compile,
-                max_num_seqs=max(
-                    config.num_prompts_per_step * config.group_size,
-                    config.num_validation_samples,
-                ),
+                max_num_seqs=compute_generator_max_num_seqs(config),
                 output_dir=config.dump_folder,
             )
 
@@ -631,9 +855,9 @@ class RLTrainer(Configurable):
 
         # Initial weight sync from trainer to generator
         with sl.log_trace_span("trainer_push_model_state_dict"):
-            self.trainer.push_model_state_dict.call().get()
+            await self._await_call(self.trainer.push_model_state_dict.call())
         with sl.log_trace_span("generator_pull_model_state_dict"):
-            self.generator.pull_model_state_dict.call(0).get()
+            await self._await_call(self.generator.pull_model_state_dict.call(0))
 
     @staticmethod
     async def _await_call(actor_call):
@@ -673,14 +897,17 @@ class RLTrainer(Configurable):
             )
             return completions, metrics
 
-        return GenerationScheduler(generate_batch)
+        return GenerationScheduler(
+            generate_batch,
+            max_admitted_prompts=self.config.derived.max_admitted_generation_prompts,
+        )
 
     async def _sync_generator_weights(
         self,
         *,
         generation_scheduler: GenerationScheduler,
         policy_version: int,
-    ) -> dict[str, float]:
+    ) -> _WeightSyncTimings:
         t_weight_sync_start = time.perf_counter()
         with sl.log_trace_span("weight_sync_admission_drain"):
             await generation_scheduler.pause_for_weight_sync()
@@ -691,105 +918,265 @@ class RLTrainer(Configurable):
             with sl.log_trace_span("trainer_push_model_state_dict"):
                 await self._await_call(self.trainer.push_model_state_dict.call())
             t_weight_sync_push_s = time.perf_counter() - t_push_start
+            t_pull_start = time.perf_counter()
             with sl.log_trace_span("generator_pull_model_state_dict"):
                 await self._await_call(
                     self.generator.pull_model_state_dict.call(policy_version)
                 )
+            t_weight_sync_pull_s = time.perf_counter() - t_pull_start
         finally:
             await generation_scheduler.resume_after_weight_sync()
 
+        return _WeightSyncTimings(
+            admission_drain_s=t_weight_sync_drain_s,
+            push_s=t_weight_sync_push_s,
+            pull_s=t_weight_sync_pull_s,
+            total_s=time.perf_counter() - t_weight_sync_start,
+        )
+
+    @staticmethod
+    def _forward_backward_skip_metrics(
+        fwd_bwd_metrics: dict[str, float],
+        *,
+        policy_version: int,
+    ) -> dict[str, float] | None:
+        """Return optimizer metrics for a forward/backward result to skip."""
+        validate_train_step_fwd_bwd_metrics(fwd_bwd_metrics)
+        if math.isfinite(fwd_bwd_metrics.get("loss/mean", float("nan"))):
+            return None
         return {
-            "timing/weight_sync/drain": t_weight_sync_drain_s,
-            "timing/weight_sync/push": t_weight_sync_push_s,
-            "timing/weight_sync/total": time.perf_counter() - t_weight_sync_start,
+            "train/policy_version": float(policy_version),
+            "health/train/skipped_nonfinite_loss": 1.0,
         }
 
-    @sl.log_trace_span("_collect_rollouts")
-    async def _collect_rollouts(
+    def _log_train_step(
         self,
-        num_groups: int,
+        *,
         step: int,
-        group_offset: int,
+        samples: list[ReplaySample],
+        replay_batch: ReplayBatch,
+        rollouts: list[RolloutOutput],
         generation_scheduler: GenerationScheduler,
-    ) -> tuple[list[RolloutOutput], list[m.Metric]]:
-        """Collect rollout groups through the token-env driver."""
-        sampling = self._sampling_for_rollout(self.config.generator.sampling)
+        fwd_bwd_metrics: dict[str, float],
+        optimizer_metrics: dict[str, float],
+        packing_metrics: dict[str, float],
+        checkpoint_saved: bool,
+        timings: _TrainStepTimings,
+        dropped_empty_groups: int,
+        dropped_zero_advantage_groups: int,
+        drop_metrics: list[m.Metric],
+        train_version: int,
+    ) -> None:
+        """Build, trace, and emit train-step metrics."""
+        live_generation_metrics = [
+            rename_metric_prefix(
+                [metric],
+                old_prefix="generator",
+                new_prefix="generator/live",
+            )[0]
+            for metric in generation_scheduler.pop_metrics()
+        ]
+        step_metrics = build_train_step_metrics(
+            samples=samples,
+            replay_batch=replay_batch,
+            rollouts=rollouts,
+            live_generation_metrics=live_generation_metrics,
+            fwd_bwd_metrics=fwd_bwd_metrics,
+            optimizer_metrics=optimizer_metrics,
+            packing_metrics=packing_metrics,
+            checkpoint_saved=checkpoint_saved,
+            timings=timings,
+            dropped_empty_groups=dropped_empty_groups,
+            dropped_zero_advantage_groups=dropped_zero_advantage_groups,
+            drop_metrics=drop_metrics,
+            train_version=train_version,
+        )
+        sl.log_trace_scalar(
+            _build_train_step_trace_scalars(
+                samples=samples,
+                replay_batch=replay_batch,
+                fwd_bwd_metrics=fwd_bwd_metrics,
+                optimizer_metrics=optimizer_metrics,
+                checkpoint_saved=checkpoint_saved,
+                timings=timings,
+                dropped_empty_groups=dropped_empty_groups,
+                dropped_zero_advantage_groups=dropped_zero_advantage_groups,
+                train_version=train_version,
+            )
+        )
+        self.metrics_processor.log(
+            step=step,
+            metrics=step_metrics,
+            is_validation=False,
+        )
 
-        rollouts: list[RolloutOutput] = []
+    async def _collect_finite_rollouts(
+        self,
+        *,
+        env_dataset: EnvDataset,
+        env_builder: EnvBuilder,
+        num_groups: int,
+        group_size: int,
+        sample_step: int,
+        sampling: SamplingConfig,
+        metrics_prefix: str,
+    ) -> tuple[list[RolloutOutput], list[m.Metric]]:
+        """Collect a bounded set of rollout groups."""
+        sampling = self._sampling_for_rollout(sampling)
+        generation_scheduler = self._make_generation_scheduler(
+            metrics_prefix=metrics_prefix,
+        )
         token_env_config = TokenEnvConfig(
             max_trajectory_tokens=self.config.batcher.batch.seq_len,
             max_generation_tokens=sampling.max_tokens,
         )
-        for idx in range(num_groups):
-            example = self.train_dataset.sample_group(
-                sample_step=step,
-                group_idx=group_offset + idx,
-            )
-            rollouts.extend(
-                await run_rollout_group(
-                    env_builder=self.train_env_builder,
-                    example=example,
-                    group_size=self.config.group_size,
-                    renderer=self.renderer,
-                    completion_fn=generation_scheduler.submit,
-                    sampling=sampling,
-                    max_turns=self.config.max_rollout_turns,
-                    token_env_config=token_env_config,
-                )
-            )
+        examples = [
+            env_dataset.sample_group(sample_step=sample_step, group_idx=idx)
+            for idx in range(num_groups)
+        ]
+        pending: set[asyncio.Task[list[RolloutOutput]]] = set()
+        rollouts: list[RolloutOutput] = []
+        next_idx = 0
+        max_inflight = max(self.config.derived.rollout_concurrency, 1)
 
-        return rollouts, build_rollout_metrics(
+        try:
+            while next_idx < len(examples) or pending:
+                while next_idx < len(examples) and len(pending) < max_inflight:
+                    example = examples[next_idx]
+                    pending.add(
+                        asyncio.create_task(
+                            run_rollout_group(
+                                env_builder=env_builder,
+                                example=example,
+                                group_size=group_size,
+                                renderer=self.renderer,
+                                completion_fn=generation_scheduler.submit,
+                                sampling=sampling,
+                                max_turns=self.config.max_rollout_turns,
+                                token_env_config=token_env_config,
+                            )
+                        )
+                    )
+                    next_idx += 1
+
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    rollouts.extend(task.result())
+        except BaseException:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            raise
+        finally:
+            await generation_scheduler.close()
+
+        metrics = build_rollout_metrics(
             "rollout",
             rollouts,
             generation_scheduler.pop_metrics(),
         )
+        return rollouts, metrics
 
-    @sl.log_trace_span("validate")
-    async def validate(self) -> list[m.Metric]:
-        """Run validation on held-out prompts using greedy sampling.
-
-        TODO: investigate using pass@k.
-        """
-        t_validate_start = time.perf_counter()
-        num_samples = self.config.num_validation_samples
-        greedy = self._sampling_for_rollout(
-            SamplingConfig(
-                temperature=0.0,
-                top_p=1.0,
-                max_tokens=self.config.generator.sampling.max_tokens,
-            )
-        )
-        generation_scheduler = self._make_generation_scheduler(
-            metrics_prefix="validation_generator"
-        )
-
-        rollouts: list[RolloutOutput] = []
+    async def _continuous_rollouts(
+        self,
+        *,
+        worker_idx: int,
+        replay_buffer: ReplayBuffer,
+        generation_scheduler: GenerationScheduler,
+        drop_counters: _RolloutDropCounters,
+        producer_rollouts: dict[tuple[str, int], RolloutOutput],
+        shutdown: asyncio.Event,
+        next_example: Callable[[], Awaitable[EnvExample]],
+    ) -> None:
+        """Produce rollout groups until training finishes or a producer fails."""
+        sampling = self._sampling_for_rollout(self.config.generator.sampling)
         token_env_config = TokenEnvConfig(
             max_trajectory_tokens=self.config.batcher.batch.seq_len,
-            max_generation_tokens=greedy.max_tokens,
+            max_generation_tokens=sampling.max_tokens,
         )
         try:
-            for idx in range(num_samples):
-                example = self.validation_dataset.sample_group(
-                    sample_step=0,
-                    group_idx=idx,
-                )
-                rollouts.extend(
-                    await run_rollout_group(
-                        env_builder=self.validation_env_builder,
+            while not shutdown.is_set():
+                example = await next_example()
+                with sl.log_trace_span("rollout_group"):
+                    group_rollouts = await run_rollout_group(
+                        env_builder=self.train_env_builder,
                         example=example,
-                        group_size=1,
+                        group_size=self.config.group_size,
                         renderer=self.renderer,
                         completion_fn=generation_scheduler.submit,
-                        sampling=greedy,
+                        sampling=sampling,
                         max_turns=self.config.max_rollout_turns,
                         token_env_config=token_env_config,
                     )
-                )
-        finally:
-            await generation_scheduler.close()
 
-        generation_metrics = generation_scheduler.pop_metrics()
+                if self.rollout_sample_logger is not None:
+                    self.rollout_sample_logger.write(
+                        step=example.sample_step,
+                        phase="train_rollout",
+                        rollouts=group_rollouts,
+                    )
+
+                samples = rollouts_to_replay_samples(group_rollouts)
+                if shutdown.is_set():
+                    return
+                if not samples:
+                    drop_counters.record_empty()
+                    sl.log_trace_scalar({"rollout.dropped_empty_groups": 1})
+                    continue
+                if self.config.drop_zero_advantage_groups and not has_advantage_signal(
+                    samples, eps=_ZERO_ADVANTAGE_EPS
+                ):
+                    rewards = [
+                        float(rollout.reward)
+                        for rollout in group_rollouts
+                        if rollout.reward is not None
+                    ]
+                    drop_counters.record_zero_advantage(rewards)
+                    sl.log_trace_scalar({"rollout.dropped_zero_advantage_groups": 1})
+                    continue
+
+                drop_counters.record_admitted()
+                for rollout in group_rollouts:
+                    producer_rollouts[(rollout.group_id, rollout.sample_idx)] = rollout
+                with sl.log_trace_span("replay_buffer_put"):
+                    await replay_buffer.put(samples)
+        except asyncio.CancelledError:
+            raise
+        except RuntimeError:
+            if shutdown.is_set():
+                return
+            shutdown.set()
+            await replay_buffer.close()
+            logger.exception("rollout producer %d failed", worker_idx)
+            raise
+        except BaseException:
+            shutdown.set()
+            await replay_buffer.close()
+            logger.exception("rollout producer %d failed", worker_idx)
+            raise
+
+    @sl.log_trace_span("validate")
+    async def validate(self) -> list[m.Metric]:
+        """Run validation on held-out prompts using greedy sampling."""
+        t_validate_start = time.perf_counter()
+        greedy = SamplingConfig(
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=self.config.generator.sampling.max_tokens,
+        )
+        rollouts, validation_metrics = await self._collect_finite_rollouts(
+            env_dataset=self.validation_dataset,
+            env_builder=self.validation_env_builder,
+            num_groups=self.config.num_validation_samples,
+            group_size=1,
+            sample_step=0,
+            sampling=greedy,
+            metrics_prefix="validation_generator",
+        )
+
         if self.config.log_samples:
             _log_samples(rollouts)
         if self.rollout_sample_logger is not None:
@@ -799,31 +1186,30 @@ class RLTrainer(Configurable):
                 rollouts=rollouts,
             )
 
-        validation_metrics = build_rollout_metrics(
-            "validation/rollout",
-            rollouts,
-            generation_metrics,
+        validation_metrics = rename_metric_prefix(
+            validation_metrics,
+            old_prefix="rollout",
+            new_prefix="validation/rollout",
         )
         validation_metrics = rename_metric_prefix(
             validation_metrics,
             old_prefix="reward",
             new_prefix="validation/reward",
         )
+        t_validate_s = time.perf_counter() - t_validate_start
         validation_metrics += [
             m.Metric("validation/num_samples", m.NoReduce(float(len(rollouts)))),
+            m.Metric("timing/validate", m.NoReduce(t_validate_s)),
         ]
-
-        t_validate_s = time.perf_counter() - t_validate_start
-        validation_metrics.append(m.Metric("timing/validate", m.NoReduce(t_validate_s)))
         return validation_metrics
 
     async def train(self):
         num_steps = self.config.num_steps
-        num_groups = self.config.num_prompts_per_step
+        logprob_config = TrainingLogprobConfig.from_sampling(
+            self.config.generator.sampling
+        )
         logger.info(f"Pre-training validation; then {num_steps} steps of RL training")
 
-        # collect validation metrics before training
-        # so we can compare before/after
         pre_validation_metrics = await self.validate()
         self.metrics_processor.log(
             step=0,
@@ -836,77 +1222,92 @@ class RLTrainer(Configurable):
 
         sl.log_trace_instant("training_start")
 
+        derived = self.config.derived
+        replay_buffer = ReplayBuffer(
+            max_samples=max(derived.replay_buffer_samples, 1),
+            max_age_steps=self.config.max_offpolicy_steps,
+        )
         generation_scheduler = self._make_generation_scheduler(
             metrics_prefix="generator"
         )
+        drop_counters = _RolloutDropCounters(
+            max_no_signal_groups=self.config.max_no_signal_groups,
+        )
+        producer_rollouts: dict[tuple[str, int], RolloutOutput] = {}
+        shutdown = asyncio.Event()
+        next_group_idx = 0
+        next_group_lock = asyncio.Lock()
+
+        async def next_example() -> EnvExample:
+            nonlocal next_group_idx
+            async with next_group_lock:
+                absolute_group_idx = next_group_idx
+                next_group_idx += 1
+            sample_step, group_idx = divmod(
+                absolute_group_idx,
+                max(self.config.num_prompts_per_step, 1),
+            )
+            return self.train_dataset.sample_group(
+                sample_step=sample_step,
+                group_idx=group_idx,
+            )
+
+        rollout_tasks = [
+            asyncio.create_task(
+                self._continuous_rollouts(
+                    worker_idx=worker_idx,
+                    replay_buffer=replay_buffer,
+                    generation_scheduler=generation_scheduler,
+                    drop_counters=drop_counters,
+                    producer_rollouts=producer_rollouts,
+                    shutdown=shutdown,
+                    next_example=next_example,
+                )
+            )
+            for worker_idx in range(max(derived.rollout_concurrency, 1))
+        ]
+
+        policy_version = 0
         try:
             for step in range(1, num_steps + 1):
                 sl.set_step(step)
-                # Propagate the step counter to actors for structured logging.
-                self.trainer.sync_log_step.call(step)
-                self.generator.sync_log_step.call(step)
-                # Cancellation point for Ctrl-C (KeyboardInterrupt) handling.
-                # This yields to the event loop to check for cancellation, which
-                # doesn't happen with `.get` calls.
-                # TODO: investigate replacing `.get()` with `await
-                await asyncio.sleep(0)
+                await self._await_call(self.trainer.sync_log_step.call(step))
+                await self._await_call(self.generator.sync_log_step.call(step))
 
                 t_step_start = time.perf_counter()
+                t_replay_start = time.perf_counter()
+                train_version = policy_version
+                with sl.log_trace_span("replay_buffer_get_batch"):
+                    replay_batch = await replay_buffer.get_batch(
+                        min_loss_tokens=self.batcher.num_tokens_target,
+                        train_version=train_version,
+                    )
+                t_replay_wait_s = time.perf_counter() - t_replay_start
+                await _raise_rollout_task_errors(rollout_tasks)
 
-                # --- rollouts ---
-                # Collect rollouts until total response tokens reach the
-                # token budget. The Batcher then packs, truncates to
-                # global_batch_size rows, and splits into microbatches.
-                t_rollout_start = time.perf_counter()
+                drop_stats = drop_counters.pop()
+                samples = replay_batch.samples
                 rollouts: list[RolloutOutput] = []
-                rollout_metrics: list[m.Metric] = []
-                samples: list[ReplaySample] = []
-                collected_tokens = 0
-                group_offset = 0
-                while collected_tokens < self.batcher.num_tokens_target:
-                    new_rollouts, new_metrics = await self._collect_rollouts(
-                        num_groups,
-                        step=step,
-                        group_offset=group_offset,
-                        generation_scheduler=generation_scheduler,
-                    )
-                    new_samples = rollouts_to_replay_samples(new_rollouts)
-                    if not new_samples:
-                        raise RuntimeError(
-                            "rollout wave produced no trainable replay samples"
-                        )
-                    rollouts.extend(new_rollouts)
-                    samples.extend(new_samples)
-                    rollout_metrics.extend(new_metrics)
-                    collected_tokens += sum(
-                        sample.num_loss_tokens for sample in new_samples
-                    )
-                    group_offset += num_groups
-
-                if self.rollout_sample_logger is not None:
-                    self.rollout_sample_logger.write(
-                        step=step,
-                        phase="train",
-                        rollouts=rollouts,
-                    )
-                sample_metrics: list[m.Metric] = [
-                    m.Metric(
-                        "advantage",
-                        m.SummaryStats.from_list(
-                            [
-                                sample.advantage
-                                for sample in samples
-                                for _ in range(sample.num_loss_tokens)
-                            ]
-                        ),
-                    )
-                ]
-                t_rollout_s = time.perf_counter() - t_rollout_start
-
+                rollout_keys: set[tuple[str, int]] = set()
+                for sample in samples:
+                    key = (sample.group_id, sample.sample_idx)
+                    if key not in rollout_keys and key in producer_rollouts:
+                        rollouts.append(producer_rollouts[key])
+                    rollout_keys.add(key)
+                dropped_keys = {
+                    (sample.group_id, sample.sample_idx)
+                    for sample in replay_batch.dropped_samples
+                }
+                for key in rollout_keys | dropped_keys:
+                    producer_rollouts.pop(key, None)
                 if self.config.log_samples:
                     _log_samples(rollouts)
+                if not samples:
+                    await _raise_rollout_task_errors(rollout_tasks, timeout_s=1.0)
+                    raise RuntimeError(
+                        "replay buffer closed before producing trainable samples"
+                    )
 
-                # --- train ---
                 t_train_start = time.perf_counter()
                 with sl.log_trace_span("batcher_batch"):
                     (
@@ -916,74 +1317,107 @@ class RLTrainer(Configurable):
                     ) = self.batcher.batch(samples, dp_degree=self.trainer_dp_degree)
 
                 with sl.log_trace_span("trainer_forward_backward_call"):
-                    fwd_bwd_metrics = self._get_rank_0_value(
+                    fwd_bwd_metrics = await self._await_rank_0(
                         self.trainer.forward_backward.call(
                             microbatches,
                             num_global_valid_tokens=num_global_valid_tokens,
-                            logprob_config=TrainingLogprobConfig.from_sampling(
-                                self.config.generator.sampling
-                            ),
-                        ).get()
+                            logprob_config=logprob_config,
+                        )
                     )
+                skip_metrics = self._forward_backward_skip_metrics(
+                    fwd_bwd_metrics,
+                    policy_version=policy_version,
+                )
+                if skip_metrics is not None:
+                    t_train_s = time.perf_counter() - t_train_start
+                    t_step_s = time.perf_counter() - t_step_start
+                    logger.warning(
+                        "Step %d skipped optimizer step because loss was not finite",
+                        step,
+                    )
+                    self._log_train_step(
+                        step=step,
+                        samples=samples,
+                        replay_batch=replay_batch,
+                        rollouts=rollouts,
+                        generation_scheduler=generation_scheduler,
+                        fwd_bwd_metrics=fwd_bwd_metrics,
+                        optimizer_metrics=skip_metrics,
+                        packing_metrics=packing_metrics,
+                        checkpoint_saved=False,
+                        timings=_TrainStepTimings(
+                            step_s=t_step_s,
+                            replay_wait_s=t_replay_wait_s,
+                            rollout_s=t_replay_wait_s,
+                            train_s=t_train_s,
+                            checkpoint_s=0.0,
+                            weight_sync=_zero_weight_sync_timings(),
+                        ),
+                        dropped_empty_groups=drop_stats.empty_groups,
+                        dropped_zero_advantage_groups=drop_stats.zero_advantage_groups,
+                        drop_metrics=drop_stats.metrics,
+                        train_version=train_version,
+                    )
+                    continue
+
                 with sl.log_trace_span("trainer_optim_step_call"):
-                    optim_output = self._get_rank_0_value(
-                        self.trainer.optim_step.call().get()
+                    optim_output = await self._await_rank_0(
+                        self.trainer.optim_step.call()
                     )
                 trainer_policy_version = optim_output.policy_version
-                optimizer_metrics = optim_output.metrics
+                optimizer_metrics = {
+                    **optim_output.metrics,
+                    "health/train/skipped_nonfinite_loss": 0.0,
+                }
                 t_train_s = time.perf_counter() - t_train_start
 
-                # --- weight sync ---
-                weight_sync_metrics = await self._sync_generator_weights(
+                weight_sync_timings = await self._sync_generator_weights(
                     generation_scheduler=generation_scheduler,
                     policy_version=trainer_policy_version,
                 )
-                t_step_s = time.perf_counter() - t_step_start
-                # --- divergence check before any logging ---
-                if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
-                    logger.error("Loss is NaN/Inf; training diverged")
-                    break
+                policy_version = trainer_policy_version
 
-                # --- Prepare metrics ---
-                total_tokens = sum(len(sample.token_ids) for sample in samples)
-
-                step_metrics: list[m.Metric] = []
-
-                step_metrics += rollout_metrics
-                step_metrics += sample_metrics
-
-                # Actor metrics are already globally reduced; NoReduce passes them through.
-                step_metrics += [
-                    m.Metric(k, m.NoReduce(v)) for k, v in fwd_bwd_metrics.items()
-                ]
-                step_metrics += [
-                    m.Metric(k, m.NoReduce(v)) for k, v in optimizer_metrics.items()
-                ]
-                step_metrics += [
-                    m.Metric(k, m.NoReduce(v)) for k, v in packing_metrics.items()
-                ]
-
-                # timing metrics
-                for key, value in [
-                    ("timing/step", t_step_s),
-                    ("timing/rollout", t_rollout_s),
-                    ("timing/train", t_train_s),
-                    *weight_sync_metrics.items(),
-                ]:
-                    step_metrics.append(m.Metric(key, m.NoReduce(value)))
-
-                step_metrics.append(
-                    m.Metric(
-                        "perf/tokens_per_second",
-                        m.NoReduce(total_tokens / t_step_s),
+                t_checkpoint_start = time.perf_counter()
+                with sl.log_trace_span("trainer_save_checkpoint_call"):
+                    checkpoint_saved = await self._await_rank_0(
+                        self.trainer.save_checkpoint.call(
+                            step,
+                            last_step=step == num_steps,
+                        )
                     )
-                )
+                t_checkpoint_s = time.perf_counter() - t_checkpoint_start
+                t_step_s = time.perf_counter() - t_step_start
 
-                self.metrics_processor.log(
-                    step=step, metrics=step_metrics, is_validation=False
+                self._log_train_step(
+                    step=step,
+                    samples=samples,
+                    replay_batch=replay_batch,
+                    rollouts=rollouts,
+                    generation_scheduler=generation_scheduler,
+                    fwd_bwd_metrics=fwd_bwd_metrics,
+                    optimizer_metrics=optimizer_metrics,
+                    packing_metrics=packing_metrics,
+                    checkpoint_saved=checkpoint_saved,
+                    timings=_TrainStepTimings(
+                        step_s=t_step_s,
+                        replay_wait_s=t_replay_wait_s,
+                        rollout_s=t_replay_wait_s,
+                        train_s=t_train_s,
+                        checkpoint_s=t_checkpoint_s,
+                        weight_sync=weight_sync_timings,
+                    ),
+                    dropped_empty_groups=drop_stats.empty_groups,
+                    dropped_zero_advantage_groups=drop_stats.zero_advantage_groups,
+                    drop_metrics=drop_stats.metrics,
+                    train_version=train_version,
                 )
         finally:
+            shutdown.set()
+            await replay_buffer.close()
+            for task in rollout_tasks:
+                task.cancel()
             await generation_scheduler.close()
+            await asyncio.gather(*rollout_tasks, return_exceptions=True)
 
         post_validation_metrics = await self.validate()
         self.metrics_processor.log(
@@ -995,8 +1429,6 @@ class RLTrainer(Configurable):
             post_validation_metrics
         )
 
-        # Side-by-side pre/post summary so the before/after improvement is
-        # visible without scrolling back through the train loop.
         reward_keys = sorted(
             k
             for k in set(pre_validation_agg) | set(post_validation_agg)
