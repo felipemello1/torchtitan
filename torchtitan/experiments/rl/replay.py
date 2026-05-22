@@ -141,13 +141,13 @@ def _is_prefix(prefix: list[int], values: list[int]) -> bool:
 
 
 class ReplayBuffer:
-    """Bounded FIFO of replay samples consumed by loss-token budget.
+    """Bounded FIFO of replay samples consumed by sample count.
 
     Example::
 
         buffer = ReplayBuffer(max_samples=128, max_age_steps=1)
         await buffer.put(samples)
-        batch = await buffer.get_batch(min_loss_tokens=8192, train_version=4)
+        batch = await buffer.get_batch(min_samples=64, train_version=4)
     """
 
     def __init__(self, *, max_samples: int, max_age_steps: int | None = None):
@@ -181,12 +181,12 @@ class ReplayBuffer:
     async def get_batch(
         self,
         *,
-        min_loss_tokens: int,
+        min_samples: int,
         train_version: int,
     ) -> ReplayBatch:
-        """Pop FIFO samples until the loss-token budget is reached."""
-        if min_loss_tokens <= 0:
-            raise ValueError(f"min_loss_tokens must be positive, got {min_loss_tokens}")
+        """Pop FIFO samples until at least ``min_samples`` are available."""
+        if min_samples <= 0:
+            raise ValueError(f"min_samples must be positive, got {min_samples}")
 
         consumed: list[ReplaySample] = []
         dropped_samples: list[ReplaySample] = []
@@ -196,7 +196,7 @@ class ReplayBuffer:
 
         async with self._condition:
             pre_pull_depth_samples: int | None = None
-            while consumed_loss_tokens < min_loss_tokens:
+            while len(consumed) < min_samples:
                 while not self._closed and not self._samples:
                     await self._condition.wait()
                 if self._closed and not self._samples:

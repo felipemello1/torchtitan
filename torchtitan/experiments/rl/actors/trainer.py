@@ -32,6 +32,7 @@ from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.experiments.rl.loss import LossOutput
 from torchtitan.experiments.rl.sampling import TrainingLogprobConfig
+from torchtitan.experiments.rl.trainer_microbatch import schedule_training_microbatches
 from torchtitan.experiments.rl.types import OptimStepOutput, TrainingBatch
 from torchtitan.models.common.attention import create_varlen_metadata_for_document
 from torchtitan.observability import structured_logger as sl
@@ -182,15 +183,29 @@ class MetricAccumulator:
         self.sum_reduced_metrics: dict[str, torch.Tensor] = {}
         self.max_reduced_metrics: dict[str, torch.Tensor] = {}
 
-    def add_sum(self, metrics: dict[str, torch.Tensor]) -> None:
+    def add_sum(
+        self,
+        metrics: dict[str, torch.Tensor],
+        *,
+        active: bool = True,
+    ) -> None:
         for key, value in metrics.items():
+            if not active:
+                value = torch.zeros((), dtype=value.dtype, device=value.device)
             previous = self.sum_reduced_metrics.get(key)
             self.sum_reduced_metrics[key] = (
                 value if previous is None else previous + value
             )
 
-    def add_max(self, metrics: dict[str, torch.Tensor]) -> None:
+    def add_max(
+        self,
+        metrics: dict[str, torch.Tensor],
+        *,
+        active: bool = True,
+    ) -> None:
         for key, value in metrics.items():
+            if not active:
+                value = torch.zeros((), dtype=value.dtype, device=value.device)
             previous = self.max_reduced_metrics.get(key)
             self.max_reduced_metrics[key] = (
                 value if previous is None else torch.maximum(previous, value)
@@ -233,6 +248,12 @@ class PolicyTrainer(Actor, Configurable):
         checkpoint: CheckpointManager.Config = field(
             default_factory=CheckpointManager.Config
         )
+        max_microbatch_samples: int | None = None
+        """Maximum replay samples per trainer forward/backward microbatch."""
+
+        max_microbatch_tokens: int | None = None
+        """Target packed tokens per microbatch; samples are never split."""
+
         dump_folder: str = ""
         """Folder for AC debug dumps when using memory_budget mode."""
 
@@ -258,6 +279,22 @@ class PolicyTrainer(Actor, Configurable):
         self.config = config
         self.compile_config = compile_config
         self.loss_fn = config.loss.build()
+        if (
+            config.max_microbatch_samples is not None
+            and config.max_microbatch_samples <= 0
+        ):
+            raise ValueError(
+                "max_microbatch_samples must be positive or None, got "
+                f"{config.max_microbatch_samples}"
+            )
+        if (
+            config.max_microbatch_tokens is not None
+            and config.max_microbatch_tokens <= 0
+        ):
+            raise ValueError(
+                "max_microbatch_tokens must be positive or None, got "
+                f"{config.max_microbatch_tokens}"
+            )
 
         # Only cast if generator dtype differs from training dtype, otherwise
         # staging buffers would be allocated for a no-op cast.
@@ -318,7 +355,7 @@ class PolicyTrainer(Actor, Configurable):
             lr_schedulers=self.lr_schedulers,
             states={"train_state": self},
             sd_adapter=self.sd_adapter,
-            base_folder=config.dump_folder,
+            base_folder=output_dir,
         )
         self.checkpointer.load()
         if not self.checkpointer.enable:
@@ -465,23 +502,24 @@ class PolicyTrainer(Actor, Configurable):
         model = self.model_parts[0]
         device = self.device
         token_ids = microbatch.token_ids.to(device)
-        positions = microbatch.positions.to(device)
-        loss_mask = microbatch.loss_mask.to(device)
-        ref_logprobs = microbatch.ref_logprobs.to(device)
-        advantages = microbatch.advantages.to(device)
+        seq_lens = microbatch.seq_lens
+        loss_mask = microbatch.loss_mask.to(device)[:, 1:]
+        ref_logprobs = microbatch.ref_logprobs.to(device)[:, 1:]
+        advantages = microbatch.advantages.to(device)[:, 1:]
 
+        positions = torch.cat(
+            [torch.arange(length, device=device) for length in seq_lens]
+        ).unsqueeze(0)
         attention_masks = create_varlen_metadata_for_document(positions)
 
         with sl.log_trace_span("model_forward"):
             logits = model(
                 token_ids, attention_masks=attention_masks, positions=positions
             )
-        # compute_logprobs returns [B, L-1]; pad to [B, L] so positions align
-        # with the loss_mask / ref_logprobs / advantages tensors.
-        policy_logprobs = torch.nn.functional.pad(
-            compute_logprobs(logits, token_ids, temperature=logprob_config.temperature),
-            (1, 0),
-            value=0.0,
+        policy_logprobs = compute_logprobs(
+            logits,
+            token_ids,
+            temperature=logprob_config.temperature,
         )
 
         with sl.log_trace_span("loss_fn"):
@@ -505,7 +543,7 @@ class PolicyTrainer(Actor, Configurable):
     @sl.log_trace_span("forward_backward")
     async def forward_backward(
         self,
-        training_steps: list[list[TrainingBatch]],
+        train_data: list[TrainingBatch],
         *,
         num_global_valid_tokens: int,
         logprob_config: TrainingLogprobConfig,
@@ -517,9 +555,8 @@ class PolicyTrainer(Actor, Configurable):
         a separate endpoint call.
 
         Args:
-            training_steps: Per-step microbatches, shape
-                `[grad_accum_steps][dp_degree]`. The local rank picks
-                `training_steps[step][self.dp_rank]` at each microstep.
+            train_data: One packed replay shard per DP rank. The trainer
+                slices its local shard into sample-aligned microbatches.
             num_global_valid_tokens: Total trainable response tokens across
                 all DP ranks for the full optimizer step. The controller
                 computes this before sharding.
@@ -543,10 +580,24 @@ class PolicyTrainer(Actor, Configurable):
                 f"{len(self.model_parts)} (pipeline parallelism is not yet "
                 "supported in RL)."
             )
-        if not training_steps:
-            raise ValueError("training_steps must contain at least one microstep")
+        if not train_data:
+            raise ValueError("train_data must contain at least one DP shard")
 
         device = self.device
+        schedule = schedule_training_microbatches(
+            train_data,
+            dp_rank=self.dp_rank,
+            max_samples=self.config.max_microbatch_samples,
+            max_tokens=self.config.max_microbatch_tokens,
+        )
+        rope_cache = getattr(getattr(self, "model", None), "freqs_cis", None)
+        if rope_cache is not None and schedule.max_seq_len > rope_cache.shape[0]:
+            raise ValueError(
+                f"Replay sample length {schedule.max_seq_len} exceeds rope "
+                f"cache size {rope_cache.shape[0]}. Increase model max_seq_len or "
+                "reduce generation max_tokens."
+            )
+
         global_tokens_tensor = torch.tensor(
             float(max(num_global_valid_tokens, 1)),
             device=device,
@@ -557,15 +608,19 @@ class PolicyTrainer(Actor, Configurable):
         # accumulate into a single optimizer step.
         self.optimizers.zero_grad()
         metric_accumulator = MetricAccumulator()
-
-        for step_batches in training_steps:
-            if self.dp_rank >= len(step_batches):
-                raise ValueError(
-                    f"forward_backward got {len(step_batches)} DP shards but "
-                    f"dp_rank={self.dp_rank} requires at least "
-                    f"{self.dp_rank + 1}"
+        metric_accumulator.add_max(
+            {
+                "train/microbatches/max": torch.tensor(
+                    float(schedule.max_microbatches),
+                    device=device,
+                    dtype=torch.float32,
                 )
-            local_batch = step_batches[self.dp_rank]
+            }
+        )
+
+        for scheduled_microbatch in schedule.microbatches:
+            local_batch = scheduled_microbatch.batch
+            is_real = scheduled_microbatch.is_real
 
             with sl.log_trace_span("forward_backward_microbatch"):
                 loss_out, drift = self._forward_one_microbatch(
@@ -579,17 +634,27 @@ class PolicyTrainer(Actor, Configurable):
             metric_accumulator.add_sum(
                 {
                     **loss_out.sum_metrics,
-                    "bit_wise/logprob_diff/mean": drift.logprob_diff_mean,
-                    "bit_wise/ratio_tokens_different/mean": (
-                        drift.ratio_tokens_different
-                    ),
-                }
+                    "logprob_drift/diff_mean": drift.logprob_diff_mean,
+                    "logprob_drift/diff_fraction": drift.ratio_tokens_different,
+                },
+                active=is_real,
             )
             metric_accumulator.add_max(
                 {
                     **loss_out.max_metrics,
-                    "bit_wise/logprob_diff/max": drift.logprob_diff_max,
-                }
+                    "logprob_drift/diff_max_abs": drift.logprob_diff_max,
+                    "train/microbatch_tokens/max": torch.tensor(
+                        float(sum(local_batch.seq_lens)),
+                        device=device,
+                        dtype=torch.float32,
+                    ),
+                    "train/microbatch_samples/max": torch.tensor(
+                        float(len(local_batch.seq_lens)),
+                        device=device,
+                        dtype=torch.float32,
+                    ),
+                },
+                active=is_real,
             )
 
         return self.reduce_forward_backward_metrics(
@@ -620,6 +685,23 @@ class PolicyTrainer(Actor, Configurable):
                 foreach=True,
                 pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
             )
+        grad_norm_value = float(grad_norm.item())
+
+        if not bool(torch.isfinite(grad_norm).item()):
+            logger.warning(
+                "Skipping optimizer step because gradient norm is non-finite: %s",
+                grad_norm_value,
+            )
+            self.optimizers.zero_grad()
+            return OptimStepOutput(
+                policy_version=self.policy_version,
+                metrics={
+                    "train/grad_norm/mean": grad_norm_value,
+                    "train/lr": current_lr,
+                    "train/policy_version": float(self.policy_version),
+                    "health/train/skipped_nonfinite_grad_norm": 1.0,
+                },
+            )
 
         with sl.log_trace_span("optim"):
             self.optimizers.step()
@@ -635,9 +717,10 @@ class PolicyTrainer(Actor, Configurable):
         return OptimStepOutput(
             policy_version=self.policy_version,
             metrics={
-                "train/grad_norm/mean": float(grad_norm.item()),
+                "train/grad_norm/mean": grad_norm_value,
                 "train/lr": current_lr,
                 "train/policy_version": float(self.policy_version),
+                "health/train/skipped_nonfinite_grad_norm": 0.0,
             },
         )
 

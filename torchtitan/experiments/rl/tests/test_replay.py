@@ -160,7 +160,7 @@ def test_has_advantage_signal_respects_epsilon() -> None:
     )
 
 
-def test_replay_buffer_batches_by_loss_token_budget() -> None:
+def test_replay_buffer_batches_by_sample_budget() -> None:
     async def run() -> None:
         buffer = ReplayBuffer(max_samples=4)
         await buffer.put(
@@ -171,7 +171,7 @@ def test_replay_buffer_batches_by_loss_token_budget() -> None:
             ]
         )
 
-        batch = await buffer.get_batch(min_loss_tokens=3, train_version=0)
+        batch = await buffer.get_batch(min_samples=2, train_version=0)
 
         assert [sample.sample_idx for sample in batch.samples] == [0, 1]
         assert sum(sample.num_loss_tokens for sample in batch.samples) == 3
@@ -180,6 +180,15 @@ def test_replay_buffer_batches_by_loss_token_budget() -> None:
         assert metrics["replay/num_loss_tokens"] == 3.0
         assert metrics["replay/buffer/depth_samples_pre_pull"] == 3.0
         assert metrics["replay/buffer/depth_samples_post_pull"] == 1.0
+
+    asyncio.run(run())
+
+
+def test_replay_buffer_requires_positive_sample_budget() -> None:
+    async def run() -> None:
+        buffer = ReplayBuffer(max_samples=4)
+        with pytest.raises(ValueError, match="min_samples must be positive"):
+            await buffer.get_batch(min_samples=0, train_version=0)
 
     asyncio.run(run())
 
@@ -194,7 +203,7 @@ def test_replay_buffer_drops_stale_samples_before_filling_batch() -> None:
             ]
         )
 
-        batch = await buffer.get_batch(min_loss_tokens=1, train_version=2)
+        batch = await buffer.get_batch(min_samples=1, train_version=2)
 
         assert [sample.sample_idx for sample in batch.samples] == [1]
         assert [sample.sample_idx for sample in batch.dropped_samples] == [0]
@@ -208,7 +217,7 @@ def test_replay_buffer_drops_stale_samples_before_filling_batch() -> None:
 def test_replay_buffer_close_unblocks_get_and_rejects_put() -> None:
     async def run() -> None:
         buffer = ReplayBuffer(max_samples=1)
-        task = asyncio.create_task(buffer.get_batch(min_loss_tokens=1, train_version=0))
+        task = asyncio.create_task(buffer.get_batch(min_samples=1, train_version=0))
         await asyncio.sleep(0)
 
         await buffer.close()

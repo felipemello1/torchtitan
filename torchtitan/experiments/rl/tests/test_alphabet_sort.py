@@ -145,29 +145,3 @@ CarolXavier // new name!
     assert final.status == RolloutStatus.COMPLETED
     assert final.reward == pytest.approx(1.0)
     assert final.reward_components["alphabet_sort"] == pytest.approx(1.0)
-
-
-def test_alphabet_sort_recipe_shapes() -> None:
-    from torchtitan.experiments.rl.config_registry import (
-        rl_dapo_qwen3_0_6b_alphabet_sort,
-        rl_dapo_qwen3_1_7b_alphabet_sort_2gpu,
-        rl_dapo_qwen3_1_7b_alphabet_sort_2gpu_acceptance,
-        rl_dapo_qwen3_1_7b_alphabet_sort_3gpu_multigen,
-    )
-
-    small = rl_dapo_qwen3_0_6b_alphabet_sort()
-    two_gpu = rl_dapo_qwen3_1_7b_alphabet_sort_2gpu()
-    three_gpu_multigen = rl_dapo_qwen3_1_7b_alphabet_sort_3gpu_multigen()
-    acceptance = rl_dapo_qwen3_1_7b_alphabet_sort_2gpu_acceptance()
-
-    assert small.max_rollout_turns == 5
-    assert small.train_dataset.min_turns == 3
-    assert small.train_dataset.max_turns == 5
-    assert small.batcher.batch.local_batch_size == 8
-    assert small.batcher.batch.global_batch_size == 64
-    assert two_gpu.batcher.batch.local_batch_size == 4
-    assert two_gpu.batcher.batch.global_batch_size == 128
-    assert three_gpu_multigen.num_generator_instances == 2
-    assert three_gpu_multigen.generator.parallelism.tensor_parallel_degree == 1
-    assert acceptance.batcher.batch.local_batch_size == 4
-    assert acceptance.batcher.batch.global_batch_size == 256

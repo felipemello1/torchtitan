@@ -55,6 +55,7 @@ from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.config import CommConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.utils import set_batch_invariance
+from torchtitan.experiments.rl.config_derivation import compute_generator_max_num_seqs
 from torchtitan.experiments.rl.config_registry import rl_grpo_qwen3_0_6b_batch_invariant
 from torchtitan.experiments.rl.grpo import RLTrainer
 from torchtitan.experiments.rl.models.vllm_registry import (
@@ -197,7 +198,7 @@ def build_inference_engine(config: RLTrainer.Config) -> LLMEngine:
     if not has_cuda_capability(9, 0):
         engine_kwargs["block_size"] = 256  # set blocksize to be 256 to align with FA2
 
-    max_num_seqs = config.num_prompts_per_step * config.group_size
+    max_num_seqs = compute_generator_max_num_seqs(config)
     engine_kwargs["max_num_seqs"] = max_num_seqs
     vllm_compilation_config = gen_config.cudagraph.get_vllm_compilation_config(
         max_num_seqs=max_num_seqs,

@@ -353,8 +353,8 @@ class VLLMGenerator(Actor, Configurable):
         model_spec: TorchTitan model specification.
         model_path: Path to the HF model checkpoint.
         compile_config: Per-layer `torch.compile` config shared with trainer.
-        max_num_seqs: vLLM batch dim, sized by the controller as
-            `num_prompts_per_step * group_size`.
+        max_num_seqs: vLLM batch dim, sized from the controller's derived
+            generation capacity.
         output_dir: Structured-logger output directory.
     """
 

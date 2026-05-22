@@ -5,10 +5,20 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
+from dataclasses import dataclass
+from typing import ClassVar
 
 import pytest
 from torchtitan.config import ConfigManager
 from torchtitan.trainer import Trainer
+
+
+@dataclass(kw_only=True, slots=True)
+class _ConfigWithRemovedOverrides:
+    _removed_cli_overrides: ClassVar[dict[str, str]] = {
+        "old.path": "Use `new.path` instead."
+    }
+    value: int = 1
 
 
 class TestConfigManager(unittest.TestCase):
@@ -75,6 +85,18 @@ class TestConfigManager(unittest.TestCase):
             ]
         )
         assert config.training.steps == 5
+
+    def test_removed_cli_override_message(self):
+        """Removed config overrides fail before tyro's generic unknown-option error."""
+        for args in (["--old.path", "1"], ["--old.path=1"]):
+            with self.subTest(args=args):
+                config_manager = ConfigManager()
+                config_manager._load_config = lambda args: (  # type: ignore[method-assign]
+                    _ConfigWithRemovedOverrides(),
+                    args,
+                )
+                with pytest.raises(ValueError, match="Use `new.path` instead"):
+                    config_manager.parse_args(args)
 
     def test_cli_override_dump_folder(self):
         """CLI args override config defaults for nested fields."""

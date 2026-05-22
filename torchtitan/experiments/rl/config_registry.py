@@ -60,7 +60,7 @@ def _alphabet_sort_config(
     hf_assets_path: str,
     lr: float,
     batch: BatchConfig,
-    num_validation_samples: int,
+    num_validation_prompts: int,
     num_steps: int = 50,
     trainer_tensor_parallel_degree: int = 2,
     generator_tensor_parallel_degree: int = 2,
@@ -69,15 +69,15 @@ def _alphabet_sort_config(
     max_offpolicy_steps: int = 1,
     async_pipeline: AsyncPipelineConfig | None = None,
     compile: CompileConfig | None = None,
+    trainer_max_microbatch_samples: int | None = 8,
 ) -> RLTrainer.Config:
     return RLTrainer.Config(
         model_spec=model_registry(model_size, attn_backend="varlen"),
         hf_assets_path=hf_assets_path,
         num_steps=num_steps,
-        num_prompts_per_step=5,
         group_size=group_size,
         max_rollout_turns=5,
-        num_validation_samples=num_validation_samples,
+        num_validation_prompts=num_validation_prompts,
         save_rollout_samples=True,
         num_generator_instances=num_generator_instances,
         max_offpolicy_steps=max_offpolicy_steps,
@@ -94,6 +94,7 @@ def _alphabet_sort_config(
         batcher=Batcher.Config(batch=batch),
         trainer=PolicyTrainer.Config(
             optimizer=OptimizersContainer.Config(lr=lr),
+            max_microbatch_samples=trainer_max_microbatch_samples,
             lr_scheduler=LRSchedulersContainer.Config(
                 warmup_steps=0,
                 decay_ratio=0.0,
@@ -140,9 +141,8 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
         model_spec=model_registry("0.6B", attn_backend="varlen"),
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
         num_steps=10,
-        num_prompts_per_step=5,
         group_size=group_size,
-        num_validation_samples=20,
+        num_validation_prompts=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
         train_dataset=SumDigitsDataset.Config(seed=42),
         train_env_builder=SumDigitsBuilder.Config(
@@ -202,9 +202,8 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
         model_spec=model_registry("1.7B", attn_backend="varlen"),
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-1.7B",
         num_steps=10,
-        num_prompts_per_step=5,
         group_size=group_size,
-        num_validation_samples=20,
+        num_validation_prompts=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
         train_dataset=SumDigitsDataset.Config(seed=42),
         train_env_builder=SumDigitsBuilder.Config(
@@ -265,9 +264,8 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
         model_spec=model_registry("14B", attn_backend="varlen"),
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-14B",
         num_steps=10,
-        num_prompts_per_step=5,
         group_size=group_size,
-        num_validation_samples=20,
+        num_validation_prompts=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
         train_dataset=SumDigitsDataset.Config(seed=42),
         train_env_builder=SumDigitsBuilder.Config(
@@ -331,9 +329,8 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
         model_spec=model_registry("0.6B", attn_backend="varlen"),
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
         num_steps=10,
-        num_prompts_per_step=5,
         group_size=group_size,
-        num_validation_samples=20,
+        num_validation_prompts=20,
         compile=CompileConfig(enable=True, backend="aot_eager"),
         train_dataset=SumDigitsDataset.Config(seed=42),
         train_env_builder=SumDigitsBuilder.Config(
@@ -398,7 +395,7 @@ def rl_dapo_qwen3_0_6b_alphabet_sort() -> RLTrainer.Config:
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
         lr=1e-6,
         batch=BatchConfig(local_batch_size=8, global_batch_size=64, seq_len=2048),
-        num_validation_samples=32,
+        num_validation_prompts=32,
     )
 
 
@@ -409,9 +406,10 @@ def rl_dapo_qwen3_1_7b_alphabet_sort_2gpu() -> RLTrainer.Config:
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-1.7B",
         lr=1e-6,
         batch=BatchConfig(local_batch_size=4, global_batch_size=128, seq_len=2048),
-        num_validation_samples=16,
+        num_validation_prompts=16,
         trainer_tensor_parallel_degree=1,
         generator_tensor_parallel_degree=1,
+        trainer_max_microbatch_samples=4,
         compile=CompileConfig(enable=False),
     )
 
@@ -423,10 +421,11 @@ def rl_dapo_qwen3_1_7b_alphabet_sort_3gpu_multigen() -> RLTrainer.Config:
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-1.7B",
         lr=1e-6,
         batch=BatchConfig(local_batch_size=4, global_batch_size=128, seq_len=2048),
-        num_validation_samples=16,
+        num_validation_prompts=16,
         trainer_tensor_parallel_degree=1,
         generator_tensor_parallel_degree=1,
         num_generator_instances=2,
+        trainer_max_microbatch_samples=4,
         compile=CompileConfig(enable=False),
     )
 
@@ -436,11 +435,13 @@ def rl_dapo_qwen3_1_7b_alphabet_sort_2gpu_acceptance() -> RLTrainer.Config:
     return _alphabet_sort_config(
         model_size="1.7B",
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-1.7B",
-        lr=2e-6,
+        lr=1e-5,
         num_steps=100,
-        batch=BatchConfig(local_batch_size=4, global_batch_size=256, seq_len=2048),
-        num_validation_samples=64,
+        batch=BatchConfig(local_batch_size=8, global_batch_size=128, seq_len=2048),
+        num_validation_prompts=64,
         trainer_tensor_parallel_degree=1,
         generator_tensor_parallel_degree=1,
+        async_pipeline=AsyncPipelineConfig(rollout_concurrency_groups=16),
+        trainer_max_microbatch_samples=16,
         compile=CompileConfig(enable=False),
     )

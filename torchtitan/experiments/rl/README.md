@@ -8,7 +8,7 @@ This directory contains code for RL training using TorchTitan model definitions 
 The integration consists of the following components:
 
 1. **vLLM Model Wrapper** (`models/vllm_wrapper.py`): Adapts TorchTitan models for vLLM's inference engine
-2. **RL Training Loop** (`grpo.py`): GRPO-based RL training with Monarch actors (single-turn only for now)
+2. **RL Training Loop** (`grpo.py`): GRPO/DAPO training with Monarch actors, async rollout producers, and replay
 
 
 ## Key features available
@@ -78,6 +78,8 @@ python torchtitan/experiments/rl/grpo.py --module rl --config rl_grpo_qwen3_0_6b
 **NOTE:** If you downloaded your HF model to a different path than the one in step 4, specify it in your command with `--hf_assets_path=<path_to_model_checkpoint>`.
 
 **Metrics:** W&B is on by default — run `wandb login` first, or pass `--metrics.no-enable-wandb` to disable. TensorBoard is also supported via `--metrics.enable-tensorboard`.
+
+For capacity formulas and operator-facing metric guidance, see [`docs/tuning.md`](docs/tuning.md).
 
 We use a unified model definition from torchtitan for the trainer and generator, ensuring bitwise-identical models to address a class of subtle correctness bugs in RL for LLMs.
 
