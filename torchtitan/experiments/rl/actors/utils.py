@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -35,6 +36,20 @@ def compute_logprobs(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Ten
     return logprobs.gather(2, shift_targets.unsqueeze(-1)).squeeze(-1)
 
 
+def direct_rdma_weight_sync_enabled() -> bool:
+    value = os.environ.get("TORCHTITAN_RL_DIRECT_RDMA", "1").lower()
+    if value in {"0", "false", "no", "off"}:
+        return False
+    if value not in {"1", "true", "yes", "on"}:
+        raise ValueError(
+            "TORCHTITAN_RL_DIRECT_RDMA must be one of 0/1, false/true, no/yes, or off/on"
+        )
+
+    from monarch.rdma import is_rdma_available
+
+    return is_rdma_available()
+
+
 @sl.log_trace_span("extract_response_logprobs")
 def extract_response_logprobs(
     packed_logprobs: torch.Tensor,
@@ -54,6 +69,107 @@ def extract_response_logprobs(
         result.append(packed_logprobs[0, s:e])
         seq_start += seq_lens[i]
     return result
+
+
+@dataclass(frozen=True, slots=True)
+class PackedPolicyLossInputs:
+    """Policy-loss side tensors aligned to ``token_ids[:, 1:]``.
+
+    ``policy_logprobs`` is intentionally absent: chunked CE supplies it one
+    sequence chunk at a time to the reducer.
+    """
+
+    generator_logprobs: torch.Tensor
+    advantages: torch.Tensor
+    loss_mask: torch.Tensor
+    loss_weights: torch.Tensor
+
+
+def build_packed_policy_loss_inputs(
+    *,
+    num_shift_tokens: int,
+    seq_lens: list[int],
+    prompt_lens: list[int],
+    response_lens: list[int],
+    generator_logprobs: list[list[float]],
+    advantages: torch.Tensor,
+    num_global_valid_tokens: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> PackedPolicyLossInputs:
+    """Build packed side tensors aligned to next-token prediction positions."""
+    num_samples = len(response_lens)
+    for name, values in (
+        ("seq_lens", seq_lens),
+        ("prompt_lens", prompt_lens),
+        ("generator_logprobs", generator_logprobs),
+    ):
+        if len(values) != num_samples:
+            raise ValueError(
+                f"{name} must have {num_samples} entries, got {len(values)}"
+            )
+    if advantages.numel() != num_samples:
+        raise ValueError(
+            f"advantages must have {num_samples} elements, got {advantages.numel()}"
+        )
+    if sum(seq_lens) - 1 != num_shift_tokens:
+        raise ValueError(
+            f"num_shift_tokens must be sum(seq_lens) - 1, got {num_shift_tokens} "
+            f"for seq_lens={seq_lens}"
+        )
+
+    shape = (1, num_shift_tokens)
+    generator = torch.zeros(shape, device=device, dtype=dtype)
+    expanded_advantages = torch.zeros(shape, device=device, dtype=dtype)
+    loss_mask = torch.zeros(shape, device=device, dtype=torch.float32)
+
+    advantages = advantages.to(device=device, dtype=dtype).view(num_samples)
+    seq_start = 0
+    for idx, (seq_len, prompt_len, response_len) in enumerate(
+        zip(seq_lens, prompt_lens, response_lens, strict=True)
+    ):
+        if prompt_len < 1:
+            raise ValueError(f"prompt_lens[{idx}] must be >= 1, got {prompt_len}")
+        if response_len < 0:
+            raise ValueError(f"response_lens[{idx}] must be >= 0, got {response_len}")
+        if prompt_len + response_len > seq_len:
+            raise ValueError(
+                f"prompt_lens[{idx}] + response_lens[{idx}] exceeds seq_lens[{idx}]"
+            )
+        if len(generator_logprobs[idx]) != response_len:
+            raise ValueError(
+                f"generator_logprobs[{idx}] has {len(generator_logprobs[idx])} "
+                f"tokens but response_lens[{idx}] is {response_len}"
+            )
+
+        start = seq_start + prompt_len - 1
+        end = start + response_len
+        if end > num_shift_tokens:
+            raise ValueError(
+                f"Response {idx} maps to shifted slice [{start}, {end}), beyond "
+                f"num_shift_tokens={num_shift_tokens}"
+            )
+        if response_len > 0:
+            generator[:, start:end] = torch.as_tensor(
+                generator_logprobs[idx],
+                device=device,
+                dtype=dtype,
+            )
+            expanded_advantages[:, start:end] = advantages[idx]
+            loss_mask[:, start:end] = 1.0
+
+        seq_start += seq_len
+
+    loss_weights = loss_mask / num_global_valid_tokens.to(
+        device=device,
+        dtype=torch.float32,
+    ).clamp(min=1.0)
+    return PackedPolicyLossInputs(
+        generator_logprobs=generator,
+        advantages=expanded_advantages,
+        loss_mask=loss_mask,
+        loss_weights=loss_weights,
+    )
 
 
 @dataclass(frozen=True, slots=True)

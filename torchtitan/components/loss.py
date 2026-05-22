@@ -6,6 +6,7 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TypeAlias
 
@@ -13,7 +14,6 @@ import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.experimental import local_map
-
 from torchtitan.config import CompileConfig, Configurable
 from torchtitan.tools.logging import logger
 
@@ -21,6 +21,27 @@ from torchtitan.tools.logging import logger
 IGNORE_INDEX = -100
 
 LossFunction: TypeAlias = Callable[..., torch.Tensor]
+
+
+def _prepare_labels_for_dtensor_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from torch.distributed.tensor import DTensor, Replicate
+
+    if not isinstance(logits, DTensor):
+        return logits, labels
+
+    if all(isinstance(placement, Replicate) for placement in logits.placements):
+        return logits.to_local(), labels
+
+    if not isinstance(labels, DTensor):
+        labels = DTensor.from_local(
+            labels,
+            device_mesh=logits.device_mesh,
+            placements=tuple(Replicate() for _ in logits.placements),
+        )
+    return logits, labels
 
 
 def cross_entropy_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -114,6 +135,369 @@ def mse_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.mse_loss(
         pred.float(), labels.float().detach(), reduction="sum"
     )
+
+
+def selected_token_logprobs(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    ignore_index: int = IGNORE_INDEX,
+) -> torch.Tensor:
+    """Return log probability for each selected label.
+
+    This is the `reduction="none"` equivalent of cross entropy. Ignored labels
+    return zero, so downstream masks can be applied without a separate gather
+    special case.
+    """
+    from torch.distributed.tensor import DTensor
+
+    logits, labels = _prepare_labels_for_dtensor_logits(logits, labels)
+
+    losses = torch.nn.functional.cross_entropy(
+        logits.flatten(0, 1).float(),
+        labels.flatten(0, 1),
+        reduction="none",
+        ignore_index=ignore_index,
+    ).view_as(labels)
+    logprobs = -losses
+    if isinstance(logprobs, DTensor):
+        logprobs = logprobs.to_local()
+    return logprobs
+
+
+def _chunk_slices(seq_len: int, num_chunks: int) -> list[slice]:
+    if num_chunks < 1:
+        raise ValueError(f"num_chunks must be >= 1, got {num_chunks}")
+    if seq_len < 1:
+        raise ValueError("Cannot chunk an empty sequence")
+
+    quotient, remainder = divmod(seq_len, num_chunks)
+    start = 0
+    slices = []
+    for idx in range(num_chunks):
+        chunk_len = quotient + int(idx < remainder)
+        if chunk_len == 0:
+            continue
+        end = start + chunk_len
+        slices.append(slice(start, end))
+        start = end
+    return slices
+
+
+def _replicate_tp_hidden_states(hidden_states: torch.Tensor) -> torch.Tensor:
+    from torch.distributed.tensor import DTensor, Replicate
+
+    if not isinstance(hidden_states, DTensor):
+        return hidden_states
+
+    mesh = hidden_states.device_mesh
+    if mesh.mesh_dim_names is None or "tp" not in mesh.mesh_dim_names:
+        return hidden_states
+
+    tp_axis = mesh.mesh_dim_names.index("tp")
+    placements = list(hidden_states.placements)
+    if isinstance(placements[tp_axis], Replicate):
+        return hidden_states
+
+    placements[tp_axis] = Replicate()
+    return hidden_states.redistribute(mesh, tuple(placements))
+
+
+class _FSDPChunkedLossContext:
+    """Temporarily keep an FSDP lm_head unsharded across sequence chunks."""
+
+    def __init__(self, lm_head: nn.Module, *, manage_gradient_sync: bool):
+        self.lm_head = lm_head
+        self.manage_gradient_sync = manage_gradient_sync
+
+    def __enter__(self):
+        self.lm_head.set_reshard_after_forward(False)
+        self.lm_head.set_reshard_after_backward(False)
+        if self.manage_gradient_sync:
+            self.lm_head.set_requires_gradient_sync(False, recurse=False)
+        return self
+
+    def enable_gradient_sync_for_last_chunk(self) -> None:
+        if self.manage_gradient_sync:
+            self.lm_head.set_requires_gradient_sync(True, recurse=False)
+
+    def __exit__(self, *args) -> None:
+        self.lm_head.set_reshard_after_forward(True)
+        self.lm_head.set_reshard_after_backward(True)
+        if self.manage_gradient_sync:
+            self.lm_head.set_requires_gradient_sync(True, recurse=False)
+        self.lm_head.reshard()
+
+
+def _maybe_fsdp_chunked_loss_context(
+    lm_head: nn.Module,
+    fsdp_enabled: bool,
+    *,
+    manage_gradient_sync: bool,
+):
+    if not fsdp_enabled:
+        return nullcontext(None)
+    return _FSDPChunkedLossContext(
+        lm_head,
+        manage_gradient_sync=manage_gradient_sync,
+    )
+
+
+def _chunked_selected_token_logprobs(
+    hidden_states: torch.Tensor,
+    lm_head: nn.Module,
+    labels: torch.Tensor,
+    *,
+    num_chunks: int = 8,
+    ignore_index: int = IGNORE_INDEX,
+    selected_logprobs_fn: Callable[..., torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Compute selected-token logprobs without full-sequence logits.
+
+    The returned tensor has shape ``[batch, seq_len]`` and behaves like
+    ``selected_token_logprobs(lm_head(hidden_states), labels)``. Backward
+    replays ``lm_head`` one sequence chunk at a time.
+    """
+    if hidden_states.ndim != 3:
+        raise ValueError(
+            f"hidden_states must have shape [batch, seq, hidden], got "
+            f"{tuple(hidden_states.shape)}"
+        )
+    if labels.shape != hidden_states.shape[:2]:
+        raise ValueError(
+            f"labels must have shape {tuple(hidden_states.shape[:2])}, got "
+            f"{tuple(labels.shape)}"
+        )
+
+    hidden_states = _replicate_tp_hidden_states(hidden_states)
+    selected_logprobs_fn = selected_logprobs_fn or selected_token_logprobs
+    return _ChunkedSelectedTokenLogprobs.apply(
+        hidden_states,
+        labels,
+        lm_head,
+        num_chunks,
+        ignore_index,
+        selected_logprobs_fn,
+        *lm_head.parameters(),
+    )
+
+
+def _chunked_token_loss(
+    hidden_states: torch.Tensor,
+    lm_head: nn.Module,
+    labels: torch.Tensor,
+    *,
+    reducer: Callable[[torch.Tensor, torch.Tensor, slice], torch.Tensor],
+    num_chunks: int = 8,
+    ignore_index: int = IGNORE_INDEX,
+    selected_logprobs_fn: Callable[..., torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Run a scalar token loss over selected-logprob chunks.
+
+    ``reducer(logprobs, labels, chunk)`` receives one contiguous sequence
+    chunk and must return a scalar. The helper immediately backprops each chunk
+    through ``lm_head`` and bridges the accumulated hidden-state gradient back
+    to the decoder, matching ``ChunkedCELoss``'s memory pattern.
+    """
+    from torch.distributed._composable.fsdp import FSDPModule
+    from torch.distributed.tensor import DTensor
+
+    if hidden_states.ndim != 3:
+        raise ValueError(
+            f"hidden_states must have shape [batch, seq, hidden], got "
+            f"{tuple(hidden_states.shape)}"
+        )
+    if labels.shape != hidden_states.shape[:2]:
+        raise ValueError(
+            f"labels must have shape {tuple(hidden_states.shape[:2])}, got "
+            f"{tuple(labels.shape)}"
+        )
+
+    hidden_states = _replicate_tp_hidden_states(hidden_states)
+    selected_logprobs_fn = selected_logprobs_fn or selected_token_logprobs
+    requires_grad = hidden_states.requires_grad
+    h_detached = hidden_states.detach().requires_grad_(requires_grad)
+    chunks = _chunk_slices(h_detached.shape[1], num_chunks)
+
+    local_hidden_states = (
+        hidden_states.to_local()
+        if isinstance(hidden_states, DTensor)
+        else hidden_states
+    )
+    grad_accumulator = (
+        GradAccumulator(h_detached, num_chunks=len(chunks), dtype=torch.float32)
+        if requires_grad
+        else None
+    )
+    total_loss = local_hidden_states.new_zeros((), dtype=torch.float32)
+
+    fsdp_enabled = isinstance(lm_head, FSDPModule)
+    last_idx = len(chunks) - 1
+    grad_context = torch.enable_grad() if requires_grad else torch.no_grad()
+    with _maybe_fsdp_chunked_loss_context(
+        lm_head,
+        fsdp_enabled,
+        manage_gradient_sync=requires_grad,
+    ) as fsdp_context, grad_context:
+        for idx, chunk in enumerate(chunks):
+            if fsdp_context is not None and requires_grad and idx == last_idx:
+                fsdp_context.enable_gradient_sync_for_last_chunk()
+
+            h_chunk = (
+                h_detached[:, chunk, :]
+                .contiguous()
+                .detach()
+                .requires_grad_(requires_grad)
+            )
+            label_chunk = labels[:, chunk].contiguous()
+            logits = lm_head(h_chunk)
+            # TODO(chunked-rl): If RL needs entropy metrics, compute them here
+            # under no_grad from the chunk logits instead of carrying entropy
+            # through PackedPolicyLossInputs.
+            logprobs = selected_logprobs_fn(
+                logits,
+                label_chunk,
+                ignore_index=ignore_index,
+            )
+            chunk_loss = reducer(logprobs, label_chunk, chunk)
+            if chunk_loss.ndim != 0:
+                raise ValueError(
+                    "reducer must return a scalar tensor, got "
+                    f"shape {tuple(chunk_loss.shape)}"
+                )
+            total_loss = total_loss + chunk_loss.detach()
+
+            if requires_grad:
+                chunk_loss.backward()
+                assert h_chunk.grad is not None
+                assert grad_accumulator is not None
+                grad_accumulator.add(h_chunk.grad)
+                h_chunk.grad = None
+
+    if not requires_grad:
+        return total_loss
+
+    assert grad_accumulator is not None
+    return _ChunkedLossWithParamGrads.apply(
+        hidden_states,
+        grad_accumulator.result().to(hidden_states.dtype),
+        total_loss,
+        lm_head,
+        fsdp_enabled,
+        *lm_head.parameters(),
+    )
+
+
+class _ChunkedSelectedTokenLogprobs(torch.autograd.Function):
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def forward(
+        ctx,
+        hidden_states: torch.Tensor,
+        labels: torch.Tensor,
+        lm_head: nn.Module,
+        num_chunks: int,
+        ignore_index: int,
+        selected_logprobs_fn: Callable[..., torch.Tensor],
+        *lm_params: torch.Tensor,
+    ) -> torch.Tensor:
+        from torch.distributed._composable.fsdp import FSDPModule
+
+        ctx.save_for_backward(hidden_states, labels)
+        ctx.lm_head = lm_head
+        ctx.num_chunks = num_chunks
+        ctx.ignore_index = ignore_index
+        ctx.selected_logprobs_fn = selected_logprobs_fn
+        ctx.lm_params = lm_params
+
+        fsdp_enabled = isinstance(lm_head, FSDPModule)
+        with _maybe_fsdp_chunked_loss_context(
+            lm_head,
+            fsdp_enabled,
+            manage_gradient_sync=False,
+        ):
+            logprob_chunks = []
+            for chunk in _chunk_slices(hidden_states.shape[1], num_chunks):
+                h_chunk = hidden_states[:, chunk, :].contiguous()
+                label_chunk = labels[:, chunk].contiguous()
+                logits = lm_head(h_chunk)
+                logprob_chunks.append(
+                    selected_logprobs_fn(
+                        logits,
+                        label_chunk,
+                        ignore_index=ignore_index,
+                    )
+                )
+
+        return torch.cat(logprob_chunks, dim=1)
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, ...]:
+        from torch.distributed._composable.fsdp import FSDPModule
+
+        hidden_states, labels = ctx.saved_tensors
+        lm_head = ctx.lm_head
+        num_chunks = ctx.num_chunks
+        ignore_index = ctx.ignore_index
+        selected_logprobs_fn = ctx.selected_logprobs_fn
+        lm_params = ctx.lm_params
+        chunks = _chunk_slices(hidden_states.shape[1], num_chunks)
+
+        fsdp_enabled = isinstance(lm_head, FSDPModule)
+        grad_accumulator = GradAccumulator(
+            hidden_states,
+            num_chunks=len(chunks),
+            dtype=torch.float32,
+        )
+
+        last_idx = len(chunks) - 1
+        with _maybe_fsdp_chunked_loss_context(
+            lm_head,
+            fsdp_enabled,
+            manage_gradient_sync=True,
+        ) as fsdp_context, torch.enable_grad():
+            for idx, chunk in enumerate(chunks):
+                if fsdp_context is not None and idx == last_idx:
+                    fsdp_context.enable_gradient_sync_for_last_chunk()
+
+                h_chunk = (
+                    hidden_states[:, chunk, :]
+                    .contiguous()
+                    .detach()
+                    .requires_grad_(True)
+                )
+                label_chunk = labels[:, chunk].contiguous()
+                logits = lm_head(h_chunk)
+                logprobs = selected_logprobs_fn(
+                    logits,
+                    label_chunk,
+                    ignore_index=ignore_index,
+                )
+                torch.autograd.backward(
+                    logprobs,
+                    grad_tensors=grad_output[:, chunk].contiguous(),
+                )
+                assert h_chunk.grad is not None
+                grad_accumulator.add(h_chunk.grad)
+                h_chunk.grad = None
+
+        lm_param_grads = _capture_lm_head_param_grads(lm_head, fsdp_enabled, lm_params)
+        if fsdp_enabled:
+            torch.autograd.Variable._execution_engine.queue_callback(
+                lambda: _restore_lm_head_gradient_sync(lm_head)
+            )
+        return (
+            grad_accumulator.result().to(hidden_states.dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+            *lm_param_grads,
+        )
 
 
 class BaseLoss(ABC, Configurable):
@@ -213,6 +597,7 @@ class GradAccumulator:
         self.num_chunks = num_chunks
         self.seq_dim = seq_dim
         self._next_idx = 0
+        self._next_start = 0
         self._device_mesh: DeviceMesh | None = None
         self._placements: tuple[Placement, ...] | None = None
 
@@ -238,19 +623,29 @@ class GradAccumulator:
 
         # Extract local tensor if DTensor
         if isinstance(chunk_grad, DTensor):
+            if (
+                self._device_mesh is not None
+                and self._placements is not None
+                and chunk_grad.placements != self._placements
+            ):
+                chunk_grad = chunk_grad.redistribute(
+                    self._device_mesh,
+                    self._placements,
+                )
             chunk_grad = chunk_grad.to_local()
 
         if chunk_grad.dtype != self._buffer.dtype:
             chunk_grad = chunk_grad.to(self._buffer.dtype)
 
         chunk_seq_len = chunk_grad.shape[self.seq_dim]
-        start = self._next_idx * chunk_seq_len
+        start = self._next_start
         end = start + chunk_seq_len
 
         slices = [slice(None)] * self._buffer.ndim
         slices[self.seq_dim] = slice(start, end)
         self._buffer[tuple(slices)] = chunk_grad
 
+        self._next_start = end
         self._next_idx += 1
 
     def result(self) -> torch.Tensor:
@@ -306,6 +701,9 @@ class ChunkedCELoss(BaseLoss):
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseLoss.Config):
+        # TODO(chunked-rl): Consider a max_tokens_per_chunk knob after the
+        # reducer API lands. Keeping a single chunk-count knob makes this
+        # review match current TorchTitan behavior.
         num_chunks: int = 8
         """Number of chunks to split the sequence into."""
 
@@ -317,12 +715,65 @@ class ChunkedCELoss(BaseLoss):
     ):
         self.fn: LossFunction = cross_entropy_loss
         self._maybe_compile(compile_config)
+        self._selected_logprobs_fn: Callable[
+            ..., torch.Tensor
+        ] = selected_token_logprobs
+        if (
+            compile_config is not None
+            and compile_config.enable
+            and "loss" in compile_config.components
+        ):
+            self._selected_logprobs_fn = torch.compile(
+                selected_token_logprobs,
+                backend=compile_config.backend,
+            )
         self.num_chunks = config.num_chunks
         self.lm_head: nn.Module | None = None
 
     def set_lm_head(self, lm_head: nn.Module) -> None:
         """Set the lm_head module. Must be called before the first __call__."""
         self.lm_head = lm_head
+
+    def _require_lm_head(self) -> nn.Module:
+        if self.lm_head is None:
+            raise ValueError("Set lm_head before calling ChunkedCELoss")
+        return self.lm_head
+
+    def compute_selected_token_logprobs(
+        self,
+        pred: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        ignore_index: int = IGNORE_INDEX,
+    ) -> torch.Tensor:
+        """Return selected-token logprobs with the same chunking policy as CE."""
+        return _chunked_selected_token_logprobs(
+            pred,
+            self._require_lm_head(),
+            labels,
+            num_chunks=self.num_chunks,
+            ignore_index=ignore_index,
+            selected_logprobs_fn=self._selected_logprobs_fn,
+        )
+
+    def reduce_selected_token_logprobs(
+        self,
+        pred: torch.Tensor,
+        labels: torch.Tensor,
+        reducer: Callable[[torch.Tensor, torch.Tensor, slice], torch.Tensor],
+        *,
+        ignore_index: int = IGNORE_INDEX,
+    ) -> torch.Tensor:
+        """Run a scalar reducer over selected-token logprobs one chunk at a time."""
+        return _chunked_token_loss(
+            pred,
+            self._require_lm_head(),
+            labels,
+            reducer=reducer,
+            num_chunks=self.num_chunks,
+            ignore_index=ignore_index,
+            selected_logprobs_fn=self._selected_logprobs_fn,
+        )
 
     def __call__(
         self,
@@ -346,8 +797,7 @@ class ChunkedCELoss(BaseLoss):
 
         hidden_states = pred
         num_chunks = self.num_chunks
-        lm_head = self.lm_head
-        assert lm_head is not None, "Set lm_head before calling ChunkedCELoss"
+        lm_head = self._require_lm_head()
         fsdp_enabled = isinstance(lm_head, FSDPModule)
 
         # If SP is enabled, hidden states are Shard(1) on the TP mesh dim.
@@ -454,53 +904,136 @@ class ChunkedCELoss(BaseLoss):
         lm_head: nn.Module,
         fsdp_enabled: bool,
     ) -> torch.Tensor:
-        """Return a differentiable loss via _DecoderOutputGradientBackProp.
+        """Return a differentiable loss via _ChunkedLossWithParamGrads.
         When ``.backward()`` is called (by the trainer or PP schedule),
-        autograd calls ``_DecoderOutputGradientBackProp.backward`` which
-        returns ``accumulated_grad`` as the gradient for ``hidden_states``,
-        propagating through the decoder. Subclasses override to swap in a
-        different autograd Function.
+        autograd returns the accumulated hidden gradient and captured lm_head
+        parameter gradients, scaled by the upstream ``grad_output``.
         """
-        return _DecoderOutputGradientBackProp.apply(
-            hidden_states, accumulated_grad, total_loss
+        return _ChunkedLossWithParamGrads.apply(
+            hidden_states,
+            accumulated_grad,
+            total_loss,
+            lm_head,
+            fsdp_enabled,
+            *lm_head.parameters(),
         )
 
 
-class _DecoderOutputGradientBackProp(torch.autograd.Function):
-    """Bridges chunked lm_head backward with decoder backward via autograd.
+def _grad_output_scale_tensor(
+    grad_output: torch.Tensor,
+    grad: torch.Tensor,
+) -> torch.Tensor:
+    from torch.distributed.tensor import DTensor, Replicate
 
-    Forward takes hidden_states (connected to decoder graph), the accumulated
-    gradient from chunked lm_head backward, and the loss value. Returns a
-    detached loss with this Function as its grad_fn.
+    if isinstance(grad_output, DTensor):
+        grad_output = grad_output.redistribute(
+            grad_output.device_mesh,
+            tuple(Replicate() for _ in grad_output.placements),
+        ).to_local()
+    if grad_output.numel() != 1:
+        raise RuntimeError(
+            "Chunked loss bridge only supports scalar grad_output, got "
+            f"shape {tuple(grad_output.shape)}"
+        )
+    if isinstance(grad, DTensor):
+        local_grad = grad.to_local()
+        local_scale = grad_output.to(
+            device=local_grad.device,
+            dtype=local_grad.dtype,
+        )
+        return DTensor.from_local(
+            local_scale,
+            device_mesh=grad.device_mesh,
+            placements=tuple(Replicate() for _ in grad.placements),
+        )
+    return grad_output.to(device=grad.device, dtype=grad.dtype)
 
-    Backward returns accumulated_grad as the gradient for hidden_states.
-    Autograd then propagates this through the decoder layers automatically —
-    no explicit hidden_states.backward() needed.
-    """
+
+def _scale_grad_by_output(
+    grad: torch.Tensor | None,
+    grad_output: torch.Tensor,
+) -> torch.Tensor | None:
+    if grad is None:
+        return None
+    return grad * _grad_output_scale_tensor(grad_output, grad)
+
+
+def _capture_lm_head_param_grads(
+    lm_head: nn.Module,
+    fsdp_enabled: bool,
+    lm_params: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor | None, ...]:
+    """Move chunk-loop parameter grads from side effects into autograd."""
+    param_grads: list[torch.Tensor | None] = []
+    for param in lm_params:
+        if param.grad is None:
+            param_grads.append(None)
+        else:
+            param_grads.append(param.grad.detach())
+            param.grad = None
+
+    if fsdp_enabled:
+        # The returned grads are already in the placement produced by the
+        # chunk-loop's final FSDP reduction. Keep FSDP from reducing them again
+        # when AccumulateGrad receives this Function's outputs.
+        lm_head.set_requires_gradient_sync(False, recurse=False)
+
+    return tuple(param_grads)
+
+
+def _restore_lm_head_gradient_sync(lm_head: nn.Module) -> None:
+    lm_head.set_requires_gradient_sync(True, recurse=False)
+
+
+class _ChunkedLossWithParamGrads(torch.autograd.Function):
+    """Bridge chunked hidden-state and lm_head parameter grads into autograd."""
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(
         ctx,
         hidden_states: torch.Tensor,
-        accumulated_grad: torch.Tensor,
-        loss: torch.Tensor,
+        accumulated_h_grad: torch.Tensor,
+        total_loss: torch.Tensor,
+        lm_head: nn.Module,
+        fsdp_enabled: bool,
+        *lm_params: torch.Tensor,
     ) -> torch.Tensor:
-        ctx.save_for_backward(accumulated_grad)
-        return loss.detach()
+        param_grads = _capture_lm_head_param_grads(
+            lm_head,
+            fsdp_enabled,
+            lm_params,
+        )
+        ctx.param_grad_is_none = tuple(grad is None for grad in param_grads)
+        ctx.save_for_backward(
+            accumulated_h_grad,
+            *(grad for grad in param_grads if grad is not None),
+        )
+        ctx.lm_head = lm_head
+        ctx.fsdp_enabled = fsdp_enabled
+        return total_loss.detach()
 
     @staticmethod
-    def backward(  # pyrefly: ignore[bad-override]
-        ctx, grad_output: torch.Tensor
-    ) -> tuple[torch.Tensor, None, None]:
-        (accumulated_grad,) = ctx.saved_tensors
-        # Return accumulated_grad as the gradient for hidden_states.
-        # Autograd then propagates this through hidden_states' existing
-        # decoder graph — equivalent to hidden_states.backward(accumulated_grad)
-        # but expressed as a return value so autograd handles the traversal
-        # in a single pass (no "backward through graph twice" error).
-        # Note: this is not safe if downstream accidentally runs tensor ops after
-        # the loss returns, which would produce a non-trivial grad_output that we need
-        # to properly handle. The complicated part is that grad_output might not be
-        # on the same device mesh as accumlated_grad.
-        return accumulated_grad, None, None
+    def backward(ctx, grad_output: torch.Tensor):  # pyrefly: ignore[bad-override]
+        saved = ctx.saved_tensors
+        accumulated_h_grad = saved[0]
+        saved_param_grads = iter(saved[1:])
+        param_grads = tuple(
+            None if is_none else next(saved_param_grads)
+            for is_none in ctx.param_grad_is_none
+        )
+        if ctx.fsdp_enabled:
+            torch.autograd.Variable._execution_engine.queue_callback(
+                lambda: _restore_lm_head_gradient_sync(ctx.lm_head)
+            )
+        return (
+            _scale_grad_by_output(accumulated_h_grad, grad_output),
+            None,
+            None,
+            None,
+            None,
+            *(
+                _scale_grad_by_output(param_grad, grad_output)
+                for param_grad in param_grads
+            ),
+        )

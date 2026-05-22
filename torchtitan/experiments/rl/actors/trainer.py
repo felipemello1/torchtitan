@@ -15,6 +15,7 @@ import torch.distributed.distributed_c10d as c10d
 import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.loss import ChunkedCELoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import (
@@ -30,7 +31,9 @@ from torchtitan.config import (
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.experiments.rl.actors.utils import (
+    build_packed_policy_loss_inputs,
     compute_logprobs,
+    direct_rdma_weight_sync_enabled,
     extract_response_logprobs,
     PartialLogprobDrift,
     verify_logprob_identity,
@@ -75,6 +78,8 @@ class PolicyTrainer(Actor, Configurable):
         comm: CommConfig = field(default_factory=CommConfig)
         debug: DebugConfig = field(default_factory=DebugConfig)
         loss: Configurable.Config = field(default_factory=Configurable.Config)
+        chunked_loss_num_chunks: int = 8
+        """Number of sequence chunks for policy logprobs; 1 uses dense logits."""
         ac_config: ActivationCheckpointConfig = field(
             default_factory=lambda: ActivationCheckpointConfig(mode="none")
         )
@@ -106,6 +111,12 @@ class PolicyTrainer(Actor, Configurable):
         self.config = config
         self.compile_config = compile_config
         self.loss_fn = config.loss.build()
+        self.chunked_ce_loss: ChunkedCELoss | None = None
+        if config.chunked_loss_num_chunks > 1:
+            self.chunked_ce_loss = ChunkedCELoss(
+                ChunkedCELoss.Config(num_chunks=config.chunked_loss_num_chunks),
+                compile_config=compile_config,
+            )
 
         # Only cast if generator dtype differs from training dtype, otherwise
         # staging buffers would be allocated for a no-op cast.
@@ -145,6 +156,12 @@ class PolicyTrainer(Actor, Configurable):
         # Create training policy model
         model = self._build_model(model_spec, config, device_type)
         model.train()
+        if self.chunked_ce_loss is not None:
+            model._skip_lm_head = True
+            lm_head = getattr(model, "lm_head", None)
+            if lm_head is None:
+                raise ValueError("Chunked RL loss requires a model lm_head")
+            self.chunked_ce_loss.set_lm_head(lm_head)
         self.model = model
         self.model_parts = [model]
 
@@ -362,33 +379,91 @@ class PolicyTrainer(Actor, Configurable):
         ).unsqueeze(0)
         attention_masks = create_varlen_metadata_for_document(positions)
 
+        self.optimizers.zero_grad()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+
         with sl.log_trace_span("model_forward"):
-            logits = model(
+            model_output = model(
                 token_ids, attention_masks=attention_masks, positions=positions
             )
-        all_policy_logprobs = compute_logprobs(logits, token_ids)
-        policy_logprobs = extract_response_logprobs(
-            all_policy_logprobs, seq_lens, prompt_lens, response_lens
-        )
 
+        policy_logprobs: list[torch.Tensor] | None = None
+        verification: PartialLogprobDrift | None = None
         with sl.log_trace_span("loss_fn"):
-            loss, loss_metrics = self.loss_fn(
-                policy_logprobs=policy_logprobs,
-                advantages=advantages,
-                num_global_valid_tokens=num_global_valid_tokens,
-            )
+            loss_metrics: dict[str, torch.Tensor] = {}
+            used_chunked_reducer = False
+            if self.chunked_ce_loss is not None:
+                packed_inputs = build_packed_policy_loss_inputs(
+                    num_shift_tokens=token_ids.shape[1] - 1,
+                    seq_lens=seq_lens,
+                    prompt_lens=prompt_lens,
+                    response_lens=response_lens,
+                    generator_logprobs=local_batch.token_logprobs,
+                    advantages=advantages,
+                    num_global_valid_tokens=num_global_valid_tokens,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                make_token_reducer = getattr(self.loss_fn, "make_token_reducer", None)
+                reducer = (
+                    make_token_reducer(packed_inputs)
+                    if callable(make_token_reducer)
+                    else None
+                )
+                if reducer is not None:
+                    loss = self.chunked_ce_loss.reduce_selected_token_logprobs(
+                        model_output[:, :-1, :],
+                        token_ids[:, 1:],
+                        reducer.chunk_loss,
+                    )
+                    loss_metrics = reducer.metrics()
+                    diff_sum, diff_max, diff_count = reducer.logprob_drift()
+                    verification = PartialLogprobDrift(
+                        logprob_diff_mean=diff_sum / num_global_valid_tokens,
+                        logprob_diff_max=diff_max,
+                        ratio_tokens_different=diff_count / num_global_valid_tokens,
+                    )
+                    used_chunked_reducer = True
+                else:
+                    all_policy_logprobs = (
+                        self.chunked_ce_loss.compute_selected_token_logprobs(
+                            model_output[:, :-1, :],
+                            token_ids[:, 1:],
+                        )
+                    )
+                    policy_logprobs = extract_response_logprobs(
+                        all_policy_logprobs, seq_lens, prompt_lens, response_lens
+                    )
 
-        self.optimizers.zero_grad()
+            if self.chunked_ce_loss is None:
+                all_policy_logprobs = compute_logprobs(model_output, token_ids)
+                policy_logprobs = extract_response_logprobs(
+                    all_policy_logprobs, seq_lens, prompt_lens, response_lens
+                )
+
+            if not used_chunked_reducer:
+                if policy_logprobs is None:
+                    raise ValueError("Policy logprobs were not computed")
+                loss, loss_metrics = self.loss_fn(
+                    policy_logprobs=policy_logprobs,
+                    advantages=advantages,
+                    num_global_valid_tokens=num_global_valid_tokens,
+                    generator_token_logprobs=local_batch.token_logprobs,
+                )
+
         with sl.log_trace_span("model_backward"):
             loss.backward()
 
         # Metrics for bitwise verification of policy logprobs.
-        verification: PartialLogprobDrift = verify_logprob_identity(
-            generator_token_logprobs=local_batch.token_logprobs,
-            trainer_token_logprobs=policy_logprobs,
-            num_global_valid_tokens=num_global_valid_tokens,
-            device=device,
-        )
+        if verification is None:
+            assert policy_logprobs is not None
+            verification = verify_logprob_identity(
+                generator_token_logprobs=local_batch.token_logprobs,
+                trainer_token_logprobs=policy_logprobs,
+                num_global_valid_tokens=num_global_valid_tokens,
+                device=device,
+            )
 
         # Per-rank pre-normalized metrics, so SUM-reducing reconstructs the global.
         sum_reduced_metrics = {
@@ -399,6 +474,12 @@ class PolicyTrainer(Actor, Configurable):
         max_reduced_metrics = {
             "bit_wise/logprob_diff/max": verification.logprob_diff_max,
         }
+        if device.type == "cuda":
+            max_reduced_metrics["train/memory/max_active_gib"] = torch.tensor(
+                torch.cuda.max_memory_allocated(device) / (1024**3),
+                device=device,
+                dtype=torch.float32,
+            )
 
         return self.reduce_forward_backward_metrics(
             sum_reduced_metrics=sum_reduced_metrics,
@@ -480,11 +561,9 @@ class PolicyTrainer(Actor, Configurable):
         from the source's GPU memory".
 
         """
-        from monarch.rdma import is_rdma_available
-
         await ts.put_state_dict(
             self.model.state_dict(),
             "model_state_dict",
-            direct_rdma=is_rdma_available(),
+            direct_rdma=direct_rdma_weight_sync_enabled(),
             transfer_dtype=self._transfer_dtype,
         )

@@ -48,6 +48,7 @@ from torchtitan.config import (
 )
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
+from torchtitan.experiments.rl.actors.utils import PackedPolicyLossInputs
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.types import (
     Completion,
@@ -97,7 +98,16 @@ class GRPOLoss(Configurable):
         policy_logprobs: list[torch.Tensor],
         advantages: torch.Tensor,
         num_global_valid_tokens: torch.Tensor,
+        generator_token_logprobs: list[list[float]] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if generator_token_logprobs is not None:
+            return self._token_loss(
+                policy_logprobs=policy_logprobs,
+                generator_token_logprobs=generator_token_logprobs,
+                advantages=advantages,
+                num_global_valid_tokens=num_global_valid_tokens,
+            )
+
         response_lens = torch.tensor(
             [sample_logprobs.numel() for sample_logprobs in policy_logprobs],
             device=advantages.device,
@@ -120,6 +130,227 @@ class GRPOLoss(Configurable):
 
         with torch.no_grad():
             clipped_frac = (torch.abs(ratio - clipped_ratio) > 1e-6).to(ratio.dtype)
+            loss_metrics = {
+                "loss/mean": pg_loss.detach(),
+                "loss/ratio/mean": _token_weighted_mean(
+                    ratio,
+                    num_tokens_by_sample=response_lens,
+                    num_global_valid_tokens=num_global_valid_tokens,
+                ),
+                "loss/ratio/clipped_frac": _token_weighted_mean(
+                    clipped_frac,
+                    num_tokens_by_sample=response_lens,
+                    num_global_valid_tokens=num_global_valid_tokens,
+                ),
+            }
+
+        return pg_loss, loss_metrics
+
+    def make_token_reducer(self, inputs: PackedPolicyLossInputs) -> "_GRPOTokenReducer":
+        return _GRPOTokenReducer(inputs, self.clip_eps)
+
+    def _token_loss(
+        self,
+        *,
+        policy_logprobs: list[torch.Tensor],
+        generator_token_logprobs: list[list[float]],
+        advantages: torch.Tensor,
+        num_global_valid_tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if len(policy_logprobs) != len(generator_token_logprobs):
+            raise ValueError(
+                "generator_token_logprobs must have the same number of samples as "
+                f"policy_logprobs, got {len(generator_token_logprobs)} and "
+                f"{len(policy_logprobs)}"
+            )
+
+        loss = advantages.new_zeros((), dtype=torch.float32)
+        ratio_mean = loss.clone()
+        clipped_frac = loss.clone()
+        for idx, (sample_logprobs, sample_generator_logprobs) in enumerate(
+            zip(policy_logprobs, generator_token_logprobs, strict=True)
+        ):
+            if sample_logprobs.numel() != len(sample_generator_logprobs):
+                raise ValueError(
+                    f"policy_logprobs[{idx}] has {sample_logprobs.numel()} tokens but "
+                    f"generator_token_logprobs[{idx}] has "
+                    f"{len(sample_generator_logprobs)}"
+                )
+            generator = torch.as_tensor(
+                sample_generator_logprobs,
+                device=sample_logprobs.device,
+                dtype=sample_logprobs.dtype,
+            )
+            pg_loss, ratio, clipped_ratio = _grpo_token_loss_terms(
+                sample_logprobs,
+                generator,
+                advantages[idx],
+                self.clip_eps,
+            )
+            loss = loss + pg_loss.float().sum() / num_global_valid_tokens
+            with torch.no_grad():
+                ratio_mean = ratio_mean + ratio.float().sum() / num_global_valid_tokens
+                clipped_frac = clipped_frac + (
+                    (torch.abs(ratio - clipped_ratio) > 1e-6).float().sum()
+                    / num_global_valid_tokens
+                )
+
+        return loss, {
+            "loss/mean": loss.detach(),
+            "loss/ratio/mean": ratio_mean,
+            "loss/ratio/clipped_frac": clipped_frac,
+        }
+
+
+def _grpo_token_loss_terms(
+    policy_logprobs: torch.Tensor,
+    generator_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    clip_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ratio = torch.exp(policy_logprobs - generator_logprobs.detach())
+    clipped_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+    pg_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
+    return pg_loss, ratio, clipped_ratio
+
+
+class _GRPOTokenReducer:
+    """Chunk-local GRPO reducer aligned to ``token_ids[:, 1:]``."""
+
+    def __init__(self, inputs: PackedPolicyLossInputs, clip_eps: float):
+        self.inputs = inputs
+        self.clip_eps = clip_eps
+        device = inputs.loss_mask.device
+        self._loss = torch.zeros((), device=device, dtype=torch.float32)
+        self._ratio = torch.zeros_like(self._loss)
+        self._clipped = torch.zeros_like(self._loss)
+        self._diff_sum = torch.zeros_like(self._loss)
+        self._diff_max = torch.zeros_like(self._loss)
+        self._diff_count = torch.zeros_like(self._loss)
+
+    def chunk_loss(
+        self,
+        policy_logprobs: torch.Tensor,
+        _labels: torch.Tensor,
+        token_slice: slice,
+    ) -> torch.Tensor:
+        generator = self.inputs.generator_logprobs[:, token_slice]
+        advantages = self.inputs.advantages[:, token_slice]
+        mask = self.inputs.loss_mask[:, token_slice]
+        weights = self.inputs.loss_weights[:, token_slice].to(policy_logprobs.dtype)
+
+        pg_loss, ratio, clipped_ratio = _grpo_token_loss_terms(
+            policy_logprobs,
+            generator,
+            advantages,
+            self.clip_eps,
+        )
+        chunk_loss = (pg_loss * weights).sum()
+
+        with torch.no_grad():
+            mask_float = mask.to(torch.float32)
+            self._loss = self._loss + chunk_loss.detach().float()
+            self._ratio = self._ratio + (ratio.detach().float() * weights).sum()
+            self._clipped = (
+                self._clipped
+                + ((torch.abs(ratio - clipped_ratio) > 1e-6).float() * weights).sum()
+            )
+            diff = policy_logprobs.detach().float() - generator.detach().float()
+            self._diff_sum = self._diff_sum + (diff * mask_float).sum()
+            active = mask.bool()
+            if active.any():
+                active_abs_diff = diff.abs()[active]
+                self._diff_max = torch.maximum(self._diff_max, active_abs_diff.max())
+                self._diff_count = self._diff_count + (active_abs_diff > 1e-6).sum()
+
+        return chunk_loss
+
+    def metrics(self) -> dict[str, torch.Tensor]:
+        return {
+            "loss/mean": self._loss,
+            "loss/ratio/mean": self._ratio,
+            "loss/ratio/clipped_frac": self._clipped,
+        }
+
+    def logprob_drift(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._diff_sum, self._diff_max, self._diff_count
+
+
+class GSPOLoss(Configurable):
+    """GSPO-style clipped surrogate with sequence-level importance ratios."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        clip_eps: float = 0.2
+        """PPO clipping epsilon for the sequence probability ratio."""
+
+    def __init__(self, config: Config):
+        self.clip_eps = config.clip_eps
+
+    def make_token_reducer(self, inputs: PackedPolicyLossInputs) -> None:
+        del inputs
+        return None
+
+    def __call__(
+        self,
+        policy_logprobs: list[torch.Tensor],
+        advantages: torch.Tensor,
+        num_global_valid_tokens: torch.Tensor,
+        generator_token_logprobs: list[list[float]] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if generator_token_logprobs is None:
+            raise ValueError("GSPOLoss requires generator_token_logprobs")
+        if len(policy_logprobs) != len(generator_token_logprobs):
+            raise ValueError(
+                "generator_token_logprobs must have the same number of samples as "
+                f"policy_logprobs, got {len(generator_token_logprobs)} and "
+                f"{len(policy_logprobs)}"
+            )
+
+        response_lens = torch.tensor(
+            [sample_logprobs.numel() for sample_logprobs in policy_logprobs],
+            device=advantages.device,
+            dtype=advantages.dtype,
+        )
+        ratio_values = []
+        sample_losses = []
+        clipped_flags = []
+        for idx, (sample_logprobs, sample_generator_logprobs) in enumerate(
+            zip(policy_logprobs, generator_token_logprobs, strict=True)
+        ):
+            if sample_logprobs.numel() != len(sample_generator_logprobs):
+                raise ValueError(
+                    f"policy_logprobs[{idx}] has {sample_logprobs.numel()} tokens but "
+                    f"generator_token_logprobs[{idx}] has "
+                    f"{len(sample_generator_logprobs)}"
+                )
+            generator = torch.as_tensor(
+                sample_generator_logprobs,
+                device=sample_logprobs.device,
+                dtype=sample_logprobs.dtype,
+            )
+            if sample_logprobs.numel() == 0:
+                mean_log_ratio = sample_logprobs.new_zeros(())
+            else:
+                mean_log_ratio = (sample_logprobs - generator.detach()).mean()
+            ratio = torch.exp(mean_log_ratio)
+            clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
+            sample_losses.append(
+                -torch.min(ratio * advantages[idx], clipped_ratio * advantages[idx])
+            )
+            ratio_values.append(ratio)
+            clipped_flags.append((torch.abs(ratio - clipped_ratio) > 1e-6).to(ratio))
+
+        sample_pg_losses = torch.stack(sample_losses)
+        ratio = torch.stack(ratio_values)
+        clipped_frac = torch.stack(clipped_flags)
+        pg_loss = _token_weighted_mean(
+            sample_pg_losses,
+            num_tokens_by_sample=response_lens,
+            num_global_valid_tokens=num_global_valid_tokens,
+        )
+
+        with torch.no_grad():
             loss_metrics = {
                 "loss/mean": pg_loss.detach(),
                 "loss/ratio/mean": _token_weighted_mean(
