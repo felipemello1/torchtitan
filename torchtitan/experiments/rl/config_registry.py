@@ -23,7 +23,8 @@ from torchtitan.config import (
 )
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
-from torchtitan.experiments.rl.grpo import Batcher, GRPOLoss, RLTrainer
+from torchtitan.experiments.rl.grpo import Batcher, RLTrainer
+from torchtitan.experiments.rl.loss import DAPOLoss
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
 from torchtitan.experiments.rl.sum_digits import SumDigitsEnv
 from torchtitan.models.qwen3 import model_registry
@@ -65,7 +66,7 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
                 interval=10,
                 last_save_model_only=False,
             ),
-            loss=GRPOLoss.Config(),
+            loss=DAPOLoss.Config(),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -79,7 +80,7 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
             sampling=SamplingConfig(
                 n=group_size,
                 temperature=0.8,
-                top_p=0.95,
+                top_p=1.0,
                 max_tokens=100,
             ),
         ),
@@ -122,7 +123,7 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
                 interval=10,
                 last_save_model_only=False,
             ),
-            loss=GRPOLoss.Config(),
+            loss=DAPOLoss.Config(),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -137,7 +138,7 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
             sampling=SamplingConfig(
                 n=group_size,
                 temperature=0.8,
-                top_p=0.95,
+                top_p=1.0,
                 max_tokens=100,
             ),
         ),
@@ -180,7 +181,7 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
                 interval=10,
                 last_save_model_only=False,
             ),
-            loss=GRPOLoss.Config(),
+            loss=DAPOLoss.Config(),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -194,7 +195,7 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
             sampling=SamplingConfig(
                 n=group_size,
                 temperature=0.8,
-                top_p=0.95,
+                top_p=1.0,
                 max_tokens=100,
             ),
         ),
@@ -245,7 +246,7 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
                 last_save_model_only=False,
             ),
             debug=batch_invariant_config,
-            loss=GRPOLoss.Config(),
+            loss=DAPOLoss.Config(),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -259,7 +260,7 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
             sampling=SamplingConfig(
                 n=group_size,
                 temperature=0.8,
-                top_p=0.95,
+                top_p=1.0,
                 max_tokens=100,
             ),
             debug=batch_invariant_config,

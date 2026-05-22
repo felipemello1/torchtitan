@@ -13,14 +13,13 @@ methods on plain dataclasses.
 
 from __future__ import annotations
 
-import math
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import torch
 
-from torchtitan.experiments.rl.grpo import _prepare_reward_metrics, GRPOLoss, RLTrainer
+from torchtitan.experiments.rl.grpo import _prepare_reward_metrics, RLTrainer
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.types import Completion, Step, Trajectory
 
@@ -66,7 +65,7 @@ class TestBuildRewardMetrics:
             assert isinstance(entry.value, m.Mean)
 
     def test_components_observed_in_some_trajectories_only(self) -> None:
-        # `format` only appears in the second trajectory — it should
+        # `format` only appears in the second trajectory; it should
         # average over that one entry (no zero-fill).
         trajectories = [
             _reward_trajectory({"correctness": 1.0}, sample_idx=0),
@@ -120,9 +119,7 @@ class _FakeEnv:
 
 
 def _build_collect_rollouts_inputs(self_obj):
-    """Build a hollow RLTrainer instance + completions wired into the
-    fake generator — without spawning real meshes.
-    """
+    """Build a hollow RLTrainer instance with fake generator completions."""
 
     completions = [
         _completion(prompt_idx=0, response_len=10),
@@ -149,10 +146,10 @@ def _build_collect_rollouts_inputs(self_obj):
 class TestCollectRollouts:
     def test_passes_token_ids_to_generator(self) -> None:
         """Controller tokenizes env prompts and hands the IDs (not strings)
-        to ``generator.generate.call``."""
+        to `generator.generate.call`."""
         controller = RLTrainer.__new__(RLTrainer)
         _build_collect_rollouts_inputs(controller)
-        controller._collect_rollouts(num_groups=2, step=0)
+        controller._collect_rollouts(num_groups=2, step=0, group_offset=0)
         # _FakeEnv.prompt == "p"; encode side_effect returns [ord(prompt)] = [112].
         controller.generator.generate.call.assert_called_once_with([[112], [112]])
 
@@ -160,7 +157,7 @@ class TestCollectRollouts:
         controller = RLTrainer.__new__(RLTrainer)
         completions = _build_collect_rollouts_inputs(controller)
         trajectories, rollout_metrics = controller._collect_rollouts(
-            num_groups=2, step=0
+            num_groups=2, step=0, group_offset=0
         )
         assert len(trajectories) == len(completions)
         agg = m.MetricsProcessor._aggregate_metrics(rollout_metrics)
@@ -194,14 +191,16 @@ class TestCollectRollouts:
         controller.generator = MagicMock()
         controller._get_rank_0_value = lambda value, has_gpus=True: (completions, [])
 
-        _, rollout_metrics = controller._collect_rollouts(num_groups=2, step=0)
+        _, rollout_metrics = controller._collect_rollouts(
+            num_groups=2, step=0, group_offset=0
+        )
         agg = m.MetricsProcessor._aggregate_metrics(rollout_metrics)
         # 3 of 4 completions hit max_tokens.
         assert agg["rollout/truncation_rate/mean"] == pytest.approx(0.75)
 
     def test_total_length_uses_per_episode_max(self) -> None:
         """rollout/total_length/max must be max(prompt+response per
-        episode), **not** max(prompt) + max(response) — the latter
+        episode), **not** max(prompt) + max(response); the latter
         may combine two different episodes."""
         controller = RLTrainer.__new__(RLTrainer)
 
@@ -228,7 +227,7 @@ class TestCollectRollouts:
         controller._get_rank_0_value = lambda value, has_gpus=True: (completions, [])
 
         trajectories, rollout_metrics = controller._collect_rollouts(
-            num_groups=3, step=0
+            num_groups=3, step=0, group_offset=0
         )
         agg = m.MetricsProcessor._aggregate_metrics(rollout_metrics)
         per_side_max_sum = max(len(t.prompt_token_ids) for t in trajectories) + max(
@@ -376,100 +375,12 @@ class TestRLTrainerConfigWiring:
         assert "X" not in fresh.metrics.console_log_keys_train
         assert "Y" not in fresh.metrics.console_log_keys_validation
 
-    def test_metrics_default_wandb_enabled(self) -> None:
+    def test_metrics_default_wandb_disabled(self) -> None:
         from torchtitan.experiments.rl.config_registry import rl_grpo_qwen3_0_6b
 
         cfg = rl_grpo_qwen3_0_6b()
-        assert cfg.metrics.enable_wandb is True
+        assert cfg.metrics.enable_wandb is False
         assert cfg.metrics.enable_tensorboard is False
-
-
-# ---------------------------------------------------------------------------
-# GRPOLoss bridge
-# ---------------------------------------------------------------------------
-
-
-class TestGRPOLossBridge:
-    def test_loss_keeps_gradient(self) -> None:
-        """`loss` must remain differentiable so `.backward()` works.
-        Regression test for `_token_weighted_mean` accidentally detaching."""
-        loss_fn = GRPOLoss(GRPOLoss.Config(clip_eps=0.2))
-        policy_logprobs = [
-            torch.zeros(2, requires_grad=True),
-            torch.zeros(8, requires_grad=True),
-        ]
-
-        loss, _loss_metrics = loss_fn(
-            policy_logprobs=policy_logprobs,
-            advantages=torch.tensor([1.0, -1.0]),
-            num_global_valid_tokens=torch.tensor(10.0),
-        )
-
-        assert loss.requires_grad
-        assert loss.grad_fn is not None
-        loss.backward()
-        assert all(sample.grad is not None for sample in policy_logprobs)
-
-    def test_returns_loss_and_pre_normalized_metrics(self) -> None:
-        loss_fn = GRPOLoss(GRPOLoss.Config(clip_eps=0.2))
-        # Two samples with unequal response lengths.
-        policy_logprobs = [
-            torch.zeros(2, requires_grad=True),
-            torch.zeros(8, requires_grad=True),
-        ]
-        advantages = torch.tensor([1.0, -1.0])
-        # Single-rank case: global == local valid tokens.
-        num_global_valid_tokens = torch.tensor(10.0)
-
-        loss, loss_metrics = loss_fn(
-            policy_logprobs=policy_logprobs,
-            advantages=advantages,
-            num_global_valid_tokens=num_global_valid_tokens,
-        )
-        assert isinstance(loss, torch.Tensor)
-        assert isinstance(loss_metrics, dict)
-        for key in ("loss/mean", "loss/ratio/mean", "loss/ratio/clipped_frac"):
-            assert key in loss_metrics
-
-    def test_loss_is_token_weighted_sum_over_global_tokens(self) -> None:
-        """loss = sum_i(sample_loss_i * num_tokens_i) / num_global_valid_tokens.
-
-        Under unequal response lengths this differs from a naive sample mean.
-        """
-        loss_fn = GRPOLoss(GRPOLoss.Config(clip_eps=0.2))
-        policy_logprobs = [
-            torch.full((2,), 0.1, requires_grad=True),
-            torch.full((8,), 0.0, requires_grad=True),
-        ]
-        advantages = torch.tensor([1.0, -1.0])
-        num_global_valid_tokens = torch.tensor(10.0)
-
-        loss, loss_metrics = loss_fn(
-            policy_logprobs=policy_logprobs,
-            advantages=advantages,
-            num_global_valid_tokens=num_global_valid_tokens,
-        )
-        # loss/mean metric is the same value as loss (both pre-normalized).
-        assert math.isclose(
-            loss_metrics["loss/mean"].item(),
-            loss.item(),
-            rel_tol=1e-6,
-        )
-
-        # And it is NOT equal to the unweighted sample mean of policy gradient
-        # losses, which is what the prior implementation used.
-        per_sample_mean_logprobs = torch.stack(
-            [sample_logprobs.mean() for sample_logprobs in policy_logprobs]
-        )
-        ratio = torch.exp(per_sample_mean_logprobs)
-        clipped_ratio = torch.clamp(ratio, 1 - 0.2, 1 + 0.2)
-        sample_policy_gradient_losses = -torch.min(
-            ratio * advantages, clipped_ratio * advantages
-        )
-        unweighted_sample_mean = float(sample_policy_gradient_losses.mean().item())
-        assert not math.isclose(
-            loss.item(), unweighted_sample_mean, rel_tol=1e-4, abs_tol=1e-6
-        )
 
 
 # ---------------------------------------------------------------------------

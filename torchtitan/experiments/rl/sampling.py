@@ -6,11 +6,78 @@
 
 """Sampling configuration shared by the vLLM actor and downstream RL code."""
 
+from dataclasses import dataclass
+
 
 TRAINING_VLLM_LOGPROBS_MODE = "processed_logprobs"
-"""vLLM logprob mode used for behavior-policy probabilities in training.
+"""vLLM logprob mode used for the reference-policy (`pi_old`) probabilities
+recorded at sampling time.
 
 Returns the logprob distribution after vLLM's sampling-temperature transform,
 so the trainer can recover the same distribution by dividing its own logits
 by the same temperature before `log_softmax`.
 """
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingLogprobConfig:
+    """Trainer-side logprob correction parameters.
+
+    Recreates the sampling-time logprob distribution inside the trainer so
+    PPO/GRPO/DAPO importance ratios operate on the same probability space
+    the rollouts came from. The generator emits reference logprobs through
+    vLLM's `processed_logprobs` mode (see `TRAINING_VLLM_LOGPROBS_MODE`),
+    which applies the sampling temperature; the trainer divides its own
+    logits by the same temperature before `log_softmax` so the two log
+    spaces line up.
+
+    Example::
+
+        # Sampling at temperature=0.8 with no nucleus truncation.
+        sampling = SamplingConfig(n=8, temperature=0.8, top_p=1.0, max_tokens=100)
+        logprob_config = TrainingLogprobConfig.from_sampling(sampling)
+        # logprob_config.temperature == 0.8
+
+        # Used by `compute_logprobs` to rebuild the sampling distribution:
+        # logits.float().div_(logprob_config.temperature).log_softmax(-1)
+    """
+
+    temperature: float
+    """Generator sampling temperature. Trainer logits are divided by this
+    value before `log_softmax`."""
+
+    def __post_init__(self) -> None:
+        if self.temperature <= 0.0:
+            raise ValueError(
+                "training logprob temperature must be positive, "
+                f"got {self.temperature}"
+            )
+
+    @classmethod
+    def from_sampling(
+        cls, sampling: "SamplingConfig"
+    ) -> "TrainingLogprobConfig":  # noqa: F821
+        """Build a logprob-correction contract from the generator's sampling config.
+
+        Currently restricted to `top_p == 1.0` because nucleus sampling
+        renormalizes the distribution per token; the trainer cannot
+        reconstruct the same support set without replaying the sort/truncate
+        step. Temperature-only sampling is recoverable analytically.
+
+        Example::
+
+            sampling = SamplingConfig(n=4, temperature=0.7, top_p=1.0, max_tokens=128)
+            TrainingLogprobConfig.from_sampling(sampling)
+            # -> TrainingLogprobConfig(temperature=0.7)
+
+            TrainingLogprobConfig.from_sampling(
+                SamplingConfig(n=4, temperature=0.7, top_p=0.95, max_tokens=128)
+            )
+            # -> ValueError: trainer logprob correction supports top_p=1.0 only ...
+        """
+        if sampling.top_p != 1.0:
+            raise ValueError(
+                "trainer logprob correction supports top_p=1.0 only; "
+                f"got top_p={sampling.top_p}"
+            )
+        return cls(temperature=sampling.temperature)

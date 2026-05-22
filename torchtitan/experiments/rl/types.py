@@ -110,9 +110,9 @@ class Episode:
 class TrainingBatch:
     token_ids: torch.Tensor  # [B, L]
     positions: torch.Tensor  # [B, L]
-    ref_logprobs: torch.Tensor  # [B, L] — 0.0 for prompt/padding
-    response_mask: torch.Tensor  # [B, L] — 1.0 for response, 0.0 for prompt/padding
-    advantages: torch.Tensor  # [B, L] — per-token, 0.0 for prompt/padding
+    ref_logprobs: torch.Tensor  # [B, L]; 0.0 for prompt/padding
+    loss_mask: torch.Tensor  # [B, L]; 1.0 for response, 0.0 for prompt/padding
+    advantages: torch.Tensor  # [B, L]; per-token, 0.0 for prompt/padding
 
 
 @dataclass(frozen=True, slots=True)
