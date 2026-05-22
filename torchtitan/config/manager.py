@@ -34,6 +34,7 @@ class ConfigManager:
     def parse_args(self, args: list[str] = sys.argv[1:]):
         loaded_config, args = self._load_config(args)
         config_cls = type(loaded_config)
+        self._reject_removed_cli_overrides(config_cls, args)
 
         self.config = tyro.cli(
             config_cls, args=args, default=loaded_config, registry=custom_registry
@@ -149,6 +150,23 @@ class ConfigManager:
 
         loaded_config = config_fn()
         return loaded_config, filtered_args
+
+    @staticmethod
+    def _reject_removed_cli_overrides(config_cls: type, args: list[str]) -> None:
+        removed = getattr(config_cls, "_removed_cli_overrides", {})
+        if not removed:
+            return
+
+        for arg in args:
+            if not arg.startswith("--") or arg == "--":
+                continue
+            option = arg[2:].split("=", 1)[0]
+            candidates = (option, option.replace("-", "_"))
+            for name in candidates:
+                if name in removed:
+                    raise ValueError(
+                        f"Config option `--{option}` was removed. {removed[name]}"
+                    )
 
     @staticmethod
     def _merge_configs(base, custom) -> type:

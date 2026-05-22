@@ -29,6 +29,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
+from typing import ClassVar
 
 # must run before torch import
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -49,6 +50,7 @@ from torchtitan.experiments.rl.config_derivation import (
     compute_world_size,
     derived_capacity,
     DerivedRLConfig,
+    format_resolved_config,
 )
 from torchtitan.experiments.rl.envs import (
     EnvBuilder,
@@ -81,6 +83,7 @@ from torchtitan.experiments.rl.rollouts import run_rollout_group
 from torchtitan.experiments.rl.sampling import SamplingConfig, TrainingLogprobConfig
 from torchtitan.experiments.rl.types import (
     Completion,
+    OptimStepOutput,
     ReplaySample,
     RolloutOutput,
     TrainingBatch,
@@ -321,18 +324,13 @@ def _build_train_step_trace_scalars(
         trace_scalars[key.replace("/", ".")] = fwd_bwd_metrics[key]
     key = "health/train/skipped_nonfinite_loss"
     trace_scalars[key.replace("/", ".")] = optimizer_metrics.get(key, 0.0)
+    key = "health/train/skipped_nonfinite_grad_norm"
+    trace_scalars[key.replace("/", ".")] = optimizer_metrics.get(key, 0.0)
     return trace_scalars
 
 
 class Batcher(Configurable):
-    """Packs training samples into ``[B, seq_len]`` batches for the trainer.
-
-    The controller collects rollouts until the total response tokens reach
-    ``num_tokens_target`` (= ``global_batch_size * seq_len``), then
-    packs all collected samples into fixed-length rows, truncates to
-    ``global_batch_size``, and splits into
-    ``[grad_accum_steps][dp_degree]`` microbatches.
-    """
+    """Legacy fixed-row packer used by tests and non-async callsites."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
@@ -364,11 +362,11 @@ class Batcher(Configurable):
         *,
         dp_degree: int,
     ) -> tuple[list[list[TrainingBatch]], int, dict[str, float]]:
-        """Pack samples into `[B, seq_len]` microbatches.
+        """Pack samples into sample-aligned trainer microbatches.
 
         Returns:
             microbatches: shape `[gradient_accumulation_steps][dp_degree]`,
-                each entry is a `TrainingBatch` with `local_batch_size` rows.
+                each entry is a packed varlen `TrainingBatch`.
             num_global_valid_tokens: total response tokens across the batch
                 (excludes padding). Used to normalize the loss so that
                 gradient accumulation matches a single large-batch step.
@@ -380,7 +378,7 @@ class Batcher(Configurable):
                 local_batch_size=2, global_batch_size=8, seq_len=2048,
             )), pad_id=0)
             mb, num_tok, stats = batcher.batch(samples, dp_degree=2)
-            # mb is [grad_accum=2][dp=2], each TrainingBatch holds 2 rows.
+            # mb is [grad_accum=2][dp=2], each TrainingBatch keeps seq_lens.
             # num_tok = total response tokens across all 8 packed rows.
         """
         packed_rows = list(self._pack_samples(samples))
@@ -456,7 +454,7 @@ class Batcher(Configurable):
             }
 
     def _pack_samples(self, samples: list[ReplaySample]) -> Iterator[dict]:
-        """Pack all samples into [1, seq_len] rows."""
+        """Pack all samples into padded [1, seq_len] rows."""
         yield from pack(
             self._iter_training_samples(samples),
             max_seq_length=self.seq_len,
@@ -470,13 +468,38 @@ class Batcher(Configurable):
 
     @staticmethod
     def collate(rows: list[dict]) -> TrainingBatch:
-        """Concatenate packed rows into a single [B, L] TrainingBatch."""
+        """Concatenate packed rows into a sample-aligned varlen TrainingBatch."""
+        if not rows:
+            return TrainingBatch(
+                token_ids=torch.zeros((1, 1), dtype=torch.long),
+                seq_lens=[1],
+                ref_logprobs=torch.zeros((1, 1), dtype=torch.float32),
+                loss_mask=torch.zeros((1, 1), dtype=torch.float32),
+                advantages=torch.zeros((1, 1), dtype=torch.float32),
+            )
+
+        token_ids: list[torch.Tensor] = []
+        ref_logprobs: list[torch.Tensor] = []
+        loss_mask: list[torch.Tensor] = []
+        advantages: list[torch.Tensor] = []
+        seq_lens: list[int] = []
+        for row in rows:
+            offset = 0
+            for seq_len in row["seq_lens"]:
+                end = offset + seq_len
+                token_ids.append(row["input_ids"][:, offset:end])
+                ref_logprobs.append(row["ref_logprobs"][:, offset:end])
+                loss_mask.append(row["loss_mask"][:, offset:end])
+                advantages.append(row["advantages"][:, offset:end])
+                seq_lens.append(seq_len)
+                offset = end
+
         return TrainingBatch(
-            token_ids=torch.cat([r["input_ids"] for r in rows]),
-            positions=torch.cat([r["positions"] for r in rows]),
-            ref_logprobs=torch.cat([r["ref_logprobs"] for r in rows]),
-            loss_mask=torch.cat([r["loss_mask"] for r in rows]),
-            advantages=torch.cat([r["advantages"] for r in rows]),
+            token_ids=torch.cat(token_ids, dim=1),
+            seq_lens=seq_lens,
+            ref_logprobs=torch.cat(ref_logprobs, dim=1),
+            loss_mask=torch.cat(loss_mask, dim=1),
+            advantages=torch.cat(advantages, dim=1),
         )
 
 
@@ -500,17 +523,38 @@ class RLTrainer(Configurable):
         dump_folder: str = "outputs/rl"
         """Root output folder for RL artifacts (temp weights, logs, etc.)."""
 
-        num_prompts_per_step: int = 5
-        """Number of prompt groups per dataset sample step."""
-
         group_size: int = 8
         """Number of sampled completions per prompt group."""
 
         max_rollout_turns: int = 1
         """Maximum assistant turns per rollout."""
 
-        num_validation_samples: int = 20
+        num_validation_prompts: int = 20
         """Number of held-out prompts scored greedily per validation pass."""
+
+        _removed_cli_overrides: ClassVar[dict[str, str]] = {
+            "num_prompts_per_step": (
+                "Training prompt groups now derive from `BatchConfig` "
+                "(`batcher.batch.global_batch_size`, "
+                "`batcher.batch.local_batch_size`, and `group_size`)."
+            ),
+            "rollout_group_size": "Use `group_size`.",
+            "num_validation_samples": "Use `num_validation_prompts`.",
+            "async_rollout_groups": (
+                "Use `async_pipeline.rollout_concurrency_groups`."
+            ),
+            "async_pipeline.rollout_concurrency": (
+                "Use `async_pipeline.rollout_concurrency_groups`."
+            ),
+            "replay_buffer_groups": (
+                "Use `async_pipeline.replay_buffer_samples`; it is measured "
+                "in samples, not groups."
+            ),
+            "max_admitted_generation_prompts": (
+                "Use `async_pipeline.max_admitted_generation_prompts` only "
+                "when the derived admission cap is not appropriate."
+            ),
+        }
 
         train_env_builder: Configurable.Config = field(default=None)  # type: ignore[assignment]
         """Builds single-use training envs from sampled dataset rows."""
@@ -609,15 +653,10 @@ class RLTrainer(Configurable):
                     "max_rollout_sample_groups must be non-negative, "
                     f"got {self.max_rollout_sample_groups}"
                 )
-            if self.num_prompts_per_step <= 0:
+            if self.num_validation_prompts <= 0:
                 raise ValueError(
-                    "num_prompts_per_step must be positive, "
-                    f"got {self.num_prompts_per_step}"
-                )
-            if self.num_validation_samples <= 0:
-                raise ValueError(
-                    "num_validation_samples must be positive, "
-                    f"got {self.num_validation_samples}"
+                    "num_validation_prompts must be positive, "
+                    f"got {self.num_validation_prompts}"
                 )
             if self.max_offpolicy_steps < 0:
                 raise ValueError(
@@ -636,12 +675,12 @@ class RLTrainer(Configurable):
                 )
             pipeline = self.async_pipeline
             if (
-                pipeline.rollout_concurrency is not None
-                and pipeline.rollout_concurrency <= 0
+                pipeline.rollout_concurrency_groups is not None
+                and pipeline.rollout_concurrency_groups <= 0
             ):
                 raise ValueError(
-                    "async_pipeline.rollout_concurrency must be positive "
-                    f"or None, got {pipeline.rollout_concurrency}"
+                    "async_pipeline.rollout_concurrency_groups must be positive "
+                    f"or None, got {pipeline.rollout_concurrency_groups}"
                 )
             if (
                 pipeline.replay_buffer_samples is not None
@@ -742,6 +781,62 @@ class RLTrainer(Configurable):
         await self._await_call(self.trainer.sync_log_step.call(step))
         for generator in self._generator_actors():
             await self._await_call(generator.sync_log_step.call(step))
+
+    def _shard_samples(self, samples: list[ReplaySample]) -> list[list[ReplaySample]]:
+        """Round-robin replay samples across trainer DP ranks."""
+        return [
+            [samples[i] for i in range(rank, len(samples), self.trainer_dp_degree)]
+            for rank in range(self.trainer_dp_degree)
+        ]
+
+    @staticmethod
+    @sl.log_trace_span("_collate_samples")
+    def _collate_samples(samples: list[ReplaySample]) -> TrainingBatch:
+        """Pack replay samples into one varlen token batch.
+
+        Example::
+
+            sample = ReplaySample(
+                token_ids=[10, 11, 20],
+                loss_mask=[0, 0, 1],
+                ref_logprobs=[0.0, 0.0, -0.4],
+                advantage=0.7,
+                group_id="g0",
+                sample_idx=0,
+                behavior_version=3,
+                reward=1.0,
+            )
+            batch = RLTrainer._collate_samples([sample])
+            # batch.token_ids is [1, 3], and batch.seq_lens == [3].
+        """
+        if not samples:
+            return TrainingBatch(
+                token_ids=torch.zeros((1, 1), dtype=torch.long),
+                seq_lens=[1],
+                ref_logprobs=torch.zeros((1, 1), dtype=torch.float32),
+                loss_mask=torch.zeros((1, 1), dtype=torch.float32),
+                advantages=torch.zeros((1, 1), dtype=torch.float32),
+            )
+
+        all_ids: list[int] = []
+        all_masks: list[int] = []
+        all_ref_logprobs: list[float] = []
+        all_advantages: list[float] = []
+        for sample in samples:
+            all_ids.extend(sample.token_ids)
+            all_masks.extend(sample.loss_mask)
+            all_ref_logprobs.extend(sample.ref_logprobs)
+            all_advantages.extend(
+                sample.advantage if mask else 0.0 for mask in sample.loss_mask
+            )
+
+        return TrainingBatch(
+            token_ids=torch.tensor([all_ids], dtype=torch.long),
+            seq_lens=[len(sample.token_ids) for sample in samples],
+            ref_logprobs=torch.tensor([all_ref_logprobs], dtype=torch.float32),
+            loss_mask=torch.tensor([all_masks], dtype=torch.float32),
+            advantages=torch.tensor([all_advantages], dtype=torch.float32),
+        )
 
     def _get_rank_0_value(self, result, has_gpus: bool = True):
         """Extract rank 0 result, handling both single and multi-node meshes.
@@ -859,6 +954,7 @@ class RLTrainer(Configurable):
                 host_mesh is provided.
         """
         config = self.config
+        logger.info("\n%s", format_resolved_config(config))
 
         self.trainer_world_size = compute_world_size(config.trainer.parallelism)
         self.generator_world_size = compute_world_size(config.generator.parallelism)
@@ -1075,7 +1171,24 @@ class RLTrainer(Configurable):
         return {
             "train/policy_version": float(policy_version),
             "health/train/skipped_nonfinite_loss": 1.0,
+            "health/train/skipped_nonfinite_grad_norm": 0.0,
         }
+
+    @staticmethod
+    def _optimizer_step_skipped(
+        optim_output: OptimStepOutput,
+        *,
+        previous_policy_version: int,
+    ) -> bool:
+        """Return whether ``optim_step`` declined to update weights."""
+        return (
+            optim_output.policy_version == previous_policy_version
+            or optim_output.metrics.get(
+                "health/train/skipped_nonfinite_grad_norm",
+                0.0,
+            )
+            > 0.0
+        )
 
     def _log_train_step(
         self,
@@ -1165,7 +1278,7 @@ class RLTrainer(Configurable):
         pending: set[asyncio.Task[list[RolloutOutput]]] = set()
         rollouts: list[RolloutOutput] = []
         next_idx = 0
-        max_inflight = max(self.config.derived.rollout_concurrency, 1)
+        max_inflight = max(self.config.derived.rollout_concurrency_groups, 1)
 
         try:
             while next_idx < len(examples) or pending:
@@ -1298,7 +1411,7 @@ class RLTrainer(Configurable):
         rollouts, validation_metrics = await self._collect_finite_rollouts(
             env_dataset=self.validation_dataset,
             env_builder=self.validation_env_builder,
-            num_groups=self.config.num_validation_samples,
+            num_groups=self.config.num_validation_prompts,
             group_size=1,
             sample_step=0,
             sampling=greedy,
@@ -1373,7 +1486,7 @@ class RLTrainer(Configurable):
                 next_group_idx += 1
             sample_step, group_idx = divmod(
                 absolute_group_idx,
-                max(self.config.num_prompts_per_step, 1),
+                max(derived.prompt_groups_per_batch, 1),
             )
             return self.train_dataset.sample_group(
                 sample_step=sample_step,
@@ -1392,7 +1505,7 @@ class RLTrainer(Configurable):
                     next_example=next_example,
                 )
             )
-            for worker_idx in range(max(derived.rollout_concurrency, 1))
+            for worker_idx in range(max(derived.rollout_concurrency_groups, 1))
         ]
 
         policy_version = 0
@@ -1406,7 +1519,7 @@ class RLTrainer(Configurable):
                 train_version = policy_version
                 with sl.log_trace_span("replay_buffer_get_batch"):
                     replay_batch = await replay_buffer.get_batch(
-                        min_loss_tokens=self.batcher.num_tokens_target,
+                        min_samples=derived.global_batch_rows,
                         train_version=train_version,
                     )
                 t_replay_wait_s = time.perf_counter() - t_replay_start
@@ -1437,16 +1550,19 @@ class RLTrainer(Configurable):
 
                 t_train_start = time.perf_counter()
                 with sl.log_trace_span("batcher_batch"):
-                    (
-                        microbatches,
-                        num_global_valid_tokens,
-                        packing_metrics,
-                    ) = self.batcher.batch(samples, dp_degree=self.trainer_dp_degree)
+                    train_data = [
+                        self._collate_samples(per_rank_samples)
+                        for per_rank_samples in self._shard_samples(samples)
+                    ]
+                    num_global_valid_tokens = sum(
+                        sample.num_loss_tokens for sample in samples
+                    )
+                    packing_metrics: dict[str, float] = {}
 
                 with sl.log_trace_span("trainer_forward_backward_call"):
                     fwd_bwd_metrics = await self._await_rank_0(
                         self.trainer.forward_backward.call(
-                            microbatches,
+                            train_data,
                             num_global_valid_tokens=num_global_valid_tokens,
                             logprob_config=logprob_config,
                         )
@@ -1497,6 +1613,41 @@ class RLTrainer(Configurable):
                     "health/train/skipped_nonfinite_loss": 0.0,
                 }
                 t_train_s = time.perf_counter() - t_train_start
+
+                if self._optimizer_step_skipped(
+                    optim_output,
+                    previous_policy_version=policy_version,
+                ):
+                    t_step_s = time.perf_counter() - t_step_start
+                    logger.warning(
+                        "Step %d skipped weight sync and checkpoint because "
+                        "optimizer step did not publish a new policy version",
+                        step,
+                    )
+                    self._log_train_step(
+                        step=step,
+                        samples=samples,
+                        replay_batch=replay_batch,
+                        rollouts=rollouts,
+                        generation_scheduler=generation_scheduler,
+                        fwd_bwd_metrics=fwd_bwd_metrics,
+                        optimizer_metrics=optimizer_metrics,
+                        packing_metrics=packing_metrics,
+                        checkpoint_saved=False,
+                        timings=_TrainStepTimings(
+                            step_s=t_step_s,
+                            replay_wait_s=t_replay_wait_s,
+                            rollout_s=t_replay_wait_s,
+                            train_s=t_train_s,
+                            checkpoint_s=0.0,
+                            weight_sync=_zero_weight_sync_timings(),
+                        ),
+                        dropped_empty_groups=drop_stats.empty_groups,
+                        dropped_zero_advantage_groups=drop_stats.zero_advantage_groups,
+                        drop_metrics=drop_stats.metrics,
+                        train_version=train_version,
+                    )
+                    continue
 
                 weight_sync_timings = await self._sync_generator_weights(
                     generation_scheduler=generation_scheduler,

@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from torchtitan.config import BatchConfig
-from torchtitan.experiments.rl.grpo import Batcher
+from torchtitan.experiments.rl.grpo import Batcher, RLTrainer
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.observability.metrics.rl import (
     _TrainStepTimings,
@@ -25,6 +25,7 @@ from torchtitan.experiments.rl.observability.metrics.rl import (
 )
 from torchtitan.experiments.rl.replay import ReplayBatch
 from torchtitan.experiments.rl.types import (
+    OptimStepOutput,
     ReplaySample,
     RolloutOutput,
     RolloutStatus,
@@ -261,6 +262,27 @@ class TestRLTrainerConfigWiring:
         assert cfg.metrics.enable_tensorboard is False
 
 
+def test_optimizer_step_skipped_detects_unchanged_policy_version() -> None:
+    assert RLTrainer._optimizer_step_skipped(
+        OptimStepOutput(policy_version=4, metrics={}),
+        previous_policy_version=4,
+    )
+    assert RLTrainer._optimizer_step_skipped(
+        OptimStepOutput(
+            policy_version=5,
+            metrics={"health/train/skipped_nonfinite_grad_norm": 1.0},
+        ),
+        previous_policy_version=4,
+    )
+    assert not RLTrainer._optimizer_step_skipped(
+        OptimStepOutput(
+            policy_version=5,
+            metrics={"health/train/skipped_nonfinite_grad_norm": 0.0},
+        ),
+        previous_policy_version=4,
+    )
+
+
 def _stub_trainer_for_reducers(dp_size: int):
     from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 
@@ -278,15 +300,15 @@ class TestReducerFastPaths:
         out = trainer.reduce_forward_backward_metrics(
             sum_reduced_metrics={
                 "loss/mean": torch.tensor(3.0),
-                "bit_wise/logprob_diff/mean": torch.tensor(0.001),
-                "bit_wise/ratio_tokens_different/mean": torch.tensor(0.0),
+                "logprob_drift/diff_mean": torch.tensor(0.001),
+                "logprob_drift/diff_fraction": torch.tensor(0.0),
             },
-            max_reduced_metrics={"bit_wise/logprob_diff/max": torch.tensor(0.005)},
+            max_reduced_metrics={"logprob_drift/diff_max_abs": torch.tensor(0.005)},
         )
         assert out["loss/mean"] == pytest.approx(3.0)
-        assert out["bit_wise/logprob_diff/mean"] == pytest.approx(0.001)
-        assert out["bit_wise/logprob_diff/max"] == pytest.approx(0.005)
-        assert out["bit_wise/ratio_tokens_different/mean"] == 0.0
+        assert out["logprob_drift/diff_mean"] == pytest.approx(0.001)
+        assert out["logprob_drift/diff_max_abs"] == pytest.approx(0.005)
+        assert out["logprob_drift/diff_fraction"] == 0.0
 
     def test_unbiased_sum_reduction_across_ranks(self) -> None:
         trainer = _stub_trainer_for_reducers(dp_size=2)
@@ -306,7 +328,7 @@ class TestReducerFastPaths:
         ):
             out = trainer.reduce_forward_backward_metrics(
                 sum_reduced_metrics={"loss/mean": rank0_share[0]},
-                max_reduced_metrics={"bit_wise/logprob_diff/max": torch.tensor(0.0)},
+                max_reduced_metrics={"logprob_drift/diff_max_abs": torch.tensor(0.0)},
             )
         assert out["loss/mean"] == pytest.approx(40.0 / 15.0)
 
@@ -330,11 +352,11 @@ class TestReducerFastPaths:
         ):
             out = trainer.reduce_forward_backward_metrics(
                 sum_reduced_metrics={"loss/mean": torch.tensor(0.5)},
-                max_reduced_metrics={"bit_wise/logprob_diff/max": torch.tensor(0.003)},
+                max_reduced_metrics={"logprob_drift/diff_max_abs": torch.tensor(0.003)},
             )
 
         assert out["loss/mean"] == pytest.approx(1.0)
-        assert out["bit_wise/logprob_diff/max"] == pytest.approx(0.006)
+        assert out["logprob_drift/diff_max_abs"] == pytest.approx(0.006)
 
     def test_sum_only_skips_max_collective(self) -> None:
         import torch.distributed.distributed_c10d as c10d
@@ -381,11 +403,11 @@ class TestReducerFastPaths:
             out = trainer.reduce_forward_backward_metrics(
                 sum_reduced_metrics={},
                 max_reduced_metrics={
-                    "bit_wise/logprob_diff/max": torch.tensor(0.003),
+                    "logprob_drift/diff_max_abs": torch.tensor(0.003),
                 },
             )
         assert seen_ops == [c10d.ReduceOp.MAX.name]
-        assert out == {"bit_wise/logprob_diff/max": pytest.approx(0.006)}
+        assert out == {"logprob_drift/diff_max_abs": pytest.approx(0.006)}
 
     def test_both_empty_returns_empty(self) -> None:
         trainer = _stub_trainer_for_reducers(dp_size=2)

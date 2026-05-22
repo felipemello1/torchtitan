@@ -38,7 +38,7 @@ def compute_world_size(parallelism: ParallelismConfig) -> int:
 class AsyncPipelineConfig:
     """Capacity overrides for async rollout producers and replay."""
 
-    rollout_concurrency: int | None = None
+    rollout_concurrency_groups: int | None = None
     """Prompt groups concurrently producing rollouts. ``None`` derives from batch size."""
 
     replay_buffer_samples: int | None = None
@@ -54,11 +54,13 @@ class DerivedRLConfig:
 
     global_batch_rows: int
     local_batch_rows: int
+    trainer_microbatch_rows: int | None
     seq_len: int
     trainer_dp_degree: int
     gradient_accumulation_steps: int
     rollout_token_target: int
-    rollout_concurrency: int
+    prompt_groups_per_batch: int
+    rollout_concurrency_groups: int
     replay_buffer_samples: int
     max_admitted_generation_prompts: int
 
@@ -88,38 +90,33 @@ def derived_capacity(cfg: "RLTrainer.Config") -> DerivedRLConfig:
         if batch.global_batch_size > 0
         else batch.local_batch_size * dp
     )
-    rows_per_grad_accum = batch.local_batch_size * dp
     if global_batch_rows <= 0:
         raise ValueError(f"global_batch_rows must be positive, got {global_batch_rows}")
-    if global_batch_rows % rows_per_grad_accum != 0:
-        raise ValueError(
-            "BatchConfig.global_batch_size must be divisible by "
-            "local_batch_size * trainer_dp_degree; got "
-            f"global_batch_size={global_batch_rows}, "
-            f"local_batch_size={batch.local_batch_size}, dp={dp}"
-        )
-    gradient_accumulation_steps = global_batch_rows // rows_per_grad_accum
+    trainer_microbatch_rows = cfg.trainer.max_microbatch_samples
+    rows_per_grad_accum = (trainer_microbatch_rows or batch.local_batch_size) * dp
+    _validate_positive("trainer microbatch rows", rows_per_grad_accum)
+    gradient_accumulation_steps = _ceil_div(global_batch_rows, rows_per_grad_accum)
     rollout_token_target = global_batch_rows * batch.seq_len
 
     prompt_groups_per_batch = _ceil_div(global_batch_rows, cfg.group_size)
-    default_rollout_concurrency = prompt_groups_per_batch * (
+    default_rollout_concurrency_groups = prompt_groups_per_batch * (
         cfg.max_offpolicy_steps + 1
     )
-    rollout_concurrency = (
-        cfg.async_pipeline.rollout_concurrency
-        if cfg.async_pipeline.rollout_concurrency is not None
-        else default_rollout_concurrency
+    rollout_concurrency_groups = (
+        cfg.async_pipeline.rollout_concurrency_groups
+        if cfg.async_pipeline.rollout_concurrency_groups is not None
+        else default_rollout_concurrency_groups
     )
 
     replay_buffer_samples = (
         cfg.async_pipeline.replay_buffer_samples
         if cfg.async_pipeline.replay_buffer_samples is not None
-        else max(global_batch_rows, rollout_concurrency * cfg.group_size)
+        else max(global_batch_rows, rollout_concurrency_groups * cfg.group_size)
     )
 
     default_max_admitted = max(
-        rollout_concurrency * cfg.group_size,
-        cfg.num_validation_samples,
+        rollout_concurrency_groups * cfg.group_size,
+        cfg.num_validation_prompts,
     )
     max_admitted_generation_prompts = (
         cfg.async_pipeline.max_admitted_generation_prompts
@@ -130,11 +127,13 @@ def derived_capacity(cfg: "RLTrainer.Config") -> DerivedRLConfig:
     return DerivedRLConfig(
         global_batch_rows=global_batch_rows,
         local_batch_rows=batch.local_batch_size,
+        trainer_microbatch_rows=trainer_microbatch_rows,
         seq_len=batch.seq_len,
         trainer_dp_degree=dp,
         gradient_accumulation_steps=gradient_accumulation_steps,
         rollout_token_target=rollout_token_target,
-        rollout_concurrency=rollout_concurrency,
+        prompt_groups_per_batch=prompt_groups_per_batch,
+        rollout_concurrency_groups=rollout_concurrency_groups,
         replay_buffer_samples=replay_buffer_samples,
         max_admitted_generation_prompts=max_admitted_generation_prompts,
     )
@@ -143,7 +142,7 @@ def derived_capacity(cfg: "RLTrainer.Config") -> DerivedRLConfig:
 def compute_generator_max_num_seqs(cfg: "RLTrainer.Config") -> int:
     """Resolve the vLLM running-sequence cap for the generator actor."""
     derived = cfg.derived
-    return max(derived.max_admitted_generation_prompts, cfg.num_validation_samples)
+    return max(derived.max_admitted_generation_prompts, cfg.num_validation_prompts)
 
 
 def format_resolved_config(cfg: "RLTrainer.Config") -> str:
@@ -160,16 +159,27 @@ def format_resolved_config(cfg: "RLTrainer.Config") -> str:
         ("batch.global_batch_size", f"{derived.global_batch_rows} rows"),
         ("batch.global_batch_origin", global_batch_origin),
         ("batch.local_batch_size", f"{derived.local_batch_rows} rows"),
+        (
+            "trainer.max_microbatch_samples",
+            "None"
+            if derived.trainer_microbatch_rows is None
+            else f"{derived.trainer_microbatch_rows} samples",
+        ),
         ("batch.seq_len", f"{derived.seq_len} tokens"),
         ("trainer_dp_degree", str(derived.trainer_dp_degree)),
         ("gradient_accumulation_steps", str(derived.gradient_accumulation_steps)),
         ("rollout_token_target", f"{derived.rollout_token_target} tokens"),
-        ("rollout_concurrency", f"{derived.rollout_concurrency} groups"),
+        ("prompt_groups_per_batch", f"{derived.prompt_groups_per_batch} groups"),
+        (
+            "rollout_concurrency_groups",
+            f"{derived.rollout_concurrency_groups} groups",
+        ),
         ("replay_buffer_samples", f"{derived.replay_buffer_samples} samples"),
         (
             "max_admitted_generation_prompts",
             f"{derived.max_admitted_generation_prompts} prompts",
         ),
+        ("num_validation_prompts", f"{cfg.num_validation_prompts} prompts"),
         ("num_generator_instances", str(cfg.num_generator_instances)),
         ("max_offpolicy_steps", str(cfg.max_offpolicy_steps)),
     ]

@@ -7,9 +7,9 @@
 """
 Integration tests for the RL unified workstream.
 
-Runs the full GRPO training loop (simple_grpo.py) with different
+Runs the full GRPO training loop (`grpo.py`) with different
 parallelism configurations. Uses OverrideDefinitions from the shared
-test infrastructure but with a custom runner since simple_grpo.py is
+test infrastructure but with a custom runner since the RL loop is
 a Monarch script (run with ``python``, not ``torchrun``).
 
 Usage:
@@ -99,8 +99,8 @@ def run_single_test(
     """Run a single RL integration test.
 
     Unlike the standard run_tests which uses ``./run_train.sh`` (torchrun),
-    this runs ``python simple_grpo.py`` directly since the RL script manages
-    its own distributed setup via Monarch.
+    this runs ``python torchtitan/experiments/rl/grpo.py`` directly since
+    the RL script manages its own distributed setup via Monarch.
     """
     test_name = test_flavor.test_name
     dump_folder = os.path.join(output_dir, test_name)

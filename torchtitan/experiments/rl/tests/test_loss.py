@@ -149,7 +149,7 @@ def test_metric_accumulator_combines_sum_and_max() -> None:
 def _training_batch(sample_id: int) -> TrainingBatch:
     return TrainingBatch(
         token_ids=torch.tensor([[sample_id, sample_id + 1]]),
-        positions=torch.tensor([[0, 1]]),
+        seq_lens=[2],
         ref_logprobs=torch.zeros(1, 2),
         loss_mask=torch.tensor([[0.0, 1.0]]),
         advantages=torch.ones(1, 2),
@@ -168,6 +168,10 @@ def test_forward_backward_accumulates_microsteps_before_optim_step() -> None:
     trainer.device = torch.device("cpu")
     trainer.dp_rank = 0
     trainer.optimizers = MagicMock()
+    trainer.config = SimpleNamespace(
+        max_microbatch_samples=1,
+        max_microbatch_tokens=None,
+    )
 
     backward_calls: list[int] = []
 
@@ -216,7 +220,15 @@ def test_forward_backward_accumulates_microsteps_before_optim_step() -> None:
     out = asyncio.run(
         forward_backward_impl(
             trainer,
-            [[_training_batch(i)] for i in range(1, 5)],
+            [
+                TrainingBatch(
+                    token_ids=torch.tensor([[1, 2, 3, 4]]),
+                    seq_lens=[1, 1, 1, 1],
+                    ref_logprobs=torch.zeros(1, 4),
+                    loss_mask=torch.ones(1, 4),
+                    advantages=torch.ones(1, 4),
+                )
+            ],
             num_global_valid_tokens=4,
             logprob_config=TrainingLogprobConfig(temperature=1.0),
         )
