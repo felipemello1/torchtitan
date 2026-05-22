@@ -47,6 +47,15 @@ class Completion:
     token_logprobs: list[float]
     finish_reason: str | None = None
     """vLLM `CompletionOutput.finish_reason` ("stop" | "length" | "abort")"""
+    error: str | None = None
+    """Generator-side failure reason. ``None`` for successful completions.
+
+    Populated when vLLM finishes a request with ``finish_reason`` in
+    ``{"error", "abort"}``, when prompt validation rejects an admission
+    (oversize prompt, OOV token), or when the completion-build path raises
+    on a malformed ``RequestOutput``. Controllers skip these rather than
+    feeding them through the env / reward path.
+    """
 
 
 @dataclass(kw_only=True, slots=True)

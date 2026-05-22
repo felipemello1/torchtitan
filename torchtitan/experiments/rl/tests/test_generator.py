@@ -4,187 +4,122 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Unit tests for ``VLLMGenerator.generate``.
+"""Unit tests for the engine-loop dispatch invariants added in PR 1.
 
-Exercises the endpoint in isolation by swapping in a fake vLLM engine —
-no Monarch, no GPU, no real model. Covers the token-in / token-out
-contract, the metric payload (timing math, edge cases, prefix override),
-and the completion/metrics separation.
+End-to-end behavior is covered by the GPU smokes; these tests only pin
+the two new shapes the engine loop has to honor:
+
+- ``SamplingParams.n > 1`` returns every sibling completion (RFC §6
+  cardinality), not just ``outputs[0]``;
+- vLLM ``finish_reason in {"error", "abort"}`` becomes
+  ``Completion.error`` so the controller can drop the sample.
 """
 
 import asyncio
 from types import SimpleNamespace
 
-import pytest
-
-from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
-from torchtitan.experiments.rl.observability import metrics as m
-
-
-class _FakeRenderer:
-    """Stub for vLLM's Renderer.render_cmpl.
-
-    Mirrors the real shape: takes a list of ``{"prompt_token_ids": ids}``
-    dicts and returns a list of typed ``TokensInput`` EngineInputs with
-    ``type="token"`` plus a stamped ``arrival_time``.
-    """
-
-    def render_cmpl(self, prompts):
-        return [
-            {
-                "type": "token",
-                "prompt_token_ids": p["prompt_token_ids"],
-                "arrival_time": 0.0,
-            }
-            for p in prompts
-        ]
+from torchtitan.experiments.rl.actors.generator import (
+    _PendingRequest,
+    VLLMGenerator,
+)
 
 
-class _FakeEngine:
-    def __init__(self, outputs):
-        self.outputs = outputs
-        self.add_requests = []
-        self._stepped = False
-        self.renderer = _FakeRenderer()
-
-    def add_request(self, *args, **kwargs):
-        self.add_requests.append((args, kwargs))
-
-    def has_unfinished_requests(self):
-        return not self._stepped
-
-    def step(self):
-        self._stepped = True
-        return self.outputs
-
-
-def _sample(*, index=0, token_ids=(10, 11), finish_reason="stop"):
+def _sample(*, token_ids=(10, 11), finish_reason="stop", text="ok"):
     return SimpleNamespace(
-        index=index,
-        text="ok",
+        text=text,
         token_ids=list(token_ids),
         logprobs=[{tok: SimpleNamespace(logprob=-0.1)} for tok in token_ids],
         finish_reason=finish_reason,
     )
 
 
-def _request_output(
-    *,
-    request_id="0",
-    prompt_token_ids=(1, 2),
-    outputs=None,
-    num_generation_tokens=4,
-):
+def _request_output(*, request_id, outputs):
+    # ``metrics`` is None to skip the timing emission path — these tests
+    # only care about which completions flow back to which futures.
     return SimpleNamespace(
         request_id=request_id,
-        prompt_token_ids=list(prompt_token_ids),
-        num_cached_tokens=0,
-        metrics=SimpleNamespace(
-            first_token_latency=0.012,
-            queued_ts=1.0,
-            scheduled_ts=1.005,
-            first_token_ts=1.017,
-            last_token_ts=1.047,
-            num_generation_tokens=num_generation_tokens,
-        ),
-        outputs=list(outputs or [_sample()]),
+        num_cached_tokens=None,
+        metrics=None,
+        outputs=list(outputs),
     )
 
 
-def _generator(outputs):
-    generator = VLLMGenerator.__new__(VLLMGenerator)
-    generator._engine = _FakeEngine(outputs)
-    generator.policy_version = 7
-    generator.config = SimpleNamespace(
-        sampling=SamplingConfig(n=1, temperature=0.0, top_p=1.0, max_tokens=4),
-        debug=SimpleNamespace(seed=None),
-    )
-    return generator
-
-
-def _run_generate(generator, tokenized_prompts, **kwargs):
-    return asyncio.run(
-        VLLMGenerator.generate._method(
-            generator, tokenized_prompts, **kwargs
-        )  # noqa: SLF001
+def _pending(*, request_id, prompt_idx):
+    return _PendingRequest(
+        request_id=request_id,
+        prompt_idx=prompt_idx,
+        prompt_token_ids=[1, 2],
+        sampling_params=SimpleNamespace(),
+        future=asyncio.get_running_loop().create_future(),
+        metrics_prefix="generator",
+        metrics_sink=[],
+        admitted_policy_version=7,
     )
 
 
-def test_generate_passes_token_prompt_to_vllm():
-    generator = _generator([_request_output(prompt_token_ids=[1, 2, 3])])
+def test_resolve_finished_outputs_flattens_n_siblings_in_input_order():
+    """RFC §6 cardinality: n=3 over 2 prompts must yield 6 completions.
 
-    _run_generate(generator, [[1, 2, 3]])
+    The scalar-future shape used by the reference branch's final form
+    silently dropped ``n - 1`` siblings per request when
+    ``SamplingParams.n > 1``; catching that regression is the whole
+    point of PR 1's temporary list-of-completions future.
+    """
 
-    # add_request is invoked entirely with kwargs. The ``prompt`` kwarg
-    # carries the renderer's output: a typed EngineInput (``type="token"``)
-    # with the prompt token IDs and a stamped ``arrival_time`` — keeping us
-    # off vLLM's deprecated raw-prompt path.
-    (_args, kwargs) = generator._engine.add_requests[0]
-    assert kwargs["request_id"] == "0"
-    assert kwargs["prompt"]["type"] == "token"
-    assert kwargs["prompt"]["prompt_token_ids"] == [1, 2, 3]
-    assert "arrival_time" in kwargs["prompt"]
+    async def scenario():
+        gen = VLLMGenerator.__new__(VLLMGenerator)
+        p0 = _pending(request_id="0", prompt_idx=0)
+        p1 = _pending(request_id="1", prompt_idx=1)
+        gen._pending_by_request_id = {"0": p0, "1": p1}
+        gen._resolve_finished_outputs(
+            [
+                _request_output(
+                    request_id="0",
+                    outputs=[
+                        _sample(token_ids=(10,), text="a"),
+                        _sample(token_ids=(11,), text="b"),
+                        _sample(token_ids=(12,), text="c"),
+                    ],
+                ),
+                _request_output(
+                    request_id="1",
+                    outputs=[
+                        _sample(token_ids=(20,), text="d"),
+                        _sample(token_ids=(21,), text="e"),
+                        _sample(token_ids=(22,), text="f"),
+                    ],
+                ),
+            ]
+        )
+        per_prompt = await asyncio.gather(p0.future, p1.future)
+        return [c for siblings in per_prompt for c in siblings]
 
-
-def test_generate_carries_finish_reason_and_metrics():
-    output = _request_output(
-        outputs=[
-            _sample(index=0, token_ids=(10, 11), finish_reason="length"),
-            _sample(index=1, token_ids=(12,), finish_reason="stop"),
-        ]
-    )
-    generator = _generator([output])
-
-    completions, generation_metrics = _run_generate(generator, [[1, 2]])
-
-    assert [c.finish_reason for c in completions] == ["length", "stop"]
-    assert not hasattr(completions[0], "metrics")
-    aggregate = m.MetricsProcessor._aggregate_metrics(generation_metrics)
-    assert aggregate["generator/output_tokens/sum"] == 3
-    assert aggregate["generator/num_cached_tokens/mean"] == 0
-    assert aggregate["generator/num_cached_tokens/max"] == 0
-    assert aggregate["generator/time_to_first_token_ms/mean"] == 12
-    assert aggregate["generator/time_to_first_token_ms/max"] == 12
-    assert aggregate["generator/queue_time_ms/mean"] == pytest.approx(5)
-    assert aggregate["generator/queue_time_ms/max"] == pytest.approx(5)
-    assert aggregate["generator/prefill_time_ms/mean"] == pytest.approx(12)
-    assert aggregate["generator/prefill_time_ms/max"] == pytest.approx(12)
-    assert aggregate["generator/decode_time_ms/mean"] == pytest.approx(30)
-    assert aggregate["generator/decode_time_ms/max"] == pytest.approx(30)
-    assert aggregate["generator/inter_token_latency_ms/mean"] == pytest.approx(10)
-    assert aggregate["generator/inter_token_latency_ms/max"] == pytest.approx(10)
-    assert "generator/e2e_latency_ms/mean" not in aggregate
+    completions = asyncio.run(scenario())
+    assert [c.prompt_idx for c in completions] == [0, 0, 0, 1, 1, 1]
+    assert [c.text for c in completions] == ["a", "b", "c", "d", "e", "f"]
 
 
-def test_generate_metrics_prefix_override_namespaces_keys():
-    output = _request_output(
-        outputs=[_sample(index=0, token_ids=(10, 11))],
-    )
-    generator = _generator([output])
+def test_resolve_finished_outputs_maps_abort_finish_reason_to_completion_error():
+    """vLLM ``abort`` becomes ``Completion.error`` so the controller drops
+    the sample instead of feeding empty text to the env."""
 
-    _, generation_metrics = _run_generate(
-        generator, [[1, 2]], metrics_prefix="validation/generator"
-    )
+    async def scenario():
+        gen = VLLMGenerator.__new__(VLLMGenerator)
+        pending = _pending(request_id="42", prompt_idx=2)
+        gen._pending_by_request_id = {"42": pending}
+        gen._resolve_finished_outputs(
+            [
+                _request_output(
+                    request_id="42",
+                    outputs=[
+                        _sample(token_ids=(99,), finish_reason="abort", text="")
+                    ],
+                )
+            ]
+        )
+        return await pending.future
 
-    metric_keys = {metric.key for metric in generation_metrics}
-    assert "validation/generator/output_tokens" in metric_keys
-    assert "validation/generator/queue_time_ms" in metric_keys
-    assert all(key.startswith("validation/generator/") for key in metric_keys)
-
-
-def test_decode_metrics_are_absent_for_single_generated_token():
-    generator = _generator(
-        [
-            _request_output(
-                outputs=[_sample(index=0, token_ids=(10,))],
-                num_generation_tokens=1,
-            )
-        ]
-    )
-
-    _, generation_metrics = _run_generate(generator, [[1, 2]])
-
-    metric_keys = {metric.key for metric in generation_metrics}
-    assert "generator/prefill_time_ms" in metric_keys
-    assert "generator/decode_time_ms" not in metric_keys
-    assert "generator/inter_token_latency_ms" not in metric_keys
+    completions = asyncio.run(scenario())
+    assert len(completions) == 1
+    assert completions[0].error is not None
+    assert completions[0].prompt_idx == 2

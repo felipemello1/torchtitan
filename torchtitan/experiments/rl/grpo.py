@@ -686,9 +686,23 @@ class RLTrainer(Configurable):
             self.generator.generate.call(tokenized_prompts).get()
         )
 
+        # Drop completions the generator surfaced as errors (oversize prompt,
+        # OOV token, vLLM ``abort``); the env / reward path expects healthy
+        # responses and would crash on the empty ones. Sibling completions
+        # in the same group are unaffected.
+        ok_completions: list[Completion] = []
+        errored = 0
+        for c in completions:
+            if c.error is not None:
+                errored += 1
+                continue
+            ok_completions.append(c)
+        if errored:
+            logger.warning("skipping %d completions with generator errors", errored)
+
         trajectories: list[Trajectory] = []
         with sl.log_trace_span("score"):
-            for c in completions:
+            for c in ok_completions:
                 step_result = envs[c.prompt_idx].step(c.text)
                 trajectories.append(
                     Trajectory(
@@ -698,11 +712,12 @@ class RLTrainer(Configurable):
                     )
                 )
 
-        # Metrics
-        response_lens = [len(c.token_ids) for c in completions]
+        # Metrics — report on the rollouts that actually scored, so a
+        # single bad prompt doesn't skew length / truncation stats.
+        response_lens = [len(c.token_ids) for c in ok_completions]
         prompt_lens = [len(t.prompt_token_ids) for t in trajectories]
         total_lens = [p + r for p, r in zip(prompt_lens, response_lens, strict=True)]
-        truncated = [c.finish_reason == "length" for c in completions]
+        truncated = [c.finish_reason == "length" for c in ok_completions]
         rollout_metrics: list[m.Metric] = [
             m.Metric("rollout/response_length", m.Mean.from_list(response_lens)),
             m.Metric("rollout/response_length", m.Max.from_list(response_lens)),
@@ -815,17 +830,30 @@ class RLTrainer(Configurable):
             ).get()
         )
 
+        ok_completions: list[Completion] = []
+        errored = 0
+        for c in completions:
+            if c.error is not None:
+                errored += 1
+                continue
+            ok_completions.append(c)
+        if errored:
+            logger.warning(
+                "validation: skipping %d completions with generator errors",
+                errored,
+            )
+
         trajectories = [
             Trajectory(
-                sample_idx=i,
-                prompt_token_ids=tokenized_prompts[i],
-                transitions=[(c, envs[i].step(c.text))],
+                sample_idx=c.prompt_idx,
+                prompt_token_ids=tokenized_prompts[c.prompt_idx],
+                transitions=[(c, envs[c.prompt_idx].step(c.text))],
             )
-            for i, c in enumerate(completions)
+            for c in ok_completions
         ]
 
         if self.config.log_samples:
-            _log_samples(completions)
+            _log_samples(ok_completions)
 
         validation_metrics: list[m.Metric] = [
             m.Metric(
@@ -834,7 +862,7 @@ class RLTrainer(Configurable):
             ),
             m.Metric(
                 "validation/response_length",
-                m.Mean.from_list([len(c.token_ids) for c in completions]),
+                m.Mean.from_list([len(c.token_ids) for c in ok_completions]),
             ),
             m.Metric("validation/num_samples", m.NoReduce(float(len(trajectories)))),
         ]
