@@ -7,12 +7,12 @@
 """
 Config entry points for the RL/unified experiment.
 
-Each function returns a complete ``RLTrainer.Config`` and is discoverable by
-``ConfigManager`` via ``--module rl --config <function_name>``.
+Each function returns a complete `RLTrainer.Config` and is discoverable by
+`ConfigManager` via `--module rl --config <function_name>`.
 
-NOTE: the ``rl_grpo_*`` entry points build ``DAPOLoss`` (DAPO is the default RL
-loss). The ``rl_grpo_`` prefix is kept for backward compatibility with existing
-README / command references; swap ``trainer.loss`` to ``GRPOLoss.Config()`` for
+NOTE: the `rl_grpo_*` entry points build `DAPOLoss` (DAPO is the default RL
+loss). The `rl_grpo_` prefix is kept for backward compatibility with existing
+README / command references; swap `trainer.loss` to `GRPOLoss.Config()` for
 plain GRPO.
 """
 

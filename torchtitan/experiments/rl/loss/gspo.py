@@ -53,7 +53,7 @@ class GSPOLoss(Configurable):
         clip_low (float): Lower clip bound offset (default 0.2).
         clip_high (float): Upper clip bound offset (default 0.2).
         agg_type (AggType): Aggregation method (default "sequence_mean").
-        log_entropy (bool): Emit loss/entropy/mean (needs logits; default False).
+        log_entropy (bool): Emit loss/entropy/mean (needs logits; default True).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -61,7 +61,7 @@ class GSPOLoss(Configurable):
         clip_low: float = 0.2
         clip_high: float = 0.2
         agg_type: AggType = "sequence_mean"
-        log_entropy: bool = False
+        log_entropy: bool = True
 
     def __init__(self, config: Config):
         self.clip_low = config.clip_low

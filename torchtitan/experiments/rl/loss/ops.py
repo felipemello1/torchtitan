@@ -8,7 +8,7 @@
 
 Each metric helper returns a pre-normalized scalar (sum / global_denominator) so
 SUM-reduction across the loss mesh and gradient-accumulation microbatches
-reconstructs the exact global value (see ``LossNormalization``).
+reconstructs the exact global value (see `LossNormalization`).
 """
 
 import torch
@@ -32,7 +32,7 @@ def masked_token_mean(
     Args:
         values (torch.Tensor): Per-token values (B, S).
         loss_mask (torch.Tensor): Valid token mask (B, S).
-        normalization (LossNormalization): Carries ``num_global_valid_tokens``.
+        normalization (LossNormalization): Carries `num_global_valid_tokens`.
 
     Returns:
         torch.Tensor: Scalar pre-normalized contribution.
@@ -88,7 +88,7 @@ def compute_sequence_ratio(
 
     One ratio per response (not per token) matches how rewards are assigned and
     lowers variance for long sequences. Multiple episodes may be packed into one
-    (B=1, S) row, so the per-episode mean is taken over ``segment_ids`` rather
+    (B=1, S) row, so the per-episode mean is taken over `segment_ids` rather
     than the whole row. A reparameterization keeps per-token gradient flow: the
     forward value is the episode ratio, but gradients flow through each token's
     current-policy logprob.
@@ -354,7 +354,7 @@ def ppo_clip_metrics(
     loss_mask: torch.Tensor,
     normalization: LossNormalization,
 ) -> dict[str, torch.Tensor]:
-    """Clip diagnostics. ``high/frac`` / ``low/frac`` are the fractions of valid
+    """Clip diagnostics. `high/frac` / `low/frac` are the fractions of valid
     tokens clipped against a positive / negative advantage respectively."""
     clipped_high = ratio > clipped_ratio  # ratio above 1 + clip_high
     clipped_low = ratio < clipped_ratio  # ratio below 1 - clip_low

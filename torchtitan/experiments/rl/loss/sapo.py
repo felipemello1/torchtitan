@@ -97,7 +97,7 @@ class SAPOLoss(Configurable):
         tau_pos (float): Temperature for positive advantages (default 1.0).
         tau_neg (float): Temperature for negative advantages (default 1.05).
         agg_type (AggType): Aggregation method (default "sequence_mean").
-        log_entropy (bool): Emit loss/entropy/mean (needs logits; default False).
+        log_entropy (bool): Emit loss/entropy/mean (needs logits; default True).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -105,7 +105,7 @@ class SAPOLoss(Configurable):
         tau_pos: float = 1.0
         tau_neg: float = 1.05
         agg_type: AggType = "sequence_mean"
-        log_entropy: bool = False
+        log_entropy: bool = True
 
     def __init__(self, config: Config):
         self.tau_pos = config.tau_pos

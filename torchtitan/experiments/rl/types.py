@@ -69,8 +69,8 @@ class ForwardBackwardOutput:
     """Metrics returned by `PolicyTrainer.forward_backward`, split by reducer.
 
     Both dicts hold scalars already reduced across the loss mesh. The controller
-    folds them across gradient-accumulation microbatches: ``sum_metrics`` are
-    summed, ``max_metrics`` are maxed. Dict membership is the reducer.
+    folds them across gradient-accumulation microbatches: `sum_metrics` are
+    summed, `max_metrics` are maxed. Dict membership is the reducer.
     """
 
     sum_metrics: dict[str, float]

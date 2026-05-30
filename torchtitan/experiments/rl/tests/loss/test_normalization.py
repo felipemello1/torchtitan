@@ -132,3 +132,33 @@ def test_batcher_normalization_and_segment_ids():
             ids = tb.segment_ids[tb.segment_ids >= 0].tolist()
             seen.update(ids)
     assert seen == {0, 1, 2, 3}
+
+
+def test_log_entropy_logged_only_with_logits():
+    """log_entropy emits loss/entropy/mean iff logits are supplied; entropy is
+    logging-only, so the loss value is identical either way."""
+    torch.manual_seed(0)
+    B, S, V = 2, 4, 10
+    logits = torch.randn(B, S, V)
+    loss_mask = torch.ones(B, S, dtype=torch.bool)
+    norm = LossNormalization(
+        num_global_valid_tokens=int(loss_mask.sum()),
+        num_global_sequences=B,
+        num_global_fixed_horizon_tokens=B * S,
+    )
+    kwargs = dict(
+        policy_logprobs=torch.randn(B, S),
+        generator_logprobs=torch.randn(B, S),
+        loss_mask=loss_mask,
+        advantages=torch.randn(B, S),
+        normalization=norm,
+        segment_ids=torch.arange(B).unsqueeze(1).expand(B, S).contiguous(),
+    )
+    loss_fn = DAPOLoss.Config(log_entropy=True).build()
+    with_logits = loss_fn(logits=logits, **kwargs)
+    without_logits = loss_fn(**kwargs)
+
+    assert "loss/entropy/mean" in with_logits.sum_metrics
+    assert torch.isfinite(with_logits.sum_metrics["loss/entropy/mean"])
+    assert "loss/entropy/mean" not in without_logits.sum_metrics
+    assert_close(with_logits.loss, without_logits.loss)

@@ -119,7 +119,7 @@ class CISPOLoss(Configurable):
             no lower clipping).
         clip_high (float): Upper clip bound offset (default 4.0).
         agg_type (AggType): Aggregation method (default "token_mean").
-        log_entropy (bool): Emit loss/entropy/mean (needs logits; default False).
+        log_entropy (bool): Emit loss/entropy/mean (needs logits; default True).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -127,7 +127,7 @@ class CISPOLoss(Configurable):
         clip_low: float = 1.0
         clip_high: float = 4.0
         agg_type: AggType = "token_mean"
-        log_entropy: bool = False
+        log_entropy: bool = True
 
     def __init__(self, config: Config):
         self.clip_low = config.clip_low

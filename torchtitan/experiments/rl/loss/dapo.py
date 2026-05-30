@@ -63,7 +63,7 @@ def dual_clip_metrics(
 ) -> dict[str, torch.Tensor]:
     """Fraction of valid negative-advantage tokens whose penalty was dual-clipped.
 
-    ``pg_loss`` is the pre-dual-clip PPO loss, so the comparison detects where the
+    `pg_loss` is the pre-dual-clip PPO loss, so the comparison detects where the
     dual-clip ceiling actually bound.
     """
     was_dual_clipped = (pg_loss > dual_clip_bound) & (advantages < 0) & loss_mask.bool()
@@ -108,7 +108,7 @@ class DAPOLoss(Configurable):
         clip_high (float): Upper clip bound (default 0.28).
         dual_clip_c (float): Dual-clip constant (default 3.0).
         agg_type (AggType): Aggregation method (default "token_mean").
-        log_entropy (bool): Emit loss/entropy/mean (needs logits; default False).
+        log_entropy (bool): Emit loss/entropy/mean (needs logits; default True).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -117,7 +117,7 @@ class DAPOLoss(Configurable):
         clip_high: float = 0.28
         dual_clip_c: float = 3.0
         agg_type: AggType = "token_mean"
-        log_entropy: bool = False
+        log_entropy: bool = True
 
     def __init__(self, config: Config):
         self.clip_low = config.clip_low

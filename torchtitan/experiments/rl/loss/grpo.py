@@ -67,7 +67,7 @@ class GRPOLoss(Configurable):
         beta (float): KL penalty coefficient (default 0.0; >0 requires ref_logprobs).
         kl_type (KLType): KL estimator (default "k3").
         agg_type (AggType): Aggregation method (default "token_mean").
-        log_entropy (bool): Emit loss/entropy/mean (needs logits; default False).
+        log_entropy (bool): Emit loss/entropy/mean (needs logits; default True).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -77,7 +77,7 @@ class GRPOLoss(Configurable):
         beta: float = 0.0
         kl_type: KLType = "k3"
         agg_type: AggType = "token_mean"
-        log_entropy: bool = False
+        log_entropy: bool = True
 
     def __init__(self, config: Config):
         self.clip_low = config.clip_low

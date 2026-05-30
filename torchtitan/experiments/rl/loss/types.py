@@ -24,12 +24,12 @@ class LossNormalization:
 
     Attributes:
         num_global_valid_tokens (int): Total response tokens (loss_mask == 1)
-            across the whole global batch. Denominator for ``token_mean`` and for
+            across the whole global batch. Denominator for `token_mean` and for
             every pre-normalized metric.
         num_global_sequences (int): Total source episodes across the global batch.
-            Denominator for ``sequence_mean``.
-        num_global_fixed_horizon_tokens (int): ``num_global_sequences * seq_len``;
-            a length-independent constant horizon. Denominator for ``fixed_horizon``.
+            Denominator for `sequence_mean`.
+        num_global_fixed_horizon_tokens (int): `num_global_sequences * seq_len`;
+            a length-independent constant horizon. Denominator for `fixed_horizon`.
     """
 
     num_global_valid_tokens: int
