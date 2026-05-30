@@ -32,14 +32,14 @@ def policy_logprobs_from(
 
 
 def make_segment_ids(B: int, S: int) -> torch.Tensor:
-    """One segment per row (row i -> id i), matching forge's one-episode-per-row
-    fixtures so sequence-level losses reproduce forge's per-row math."""
+    """One segment per row (row i -> id i). With one episode per row, the
+    sequence-level losses reduce to per-row aggregation."""
     return torch.arange(B).unsqueeze(1).expand(B, S).contiguous()
 
 
 def make_normalization(loss_mask: torch.Tensor, B: int, S: int) -> LossNormalization:
     """Single-batch normalization: global tokens == local valid tokens, one
-    sequence per row, fixed horizon == B * S (matches forge's mask.numel())."""
+    sequence per row, fixed horizon == B * S (the dense token count here)."""
     return LossNormalization(
         num_global_valid_tokens=int(loss_mask.sum().item()),
         num_global_sequences=B,
@@ -49,8 +49,9 @@ def make_normalization(loss_mask: torch.Tensor, B: int, S: int) -> LossNormaliza
 
 @pytest.fixture
 def inputs():
-    """Mirror forge's loss fixture (draw order: logits, target_ids, ref, advantages)
-    so the tensors -- and the golden loss/grad values -- match forge."""
+    """Fixed loss fixture; RNG draw order (logits, target_ids, ref, advantages)
+    is load-bearing -- it produces the golden loss/grad values the per-loss
+    tests assert."""
     torch.manual_seed(42)
     B, S, V = 2, 4, 10
 

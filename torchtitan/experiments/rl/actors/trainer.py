@@ -493,9 +493,8 @@ class PolicyTrainer(Actor, Configurable):
             self.optimizers.step()
             self.lr_schedulers.step()
 
-        # Zero grads after the step so the next step's gradient-accumulation
-        # microbatches accumulate from zero. forward_backward no longer zeroes
-        # per microbatch (that dropped all but the last microbatch's gradient).
+        # Zero grads once per step (here, not in forward_backward) so a step's
+        # gradient-accumulation microbatches all accumulate from zero.
         self.optimizers.zero_grad()
 
         self.policy_version += 1
