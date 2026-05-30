@@ -90,7 +90,7 @@ class SAPOLoss(Configurable):
            smoothly rather than dropping to zero.
 
     NOTE: The default 'sequence_mean' aggregation operates per source episode via
-    segment_ids (multiple episodes may be packed into one row), so segment_ids is
+    sample_ids (multiple episodes may be packed into one row), so sample_ids is
     required unless agg_type is changed to a token-level mode.
 
     Args:
@@ -121,13 +121,13 @@ class SAPOLoss(Configurable):
         loss_mask: torch.Tensor,  # (B, S)
         advantages: torch.Tensor,  # (B, S)
         normalization: LossNormalization,
-        segment_ids: torch.Tensor | None = None,
+        sample_ids: torch.Tensor | None = None,
         logits: torch.Tensor | None = None,
         ref_logprobs: torch.Tensor | None = None,
     ) -> LossOutput:
-        if self.agg_type == "sequence_mean" and segment_ids is None:
+        if self.agg_type == "sequence_mean" and sample_ids is None:
             raise ValueError(
-                "SAPOLoss with agg_type='sequence_mean' requires segment_ids."
+                "SAPOLoss with agg_type='sequence_mean' requires sample_ids."
             )
         ratio, log_ratio = compute_token_ratio(policy_logprobs, generator_logprobs)
         pg_loss, gate = pg_soft_gate(
@@ -138,7 +138,7 @@ class SAPOLoss(Configurable):
             loss_mask,
             agg_type=self.agg_type,
             normalization=normalization,
-            segment_ids=segment_ids,
+            sample_ids=sample_ids,
         )
         with torch.no_grad():
             sum_metrics = {

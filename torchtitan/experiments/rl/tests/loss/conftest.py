@@ -31,8 +31,8 @@ def policy_logprobs_from(
     ).reshape(B, S)
 
 
-def make_segment_ids(B: int, S: int) -> torch.Tensor:
-    """One segment per row (row i -> id i). With one episode per row, the
+def make_sample_ids(B: int, S: int) -> torch.Tensor:
+    """One sample per row (row i -> id i). With one episode per row, the
     sequence-level losses reduce to per-row aggregation."""
     return torch.arange(B).unsqueeze(1).expand(B, S).contiguous()
 
@@ -82,6 +82,6 @@ def inputs():
         "advantages": advantages,
         "loss_mask": loss_mask,
         "policy_logprobs": policy_logprobs_from(logits, target_ids),
-        "segment_ids": make_segment_ids(B, S),
+        "sample_ids": make_sample_ids(B, S),
         "normalization": make_normalization(loss_mask, B, S),
     }

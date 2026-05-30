@@ -46,8 +46,8 @@ class GSPOLoss(Configurable):
            instead of per-token. Reduces variance for long sequences.
 
     NOTE: Both the sequence ratio and 'sequence_mean' aggregation operate per
-    source episode via segment_ids (multiple episodes may be packed into one row),
-    so segment_ids is required.
+    source episode via sample_ids (multiple episodes may be packed into one row),
+    so sample_ids is required.
 
     Args:
         clip_low (float): Lower clip bound offset (default 0.2).
@@ -77,16 +77,16 @@ class GSPOLoss(Configurable):
         loss_mask: torch.Tensor,  # (B, S)
         advantages: torch.Tensor,  # (B, S)
         normalization: LossNormalization,
-        segment_ids: torch.Tensor | None = None,
+        sample_ids: torch.Tensor | None = None,
         logits: torch.Tensor | None = None,
         ref_logprobs: torch.Tensor | None = None,
     ) -> LossOutput:
-        if segment_ids is None:
+        if sample_ids is None:
             raise ValueError(
-                "GSPOLoss requires segment_ids (sequence ratio + sequence_mean)."
+                "GSPOLoss requires sample_ids (sequence ratio + sequence_mean)."
             )
         ratio, log_ratio = compute_sequence_ratio(
-            policy_logprobs, generator_logprobs, loss_mask, segment_ids
+            policy_logprobs, generator_logprobs, loss_mask, sample_ids
         )
         pg_loss, clipped_ratio = pg_ppo_clip(
             ratio, advantages, clip_low=self.clip_low, clip_high=self.clip_high
@@ -96,7 +96,7 @@ class GSPOLoss(Configurable):
             loss_mask,
             agg_type=self.agg_type,
             normalization=normalization,
-            segment_ids=segment_ids,
+            sample_ids=sample_ids,
         )
         with torch.no_grad():
             sum_metrics = {

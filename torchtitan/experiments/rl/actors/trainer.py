@@ -414,7 +414,7 @@ class PolicyTrainer(Actor, Configurable):
         loss_mask = local_batch.loss_mask.to(device)
         generator_logprobs = local_batch.generator_logprobs.to(device)
         advantages = local_batch.advantages.to(device)
-        segment_ids = local_batch.segment_ids.to(device)
+        sample_ids = local_batch.sample_ids.to(device)
 
         attention_masks = create_varlen_metadata_for_document(positions)
 
@@ -431,7 +431,7 @@ class PolicyTrainer(Actor, Configurable):
                 loss_mask=loss_mask,
                 advantages=advantages,
                 normalization=normalization,
-                segment_ids=segment_ids,
+                sample_ids=sample_ids,
                 logits=logits,
             )
 

@@ -219,7 +219,7 @@ class Batcher(Configurable):
         """
 
         def _iterate_samples() -> Iterator[dict]:
-            for segment_id, ep in enumerate(episodes):
+            for sample_id, ep in enumerate(episodes):
                 prompt_len = len(ep.prompt_token_ids)
                 response_len = len(ep.token_ids)
                 raw_ids = ep.prompt_token_ids + ep.token_ids
@@ -228,14 +228,14 @@ class Batcher(Configurable):
                 advantages = [0.0] * prompt_len + [ep.advantage] * response_len
                 # Unique per source episode; packing preserves it so sequence-level
                 # losses can recover episode boundaries within a packed row.
-                segment_ids = [segment_id] * (len(raw_ids) - 1)
+                sample_ids = [sample_id] * (len(raw_ids) - 1)
                 yield {
                     "input_ids": raw_ids[:-1],
                     "labels": raw_ids[1:],
                     "generator_logprobs": gen_lp[1:],
                     "loss_mask": loss_mask[1:],
                     "advantages": advantages[1:],
-                    "segment_ids": segment_ids,
+                    "sample_ids": sample_ids,
                 }
 
         yield from pack(
@@ -247,7 +247,7 @@ class Batcher(Configurable):
                 "generator_logprobs": 0.0,
                 "loss_mask": False,
                 "advantages": 0.0,
-                "segment_ids": -1,
+                "sample_ids": -1,
             },
         )
 
@@ -263,5 +263,5 @@ class Batcher(Configurable):
             generator_logprobs=torch.cat([r["generator_logprobs"] for r in rows]),
             loss_mask=torch.cat([r["loss_mask"] for r in rows]),
             advantages=torch.cat([r["advantages"] for r in rows]),
-            segment_ids=torch.cat([r["segment_ids"] for r in rows]),
+            sample_ids=torch.cat([r["sample_ids"] for r in rows]),
         )

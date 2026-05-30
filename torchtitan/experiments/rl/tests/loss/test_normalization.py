@@ -5,8 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 """Titan-specific normalization tests: global-denominator invariance under
-gradient accumulation, segment-aware aggregation/ratio under packing, and the
-batcher's LossNormalization + segment_ids."""
+gradient accumulation, sample-aware aggregation/ratio under packing, and the
+batcher's LossNormalization + sample_ids."""
 
 import math
 
@@ -33,7 +33,7 @@ def test_grad_accum_invariance(agg_type):
     gen = torch.randn(B, S)
     adv = torch.randn(B, S)
     loss_mask = torch.ones(B, S, dtype=torch.bool)
-    segment_ids = torch.arange(B).unsqueeze(1).expand(B, S).contiguous()
+    sample_ids = torch.arange(B).unsqueeze(1).expand(B, S).contiguous()
     norm = LossNormalization(
         num_global_valid_tokens=int(loss_mask.sum()),
         num_global_sequences=B,
@@ -49,7 +49,7 @@ def test_grad_accum_invariance(agg_type):
             loss_mask=loss_mask[rows],
             advantages=adv[rows],
             normalization=norm,
-            segment_ids=segment_ids[rows],
+            sample_ids=sample_ids[rows],
         ).loss
 
     full = run(slice(0, B))
@@ -57,7 +57,7 @@ def test_grad_accum_invariance(agg_type):
     assert_close(split, full)
 
 
-def test_sequence_mean_uses_segments_not_rows():
+def test_sequence_mean_uses_samples_not_rows():
     """sequence_mean averages per source episode, not per packed row.
 
     Two episodes packed in one row: episode 0 tokens [2, 4] -> mean 3, episode 1
@@ -65,7 +65,7 @@ def test_sequence_mean_uses_segments_not_rows():
     """
     per_token_loss = torch.tensor([[2.0, 4.0, 10.0, 0.0]])
     loss_mask = torch.tensor([[True, True, True, False]])
-    segment_ids = torch.tensor([[0, 0, 1, -1]])
+    sample_ids = torch.tensor([[0, 0, 1, -1]])
     norm = LossNormalization(
         num_global_valid_tokens=3,
         num_global_sequences=2,
@@ -76,13 +76,13 @@ def test_sequence_mean_uses_segments_not_rows():
         loss_mask,
         agg_type="sequence_mean",
         normalization=norm,
-        segment_ids=segment_ids,
+        sample_ids=sample_ids,
     )
     assert_close(loss, torch.tensor(6.5))
 
 
 def test_sequence_ratio_is_per_episode():
-    """The sequence ratio is one value per episode (segment), not per row.
+    """The sequence ratio is one value per episode (sample), not per row.
 
     One row, two episodes: episode 0 log-ratio 0 -> ratio 1; episode 1 log-ratio
     ln(2) -> ratio 2.
@@ -90,14 +90,14 @@ def test_sequence_ratio_is_per_episode():
     policy = torch.tensor([[0.0, 0.0, math.log(2.0), math.log(2.0)]])
     gen = torch.zeros(1, 4)
     loss_mask = torch.ones(1, 4, dtype=torch.bool)
-    segment_ids = torch.tensor([[0, 0, 1, 1]])
-    ratio, _ = compute_sequence_ratio(policy, gen, loss_mask, segment_ids)
+    sample_ids = torch.tensor([[0, 0, 1, 1]])
+    ratio, _ = compute_sequence_ratio(policy, gen, loss_mask, sample_ids)
     assert_close(ratio[0, 0], torch.tensor(1.0))
     assert_close(ratio[0, 2], torch.tensor(2.0))
 
 
-def test_batcher_normalization_and_segment_ids():
-    """Batcher reports global denominators and globally-unique segment ids."""
+def test_batcher_normalization_and_sample_ids():
+    """Batcher reports global denominators and globally-unique sample ids."""
     episodes = [
         Episode(
             policy_version=0,
@@ -129,13 +129,13 @@ def test_batcher_normalization_and_segment_ids():
     seen = set()
     for step in microbatches:
         for tb in step:
-            ids = tb.segment_ids[tb.segment_ids >= 0].tolist()
+            ids = tb.sample_ids[tb.sample_ids >= 0].tolist()
             seen.update(ids)
     assert seen == {0, 1, 2, 3}
 
 
 def test_batcher_packs_multiple_episodes_into_one_row():
-    """Short episodes greedy-pack into a single row; segment_ids delineate each
+    """Short episodes greedy-pack into a single row; sample_ids delineate each
     source episode within that row (not one episode per row)."""
     episodes = [
         Episode(
@@ -163,9 +163,9 @@ def test_batcher_packs_multiple_episodes_into_one_row():
     # One grad-accum step, one rank, one packed row holding all three episodes.
     assert len(microbatches) == 1 and len(microbatches[0]) == 1
     tb = microbatches[0][0]
-    assert tb.segment_ids.shape == (1, 6)
+    assert tb.sample_ids.shape == (1, 6)
     # Episode boundaries are contiguous within the single row.
-    assert tb.segment_ids.tolist() == [[0, 0, 1, 1, 2, 2]]
+    assert tb.sample_ids.tolist() == [[0, 0, 1, 1, 2, 2]]
     assert norm.num_global_sequences == 3
     assert norm.num_global_valid_tokens == 6
 
@@ -188,7 +188,7 @@ def test_log_entropy_logged_only_with_logits():
         loss_mask=loss_mask,
         advantages=torch.randn(B, S),
         normalization=norm,
-        segment_ids=torch.arange(B).unsqueeze(1).expand(B, S).contiguous(),
+        sample_ids=torch.arange(B).unsqueeze(1).expand(B, S).contiguous(),
     )
     loss_fn = DAPOLoss.Config(log_entropy=True).build()
     with_logits = loss_fn(logits=logits, **kwargs)

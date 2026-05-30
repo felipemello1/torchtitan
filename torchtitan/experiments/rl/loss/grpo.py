@@ -96,7 +96,7 @@ class GRPOLoss(Configurable):
         loss_mask: torch.Tensor,  # (B, S)
         advantages: torch.Tensor,  # (B, S)
         normalization: LossNormalization,
-        segment_ids: torch.Tensor | None = None,
+        sample_ids: torch.Tensor | None = None,
         logits: torch.Tensor | None = None,
         ref_logprobs: torch.Tensor | None = None,
     ) -> LossOutput:
@@ -117,7 +117,7 @@ class GRPOLoss(Configurable):
             loss_mask,
             agg_type=self.agg_type,
             normalization=normalization,
-            segment_ids=segment_ids,
+            sample_ids=sample_ids,
         )
         with torch.no_grad():
             sum_metrics = {

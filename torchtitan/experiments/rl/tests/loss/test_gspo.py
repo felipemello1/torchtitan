@@ -11,7 +11,7 @@ from torchtitan.experiments.rl.loss import GSPOLoss
 from .conftest import (
     assert_close,
     make_normalization,
-    make_segment_ids,
+    make_sample_ids,
     policy_logprobs_from,
 )
 
@@ -26,7 +26,7 @@ class TestGSPOLoss:
             loss_mask=d["loss_mask"],
             advantages=d["advantages"],
             normalization=d["normalization"],
-            segment_ids=d["segment_ids"],
+            sample_ids=d["sample_ids"],
         )
 
         assert_close(output.loss, torch.tensor(0.242948))
@@ -43,7 +43,7 @@ class TestGSPOLoss:
             loss_mask=d["loss_mask"],
             advantages=d["advantages"],
             normalization=d["normalization"],
-            segment_ids=d["segment_ids"],
+            sample_ids=d["sample_ids"],
         )
 
         output.loss.backward()
@@ -60,7 +60,7 @@ class TestGSPOLoss:
             loss_mask=d["loss_mask"],
             advantages=advantages,
             normalization=d["normalization"],
-            segment_ids=d["segment_ids"],
+            sample_ids=d["sample_ids"],
         )
 
         assert output.loss.isfinite()
@@ -77,7 +77,7 @@ class TestGSPOLoss:
             loss_mask=empty_mask,
             advantages=d["advantages"],
             normalization=make_normalization(empty_mask, d["B"], d["S"]),
-            segment_ids=d["segment_ids"],
+            sample_ids=d["sample_ids"],
         )
 
         assert output.loss.isfinite()
@@ -99,7 +99,7 @@ class TestGSPOLoss:
             loss_mask=loss_mask,
             advantages=advantages,
             normalization=make_normalization(loss_mask, B, 0),
-            segment_ids=make_segment_ids(B, 0),
+            sample_ids=make_sample_ids(B, 0),
         )
 
         assert output.loss.isfinite()

@@ -82,13 +82,13 @@ def compute_sequence_ratio(
     policy_logprobs: torch.Tensor,
     generator_logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
-    segment_ids: torch.Tensor,
+    sample_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sequence-level importance ratio, one per source episode (segment).
+    """Sequence-level importance ratio, one per source episode (sample).
 
     One ratio per response (not per token) matches how rewards are assigned and
     lowers variance for long sequences. Multiple episodes may be packed into one
-    (B=1, S) row, so the per-episode mean is taken over `segment_ids` rather
+    (B=1, S) row, so the per-episode mean is taken over `sample_ids` rather
     than the whole row. A reparameterization keeps per-token gradient flow: the
     forward value is the episode ratio, but gradients flow through each token's
     current-policy logprob.
@@ -99,21 +99,19 @@ def compute_sequence_ratio(
         policy_logprobs (torch.Tensor): Log probs from current policy (B, S).
         generator_logprobs (torch.Tensor): Log probs from sampling policy (B, S).
         loss_mask (torch.Tensor): Valid token mask (B, S).
-        segment_ids (torch.Tensor): Source-episode id per token (B, S), -1 for padding.
+        sample_ids (torch.Tensor): Source-episode id per token (B, S), -1 for padding.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]: (ratio, log_ratio), both (B, S);
             1.0 / 0.0 at non-trained positions.
     """
-    valid = loss_mask.bool() & (segment_ids >= 0)
+    valid = loss_mask.bool() & (sample_ids >= 0)
     if not bool(valid.any()):
         zero = torch.zeros_like(policy_logprobs)
         return torch.ones_like(policy_logprobs), zero
 
     token_log_ratio = policy_logprobs - generator_logprobs.detach()
-    _unique, inverse = torch.unique(
-        segment_ids[valid], sorted=True, return_inverse=True
-    )
+    _unique, inverse = torch.unique(sample_ids[valid], sorted=True, return_inverse=True)
     sums = torch.zeros(
         int(inverse.max()) + 1,
         device=policy_logprobs.device,
@@ -122,7 +120,7 @@ def compute_sequence_ratio(
     counts = torch.zeros_like(sums)
     sums.scatter_add_(0, inverse, token_log_ratio[valid])
     counts.scatter_add_(0, inverse, torch.ones_like(token_log_ratio[valid]))
-    seq_log_ratio = sums / counts.clamp_min(1)  # [num_local_segments]
+    seq_log_ratio = sums / counts.clamp_min(1)  # [num_local_samples]
 
     # Reparameterization: forward = sequence ratio, backward = per-token grads.
     log_ratio = torch.zeros_like(policy_logprobs)
@@ -224,7 +222,7 @@ def aggregate_loss(
     *,
     agg_type: AggType,
     normalization: LossNormalization,
-    segment_ids: torch.Tensor | None,
+    sample_ids: torch.Tensor | None,
 ) -> torch.Tensor:
     """Aggregate per-token loss to a scalar using a global denominator.
 
@@ -240,7 +238,7 @@ def aggregate_loss(
         bias. Each token contributes equally regardless of sequence length.
 
     sequence_mean: mean per source episode, then sum / num_global_sequences
-        Episode boundaries come from segment_ids (multiple episodes may be packed
+        Episode boundaries come from sample_ids (multiple episodes may be packed
         into one row). NOTE: per-sequence averaging introduces a length bias, as
         discussed in the DR-GRPO paper.
 
@@ -249,7 +247,7 @@ def aggregate_loss(
         loss_mask (torch.Tensor): Valid token mask (B, S).
         agg_type (AggType): Aggregation strategy.
         normalization (LossNormalization): Global denominators.
-        segment_ids (torch.Tensor | None): Source-episode ids (B, S); required for
+        sample_ids (torch.Tensor | None): Source-episode ids (B, S); required for
             sequence_mean.
 
     Returns:
@@ -264,28 +262,24 @@ def aggregate_loss(
             normalization.num_global_fixed_horizon_tokens, 1
         )
     if agg_type == "sequence_mean":
-        if segment_ids is None:
-            raise ValueError("segment_ids is required for sequence_mean aggregation")
-        return _sequence_mean_loss(
-            per_token_loss, loss_mask, segment_ids, normalization
-        )
+        if sample_ids is None:
+            raise ValueError("sample_ids is required for sequence_mean aggregation")
+        return _sequence_mean_loss(per_token_loss, loss_mask, sample_ids, normalization)
     raise ValueError(f"Unknown agg_type: {agg_type}")
 
 
 def _sequence_mean_loss(
     per_token_loss: torch.Tensor,
     loss_mask: torch.Tensor,
-    segment_ids: torch.Tensor,
+    sample_ids: torch.Tensor,
     normalization: LossNormalization,
 ) -> torch.Tensor:
     """Mean each source episode, then sum(per-episode means) / num_global_sequences."""
-    valid = loss_mask.bool() & (segment_ids >= 0)
+    valid = loss_mask.bool() & (sample_ids >= 0)
     if not bool(valid.any()):
         return per_token_loss.sum() * 0.0  # finite 0 that keeps the autograd graph
 
-    _unique, inverse = torch.unique(
-        segment_ids[valid], sorted=True, return_inverse=True
-    )
+    _unique, inverse = torch.unique(sample_ids[valid], sorted=True, return_inverse=True)
     sums = torch.zeros(
         int(inverse.max()) + 1,
         device=per_token_loss.device,
