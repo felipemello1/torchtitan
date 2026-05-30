@@ -435,9 +435,7 @@ class PolicyTrainer(Actor, Configurable):
                 logits=logits,
             )
 
-        # No zero_grad here: gradients accumulate across the controller's
-        # gradient-accumulation microbatch loop and are zeroed once in
-        # optim_step (after the optimizer step).
+        # Accumulate gradients across all controller microbatches for this step.
         with sl.log_trace_span("model_backward"):
             loss_output.loss.backward()
 
@@ -493,8 +491,7 @@ class PolicyTrainer(Actor, Configurable):
             self.optimizers.step()
             self.lr_schedulers.step()
 
-        # Zero grads once per step (here, not in forward_backward) so a step's
-        # gradient-accumulation microbatches all accumulate from zero.
+        # Clear accumulated gradients after applying the step.
         self.optimizers.zero_grad()
 
         self.policy_version += 1
