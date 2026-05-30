@@ -20,7 +20,8 @@ from torchtitan.config import (
     ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
+from torchtitan.experiments.rl.actors.generators import SamplingConfig
+from torchtitan.experiments.rl.actors.generators.base import VLLMGeneratorBase
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.batcher import BatchConfig, Batcher
 from torchtitan.experiments.rl.grpo import GRPOLoss, RLTrainer
@@ -68,7 +69,7 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
             ),
             loss=GRPOLoss.Config(),
         ),
-        generator=VLLMGenerator.Config(
+        generator=VLLMGeneratorBase.Config(
             model_dtype="bfloat16",
             parallelism=ParallelismConfig(
                 tensor_parallel_degree=4,
@@ -125,7 +126,7 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
             ),
             loss=GRPOLoss.Config(),
         ),
-        generator=VLLMGenerator.Config(
+        generator=VLLMGeneratorBase.Config(
             model_dtype="bfloat16",
             parallelism=ParallelismConfig(
                 data_parallel_shard_degree=1,
@@ -183,7 +184,7 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
             ),
             loss=GRPOLoss.Config(),
         ),
-        generator=VLLMGenerator.Config(
+        generator=VLLMGeneratorBase.Config(
             model_dtype="bfloat16",
             parallelism=ParallelismConfig(
                 tensor_parallel_degree=8,
@@ -248,7 +249,7 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
             debug=batch_invariant_config,
             loss=GRPOLoss.Config(),
         ),
-        generator=VLLMGenerator.Config(
+        generator=VLLMGeneratorBase.Config(
             model_dtype="bfloat16",
             parallelism=ParallelismConfig(
                 tensor_parallel_degree=2,

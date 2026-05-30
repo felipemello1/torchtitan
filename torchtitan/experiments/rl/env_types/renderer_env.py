@@ -17,7 +17,7 @@ from torchtitan.experiments.rl.env_types.message_env import MessageEnv
 from torchtitan.experiments.rl.rollouts.types import RolloutStatus
 
 if TYPE_CHECKING:
-    from torchtitan.experiments.rl.actors.generator import Completion
+    from torchtitan.experiments.rl.types import Completion
 
 logger = logging.getLogger(__name__)
 

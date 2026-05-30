@@ -8,7 +8,7 @@
 RL training loop using Monarch Actors.
 
 This demonstrates:
-1. Distributed actor architecture with VLLMGenerator (vLLM) and PolicyTrainer (TorchTitan)
+1. Distributed actor architecture with vLLM generators and PolicyTrainer (TorchTitan)
    running on separate GPU meshes
 2. Weight synchronization across meshes: trainer gathers full (unsharded) weights,
    generator reshards to match its own parallelism layout via distribute_tensor
@@ -27,6 +27,7 @@ import math
 import os
 import statistics
 import time
+import zlib
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -45,24 +46,17 @@ from torchtitan.config import (
     Configurable,
     ParallelismConfig,
 )
-from torchtitan.experiments.rl.actors.generator import (
-    Completion,
-    SamplingConfig,
-    VLLMGenerator,
-)
+from torchtitan.experiments.rl.actors.generators import build_generator, SamplingConfig
+from torchtitan.experiments.rl.actors.generators.base import VLLMGeneratorBase
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.batcher import Batcher
-from torchtitan.experiments.rl.env_types import RendererEnv, TokenizedStepOutput
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.rollouts import (
     DatasetOutput,
     prepare_rollout_metrics,
-    Rollout,
     rollout_to_episode,
     RolloutGroup,
-    RolloutStatus,
-    RolloutTurn,
 )
 from torchtitan.experiments.rl.tasks import Task
 from torchtitan.experiments.rl.types import Episode
@@ -196,8 +190,8 @@ def _log_samples(episodes: list[Episode]) -> None:
 class RLTrainer(Configurable):
     """Top-level RL training orchestrator.
 
-    Owns a `PolicyTrainer` actor (gradient updates), a `VLLMGenerator` actor
-    (sampling), one or more `Task`s (rubric + env construction), and a
+    Owns a `PolicyTrainer` actor (gradient updates), one or more generator
+    actors (sampling), one or more `Task`s (rubric + env construction), and a
     `Dataset` per phase (train/validation). Each training step samples groups
     of rollouts, scores them via per-task rubrics, builds GRPO advantages, and
     syncs trainer weights to the generator.
@@ -266,8 +260,10 @@ class RLTrainer(Configurable):
         )
         """PolicyTrainer config. Controls optimizer, training, parallelism."""
 
-        generator: VLLMGenerator.Config = field(default_factory=VLLMGenerator.Config)
-        """VLLMGenerator actor configuration (vLLM engine, sampling)."""
+        generator: VLLMGeneratorBase.Config = field(
+            default_factory=VLLMGeneratorBase.Config
+        )
+        """Generator actor configuration (vLLM engine, sampling, backend, count)."""
 
         metrics: m.MetricsProcessor.Config = field(
             default_factory=m.MetricsProcessor.Config
@@ -312,7 +308,7 @@ class RLTrainer(Configurable):
     def __init__(self, config: Config):
         self.config = config
         self.trainer = None
-        self.generator = None
+        self.generators: list[VLLMGeneratorBase] = []
         self._proc_meshes = []
         self.metrics_processor: m.MetricsProcessor = config.metrics.build(
             log_dir=config.dump_folder,
@@ -336,10 +332,9 @@ class RLTrainer(Configurable):
     async def close(self):
         """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
         logger.info("Closing: tearing down actors and process meshes.")
-        for actor_name, actor in (
-            ("trainer", self.trainer),
-            ("generator", self.generator),
-        ):
+        actors = [("trainer", self.trainer)]
+        actors += [(f"generator_{i}", g) for i, g in enumerate(self.generators)]
+        for actor_name, actor in actors:
             if actor is None:
                 continue
             try:
@@ -373,6 +368,34 @@ class RLTrainer(Configurable):
         if has_gpus:
             kwargs["gpus"] = 0
         return result.item(**kwargs)
+
+    async def _await_call(self, endpoint, *args, **kwargs):
+        """Await a Monarch endpoint off the event loop, then unwrap rank 0.
+
+        Replaces the blocking `_get_rank_0_value(endpoint.call(...).get())`
+        pattern; running `.get()` in a thread keeps the event loop (and Ctrl-C)
+        responsive while the call is in flight.
+        """
+        result = await asyncio.to_thread(endpoint.call(*args, **kwargs).get)
+        return self._get_rank_0_value(result)
+
+    def _make_generate_fn(self, gen, *, metrics_prefix):
+        """Bind one routed generator + rank-0 unwrap into the async fn a Task calls.
+
+        The returned closure is the Monarch-free `GenerateFn` a `Task` drives: it
+        hides `.call(...).get()` and the rank-0 unwrap behind a plain `await`.
+        """
+
+        async def generate(prompt_token_ids, *, request_id, sampling_config=None):
+            return await self._await_call(
+                gen.generate,
+                prompt_token_ids,
+                request_id=request_id,
+                sampling_config=sampling_config,
+                metrics_prefix=metrics_prefix,
+            )
+
+        return generate
 
     @staticmethod
     def _compute_world_size(p: ParallelismConfig) -> int:
@@ -444,9 +467,12 @@ class RLTrainer(Configurable):
             trainer_parallelism.data_parallel_replicate_degree * dp_shard
         )
 
-        total_gpus = self.trainer_world_size + self.generator_world_size
+        num_generators = config.generator.num_generators
+        total_gpus = (
+            self.trainer_world_size + num_generators * self.generator_world_size
+        )
         logger.info(
-            f"{self.generator_world_size} generator GPUs + "
+            f"{num_generators} generators x {self.generator_world_size} GPUs + "
             f"{self.trainer_world_size} trainer GPUs = {total_gpus} total"
         )
 
@@ -497,28 +523,40 @@ class RLTrainer(Configurable):
                     per_host={"gpus": trainer_gpus_per_node},
                     bootstrap=trainer_provisioner.allocate(trainer_gpus_per_node),
                 )
-                generator_mesh = generator_host_mesh.spawn_procs(
-                    per_host={"gpus": generator_gpus_per_node},
-                    bootstrap=generator_provisioner.allocate(generator_gpus_per_node),
-                )
+                # TODO(multi-node multi-generator): multi-node currently spawns a
+                # single generator mesh spanning generator_nodes. Splitting it into
+                # `num_generators` independent meshes here is the follow-up.
+                generator_meshes = [
+                    generator_host_mesh.spawn_procs(
+                        per_host={"gpus": generator_gpus_per_node},
+                        bootstrap=generator_provisioner.allocate(
+                            generator_gpus_per_node
+                        ),
+                    )
+                ]
             else:
                 # Single-node mode: partition GPUs on this_host() via
-                # CUDA_VISIBLE_DEVICES
+                # CUDA_VISIBLE_DEVICES. The Provisioner hands out non-overlapping
+                # GPU ranges per allocate(), so each generator gets its own GPUs.
                 provisioner = Provisioner(total_gpus=total_gpus)
                 trainer_mesh = this_host().spawn_procs(
                     per_host={"gpus": self.trainer_world_size},
                     bootstrap=provisioner.allocate(self.trainer_world_size),
                 )
-                generator_mesh = this_host().spawn_procs(
-                    per_host={"gpus": self.generator_world_size},
-                    bootstrap=provisioner.allocate(self.generator_world_size),
-                )
+                generator_meshes = [
+                    this_host().spawn_procs(
+                        per_host={"gpus": self.generator_world_size},
+                        bootstrap=provisioner.allocate(self.generator_world_size),
+                    )
+                    for _ in range(num_generators)
+                ]
 
             # Store proc meshes for cleanup
-            self._proc_meshes = [trainer_mesh, generator_mesh]
+            self._proc_meshes = [trainer_mesh, *generator_meshes]
 
             await setup_torch_elastic_env_async(trainer_mesh)
-            await setup_torch_elastic_env_async(generator_mesh)
+            for mesh in generator_meshes:
+                await setup_torch_elastic_env_async(mesh)
 
             # Spawn actors on their respective meshes
             self.trainer = trainer_mesh.spawn(
@@ -532,19 +570,26 @@ class RLTrainer(Configurable):
                 output_dir=config.dump_folder,
             )
 
-            self.generator = generator_mesh.spawn(
-                "generator",
-                VLLMGenerator,
-                config.generator,
-                model_spec=config.model_spec,
-                model_path=config.hf_assets_path,
-                compile_config=config.compile,
-                max_num_seqs=max(
-                    config.num_prompts_per_step * config.generator.sampling.n,
-                    config.num_validation_samples,
-                ),
-                output_dir=config.dump_folder,
+            # Each generator is an independent vLLM engine with its own KV/prefix
+            # cache; the controller routes whole groups to one by hashing group_id.
+            GenClass = build_generator(config.generator.backend)
+            max_num_seqs = max(
+                config.num_prompts_per_step * config.generator.sampling.n,
+                config.num_validation_samples,
             )
+            self.generators = [
+                mesh.spawn(
+                    f"generator_{i}",
+                    GenClass,
+                    config.generator,
+                    model_spec=config.model_spec,
+                    model_path=config.hf_assets_path,
+                    compile_config=config.compile,
+                    max_num_seqs=max_num_seqs,
+                    output_dir=config.dump_folder,
+                )
+                for i, mesh in enumerate(generator_meshes)
+            ]
 
         # Initialize TorchStore for weight sync between trainer and generator.
         # StorageVolumes are spawned on the trainer mesh so they are colocated
@@ -555,54 +600,17 @@ class RLTrainer(Configurable):
         with sl.log_trace_span("torchstore_init"):
             await ts.initialize(mesh=trainer_mesh, strategy=ts.LocalRankStrategy())
 
-        # Initial weight sync from trainer to generator
+        # Initial weight sync: push once from the trainer, then pull on all
+        # generators (they share one TorchStore weight version).
         with sl.log_trace_span("trainer_push_model_state_dict"):
-            self.trainer.push_model_state_dict.call().get()
+            await self._await_call(self.trainer.push_model_state_dict)
         with sl.log_trace_span("generator_pull_model_state_dict"):
-            self.generator.pull_model_state_dict.call(0).get()
+            await asyncio.gather(
+                *(self._await_call(g.pull_model_state_dict, 0) for g in self.generators)
+            )
 
     @sl.log_trace_span("_collect_rollouts")
     async def _collect_rollouts(
-        self,
-        num_groups: int,
-        step: int,
-        group_offset: int,
-    ) -> tuple[list[RolloutGroup], list[m.Metric]]:
-        """Collect train rollout groups and emit rollout-shape metrics.
-
-        Args:
-            num_groups: Number of prompt groups to collect in this round.
-            step: Current training step (tagged into `group_id` for metrics).
-            group_offset: Starting group index so generated `group_id`s
-                stay unique across collection rounds within a step.
-
-        Returns:
-            Scored rollout groups and rollout/generator metrics.
-        """
-        group_size = self.config.generator.sampling.n
-        sampling_cfg = replace(
-            self.config.generator.sampling, stop_token_ids=self._stop_token_ids
-        )
-
-        rollout_groups, generation_metrics = await self._run_rollouts(
-            dataset=self._train_dataset,
-            num_groups=num_groups,
-            group_size=group_size,
-            sampling_cfg=sampling_cfg,
-            step=step,
-            group_offset=group_offset,
-            metrics_prefix="generator",
-        )
-
-        rollout_metrics = prepare_rollout_metrics(
-            "rollout",
-            [rollout for group in rollout_groups for rollout in group.rollouts],
-        )
-        rollout_metrics += generation_metrics
-        return rollout_groups, rollout_metrics
-
-    @sl.log_trace_span("_run_rollouts")
-    async def _run_rollouts(
         self,
         *,
         dataset: object,
@@ -613,210 +621,74 @@ class RLTrainer(Configurable):
         group_offset: int,
         metrics_prefix: str,
     ) -> tuple[list[RolloutGroup], list[m.Metric]]:
-        """Build groups, batch-generate, then per group: env.step +
-        task.score_group. Per-group failures are logged and dropped.
+        """Sample groups, route each to a generator, fan out scored rollouts.
 
-        Steps:
-        1. Get examples from dataset
-        2. For each example, find associated task, e.g. CodingTask, SearchTask, etc
-        3. Create N envs for that example: `envs_per_group: list = task.make_envs(example, group_size)`
-        4. For each env, get initial prompt (n_groups * n_rollouts_per_group)
-        5. Run one batched `generate` call
-        6. For each rollout, run `env.step`
-        7. For each RolloutGroup, run `reward = task.score_group(RolloutGroup)`
-        7. Return scored List[RolloutGroup]
-        TODO(continuous-batching): once available, run rollouts independently
-        instead of batching one `generate` over all prompts at once.
-        """
-
-        @dataclass(kw_only=True, slots=True)
-        class _PendingGroup:
-            """One prompt group under construction: built before generation, then
-            stepped and scored into a `RolloutGroup`."""
-
-            group_id: str
-            example: DatasetOutput
-            task: Task
-            envs: list[RendererEnv]  # [group_size]
-
-        # 1. Get examples from dataset
-        # 2. For each example, find associated task, e.g. CodingTask, SearchTask, etc
-        # 3. Create N envs for that example: `task.make_envs(example, group_size)`
-        pending_groups: list[_PendingGroup] = []
-        for group_idx in range(num_groups):
-            # TODO: add dataloader and get a batch
-            example: DatasetOutput = dataset.sample_example()
-            task: Task = self._str2task_map[example.task_name]
-            pending_groups.append(
-                _PendingGroup(
-                    group_id=f"{example.task_name}/step={step}/group={group_offset + group_idx}",
-                    example=example,
-                    task=task,
-                    envs=task.make_envs(
-                        example=example,
-                        group_size=group_size,
-                        renderer=self.renderer,
-                    ),  # [N_samples_per_group]
-                )
-            )
-
-        try:
-            # 4. For each env, get initial prompt (n_groups * n_rollouts_per_group)
-            initial_steps: list[list[TokenizedStepOutput]] = await asyncio.gather(
-                *(
-                    asyncio.gather(*(env.initial_prompt() for env in group.envs))
-                    for group in pending_groups
-                )
-            )  # [G][N]
-
-            # Drop the whole group if its prompt overflowed (siblings share one prompt)
-            # TODO: add metrics for dropped groups
-            runnable_group_idxs = [
-                group_idx
-                for group_idx in range(num_groups)
-                if initial_steps[group_idx][0].status is RolloutStatus.ONGOING
-            ]
-
-            # 5. Run one batched `generate` call (n=1: one rollout per prompt).
-            # `rollout_index` is parallel to the prompts, so the i-th prompt (and
-            # i-th completion, once ordered) belongs to rollout_index[i].
-            # TODO: pass the remaining budget (max_rollout_tokens - len(prompt)) to the
-            # sampling_config, to limit generation length in one turn.
-            rollout_index = [
-                (group_idx, sample_idx)
-                for group_idx in runnable_group_idxs
-                for sample_idx in range(group_size)
-            ]
-            completions, gen_metrics = self._get_rank_0_value(
-                self.generator.generate.call(
-                    [
-                        list(initial_steps[group_idx][sample_idx].next_prompt_token_ids)
-                        for group_idx, sample_idx in rollout_index
-                    ],
-                    sampling_config=replace(sampling_cfg, n=1),
-                    metrics_prefix=metrics_prefix,
-                ).get()
-            )
-
-            # 6. For each rollout, run `env.step`. Order completions by prompt_idx so
-            # they line up 1:1 with rollout_index.
-            ordered_completions = sorted(
-                completions, key=lambda completion: completion.prompt_idx
-            )
-            rollouts = await asyncio.gather(
-                *(
-                    self._do_single_rollout(
-                        group_id=pending_groups[group_idx].group_id,
-                        sample_idx=sample_idx,
-                        env=pending_groups[group_idx].envs[sample_idx],
-                        initial_step=initial_steps[group_idx][sample_idx],
-                        completion=completion,
-                    )
-                    for (group_idx, sample_idx), completion in zip(
-                        rollout_index, ordered_completions, strict=True
-                    )
-                )
-            )
-        finally:
-            await asyncio.gather(
-                *(env.close() for group in pending_groups for env in group.envs),
-                return_exceptions=True,
-            )
-
-        # 7. For each RolloutGroup, run `reward = task.score_group(RolloutGroup)`.
-        # Group by the rollout's own group_id (sample order preserved)
-        rollouts_by_group_id: dict[str, list[Rollout]] = {}
-        for rollout in rollouts:
-            rollouts_by_group_id.setdefault(rollout.group_id, []).append(rollout)
-
-        rollout_groups: list[RolloutGroup] = []
-        num_failed_groups = 0
-        for group_idx in runnable_group_idxs:
-            group = pending_groups[group_idx]
-            rollouts = rollouts_by_group_id[group.group_id]  # [N], sample order
-            try:
-                rewards = await group.task.score_group(
-                    rollouts, group.example.env_input
-                )
-                for rollout, reward in zip(rollouts, rewards, strict=True):
-                    rollout.reward = reward.reward
-                    rollout.reward_components = reward.components
-                rollout_groups.append(
-                    RolloutGroup(
-                        group_id=group.group_id,
-                        env_input=group.example.env_input,
-                        rollouts=rollouts,
-                    )
-                )
-            except Exception:
-                logger.exception("group %s scoring failed; dropping", group.group_id)
-                num_failed_groups += 1
-
-        gen_metrics = list(gen_metrics)
-        gen_metrics.append(
-            m.Metric("rollout/group_failures", m.Sum(float(num_failed_groups)))
-        )
-        return rollout_groups, gen_metrics
-
-    @sl.log_trace_span("do_single_rollout")
-    async def _do_single_rollout(
-        self,
-        *,
-        group_id: str,
-        sample_idx: int,
-        env: RendererEnv,
-        initial_step: TokenizedStepOutput,
-        completion: Completion,
-    ) -> Rollout:
-        """Step one env into a `Rollout`. On failure, return the turns
-        collected so far with an `ERROR` status.
-
-        Reward is left unset; the controller scores via `task.score_group(...)`
-        afterward and fills `reward` / `reward_components`.
+        Each group is routed to one generator by `crc32(group_id) % N` (a
+        process-stable hash, unlike Python's salted `hash`), so all of a group's
+        siblings and turns reuse that engine's prefix/KV cache. `do_group_rollout`
+        already scores the group, so per-group failures are logged and dropped.
 
         Args:
-            group_id: Stable prompt-group ID used for advantage centering.
-            sample_idx: Sample index within the group (0..group_size-1).
-            env: The env for this rollout.
-            initial_step: Initial prompt step for this env.
-            completion: Generator completion for this env's initial prompt.
+            dataset: Dataset to sample prompt groups from.
+            num_groups: Number of prompt groups to collect this round.
+            group_size: Number of sibling rollouts per group.
+            sampling_cfg: Sampling config for every generate call.
+            step: Current step (tagged into `group_id` for metrics).
+            group_offset: Starting group index so `group_id`s stay unique
+                across collection rounds within a step.
+            metrics_prefix: Prefix for the drained per-generator metrics.
 
         Returns:
-            One unscored Rollout.
+            Scored rollout groups and rollout/generator metrics.
         """
-        rollout_turns: list[RolloutTurn] = []
-        try:
-            step_result = await env.step_completion(completion)
-            rollout_turns.append(
-                RolloutTurn(
-                    prompt_token_ids=list(initial_step.next_prompt_token_ids),
-                    response_token_ids=list(completion.token_ids),
-                    response_logprobs=list(completion.token_logprobs),
-                    policy_version=completion.policy_version,
-                    prompt_messages=list(initial_step.next_prompt_messages),
-                    assistant_message=step_result.assistant_message,
-                    env_messages=list(step_result.env_messages),
-                    reward_components=dict(step_result.env_reward_components),
+        # 1. Sample examples and route each group to one generator.
+        pending: list[tuple[str, DatasetOutput, VLLMGeneratorBase]] = []
+        for i in range(num_groups):
+            # TODO: add dataloader and get a batch
+            example: DatasetOutput = dataset.sample_example()
+            group_id = f"{example.task_name}/step={step}/group={group_offset + i}"
+            gen = self.generators[zlib.crc32(group_id.encode()) % len(self.generators)]
+            pending.append((group_id, example, gen))
+
+        # 2. Fan out whole groups concurrently; each group drives its own
+        # generates against its routed generator.
+        group_results = await asyncio.gather(
+            *(
+                self._str2task_map[example.task_name].do_group_rollout(
+                    example=example,
+                    group_id=group_id,
+                    group_size=group_size,
+                    renderer=self.renderer,
+                    sampling_config=sampling_cfg,
+                    generate=self._make_generate_fn(gen, metrics_prefix=metrics_prefix),
                 )
-            )
-            status = step_result.status
-            # TODO(multi-turn): while not status.is_terminal(): generate → step → append turn.
-            if not status.is_terminal():
-                raise RuntimeError(
-                    f"env {group_id}/{sample_idx} returned a non-terminal turn; "
-                    "the controller does not yet support multi-turn rollouts."
-                )
-        except Exception:
-            logger.exception(
-                "rollout %s/%d failed; keeping %d turn(s) as ERROR",
-                group_id,
-                sample_idx,
-                len(rollout_turns),
-            )
-            status = RolloutStatus.ERROR
-        return Rollout(
-            group_id=group_id, sample_idx=sample_idx, status=status, turns=rollout_turns
+                for group_id, example, gen in pending
+            ),
+            return_exceptions=True,
         )
+
+        # 3. Keep groups that succeeded; drop and count the ones that raised.
+        rollout_groups: list[RolloutGroup] = []
+        num_failed_groups = 0
+        for (group_id, _, _), result in zip(pending, group_results, strict=True):
+            if isinstance(result, BaseException):
+                logger.exception("group %s failed; dropping", group_id, exc_info=result)
+                num_failed_groups += 1
+                continue
+            rollout_groups.append(result)
+
+        # 4. Drain buffered metrics from every generator + rollout-shape metrics.
+        metrics: list[m.Metric] = []
+        for g in self.generators:
+            metrics += await self._await_call(g.pop_metrics)
+        metrics += prepare_rollout_metrics(
+            "rollout",
+            [rollout for group in rollout_groups for rollout in group.rollouts],
+        )
+        metrics.append(
+            m.Metric("rollout/group_failures", m.Sum(float(num_failed_groups)))
+        )
+        return rollout_groups, metrics
 
     @staticmethod
     @sl.log_trace_span("_build_episodes")
@@ -909,7 +781,7 @@ class RLTrainer(Configurable):
             stop_token_ids=self._stop_token_ids,
         )
 
-        rollout_groups, generation_metrics = await self._run_rollouts(
+        rollout_groups, generation_metrics = await self._collect_rollouts(
             dataset=self._validation_dataset,
             num_groups=num_samples,
             group_size=1,
@@ -957,7 +829,8 @@ class RLTrainer(Configurable):
             sl.set_step(step)
             # Propagate the step counter to actors for structured logging.
             self.trainer.sync_log_step.call(step)
-            self.generator.sync_log_step.call(step)
+            for g in self.generators:
+                g.sync_log_step.call(step)
             # Cancellation point for Ctrl-C (KeyboardInterrupt) handling.
             # This yields to the event loop to check for cancellation, which
             # doesn't happen with `.get` calls.
@@ -982,7 +855,16 @@ class RLTrainer(Configurable):
             num_tokens_target = self.batcher.num_tokens_target(self.trainer_dp_degree)
             while collected_tokens < num_tokens_target:
                 new_rollout_groups, new_metrics = await self._collect_rollouts(
-                    num_groups, step=step, group_offset=group_offset
+                    dataset=self._train_dataset,
+                    num_groups=num_groups,
+                    group_size=self.config.generator.sampling.n,
+                    sampling_cfg=replace(
+                        self.config.generator.sampling,
+                        stop_token_ids=self._stop_token_ids,
+                    ),
+                    step=step,
+                    group_offset=group_offset,
+                    metrics_prefix="generator",
                 )
                 rollout_groups.extend(new_rollout_groups)
                 rollout_metrics.extend(new_metrics)
@@ -1017,10 +899,10 @@ class RLTrainer(Configurable):
             fwd_bwd_metrics: dict[str, float] = {}
             for microbatch in microbatches:
                 with sl.log_trace_span("trainer_forward_backward_call"):
-                    mb_metrics = self._get_rank_0_value(
-                        self.trainer.forward_backward.call(
-                            microbatch, num_global_valid_tokens
-                        ).get()
+                    mb_metrics = await self._await_call(
+                        self.trainer.forward_backward,
+                        microbatch,
+                        num_global_valid_tokens,
                     )
                     for k, v in mb_metrics.items():
                         if k not in fwd_bwd_metrics:
@@ -1030,9 +912,7 @@ class RLTrainer(Configurable):
                         elif k.endswith(("/mean", "/frac")):
                             fwd_bwd_metrics[k] += v
             with sl.log_trace_span("trainer_optim_step_call"):
-                optim_output = self._get_rank_0_value(
-                    self.trainer.optim_step.call().get()
-                )
+                optim_output = await self._await_call(self.trainer.optim_step)
             trainer_policy_version = optim_output.policy_version
             optimizer_metrics = optim_output.metrics
             t_train_s = time.perf_counter() - t_train_start
@@ -1042,10 +922,17 @@ class RLTrainer(Configurable):
             # instead of having `trainer.optim_step` return it
             t_push_start = time.perf_counter()
             with sl.log_trace_span("trainer_push_model_state_dict"):
-                self.trainer.push_model_state_dict.call().get()
+                await self._await_call(self.trainer.push_model_state_dict)
             t_weight_sync_push_s = time.perf_counter() - t_push_start
             with sl.log_trace_span("generator_pull_model_state_dict"):
-                self.generator.pull_model_state_dict.call(trainer_policy_version).get()
+                await asyncio.gather(
+                    *(
+                        self._await_call(
+                            g.pull_model_state_dict, trainer_policy_version
+                        )
+                        for g in self.generators
+                    )
+                )
             t_weight_sync_total_s = time.perf_counter() - t_push_start
             t_step_s = time.perf_counter() - t_step_start
             # --- divergence check before any logging ---

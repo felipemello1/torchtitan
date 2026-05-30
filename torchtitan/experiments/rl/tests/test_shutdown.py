@@ -9,7 +9,7 @@ import asyncio
 import pytest
 
 from torchtitan.experiments.rl import grpo
-from torchtitan.experiments.rl.actors.generator import VLLMGenerator
+from torchtitan.experiments.rl.actors.generators.base import VLLMGeneratorBase
 from torchtitan.experiments.rl.batcher import Batcher
 
 
@@ -67,7 +67,7 @@ class _FakeConfigManager:
 
 
 def _make_stub_rl_trainer():
-    """Create an RLTrainer with a minimal stub config (no VLLMGenerator validation)."""
+    """Create an RLTrainer with a minimal stub config (no generator validation)."""
     from torchtitan.experiments.rl.observability import metrics as m
 
     class _StubConfig:
@@ -120,7 +120,7 @@ def test_rl_trainer_shutdown_is_noop_before_meshes_spawn():
     asyncio.run(trainer.close())
 
     assert trainer.trainer is None
-    assert trainer.generator is None
+    assert trainer.generators == []
     assert trainer._proc_meshes == []
 
 
@@ -140,7 +140,7 @@ def test_main_swallows_cancellation_after_shutdown(monkeypatch):
 
 
 def test_vllm_generator_does_not_touch_cuda_from_finalizer():
-    assert "__del__" not in VLLMGenerator.__dict__
+    assert "__del__" not in VLLMGeneratorBase.__dict__
 
 
 class _StubEndpoint:
