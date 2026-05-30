@@ -52,7 +52,7 @@ from torchtitan.experiments.rl.actors.generator import (
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.batcher import Batcher
 from torchtitan.experiments.rl.env_types import RendererEnv, TokenizedStepOutput
-from torchtitan.experiments.rl.loss import GRPOLoss
+from torchtitan.experiments.rl.loss import DAPOLoss
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.rollouts import (
@@ -188,7 +188,7 @@ class RLTrainer(Configurable):
         """Batcher config: local_batch_size, seq_len."""
 
         trainer: PolicyTrainer.Config = field(
-            default_factory=lambda: PolicyTrainer.Config(loss=GRPOLoss.Config())
+            default_factory=lambda: PolicyTrainer.Config(loss=DAPOLoss.Config())
         )
         """PolicyTrainer config. Controls optimizer, training, parallelism."""
 
@@ -213,13 +213,10 @@ class RLTrainer(Configurable):
             if not self.tasks:
                 raise ValueError("tasks must not be empty")
 
-            if (
-                isinstance(self.trainer.loss, GRPOLoss.Config)
-                and self.trainer.loss.beta > 0
-            ):
+            if getattr(self.trainer.loss, "beta", 0) > 0:
                 raise NotImplementedError(
-                    "GRPOLoss beta>0 (reference-policy KL) is not yet supported in "
-                    "the RL controller: there is no reference model and TrainingBatch "
+                    "Reference-policy KL (loss beta>0) is not yet supported in the "
+                    "RL controller: there is no reference model and TrainingBatch "
                     "carries no ref_logprobs. Set trainer.loss.beta=0 until a "
                     "reference policy is wired."
                 )

@@ -155,20 +155,6 @@ class CISPOLoss(Configurable):
             clip_low=self.clip_low,
             clip_high=self.clip_high,
         )
-        sum_metrics = {
-            **ratio_metrics(ratio, log_ratio, loss_mask, normalization),
-            **cispo_clip_metrics(
-                ratio,
-                clipped_ratio,
-                self.clip_low,
-                self.clip_high,
-                loss_mask,
-                normalization,
-            ),
-        }
-        sum_metrics.update(
-            entropy_metrics(self.log_entropy, logits, loss_mask, normalization)
-        )
         loss = aggregate_loss(
             pg_loss,
             loss_mask,
@@ -176,5 +162,18 @@ class CISPOLoss(Configurable):
             normalization=normalization,
             segment_ids=segment_ids,
         )
-        sum_metrics["loss/mean"] = loss.detach()
+        with torch.no_grad():
+            sum_metrics = {
+                "loss/mean": loss.detach(),
+                **ratio_metrics(ratio, log_ratio, loss_mask, normalization),
+                **cispo_clip_metrics(
+                    ratio,
+                    clipped_ratio,
+                    self.clip_low,
+                    self.clip_high,
+                    loss_mask,
+                    normalization,
+                ),
+                **entropy_metrics(self.log_entropy, logits, loss_mask, normalization),
+            }
         return LossOutput(loss=loss, sum_metrics=sum_metrics)

@@ -142,22 +142,8 @@ class DAPOLoss(Configurable):
         pg_loss, clipped_ratio = pg_ppo_clip(
             ratio, advantages, clip_low=self.clip_low, clip_high=self.clip_high
         )
-        sum_metrics = {
-            **ratio_metrics(ratio, log_ratio, loss_mask, normalization),
-            **ppo_clip_metrics(
-                ratio, clipped_ratio, advantages, loss_mask, normalization
-            ),
-        }
         dual_pg_loss, dual_clip_bound = pg_dual_clip(
             pg_loss, advantages, dual_clip_c=self.dual_clip_c
-        )
-        sum_metrics.update(
-            dual_clip_metrics(
-                pg_loss, dual_clip_bound, advantages, loss_mask, normalization
-            )
-        )
-        sum_metrics.update(
-            entropy_metrics(self.log_entropy, logits, loss_mask, normalization)
         )
         loss = aggregate_loss(
             dual_pg_loss,
@@ -166,5 +152,16 @@ class DAPOLoss(Configurable):
             normalization=normalization,
             segment_ids=segment_ids,
         )
-        sum_metrics["loss/mean"] = loss.detach()
+        with torch.no_grad():
+            sum_metrics = {
+                "loss/mean": loss.detach(),
+                **ratio_metrics(ratio, log_ratio, loss_mask, normalization),
+                **ppo_clip_metrics(
+                    ratio, clipped_ratio, advantages, loss_mask, normalization
+                ),
+                **dual_clip_metrics(
+                    pg_loss, dual_clip_bound, advantages, loss_mask, normalization
+                ),
+                **entropy_metrics(self.log_entropy, logits, loss_mask, normalization),
+            }
         return LossOutput(loss=loss, sum_metrics=sum_metrics)

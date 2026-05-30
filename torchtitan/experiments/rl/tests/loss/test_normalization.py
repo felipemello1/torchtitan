@@ -134,6 +134,42 @@ def test_batcher_normalization_and_segment_ids():
     assert seen == {0, 1, 2, 3}
 
 
+def test_batcher_packs_multiple_episodes_into_one_row():
+    """Short episodes greedy-pack into a single row; segment_ids delineate each
+    source episode within that row (not one episode per row)."""
+    episodes = [
+        Episode(
+            policy_version=0,
+            prompt_idx=i,
+            prompt_token_ids=[1],
+            text="",
+            token_ids=[2, 3],
+            token_logprobs=[0.0, 0.0],
+            reward=0.0,
+            advantage=float(i),
+        )
+        for i in range(3)
+    ]
+    # Each episode is 2 tokens after the [:-1]/[1:] shift (raw len 3 -> 2), so
+    # all three pack into one [1, 6] row with no padding.
+    batcher = Batcher(
+        Batcher.Config(
+            batch=BatchConfig(local_batch_size=1, global_batch_size=1, seq_len=6)
+        ),
+        pad_id=0,
+    )
+    microbatches, norm, _ = batcher.batch(episodes, dp_degree=1)
+
+    # One grad-accum step, one rank, one packed row holding all three episodes.
+    assert len(microbatches) == 1 and len(microbatches[0]) == 1
+    tb = microbatches[0][0]
+    assert tb.segment_ids.shape == (1, 6)
+    # Episode boundaries are contiguous within the single row.
+    assert tb.segment_ids.tolist() == [[0, 0, 1, 1, 2, 2]]
+    assert norm.num_global_sequences == 3
+    assert norm.num_global_valid_tokens == 6
+
+
 def test_log_entropy_logged_only_with_logits():
     """log_entropy emits loss/entropy/mean iff logits are supplied; entropy is
     logging-only, so the loss value is identical either way."""

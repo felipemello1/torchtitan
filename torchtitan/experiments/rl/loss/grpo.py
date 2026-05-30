@@ -14,6 +14,7 @@ from torchtitan.experiments.rl.loss.ops import (
     compute_kl,
     compute_token_ratio,
     entropy_metrics,
+    masked_token_mean,
     pg_ppo_clip,
     ppo_clip_metrics,
     ratio_metrics,
@@ -103,25 +104,14 @@ class GRPOLoss(Configurable):
         pg_loss, clipped_ratio = pg_ppo_clip(
             ratio, advantages, clip_low=self.clip_low, clip_high=self.clip_high
         )
-        sum_metrics = {
-            **ratio_metrics(ratio, log_ratio, loss_mask, normalization),
-            **ppo_clip_metrics(
-                ratio, clipped_ratio, advantages, loss_mask, normalization
-            ),
-        }
 
+        kl = None
         if self.beta > 0:
             if ref_logprobs is None:
                 raise ValueError("GRPOLoss.beta>0 requires ref_logprobs")
-            kl, kl_metrics = compute_kl(
-                policy_logprobs, ref_logprobs, loss_mask, normalization, self.kl_type
-            )
+            kl = compute_kl(policy_logprobs, ref_logprobs, self.kl_type)
             pg_loss = pg_loss + self.beta * kl
-            sum_metrics.update(kl_metrics)
 
-        sum_metrics.update(
-            entropy_metrics(self.log_entropy, logits, loss_mask, normalization)
-        )
         loss = aggregate_loss(
             pg_loss,
             loss_mask,
@@ -129,5 +119,17 @@ class GRPOLoss(Configurable):
             normalization=normalization,
             segment_ids=segment_ids,
         )
-        sum_metrics["loss/mean"] = loss.detach()
+        with torch.no_grad():
+            sum_metrics = {
+                "loss/mean": loss.detach(),
+                **ratio_metrics(ratio, log_ratio, loss_mask, normalization),
+                **ppo_clip_metrics(
+                    ratio, clipped_ratio, advantages, loss_mask, normalization
+                ),
+                **entropy_metrics(self.log_entropy, logits, loss_mask, normalization),
+            }
+            if kl is not None:
+                sum_metrics["loss/kl_ref/mean"] = masked_token_mean(
+                    kl, loss_mask, normalization
+                )
         return LossOutput(loss=loss, sum_metrics=sum_metrics)

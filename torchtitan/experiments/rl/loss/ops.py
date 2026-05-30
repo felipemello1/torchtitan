@@ -134,11 +134,7 @@ def compute_sequence_ratio(
     return torch.exp(log_ratio), log_ratio
 
 
-def compute_entropy(
-    logits: torch.Tensor,
-    loss_mask: torch.Tensor,
-    normalization: LossNormalization,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     """Compute per-token entropy (logging only).
 
     Formula: H = logsumexp(logits) - sum(softmax(logits) * logits)
@@ -149,12 +145,9 @@ def compute_entropy(
 
     Args:
         logits (torch.Tensor): Model output logits (B, S, V).
-        loss_mask (torch.Tensor): Valid token mask (B, S).
-        normalization (LossNormalization): Global token denominator for the metric.
 
     Returns:
-        tuple[torch.Tensor, dict[str, torch.Tensor]]: entropy (B, S) and
-            {"loss/entropy/mean": ...}.
+        torch.Tensor: Per-token entropy (B, S).
     """
     from torch.distributed.tensor import DTensor
 
@@ -163,9 +156,7 @@ def compute_entropy(
     logits_fp32 = logits.float()
     probs = F.softmax(logits_fp32, dim=-1)
     entropy = torch.logsumexp(logits_fp32, dim=-1) - (probs * logits_fp32).sum(dim=-1)
-    return entropy, {
-        "loss/entropy/mean": masked_token_mean(entropy, loss_mask, normalization)
-    }
+    return entropy
 
 
 def entropy_metrics(
@@ -178,17 +169,15 @@ def entropy_metrics(
     available, else {}. Lets each loss fold entropy in with one line."""
     if not (log_entropy and logits is not None):
         return {}
-    _entropy, metrics = compute_entropy(logits, loss_mask, normalization)
-    return metrics
+    entropy = compute_entropy(logits)
+    return {"loss/entropy/mean": masked_token_mean(entropy, loss_mask, normalization)}
 
 
 def compute_kl(
     policy_logprobs: torch.Tensor,
     ref_logprobs: torch.Tensor,
-    loss_mask: torch.Tensor,
-    normalization: LossNormalization,
     kl_type: KLType = "k3",
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+) -> torch.Tensor:
     """Compute per-token KL divergence using Schulman's estimators.
 
     Reference: Schulman's blog post (http://joschu.net/blog/kl-approx.html).
@@ -208,13 +197,10 @@ def compute_kl(
     Args:
         policy_logprobs (torch.Tensor): Log probs from current policy (B, S).
         ref_logprobs (torch.Tensor): Log probs from reference policy (B, S).
-        loss_mask (torch.Tensor): Valid token mask (B, S).
-        normalization (LossNormalization): Global token denominator for the metric.
         kl_type (KLType): KL estimator type: "k1", "k2", or "k3" (default: "k3").
 
     Returns:
-        tuple[torch.Tensor, dict[str, torch.Tensor]]: Per-token KL (B, S) and
-            {"loss/kl_ref/mean": ...}.
+        torch.Tensor: Per-token KL (B, S).
     """
     log_ratio = policy_logprobs - ref_logprobs.detach()  # log(π_θ / π_ref)
 
@@ -229,7 +215,7 @@ def compute_kl(
     else:
         raise ValueError(f"Unknown kl_type: {kl_type}")
 
-    return kl, {"loss/kl_ref/mean": masked_token_mean(kl, loss_mask, normalization)}
+    return kl
 
 
 def aggregate_loss(
