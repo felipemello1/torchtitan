@@ -9,6 +9,11 @@ Config entry points for the RL/unified experiment.
 
 Each function returns a complete ``RLTrainer.Config`` and is discoverable by
 ``ConfigManager`` via ``--module rl --config <function_name>``.
+
+NOTE: the ``rl_grpo_*`` entry points build ``DAPOLoss`` (DAPO is the default RL
+loss). The ``rl_grpo_`` prefix is kept for backward compatibility with existing
+README / command references; swap ``trainer.loss`` to ``GRPOLoss.Config()`` for
+plain GRPO.
 """
 
 from torchtitan.components.checkpoint import CheckpointManager
@@ -32,7 +37,7 @@ from torchtitan.models.qwen3 import model_registry
 
 
 def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
-    """GRPO training config for Qwen3-0.6B (6 GPUs: 4 gen + 2 train)."""
+    """DAPO training config for Qwen3-0.6B (6 GPUs: 4 gen + 2 train)."""
     group_size = 8
     return RLTrainer.Config(
         model_spec=model_registry("0.6B", attn_backend="varlen"),
@@ -89,7 +94,7 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
 
 
 def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
-    """GRPO training config for Qwen3-1.7B (6 GPUs: 4 gen + 2 train)."""
+    """DAPO training config for Qwen3-1.7B (6 GPUs: 4 gen + 2 train)."""
     group_size = 8
     return RLTrainer.Config(
         model_spec=model_registry("1.7B", attn_backend="varlen"),
@@ -147,7 +152,7 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
 
 
 def rl_grpo_qwen3_14b() -> RLTrainer.Config:
-    """GRPO training config for Qwen3-14B (16 GPUs: 8 gen + 8 train)."""
+    """DAPO training config for Qwen3-14B (16 GPUs: 8 gen + 8 train)."""
     group_size = 8
     return RLTrainer.Config(
         model_spec=model_registry("14B", attn_backend="varlen"),
@@ -204,7 +209,7 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
 
 
 def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
-    """On-policy GRPO config for Qwen3-0.6B (4 GPUs: 2 gen + 2 train).
+    """On-policy DAPO config for Qwen3-0.6B (4 GPUs: 2 gen + 2 train).
 
     Enables deterministic + batch-invariant mode for true on-policy RL training.
     """
