@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Unit tests for ``VLLMGenerator.generate``.
+"""Unit tests for ``LLMEngineGenerator.generate``.
 
 Exercises the endpoint in isolation by swapping in a fake vLLM engine —
 no Monarch, no GPU, no real model. Covers the token-in / token-out
@@ -17,7 +17,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
+from torchtitan.experiments.rl.actors.generators import SamplingConfig
+from torchtitan.experiments.rl.actors.generators.llm_engine.generator import (
+    LLMEngineGenerator,
+)
 from torchtitan.experiments.rl.observability import metrics as m
 
 
@@ -92,7 +95,7 @@ def _request_output(
 
 
 def _generator(outputs):
-    generator = VLLMGenerator.__new__(VLLMGenerator)
+    generator = LLMEngineGenerator.__new__(LLMEngineGenerator)
     generator._engine = _FakeEngine(outputs)
     generator.policy_version = 7
     generator.config = SimpleNamespace(
@@ -104,7 +107,7 @@ def _generator(outputs):
 
 def _run_generate(generator, tokenized_prompts, **kwargs):
     return asyncio.run(
-        VLLMGenerator.generate._method(
+        LLMEngineGenerator.generate._method(
             generator, tokenized_prompts, **kwargs
         )  # noqa: SLF001
     )

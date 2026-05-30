@@ -11,6 +11,8 @@ Each function returns a complete ``RLTrainer.Config`` and is discoverable by
 ``ConfigManager`` via ``--module rl --config <function_name>``.
 """
 
+from dataclasses import replace
+
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
@@ -20,7 +22,8 @@ from torchtitan.config import (
     ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
+from torchtitan.experiments.rl.actors.generators import SamplingConfig
+from torchtitan.experiments.rl.actors.generators.base import VLLMGeneratorBase
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.batcher import BatchConfig, Batcher
 from torchtitan.experiments.rl.grpo import GRPOLoss, RLTrainer
@@ -68,7 +71,7 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
             ),
             loss=GRPOLoss.Config(),
         ),
-        generator=VLLMGenerator.Config(
+        generator=VLLMGeneratorBase.Config(
             model_dtype="bfloat16",
             parallelism=ParallelismConfig(
                 tensor_parallel_degree=4,
@@ -82,6 +85,60 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
                 temperature=0.8,
                 top_p=0.95,
                 max_tokens=700,
+            ),
+        ),
+    )
+
+
+def rl_grpo_qwen3_0_6b_6gen_dp2() -> RLTrainer.Config:
+    """Qwen3-0.6B on 8 GPUs: 6 generators (TP=1) + trainer dp=2.
+
+    The continuous-batching target topology: groups route across 6 independent
+    generator engines by ``hash(group_id)``; the trainer trains data-parallel
+    over 2 GPUs. Derived from ``rl_grpo_qwen3_0_6b`` (only the parallelism +
+    generator count differ).
+    """
+    base = rl_grpo_qwen3_0_6b()
+    return replace(
+        base,
+        generator=replace(
+            base.generator,
+            num_generators=6,
+            parallelism=ParallelismConfig(
+                tensor_parallel_degree=1,
+                enable_sequence_parallel=False,
+                disable_loss_parallel=True,
+            ),
+        ),
+        trainer=replace(
+            base.trainer,
+            parallelism=ParallelismConfig(
+                data_parallel_replicate_degree=2,
+                tensor_parallel_degree=1,
+                enable_sequence_parallel=False,
+                disable_loss_parallel=True,
+            ),
+        ),
+    )
+
+
+def rl_grpo_qwen3_0_6b_6gen() -> RLTrainer.Config:
+    """Qwen3-0.6B on 8 GPUs: 6 generators (TP=1) + trainer TP=2.
+
+    Isolates the 6-generator routing + continuous-batching path from the trainer
+    parallelism: reuses the TP=2 trainer that trains cleanly in
+    ``rl_grpo_qwen3_0_6b``. (``rl_grpo_qwen3_0_6b_6gen_dp2`` is the dp=2 target.)
+    """
+    base = rl_grpo_qwen3_0_6b()
+    return replace(
+        base,
+        generator=replace(
+            base.generator,
+            num_generators=6,
+            parallelism=ParallelismConfig(
+                tensor_parallel_degree=1,
+                enable_sequence_parallel=False,
+                disable_loss_parallel=True,
             ),
         ),
     )
@@ -125,7 +182,7 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
             ),
             loss=GRPOLoss.Config(),
         ),
-        generator=VLLMGenerator.Config(
+        generator=VLLMGeneratorBase.Config(
             model_dtype="bfloat16",
             parallelism=ParallelismConfig(
                 data_parallel_shard_degree=1,
@@ -183,7 +240,7 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
             ),
             loss=GRPOLoss.Config(),
         ),
-        generator=VLLMGenerator.Config(
+        generator=VLLMGeneratorBase.Config(
             model_dtype="bfloat16",
             parallelism=ParallelismConfig(
                 tensor_parallel_degree=8,
@@ -248,7 +305,7 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
             debug=batch_invariant_config,
             loss=GRPOLoss.Config(),
         ),
-        generator=VLLMGenerator.Config(
+        generator=VLLMGeneratorBase.Config(
             model_dtype="bfloat16",
             parallelism=ParallelismConfig(
                 tensor_parallel_degree=2,
