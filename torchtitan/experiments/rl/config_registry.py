@@ -106,6 +106,7 @@ def rl_grpo_qwen3_0_6b_6gen_dp2() -> RLTrainer.Config:
             num_generators=6,
             parallelism=ParallelismConfig(
                 tensor_parallel_degree=1,
+                enable_sequence_parallel=False,
                 disable_loss_parallel=True,
             ),
         ),
@@ -114,6 +115,29 @@ def rl_grpo_qwen3_0_6b_6gen_dp2() -> RLTrainer.Config:
             parallelism=ParallelismConfig(
                 data_parallel_replicate_degree=2,
                 tensor_parallel_degree=1,
+                enable_sequence_parallel=False,
+                disable_loss_parallel=True,
+            ),
+        ),
+    )
+
+
+def rl_grpo_qwen3_0_6b_6gen() -> RLTrainer.Config:
+    """Qwen3-0.6B on 8 GPUs: 6 generators (TP=1) + trainer TP=2.
+
+    Isolates the 6-generator routing + continuous-batching path from the trainer
+    parallelism: reuses the TP=2 trainer that trains cleanly in
+    ``rl_grpo_qwen3_0_6b``. (``rl_grpo_qwen3_0_6b_6gen_dp2`` is the dp=2 target.)
+    """
+    base = rl_grpo_qwen3_0_6b()
+    return replace(
+        base,
+        generator=replace(
+            base.generator,
+            num_generators=6,
+            parallelism=ParallelismConfig(
+                tensor_parallel_degree=1,
+                enable_sequence_parallel=False,
                 disable_loss_parallel=True,
             ),
         ),
