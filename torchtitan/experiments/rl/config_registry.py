@@ -32,6 +32,10 @@ from torchtitan.experiments.rl.grpo import RLTrainer
 from torchtitan.experiments.rl.loss import DAPOLoss
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
 from torchtitan.experiments.rl.renderer import RendererConfig
+from torchtitan.experiments.rl.tasks.alphabet_sort import (
+    AlphabetSortDataset,
+    AlphabetSortTask,
+)
 from torchtitan.experiments.rl.tasks.sum_digits import SumDigitsDataset, SumDigitsTask
 from torchtitan.models.qwen3 import model_registry
 
@@ -91,6 +95,19 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
             ),
         ),
     )
+
+
+def rl_grpo_qwen3_0_6b_alphabet_sort() -> RLTrainer.Config:
+    """DAPO training config for Qwen3-0.6B on the AlphabetSort task."""
+    config = rl_grpo_qwen3_0_6b()
+    config.num_steps = 20
+    config.train_dataset = AlphabetSortDataset.Config(seed=1337420)
+    config.validation_dataset = AlphabetSortDataset.Config(seed=99)
+    config.tasks = {"alphabet_sort": AlphabetSortTask.Config()}
+    # The answer is a structured sorted list, not a reasoning trace; thinking spends
+    # the token budget and truncates the list before it is emitted.
+    config.renderer.enable_thinking = False
+    return config
 
 
 def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:

@@ -27,7 +27,7 @@ import math
 import os
 import statistics
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
@@ -265,7 +265,13 @@ class RLTrainer(Configurable):
             config.batcher, pad_id=self.renderer._tokenizer.eos_token_id
         )
         self._train_dataset = config.train_dataset.build()
-        self._validation_dataset = config.validation_dataset.build()
+        # Fixed held-out validation set: materialize once so every validation pass
+        # scores the same problems (the dataset is an endless stream, not reset
+        # between passes).
+        validation_dataset = config.validation_dataset.build()
+        self._validation_examples = [
+            next(validation_dataset) for _ in range(config.num_validation_samples)
+        ]
         self._str2task_map: dict[str, Task] = {
             name: cfg.build() for name, cfg in config.tasks.items()
         }
@@ -522,7 +528,7 @@ class RLTrainer(Configurable):
         )
 
         rollout_groups, generation_metrics = await self._run_rollouts(
-            dataset=self._train_dataset,
+            examples=self._train_dataset,
             num_groups=num_groups,
             group_size=group_size,
             sampling_cfg=sampling_cfg,
@@ -542,7 +548,7 @@ class RLTrainer(Configurable):
     async def _run_rollouts(
         self,
         *,
-        dataset: object,
+        examples: Iterator[DatasetOutput],
         num_groups: int,
         group_size: int,
         sampling_cfg: SamplingConfig,
@@ -582,7 +588,7 @@ class RLTrainer(Configurable):
         pending_groups: list[_PendingGroup] = []
         for group_idx in range(num_groups):
             # TODO: add dataloader and get a batch
-            example: DatasetOutput = dataset.sample_example()
+            example: DatasetOutput = next(examples)
             task: Task = self._str2task_map[example.task_name]
             pending_groups.append(
                 _PendingGroup(
@@ -847,7 +853,7 @@ class RLTrainer(Configurable):
         )
 
         rollout_groups, generation_metrics = await self._run_rollouts(
-            dataset=self._validation_dataset,
+            examples=iter(self._validation_examples),
             num_groups=num_samples,
             group_size=1,
             sampling_cfg=greedy,

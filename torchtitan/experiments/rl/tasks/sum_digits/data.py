@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from torchtitan.config import Configurable
@@ -25,14 +26,13 @@ class SumDigitsInput:
 
 
 class SumDigitsDataset(Configurable):
-    """Stateful, seeded RNG dataset of SumDigits problems.
+    """Endless seeded stream of SumDigits problems.
 
-    Example:
+    Iterate for problems; `state_dict`/`load_state_dict` snapshot the RNG so a run
+    can resume mid-stream.
 
-        ds = SumDigitsDataset(SumDigitsDataset.Config(seed=42))
-        ex = ds.sample_example()
-        # ex.task_name == "sum_digits"
-        # ex.env_input is a SumDigitsInput
+        dataset = SumDigitsDataset(SumDigitsDataset.Config(seed=42))
+        problem = next(iter(dataset))   # problem.task_name == "sum_digits"
     """
 
     TASK_NAME = "sum_digits"
@@ -44,8 +44,20 @@ class SumDigitsDataset(Configurable):
     def __init__(self, config: Config) -> None:
         self._rng = random.Random(config.seed)
 
-    def sample_example(self) -> DatasetOutput:
-        """Sample one SumDigits problem."""
+    def __iter__(self) -> Iterator[DatasetOutput]:
+        return self
+
+    def __next__(self) -> DatasetOutput:
+        return self._sample_problem()
+
+    def state_dict(self) -> dict:
+        """Snapshot the RNG so a run can resume at the same point in the stream."""
+        return {"rng_state": self._rng.getstate()}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self._rng.setstate(state_dict["rng_state"])
+
+    def _sample_problem(self) -> DatasetOutput:
         n = self._rng.randint(2, 4)
         numbers = [self._rng.randint(10, 99) for _ in range(n)]
         target = sum(int(d) for num in numbers for d in str(num))
