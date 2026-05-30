@@ -11,6 +11,8 @@ Each function returns a complete ``RLTrainer.Config`` and is discoverable by
 ``ConfigManager`` via ``--module rl --config <function_name>``.
 """
 
+from dataclasses import replace
+
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
@@ -83,6 +85,36 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
                 temperature=0.8,
                 top_p=0.95,
                 max_tokens=700,
+            ),
+        ),
+    )
+
+
+def rl_grpo_qwen3_0_6b_6gen_dp2() -> RLTrainer.Config:
+    """Qwen3-0.6B on 8 GPUs: 6 generators (TP=1) + trainer dp=2.
+
+    The continuous-batching target topology: groups route across 6 independent
+    generator engines by ``hash(group_id)``; the trainer trains data-parallel
+    over 2 GPUs. Derived from ``rl_grpo_qwen3_0_6b`` (only the parallelism +
+    generator count differ).
+    """
+    base = rl_grpo_qwen3_0_6b()
+    return replace(
+        base,
+        generator=replace(
+            base.generator,
+            num_generators=6,
+            parallelism=ParallelismConfig(
+                tensor_parallel_degree=1,
+                disable_loss_parallel=True,
+            ),
+        ),
+        trainer=replace(
+            base.trainer,
+            parallelism=ParallelismConfig(
+                data_parallel_replicate_degree=2,
+                tensor_parallel_degree=1,
+                disable_loss_parallel=True,
             ),
         ),
     )

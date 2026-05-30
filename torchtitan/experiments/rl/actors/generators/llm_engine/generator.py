@@ -161,6 +161,10 @@ class LLMEngineGenerator(VLLMGeneratorBase):
 
     # --- engine loop -------------------------------------------------------
 
+    def _get_model(self):
+        """Return the vLLM model wrapper owned by the driver worker."""
+        return self._engine.model_executor.driver_worker.get_model()
+
     async def _ensure_engine_loop(self) -> None:
         if self._loop_task is None:
             self._loop_task = asyncio.create_task(self._engine_loop())
@@ -413,5 +417,8 @@ class LLMEngineGenerator(VLLMGeneratorBase):
                 if renderer is not None:
                     renderer.shutdown()
             finally:
-                self._engine.engine_core.shutdown()
+                # external_launcher builds may not expose engine_core.shutdown;
+                # Monarch owns the process group and tears workers down on stop.
+                with contextlib.suppress(AttributeError):
+                    self._engine.engine_core.shutdown()
             self._engine = None
