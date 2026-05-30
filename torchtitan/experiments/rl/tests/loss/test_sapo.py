@@ -1,0 +1,106 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import torch
+
+from torchtitan.experiments.rl.loss import SAPOLoss
+
+from .conftest import (
+    assert_close,
+    make_normalization,
+    make_segment_ids,
+    policy_logprobs_from,
+)
+
+
+class TestSAPOLoss:
+    def test_forward(self, inputs):
+        d = inputs
+        loss_fn = SAPOLoss.Config(tau_pos=1.0, tau_neg=1.05).build()
+        output = loss_fn(
+            policy_logprobs=d["policy_logprobs"],
+            generator_logprobs=d["generator_logprobs"],
+            loss_mask=d["loss_mask"],
+            advantages=d["advantages"],
+            normalization=d["normalization"],
+            segment_ids=d["segment_ids"],
+        )
+
+        assert_close(output.loss, torch.tensor(0.376388))
+
+    def test_backward(self, inputs):
+        d = inputs
+        logits = d["logits"].clone().requires_grad_(True)
+        policy_logprobs = policy_logprobs_from(logits, d["target_ids"])
+
+        loss_fn = SAPOLoss.Config(tau_pos=1.0, tau_neg=1.05).build()
+        output = loss_fn(
+            policy_logprobs=policy_logprobs,
+            generator_logprobs=d["generator_logprobs"],
+            loss_mask=d["loss_mask"],
+            advantages=d["advantages"],
+            normalization=d["normalization"],
+            segment_ids=d["segment_ids"],
+        )
+
+        output.loss.backward()
+        assert_close(logits.grad.norm(), torch.tensor(0.437776))
+
+    def test_zero_advantages(self, inputs):
+        d = inputs
+        advantages = torch.zeros_like(d["advantages"])
+
+        loss_fn = SAPOLoss.Config().build()
+        output = loss_fn(
+            policy_logprobs=d["policy_logprobs"],
+            generator_logprobs=d["generator_logprobs"],
+            loss_mask=d["loss_mask"],
+            advantages=advantages,
+            normalization=d["normalization"],
+            segment_ids=d["segment_ids"],
+        )
+
+        assert output.loss.isfinite()
+
+    def test_empty_mask(self, inputs):
+        """Loss should be finite (zero) when mask is all zeros (no trainable tokens)."""
+        d = inputs
+        empty_mask = torch.zeros_like(d["loss_mask"])
+
+        loss_fn = SAPOLoss.Config().build()
+        output = loss_fn(
+            policy_logprobs=d["policy_logprobs"],
+            generator_logprobs=d["generator_logprobs"],
+            loss_mask=empty_mask,
+            advantages=d["advantages"],
+            normalization=make_normalization(empty_mask, d["B"], d["S"]),
+            segment_ids=d["segment_ids"],
+        )
+
+        assert output.loss.isfinite()
+        assert output.loss == 0.0
+
+    def test_empty_sequence(self):
+        """Loss should be zero when sequence length is 0."""
+        B, V = 2, 10
+        logits = torch.empty(B, 0, V)
+        target_ids = torch.empty(B, 0, dtype=torch.long)
+        advantages = torch.empty(B, 0)
+        generator_logprobs = torch.empty(B, 0)
+        loss_mask = torch.empty(B, 0)
+
+        loss_fn = SAPOLoss.Config().build()
+        output = loss_fn(
+            policy_logprobs=policy_logprobs_from(logits, target_ids),
+            generator_logprobs=generator_logprobs,
+            loss_mask=loss_mask,
+            advantages=advantages,
+            normalization=make_normalization(loss_mask, B, 0),
+            segment_ids=make_segment_ids(B, 0),
+        )
+
+        assert output.loss.isfinite()
+        assert output.loss == 0.0

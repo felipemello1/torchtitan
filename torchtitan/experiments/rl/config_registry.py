@@ -23,7 +23,8 @@ from torchtitan.config import (
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.batcher import BatchConfig, Batcher
-from torchtitan.experiments.rl.grpo import GRPOLoss, RLTrainer
+from torchtitan.experiments.rl.grpo import RLTrainer
+from torchtitan.experiments.rl.loss import DAPOLoss
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.tasks.sum_digits import SumDigitsDataset, SumDigitsTask
@@ -66,7 +67,7 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
                 interval=10,
                 last_save_model_only=False,
             ),
-            loss=GRPOLoss.Config(),
+            loss=DAPOLoss.Config(),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -123,7 +124,7 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
                 interval=10,
                 last_save_model_only=False,
             ),
-            loss=GRPOLoss.Config(),
+            loss=DAPOLoss.Config(),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -181,7 +182,7 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
                 interval=10,
                 last_save_model_only=False,
             ),
-            loss=GRPOLoss.Config(),
+            loss=DAPOLoss.Config(),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -246,7 +247,7 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
                 last_save_model_only=False,
             ),
             debug=batch_invariant_config,
-            loss=GRPOLoss.Config(),
+            loss=DAPOLoss.Config(),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",

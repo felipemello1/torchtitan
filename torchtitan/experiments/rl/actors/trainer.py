@@ -31,7 +31,12 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.utils import set_batch_invariance
-from torchtitan.experiments.rl.types import OptimStepOutput, TrainingBatch
+from torchtitan.experiments.rl.loss.types import LossNormalization
+from torchtitan.experiments.rl.types import (
+    ForwardBackwardOutput,
+    OptimStepOutput,
+    TrainingBatch,
+)
 from torchtitan.models.common.attention import create_varlen_metadata_for_document
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.model_spec import ModelSpec
@@ -331,7 +336,7 @@ class PolicyTrainer(Actor, Configurable):
         *,
         sum_reduced_metrics: dict[str, torch.Tensor],
         max_reduced_metrics: dict[str, torch.Tensor],
-    ) -> dict[str, float]:
+    ) -> ForwardBackwardOutput:
         """Reduce forward/backward metrics across the loss mesh.
 
         Args:
@@ -341,17 +346,19 @@ class PolicyTrainer(Actor, Configurable):
             max_reduced_metrics: Per-rank values to be MAX-reduced.
 
         Returns:
-            {key: float} after collective reduction.
+            ForwardBackwardOutput with the two reducer buckets kept separate, so
+            the controller folds each with the matching op across
+            gradient-accumulation microbatches.
         """
         # TODO: switch from plain tensors to DTensor / spmd_types so the
         # reduction op is encoded in the placement instead of split across
         # `sum_reduced_metrics` / `max_reduced_metrics` dicts.
         loss_mesh = self.parallel_dims.get_optional_mesh("loss")
 
-        out: dict[str, float] = {}
-        for values_by_key, op in [
-            (sum_reduced_metrics, c10d.ReduceOp.SUM),
-            (max_reduced_metrics, c10d.ReduceOp.MAX),
+        reduced: dict[str, dict[str, float]] = {"sum": {}, "max": {}}
+        for bucket, values_by_key, op in [
+            ("sum", sum_reduced_metrics, c10d.ReduceOp.SUM),
+            ("max", max_reduced_metrics, c10d.ReduceOp.MAX),
         ]:
             if not values_by_key:
                 continue
@@ -360,27 +367,29 @@ class PolicyTrainer(Actor, Configurable):
             if loss_mesh is not None:
                 stacked = funcol.all_reduce(stacked, reduceOp=op.name, group=loss_mesh)
             for key, value in zip(keys, stacked.cpu().tolist(), strict=True):
-                out[key] = float(value)
-        return out
+                reduced[bucket][key] = float(value)
+        return ForwardBackwardOutput(
+            sum_metrics=reduced["sum"], max_metrics=reduced["max"]
+        )
 
     @endpoint
     @sl.log_trace_span("forward_backward")
     async def forward_backward(
         self,
         training_data: list[TrainingBatch],
-        num_global_valid_tokens: int,
-    ) -> dict[str, float]:
+        normalization: LossNormalization,
+    ) -> ForwardBackwardOutput:
         """Run forward pass, compute loss, call backward, and reduce metrics.
 
         Args:
             training_data: List of TrainingBatch, one per DP rank. Local rank
                 picks training_data[self.dp_rank].
-            num_global_valid_tokens: Total response tokens across all DP
-                ranks for this step. The controller computes this before
-                sharding episodes.
+            normalization: Global denominators (valid tokens, sequences, fixed
+                horizon) across all DP ranks for this step. The controller
+                computes these before sharding episodes.
 
         Returns:
-            dict[str, float]: Globally-reduced metrics.
+            ForwardBackwardOutput: Globally-reduced metrics, split by reducer.
         """
         logger.debug(
             f"{os.getpid()=} PolicyTrainer forward_backward "
@@ -405,6 +414,7 @@ class PolicyTrainer(Actor, Configurable):
         loss_mask = local_batch.loss_mask.to(device)
         generator_logprobs = local_batch.generator_logprobs.to(device)
         advantages = local_batch.advantages.to(device)
+        segment_ids = local_batch.segment_ids.to(device)
 
         attention_masks = create_varlen_metadata_for_document(positions)
 
@@ -415,33 +425,36 @@ class PolicyTrainer(Actor, Configurable):
         policy_logprobs = compute_logprobs(logits, labels)
 
         with sl.log_trace_span("loss_fn"):
-            loss, loss_metrics = self.loss_fn(
+            loss_output = self.loss_fn(
                 policy_logprobs=policy_logprobs,
                 generator_logprobs=generator_logprobs,
                 loss_mask=loss_mask,
                 advantages=advantages,
-                num_global_valid_tokens=num_global_valid_tokens,
+                normalization=normalization,
+                segment_ids=segment_ids,
+                logits=logits,
             )
 
         self.optimizers.zero_grad()
         with sl.log_trace_span("model_backward"):
-            loss.backward()
+            loss_output.loss.backward()
 
         # Metrics for bitwise verification of policy logprobs.
         verification: PartialLogprobDrift = verify_logprob_identity(
             generator_logprobs=generator_logprobs,
             policy_logprobs=policy_logprobs,
             loss_mask=loss_mask,
-            num_global_valid_tokens=num_global_valid_tokens,
+            num_global_valid_tokens=normalization.num_global_valid_tokens,
         )
 
         # Per-rank pre-normalized metrics, so SUM-reducing reconstructs the global.
         sum_reduced_metrics = {
-            **loss_metrics,
+            **loss_output.sum_metrics,
             "bit_wise/logprob_diff/mean": verification.logprob_diff_mean,
             "bit_wise/ratio_tokens_different/mean": verification.ratio_tokens_different,
         }
         max_reduced_metrics = {
+            **loss_output.max_metrics,
             "bit_wise/logprob_diff/max": verification.logprob_diff_max,
         }
 

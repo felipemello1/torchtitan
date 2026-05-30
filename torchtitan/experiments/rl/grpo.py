@@ -34,7 +34,6 @@ from dataclasses import dataclass, field, replace
 # must run before torch import
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-import torch
 import torchstore as ts
 from monarch.actor import this_host
 from monarch.spmd import setup_torch_elastic_env_async
@@ -53,6 +52,7 @@ from torchtitan.experiments.rl.actors.generator import (
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.batcher import Batcher
 from torchtitan.experiments.rl.env_types import RendererEnv, TokenizedStepOutput
+from torchtitan.experiments.rl.loss import GRPOLoss
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.rollouts import (
@@ -70,80 +70,6 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.model_spec import ModelSpec
 
 logger = logging.getLogger(__name__)
-
-
-class GRPOLoss(Configurable):
-    """Per-token clipped surrogate loss for GRPO.
-
-    Computes the PPO-style clipped objective at the token level::
-
-        ratio_t = exp(policy_logprob_t - ref_logprob_t)     # π_θ / π_old
-        clipped_t = clamp(ratio_t, 1 - ε, 1 + ε)
-        loss_t = -min(ratio_t * A_t, clipped_t * A_t)
-
-    The final scalar loss is the sum of per-token losses over loss
-    positions (where ``loss_mask == 1``), divided by
-    ``num_global_valid_tokens`` (total loss positions across all
-    microbatches and DP ranks).  This normalization ensures that
-    gradient accumulation across microbatches produces the same
-    result as a single large-batch forward pass.
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Configurable.Config):
-        clip_eps: float = 0.2
-        """PPO clipping epsilon for the probability ratio."""
-
-    def __init__(self, config: Config):
-        self.clip_eps = config.clip_eps
-
-    def __call__(
-        self,
-        policy_logprobs: torch.Tensor,
-        generator_logprobs: torch.Tensor,
-        loss_mask: torch.Tensor,
-        advantages: torch.Tensor,
-        num_global_valid_tokens: int,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute per-token GRPO clipped surrogate loss.
-
-        Args:
-            policy_logprobs: [B, L] log π_θ(a_t | s_t) from the current policy.
-            generator_logprobs: [B, L] log π_old(a_t | s_t) from the sampling policy.
-            loss_mask: [B, L] bool mask; True for response tokens.
-            advantages: [B, L] per-token advantages (0.0 for prompt/padding).
-            num_global_valid_tokens: total response tokens across all microbatches
-                and DP ranks; used as the loss denominator so gradient
-                accumulation is equivalent to a single large-batch step.
-
-        Returns:
-            (loss, metrics) where loss is a scalar tensor and metrics is a
-            dict of scalar tensors pre-normalized for SUM reduction across
-            DP ranks.
-        """
-        # Per-token importance sampling ratio: π_θ / π_old
-        log_ratio = policy_logprobs - generator_logprobs
-        ratio = torch.exp(log_ratio)
-
-        clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
-        token_pg_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
-
-        masked_loss = token_pg_loss * loss_mask
-        loss_denominator = max(num_global_valid_tokens, 1)
-        loss = masked_loss.sum() / loss_denominator
-
-        with torch.no_grad():
-            masked_ratio = ratio * loss_mask
-            metrics = {
-                "loss/mean": loss.detach(),
-                "loss/ratio_mean": masked_ratio.sum() / loss_denominator,
-                "loss/ratio_clipped_frac": (
-                    (torch.abs(ratio - clipped_ratio) > 1e-6).float() * loss_mask
-                ).sum()
-                / loss_denominator,
-            }
-
-        return loss, metrics
 
 
 class Provisioner:
@@ -286,6 +212,17 @@ class RLTrainer(Configurable):
                 raise ValueError("validation_dataset is required")
             if not self.tasks:
                 raise ValueError("tasks must not be empty")
+
+            if (
+                isinstance(self.trainer.loss, GRPOLoss.Config)
+                and self.trainer.loss.beta > 0
+            ):
+                raise NotImplementedError(
+                    "GRPOLoss beta>0 (reference-policy KL) is not yet supported in "
+                    "the RL controller: there is no reference model and TrainingBatch "
+                    "carries no ref_logprobs. Set trainer.loss.beta=0 until a "
+                    "reference policy is wired."
+                )
 
             if self.trainer.debug.batch_invariant:
                 if not self.trainer.debug.deterministic:
@@ -1006,29 +943,30 @@ class RLTrainer(Configurable):
             with sl.log_trace_span("batcher_batch"):
                 (
                     microbatches,
-                    num_global_valid_tokens,
+                    normalization,
                     packing_metrics,
                 ) = self.batcher.batch(episodes, dp_degree=self.trainer_dp_degree)
 
-            # Aggregate metrics across gradient-accumulation microbatches.
-            # "/mean" and "/frac" metrics are pre-normalized by
-            # num_global_valid_tokens, so summing reconstructs the global
-            # value.  "/max" metrics take the max across microbatches.
-            fwd_bwd_metrics: dict[str, float] = {}
+            # Aggregate metrics across gradient-accumulation microbatches by
+            # reducer bucket: sum_metrics are pre-normalized by the global token
+            # count so summing reconstructs the global value; max_metrics take
+            # the max.
+            fwd_bwd_sum_metrics: dict[str, float] = {}
+            fwd_bwd_max_metrics: dict[str, float] = {}
             for microbatch in microbatches:
                 with sl.log_trace_span("trainer_forward_backward_call"):
                     mb_metrics = self._get_rank_0_value(
                         self.trainer.forward_backward.call(
-                            microbatch, num_global_valid_tokens
+                            microbatch, normalization
                         ).get()
                     )
-                    for k, v in mb_metrics.items():
-                        if k not in fwd_bwd_metrics:
-                            fwd_bwd_metrics[k] = v
-                        elif k.endswith("/max"):
-                            fwd_bwd_metrics[k] = max(fwd_bwd_metrics[k], v)
-                        elif k.endswith(("/mean", "/frac")):
-                            fwd_bwd_metrics[k] += v
+                    for k, v in mb_metrics.sum_metrics.items():
+                        fwd_bwd_sum_metrics[k] = fwd_bwd_sum_metrics.get(k, 0.0) + v
+                    for k, v in mb_metrics.max_metrics.items():
+                        fwd_bwd_max_metrics[k] = max(
+                            fwd_bwd_max_metrics.get(k, float("-inf")), v
+                        )
+            fwd_bwd_metrics = {**fwd_bwd_sum_metrics, **fwd_bwd_max_metrics}
             with sl.log_trace_span("trainer_optim_step_call"):
                 optim_output = self._get_rank_0_value(
                     self.trainer.optim_step.call().get()

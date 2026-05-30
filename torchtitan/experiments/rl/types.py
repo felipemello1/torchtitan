@@ -53,6 +53,7 @@ class TrainingBatch:
     generator_logprobs: torch.Tensor  # [B, L]
     loss_mask: torch.Tensor  # [B, L]
     advantages: torch.Tensor  # [B, L]
+    segment_ids: torch.Tensor  # [B, L], unique per source episode in the microbatch, -1 for padding
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,3 +62,16 @@ class OptimStepOutput:
 
     policy_version: int
     metrics: dict[str, float]
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardBackwardOutput:
+    """Metrics returned by `PolicyTrainer.forward_backward`, split by reducer.
+
+    Both dicts hold scalars already reduced across the loss mesh. The controller
+    folds them across gradient-accumulation microbatches: ``sum_metrics`` are
+    summed, ``max_metrics`` are maxed. Dict membership is the reducer.
+    """
+
+    sum_metrics: dict[str, float]
+    max_metrics: dict[str, float]

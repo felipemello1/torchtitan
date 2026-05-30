@@ -13,6 +13,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 from torchtitan.config import Configurable
+from torchtitan.experiments.rl.loss.types import LossNormalization
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.types import Episode, TrainingBatch
 
@@ -132,15 +133,15 @@ class Batcher(Configurable):
         episodes: list[Episode],
         *,
         dp_degree: int,
-    ) -> tuple[list[list[TrainingBatch]], int, list[m.Metric]]:
+    ) -> tuple[list[list[TrainingBatch]], LossNormalization, list[m.Metric]]:
         """Pack episodes into ``[B, seq_len]`` microbatches.
 
         Returns:
             microbatches: shape ``[gradient_accumulation_steps][dp_degree]``,
                 each entry is a ``TrainingBatch`` with ``local_batch_size`` rows.
-            num_global_valid_tokens: total response tokens across the batch
-                (excludes padding). Used to normalize the loss so that
-                gradient accumulation matches a single large-batch step.
+            normalization: global denominators (valid tokens, sequences, fixed
+                horizon) used to normalize the loss so gradient accumulation
+                matches a single large-batch step.
             packing_metrics: list of Metric objects for logging.
         """
         # TODO: Consider consuming the iterator lazily instead of
@@ -167,6 +168,7 @@ class Batcher(Configurable):
         num_global_valid_tokens = sum(
             int(row["loss_mask"].sum().item()) for row in packed_rows
         )
+        num_global_sequences = sum(len(row["seq_lens"]) for row in packed_rows)
 
         microbatches: list[list[TrainingBatch]] = []
         for step in range(gradient_accumulation_steps):
@@ -201,7 +203,12 @@ class Batcher(Configurable):
             ),
         ]
 
-        return microbatches, num_global_valid_tokens, packing_metrics
+        normalization = LossNormalization(
+            num_global_valid_tokens=num_global_valid_tokens,
+            num_global_sequences=num_global_sequences,
+            num_global_fixed_horizon_tokens=num_global_sequences * self.seq_len,
+        )
+        return microbatches, normalization, packing_metrics
 
     def _pack_episodes(self, episodes: list[Episode]) -> Iterator[dict]:
         """Pack all episodes into [1, seq_len] rows.
@@ -212,19 +219,23 @@ class Batcher(Configurable):
         """
 
         def _iterate_samples() -> Iterator[dict]:
-            for ep in episodes:
+            for segment_id, ep in enumerate(episodes):
                 prompt_len = len(ep.prompt_token_ids)
                 response_len = len(ep.token_ids)
                 raw_ids = ep.prompt_token_ids + ep.token_ids
                 gen_lp = [0.0] * prompt_len + ep.token_logprobs
                 loss_mask = [False] * prompt_len + [True] * response_len
                 advantages = [0.0] * prompt_len + [ep.advantage] * response_len
+                # Unique per source episode; packing preserves it so sequence-level
+                # losses can recover episode boundaries within a packed row.
+                segment_ids = [segment_id] * (len(raw_ids) - 1)
                 yield {
                     "input_ids": raw_ids[:-1],
                     "labels": raw_ids[1:],
                     "generator_logprobs": gen_lp[1:],
                     "loss_mask": loss_mask[1:],
                     "advantages": advantages[1:],
+                    "segment_ids": segment_ids,
                 }
 
         yield from pack(
@@ -236,6 +247,7 @@ class Batcher(Configurable):
                 "generator_logprobs": 0.0,
                 "loss_mask": False,
                 "advantages": 0.0,
+                "segment_ids": -1,
             },
         )
 
@@ -251,4 +263,5 @@ class Batcher(Configurable):
             generator_logprobs=torch.cat([r["generator_logprobs"] for r in rows]),
             loss_mask=torch.cat([r["loss_mask"] for r in rows]),
             advantages=torch.cat([r["advantages"] for r in rows]),
+            segment_ids=torch.cat([r["segment_ids"] for r in rows]),
         )
