@@ -86,10 +86,10 @@ class GSPOLoss(Configurable):
                 "GSPOLoss requires sample_ids (sequence ratio + sequence_mean)."
             )
         policy_logprobs = compute_logprobs(logits, target_ids)
-        ratio, _log_ratio, m_ratio = compute_sequence_ratio(
+        ratio, _log_ratio, ratio_metrics = compute_sequence_ratio(
             policy_logprobs, generator_logprobs, loss_mask, sample_ids, normalization
         )
-        pg_loss, m_clip = pg_ppo_clip(
+        pg_loss, clip_metrics = pg_ppo_clip(
             ratio,
             advantages,
             loss_mask,
@@ -104,16 +104,20 @@ class GSPOLoss(Configurable):
             normalization=normalization,
             sample_ids=sample_ids,
         )
-        drift_sum, max_metrics = logprob_drift_metrics(
+        drift_sum_metrics, drift_max_metrics = logprob_drift_metrics(
             policy_logprobs, generator_logprobs, loss_mask, normalization
         )
         sum_metrics = {
             "loss/mean": loss.detach(),
-            **m_ratio,
-            **m_clip,
-            **drift_sum,
+            **ratio_metrics,
+            **clip_metrics,
+            **drift_sum_metrics,
         }
         if self.log_entropy:
-            _entropy, m_entropy = compute_entropy(logits, loss_mask, normalization)
-            sum_metrics.update(m_entropy)
-        return LossOutput(loss=loss, sum_metrics=sum_metrics, max_metrics=max_metrics)
+            _entropy, entropy_metrics = compute_entropy(
+                logits, loss_mask, normalization
+            )
+            sum_metrics.update(entropy_metrics)
+        return LossOutput(
+            loss=loss, sum_metrics=sum_metrics, max_metrics=drift_max_metrics
+        )

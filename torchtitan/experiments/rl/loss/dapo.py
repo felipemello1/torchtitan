@@ -133,10 +133,10 @@ class DAPOLoss(Configurable):
         ref_logprobs: torch.Tensor | None = None,
     ) -> LossOutput:
         policy_logprobs = compute_logprobs(logits, target_ids)
-        ratio, _log_ratio, m_ratio = compute_token_ratio(
+        ratio, _log_ratio, ratio_metrics = compute_token_ratio(
             policy_logprobs, generator_logprobs, loss_mask, normalization
         )
-        pg_loss, m_clip = pg_ppo_clip(
+        pg_loss, clip_metrics = pg_ppo_clip(
             ratio,
             advantages,
             loss_mask,
@@ -144,7 +144,7 @@ class DAPOLoss(Configurable):
             clip_low=self.clip_low,
             clip_high=self.clip_high,
         )
-        dual_pg_loss, m_dual = pg_dual_clip(
+        dual_pg_loss, dual_metrics = pg_dual_clip(
             pg_loss, advantages, loss_mask, normalization, dual_clip_c=self.dual_clip_c
         )
         loss = aggregate_loss(
@@ -154,17 +154,21 @@ class DAPOLoss(Configurable):
             normalization=normalization,
             sample_ids=sample_ids,
         )
-        drift_sum, max_metrics = logprob_drift_metrics(
+        drift_sum_metrics, drift_max_metrics = logprob_drift_metrics(
             policy_logprobs, generator_logprobs, loss_mask, normalization
         )
         sum_metrics = {
             "loss/mean": loss.detach(),
-            **m_ratio,
-            **m_clip,
-            **m_dual,
-            **drift_sum,
+            **ratio_metrics,
+            **clip_metrics,
+            **dual_metrics,
+            **drift_sum_metrics,
         }
         if self.log_entropy:
-            _entropy, m_entropy = compute_entropy(logits, loss_mask, normalization)
-            sum_metrics.update(m_entropy)
-        return LossOutput(loss=loss, sum_metrics=sum_metrics, max_metrics=max_metrics)
+            _entropy, entropy_metrics = compute_entropy(
+                logits, loss_mask, normalization
+            )
+            sum_metrics.update(entropy_metrics)
+        return LossOutput(
+            loss=loss, sum_metrics=sum_metrics, max_metrics=drift_max_metrics
+        )

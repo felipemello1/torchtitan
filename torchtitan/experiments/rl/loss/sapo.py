@@ -145,10 +145,10 @@ class SAPOLoss(Configurable):
                 "SAPOLoss with agg_type='sequence_mean' requires sample_ids."
             )
         policy_logprobs = compute_logprobs(logits, target_ids)
-        ratio, _log_ratio, m_ratio = compute_token_ratio(
+        ratio, _log_ratio, ratio_metrics = compute_token_ratio(
             policy_logprobs, generator_logprobs, loss_mask, normalization
         )
-        pg_loss, m_gate = pg_soft_gate(
+        pg_loss, gate_metrics = pg_soft_gate(
             ratio,
             advantages,
             loss_mask,
@@ -163,16 +163,20 @@ class SAPOLoss(Configurable):
             normalization=normalization,
             sample_ids=sample_ids,
         )
-        drift_sum, max_metrics = logprob_drift_metrics(
+        drift_sum_metrics, drift_max_metrics = logprob_drift_metrics(
             policy_logprobs, generator_logprobs, loss_mask, normalization
         )
         sum_metrics = {
             "loss/mean": loss.detach(),
-            **m_ratio,
-            **m_gate,
-            **drift_sum,
+            **ratio_metrics,
+            **gate_metrics,
+            **drift_sum_metrics,
         }
         if self.log_entropy:
-            _entropy, m_entropy = compute_entropy(logits, loss_mask, normalization)
-            sum_metrics.update(m_entropy)
-        return LossOutput(loss=loss, sum_metrics=sum_metrics, max_metrics=max_metrics)
+            _entropy, entropy_metrics = compute_entropy(
+                logits, loss_mask, normalization
+            )
+            sum_metrics.update(entropy_metrics)
+        return LossOutput(
+            loss=loss, sum_metrics=sum_metrics, max_metrics=drift_max_metrics
+        )

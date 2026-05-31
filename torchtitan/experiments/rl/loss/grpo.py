@@ -100,10 +100,10 @@ class GRPOLoss(Configurable):
         ref_logprobs: torch.Tensor | None = None,
     ) -> LossOutput:
         policy_logprobs = compute_logprobs(logits, target_ids)
-        ratio, _log_ratio, m_ratio = compute_token_ratio(
+        ratio, _log_ratio, ratio_metrics = compute_token_ratio(
             policy_logprobs, generator_logprobs, loss_mask, normalization
         )
-        pg_loss, m_clip = pg_ppo_clip(
+        pg_loss, clip_metrics = pg_ppo_clip(
             ratio,
             advantages,
             loss_mask,
@@ -112,11 +112,11 @@ class GRPOLoss(Configurable):
             clip_high=self.clip_high,
         )
 
-        m_kl: dict[str, torch.Tensor] = {}
+        kl_metrics: dict[str, torch.Tensor] = {}
         if self.beta > 0:
             if ref_logprobs is None:
                 raise ValueError("GRPOLoss.beta>0 requires ref_logprobs")
-            kl, m_kl = compute_kl(
+            kl, kl_metrics = compute_kl(
                 policy_logprobs, ref_logprobs, loss_mask, normalization, self.kl_type
             )
             pg_loss = pg_loss + self.beta * kl
@@ -128,17 +128,21 @@ class GRPOLoss(Configurable):
             normalization=normalization,
             sample_ids=sample_ids,
         )
-        drift_sum, max_metrics = logprob_drift_metrics(
+        drift_sum_metrics, drift_max_metrics = logprob_drift_metrics(
             policy_logprobs, generator_logprobs, loss_mask, normalization
         )
         sum_metrics = {
             "loss/mean": loss.detach(),
-            **m_ratio,
-            **m_clip,
-            **m_kl,
-            **drift_sum,
+            **ratio_metrics,
+            **clip_metrics,
+            **kl_metrics,
+            **drift_sum_metrics,
         }
         if self.log_entropy:
-            _entropy, m_entropy = compute_entropy(logits, loss_mask, normalization)
-            sum_metrics.update(m_entropy)
-        return LossOutput(loss=loss, sum_metrics=sum_metrics, max_metrics=max_metrics)
+            _entropy, entropy_metrics = compute_entropy(
+                logits, loss_mask, normalization
+            )
+            sum_metrics.update(entropy_metrics)
+        return LossOutput(
+            loss=loss, sum_metrics=sum_metrics, max_metrics=drift_max_metrics
+        )
