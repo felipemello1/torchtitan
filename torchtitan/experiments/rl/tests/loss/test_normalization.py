@@ -19,7 +19,7 @@ from torchtitan.experiments.rl.loss.ops import aggregate_loss, compute_sequence_
 from torchtitan.experiments.rl.loss.types import LossNormalization
 from torchtitan.experiments.rl.types import Episode
 
-from .conftest import assert_close
+from .conftest import assert_close, make_normalization
 
 
 @pytest.mark.parametrize("agg_type", ["token_mean", "fixed_horizon", "sequence_mean"])
@@ -28,8 +28,9 @@ def test_grad_accum_invariance(agg_type):
     the same global LossNormalization. This is what makes grad accumulation
     equivalent to a single large-batch step."""
     torch.manual_seed(0)
-    B, S = 4, 6
-    policy = torch.randn(B, S)
+    B, S, V = 4, 6, 10
+    logits = torch.randn(B, S, V)
+    target_ids = torch.randint(0, V, (B, S))
     gen = torch.randn(B, S)
     adv = torch.randn(B, S)
     loss_mask = torch.ones(B, S, dtype=torch.bool)
@@ -44,7 +45,8 @@ def test_grad_accum_invariance(agg_type):
 
     def run(rows):
         return loss_fn(
-            policy_logprobs=policy[rows],
+            logits=logits[rows],
+            target_ids=target_ids[rows],
             generator_logprobs=gen[rows],
             loss_mask=loss_mask[rows],
             advantages=adv[rows],
@@ -91,7 +93,10 @@ def test_sequence_ratio_is_per_episode():
     gen = torch.zeros(1, 4)
     loss_mask = torch.ones(1, 4, dtype=torch.bool)
     sample_ids = torch.tensor([[0, 0, 1, 1]])
-    ratio, _ = compute_sequence_ratio(policy, gen, loss_mask, sample_ids)
+    norm = make_normalization(loss_mask, 1, 4)
+    ratio, _log_ratio, _metrics = compute_sequence_ratio(
+        policy, gen, loss_mask, sample_ids, norm
+    )
     assert_close(ratio[0, 0], torch.tensor(1.0))
     assert_close(ratio[0, 2], torch.tensor(2.0))
 
@@ -170,31 +175,25 @@ def test_batcher_packs_multiple_episodes_into_one_row():
     assert norm.num_global_valid_tokens == 6
 
 
-def test_log_entropy_logged_only_with_logits():
-    """log_entropy emits loss/entropy/mean iff logits are supplied; entropy is
-    logging-only, so the loss value is identical either way."""
+def test_log_entropy_flag_controls_entropy_metric():
+    """log_entropy gates loss/entropy/mean; entropy is logging-only, so the loss
+    value is identical with the flag on or off."""
     torch.manual_seed(0)
     B, S, V = 2, 4, 10
-    logits = torch.randn(B, S, V)
     loss_mask = torch.ones(B, S, dtype=torch.bool)
-    norm = LossNormalization(
-        num_global_valid_tokens=int(loss_mask.sum()),
-        num_global_sequences=B,
-        num_global_fixed_horizon_tokens=B * S,
-    )
     kwargs = dict(
-        policy_logprobs=torch.randn(B, S),
+        logits=torch.randn(B, S, V),
+        target_ids=torch.randint(0, V, (B, S)),
         generator_logprobs=torch.randn(B, S),
         loss_mask=loss_mask,
         advantages=torch.randn(B, S),
-        normalization=norm,
+        normalization=make_normalization(loss_mask, B, S),
         sample_ids=torch.arange(B).unsqueeze(1).expand(B, S).contiguous(),
     )
-    loss_fn = DAPOLoss.Config(log_entropy=True).build()
-    with_logits = loss_fn(logits=logits, **kwargs)
-    without_logits = loss_fn(**kwargs)
+    with_entropy = DAPOLoss.Config(log_entropy=True).build()(**kwargs)
+    without_entropy = DAPOLoss.Config(log_entropy=False).build()(**kwargs)
 
-    assert "loss/entropy/mean" in with_logits.sum_metrics
-    assert torch.isfinite(with_logits.sum_metrics["loss/entropy/mean"])
-    assert "loss/entropy/mean" not in without_logits.sum_metrics
-    assert_close(with_logits.loss, without_logits.loss)
+    assert "loss/entropy/mean" in with_entropy.sum_metrics
+    assert torch.isfinite(with_entropy.sum_metrics["loss/entropy/mean"])
+    assert "loss/entropy/mean" not in without_entropy.sum_metrics
+    assert_close(with_entropy.loss, without_entropy.loss)

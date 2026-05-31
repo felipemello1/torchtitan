@@ -11,13 +11,12 @@ import torch
 from torchtitan.config import Configurable
 from torchtitan.experiments.rl.loss.ops import (
     aggregate_loss,
+    compute_entropy,
     compute_kl,
+    compute_logprobs,
     compute_token_ratio,
-    entropy_metrics,
-    masked_token_mean,
+    logprob_drift_metrics,
     pg_ppo_clip,
-    ppo_clip_metrics,
-    ratio_metrics,
 )
 from torchtitan.experiments.rl.loss.types import (
     AggType,
@@ -68,7 +67,7 @@ class GRPOLoss(Configurable):
         beta (float): KL penalty coefficient (default 0.0; >0 requires ref_logprobs).
         kl_type (KLType): KL estimator (default "k3").
         agg_type (AggType): Aggregation method (default "token_mean").
-        log_entropy (bool): Emit loss/entropy/mean (needs logits; default True).
+        log_entropy (bool): Emit loss/entropy/mean (default True).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -91,25 +90,35 @@ class GRPOLoss(Configurable):
     def __call__(
         self,
         *,
-        policy_logprobs: torch.Tensor,  # (B, S)
+        logits: torch.Tensor,  # (B, S, V)
+        target_ids: torch.Tensor,  # (B, S)
         generator_logprobs: torch.Tensor,  # (B, S)
         loss_mask: torch.Tensor,  # (B, S)
         advantages: torch.Tensor,  # (B, S)
         normalization: LossNormalization,
         sample_ids: torch.Tensor | None = None,
-        logits: torch.Tensor | None = None,
         ref_logprobs: torch.Tensor | None = None,
     ) -> LossOutput:
-        ratio, log_ratio = compute_token_ratio(policy_logprobs, generator_logprobs)
-        pg_loss, clipped_ratio = pg_ppo_clip(
-            ratio, advantages, clip_low=self.clip_low, clip_high=self.clip_high
+        policy_logprobs = compute_logprobs(logits, target_ids)
+        ratio, _log_ratio, m_ratio = compute_token_ratio(
+            policy_logprobs, generator_logprobs, loss_mask, normalization
+        )
+        pg_loss, m_clip = pg_ppo_clip(
+            ratio,
+            advantages,
+            loss_mask,
+            normalization,
+            clip_low=self.clip_low,
+            clip_high=self.clip_high,
         )
 
-        kl = None
+        m_kl: dict[str, torch.Tensor] = {}
         if self.beta > 0:
             if ref_logprobs is None:
                 raise ValueError("GRPOLoss.beta>0 requires ref_logprobs")
-            kl = compute_kl(policy_logprobs, ref_logprobs, self.kl_type)
+            kl, m_kl = compute_kl(
+                policy_logprobs, ref_logprobs, loss_mask, normalization, self.kl_type
+            )
             pg_loss = pg_loss + self.beta * kl
 
         loss = aggregate_loss(
@@ -119,17 +128,17 @@ class GRPOLoss(Configurable):
             normalization=normalization,
             sample_ids=sample_ids,
         )
-        with torch.no_grad():
-            sum_metrics = {
-                "loss/mean": loss.detach(),
-                **ratio_metrics(ratio, log_ratio, loss_mask, normalization),
-                **ppo_clip_metrics(
-                    ratio, clipped_ratio, advantages, loss_mask, normalization
-                ),
-                **entropy_metrics(self.log_entropy, logits, loss_mask, normalization),
-            }
-            if kl is not None:
-                sum_metrics["loss/kl_ref/mean"] = masked_token_mean(
-                    kl, loss_mask, normalization
-                )
-        return LossOutput(loss=loss, sum_metrics=sum_metrics)
+        drift_sum, max_metrics = logprob_drift_metrics(
+            policy_logprobs, generator_logprobs, loss_mask, normalization
+        )
+        sum_metrics = {
+            "loss/mean": loss.detach(),
+            **m_ratio,
+            **m_clip,
+            **m_kl,
+            **drift_sum,
+        }
+        if self.log_entropy:
+            _entropy, m_entropy = compute_entropy(logits, loss_mask, normalization)
+            sum_metrics.update(m_entropy)
+        return LossOutput(loss=loss, sum_metrics=sum_metrics, max_metrics=max_metrics)

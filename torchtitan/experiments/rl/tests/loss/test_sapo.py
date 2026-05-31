@@ -8,12 +8,7 @@ import torch
 
 from torchtitan.experiments.rl.loss import SAPOLoss
 
-from .conftest import (
-    assert_close,
-    make_normalization,
-    make_sample_ids,
-    policy_logprobs_from,
-)
+from .conftest import assert_close, make_normalization, make_sample_ids
 
 
 class TestSAPOLoss:
@@ -21,7 +16,8 @@ class TestSAPOLoss:
         d = inputs
         loss_fn = SAPOLoss.Config(tau_pos=1.0, tau_neg=1.05).build()
         output = loss_fn(
-            policy_logprobs=d["policy_logprobs"],
+            logits=d["logits"],
+            target_ids=d["target_ids"],
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=d["advantages"],
@@ -34,11 +30,11 @@ class TestSAPOLoss:
     def test_backward(self, inputs):
         d = inputs
         logits = d["logits"].clone().requires_grad_(True)
-        policy_logprobs = policy_logprobs_from(logits, d["target_ids"])
 
         loss_fn = SAPOLoss.Config(tau_pos=1.0, tau_neg=1.05).build()
         output = loss_fn(
-            policy_logprobs=policy_logprobs,
+            logits=logits,
+            target_ids=d["target_ids"],
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=d["advantages"],
@@ -55,7 +51,8 @@ class TestSAPOLoss:
 
         loss_fn = SAPOLoss.Config().build()
         output = loss_fn(
-            policy_logprobs=d["policy_logprobs"],
+            logits=d["logits"],
+            target_ids=d["target_ids"],
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=advantages,
@@ -72,7 +69,8 @@ class TestSAPOLoss:
 
         loss_fn = SAPOLoss.Config().build()
         output = loss_fn(
-            policy_logprobs=d["policy_logprobs"],
+            logits=d["logits"],
+            target_ids=d["target_ids"],
             generator_logprobs=d["generator_logprobs"],
             loss_mask=empty_mask,
             advantages=d["advantages"],
@@ -94,7 +92,8 @@ class TestSAPOLoss:
 
         loss_fn = SAPOLoss.Config().build()
         output = loss_fn(
-            policy_logprobs=policy_logprobs_from(logits, target_ids),
+            logits=logits,
+            target_ids=target_ids,
             generator_logprobs=generator_logprobs,
             loss_mask=loss_mask,
             advantages=advantages,

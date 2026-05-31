@@ -11,11 +11,11 @@ import torch
 from torchtitan.config import Configurable
 from torchtitan.experiments.rl.loss.ops import (
     aggregate_loss,
+    compute_entropy,
+    compute_logprobs,
     compute_sequence_ratio,
-    entropy_metrics,
+    logprob_drift_metrics,
     pg_ppo_clip,
-    ppo_clip_metrics,
-    ratio_metrics,
 )
 from torchtitan.experiments.rl.loss.types import AggType, LossNormalization, LossOutput
 
@@ -53,7 +53,7 @@ class GSPOLoss(Configurable):
         clip_low (float): Lower clip bound offset (default 0.2).
         clip_high (float): Upper clip bound offset (default 0.2).
         agg_type (AggType): Aggregation method (default "sequence_mean").
-        log_entropy (bool): Emit loss/entropy/mean (needs logits; default True).
+        log_entropy (bool): Emit loss/entropy/mean (default True).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -72,24 +72,30 @@ class GSPOLoss(Configurable):
     def __call__(
         self,
         *,
-        policy_logprobs: torch.Tensor,  # (B, S)
+        logits: torch.Tensor,  # (B, S, V)
+        target_ids: torch.Tensor,  # (B, S)
         generator_logprobs: torch.Tensor,  # (B, S)
         loss_mask: torch.Tensor,  # (B, S)
         advantages: torch.Tensor,  # (B, S)
         normalization: LossNormalization,
         sample_ids: torch.Tensor | None = None,
-        logits: torch.Tensor | None = None,
         ref_logprobs: torch.Tensor | None = None,
     ) -> LossOutput:
         if sample_ids is None:
             raise ValueError(
                 "GSPOLoss requires sample_ids (sequence ratio + sequence_mean)."
             )
-        ratio, log_ratio = compute_sequence_ratio(
-            policy_logprobs, generator_logprobs, loss_mask, sample_ids
+        policy_logprobs = compute_logprobs(logits, target_ids)
+        ratio, _log_ratio, m_ratio = compute_sequence_ratio(
+            policy_logprobs, generator_logprobs, loss_mask, sample_ids, normalization
         )
-        pg_loss, clipped_ratio = pg_ppo_clip(
-            ratio, advantages, clip_low=self.clip_low, clip_high=self.clip_high
+        pg_loss, m_clip = pg_ppo_clip(
+            ratio,
+            advantages,
+            loss_mask,
+            normalization,
+            clip_low=self.clip_low,
+            clip_high=self.clip_high,
         )
         loss = aggregate_loss(
             pg_loss,
@@ -98,13 +104,16 @@ class GSPOLoss(Configurable):
             normalization=normalization,
             sample_ids=sample_ids,
         )
-        with torch.no_grad():
-            sum_metrics = {
-                "loss/mean": loss.detach(),
-                **ratio_metrics(ratio, log_ratio, loss_mask, normalization),
-                **ppo_clip_metrics(
-                    ratio, clipped_ratio, advantages, loss_mask, normalization
-                ),
-                **entropy_metrics(self.log_entropy, logits, loss_mask, normalization),
-            }
-        return LossOutput(loss=loss, sum_metrics=sum_metrics)
+        drift_sum, max_metrics = logprob_drift_metrics(
+            policy_logprobs, generator_logprobs, loss_mask, normalization
+        )
+        sum_metrics = {
+            "loss/mean": loss.detach(),
+            **m_ratio,
+            **m_clip,
+            **drift_sum,
+        }
+        if self.log_entropy:
+            _entropy, m_entropy = compute_entropy(logits, loss_mask, normalization)
+            sum_metrics.update(m_entropy)
+        return LossOutput(loss=loss, sum_metrics=sum_metrics, max_metrics=max_metrics)

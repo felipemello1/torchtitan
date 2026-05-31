@@ -11,10 +11,11 @@ import torch
 from torchtitan.config import Configurable
 from torchtitan.experiments.rl.loss.ops import (
     aggregate_loss,
+    compute_entropy,
+    compute_logprobs,
     compute_token_ratio,
-    entropy_metrics,
+    logprob_drift_metrics,
     masked_token_mean,
-    ratio_metrics,
 )
 from torchtitan.experiments.rl.loss.types import AggType, LossNormalization, LossOutput
 
@@ -22,10 +23,12 @@ from torchtitan.experiments.rl.loss.types import AggType, LossNormalization, Los
 def pg_soft_gate(
     ratio: torch.Tensor,
     advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    normalization: LossNormalization,
     *,
     tau_pos: float = 1.0,
     tau_neg: float = 1.05,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """SAPO's soft sigmoid gating.
 
     Reference: Gao et al., "Soft Adaptive Policy Optimization" (2025).
@@ -34,12 +37,14 @@ def pg_soft_gate(
     Formula: gate(r) = (4/τ) * sigmoid(τ * (r - 1))
              L = -gate(r) * A
 
-    Replaces PPO's hard clipping with smooth sigmoid decay. The 4/τ normalization
+    Replaces PPO's hard clipping with smooth sigmoid gating. The 4/τ normalization
     ensures the GRADIENT ∂gate/∂r = 1.0 at r=1, matching vanilla policy gradient
-    on-policy. As r deviates from 1, the gate decays smoothly toward 0.
+    on-policy. As r deviates from 1, that gradient decays smoothly toward 0 (the
+    gate value itself saturates at 4/τ), so updates taper instead of being
+    hard-clipped.
 
-    Asymmetric temperature: τ_neg > τ_pos makes the gate decay faster for
-    negative advantages. When decreasing a token's probability (negative
+    Asymmetric temperature: τ_neg > τ_pos makes the gate's gradient decay faster
+    for negative advantages. When decreasing a token's probability (negative
     advantage), that probability mass redistributes across the entire vocabulary.
     This one-to-many effect amplifies noise in negative updates. A higher τ_neg
     compensates by applying a tighter trust region for negative advantages.
@@ -47,17 +52,26 @@ def pg_soft_gate(
     Args:
         ratio (torch.Tensor): Importance ratio (B, S).
         advantages (torch.Tensor): Advantage estimates (B, S).
+        loss_mask (torch.Tensor): Valid token mask (B, S).
+        normalization (LossNormalization): Global token denominator for the metric.
         tau_pos (float): Temperature for positive advantages (default 1.0).
         tau_neg (float): Temperature for negative advantages (default 1.05).
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]: (pg_loss, gate), both (B, S).
+        tuple[torch.Tensor, dict[str, torch.Tensor]]: (pg_loss, metrics); pg_loss
+            is (B, S).
     """
     pos_gate = (4.0 / tau_pos) * torch.sigmoid(tau_pos * (ratio - 1))
     neg_gate = (4.0 / tau_neg) * torch.sigmoid(tau_neg * (ratio - 1))
     gate = torch.where(advantages > 0, pos_gate, neg_gate)
     pg_loss = -gate * advantages
-    return pg_loss, gate
+    with torch.no_grad():
+        metrics = {
+            "loss/soft_gate/gate/mean": masked_token_mean(
+                gate, loss_mask, normalization
+            )
+        }
+    return pg_loss, metrics
 
 
 class SAPOLoss(Configurable):
@@ -77,10 +91,11 @@ class SAPOLoss(Configurable):
 
     SAPO replaces PPO's hard clipping with smooth sigmoid gating. The 4/τ factor
     is chosen so that the effective gradient scaling equals 1.0 at r=1 (on-policy).
-    As r deviates from 1, the gate decays smoothly toward 0.
+    As r deviates from 1, that gradient scaling decays smoothly toward 0 (the gate
+    value saturates at 4/τ).
 
-    Asymmetric temperature: τ_neg > τ_pos makes the gate decay faster for
-    negative advantages. When decreasing a token's probability (negative
+    Asymmetric temperature: τ_neg > τ_pos makes the gate's gradient decay faster
+    for negative advantages. When decreasing a token's probability (negative
     advantage), that probability mass redistributes across the entire vocabulary.
     This one-to-many effect amplifies noise in negative updates. A higher τ_neg
     compensates by applying a tighter trust region for negative advantages.
@@ -97,7 +112,7 @@ class SAPOLoss(Configurable):
         tau_pos (float): Temperature for positive advantages (default 1.0).
         tau_neg (float): Temperature for negative advantages (default 1.05).
         agg_type (AggType): Aggregation method (default "sequence_mean").
-        log_entropy (bool): Emit loss/entropy/mean (needs logits; default True).
+        log_entropy (bool): Emit loss/entropy/mean (default True).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -116,22 +131,30 @@ class SAPOLoss(Configurable):
     def __call__(
         self,
         *,
-        policy_logprobs: torch.Tensor,  # (B, S)
+        logits: torch.Tensor,  # (B, S, V)
+        target_ids: torch.Tensor,  # (B, S)
         generator_logprobs: torch.Tensor,  # (B, S)
         loss_mask: torch.Tensor,  # (B, S)
         advantages: torch.Tensor,  # (B, S)
         normalization: LossNormalization,
         sample_ids: torch.Tensor | None = None,
-        logits: torch.Tensor | None = None,
         ref_logprobs: torch.Tensor | None = None,
     ) -> LossOutput:
         if self.agg_type == "sequence_mean" and sample_ids is None:
             raise ValueError(
                 "SAPOLoss with agg_type='sequence_mean' requires sample_ids."
             )
-        ratio, log_ratio = compute_token_ratio(policy_logprobs, generator_logprobs)
-        pg_loss, gate = pg_soft_gate(
-            ratio, advantages, tau_pos=self.tau_pos, tau_neg=self.tau_neg
+        policy_logprobs = compute_logprobs(logits, target_ids)
+        ratio, _log_ratio, m_ratio = compute_token_ratio(
+            policy_logprobs, generator_logprobs, loss_mask, normalization
+        )
+        pg_loss, m_gate = pg_soft_gate(
+            ratio,
+            advantages,
+            loss_mask,
+            normalization,
+            tau_pos=self.tau_pos,
+            tau_neg=self.tau_neg,
         )
         loss = aggregate_loss(
             pg_loss,
@@ -140,13 +163,16 @@ class SAPOLoss(Configurable):
             normalization=normalization,
             sample_ids=sample_ids,
         )
-        with torch.no_grad():
-            sum_metrics = {
-                "loss/mean": loss.detach(),
-                **ratio_metrics(ratio, log_ratio, loss_mask, normalization),
-                "loss/soft_gate/gate/mean": masked_token_mean(
-                    gate, loss_mask, normalization
-                ),
-                **entropy_metrics(self.log_entropy, logits, loss_mask, normalization),
-            }
-        return LossOutput(loss=loss, sum_metrics=sum_metrics)
+        drift_sum, max_metrics = logprob_drift_metrics(
+            policy_logprobs, generator_logprobs, loss_mask, normalization
+        )
+        sum_metrics = {
+            "loss/mean": loss.detach(),
+            **m_ratio,
+            **m_gate,
+            **drift_sum,
+        }
+        if self.log_entropy:
+            _entropy, m_entropy = compute_entropy(logits, loss_mask, normalization)
+            sum_metrics.update(m_entropy)
+        return LossOutput(loss=loss, sum_metrics=sum_metrics, max_metrics=max_metrics)

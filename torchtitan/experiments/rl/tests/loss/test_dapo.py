@@ -8,12 +8,7 @@ import torch
 
 from torchtitan.experiments.rl.loss import DAPOLoss
 
-from .conftest import (
-    assert_close,
-    make_normalization,
-    make_sample_ids,
-    policy_logprobs_from,
-)
+from .conftest import assert_close, make_normalization, make_sample_ids
 
 
 class TestDAPOLoss:
@@ -21,7 +16,8 @@ class TestDAPOLoss:
         d = inputs
         loss_fn = DAPOLoss.Config(clip_low=0.2, clip_high=0.28, dual_clip_c=3.0).build()
         output = loss_fn(
-            policy_logprobs=d["policy_logprobs"],
+            logits=d["logits"],
+            target_ids=d["target_ids"],
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=d["advantages"],
@@ -34,11 +30,11 @@ class TestDAPOLoss:
     def test_backward(self, inputs):
         d = inputs
         logits = d["logits"].clone().requires_grad_(True)
-        policy_logprobs = policy_logprobs_from(logits, d["target_ids"])
 
         loss_fn = DAPOLoss.Config(clip_low=0.2, clip_high=0.28, dual_clip_c=3.0).build()
         output = loss_fn(
-            policy_logprobs=policy_logprobs,
+            logits=logits,
+            target_ids=d["target_ids"],
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=d["advantages"],
@@ -55,7 +51,8 @@ class TestDAPOLoss:
 
         loss_fn = DAPOLoss.Config().build()
         output = loss_fn(
-            policy_logprobs=d["policy_logprobs"],
+            logits=d["logits"],
+            target_ids=d["target_ids"],
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=advantages,
@@ -72,7 +69,8 @@ class TestDAPOLoss:
 
         loss_fn = DAPOLoss.Config().build()
         output = loss_fn(
-            policy_logprobs=d["policy_logprobs"],
+            logits=d["logits"],
+            target_ids=d["target_ids"],
             generator_logprobs=d["generator_logprobs"],
             loss_mask=empty_mask,
             advantages=d["advantages"],
@@ -94,7 +92,8 @@ class TestDAPOLoss:
 
         loss_fn = DAPOLoss.Config().build()
         output = loss_fn(
-            policy_logprobs=policy_logprobs_from(logits, target_ids),
+            logits=logits,
+            target_ids=target_ids,
             generator_logprobs=generator_logprobs,
             loss_mask=loss_mask,
             advantages=advantages,

@@ -11,10 +11,11 @@ import torch
 from torchtitan.config import Configurable
 from torchtitan.experiments.rl.loss.ops import (
     aggregate_loss,
+    compute_entropy,
+    compute_logprobs,
     compute_token_ratio,
-    entropy_metrics,
+    logprob_drift_metrics,
     masked_token_mean,
-    ratio_metrics,
 )
 from torchtitan.experiments.rl.loss.types import AggType, LossNormalization, LossOutput
 
@@ -23,10 +24,12 @@ def pg_cispo(
     ratio: torch.Tensor,
     policy_logprobs: torch.Tensor,
     advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    normalization: LossNormalization,
     *,
     clip_low: float = 1.0,
-    clip_high: float = 5.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    clip_high: float = 4.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """CISPO: Clipped Importance Sampling Policy Optimization.
 
     Reference: Chen et al., "MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention" (2025).
@@ -48,39 +51,31 @@ def pg_cispo(
         ratio (torch.Tensor): Importance ratio (B, S).
         policy_logprobs (torch.Tensor): Log probs from current policy (B, S).
         advantages (torch.Tensor): Advantage estimates (B, S).
+        loss_mask (torch.Tensor): Valid token mask (B, S).
+        normalization (LossNormalization): Global token denominator for metrics.
         clip_low (float): Lower clip bound offset (default 1.0, no effective clipping).
-        clip_high (float): Upper clip bound offset (default 5.0).
+        clip_high (float): Upper clip bound offset (default 4.0).
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]: (pg_loss, clipped_ratio), both (B, S).
-            clipped_ratio is detached.
+        tuple[torch.Tensor, dict[str, torch.Tensor]]: (pg_loss, metrics); pg_loss
+            is (B, S). The high/low fractions are unconditional (no advantage-sign
+            filter), unlike PPO's pg clip fractions.
     """
     clipped_ratio = torch.clamp(ratio, min=1 - clip_low, max=1 + clip_high).detach()
     pg_loss = -clipped_ratio * advantages * policy_logprobs
-    return pg_loss, clipped_ratio
-
-
-def cispo_clip_metrics(
-    ratio: torch.Tensor,
-    clipped_ratio: torch.Tensor,
-    clip_low: float,
-    clip_high: float,
-    loss_mask: torch.Tensor,
-    normalization: LossNormalization,
-) -> dict[str, torch.Tensor]:
-    """CISPO clip diagnostics. The high/low fractions are unconditional (no
-    advantage-sign convention), unlike PPO's pg clip fractions."""
-    return {
-        "loss/clip/clipped_ratio/mean": masked_token_mean(
-            clipped_ratio, loss_mask, normalization
-        ),
-        "loss/clip/high_unconditional/frac": masked_token_mean(
-            (ratio > 1 + clip_high).float(), loss_mask, normalization
-        ),
-        "loss/clip/low_unconditional/frac": masked_token_mean(
-            (ratio < 1 - clip_low).float(), loss_mask, normalization
-        ),
-    }
+    with torch.no_grad():
+        metrics = {
+            "loss/clip/clipped_ratio/mean": masked_token_mean(
+                clipped_ratio, loss_mask, normalization
+            ),
+            "loss/clip/high_unconditional/frac": masked_token_mean(
+                (ratio > 1 + clip_high).float(), loss_mask, normalization
+            ),
+            "loss/clip/low_unconditional/frac": masked_token_mean(
+                (ratio < 1 - clip_low).float(), loss_mask, normalization
+            ),
+        }
+    return pg_loss, metrics
 
 
 class CISPOLoss(Configurable):
@@ -119,7 +114,7 @@ class CISPOLoss(Configurable):
             no lower clipping).
         clip_high (float): Upper clip bound offset (default 4.0).
         agg_type (AggType): Aggregation method (default "token_mean").
-        log_entropy (bool): Emit loss/entropy/mean (needs logits; default True).
+        log_entropy (bool): Emit loss/entropy/mean (default True).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -138,20 +133,25 @@ class CISPOLoss(Configurable):
     def __call__(
         self,
         *,
-        policy_logprobs: torch.Tensor,  # (B, S)
+        logits: torch.Tensor,  # (B, S, V)
+        target_ids: torch.Tensor,  # (B, S)
         generator_logprobs: torch.Tensor,  # (B, S)
         loss_mask: torch.Tensor,  # (B, S)
         advantages: torch.Tensor,  # (B, S)
         normalization: LossNormalization,
         sample_ids: torch.Tensor | None = None,
-        logits: torch.Tensor | None = None,
         ref_logprobs: torch.Tensor | None = None,
     ) -> LossOutput:
-        ratio, log_ratio = compute_token_ratio(policy_logprobs, generator_logprobs)
-        pg_loss, clipped_ratio = pg_cispo(
+        policy_logprobs = compute_logprobs(logits, target_ids)
+        ratio, _log_ratio, m_ratio = compute_token_ratio(
+            policy_logprobs, generator_logprobs, loss_mask, normalization
+        )
+        pg_loss, m_clip = pg_cispo(
             ratio,
             policy_logprobs,
             advantages,
+            loss_mask,
+            normalization,
             clip_low=self.clip_low,
             clip_high=self.clip_high,
         )
@@ -162,18 +162,16 @@ class CISPOLoss(Configurable):
             normalization=normalization,
             sample_ids=sample_ids,
         )
-        with torch.no_grad():
-            sum_metrics = {
-                "loss/mean": loss.detach(),
-                **ratio_metrics(ratio, log_ratio, loss_mask, normalization),
-                **cispo_clip_metrics(
-                    ratio,
-                    clipped_ratio,
-                    self.clip_low,
-                    self.clip_high,
-                    loss_mask,
-                    normalization,
-                ),
-                **entropy_metrics(self.log_entropy, logits, loss_mask, normalization),
-            }
-        return LossOutput(loss=loss, sum_metrics=sum_metrics)
+        drift_sum, max_metrics = logprob_drift_metrics(
+            policy_logprobs, generator_logprobs, loss_mask, normalization
+        )
+        sum_metrics = {
+            "loss/mean": loss.detach(),
+            **m_ratio,
+            **m_clip,
+            **drift_sum,
+        }
+        if self.log_entropy:
+            _entropy, m_entropy = compute_entropy(logits, loss_mask, normalization)
+            sum_metrics.update(m_entropy)
+        return LossOutput(loss=loss, sum_metrics=sum_metrics, max_metrics=max_metrics)

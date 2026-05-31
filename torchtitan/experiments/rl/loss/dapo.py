@@ -11,12 +11,12 @@ import torch
 from torchtitan.config import Configurable
 from torchtitan.experiments.rl.loss.ops import (
     aggregate_loss,
+    compute_entropy,
+    compute_logprobs,
     compute_token_ratio,
-    entropy_metrics,
+    logprob_drift_metrics,
     masked_token_mean,
     pg_ppo_clip,
-    ppo_clip_metrics,
-    ratio_metrics,
 )
 from torchtitan.experiments.rl.loss.types import AggType, LossNormalization, LossOutput
 
@@ -24,9 +24,11 @@ from torchtitan.experiments.rl.loss.types import AggType, LossNormalization, Los
 def pg_dual_clip(
     pg_loss: torch.Tensor,
     advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    normalization: LossNormalization,
     *,
     dual_clip_c: float = 3.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """DAPO's dual-clip for negative advantages.
 
     Reference: Yu et al., "DAPO: An Open-Source LLM Reinforcement Learning System at Scale" (2025).
@@ -42,36 +44,28 @@ def pg_dual_clip(
     Args:
         pg_loss (torch.Tensor): Per-token PPO loss from pg_ppo_clip (B, S).
         advantages (torch.Tensor): Advantage estimates (B, S).
+        loss_mask (torch.Tensor): Valid token mask (B, S).
+        normalization (LossNormalization): Global token denominator for the metric.
         dual_clip_c (float): Dual-clip constant (default 3.0).
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]: (dual-clipped loss, dual_clip_bound),
-            both (B, S). The bound is returned so the clip-fraction metric can
-            reuse it.
+        tuple[torch.Tensor, dict[str, torch.Tensor]]: (dual-clipped loss, metrics);
+            loss is (B, S). The metric is the fraction of valid negative-advantage
+            tokens whose penalty was dual-clipped.
     """
     dual_clip_bound = -dual_clip_c * advantages
     loss = torch.where(advantages < 0, torch.minimum(pg_loss, dual_clip_bound), pg_loss)
-    return loss, dual_clip_bound
-
-
-def dual_clip_metrics(
-    pg_loss: torch.Tensor,
-    dual_clip_bound: torch.Tensor,
-    advantages: torch.Tensor,
-    loss_mask: torch.Tensor,
-    normalization: LossNormalization,
-) -> dict[str, torch.Tensor]:
-    """Fraction of valid negative-advantage tokens whose penalty was dual-clipped.
-
-    `pg_loss` is the pre-dual-clip PPO loss, so the comparison detects where the
-    dual-clip ceiling actually bound.
-    """
-    was_dual_clipped = (pg_loss > dual_clip_bound) & (advantages < 0) & loss_mask.bool()
-    return {
-        "loss/dual_clip/clip/frac": masked_token_mean(
-            was_dual_clipped.float(), loss_mask, normalization
+    with torch.no_grad():
+        # Compare against the pre-dual-clip PPO loss to detect where the ceiling bound.
+        was_dual_clipped = (
+            (pg_loss > dual_clip_bound) & (advantages < 0) & loss_mask.bool()
         )
-    }
+        metrics = {
+            "loss/dual_clip/clip/frac": masked_token_mean(
+                was_dual_clipped.float(), loss_mask, normalization
+            )
+        }
+    return loss, metrics
 
 
 class DAPOLoss(Configurable):
@@ -108,7 +102,7 @@ class DAPOLoss(Configurable):
         clip_high (float): Upper clip bound (default 0.28).
         dual_clip_c (float): Dual-clip constant (default 3.0).
         agg_type (AggType): Aggregation method (default "token_mean").
-        log_entropy (bool): Emit loss/entropy/mean (needs logits; default True).
+        log_entropy (bool): Emit loss/entropy/mean (default True).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -129,21 +123,29 @@ class DAPOLoss(Configurable):
     def __call__(
         self,
         *,
-        policy_logprobs: torch.Tensor,  # (B, S)
+        logits: torch.Tensor,  # (B, S, V)
+        target_ids: torch.Tensor,  # (B, S)
         generator_logprobs: torch.Tensor,  # (B, S)
         loss_mask: torch.Tensor,  # (B, S)
         advantages: torch.Tensor,  # (B, S)
         normalization: LossNormalization,
         sample_ids: torch.Tensor | None = None,
-        logits: torch.Tensor | None = None,
         ref_logprobs: torch.Tensor | None = None,
     ) -> LossOutput:
-        ratio, log_ratio = compute_token_ratio(policy_logprobs, generator_logprobs)
-        pg_loss, clipped_ratio = pg_ppo_clip(
-            ratio, advantages, clip_low=self.clip_low, clip_high=self.clip_high
+        policy_logprobs = compute_logprobs(logits, target_ids)
+        ratio, _log_ratio, m_ratio = compute_token_ratio(
+            policy_logprobs, generator_logprobs, loss_mask, normalization
         )
-        dual_pg_loss, dual_clip_bound = pg_dual_clip(
-            pg_loss, advantages, dual_clip_c=self.dual_clip_c
+        pg_loss, m_clip = pg_ppo_clip(
+            ratio,
+            advantages,
+            loss_mask,
+            normalization,
+            clip_low=self.clip_low,
+            clip_high=self.clip_high,
+        )
+        dual_pg_loss, m_dual = pg_dual_clip(
+            pg_loss, advantages, loss_mask, normalization, dual_clip_c=self.dual_clip_c
         )
         loss = aggregate_loss(
             dual_pg_loss,
@@ -152,16 +154,17 @@ class DAPOLoss(Configurable):
             normalization=normalization,
             sample_ids=sample_ids,
         )
-        with torch.no_grad():
-            sum_metrics = {
-                "loss/mean": loss.detach(),
-                **ratio_metrics(ratio, log_ratio, loss_mask, normalization),
-                **ppo_clip_metrics(
-                    ratio, clipped_ratio, advantages, loss_mask, normalization
-                ),
-                **dual_clip_metrics(
-                    pg_loss, dual_clip_bound, advantages, loss_mask, normalization
-                ),
-                **entropy_metrics(self.log_entropy, logits, loss_mask, normalization),
-            }
-        return LossOutput(loss=loss, sum_metrics=sum_metrics)
+        drift_sum, max_metrics = logprob_drift_metrics(
+            policy_logprobs, generator_logprobs, loss_mask, normalization
+        )
+        sum_metrics = {
+            "loss/mean": loss.detach(),
+            **m_ratio,
+            **m_clip,
+            **m_dual,
+            **drift_sum,
+        }
+        if self.log_entropy:
+            _entropy, m_entropy = compute_entropy(logits, loss_mask, normalization)
+            sum_metrics.update(m_entropy)
+        return LossOutput(loss=loss, sum_metrics=sum_metrics, max_metrics=max_metrics)

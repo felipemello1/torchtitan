@@ -12,11 +12,9 @@ from typing import Any
 import torch
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
-import torch.nn.functional as F
 import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import (
@@ -44,75 +42,6 @@ from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger
 
 logger = logging.getLogger(__name__)
-
-
-@sl.log_trace_span("compute_logprobs")
-def compute_logprobs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Compute per-position logprobs from logits and pre-shifted labels.
-
-    ``labels`` is pre-shifted per episode in the batcher
-    (``labels[i] = raw_token_ids[i+1]``), matching the pre-training
-    dataloader convention.  No internal shift is needed.
-    Output shape matches input: ``[batch, seq_len]``.
-    """
-    from torch.distributed.tensor import DTensor
-
-    if isinstance(logits, DTensor):
-        # TODO: pass `grad_placements=[Replicate(), ...]` to make the autograd
-        # contract explicit (see .claude/rules/distributed.md).
-        logits = logits.to_local()
-    B, S, V = logits.shape
-    return -F.cross_entropy(
-        logits.float().reshape(B * S, V),
-        labels.reshape(B * S),
-        reduction="none",
-        ignore_index=IGNORE_INDEX,
-    ).reshape(B, S)
-
-
-@dataclass(frozen=True, slots=True)
-class PartialLogprobDrift:
-    """Per-rank generator-vs-trainer logprob drift awaiting reduction across the loss-mesh."""
-
-    logprob_diff_mean: torch.Tensor
-    logprob_diff_max: torch.Tensor
-    ratio_tokens_different: torch.Tensor
-
-
-@torch.no_grad()
-@sl.log_trace_span("verify_logprob_identity")
-def verify_logprob_identity(
-    generator_logprobs: torch.Tensor,
-    policy_logprobs: torch.Tensor,
-    loss_mask: torch.Tensor,
-    *,
-    num_global_valid_tokens: int,
-) -> PartialLogprobDrift:
-    """Compute per-rank drift between generator and trainer logprobs.
-
-    Args:
-        generator_logprobs: [B, L] generator logprobs from TrainingBatch.
-        policy_logprobs: [B, L] trainer-computed logprobs.
-        loss_mask: [B, L] bool mask; True for response tokens.
-        num_global_valid_tokens: Total response tokens across all DP ranks.
-
-    Returns:
-        PartialLogprobDrift.
-    """
-    ref_flat = generator_logprobs[loss_mask].float()
-    policy_flat = policy_logprobs[loss_mask].float()
-
-    if ref_flat.numel() == 0:
-        zero = torch.zeros((), dtype=torch.float32, device=generator_logprobs.device)
-        return PartialLogprobDrift(zero, zero, zero)
-
-    denom = max(num_global_valid_tokens, 1)
-    diff = policy_flat - ref_flat
-    return PartialLogprobDrift(
-        logprob_diff_mean=diff.sum() / denom,
-        logprob_diff_max=diff.abs().max(),
-        ratio_tokens_different=(diff.abs() > 1e-6).sum() / denom,
-    )
 
 
 class PolicyTrainer(Actor, Configurable):
@@ -422,45 +351,27 @@ class PolicyTrainer(Actor, Configurable):
             logits = model(
                 token_ids, attention_masks=attention_masks, positions=positions
             )
-        policy_logprobs = compute_logprobs(logits, labels)
 
         with sl.log_trace_span("loss_fn"):
             loss_output = self.loss_fn(
-                policy_logprobs=policy_logprobs,
+                logits=logits,
+                target_ids=labels,
                 generator_logprobs=generator_logprobs,
                 loss_mask=loss_mask,
                 advantages=advantages,
                 normalization=normalization,
                 sample_ids=sample_ids,
-                logits=logits,
             )
 
         # Accumulate gradients across all controller microbatches for this step.
         with sl.log_trace_span("model_backward"):
             loss_output.loss.backward()
 
-        # Metrics for bitwise verification of policy logprobs.
-        verification: PartialLogprobDrift = verify_logprob_identity(
-            generator_logprobs=generator_logprobs,
-            policy_logprobs=policy_logprobs,
-            loss_mask=loss_mask,
-            num_global_valid_tokens=normalization.num_global_valid_tokens,
-        )
-
-        # Per-rank pre-normalized metrics, so SUM-reducing reconstructs the global.
-        sum_reduced_metrics = {
-            **loss_output.sum_metrics,
-            "bit_wise/logprob_diff/mean": verification.logprob_diff_mean,
-            "bit_wise/ratio_tokens_different/mean": verification.ratio_tokens_different,
-        }
-        max_reduced_metrics = {
-            **loss_output.max_metrics,
-            "bit_wise/logprob_diff/max": verification.logprob_diff_max,
-        }
-
+        # The loss owns its metrics, already pre-normalized so SUM/MAX-reducing
+        # across the loss mesh and microbatches reconstructs the global values.
         return self.reduce_forward_backward_metrics(
-            sum_reduced_metrics=sum_reduced_metrics,
-            max_reduced_metrics=max_reduced_metrics,
+            sum_reduced_metrics=loss_output.sum_metrics,
+            max_reduced_metrics=loss_output.max_metrics,
         )
 
     @endpoint

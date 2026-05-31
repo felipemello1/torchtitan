@@ -9,12 +9,7 @@ import torch
 
 from torchtitan.experiments.rl.loss import GRPOLoss
 
-from .conftest import (
-    assert_close,
-    make_normalization,
-    make_sample_ids,
-    policy_logprobs_from,
-)
+from .conftest import assert_close, make_normalization, make_sample_ids
 
 
 class TestGRPOLoss:
@@ -24,7 +19,8 @@ class TestGRPOLoss:
             clip_low=0.2, clip_high=0.2, beta=0.1, agg_type="fixed_horizon"
         ).build()
         output = loss_fn(
-            policy_logprobs=d["policy_logprobs"],
+            logits=d["logits"],
+            target_ids=d["target_ids"],
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=d["advantages"],
@@ -38,13 +34,13 @@ class TestGRPOLoss:
     def test_backward(self, inputs):
         d = inputs
         logits = d["logits"].clone().requires_grad_(True)
-        policy_logprobs = policy_logprobs_from(logits, d["target_ids"])
 
         loss_fn = GRPOLoss.Config(
             clip_low=0.2, clip_high=0.2, beta=0.1, agg_type="fixed_horizon"
         ).build()
         output = loss_fn(
-            policy_logprobs=policy_logprobs,
+            logits=logits,
+            target_ids=d["target_ids"],
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=d["advantages"],
@@ -63,7 +59,8 @@ class TestGRPOLoss:
         for kl_type in ("k1", "k2", "k3"):
             loss_fn = GRPOLoss.Config(beta=0.1, kl_type=kl_type).build()
             output = loss_fn(
-                policy_logprobs=d["policy_logprobs"],
+                logits=d["logits"],
+                target_ids=d["target_ids"],
                 generator_logprobs=d["generator_logprobs"],
                 loss_mask=d["loss_mask"],
                 advantages=d["advantages"],
@@ -79,7 +76,8 @@ class TestGRPOLoss:
         loss_fn = GRPOLoss.Config(beta=0.1).build()
         with pytest.raises(ValueError):
             loss_fn(
-                policy_logprobs=d["policy_logprobs"],
+                logits=d["logits"],
+                target_ids=d["target_ids"],
                 generator_logprobs=d["generator_logprobs"],
                 loss_mask=d["loss_mask"],
                 advantages=d["advantages"],
@@ -93,7 +91,8 @@ class TestGRPOLoss:
 
         loss_fn = GRPOLoss.Config(beta=0.0).build()
         output = loss_fn(
-            policy_logprobs=d["policy_logprobs"],
+            logits=d["logits"],
+            target_ids=d["target_ids"],
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=advantages,
@@ -110,7 +109,8 @@ class TestGRPOLoss:
 
         loss_fn = GRPOLoss.Config(beta=0.0).build()
         output = loss_fn(
-            policy_logprobs=d["policy_logprobs"],
+            logits=d["logits"],
+            target_ids=d["target_ids"],
             generator_logprobs=d["generator_logprobs"],
             loss_mask=empty_mask,
             advantages=d["advantages"],
@@ -132,7 +132,8 @@ class TestGRPOLoss:
 
         loss_fn = GRPOLoss.Config(beta=0.0).build()
         output = loss_fn(
-            policy_logprobs=policy_logprobs_from(logits, target_ids),
+            logits=logits,
+            target_ids=target_ids,
             generator_logprobs=generator_logprobs,
             loss_mask=loss_mask,
             advantages=advantages,

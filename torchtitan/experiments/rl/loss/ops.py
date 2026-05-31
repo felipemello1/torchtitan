@@ -6,7 +6,9 @@
 
 """Shared tensor primitives for the RL policy-gradient losses.
 
-Each metric helper returns a pre-normalized scalar (sum / global_denominator) so
+Each op computes its result first, then assembles its own metrics in a trailing
+`torch.no_grad()` block and returns them alongside the result (`result, metrics
+= op(...)`). Metrics are pre-normalized scalars (sum / global_denominator) so
 SUM-reduction across the loss mesh and gradient-accumulation microbatches
 reconstructs the exact global value (see `LossNormalization`).
 """
@@ -14,6 +16,7 @@ reconstructs the exact global value (see `LossNormalization`).
 import torch
 import torch.nn.functional as F
 
+from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.experiments.rl.loss.types import AggType, KLType, LossNormalization
 
 
@@ -40,10 +43,46 @@ def masked_token_mean(
     return (values * loss_mask).sum() / max(normalization.num_global_valid_tokens, 1)
 
 
+def compute_logprobs(
+    logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Per-token log probs for the target tokens via negative cross-entropy.
+
+    Casts to fp32 before the temperature division to preserve precision under
+    bf16/fp16 training. A vocab-replicated DTensor is converted to local first,
+    mirroring the model's logit layout under tensor parallelism.
+
+    Args:
+        logits (torch.Tensor): Model output logits (B, S, V).
+        target_ids (torch.Tensor): Target token ids (B, S); pre-shifted per
+            episode by the batcher (target_ids[i] = raw_token_ids[i+1]).
+        temperature (float): Softmax temperature (default 1.0).
+
+    Returns:
+        torch.Tensor: Per-token log probs (B, S).
+    """
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(logits, DTensor):
+        logits = logits.to_local()
+    logits_fp32 = logits.float() / temperature
+    B, S, V = logits_fp32.shape
+    return -F.cross_entropy(
+        logits_fp32.reshape(B * S, V),
+        target_ids.reshape(B * S).long(),
+        reduction="none",
+        ignore_index=IGNORE_INDEX,
+    ).reshape(B, S)
+
+
 def compute_token_ratio(
     policy_logprobs: torch.Tensor,
     generator_logprobs: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    loss_mask: torch.Tensor,
+    normalization: LossNormalization,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Per-token importance ratio for off-policy correction.
 
     The ratio r = π_θ/π_old measures how much the current policy differs from
@@ -56,26 +95,24 @@ def compute_token_ratio(
     Args:
         policy_logprobs (torch.Tensor): Log probs from current policy (B, S).
         generator_logprobs (torch.Tensor): Log probs from sampling policy (B, S).
+        loss_mask (torch.Tensor): Valid token mask (B, S).
+        normalization (LossNormalization): Global token denominator for metrics.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]: (ratio, log_ratio), both (B, S).
+        tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]: (ratio,
+            log_ratio, metrics); ratio and log_ratio are (B, S). Metrics: mean
+            ratio (≈1 on-policy) and the k1 policy/old KL proxy mean(-log_ratio).
     """
     log_ratio = policy_logprobs - generator_logprobs.detach()
-    return torch.exp(log_ratio), log_ratio
-
-
-def ratio_metrics(
-    ratio: torch.Tensor,
-    log_ratio: torch.Tensor,
-    loss_mask: torch.Tensor,
-    normalization: LossNormalization,
-) -> dict[str, torch.Tensor]:
-    """Health metrics shared by every loss: mean ratio (≈1 on-policy) and the
-    k1 policy/old KL proxy mean(-log_ratio)."""
-    return {
-        "loss/ratio/mean": masked_token_mean(ratio, loss_mask, normalization),
-        "loss/kl_policy/mean": masked_token_mean(-log_ratio, loss_mask, normalization),
-    }
+    ratio = torch.exp(log_ratio)
+    with torch.no_grad():
+        metrics = {
+            "loss/ratio/mean": masked_token_mean(ratio, loss_mask, normalization),
+            "loss/kl_policy/mean": masked_token_mean(
+                -log_ratio, loss_mask, normalization
+            ),
+        }
+    return ratio, log_ratio, metrics
 
 
 def compute_sequence_ratio(
@@ -83,7 +120,8 @@ def compute_sequence_ratio(
     generator_logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
     sample_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    normalization: LossNormalization,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Sequence-level importance ratio, one per source episode (sample).
 
     One ratio per response (not per token) matches how rewards are assigned and
@@ -100,52 +138,71 @@ def compute_sequence_ratio(
         generator_logprobs (torch.Tensor): Log probs from sampling policy (B, S).
         loss_mask (torch.Tensor): Valid token mask (B, S).
         sample_ids (torch.Tensor): Source-episode id per token (B, S), -1 for padding.
+        normalization (LossNormalization): Global token denominator for metrics.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]: (ratio, log_ratio), both (B, S);
-            1.0 / 0.0 at non-trained positions.
+        tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]: (ratio,
+            log_ratio, metrics); ratio and log_ratio are (B, S), 1.0 / 0.0 at
+            non-trained positions.
     """
     valid = loss_mask.bool() & (sample_ids >= 0)
     if not bool(valid.any()):
-        zero = torch.zeros_like(policy_logprobs)
-        return torch.ones_like(policy_logprobs), zero
+        log_ratio = torch.zeros_like(policy_logprobs)
+        ratio = torch.ones_like(policy_logprobs)
+    else:
+        token_log_ratio = policy_logprobs - generator_logprobs.detach()
+        _unique, inverse = torch.unique(
+            sample_ids[valid], sorted=True, return_inverse=True
+        )
+        sums = torch.zeros(
+            int(inverse.max()) + 1,
+            device=policy_logprobs.device,
+            dtype=policy_logprobs.dtype,
+        )
+        counts = torch.zeros_like(sums)
+        sums.scatter_add_(0, inverse, token_log_ratio[valid])
+        counts.scatter_add_(0, inverse, torch.ones_like(token_log_ratio[valid]))
+        seq_log_ratio = sums / counts.clamp_min(1)  # [num_local_samples]
 
-    token_log_ratio = policy_logprobs - generator_logprobs.detach()
-    _unique, inverse = torch.unique(sample_ids[valid], sorted=True, return_inverse=True)
-    sums = torch.zeros(
-        int(inverse.max()) + 1,
-        device=policy_logprobs.device,
-        dtype=policy_logprobs.dtype,
-    )
-    counts = torch.zeros_like(sums)
-    sums.scatter_add_(0, inverse, token_log_ratio[valid])
-    counts.scatter_add_(0, inverse, torch.ones_like(token_log_ratio[valid]))
-    seq_log_ratio = sums / counts.clamp_min(1)  # [num_local_samples]
-
-    # Reparameterization: forward = sequence ratio, backward = per-token grads.
-    log_ratio = torch.zeros_like(policy_logprobs)
-    log_ratio[valid] = (
-        policy_logprobs[valid]
-        - policy_logprobs[valid].detach()
-        + seq_log_ratio[inverse].detach()
-    )
-    return torch.exp(log_ratio), log_ratio
+        # Reparameterization: forward = sequence ratio, backward = per-token grads.
+        log_ratio = torch.zeros_like(policy_logprobs)
+        log_ratio[valid] = (
+            policy_logprobs[valid]
+            - policy_logprobs[valid].detach()
+            + seq_log_ratio[inverse].detach()
+        )
+        ratio = torch.exp(log_ratio)
+    with torch.no_grad():
+        metrics = {
+            "loss/ratio/mean": masked_token_mean(ratio, loss_mask, normalization),
+            "loss/kl_policy/mean": masked_token_mean(
+                -log_ratio, loss_mask, normalization
+            ),
+        }
+    return ratio, log_ratio, metrics
 
 
-def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
+def compute_entropy(
+    logits: torch.Tensor,
+    loss_mask: torch.Tensor,
+    normalization: LossNormalization,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute per-token entropy (logging only).
 
     Formula: H = logsumexp(logits) - sum(softmax(logits) * logits)
         This is equivalent to -sum(p * log(p)) but numerically stable.
 
-    Converts a vocab-replicated DTensor to local first, mirroring the trainer's
-    logprob path.
+    Converts a vocab-replicated DTensor to local first, mirroring the logprob
+    path.
 
     Args:
         logits (torch.Tensor): Model output logits (B, S, V).
+        loss_mask (torch.Tensor): Valid token mask (B, S).
+        normalization (LossNormalization): Global token denominator for the metric.
 
     Returns:
-        torch.Tensor: Per-token entropy (B, S).
+        tuple[torch.Tensor, dict[str, torch.Tensor]]: (entropy, metrics); entropy
+            is (B, S), metrics is {"loss/entropy/mean": ...}.
     """
     from torch.distributed.tensor import DTensor
 
@@ -154,28 +211,20 @@ def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     logits_fp32 = logits.float()
     probs = F.softmax(logits_fp32, dim=-1)
     entropy = torch.logsumexp(logits_fp32, dim=-1) - (probs * logits_fp32).sum(dim=-1)
-    return entropy
-
-
-def entropy_metrics(
-    log_entropy: bool,
-    logits: torch.Tensor | None,
-    loss_mask: torch.Tensor,
-    normalization: LossNormalization,
-) -> dict[str, torch.Tensor]:
-    """{"loss/entropy/mean": ...} when entropy logging is on and logits are
-    available, else {}. Lets each loss fold entropy in with one line."""
-    if not (log_entropy and logits is not None):
-        return {}
-    entropy = compute_entropy(logits)
-    return {"loss/entropy/mean": masked_token_mean(entropy, loss_mask, normalization)}
+    with torch.no_grad():
+        metrics = {
+            "loss/entropy/mean": masked_token_mean(entropy, loss_mask, normalization)
+        }
+    return entropy, metrics
 
 
 def compute_kl(
     policy_logprobs: torch.Tensor,
     ref_logprobs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    normalization: LossNormalization,
     kl_type: KLType = "k3",
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute per-token KL divergence using Schulman's estimators.
 
     Reference: Schulman's blog post (http://joschu.net/blog/kl-approx.html).
@@ -195,10 +244,13 @@ def compute_kl(
     Args:
         policy_logprobs (torch.Tensor): Log probs from current policy (B, S).
         ref_logprobs (torch.Tensor): Log probs from reference policy (B, S).
+        loss_mask (torch.Tensor): Valid token mask (B, S).
+        normalization (LossNormalization): Global token denominator for the metric.
         kl_type (KLType): KL estimator type: "k1", "k2", or "k3" (default: "k3").
 
     Returns:
-        torch.Tensor: Per-token KL (B, S).
+        tuple[torch.Tensor, dict[str, torch.Tensor]]: (kl, metrics); kl is (B, S),
+            metrics is {"loss/kl_ref/mean": ...}.
     """
     log_ratio = policy_logprobs - ref_logprobs.detach()  # log(π_θ / π_ref)
 
@@ -213,7 +265,56 @@ def compute_kl(
     else:
         raise ValueError(f"Unknown kl_type: {kl_type}")
 
-    return kl
+    with torch.no_grad():
+        metrics = {"loss/kl_ref/mean": masked_token_mean(kl, loss_mask, normalization)}
+    return kl, metrics
+
+
+def logprob_drift_metrics(
+    policy_logprobs: torch.Tensor,
+    generator_logprobs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    normalization: LossNormalization,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Generator-vs-policy logprob drift, a bitwise on-policy diagnostic.
+
+    Returns (sum_metrics, max_metrics): the mean drift and the fraction of tokens
+    that differ are pre-normalized by the global token count (SUM-folded); the max
+    absolute drift is MAX-folded.
+
+    Args:
+        policy_logprobs (torch.Tensor): Trainer-recomputed log probs (B, S).
+        generator_logprobs (torch.Tensor): Generator (sampling) log probs (B, S).
+        loss_mask (torch.Tensor): Valid token mask (B, S).
+        normalization (LossNormalization): Global token denominator for the means.
+
+    Returns:
+        tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]: (sum_metrics,
+            max_metrics).
+    """
+    with torch.no_grad():
+        valid = loss_mask.bool()
+        ref = generator_logprobs[valid].float()
+        policy = policy_logprobs[valid].float()
+        if ref.numel() == 0:
+            zero = torch.zeros(
+                (), dtype=torch.float32, device=generator_logprobs.device
+            )
+            return (
+                {
+                    "bit_wise/logprob_diff/mean": zero,
+                    "bit_wise/ratio_tokens_different/mean": zero,
+                },
+                {"bit_wise/logprob_diff/max": zero},
+            )
+        denom = max(normalization.num_global_valid_tokens, 1)
+        diff = policy - ref
+        sum_metrics = {
+            "bit_wise/logprob_diff/mean": diff.sum() / denom,
+            "bit_wise/ratio_tokens_different/mean": (diff.abs() > 1e-6).sum() / denom,
+        }
+        max_metrics = {"bit_wise/logprob_diff/max": diff.abs().max()}
+    return sum_metrics, max_metrics
 
 
 def aggregate_loss(
@@ -295,10 +396,12 @@ def _sequence_mean_loss(
 def pg_ppo_clip(
     ratio: torch.Tensor,
     advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    normalization: LossNormalization,
     *,
     clip_low: float = 0.2,
     clip_high: float = 0.2,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """PPO clipped surrogate objective.
 
     Reference: Schulman et al., "Proximal Policy Optimization" (2017).
@@ -314,38 +417,32 @@ def pg_ppo_clip(
     Args:
         ratio (torch.Tensor): Importance ratio π_θ/π_old (B, S).
         advantages (torch.Tensor): Advantage estimates (B, S).
+        loss_mask (torch.Tensor): Valid token mask (B, S).
+        normalization (LossNormalization): Global token denominator for metrics.
         clip_low (float): Lower bound offset. Ratio is clamped to min of (1 - clip_low).
             E.g., clip_low=0.2 means ratio >= 0.8. Default: 0.2.
         clip_high (float): Upper bound offset. Ratio is clamped to max of (1 + clip_high).
             E.g., clip_high=0.2 means ratio <= 1.2. Default: 0.2.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]: (pg_loss, clipped_ratio), both (B, S).
+        tuple[torch.Tensor, dict[str, torch.Tensor]]: (pg_loss, metrics); pg_loss
+            is (B, S). `high/frac` / `low/frac` are the fractions of valid tokens
+            clipped against a positive / negative advantage respectively.
     """
     clipped_ratio = torch.clamp(ratio, 1 - clip_low, 1 + clip_high)
     pg_loss = torch.maximum(-ratio * advantages, -clipped_ratio * advantages)
-    return pg_loss, clipped_ratio
-
-
-def ppo_clip_metrics(
-    ratio: torch.Tensor,
-    clipped_ratio: torch.Tensor,
-    advantages: torch.Tensor,
-    loss_mask: torch.Tensor,
-    normalization: LossNormalization,
-) -> dict[str, torch.Tensor]:
-    """Clip diagnostics. `high/frac` / `low/frac` are the fractions of valid
-    tokens clipped against a positive / negative advantage respectively."""
-    clipped_high = ratio > clipped_ratio  # ratio above 1 + clip_high
-    clipped_low = ratio < clipped_ratio  # ratio below 1 - clip_low
-    return {
-        "loss/clip/clipped_ratio/mean": masked_token_mean(
-            clipped_ratio, loss_mask, normalization
-        ),
-        "loss/clip/high/frac": masked_token_mean(
-            (clipped_high & (advantages > 0)).float(), loss_mask, normalization
-        ),
-        "loss/clip/low/frac": masked_token_mean(
-            (clipped_low & (advantages < 0)).float(), loss_mask, normalization
-        ),
-    }
+    with torch.no_grad():
+        clipped_high = ratio > clipped_ratio  # ratio above 1 + clip_high
+        clipped_low = ratio < clipped_ratio  # ratio below 1 - clip_low
+        metrics = {
+            "loss/clip/clipped_ratio/mean": masked_token_mean(
+                clipped_ratio, loss_mask, normalization
+            ),
+            "loss/clip/high/frac": masked_token_mean(
+                (clipped_high & (advantages > 0)).float(), loss_mask, normalization
+            ),
+            "loss/clip/low/frac": masked_token_mean(
+                (clipped_low & (advantages < 0)).float(), loss_mask, normalization
+            ),
+        }
+    return pg_loss, metrics
