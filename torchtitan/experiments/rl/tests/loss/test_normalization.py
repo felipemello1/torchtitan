@@ -193,7 +193,7 @@ def test_log_entropy_flag_controls_entropy_metric():
     with_entropy = DAPOLoss.Config(log_entropy=True).build()(**kwargs)
     without_entropy = DAPOLoss.Config(log_entropy=False).build()(**kwargs)
 
-    assert "loss/entropy/mean" in with_entropy.sum_metrics
-    assert torch.isfinite(with_entropy.sum_metrics["loss/entropy/mean"])
-    assert "loss/entropy/mean" not in without_entropy.sum_metrics
+    assert "loss/entropy/mean" in with_entropy.metrics
+    assert torch.isfinite(with_entropy.metrics["loss/entropy/mean"].value)
+    assert "loss/entropy/mean" not in without_entropy.metrics
     assert_close(with_entropy.loss, without_entropy.loss)

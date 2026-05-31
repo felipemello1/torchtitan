@@ -93,7 +93,7 @@ class TestComputeEntropy:
         )
         assert_close(entropy, expected)
         assert (entropy >= 0).all()
-        assert_close(metrics["loss/entropy/mean"], torch.tensor(1.851785))
+        assert_close(metrics["loss/entropy/mean"].value, torch.tensor(1.851785))
 
     def test_backward(self, inputs):
         d = inputs
@@ -232,7 +232,7 @@ class TestComputeKl:
         )
 
         assert_close(kl, expected_kl)
-        assert_close(metrics["loss/kl_ref/mean"], torch.tensor(expected_mean))
+        assert_close(metrics["loss/kl_ref/mean"].value, torch.tensor(expected_mean))
 
         loss = masked_token_mean(kl, d["loss_mask"], norm)
         loss.backward()

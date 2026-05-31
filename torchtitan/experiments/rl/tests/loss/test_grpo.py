@@ -68,7 +68,7 @@ class TestGRPOLoss:
                 sample_ids=d["sample_ids"],
                 ref_logprobs=d["ref_logprobs"],
             )
-            kl_values[kl_type] = float(output.sum_metrics["loss/kl_ref/mean"])
+            kl_values[kl_type] = float(output.metrics["loss/kl_ref/mean"].value)
         assert len({round(v, 6) for v in kl_values.values()}) == 3, kl_values
 
     def test_beta_requires_ref_logprobs(self, inputs):

@@ -29,7 +29,7 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.utils import set_batch_invariance
-from torchtitan.experiments.rl.loss.types import LossNormalization
+from torchtitan.experiments.rl.loss.types import LossMetric, LossNormalization
 from torchtitan.experiments.rl.types import (
     ForwardBackwardOutput,
     OptimStepOutput,
@@ -262,33 +262,27 @@ class PolicyTrainer(Actor, Configurable):
 
     def reduce_forward_backward_metrics(
         self,
-        *,
-        sum_reduced_metrics: dict[str, torch.Tensor],
-        max_reduced_metrics: dict[str, torch.Tensor],
+        metrics: dict[str, LossMetric],
     ) -> ForwardBackwardOutput:
         """Reduce forward/backward metrics across the loss mesh.
 
-        Args:
-            sum_reduced_metrics: Per-rank shares to be SUM-reduced. Each
-                value must be pre-normalized so that summing across ranks
-                reconstructs the global metric.
-            max_reduced_metrics: Per-rank values to be MAX-reduced.
+        Each metric carries its own reduction (`LossMetric.reduce`), so the
+        trainer groups by it rather than being handed pre-split buckets. `sum`
+        values must be pre-normalized so that summing the per-rank shares
+        reconstructs the global metric; `max` values are MAX-reduced.
 
         Returns:
             ForwardBackwardOutput with the two reducer buckets kept separate, so
             the controller folds each with the matching op across
             gradient-accumulation microbatches.
         """
-        # TODO: switch from plain tensors to DTensor / spmd_types so the
-        # reduction op is encoded in the placement instead of split across
-        # `sum_reduced_metrics` / `max_reduced_metrics` dicts.
         loss_mesh = self.parallel_dims.get_optional_mesh("loss")
 
         reduced: dict[str, dict[str, float]] = {"sum": {}, "max": {}}
-        for bucket, values_by_key, op in [
-            ("sum", sum_reduced_metrics, c10d.ReduceOp.SUM),
-            ("max", max_reduced_metrics, c10d.ReduceOp.MAX),
-        ]:
+        for bucket, op in [("sum", c10d.ReduceOp.SUM), ("max", c10d.ReduceOp.MAX)]:
+            values_by_key = {
+                key: m.value for key, m in metrics.items() if m.reduce == bucket
+            }
             if not values_by_key:
                 continue
             keys = list(values_by_key)
@@ -367,12 +361,8 @@ class PolicyTrainer(Actor, Configurable):
         with sl.log_trace_span("model_backward"):
             loss_output.loss.backward()
 
-        # The loss owns its metrics, already pre-normalized so SUM/MAX-reducing
-        # across the loss mesh and microbatches reconstructs the global values.
-        return self.reduce_forward_backward_metrics(
-            sum_reduced_metrics=loss_output.sum_metrics,
-            max_reduced_metrics=loss_output.max_metrics,
-        )
+        # The loss owns its metrics; each LossMetric carries its own reduction.
+        return self.reduce_forward_backward_metrics(loss_output.metrics)
 
     @endpoint
     @sl.log_trace_span("optim_step")

@@ -17,7 +17,12 @@ from torchtitan.experiments.rl.loss.ops import (
     logprob_drift_metrics,
     masked_token_mean,
 )
-from torchtitan.experiments.rl.loss.types import AggType, LossNormalization, LossOutput
+from torchtitan.experiments.rl.loss.types import (
+    AggType,
+    LossMetric,
+    LossNormalization,
+    LossOutput,
+)
 
 
 def pg_cispo(
@@ -29,7 +34,7 @@ def pg_cispo(
     *,
     clip_low: float = 1.0,
     clip_high: float = 4.0,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+) -> tuple[torch.Tensor, dict[str, LossMetric]]:
     """CISPO: Clipped Importance Sampling Policy Optimization.
 
     Reference: Chen et al., "MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention" (2025).
@@ -57,7 +62,7 @@ def pg_cispo(
         clip_high (float): Upper clip bound offset (default 4.0).
 
     Returns:
-        tuple[torch.Tensor, dict[str, torch.Tensor]]: (pg_loss, metrics); pg_loss
+        tuple[torch.Tensor, dict[str, LossMetric]]: (pg_loss, metrics); pg_loss
             is (B, S). The high/low fractions are unconditional (no advantage-sign
             filter), unlike PPO's pg clip fractions.
     """
@@ -65,14 +70,18 @@ def pg_cispo(
     pg_loss = -clipped_ratio * advantages * policy_logprobs
     with torch.no_grad():
         metrics = {
-            "loss/clip/clipped_ratio/mean": masked_token_mean(
-                clipped_ratio, loss_mask, normalization
+            "loss/clip/clipped_ratio/mean": LossMetric(
+                masked_token_mean(clipped_ratio, loss_mask, normalization)
             ),
-            "loss/clip/high_unconditional/frac": masked_token_mean(
-                (ratio > 1 + clip_high).float(), loss_mask, normalization
+            "loss/clip/high_unconditional/frac": LossMetric(
+                masked_token_mean(
+                    (ratio > 1 + clip_high).float(), loss_mask, normalization
+                )
             ),
-            "loss/clip/low_unconditional/frac": masked_token_mean(
-                (ratio < 1 - clip_low).float(), loss_mask, normalization
+            "loss/clip/low_unconditional/frac": LossMetric(
+                masked_token_mean(
+                    (ratio < 1 - clip_low).float(), loss_mask, normalization
+                )
             ),
         }
     return pg_loss, metrics
@@ -162,20 +171,18 @@ class CISPOLoss(Configurable):
             normalization=normalization,
             sample_ids=sample_ids,
         )
-        drift_sum_metrics, drift_max_metrics = logprob_drift_metrics(
+        drift_metrics = logprob_drift_metrics(
             policy_logprobs, generator_logprobs, loss_mask, normalization
         )
-        sum_metrics = {
-            "loss/mean": loss.detach(),
+        metrics = {
+            "loss/mean": LossMetric(loss.detach()),
             **ratio_metrics,
             **clip_metrics,
-            **drift_sum_metrics,
+            **drift_metrics,
         }
         if self.log_entropy:
             _entropy, entropy_metrics = compute_entropy(
                 logits, loss_mask, normalization
             )
-            sum_metrics.update(entropy_metrics)
-        return LossOutput(
-            loss=loss, sum_metrics=sum_metrics, max_metrics=drift_max_metrics
-        )
+            metrics.update(entropy_metrics)
+        return LossOutput(loss=loss, metrics=metrics)

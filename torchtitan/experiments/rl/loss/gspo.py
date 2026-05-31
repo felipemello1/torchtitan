@@ -17,7 +17,12 @@ from torchtitan.experiments.rl.loss.ops import (
     logprob_drift_metrics,
     pg_ppo_clip,
 )
-from torchtitan.experiments.rl.loss.types import AggType, LossNormalization, LossOutput
+from torchtitan.experiments.rl.loss.types import (
+    AggType,
+    LossMetric,
+    LossNormalization,
+    LossOutput,
+)
 
 
 class GSPOLoss(Configurable):
@@ -104,20 +109,18 @@ class GSPOLoss(Configurable):
             normalization=normalization,
             sample_ids=sample_ids,
         )
-        drift_sum_metrics, drift_max_metrics = logprob_drift_metrics(
+        drift_metrics = logprob_drift_metrics(
             policy_logprobs, generator_logprobs, loss_mask, normalization
         )
-        sum_metrics = {
-            "loss/mean": loss.detach(),
+        metrics = {
+            "loss/mean": LossMetric(loss.detach()),
             **ratio_metrics,
             **clip_metrics,
-            **drift_sum_metrics,
+            **drift_metrics,
         }
         if self.log_entropy:
             _entropy, entropy_metrics = compute_entropy(
                 logits, loss_mask, normalization
             )
-            sum_metrics.update(entropy_metrics)
-        return LossOutput(
-            loss=loss, sum_metrics=sum_metrics, max_metrics=drift_max_metrics
-        )
+            metrics.update(entropy_metrics)
+        return LossOutput(loss=loss, metrics=metrics)

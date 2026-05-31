@@ -8,16 +8,22 @@
 
 Each op computes its result first, then assembles its own metrics in a trailing
 `torch.no_grad()` block and returns them alongside the result (`result, metrics
-= op(...)`). Metrics are pre-normalized scalars (sum / global_denominator) so
-SUM-reduction across the loss mesh and gradient-accumulation microbatches
-reconstructs the exact global value (see `LossNormalization`).
+= op(...)`). Each metric is a `LossMetric` that carries its own reduction, so the
+loss and trainer never decide it. Pre-normalized metrics (`reduce="sum"`) are
+divided by a global denominator (see `LossNormalization`) so summing the per-rank
+/ per-microbatch shares reconstructs the exact global value.
 """
 
 import torch
 import torch.nn.functional as F
 
 from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.experiments.rl.loss.types import AggType, KLType, LossNormalization
+from torchtitan.experiments.rl.loss.types import (
+    AggType,
+    KLType,
+    LossMetric,
+    LossNormalization,
+)
 
 
 def masked_token_mean(
@@ -82,7 +88,7 @@ def compute_token_ratio(
     generator_logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
     normalization: LossNormalization,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, LossMetric]]:
     """Per-token importance ratio for off-policy correction.
 
     The ratio r = π_θ/π_old measures how much the current policy differs from
@@ -99,7 +105,7 @@ def compute_token_ratio(
         normalization (LossNormalization): Global token denominator for metrics.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]: (ratio,
+        tuple[torch.Tensor, torch.Tensor, dict[str, LossMetric]]: (ratio,
             log_ratio, metrics); ratio and log_ratio are (B, S). Metrics: mean
             ratio (≈1 on-policy) and the k1 policy/old KL proxy mean(-log_ratio).
     """
@@ -107,9 +113,11 @@ def compute_token_ratio(
     ratio = torch.exp(log_ratio)
     with torch.no_grad():
         metrics = {
-            "loss/ratio/mean": masked_token_mean(ratio, loss_mask, normalization),
-            "loss/kl_policy/mean": masked_token_mean(
-                -log_ratio, loss_mask, normalization
+            "loss/ratio/mean": LossMetric(
+                masked_token_mean(ratio, loss_mask, normalization)
+            ),
+            "loss/kl_policy/mean": LossMetric(
+                masked_token_mean(-log_ratio, loss_mask, normalization)
             ),
         }
     return ratio, log_ratio, metrics
@@ -121,7 +129,7 @@ def compute_sequence_ratio(
     loss_mask: torch.Tensor,
     sample_ids: torch.Tensor,
     normalization: LossNormalization,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, LossMetric]]:
     """Sequence-level importance ratio, one per source episode (sample).
 
     One ratio per response (not per token) matches how rewards are assigned and
@@ -141,7 +149,7 @@ def compute_sequence_ratio(
         normalization (LossNormalization): Global token denominator for metrics.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]: (ratio,
+        tuple[torch.Tensor, torch.Tensor, dict[str, LossMetric]]: (ratio,
             log_ratio, metrics); ratio and log_ratio are (B, S), 1.0 / 0.0 at
             non-trained positions.
     """
@@ -174,9 +182,11 @@ def compute_sequence_ratio(
         ratio = torch.exp(log_ratio)
     with torch.no_grad():
         metrics = {
-            "loss/ratio/mean": masked_token_mean(ratio, loss_mask, normalization),
-            "loss/kl_policy/mean": masked_token_mean(
-                -log_ratio, loss_mask, normalization
+            "loss/ratio/mean": LossMetric(
+                masked_token_mean(ratio, loss_mask, normalization)
+            ),
+            "loss/kl_policy/mean": LossMetric(
+                masked_token_mean(-log_ratio, loss_mask, normalization)
             ),
         }
     return ratio, log_ratio, metrics
@@ -186,7 +196,7 @@ def compute_entropy(
     logits: torch.Tensor,
     loss_mask: torch.Tensor,
     normalization: LossNormalization,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+) -> tuple[torch.Tensor, dict[str, LossMetric]]:
     """Compute per-token entropy (logging only).
 
     Formula: H = logsumexp(logits) - sum(softmax(logits) * logits)
@@ -201,7 +211,7 @@ def compute_entropy(
         normalization (LossNormalization): Global token denominator for the metric.
 
     Returns:
-        tuple[torch.Tensor, dict[str, torch.Tensor]]: (entropy, metrics); entropy
+        tuple[torch.Tensor, dict[str, LossMetric]]: (entropy, metrics); entropy
             is (B, S), metrics is {"loss/entropy/mean": ...}.
     """
     from torch.distributed.tensor import DTensor
@@ -213,7 +223,9 @@ def compute_entropy(
     entropy = torch.logsumexp(logits_fp32, dim=-1) - (probs * logits_fp32).sum(dim=-1)
     with torch.no_grad():
         metrics = {
-            "loss/entropy/mean": masked_token_mean(entropy, loss_mask, normalization)
+            "loss/entropy/mean": LossMetric(
+                masked_token_mean(entropy, loss_mask, normalization)
+            )
         }
     return entropy, metrics
 
@@ -224,7 +236,7 @@ def compute_kl(
     loss_mask: torch.Tensor,
     normalization: LossNormalization,
     kl_type: KLType = "k3",
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+) -> tuple[torch.Tensor, dict[str, LossMetric]]:
     """Compute per-token KL divergence using Schulman's estimators.
 
     Reference: Schulman's blog post (http://joschu.net/blog/kl-approx.html).
@@ -249,7 +261,7 @@ def compute_kl(
         kl_type (KLType): KL estimator type: "k1", "k2", or "k3" (default: "k3").
 
     Returns:
-        tuple[torch.Tensor, dict[str, torch.Tensor]]: (kl, metrics); kl is (B, S),
+        tuple[torch.Tensor, dict[str, LossMetric]]: (kl, metrics); kl is (B, S),
             metrics is {"loss/kl_ref/mean": ...}.
     """
     log_ratio = policy_logprobs - ref_logprobs.detach()  # log(π_θ / π_ref)
@@ -266,7 +278,11 @@ def compute_kl(
         raise ValueError(f"Unknown kl_type: {kl_type}")
 
     with torch.no_grad():
-        metrics = {"loss/kl_ref/mean": masked_token_mean(kl, loss_mask, normalization)}
+        metrics = {
+            "loss/kl_ref/mean": LossMetric(
+                masked_token_mean(kl, loss_mask, normalization)
+            )
+        }
     return kl, metrics
 
 
@@ -275,12 +291,12 @@ def logprob_drift_metrics(
     generator_logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
     normalization: LossNormalization,
-) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+) -> dict[str, LossMetric]:
     """Generator-vs-policy logprob drift, a bitwise on-policy diagnostic.
 
-    Returns (sum_metrics, max_metrics): the mean drift and the fraction of tokens
-    that differ are pre-normalized by the global token count (SUM-folded); the max
-    absolute drift is MAX-folded.
+    The mean drift and the fraction of tokens that differ are pre-normalized by
+    the global token count (`reduce="sum"`); the max absolute drift is
+    `reduce="max"`.
 
     Args:
         policy_logprobs (torch.Tensor): Trainer-recomputed log probs (B, S).
@@ -289,8 +305,7 @@ def logprob_drift_metrics(
         normalization (LossNormalization): Global token denominator for the means.
 
     Returns:
-        tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]: (sum_metrics,
-            max_metrics).
+        dict[str, LossMetric]: drift mean / ratio-different (sum) and max (max).
     """
     with torch.no_grad():
         valid = loss_mask.bool()
@@ -300,21 +315,20 @@ def logprob_drift_metrics(
             zero = torch.zeros(
                 (), dtype=torch.float32, device=generator_logprobs.device
             )
-            return (
-                {
-                    "bit_wise/logprob_diff/mean": zero,
-                    "bit_wise/ratio_tokens_different/mean": zero,
-                },
-                {"bit_wise/logprob_diff/max": zero},
-            )
+            return {
+                "bit_wise/logprob_diff/mean": LossMetric(zero),
+                "bit_wise/ratio_tokens_different/mean": LossMetric(zero),
+                "bit_wise/logprob_diff/max": LossMetric(zero, "max"),
+            }
         denom = max(normalization.num_global_valid_tokens, 1)
         diff = policy - ref
-        sum_metrics = {
-            "bit_wise/logprob_diff/mean": diff.sum() / denom,
-            "bit_wise/ratio_tokens_different/mean": (diff.abs() > 1e-6).sum() / denom,
+        return {
+            "bit_wise/logprob_diff/mean": LossMetric(diff.sum() / denom),
+            "bit_wise/ratio_tokens_different/mean": LossMetric(
+                (diff.abs() > 1e-6).sum() / denom
+            ),
+            "bit_wise/logprob_diff/max": LossMetric(diff.abs().max(), "max"),
         }
-        max_metrics = {"bit_wise/logprob_diff/max": diff.abs().max()}
-    return sum_metrics, max_metrics
 
 
 def aggregate_loss(
@@ -401,7 +415,7 @@ def pg_ppo_clip(
     *,
     clip_low: float = 0.2,
     clip_high: float = 0.2,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+) -> tuple[torch.Tensor, dict[str, LossMetric]]:
     """PPO clipped surrogate objective.
 
     Reference: Schulman et al., "Proximal Policy Optimization" (2017).
@@ -425,7 +439,7 @@ def pg_ppo_clip(
             E.g., clip_high=0.2 means ratio <= 1.2. Default: 0.2.
 
     Returns:
-        tuple[torch.Tensor, dict[str, torch.Tensor]]: (pg_loss, metrics); pg_loss
+        tuple[torch.Tensor, dict[str, LossMetric]]: (pg_loss, metrics); pg_loss
             is (B, S). `high/frac` / `low/frac` are the fractions of valid tokens
             clipped against a positive / negative advantage respectively.
     """
@@ -435,14 +449,18 @@ def pg_ppo_clip(
         clipped_high = ratio > clipped_ratio  # ratio above 1 + clip_high
         clipped_low = ratio < clipped_ratio  # ratio below 1 - clip_low
         metrics = {
-            "loss/clip/clipped_ratio/mean": masked_token_mean(
-                clipped_ratio, loss_mask, normalization
+            "loss/clip/clipped_ratio/mean": LossMetric(
+                masked_token_mean(clipped_ratio, loss_mask, normalization)
             ),
-            "loss/clip/high/frac": masked_token_mean(
-                (clipped_high & (advantages > 0)).float(), loss_mask, normalization
+            "loss/clip/high/frac": LossMetric(
+                masked_token_mean(
+                    (clipped_high & (advantages > 0)).float(), loss_mask, normalization
+                )
             ),
-            "loss/clip/low/frac": masked_token_mean(
-                (clipped_low & (advantages < 0)).float(), loss_mask, normalization
+            "loss/clip/low/frac": LossMetric(
+                masked_token_mean(
+                    (clipped_low & (advantages < 0)).float(), loss_mask, normalization
+                )
             ),
         }
     return pg_loss, metrics

@@ -17,7 +17,12 @@ from torchtitan.experiments.rl.loss.ops import (
     logprob_drift_metrics,
     masked_token_mean,
 )
-from torchtitan.experiments.rl.loss.types import AggType, LossNormalization, LossOutput
+from torchtitan.experiments.rl.loss.types import (
+    AggType,
+    LossMetric,
+    LossNormalization,
+    LossOutput,
+)
 
 
 def pg_soft_gate(
@@ -28,7 +33,7 @@ def pg_soft_gate(
     *,
     tau_pos: float = 1.0,
     tau_neg: float = 1.05,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+) -> tuple[torch.Tensor, dict[str, LossMetric]]:
     """SAPO's soft sigmoid gating.
 
     Reference: Gao et al., "Soft Adaptive Policy Optimization" (2025).
@@ -58,7 +63,7 @@ def pg_soft_gate(
         tau_neg (float): Temperature for negative advantages (default 1.05).
 
     Returns:
-        tuple[torch.Tensor, dict[str, torch.Tensor]]: (pg_loss, metrics); pg_loss
+        tuple[torch.Tensor, dict[str, LossMetric]]: (pg_loss, metrics); pg_loss
             is (B, S).
     """
     pos_gate = (4.0 / tau_pos) * torch.sigmoid(tau_pos * (ratio - 1))
@@ -67,8 +72,8 @@ def pg_soft_gate(
     pg_loss = -gate * advantages
     with torch.no_grad():
         metrics = {
-            "loss/soft_gate/gate/mean": masked_token_mean(
-                gate, loss_mask, normalization
+            "loss/soft_gate/gate/mean": LossMetric(
+                masked_token_mean(gate, loss_mask, normalization)
             )
         }
     return pg_loss, metrics
@@ -163,20 +168,18 @@ class SAPOLoss(Configurable):
             normalization=normalization,
             sample_ids=sample_ids,
         )
-        drift_sum_metrics, drift_max_metrics = logprob_drift_metrics(
+        drift_metrics = logprob_drift_metrics(
             policy_logprobs, generator_logprobs, loss_mask, normalization
         )
-        sum_metrics = {
-            "loss/mean": loss.detach(),
+        metrics = {
+            "loss/mean": LossMetric(loss.detach()),
             **ratio_metrics,
             **gate_metrics,
-            **drift_sum_metrics,
+            **drift_metrics,
         }
         if self.log_entropy:
             _entropy, entropy_metrics = compute_entropy(
                 logits, loss_mask, normalization
             )
-            sum_metrics.update(entropy_metrics)
-        return LossOutput(
-            loss=loss, sum_metrics=sum_metrics, max_metrics=drift_max_metrics
-        )
+            metrics.update(entropy_metrics)
+        return LossOutput(loss=loss, metrics=metrics)

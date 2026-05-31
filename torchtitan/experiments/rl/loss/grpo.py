@@ -21,6 +21,7 @@ from torchtitan.experiments.rl.loss.ops import (
 from torchtitan.experiments.rl.loss.types import (
     AggType,
     KLType,
+    LossMetric,
     LossNormalization,
     LossOutput,
 )
@@ -112,7 +113,7 @@ class GRPOLoss(Configurable):
             clip_high=self.clip_high,
         )
 
-        kl_metrics: dict[str, torch.Tensor] = {}
+        kl_metrics: dict[str, LossMetric] = {}
         if self.beta > 0:
             if ref_logprobs is None:
                 raise ValueError("GRPOLoss.beta>0 requires ref_logprobs")
@@ -128,21 +129,19 @@ class GRPOLoss(Configurable):
             normalization=normalization,
             sample_ids=sample_ids,
         )
-        drift_sum_metrics, drift_max_metrics = logprob_drift_metrics(
+        drift_metrics = logprob_drift_metrics(
             policy_logprobs, generator_logprobs, loss_mask, normalization
         )
-        sum_metrics = {
-            "loss/mean": loss.detach(),
+        metrics = {
+            "loss/mean": LossMetric(loss.detach()),
             **ratio_metrics,
             **clip_metrics,
             **kl_metrics,
-            **drift_sum_metrics,
+            **drift_metrics,
         }
         if self.log_entropy:
             _entropy, entropy_metrics = compute_entropy(
                 logits, loss_mask, normalization
             )
-            sum_metrics.update(entropy_metrics)
-        return LossOutput(
-            loss=loss, sum_metrics=sum_metrics, max_metrics=drift_max_metrics
-        )
+            metrics.update(entropy_metrics)
+        return LossOutput(loss=loss, metrics=metrics)
