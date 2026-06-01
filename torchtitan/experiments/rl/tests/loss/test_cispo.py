@@ -8,7 +8,7 @@ import torch
 
 from torchtitan.experiments.rl.loss import CISPOLoss
 
-from .conftest import assert_close, make_normalization, make_sample_ids
+from .conftest import assert_close, num_valid_tokens
 
 
 class TestCISPOLoss:
@@ -21,8 +21,7 @@ class TestCISPOLoss:
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=d["advantages"],
-            normalization=d["normalization"],
-            sample_ids=d["sample_ids"],
+            num_global_valid_tokens=d["num_global_valid_tokens"],
         )
 
         assert_close(output.loss, torch.tensor(-0.083283))
@@ -38,8 +37,7 @@ class TestCISPOLoss:
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=d["advantages"],
-            normalization=d["normalization"],
-            sample_ids=d["sample_ids"],
+            num_global_valid_tokens=d["num_global_valid_tokens"],
         )
 
         output.loss.backward()
@@ -56,8 +54,7 @@ class TestCISPOLoss:
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=advantages,
-            normalization=d["normalization"],
-            sample_ids=d["sample_ids"],
+            num_global_valid_tokens=d["num_global_valid_tokens"],
         )
 
         assert output.loss.isfinite()
@@ -74,8 +71,7 @@ class TestCISPOLoss:
             generator_logprobs=d["generator_logprobs"],
             loss_mask=empty_mask,
             advantages=d["advantages"],
-            normalization=make_normalization(empty_mask, d["B"], d["S"]),
-            sample_ids=d["sample_ids"],
+            num_global_valid_tokens=num_valid_tokens(empty_mask),
         )
 
         assert output.loss.isfinite()
@@ -97,8 +93,7 @@ class TestCISPOLoss:
             generator_logprobs=generator_logprobs,
             loss_mask=loss_mask,
             advantages=advantages,
-            normalization=make_normalization(loss_mask, B, 0),
-            sample_ids=make_sample_ids(B, 0),
+            num_global_valid_tokens=num_valid_tokens(loss_mask),
         )
 
         assert output.loss.isfinite()

@@ -13,7 +13,6 @@ import torch
 logger = logging.getLogger(__name__)
 
 from torchtitan.config import Configurable
-from torchtitan.experiments.rl.loss.types import LossNormalization
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.types import Episode, TrainingBatch
 
@@ -28,11 +27,10 @@ def pack(
     dtypes: dict[str, torch.dtype] | None = None
     buffer: dict[str, list] = {key: [] for key in keys}
     position_buffer: list[int] = []
-    seq_lens_buffer: list[int] = []
     buffer_length = 0
 
     def _flush() -> dict:
-        nonlocal buffer, position_buffer, seq_lens_buffer, buffer_length
+        nonlocal buffer, position_buffer, buffer_length
         assert dtypes is not None
         pad_length = max_seq_length - buffer_length
         if pad_length > 0:
@@ -50,11 +48,9 @@ def pack(
         result["positions"] = torch.tensor(position_buffer, dtype=torch.long).unsqueeze(
             0
         )
-        result["seq_lens"] = list(seq_lens_buffer)
 
         buffer = {key: [] for key in keys}
         position_buffer = []
-        seq_lens_buffer = []
         buffer_length = 0
         return result
 
@@ -78,7 +74,6 @@ def pack(
         for key in keys:
             buffer[key].extend(sample[key])
         position_buffer.extend(range(sample_length))
-        seq_lens_buffer.append(sample_length)
         buffer_length += sample_length
 
     if buffer_length > 0:
@@ -133,15 +128,16 @@ class Batcher(Configurable):
         episodes: list[Episode],
         *,
         dp_degree: int,
-    ) -> tuple[list[list[TrainingBatch]], LossNormalization, list[m.Metric]]:
+    ) -> tuple[list[list[TrainingBatch]], int, list[m.Metric]]:
         """Pack episodes into ``[B, seq_len]`` microbatches.
 
         Returns:
             microbatches: shape ``[gradient_accumulation_steps][dp_degree]``,
                 each entry is a ``TrainingBatch`` with ``local_batch_size`` rows.
-            normalization: global denominators (valid tokens, sequences, fixed
-                horizon) used to normalize the loss so gradient accumulation
-                matches a single large-batch step.
+            num_global_valid_tokens: total response tokens (loss_mask == 1) across
+                the whole global batch; the token-mean denominator, shared by every
+                DP rank and microbatch so gradient accumulation matches a single
+                large-batch step.
             packing_metrics: list of Metric objects for logging.
         """
         # TODO: Consider consuming the iterator lazily instead of
@@ -168,7 +164,6 @@ class Batcher(Configurable):
         num_global_valid_tokens = sum(
             int(row["loss_mask"].sum().item()) for row in packed_rows
         )
-        num_global_sequences = sum(len(row["seq_lens"]) for row in packed_rows)
 
         microbatches: list[list[TrainingBatch]] = []
         for step in range(gradient_accumulation_steps):
@@ -203,12 +198,7 @@ class Batcher(Configurable):
             ),
         ]
 
-        normalization = LossNormalization(
-            num_global_valid_tokens=num_global_valid_tokens,
-            num_global_sequences=num_global_sequences,
-            num_global_fixed_horizon_tokens=num_global_sequences * self.seq_len,
-        )
-        return microbatches, normalization, packing_metrics
+        return microbatches, num_global_valid_tokens, packing_metrics
 
     def _pack_episodes(self, episodes: list[Episode]) -> Iterator[dict]:
         """Pack all episodes into [1, seq_len] rows.
@@ -219,23 +209,19 @@ class Batcher(Configurable):
         """
 
         def _iterate_samples() -> Iterator[dict]:
-            for sample_id, ep in enumerate(episodes):
+            for ep in episodes:
                 prompt_len = len(ep.prompt_token_ids)
                 response_len = len(ep.token_ids)
                 raw_ids = ep.prompt_token_ids + ep.token_ids
                 gen_lp = [0.0] * prompt_len + ep.token_logprobs
                 loss_mask = [False] * prompt_len + [True] * response_len
                 advantages = [0.0] * prompt_len + [ep.advantage] * response_len
-                # Unique per source episode; packing preserves it so sequence-level
-                # losses can recover episode boundaries within a packed row.
-                sample_ids = [sample_id] * (len(raw_ids) - 1)
                 yield {
                     "input_ids": raw_ids[:-1],
                     "labels": raw_ids[1:],
                     "generator_logprobs": gen_lp[1:],
                     "loss_mask": loss_mask[1:],
                     "advantages": advantages[1:],
-                    "sample_ids": sample_ids,
                 }
 
         yield from pack(
@@ -247,7 +233,6 @@ class Batcher(Configurable):
                 "generator_logprobs": 0.0,
                 "loss_mask": False,
                 "advantages": 0.0,
-                "sample_ids": -1,
             },
         )
 
@@ -263,5 +248,4 @@ class Batcher(Configurable):
             generator_logprobs=torch.cat([r["generator_logprobs"] for r in rows]),
             loss_mask=torch.cat([r["loss_mask"] for r in rows]),
             advantages=torch.cat([r["advantages"] for r in rows]),
-            sample_ids=torch.cat([r["sample_ids"] for r in rows]),
         )

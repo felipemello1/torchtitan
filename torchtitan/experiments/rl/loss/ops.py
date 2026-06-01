@@ -8,45 +8,40 @@
 
 Each op computes its result first, then assembles its own metrics in a trailing
 `torch.no_grad()` block and returns them alongside the result (`result, metrics
-= op(...)`). Each metric is a `LossMetric` that carries its own reduction, so the
-loss and trainer never decide it. Pre-normalized metrics (`reduce="sum"`) are
-divided by a global denominator (see `LossNormalization`) so summing the per-rank
-/ per-microbatch shares reconstructs the exact global value.
+= op(...)`). Each metric is a `LossMetric` that carries its own reduction. Metrics
+and the loss are normalized by the global response-token count
+(`num_global_valid_tokens`) so summing the per-rank / per-microbatch shares
+reconstructs the exact averaged global value.
 """
 
 import torch
 import torch.nn.functional as F
 
 from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.experiments.rl.loss.types import (
-    AggType,
-    KLType,
-    LossMetric,
-    LossNormalization,
-)
+from torchtitan.experiments.rl.loss.types import KLType, LossMetric
 
 
 def masked_token_mean(
     values: torch.Tensor,
     loss_mask: torch.Tensor,
-    normalization: LossNormalization,
+    num_global_valid_tokens: int,
 ) -> torch.Tensor:
     """Per-rank share of a global token mean: sum(values * mask) / global_tokens.
 
     Uses the global token count (not the local mask sum) as the divisor, so that
     SUM-reducing this across DP ranks and gradient-accumulation microbatches
     reconstructs the exact global mean (the denominator is the same constant
-    everywhere).
+    everywhere). This is also the loss reduction (token-level mean).
 
     Args:
         values (torch.Tensor): Per-token values (B, S).
         loss_mask (torch.Tensor): Valid token mask (B, S).
-        normalization (LossNormalization): Carries `num_global_valid_tokens`.
+        num_global_valid_tokens (int): Total response tokens across the global batch.
 
     Returns:
         torch.Tensor: Scalar pre-normalized contribution.
     """
-    return (values * loss_mask).sum() / max(normalization.num_global_valid_tokens, 1)
+    return (values * loss_mask).sum() / max(num_global_valid_tokens, 1)
 
 
 def compute_logprobs(
@@ -87,7 +82,7 @@ def compute_token_ratio(
     policy_logprobs: torch.Tensor,
     generator_logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
-    normalization: LossNormalization,
+    num_global_valid_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, LossMetric]]:
     """Per-token importance ratio for off-policy correction.
 
@@ -102,7 +97,7 @@ def compute_token_ratio(
         policy_logprobs (torch.Tensor): Log probs from current policy (B, S).
         generator_logprobs (torch.Tensor): Log probs from sampling policy (B, S).
         loss_mask (torch.Tensor): Valid token mask (B, S).
-        normalization (LossNormalization): Global token denominator for metrics.
+        num_global_valid_tokens (int): Global token denominator for metrics.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor, dict[str, LossMetric]]: (ratio,
@@ -114,79 +109,10 @@ def compute_token_ratio(
     with torch.no_grad():
         metrics = {
             "loss/ratio/mean": LossMetric(
-                masked_token_mean(ratio, loss_mask, normalization)
+                masked_token_mean(ratio, loss_mask, num_global_valid_tokens)
             ),
             "loss/kl_policy/mean": LossMetric(
-                masked_token_mean(-log_ratio, loss_mask, normalization)
-            ),
-        }
-    return ratio, log_ratio, metrics
-
-
-def compute_sequence_ratio(
-    policy_logprobs: torch.Tensor,
-    generator_logprobs: torch.Tensor,
-    loss_mask: torch.Tensor,
-    sample_ids: torch.Tensor,
-    normalization: LossNormalization,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, LossMetric]]:
-    """Sequence-level importance ratio, one per source episode (sample).
-
-    One ratio per response (not per token) matches how rewards are assigned and
-    lowers variance for long sequences. Multiple episodes may be packed into one
-    (B=1, S) row, so the per-episode mean is taken over `sample_ids` rather
-    than the whole row. A reparameterization keeps per-token gradient flow: the
-    forward value is the episode ratio, but gradients flow through each token's
-    current-policy logprob.
-
-    Reference: Zheng et al., "GSPO" (arXiv:2507.18071, 2025).
-
-    Args:
-        policy_logprobs (torch.Tensor): Log probs from current policy (B, S).
-        generator_logprobs (torch.Tensor): Log probs from sampling policy (B, S).
-        loss_mask (torch.Tensor): Valid token mask (B, S).
-        sample_ids (torch.Tensor): Source-episode id per token (B, S), -1 for padding.
-        normalization (LossNormalization): Global token denominator for metrics.
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor, dict[str, LossMetric]]: (ratio,
-            log_ratio, metrics); ratio and log_ratio are (B, S), 1.0 / 0.0 at
-            non-trained positions.
-    """
-    valid = loss_mask.bool() & (sample_ids >= 0)
-    if not bool(valid.any()):
-        log_ratio = torch.zeros_like(policy_logprobs)
-        ratio = torch.ones_like(policy_logprobs)
-    else:
-        token_log_ratio = policy_logprobs - generator_logprobs.detach()
-        _unique, inverse = torch.unique(
-            sample_ids[valid], sorted=True, return_inverse=True
-        )
-        sums = torch.zeros(
-            int(inverse.max()) + 1,
-            device=policy_logprobs.device,
-            dtype=policy_logprobs.dtype,
-        )
-        counts = torch.zeros_like(sums)
-        sums.scatter_add_(0, inverse, token_log_ratio[valid])
-        counts.scatter_add_(0, inverse, torch.ones_like(token_log_ratio[valid]))
-        seq_log_ratio = sums / counts.clamp_min(1)  # [num_local_samples]
-
-        # Reparameterization: forward = sequence ratio, backward = per-token grads.
-        log_ratio = torch.zeros_like(policy_logprobs)
-        log_ratio[valid] = (
-            policy_logprobs[valid]
-            - policy_logprobs[valid].detach()
-            + seq_log_ratio[inverse].detach()
-        )
-        ratio = torch.exp(log_ratio)
-    with torch.no_grad():
-        metrics = {
-            "loss/ratio/mean": LossMetric(
-                masked_token_mean(ratio, loss_mask, normalization)
-            ),
-            "loss/kl_policy/mean": LossMetric(
-                masked_token_mean(-log_ratio, loss_mask, normalization)
+                masked_token_mean(-log_ratio, loss_mask, num_global_valid_tokens)
             ),
         }
     return ratio, log_ratio, metrics
@@ -195,7 +121,7 @@ def compute_sequence_ratio(
 def compute_entropy(
     logits: torch.Tensor,
     loss_mask: torch.Tensor,
-    normalization: LossNormalization,
+    num_global_valid_tokens: int,
 ) -> tuple[torch.Tensor, dict[str, LossMetric]]:
     """Compute per-token entropy (logging only).
 
@@ -208,7 +134,7 @@ def compute_entropy(
     Args:
         logits (torch.Tensor): Model output logits (B, S, V).
         loss_mask (torch.Tensor): Valid token mask (B, S).
-        normalization (LossNormalization): Global token denominator for the metric.
+        num_global_valid_tokens (int): Global token denominator for the metric.
 
     Returns:
         tuple[torch.Tensor, dict[str, LossMetric]]: (entropy, metrics); entropy
@@ -224,7 +150,7 @@ def compute_entropy(
     with torch.no_grad():
         metrics = {
             "loss/entropy/mean": LossMetric(
-                masked_token_mean(entropy, loss_mask, normalization)
+                masked_token_mean(entropy, loss_mask, num_global_valid_tokens)
             )
         }
     return entropy, metrics
@@ -234,7 +160,7 @@ def compute_kl(
     policy_logprobs: torch.Tensor,
     ref_logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
-    normalization: LossNormalization,
+    num_global_valid_tokens: int,
     kl_type: KLType = "k3",
 ) -> tuple[torch.Tensor, dict[str, LossMetric]]:
     """Compute per-token KL divergence using Schulman's estimators.
@@ -257,7 +183,7 @@ def compute_kl(
         policy_logprobs (torch.Tensor): Log probs from current policy (B, S).
         ref_logprobs (torch.Tensor): Log probs from reference policy (B, S).
         loss_mask (torch.Tensor): Valid token mask (B, S).
-        normalization (LossNormalization): Global token denominator for the metric.
+        num_global_valid_tokens (int): Global token denominator for the metric.
         kl_type (KLType): KL estimator type: "k1", "k2", or "k3" (default: "k3").
 
     Returns:
@@ -280,7 +206,7 @@ def compute_kl(
     with torch.no_grad():
         metrics = {
             "loss/kl_ref/mean": LossMetric(
-                masked_token_mean(kl, loss_mask, normalization)
+                masked_token_mean(kl, loss_mask, num_global_valid_tokens)
             )
         }
     return kl, metrics
@@ -290,7 +216,7 @@ def logprob_drift_metrics(
     policy_logprobs: torch.Tensor,
     generator_logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
-    normalization: LossNormalization,
+    num_global_valid_tokens: int,
 ) -> dict[str, LossMetric]:
     """Generator-vs-policy logprob drift, a bitwise on-policy diagnostic.
 
@@ -302,7 +228,7 @@ def logprob_drift_metrics(
         policy_logprobs (torch.Tensor): Trainer-recomputed log probs (B, S).
         generator_logprobs (torch.Tensor): Generator (sampling) log probs (B, S).
         loss_mask (torch.Tensor): Valid token mask (B, S).
-        normalization (LossNormalization): Global token denominator for the means.
+        num_global_valid_tokens (int): Global token denominator for the means.
 
     Returns:
         dict[str, LossMetric]: drift mean / ratio-different (sum) and max (max).
@@ -320,7 +246,7 @@ def logprob_drift_metrics(
                 "bit_wise/ratio_tokens_different/mean": LossMetric(zero),
                 "bit_wise/logprob_diff/max": LossMetric(zero, "max"),
             }
-        denom = max(normalization.num_global_valid_tokens, 1)
+        denom = max(num_global_valid_tokens, 1)
         diff = policy - ref
         return {
             "bit_wise/logprob_diff/mean": LossMetric(diff.sum() / denom),
@@ -331,87 +257,11 @@ def logprob_drift_metrics(
         }
 
 
-def aggregate_loss(
-    per_token_loss: torch.Tensor,
-    loss_mask: torch.Tensor,
-    *,
-    agg_type: AggType,
-    normalization: LossNormalization,
-    sample_ids: torch.Tensor | None,
-) -> torch.Tensor:
-    """Aggregate per-token loss to a scalar using a global denominator.
-
-    Different aggregation strategies have different bias properties that affect
-    training dynamics:
-
-    token_mean: sum(loss*mask) / num_global_valid_tokens
-        Pre-normalized by the global token count so gradient accumulation and DP
-        reproduce a single large-batch step.
-
-    fixed_horizon: sum(loss*mask) / num_global_fixed_horizon_tokens
-        Constant denominator (num_global_sequences * seq_len) removes length
-        bias. Each token contributes equally regardless of sequence length.
-
-    sequence_mean: mean per source episode, then sum / num_global_sequences
-        Episode boundaries come from sample_ids (multiple episodes may be packed
-        into one row). NOTE: per-sequence averaging introduces a length bias, as
-        discussed in the DR-GRPO paper.
-
-    Args:
-        per_token_loss (torch.Tensor): Per-token loss (B, S).
-        loss_mask (torch.Tensor): Valid token mask (B, S).
-        agg_type (AggType): Aggregation strategy.
-        normalization (LossNormalization): Global denominators.
-        sample_ids (torch.Tensor | None): Source-episode ids (B, S); required for
-            sequence_mean.
-
-    Returns:
-        torch.Tensor: Scalar loss.
-    """
-    if agg_type == "token_mean":
-        return (per_token_loss * loss_mask).sum() / max(
-            normalization.num_global_valid_tokens, 1
-        )
-    if agg_type == "fixed_horizon":
-        return (per_token_loss * loss_mask).sum() / max(
-            normalization.num_global_fixed_horizon_tokens, 1
-        )
-    if agg_type == "sequence_mean":
-        if sample_ids is None:
-            raise ValueError("sample_ids is required for sequence_mean aggregation")
-        return _sequence_mean_loss(per_token_loss, loss_mask, sample_ids, normalization)
-    raise ValueError(f"Unknown agg_type: {agg_type}")
-
-
-def _sequence_mean_loss(
-    per_token_loss: torch.Tensor,
-    loss_mask: torch.Tensor,
-    sample_ids: torch.Tensor,
-    normalization: LossNormalization,
-) -> torch.Tensor:
-    """Mean each source episode, then sum(per-episode means) / num_global_sequences."""
-    valid = loss_mask.bool() & (sample_ids >= 0)
-    if not bool(valid.any()):
-        return per_token_loss.sum() * 0.0  # finite 0 that keeps the autograd graph
-
-    _unique, inverse = torch.unique(sample_ids[valid], sorted=True, return_inverse=True)
-    sums = torch.zeros(
-        int(inverse.max()) + 1,
-        device=per_token_loss.device,
-        dtype=per_token_loss.dtype,
-    )
-    counts = torch.zeros_like(sums)
-    sums.scatter_add_(0, inverse, per_token_loss[valid])
-    counts.scatter_add_(0, inverse, torch.ones_like(per_token_loss[valid]))
-    per_sequence = sums / counts.clamp_min(1)
-    return per_sequence.sum() / max(normalization.num_global_sequences, 1)
-
-
 def pg_ppo_clip(
     ratio: torch.Tensor,
     advantages: torch.Tensor,
     loss_mask: torch.Tensor,
-    normalization: LossNormalization,
+    num_global_valid_tokens: int,
     *,
     clip_low: float = 0.2,
     clip_high: float = 0.2,
@@ -432,7 +282,7 @@ def pg_ppo_clip(
         ratio (torch.Tensor): Importance ratio π_θ/π_old (B, S).
         advantages (torch.Tensor): Advantage estimates (B, S).
         loss_mask (torch.Tensor): Valid token mask (B, S).
-        normalization (LossNormalization): Global token denominator for metrics.
+        num_global_valid_tokens (int): Global token denominator for metrics.
         clip_low (float): Lower bound offset. Ratio is clamped to min of (1 - clip_low).
             E.g., clip_low=0.2 means ratio >= 0.8. Default: 0.2.
         clip_high (float): Upper bound offset. Ratio is clamped to max of (1 + clip_high).
@@ -450,16 +300,20 @@ def pg_ppo_clip(
         clipped_low = ratio < clipped_ratio  # ratio below 1 - clip_low
         metrics = {
             "loss/clip/clipped_ratio/mean": LossMetric(
-                masked_token_mean(clipped_ratio, loss_mask, normalization)
+                masked_token_mean(clipped_ratio, loss_mask, num_global_valid_tokens)
             ),
             "loss/clip/high/frac": LossMetric(
                 masked_token_mean(
-                    (clipped_high & (advantages > 0)).float(), loss_mask, normalization
+                    (clipped_high & (advantages > 0)).float(),
+                    loss_mask,
+                    num_global_valid_tokens,
                 )
             ),
             "loss/clip/low/frac": LossMetric(
                 masked_token_mean(
-                    (clipped_low & (advantages < 0)).float(), loss_mask, normalization
+                    (clipped_low & (advantages < 0)).float(),
+                    loss_mask,
+                    num_global_valid_tokens,
                 )
             ),
         }

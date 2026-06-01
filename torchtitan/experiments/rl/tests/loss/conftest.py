@@ -8,8 +8,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from torchtitan.experiments.rl.loss.types import LossNormalization
-
 IGNORE_INDEX = -100
 
 
@@ -20,7 +18,7 @@ def assert_close(actual, expected, atol=1e-4, rtol=1e-4):
 def policy_logprobs_from(
     logits: torch.Tensor, target_ids: torch.Tensor
 ) -> torch.Tensor:
-    """Per-token logprobs via negative cross-entropy, matching the trainer's
+    """Per-token logprobs via negative cross-entropy, matching the loss's
     `compute_logprobs` (temperature 1). Differentiable in `logits`."""
     B, S, V = logits.shape
     return -F.cross_entropy(
@@ -31,20 +29,10 @@ def policy_logprobs_from(
     ).reshape(B, S)
 
 
-def make_sample_ids(B: int, S: int) -> torch.Tensor:
-    """One sample per row (row i -> id i). With one episode per row, the
-    sequence-level losses reduce to per-row aggregation."""
-    return torch.arange(B).unsqueeze(1).expand(B, S).contiguous()
-
-
-def make_normalization(loss_mask: torch.Tensor, B: int, S: int) -> LossNormalization:
-    """Single-batch normalization: global tokens == local valid tokens, one
-    sequence per row, fixed horizon == B * S (the dense token count here)."""
-    return LossNormalization(
-        num_global_valid_tokens=int(loss_mask.sum().item()),
-        num_global_sequences=B,
-        num_global_fixed_horizon_tokens=B * S,
-    )
+def num_valid_tokens(loss_mask: torch.Tensor) -> int:
+    """Global response-token count; in the single-batch test setup the global
+    count equals the local valid-token count."""
+    return int(loss_mask.sum().item())
 
 
 @pytest.fixture
@@ -82,6 +70,5 @@ def inputs():
         "advantages": advantages,
         "loss_mask": loss_mask,
         "policy_logprobs": policy_logprobs_from(logits, target_ids),
-        "sample_ids": make_sample_ids(B, S),
-        "normalization": make_normalization(loss_mask, B, S),
+        "num_global_valid_tokens": num_valid_tokens(loss_mask),
     }

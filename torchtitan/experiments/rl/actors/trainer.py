@@ -29,7 +29,7 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.utils import set_batch_invariance
-from torchtitan.experiments.rl.loss.types import LossMetric, LossNormalization
+from torchtitan.experiments.rl.loss.types import LossMetric
 from torchtitan.experiments.rl.types import (
     ForwardBackwardOutput,
     OptimStepOutput,
@@ -300,16 +300,16 @@ class PolicyTrainer(Actor, Configurable):
     async def forward_backward(
         self,
         training_data: list[TrainingBatch],
-        normalization: LossNormalization,
+        num_global_valid_tokens: int,
     ) -> ForwardBackwardOutput:
         """Run forward pass, compute loss, call backward, and reduce metrics.
 
         Args:
             training_data: List of TrainingBatch, one per DP rank. Local rank
                 picks training_data[self.dp_rank].
-            normalization: Global denominators (valid tokens, sequences, fixed
-                horizon) across all DP ranks for this step. The controller
-                computes these before sharding episodes.
+            num_global_valid_tokens: Total response tokens across all DP ranks for
+                this step (the token-mean denominator). The controller computes it
+                before sharding episodes.
 
         Returns:
             ForwardBackwardOutput: Globally-reduced metrics, split by reducer.
@@ -337,7 +337,6 @@ class PolicyTrainer(Actor, Configurable):
         loss_mask = local_batch.loss_mask.to(device)
         generator_logprobs = local_batch.generator_logprobs.to(device)
         advantages = local_batch.advantages.to(device)
-        sample_ids = local_batch.sample_ids.to(device)
 
         attention_masks = create_varlen_metadata_for_document(positions)
 
@@ -353,8 +352,7 @@ class PolicyTrainer(Actor, Configurable):
                 generator_logprobs=generator_logprobs,
                 loss_mask=loss_mask,
                 advantages=advantages,
-                normalization=normalization,
-                sample_ids=sample_ids,
+                num_global_valid_tokens=num_global_valid_tokens,
             )
 
         # Accumulate gradients across all controller microbatches for this step.

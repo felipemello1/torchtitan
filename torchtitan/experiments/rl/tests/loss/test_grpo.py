@@ -9,48 +9,42 @@ import torch
 
 from torchtitan.experiments.rl.loss import GRPOLoss
 
-from .conftest import assert_close, make_normalization, make_sample_ids
+from .conftest import assert_close, num_valid_tokens
 
 
 class TestGRPOLoss:
     def test_forward(self, inputs):
         d = inputs
-        loss_fn = GRPOLoss.Config(
-            clip_low=0.2, clip_high=0.2, beta=0.1, agg_type="fixed_horizon"
-        ).build()
+        loss_fn = GRPOLoss.Config(clip_low=0.2, clip_high=0.2, beta=0.1).build()
         output = loss_fn(
             logits=d["logits"],
             target_ids=d["target_ids"],
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=d["advantages"],
-            normalization=d["normalization"],
-            sample_ids=d["sample_ids"],
+            num_global_valid_tokens=d["num_global_valid_tokens"],
             ref_logprobs=d["ref_logprobs"],
         )
 
-        assert_close(output.loss, torch.tensor(0.260804))
+        assert_close(output.loss, torch.tensor(0.521607))
 
     def test_backward(self, inputs):
         d = inputs
         logits = d["logits"].clone().requires_grad_(True)
 
-        loss_fn = GRPOLoss.Config(
-            clip_low=0.2, clip_high=0.2, beta=0.1, agg_type="fixed_horizon"
-        ).build()
+        loss_fn = GRPOLoss.Config(clip_low=0.2, clip_high=0.2, beta=0.1).build()
         output = loss_fn(
             logits=logits,
             target_ids=d["target_ids"],
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=d["advantages"],
-            normalization=d["normalization"],
-            sample_ids=d["sample_ids"],
+            num_global_valid_tokens=d["num_global_valid_tokens"],
             ref_logprobs=d["ref_logprobs"],
         )
 
         output.loss.backward()
-        assert_close(logits.grad.norm(), torch.tensor(0.137857))
+        assert_close(logits.grad.norm(), torch.tensor(0.275714))
 
     def test_kl_estimators_differ(self, inputs):
         """k1/k2/k3 produce distinct loss/kl_ref/mean on the same inputs."""
@@ -64,8 +58,7 @@ class TestGRPOLoss:
                 generator_logprobs=d["generator_logprobs"],
                 loss_mask=d["loss_mask"],
                 advantages=d["advantages"],
-                normalization=d["normalization"],
-                sample_ids=d["sample_ids"],
+                num_global_valid_tokens=d["num_global_valid_tokens"],
                 ref_logprobs=d["ref_logprobs"],
             )
             kl_values[kl_type] = float(output.metrics["loss/kl_ref/mean"].value)
@@ -81,8 +74,7 @@ class TestGRPOLoss:
                 generator_logprobs=d["generator_logprobs"],
                 loss_mask=d["loss_mask"],
                 advantages=d["advantages"],
-                normalization=d["normalization"],
-                sample_ids=d["sample_ids"],
+                num_global_valid_tokens=d["num_global_valid_tokens"],
             )
 
     def test_zero_advantages(self, inputs):
@@ -96,8 +88,7 @@ class TestGRPOLoss:
             generator_logprobs=d["generator_logprobs"],
             loss_mask=d["loss_mask"],
             advantages=advantages,
-            normalization=d["normalization"],
-            sample_ids=d["sample_ids"],
+            num_global_valid_tokens=d["num_global_valid_tokens"],
         )
 
         assert output.loss.isfinite()
@@ -114,8 +105,7 @@ class TestGRPOLoss:
             generator_logprobs=d["generator_logprobs"],
             loss_mask=empty_mask,
             advantages=d["advantages"],
-            normalization=make_normalization(empty_mask, d["B"], d["S"]),
-            sample_ids=d["sample_ids"],
+            num_global_valid_tokens=num_valid_tokens(empty_mask),
         )
 
         assert output.loss.isfinite()
@@ -137,8 +127,7 @@ class TestGRPOLoss:
             generator_logprobs=generator_logprobs,
             loss_mask=loss_mask,
             advantages=advantages,
-            normalization=make_normalization(loss_mask, B, 0),
-            sample_ids=make_sample_ids(B, 0),
+            num_global_valid_tokens=num_valid_tokens(loss_mask),
         )
 
         assert output.loss.isfinite()

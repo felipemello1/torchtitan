@@ -940,7 +940,7 @@ class RLTrainer(Configurable):
             with sl.log_trace_span("batcher_batch"):
                 (
                     microbatches,
-                    normalization,
+                    num_global_valid_tokens,
                     packing_metrics,
                 ) = self.batcher.batch(episodes, dp_degree=self.trainer_dp_degree)
 
@@ -954,7 +954,7 @@ class RLTrainer(Configurable):
                 with sl.log_trace_span("trainer_forward_backward_call"):
                     mb_metrics = self._get_rank_0_value(
                         self.trainer.forward_backward.call(
-                            microbatch, normalization
+                            microbatch, num_global_valid_tokens
                         ).get()
                     )
                     for k, v in mb_metrics.sum_metrics.items():

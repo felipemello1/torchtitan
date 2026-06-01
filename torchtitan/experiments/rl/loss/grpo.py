@@ -10,30 +10,25 @@ import torch
 
 from torchtitan.config import Configurable
 from torchtitan.experiments.rl.loss.ops import (
-    aggregate_loss,
     compute_entropy,
     compute_kl,
     compute_logprobs,
     compute_token_ratio,
     logprob_drift_metrics,
+    masked_token_mean,
     pg_ppo_clip,
 )
-from torchtitan.experiments.rl.loss.types import (
-    AggType,
-    KLType,
-    LossMetric,
-    LossNormalization,
-    LossOutput,
-)
+from torchtitan.experiments.rl.loss.types import KLType, LossMetric, LossOutput
 
 
 class GRPOLoss(Configurable):
-    """DR-GRPO: "Done Right" GRPO with unbiased aggregation.
+    """GRPO: Group Relative Policy Optimization.
 
     Reference: Liu et al., "Understanding R1-Zero-Like Training" (2025).
     https://arxiv.org/abs/2503.20783
 
     Per-token: L_t = max(-r*A, -clip(r, 1-ε_low, 1+ε_high)*A) + beta*KL
+    Aggregated: L = sum(L_t * mask) / num_global_valid_tokens
 
     where:
         r = π_θ(y_t|q,y_<t) / π_old(y_t|q,y_<t)  — importance ratio
@@ -45,17 +40,10 @@ class GRPOLoss(Configurable):
     within each group. This eliminates the need for a separate critic model at
     the cost of sampling more responses.
 
-    DR-GRPO fixes two biases in vanilla GRPO:
-    1. Length bias: GRPO divides by |o_i| (agg_type='sequence_mean'), rewarding
-       shorter correct and longer incorrect sequences. agg_type='fixed_horizon'
-       removes this by dividing by a constant horizon instead.
-    2. Difficulty bias: GRPO normalizes advantages by std, over-weighting easy
-       problems with low variance. DR-GRPO uses mean-only advantages. NOTE: this
-       is a property of the caller-provided advantages, not this loss.
-
-    NOTE: Default agg_type is 'token_mean' (matches the controller's global-token
-    normalization); 'fixed_horizon' stays selectable for DR-GRPO. clip_high >
-    clip_low ("clip-higher") is reportedly better, though not in the original paper.
+    NOTE: difficulty bias (vanilla GRPO normalizes advantages by std, over-weighting
+    easy low-variance problems) is a property of the caller-provided advantages, not
+    this loss. clip_high > clip_low ("clip-higher") is reportedly better, though not
+    in the original paper.
 
     NOTE: beta defaults to 0.0. KL (beta>0) needs ref_logprobs from a reference
     model, which the RL controller does not yet provide, so RLTrainer.Config
@@ -67,7 +55,6 @@ class GRPOLoss(Configurable):
         clip_high (float): Upper clip bound (default 0.28).
         beta (float): KL penalty coefficient (default 0.0; >0 requires ref_logprobs).
         kl_type (KLType): KL estimator (default "k3").
-        agg_type (AggType): Aggregation method (default "token_mean").
         log_entropy (bool): Emit loss/entropy/mean (default True).
     """
 
@@ -77,7 +64,6 @@ class GRPOLoss(Configurable):
         clip_high: float = 0.28
         beta: float = 0.0
         kl_type: KLType = "k3"
-        agg_type: AggType = "token_mean"
         log_entropy: bool = True
 
     def __init__(self, config: Config):
@@ -85,7 +71,6 @@ class GRPOLoss(Configurable):
         self.clip_high = config.clip_high
         self.beta = config.beta
         self.kl_type = config.kl_type
-        self.agg_type = config.agg_type
         self.log_entropy = config.log_entropy
 
     def __call__(
@@ -96,19 +81,18 @@ class GRPOLoss(Configurable):
         generator_logprobs: torch.Tensor,  # (B, S)
         loss_mask: torch.Tensor,  # (B, S)
         advantages: torch.Tensor,  # (B, S)
-        normalization: LossNormalization,
-        sample_ids: torch.Tensor | None = None,
+        num_global_valid_tokens: int,
         ref_logprobs: torch.Tensor | None = None,
     ) -> LossOutput:
         policy_logprobs = compute_logprobs(logits, target_ids)
         ratio, _log_ratio, ratio_metrics = compute_token_ratio(
-            policy_logprobs, generator_logprobs, loss_mask, normalization
+            policy_logprobs, generator_logprobs, loss_mask, num_global_valid_tokens
         )
         pg_loss, clip_metrics = pg_ppo_clip(
             ratio,
             advantages,
             loss_mask,
-            normalization,
+            num_global_valid_tokens,
             clip_low=self.clip_low,
             clip_high=self.clip_high,
         )
@@ -118,19 +102,17 @@ class GRPOLoss(Configurable):
             if ref_logprobs is None:
                 raise ValueError("GRPOLoss.beta>0 requires ref_logprobs")
             kl, kl_metrics = compute_kl(
-                policy_logprobs, ref_logprobs, loss_mask, normalization, self.kl_type
+                policy_logprobs,
+                ref_logprobs,
+                loss_mask,
+                num_global_valid_tokens,
+                self.kl_type,
             )
             pg_loss = pg_loss + self.beta * kl
 
-        loss = aggregate_loss(
-            pg_loss,
-            loss_mask,
-            agg_type=self.agg_type,
-            normalization=normalization,
-            sample_ids=sample_ids,
-        )
+        loss = masked_token_mean(pg_loss, loss_mask, num_global_valid_tokens)
         drift_metrics = logprob_drift_metrics(
-            policy_logprobs, generator_logprobs, loss_mask, normalization
+            policy_logprobs, generator_logprobs, loss_mask, num_global_valid_tokens
         )
         metrics = {
             "loss/mean": LossMetric(loss.detach()),
@@ -141,7 +123,7 @@ class GRPOLoss(Configurable):
         }
         if self.log_entropy:
             _entropy, entropy_metrics = compute_entropy(
-                logits, loss_mask, normalization
+                logits, loss_mask, num_global_valid_tokens
             )
             metrics.update(entropy_metrics)
         return LossOutput(loss=loss, metrics=metrics)

@@ -9,33 +9,8 @@ from typing import Literal
 
 import torch
 
-AggType = Literal["token_mean", "fixed_horizon", "sequence_mean"]
-RatioType = Literal["token", "sequence"]
 KLType = Literal["k1", "k2", "k3"]
 Reduce = Literal["sum", "max"]
-
-
-@dataclass(frozen=True, slots=True)
-class LossNormalization:
-    """Global denominators for one optimizer step.
-
-    Computed once by the batcher and shared by every DP rank and every
-    gradient-accumulation microbatch, so that pre-normalized per-token
-    contributions SUM-reduce to the exact global value.
-
-    Attributes:
-        num_global_valid_tokens (int): Total response tokens (loss_mask == 1)
-            across the whole global batch. Denominator for `token_mean` and for
-            every pre-normalized metric.
-        num_global_sequences (int): Total source episodes across the global batch.
-            Denominator for `sequence_mean`.
-        num_global_fixed_horizon_tokens (int): `num_global_sequences * seq_len`;
-            a length-independent constant horizon. Denominator for `fixed_horizon`.
-    """
-
-    num_global_valid_tokens: int
-    num_global_sequences: int
-    num_global_fixed_horizon_tokens: int
 
 
 @dataclass(frozen=True, slots=True)

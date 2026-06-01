@@ -8,29 +8,18 @@
 from torchtitan.experiments.rl.loss.cispo import CISPOLoss
 from torchtitan.experiments.rl.loss.dapo import DAPOLoss
 from torchtitan.experiments.rl.loss.grpo import GRPOLoss
-from torchtitan.experiments.rl.loss.gspo import GSPOLoss
-from torchtitan.experiments.rl.loss.sapo import SAPOLoss
 
 # Types
-from torchtitan.experiments.rl.loss.types import (
-    AggType,
-    KLType,
-    LossNormalization,
-    LossOutput,
-    RatioType,
-)
+from torchtitan.experiments.rl.loss.types import KLType, LossMetric, LossOutput, Reduce
 
 __all__ = [
     # Loss classes
     "GRPOLoss",
     "DAPOLoss",
-    "GSPOLoss",
     "CISPOLoss",
-    "SAPOLoss",
     # Types
-    "AggType",
-    "RatioType",
     "KLType",
-    "LossNormalization",
+    "Reduce",
+    "LossMetric",
     "LossOutput",
 ]

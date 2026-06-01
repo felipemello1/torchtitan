@@ -10,7 +10,6 @@ import torch
 
 from torchtitan.config import Configurable
 from torchtitan.experiments.rl.loss.ops import (
-    aggregate_loss,
     compute_entropy,
     compute_logprobs,
     compute_token_ratio,
@@ -18,19 +17,14 @@ from torchtitan.experiments.rl.loss.ops import (
     masked_token_mean,
     pg_ppo_clip,
 )
-from torchtitan.experiments.rl.loss.types import (
-    AggType,
-    LossMetric,
-    LossNormalization,
-    LossOutput,
-)
+from torchtitan.experiments.rl.loss.types import LossMetric, LossOutput
 
 
 def pg_dual_clip(
     pg_loss: torch.Tensor,
     advantages: torch.Tensor,
     loss_mask: torch.Tensor,
-    normalization: LossNormalization,
+    num_global_valid_tokens: int,
     *,
     dual_clip_c: float = 3.0,
 ) -> tuple[torch.Tensor, dict[str, LossMetric]]:
@@ -50,7 +44,7 @@ def pg_dual_clip(
         pg_loss (torch.Tensor): Per-token PPO loss from pg_ppo_clip (B, S).
         advantages (torch.Tensor): Advantage estimates (B, S).
         loss_mask (torch.Tensor): Valid token mask (B, S).
-        normalization (LossNormalization): Global token denominator for the metric.
+        num_global_valid_tokens (int): Global token denominator for the metric.
         dual_clip_c (float): Dual-clip constant (default 3.0).
 
     Returns:
@@ -67,7 +61,9 @@ def pg_dual_clip(
         )
         metrics = {
             "loss/dual_clip/clip/frac": LossMetric(
-                masked_token_mean(was_dual_clipped.float(), loss_mask, normalization)
+                masked_token_mean(
+                    was_dual_clipped.float(), loss_mask, num_global_valid_tokens
+                )
             )
         }
     return loss, metrics
@@ -93,7 +89,6 @@ class DAPOLoss(Configurable):
     Differences from GRPO:
     - Clip-higher: ε_high > ε_low allows more exploration for low-probability tokens.
     - Dual-clip: Caps penalty on negative advantages to prevent over-penalization.
-    - Token-level aggregation: Divides by total trainable tokens across all sequences.
 
     NOTE: This is the DAPO policy loss only; it consumes caller-provided advantages.
     The DAPO paper's other techniques are data/controller concerns and are NOT
@@ -106,7 +101,6 @@ class DAPOLoss(Configurable):
         clip_low (float): Lower clip bound (default 0.2).
         clip_high (float): Upper clip bound (default 0.28).
         dual_clip_c (float): Dual-clip constant (default 3.0).
-        agg_type (AggType): Aggregation method (default "token_mean").
         log_entropy (bool): Emit loss/entropy/mean (default True).
     """
 
@@ -115,14 +109,12 @@ class DAPOLoss(Configurable):
         clip_low: float = 0.2
         clip_high: float = 0.28
         dual_clip_c: float = 3.0
-        agg_type: AggType = "token_mean"
         log_entropy: bool = True
 
     def __init__(self, config: Config):
         self.clip_low = config.clip_low
         self.clip_high = config.clip_high
         self.dual_clip_c = config.dual_clip_c
-        self.agg_type = config.agg_type
         self.log_entropy = config.log_entropy
 
     def __call__(
@@ -133,34 +125,31 @@ class DAPOLoss(Configurable):
         generator_logprobs: torch.Tensor,  # (B, S)
         loss_mask: torch.Tensor,  # (B, S)
         advantages: torch.Tensor,  # (B, S)
-        normalization: LossNormalization,
-        sample_ids: torch.Tensor | None = None,
+        num_global_valid_tokens: int,
         ref_logprobs: torch.Tensor | None = None,
     ) -> LossOutput:
         policy_logprobs = compute_logprobs(logits, target_ids)
         ratio, _log_ratio, ratio_metrics = compute_token_ratio(
-            policy_logprobs, generator_logprobs, loss_mask, normalization
+            policy_logprobs, generator_logprobs, loss_mask, num_global_valid_tokens
         )
         pg_loss, clip_metrics = pg_ppo_clip(
             ratio,
             advantages,
             loss_mask,
-            normalization,
+            num_global_valid_tokens,
             clip_low=self.clip_low,
             clip_high=self.clip_high,
         )
         dual_pg_loss, dual_metrics = pg_dual_clip(
-            pg_loss, advantages, loss_mask, normalization, dual_clip_c=self.dual_clip_c
-        )
-        loss = aggregate_loss(
-            dual_pg_loss,
+            pg_loss,
+            advantages,
             loss_mask,
-            agg_type=self.agg_type,
-            normalization=normalization,
-            sample_ids=sample_ids,
+            num_global_valid_tokens,
+            dual_clip_c=self.dual_clip_c,
         )
+        loss = masked_token_mean(dual_pg_loss, loss_mask, num_global_valid_tokens)
         drift_metrics = logprob_drift_metrics(
-            policy_logprobs, generator_logprobs, loss_mask, normalization
+            policy_logprobs, generator_logprobs, loss_mask, num_global_valid_tokens
         )
         metrics = {
             "loss/mean": LossMetric(loss.detach()),
@@ -171,7 +160,7 @@ class DAPOLoss(Configurable):
         }
         if self.log_entropy:
             _entropy, entropy_metrics = compute_entropy(
-                logits, loss_mask, normalization
+                logits, loss_mask, num_global_valid_tokens
             )
             metrics.update(entropy_metrics)
         return LossOutput(loss=loss, metrics=metrics)

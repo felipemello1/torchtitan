@@ -10,19 +10,13 @@ import torch
 
 from torchtitan.config import Configurable
 from torchtitan.experiments.rl.loss.ops import (
-    aggregate_loss,
     compute_entropy,
     compute_logprobs,
     compute_token_ratio,
     logprob_drift_metrics,
     masked_token_mean,
 )
-from torchtitan.experiments.rl.loss.types import (
-    AggType,
-    LossMetric,
-    LossNormalization,
-    LossOutput,
-)
+from torchtitan.experiments.rl.loss.types import LossMetric, LossOutput
 
 
 def pg_cispo(
@@ -30,7 +24,7 @@ def pg_cispo(
     policy_logprobs: torch.Tensor,
     advantages: torch.Tensor,
     loss_mask: torch.Tensor,
-    normalization: LossNormalization,
+    num_global_valid_tokens: int,
     *,
     clip_low: float = 1.0,
     clip_high: float = 4.0,
@@ -57,7 +51,7 @@ def pg_cispo(
         policy_logprobs (torch.Tensor): Log probs from current policy (B, S).
         advantages (torch.Tensor): Advantage estimates (B, S).
         loss_mask (torch.Tensor): Valid token mask (B, S).
-        normalization (LossNormalization): Global token denominator for metrics.
+        num_global_valid_tokens (int): Global token denominator for metrics.
         clip_low (float): Lower clip bound offset (default 1.0, no effective clipping).
         clip_high (float): Upper clip bound offset (default 4.0).
 
@@ -71,16 +65,20 @@ def pg_cispo(
     with torch.no_grad():
         metrics = {
             "loss/clip/clipped_ratio/mean": LossMetric(
-                masked_token_mean(clipped_ratio, loss_mask, normalization)
+                masked_token_mean(clipped_ratio, loss_mask, num_global_valid_tokens)
             ),
             "loss/clip/high_unconditional/frac": LossMetric(
                 masked_token_mean(
-                    (ratio > 1 + clip_high).float(), loss_mask, normalization
+                    (ratio > 1 + clip_high).float(),
+                    loss_mask,
+                    num_global_valid_tokens,
                 )
             ),
             "loss/clip/low_unconditional/frac": LossMetric(
                 masked_token_mean(
-                    (ratio < 1 - clip_low).float(), loss_mask, normalization
+                    (ratio < 1 - clip_low).float(),
+                    loss_mask,
+                    num_global_valid_tokens,
                 )
             ),
         }
@@ -116,13 +114,11 @@ class CISPOLoss(Configurable):
     Differences from GRPO:
         1. REINFORCE-style: Ratio is detached; gradient flows through logprobs.
         2. Upper-only clipping (default): No lower bound, like GSPO.
-        3. Token-level aggregation: Divides by total trainable tokens across all sequences.
 
     Args:
         clip_low (float): Lower clip bound offset (default 1.0,  effectively
             no lower clipping).
         clip_high (float): Upper clip bound offset (default 4.0).
-        agg_type (AggType): Aggregation method (default "token_mean").
         log_entropy (bool): Emit loss/entropy/mean (default True).
     """
 
@@ -130,13 +126,11 @@ class CISPOLoss(Configurable):
     class Config(Configurable.Config):
         clip_low: float = 1.0
         clip_high: float = 4.0
-        agg_type: AggType = "token_mean"
         log_entropy: bool = True
 
     def __init__(self, config: Config):
         self.clip_low = config.clip_low
         self.clip_high = config.clip_high
-        self.agg_type = config.agg_type
         self.log_entropy = config.log_entropy
 
     def __call__(
@@ -147,32 +141,25 @@ class CISPOLoss(Configurable):
         generator_logprobs: torch.Tensor,  # (B, S)
         loss_mask: torch.Tensor,  # (B, S)
         advantages: torch.Tensor,  # (B, S)
-        normalization: LossNormalization,
-        sample_ids: torch.Tensor | None = None,
+        num_global_valid_tokens: int,
         ref_logprobs: torch.Tensor | None = None,
     ) -> LossOutput:
         policy_logprobs = compute_logprobs(logits, target_ids)
         ratio, _log_ratio, ratio_metrics = compute_token_ratio(
-            policy_logprobs, generator_logprobs, loss_mask, normalization
+            policy_logprobs, generator_logprobs, loss_mask, num_global_valid_tokens
         )
         pg_loss, clip_metrics = pg_cispo(
             ratio,
             policy_logprobs,
             advantages,
             loss_mask,
-            normalization,
+            num_global_valid_tokens,
             clip_low=self.clip_low,
             clip_high=self.clip_high,
         )
-        loss = aggregate_loss(
-            pg_loss,
-            loss_mask,
-            agg_type=self.agg_type,
-            normalization=normalization,
-            sample_ids=sample_ids,
-        )
+        loss = masked_token_mean(pg_loss, loss_mask, num_global_valid_tokens)
         drift_metrics = logprob_drift_metrics(
-            policy_logprobs, generator_logprobs, loss_mask, normalization
+            policy_logprobs, generator_logprobs, loss_mask, num_global_valid_tokens
         )
         metrics = {
             "loss/mean": LossMetric(loss.detach()),
@@ -182,7 +169,7 @@ class CISPOLoss(Configurable):
         }
         if self.log_entropy:
             _entropy, entropy_metrics = compute_entropy(
-                logits, loss_mask, normalization
+                logits, loss_mask, num_global_valid_tokens
             )
             metrics.update(entropy_metrics)
         return LossOutput(loss=loss, metrics=metrics)

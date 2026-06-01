@@ -53,7 +53,6 @@ class TrainingBatch:
     generator_logprobs: torch.Tensor  # [B, L]
     loss_mask: torch.Tensor  # [B, L]
     advantages: torch.Tensor  # [B, L]
-    sample_ids: torch.Tensor  # [B, L], unique per source episode in the microbatch, -1 for padding
 
 
 @dataclass(frozen=True, slots=True)
