@@ -27,6 +27,7 @@ from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGener
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.batcher import BatchConfig, Batcher
 from torchtitan.experiments.rl.examples.alphabet_sort import AlphabetSortRollouter
+from torchtitan.experiments.rl.examples.search_r1 import SearchR1Rollouter
 from torchtitan.experiments.rl.loss import DAPOLoss
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
 from torchtitan.experiments.rl.renderer import RendererConfig
@@ -380,3 +381,33 @@ def rl_grpo_qwen3_0_6b_varlen_batch_invariant() -> RLTrainer.Config:
             debug=batch_invariant_config,
         ),
     )
+
+
+def rl_grpo_qwen3_0_6b_search_r1() -> RLTrainer.Config:
+    """DAPO Search-R1 (multi-turn retrieval QA) for Qwen3-0.6B, flex attention
+    (4 GPUs: 2 gen + 2 train). Smoke config for the multi-turn search pipeline.
+
+    Requires a running local dense retrieval server and the Search-R1 NQ/HotpotQA
+    parquet data; see `examples/search_r1/README.md`.
+    """
+    # The base config already renders the qwen3 text-tag protocol (enable_thinking=False), which
+    # keeps the model's <think>/<search>/<answer> tags in the completion text.
+    config = rl_grpo_qwen3_0_6b_flex()
+    config.rollouter = SearchR1Rollouter.Config()
+    # Longer packed sequences to fit retrieved passages across turns.
+    config.batcher = dataclasses.replace(
+        config.batcher,
+        batch=BatchConfig(local_batch_size=1, global_batch_size=8, seq_len=4096),
+    )
+    # Stop at the tool/answer boundary so the env can inject results between turns.
+    config.generator = dataclasses.replace(
+        config.generator,
+        sampling=SamplingConfig(
+            temperature=0.8,
+            top_p=0.95,
+            max_tokens=512,
+            stop=["</search>", "</answer>"],
+        ),
+    )
+    config.num_validation_samples = 64  # NQ test questions per eval (less noisy EM)
+    return config

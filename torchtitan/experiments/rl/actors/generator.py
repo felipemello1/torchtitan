@@ -169,6 +169,15 @@ class SamplingConfig:
     max_tokens: int = 100
     """Maximum number of tokens to generate per completion."""
 
+    stop: list[str] = field(default_factory=list)
+    """Stop strings that halt generation (in addition to the renderer's role-boundary stop
+    tokens). Used by multi-turn tool envs to stop at a tool/answer boundary, e.g.
+    `["</search>", "</answer>"]`."""
+
+    include_stop_str_in_output: bool = True
+    """Keep the matched `stop` string in the completion. Required when a multi-turn env parses the
+    boundary tag (e.g. `</search>`) and its tokens must stay aligned with their logprobs."""
+
 
 class VLLMGenerator(Actor, Configurable):
     """vLLM engine driving many concurrent `generate` calls through one SPMD engine loop.
@@ -717,6 +726,8 @@ class VLLMGenerator(Actor, Configurable):
             max_tokens=sampling.max_tokens,
             n=1,  # group_size pre-expands prompts; the RL loop always samples n=1
             stop_token_ids=self._stop_token_ids or None,
+            stop=sampling.stop or None,
+            include_stop_str_in_output=sampling.include_stop_str_in_output,
             seed=self.config.debug.seed,
             logprobs=1,
             output_kind=RequestOutputKind.FINAL_ONLY,
