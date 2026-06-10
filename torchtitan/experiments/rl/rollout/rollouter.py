@@ -250,6 +250,7 @@ class Rollouter(Configurable):
                         completion_token_ids=completion.token_ids,
                         completion_logprobs=completion.token_logprobs,
                         policy_version=completion.policy_version,
+                        version_intervals=completion.version_intervals,
                         completion_message=next_step.completion_message,
                         env_messages=next_step.env_messages,
                         env_rewards=next_step.env_rewards,
