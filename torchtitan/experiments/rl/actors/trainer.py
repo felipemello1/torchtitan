@@ -31,6 +31,7 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.utils import set_batch_invariance
+from torchtitan.experiments.rl.loss import LossOutput
 from torchtitan.experiments.rl.types import OptimStepOutput, TrainingBatch
 from torchtitan.models.common.attention import FlexAttention
 from torchtitan.observability import structured_logger as sl
@@ -63,51 +64,6 @@ def compute_logprobs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor
         reduction="none",
         ignore_index=IGNORE_INDEX,
     ).reshape(B, S)
-
-
-@dataclass(frozen=True, slots=True)
-class PartialLogprobDrift:
-    """Per-rank generator-vs-trainer logprob drift awaiting reduction across the loss-mesh."""
-
-    logprob_diff_mean: torch.Tensor
-    logprob_diff_max: torch.Tensor
-    ratio_tokens_different: torch.Tensor
-
-
-@torch.no_grad()
-@sl.log_trace_span("verify_logprob_identity")
-def verify_logprob_identity(
-    generator_logprobs: torch.Tensor,
-    policy_logprobs: torch.Tensor,
-    loss_mask: torch.Tensor,
-    *,
-    num_global_valid_tokens: int,
-) -> PartialLogprobDrift:
-    """Compute per-rank drift between generator and trainer logprobs.
-
-    Args:
-        generator_logprobs: [B, L] generator logprobs from TrainingBatch.
-        policy_logprobs: [B, L] trainer-computed logprobs.
-        loss_mask: [B, L] bool mask; True for response tokens.
-        num_global_valid_tokens: Total response tokens across all DP ranks.
-
-    Returns:
-        PartialLogprobDrift.
-    """
-    ref_flat = generator_logprobs[loss_mask].float()
-    policy_flat = policy_logprobs[loss_mask].float()
-
-    if ref_flat.numel() == 0:
-        zero = torch.zeros((), dtype=torch.float32, device=generator_logprobs.device)
-        return PartialLogprobDrift(zero, zero, zero)
-
-    denom = max(num_global_valid_tokens, 1)
-    diff = policy_flat - ref_flat
-    return PartialLogprobDrift(
-        logprob_diff_mean=diff.sum() / denom,
-        logprob_diff_max=diff.abs().max(),
-        ratio_tokens_different=(diff.abs() > 1e-6).sum() / denom,
-    )
 
 
 class PolicyTrainer(Actor, Configurable):
@@ -423,11 +379,14 @@ class PolicyTrainer(Actor, Configurable):
             logits = model(
                 token_ids, attention_masks=attention_masks, positions=positions
             )
-        policy_logprobs = compute_logprobs(logits, labels)
 
+        # The loss computes its own policy logprobs from logits, the off-policy ratio, the
+        # clipped objective, and the generator-vs-policy logprob drift; it returns each metric
+        # tagged with how it reduces (sum vs max).
         with sl.log_trace_span("loss_fn"):
-            loss, loss_metrics = self.loss_fn(
-                policy_logprobs=policy_logprobs,
+            loss_output: LossOutput = self.loss_fn(
+                logits=logits,
+                target_ids=labels,
                 generator_logprobs=generator_logprobs,
                 loss_mask=loss_mask,
                 advantages=advantages,
@@ -435,26 +394,20 @@ class PolicyTrainer(Actor, Configurable):
             )
 
         with sl.log_trace_span("model_backward"):
-            loss.backward()
+            loss_output.loss.backward()
 
-        # Metrics for bitwise verification of policy logprobs.
-        verification: PartialLogprobDrift = verify_logprob_identity(
-            generator_logprobs=generator_logprobs,
-            policy_logprobs=policy_logprobs,
-            loss_mask=loss_mask,
-            num_global_valid_tokens=num_global_valid_tokens,
-        )
-
-        # Per-rank pre-normalized metrics, so SUM-reducing reconstructs the global.
+        # Split the loss's metrics by their declared reduction; each value is a per-rank share,
+        # so SUM-reducing the "sum" group reconstructs the global metric and MAX the "max" group.
         sum_reduced_metrics = {
-            **loss_metrics,
-            "bit_wise/logprob_diff/mean": verification.logprob_diff_mean,
-            "bit_wise/ratio_tokens_different/mean": verification.ratio_tokens_different,
+            key: metric.value
+            for key, metric in loss_output.metrics.items()
+            if metric.reduce == "sum"
         }
         max_reduced_metrics = {
-            "bit_wise/logprob_diff/max": verification.logprob_diff_max,
+            key: metric.value
+            for key, metric in loss_output.metrics.items()
+            if metric.reduce == "max"
         }
-
         return self.reduce_forward_backward_metrics(
             sum_reduced_metrics=sum_reduced_metrics,
             max_reduced_metrics=max_reduced_metrics,
