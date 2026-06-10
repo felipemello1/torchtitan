@@ -124,6 +124,10 @@ class RLTrainer(Configurable):
         """Depth bound: batches the rollout producer may bank ahead before backpressure.
         Set >= `max_offpolicy_steps + 1` to use the full staleness budget."""
 
+        weight_sync_interval: int = 1
+        """Sync trainer->generator weights every N optimizer steps. >1 amortizes the push+pull
+        cost but the generator lags up to N versions, so keep `max_offpolicy_steps >= N`."""
+
         rollouter: Rollouter.Config
         """The rollouter: its datasets, envs, and rubric."""
         # TODO: support multiple rollouters for data mixing.
@@ -637,6 +641,9 @@ class RLTrainer(Configurable):
             max_buffered_batches=self.config.max_buffered_batches,
         )
         self._train_version = 0
+        self._pending_pull: asyncio.Task | None = (
+            None  # in-flight async generator weight pull
+        )
         producer = asyncio.create_task(self._produce_rollouts(buffer))
 
         # If the producer crashes, close the buffer so the consumer's `get_batch` returns instead
@@ -791,6 +798,12 @@ class RLTrainer(Configurable):
                 train_version=self._train_version,
             )
 
+    async def _pull_weights_to_generator(self, version: int) -> None:
+        """Coroutine wrapper so the generator pull can be an `asyncio.create_task` (the Monarch
+        `.call()` future is awaitable but not a coroutine, which `create_task` requires)."""
+        with sl.log_trace_span("generator_pull_model_state_dict"):
+            await self.generator.pull_model_state_dict.call(version)
+
     async def _consume_and_train(
         self, buffer: EpisodeBuffer, *, num_steps: int
     ) -> None:
@@ -845,18 +858,27 @@ class RLTrainer(Configurable):
                 )
             t_train_s = time.perf_counter() - t_train_start
 
-            # --- weight sync: push, then pull (the engine keeps generating during the pull) ---
+            # --- weight sync ---
+            # Sync every `weight_sync_interval` steps: the generator lags up to that many versions
+            # (the buffer's off-policy drop tolerates it), trading staleness for fewer push+pulls.
+            # The push (snapshot) blocks — it must finish before the next optim mutates the weights —
+            # but the pull (generator loads) does NOT: the trainer never waits on the generator
+            # weights, so we fire it in the background (one in flight) and the new version lands a
+            # beat later (+1 staleness, absorbed by the buffer). `_train_version` (the trainer's
+            # version) still advances every step, so staleness is measured correctly against it.
             t_push_start = time.perf_counter()
-            with sl.log_trace_span("trainer_push_model_state_dict"):
-                await self.trainer.push_model_state_dict.call()
-            t_weight_sync_push_s = time.perf_counter() - t_push_start
-            with sl.log_trace_span("generator_pull_model_state_dict"):
-                await self.generator.pull_model_state_dict.call(
-                    optim_output.policy_version
+            t_weight_sync_push_s = 0.0
+            t_weight_sync_total_s = 0.0
+            if step % self.config.weight_sync_interval == 0:
+                with sl.log_trace_span("trainer_push_model_state_dict"):
+                    await self.trainer.push_model_state_dict.call()
+                t_weight_sync_push_s = time.perf_counter() - t_push_start
+                t_weight_sync_total_s = t_weight_sync_push_s
+                if self._pending_pull is not None:
+                    await self._pending_pull  # serialize: apply versions in order
+                self._pending_pull = asyncio.create_task(
+                    self._pull_weights_to_generator(optim_output.policy_version)
                 )
-            t_weight_sync_total_s = time.perf_counter() - t_push_start
-            # From here the producer samples at, and the buffer measures staleness against, the
-            # new version.
             self._train_version = optim_output.policy_version
             t_step_s = time.perf_counter() - t_step_start
 
@@ -881,15 +903,28 @@ class RLTrainer(Configurable):
             ]:
                 step_metrics.append(m.Metric(key, m.NoReduce(value)))
 
-            # TODO(perf-metrics): this is trained-tokens / WHOLE step (goodput). Add per-component
-            #   active throughput (tokens/t_train) and a producer tokens/s so the active-vs-goodput
-            #   gap (the trainer-idle bubble) is visible.
+            # Goodput (trained tokens / whole step) vs trainer-active throughput (/ t_train). The
+            # gap between them is the trainer-idle bubble (get_batch wait + weight sync); a
+            # producer-side generator rate is added separately (see `_rollout_worker`).
+            # TODO(perf-metrics): a true MFU needs total (not just trained) tokens through the model.
             step_metrics.append(
                 m.Metric(
                     "perf/tokens_per_second",
                     m.NoReduce(num_global_valid_tokens / t_step_s if t_step_s else 0.0),
                 )
             )
+            step_metrics.append(
+                m.Metric(
+                    "perf/trainer_active_tokens_per_second",
+                    m.NoReduce(
+                        num_global_valid_tokens / t_train_s if t_train_s else 0.0
+                    ),
+                )
+            )
             self.metrics_processor.log(
                 step=step, metrics=step_metrics, is_validation=False
             )
+
+        # Let the last background weight pull finish so it isn't cancelled mid-collective.
+        if self._pending_pull is not None:
+            await self._pending_pull
