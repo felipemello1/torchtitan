@@ -9,6 +9,7 @@ RL trainer used for synchronous grpo training.
 """
 
 import asyncio
+import functools
 import logging
 import math
 import os
@@ -26,9 +27,14 @@ from monarch.actor import ProcMesh
 from monarch.spmd import setup_torch_elastic_env_async
 
 from torchtitan.config import CompileConfig, Configurable
-from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
+from torchtitan.experiments.rl.actors.generator import (
+    GenerateFn,
+    SamplingConfig,
+    VLLMGenerator,
+)
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.batcher import Batcher
+from torchtitan.experiments.rl.episode_buffer import EpisodeBuffer
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.rollout import (
@@ -174,10 +180,8 @@ class RLTrainer(Configurable):
         """Root output folder for RL artifacts (temp weights, logs, etc.)."""
 
         num_groups_per_rollout_batch: int = 5
-        """GRPO groups collected per rollout batch; a train step may collect several batches
-        until the token target is met. Rollouts per batch = `num_groups_per_rollout_batch * group_size`."""
-        # TODO(continuous-batching): this knob exists because we collect to a token budget
-        # in discrete sync batches; async/continuous batching streams may change this logic
+        """GRPO groups the producer keeps generating concurrently.
+        Rollouts in flight = `num_groups_per_rollout_batch * group_size`."""
 
         group_size: int = 8
         """Sibling rollouts sampled per dataset row (the GRPO group). The generator
@@ -185,6 +189,14 @@ class RLTrainer(Configurable):
 
         num_validation_samples: int = 20
         """Number of held-out prompts scored greedily (temp=0, n=1) per validation pass."""
+
+        max_offpolicy_steps: int = 1
+        """Off-policy bound: drop an episode whose oldest token is more than this many versions
+        behind the trainer. 0 = strict on-policy. See `EpisodeBuffer`."""
+
+        max_buffered_batches: int = 2
+        """Depth bound: batches the rollout producer may bank ahead before backpressure.
+        Set >= `max_offpolicy_steps + 1` to use the full staleness budget."""
 
         rollouter: Rollouter.Config
         """The rollouter: its datasets, envs, and rubric."""
@@ -308,6 +320,23 @@ class RLTrainer(Configurable):
         where all ranks return the same result.
         """
         return result.get(0)
+
+    async def _generate(
+        self, prompt_token_ids, *, request_id, sampling_config=None, metrics_prefix
+    ):
+        """Await one completion from the generator (rank 0 value; None on followers).
+
+        `metrics_prefix` namespaces the per-generation metrics (e.g. `"generator"` for training,
+        `"validation_generator"` for validation). Bind it with `functools.partial` to hand a
+        `GenerateFn` to the rollouter.
+        """
+        result = await self.generator.generate.call(
+            prompt_token_ids,
+            request_id=request_id,
+            sampling_config=sampling_config,
+            metrics_prefix=metrics_prefix,
+        )
+        return self._get_rank_0_value(result)
 
     def _shard_episodes(self, episodes: list[Episode]) -> list[list[Episode]]:
         """Round-robin partition episodes across DP ranks."""
@@ -441,15 +470,9 @@ class RLTrainer(Configurable):
             "validation_generator" if is_validation else "generator"
         )
         rollout_metrics_prefix = "validation" if is_validation else "rollout"
-
-        async def generate(prompt_token_ids, *, request_id, sampling_config=None):
-            result = await self.generator.generate.call(
-                prompt_token_ids,
-                request_id=request_id,
-                sampling_config=sampling_config,
-                metrics_prefix=generation_metrics_prefix,
-            )
-            return self._get_rank_0_value(result)
+        generate = functools.partial(
+            self._generate, metrics_prefix=generation_metrics_prefix
+        )
 
         # Validation ids live in their own namespace so they never collide with a train
         # request still in flight in the long-lived continuous-batching engine.
@@ -572,17 +595,17 @@ class RLTrainer(Configurable):
                 branches_per_rollout.append(float(len(rollout_episodes)))
                 advantages_per_rollout.append(rollout.advantage)
 
-        num_groups = len(rollout_groups)
-        zero_std_frac = (
-            sum(1 for s in group_stds if s == 0.0) / num_groups if num_groups else 0.0
-        )
+        # Fraction of groups whose siblings all scored the same (std 0 -> no GRPO signal). A
+        # per-group 0/1 indicator under Mean, not NoReduce: the async producer banks many groups
+        # between train steps, so the metric must aggregate across them (NoReduce takes one entry).
+        zero_std = [1.0 if std == 0.0 else 0.0 for std in group_stds]
         # Rollout reward rides `rollout_reward` (see `prepare_rollout_metrics`); here we emit
         # only the GRPO-specific signals — advantage, per-group reward std, zero-std fraction.
         episode_metrics: list[m.Metric] = [
             m.Metric("advantage", m.SummaryStats.from_list(advantages_per_rollout)),
             m.Metric("reward/group_std", m.Mean.from_list(group_stds)),
             m.Metric("reward/group_std", m.Max.from_list(group_stds)),
-            m.Metric("reward/zero_std_frac", m.NoReduce(zero_std_frac)),
+            m.Metric("reward/zero_std_frac", m.Mean.from_list(zero_std)),
             m.Metric(
                 "rollout/branches_per_rollout", m.Mean.from_list(branches_per_rollout)
             ),
@@ -652,8 +675,9 @@ class RLTrainer(Configurable):
 
     async def train(self):
         num_steps = self.config.num_steps
-        num_groups = self.config.num_groups_per_rollout_batch
-        logger.info(f"Pre-training validation; then {num_steps} steps of RL training")
+        logger.info(
+            f"Pre-training validation; then {num_steps} steps of async RL training"
+        )
 
         # collect validation metrics before training
         # so we can compare before/after
@@ -669,157 +693,43 @@ class RLTrainer(Configurable):
 
         sl.log_trace_instant("training_start")
 
-        for step in range(1, num_steps + 1):
-            sl.set_step(step)
-            # Propagate the step counter to actors for structured logging.
-            self.trainer.sync_log_step.call(step)
-            self.generator.sync_log_step.call(step)
+        # Producer (rollout collection) and consumer (trainer) run concurrently, sharing one
+        # in-process buffer: the producer banks fresh episodes; the consumer trains on whole
+        # batches and hotswaps weights, advancing `_train_version`.
+        buffer = EpisodeBuffer(
+            batcher=self.batcher,
+            dp_degree=self.trainer_dp_degree,
+            max_offpolicy_steps=self.config.max_offpolicy_steps,
+            max_buffered_batches=self.config.max_buffered_batches,
+        )
+        self._train_version = 0
+        producer = asyncio.create_task(self._produce_rollouts(buffer))
 
-            t_step_start = time.perf_counter()
+        # If the producer crashes, close the buffer so the consumer's `get_batch` returns instead
+        # of hanging; `await producer` in the finally then re-raises the real exception. Hold a
+        # reference to the close task — asyncio only weak-refs tasks, so a fire-and-forget one can
+        # be GC'd before it runs.
+        close_tasks: list[asyncio.Task] = []
 
-            # --- rollouts ---
-            # Collect rollouts until total response tokens reach the
-            # token budget. The Batcher then packs, truncates to
-            # global_batch_size rows, and splits into microbatches.
-            t_rollout_start = time.perf_counter()
-            rollout_groups: list[RolloutGroup] = []
-            rollout_metrics: list[m.Metric] = []
-            collected_tokens = 0
-            group_offset = 0
-            # num_tokens_target (= global_batch_size * seq_len) is the stop
-            # condition for collected tokens before a train step can proceed.
-            # NOTE: this is a proxy — packing adds padding to fill fixed-length
-            # rows, so actual token consumption may exceed collected_tokens.
-            num_tokens_target = self.batcher.num_tokens_target(self.trainer_dp_degree)
-            while collected_tokens < num_tokens_target:
-                new_rollout_groups, new_metrics = await self._collect_rollouts(
-                    is_validation=False,
-                    num_groups=num_groups,
-                    group_size=self.config.group_size,
-                    sampling=self._sampling,
-                    step=step,
-                    group_offset=group_offset,
-                )
-                rollout_groups.extend(new_rollout_groups)
-                rollout_metrics.extend(new_metrics)
-                # Count the packed training tokens per rollout. A multi-turn rollout's turns
-                # share a growing prefix (turn n's prompt holds all prior turns), so summing
-                # per-turn would multiply-count that prefix; the packed episode is the full
-                # conversation = the last turn's prompt + completion.
-                collected_tokens += sum(
-                    len(rollout.turns[-1].prompt_token_ids)
-                    + len(rollout.turns[-1].completion_token_ids)
-                    - 1
-                    for group in new_rollout_groups
-                    for rollout in group.rollouts
-                    if rollout.turns
-                )
-                group_offset += num_groups
+        def _close_buffer_if_producer_crashed(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception() is not None:
+                close_tasks.append(asyncio.create_task(buffer.close()))
 
-            episodes, episode_metrics = self._build_episodes(rollout_groups)
-            t_rollout_s = time.perf_counter() - t_rollout_start
+        producer.add_done_callback(_close_buffer_if_producer_crashed)
 
-            if self.config.log_samples:
-                _log_samples(rollout_groups)
-            self.rollout_recorder.record(
-                step=step, is_validation=False, rollout_groups=rollout_groups
-            )
+        try:
+            await self._consume_and_train(buffer, num_steps=num_steps)
+        finally:
+            await buffer.close()
+            producer.cancel()
+            try:
+                await producer  # re-raises a producer crash; CancelledError on a clean stop
+            except asyncio.CancelledError:
+                pass
 
-            # --- train ---
-            t_train_start = time.perf_counter()
-            with sl.log_trace_span("batcher_batch"):
-                (
-                    microbatches,
-                    num_global_valid_tokens,
-                    packing_metrics,
-                ) = self.batcher.batch(episodes, dp_degree=self.trainer_dp_degree)
-
-            # Aggregate metrics across gradient-accumulation microbatches.
-            # "/mean" and "/frac" metrics are pre-normalized by
-            # num_global_valid_tokens, so summing reconstructs the global
-            # value.  "/max" metrics take the max across microbatches.
-            fwd_bwd_metrics: dict[str, float] = {}
-            for microbatch in microbatches:
-                with sl.log_trace_span("trainer_forward_backward_call"):
-                    mb_metrics = self._get_rank_0_value(
-                        await self.trainer.forward_backward.call(
-                            microbatch, num_global_valid_tokens
-                        )
-                    )
-                    for k, v in mb_metrics.items():
-                        if k not in fwd_bwd_metrics:
-                            fwd_bwd_metrics[k] = v
-                        elif k.endswith("/max"):
-                            fwd_bwd_metrics[k] = max(fwd_bwd_metrics[k], v)
-                        elif k.endswith(("/mean", "/frac")):
-                            fwd_bwd_metrics[k] += v
-            with sl.log_trace_span("trainer_optim_step_call"):
-                optim_output = self._get_rank_0_value(
-                    await self.trainer.optim_step.call()
-                )
-            trainer_policy_version = optim_output.policy_version
-            optimizer_metrics = optim_output.metrics
-            t_train_s = time.perf_counter() - t_train_start
-
-            # --- weight sync ---
-            # TODO: we should have `push_model_state_dict` return `trainer_policy_version`
-            # instead of having `trainer.optim_step` return it
-            t_push_start = time.perf_counter()
-            with sl.log_trace_span("trainer_push_model_state_dict"):
-                await self.trainer.push_model_state_dict.call()
-            t_weight_sync_push_s = time.perf_counter() - t_push_start
-            with sl.log_trace_span("generator_pull_model_state_dict"):
-                # The synchronous loop awaited all generates before this step, so the engine is
-                # idle and a direct pull needs no hold.
-                await self.generator.pull_model_state_dict.call(trainer_policy_version)
-            t_weight_sync_total_s = time.perf_counter() - t_push_start
-            t_step_s = time.perf_counter() - t_step_start
-            # --- divergence check before any logging ---
-            if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
-                logger.error("Loss is NaN/Inf; training diverged")
-                break
-
-            # --- Prepare metrics ---
-            total_tokens = sum(len(episode.token_ids) for episode in episodes)
-
-            step_metrics: list[m.Metric] = []
-
-            step_metrics += rollout_metrics
-            step_metrics += episode_metrics
-
-            # Actor metrics are already globally reduced and aggregated
-            # across microbatches; NoReduce passes them through.
-            step_metrics += [
-                m.Metric(k, m.NoReduce(v)) for k, v in fwd_bwd_metrics.items()
-            ]
-            step_metrics += [
-                m.Metric(k, m.NoReduce(v)) for k, v in optimizer_metrics.items()
-            ]
-            step_metrics += packing_metrics
-
-            # timing metrics
-            for key, value in [
-                ("timing/step", t_step_s),
-                ("timing/rollout", t_rollout_s),
-                ("timing/train", t_train_s),
-                ("timing/weight_sync/push", t_weight_sync_push_s),
-                ("timing/weight_sync/total", t_weight_sync_total_s),
-            ]:
-                step_metrics.append(m.Metric(key, m.NoReduce(value)))
-
-            # TODO(perf-metrics): this is trainer tokens / WHOLE step — a goodput that folds in
-            #   rollout + weight-sync idle (the trainer sits idle ~87% of the step). Split into
-            #   per-component active throughput (total_tokens/t_train_s; generated_tokens/t_rollout_s)
-            #   vs goodput (.../t_step_s); the active-vs-goodput gap is the sync idle bubble. The
-            #   rollout's generated_tokens must sum ALL collected rollouts, not just the kept batch.
-            step_metrics.append(
-                m.Metric("perf/tokens_per_second", m.NoReduce(total_tokens / t_step_s))
-            )
-
-            self.metrics_processor.log(
-                step=step, metrics=step_metrics, is_validation=False
-            )
-
+        # TODO(async): the engine may still hold abandoned train requests when post-validation
+        #   starts; they resolve harmlessly (validation uses a `val/` id namespace) but share the
+        #   engine. Drain them first if it skews validation timing.
         post_validation_metrics = await self.validate(step=num_steps)
         self.metrics_processor.log(
             step=num_steps,
@@ -844,3 +754,208 @@ class RLTrainer(Configurable):
             post = post_validation_agg.get(key, float("nan"))
             logger.info(f"  {key}:  {pre:+.3f}  /  {post:+.3f}")
         logger.info("=" * 60)
+
+    @sl.log_trace_span("_produce_rollouts")
+    async def _produce_rollouts(self, buffer: EpisodeBuffer) -> None:
+        """Producer: a data-prefetch coroutine keeps `num_groups_per_rollout_batch` rollout
+        workers fed with ready examples; each worker runs a group rollout, scores it into
+        episodes, and `put`s them in the buffer (`put` backpressures at the depth bound).
+
+        The prefetch queue decouples data sampling from generation, and `get_batch`'s threaded
+        packing keeps the consumer's batching off the event loop. Runs until `train()` cancels it.
+        """
+        num_workers = self.config.num_groups_per_rollout_batch
+        generate = functools.partial(self._generate, metrics_prefix="generator")
+
+        # DATA stage feeds ROLLOUT stage; one spare example queued per worker.
+        example_queue: asyncio.Queue = asyncio.Queue(maxsize=num_workers)
+        tasks = [
+            asyncio.create_task(self._prefetch_examples(example_queue)),
+            *(
+                asyncio.create_task(
+                    self._rollout_worker(
+                        worker_id=worker_id,
+                        example_queue=example_queue,
+                        buffer=buffer,
+                        generate=generate,
+                    )
+                )
+                for worker_id in range(num_workers)
+            ),
+        ]
+        try:
+            # Workers run until cancelled; surface the first crash (gather leaves siblings running,
+            # so the finally cancels them).
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            # Let the cancellations unwind before returning (don't leave orphan workers running).
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _prefetch_examples(self, example_queue: asyncio.Queue) -> None:
+        """DATA stage: sample training examples off the event loop and queue them, so a rollout
+        worker always has a ready example to start on (the queue depth is the prefetch)."""
+        while True:
+            example = await asyncio.to_thread(self._rollouter.get_training_sample)
+            await example_queue.put(example)
+
+    async def _rollout_worker(
+        self,
+        *,
+        worker_id: int,
+        example_queue: asyncio.Queue,
+        buffer: EpisodeBuffer,
+        generate: GenerateFn,
+    ) -> None:
+        """ROLLOUT stage: pull a ready example, run its group rollout, score it into episodes,
+        and `put` them in the buffer. A group that raises is logged + dropped (its
+        `group_failures` rides out with the next batch); the worker keeps going."""
+        group_count = 0
+        while True:
+            example = await example_queue.get()
+            group_id = (
+                f"step={self._train_version + 1}/group=w{worker_id}_{group_count}"
+            )
+            group_count += 1
+            try:
+                group = await self._rollouter.run_group_rollouts(
+                    generate=generate,
+                    example=example,
+                    group_id=group_id,
+                    group_size=self.config.group_size,
+                    sampling=self._sampling,
+                    renderer=self.renderer,
+                )
+            except Exception:
+                logger.exception("rollout group %s failed; dropping", group_id)
+                await buffer.put(
+                    [],
+                    [m.Metric("rollout/group_failures", m.Sum(1.0))],
+                    train_version=self._train_version,
+                )
+                continue
+
+            episodes, episode_metrics = self._build_episodes([group])
+            rollout_metrics = prepare_rollout_metrics("rollout", group.rollouts)
+            generation_metrics = [
+                metric
+                for rollout in group.rollouts
+                for rollout_turn in rollout.turns
+                for metric in rollout_turn.metrics
+            ]
+            if self.config.log_samples:
+                _log_samples([group])
+            self.rollout_recorder.record(
+                step=self._train_version + 1,
+                is_validation=False,
+                rollout_groups=[group],
+            )
+            await buffer.put(
+                episodes,
+                rollout_metrics + generation_metrics + episode_metrics,
+                train_version=self._train_version,
+            )
+
+    async def _consume_and_train(
+        self, buffer: EpisodeBuffer, *, num_steps: int
+    ) -> None:
+        """Consumer: each step pull one packed batch, train + optim, then push/pull weights
+        (hotswap) and advance `_train_version`. The `get_batch` wait is the trainer-idle bubble.
+        """
+        for step in range(1, num_steps + 1):
+            sl.set_step(step)
+            # Propagate the step counter to actors for structured logging.
+            self.trainer.sync_log_step.call(step)
+            self.generator.sync_log_step.call(step)
+            t_step_start = time.perf_counter()
+
+            # --- wait for one fresh batch (this wait is the trainer idle time) ---
+            t_get_start = time.perf_counter()
+            batch = await buffer.get_batch(train_version=self._train_version)
+            if batch is None:
+                logger.info("Episode buffer closed and drained; stopping training")
+                break
+            microbatches, num_global_valid_tokens, buffer_metrics = batch
+            t_get_s = time.perf_counter() - t_get_start
+
+            # --- train ---
+            # Aggregate metrics across gradient-accumulation microbatches: "/mean" and "/frac" are
+            # pre-normalized by num_global_valid_tokens (sum reconstructs the global value); "/max"
+            # takes the max.
+            t_train_start = time.perf_counter()
+            fwd_bwd_metrics: dict[str, float] = {}
+            for microbatch in microbatches:
+                with sl.log_trace_span("trainer_forward_backward_call"):
+                    mb_metrics = self._get_rank_0_value(
+                        await self.trainer.forward_backward.call(
+                            microbatch, num_global_valid_tokens
+                        )
+                    )
+                    for k, v in mb_metrics.items():
+                        if k not in fwd_bwd_metrics:
+                            fwd_bwd_metrics[k] = v
+                        elif k.endswith("/max"):
+                            fwd_bwd_metrics[k] = max(fwd_bwd_metrics[k], v)
+                        elif k.endswith(("/mean", "/frac")):
+                            fwd_bwd_metrics[k] += v
+
+            # Divergence check before optim/sync, so a bad step never publishes weights.
+            if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
+                logger.error("Loss is NaN/Inf; training diverged")
+                break
+
+            with sl.log_trace_span("trainer_optim_step_call"):
+                optim_output = self._get_rank_0_value(
+                    await self.trainer.optim_step.call()
+                )
+            t_train_s = time.perf_counter() - t_train_start
+
+            # --- weight sync: push, then pull (the engine keeps generating during the pull) ---
+            t_push_start = time.perf_counter()
+            with sl.log_trace_span("trainer_push_model_state_dict"):
+                await self.trainer.push_model_state_dict.call()
+            t_weight_sync_push_s = time.perf_counter() - t_push_start
+            with sl.log_trace_span("generator_pull_model_state_dict"):
+                await self.generator.pull_model_state_dict.call(
+                    optim_output.policy_version
+                )
+            t_weight_sync_total_s = time.perf_counter() - t_push_start
+            # From here the producer samples at, and the buffer measures staleness against, the
+            # new version.
+            self._train_version = optim_output.policy_version
+            t_step_s = time.perf_counter() - t_step_start
+
+            # --- metrics (rollout/episode/packing/staleness ride out of the buffer with the batch) ---
+            step_metrics: list[m.Metric] = list(buffer_metrics)
+            step_metrics += [
+                m.Metric(k, m.NoReduce(v)) for k, v in fwd_bwd_metrics.items()
+            ]
+            step_metrics += [
+                m.Metric(k, m.NoReduce(v)) for k, v in optim_output.metrics.items()
+            ]
+            for key, value in [
+                ("timing/step", t_step_s),
+                ("timing/get_batch", t_get_s),
+                ("timing/train", t_train_s),
+                ("timing/weight_sync/push", t_weight_sync_push_s),
+                ("timing/weight_sync/total", t_weight_sync_total_s),
+                (
+                    "controller/trainer_idle_time_ratio",
+                    t_get_s / t_step_s if t_step_s else 0.0,
+                ),
+            ]:
+                step_metrics.append(m.Metric(key, m.NoReduce(value)))
+
+            # TODO(perf-metrics): this is trained-tokens / WHOLE step (goodput). Add per-component
+            #   active throughput (tokens/t_train) and a producer tokens/s so the active-vs-goodput
+            #   gap (the trainer-idle bubble) is visible.
+            step_metrics.append(
+                m.Metric(
+                    "perf/tokens_per_second",
+                    m.NoReduce(num_global_valid_tokens / t_step_s if t_step_s else 0.0),
+                )
+            )
+            self.metrics_processor.log(
+                step=step, metrics=step_metrics, is_validation=False
+            )

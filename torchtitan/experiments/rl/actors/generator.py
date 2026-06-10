@@ -596,6 +596,15 @@ class VLLMGenerator(Actor, Configurable):
                                 prompt=engine_input,
                                 params=self._build_sampling_params(request.sampling),
                             )
+                            # Stamp the admission (sampling) version. A pull takes priority over
+                            # STEP in `_decide_next_action`, so by here `policy_version` already
+                            # reflects any just-applied swap. Only rank 0 holds the futures.
+                            # TODO(async): record exact in-turn swap boundaries (a mid-decode pull
+                            #   splits this into >1 interval); FINAL_ONLY output hides per-step counts.
+                            if self._tp_rank == 0:
+                                self._inflight_requests[
+                                    request.request_id
+                                ].version_intervals = [(0, self.policy_version)]
 
                 # Barrier 2 (NCCL): a burst of steps (then loop back for a new decision)
                 for _ in range(self.config.max_steps_per_iteration):
@@ -684,14 +693,19 @@ class VLLMGenerator(Actor, Configurable):
                     m.Mean(inflight_at_completion),
                 )
             )
+            # Attribute the completion to the version it was ADMITTED (sampled) at, not the
+            # current `self.policy_version` (a mid-flight hotswap may have advanced it): the
+            # off-policy filter must see the oldest version the tokens were sampled at.
+            admission_version = inflight.version_intervals[0][1]
             inflight.future.set_result(
                 Completion(
-                    policy_version=self.policy_version,
+                    policy_version=admission_version,
                     request_id=request_output.request_id,
                     token_ids=list(completion_output.token_ids),
                     token_logprobs=token_logprobs,
                     finish_reason=completion_output.finish_reason,
                     metrics=metrics,
+                    version_intervals=inflight.version_intervals,
                 )
             )
 
@@ -829,10 +843,12 @@ class PendingRequest:
 class _InflightRequest:
     """RANK 0: an admitted request the loop will resolve. `metrics_prefix` namespaces the
     per-generation metrics built at completion (e.g. "generator" vs "validation_generator").
+    `version_intervals` records the policy version this request was admitted at (see `Completion`).
     """
 
     future: asyncio.Future[Completion]
     metrics_prefix: str
+    version_intervals: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass(kw_only=True, slots=True)
