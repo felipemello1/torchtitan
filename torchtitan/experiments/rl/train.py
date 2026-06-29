@@ -38,6 +38,7 @@ from monarch.actor import HostMesh, ProcMesh, this_host
 
 from torchtitan.config import ConfigManager, ParallelismConfig
 from torchtitan.experiments.rl.controller import Controller
+from torchtitan.experiments.rl.gantt import best_effort_generate_rl_gantt_on_shutdown
 from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismConfig
 from torchtitan.observability import structured_logger as sl
 
@@ -281,6 +282,15 @@ async def main():
         logger.info("Interrupted; attempting graceful shutdown...")
     finally:
         await rl_trainer.close()
+        # expected rank-0 sources: controller + trainer + one per generator.
+        if (
+            config.generate_gantt_on_shutdown
+            and config.trainer.debug.enable_structured_logging
+        ):
+            best_effort_generate_rl_gantt_on_shutdown(
+                config.dump_folder,
+                expected_rank0_files=2 + config.num_generators,
+            )
 
 
 if __name__ == "__main__":

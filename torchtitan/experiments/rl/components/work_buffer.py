@@ -107,6 +107,7 @@ class RolloutGroupWorkBuffer(Configurable):
     def _has_active_slot_available(self) -> bool:
         return self._active_rollout_groups < self._max_active_rollout_groups
 
+    @sl.log_trace_span("wait_for_slot")
     async def wait_for_slot(self) -> bool:
         """Wait until one more rollout group may enter the active off-policy window.
 
@@ -161,7 +162,7 @@ class RolloutGroupWorkBuffer(Configurable):
             work.state = _RolloutGroupWorkState.FINALIZED
             self._condition.notify_all()
 
-    @sl.log_trace_span("take_finalized")
+    @sl.log_trace_span("wait_for_finalized_group")
     async def take_finalized(self) -> RolloutGroup | None:
         """Batcher loop: strict FIFO — return the OLDEST group once it is FINALIZED, else stall.
 

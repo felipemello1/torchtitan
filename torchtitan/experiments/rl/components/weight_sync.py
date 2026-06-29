@@ -14,6 +14,7 @@ from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.routing.inter_generator_router import (
     InterGeneratorRouter,
 )
+from torchtitan.experiments.rl.trace_names import WEIGHT_SYNC_MANAGER_TASK_NAME
 from torchtitan.observability import structured_logger as sl
 
 # dummy no-op for step 0, used in WeightSyncManager
@@ -71,10 +72,15 @@ class WeightSyncManager:
         Args:
             version: policy version the generators hold after the pull completes.
         """
-        push_task = asyncio.create_task(self._trainer_push())
+        # Both tasks share one name so the gantt pins them to a single weight_sync row. Safe: pull awaits
+        # push, and the next step awaits the previous push+pull before starting, so the two never overlap.
+        push_task = asyncio.create_task(
+            self._trainer_push(), name=WEIGHT_SYNC_MANAGER_TASK_NAME
+        )
         self._trainer_push_task = push_task
         self._generator_pull_task = asyncio.create_task(
-            self._generator_pull_and_release_buffer_slots(version, push_task)
+            self._generator_pull_and_release_buffer_slots(version, push_task),
+            name=WEIGHT_SYNC_MANAGER_TASK_NAME,
         )
 
     async def wait_prev_push(self) -> list[m.Metric]:
