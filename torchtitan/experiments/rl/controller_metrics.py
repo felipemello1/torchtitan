@@ -80,7 +80,7 @@ def combine_microbatch_metrics(
 
 
 def compute_perf_ratio_metrics(
-    *, num_global_valid_tokens: int, time_metrics: list[m.Metric]
+    *, num_global_packed_tokens: int, time_metrics: list[m.Metric]
 ) -> list[m.Metric]:
     """Trainer-side timing ratios from the flushed step timers. A ratio is emitted only if every span
     it needs was recorded this step (no fallback zeros)."""
@@ -114,8 +114,9 @@ def compute_perf_ratio_metrics(
         out.append(m.Metric(key, m.NoReduce(value)))
 
     # Throughput over the whole step (includes the idle wait for the next batch).
+    # Packed tokens (all non-padded, not just loss-masked) so this matches slime's actor_train_tok_per_s.
     _add_metric(
-        "perf/trainer/tokens_per_second_full_step", num_global_valid_tokens / step_s
+        "perf/trainer/tokens_per_second_full_step", num_global_packed_tokens / step_s
     )
 
     # Each span's share of the step wall-clock (skip a span that was not recorded).
@@ -139,7 +140,7 @@ def compute_perf_ratio_metrics(
         if compute_s:
             _add_metric(
                 "perf/trainer/tokens_per_second_fwd_bwd",
-                num_global_valid_tokens / compute_s,
+                num_global_packed_tokens / compute_s,
             )
 
     # Step time the measured spans don't cover -- only when every span is present, else it misleads.

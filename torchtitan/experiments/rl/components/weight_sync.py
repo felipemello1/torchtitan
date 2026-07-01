@@ -102,6 +102,9 @@ class WeightSyncManager:
 
     async def _trainer_push(self) -> None:
         with sl.log_trace_span("trainer_push_model_state_dict"):
+            # TODO: not the true push time — this perf_counter spans an await, so under overlap it
+            #   absorbs the concurrent fwd/bwd (reads ~3s overlapped vs ~0.4s run alone). Time the
+            #   copy where it is a non-yielding region (torchstore's copy stream) for a real number.
             start = time.perf_counter()
             await self._trainer.push_model_state_dict.call()
             self._last_push_s = time.perf_counter() - start
