@@ -47,7 +47,7 @@ RL_COLLAPSE: tuple[CollapsedTasks, ...] = (
     CollapsedTasks(
         match=rf"^{ROLLOUT_WORKER_TASK_NAME_PREFIX}_\d+$",
         max_rows=1,
-        label="rollout worker",
+        label="rollout_worker_loop",
     ),
     # The auto-named Task-N family is one-RPC-per-task; label it by what the RPC IS on each source
     # (first match wins per source). ~num_workers*group_size concurrent -> 8 rows (raw=True for all).

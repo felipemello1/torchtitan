@@ -13,9 +13,9 @@ it without pulling in the renderer. The render policy that *uses* these lives in
 ``torchtitan/experiments/rl/gantt.py``.
 """
 
-TRAINER_TASK_NAME = "trainer"
-BATCHER_TASK_NAME = "batcher"
-DATA_INPUT_TASK_NAME = "data_input"
+TRAINER_TASK_NAME = "trainer_loop"
+BATCHER_TASK_NAME = "batcher_loop"
+DATA_INPUT_TASK_NAME = "data_input_loop"
 WEIGHT_SYNC_MANAGER_TASK_NAME = "weight_sync_manager"
 VLLM_ENGINE_TASK_NAME = "vllm_engine"
 
