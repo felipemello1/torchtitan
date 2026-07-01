@@ -37,23 +37,22 @@ What you GET (Perfetto; one process per rank file, nested spans stack as a flame
                   │ rollout worker   ▓ rollout_group ▓▓ score ▓          <- collapsed: 32 workers -> 1 row
                   └ task 0..7        ▓ generate ▓ ▓ generate ▓ ...       <- collapsed: 256 tasks -> 8 rows
 
-How it works (per source):
+How it works (two streaming passes over the selected files; memory stays bounded to the
+window, not the run):
 
-    JSONL records
-      -> select records:  file_name_regex, ranks, sources, step window
-      -> pair *_start / *_end   (LIFO stack per (source, task_name); nested spans pair correctly)
-      -> last_seconds window:   keep spans that overlap it
-      -> hide_spans:            drop matching span names from the view (opt-in; default keeps all)
-      -> assign rows:           pinned_tasks  -> one row each, in your order
-                                collapse      -> pack a task family into <= max_rows rows (extras dropped from the VIEW)
-                                task_name=None -> one "main" row  (SPMD / non-async)
-                                anything else  -> one row per task
-      -> emit Chrome trace:     process_name + thread_name(label) + X spans + i instants
+    pass 1: resolve last_steps / start_step / end_step / start_time_us
+              to a wall-clock window [start_us, end_us]
+    pass 2: stream records -> pair *_start / *_end (LIFO stack per execution key)
+              -> keep spans overlapping the window, clipped to its edges
+              -> assign rows:  pinned_tasks   -> one row each, in your order
+                               collapse       -> pack a task family into <= max_rows rows
+                               task_name=None -> one row per native thread (SPMD / non-async)
+                               anything else  -> interval-packed shared rows
+              -> emit Chrome trace: process/thread metadata + X spans + i instants
+                 (compact JSON, atomic replace)
 
 `raw=True` renders every task on its own row, all ranks, no labels (the exhaustive view).
 The JSONL on disk is the complete, all-ranks event store and is never changed here.
-
-TODO: file rotation / mtime-skipping for very long runs (windowing still reads the selected files first).
 """
 
 import argparse
@@ -62,6 +61,7 @@ import json
 import os
 import re
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass
 from glob import glob
 from typing import Any
@@ -98,13 +98,18 @@ class CollapsedTasks:
         # -> row "rollout worker"   (worker 0, which starts first)
 
         # label the same Task-N family differently on the generator vs elsewhere
-        CollapsedTasks(match=r"^Task-\d+$", max_rows=8, label="generation request", source_match="rl_generator")
+        CollapsedTasks(match=r"^Task-\d+$", max_rows=8, label="generator endpoint", source_match="rl_generator")
     """
 
     match: str
     max_rows: int | None
     label: str
     source_match: str | None = None
+
+
+# Row label for instants whose task was dropped by a collapse cap. They must stay visible
+# (errors!) but must not masquerade as events of a semantic row like "trainer_loop".
+OVERFLOW_ROW_LABEL = "overflow"
 
 
 def generate_gantt_trace(
@@ -115,12 +120,12 @@ def generate_gantt_trace(
     ranks: tuple[int, ...] | None = (0,),
     sources: tuple[str, ...] | None = None,
     file_name_regex: str | None = None,
-    last_seconds: float | None = None,
+    start_time_us: int | None = None,
+    last_steps: int | None = None,
     start_step: int | None = None,
     end_step: int | None = None,
     pinned_tasks: tuple[str, ...] = (),
     collapse: tuple[CollapsedTasks, ...] = (),
-    hide_spans: tuple[str, ...] = (),
     source_order: tuple[str, ...] = (),
 ) -> dict:
     r"""Render per-rank JSONL into a Perfetto Chrome-Trace JSON (see the module docstring).
@@ -135,15 +140,16 @@ def generate_gantt_trace(
         sources: Keep only these source names; ``None`` = all. Example: ``sources=("rl_controller",)``.
         file_name_regex: Only load files whose basename matches -- pick one run from a dir holding
             several. Example: ``file_name_regex="20260625-1941"``.
-        last_seconds: Keep only the last N seconds of the run (spans overlapping the window).
-            Example: ``last_seconds=120`` (last 2 minutes of a long run).
+        start_time_us: Drop records before this epoch-microsecond timestamp; files whose mtime
+            predates it are skipped without reading. Pass the run's start time to isolate the
+            current run in a reused dump folder. Example: ``start_time_us=run_started_us``.
+        last_steps: Keep only the final N observed training steps, resolved from the records
+            themselves -- no need to know the run's final step number. Example: ``last_steps=10``.
         start_step, end_step: Inclusive training-step window. Example: ``start_step=90, end_step=100``.
         pinned_tasks: Exact task names that each get their own row, in this order.
             Example: ``pinned_tasks=("trainer", "batcher", "data_input")``.
         collapse: Rules to fold high-cardinality task families into a few rows (see
             :class:`CollapsedTasks`). Example: ``collapse=(CollapsedTasks(r"^Task-\d+$", 8, "task"),)``.
-        hide_spans: Span-name regexes to drop from the view (opt-in; default hides nothing).
-            Example: ``hide_spans=(r"\.Config\.build$",)`` to mute env/model build spam.
         source_order: Process order by source-name prefix (rows from unlisted prefixes sort last, then
             by name). Default ``()`` = lexicographic. Example:
             ``source_order=("rl_controller", "rl_trainer", "rl_generator")``.
@@ -151,45 +157,54 @@ def generate_gantt_trace(
     Returns:
         The Chrome-Trace dict (``{"traceEvents": [...]}``), also written to ``output_path``.
     """
-    records = load_all_records(log_dir, file_name_regex=file_name_regex)
-    if not records:
-        logger.info(f"No records found in {log_dir}")
-        return {"traceEvents": []}
+    paths = _selected_jsonl_paths(
+        log_dir, file_name_regex=file_name_regex, min_time_us=start_time_us
+    )
+    effective_ranks = None if raw else ranks
 
-    # Per-record selection. raw shows all ranks; the other selectors still apply.
-    records = _filter_records(
-        records,
-        ranks=None if raw else ranks,
+    # Pass 1: resolve the step selectors to a wall-clock window (None bound = unbounded).
+    window_start_us, window_end_us = _resolve_time_window(
+        paths,
+        ranks=effective_ranks,
         sources=sources,
+        start_time_us=start_time_us,
+        last_steps=last_steps,
         start_step=start_step,
         end_step=end_step,
     )
-    if not records:
-        logger.info(f"No records left in {log_dir} after selection")
+    if window_start_us is not None:
+        # A file whose last write predates the window start closed all its spans
+        # before the window; skip it without reading.
+        paths = _selected_jsonl_paths(
+            log_dir, file_name_regex=file_name_regex, min_time_us=window_start_us
+        )
+
+    # Pass 2: stream, pair, and keep only window-overlapping spans/instants.
+    paired, instants, sources_seen = _collect_paired_and_instants(
+        _iter_selected_records(paths, ranks=effective_ranks, sources=sources),
+        window_start_us=window_start_us,
+        window_end_us=window_end_us,
+    )
+    if not paired and not instants:
+        logger.info(f"No records found in {log_dir} (after selection)")
         return {"traceEvents": []}
 
-    sources_seen = _order_sources({r["_source_file"] for r in records}, source_order)
-    source_to_pid = {s: i for i, s in enumerate(sources_seen)}
-
-    paired, instants = _collect_paired_and_instants(records, source_to_pid)
-
-    # last_seconds window after pairing so overlapping spans survive (no clipping).
-    paired, instants = _apply_last_seconds(
-        paired, instants, records, last_seconds=last_seconds
-    )
+    ordered_sources = _order_sources(sources_seen, source_order)
+    source_to_pid = {s: i for i, s in enumerate(ordered_sources)}
 
     if raw:
-        tid_by_source_and_task = _assign_tids_raw(paired)
+        tid_by_key = _assign_tids_raw(paired)
         row_labels: dict[tuple[str, int], str] = {}
     else:
-        paired = _drop_hidden_spans(paired, hide_spans)
-        paired, tid_by_source_and_task, row_labels = _assign_tids_policy(
+        paired, tid_by_key, row_labels = _assign_tids_policy(
             paired, pinned_tasks=pinned_tasks, collapse=collapse
         )
 
     # raw keeps the full per-rank basenames; the default view shortens them to role (+ index).
     process_labels = (
-        {s: s for s in sources_seen} if raw else _simplify_source_names(sources_seen)
+        {s: s for s in ordered_sources}
+        if raw
+        else _simplify_source_names(ordered_sources)
     )
 
     events = _emit_chrome_events(
@@ -197,294 +212,190 @@ def generate_gantt_trace(
         instants=instants,
         source_to_pid=source_to_pid,
         process_labels=process_labels,
-        tid_by_source_and_task=tid_by_source_and_task,
+        tid_by_key=tid_by_key,
         row_labels=row_labels,
     )
 
     trace = {"traceEvents": events}
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w") as f:
-        json.dump(trace, f, indent=2)
+    # Atomic + compact: a reader never sees a half-written file, and Perfetto
+    # ignores whitespace (indent=2 was +50% file size).
+    tmp_path = output_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(trace, f, separators=(",", ":"))
+    os.replace(tmp_path, output_path)
 
     logger.info(f"Chrome Trace: {output_path}  (raw={raw})")
-    logger.info(f"  {len(events)} events from {len(sources_seen)} sources")
+    logger.info(f"  {len(events)} events from {len(ordered_sources)} sources")
     logger.info("  View in: chrome://tracing or https://ui.perfetto.dev")
     return trace
 
 
-def load_all_records(log_dir: str, *, file_name_regex: str | None = None) -> list[dict]:
-    r"""Load JSONL records from a ``structured_logs/`` directory.
+def _selected_jsonl_paths(
+    log_dir: str, *, file_name_regex: str | None, min_time_us: int | None
+) -> list[str]:
+    """The ``*.jsonl`` files to read: basename-filtered, then mtime-skipped.
 
-    Args:
-        log_dir: Directory of ``*.jsonl`` files (one per rank).
-        file_name_regex: If set, only load files whose basename matches (``re.search``), so a
-            directory holding several runs can be narrowed to one.
-
-    Returns:
-        All records across the selected files, each annotated with ``"_source_file"`` (the
-        filename minus ``.jsonl``) for per-process grouping.
+    A file whose mtime predates ``min_time_us`` received its last record before the
+    threshold, so nothing in it can land at/after it. This keeps a reused dump folder
+    O(current run) instead of O(every run ever dumped there). Mtime only ever SKIPS
+    files; record selection is always by the records' own timestamps. A 2s slack
+    absorbs filesystems that round mtime down to whole seconds.
     """
     pattern = re.compile(file_name_regex) if file_name_regex else None
-    records = []
+    paths = []
     for path in sorted(glob(os.path.join(log_dir, "*.jsonl"))):
-        basename = os.path.basename(path)
-        if pattern is not None and not pattern.search(basename):
+        if pattern is not None and not pattern.search(os.path.basename(path)):
             continue
+        if (
+            min_time_us is not None
+            and (os.stat(path).st_mtime + 2.0) * 1_000_000 < min_time_us
+        ):
+            continue
+        paths.append(path)
+    return paths
+
+
+def _iter_selected_records(
+    paths: list[str],
+    *,
+    ranks: tuple[int, ...] | None,
+    sources: tuple[str, ...] | None,
+) -> Iterator[dict]:
+    """Stream records from ``paths`` (rank/source-filtered), tagging each with
+    ``_source_file`` (the basename minus ``.jsonl``) for per-process grouping."""
+    rank_set = set(ranks) if ranks is not None else None
+    source_set = set(sources) if sources is not None else None
+    for path in paths:
+        basename = os.path.basename(path)
         source_name = basename.rsplit(".", 1)[0] if "." in basename else basename
         with open(path) as f:
             for line in f:
                 line = line.strip()
-                if line:
-                    r = json.loads(line)
-                    r["_source_file"] = source_name
-                    records.append(r)
-    return records
+                if not line:
+                    continue
+                r = json.loads(line)
+                if rank_set is not None and r.get("global_rank") not in rank_set:
+                    continue
+                if source_set is not None and r.get("source") not in source_set:
+                    continue
+                r["_source_file"] = source_name
+                yield r
 
 
-def _filter_records(
-    records: list[dict],
+def _resolve_time_window(
+    paths: list[str],
     *,
     ranks: tuple[int, ...] | None,
     sources: tuple[str, ...] | None,
+    start_time_us: int | None,
+    last_steps: int | None,
     start_step: int | None,
     end_step: int | None,
-) -> list[dict]:
-    """Per-record selection by rank, source, and step window (``None`` = no filter)."""
-    rank_set = set(ranks) if ranks is not None else None
-    source_set = set(sources) if sources is not None else None
-    out = []
-    for r in records:
-        if (
-            rank_set is not None
-            and r.get("global_rank", r.get("rank", 0)) not in rank_set
-        ):
-            continue
-        if source_set is not None and r.get("source") not in source_set:
-            continue
-        step = r.get("step")
-        if start_step is not None and (step is None or step < start_step):
-            continue
-        if end_step is not None and (step is None or step > end_step):
-            continue
-        out.append(r)
-    return out
+) -> tuple[int | None, int | None]:
+    """Resolve the step selectors to a ``[start_us, end_us]`` wall-clock window (pass 1).
 
-
-def _apply_last_seconds(
-    paired: list[dict],
-    instants: list[dict],
-    records: list[dict],
-    *,
-    last_seconds: float | None,
-) -> tuple[list[dict], list[dict]]:
-    """Keep only the last ``last_seconds`` of the run: spans overlapping the window, instants inside it.
-
-    The window is ``[max_time_us - last_seconds*1e6, max_time_us]`` over the selected records.
-    Spans are kept (not clipped) if they overlap, so context at the window edge survives.
-    """
-    if last_seconds is None:
-        return paired, instants
-    hi = max((r.get("time_us") or 0) for r in records)
-    lo = hi - last_seconds * 1_000_000
-    paired = [p for p in paired if p["start_ts"] <= hi and p["end_ts"] >= lo]
-    instants = [i for i in instants if lo <= i["time_us"] <= hi]
-    return paired, instants
-
-
-def _drop_hidden_spans(paired: list[dict], hide_spans: tuple[str, ...]) -> list[dict]:
-    """Drop spans whose ``display_name`` matches any hide regex (default: hide nothing)."""
-    if not hide_spans:
-        return paired
-    patterns = [re.compile(rx) for rx in hide_spans]
-    return [
-        p for p in paired if not any(rx.search(p["display_name"]) for rx in patterns)
-    ]
-
-
-def _pack_intervals(ranges: dict[str | None, tuple[int, int]]) -> dict[str | None, int]:
-    """Interval scheduling: non-overlapping tasks reuse a row, preferring low row ids.
-
-    Row count equals peak concurrency. Among free rows we reuse the LOWEST id (not the
-    earliest-ending one), so a downstream cap (keep first K rows) retains as much
-    non-overlapping work as possible instead of stranding it on a high, dropped row.
-
-    Args:
-        ranges: ``task_name -> (min_start_ts, max_end_ts)``.
-
-    Returns:
-        ``task_name -> row`` over ``0..K-1`` where K is the peak concurrency.
+    Steps are stamps on records, but spans are drawn in time -- so the step selectors
+    become the wall-clock extent of the selected steps, and pass 2 keeps whatever
+    overlaps that extent. ``None`` bound = unbounded on that side. Memory is bounded:
+    only per-step ``[min, max]`` timestamps of the still-relevant steps are retained.
 
     Example:
 
-        _pack_intervals({"a": (0, 100), "b": (0, 90), "c": (101, 110)})
-        # -> {"a": 0, "b": 1, "c": 0}   # c reuses row 0 (free after 100), not row 1
+        # records: step 1 @ [t1a, t1b], ..., step 20 @ [t20a, t20b]
+        _resolve_time_window(paths, last_steps=10, ...)            # -> (t11a, t20b)
+        _resolve_time_window(paths, start_step=5, end_step=6, ...) # -> (t5a, t6b)
     """
-    busy: list[tuple[int, int]] = []  # heap of (end_ts, row) currently occupied
-    available: list[int] = []  # min-heap of freed row ids (reuse the lowest)
-    next_row = 0
-    row_of: dict[str | None, int] = {}
-    for task_name, (start, end) in sorted(ranges.items(), key=lambda kv: kv[1][0]):
-        # Free every row whose task has ended at/before this task starts.
-        while busy and busy[0][0] <= start:
-            _, freed = heapq.heappop(busy)
-            heapq.heappush(available, freed)
-        if available:
-            row = heapq.heappop(available)
-        else:
-            row = next_row
-            next_row += 1
-        heapq.heappush(busy, (end, row))
-        row_of[task_name] = row
-    return row_of
+    if last_steps is None and start_step is None and end_step is None:
+        return start_time_us, None
+
+    step_bounds: dict[int, list[int]] = {}
+    max_step: int | None = None
+    for r in _iter_selected_records(paths, ranks=ranks, sources=sources):
+        step = r.get("step")
+        if step is None:
+            continue
+        time_us = r["time_us"]
+        if start_time_us is not None and time_us < start_time_us:
+            continue
+        if start_step is not None and step < start_step:
+            continue
+        if end_step is not None and step > end_step:
+            continue
+        if last_steps is not None:
+            max_step = step if max_step is None else max(max_step, step)
+            cutoff = max_step - last_steps + 1
+            if step < cutoff:
+                continue
+            for old_step in [s for s in step_bounds if s < cutoff]:
+                del step_bounds[old_step]
+        bounds = step_bounds.setdefault(step, [time_us, time_us])
+        bounds[0] = min(bounds[0], time_us)
+        bounds[1] = max(bounds[1], time_us)
+
+    if not step_bounds:
+        # No stepped record matched (e.g. logs from before the first set_step); fall
+        # back to the explicit time bound only.
+        return start_time_us, None
+
+    window_start = min(b[0] for b in step_bounds.values())
+    if start_time_us is not None:
+        window_start = max(window_start, start_time_us)
+    window_end = max(b[1] for b in step_bounds.values())
+    return window_start, window_end
 
 
-def _task_ranges(spans: list[dict]) -> dict[str | None, tuple[int, int]]:
-    """Compute each task's ``[min(start_ts), max(end_ts)]`` over its spans."""
-    ranges: dict[str | None, tuple[int, int]] = {}
-    for s in spans:
-        tn = s.get("task_name")
-        start, end = s["start_ts"], s["end_ts"]
-        cur = ranges.get(tn)
-        ranges[tn] = (
-            (start, end) if cur is None else (min(cur[0], start), max(cur[1], end))
-        )
-    return ranges
+def _execution_key(record: dict) -> tuple[str, str, Any]:
+    """The LIFO-stack identity a span belongs to.
 
+    Asyncio spans pair per task; SPMD / non-async spans (``task_name=None``) pair per
+    native thread so two threads' spans never cross-pair.
 
-def _assign_tids_raw(paired: list[dict]) -> dict[tuple[str, str | None], int]:
-    """Exhaustive layout: pack every ``(source, task)`` onto its own row (no labels)."""
-    by_source: dict[str, list[dict]] = defaultdict(list)
-    for p in paired:
-        by_source[p["source"]].append(p)
-    tid_by_source_and_task: dict[tuple[str, str | None], int] = {}
-    for source, spans in by_source.items():
-        row_of = _pack_intervals(_task_ranges(spans))
-        for task_name, row in row_of.items():
-            tid_by_source_and_task[(source, task_name)] = row
-        for s in spans:
-            s["tid"] = row_of[s.get("task_name")]
-    return tid_by_source_and_task
+    Example:
 
-
-def _assign_tids_policy(
-    paired: list[dict],
-    *,
-    pinned_tasks: tuple[str, ...],
-    collapse: tuple[CollapsedTasks, ...],
-) -> tuple[list[dict], dict[tuple[str, str | None], int], dict[tuple[str, int], str]]:
-    """Caller-policy row assignment, per source: pinned -> collapse groups -> main -> other.
-
-    Returns ``(kept_paired, tid_by_source_and_task, row_labels)``; ``row_labels`` maps
-    ``(source, tid) -> label`` for ``thread_name``. Overflow tasks are dropped from the view.
-    A task is claimed by the FIRST collapse group whose ``match`` hits it.
+        _execution_key({"_source_file": "a", "task_name": "Task-3", "tid": 7})
+        # -> ("a", "task", "Task-3")
+        _execution_key({"_source_file": "a", "tid": 41})
+        # -> ("a", "thread", 41)
     """
-    compiled = [
-        (g, re.compile(g.match), re.compile(g.source_match) if g.source_match else None)
-        for g in collapse
-    ]
-
-    by_source: dict[str, list[dict]] = defaultdict(list)
-    for p in paired:
-        by_source[p["source"]].append(p)
-
-    kept_paired: list[dict] = []
-    tid_by_source_and_task: dict[tuple[str, str | None], int] = {}
-    row_labels: dict[tuple[str, int], str] = {}
-
-    for source, spans in by_source.items():
-        spans_by_task: dict[str | None, list[dict]] = defaultdict(list)
-        for s in spans:
-            spans_by_task[s.get("task_name")].append(s)
-
-        next_tid = 0
-        claimed: set[str | None] = set()
-
-        def _row(label: str) -> int:
-            nonlocal next_tid
-            tid = next_tid
-            next_tid += 1
-            row_labels[(source, tid)] = label
-            return tid
-
-        def _place(task_name: str | None, tid: int) -> None:
-            tid_by_source_and_task[(source, task_name)] = tid
-            kept_paired.extend({**s, "tid": tid} for s in spans_by_task[task_name])
-
-        # 1) pinned, in caller order
-        for task_name in pinned_tasks:
-            if task_name in spans_by_task:
-                _place(task_name, _row(task_name))
-                claimed.add(task_name)
-
-        # 2) collapse groups, in caller order (first match wins). A rule with source_match only
-        #    applies to matching sources, so the same Task-N family can be labeled per source.
-        for group, rx, source_rx in compiled:
-            if source_rx is not None and not source_rx.search(source):
-                continue
-            members = [
-                t
-                for t in spans_by_task
-                if t is not None and t not in claimed and rx.search(t)
-            ]
-            if not members:
-                continue
-            claimed.update(members)
-            row_of = _pack_intervals(
-                {t: _task_ranges(spans_by_task[t])[t] for t in members}
-            )
-            kept_rows = sorted(
-                {
-                    r
-                    for r in row_of.values()
-                    if group.max_rows is None or r < group.max_rows
-                }
-            )
-            row_to_tid = {
-                r: _row(group.label if group.max_rows == 1 else f"{group.label} {r}")
-                for r in kept_rows
-            }
-            for task_name, row in row_of.items():
-                tid = row_to_tid.get(row)
-                if tid is not None:  # else overflow -> dropped from the view
-                    _place(task_name, tid)
-
-        # 3) main (SPMD / non-async)
-        if None in spans_by_task:
-            _place(None, _row("main"))
-
-        # 4) other named tasks, one row each
-        for task_name in sorted(
-            (t for t in spans_by_task if t is not None and t not in claimed), key=str
-        ):
-            _place(task_name, _row(task_name))
-
-    return kept_paired, tid_by_source_and_task, row_labels
+    task_name = record.get("task_name")
+    if task_name is not None:
+        return (record["_source_file"], "task", task_name)
+    return (record["_source_file"], "thread", record.get("tid"))
 
 
 def _collect_paired_and_instants(
-    records: list[dict], source_to_pid: dict[str, int]
-) -> tuple[list[dict], list[dict]]:
-    """Pair ``_start`` / ``_end`` via a per-(source, task_name) LIFO stack.
+    records: Iterator[dict],
+    *,
+    window_start_us: int | None,
+    window_end_us: int | None,
+) -> tuple[list[dict], list[dict], set[str]]:
+    """Pair ``_start`` / ``_end`` via a per-execution-key LIFO stack (pass 2, streaming).
 
-    Nested spans in one task pair correctly; SPMD code has ``task_name=None`` throughout and
-    pairs on a single stack per source. Instants cover ``log_trace_instant``,
+    Spans overlapping the window are kept and CLIPPED to its edges, so one long outer
+    span (a checkpoint save, a run-long wait) can't stretch the rendered view to the
+    whole run; ``duration_ms`` keeps the true unclipped duration for the tooltip.
+    Instants must lie inside the window. Instants cover ``log_trace_instant``,
     ``log_trace_scalar`` metric values, and ``_error`` records.
     """
+    lo = window_start_us if window_start_us is not None else float("-inf")
+    hi = window_end_us if window_end_us is not None else float("inf")
+
     paired: list[dict[str, Any]] = []
     instants: list[dict[str, Any]] = []
-    pending: dict[tuple[str, str | None], list[dict]] = defaultdict(list)
+    pending: dict[tuple[str, str, Any], list[dict]] = defaultdict(list)
+    sources_seen: set[str] = set()
 
     for r in records:
-        event_type = r.get("log_type_name", "")
+        event_type = r.get("log_type_name") or ""
         log_type = r.get("log_type", "")
-        time_us = r.get("time_us") or (r.get("time_ms") or 0) * 1000
-        pid = source_to_pid[r["_source_file"]]
-        rank = r.get("rank", 0)
+        time_us = r["time_us"]
         step = r.get("step")
         task_name = r.get("task_name")
         source = r["_source_file"]
         caller = r.get("caller")
-        key = (source, task_name)
+        key = _execution_key(r)
+        sources_seen.add(source)
 
         if log_type == str(LogType.INSTANT):
             if event_type == "metric_value":
@@ -493,28 +404,24 @@ def _collect_paired_and_instants(
                 display_name = f"{event_name}={value:.4f}"
             else:
                 display_name = event_type
-            instants.append(
-                {
-                    "name": display_name,
-                    "time_us": time_us,
-                    "pid": pid,
-                    "source": source,
-                    "task_name": task_name,
-                    "step": step,
-                    "caller": caller,
-                }
-            )
+            if lo <= time_us <= hi:
+                instants.append(
+                    {
+                        "name": display_name,
+                        "time_us": time_us,
+                        "source": source,
+                        "key": key,
+                        "step": step,
+                        "caller": caller,
+                    }
+                )
         elif event_type.endswith("_start"):
             type_name = event_type.removesuffix("_start")
-            display_name = r.get("event_name") or type_name
             pending[key].append(
                 {
                     "ts": time_us,
                     "step": step,
-                    "display_name": display_name,
-                    "pid": pid,
-                    "rank": rank,
-                    "task_name": task_name,
+                    "display_name": r.get("event_name") or type_name,
                     "source": source,
                     "caller": caller,
                 }
@@ -531,14 +438,14 @@ def _collect_paired_and_instants(
             else:
                 end_ts = time_us
                 start_ts = end_ts - duration_us
+            if start_ts > hi or end_ts < lo:
+                continue
             paired.append(
                 {
-                    "pid": pid,
-                    "rank": (start or {}).get("rank", rank),
-                    "task_name": (start or {}).get("task_name", task_name),
                     "source": (start or {}).get("source", source),
-                    "start_ts": start_ts,
-                    "end_ts": end_ts,
+                    "key": key,
+                    "start_ts": int(max(start_ts, lo)),
+                    "end_ts": int(min(end_ts, hi)),
                     "display_name": (start or {}).get("display_name", type_name),
                     "step": step,
                     "duration_ms": duration_ms,
@@ -547,31 +454,224 @@ def _collect_paired_and_instants(
             )
         elif event_type.endswith("_error"):
             type_name = event_type.removesuffix("_error")
-            instants.append(
-                {
-                    "name": f"ERROR: {type_name}",
-                    "time_us": time_us,
-                    "pid": pid,
-                    "source": source,
-                    "task_name": task_name,
-                    "step": step,
-                    "caller": caller,
-                }
-            )
+            if lo <= time_us <= hi:
+                instants.append(
+                    {
+                        "name": f"ERROR: {type_name}",
+                        "time_us": time_us,
+                        "source": source,
+                        "key": key,
+                        "step": step,
+                        "caller": caller,
+                    }
+                )
         else:
-            instants.append(
+            if lo <= time_us <= hi:
+                instants.append(
+                    {
+                        "name": event_type,
+                        "time_us": time_us,
+                        "source": source,
+                        "key": key,
+                        "step": step,
+                        "caller": caller,
+                    }
+                )
+
+    return paired, instants, sources_seen
+
+
+def _pack_intervals(ranges: dict[Any, tuple[int, int]]) -> dict[Any, int]:
+    """Interval scheduling: non-overlapping tasks reuse a row, preferring low row ids.
+
+    Row count equals peak concurrency. Among free rows we reuse the LOWEST id (not the
+    earliest-ending one), so a downstream cap (keep first K rows) retains as much
+    non-overlapping work as possible instead of stranding it on a high, dropped row.
+
+    Args:
+        ranges: ``key -> (min_start_ts, max_end_ts)``.
+
+    Returns:
+        ``key -> row`` over ``0..K-1`` where K is the peak concurrency.
+
+    Example:
+
+        _pack_intervals({"a": (0, 100), "b": (0, 90), "c": (101, 110)})
+        # -> {"a": 0, "b": 1, "c": 0}   # c reuses row 0 (free after 100), not row 1
+    """
+    busy: list[tuple[int, int]] = []  # heap of (end_ts, row) currently occupied
+    available: list[int] = []  # min-heap of freed row ids (reuse the lowest)
+    next_row = 0
+    row_of: dict[Any, int] = {}
+    for key, (start, end) in sorted(
+        ranges.items(), key=lambda kv: (kv[1][0], str(kv[0]))
+    ):
+        # Free every row whose task has ended at/before this task starts.
+        while busy and busy[0][0] <= start:
+            _, freed = heapq.heappop(busy)
+            heapq.heappush(available, freed)
+        if available:
+            row = heapq.heappop(available)
+        else:
+            row = next_row
+            next_row += 1
+        heapq.heappush(busy, (end, row))
+        row_of[key] = row
+    return row_of
+
+
+def _key_ranges(spans: list[dict]) -> dict[Any, tuple[int, int]]:
+    """Each execution key's ``[min(start_ts), max(end_ts)]`` over its spans."""
+    ranges: dict[Any, tuple[int, int]] = {}
+    for s in spans:
+        key = s["key"]
+        start, end = s["start_ts"], s["end_ts"]
+        cur = ranges.get(key)
+        ranges[key] = (
+            (start, end) if cur is None else (min(cur[0], start), max(cur[1], end))
+        )
+    return ranges
+
+
+def _assign_tids_raw(paired: list[dict]) -> dict[tuple[str, str, Any], int]:
+    """Exhaustive layout: pack every execution key onto its own row (no labels)."""
+    by_source: dict[str, list[dict]] = defaultdict(list)
+    for p in paired:
+        by_source[p["source"]].append(p)
+    tid_by_key: dict[tuple[str, str, Any], int] = {}
+    for spans in by_source.values():
+        row_of = _pack_intervals(_key_ranges(spans))
+        for key, row in row_of.items():
+            tid_by_key[key] = row
+        for s in spans:
+            s["tid"] = row_of[s["key"]]
+    return tid_by_key
+
+
+def _assign_tids_policy(
+    paired: list[dict],
+    *,
+    pinned_tasks: tuple[str, ...],
+    collapse: tuple[CollapsedTasks, ...],
+) -> tuple[list[dict], dict[tuple[str, str, Any], int], dict[tuple[str, int], str]]:
+    """Caller-policy row assignment, per source: pinned -> collapse groups -> threads -> other.
+
+    Returns ``(kept_paired, tid_by_key, row_labels)``; ``row_labels`` maps
+    ``(source, tid) -> label`` for ``thread_name``. Overflow tasks are dropped from the
+    view and counted (their instants land on the overflow row; see ``_emit_chrome_events``).
+    A task is claimed by the FIRST collapse group whose ``match`` hits it.
+    """
+    compiled = [
+        (g, re.compile(g.match), re.compile(g.source_match) if g.source_match else None)
+        for g in collapse
+    ]
+
+    by_source: dict[str, list[dict]] = defaultdict(list)
+    for p in paired:
+        by_source[p["source"]].append(p)
+
+    kept_paired: list[dict] = []
+    tid_by_key: dict[tuple[str, str, Any], int] = {}
+    row_labels: dict[tuple[str, int], str] = {}
+    dropped_span_count = 0
+    dropped_task_count = 0
+
+    for source, spans in by_source.items():
+        spans_by_key: dict[tuple[str, str, Any], list[dict]] = defaultdict(list)
+        for s in spans:
+            spans_by_key[s["key"]].append(s)
+
+        next_tid = 0
+        claimed: set[tuple[str, str, Any]] = set()
+
+        def _row(label: str) -> int:
+            nonlocal next_tid
+            tid = next_tid
+            next_tid += 1
+            row_labels[(source, tid)] = label
+            return tid
+
+        def _place(key: tuple[str, str, Any], tid: int) -> None:
+            tid_by_key[key] = tid
+            kept_paired.extend({**s, "tid": tid} for s in spans_by_key[key])
+
+        # 1) pinned, in caller order
+        for task_name in pinned_tasks:
+            key = (source, "task", task_name)
+            if key in spans_by_key:
+                _place(key, _row(task_name))
+                claimed.add(key)
+
+        # 2) collapse groups, in caller order (first match wins). A rule with source_match only
+        #    applies to matching sources, so the same Task-N family can be labeled per source.
+        for group, rx, source_rx in compiled:
+            if source_rx is not None and not source_rx.search(source):
+                continue
+            members = [
+                k
+                for k in spans_by_key
+                if k[1] == "task" and k not in claimed and rx.search(k[2])
+            ]
+            if not members:
+                continue
+            claimed.update(members)
+            row_of = _pack_intervals(
+                {k: _key_ranges(spans_by_key[k])[k] for k in members}
+            )
+            kept_rows = sorted(
                 {
-                    "name": event_type,
-                    "time_us": time_us,
-                    "pid": pid,
-                    "source": source,
-                    "task_name": task_name,
-                    "step": step,
-                    "caller": caller,
+                    r
+                    for r in row_of.values()
+                    if group.max_rows is None or r < group.max_rows
                 }
             )
+            row_to_tid = {
+                r: _row(group.label if group.max_rows == 1 else f"{group.label} {r}")
+                for r in kept_rows
+            }
+            for key, row in row_of.items():
+                tid = row_to_tid.get(row)
+                if tid is not None:
+                    _place(key, tid)
+                else:  # overflow: dropped from the view; instants go to the overflow row
+                    dropped_span_count += len(spans_by_key[key])
+                    dropped_task_count += 1
 
-    return paired, instants
+        # 3) native threads (SPMD / non-async): one row per thread. A single-thread source
+        #    keeps the plain "main" label.
+        thread_keys = sorted(
+            (k for k in spans_by_key if k[1] == "thread"), key=lambda k: str(k[2])
+        )
+        for key in thread_keys:
+            label = "main" if len(thread_keys) == 1 else f"main {key[2]}"
+            _place(key, _row(label))
+
+        # 4) other named tasks: interval-packed so sequential one-shot tasks share a row
+        #    (e.g. 5 sequential endpoint calls -> 1 row, not 5). A row holding exactly one
+        #    task keeps that task's name as its label.
+        other = [k for k in spans_by_key if k[1] == "task" and k not in claimed]
+        if other:
+            row_of = _pack_intervals(
+                {k: _key_ranges(spans_by_key[k])[k] for k in other}
+            )
+            keys_per_row: dict[int, list] = defaultdict(list)
+            for key, row in row_of.items():
+                keys_per_row[row].append(key)
+            row_to_tid = {}
+            for row in sorted(keys_per_row):
+                keys = keys_per_row[row]
+                label = keys[0][2] if len(keys) == 1 else f"tasks {row}"
+                row_to_tid[row] = _row(label)
+            for key, row in row_of.items():
+                _place(key, row_to_tid[row])
+
+    if dropped_task_count:
+        logger.info(
+            f"Gantt view omitted {dropped_span_count} spans across {dropped_task_count} "
+            f"tasks due to collapse row caps; use raw=True for an exhaustive render"
+        )
+
+    return kept_paired, tid_by_key, row_labels
 
 
 def _order_sources(sources: set[str], source_order: tuple[str, ...]) -> list[str]:
@@ -624,16 +724,6 @@ def _simplify_source_names(sources: list[str]) -> dict[str, str]:
     return labels
 
 
-def _resolve_instant_tid(
-    *,
-    source: str,
-    task_name: str | None,
-    tid_by_source_and_task: dict[tuple[str, str | None], int],
-) -> int:
-    """Instant goes on its task's row if kept, else the source's first row (row 0)."""
-    return tid_by_source_and_task.get((source, task_name), 0)
-
-
 def _chrome_tid_for_row(pid: int, row_index: int) -> int:
     """Map a semantic row index to the Chrome-trace ``tid`` Perfetto should use.
 
@@ -658,12 +748,40 @@ def _emit_chrome_events(
     instants: list[dict],
     source_to_pid: dict[str, int],
     process_labels: dict[str, str],
-    tid_by_source_and_task: dict[tuple[str, str | None], int],
+    tid_by_key: dict[tuple[str, str, Any], int],
     row_labels: dict[tuple[str, int], str],
 ) -> list[dict]:
-    """Build the Chrome Trace events: ``process_name`` per source, ``thread_name`` per labeled
-    row, ``thread_sort_index`` so Perfetto honors our row order, ``X`` per span, ``i`` per instant."""
+    """Build the Chrome Trace events: ``process_name`` + ``process_sort_index`` per source,
+    ``thread_name`` + ``thread_sort_index`` per labeled row, ``X`` per span, ``i`` per instant.
+
+    An instant whose task was dropped by a collapse cap lands on a per-source ``overflow``
+    row (created on demand), NOT on row 0 -- an error from a dropped task must stay visible
+    without masquerading as a main-loop event.
+    """
     events: list[dict[str, Any]] = []
+
+    # Resolve instant rows first: they may mint overflow rows, which must be labeled
+    # before the thread-metadata pass below.
+    next_row_by_source: dict[str, int] = defaultdict(int)
+    for source, row_index in row_labels:
+        next_row_by_source[source] = max(next_row_by_source[source], row_index + 1)
+    overflow_row_by_source: dict[str, int] = {}
+
+    def _overflow_row(source: str) -> int:
+        if source not in overflow_row_by_source:
+            row_index = next_row_by_source[source]
+            next_row_by_source[source] = row_index + 1
+            overflow_row_by_source[source] = row_index
+            row_labels[(source, row_index)] = OVERFLOW_ROW_LABEL
+        return overflow_row_by_source[source]
+
+    instant_rows = []
+    for i in instants:
+        row_index = tid_by_key.get(i["key"])
+        if row_index is None:
+            # raw mode has no labels and keeps every key; only the policy view drops tasks.
+            row_index = _overflow_row(i["source"]) if row_labels else 0
+        instant_rows.append(row_index)
 
     for source, pid in source_to_pid.items():
         events.append(
@@ -675,9 +793,19 @@ def _emit_chrome_events(
                 "args": {"name": process_labels[source]},
             }
         )
+        # Perfetto orders processes by this metadata; pids are assigned in source_order.
+        events.append(
+            {
+                "name": "process_sort_index",
+                "ph": "M",
+                "pid": pid,
+                "tid": 0,
+                "args": {"sort_index": pid},
+            }
+        )
 
-    # thread_name + thread_sort_index per row. The emitted tid claims the main-thread slot for row 0;
-    # sort_index keeps our semantic row order (row_index) for the rest.
+    # thread_name + thread_sort_index per row. The emitted tid claims the main-thread slot for
+    # row 0; sort_index keeps our semantic row order (row_index) for the rest.
     for (source, row_index), label in row_labels.items():
         pid = source_to_pid[source]
         chrome_tid = _chrome_tid_for_row(pid, row_index)
@@ -708,34 +836,31 @@ def _emit_chrome_events(
         }
         if p.get("caller"):
             args["caller"] = p["caller"]
+        pid = source_to_pid[p["source"]]
         events.append(
             {
                 "name": p["display_name"],
                 "ph": "X",
                 "ts": p["start_ts"],
                 "dur": p["end_ts"] - p["start_ts"],
-                "pid": p["pid"],
-                "tid": _chrome_tid_for_row(p["pid"], p.get("tid", 0)),
+                "pid": pid,
+                "tid": _chrome_tid_for_row(pid, p.get("tid", 0)),
                 "args": args,
             }
         )
 
-    for i in instants:
-        row_index = _resolve_instant_tid(
-            source=i["source"],
-            task_name=i["task_name"],
-            tid_by_source_and_task=tid_by_source_and_task,
-        )
+    for i, row_index in zip(instants, instant_rows):
         args = {**({"step": i["step"]} if i["step"] is not None else {})}
         if i.get("caller"):
             args["caller"] = i["caller"]
+        pid = source_to_pid[i["source"]]
         events.append(
             {
                 "name": i["name"],
                 "ph": "i",
                 "ts": i["time_us"],
-                "pid": i["pid"],
-                "tid": _chrome_tid_for_row(i["pid"], row_index),
+                "pid": pid,
+                "tid": _chrome_tid_for_row(pid, row_index),
                 "s": "t",
                 "args": args,
             }
@@ -775,10 +900,16 @@ def main() -> None:
         help="Only load files whose basename matches.",
     )
     p.add_argument(
-        "--last-seconds",
-        type=float,
+        "--start-time-us",
+        type=int,
         default=None,
-        help="Keep only the last N seconds of the run.",
+        help="Drop records before this epoch-microsecond timestamp.",
+    )
+    p.add_argument(
+        "--last-steps",
+        type=int,
+        default=None,
+        help="Keep only the final N observed training steps.",
     )
     p.add_argument("--start-step", type=int, default=None)
     p.add_argument("--end-step", type=int, default=None)
@@ -788,12 +919,6 @@ def main() -> None:
         default=None,
         help="Comma-separated task names to pin as their own rows.",
     )
-    p.add_argument(
-        "--hide-span",
-        action="append",
-        default=None,
-        help="Span-name regex to hide (repeatable).",
-    )
     args = p.parse_args()
 
     ranks = (
@@ -801,7 +926,6 @@ def main() -> None:
     )
     sources = tuple(args.sources.split(",")) if args.sources else None
     pinned = tuple(args.pinned.split(",")) if args.pinned else ()
-    hide = tuple(args.hide_span) if args.hide_span else ()
 
     generate_gantt_trace(
         args.log_dir,
@@ -810,11 +934,11 @@ def main() -> None:
         ranks=ranks,
         sources=sources,
         file_name_regex=args.file_name_regex,
-        last_seconds=args.last_seconds,
+        start_time_us=args.start_time_us,
+        last_steps=args.last_steps,
         start_step=args.start_step,
         end_step=args.end_step,
         pinned_tasks=pinned,
-        hide_spans=hide,
     )
 
 

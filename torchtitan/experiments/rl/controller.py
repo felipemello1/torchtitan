@@ -221,6 +221,11 @@ class Controller(Configurable):
         """On shutdown, best-effort render the structured-log gantt to ``dump_folder/gantt.json``
         (needs structured logging enabled). Set False to skip the auto-render."""
 
+        gantt_last_steps: int | None = 10
+        """Step window for the auto-rendered gantt: the final N steps. None = full run (fine for
+        short runs; a ~1000-step full render is too big to open). Any other window can be
+        re-rendered from ``structured_logs/`` via ``generate_rl_gantt(..., start_step=...)``."""
+
         async_loop: AsyncLoopConfig = field(default_factory=AsyncLoopConfig)
         """How the data->rollout->batch->train loop is sized and coordinated."""
 

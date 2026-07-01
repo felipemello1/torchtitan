@@ -19,7 +19,6 @@ import random
 import socket
 import string
 import threading
-from timeit import default_timer as timer
 from typing import Any
 
 from torchtitan.observability.structured_logger.step_state import (
@@ -49,10 +48,12 @@ class TraceJsonlFormatter(logging.Formatter):
 
     Example output (wrapped for readability)::
 
-        {"rank": 0, "source": "training", "step": 5,
-         "log_type_name": "fwd_bwd_end", "value": 12.5, "task_name": "Task-1",
-         "step_tags": ["gc"],
-         "time_us": 1709500000123456, "caller": "trainer.py:796:train_step",
+        {"global_rank": 0, "local_rank": 0, "source": "rl_trainer",
+         "host_name": "devgpu001", "pid": 4242, "tid": 4242,
+         "step": 5, "relative_step": 5, "step_tags": ["gc"],
+         "time_us": 1709500000123456, "log_type": "event",
+         "log_type_name": "fwd_bwd_end", "event_name": null, "value": 12.5,
+         "task_name": "trainer_loop", "caller": "trainer.py:796:train_step",
          "seq_id": 42}
     """
 
@@ -63,58 +64,47 @@ class TraceJsonlFormatter(logging.Formatter):
         self._local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self._host_name = socket.gethostname()
         self._seq_counter = itertools.count()
-        # Per-instance threadlocal: prevents delta_ms leakage when multiple
-        # formatters (e.g. default JSONL + custom backend) are attached to
-        # the same logger in the same process.
-        self._thread_local = threading.local()
 
     def format(self, record: logging.LogRecord) -> str:
         return json.dumps(self._log_dict(record))
 
     def _log_dict(self, record: logging.LogRecord) -> dict[str, Any]:
-        """Build the flat dict emitted as one JSONL line."""
-        log_dict: dict[str, Any] = {}
+        """Build the flat dict emitted as one JSONL line.
 
-        log_dict["delta_ms"] = self._refresh_event_delta()
-        log_dict["tid"] = threading.get_native_id()
+        `host_name`/`pid` stay on every row (not just a startup record): `global_rank`
+        is mesh-local (trainer and generator both have rank 0), so they are the only
+        physical-process identity a windowed or merged read can rely on.
+        """
+        log_dict: dict[str, Any] = {
+            "global_rank": self.rank,
+            "local_rank": self._local_rank,
+            "source": self.source,
+            "host_name": self._host_name,
+            "pid": os.getpid(),
+            "tid": threading.get_native_id(),
+        }
 
-        # Rank/source from self (constants, set once in init_structured_logger)
-        log_dict["rank"] = self.rank
-        log_dict["global_rank"] = self.rank
-        log_dict["local_rank"] = self._local_rank
-        log_dict["source"] = self.source
-        log_dict["host_name"] = self._host_name
-        log_dict["pid"] = os.getpid()
-
-        # Step/step_tags/relative_step from hybrid ContextVar/globals
-        step = get_step()
+        # Step context: per-record override (from event_extra) wins over step_state.
+        step = getattr(record, str(ExtraFields.STEP), None)
+        step = step if step is not None else get_step()
         if step is not None:
             log_dict["step"] = step
-        relative_step = get_relative_step()
+        relative_step = getattr(record, str(ExtraFields.RELATIVE_STEP), None)
+        relative_step = (
+            relative_step if relative_step is not None else get_relative_step()
+        )
         if relative_step is not None:
             log_dict["relative_step"] = relative_step
         step_tags = get_step_tags()
         if step_tags:
             log_dict["step_tags"] = list(step_tags)
 
-        log_dict["time"] = int(record.created)
-        log_dict["time_ms"] = int(record.created * 1000)
         log_dict["time_us"] = int(record.created * 1_000_000)
-
-        log_dict["log_type"] = getattr(
-            record, str(ExtraFields.LOG_TYPE), str(LogType.TEXT)
+        log_type = getattr(record, str(ExtraFields.LOG_TYPE), str(LogType.TEXT))
+        log_dict["log_type"] = log_type
+        log_dict["log_type_name"] = getattr(
+            record, str(ExtraFields.LOG_TYPE_NAME), None
         )
-        log_type_name = getattr(record, str(ExtraFields.LOG_TYPE_NAME), None)
-        log_dict["log_type_name"] = log_type_name
-
-        # Per-record step/relative_step override (from event_extra)
-        record_step = getattr(record, str(ExtraFields.STEP), None)
-        if record_step is not None:
-            log_dict["step"] = record_step
-        record_relative_step = getattr(record, str(ExtraFields.RELATIVE_STEP), None)
-        if record_relative_step is not None:
-            log_dict["relative_step"] = record_relative_step
-
         log_dict["event_name"] = getattr(record, str(ExtraFields.EVENT_NAME), None)
 
         value = getattr(record, str(ExtraFields.VALUE), None)
@@ -130,35 +120,22 @@ class TraceJsonlFormatter(logging.Formatter):
         log_dict[
             "caller"
         ] = f"{os.path.relpath(record.pathname)}:{record.lineno}:{record.funcName}"
-        log_dict["log_file"] = record.filename
-        log_dict["log_function"] = record.funcName
-        log_dict["log_level"] = record.levelname
-        log_dict["logger_name"] = record.name
-        if record.stack_info:
-            log_dict["stack_info"] = record.stack_info
 
         log_dict["seq_id"] = next(self._seq_counter)
 
-        # Truncate long free-text messages. Event records
-        # (log_trace_span/scalar/instant) pass msg="", so this branch really
-        # only catches plain logger.info() calls routed to the structured
-        # logger -- usually a user mistake.
-        message = record.getMessage()
-        if message is not None:
-            if len(message) <= MAX_MESSAGE_SIZE:
+        # EVENT/INSTANT rows are fully described by their structured fields; the
+        # human message would duplicate them on every span (measured ~10% of file
+        # size). TEXT rows keep it -- it's all they have. Custom handlers still see
+        # the original LogRecord, so this is a JSONL-format decision only.
+        if log_type == str(LogType.TEXT):
+            message = record.getMessage()
+            if message:
+                if len(message) > MAX_MESSAGE_SIZE:
+                    half = MAX_MESSAGE_SIZE // 2
+                    message = message[:half] + "..." + message[-half:]
                 log_dict["message"] = message
-            else:
-                half = MAX_MESSAGE_SIZE // 2
-                log_dict["message"] = message[:half] + "..." + message[-half:]
 
         return log_dict
-
-    def _refresh_event_delta(self) -> float:
-        if not hasattr(self._thread_local, "last_event_time"):
-            self._thread_local.last_event_time = timer()
-        event_delta = (timer() - self._thread_local.last_event_time) * 1000
-        self._thread_local.last_event_time = timer()
-        return event_delta
 
 
 class TraceJsonlHandler(logging.FileHandler):

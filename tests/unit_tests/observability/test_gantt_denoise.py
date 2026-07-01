@@ -4,11 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Proposed additions to tests/unit_tests/observability/test_structured_logging.py.
-
-Generic renderer (policy supplied by the test, as the RL preset does) + windowing.
-Synthetic fixtures only. Run against this RC via the bundled ``run_tests.py``.
-"""
+"""Generic renderer (policy supplied by the test, as the RL preset does) + windowing.
+Synthetic fixtures only; no GPU."""
 
 import json
 from collections import defaultdict
@@ -17,6 +14,7 @@ from torchtitan.observability.structured_logger.gantt_generator import (
     _pack_intervals,
     CollapsedTasks,
     generate_gantt_trace,
+    OVERFLOW_ROW_LABEL,
 )
 
 # RL-shaped policy used by several tests (mirrors experiments/rl/gantt.py).
@@ -27,17 +25,18 @@ RL_COLLAPSE = (
 )
 
 
-def _span(task, name, t0, t1, *, rank=0, source="rl_controller", step=1):
+def _span(task, name, t0, t1, *, rank=0, source="rl_controller", step=1, tid=None):
     dur = (t1 - t0) / 1000
     base = {
         "log_type": "event",
         "global_rank": rank,
-        "rank": rank,
         "source": source,
         "step": step,
     }
     if task is not None:
         base["task_name"] = task
+    if tid is not None:
+        base["tid"] = tid
     return [
         {**base, "log_type_name": f"{name}_start", "time_us": t0},
         {**base, "log_type_name": f"{name}_end", "time_us": t1, "value": dur},
@@ -186,10 +185,15 @@ def test_thread_name_for_every_row(tmp_path):
     )
     src = "rl_controller"
     used = {e["tid"] for e in t["traceEvents"] if e["ph"] == "X"}
-    assert used == set(_labels(t)[src])
+    labeled = _labels(t)[src]
+    assert used <= set(labeled)
+    # the only labeled row without spans is the overflow row (instants only)
+    assert {label for tid, label in labeled.items() if tid not in used} <= {
+        OVERFLOW_ROW_LABEL
+    }
 
 
-def test_hide_spans_default_empty_and_opt_in(tmp_path):
+def test_all_spans_visible_by_default(tmp_path):
     _controller(tmp_path)
     t = generate_gantt_trace(
         str(tmp_path),
@@ -200,17 +204,6 @@ def test_hide_spans_default_empty_and_opt_in(tmp_path):
     assert "PolicyTrainer.Config.build" in {
         e["name"] for e in t["traceEvents"] if e["ph"] == "X"
     }
-    t = generate_gantt_trace(
-        str(tmp_path),
-        str(tmp_path / "g2.json"),
-        pinned_tasks=RL_PINNED,
-        collapse=RL_COLLAPSE,
-        hide_spans=(r"\.Config\.build$",),
-    )
-    assert "PolicyTrainer.Config.build" not in {
-        e["name"] for e in t["traceEvents"] if e["ph"] == "X"
-    }
-    assert "trainer" in next(iter(_labels(t).values())).values()  # row still present
 
 
 def test_raw_all_ranks_no_labels(tmp_path):
@@ -266,18 +259,66 @@ def test_step_window(tmp_path):
     assert sum(1 for e in t["traceEvents"] if e["ph"] == "X") == 3
 
 
-def test_last_seconds_window_keeps_overlapping(tmp_path):
-    # span "long" runs the whole time; "late" only near the end. Keep the last ~0.6ms.
-    recs = _span("trainer", "long", 0, 10000) + _span("trainer", "late", 9400, 9900)
+def test_last_steps_window(tmp_path):
+    # 1000 steps; last_steps=10 must keep exactly steps 991..1000 without the caller
+    # knowing the final step number.
+    recs = []
+    for stp in range(1, 1001):
+        recs += _span("trainer", "train_step", stp * 1000, stp * 1000 + 500, step=stp)
     _write(tmp_path, "rl_controller.global_rank_0.t.jsonl", recs)
     t = generate_gantt_trace(
         str(tmp_path),
         str(tmp_path / "g.json"),
         pinned_tasks=("trainer",),
-        last_seconds=0.0006,
-    )  # window ~[9400, 10000]
+        last_steps=10,
+    )
+    steps = {
+        e["args"]["step"]
+        for e in t["traceEvents"]
+        if e["ph"] == "X" and "step" in e["args"]
+    }
+    assert steps == set(range(991, 1001))
+
+
+def test_window_clips_boundary_span_keeps_true_duration(tmp_path):
+    # A span crossing the window edge is retained but clipped; its true duration
+    # survives in args (duration_ms comes from the record's value, not the clip).
+    recs = []
+    for stp in (1, 2):
+        recs += _span("trainer", "train_step", stp * 10_000, stp * 10_000 + 500, step=stp)
+    # crosses from step-1 territory into step 2's window: [10_200, 20_400]
+    recs += _span("trainer", "long_save", 10_200, 20_400, step=1)
+    _write(tmp_path, "rl_controller.global_rank_0.t.jsonl", recs)
+    t = generate_gantt_trace(
+        str(tmp_path),
+        str(tmp_path / "g.json"),
+        pinned_tasks=("trainer",),
+        start_step=2,
+        end_step=2,
+    )
+    long_save = [e for e in t["traceEvents"] if e["ph"] == "X" and e["name"] == "long_save"]
+    assert len(long_save) == 1
+    window_start = 20_000  # step 2's first record
+    assert long_save[0]["ts"] == window_start  # clipped to the window edge
+    assert long_save[0]["args"]["duration_ms"] == "10.20"  # true duration kept
+
+
+def test_start_time_us_drops_older_records(tmp_path):
+    # Same file holds records from an old run and the current run; start_time_us
+    # keeps only the current run's.
+    recs = _span("trainer", "old_step", 0, 1000, step=999) + _span(
+        "trainer", "new_step", 5_000_000, 5_001_000, step=1
+    )
+    _write(tmp_path, "rl_controller.global_rank_0.t.jsonl", recs)
+    t = generate_gantt_trace(
+        str(tmp_path),
+        str(tmp_path / "g.json"),
+        pinned_tasks=("trainer",),
+        start_time_us=4_000_000,
+        last_steps=10,
+    )
     names = {e["name"] for e in t["traceEvents"] if e["ph"] == "X"}
-    assert names == {"long", "late"}  # 'long' overlaps the window, 'late' is inside
+    assert names == {"new_step"}
 
 
 def test_spmd_main(tmp_path):
@@ -285,25 +326,83 @@ def test_spmd_main(tmp_path):
         _write(
             tmp_path,
             f"training.global_rank_{rank}.t.jsonl",
-            _span(None, "fwd_bwd", 0, 1000, rank=rank, source="training"),
+            _span(None, "fwd_bwd", 0, 1000, rank=rank, source="training", tid=7),
         )
     t = generate_gantt_trace(str(tmp_path), str(tmp_path / "g.json"))
     assert _rows(t) == {"training": 1}
     assert set(next(iter(_labels(t).values())).values()) == {"main"}
 
 
-def test_instant_on_dropped_task_falls_back(tmp_path):
+def test_two_native_threads_pair_separately(tmp_path):
+    # Two OS threads (task_name=None) with interleaved starts/ends: pairing per tid
+    # keeps each thread's LIFO stack intact; one shared stack would cross-pair them.
+    recs = [
+        {"log_type": "event", "global_rank": 0, "source": "training", "step": 1,
+         "tid": 11, "log_type_name": "load_start", "time_us": 0},
+        {"log_type": "event", "global_rank": 0, "source": "training", "step": 1,
+         "tid": 22, "log_type_name": "save_start", "time_us": 100},
+        {"log_type": "event", "global_rank": 0, "source": "training", "step": 1,
+         "tid": 11, "log_type_name": "load_end", "time_us": 500, "value": 0.5},
+        {"log_type": "event", "global_rank": 0, "source": "training", "step": 1,
+         "tid": 22, "log_type_name": "save_end", "time_us": 900, "value": 0.8},
+    ]
+    _write(tmp_path, "training.global_rank_0.t.jsonl", recs)
+    t = generate_gantt_trace(str(tmp_path), str(tmp_path / "g.json"))
+    spans = {e["name"]: e for e in t["traceEvents"] if e["ph"] == "X"}
+    assert spans["load"]["dur"] == 500  # 0 -> 500 on thread 11
+    assert spans["save"]["dur"] == 800  # 100 -> 900 on thread 22
+    assert spans["load"]["tid"] != spans["save"]["tid"]  # one row per thread
+
+
+def test_instant_on_dropped_task_goes_to_overflow_row(tmp_path):
+    # The `loss` instant's task (Task-19) is dropped by the max_rows cap below; the
+    # instant must land on a labeled overflow row, not masquerade on a semantic row 0.
     _controller(tmp_path)
+    collapse = (CollapsedTasks(match=r"^Task-\d+$", max_rows=2, label="task"),)
     t = generate_gantt_trace(
         str(tmp_path),
         str(tmp_path / "g.json"),
         pinned_tasks=RL_PINNED,
-        collapse=RL_COLLAPSE,
+        collapse=collapse,
     )
+    lbl = next(iter(_labels(t).values()))
+    overflow_tids = [tid for tid, label in lbl.items() if label == OVERFLOW_ROW_LABEL]
+    assert len(overflow_tids) == 1
     loss = [
         e for e in t["traceEvents"] if e["ph"] == "i" and e["name"].startswith("loss")
     ]
-    assert loss and all(e["tid"] == 0 for e in loss)
+    assert loss and all(e["tid"] == overflow_tids[0] for e in loss)
+
+
+def test_instant_on_kept_task_stays_on_its_row(tmp_path):
+    # With all 20 Task-N rows kept, Task-19's instant renders on Task-19's row.
+    _controller(tmp_path)
+    collapse = (CollapsedTasks(match=r"^Task-\d+$", max_rows=None, label="task"),)
+    t = generate_gantt_trace(
+        str(tmp_path),
+        str(tmp_path / "g.json"),
+        pinned_tasks=RL_PINNED,
+        collapse=collapse,
+    )
+    lbl = next(iter(_labels(t).values()))
+    assert OVERFLOW_ROW_LABEL not in lbl.values()
+    loss = [
+        e for e in t["traceEvents"] if e["ph"] == "i" and e["name"].startswith("loss")
+    ]
+    assert len(loss) == 1
+
+
+def test_sequential_unclaimed_tasks_share_one_row(tmp_path):
+    # 5 sequential named tasks not matching any collapse rule: interval packing puts
+    # them on ONE shared row (like 5 sequential endpoint calls), not five rows.
+    recs = []
+    for i, task in enumerate(["Task-2", "Task-4", "Task-6", "Task-8", "Task-10"]):
+        start = 1000 + i * 10_000
+        recs += _span(task, "work", start, start + 500)
+    _write(tmp_path, "rl_controller.global_rank_0.t.jsonl", recs)
+    t = generate_gantt_trace(str(tmp_path), str(tmp_path / "g.json"))
+    tids = {e["tid"] for e in t["traceEvents"] if e["ph"] == "X"}
+    assert len(tids) == 1
 
 
 def test_determinism(tmp_path):
@@ -378,7 +477,7 @@ def test_process_names_simplified_default_full_in_raw(tmp_path):
     }
 
 
-def test_thread_sort_index_present_and_matches_tid(tmp_path):
+def test_thread_sort_index_covers_rendered_rows(tmp_path):
     _controller(tmp_path)
     t = generate_gantt_trace(
         str(tmp_path),
@@ -391,6 +490,39 @@ def test_thread_sort_index_present_and_matches_tid(tmp_path):
         for e in t["traceEvents"]
         if e["ph"] == "M" and e["name"] == "thread_sort_index"
     ]
-    assert sort_idx and all(e["args"]["sort_index"] == e["tid"] for e in sort_idx)
+    assert sort_idx
     rendered = {(e["pid"], e["tid"]) for e in t["traceEvents"] if e["ph"] == "X"}
     assert rendered <= {(e["pid"], e["tid"]) for e in sort_idx}
+
+
+def test_process_sort_index_one_per_pid_matching_pid(tmp_path):
+    # Perfetto orders processes by process_sort_index; pids are assigned in
+    # source_order, so sort_index == pid keeps controller -> trainer -> generator.
+    _controller(tmp_path)
+    _write(
+        tmp_path,
+        "rl_generator.global_rank_0.t.jsonl",
+        _span("vllm_engine", "vllm_engine_step_burst", 0, 1000, source="rl_generator"),
+    )
+    t = generate_gantt_trace(
+        str(tmp_path),
+        str(tmp_path / "g.json"),
+        pinned_tasks=RL_PINNED,
+        collapse=RL_COLLAPSE,
+        source_order=("rl_controller", "rl_trainer", "rl_generator"),
+    )
+    proc_sort = [
+        e
+        for e in t["traceEvents"]
+        if e["ph"] == "M" and e["name"] == "process_sort_index"
+    ]
+    pids = {e["pid"] for e in t["traceEvents"] if e["ph"] == "X"}
+    assert {e["pid"] for e in proc_sort} == pids  # one per rendered pid
+    assert all(e["args"]["sort_index"] == e["pid"] for e in proc_sort)
+    # controller got pid 0 (first in source_order), generator a higher pid
+    pid_name = {
+        e["pid"]: e["args"]["name"]
+        for e in t["traceEvents"]
+        if e["ph"] == "M" and e["name"] == "process_name"
+    }
+    assert pid_name[0] == "rl_controller"
