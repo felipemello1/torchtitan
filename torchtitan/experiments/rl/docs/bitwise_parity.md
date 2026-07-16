@@ -169,6 +169,8 @@ group_size 8 = 32 rollouts/step. The two runs differ ONLY in
 | trainer full-step throughput  | 11.1 tok/s         | 9.2 tok/s | 1.2x slower     |
 | kl_div max / logprob_diff max | 0.0084 / 1.56 (>0) | 0 / 0     | bitwise parity  |
 
+Trainer throughput rows above use the former loss-masked-token numerator and are not comparable with later all-input-token measurements.
+
 **Takeaways.**
 
 - Batch-invariant mode makes the raw *compute* ~2.4-2.9x slower (generator

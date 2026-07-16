@@ -160,6 +160,10 @@ class Batcher(Configurable):
             num_global_valid_tokens=sum(
                 int(row["loss_mask"].sum().item()) for row in packed_rows
             ),
+            num_global_input_tokens=sum(
+                len(training_sample.token_ids) - 1
+                for training_sample in training_samples
+            ),
             metrics=[
                 *metrics,
                 *self._packing_metrics(

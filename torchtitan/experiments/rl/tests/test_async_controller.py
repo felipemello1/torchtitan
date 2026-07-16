@@ -90,6 +90,37 @@ def test_batcher_carries_metric_only_groups_until_trainable_batch() -> None:
     assert batch.num_global_valid_tokens > 0
 
 
+def test_batcher_counts_non_padding_input_tokens_for_throughput() -> None:
+    # 3 raw tokens -> 2 model-input tokens (raw[:-1]); 1 loss-masked token;
+    # per_sample_pad_multiple=4 aligns the packed row to 4; the [1, 8] row has 8 slots.
+    # The input-token count must be the logical 2, not the aligned 4 or the 8 slots.
+    batcher = Batcher.Config(
+        batch=BatchConfig(local_batch_size=1, seq_len=8),
+        per_sample_pad_multiple=4,
+    ).build(num_groups_per_train_step=1, dp_degree=1, pad_id=0)
+    training_sample = _training_sample(group_id=0, rollout_id=0)
+    training_sample.loss_mask = [False, False, True]
+    batch = batcher.add_training_samples(
+        training_sample_group=TrainingSampleGroup(
+            group_id=0,
+            training_samples=[training_sample],
+            metrics=[],
+        )
+    )
+
+    assert batch is not None
+    assert batch.num_global_valid_tokens == 1
+    assert batch.num_global_input_tokens == 2
+    assert (
+        sum(
+            microbatch.token_ids.numel()
+            for ranks in batch.microbatches
+            for microbatch in ranks
+        )
+        == 8
+    )
+
+
 def test_microbatch_grid_spreads_pad_rows_across_cells() -> None:
     # 5 real rows, local_batch_size=2, dp_degree=2 -> 4 cells x 2 = 8 rows (3 pad).
     # Round-robin dealing spreads the pad rows so no (microbatch, rank) cell is all-pad.
@@ -117,7 +148,7 @@ def test_compute_perf_ratio_metrics_reads_flushed_means() -> None:
     ratios = {
         metric.key: metric.value.value
         for metric in compute_perf_ratio_metrics(
-            num_global_valid_tokens=100, time_metrics=time_metrics
+            num_global_input_tokens=100, time_metrics=time_metrics
         )
     }
     assert ratios["perf/trainer/tokens_per_second_full_step"] == 50.0
@@ -131,7 +162,7 @@ def test_compute_perf_ratio_metrics_skips_missing_spans() -> None:
     keys = {
         metric.key
         for metric in compute_perf_ratio_metrics(
-            num_global_valid_tokens=100, time_metrics=time_metrics
+            num_global_input_tokens=100, time_metrics=time_metrics
         )
     }
     assert keys == {"perf/trainer/tokens_per_second_full_step"}
@@ -139,7 +170,7 @@ def test_compute_perf_ratio_metrics_skips_missing_spans() -> None:
 
 def test_compute_perf_ratio_metrics_returns_empty_without_total() -> None:
     assert (
-        compute_perf_ratio_metrics(num_global_valid_tokens=100, time_metrics=[]) == []
+        compute_perf_ratio_metrics(num_global_input_tokens=100, time_metrics=[]) == []
     )
 
 

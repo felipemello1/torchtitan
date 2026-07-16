@@ -1080,7 +1080,7 @@ class Controller(Configurable):
                         *push_metrics,
                         *pull_metrics,
                         *compute_perf_ratio_metrics(
-                            num_global_valid_tokens=packed.num_global_valid_tokens,
+                            num_global_input_tokens=packed.num_global_input_tokens,
                             time_metrics=time_metrics,
                         ),
                     ],

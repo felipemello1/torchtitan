@@ -143,10 +143,14 @@ class TrainingBatch:
         #    microbatches = [[TrainingMicrobatch(token_ids=[2, 10])],
         #                    [TrainingMicrobatch(token_ids=[2, 10])]]   # mb1 = 1 real row + 1 pad row
         # num_global_valid_tokens = count of loss_mask=True tokens across the 5 samples
+        # num_global_input_tokens = 25 (5 samples x 5 non-padding model-input tokens)
     """
 
     microbatches: list[list[TrainingMicrobatch]]  # [num_microbatches][dp_degree]
     num_global_valid_tokens: int
+    """Loss-masked assistant tokens across the batch; the loss-normalization denominator."""
+    num_global_input_tokens: int
+    """Non-padding model-input tokens across the batch; the throughput numerator."""
     metrics: list[m.Metric]
     # one per packed training_sample; trainer computes policy_age at consume time
     min_policy_versions: list[int]
