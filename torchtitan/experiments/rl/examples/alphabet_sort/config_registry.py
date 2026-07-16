@@ -53,6 +53,7 @@ from torchtitan.experiments.rl.routing.strategies import (
     LeastLoadedRoutingStrategy,
     StickySessionRoutingStrategy,
 )
+from torchtitan.experiments.rl.validator import Validator
 from torchtitan.models.gpt_oss import model_registry as gpt_oss_model_registry
 from torchtitan.models.qwen3 import model_registry
 from torchtitan.protocols.model import ModelConfigConverter
@@ -88,7 +89,7 @@ def rl_grpo_qwen3_0_6b_varlen() -> Controller.Config:
             num_training_steps=10,
             num_groups_per_train_step=8,
             group_size=group_size,
-            validation=ValidationConfig(num_samples=20),
+            validation=ValidationConfig(validator=Validator.Config(num_samples=20)),
             batcher=Batcher.Config(
                 batch=BatchConfig(local_batch_size=2, seq_len=2048),
             ),
@@ -147,7 +148,7 @@ def rl_grpo_qwen3_0_6b_flex() -> Controller.Config:
             num_training_steps=10,
             num_groups_per_train_step=8,
             group_size=group_size,
-            validation=ValidationConfig(num_samples=20),
+            validation=ValidationConfig(validator=Validator.Config(num_samples=20)),
             batcher=Batcher.Config(
                 batch=BatchConfig(local_batch_size=2, seq_len=2048),
             ),
@@ -243,7 +244,7 @@ def rl_grpo_gpt_oss_20b_varlen() -> Controller.Config:
             num_training_steps=10,
             num_groups_per_train_step=5,
             group_size=group_size,
-            validation=ValidationConfig(num_samples=20),
+            validation=ValidationConfig(validator=Validator.Config(num_samples=20)),
             batcher=Batcher.Config(
                 batch=BatchConfig(local_batch_size=2, seq_len=2048),
             ),
@@ -302,7 +303,7 @@ def rl_grpo_gpt_oss_debug_varlen() -> Controller.Config:
             num_training_steps=3,
             num_groups_per_train_step=5,
             group_size=group_size,
-            validation=ValidationConfig(num_samples=20),
+            validation=ValidationConfig(validator=Validator.Config(num_samples=20)),
             batcher=Batcher.Config(
                 batch=BatchConfig(local_batch_size=2, seq_len=2048),
             ),
@@ -366,7 +367,7 @@ def rl_grpo_gpt_oss_debug_varlen_batch_invariant() -> Controller.Config:
             max_offpolicy_steps=0,
             num_groups_per_train_step=5,
             group_size=group_size,
-            validation=ValidationConfig(num_samples=20),
+            validation=ValidationConfig(validator=Validator.Config(num_samples=20)),
             batcher=Batcher.Config(
                 batch=BatchConfig(local_batch_size=2, seq_len=2048),
             ),
@@ -429,7 +430,7 @@ def rl_grpo_qwen3_1_7b() -> Controller.Config:
             num_training_steps=10,
             num_groups_per_train_step=8,
             group_size=group_size,
-            validation=ValidationConfig(num_samples=20),
+            validation=ValidationConfig(validator=Validator.Config(num_samples=20)),
             batcher=Batcher.Config(
                 batch=BatchConfig(local_batch_size=2, seq_len=2048),
             ),
@@ -483,7 +484,7 @@ def rl_grpo_qwen3_14b() -> Controller.Config:
             num_training_steps=10,
             num_groups_per_train_step=8,
             group_size=group_size,
-            validation=ValidationConfig(num_samples=20),
+            validation=ValidationConfig(validator=Validator.Config(num_samples=20)),
             batcher=Batcher.Config(
                 batch=BatchConfig(local_batch_size=2, seq_len=2048),
             ),
@@ -542,7 +543,7 @@ def rl_grpo_qwen3_moe_debug_varlen() -> Controller.Config:
             num_training_steps=5,
             num_groups_per_train_step=8,
             group_size=group_size,
-            validation=ValidationConfig(num_samples=20),
+            validation=ValidationConfig(validator=Validator.Config(num_samples=20)),
             batcher=Batcher.Config(
                 batch=BatchConfig(local_batch_size=2, seq_len=2048),
             ),
@@ -675,7 +676,7 @@ def rl_grpo_qwen3_moe_debug_varlen_batch_invariant() -> Controller.Config:
             max_offpolicy_steps=0,
             num_groups_per_train_step=8,
             group_size=group_size,
-            validation=ValidationConfig(num_samples=20),
+            validation=ValidationConfig(validator=Validator.Config(num_samples=20)),
             batcher=Batcher.Config(
                 batch=BatchConfig(local_batch_size=2, seq_len=2048),
             ),
@@ -747,7 +748,7 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> Controller.Config:
             num_training_steps=10,
             num_groups_per_train_step=8,
             group_size=group_size,
-            validation=ValidationConfig(num_samples=20),
+            validation=ValidationConfig(validator=Validator.Config(num_samples=20)),
             batcher=Batcher.Config(
                 batch=BatchConfig(local_batch_size=2, seq_len=2048),
             ),
@@ -852,7 +853,7 @@ def rl_grpo_qwen3_0_6b_varlen_batch_invariant() -> Controller.Config:
             max_offpolicy_steps=0,
             num_groups_per_train_step=8,
             group_size=group_size,
-            validation=ValidationConfig(num_samples=20),
+            validation=ValidationConfig(validator=Validator.Config(num_samples=20)),
             batcher=Batcher.Config(
                 batch=BatchConfig(local_batch_size=2, seq_len=2048),
             ),
