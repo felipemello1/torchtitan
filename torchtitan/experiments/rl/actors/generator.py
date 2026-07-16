@@ -37,6 +37,7 @@ from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.routing.intra_generator_router import (
     IntraGeneratorRouter,
 )
+from torchtitan.experiments.rl.trace_names import VLLM_ENGINE_TASK_NAME
 from torchtitan.experiments.rl.types import Completion
 from torchtitan.models.common.attention import (
     FlexAttention,
@@ -946,7 +947,9 @@ class VLLMGenerator(Actor, Configurable):
     async def start_engine_loop(self) -> None:
         """Start the background engine loop on every rank (one-time, idempotent)."""
         if self._engine_loop_task is None:
-            self._engine_loop_task = asyncio.create_task(self._engine_loop())
+            self._engine_loop_task = asyncio.create_task(
+                self._engine_loop(), name=VLLM_ENGINE_TASK_NAME
+            )
 
     def _rank0_check_engine_loop_running(self, endpoint_name: str) -> None:
         """Guard for the rank-0-only endpoints"""
@@ -958,7 +961,7 @@ class VLLMGenerator(Actor, Configurable):
             )
 
     @endpoint
-    @sl.log_trace_span("generate")
+    @sl.log_trace_span("generate_request")
     async def generate(
         self,
         prompt_token_ids: list[int],
@@ -1019,7 +1022,6 @@ class VLLMGenerator(Actor, Configurable):
         # Await outside the lock so other generate / pull calls can proceed meanwhile.
         return await generation_future
 
-    @sl.log_trace_span("engine_loop")
     async def _engine_loop(self) -> None:
         """Non-stop loop running on all ranks to produce new tokens.
 
@@ -1109,8 +1111,7 @@ class VLLMGenerator(Actor, Configurable):
                         if not self._engine.has_unfinished_requests():
                             break
                         with torch.no_grad():
-                            with sl.log_trace_span("vllm_engine_step"):
-                                request_outputs = self._engine.step()
+                            request_outputs = self._engine.step()
                         self._request_dispatcher.process_finished_requests(
                             request_outputs, self.policy_version
                         )
@@ -1221,7 +1222,7 @@ class VLLMGenerator(Actor, Configurable):
         # Await outside the lock so other generate / pull calls can proceed meanwhile.
         await pull_model_state_dict_future
 
-    @sl.log_trace_span("pull_model_state_dict_copy")
+    @sl.log_trace_span("apply_pulled_model_state_dict")
     async def _pull_model_state_dict(self, version: int) -> None:
         """ALL RANKS: collectively copy the latest weights from TorchStore, optionally drop the
         prefix cache (so no new request reuses an old-weight prefix), and bump the policy version.

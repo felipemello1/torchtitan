@@ -52,7 +52,7 @@ for step in range(loaded_step + 1, num_steps + 1):
          })
 ```
 
-Call `init_logger()` and `sl.init_structured_logger()` once per process before any trace calls. Rank and source are baked into the formatter at init; every JSONL entry automatically includes `rank`, `source`, `caller` (file:line:function), `time_us`, `step`, `relative_step`, and (when tags are set) `step_tags`.
+Call `init_logger()` and `sl.init_structured_logger()` once per process before any trace calls. Rank and source are baked into the formatter at init; every JSONL entry automatically includes `global_rank`, `source`, process identity (`host_name`, `pid`, `tid` — `global_rank` is mesh-local, so these disambiguate actors), `caller` (file:line:function), `time_us`, `step`, `relative_step`, and (when tags are set) `step_tags`.
 
 ## API reference
 
@@ -187,3 +187,22 @@ reward                                       ▓▓▓                          
 ```
 
 Each `log_trace_span` becomes a bar. Every source file becomes a separate process row. Auto-named asyncio tasks are slot-packed into a contiguous `0..K-1` range where K is peak concurrency, so the track count stays readable even for long async runs (e.g. RL actors dispatching many concurrent RPCs).
+
+The renderer is generic; RL supplies its pin/collapse policy in `torchtitan/experiments/rl/gantt.py` (`generate_rl_gantt`), and RL runs auto-render `dump_folder/gantt.json` on shutdown (`Controller.Config.generate_gantt_on_shutdown`, windowed by `gantt_last_steps`).
+
+### Windowing long runs
+
+The JSONL is the complete store; the gantt is a bounded view. For a 200-1000-step run, render a slice instead of the whole run:
+
+```python
+generate_gantt_trace(logs, out, last_steps=10)               # final 10 observed steps
+generate_gantt_trace(logs, out, start_step=90, end_step=100) # an explicit step window
+generate_gantt_trace(logs, out, start_time_us=run_started_us) # isolate the current run
+                                                              # in a reused dump folder
+```
+
+Two streaming passes keep memory bounded to the window (pass 1 resolves steps to a time window; pass 2 pairs and keeps only overlapping spans, clipped to the window edges). Files whose mtime predates the window are skipped without reading.
+
+### Scaling beyond local JSONL
+
+`TITAN_STRUCT_LOGGER_HANDLERS` is the seam for remote sinks: a handler factory can stream the same records to a database or an OTLP exporter instead of (or alongside) local files. The span records map 1:1 onto OTel spans (`*_start`/`*_end` pair -> span; `value` = duration ms; `task_name` -> attribute) and `metric_value` instants onto gauges. Distributed tracing additionally needs span identity + context propagation across RPC boundaries — a follow-up, not a schema the JSONL bakes in today. Local file rotation/retention is likewise deferred until a remote sink exists.

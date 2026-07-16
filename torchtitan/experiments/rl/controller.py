@@ -134,6 +134,12 @@ from torchtitan.experiments.rl.routing.inter_generator_router import (
     InterGeneratorRouter,
 )
 from torchtitan.experiments.rl.routing.types import RoutingContext
+from torchtitan.experiments.rl.trace_names import (
+    BATCHER_TASK_NAME,
+    DATA_INPUT_TASK_NAME,
+    rollout_worker_task_name,
+    TRAINER_TASK_NAME,
+)
 from torchtitan.experiments.rl.types import Completion, TrainingBatch
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.model_spec import ModelSpec
@@ -210,6 +216,15 @@ class Controller(Configurable):
 
         dump_folder: str = "outputs/rl"
         """Root output folder for RL artifacts (temp weights, logs, etc.)."""
+
+        generate_gantt_on_shutdown: bool = True
+        """On shutdown, best-effort render the structured-log gantt to ``dump_folder/gantt.json``
+        (needs structured logging enabled). Set False to skip the auto-render."""
+
+        gantt_last_steps: int | None = 10
+        """Step window for the auto-rendered gantt: the final N steps. None = full run (fine for
+        short runs; a ~1000-step full render is too big to open). Any other window can be
+        re-rendered from ``structured_logs/`` via ``generate_rl_gantt(..., start_step=...)``."""
 
         async_loop: AsyncLoopConfig = field(default_factory=AsyncLoopConfig)
         """How the data->rollout->batch->train loop is sized and coordinated."""
@@ -430,7 +445,7 @@ class Controller(Configurable):
         turns reuse one generator's prefix KV)."""
         # TODO: make this a pluggable config (a GenerateFn factory) so non-router generate backends can be swapped in.
 
-        @sl.log_trace_span("generate")
+        @sl.log_trace_span("generate_rpc")
         async def generate(
             prompt_token_ids: list[int],
             *,
@@ -749,14 +764,14 @@ class Controller(Configurable):
                     group_buffer=self._group_buffer,
                     generate_fn=generate_fn,
                 ),
-                name=f"rollout_worker_{group_worker_id}",
+                name=rollout_worker_task_name(group_worker_id),
             )
             for group_worker_id in range(max_active_rollout_groups)
         ]
 
         # data_input_loop
         data_input_task = asyncio.create_task(
-            self._data_input_loop(self._group_buffer), name="data_input"
+            self._data_input_loop(self._group_buffer), name=DATA_INPUT_TASK_NAME
         )
 
         # training_sample_batcher_loop
@@ -767,7 +782,7 @@ class Controller(Configurable):
                 batcher=batcher,
                 training_batch_queue=training_batch_queue,
             ),
-            name="batcher",
+            name=BATCHER_TASK_NAME,
         )
 
         # trainer_loop
@@ -775,7 +790,7 @@ class Controller(Configurable):
             self._trainer_loop(
                 training_batch_queue, num_training_steps=num_training_steps
             ),
-            name="trainer",
+            name=TRAINER_TASK_NAME,
         )
 
         # run everything until trainer finishes its number of steps
@@ -949,8 +964,10 @@ class Controller(Configurable):
                     training_sample_group=training_sample_group,
                 )
             if maybe_training_batch is not None:
-                await training_batch_queue.put(maybe_training_batch)
-        await training_batch_queue.put(None)
+                with sl.log_trace_span("wait_for_batch_queue_slot"):
+                    await training_batch_queue.put(maybe_training_batch)
+        with sl.log_trace_span("wait_for_batch_queue_slot"):
+            await training_batch_queue.put(None)
         # TODO(async-rl): if finite datasets are supported, drain a final partial batch here.
 
     async def _trainer_loop(

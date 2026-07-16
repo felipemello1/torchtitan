@@ -343,7 +343,7 @@ class TestTraceJsonlFormatter:
         # Flat JSON: fields at top level, no "int"/"normal"/"double" keys
         assert "int" not in parsed
         assert "normal" not in parsed
-        assert parsed["rank"] == 0
+        assert parsed["global_rank"] == 0
         assert parsed["source"] == "trainer"
         assert parsed["step"] == 5
 
@@ -361,7 +361,7 @@ class TestTraceJsonlFormatter:
         for k, v in event_extra("step").items():
             setattr(record, k, v)
         parsed = json.loads(fmt.format(record))
-        assert parsed["rank"] == 3
+        assert parsed["global_rank"] == 3
         assert parsed["source"] == "generator"
 
     def test_step_from_global(self):
@@ -397,21 +397,30 @@ class TestTraceJsonlFormatter:
         parsed = json.loads(fmt.format(record))
         assert parsed["task_name"] == "worker-0"
 
-    def test_message_truncation(self):
+    def test_message_only_on_text_rows_and_truncated(self):
+        """EVENT rows drop the message (structured fields carry it); TEXT rows keep
+        a truncated one."""
         fmt = TraceJsonlFormatter(rank=0, source="test")
         long_msg = "x" * (MAX_MESSAGE_SIZE + 100)
-        record = logging.LogRecord(
-            name="test",
-            level=logging.INFO,
-            pathname="test.py",
-            lineno=1,
-            msg=long_msg,
-            args=None,
-            exc_info=None,
-        )
+
+        def _record(msg):
+            return logging.LogRecord(
+                name="test",
+                level=logging.INFO,
+                pathname="test.py",
+                lineno=1,
+                msg=msg,
+                args=None,
+                exc_info=None,
+            )
+
+        event_record = _record(long_msg)
         for k, v in event_extra("step").items():
-            setattr(record, k, v)
-        parsed = json.loads(fmt.format(record))
+            setattr(event_record, k, v)
+        assert "message" not in json.loads(fmt.format(event_record))
+
+        text_record = _record(long_msg)  # no event extras -> log_type TEXT
+        parsed = json.loads(fmt.format(text_record))
         assert "..." in parsed["message"]
         assert len(parsed["message"]) < len(long_msg)
 
@@ -469,7 +478,6 @@ class TestTraceJsonlFormatter:
             setattr(record, k, v)
         parsed = json.loads(fmt.format(record))
         assert parsed["global_rank"] == 5
-        assert parsed["rank"] == 5
 
     def test_local_rank_in_output(self):
         """local_rank from LOCAL_RANK env var (default 0)."""
@@ -573,7 +581,7 @@ class TestInitStructuredLogger:
         with open(os.path.join(structured_logs_dir, jsonl_files[0])) as f:
             line = f.readline().strip()
         parsed = json.loads(line)
-        assert parsed["rank"] == 0
+        assert parsed["global_rank"] == 0
         assert parsed["source"] == "trainer"
 
     def test_idempotent(self, tmp_path, structured_logger_fixture):
@@ -1005,7 +1013,7 @@ class TestGenerateGanttTrace:
             {
                 "log_type_name": "fwd_bwd_start",
                 "time_us": 1000,
-                "rank": 0,
+                "global_rank": 0,
                 "step": 1,
                 "span_id": 0,
                 "event_name": "fwd_bwd",
@@ -1013,7 +1021,7 @@ class TestGenerateGanttTrace:
             {
                 "log_type_name": "fwd_bwd_end",
                 "time_us": 2000,
-                "rank": 0,
+                "global_rank": 0,
                 "step": 1,
                 "span_id": 0,
                 "value": 1.0,
@@ -1048,7 +1056,7 @@ class TestGenerateGanttTrace:
                 "log_type_name": "metric_value",
                 "log_type": "instant",
                 "time_us": 1000,
-                "rank": 0,
+                "global_rank": 0,
                 "step": 1,
                 "event_name": "train.loss",
                 "value": 2.5,
@@ -1070,7 +1078,7 @@ class TestGenerateGanttTrace:
     def test_error_events(self, tmp_path):
         """_error events become instant error markers."""
         records = [
-            {"log_type_name": "fwd_bwd_error", "time_us": 1500, "rank": 0, "step": 1},
+            {"log_type_name": "fwd_bwd_error", "time_us": 1500, "global_rank": 0, "step": 1},
         ]
         jsonl_path = os.path.join(str(tmp_path), "structured_logs", "test.jsonl")
         self._write_jsonl(jsonl_path, records)
@@ -1098,13 +1106,13 @@ class TestGenerateGanttTrace:
                 "log_type_name": "structured_logger_started",
                 "log_type": "instant",
                 "time_us": 1000,
-                "rank": 0,
+                "global_rank": 0,
             },
             {
                 "log_type_name": "training_start",
                 "log_type": "instant",
                 "time_us": 2000,
-                "rank": 0,
+                "global_rank": 0,
             },
         ]
         jsonl_path = os.path.join(str(tmp_path), "structured_logs", "test.jsonl")
@@ -1129,7 +1137,7 @@ class TestGenerateGanttTrace:
         event is silently dropped.
         """
         records = [
-            {"log_type_name": "ad_hoc_marker", "time_us": 1000, "rank": 0, "step": 3},
+            {"log_type_name": "ad_hoc_marker", "time_us": 1000, "global_rank": 0, "step": 3},
         ]
         jsonl_path = os.path.join(str(tmp_path), "structured_logs", "test.jsonl")
         self._write_jsonl(jsonl_path, records)
@@ -1150,14 +1158,14 @@ class TestGenerateGanttTrace:
             {
                 "log_type_name": "fwd_bwd_start",
                 "time_us": 1000,
-                "rank": 0,
+                "global_rank": 0,
                 "step": 1,
                 "span_id": 0,
             },
             {
                 "log_type_name": "fwd_bwd_end",
                 "time_us": 2000,
-                "rank": 0,
+                "global_rank": 0,
                 "step": 1,
                 "span_id": 0,
                 "value": 1.0,
@@ -1182,14 +1190,14 @@ class TestGenerateGanttTrace:
             {
                 "log_type_name": "step_start",
                 "time_us": 1000,
-                "rank": 0,
+                "global_rank": 0,
                 "step": 1,
                 "event_name": "step",
             },
             {
                 "log_type_name": "step_end",
                 "time_us": 2000,
-                "rank": 0,
+                "global_rank": 0,
                 "step": 1,
                 "value": 1.0,
                 "event_name": "step",
@@ -1218,7 +1226,7 @@ class TestGenerateGanttTrace:
         return {
             "log_type_name": f"{type_name}_start",
             "time_us": time_us,
-            "rank": rank,
+            "global_rank": rank,
             "task_name": task_name,
             **({"event_name": event_name} if event_name else {}),
         }
@@ -1227,7 +1235,7 @@ class TestGenerateGanttTrace:
         return {
             "log_type_name": f"{type_name}_end",
             "time_us": time_us,
-            "rank": rank,
+            "global_rank": rank,
             "task_name": task_name,
             "value": duration_ms,
         }
@@ -1485,15 +1493,16 @@ class TestGenerateGanttTrace:
             {
                 "log_type_name": "work_error",
                 "time_us": 1500,
-                "rank": 0,
+                "global_rank": 0,
                 "task_name": "train_loop",
             },
-            # Metric with no task -> falls back to tid 0.
+            # Metric with no task and no span on its thread -> overflow row (must not
+            # masquerade on a semantic row).
             {
                 "log_type_name": "metric_value",
                 "log_type": "instant",
                 "time_us": 1700,
-                "rank": 0,
+                "global_rank": 0,
                 "event_name": "loss",
                 "value": 2.5,
                 "task_name": None,
@@ -1517,9 +1526,9 @@ class TestGenerateGanttTrace:
             for e in trace["traceEvents"]
             if e.get("ph") == "i" and "loss" in e["name"]
         )
-        # Error on explicit task's track, metric on main track.
+        # Error on explicit task's track; task-less metric off the semantic rows.
         assert error["tid"] == span["tid"]
-        assert metric["tid"] == 0
+        assert metric["tid"] != span["tid"]
 
 
 # ---------------------------------------------------------------------------

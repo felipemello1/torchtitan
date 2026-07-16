@@ -62,6 +62,9 @@ class _FakeConfig:
     """Fake config whose build() returns a _FakeController."""
 
     dump_folder = "/tmp/test_rl"
+    # Mirror Controller.Config; the gantt render is skipped here (logging off).
+    generate_gantt_on_shutdown = True
+    gantt_last_steps = 10
     trainer = _FakeTrainerConfig()
     # main() also reads config.generator.parallelism (same stubbing applies).
     generator = SimpleNamespace(parallelism=None)

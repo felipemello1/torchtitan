@@ -25,6 +25,7 @@ python3 -m torchtitan.experiments.rl.train \
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass
 
 # must run before torch import. Set it as early as possible to avoid other
@@ -38,6 +39,7 @@ from monarch.actor import HostMesh, ProcMesh, this_host
 
 from torchtitan.config import ConfigManager, ParallelismConfig
 from torchtitan.experiments.rl.controller import Controller
+from torchtitan.experiments.rl.gantt import best_effort_generate_rl_gantt_on_shutdown
 from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismConfig
 from torchtitan.observability import structured_logger as sl
 
@@ -249,6 +251,10 @@ async def main():
     # https://github.com/meta-pytorch/monarch/pull/4211
     os.environ["MONARCH_ACTOR_QUEUE_DISPATCH"] = "0"
 
+    # Captured before logger init: the shutdown gantt uses it to isolate this run's
+    # records in a reused dump folder.
+    run_started_us = time.time_ns() // 1_000
+
     config = ConfigManager().parse_args()
     assert isinstance(config, Controller.Config)
     sl.init_structured_logger(
@@ -281,6 +287,15 @@ async def main():
         logger.info("Interrupted; attempting graceful shutdown...")
     finally:
         await rl_trainer.close()
+        if (
+            config.generate_gantt_on_shutdown
+            and config.trainer.debug.enable_structured_logging
+        ):
+            best_effort_generate_rl_gantt_on_shutdown(
+                config.dump_folder,
+                start_time_us=run_started_us,
+                last_steps=config.gantt_last_steps,
+            )
 
 
 if __name__ == "__main__":
