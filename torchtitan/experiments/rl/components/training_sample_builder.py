@@ -85,6 +85,9 @@ class TrainingSampleBuilder(Configurable):
                 m.Mean(1.0 if is_zero_std else 0.0),
             )
         )
+        # TODO(metrics): when drop_zero_std_reward_groups=True, the reward we log downstream averages only the
+        # KEPT groups, which biases the mean up (more all-wrong than all-correct groups are dropped). Log reward
+        # over BOTH the pre-filter (full) and post-filter (kept) sets so the metric is unambiguous under the drop.
         if self.config.drop_zero_std_reward_groups and is_zero_std:
             metrics.append(
                 m.Metric(
