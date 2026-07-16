@@ -109,8 +109,7 @@ class _FakeSampling:
 
 
 def _validator(*, num_samples: int = 2, rollouter: _FakeRollouter | None = None, recorder=None):
-    return Validator(
-        Validator.Config(num_samples=num_samples),
+    return Validator.Config(num_samples=num_samples).build(
         rollouter=rollouter or _FakeRollouter(),
         renderer=object(),
         rollout_recorder=recorder or _FakeRecorder(),
@@ -613,9 +612,9 @@ def test_drain_pass_logs_at_completion_step_not_trigger_step() -> None:
 
 
 def test_max_num_seqs_concurrency_uses_validator_num_samples() -> None:
-    # Regression: the vLLM sizing math reads validation.validator.num_samples (the
+    # Regression: the vLLM sizing math reads the nested validator config (the
     # bitwise-parity helper reproduces this exact expression); the old flat
-    # validation.num_samples path is gone.
+    # field on ValidationConfig is gone.
     from torchtitan.experiments.rl.controller import ValidationConfig
 
     validation = ValidationConfig(validator=Validator.Config(num_samples=500))
