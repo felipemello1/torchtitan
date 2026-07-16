@@ -376,6 +376,8 @@ def _controller(
 
     controller.config = _Config()
     controller._validator = _validator(num_samples=num_samples, rollouter=rollouter)
+    # The worker logs completed passes at the newest trainer step (W&B monotonicity).
+    controller._trainer_policy_version = 0
 
     controller._validation_gate_data_input = _open_gate()
     controller._validation_gate_trainer = _open_gate()
@@ -393,10 +395,12 @@ def _controller(
     class _Processor:
         def __init__(self):
             self.logged: list[int] = []
+            self.logged_metrics: list[list] = []
 
-        def log(self, *, step, metrics, is_validation):
+        def log(self, step, metrics, *, is_validation):
             assert is_validation
             self.logged.append(step)
+            self.logged_metrics.append(list(metrics))
 
     controller.metrics_processor = _Processor()
     controller._make_generate_fn = lambda metrics_prefix: _fake_generate_fn
@@ -488,6 +492,8 @@ def test_worker_pass_reopens_gates_on_success() -> None:
         controller = _controller(
             loop_mode=ValidationLoopMode.PAUSE_TRAINER, weight_sync=manager
         )
+        # PAUSE: the trainer is parked at the trigger version, so completion == trigger step.
+        controller._trainer_policy_version = 2
         worker = asyncio.create_task(controller._periodic_validation_loop())
 
         await controller._trigger_periodic_validation(step=2)
@@ -565,6 +571,61 @@ def test_drain_worker_runs_catch_up_and_reopens() -> None:
         worker.cancel()
 
     asyncio.run(run())
+
+
+def test_drain_pass_logs_at_completion_step_not_trigger_step() -> None:
+    # W&B monotonicity: the pass triggered at step 2 finishes after the trainer logged
+    # step 4 -> the validation record must carry backend step 4 (never < the trainer's
+    # current step), while validation/policy_version still reports the frozen policy 2.
+    async def run() -> None:
+        gate = _open_gate()
+        manager, router, _ = _weight_sync(gate=gate)
+        hold = asyncio.Event()
+        controller = _controller(
+            loop_mode=ValidationLoopMode.DRAIN_TRAINER,
+            weight_sync=manager,
+            rollouter=_FakeRollouter(policy_version=2, hold=hold),
+        )
+        controller._trainer_policy_version = 2
+        worker = asyncio.create_task(controller._periodic_validation_loop())
+
+        await controller._trigger_periodic_validation(step=2)
+        # Two DRAIN trainer steps advance the trainer to 4 while the pass runs.
+        for drained_version in (3, 4):
+            controller._trainer_policy_version = drained_version
+            manager.start_async_push_pull(version=drained_version)
+            await manager.wait_prev_pull()
+
+        hold.set()
+        await asyncio.wait_for(controller._validation_idle.wait(), timeout=5)
+
+        assert controller.metrics_processor.logged == [4]  # completion step, monotonic
+        policy_versions = [
+            metric.value.value
+            for metric in controller.metrics_processor.logged_metrics[0]
+            if metric.key == "validation/policy_version"
+        ]
+        assert policy_versions == [2.0]  # the frozen policy actually evaluated
+
+        worker.cancel()
+
+    asyncio.run(run())
+
+
+def test_max_num_seqs_concurrency_uses_validator_num_samples() -> None:
+    # Regression: the vLLM sizing math reads validation.validator.num_samples (the
+    # bitwise-parity helper reproduces this exact expression); the old flat
+    # validation.num_samples path is gone.
+    from torchtitan.experiments.rl.controller import ValidationConfig
+
+    validation = ValidationConfig(validator=Validator.Config(num_samples=500))
+    assert not hasattr(validation, "num_samples")
+    num_group_workers, group_size = 4, 8
+    rollout_concurrency = max(
+        num_group_workers * group_size,
+        validation.validator.num_samples,
+    )
+    assert rollout_concurrency == 500
 
 
 def test_drain_catch_up_waits_active_trainer_step() -> None:

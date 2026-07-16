@@ -880,7 +880,7 @@ class Controller(Configurable):
         would trade a supervised failure for a born-stale batch.
         """
         while True:
-            step = await self._validation_trigger.get()
+            trigger_step = await self._validation_trigger.get()
             mode = self.config.async_loop.validation.loop_mode
 
             if mode is not ValidationLoopMode.PAUSE_TRAINER:
@@ -889,7 +889,12 @@ class Controller(Configurable):
                 async with self._data_admission_active:
                     pass
 
-            await self._validate_and_log(step=step)
+            metrics = await self._validator.evaluate(
+                step=trigger_step,
+                generate_fn=self._make_generate_fn(
+                    metrics_prefix="validation_generator"
+                ),
+            )
 
             if mode is ValidationLoopMode.DRAIN_TRAINER:
                 # Stop a NEW trainer step from starting; the active one finishes and its
@@ -897,6 +902,17 @@ class Controller(Configurable):
                 self._validation_gate_trainer.clear()
             async with self._trainer_step_active:
                 await self._weight_sync.catch_up_pull()
+                # Log at the newest trainer step: W&B requires monotonic steps, and under
+                # DRAIN the trainer logged steps past trigger_step while the pass ran
+                # (backdating to trigger_step gets the record dropped). The frozen policy
+                # actually evaluated is still recorded as validation/policy_version. Equal
+                # to trigger_step in PAUSE modes. The trainer flushes a step's metrics
+                # synchronously after releasing the lock, so this step never outruns it.
+                self.metrics_processor.log(
+                    step=self._trainer_policy_version,
+                    metrics=metrics,
+                    is_validation=True,
+                )
 
             # Success only: reopen. (On an exception above, gates stay closed and run()
             # observes this task's failure.)
