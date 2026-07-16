@@ -46,6 +46,7 @@ from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismC
 from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.rollout.advantage import AdvantageEstimator
+from torchtitan.experiments.rl.validator import Validator
 from torchtitan.models.qwen3 import model_registry
 
 
@@ -63,7 +64,7 @@ def rl_grpo_qwen3_1_7b_search_r1() -> Controller.Config:
             num_training_steps=500,
             num_groups_per_train_step=8,
             group_size=8,
-            validation=ValidationConfig(num_samples=500),
+            validation=ValidationConfig(validator=Validator.Config(num_samples=500)),
             batcher=Batcher.Config(
                 batch=BatchConfig(local_batch_size=1, seq_len=4096),
             ),
@@ -182,7 +183,7 @@ def rl_grpo_qwen3_30b_a3b_deepep_search_r1_perf() -> Controller.Config:
             num_training_steps=500,
             num_groups_per_train_step=32,  # TODO: TBD
             group_size=8,  # TODO: TBD
-            validation=ValidationConfig(num_samples=500),
+            validation=ValidationConfig(validator=Validator.Config(num_samples=500)),
             batcher=Batcher.Config(
                 # TODO: TBD local_batch_size, seq_len
                 batch=BatchConfig(local_batch_size=1, seq_len=4096),
