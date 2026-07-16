@@ -258,7 +258,7 @@ def build_inference_engine(config: Controller.Config) -> LLMEngine:
     ) * async_loop.num_groups_per_train_step
     rollout_concurrency = max(
         num_group_workers * async_loop.group_size,
-        async_loop.validation.num_samples,
+        async_loop.validation.validator.num_samples,
     )
     max_num_seqs = min((rollout_concurrency + gen_dp - 1) // gen_dp, 512)
     engine_kwargs["max_num_seqs"] = max_num_seqs

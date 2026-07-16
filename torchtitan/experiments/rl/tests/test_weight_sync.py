@@ -62,11 +62,15 @@ async def _noop():
 
 
 def _manager(*, trainer, router, buffer, num_groups_per_train_step=8):
+    # Open pull gate: the normal (non-validation) path pulls every cycle.
+    generator_pull_gate = asyncio.Event()
+    generator_pull_gate.set()
     return WeightSyncManager(
         trainer=trainer,
         generator_router=router,
         group_buffer=buffer,
         num_groups_per_train_step=num_groups_per_train_step,
+        generator_pull_gate=generator_pull_gate,
     )
 
 

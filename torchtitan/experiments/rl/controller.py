@@ -91,9 +91,9 @@ import asyncio
 import logging
 import math
 import os
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from typing import Annotated
 
 # PYTORCH_CUDA_ALLOC_CONF is set in torchtitan/experiments/rl/__init__.py (before torch is imported)
@@ -135,20 +135,50 @@ from torchtitan.experiments.rl.routing.inter_generator_router import (
 )
 from torchtitan.experiments.rl.routing.types import RoutingContext
 from torchtitan.experiments.rl.types import Completion, TrainingBatch
+from torchtitan.experiments.rl.validator import Validator
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.model_spec import ModelSpec
 
 logger = logging.getLogger(__name__)
 
 
+class ValidationLoopMode(StrEnum):
+    """What pauses while a periodic validation pass runs (every mode samples ONE generator version).
+
+    Single-policy holds iff the generator does not pull a new version during the pass, and the
+    trainer's weight-sync chain is the only thing that pulls. The modes differ in which loops keep
+    running:
+
+      PAUSE_TRAINER                 -- the trainer pauses before its next step, so no push/pull can
+                                       move the generator. Data admission and rollouts continue,
+                                       filling the buffer at the frozen version.
+      PAUSE_TRAINER_AND_DATA_INPUT  -- also pauses new data admission; already-admitted rollouts
+                                       still drain, but eval competes with less generation.
+      DRAIN_TRAINER                 -- the trainer keeps training the bounded backlog; its weight-sync
+                                       cycles push but skip the generator pull (the generator stays
+                                       frozen), and data admission is paused so nothing is born at the
+                                       frozen version. One catch-up pull runs before admission reopens.
+    """
+
+    PAUSE_TRAINER = "pause_trainer"
+    PAUSE_TRAINER_AND_DATA_INPUT = "pause_trainer_and_data_input"
+    DRAIN_TRAINER = "drain_trainer"
+    # TODO(validation): LIVE_MIXED_POLICY (no pause; eval spans versions, prime-rl style) is
+    #   deferred: it is a mixed-policy footgun, not single-policy.
+
+
 @dataclass(kw_only=True, slots=True)
 class ValidationConfig:
-    """Held-out validation that runs at the start and end of training"""
+    """Held-out validation at the start/end of training, and optionally every `interval_steps`."""
 
-    # TODO: enable periodic validation with proper overlapping
+    validator: Validator.Config = field(default_factory=Validator.Config)
+    """What one held-out validation pass evaluates."""
 
-    num_samples: int = 20
-    """Held-out prompts scored greedily (temp=0, n=1) per validation pass. 0 skips validation."""
+    interval_steps: int = 0
+    """Run a periodic pass every N optimizer steps, in addition to start/end. 0 disables periodic passes."""
+
+    loop_mode: ValidationLoopMode = ValidationLoopMode.PAUSE_TRAINER
+    """What pauses while a periodic pass runs. See `ValidationLoopMode`."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -377,6 +407,12 @@ class Controller(Configurable):
         self.rollout_recorder = config.rollout_recorder.build(
             dump_dir=config.dump_folder
         )
+        self._validator = config.async_loop.validation.validator.build(
+            rollouter=self._rollouter,
+            renderer=self.renderer,
+            rollout_recorder=self.rollout_recorder,
+            sampling=self._sampling,
+        )
 
     async def close(self):
         """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
@@ -488,7 +524,7 @@ class Controller(Configurable):
         ) * async_loop.num_groups_per_train_step
         rollout_concurrency = max(
             max_active_rollout_groups * async_loop.group_size,
-            async_loop.validation.num_samples,
+            async_loop.validation.validator.num_samples,
         )
         # Renderer thread pool: render work is CPU-bound, so size to CPU count (decoupled from rollout concurrency).
         asyncio.get_running_loop().set_default_executor(
@@ -598,88 +634,6 @@ class Controller(Configurable):
                 policy_version=self.start_step
             )
 
-    # TODO: fold validation into a Validator(Configurable) the controller attaches, instead of 4 methods.
-    @sl.log_trace_span("_collect_validation_rollouts")
-    async def _collect_validation_rollouts(
-        self, *, num_groups: int, sampling: SamplingConfig, step: int
-    ) -> tuple[list[RolloutGroup], list[m.Metric]]:
-        """Sample held-out prompts, run each greedily (n=1) concurrently, and emit validation metrics."""
-        # TODO: group_size=1 (best-of-1) only. Support best-of-N.
-        generate = self._make_generate_fn(metrics_prefix="validation_generator")
-        # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
-        samples = [self._rollouter.get_validation_sample() for _ in range(num_groups)]
-        group_results = await asyncio.gather(
-            *(
-                self._rollouter.run_group_rollouts(
-                    generate_fn=generate,
-                    sample=sample,
-                    # Negative ids keep validation disjoint from training group ids, so their
-                    # request_ids can't collide in the shared engine (e.g. post-validation).
-                    group_id=-(i + 1),
-                    group_size=1,
-                    sampling=sampling,
-                    renderer=self.renderer,
-                )
-                for i, sample in enumerate(samples)
-            ),
-            return_exceptions=True,
-        )
-
-        # Keep the groups that succeeded; log + count the ones that raised.
-        rollout_groups: list[RolloutGroup] = []
-        num_failed_groups = 0
-        for i, result in enumerate(group_results):
-            if isinstance(result, BaseException):
-                logger.error(
-                    f"validation group {-(i + 1)} (step={step}) failed; dropping",
-                    exc_info=(type(result), result, result.__traceback__),
-                )
-                num_failed_groups += 1
-                continue
-            rollout_groups.append(result)
-
-        metrics = compute_rollout_metrics(
-            prefix="validation",
-            rollouts=[
-                rollout for group in rollout_groups for rollout in group.rollouts
-            ],
-        )
-        metrics.append(
-            m.Metric("validation/group_failures", m.Sum(float(num_failed_groups)))
-        )
-        return rollout_groups, metrics
-
-    # TODO: we currently determine validation.num_samples
-    # but what if i want to run the entire dataset?
-    @sl.log_trace_span("validate")
-    async def validate(self, *, step: int) -> list[m.Metric]:
-        """Run greedy validation on held-out prompts.
-
-        Args:
-            step: Training step this validation pass belongs to (0 for the
-                pre-training pass); tagged into logged rollout samples.
-
-        Returns:
-            Validation rollout metrics, generation metrics, and validation
-            timing.
-        """
-        # TODO: investigate using pass@k for validation.
-        t_validate_start = time.perf_counter()
-        num_samples = self.config.async_loop.validation.num_samples
-        if num_samples == 0:  # skip validation (e.g. loss guard CI)
-            return []
-        greedy = replace(self._sampling, temperature=0.0, top_p=1.0)
-
-        rollout_groups, validation_metrics = await self._collect_validation_rollouts(
-            num_groups=num_samples, sampling=greedy, step=step
-        )
-
-        self.rollout_recorder.record(is_validation=True, rollout_groups=rollout_groups)
-
-        t_validate_s = time.perf_counter() - t_validate_start
-        validation_metrics.append(m.Metric("timing/validate", m.NoReduce(t_validate_s)))
-        return validation_metrics
-
     async def run(self) -> None:
         """Start every async loop and run until training completes or a stage crashes.
 
@@ -714,12 +668,31 @@ class Controller(Configurable):
             max_active_rollout_groups=max_active_rollout_groups,
         )
 
+        # Periodic-validation coordination. Gates are set == open; a pass clears the ones its
+        # loop_mode uses and the worker reopens them after a successful pass (they stay closed on
+        # failure -- the supervised worker's exception tears the run down).
+        self._validation_gate_data_input = asyncio.Event()
+        self._validation_gate_data_input.set()
+        self._validation_gate_trainer = asyncio.Event()
+        self._validation_gate_trainer.set()
+        self._validation_gate_generator_pull = asyncio.Event()
+        self._validation_gate_generator_pull.set()
+        # Held while the data loop admits one sample and while the trainer owns a consumed batch
+        # (through start_async_push_pull); the validation worker uses them as exact barriers.
+        self._data_admission_active = asyncio.Lock()
+        self._trainer_step_active = asyncio.Lock()
+        # idle means "no pass in flight"; the trigger clears it, the worker sets it after reopening.
+        self._validation_idle = asyncio.Event()
+        self._validation_idle.set()
+        self._validation_trigger: asyncio.Queue[int] = asyncio.Queue(maxsize=1)
+
         # Overlaps each step's weight handoff (push -> pull -> buffer-slot release) with the next step's fwd/bwd
         self._weight_sync = WeightSyncManager(
             trainer=self.trainer,
             generator_router=self.generator_router,
             group_buffer=self._group_buffer,
             num_groups_per_train_step=async_loop.num_groups_per_train_step,
+            generator_pull_gate=self._validation_gate_generator_pull,
         )
 
         # training_sample_builder
@@ -778,12 +751,18 @@ class Controller(Configurable):
             name="trainer",
         )
 
+        # periodic_validation_loop: one long-lived worker, supervised like the other producers.
+        validation_task = asyncio.create_task(
+            self._periodic_validation_loop(), name="periodic_validation"
+        )
+
         # run everything until trainer finishes its number of steps
         # or some other loop breaks
         background_tasks = [
             data_input_task,
             *rollout_tasks,
             batcher_task,
+            validation_task,
         ]
         try:
             done, _ = await asyncio.wait(
@@ -800,6 +779,21 @@ class Controller(Configurable):
                 raise RuntimeError(f"{task.get_name()} exited unexpectedly")
             if trainer_task in done:
                 await trainer_task
+                # Wait for an in-flight periodic pass: idle (success) or the worker dying (failure).
+                # Racing both is what makes a pass that fails AFTER the trainer finished unable to hang us.
+                validation_idle_waiter = asyncio.create_task(
+                    self._validation_idle.wait()
+                )
+                validation_done, _ = await asyncio.wait(
+                    [validation_task, validation_idle_waiter],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if validation_task in validation_done:
+                    validation_idle_waiter.cancel()
+                    await asyncio.gather(
+                        validation_idle_waiter, return_exceptions=True
+                    )
+                    await validation_task  # re-raises the worker's failure
         finally:
             # Graceful first: buffer.close() (awaited) wakes loops blocked on the buffer so they return.
             # Then cancel covers anything blocked on the queue (which close does not wake); gather awaits all.
@@ -810,15 +804,122 @@ class Controller(Configurable):
                 *background_tasks, trainer_task, return_exceptions=True
             )
 
-        # Post-training validation (held-out eval after the final step).
-        post_validation = await self._validate_and_log(step=num_training_steps)
-        self._log_reward_delta(pre_validation, post_validation)
+        # Post-training validation (held-out eval after the final step). Skipped when a fully
+        # completed checkpoint resumes (start_step == num_training_steps): the pre-validation above
+        # already evaluated this exact step.
+        if self.start_step < num_training_steps:
+            post_validation = await self._validate_and_log(step=num_training_steps)
+            self._log_reward_delta(pre_validation, post_validation)
 
     async def _validate_and_log(self, *, step: int) -> dict[str, float]:
         """Run one validation pass, log it, and return its aggregated values for the pre/post delta."""
-        metrics = await self.validate(step=step)
+        metrics = await self._validator.evaluate(
+            step=step,
+            generate_fn=self._make_generate_fn(metrics_prefix="validation_generator"),
+        )
         self.metrics_processor.log(step=step, metrics=metrics, is_validation=True)
         return m.MetricsProcessor._aggregate_metrics(metrics)
+
+    def _should_start_periodic_validation(self, *, step: int, final_step: int) -> bool:
+        """True when a periodic pass belongs at this step.
+
+        Skips the final step (post-training validation covers it). Absolute-step arithmetic
+        handles resume: `start_step=37, interval_steps=10` evaluates at 40, 50, ...
+
+        Example:
+
+            # interval_steps=5, num_samples=20, final_step=100
+            _should_start_periodic_validation(step=5, final_step=100)    # True
+            _should_start_periodic_validation(step=4, final_step=100)    # False (not a multiple)
+            _should_start_periodic_validation(step=100, final_step=100)  # False (final step)
+        """
+        validation = self.config.async_loop.validation
+        return (
+            validation.validator.num_samples > 0
+            and validation.interval_steps > 0
+            and step < final_step
+            and step % validation.interval_steps == 0
+        )
+
+    async def _trigger_periodic_validation(self, *, step: int) -> None:
+        """Trainer-side trigger at the cadence: settle weight sync, close gates, enqueue the pass.
+
+        Runs inside `_trainer_step_active`, after `start_async_push_pull(step)`. Settling the
+        in-flight push->pull first means the generator holds exactly version `step` when the gates
+        freeze it -- the pass is attributed to a settled version, not a moving one. Skip-if-running
+        checks idle BEFORE settling so a skipped cadence pays nothing.
+        """
+        if not self._validation_idle.is_set():
+            logger.info(
+                "validation still running; skipping periodic pass at step %d", step
+            )
+            return
+        await self._weight_sync.wait_inflight_push_pull()
+        mode = self.config.async_loop.validation.loop_mode
+        if mode in (
+            ValidationLoopMode.PAUSE_TRAINER,
+            ValidationLoopMode.PAUSE_TRAINER_AND_DATA_INPUT,
+        ):
+            self._validation_gate_trainer.clear()
+        if mode in (
+            ValidationLoopMode.PAUSE_TRAINER_AND_DATA_INPUT,
+            ValidationLoopMode.DRAIN_TRAINER,
+        ):
+            self._validation_gate_data_input.clear()
+        if mode is ValidationLoopMode.DRAIN_TRAINER:
+            self._validation_gate_generator_pull.clear()
+        self._validation_idle.clear()
+        self._validation_trigger.put_nowait(step)
+
+    async def _periodic_validation_loop(self) -> None:
+        """Long-lived worker: run each triggered pass, then reopen gates (success only).
+
+        Supervised in run()'s background_tasks, so a validator or catch-up failure wakes run()
+        immediately -- even when the trainer is blocked on an empty batch queue. On failure the
+        gates stay closed on purpose: reopening admission against an unconfirmed generator version
+        would trade a supervised failure for a born-stale batch.
+        """
+        while True:
+            trigger_step = await self._validation_trigger.get()
+            mode = self.config.async_loop.validation.loop_mode
+
+            if mode is not ValidationLoopMode.PAUSE_TRAINER:
+                # Exact admission barrier: wait out an in-flight admission, so no sample slips
+                # in after the gate closed.
+                async with self._data_admission_active:
+                    pass
+
+            metrics = await self._validator.evaluate(
+                step=trigger_step,
+                generate_fn=self._make_generate_fn(
+                    metrics_prefix="validation_generator"
+                ),
+            )
+
+            if mode is ValidationLoopMode.DRAIN_TRAINER:
+                # Stop a NEW trainer step from starting; the active one finishes and its
+                # push settles under the lock below.
+                self._validation_gate_trainer.clear()
+            async with self._trainer_step_active:
+                await self._weight_sync.catch_up_pull()
+                # Log at the newest trainer step: W&B requires monotonic steps, and under
+                # DRAIN the trainer logged steps past trigger_step while the pass ran
+                # (backdating to trigger_step gets the record dropped). The frozen policy
+                # actually evaluated is still recorded as validation/policy_version. Equal
+                # to trigger_step in PAUSE modes. The trainer flushes a step's metrics
+                # synchronously after releasing the lock, so this step never outruns it.
+                self.metrics_processor.log(
+                    step=self._trainer_policy_version,
+                    metrics=metrics,
+                    is_validation=True,
+                )
+
+            # Success only: reopen. (On an exception above, gates stay closed and run()
+            # observes this task's failure.)
+            self._validation_gate_generator_pull.set()
+            self._validation_gate_data_input.set()
+            self._validation_gate_trainer.set()
+            self._validation_idle.set()
 
     def _log_reward_delta(self, pre: dict[str, float], post: dict[str, float]) -> None:
         """Console pre/post reward summary, visible without scrolling back through the loop."""
@@ -847,16 +948,26 @@ class Controller(Configurable):
         # we could a) increase the number of threads; b) revisit how we release slots and see if
         # we can release them on the batcher while still preserving max off-policy steps.
         # finally, c) we need to check how will this data input loop truly overlaps with the rollout loop.
-        while await group_buffer.wait_for_slot():
-            with sl.log_trace_span("get_training_sample"):
-                # to_thread: Dont block on dataset reads
-                sample = await asyncio.to_thread(self._rollouter.get_training_sample)
-            await group_buffer.add_work(
-                RolloutGroupWork(
-                    group_id=group_index,
-                    sample=sample,
+        while True:
+            await self._validation_gate_data_input.wait()
+            if not await group_buffer.wait_for_slot():
+                break
+            # The admission lock makes the pause exact: the validation worker barriers on it, so
+            # once the worker proceeds, no in-flight admission can still add_work.
+            async with self._data_admission_active:
+                if not self._validation_gate_data_input.is_set():
+                    continue  # gate closed while we waited for a slot; re-check it
+                with sl.log_trace_span("get_training_sample"):
+                    # to_thread: Dont block on dataset reads
+                    sample = await asyncio.to_thread(
+                        self._rollouter.get_training_sample
+                    )
+                await group_buffer.add_work(
+                    RolloutGroupWork(
+                        group_id=group_index,
+                        sample=sample,
+                    )
                 )
-            )
             group_index += 1
         logger.info("Buffer closed; data input loop stopping")
 
@@ -987,6 +1098,9 @@ class Controller(Configurable):
             with sl.log_trace_span("train_step"), step_timer.record(
                 "timing/step/total"
             ):
+                # PAUSE modes park the trainer here for the duration of a validation pass.
+                await self._validation_gate_trainer.wait()
+
                 # Waits for a TrainingBatch to be ready (or None on shutdown).
                 with sl.log_trace_span("wait_for_training_batch"), step_timer.record(
                     "timing/step/wait_for_training_batch"
@@ -997,64 +1111,72 @@ class Controller(Configurable):
                     logger.info("Batcher closed and drained; stopping training")
                     break
 
-                # Policy age is computed HERE, at consumption time, against the live trainer version, so it is
-                # faithful to what this step trains on -- not the version when the batch was packed.
-                policy_age_panel = compute_policy_age_metrics(
-                    trainer_policy_version=self._trainer_policy_version,
-                    min_policy_versions=packed.min_policy_versions,
-                    max_offpolicy_steps=self.config.async_loop.max_offpolicy_steps,
-                )
-
-                # TODO(async): can't stream microbatches (interleave pack->train) — the loss is normalized by
-                #   packed.num_global_valid_tokens (sum over ALL microbatches), needed before any fwd/bwd. To
-                #   support streaming, accumulate raw loss/token counts across microbatches and scale before optim.
-                with sl.log_trace_span("forward_backward"), step_timer.record(
-                    "timing/step/forward_backward"
-                ):
-                    # fwd_bwd on all microbatches
-                    microbatch_metrics = [
-                        self._get_rank_0_value(
-                            await self.trainer.forward_backward.call(
-                                microbatch, packed.num_global_valid_tokens
-                            )
-                        )
-                        for microbatch in packed.microbatches
-                    ]
-
-                    fwd_bwd_metrics = combine_microbatch_metrics(microbatch_metrics)
-
-                    if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
-                        logger.error("Loss is NaN/Inf; training diverged")
-                        break
-
-                # Await trainer weight push to finish before optim step mutates the weights.
-                with sl.log_trace_span(
-                    "blocking_trainer_push_model_state_dict"
-                ), step_timer.record(
-                    "timing/step/blocking_trainer_push_model_state_dict"
-                ):
-                    push_metrics = await self._weight_sync.wait_prev_push()
-
-                with sl.log_trace_span("optim_step"), step_timer.record(
-                    "timing/step/optim"
-                ):
-                    optim_result = self._get_rank_0_value(
-                        await self.trainer.optim_step.call()
+                # The lock means "a consumed batch is being trained/published". The DRAIN
+                # catch-up acquires it so it never pulls between this step's optim and its push.
+                async with self._trainer_step_active:
+                    # Policy age is computed HERE, at consumption time, against the live trainer version, so it is
+                    # faithful to what this step trains on -- not the version when the batch was packed.
+                    policy_age_panel = compute_policy_age_metrics(
+                        trainer_policy_version=self._trainer_policy_version,
+                        min_policy_versions=packed.min_policy_versions,
+                        max_offpolicy_steps=self.config.async_loop.max_offpolicy_steps,
                     )
-                self._trainer_policy_version = optim_result.policy_version
 
-                # Await generator weight pull to finish before the trainer's next push.
-                with sl.log_trace_span(
-                    "blocking_generator_pull_model_state_dict"
-                ), step_timer.record(
-                    "timing/step/blocking_generator_pull_model_state_dict"
-                ):
-                    pull_metrics = await self._weight_sync.wait_prev_pull()
+                    # TODO(async): can't stream microbatches (interleave pack->train) — the loss is normalized by
+                    #   packed.num_global_valid_tokens (sum over ALL microbatches), needed before any fwd/bwd. To
+                    #   support streaming, accumulate raw loss/token counts across microbatches and scale before optim.
+                    with sl.log_trace_span("forward_backward"), step_timer.record(
+                        "timing/step/forward_backward"
+                    ):
+                        # fwd_bwd on all microbatches
+                        microbatch_metrics = [
+                            self._get_rank_0_value(
+                                await self.trainer.forward_backward.call(
+                                    microbatch, packed.num_global_valid_tokens
+                                )
+                            )
+                            for microbatch in packed.microbatches
+                        ]
 
-                # Overlap this step's push -> pull -> buffer-slot release with the next step's fwd/bwd.
-                self._weight_sync.start_async_push_pull(
-                    version=optim_result.policy_version
-                )
+                        fwd_bwd_metrics = combine_microbatch_metrics(microbatch_metrics)
+
+                        if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
+                            logger.error("Loss is NaN/Inf; training diverged")
+                            break
+
+                    # Await trainer weight push to finish before optim step mutates the weights.
+                    with sl.log_trace_span(
+                        "blocking_trainer_push_model_state_dict"
+                    ), step_timer.record(
+                        "timing/step/blocking_trainer_push_model_state_dict"
+                    ):
+                        push_metrics = await self._weight_sync.wait_prev_push()
+
+                    with sl.log_trace_span("optim_step"), step_timer.record(
+                        "timing/step/optim"
+                    ):
+                        optim_result = self._get_rank_0_value(
+                            await self.trainer.optim_step.call()
+                        )
+                    self._trainer_policy_version = optim_result.policy_version
+
+                    # Await generator weight pull to finish before the trainer's next push.
+                    with sl.log_trace_span(
+                        "blocking_generator_pull_model_state_dict"
+                    ), step_timer.record(
+                        "timing/step/blocking_generator_pull_model_state_dict"
+                    ):
+                        pull_metrics = await self._weight_sync.wait_prev_pull()
+
+                    # Overlap this step's push -> pull -> buffer-slot release with the next step's fwd/bwd.
+                    self._weight_sync.start_async_push_pull(
+                        version=optim_result.policy_version
+                    )
+
+                    if self._should_start_periodic_validation(
+                        step=step, final_step=num_training_steps
+                    ):
+                        await self._trigger_periodic_validation(step=step)
 
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.
