@@ -166,6 +166,23 @@ python -m torchtitan.experiments.rl.train \
 
 Install the batch-invariant kernels shown in [Prerequisites](#prerequisites), then follow the [bitwise parity guide](./docs/bitwise_parity.md) for configuration, supported layouts, verification, and limitations.
 
+## Multi-node on SLURM
+
+Configurations whose total GPU footprint exceeds a single node (e.g.
+`rl_grpo_qwen3_14b`: trainer TP=8 + generator TP=8 = 16 GPUs) run through the
+`slurm_launcher` entry point, which submits one sbatch covering the trainer plus
+one mesh per generator on disjoint nodes:
+
+```bash
+RL_SLURM_PARTITION=h100 RL_SLURM_GPUS_PER_NODE=8 \
+python -m torchtitan.experiments.rl.slurm_launcher \
+    --module alphabet_sort --config rl_grpo_qwen3_14b
+```
+
+See [docs/multinode_slurm.md](docs/multinode_slurm.md) for the rest of the
+`RL_SLURM_*` variables, which process the controller runs in (`RL_SLURM_BATCH`),
+and where the logs land.
+
 For background, see [train/inference mismatch in asynchronous RL](https://yichuan-w.github.io/blog/GDN-train-inference-mismatch-asyncRL/) and [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/).
 
 ## Observability
