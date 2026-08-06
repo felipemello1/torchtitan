@@ -183,6 +183,20 @@ See [docs/multinode_slurm.md](docs/multinode_slurm.md) for the rest of the
 `RL_SLURM_*` variables, which process the controller runs in (`RL_SLURM_BATCH`),
 and where the logs land.
 
+## Weight-sync transport
+
+Which TorchStore transport carries the trainer->generator weight sync is a config
+dial, not an env ritual:
+`--weight-sync-transport {auto,gloo,monarch_rdma,monarch_rpc,torchcomms}`
+(`Controller.Config.weight_sync_transport`). Pair it with
+`--generator.manual-cpu-stage-weight-sync` where registering GPU memory as the RDMA
+destination fails. Neither knob is set by any checked-in config; both are per-run
+choices.
+
+See [docs/weight_sync_transport.md](docs/weight_sync_transport.md) for what each
+value does, how to tell from the logs which transport a run actually used, and the
+settings validated on GB300/CoreWeave.
+
 For background, see [train/inference mismatch in asynchronous RL](https://yichuan-w.github.io/blog/GDN-train-inference-mismatch-asyncRL/) and [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/).
 
 ## Observability
