@@ -225,6 +225,22 @@ def test_model_config_rejects_invalid_layer_and_converted_projection() -> None:
             model_config=model_config,
         )
 
+    config.tensor_logging.layer_ids = (0,)
+    original = model_config.layers[0].attention.wo
+
+    @dataclass(kw_only=True, slots=True)
+    class ConvertedLinearConfig(Linear.Config):
+        pass
+
+    kwargs = {field.name: getattr(original, field.name) for field in fields(original)}
+    model_config.layers[0].attention.wo = ConvertedLinearConfig(**kwargs)
+    with pytest.raises(ValueError, match="ordinary Linear.Config"):
+        TensorLogging.validate_model_config(
+            config.tensor_logging,
+            model_spec=config.model_spec,
+            model_config=model_config,
+        )
+
 
 def test_model_config_rejects_quantization_anywhere() -> None:
     config = _enabled_config()
@@ -311,22 +327,6 @@ def test_torchft_rejects_tensor_logging() -> None:
     config = _enabled_config()
     with pytest.raises(ValueError, match="does not yet support TorchFT"):
         FaultTolerantTrainer(config)
-
-    config.tensor_logging.layer_ids = (0,)
-    original = model_config.layers[0].attention.wo
-
-    @dataclass(kw_only=True, slots=True)
-    class ConvertedLinearConfig(Linear.Config):
-        pass
-
-    kwargs = {field.name: getattr(original, field.name) for field in fields(original)}
-    model_config.layers[0].attention.wo = ConvertedLinearConfig(**kwargs)
-    with pytest.raises(ValueError, match="ordinary Linear.Config"):
-        TensorLogging.validate_model_config(
-            config.tensor_logging,
-            model_spec=config.model_spec,
-            model_config=model_config,
-        )
 
 
 def test_disabled_config_bypasses_tensor_logging_validation() -> None:
