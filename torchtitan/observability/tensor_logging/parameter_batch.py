@@ -111,7 +111,23 @@ class ParameterStatisticsBatch:
                 )
             )
 
-        self._owner_meshes = bound_parameters[0].owner_meshes
+        owner_meshes = bound_parameters[0].owner_meshes
+        use_world_mesh = (
+            len(owner_meshes) == 2
+            and parallel_dims.dp_replicate == 1
+            and parallel_dims.cp == 1
+            and parallel_dims.pp == 1
+            and parallel_dims.ep == 1
+        )
+        if use_world_mesh:
+            owner_count = owner_meshes[0].size() * owner_meshes[1].size()
+            if owner_count != parallel_dims.world_mesh.size():
+                raise ValueError(
+                    "tensor logging compound parameter owners must span WORLD"
+                )
+            self._reduction_meshes = (parallel_dims.world_mesh,)
+        else:
+            self._reduction_meshes = owner_meshes
         self._local_device = bound_parameters[0].value.device
         self._parallel_dims = parallel_dims
         self._rows = tuple(
@@ -178,7 +194,7 @@ class ParameterStatisticsBatch:
                 sums=torch.stack(row_sums),
                 abs_max=torch.stack(row_maxima),
             ),
-            self._owner_meshes,
+            self._reduction_meshes,
         )
         return ParameterStatisticsSnapshot(
             statistics=reduced,

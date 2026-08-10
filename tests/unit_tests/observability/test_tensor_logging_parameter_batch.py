@@ -164,6 +164,7 @@ def test_all_absent_optional_gradient_is_omitted(fake_world_one: None) -> None:
 
 def test_parameter_rows_share_one_packed_reduction(fake_world_one: None) -> None:
     batch, _ = _build_batch()
+    assert batch._reduction_meshes == ()
 
     with patch(
         "torchtitan.observability.tensor_logging.parameter_batch.reduce_finite_statistics",
@@ -303,6 +304,12 @@ class TestParameterBatchTwoRanks(DTensorTestBase):
             tp=tp,
             device_type=self.device_type,
         )
+        expected_mesh_name = "fsdp" if dp_shard == 2 else "tp"
+        self.assertEqual(len(batch._reduction_meshes), 1)
+        self.assertIs(
+            batch._reduction_meshes[0],
+            batch._parallel_dims.get_mesh(expected_mesh_name),
+        )
         parameter = model.layers[0].attention.wo.weight
         assert isinstance(parameter, DTensor)
         with torch.no_grad():
@@ -358,6 +365,11 @@ class TestParameterBatchFourRanks(DTensorTestBase):
             dp_shard=2,
             tp=2,
             device_type=self.device_type,
+        )
+        self.assertEqual(len(batch._reduction_meshes), 1)
+        self.assertIs(
+            batch._reduction_meshes[0],
+            batch._parallel_dims.world_mesh,
         )
         parameter = model.layers[0].attention.wo.weight
         assert isinstance(parameter, DTensor)

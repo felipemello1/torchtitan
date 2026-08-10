@@ -25,7 +25,6 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.observability.tensor_logging import reduction
 from torchtitan.observability.tensor_logging.parameter_statistics import (
-    reduce_rowwise_parameter_finite_statistics,
     resolve_rowwise_parameter_owner_meshes,
     validate_reduced_parameter_numel,
 )
@@ -288,9 +287,9 @@ class TestRowwiseParameterSingleton(DTensorTestBase):
             parameter,
             parallel_dims=parallel_dims,
         )
-        statistics = reduce_rowwise_parameter_finite_statistics(
-            parameter,
-            parallel_dims=parallel_dims,
+        statistics = reduce_finite_statistics(
+            finite_statistics(parameter.to_local()),
+            owner_meshes,
         )
         host_statistics = _to_cpu(statistics)
 
@@ -333,9 +332,9 @@ class TestRowwiseParameterTwoRanks(DTensorTestBase):
             parameter,
             parallel_dims=parallel_dims,
         )
-        statistics = reduce_rowwise_parameter_finite_statistics(
-            parameter,
-            parallel_dims=parallel_dims,
+        statistics = reduce_finite_statistics(
+            finite_statistics(parameter.to_local()),
+            owner_meshes,
         )
         host_statistics = _to_cpu(statistics)
 
@@ -397,9 +396,9 @@ class TestRowwiseParameterFourRanks(DTensorTestBase):
             parameter,
             parallel_dims=parallel_dims,
         )
-        statistics = reduce_rowwise_parameter_finite_statistics(
-            parameter,
-            parallel_dims=parallel_dims,
+        statistics = reduce_finite_statistics(
+            finite_statistics(parameter.to_local()),
+            owner_meshes,
         )
         host_statistics = _to_cpu(statistics)
 
@@ -427,9 +426,9 @@ class TestRowwiseParameterFourRanks(DTensorTestBase):
             parallel_dims=parallel_dims,
         )
         gradient_statistics = _to_cpu(
-            reduce_rowwise_parameter_finite_statistics(
-                gradient,
-                parallel_dims=parallel_dims,
+            reduce_finite_statistics(
+                finite_statistics(gradient.to_local()),
+                gradient_owner_meshes,
             )
         )
         self.assertIs(gradient_owner_meshes[0], fsdp_mesh)
@@ -462,9 +461,9 @@ class TestRowwiseParameterFourRanks(DTensorTestBase):
             parallel_dims=parallel_dims,
         )
         statistics = _to_cpu(
-            reduce_rowwise_parameter_finite_statistics(
-                parameter,
-                parallel_dims=parallel_dims,
+            reduce_finite_statistics(
+                finite_statistics(parameter.to_local()),
+                owner_meshes,
             )
         )
 

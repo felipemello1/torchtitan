@@ -36,6 +36,7 @@ def main() -> None:
     parallel_dims.build_mesh()
     dp_mesh = parallel_dims.get_mesh("batch")
     tp_mesh = parallel_dims.get_mesh("tp")
+    world_mesh = parallel_dims.world_mesh
     dp_coordinate = dp_mesh.get_local_rank()
     tp_coordinate = tp_mesh.get_local_rank()
     one = torch.ones((), dtype=torch.int64, device=device)
@@ -47,12 +48,14 @@ def main() -> None:
 
     assert reduce_sum(one, dp_mesh).item() == 2
     assert reduce_sum(one, tp_mesh).item() == 2
+    assert reduce_sum(one, world_mesh).item() == 4
     assert reduce_sum(value, dp_mesh).item() == 102 + 20 * tp_coordinate
     assert reduce_sum(value, tp_mesh).item() == 12 + 200 * dp_coordinate
+    assert reduce_sum(value, world_mesh).item() == 224
 
     dist.barrier()
     if dist.get_rank() == 0:
-        print("PASS: DP cohorts 102/122; TP cohorts 12/212")
+        print("PASS: DP cohorts 102/122; TP cohorts 12/212; WORLD cohort 224")
     dist.destroy_process_group()
 
 

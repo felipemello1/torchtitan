@@ -9,11 +9,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.observability.tensor_logging.recorders import (
-    finite_statistics,
-    FiniteStatistics,
-)
-from torchtitan.observability.tensor_logging.reduction import reduce_finite_statistics
+from torchtitan.observability.tensor_logging.recorders import FiniteStatistics
 
 
 def resolve_rowwise_parameter_owner_meshes(
@@ -70,21 +66,6 @@ def resolve_rowwise_parameter_owner_meshes(
     if parallel_dims.tp_enabled:
         owner_meshes.append(parallel_dims.get_mesh("tp"))
     return tuple(owner_meshes)
-
-
-def reduce_rowwise_parameter_finite_statistics(
-    value: torch.Tensor,
-    *,
-    parallel_dims: ParallelDims,
-) -> FiniteStatistics:
-    """Build and reduce finite statistics from one validated local shard."""
-    owner_meshes = resolve_rowwise_parameter_owner_meshes(
-        value,
-        parallel_dims=parallel_dims,
-    )
-    assert isinstance(value, DTensor)
-    local_statistics = finite_statistics(value.to_local())
-    return reduce_finite_statistics(local_statistics, owner_meshes)
 
 
 def validate_reduced_parameter_numel(
