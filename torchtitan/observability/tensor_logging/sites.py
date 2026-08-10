@@ -8,6 +8,8 @@ from enum import Enum
 
 
 class TensorMetricSite(str, Enum):
+    """Built-in semantic tensor sites available to recipes."""
+
     ATTENTION_INPUT = "attention_input"
     ATTENTION_INPUT_GRAD = "attention_input_grad"
     ATTENTION_OUTPUT_WEIGHT = "attention_output_weight"

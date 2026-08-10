@@ -34,7 +34,16 @@ from torchtitan.tools.logging import logger
 
 
 class TensorLogging(Configurable):
-    """Distributed logging for the selected built-in tensor sites."""
+    """Distributed logging for selected built-in tensor sites.
+
+    Example:
+
+        config.tensor_logging = TensorLogging.Config(
+            enable=True,
+            sites=(TensorMetricSite.ATTENTION_OUTPUT_WEIGHT,),
+            layer_ids=(0,),
+        )
+    """
 
     _batch: ParameterStatisticsBatch
     _is_writer: bool
@@ -44,6 +53,8 @@ class TensorLogging(Configurable):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
+        """Selects the built-in tensor sites and global decoder layers to log."""
+
         enable: bool = False
         """Whether to collect selected distributed tensor statistics."""
 
