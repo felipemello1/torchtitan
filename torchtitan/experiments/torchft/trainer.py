@@ -42,6 +42,12 @@ class FaultTolerantTrainer(Trainer):
     def __init__(self, config: Config):
         torch._C._log_api_usage_once("torchtitan.train")
 
+        if (
+            config.tensor_logging.enable
+            and not config.checkpoint.create_seed_checkpoint
+        ):
+            raise ValueError("tensor logging does not yet support TorchFT")
+
         self.config = config
         assert (
             config.model_spec is not None

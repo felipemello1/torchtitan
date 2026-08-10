@@ -49,6 +49,7 @@ from torchtitan.distributed.spmd_types import annotate_input_spmd_types
 from torchtitan.models.common.attention import FlexAttention, VarlenAttention
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.observability import structured_logger as sl
+from torchtitan.observability.tensor_logging import TensorLogging
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools import utils
@@ -80,6 +81,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         profiler: Profiler.Config = field(default_factory=Profiler.Config)
         metrics: MetricsProcessor.Config = field(
             default_factory=MetricsProcessor.Config
+        )
+        tensor_logging: TensorLogging.Config = field(
+            default_factory=TensorLogging.Config
         )
         tokenizer: BaseTokenizer.Config = field(
             default_factory=HuggingFaceTokenizer.Config
@@ -223,6 +227,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     lr_schedulers: LRSchedulersContainer
     validator: BaseValidator
     metrics_processor: MetricsProcessor
+    tensor_logging: TensorLogging | None
     checkpointer: CheckpointManager
 
     # runtime utilities
@@ -244,10 +249,32 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         torch._C._log_api_usage_once("torchtitan.train")
 
         self.config = config
+        self.tensor_logging = None
         assert (
             config.model_spec is not None
         ), "model_spec must be set before creating Trainer"
         model_spec = config.model_spec
+
+        # Model overrides run after update_from_config because it initializes
+        # sharding fields on the configs that an override may replace.
+        model_config = model_spec.model
+        model_config.update_from_config(config=config)
+        self.model_config = model_config
+        if config.override.imports:
+            apply_overrides(config.override, config)
+
+        tensor_logging_enabled = (
+            config.tensor_logging.enable
+            and not config.checkpoint.create_seed_checkpoint
+        )
+        if config.tensor_logging.enable and config.checkpoint.create_seed_checkpoint:
+            logger.info("Tensor logging is bypassed while creating a seed checkpoint")
+        elif tensor_logging_enabled:
+            TensorLogging.validate_job_config(
+                config.tensor_logging,
+                trainer_config=config,
+                is_core_trainer=type(self) is Trainer,
+            )
 
         device_module, device_type = utils.device_module, utils.device_type
         # pyrefly: ignore [read-only]
@@ -296,21 +323,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             distinct_seed_mesh_dims=["pp"],
         )
 
-        # build model (using meta init)
-        model_config = model_spec.model
-        # set the model args from training job configs
-        model_config.update_from_config(
-            config=config,
-        )
-        self.model_config = model_config
-
-        # Apply overrides to the full config tree, before any component is
-        # built. The model config is reached via ModelSpec.traverse. Model
-        # overrides must run after update_from_config above (it sets sharding
-        # config on the pre-override modules); all other components (optimizer,
-        # loss, dataloader, …) are built later in __init__.
-        if config.override.imports:
-            apply_overrides(config.override, config)
+        if tensor_logging_enabled:
+            TensorLogging.validate_model_config(
+                config.tensor_logging,
+                model_spec=model_spec,
+                model_config=model_config,
+            )
 
         logger.info(f"Building {model_spec.name} {model_spec.flavor}")
 
@@ -487,6 +505,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 self.model_parts[
                     0
                 ]._skip_lm_head = True  # pyrefly: ignore[bad-argument-type]
+
+        if tensor_logging_enabled:
+            assert len(self.model_parts) == 1
+            self.tensor_logging = config.tensor_logging.build(
+                model=self.model_parts[0],
+                parallel_dims=parallel_dims,
+                metrics_processor=self.metrics_processor,
+                device=self.device,
+            )
 
         # initialize device memory monitor and get peak flops for MFU calculation
         device_memory_monitor = self.metrics_processor.device_memory_monitor
@@ -816,6 +843,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.optimizers.zero_grad()
         # Save per-optimizer-group learning rates for logging
         lr_metrics = self.lr_schedulers.get_metrics()
+        should_log = self.metrics_processor.should_log(self.step)
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
@@ -870,6 +898,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             )
             accumulated_losses.append(loss.detach())
 
+        tensor_snapshot = (
+            self.tensor_logging.collect(step=self.step)
+            if self.tensor_logging is not None and should_log
+            else None
+        )
+
         with sl.log_trace_span("optim"):
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.model_parts for p in m.parameters()],
@@ -886,7 +920,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         loss = torch.sum(torch.stack(accumulated_losses))
 
         # log metrics
-        if not self.metrics_processor.should_log(self.step):
+        if not should_log:
             return
 
         with sl.log_trace_span("collect_dist_metrics"):
@@ -935,13 +969,38 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,
         }
-        self.metrics_processor.log(
-            self.step,
-            global_avg_loss,
-            global_max_loss,
-            float(grad_norm.item()),
-            extra_metrics=extra_metrics,
-        )
+        if self.tensor_logging is None:
+            self.metrics_processor.log(
+                self.step,
+                global_avg_loss,
+                global_max_loss,
+                float(grad_norm.item()),
+                extra_metrics=extra_metrics,
+            )
+        else:
+            assert tensor_snapshot is not None
+            local_error = tensor_snapshot.local_error
+            if local_error is None:
+                try:
+                    extra_metrics.update(
+                        self.tensor_logging.derive_metrics(
+                            tensor_snapshot,
+                            step=self.step,
+                        )
+                    )
+                    self.metrics_processor.log(
+                        self.step,
+                        global_avg_loss,
+                        global_max_loss,
+                        float(grad_norm.item()),
+                        extra_metrics=extra_metrics,
+                    )
+                except Exception as error:
+                    local_error = error
+            self.tensor_logging.complete_publication(
+                step=self.step,
+                local_error=local_error,
+            )
 
     @record
     def train(self):
@@ -950,6 +1009,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         sl.log_trace_instant("training_start")
 
         self.checkpointer.load(step=config.checkpoint.load_step)
+        if self.tensor_logging is not None:
+            self.tensor_logging.reset_after_checkpoint_load(step=self.step)
 
         # Capture loaded step for relative_step calculation.
         # After checkpoint load: self.step = restored step (e.g. 100), or 0 if fresh.

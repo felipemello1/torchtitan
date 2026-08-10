@@ -362,6 +362,14 @@ class MetricsProcessor(Configurable):
     def should_log(self, step: int) -> bool:
         return step == 1 or step % self.config.log_freq == 0
 
+    @property
+    def has_active_logger(self) -> bool:
+        """Whether this rank owns at least one configured metric sink."""
+        return (
+            isinstance(self.logger, LoggerContainer)
+            and self.logger.number_of_loggers > 0
+        )
+
     def _build_metric_logger(
         self,
         *,

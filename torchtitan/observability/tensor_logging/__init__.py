@@ -5,3 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 """Distributed tensor logging for selected TorchTitan model sites."""
+
+from torchtitan.observability.tensor_logging.component import TensorLogging
+from torchtitan.observability.tensor_logging.sites import TensorMetricSite
+
+__all__ = ["TensorLogging", "TensorMetricSite"]

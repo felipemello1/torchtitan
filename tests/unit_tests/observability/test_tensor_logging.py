@@ -5,11 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
+import torch.distributed as dist
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
 )
 from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.observability.tensor_logging.component import TensorLogging
 from torchtitan.observability.tensor_logging.recorders import (
     derive_finite_statistics,
     finite_statistics,
@@ -164,3 +166,29 @@ class TestTensorLoggingReductionFourRanks(DTensorTestBase):
                 "abs_max": 4.0,
             },
         )
+
+        tensor_logging = object.__new__(TensorLogging)
+        tensor_logging._outcome_template = torch.empty(
+            (), dtype=torch.int32, device=self.device_type
+        )
+        tensor_logging._last_successful_publication_step = 0
+        rank = dist.get_rank()
+
+        writer_error = RuntimeError("writer sink failed") if rank == 0 else None
+        expected_message = "writer sink failed" if rank == 0 else "another rank"
+        with self.assertRaisesRegex(RuntimeError, expected_message):
+            tensor_logging.complete_publication(step=1, local_error=writer_error)
+        self.assertEqual(tensor_logging._last_successful_publication_step, 0)
+
+        nonwriter_error = (
+            RuntimeError("nonwriter publication failed") if rank == 1 else None
+        )
+        expected_message = (
+            "nonwriter publication failed" if rank == 1 else "another rank"
+        )
+        with self.assertRaisesRegex(RuntimeError, expected_message):
+            tensor_logging.complete_publication(step=2, local_error=nonwriter_error)
+        self.assertEqual(tensor_logging._last_successful_publication_step, 0)
+
+        tensor_logging.complete_publication(step=3, local_error=None)
+        self.assertEqual(tensor_logging._last_successful_publication_step, 3)
