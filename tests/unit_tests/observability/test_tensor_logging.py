@@ -82,138 +82,13 @@ def test_empty_finite_statistics_uses_max_identity() -> None:
     }
 
 
-class TestTensorLoggingReductionTwoRanks(DTensorTestBase):
-    @property
-    def world_size(self) -> int:
-        return 2
-
-    @with_comms
-    def test_dp_sum(self) -> None:
-        parallel_dims = ParallelDims(
-            dp_replicate=1,
-            dp_shard=2,
-            cp=1,
-            tp=1,
-            pp=1,
-            ep=1,
-            world_size=self.world_size,
-        )
-        parallel_dims.build_mesh()
-        mesh = parallel_dims.get_mesh("batch")
-
-        one = torch.ones((), device=self.device_type)
-        rank_value = torch.tensor(self.rank + 1, device=self.device_type)
-
-        self.assertEqual(reduce_sum(one, mesh).item(), 2)
-        self.assertEqual(reduce_sum(rank_value, mesh).item(), 3)
-
-    @with_comms
-    def test_tp_sum(self) -> None:
-        parallel_dims = ParallelDims(
-            dp_replicate=1,
-            dp_shard=1,
-            cp=1,
-            tp=2,
-            pp=1,
-            ep=1,
-            world_size=self.world_size,
-        )
-        parallel_dims.build_mesh()
-        mesh = parallel_dims.get_mesh("tp")
-
-        one = torch.ones((), device=self.device_type)
-        rank_value = torch.tensor(self.rank + 1, device=self.device_type)
-
-        self.assertEqual(reduce_sum(one, mesh).item(), 2)
-        self.assertEqual(reduce_sum(rank_value, mesh).item(), 3)
-
-    @with_comms
-    def test_unequal_local_counts_use_a_global_denominator(self) -> None:
-        parallel_dims = ParallelDims(
-            dp_replicate=1,
-            dp_shard=2,
-            cp=1,
-            tp=1,
-            pp=1,
-            ep=1,
-            world_size=self.world_size,
-        )
-        parallel_dims.build_mesh()
-        mesh = parallel_dims.get_mesh("batch")
-        local_value = (
-            torch.tensor([1.0], device=self.device_type)
-            if self.rank == 0
-            else torch.tensor([1.0, 3.0, 5.0], device=self.device_type)
-        )
-        local_statistics = finite_statistics(local_value)
-        global_statistics = FiniteStatistics(
-            counts=reduce_sum(local_statistics.counts, mesh).cpu(),
-            sums=reduce_sum(local_statistics.sums, mesh).cpu(),
-            abs_max=reduce_max(local_statistics.abs_max, mesh).cpu(),
-        )
-
-        result = derive_finite_statistics(global_statistics)
-
-        self.assertEqual(result["numel"], 4)
-        self.assertEqual(result["abs_mean"], 2.5)
-        self.assertEqual(result["square_mean"], 9.0)
-        self.assertEqual(result["rms"], 3.0)
-        self.assertEqual(result["abs_max"], 5.0)
-
-    @with_comms
-    def test_mixed_nonfinite_values_reduce_exact_counts(self) -> None:
-        parallel_dims = ParallelDims(
-            dp_replicate=1,
-            dp_shard=2,
-            cp=1,
-            tp=1,
-            pp=1,
-            ep=1,
-            world_size=self.world_size,
-        )
-        parallel_dims.build_mesh()
-        mesh = parallel_dims.get_mesh("batch")
-        local_value = (
-            torch.tensor([0.0, float("nan")], device=self.device_type)
-            if self.rank == 0
-            else torch.tensor([-2.0, float("inf"), 4.0], device=self.device_type)
-        )
-        local_statistics = finite_statistics(local_value)
-        reduced_counts = reduce_sum(local_statistics.counts, mesh)
-        reduced_sums = reduce_sum(local_statistics.sums, mesh)
-        reduced_abs_max = reduce_max(local_statistics.abs_max, mesh)
-
-        self.assertEqual(type(reduced_counts), torch.Tensor)
-        self.assertEqual(type(reduced_sums), torch.Tensor)
-        self.assertEqual(type(reduced_abs_max), torch.Tensor)
-        global_statistics = FiniteStatistics(
-            counts=reduced_counts.cpu(),
-            sums=reduced_sums.cpu(),
-            abs_max=reduced_abs_max.cpu(),
-        )
-
-        self.assertEqual(
-            derive_finite_statistics(global_statistics),
-            {
-                "numel": 5,
-                "nonfinite_count": 2,
-                "zero_count": 1,
-                "zero_fraction": 1 / 3,
-                "abs_mean": 2.0,
-                "square_mean": 20 / 3,
-                "rms": (20 / 3) ** 0.5,
-                "abs_max": 4.0,
-            },
-        )
-
-
 class TestTensorLoggingReductionFourRanks(DTensorTestBase):
     @property
     def world_size(self) -> int:
         return 4
 
     @with_comms
-    def test_mixed_dp_tp_uses_the_requested_axis(self) -> None:
+    def test_requested_axes_and_finite_statistics(self) -> None:
         parallel_dims = ParallelDims(
             dp_replicate=1,
             dp_shard=2,
@@ -238,3 +113,54 @@ class TestTensorLoggingReductionFourRanks(DTensorTestBase):
 
         self.assertEqual(dp_result.item(), 102 + 20 * tp_coordinate)
         self.assertEqual(tp_result.item(), 12 + 200 * dp_coordinate)
+
+        unequal_local_value = (
+            torch.tensor([1.0], device=self.device_type)
+            if dp_coordinate == 0
+            else torch.tensor([1.0, 3.0, 5.0], device=self.device_type)
+        )
+        unequal_local_statistics = finite_statistics(unequal_local_value)
+        unequal_global_statistics = FiniteStatistics(
+            counts=reduce_sum(unequal_local_statistics.counts, dp_mesh).cpu(),
+            sums=reduce_sum(unequal_local_statistics.sums, dp_mesh).cpu(),
+            abs_max=reduce_max(unequal_local_statistics.abs_max, dp_mesh).cpu(),
+        )
+        unequal_result = derive_finite_statistics(unequal_global_statistics)
+
+        self.assertEqual(unequal_result["numel"], 4)
+        self.assertEqual(unequal_result["abs_mean"], 2.5)
+        self.assertEqual(unequal_result["square_mean"], 9.0)
+        self.assertEqual(unequal_result["rms"], 3.0)
+        self.assertEqual(unequal_result["abs_max"], 5.0)
+
+        nonfinite_local_value = (
+            torch.tensor([0.0, float("nan")], device=self.device_type)
+            if dp_coordinate == 0
+            else torch.tensor([-2.0, float("inf"), 4.0], device=self.device_type)
+        )
+        nonfinite_local_statistics = finite_statistics(nonfinite_local_value)
+        reduced_counts = reduce_sum(nonfinite_local_statistics.counts, dp_mesh)
+        reduced_sums = reduce_sum(nonfinite_local_statistics.sums, dp_mesh)
+        reduced_abs_max = reduce_max(nonfinite_local_statistics.abs_max, dp_mesh)
+
+        self.assertEqual(type(reduced_counts), torch.Tensor)
+        self.assertEqual(type(reduced_sums), torch.Tensor)
+        self.assertEqual(type(reduced_abs_max), torch.Tensor)
+        nonfinite_global_statistics = FiniteStatistics(
+            counts=reduced_counts.cpu(),
+            sums=reduced_sums.cpu(),
+            abs_max=reduced_abs_max.cpu(),
+        )
+        self.assertEqual(
+            derive_finite_statistics(nonfinite_global_statistics),
+            {
+                "numel": 5,
+                "nonfinite_count": 2,
+                "zero_count": 1,
+                "zero_fraction": 1 / 3,
+                "abs_mean": 2.0,
+                "square_mean": 20 / 3,
+                "rms": (20 / 3) ** 0.5,
+                "abs_max": 4.0,
+            },
+        )
