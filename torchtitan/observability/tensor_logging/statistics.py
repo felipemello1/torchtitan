@@ -20,6 +20,41 @@ class FiniteStatistics:
     abs_max: torch.Tensor
 
 
+def bounded_tensor_views(
+    value: torch.Tensor,
+    *,
+    max_chunk_elements: int,
+) -> tuple[torch.Tensor, ...]:
+    """Split local storage into bounded views without copying it.
+
+    Args:
+        value: Local tensor storage.
+        max_chunk_elements: Maximum elements in each returned view.
+
+    Example:
+
+        views = bounded_tensor_views(torch.ones(4, 8), max_chunk_elements=10)
+        assert max(view.numel() for view in views) <= 10
+    """
+    if max_chunk_elements <= 0:
+        raise ValueError("max_chunk_elements must be positive")
+    chunks = [value.detach()]
+    for dimension in range(value.ndim):
+        split_chunks = []
+        for chunk in chunks:
+            if chunk.numel() <= max_chunk_elements:
+                split_chunks.append(chunk)
+                continue
+            elements_per_index = chunk.numel() // chunk.shape[dimension]
+            indices_per_chunk = max(
+                1,
+                max_chunk_elements // elements_per_index,
+            )
+            split_chunks.extend(chunk.split(indices_per_chunk, dim=dimension))
+        chunks = split_chunks
+    return tuple(chunks)
+
+
 def finite_statistics(
     value: torch.Tensor,
     *,
@@ -55,21 +90,11 @@ def finite_statistics(
         return FiniteStatistics(counts=counts, sums=sums, abs_max=abs_max)
 
     # Split tensor views before FP32 conversion so strided inputs stay bounded.
-    chunks = [value.detach()]
-    if max_chunk_elements is not None:
-        for dimension in range(value.ndim):
-            split_chunks = []
-            for chunk in chunks:
-                if chunk.numel() <= max_chunk_elements:
-                    split_chunks.append(chunk)
-                    continue
-                elements_per_index = chunk.numel() // chunk.shape[dimension]
-                indices_per_chunk = max(
-                    1,
-                    max_chunk_elements // elements_per_index,
-                )
-                split_chunks.extend(chunk.split(indices_per_chunk, dim=dimension))
-            chunks = split_chunks
+    chunks = (
+        (value.detach(),)
+        if max_chunk_elements is None
+        else bounded_tensor_views(value, max_chunk_elements=max_chunk_elements)
+    )
 
     for chunk in chunks:
         finite = torch.isfinite(chunk)

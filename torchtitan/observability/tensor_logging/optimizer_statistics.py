@@ -25,6 +25,7 @@ from torchtitan.observability.tensor_logging.parameter_ownership import (
     resolve_parameter_owner_meshes,
 )
 from torchtitan.observability.tensor_logging.statistics import (
+    bounded_tensor_views,
     derive_finite_statistics,
     finite_statistics,
     FiniteStatistics,
@@ -483,32 +484,46 @@ class AdamWStatisticsRecorder:
                     if self._record_distributions:
                         bias_correction1 = 1 - beta1**step
                         bias_correction2 = 1 - beta2**step
-                        denominator = (
-                            local_exp_avg_sq.sqrt() / bias_correction2.sqrt()
-                        ).add(eps)
-                        values = (
-                            local_exp_avg,
-                            denominator,
-                            local_gradient / denominator,
-                            -(lr / bias_correction1) * local_exp_avg / denominator,
-                        )
-                        for distribution_index, value in enumerate(values):
-                            statistics = finite_statistics(
-                                value,
+                        for moment, variance, gradient_chunk in zip(
+                            bounded_tensor_views(
+                                local_exp_avg,
                                 max_chunk_elements=_MAX_CHUNK_ELEMENTS,
+                            ),
+                            bounded_tensor_views(
+                                local_exp_avg_sq,
+                                max_chunk_elements=_MAX_CHUNK_ELEMENTS,
+                            ),
+                            bounded_tensor_views(
+                                local_gradient,
+                                max_chunk_elements=_MAX_CHUNK_ELEMENTS,
+                            ),
+                            strict=True,
+                        ):
+                            self._add_distribution_statistics(
+                                group_index, parameter_index, 0, moment
                             )
-                            row_index = (
-                                parameter_index * len(_DISTRIBUTION_NAMES)
-                                + distribution_index
+                            denominator = (
+                                variance.sqrt() / bias_correction2.sqrt()
+                            ).add(eps)
+                            self._add_distribution_statistics(
+                                group_index, parameter_index, 1, denominator
                             )
-                            self._counts[group_index][row_index, :3].copy_(
-                                statistics.counts
+                            self._add_distribution_statistics(
+                                group_index,
+                                parameter_index,
+                                2,
+                                gradient_chunk / denominator,
                             )
-                            self._counts[group_index][row_index, 3] = 1
-                            self._sums[group_index][row_index].copy_(statistics.sums)
-                            self._maxima[group_index][row_index].copy_(
-                                statistics.abs_max
+                            self._add_distribution_statistics(
+                                group_index,
+                                parameter_index,
+                                3,
+                                -(lr / bias_correction1) * moment / denominator,
                             )
+                        first_row = parameter_index * len(_DISTRIBUTION_NAMES)
+                        self._counts[group_index][
+                            first_row : first_row + len(_DISTRIBUTION_NAMES), 3
+                        ] = 1
 
                     if self._record_cosine:
                         momentum = local_exp_avg.float()
@@ -528,3 +543,21 @@ class AdamWStatisticsRecorder:
                         self._local_error = ValueError(
                             f"invalid AdamW tensor sample {parameter.fqn!r}: {error}"
                         )
+
+    def _add_distribution_statistics(
+        self,
+        group_index: int,
+        parameter_index: int,
+        distribution_index: int,
+        value: torch.Tensor,
+    ) -> None:
+        statistics = finite_statistics(value)
+        row_index = parameter_index * len(_DISTRIBUTION_NAMES) + distribution_index
+        self._counts[group_index][row_index, :3].add_(statistics.counts)
+        self._sums[group_index][row_index].add_(statistics.sums)
+        self._maxima[group_index][row_index].copy_(
+            torch.maximum(
+                self._maxima[group_index][row_index],
+                statistics.abs_max,
+            )
+        )
