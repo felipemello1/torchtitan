@@ -156,12 +156,18 @@ class RouterStatisticsRecorder:
             self._distribution_sums.zero_()
             self._distribution_counts.zero_()
             if self._world_mesh is not None:
-                distribution_sums = reduce_sum(
-                    distribution_sums, self._world_mesh, batch=batch
-                )
-                distribution_counts = reduce_sum(
-                    distribution_counts, self._world_mesh, batch=batch
-                )
+                if batch is None:
+                    distribution_sums = reduce_sum(distribution_sums, self._world_mesh)
+                    distribution_counts = reduce_sum(
+                        distribution_counts, self._world_mesh
+                    )
+                else:
+                    distribution_sums = batch.sum(
+                        distribution_sums, (self._world_mesh,)
+                    )
+                    distribution_counts = batch.sum(
+                        distribution_counts, (self._world_mesh,)
+                    )
 
         sequence_floats = None
         sequence_counts = None
@@ -212,8 +218,10 @@ class RouterStatisticsRecorder:
                 else:
                     batch.sum(sequence_floats[:, 0], (self._world_mesh,))
                     batch.max(sequence_floats[:, 1], (self._world_mesh,))
-                sequence_counts = reduce_sum(
-                    sequence_counts, self._world_mesh, batch=batch
+                sequence_counts = (
+                    reduce_sum(sequence_counts, self._world_mesh)
+                    if batch is None
+                    else batch.sum(sequence_counts, (self._world_mesh,))
                 )
 
         snapshot = RouterStatisticsSnapshot(

@@ -535,7 +535,7 @@ def test_model_config_rejects_quantization_anywhere() -> None:
         )
 
 
-def test_override_can_enable_tensor_logging_before_validation() -> None:
+def test_override_can_enable_tensor_logging_before_validation(monkeypatch) -> None:
     config = llama3_debugmodel()
     config.metrics.enable_tensorboard = True
 
@@ -546,7 +546,15 @@ def test_override_can_enable_tensor_logging_before_validation() -> None:
         return replace(current, enable=True)
 
     config.override.imports = [f"{__name__}.{enable_tensor_logging.__name__}"]
+    monkeypatch.setenv("LOCAL_RANK", "0")
     with (
+        patch("torchtitan.trainer.utils.device_module.set_device"),
+        patch.object(
+            Trainer,
+            "init_distributed",
+            return_value=Mock(tp=1, cp=1, dp_enabled=False),
+        ),
+        patch("torchtitan.trainer.dist_utils.set_determinism"),
         patch.object(
             TensorLogging,
             "validate_job_config",
@@ -581,7 +589,7 @@ def test_override_can_disable_tensor_logging_before_validation(monkeypatch) -> N
         Trainer(config)
 
 
-def test_override_selection_is_validated_after_replacement() -> None:
+def test_override_selection_is_validated_after_replacement(monkeypatch) -> None:
     config = _enabled_config()
 
     @override(target=TensorLogging.Config, fqns=["tensor_logging"])
@@ -591,7 +599,17 @@ def test_override_selection_is_validated_after_replacement() -> None:
         return replace(current, layer_ids=(0, 0))
 
     config.override.imports = [f"{__name__}.{duplicate_tensor_logging_layer.__name__}"]
-    with pytest.raises(ValueError, match="must not contain duplicates"):
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    with (
+        patch("torchtitan.trainer.utils.device_module.set_device"),
+        patch.object(
+            Trainer,
+            "init_distributed",
+            return_value=Mock(tp=1, cp=1, dp_enabled=False),
+        ),
+        patch("torchtitan.trainer.dist_utils.set_determinism"),
+        pytest.raises(ValueError, match="must not contain duplicates"),
+    ):
         Trainer(config)
 
 

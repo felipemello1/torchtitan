@@ -268,24 +268,16 @@ def derive_finite_statistics_values(
 def reduce_sum(
     value: torch.Tensor,
     mesh: DeviceMesh,
-    *,
-    batch: ReductionBatch | None = None,
 ) -> torch.Tensor:
     """Sum a device tensor over one family-resolved mesh."""
-    if batch is not None:
-        return batch.sum(value, (mesh,))
     return funcol.wait_tensor(funcol.all_reduce(value, reduceOp="sum", group=mesh))
 
 
 def reduce_max(
     value: torch.Tensor,
     mesh: DeviceMesh,
-    *,
-    batch: ReductionBatch | None = None,
 ) -> torch.Tensor:
     """Take a device-tensor maximum over one family-resolved mesh."""
-    if batch is not None:
-        return batch.max(value, (mesh,))
     return funcol.wait_tensor(funcol.all_reduce(value, reduceOp="max", group=mesh))
 
 

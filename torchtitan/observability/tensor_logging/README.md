@@ -60,6 +60,8 @@ EXPERT_COMPUTE_ROWS
 EXPERT_BIAS
 ```
 
+`ROUTER_DISTRIBUTION` reports the entropy of the L1-normalized sigmoid/softmax of the count-weighted mean router logits plus shifted expert bias. It is measured in nats in `[0, ln(num_experts)]`; it is not mean per-token entropy. Offered assignments describe the physical routed positions seen by the dispatcher, including sequence padding introduced by the supported EP/SP path.
+
 Whole-model and AdamW state:
 
 ```text
@@ -114,9 +116,11 @@ Compatible rows are packed by dtype and owner cohort. One collective is not laun
 
 ## Cadence
 
-Boundary, parameter, whole-gradient, expert-bias, and optimizer families are point samples from the selected logging step. Router-count and data families accumulate every training step and publish/reset at `metrics.log_freq`.
+Boundary, parameter, whole-gradient, expert-bias, and optimizer families are point samples from the selected logging step. Router-distribution, expert-count, and data families accumulate every training step and publish/reset at `metrics.log_freq`. `PER_SEQUENCE_ROUTING` instead publishes the final forward sample in that window.
 
-`observation_count` states how many authoritative samples contributed. `window_steps` states how many successful optimizer steps elapsed since the preceding publication. A checkpoint load resets nonpersistent partial-window state.
+`observation_count` uses the family's authoritative unit: module calls for boundary rows, producer calls after replica exclusion for interval rows, and one for point samples. `window_steps` states how many successful optimizer steps elapsed since the preceding publication. A checkpoint load resets nonpersistent partial-window state.
+
+Publication steps perform the packed reductions, host transfer, scalar derivation, and sink write, so they are slower than adjacent non-publication steps. `metrics.log_freq` amortizes that work; choose it with the selected family count and sink cost in mind.
 
 ## Current support boundary
 

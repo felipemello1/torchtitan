@@ -255,27 +255,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         ), "model_spec must be set before creating Trainer"
         model_spec = config.model_spec
 
-        # Model overrides run after update_from_config because it initializes
-        # sharding fields on the configs that an override may replace.
-        model_config = model_spec.model
-        model_config.update_from_config(config=config)
-        self.model_config = model_config
-        if config.override.imports:
-            apply_overrides(config.override, config)
-
-        tensor_logging_enabled = (
-            config.tensor_logging.enable
-            and not config.checkpoint.create_seed_checkpoint
-        )
-        if config.tensor_logging.enable and config.checkpoint.create_seed_checkpoint:
-            logger.info("Tensor logging is bypassed while creating a seed checkpoint")
-        elif tensor_logging_enabled:
-            TensorLogging.validate_job_config(
-                config.tensor_logging,
-                trainer_config=config,
-                is_core_trainer=type(self) is Trainer,
-            )
-
         device_module, device_type = utils.device_module, utils.device_type
         # pyrefly: ignore [read-only]
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
@@ -323,7 +302,34 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             distinct_seed_mesh_dims=["pp"],
         )
 
-        if tensor_logging_enabled:
+        # build model (using meta init)
+        model_config = model_spec.model
+        # set the model args from training job configs
+        model_config.update_from_config(
+            config=config,
+        )
+        self.model_config = model_config
+
+        # Apply overrides to the full config tree, before any component is
+        # built. The model config is reached via ModelSpec.traverse. Model
+        # overrides must run after update_from_config above (it sets sharding
+        # config on the pre-override modules); all other components (optimizer,
+        # loss, dataloader, …) are built later in __init__.
+        if config.override.imports:
+            apply_overrides(config.override, config)
+
+        tensor_logging_enabled = (
+            config.tensor_logging.enable
+            and not config.checkpoint.create_seed_checkpoint
+        )
+        if config.tensor_logging.enable and config.checkpoint.create_seed_checkpoint:
+            logger.info("Tensor logging is bypassed while creating a seed checkpoint")
+        elif tensor_logging_enabled:
+            TensorLogging.validate_job_config(
+                config.tensor_logging,
+                trainer_config=config,
+                is_core_trainer=type(self) is Trainer,
+            )
             TensorLogging.validate_model_config(
                 config.tensor_logging,
                 model_spec=model_spec,

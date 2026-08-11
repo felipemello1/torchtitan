@@ -138,7 +138,11 @@ class ExpertCountRecorder:
         values = self._interval.clone()
         self._interval.zero_()
         if self._world_mesh is not None:
-            values = reduce_sum(values, self._world_mesh, batch=batch)
+            values = (
+                reduce_sum(values, self._world_mesh)
+                if batch is None
+                else batch.sum(values, (self._world_mesh,))
+            )
         snapshot = ExpertCountSnapshot(values=values, local_error=self._local_error)
         self._local_error = None
         return snapshot

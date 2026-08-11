@@ -141,12 +141,16 @@ class DataStatisticsRecorder:
         batch: ReductionBatch | None = None,
     ) -> DataStatisticsSnapshot:
         """Reduce and clear the interval accumulated since the last publication."""
-        integers = reduce_sum(self._integers.clone(), self._world_mesh, batch=batch)
-        loss_sum = (
-            reduce_sum(self._loss_sum.clone(), self._world_mesh, batch=batch)
-            if self._loss_selected
-            else None
-        )
+        integers = self._integers.clone()
+        loss_sum = self._loss_sum.clone() if self._loss_selected else None
+        if batch is None:
+            integers = reduce_sum(integers, self._world_mesh)
+            if loss_sum is not None:
+                loss_sum = reduce_sum(loss_sum, self._world_mesh)
+        else:
+            integers = batch.sum(integers, (self._world_mesh,))
+            if loss_sum is not None:
+                loss_sum = batch.sum(loss_sum, (self._world_mesh,))
         snapshot = DataStatisticsSnapshot(
             integers=integers,
             loss_sum=loss_sum,
