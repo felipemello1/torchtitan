@@ -60,7 +60,7 @@ EXPERT_COMPUTE_ROWS
 EXPERT_BIAS
 ```
 
-`ROUTER_DISTRIBUTION` reports the entropy of the L1-normalized sigmoid/softmax of the count-weighted mean router logits plus shifted expert bias. It is measured in nats in `[0, ln(num_experts)]`; it is not mean per-token entropy. Offered assignments describe the physical routed positions seen by the dispatcher, including sequence padding introduced by the supported EP/SP path.
+`ROUTER_DISTRIBUTION` reports the entropy of the L1-normalized sigmoid/softmax of the count-weighted mean router logits plus shifted expert bias. It is measured in nats in `[0, ln(num_experts)]`; zero total activated mass has entropy zero, and this is not mean per-token entropy. Offered assignments describe the physical routed positions seen by the dispatcher, including sequence padding introduced by the supported EP/SP path.
 
 Whole-model and AdamW state:
 
