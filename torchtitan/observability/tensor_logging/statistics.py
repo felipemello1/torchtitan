@@ -31,6 +31,31 @@ class _ReductionRequest:
     operation: str
 
 
+def _accumulate_finite_statistics(
+    value: torch.Tensor,
+    counts: torch.Tensor,
+    sums: torch.Tensor,
+    abs_max: torch.Tensor,
+) -> None:
+    finite = torch.isfinite(value)
+    finite_value = torch.where(finite, value, 0.0).float()
+    finite_abs = torch.abs(finite_value)
+
+    counts[0].add_(value.numel())
+    counts[1].add_(torch.count_nonzero(~finite))
+    counts[2].add_(torch.count_nonzero(finite & (value == 0)))
+    sums[0].add_(finite_abs.sum())
+    sums[1].add_(torch.square(finite_value).sum())
+    abs_max.copy_(torch.maximum(abs_max, finite_abs.amax().reshape(1)))
+
+
+# pyrefly: ignore[no-matching-overload]
+_compiled_accumulate_finite_statistics = torch.compile(
+    _accumulate_finite_statistics,
+    dynamic=True,
+)
+
+
 class ReductionBatch:
     """Pack tensor telemetry reductions by mesh, dtype, and operation."""
 
@@ -199,16 +224,12 @@ def finite_statistics(
     )
 
     for chunk in chunks:
-        finite = torch.isfinite(chunk)
-        finite_value = torch.where(finite, chunk, 0.0).float()
-        finite_abs = torch.abs(finite_value)
-
-        counts[0].add_(chunk.numel())
-        counts[1].add_(torch.count_nonzero(~finite))
-        counts[2].add_(torch.count_nonzero(finite & (chunk == 0)))
-        sums[0].add_(finite_abs.sum())
-        sums[1].add_(torch.square(finite_value).sum())
-        abs_max.copy_(torch.maximum(abs_max, finite_abs.amax().reshape(1)))
+        accumulate = (
+            _compiled_accumulate_finite_statistics
+            if chunk.device.type == "cuda"
+            else _accumulate_finite_statistics
+        )
+        accumulate(chunk, counts, sums, abs_max)
     return FiniteStatistics(counts=counts, sums=sums, abs_max=abs_max)
 
 
