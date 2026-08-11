@@ -12,6 +12,11 @@ import torch
 import torch.distributed as dist
 import torch.testing._internal.distributed.fake_pg  # noqa: F401
 from torch import nn
+from torch.distributed.tensor import DTensor, Partial, Replicate
+from torch.testing._internal.distributed._tensor.common_dtensor import (
+    DTensorTestBase,
+    with_comms,
+)
 
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.distributed.parallel_dims import ParallelDims
@@ -106,3 +111,74 @@ def test_missing_optimizer_hook_is_reported(fake_world_one: None) -> None:
     snapshot = recorder.collect()
     assert snapshot.local_error is not None
     assert "did not observe" in str(snapshot.local_error)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestExpertBiasFourRanks(DTensorTestBase):
+    @property
+    def world_size(self) -> int:
+        return 4
+
+    @with_comms
+    def test_source_update_produces_identical_replicas(self) -> None:
+        parallel_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=2,
+            cp=1,
+            tp=2,
+            pp=1,
+            ep=2,
+            world_size=self.world_size,
+        )
+        parallel_dims.build_mesh()
+        tp_mesh = parallel_dims.get_mesh("tp")
+        model, moe = _build_model()
+        moe.expert_bias_E = DTensor.from_local(
+            torch.zeros(2, dtype=torch.float32, device=self.device_type),
+            tp_mesh,
+            (Replicate(),),
+            shape=torch.Size((2,)),
+            stride=(1,),
+            run_check=False,
+        )
+        moe.tokens_per_expert_E = DTensor.from_local(
+            torch.tensor(
+                [float(self.rank + 1), 1.0],
+                dtype=torch.float32,
+                device=self.device_type,
+            ),
+            tp_mesh,
+            (Partial(),),
+            shape=torch.Size((2,)),
+            stride=(1,),
+            run_check=False,
+        )
+        moe.dummy.data = moe.dummy.data.to(self.device_type)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        register_moe_load_balancing_hook(optimizer, [model], parallel_dims)  # type: ignore[arg-type]
+        recorder = ExpertBiasRecorder(
+            model=model,
+            layer_ids=(0,),
+            device=torch.device(self.device_type),
+        )
+        recorder.bind_optimizer(optimizer)
+        recorder.begin_step(should_log=True)
+        moe.dummy.grad = torch.ones_like(moe.dummy)
+
+        optimizer.step()
+        metrics = recorder.derive_metrics(recorder.collect(), window_steps=1)
+        prefix = "tensor_metrics/layers.0"
+        self.assertAlmostEqual(
+            metrics[f"{prefix}.experts.0.router_expert_bias_post_update"],
+            -0.1,
+        )
+        self.assertAlmostEqual(
+            metrics[f"{prefix}.experts.1.router_expert_bias_post_update"],
+            0.1,
+        )
+        local_bias = moe.expert_bias_E.to_local()
+        gathered = [torch.empty_like(local_bias) for _ in range(self.world_size)]
+        dist.all_gather(gathered, local_bias)
+        for bias in gathered:
+            self.assertEqual(bias, local_bias)
+        recorder.close()
