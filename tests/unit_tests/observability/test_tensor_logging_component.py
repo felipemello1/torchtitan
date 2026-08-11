@@ -353,6 +353,7 @@ def test_model_config_rejects_invalid_layer_and_converted_projection() -> None:
         )
 
     config.tensor_logging.layer_ids = (0,)
+    config.tensor_logging.families = (TensorMetricFamily.BOUNDARY_OUTPUT,)
     original = model_config.layers[0].attention.wo
 
     @dataclass(kw_only=True, slots=True)

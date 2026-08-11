@@ -79,6 +79,13 @@ def fake_world_one() -> Iterator[None]:
     dist.destroy_process_group()
 
 
+@pytest.fixture
+def fake_world_four() -> Iterator[None]:
+    dist.init_process_group("fake", rank=0, world_size=4)
+    yield
+    dist.destroy_process_group()
+
+
 def _build_batch() -> tuple[ParameterStatisticsBatch, nn.Parameter]:
     with patch("torchtitan.distributed.parallel_dims.device_type", "cpu"):
         parallel_dims = ParallelDims(
@@ -132,7 +139,6 @@ def test_singleton_batch_derives_weight_and_completed_gradient(
     snapshot = batch.collect(step=3)
     metrics = batch.derive_metrics(
         snapshot,
-        expected_contributors=1,
         window_steps=2,
     )
 
@@ -154,7 +160,6 @@ def test_all_absent_optional_gradient_is_omitted(fake_world_one: None) -> None:
     assert snapshot.local_error is None
     metrics = batch.derive_metrics(
         snapshot,
-        expected_contributors=1,
         window_steps=1,
     )
 
@@ -164,7 +169,7 @@ def test_all_absent_optional_gradient_is_omitted(fake_world_one: None) -> None:
 
 def test_parameter_rows_share_one_packed_reduction(fake_world_one: None) -> None:
     batch, _ = _build_batch()
-    assert batch._reduction_meshes == ()
+    assert batch._groups[0].reduction_meshes == ()
 
     with patch(
         "torchtitan.observability.tensor_logging.parameter_batch.reduce_finite_statistics",
@@ -172,9 +177,9 @@ def test_parameter_rows_share_one_packed_reduction(fake_world_one: None) -> None
     ) as reduce_batch:
         snapshot = batch.collect(step=1)
 
-    assert snapshot.statistics.counts.shape == (2, 4)
-    assert snapshot.statistics.sums.shape == (2, 2)
-    assert snapshot.statistics.abs_max.shape == (2, 1)
+    assert snapshot.statistics[0].counts.shape == (2, 4)
+    assert snapshot.statistics[0].sums.shape == (2, 2)
+    assert snapshot.statistics[0].abs_max.shape == (2, 1)
     reduce_batch.assert_called_once()
 
 
@@ -206,17 +211,76 @@ def test_two_layers_share_one_packed_reduction(fake_world_one: None) -> None:
     ) as reduce_batch:
         snapshot = batch.collect(step=1)
 
-    assert snapshot.statistics.counts.shape == (4, 4)
-    assert snapshot.statistics.sums.shape == (4, 2)
-    assert snapshot.statistics.abs_max.shape == (4, 1)
+    assert snapshot.statistics[0].counts.shape == (4, 4)
+    assert snapshot.statistics[0].sums.shape == (4, 2)
+    assert snapshot.statistics[0].abs_max.shape == (4, 1)
     reduce_batch.assert_called_once()
 
 
-def test_parameter_dimensions_must_divide_owner_degrees() -> None:
-    parallel_dims = Mock(dp_shard=2, tp=1)
+def test_tp_sharded_and_replicated_parameters_use_separate_cohorts(
+    fake_world_four: None,
+) -> None:
+    with patch("torchtitan.distributed.parallel_dims.device_type", "cpu"):
+        parallel_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=2,
+            cp=1,
+            tp=2,
+            pp=1,
+            ep=1,
+            world_size=4,
+        )
+        parallel_dims.build_mesh()
+    mesh = parallel_dims.get_mesh(["fsdp", "tp"])
+    layer = nn.Module()
+    layer.replicated_weight = nn.Parameter(
+        DTensor.from_local(
+            torch.ones(4, 4),
+            mesh,
+            (Shard(0), Replicate()),
+            shape=torch.Size((8, 4)),
+            stride=(4, 1),
+            run_check=False,
+        )
+    )
+    layer.sharded_weight = nn.Parameter(
+        DTensor.from_local(
+            torch.ones(2, 4),
+            mesh,
+            (Shard(0), Shard(0)),
+            shape=torch.Size((8, 4)),
+            stride=(4, 1),
+            run_check=False,
+        )
+    )
+    model = nn.Module()
+    model.layers = nn.ModuleList([layer])
+
+    batch = ParameterStatisticsBatch(
+        model=model,
+        parallel_dims=parallel_dims,
+        layer_ids=(0,),
+        families=(TensorMetricFamily.PARAMETER,),
+    )
+
+    assert len(batch._groups) == 2
+    replicated_group, sharded_group = batch._groups
+    assert replicated_group.owner_meshes == (parallel_dims.get_mesh("fsdp"),)
+    assert replicated_group.reduction_meshes == (parallel_dims.get_mesh("fsdp"),)
+    assert replicated_group.expected_contributors == 2
+    assert sharded_group.owner_meshes == (
+        parallel_dims.get_mesh("fsdp"),
+        parallel_dims.get_mesh("tp"),
+    )
+    assert sharded_group.reduction_meshes == (parallel_dims.world_mesh,)
+    assert sharded_group.expected_contributors == 4
+
+
+def test_selected_parameters_must_be_dtensors() -> None:
+    parallel_dims = Mock(spmd_backend="default")
     weight = nn.Parameter(torch.ones(3, 2))
 
-    with pytest.raises(ValueError, match="divisible by dp_shard"):
+    with pytest.raises(ValueError, match="require a DTensor"):
         ParameterStatisticsBatch(
             model=_Model(weight),
             parallel_dims=parallel_dims,
@@ -228,9 +292,9 @@ def test_parameter_dimensions_must_divide_owner_degrees() -> None:
 def test_writer_derivation_uses_two_packed_host_copies(fake_world_one: None) -> None:
     batch, _ = _build_batch()
     snapshot = batch.collect(step=1)
-    host_counts = snapshot.statistics.counts
+    host_counts = snapshot.statistics[0].counts
     host_floats = torch.cat(
-        (snapshot.statistics.sums, snapshot.statistics.abs_max), dim=1
+        (snapshot.statistics[0].sums, snapshot.statistics[0].abs_max), dim=1
     )
 
     with patch.object(
@@ -240,7 +304,6 @@ def test_writer_derivation_uses_two_packed_host_copies(fake_world_one: None) -> 
     ) as copy_to_host:
         batch.derive_metrics(
             snapshot,
-            expected_contributors=1,
             window_steps=1,
         )
 
@@ -252,12 +315,11 @@ def test_writer_derivation_rejects_incomplete_parameter(
 ) -> None:
     batch, _ = _build_batch()
     snapshot = batch.collect(step=1)
-    snapshot.statistics.counts[0, 0] = 8
+    snapshot.statistics[0].counts[0, 0] = 8
 
     with pytest.raises(ValueError, match="is 8, expected 4"):
         batch.derive_metrics(
             snapshot,
-            expected_contributors=1,
             window_steps=1,
         )
 
@@ -320,9 +382,9 @@ class TestParameterBatchTwoRanks(DTensorTestBase):
             device_type=self.device_type,
         )
         expected_mesh_name = "fsdp" if dp_shard == 2 else "tp"
-        self.assertEqual(len(batch._reduction_meshes), 1)
+        self.assertEqual(len(batch._groups[0].reduction_meshes), 1)
         self.assertIs(
-            batch._reduction_meshes[0],
+            batch._groups[0].reduction_meshes[0],
             batch._parallel_dims.get_mesh(expected_mesh_name),
         )
         parameter = model.layers[0].attention.wo.weight
@@ -335,7 +397,6 @@ class TestParameterBatchTwoRanks(DTensorTestBase):
 
         metrics = batch.derive_metrics(
             batch.collect(step=1),
-            expected_contributors=self.world_size,
             window_steps=1,
         )
 
@@ -354,7 +415,6 @@ class TestParameterBatchTwoRanks(DTensorTestBase):
                 with self.assertRaisesRegex(RuntimeError, "present on 1 of 2"):
                     batch.derive_metrics(
                         subset_snapshot,
-                        expected_contributors=self.world_size,
                         window_steps=1,
                     )
 
@@ -381,9 +441,9 @@ class TestParameterBatchFourRanks(DTensorTestBase):
             tp=2,
             device_type=self.device_type,
         )
-        self.assertEqual(len(batch._reduction_meshes), 1)
+        self.assertEqual(len(batch._groups[0].reduction_meshes), 1)
         self.assertIs(
-            batch._reduction_meshes[0],
+            batch._groups[0].reduction_meshes[0],
             batch._parallel_dims.world_mesh,
         )
         parameter = model.layers[0].attention.wo.weight
@@ -396,7 +456,6 @@ class TestParameterBatchFourRanks(DTensorTestBase):
 
         metrics = batch.derive_metrics(
             batch.collect(step=1),
-            expected_contributors=self.world_size,
             window_steps=1,
         )
 

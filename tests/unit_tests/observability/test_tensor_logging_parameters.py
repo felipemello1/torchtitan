@@ -17,6 +17,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.parallel import parallelize_module, RowwiseParallel
+from torch.distributed.tensor.placement_types import _StridedShard
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
@@ -25,7 +26,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.observability.tensor_logging import statistics
 from torchtitan.observability.tensor_logging.parameter_ownership import (
-    resolve_rowwise_parameter_owner_meshes,
+    resolve_parameter_owner_meshes,
 )
 from torchtitan.observability.tensor_logging.statistics import (
     derive_finite_statistics,
@@ -215,7 +216,7 @@ def test_fake_pg_resolves_and_rejects_parameter_signatures(
         run_check=False,
     )
 
-    owner_meshes = resolve_rowwise_parameter_owner_meshes(
+    owner_meshes = resolve_parameter_owner_meshes(
         parameter,
         parallel_dims=parallel_dims,
     )
@@ -224,8 +225,53 @@ def test_fake_pg_resolves_and_rejects_parameter_signatures(
         parallel_dims.get_mesh("tp"),
     )
 
+    replicated_parameter = DTensor.from_local(
+        torch.ones(4, 8),
+        expected_mesh,
+        (Shard(0), Replicate()),
+        shape=torch.Size((8, 8)),
+        stride=(8, 1),
+        run_check=False,
+    )
+    assert resolve_parameter_owner_meshes(
+        replicated_parameter,
+        parallel_dims=parallel_dims,
+    ) == (parallel_dims.get_mesh("fsdp"),)
+
+    colwise_parameter = DTensor.from_local(
+        torch.ones(2, 8),
+        expected_mesh,
+        (Shard(0), Shard(0)),
+        shape=torch.Size((8, 8)),
+        stride=(8, 1),
+        run_check=False,
+    )
+    assert resolve_parameter_owner_meshes(
+        colwise_parameter,
+        parallel_dims=parallel_dims,
+    ) == (
+        parallel_dims.get_mesh("fsdp"),
+        parallel_dims.get_mesh("tp"),
+    )
+
+    strided_parameter = DTensor.from_local(
+        torch.ones(2, 8),
+        expected_mesh,
+        (_StridedShard(0, split_factor=2), Shard(0)),
+        shape=torch.Size((8, 8)),
+        stride=(8, 1),
+        run_check=False,
+    )
+    assert resolve_parameter_owner_meshes(
+        strided_parameter,
+        parallel_dims=parallel_dims,
+    ) == (
+        parallel_dims.get_mesh("fsdp"),
+        parallel_dims.get_mesh("tp"),
+    )
+
     with pytest.raises(ValueError, match="require a DTensor"):
-        resolve_rowwise_parameter_owner_meshes(
+        resolve_parameter_owner_meshes(
             parameter.to_local(),
             parallel_dims=parallel_dims,
         )
@@ -239,7 +285,7 @@ def test_fake_pg_resolves_and_rejects_parameter_signatures(
         run_check=False,
     )
     with pytest.raises(ValueError, match="do not accept Partial"):
-        resolve_rowwise_parameter_owner_meshes(
+        resolve_parameter_owner_meshes(
             partial,
             parallel_dims=parallel_dims,
         )
@@ -252,8 +298,8 @@ def test_fake_pg_resolves_and_rejects_parameter_signatures(
         stride=(8, 1),
         run_check=False,
     )
-    with pytest.raises(ValueError, match="expected placements"):
-        resolve_rowwise_parameter_owner_meshes(
+    with pytest.raises(ValueError, match="a dim-0 shard on the FSDP axis"):
+        resolve_parameter_owner_meshes(
             wrong_placement,
             parallel_dims=parallel_dims,
         )
@@ -268,7 +314,7 @@ def test_fake_pg_resolves_and_rejects_parameter_signatures(
         run_check=False,
     )
     with pytest.raises(ValueError, match="expected mesh axes"):
-        resolve_rowwise_parameter_owner_meshes(
+        resolve_parameter_owner_meshes(
             unnamed_parameter,
             parallel_dims=parallel_dims,
         )
@@ -285,7 +331,7 @@ def test_fake_pg_resolves_and_rejects_parameter_signatures(
             spmd_backend=backend,
         )
         with pytest.raises(ValueError, match="spmd_backend='default'"):
-            resolve_rowwise_parameter_owner_meshes(
+            resolve_parameter_owner_meshes(
                 parameter,
                 parallel_dims=unsupported_dims,
             )
@@ -304,7 +350,7 @@ def test_fake_pg_resolves_and_rejects_parameter_signatures(
         run_check=False,
     )
     with pytest.raises(ValueError, match="ParallelDims rank grid"):
-        resolve_rowwise_parameter_owner_meshes(
+        resolve_parameter_owner_meshes(
             permuted_parameter,
             parallel_dims=parallel_dims,
         )
@@ -332,7 +378,7 @@ class TestRowwiseParameterSingleton(DTensorTestBase):
         assert isinstance(parameter, DTensor)
         _fill_local(parameter, 2.0)
 
-        owner_meshes = resolve_rowwise_parameter_owner_meshes(
+        owner_meshes = resolve_parameter_owner_meshes(
             parameter,
             parallel_dims=parallel_dims,
         )
@@ -377,7 +423,7 @@ class TestRowwiseParameterTwoRanks(DTensorTestBase):
         expected_mesh = parallel_dims.get_mesh(expected_mesh_axis_name)
         _fill_local(parameter, 1.0 if expected_mesh.get_local_rank() == 0 else 3.0)
 
-        owner_meshes = resolve_rowwise_parameter_owner_meshes(
+        owner_meshes = resolve_parameter_owner_meshes(
             parameter,
             parallel_dims=parallel_dims,
         )
@@ -441,7 +487,7 @@ class TestRowwiseParameterFourRanks(DTensorTestBase):
         )
         _fill_local(parameter, fill_value)
 
-        owner_meshes = resolve_rowwise_parameter_owner_meshes(
+        owner_meshes = resolve_parameter_owner_meshes(
             parameter,
             parallel_dims=parallel_dims,
         )
@@ -470,7 +516,7 @@ class TestRowwiseParameterFourRanks(DTensorTestBase):
         linear(torch.ones(2, 8, device=self.device_type)).sum().backward()
         gradient = parameter.grad
         assert isinstance(gradient, DTensor)
-        gradient_owner_meshes = resolve_rowwise_parameter_owner_meshes(
+        gradient_owner_meshes = resolve_parameter_owner_meshes(
             gradient,
             parallel_dims=parallel_dims,
         )
@@ -505,7 +551,7 @@ class TestRowwiseParameterFourRanks(DTensorTestBase):
         replica_mesh = parallel_dims.get_mesh("dp_replicate")
         _fill_local(parameter, 1.0 if fsdp_mesh.get_local_rank() == 0 else 3.0)
 
-        owner_meshes = resolve_rowwise_parameter_owner_meshes(
+        owner_meshes = resolve_parameter_owner_meshes(
             parameter,
             parallel_dims=parallel_dims,
         )

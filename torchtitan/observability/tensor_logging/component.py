@@ -74,7 +74,6 @@ class TensorLogging(Configurable):
     _expert_count_recorder: ExpertCountRecorder | None
     _is_writer: bool
     _outcome_template: torch.Tensor
-    _expected_contributors: int
     _last_successful_publication_step: int
 
     @dataclass(kw_only=True, slots=True)
@@ -237,13 +236,13 @@ class TensorLogging(Configurable):
                     f"tensor_logging.layer_ids contains {layer_id}, but the model "
                     f"has {len(model_config.layers)} layers"
                 )
-            wo_config = model_config.layers[layer_id].attention.wo
-            if type(wo_config) is not Linear.Config:
-                raise ValueError(
-                    "tensor logging requires an ordinary Linear.Config at "
-                    f"layers.{layer_id}.attention.wo"
-                )
             if boundary_selected:
+                wo_config = model_config.layers[layer_id].attention.wo
+                if type(wo_config) is not Linear.Config:
+                    raise ValueError(
+                        "tensor output logging requires an ordinary Linear.Config at "
+                        f"layers.{layer_id}.attention.wo"
+                    )
                 feed_forward_config = model_config.layers[layer_id].feed_forward
                 if type(feed_forward_config) is not FeedForward.Config:
                     raise ValueError(
@@ -337,7 +336,6 @@ class TensorLogging(Configurable):
             )
 
         self._outcome_template = torch.empty((), dtype=torch.int32, device=device)
-        self._expected_contributors = dist.get_world_size()
         self._last_successful_publication_step = 0
 
         selected_names = ", ".join(family.name for family in selected_families)
@@ -392,7 +390,6 @@ class TensorLogging(Configurable):
             metrics.update(
                 self._parameter_batch.derive_metrics(
                     snapshot.parameter,
-                    expected_contributors=self._expected_contributors,
                     window_steps=window_steps,
                 )
             )
