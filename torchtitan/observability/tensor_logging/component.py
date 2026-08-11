@@ -18,7 +18,7 @@ from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.moe import MoE, TokenChoiceTopKRouter
 from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.llama3.model import Llama3Model
 from torchtitan.models.llama3.parallelize import parallelize_llama
@@ -30,9 +30,11 @@ from torchtitan.observability.tensor_logging.expert_counts import (
 )
 from torchtitan.observability.tensor_logging.families import (
     BOUNDARY_FAMILIES,
+    EXPERT_COUNT_FAMILIES,
     INTERNAL_FAMILIES,
     PARAMETER_FAMILIES,
     resolve_families,
+    ROUTER_FAMILIES,
     TensorMetricFamily,
 )
 from torchtitan.observability.tensor_logging.output_batch import (
@@ -42,6 +44,10 @@ from torchtitan.observability.tensor_logging.output_batch import (
 from torchtitan.observability.tensor_logging.parameter_batch import (
     ParameterStatisticsBatch,
     ParameterStatisticsSnapshot,
+)
+from torchtitan.observability.tensor_logging.router_statistics import (
+    RouterStatisticsRecorder,
+    RouterStatisticsSnapshot,
 )
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import logger
@@ -54,6 +60,7 @@ class TensorLoggingSnapshot:
     parameter: ParameterStatisticsSnapshot | None
     output: OutputStatisticsSnapshot | None
     expert_counts: ExpertCountSnapshot | None
+    router: RouterStatisticsSnapshot | None
     local_error: Exception | None
 
 
@@ -72,6 +79,7 @@ class TensorLogging(Configurable):
     _parameter_batch: ParameterStatisticsBatch | None
     _output_batch: OutputStatisticsBatch | None
     _expert_count_recorder: ExpertCountRecorder | None
+    _router_statistics_recorder: RouterStatisticsRecorder | None
     _is_writer: bool
     _outcome_template: torch.Tensor
     _last_successful_publication_step: int
@@ -265,13 +273,31 @@ class TensorLogging(Configurable):
                         "internal MoE tensor logging requires an ordinary MoE.Config "
                         f"at layers.{layer_id}.moe"
                     )
-                if type(moe_config.routed_experts.token_dispatcher) is not (
+                if any(
+                    family in EXPERT_COUNT_FAMILIES for family in selected_families
+                ) and type(moe_config.routed_experts.token_dispatcher) is not (
                     AllToAllTokenDispatcher.Config
                 ):
                     raise ValueError(
                         "internal MoE tensor logging currently requires the standard "
                         "token dispatcher"
                     )
+                if TensorMetricFamily.ROUTER_DISTRIBUTION in selected_families:
+                    router_config = moe_config.router
+                    if type(router_config) is not TokenChoiceTopKRouter.Config:
+                        raise ValueError(
+                            "router distribution logging requires an ordinary "
+                            "token-choice router"
+                        )
+                    if router_config.num_expert_groups is not None:
+                        raise ValueError(
+                            "router distribution logging does not support "
+                            "node-limited routing"
+                        )
+                    if router_config._debug_force_load_balance:
+                        raise ValueError(
+                            "router distribution logging does not support forced routing"
+                        )
 
     def __init__(
         self,
@@ -280,6 +306,7 @@ class TensorLogging(Configurable):
         model: nn.Module,
         parallel_dims: ParallelDims,
         metrics_processor: MetricsProcessor,
+        local_batch_size: int,
         device: torch.device,
     ) -> None:
         selected_families = resolve_families(config.families)
@@ -291,6 +318,12 @@ class TensorLogging(Configurable):
         )
         internal_families = tuple(
             family for family in selected_families if family in INTERNAL_FAMILIES
+        )
+        count_families = tuple(
+            family for family in internal_families if family in EXPERT_COUNT_FAMILIES
+        )
+        router_families = tuple(
+            family for family in internal_families if family in ROUTER_FAMILIES
         )
         self._parameter_batch = (
             ParameterStatisticsBatch(
@@ -318,10 +351,22 @@ class TensorLogging(Configurable):
                 model=model,
                 parallel_dims=parallel_dims,
                 layer_ids=config.layer_ids,
-                families=internal_families,
+                families=count_families,
                 device=device,
             )
-            if internal_families
+            if count_families
+            else None
+        )
+        self._router_statistics_recorder = (
+            RouterStatisticsRecorder(
+                model=model,
+                parallel_dims=parallel_dims,
+                layer_ids=config.layer_ids,
+                families=router_families,
+                local_batch_size=local_batch_size,
+                device=device,
+            )
+            if router_families
             else None
         )
 
@@ -359,8 +404,13 @@ class TensorLogging(Configurable):
             if self._expert_count_recorder is not None
             else None
         )
+        router = (
+            self._router_statistics_recorder.collect()
+            if self._router_statistics_recorder is not None
+            else None
+        )
         local_error = None
-        for snapshot in (parameter, output, expert_counts):
+        for snapshot in (parameter, output, expert_counts, router):
             if snapshot is not None and snapshot.local_error is not None:
                 local_error = snapshot.local_error
                 break
@@ -368,6 +418,7 @@ class TensorLogging(Configurable):
             parameter=parameter,
             output=output,
             expert_counts=expert_counts,
+            router=router,
             local_error=local_error,
         )
 
@@ -409,6 +460,14 @@ class TensorLogging(Configurable):
                     window_steps=window_steps,
                 )
             )
+        if snapshot.router is not None:
+            assert self._router_statistics_recorder is not None
+            metrics.update(
+                self._router_statistics_recorder.derive_metrics(
+                    snapshot.router,
+                    window_steps=window_steps,
+                )
+            )
         return metrics
 
     def reset_after_checkpoint_load(self, *, step: int) -> None:
@@ -421,6 +480,8 @@ class TensorLogging(Configurable):
             self._output_batch.close()
         if self._expert_count_recorder is not None:
             self._expert_count_recorder.close()
+        if self._router_statistics_recorder is not None:
+            self._router_statistics_recorder.close()
 
     def complete_publication(
         self,

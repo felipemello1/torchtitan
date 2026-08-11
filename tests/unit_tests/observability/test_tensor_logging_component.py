@@ -543,6 +543,7 @@ def test_component_requires_one_constructed_metrics_writer() -> None:
                 model=Mock(),
                 parallel_dims=Mock(),
                 metrics_processor=processor,
+                local_batch_size=1,
                 device=torch.device("cpu"),
             )
 
@@ -555,6 +556,7 @@ def test_component_requires_one_constructed_metrics_writer() -> None:
                 model=Mock(),
                 parallel_dims=Mock(),
                 metrics_processor=processor,
+                local_batch_size=1,
                 device=torch.device("cpu"),
             )
         assert tensor_logging._is_writer
@@ -586,8 +588,10 @@ def test_nonwriter_derivation_does_not_touch_the_metric_batch() -> None:
     tensor_logging._parameter_batch = Mock()
     tensor_logging._output_batch = Mock()
     tensor_logging._expert_count_recorder = Mock()
+    tensor_logging._router_statistics_recorder = Mock()
 
     assert tensor_logging.derive_metrics(Mock(), step=1) == {}
     tensor_logging._parameter_batch.derive_metrics.assert_not_called()
     tensor_logging._output_batch.derive_metrics.assert_not_called()
     tensor_logging._expert_count_recorder.derive_metrics.assert_not_called()
+    tensor_logging._router_statistics_recorder.derive_metrics.assert_not_called()

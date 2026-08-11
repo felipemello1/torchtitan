@@ -22,7 +22,9 @@ class TensorMetricFamily(str, Enum):
     PRECLIP_GRADIENT = "preclip_gradient"
     BOUNDARY_OUTPUT = "boundary_output"
     BOUNDARY_OUTPUT_COTANGENT = "boundary_output_cotangent"
+    ROUTER_DISTRIBUTION = "router_distribution"
     OFFERED_ASSIGNMENTS = "offered_assignments"
+    PER_SEQUENCE_ROUTING = "per_sequence_routing"
     EXPERT_COMPUTE_ROWS = "expert_compute_rows"
 
 
@@ -36,10 +38,17 @@ BOUNDARY_FAMILIES = (
     TensorMetricFamily.BOUNDARY_OUTPUT_COTANGENT,
 )
 
-INTERNAL_FAMILIES = (
+ROUTER_FAMILIES = (
+    TensorMetricFamily.ROUTER_DISTRIBUTION,
+    TensorMetricFamily.PER_SEQUENCE_ROUTING,
+)
+
+EXPERT_COUNT_FAMILIES = (
     TensorMetricFamily.OFFERED_ASSIGNMENTS,
     TensorMetricFamily.EXPERT_COMPUTE_ROWS,
 )
+
+INTERNAL_FAMILIES = ROUTER_FAMILIES + EXPERT_COUNT_FAMILIES
 
 
 def resolve_families(

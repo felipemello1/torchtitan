@@ -512,6 +512,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 model=self.model_parts[0],
                 parallel_dims=parallel_dims,
                 metrics_processor=self.metrics_processor,
+                local_batch_size=config.training.local_batch_size,
                 device=self.device,
             )
 

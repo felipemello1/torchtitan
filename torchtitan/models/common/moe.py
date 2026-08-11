@@ -226,6 +226,9 @@ class TokenChoiceTopKRouter(Module):
         self.route_norm = config.route_norm
         self.route_scale = config.route_scale
         self._debug_force_load_balance = config._debug_force_load_balance
+        self.statistics_recorder: (
+            Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], None] | None
+        ) = None
 
     def _debug_force_load_balance_routing(
         self, scores_BLE: torch.Tensor
@@ -301,20 +304,26 @@ class TokenChoiceTopKRouter(Module):
         """
         # Compute gate in float32 to help stability of expert load balancing.
         with torch.autocast(device_type=x_BLD.device.type, dtype=torch.float32):
-            scores_BLE = self.gate(x_BLD)
+            router_logits_BLE = self.gate(x_BLD)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion.
-        # scores_BLE is already float32 from the autocast above.
+        # router_logits_BLE is already float32 from the autocast above.
         if self.score_func == "sigmoid":
-            scores_BLE = torch.sigmoid(scores_BLE)
+            scores_BLE = torch.sigmoid(router_logits_BLE)
         elif self.score_func == "softmax":
-            scores_BLE = F.softmax(scores_BLE, dim=-1)
+            scores_BLE = F.softmax(router_logits_BLE, dim=-1)
         else:
             raise NotImplementedError(f"Unknown score function {self.score_func}")
 
         scores_for_choice_BLE = (
             scores_BLE if expert_bias_E is None else scores_BLE + expert_bias_E
         )
+        if self.statistics_recorder is not None:
+            self.statistics_recorder(
+                router_logits_BLE,
+                scores_for_choice_BLE,
+                expert_bias_E,
+            )
         # Apply node-limited routing if configured
         if self.num_expert_groups is not None:
             scores_for_choice_BLE = self._get_node_limited_routing_scores(
@@ -410,6 +419,9 @@ class MoE(Module):
             persistent=False,
         )
         self.offered_assignments_recorder: Callable[[torch.Tensor], None] | None = None
+        self.per_sequence_assignments_recorder: (
+            Callable[[torch.Tensor], None] | None
+        ) = None
 
     def forward(self, x_BLD: torch.Tensor) -> torch.Tensor:
         """
@@ -453,7 +465,12 @@ class MoE(Module):
             topk_expert_ids_BLK,
             True,
         )
-        num_local_tokens_per_expert_E = routing_map_BLE.sum(dim=(0, 1))
+        if self.per_sequence_assignments_recorder is None:
+            num_local_tokens_per_expert_E = routing_map_BLE.sum(dim=(0, 1))
+        else:
+            per_sequence_assignments_BE = routing_map_BLE.sum(dim=1)
+            self.per_sequence_assignments_recorder(per_sequence_assignments_BE)
+            num_local_tokens_per_expert_E = per_sequence_assignments_BE.sum(dim=0)
         if self.offered_assignments_recorder is not None:
             self.offered_assignments_recorder(num_local_tokens_per_expert_E)
 
