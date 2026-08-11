@@ -21,6 +21,7 @@ from torchtitan.observability.tensor_logging import TensorMetricFamily
 from torchtitan.observability.tensor_logging.router_statistics import (
     RouterStatisticsRecorder,
 )
+from torchtitan.observability.tensor_logging.statistics import ReductionBatch
 
 
 class _Layer(nn.Module):
@@ -140,7 +141,10 @@ class TestRouterStatisticsFourRanks(DTensorTestBase):
         assert ep_moe.per_sequence_assignments_recorder is not None
         ep_moe.per_sequence_assignments_recorder(partial_counts)
 
-        ep_metrics = ep_recorder.derive_metrics(ep_recorder.collect(), window_steps=1)
+        ep_batch = ReductionBatch()
+        ep_snapshot = ep_recorder.collect(batch=ep_batch)
+        ep_batch.reduce()
+        ep_metrics = ep_recorder.derive_metrics(ep_snapshot, window_steps=1)
         prefix = "tensor_metrics/layers.0"
         assert ep_metrics[f"{prefix}.experts.0.router_logit_mean"] == 2.5
         assert ep_metrics[f"{prefix}.moe.router.routed_position_count"] == 4
@@ -188,8 +192,11 @@ class TestRouterStatisticsFourRanks(DTensorTestBase):
         )
         assert replica_moe.router.statistics_recorder is not None
         replica_moe.router.statistics_recorder(replica_logits, replica_scores, None)
+        replica_batch = ReductionBatch()
+        replica_snapshot = replica_recorder.collect(batch=replica_batch)
+        replica_batch.reduce()
         replica_metrics = replica_recorder.derive_metrics(
-            replica_recorder.collect(), window_steps=1
+            replica_snapshot, window_steps=1
         )
         assert replica_metrics[f"{prefix}.experts.0.router_logit_mean"] == 0.5
         assert replica_metrics[f"{prefix}.moe.router.routed_position_count"] == 2
@@ -223,7 +230,10 @@ class TestRouterStatisticsFourRanks(DTensorTestBase):
             torch.tensor([[1, 0], [0, 1]], dtype=torch.int64, device=device)
         )
 
-        metrics = recorder.derive_metrics(recorder.collect(), window_steps=1)
+        batch = ReductionBatch()
+        snapshot = recorder.collect(batch=batch)
+        batch.reduce()
+        metrics = recorder.derive_metrics(snapshot, window_steps=1)
         prefix = "tensor_metrics/layers.0.moe.per_sequence"
         assert metrics[f"{prefix}.maximum_violation_mean"] == 1.0
         assert metrics[f"{prefix}.maximum_violation_max"] == 1.0

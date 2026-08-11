@@ -173,7 +173,10 @@ class RouterStatisticsRecorder:
             self._sequence_present.zero_()
             if self._router_is_tp_sharded:
                 assert self._tp_mesh is not None
-                assignments = reduce_sum(assignments, self._tp_mesh, batch=batch)
+                # Per-sequence violation is derived from the reconstructed expert
+                # vector, so this semantic reduction must complete before the
+                # downstream publication rows can join the shared batch.
+                assignments = reduce_sum(assignments, self._tp_mesh)
             sequence_sum = torch.zeros(
                 len(self._layer_ids), dtype=torch.float32, device=assignments.device
             )
@@ -197,13 +200,21 @@ class RouterStatisticsRecorder:
                 sequence_counts[:, 0].copy_(present * assignments.shape[1])
                 sequence_counts[:, 1].copy_(assigned.sum(dim=1) * present)
                 sequence_counts[:, 2].copy_(present)
+            sequence_floats = torch.stack((sequence_sum, sequence_max), dim=1)
             if self._world_mesh is not None:
-                sequence_sum = reduce_sum(sequence_sum, self._world_mesh, batch=batch)
-                sequence_max = reduce_max(sequence_max, self._world_mesh, batch=batch)
+                if batch is None:
+                    sequence_floats[:, 0].copy_(
+                        reduce_sum(sequence_floats[:, 0], self._world_mesh)
+                    )
+                    sequence_floats[:, 1].copy_(
+                        reduce_max(sequence_floats[:, 1], self._world_mesh)
+                    )
+                else:
+                    batch.sum(sequence_floats[:, 0], (self._world_mesh,))
+                    batch.max(sequence_floats[:, 1], (self._world_mesh,))
                 sequence_counts = reduce_sum(
                     sequence_counts, self._world_mesh, batch=batch
                 )
-            sequence_floats = torch.stack((sequence_sum, sequence_max), dim=1)
 
         snapshot = RouterStatisticsSnapshot(
             distribution_sums=distribution_sums,
