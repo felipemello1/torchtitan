@@ -28,6 +28,7 @@ from torchtitan.observability.tensor_logging.parameter_ownership import (
     resolve_rowwise_parameter_owner_meshes,
 )
 from torchtitan.observability.tensor_logging.statistics import (
+    derive_finite_statistics,
     finite_statistics,
     FiniteStatistics,
     reduce_finite_statistics,
@@ -48,6 +49,63 @@ def test_empty_owner_reduction_returns_an_owned_snapshot() -> None:
     assert reduced.counts.tolist() == [2, 0, 1]
     assert reduced.sums.tolist() == [2.0, 4.0]
     assert reduced.abs_max.tolist() == [2.0]
+
+
+def test_chunked_statistics_match_single_chunk() -> None:
+    value = torch.tensor([0.0, -2.0, float("nan"), float("inf"), 3.0])
+
+    single_chunk = finite_statistics(value)
+    chunked = finite_statistics(value, max_chunk_elements=2)
+
+    assert torch.equal(chunked.counts, single_chunk.counts)
+    assert torch.equal(chunked.sums, single_chunk.sums)
+    assert torch.equal(chunked.abs_max, single_chunk.abs_max)
+
+
+def test_chunked_statistics_match_noncontiguous_storage() -> None:
+    value = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4).transpose(1, 2)
+
+    single_chunk = finite_statistics(value)
+    chunked = finite_statistics(value, max_chunk_elements=5)
+
+    assert torch.equal(chunked.counts, single_chunk.counts)
+    assert torch.equal(chunked.sums, single_chunk.sums)
+    assert torch.equal(chunked.abs_max, single_chunk.abs_max)
+
+
+@pytest.mark.parametrize(
+    ("sums", "missing"),
+    [
+        ((float("inf"), 4.0), {"abs_mean"}),
+        ((2.0, float("inf")), {"square_mean", "rms"}),
+    ],
+)
+def test_derived_statistics_omit_overflowed_accumulators(
+    sums: tuple[float, float],
+    missing: set[str],
+) -> None:
+    statistics = FiniteStatistics(
+        counts=torch.tensor([2, 0, 0], dtype=torch.int64),
+        sums=torch.tensor(sums, dtype=torch.float32),
+        abs_max=torch.tensor([3.0], dtype=torch.float32),
+    )
+
+    derived = derive_finite_statistics(statistics)
+
+    assert missing.isdisjoint(derived)
+    assert derived["numel"] == 2
+    assert derived["abs_max"] == 3.0
+
+
+def test_finite_fp32_square_overflow_omits_square_metrics() -> None:
+    statistics = finite_statistics(torch.tensor([3e19], dtype=torch.float32))
+
+    derived = derive_finite_statistics(statistics)
+
+    assert torch.isinf(statistics.sums[1])
+    assert "square_mean" not in derived
+    assert "rms" not in derived
+    assert derived["abs_mean"] == pytest.approx(3e19)
 
 
 def test_finite_stat_reduction_uses_axis_then_lane_order(monkeypatch) -> None:

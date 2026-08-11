@@ -8,10 +8,20 @@ from enum import Enum
 
 
 class TensorMetricFamily(str, Enum):
-    """Semantic tensor-metric families available to recipes."""
+    """Semantic tensor-metric families available to recipes.
+
+    Example:
+
+        families = (
+            TensorMetricFamily.PARAMETER,
+            TensorMetricFamily.BOUNDARY_OUTPUT,
+        )
+    """
 
     PARAMETER = "parameter"
     PRECLIP_GRADIENT = "preclip_gradient"
+    BOUNDARY_OUTPUT = "boundary_output"
+    BOUNDARY_OUTPUT_COTANGENT = "boundary_output_cotangent"
 
 
 PARAMETER_FAMILIES = (
@@ -19,11 +29,16 @@ PARAMETER_FAMILIES = (
     TensorMetricFamily.PRECLIP_GRADIENT,
 )
 
+BOUNDARY_FAMILIES = (
+    TensorMetricFamily.BOUNDARY_OUTPUT,
+    TensorMetricFamily.BOUNDARY_OUTPUT_COTANGENT,
+)
 
-def resolve_parameter_families(
+
+def resolve_families(
     requested: tuple[TensorMetricFamily, ...] | None,
 ) -> tuple[TensorMetricFamily, ...]:
-    """Resolve and validate the parameter-family selection."""
+    """Resolve and validate the tensor-metric family selection."""
     selected = PARAMETER_FAMILIES if requested is None else requested
     if not selected:
         raise ValueError("tensor_logging.families must not be empty")

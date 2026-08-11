@@ -20,31 +20,68 @@ class FiniteStatistics:
     abs_max: torch.Tensor
 
 
-def finite_statistics(value: torch.Tensor) -> FiniteStatistics:
-    """Build fixed-shape statistics from local floating-point tensor storage."""
+def finite_statistics(
+    value: torch.Tensor,
+    *,
+    max_chunk_elements: int | None = None,
+) -> FiniteStatistics:
+    """Build fixed-shape statistics from local floating-point tensor storage.
+
+    Args:
+        value: Local tensor storage. DTensor inputs must be unwrapped first.
+        max_chunk_elements: Maximum elements converted to FP32 at once, or all
+            elements when omitted.
+
+    Example:
+
+        stats = finite_statistics(
+            torch.tensor([0.0, -2.0, float("nan")]),
+            max_chunk_elements=2,
+        )
+        # stats.counts == [3, 1, 1]
+        # stats.sums == [2.0, 4.0]
+    """
     if isinstance(value, DTensor):
         raise TypeError("finite_statistics expects local tensor storage, not a DTensor")
     if not value.is_floating_point():
         raise TypeError("finite_statistics expects a floating-point tensor")
+    if max_chunk_elements is not None and max_chunk_elements <= 0:
+        raise ValueError("max_chunk_elements must be positive")
 
-    value_fp32 = value.detach().float()
-    finite = torch.isfinite(value_fp32)
-    finite_value = torch.where(finite, value_fp32, 0.0)
-    finite_abs = torch.abs(finite_value)
+    counts = torch.zeros(3, dtype=torch.int64, device=value.device)
+    sums = torch.zeros(2, dtype=torch.float32, device=value.device)
+    abs_max = torch.zeros(1, dtype=torch.float32, device=value.device)
+    if value.numel() == 0:
+        return FiniteStatistics(counts=counts, sums=sums, abs_max=abs_max)
 
-    counts = torch.stack(
-        (
-            torch.full((), value.numel(), dtype=torch.int64, device=value.device),
-            torch.count_nonzero(~finite),
-            torch.count_nonzero(finite & (value_fp32 == 0)),
-        )
-    )
-    sums = torch.stack((finite_abs.sum(), torch.square(finite_value).sum()))
-    abs_max = (
-        finite_abs.amax().reshape(1)
-        if value.numel() > 0
-        else torch.zeros(1, dtype=torch.float32, device=value.device)
-    )
+    # Split tensor views before FP32 conversion so strided inputs stay bounded.
+    chunks = [value.detach()]
+    if max_chunk_elements is not None:
+        for dimension in range(value.ndim):
+            split_chunks = []
+            for chunk in chunks:
+                if chunk.numel() <= max_chunk_elements:
+                    split_chunks.append(chunk)
+                    continue
+                elements_per_index = chunk.numel() // chunk.shape[dimension]
+                indices_per_chunk = max(
+                    1,
+                    max_chunk_elements // elements_per_index,
+                )
+                split_chunks.extend(chunk.split(indices_per_chunk, dim=dimension))
+            chunks = split_chunks
+
+    for chunk in chunks:
+        finite = torch.isfinite(chunk)
+        finite_value = torch.where(finite, chunk, 0.0).float()
+        finite_abs = torch.abs(finite_value)
+
+        counts[0].add_(chunk.numel())
+        counts[1].add_(torch.count_nonzero(~finite))
+        counts[2].add_(torch.count_nonzero(finite & (chunk == 0)))
+        sums[0].add_(finite_abs.sum())
+        sums[1].add_(torch.square(finite_value).sum())
+        abs_max.copy_(torch.maximum(abs_max, finite_abs.amax().reshape(1)))
     return FiniteStatistics(counts=counts, sums=sums, abs_max=abs_max)
 
 
@@ -68,17 +105,16 @@ def derive_finite_statistics(statistics: FiniteStatistics) -> dict[str, int | fl
     if finite_count == 0:
         return result
 
+    result["zero_fraction"] = zero_count / finite_count
+    result["abs_max"] = float(statistics.abs_max.item())
+
     abs_sum, square_sum = (float(value) for value in statistics.sums.tolist())
-    square_mean = square_sum / finite_count
-    result.update(
-        {
-            "zero_fraction": zero_count / finite_count,
-            "abs_mean": abs_sum / finite_count,
-            "square_mean": square_mean,
-            "rms": math.sqrt(square_mean),
-            "abs_max": float(statistics.abs_max.item()),
-        }
-    )
+    if math.isfinite(abs_sum):
+        result["abs_mean"] = abs_sum / finite_count
+    if math.isfinite(square_sum):
+        square_mean = square_sum / finite_count
+        result["square_mean"] = square_mean
+        result["rms"] = math.sqrt(square_mean)
     return result
 
 

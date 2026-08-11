@@ -17,12 +17,16 @@ import torch.testing._internal.distributed.fake_pg  # noqa: F401
 
 from torchtitan.components.metrics import BaseLogger, LoggerContainer, MetricsProcessor
 from torchtitan.config import ConfigManager, override
-from torchtitan.distributed.activation_checkpoint import FullAC, MemoryBudgetAC
+from torchtitan.distributed.activation_checkpoint import (
+    FullAC,
+    MemoryBudgetAC,
+    SelectiveAC,
+)
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.llama3.config_registry import llama3_debugmodel
 from torchtitan.models.qwen3.config_registry import qwen3_debugmodel
 from torchtitan.observability.tensor_logging import TensorLogging, TensorMetricFamily
-from torchtitan.observability.tensor_logging.families import resolve_parameter_families
+from torchtitan.observability.tensor_logging.families import resolve_families
 from torchtitan.trainer import Trainer
 
 
@@ -33,27 +37,27 @@ def _enabled_config():
     return config
 
 
-def test_parameter_family_selection_is_explicit_and_unique() -> None:
-    selected = resolve_parameter_families(None)
+def test_family_selection_is_explicit_and_unique() -> None:
+    selected = resolve_families(None)
     assert selected == (
         TensorMetricFamily.PARAMETER,
         TensorMetricFamily.PRECLIP_GRADIENT,
     )
 
-    selected = resolve_parameter_families((TensorMetricFamily.PRECLIP_GRADIENT,))
+    selected = resolve_families((TensorMetricFamily.PRECLIP_GRADIENT,))
     assert selected == (TensorMetricFamily.PRECLIP_GRADIENT,)
 
     with pytest.raises(ValueError, match="must not be empty"):
-        resolve_parameter_families(())
+        resolve_families(())
     with pytest.raises(ValueError, match="duplicates"):
-        resolve_parameter_families(
+        resolve_families(
             (
                 TensorMetricFamily.PARAMETER,
                 TensorMetricFamily.PARAMETER,
             )
         )
     with pytest.raises(ValueError, match="TensorMetricFamily values"):
-        resolve_parameter_families(cast(tuple[TensorMetricFamily, ...], ("parameter",)))
+        resolve_families(cast(tuple[TensorMetricFamily, ...], ("parameter",)))
 
 
 def test_recipe_parser_accepts_the_three_field_surface() -> None:
@@ -164,6 +168,57 @@ def test_job_config_requires_one_sink_and_core_trainer() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda config: setattr(
+                config,
+                "activation_checkpoint",
+                SelectiveAC.Config(),
+            ),
+            "does not yet support activation checkpointing",
+        ),
+        (
+            lambda config: setattr(
+                config,
+                "compile",
+                replace(config.compile, enable=True, backend="inductor"),
+            ),
+            "does not yet support model compilation",
+        ),
+        (
+            lambda config: setattr(config.validator, "enable", True),
+            "does not yet support validation-enabled jobs",
+        ),
+    ],
+)
+def test_boundary_support_row_fails_closed(mutate, message: str) -> None:
+    config = _enabled_config()
+    config.tensor_logging.families = (TensorMetricFamily.BOUNDARY_OUTPUT,)
+    config.activation_checkpoint = None
+    mutate(config)
+
+    with pytest.raises(ValueError, match=message):
+        TensorLogging.validate_job_config(
+            config.tensor_logging,
+            trainer_config=config,
+            is_core_trainer=True,
+        )
+
+
+def test_parameter_only_logging_keeps_validation_support() -> None:
+    config = _enabled_config()
+    config.tensor_logging.families = (TensorMetricFamily.PARAMETER,)
+    config.validator.enable = True
+
+    TensorLogging.validate_job_config(
+        config.tensor_logging,
+        trainer_config=config,
+        is_core_trainer=True,
+    )
+
+
 @pytest.mark.parametrize("layer_ids", [(), (0, 0), (-1,), (1.5,)])
 def test_job_config_rejects_invalid_layer_ids(layer_ids) -> None:
     config = _enabled_config()
@@ -201,6 +256,10 @@ def test_disabled_model_compile_ignores_inactive_backend() -> None:
 def test_ordinary_llama_and_qwen_model_configs_are_supported(config_factory) -> None:
     config = config_factory()
     config.tensor_logging.enable = True
+    config.tensor_logging.families = (
+        TensorMetricFamily.BOUNDARY_OUTPUT,
+        TensorMetricFamily.BOUNDARY_OUTPUT_COTANGENT,
+    )
     assert config.model_spec is not None
 
     TensorLogging.validate_model_config(
@@ -452,7 +511,9 @@ def test_singleton_publication_outcome_advances_only_on_success() -> None:
 def test_nonwriter_derivation_does_not_touch_the_metric_batch() -> None:
     tensor_logging = object.__new__(TensorLogging)
     tensor_logging._is_writer = False
-    tensor_logging._batch = Mock()
+    tensor_logging._parameter_batch = Mock()
+    tensor_logging._output_batch = Mock()
 
     assert tensor_logging.derive_metrics(Mock(), step=1) == {}
-    tensor_logging._batch.derive_metrics.assert_not_called()
+    tensor_logging._parameter_batch.derive_metrics.assert_not_called()
+    tensor_logging._output_batch.derive_metrics.assert_not_called()

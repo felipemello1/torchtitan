@@ -871,6 +871,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         else:
             global_valid_tokens = float(local_valid_tokens.item())
 
+        if self.tensor_logging is not None:
+            self.tensor_logging.begin_step(should_log=should_log)
+
         # Process each gradient accumulation step, then free its inputs.
         accumulated_losses = []
         for microbatches in microbatch_groups:
@@ -1078,6 +1081,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.ntokens_seen = state_dict["ntokens_seen"]
 
     def close(self) -> None:
+        if hasattr(self, "tensor_logging") and self.tensor_logging:
+            self.tensor_logging.close()
         if hasattr(self, "checkpointer") and self.checkpointer:
             self.checkpointer.close()
         if hasattr(self, "metrics_processor") and self.metrics_processor:

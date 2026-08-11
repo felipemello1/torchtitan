@@ -16,14 +16,21 @@ from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.config import Configurable
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.llama3.model import Llama3Model
 from torchtitan.models.llama3.parallelize import parallelize_llama
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.parallelize import parallelize_qwen3
 from torchtitan.observability.tensor_logging.families import (
-    resolve_parameter_families,
+    BOUNDARY_FAMILIES,
+    PARAMETER_FAMILIES,
+    resolve_families,
     TensorMetricFamily,
+)
+from torchtitan.observability.tensor_logging.output_batch import (
+    OutputStatisticsBatch,
+    OutputStatisticsSnapshot,
 )
 from torchtitan.observability.tensor_logging.parameter_batch import (
     ParameterStatisticsBatch,
@@ -31,6 +38,15 @@ from torchtitan.observability.tensor_logging.parameter_batch import (
 )
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import logger
+
+
+@dataclass(frozen=True, slots=True)
+class TensorLoggingSnapshot:
+    """Reduced parameter and output statistics for one logging step."""
+
+    parameter: ParameterStatisticsSnapshot | None
+    output: OutputStatisticsSnapshot | None
+    local_error: Exception | None
 
 
 class TensorLogging(Configurable):
@@ -45,7 +61,8 @@ class TensorLogging(Configurable):
         )
     """
 
-    _batch: ParameterStatisticsBatch
+    _parameter_batch: ParameterStatisticsBatch | None
+    _output_batch: OutputStatisticsBatch | None
     _is_writer: bool
     _outcome_template: torch.Tensor
     _expected_contributors: int
@@ -74,7 +91,10 @@ class TensorLogging(Configurable):
         """Fail unsupported public requests before distributed construction."""
         if not config.enable:
             return
-        resolve_parameter_families(config.families)
+        selected_families = resolve_families(config.families)
+        boundary_selected = any(
+            family in BOUNDARY_FAMILIES for family in selected_families
+        )
         if not config.layer_ids:
             raise ValueError("tensor_logging.layer_ids must not be empty")
         if len(set(config.layer_ids)) != len(config.layer_ids):
@@ -136,6 +156,19 @@ class TensorLogging(Configurable):
             raise ValueError(
                 "tensor logging currently supports only the inductor compile backend"
             )
+        if boundary_selected:
+            if activation_checkpoint is not None:
+                raise ValueError(
+                    "tensor output logging does not yet support activation checkpointing"
+                )
+            if compile_model:
+                raise ValueError(
+                    "tensor output logging does not yet support model compilation"
+                )
+            if trainer_config.validator.enable:
+                raise ValueError(
+                    "tensor output logging does not yet support validation-enabled jobs"
+                )
 
     @staticmethod
     def validate_model_config(
@@ -147,6 +180,10 @@ class TensorLogging(Configurable):
         """Validate the exact model family and selected pre-build projections."""
         if not config.enable:
             return
+        selected_families = resolve_families(config.families)
+        boundary_selected = any(
+            family in BOUNDARY_FAMILIES for family in selected_families
+        )
         expected_model_type: type
         expected_parallelize_fn: object
         if model_spec.name == "llama3":
@@ -178,6 +215,18 @@ class TensorLogging(Configurable):
                     "tensor logging requires an ordinary Linear.Config at "
                     f"layers.{layer_id}.attention.wo"
                 )
+            if boundary_selected:
+                feed_forward_config = model_config.layers[layer_id].feed_forward
+                if type(feed_forward_config) is not FeedForward.Config:
+                    raise ValueError(
+                        "tensor output logging requires an ordinary "
+                        f"FeedForward.Config at layers.{layer_id}.feed_forward"
+                    )
+                if type(feed_forward_config.w2) is not Linear.Config:
+                    raise ValueError(
+                        "tensor output logging requires an ordinary Linear.Config at "
+                        f"layers.{layer_id}.feed_forward.w2"
+                    )
 
     def __init__(
         self,
@@ -188,12 +237,33 @@ class TensorLogging(Configurable):
         metrics_processor: MetricsProcessor,
         device: torch.device,
     ) -> None:
-        selected_families = resolve_parameter_families(config.families)
-        self._batch = ParameterStatisticsBatch(
-            model=model,
-            parallel_dims=parallel_dims,
-            layer_ids=config.layer_ids,
-            families=selected_families,
+        selected_families = resolve_families(config.families)
+        parameter_families = tuple(
+            family for family in selected_families if family in PARAMETER_FAMILIES
+        )
+        boundary_families = tuple(
+            family for family in selected_families if family in BOUNDARY_FAMILIES
+        )
+        self._parameter_batch = (
+            ParameterStatisticsBatch(
+                model=model,
+                parallel_dims=parallel_dims,
+                layer_ids=config.layer_ids,
+                families=parameter_families,
+            )
+            if parameter_families
+            else None
+        )
+        self._output_batch = (
+            OutputStatisticsBatch(
+                model=model,
+                parallel_dims=parallel_dims,
+                layer_ids=config.layer_ids,
+                families=boundary_families,
+                device=device,
+            )
+            if boundary_families
+            else None
         )
 
         self._is_writer = metrics_processor.has_active_logger
@@ -213,12 +283,33 @@ class TensorLogging(Configurable):
         selected_names = ", ".join(family.name for family in selected_families)
         logger.info(f"Tensor logging selected families: {selected_names}")
 
-    def collect(self, *, step: int) -> ParameterStatisticsSnapshot:
-        return self._batch.collect(step=step)
+    def begin_step(self, *, should_log: bool) -> None:
+        if self._output_batch is not None:
+            self._output_batch.begin_step(should_log=should_log)
+
+    def collect(self, *, step: int) -> TensorLoggingSnapshot:
+        parameter = (
+            self._parameter_batch.collect(step=step)
+            if self._parameter_batch is not None
+            else None
+        )
+        output = (
+            self._output_batch.collect() if self._output_batch is not None else None
+        )
+        local_error = None
+        for snapshot in (parameter, output):
+            if snapshot is not None and snapshot.local_error is not None:
+                local_error = snapshot.local_error
+                break
+        return TensorLoggingSnapshot(
+            parameter=parameter,
+            output=output,
+            local_error=local_error,
+        )
 
     def derive_metrics(
         self,
-        snapshot: ParameterStatisticsSnapshot,
+        snapshot: TensorLoggingSnapshot,
         *,
         step: int,
     ) -> dict[str, int | float]:
@@ -229,14 +320,34 @@ class TensorLogging(Configurable):
             raise RuntimeError(
                 f"tensor logging publication step {step} does not advance its window"
             )
-        return self._batch.derive_metrics(
-            snapshot,
-            expected_contributors=self._expected_contributors,
-            window_steps=window_steps,
-        )
+        metrics: dict[str, int | float] = {}
+        if snapshot.parameter is not None:
+            assert self._parameter_batch is not None
+            metrics.update(
+                self._parameter_batch.derive_metrics(
+                    snapshot.parameter,
+                    expected_contributors=self._expected_contributors,
+                    window_steps=window_steps,
+                )
+            )
+        if snapshot.output is not None:
+            assert self._output_batch is not None
+            metrics.update(
+                self._output_batch.derive_metrics(
+                    snapshot.output,
+                    window_steps=window_steps,
+                )
+            )
+        return metrics
 
     def reset_after_checkpoint_load(self, *, step: int) -> None:
         self._last_successful_publication_step = step
+        if self._output_batch is not None:
+            self._output_batch.begin_step(should_log=False)
+
+    def close(self) -> None:
+        if self._output_batch is not None:
+            self._output_batch.close()
 
     def complete_publication(
         self,
