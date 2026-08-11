@@ -241,7 +241,7 @@ def test_parameter_and_internal_moe_families_are_ep_compatible() -> None:
     )
 
     config.tensor_logging.families = (TensorMetricFamily.BOUNDARY_OUTPUT,)
-    with pytest.raises(ValueError, match="parameter or internal MoE families"):
+    with pytest.raises(ValueError, match="EP-compatible tensor metric families"):
         TensorLogging.validate_job_config(
             config.tensor_logging,
             trainer_config=config,
@@ -327,6 +327,36 @@ def test_qwen3_moe_internal_families_are_supported() -> None:
         model_spec=config.model_spec,
         model_config=config.model_spec.model,
     )
+
+
+def test_whole_gradient_and_expert_bias_configs_are_supported() -> None:
+    llama_config = llama3_debugmodel()
+    llama_config.tensor_logging.enable = True
+    llama_config.tensor_logging.families = (TensorMetricFamily.WHOLE_GRADIENT,)
+    assert llama_config.model_spec is not None
+    TensorLogging.validate_model_config(
+        llama_config.tensor_logging,
+        model_spec=llama_config.model_spec,
+        model_config=llama_config.model_spec.model,
+    )
+
+    qwen_config = qwen3_moe_debug()
+    qwen_config.tensor_logging.enable = True
+    qwen_config.tensor_logging.families = (TensorMetricFamily.EXPERT_BIAS,)
+    assert qwen_config.model_spec is not None
+    TensorLogging.validate_model_config(
+        qwen_config.tensor_logging,
+        model_spec=qwen_config.model_spec,
+        model_config=qwen_config.model_spec.model,
+    )
+
+    qwen_config.model_spec.model.layers[0].moe.load_balance_coeff = None
+    with pytest.raises(ValueError, match="auxiliary-loss-free balancing"):
+        TensorLogging.validate_model_config(
+            qwen_config.tensor_logging,
+            model_spec=qwen_config.model_spec,
+            model_config=qwen_config.model_spec.model,
+        )
 
 
 def test_internal_moe_families_reject_dense_qwen3() -> None:

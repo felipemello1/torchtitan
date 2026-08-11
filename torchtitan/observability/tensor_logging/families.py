@@ -26,6 +26,8 @@ class TensorMetricFamily(str, Enum):
     OFFERED_ASSIGNMENTS = "offered_assignments"
     PER_SEQUENCE_ROUTING = "per_sequence_routing"
     EXPERT_COMPUTE_ROWS = "expert_compute_rows"
+    WHOLE_GRADIENT = "whole_gradient"
+    EXPERT_BIAS = "expert_bias"
 
 
 PARAMETER_FAMILIES = (
@@ -49,6 +51,10 @@ EXPERT_COUNT_FAMILIES = (
 )
 
 INTERNAL_FAMILIES = ROUTER_FAMILIES + EXPERT_COUNT_FAMILIES
+
+JOB_FAMILIES = (TensorMetricFamily.WHOLE_GRADIENT,)
+
+OPTIMIZER_FAMILIES = (TensorMetricFamily.EXPERT_BIAS,)
 
 
 def resolve_families(

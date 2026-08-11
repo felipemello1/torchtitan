@@ -533,6 +533,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             model_spec.post_optimizer_build_fn(
                 self.optimizers, self.model_parts, parallel_dims
             )
+        if self.tensor_logging is not None:
+            self.tensor_logging.bind_optimizer(self.optimizers)
         self.lr_schedulers = config.lr_scheduler.build(
             optimizers=self.optimizers,
             training_steps=config.training.steps,
@@ -918,6 +920,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             )
             self.checkpointer.maybe_wait_for_staging()
             self.optimizers.step()
+            if tensor_snapshot is not None:
+                assert self.tensor_logging is not None
+                tensor_snapshot = self.tensor_logging.collect_after_optimizer(
+                    tensor_snapshot
+                )
             self.lr_schedulers.step()
 
         # Reduce the data collected over gradient accumulation steps.

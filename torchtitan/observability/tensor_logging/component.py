@@ -4,12 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.optim import Optimizer
 
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.quantization.utils import has_quantization
@@ -24,6 +25,10 @@ from torchtitan.models.llama3.model import Llama3Model
 from torchtitan.models.llama3.parallelize import parallelize_llama
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.parallelize import parallelize_qwen3
+from torchtitan.observability.tensor_logging.expert_bias import (
+    ExpertBiasRecorder,
+    ExpertBiasSnapshot,
+)
 from torchtitan.observability.tensor_logging.expert_counts import (
     ExpertCountRecorder,
     ExpertCountSnapshot,
@@ -32,6 +37,8 @@ from torchtitan.observability.tensor_logging.families import (
     BOUNDARY_FAMILIES,
     EXPERT_COUNT_FAMILIES,
     INTERNAL_FAMILIES,
+    JOB_FAMILIES,
+    OPTIMIZER_FAMILIES,
     PARAMETER_FAMILIES,
     resolve_families,
     ROUTER_FAMILIES,
@@ -49,6 +56,10 @@ from torchtitan.observability.tensor_logging.router_statistics import (
     RouterStatisticsRecorder,
     RouterStatisticsSnapshot,
 )
+from torchtitan.observability.tensor_logging.whole_gradient import (
+    WholeGradientSnapshot,
+    WholeGradientStatistics,
+)
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import logger
 
@@ -61,6 +72,8 @@ class TensorLoggingSnapshot:
     output: OutputStatisticsSnapshot | None
     expert_counts: ExpertCountSnapshot | None
     router: RouterStatisticsSnapshot | None
+    whole_gradient: WholeGradientSnapshot | None
+    expert_bias: ExpertBiasSnapshot | None
     local_error: Exception | None
 
 
@@ -80,6 +93,8 @@ class TensorLogging(Configurable):
     _output_batch: OutputStatisticsBatch | None
     _expert_count_recorder: ExpertCountRecorder | None
     _router_statistics_recorder: RouterStatisticsRecorder | None
+    _whole_gradient_statistics: WholeGradientStatistics | None
+    _expert_bias_recorder: ExpertBiasRecorder | None
     _is_writer: bool
     _outcome_template: torch.Tensor
     _last_successful_publication_step: int
@@ -139,13 +154,15 @@ class TensorLogging(Configurable):
         for name, degree in unsupported_degrees.items():
             if degree != 1:
                 raise ValueError(f"tensor logging requires {name}=1, got {degree}")
-        ep_families = INTERNAL_FAMILIES + PARAMETER_FAMILIES
+        ep_families = (
+            INTERNAL_FAMILIES + PARAMETER_FAMILIES + JOB_FAMILIES + OPTIMIZER_FAMILIES
+        )
         if parallelism.expert_parallel_degree != 1 and any(
             family not in ep_families for family in selected_families
         ):
             raise ValueError(
                 "tensor logging requires expert_parallel_degree=1 unless "
-                "only parameter or internal MoE families are selected"
+                "only EP-compatible tensor metric families are selected"
             )
         if (
             TensorMetricFamily.EXPERT_COMPUTE_ROWS in selected_families
@@ -220,6 +237,7 @@ class TensorLogging(Configurable):
         internal_selected = any(
             family in INTERNAL_FAMILIES for family in selected_families
         )
+        expert_bias_selected = TensorMetricFamily.EXPERT_BIAS in selected_families
         expected_model_type: type
         expected_parallelize_fn: object
         if model_spec.name == "llama3":
@@ -263,7 +281,7 @@ class TensorLogging(Configurable):
                         "tensor output logging requires an ordinary Linear.Config at "
                         f"layers.{layer_id}.feed_forward.w2"
                     )
-            if internal_selected:
+            if internal_selected or expert_bias_selected:
                 if model_spec.name != "qwen3":
                     raise ValueError(
                         "internal MoE tensor logging currently requires Qwen3"
@@ -272,6 +290,11 @@ class TensorLogging(Configurable):
                 if type(moe_config) is not MoE.Config:
                     raise ValueError(
                         "internal MoE tensor logging requires an ordinary MoE.Config "
+                        f"at layers.{layer_id}.moe"
+                    )
+                if expert_bias_selected and moe_config.load_balance_coeff is None:
+                    raise ValueError(
+                        "expert-bias logging requires auxiliary-loss-free balancing "
                         f"at layers.{layer_id}.moe"
                     )
                 if any(
@@ -370,6 +393,20 @@ class TensorLogging(Configurable):
             if router_families
             else None
         )
+        self._whole_gradient_statistics = (
+            WholeGradientStatistics(model=model, parallel_dims=parallel_dims)
+            if TensorMetricFamily.WHOLE_GRADIENT in selected_families
+            else None
+        )
+        self._expert_bias_recorder = (
+            ExpertBiasRecorder(
+                model=model,
+                layer_ids=config.layer_ids,
+                device=device,
+            )
+            if TensorMetricFamily.EXPERT_BIAS in selected_families
+            else None
+        )
 
         self._is_writer = metrics_processor.has_active_logger
         active_writer_count = torch.tensor(
@@ -390,6 +427,13 @@ class TensorLogging(Configurable):
     def begin_step(self, *, should_log: bool) -> None:
         if self._output_batch is not None:
             self._output_batch.begin_step(should_log=should_log)
+        if self._expert_bias_recorder is not None:
+            self._expert_bias_recorder.begin_step(should_log=should_log)
+
+    def bind_optimizer(self, optimizer: Optimizer) -> None:
+        """Bind optimizer-owned producers after model hooks are installed."""
+        if self._expert_bias_recorder is not None:
+            self._expert_bias_recorder.bind_optimizer(optimizer)
 
     def collect(self, *, step: int) -> TensorLoggingSnapshot:
         parameter = (
@@ -410,8 +454,13 @@ class TensorLogging(Configurable):
             if self._router_statistics_recorder is not None
             else None
         )
+        whole_gradient = (
+            self._whole_gradient_statistics.collect(step=step)
+            if self._whole_gradient_statistics is not None
+            else None
+        )
         local_error = None
-        for snapshot in (parameter, output, expert_counts, router):
+        for snapshot in (parameter, output, expert_counts, router, whole_gradient):
             if snapshot is not None and snapshot.local_error is not None:
                 local_error = snapshot.local_error
                 break
@@ -420,6 +469,25 @@ class TensorLogging(Configurable):
             output=output,
             expert_counts=expert_counts,
             router=router,
+            whole_gradient=whole_gradient,
+            expert_bias=None,
+            local_error=local_error,
+        )
+
+    def collect_after_optimizer(
+        self,
+        snapshot: TensorLoggingSnapshot,
+    ) -> TensorLoggingSnapshot:
+        """Attach optimizer-owned point samples to a pre-optimizer snapshot."""
+        if self._expert_bias_recorder is None:
+            return snapshot
+        expert_bias = self._expert_bias_recorder.collect()
+        local_error = snapshot.local_error
+        if local_error is None:
+            local_error = expert_bias.local_error
+        return replace(
+            snapshot,
+            expert_bias=expert_bias,
             local_error=local_error,
         )
 
@@ -469,12 +537,30 @@ class TensorLogging(Configurable):
                     window_steps=window_steps,
                 )
             )
+        if snapshot.whole_gradient is not None:
+            assert self._whole_gradient_statistics is not None
+            metrics.update(
+                self._whole_gradient_statistics.derive_metrics(
+                    snapshot.whole_gradient,
+                    window_steps=window_steps,
+                )
+            )
+        if snapshot.expert_bias is not None:
+            assert self._expert_bias_recorder is not None
+            metrics.update(
+                self._expert_bias_recorder.derive_metrics(
+                    snapshot.expert_bias,
+                    window_steps=window_steps,
+                )
+            )
         return metrics
 
     def reset_after_checkpoint_load(self, *, step: int) -> None:
         self._last_successful_publication_step = step
         if self._output_batch is not None:
             self._output_batch.begin_step(should_log=False)
+        if self._expert_bias_recorder is not None:
+            self._expert_bias_recorder.begin_step(should_log=False)
 
     def close(self) -> None:
         if self._output_batch is not None:
@@ -483,6 +569,8 @@ class TensorLogging(Configurable):
             self._expert_count_recorder.close()
         if self._router_statistics_recorder is not None:
             self._router_statistics_recorder.close()
+        if self._expert_bias_recorder is not None:
+            self._expert_bias_recorder.close()
 
     def complete_publication(
         self,
