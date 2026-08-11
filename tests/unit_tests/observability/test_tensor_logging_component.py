@@ -99,10 +99,6 @@ def test_recipe_parser_accepts_the_three_field_surface() -> None:
             "context_parallel_degree=1",
         ),
         (
-            lambda config: setattr(config.parallelism, "expert_parallel_degree", 2),
-            "expert_parallel_degree=1",
-        ),
-        (
             lambda config: setattr(
                 config.parallelism, "data_parallel_replicate_degree", 2
             ),
@@ -219,7 +215,7 @@ def test_parameter_only_logging_keeps_validation_support() -> None:
     )
 
 
-def test_internal_moe_families_are_the_only_ep_compatible_families() -> None:
+def test_parameter_and_internal_moe_families_are_ep_compatible() -> None:
     config = _enabled_config()
     config.activation_checkpoint = None
     config.parallelism.expert_parallel_degree = 2
@@ -238,7 +234,14 @@ def test_internal_moe_families_are_the_only_ep_compatible_families() -> None:
         TensorMetricFamily.OFFERED_ASSIGNMENTS,
         TensorMetricFamily.PARAMETER,
     )
-    with pytest.raises(ValueError, match="only internal MoE families"):
+    TensorLogging.validate_job_config(
+        config.tensor_logging,
+        trainer_config=config,
+        is_core_trainer=True,
+    )
+
+    config.tensor_logging.families = (TensorMetricFamily.BOUNDARY_OUTPUT,)
+    with pytest.raises(ValueError, match="parameter or internal MoE families"):
         TensorLogging.validate_job_config(
             config.tensor_logging,
             trainer_config=config,

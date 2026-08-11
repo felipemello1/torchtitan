@@ -139,12 +139,13 @@ class TensorLogging(Configurable):
         for name, degree in unsupported_degrees.items():
             if degree != 1:
                 raise ValueError(f"tensor logging requires {name}=1, got {degree}")
+        ep_families = INTERNAL_FAMILIES + PARAMETER_FAMILIES
         if parallelism.expert_parallel_degree != 1 and any(
-            family not in INTERNAL_FAMILIES for family in selected_families
+            family not in ep_families for family in selected_families
         ):
             raise ValueError(
                 "tensor logging requires expert_parallel_degree=1 unless "
-                "only internal MoE families are selected"
+                "only parameter or internal MoE families are selected"
             )
         if (
             TensorMetricFamily.EXPERT_COMPUTE_ROWS in selected_families

@@ -17,7 +17,7 @@ def resolve_parameter_owner_meshes(
     *,
     parallel_dims: ParallelDims,
 ) -> tuple[DeviceMesh, ...]:
-    """Validate a dense parameter and return its non-replica owner meshes."""
+    """Validate a parameter and return its non-replica owner meshes."""
     if parallel_dims.spmd_backend != "default":
         raise ValueError("parameter statistics require spmd_backend='default'")
     if not isinstance(value, DTensor):
@@ -25,19 +25,34 @@ def resolve_parameter_owner_meshes(
     if any(placement.is_partial() for placement in value.placements):
         raise ValueError("parameter statistics do not accept Partial placements")
 
-    expected_mesh_axis_names = (
+    dense_mesh_axis_names = (
         *(("dp_replicate",) if parallel_dims.dp_replicate > 1 else ()),
         "fsdp",
         *(("tp",) if parallel_dims.tp > 1 else ()),
     )
+    sparse_mesh_axis_names = (
+        *(("dp_replicate",) if parallel_dims.dp_replicate > 1 else ()),
+        "efsdp",
+        "ep",
+    )
     mesh = value.device_mesh
-    if mesh.mesh_dim_names != expected_mesh_axis_names:
+    mesh_axis_names = mesh.mesh_dim_names
+    if mesh_axis_names == dense_mesh_axis_names:
+        resolved_mesh_axis_names = dense_mesh_axis_names
+        storage_axis = "fsdp"
+        parallel_axis = "tp" if parallel_dims.tp > 1 else None
+    elif parallel_dims.ep > 1 and mesh_axis_names == sparse_mesh_axis_names:
+        resolved_mesh_axis_names = sparse_mesh_axis_names
+        storage_axis = "efsdp"
+        parallel_axis = "ep"
+    else:
         raise ValueError(
-            "parameter statistics expected mesh axes "
-            f"{expected_mesh_axis_names}, got {mesh.mesh_dim_names}"
+            "parameter statistics expected dense mesh axes "
+            f"{dense_mesh_axis_names} or sparse mesh axes {sparse_mesh_axis_names}, "
+            f"got {mesh_axis_names}"
         )
     placement_by_axis = dict(
-        zip(expected_mesh_axis_names, value.placements, strict=True)
+        zip(resolved_mesh_axis_names, value.placements, strict=True)
     )
     if (
         parallel_dims.dp_replicate > 1
@@ -46,13 +61,13 @@ def resolve_parameter_owner_meshes(
         raise ValueError(
             "parameter statistics require Replicate on the dp_replicate axis"
         )
-    fsdp_placement = placement_by_axis["fsdp"]
-    if not (
-        isinstance(fsdp_placement, (Shard, _StridedShard)) and fsdp_placement.dim == 0
-    ):
-        raise ValueError("parameter statistics require a dim-0 shard on the FSDP axis")
-    if parallel_dims.tp > 1:
-        tp_placement = placement_by_axis["tp"]
+    storage_placement = placement_by_axis[storage_axis]
+    if not isinstance(storage_placement, (Shard, _StridedShard)):
+        raise ValueError(
+            f"parameter statistics require a shard on the {storage_axis} axis"
+        )
+    if parallel_axis == "tp":
+        tp_placement = placement_by_axis[parallel_axis]
         if not (
             tp_placement.is_replicate()
             or isinstance(tp_placement, (Shard, _StridedShard))
@@ -60,8 +75,16 @@ def resolve_parameter_owner_meshes(
             raise ValueError(
                 "parameter statistics require Replicate or Shard on the TP axis"
             )
+    elif parallel_axis == "ep":
+        ep_placement = placement_by_axis[parallel_axis]
+        if not (
+            isinstance(ep_placement, (Shard, _StridedShard)) and ep_placement.dim == 0
+        ):
+            raise ValueError(
+                "parameter statistics require a dim-0 shard on the EP axis"
+            )
 
-    expected_mesh = parallel_dims.get_mesh(list(expected_mesh_axis_names))
+    expected_mesh = parallel_dims.get_mesh(list(resolved_mesh_axis_names))
     if mesh.device_type != expected_mesh.device_type:
         raise ValueError("parameter statistics require the ParallelDims device type")
     if not torch.equal(mesh.mesh, expected_mesh.mesh):

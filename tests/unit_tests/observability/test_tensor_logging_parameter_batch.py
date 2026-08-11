@@ -465,3 +465,65 @@ class TestParameterBatchFourRanks(DTensorTestBase):
             self.assertEqual(metrics[f"{prefix}.abs_mean"], 2.5)
             self.assertEqual(metrics[f"{prefix}.square_mean"], 7.5)
             self.assertEqual(metrics[f"{prefix}.abs_max"], 4.0)
+
+    @with_comms
+    def test_efsdp_shard_by_ep_batch(self) -> None:
+        parallel_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=1,
+            cp=1,
+            tp=4,
+            pp=1,
+            ep=2,
+            world_size=self.world_size,
+        )
+        parallel_dims.build_mesh()
+        sparse_mesh = parallel_dims.get_mesh(["efsdp", "ep"])
+        local_value = torch.full(
+            (1, 4),
+            float(self.rank + 1),
+            device=self.device_type,
+        )
+        parameter = nn.Parameter(
+            DTensor.from_local(
+                local_value,
+                sparse_mesh,
+                (Shard(0), Shard(0)),
+                shape=torch.Size((4, 4)),
+                stride=(4, 1),
+                run_check=False,
+            )
+        )
+        layer = nn.Module()
+        layer.routed_weight = parameter
+        model = nn.Module()
+        model.layers = nn.ModuleList([layer])
+        batch = ParameterStatisticsBatch(
+            model=model,
+            parallel_dims=parallel_dims,
+            layer_ids=(0,),
+            families=(
+                TensorMetricFamily.PARAMETER,
+                TensorMetricFamily.PRECLIP_GRADIENT,
+            ),
+        )
+        parameter.grad = DTensor.from_local(
+            local_value.clone(),
+            sparse_mesh,
+            (Shard(0), Shard(0)),
+            shape=torch.Size((4, 4)),
+            stride=(4, 1),
+            run_check=False,
+        )
+
+        self.assertEqual(len(batch._groups), 1)
+        self.assertIs(batch._groups[0].reduction_meshes[0], parallel_dims.world_mesh)
+        self.assertEqual(batch._groups[0].expected_contributors, 4)
+        metrics = batch.derive_metrics(batch.collect(step=1), window_steps=1)
+
+        for suffix in ("w", "dw_preclip"):
+            prefix = f"tensor_metrics/layers.0.routed_weight.{suffix}"
+            self.assertEqual(metrics[f"{prefix}.numel"], 16)
+            self.assertEqual(metrics[f"{prefix}.abs_mean"], 2.5)
+            self.assertEqual(metrics[f"{prefix}.square_mean"], 7.5)
+            self.assertEqual(metrics[f"{prefix}.abs_max"], 4.0)
