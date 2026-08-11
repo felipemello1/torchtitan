@@ -10,9 +10,10 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.optim import Optimizer
 
 from torchtitan.components.metrics import MetricsProcessor
+
+from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.config import Configurable
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
@@ -44,6 +45,10 @@ from torchtitan.observability.tensor_logging.families import (
     ROUTER_FAMILIES,
     TensorMetricFamily,
 )
+from torchtitan.observability.tensor_logging.optimizer_statistics import (
+    AdamWStatisticsRecorder,
+    OptimizerStatisticsSnapshot,
+)
 from torchtitan.observability.tensor_logging.output_batch import (
     OutputStatisticsBatch,
     OutputStatisticsSnapshot,
@@ -74,6 +79,7 @@ class TensorLoggingSnapshot:
     router: RouterStatisticsSnapshot | None
     whole_gradient: WholeGradientSnapshot | None
     expert_bias: ExpertBiasSnapshot | None
+    optimizer: OptimizerStatisticsSnapshot | None
     local_error: Exception | None
 
 
@@ -95,6 +101,7 @@ class TensorLogging(Configurable):
     _router_statistics_recorder: RouterStatisticsRecorder | None
     _whole_gradient_statistics: WholeGradientStatistics | None
     _expert_bias_recorder: ExpertBiasRecorder | None
+    _optimizer_statistics_recorder: AdamWStatisticsRecorder | None
     _is_writer: bool
     _outcome_template: torch.Tensor
     _last_successful_publication_step: int
@@ -128,6 +135,14 @@ class TensorLogging(Configurable):
         )
         internal_selected = any(
             family in INTERNAL_FAMILIES for family in selected_families
+        )
+        adamw_statistics_selected = any(
+            family
+            in (
+                TensorMetricFamily.OPTIMIZER_DISTRIBUTION,
+                TensorMetricFamily.MOMENTUM_GRADIENT_COSINE,
+            )
+            for family in selected_families
         )
         if not config.layer_ids:
             raise ValueError("tensor_logging.layer_ids must not be empty")
@@ -177,6 +192,13 @@ class TensorLogging(Configurable):
             raise ValueError("tensor logging currently requires comm.mode='default'")
         if trainer_config.training.enable_cpu_offload:
             raise ValueError("tensor logging does not yet support CPU offload")
+        if (
+            adamw_statistics_selected
+            and trainer_config.optimizer.implementation == "fused_opt_states_bf16"
+        ):
+            raise ValueError(
+                "optimizer tensor logging requires FP32 AdamW optimizer states"
+            )
         if trainer_config.metrics.save_for_all_ranks:
             raise ValueError(
                 "tensor logging does not support metrics.save_for_all_ranks=True"
@@ -407,6 +429,25 @@ class TensorLogging(Configurable):
             if TensorMetricFamily.EXPERT_BIAS in selected_families
             else None
         )
+        adamw_families = tuple(
+            family
+            for family in selected_families
+            if family
+            in (
+                TensorMetricFamily.OPTIMIZER_DISTRIBUTION,
+                TensorMetricFamily.MOMENTUM_GRADIENT_COSINE,
+            )
+        )
+        self._optimizer_statistics_recorder = (
+            AdamWStatisticsRecorder(
+                model=model,
+                parallel_dims=parallel_dims,
+                layer_ids=config.layer_ids,
+                families=adamw_families,
+            )
+            if adamw_families
+            else None
+        )
 
         self._is_writer = metrics_processor.has_active_logger
         active_writer_count = torch.tensor(
@@ -429,11 +470,15 @@ class TensorLogging(Configurable):
             self._output_batch.begin_step(should_log=should_log)
         if self._expert_bias_recorder is not None:
             self._expert_bias_recorder.begin_step(should_log=should_log)
+        if self._optimizer_statistics_recorder is not None:
+            self._optimizer_statistics_recorder.begin_step(should_log=should_log)
 
-    def bind_optimizer(self, optimizer: Optimizer) -> None:
+    def bind_optimizer(self, optimizer: OptimizersContainer) -> None:
         """Bind optimizer-owned producers after model hooks are installed."""
         if self._expert_bias_recorder is not None:
             self._expert_bias_recorder.bind_optimizer(optimizer)
+        if self._optimizer_statistics_recorder is not None:
+            self._optimizer_statistics_recorder.bind_optimizer(optimizer)
 
     def collect(self, *, step: int) -> TensorLoggingSnapshot:
         parameter = (
@@ -471,6 +516,7 @@ class TensorLogging(Configurable):
             router=router,
             whole_gradient=whole_gradient,
             expert_bias=None,
+            optimizer=None,
             local_error=local_error,
         )
 
@@ -479,15 +525,30 @@ class TensorLogging(Configurable):
         snapshot: TensorLoggingSnapshot,
     ) -> TensorLoggingSnapshot:
         """Attach optimizer-owned point samples to a pre-optimizer snapshot."""
-        if self._expert_bias_recorder is None:
+        if (
+            self._expert_bias_recorder is None
+            and self._optimizer_statistics_recorder is None
+        ):
             return snapshot
-        expert_bias = self._expert_bias_recorder.collect()
+        expert_bias = (
+            self._expert_bias_recorder.collect()
+            if self._expert_bias_recorder is not None
+            else None
+        )
+        optimizer = (
+            self._optimizer_statistics_recorder.collect()
+            if self._optimizer_statistics_recorder is not None
+            else None
+        )
         local_error = snapshot.local_error
-        if local_error is None:
+        if local_error is None and expert_bias is not None:
             local_error = expert_bias.local_error
+        if local_error is None and optimizer is not None:
+            local_error = optimizer.local_error
         return replace(
             snapshot,
             expert_bias=expert_bias,
+            optimizer=optimizer,
             local_error=local_error,
         )
 
@@ -553,6 +614,14 @@ class TensorLogging(Configurable):
                     window_steps=window_steps,
                 )
             )
+        if snapshot.optimizer is not None:
+            assert self._optimizer_statistics_recorder is not None
+            metrics.update(
+                self._optimizer_statistics_recorder.derive_metrics(
+                    snapshot.optimizer,
+                    window_steps=window_steps,
+                )
+            )
         return metrics
 
     def reset_after_checkpoint_load(self, *, step: int) -> None:
@@ -561,6 +630,8 @@ class TensorLogging(Configurable):
             self._output_batch.begin_step(should_log=False)
         if self._expert_bias_recorder is not None:
             self._expert_bias_recorder.begin_step(should_log=False)
+        if self._optimizer_statistics_recorder is not None:
+            self._optimizer_statistics_recorder.begin_step(should_log=False)
 
     def close(self) -> None:
         if self._output_batch is not None:
@@ -571,6 +642,8 @@ class TensorLogging(Configurable):
             self._router_statistics_recorder.close()
         if self._expert_bias_recorder is not None:
             self._expert_bias_recorder.close()
+        if self._optimizer_statistics_recorder is not None:
+            self._optimizer_statistics_recorder.close()
 
     def complete_publication(
         self,

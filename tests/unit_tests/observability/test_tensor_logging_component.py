@@ -215,6 +215,22 @@ def test_parameter_only_logging_keeps_validation_support() -> None:
     )
 
 
+def test_optimizer_statistics_reject_bf16_state_implementation() -> None:
+    config = _enabled_config()
+    config.tensor_logging.families = (
+        TensorMetricFamily.OPTIMIZER_DISTRIBUTION,
+        TensorMetricFamily.MOMENTUM_GRADIENT_COSINE,
+    )
+    config.optimizer.implementation = "fused_opt_states_bf16"
+
+    with pytest.raises(ValueError, match="FP32 AdamW optimizer states"):
+        TensorLogging.validate_job_config(
+            config.tensor_logging,
+            trainer_config=config,
+            is_core_trainer=True,
+        )
+
+
 def test_parameter_and_internal_moe_families_are_ep_compatible() -> None:
     config = _enabled_config()
     config.activation_checkpoint = None
