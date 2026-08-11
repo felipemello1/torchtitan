@@ -45,32 +45,23 @@ class DataStatisticsRecorder:
         device: torch.device,
     ) -> None:
         self._families = families
-        self._record_loss = TensorMetricFamily.DATASET_LOSS in families
-        self._record_segments = any(
+        self._loss_selected = TensorMetricFamily.DATASET_LOSS in families
+        self._segments_selected = any(
             family in families
             for family in (
                 TensorMetricFamily.DOCUMENT_SEGMENTS,
                 TensorMetricFamily.BLOCK_CAUSAL_MOMENTS,
             )
         )
-        if self._record_loss and dataset_id is None:
-            raise ValueError("dataset loss logging requires one stable dataset ID")
         self._dataset_id = dataset_id
         self._world_mesh = parallel_dims.world_mesh
 
         tp_mesh = parallel_dims.get_optional_mesh("tp")
         cp_mesh = parallel_dims.get_optional_mesh("cp")
-        pp_mesh = parallel_dims.get_optional_mesh("pp")
         tp_representative = tp_mesh is None or tp_mesh.get_local_rank() == 0
         cp_representative = cp_mesh is None or cp_mesh.get_local_rank() == 0
-        first_pipeline_stage = pp_mesh is None or pp_mesh.get_local_rank() == 0
-        last_pipeline_stage = (
-            pp_mesh is None or pp_mesh.get_local_rank() == pp_mesh.size() - 1
-        )
-        self._records_data = (
-            tp_representative and cp_representative and first_pipeline_stage
-        )
-        self._records_loss = tp_representative and last_pipeline_stage
+        self._is_data_contributor = tp_representative and cp_representative
+        self._is_loss_contributor = tp_representative
 
         self._integers = torch.zeros(
             _INTEGER_FIELDS,
@@ -87,7 +78,7 @@ class DataStatisticsRecorder:
         positions: torch.Tensor | None,
     ) -> None:
         """Accumulate one pre-context-parallel batch from one model replica."""
-        if not self._records_data:
+        if not self._is_data_contributor:
             return
         try:
             self._integers[_ALL_TOKEN_COUNT].add_(labels.numel())
@@ -95,12 +86,9 @@ class DataStatisticsRecorder:
                 torch.count_nonzero(labels != IGNORE_INDEX)
             )
             self._integers[_OBSERVATION_COUNT].add_(1)
-            if not self._record_segments:
+            if not self._segments_selected:
                 return
-            if positions is None:
-                raise ValueError("block-causal data batch has no positions")
-            if positions.shape != labels.shape or positions.ndim != 2:
-                raise ValueError("positions and labels must have the same [B, S] shape")
+            assert positions is not None
 
             segment_ends = torch.empty_like(positions, dtype=torch.bool)
             segment_ends[:, :-1] = positions[:, 1:] == 0
@@ -124,7 +112,7 @@ class DataStatisticsRecorder:
         global_valid_tokens: float | torch.Tensor,
     ) -> None:
         """Accumulate the local loss numerator on the authoritative loss stage."""
-        if not self._record_loss or not self._records_loss:
+        if not self._loss_selected or not self._is_loss_contributor:
             return
         try:
             local_loss = normalized_loss.detach()
@@ -137,7 +125,7 @@ class DataStatisticsRecorder:
                         "data loss must be replicated across model-parallel axes"
                     )
                 local_loss = local_loss.to_local()
-            self._loss_sum.add_((local_loss * global_valid_tokens).float().sum())
+            self._loss_sum.add_((local_loss * global_valid_tokens).float())
         except Exception as error:
             if self._local_error is None:
                 self._local_error = ValueError(
@@ -149,7 +137,7 @@ class DataStatisticsRecorder:
         integers = reduce_sum(self._integers.clone(), self._world_mesh)
         loss_sum = (
             reduce_sum(self._loss_sum.clone(), self._world_mesh)
-            if self._record_loss
+            if self._loss_selected
             else None
         )
         snapshot = DataStatisticsSnapshot(
@@ -177,7 +165,7 @@ class DataStatisticsRecorder:
         ) = (int(value) for value in snapshot.integers.cpu().tolist())
         metrics: dict[str, int | float] = {}
 
-        if self._record_loss:
+        if self._loss_selected:
             assert self._dataset_id is not None
             prefix = f"tensor_metrics/data/datasets.{self._dataset_id}"
             metrics[f"{prefix}.valid_token_count"] = valid_token_count

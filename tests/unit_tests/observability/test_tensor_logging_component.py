@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 import torch.testing._internal.distributed.fake_pg  # noqa: F401
 
+from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.metrics import BaseLogger, LoggerContainer, MetricsProcessor
 from torchtitan.config import ConfigManager, override
 from torchtitan.distributed.activation_checkpoint import (
@@ -106,7 +107,7 @@ def test_recipe_parser_accepts_the_three_field_surface() -> None:
         ),
         (
             lambda config: setattr(config.parallelism, "spmd_backend", "spmd_types"),
-            "spmd_backend='default'",
+            "spmd_backend='spmd_types'",
         ),
         (
             lambda config: setattr(config.comm, "mode", "fake_backend"),
@@ -234,6 +235,49 @@ def test_data_only_logging_admits_data_parallel_modes() -> None:
         trainer_config=config,
         is_core_trainer=True,
     )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda config: setattr(config.parallelism, "spmd_backend", "full_dtensor"),
+            "full_dtensor",
+        ),
+        (
+            lambda config: setattr(config.tensor_logging, "layer_ids", (1,)),
+            "applies only to layer-owned families",
+        ),
+    ],
+)
+def test_data_only_logging_rejects_unsupported_knobs(mutate, message: str) -> None:
+    config = _enabled_config()
+    config.tensor_logging.families = (
+        TensorMetricFamily.DATASET_LOSS,
+        TensorMetricFamily.DOCUMENT_SEGMENTS,
+        TensorMetricFamily.BLOCK_CAUSAL_MOMENTS,
+    )
+    mutate(config)
+
+    with pytest.raises(ValueError, match=message):
+        TensorLogging.validate_job_config(
+            config.tensor_logging,
+            trainer_config=config,
+            is_core_trainer=True,
+        )
+
+
+def test_document_statistics_reject_non_text_dataloader() -> None:
+    config = _enabled_config()
+    config.tensor_logging.families = (TensorMetricFamily.DOCUMENT_SEGMENTS,)
+    config.dataloader = ParallelAwareDataloader.Config()
+
+    with pytest.raises(ValueError, match="HuggingFace text dataloader"):
+        TensorLogging.validate_job_config(
+            config.tensor_logging,
+            trainer_config=config,
+            is_core_trainer=True,
+        )
 
 
 def test_optimizer_statistics_reject_bf16_state_implementation() -> None:

@@ -11,17 +11,14 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.metrics import MetricsProcessor
-
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.config import Configurable
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.hf_datasets.text_datasets import (
-    HuggingFaceTextDataLoader,
-    InterleavedHuggingFaceTextDataLoader,
-)
+from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import MoE, TokenChoiceTopKRouter
@@ -158,17 +155,26 @@ class TensorLogging(Configurable):
         non_data_selected = any(
             family not in DATA_FAMILIES for family in selected_families
         )
-        if not config.layer_ids:
-            raise ValueError("tensor_logging.layer_ids must not be empty")
-        if len(set(config.layer_ids)) != len(config.layer_ids):
-            raise ValueError("tensor_logging.layer_ids must not contain duplicates")
-        if any(
-            not isinstance(layer_id, int) or layer_id < 0
-            for layer_id in config.layer_ids
-        ):
-            raise ValueError(
-                "tensor_logging.layer_ids must contain nonnegative integers"
-            )
+        layer_owned_selected = any(
+            family not in JOB_FAMILIES + DATA_FAMILIES for family in selected_families
+        )
+        if not layer_owned_selected:
+            if config.layer_ids != (0,):
+                raise ValueError(
+                    "tensor_logging.layer_ids applies only to layer-owned families"
+                )
+        else:
+            if not config.layer_ids:
+                raise ValueError("tensor_logging.layer_ids must not be empty")
+            if len(set(config.layer_ids)) != len(config.layer_ids):
+                raise ValueError("tensor_logging.layer_ids must not contain duplicates")
+            if any(
+                not isinstance(layer_id, int) or layer_id < 0
+                for layer_id in config.layer_ids
+            ):
+                raise ValueError(
+                    "tensor_logging.layer_ids must contain nonnegative integers"
+                )
         if not is_core_trainer:
             raise ValueError("tensor logging currently supports only the core Trainer")
 
@@ -210,8 +216,14 @@ class TensorLogging(Configurable):
             raise ValueError(
                 "EXPERT_COMPUTE_ROWS requires expert_parallel_degree greater than 1"
             )
-        if parallelism.spmd_backend != "default" and non_data_selected:
-            raise ValueError("tensor logging currently requires spmd_backend='default'")
+        supported_spmd_backends = (
+            ("default",) if non_data_selected else ("default", "spmd_types")
+        )
+        if parallelism.spmd_backend not in supported_spmd_backends:
+            raise ValueError(
+                "tensor logging does not support spmd_backend="
+                f"'{parallelism.spmd_backend}' for the selected families"
+            )
         if trainer_config.comm.mode != "default":
             raise ValueError("tensor logging currently requires comm.mode='default'")
         if trainer_config.training.enable_cpu_offload:
@@ -244,9 +256,8 @@ class TensorLogging(Configurable):
             )
             for family in selected_families
         )
-        supported_document_dataloader = type(dataloader_config) in (
-            HuggingFaceTextDataLoader.Config,
-            InterleavedHuggingFaceTextDataLoader.Config,
+        supported_document_dataloader = (
+            type(dataloader_config) is HuggingFaceTextDataLoader.Config
         )
         if document_data_selected and not supported_document_dataloader:
             raise ValueError(
@@ -302,6 +313,9 @@ class TensorLogging(Configurable):
         if not config.enable:
             return
         selected_families = resolve_families(config.families)
+        layer_owned_selected = any(
+            family not in JOB_FAMILIES + DATA_FAMILIES for family in selected_families
+        )
         boundary_selected = any(
             family in BOUNDARY_FAMILIES for family in selected_families
         )
@@ -328,7 +342,7 @@ class TensorLogging(Configurable):
         if has_quantization(model_config):
             raise ValueError("tensor logging does not yet support quantized models")
 
-        for layer_id in config.layer_ids:
+        for layer_id in config.layer_ids if layer_owned_selected else ():
             if layer_id >= len(model_config.layers):
                 raise ValueError(
                     f"tensor_logging.layer_ids contains {layer_id}, but the model "
@@ -402,7 +416,7 @@ class TensorLogging(Configurable):
         parallel_dims: ParallelDims,
         metrics_processor: MetricsProcessor,
         local_batch_size: int,
-        dataloader_config: Any,
+        dataloader_config: ParallelAwareDataloader.Config,
         device: torch.device,
     ) -> None:
         selected_families = resolve_families(config.families)
