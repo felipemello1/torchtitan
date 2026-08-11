@@ -319,9 +319,16 @@ def test_router_distribution_accepts_bias_free_choice_scores() -> None:
     recorder.close()
 
 
-@pytest.mark.parametrize("score_func", ("softmax", "sigmoid"))
+@pytest.mark.parametrize(
+    ("score_func", "logits"),
+    (
+        ("softmax", [-1000.0, 0.0]),
+        ("sigmoid", [-1000.0, -1000.0]),
+    ),
+)
 def test_router_distribution_entropy_handles_saturated_logits(
     score_func: str,
+    logits: list[float],
 ) -> None:
     model, moe = _build_model(expert_bias=None, score_func=score_func)
     recorder = RouterStatisticsRecorder(
@@ -334,7 +341,7 @@ def test_router_distribution_entropy_handles_saturated_logits(
     )
     assert moe.router.statistics_recorder is not None
     moe.router.statistics_recorder(
-        torch.tensor([[[-1000.0, 0.0]]]),
+        torch.tensor([[logits]]),
         torch.tensor([[[0.0, 1.0]]]),
         None,
     )

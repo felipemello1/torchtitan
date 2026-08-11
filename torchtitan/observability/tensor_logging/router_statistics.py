@@ -12,6 +12,7 @@ from functools import partial
 import torch
 from torch import nn
 from torch.distributed.tensor import DTensor, Partial, Placement, Replicate, Shard
+from torch.nn import functional as F
 
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.models.common.moe import MoE
@@ -260,7 +261,7 @@ class RouterStatisticsRecorder:
                 else:
                     mean_scores = torch.sigmoid(mean_logits)
                 entropy_probabilities = mean_scores + mean_bias - mean_bias.min()
-                entropy_probabilities /= entropy_probabilities.sum()
+                entropy_probabilities = F.normalize(entropy_probabilities, p=1, dim=0)
                 entropy = -torch.special.xlogy(
                     entropy_probabilities, entropy_probabilities
                 ).sum()
