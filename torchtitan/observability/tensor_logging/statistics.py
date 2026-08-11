@@ -49,13 +49,6 @@ def _accumulate_finite_statistics(
     abs_max.copy_(torch.maximum(abs_max, finite_abs.amax().reshape(1)))
 
 
-# pyrefly: ignore[no-matching-overload]
-_compiled_accumulate_finite_statistics = torch.compile(
-    _accumulate_finite_statistics,
-    dynamic=True,
-)
-
-
 class ReductionBatch:
     """Pack tensor telemetry reductions by mesh, dtype, and operation."""
 
@@ -224,12 +217,7 @@ def finite_statistics(
     )
 
     for chunk in chunks:
-        accumulate = (
-            _compiled_accumulate_finite_statistics
-            if chunk.device.type == "cuda"
-            else _accumulate_finite_statistics
-        )
-        accumulate(chunk, counts, sums, abs_max)
+        _accumulate_finite_statistics(chunk, counts, sums, abs_max)
     return FiniteStatistics(counts=counts, sums=sums, abs_max=abs_max)
 
 
