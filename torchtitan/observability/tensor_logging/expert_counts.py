@@ -14,10 +14,12 @@ from torch import nn
 from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.distributed.utils import check_dtensor_placements_match
 from torchtitan.models.common.moe import MoE
 from torchtitan.observability.tensor_logging.families import TensorMetricFamily
-from torchtitan.observability.tensor_logging.statistics import reduce_sum
+from torchtitan.observability.tensor_logging.statistics import (
+    reduce_sum,
+    validate_tp_tensor,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,27 +305,12 @@ class ExpertCountRecorder:
             raise ValueError(
                 f"expected shape ({self._num_experts},), got {tuple(value.shape)}"
             )
-        if self._tp_mesh is None:
-            if isinstance(value, DTensor):
-                raise ValueError("TP=1 counts must be a local tensor")
-            return
-        if not isinstance(value, DTensor):
-            raise ValueError("TP>1 counts must be a DTensor")
-        if (
-            value.device_mesh.device_type != self._tp_mesh.device_type
-            or value.device_mesh.mesh_dim_names != self._tp_mesh.mesh_dim_names
-            or not torch.equal(value.device_mesh.mesh, self._tp_mesh.mesh)
-        ):
-            raise ValueError("counts must use the ParallelDims TP mesh")
-        if not check_dtensor_placements_match(
-            value.placements,
-            self._expected_offered_placements,
-            value.ndim,
-        ):
-            raise ValueError(
-                f"expected placements {self._expected_offered_placements}, "
-                f"got {value.placements}"
-            )
+        validate_tp_tensor(
+            value,
+            tp_mesh=self._tp_mesh,
+            expected_placements=self._expected_offered_placements,
+            label="counts",
+        )
 
     def _validate_expert_compute_rows(self, value: torch.Tensor) -> None:
         if isinstance(value, DTensor):

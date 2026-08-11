@@ -21,7 +21,6 @@ from torchtitan.models.common.moe import MoE
 @dataclass(frozen=True, slots=True)
 class ExpertBiasSnapshot:
     values: torch.Tensor
-    present: torch.Tensor
     local_error: Exception | None
 
 
@@ -75,7 +74,6 @@ class ExpertBiasRecorder:
         self._values = torch.zeros(
             (len(layer_ids), num_experts), dtype=torch.float32, device=device
         )
-        self._present = torch.zeros(len(layer_ids), dtype=torch.int64, device=device)
         self._record_next_step = False
         self._local_error: Exception | None = None
         self._hook_handle: RemovableHandle | None = None
@@ -91,7 +89,6 @@ class ExpertBiasRecorder:
     def begin_step(self, *, should_log: bool) -> None:
         """Arm one point sample for the next optimizer step."""
         self._values.zero_()
-        self._present.zero_()
         self._local_error = None
         self._record_next_step = should_log
 
@@ -104,11 +101,9 @@ class ExpertBiasRecorder:
         self._record_next_step = False
         snapshot = ExpertBiasSnapshot(
             values=self._values.clone(),
-            present=self._present.clone(),
             local_error=self._local_error,
         )
         self._values.zero_()
-        self._present.zero_()
         self._local_error = None
         return snapshot
 
@@ -120,13 +115,8 @@ class ExpertBiasRecorder:
     ) -> dict[str, int | float]:
         """Derive stable per-expert keys from the selected writer's replica."""
         values = snapshot.values.cpu()
-        present = snapshot.present.cpu()
         metrics: dict[str, int | float] = {}
         for row_index, layer_id in enumerate(self._layer_ids):
-            if int(present[row_index]) != 1:
-                raise RuntimeError(
-                    f"expert-bias sample for layer {layer_id} was not recorded once"
-                )
             prefix = f"tensor_metrics/layers.{layer_id}"
             for expert_id, value in enumerate(values[row_index]):
                 metrics[
@@ -166,7 +156,6 @@ class ExpertBiasRecorder:
                         f"got {tuple(local_bias.shape)}"
                     )
                 self._values[row_index].copy_(local_bias.detach())
-                self._present[row_index] = 1
             except Exception as error:
                 if self._local_error is None:
                     self._local_error = ValueError(

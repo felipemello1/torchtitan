@@ -123,7 +123,7 @@ Boundary, parameter, whole-gradient, expert-bias, and optimizer families are poi
 The component supports the core Trainer with ordinary Llama3 or Qwen3 model configs, the default communication mode, and TensorBoard or W&B on one canonical writer.
 
 - Parameter and trainer-owned families support eager execution, SelectiveAC, and inductor model compile where their source runs outside recomputed model hooks.
-- Boundary and internal MoE forward families currently require eager execution without activation checkpointing or model compile.
+- Boundary and internal MoE forward families currently require eager execution without activation checkpointing, model compile, or validation-enabled jobs.
 - Data-only families support CP, DP replicate, EP coexistence, and the `spmd_types` backend. `full_dtensor` remains unsupported.
 - Pipeline parallelism, CPU offload, Graph Trainer, CUDA graphs, quantized model configs, and all-rank scalar sinks fail setup.
 - Document/data metrics currently require one `HuggingFaceTextDataLoader` dataset carrying packed-document positions.

@@ -11,11 +11,13 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from torchtitan.components.checkpoint_utils import canonical_fqn
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.observability.tensor_logging.families import TensorMetricFamily
 from torchtitan.observability.tensor_logging.parameter_ownership import (
-    resolve_parameter_owner_meshes,
+    bind_parameters,
+    BoundParameter,
+    group_parameters_by_owner,
+    local_value_for_owner_group,
 )
 from torchtitan.observability.tensor_logging.statistics import (
     derive_finite_statistics,
@@ -26,15 +28,8 @@ from torchtitan.observability.tensor_logging.statistics import (
 
 
 @dataclass(frozen=True, slots=True)
-class _BoundParameter:
-    fqn: str
-    value: torch.Tensor
-    numel: int
-
-
-@dataclass(frozen=True, slots=True)
 class _ParameterRow:
-    parameter: _BoundParameter
+    parameter: BoundParameter
     family: TensorMetricFamily
 
     @property
@@ -68,74 +63,28 @@ class ParameterStatisticsBatch:
         layer_ids: tuple[int, ...],
         families: tuple[TensorMetricFamily, ...],
     ) -> None:
-        layer_prefixes = tuple(f"layers.{layer_id}." for layer_id in layer_ids)
-        parameters_by_identity: dict[int, torch.Tensor] = {}
-        names_by_identity: dict[int, list[str]] = {}
-        for name, parameter in model.named_parameters(remove_duplicate=False):
-            fqn = canonical_fqn(name)
-            if not any(fqn.startswith(prefix) for prefix in layer_prefixes):
-                continue
-            if not parameter.requires_grad or not parameter.is_floating_point():
-                continue
-            identity = id(parameter)
-            parameters_by_identity[identity] = parameter
-            names_by_identity.setdefault(identity, []).append(fqn)
-
-        bound_parameters = []
-        for identity, names in names_by_identity.items():
-            bound_parameters.append(
-                _BoundParameter(
-                    fqn=min(names),
-                    value=parameters_by_identity[identity],
-                    numel=parameters_by_identity[identity].numel(),
-                )
-            )
-        bound_parameters.sort(key=lambda parameter: parameter.fqn)
+        bound_parameters = bind_parameters(model, layer_ids=layer_ids)
         if not bound_parameters:
             raise ValueError("tensor logging found no selected-layer parameters")
-        fqns = [parameter.fqn for parameter in bound_parameters]
-        if len(fqns) != len(set(fqns)):
-            raise ValueError("tensor logging found duplicate canonical parameter FQNs")
-
-        parameters_by_owner: dict[tuple[str, ...], list[_BoundParameter]] = {}
-        owner_meshes_by_key: dict[tuple[str, ...], tuple[DeviceMesh, ...]] = {}
-        for parameter in bound_parameters:
-            owner_meshes = resolve_parameter_owner_meshes(
-                parameter.value,
-                parallel_dims=parallel_dims,
-            )
-            owner_key = tuple(
-                mesh.mesh_dim_names[0] for mesh in owner_meshes if mesh.mesh_dim_names
-            )
-            parameters_by_owner.setdefault(owner_key, []).append(parameter)
-            owner_meshes_by_key[owner_key] = owner_meshes
 
         groups = []
-        for owner_key, parameters in parameters_by_owner.items():
-            owner_meshes = owner_meshes_by_key[owner_key]
-            expected_contributors = 1
-            for mesh in owner_meshes:
-                expected_contributors *= mesh.size()
-            reduction_meshes = (
-                (parallel_dims.world_mesh,)
-                if len(owner_meshes) > 1
-                and expected_contributors == parallel_dims.world_mesh.size()
-                else owner_meshes
-            )
+        for owner_group in group_parameters_by_owner(
+            bound_parameters,
+            parallel_dims=parallel_dims,
+        ):
             groups.append(
                 _ParameterGroup(
                     rows=tuple(
                         _ParameterRow(parameter=parameter, family=family)
-                        for parameter in parameters
+                        for parameter in owner_group.parameters
                         for family in families
                     ),
-                    owner_meshes=owner_meshes,
-                    reduction_meshes=reduction_meshes,
-                    expected_contributors=expected_contributors,
+                    owner_meshes=owner_group.owner_meshes,
+                    reduction_meshes=owner_group.reduction_meshes,
+                    expected_contributors=owner_group.expected_contributors,
                 )
             )
 
-        self._local_device = bound_parameters[0].value.device
         self._parallel_dims = parallel_dims
         self._groups = tuple(groups)
 
@@ -160,24 +109,16 @@ class ParameterStatisticsBatch:
                             f"tensor logging sample {row.metric_prefix!r} is absent"
                         )
                     if row.family is TensorMetricFamily.PRECLIP_GRADIENT:
-                        gradient_owner_meshes = resolve_parameter_owner_meshes(
+                        local_value = local_value_for_owner_group(
                             value,
+                            owner_meshes=group.owner_meshes,
                             parallel_dims=self._parallel_dims,
+                            label="gradient",
                         )
-                        if len(gradient_owner_meshes) != len(group.owner_meshes) or any(
-                            actual is not expected
-                            for actual, expected in zip(
-                                gradient_owner_meshes,
-                                group.owner_meshes,
-                                strict=True,
-                            )
-                        ):
-                            raise ValueError(
-                                "gradient owner cohort differs from its parameter"
-                            )
-                    if not isinstance(value, DTensor):
-                        raise ValueError("value is not a DTensor")
-                    local_value = value.to_local()
+                    else:
+                        if not isinstance(value, DTensor):
+                            raise ValueError("value is not a DTensor")
+                        local_value = value.to_local()
                     statistics = finite_statistics(local_value)
                     present = statistics.counts.new_ones(1)
                 except Exception as error:
@@ -192,13 +133,13 @@ class ParameterStatisticsBatch:
                         )
                     statistics = FiniteStatistics(
                         counts=torch.zeros(
-                            3, dtype=torch.int64, device=self._local_device
+                            3, dtype=torch.int64, device=parameter.value.device
                         ),
                         sums=torch.zeros(
-                            2, dtype=torch.float32, device=self._local_device
+                            2, dtype=torch.float32, device=parameter.value.device
                         ),
                         abs_max=torch.zeros(
-                            1, dtype=torch.float32, device=self._local_device
+                            1, dtype=torch.float32, device=parameter.value.device
                         ),
                     )
                     present = statistics.counts.new_zeros(1)

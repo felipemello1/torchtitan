@@ -12,8 +12,6 @@ from functools import partial
 
 import torch
 from torch import nn
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torch.utils.hooks import RemovableHandle
 
@@ -22,7 +20,10 @@ from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.observability.tensor_logging.families import TensorMetricFamily
 from torchtitan.observability.tensor_logging.parameter_ownership import (
-    resolve_parameter_owner_meshes,
+    bind_parameters,
+    BoundParameter,
+    group_parameters_by_owner,
+    local_value_for_owner_group,
 )
 from torchtitan.observability.tensor_logging.statistics import (
     bounded_tensor_views,
@@ -44,21 +45,6 @@ _MAX_CHUNK_ELEMENTS = 1_048_576
 
 
 @dataclass(frozen=True, slots=True)
-class _BoundParameter:
-    fqn: str
-    value: torch.Tensor
-    numel: int
-
-
-@dataclass(frozen=True, slots=True)
-class _ParameterGroup:
-    parameters: tuple[_BoundParameter, ...]
-    owner_meshes: tuple[DeviceMesh, ...]
-    reduction_meshes: tuple[DeviceMesh, ...]
-    expected_contributors: int
-
-
-@dataclass(frozen=True, slots=True)
 class OptimizerStatisticsSnapshot:
     counts: tuple[torch.Tensor, ...]
     sums: tuple[torch.Tensor, ...]
@@ -77,69 +63,16 @@ class AdamWStatisticsRecorder:
         layer_ids: tuple[int, ...],
         families: tuple[TensorMetricFamily, ...],
     ) -> None:
-        layer_prefixes = tuple(f"layers.{layer_id}." for layer_id in layer_ids)
-        parameters_by_identity: dict[int, torch.Tensor] = {}
-        names_by_identity: dict[int, list[str]] = {}
-        for name, parameter in model.named_parameters(remove_duplicate=False):
-            fqn = canonical_fqn(name)
-            if not any(fqn.startswith(prefix) for prefix in layer_prefixes):
-                continue
-            if not parameter.requires_grad or not parameter.is_floating_point():
-                continue
-            parameters_by_identity[id(parameter)] = parameter
-            names_by_identity.setdefault(id(parameter), []).append(fqn)
-
-        parameters = tuple(
-            sorted(
-                (
-                    _BoundParameter(
-                        fqn=min(names),
-                        value=parameters_by_identity[identity],
-                        numel=parameters_by_identity[identity].numel(),
-                    )
-                    for identity, names in names_by_identity.items()
-                ),
-                key=lambda parameter: parameter.fqn,
-            )
-        )
+        parameters = bind_parameters(model, layer_ids=layer_ids)
         if not parameters:
             raise ValueError(
                 "tensor logging found no selected-layer optimizer parameters"
             )
 
-        parameters_by_owner: dict[tuple[str, ...], list[_BoundParameter]] = {}
-        owner_meshes_by_key: dict[tuple[str, ...], tuple[DeviceMesh, ...]] = {}
-        for parameter in parameters:
-            owner_meshes = resolve_parameter_owner_meshes(
-                parameter.value,
-                parallel_dims=parallel_dims,
-            )
-            owner_key = tuple(
-                mesh.mesh_dim_names[0] for mesh in owner_meshes if mesh.mesh_dim_names
-            )
-            parameters_by_owner.setdefault(owner_key, []).append(parameter)
-            owner_meshes_by_key[owner_key] = owner_meshes
-
-        groups = []
-        for owner_key, owned_parameters in parameters_by_owner.items():
-            owner_meshes = owner_meshes_by_key[owner_key]
-            expected_contributors = math.prod(mesh.size() for mesh in owner_meshes)
-            reduction_meshes = (
-                (parallel_dims.world_mesh,)
-                if len(owner_meshes) > 1
-                and expected_contributors == parallel_dims.world_mesh.size()
-                else owner_meshes
-            )
-            groups.append(
-                _ParameterGroup(
-                    parameters=tuple(owned_parameters),
-                    owner_meshes=owner_meshes,
-                    reduction_meshes=reduction_meshes,
-                    expected_contributors=expected_contributors,
-                )
-            )
-
-        self._groups = tuple(groups)
+        self._groups = group_parameters_by_owner(
+            parameters,
+            parallel_dims=parallel_dims,
+        )
         self._locations = {
             id(parameter.value): (group_index, parameter_index)
             for group_index, group in enumerate(self._groups)
@@ -203,7 +136,7 @@ class AdamWStatisticsRecorder:
             raise RuntimeError("AdamW statistics recorder is already bound")
         found: set[int] = set()
         for optimizer in optimizers.optimizers:
-            selected_groups: list[tuple[int, tuple[_BoundParameter, ...]]] = []
+            selected_groups: list[tuple[int, tuple[BoundParameter, ...]]] = []
             for optimizer_group_index, parameter_group in enumerate(
                 optimizer.param_groups
             ):
@@ -407,36 +340,13 @@ class AdamWStatisticsRecorder:
                 f"{expected} expected owners"
             )
 
-    def _local_owned_value(
-        self,
-        value: torch.Tensor,
-        *,
-        expected_owner_meshes: tuple[DeviceMesh, ...],
-    ) -> torch.Tensor:
-        owner_meshes = resolve_parameter_owner_meshes(
-            value,
-            parallel_dims=self._parallel_dims,
-        )
-        if len(owner_meshes) != len(expected_owner_meshes) or any(
-            actual is not expected
-            for actual, expected in zip(
-                owner_meshes,
-                expected_owner_meshes,
-                strict=True,
-            )
-        ):
-            raise ValueError("optimizer tensor owner cohort differs from parameter")
-        if not isinstance(value, DTensor):
-            raise ValueError("optimizer tensor is not a DTensor")
-        return value.to_local()
-
     def _record_optimizer_state(
         self,
         optimizer: Optimizer,
         _args: tuple[object, ...],
         _kwargs: dict[str, object],
         *,
-        selected_groups: tuple[tuple[int, tuple[_BoundParameter, ...]], ...],
+        selected_groups: tuple[tuple[int, tuple[BoundParameter, ...]], ...],
     ) -> None:
         if not self._record_next_step:
             return
@@ -459,17 +369,23 @@ class AdamWStatisticsRecorder:
                     step = state["step"]
                     if not isinstance(step, torch.Tensor) or step.numel() != 1:
                         raise ValueError("AdamW step state is not a scalar tensor")
-                    local_gradient = self._local_owned_value(
+                    local_gradient = local_value_for_owner_group(
                         gradient,
-                        expected_owner_meshes=group.owner_meshes,
+                        owner_meshes=group.owner_meshes,
+                        parallel_dims=self._parallel_dims,
+                        label="optimizer tensor",
                     )
-                    local_exp_avg = self._local_owned_value(
+                    local_exp_avg = local_value_for_owner_group(
                         exp_avg,
-                        expected_owner_meshes=group.owner_meshes,
+                        owner_meshes=group.owner_meshes,
+                        parallel_dims=self._parallel_dims,
+                        label="optimizer tensor",
                     )
-                    local_exp_avg_sq = self._local_owned_value(
+                    local_exp_avg_sq = local_value_for_owner_group(
                         exp_avg_sq,
-                        expected_owner_meshes=group.owner_meshes,
+                        owner_meshes=group.owner_meshes,
+                        parallel_dims=self._parallel_dims,
+                        label="optimizer tensor",
                     )
                     if (
                         local_gradient.shape != local_exp_avg.shape

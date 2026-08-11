@@ -24,6 +24,7 @@ from torchtitan.distributed.activation_checkpoint import (
     SelectiveAC,
 )
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import TokenChoiceTopKRouter
 from torchtitan.models.llama3.config_registry import llama3_debugmodel
 from torchtitan.models.qwen3.config_registry import qwen3_debugmodel, qwen3_moe_debug
 from torchtitan.observability.tensor_logging import TensorLogging, TensorMetricFamily
@@ -267,9 +268,19 @@ def test_data_only_logging_rejects_unsupported_knobs(mutate, message: str) -> No
         )
 
 
-def test_document_statistics_reject_non_text_dataloader() -> None:
+@pytest.mark.parametrize(
+    "family",
+    [
+        TensorMetricFamily.DATASET_LOSS,
+        TensorMetricFamily.DOCUMENT_SEGMENTS,
+        TensorMetricFamily.BLOCK_CAUSAL_MOMENTS,
+    ],
+)
+def test_data_statistics_reject_non_text_dataloader(
+    family: TensorMetricFamily,
+) -> None:
     config = _enabled_config()
-    config.tensor_logging.families = (TensorMetricFamily.DOCUMENT_SEGMENTS,)
+    config.tensor_logging.families = (family,)
     config.dataloader = ParallelAwareDataloader.Config()
 
     with pytest.raises(ValueError, match="HuggingFace text dataloader"):
@@ -451,6 +462,28 @@ def test_internal_moe_families_reject_dense_qwen3() -> None:
             config.tensor_logging,
             model_spec=config.model_spec,
             model_config=config.model_spec.model,
+        )
+
+
+def test_router_families_reject_converted_router_config() -> None:
+    config = qwen3_moe_debug()
+    config.tensor_logging.enable = True
+    config.tensor_logging.families = (TensorMetricFamily.PER_SEQUENCE_ROUTING,)
+    assert config.model_spec is not None
+    model_config = config.model_spec.model
+    original = model_config.layers[0].moe.router
+
+    @dataclass(kw_only=True, slots=True)
+    class ConvertedRouterConfig(TokenChoiceTopKRouter.Config):
+        pass
+
+    kwargs = {field.name: getattr(original, field.name) for field in fields(original)}
+    model_config.layers[0].moe.router = ConvertedRouterConfig(**kwargs)
+    with pytest.raises(ValueError, match="ordinary token-choice router"):
+        TensorLogging.validate_model_config(
+            config.tensor_logging,
+            model_spec=config.model_spec,
+            model_config=model_config,
         )
 
 

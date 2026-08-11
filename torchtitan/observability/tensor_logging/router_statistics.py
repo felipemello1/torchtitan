@@ -14,10 +14,13 @@ from torch import nn
 from torch.distributed.tensor import DTensor, Partial, Placement, Replicate, Shard
 
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.distributed.utils import check_dtensor_placements_match
-from torchtitan.models.common.moe import MoE, TokenChoiceTopKRouter
+from torchtitan.models.common.moe import MoE
 from torchtitan.observability.tensor_logging.families import TensorMetricFamily
-from torchtitan.observability.tensor_logging.statistics import reduce_max, reduce_sum
+from torchtitan.observability.tensor_logging.statistics import (
+    reduce_max,
+    reduce_sum,
+    validate_tp_tensor,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,11 +60,6 @@ class RouterStatisticsRecorder:
             module = model.get_submodule(fqn)
             if type(module) is not MoE:
                 raise ValueError(f"tensor logging requires an ordinary MoE at {fqn!r}")
-            if type(module.router) is not TokenChoiceTopKRouter:
-                raise ValueError(
-                    "tensor logging requires an ordinary token-choice router at "
-                    f"{fqn!r}"
-                )
             if num_experts is None:
                 num_experts = module.router.num_experts
             elif num_experts != module.router.num_experts:
@@ -69,16 +67,6 @@ class RouterStatisticsRecorder:
                     "tensor logging requires selected MoE layers to have the same "
                     "number of experts"
                 )
-            if distribution_selected:
-                if module.router.num_expert_groups is not None:
-                    raise ValueError(
-                        "router distribution logging does not support "
-                        "node-limited routing"
-                    )
-                if module.router._debug_force_load_balance:
-                    raise ValueError(
-                        "router distribution logging does not support forced routing"
-                    )
             modules.append(module)
             score_functions.append(module.router.score_func)
 
@@ -437,23 +425,9 @@ class RouterStatisticsRecorder:
         *,
         expected_placements: tuple[Placement, ...],
     ) -> None:
-        if self._tp_mesh is None:
-            if isinstance(value, DTensor):
-                raise ValueError("TP=1 router values must be local tensors")
-            return
-        if not isinstance(value, DTensor):
-            raise ValueError("TP>1 router values must be DTensors")
-        if (
-            value.device_mesh.device_type != self._tp_mesh.device_type
-            or value.device_mesh.mesh_dim_names != self._tp_mesh.mesh_dim_names
-            or not torch.equal(value.device_mesh.mesh, self._tp_mesh.mesh)
-        ):
-            raise ValueError("router values must use the ParallelDims TP mesh")
-        if not check_dtensor_placements_match(
-            value.placements,
-            expected_placements,
-            value.ndim,
-        ):
-            raise ValueError(
-                f"expected placements {expected_placements}, got {value.placements}"
-            )
+        validate_tp_tensor(
+            value,
+            tp_mesh=self._tp_mesh,
+            expected_placements=expected_placements,
+            label="router values",
+        )

@@ -17,7 +17,6 @@ from torch.distributed.tensor.placement_types import Placement
 from torch.utils.hooks import RemovableHandle
 
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.distributed.utils import check_dtensor_placements_match
 from torchtitan.models.common.attention import GQAttention
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.observability.tensor_logging.families import TensorMetricFamily
@@ -26,6 +25,7 @@ from torchtitan.observability.tensor_logging.statistics import (
     finite_statistics,
     FiniteStatistics,
     reduce_finite_statistics,
+    validate_tp_tensor,
 )
 from torchtitan.protocols.sharding import resolve_placements
 
@@ -403,27 +403,12 @@ class OutputStatisticsBatch:
             raise ValueError(f"unsupported dtype {value.dtype}")
         if value.ndim != 3:
             raise ValueError(f"expected a three-dimensional output, got {value.ndim}")
-        if not expected_placements:
-            if isinstance(value, DTensor):
-                raise ValueError("TP=1 output must be a local tensor")
-            return
-        if not isinstance(value, DTensor):
-            raise ValueError("TP>1 output must be a DTensor")
-        assert expected_mesh is not None
-        if (
-            value.device_mesh.device_type != expected_mesh.device_type
-            or value.device_mesh.mesh_dim_names != expected_mesh.mesh_dim_names
-            or not torch.equal(value.device_mesh.mesh, expected_mesh.mesh)
-        ):
-            raise ValueError("TP>1 output must use the ParallelDims TP mesh")
-        if not check_dtensor_placements_match(
-            value.placements,
-            expected_placements,
-            value.ndim,
-        ):
-            raise ValueError(
-                f"expected placements {expected_placements}, got {value.placements}"
-            )
+        validate_tp_tensor(
+            value,
+            tp_mesh=expected_mesh,
+            expected_placements=expected_placements,
+            label="output",
+        )
 
     def _latch_error(
         self,

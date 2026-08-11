@@ -11,6 +11,9 @@ import torch
 import torch.distributed._functional_collectives as funcol
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Placement
+
+from torchtitan.distributed.utils import check_dtensor_placements_match
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +21,36 @@ class FiniteStatistics:
     counts: torch.Tensor
     sums: torch.Tensor
     abs_max: torch.Tensor
+
+
+def validate_tp_tensor(
+    value: torch.Tensor,
+    *,
+    tp_mesh: DeviceMesh | None,
+    expected_placements: tuple[Placement, ...],
+    label: str,
+) -> None:
+    """Require local TP=1 storage or one exact ParallelDims TP DTensor."""
+    if tp_mesh is None:
+        if isinstance(value, DTensor):
+            raise ValueError(f"TP=1 {label} must be a local tensor")
+        return
+    if not isinstance(value, DTensor):
+        raise ValueError(f"TP>1 {label} must be a DTensor")
+    if (
+        value.device_mesh.device_type != tp_mesh.device_type
+        or value.device_mesh.mesh_dim_names != tp_mesh.mesh_dim_names
+        or not torch.equal(value.device_mesh.mesh, tp_mesh.mesh)
+    ):
+        raise ValueError(f"{label} must use the ParallelDims TP mesh")
+    if not check_dtensor_placements_match(
+        value.placements,
+        expected_placements,
+        value.ndim,
+    ):
+        raise ValueError(
+            f"expected placements {expected_placements}, got {value.placements}"
+        )
 
 
 def bounded_tensor_views(

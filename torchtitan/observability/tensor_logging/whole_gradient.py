@@ -11,12 +11,13 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
 
-from torchtitan.components.checkpoint_utils import canonical_fqn
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.observability.tensor_logging.parameter_ownership import (
-    resolve_parameter_owner_meshes,
+    bind_parameters,
+    BoundParameter,
+    group_parameters_by_owner,
+    local_value_for_owner_group,
 )
 from torchtitan.observability.tensor_logging.statistics import (
     derive_finite_statistics,
@@ -31,9 +32,7 @@ _CATEGORY_NAMES = ("all", "token_embedding", "moe")
 
 @dataclass(frozen=True, slots=True)
 class _BoundGradient:
-    fqn: str
-    parameter: torch.Tensor
-    numel: int
+    parameter: BoundParameter
     category_indices: tuple[int, ...]
 
 
@@ -55,77 +54,52 @@ class WholeGradientStatistics:
     """Collects each logical gradient element once across owner cohorts."""
 
     def __init__(self, *, model: nn.Module, parallel_dims: ParallelDims) -> None:
-        parameters_by_identity: dict[int, torch.Tensor] = {}
-        names_by_identity: dict[int, list[str]] = {}
-        for name, parameter in model.named_parameters(remove_duplicate=False):
-            if not parameter.requires_grad or not parameter.is_floating_point():
-                continue
-            identity = id(parameter)
-            parameters_by_identity[identity] = parameter
-            names_by_identity.setdefault(identity, []).append(canonical_fqn(name))
-
+        parameters = bind_parameters(model, layer_ids=None)
         gradients = []
-        for identity, names in names_by_identity.items():
-            fqn = min(names)
+        for parameter in parameters:
             category_indices = [0]
-            if "tok_embeddings.weight" in names:
+            if "tok_embeddings.weight" in parameter.aliases:
                 category_indices.append(1)
-            if any(".moe." in name for name in names):
+            if any(".moe." in name for name in parameter.aliases):
                 category_indices.append(2)
-            parameter = parameters_by_identity[identity]
             gradients.append(
                 _BoundGradient(
-                    fqn=fqn,
                     parameter=parameter,
-                    numel=parameter.numel(),
                     category_indices=tuple(category_indices),
                 )
             )
-        gradients.sort(key=lambda gradient: gradient.fqn)
         if not gradients:
             raise ValueError("tensor logging found no trainable floating parameters")
 
-        gradients_by_owner: dict[tuple[str, ...], list[_BoundGradient]] = {}
-        owner_meshes_by_key: dict[tuple[str, ...], tuple[DeviceMesh, ...]] = {}
-        for gradient in gradients:
-            owner_meshes = resolve_parameter_owner_meshes(
-                gradient.parameter,
-                parallel_dims=parallel_dims,
-            )
-            owner_key = tuple(
-                mesh.mesh_dim_names[0] for mesh in owner_meshes if mesh.mesh_dim_names
-            )
-            gradients_by_owner.setdefault(owner_key, []).append(gradient)
-            owner_meshes_by_key[owner_key] = owner_meshes
+        gradient_by_parameter_id = {
+            id(gradient.parameter.value): gradient for gradient in gradients
+        }
 
         groups = []
-        for owner_key, owned_gradients in gradients_by_owner.items():
-            owner_meshes = owner_meshes_by_key[owner_key]
-            owner_count = 1
-            for mesh in owner_meshes:
-                owner_count *= mesh.size()
-            reduction_meshes = (
-                (parallel_dims.world_mesh,)
-                if len(owner_meshes) > 1
-                and owner_count == parallel_dims.world_mesh.size()
-                else owner_meshes
+        for owner_group in group_parameters_by_owner(
+            parameters,
+            parallel_dims=parallel_dims,
+        ):
+            owned_gradients = tuple(
+                gradient_by_parameter_id[id(parameter.value)]
+                for parameter in owner_group.parameters
             )
             expected_numel = [0] * len(_CATEGORY_NAMES)
             for gradient in owned_gradients:
                 for category_index in gradient.category_indices:
-                    expected_numel[category_index] += gradient.numel
+                    expected_numel[category_index] += gradient.parameter.numel
             groups.append(
                 _GradientGroup(
-                    gradients=tuple(owned_gradients),
-                    owner_meshes=owner_meshes,
-                    reduction_meshes=reduction_meshes,
+                    gradients=owned_gradients,
+                    owner_meshes=owner_group.owner_meshes,
+                    reduction_meshes=owner_group.reduction_meshes,
                     expected_numel=tuple(expected_numel),
                 )
             )
 
         self._groups = tuple(groups)
         self._parallel_dims = parallel_dims
-        self._device = gradients[0].parameter.device
+        self._device = gradients[0].parameter.value.device
 
     def collect(self, *, step: int) -> WholeGradientSnapshot:
         """Read completed preclip gradients and reduce each owner cohort."""
@@ -142,32 +116,22 @@ class WholeGradientStatistics:
                 (len(_CATEGORY_NAMES), 1), dtype=torch.float32, device=self._device
             )
             for gradient in group.gradients:
-                value = gradient.parameter.grad
+                value = gradient.parameter.value.grad
                 try:
                     if value is None:
                         raise ValueError("gradient is absent")
-                    gradient_owner_meshes = resolve_parameter_owner_meshes(
+                    local_value = local_value_for_owner_group(
                         value,
+                        owner_meshes=group.owner_meshes,
                         parallel_dims=self._parallel_dims,
+                        label="gradient",
                     )
-                    if len(gradient_owner_meshes) != len(group.owner_meshes) or any(
-                        actual is not expected
-                        for actual, expected in zip(
-                            gradient_owner_meshes,
-                            group.owner_meshes,
-                            strict=True,
-                        )
-                    ):
-                        raise ValueError(
-                            "gradient owner cohort differs from its parameter"
-                        )
-                    if not isinstance(value, DTensor):
-                        raise ValueError("gradient is not a DTensor")
-                    statistics = finite_statistics(value.to_local())
+                    statistics = finite_statistics(local_value)
                 except Exception as error:
                     if local_error is None:
                         local_error = ValueError(
-                            f"invalid whole-gradient sample {gradient.fqn!r} "
+                            f"invalid whole-gradient sample "
+                            f"{gradient.parameter.fqn!r} "
                             f"at step {step}: {error}"
                         )
                     continue

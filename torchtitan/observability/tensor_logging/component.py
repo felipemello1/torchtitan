@@ -248,28 +248,13 @@ class TensorLogging(Configurable):
                 "metrics.enable_wandb"
             )
         dataloader_config = trainer_config.dataloader
-        document_data_selected = any(
-            family
-            in (
-                TensorMetricFamily.DOCUMENT_SEGMENTS,
-                TensorMetricFamily.BLOCK_CAUSAL_MOMENTS,
-            )
-            for family in selected_families
-        )
-        supported_document_dataloader = (
-            type(dataloader_config) is HuggingFaceTextDataLoader.Config
-        )
-        if document_data_selected and not supported_document_dataloader:
-            raise ValueError(
-                "document tensor logging requires a HuggingFace text dataloader"
-            )
+        data_selected = any(family in DATA_FAMILIES for family in selected_families)
         if (
-            TensorMetricFamily.DATASET_LOSS in selected_families
+            data_selected
             and type(dataloader_config) is not HuggingFaceTextDataLoader.Config
         ):
             raise ValueError(
-                "dataset loss tensor logging currently requires one "
-                "HuggingFace text dataset"
+                "data tensor logging requires a HuggingFace text dataloader"
             )
         activation_checkpoint = trainer_config.activation_checkpoint
         if (
@@ -391,22 +376,27 @@ class TensorLogging(Configurable):
                         "internal MoE tensor logging currently requires the standard "
                         "token dispatcher"
                     )
-                if TensorMetricFamily.ROUTER_DISTRIBUTION in selected_families:
+                router_selected = any(
+                    family in ROUTER_FAMILIES for family in selected_families
+                )
+                if router_selected:
                     router_config = moe_config.router
                     if type(router_config) is not TokenChoiceTopKRouter.Config:
                         raise ValueError(
-                            "router distribution logging requires an ordinary "
+                            "router tensor logging requires an ordinary "
                             "token-choice router"
                         )
-                    if router_config.num_expert_groups is not None:
-                        raise ValueError(
-                            "router distribution logging does not support "
-                            "node-limited routing"
-                        )
-                    if router_config._debug_force_load_balance:
-                        raise ValueError(
-                            "router distribution logging does not support forced routing"
-                        )
+                    if TensorMetricFamily.ROUTER_DISTRIBUTION in selected_families:
+                        if router_config.num_expert_groups is not None:
+                            raise ValueError(
+                                "router distribution logging does not support "
+                                "node-limited routing"
+                            )
+                        if router_config._debug_force_load_balance:
+                            raise ValueError(
+                                "router distribution logging does not support "
+                                "forced routing"
+                            )
 
     def __init__(
         self,
