@@ -18,15 +18,22 @@ from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.llama3.model import Llama3Model
 from torchtitan.models.llama3.parallelize import parallelize_llama
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.parallelize import parallelize_qwen3
 from torchtitan.observability.tensor_logging.families import (
     BOUNDARY_FAMILIES,
+    INTERNAL_FAMILIES,
     PARAMETER_FAMILIES,
     resolve_families,
     TensorMetricFamily,
+)
+from torchtitan.observability.tensor_logging.offered_assignments import (
+    OfferedAssignmentsRecorder,
+    OfferedAssignmentsSnapshot,
 )
 from torchtitan.observability.tensor_logging.output_batch import (
     OutputStatisticsBatch,
@@ -46,6 +53,7 @@ class TensorLoggingSnapshot:
 
     parameter: ParameterStatisticsSnapshot | None
     output: OutputStatisticsSnapshot | None
+    offered_assignments: OfferedAssignmentsSnapshot | None
     local_error: Exception | None
 
 
@@ -63,6 +71,7 @@ class TensorLogging(Configurable):
 
     _parameter_batch: ParameterStatisticsBatch | None
     _output_batch: OutputStatisticsBatch | None
+    _offered_assignments_recorder: OfferedAssignmentsRecorder | None
     _is_writer: bool
     _outcome_template: torch.Tensor
     _expected_contributors: int
@@ -95,6 +104,9 @@ class TensorLogging(Configurable):
         boundary_selected = any(
             family in BOUNDARY_FAMILIES for family in selected_families
         )
+        internal_selected = any(
+            family in INTERNAL_FAMILIES for family in selected_families
+        )
         if not config.layer_ids:
             raise ValueError("tensor_logging.layer_ids must not be empty")
         if len(set(config.layer_ids)) != len(config.layer_ids):
@@ -113,7 +125,6 @@ class TensorLogging(Configurable):
         unsupported_degrees = {
             "pipeline_parallel_degree": parallelism.pipeline_parallel_degree,
             "context_parallel_degree": parallelism.context_parallel_degree,
-            "expert_parallel_degree": parallelism.expert_parallel_degree,
             "data_parallel_replicate_degree": (
                 parallelism.data_parallel_replicate_degree
             ),
@@ -121,6 +132,13 @@ class TensorLogging(Configurable):
         for name, degree in unsupported_degrees.items():
             if degree != 1:
                 raise ValueError(f"tensor logging requires {name}=1, got {degree}")
+        if parallelism.expert_parallel_degree != 1 and selected_families != (
+            TensorMetricFamily.OFFERED_ASSIGNMENTS,
+        ):
+            raise ValueError(
+                "tensor logging requires expert_parallel_degree=1 unless "
+                "OFFERED_ASSIGNMENTS is the only family"
+            )
         if parallelism.spmd_backend != "default":
             raise ValueError("tensor logging currently requires spmd_backend='default'")
         if trainer_config.comm.mode != "default":
@@ -156,18 +174,18 @@ class TensorLogging(Configurable):
             raise ValueError(
                 "tensor logging currently supports only the inductor compile backend"
             )
-        if boundary_selected:
+        if boundary_selected or internal_selected:
             if activation_checkpoint is not None:
                 raise ValueError(
-                    "tensor output logging does not yet support activation checkpointing"
+                    "tensor forward logging does not yet support activation checkpointing"
                 )
             if compile_model:
                 raise ValueError(
-                    "tensor output logging does not yet support model compilation"
+                    "tensor forward logging does not yet support model compilation"
                 )
             if trainer_config.validator.enable:
                 raise ValueError(
-                    "tensor output logging does not yet support validation-enabled jobs"
+                    "tensor forward logging does not yet support validation-enabled jobs"
                 )
 
     @staticmethod
@@ -183,6 +201,9 @@ class TensorLogging(Configurable):
         selected_families = resolve_families(config.families)
         boundary_selected = any(
             family in BOUNDARY_FAMILIES for family in selected_families
+        )
+        offered_assignments_selected = (
+            TensorMetricFamily.OFFERED_ASSIGNMENTS in selected_families
         )
         expected_model_type: type
         expected_parallelize_fn: object
@@ -227,6 +248,24 @@ class TensorLogging(Configurable):
                         "tensor output logging requires an ordinary Linear.Config at "
                         f"layers.{layer_id}.feed_forward.w2"
                     )
+            if offered_assignments_selected:
+                if model_spec.name != "qwen3":
+                    raise ValueError(
+                        "offered assignment logging currently requires Qwen3"
+                    )
+                moe_config = model_config.layers[layer_id].moe
+                if type(moe_config) is not MoE.Config:
+                    raise ValueError(
+                        "offered assignment logging requires an ordinary MoE.Config "
+                        f"at layers.{layer_id}.moe"
+                    )
+                if type(moe_config.routed_experts.token_dispatcher) is not (
+                    AllToAllTokenDispatcher.Config
+                ):
+                    raise ValueError(
+                        "offered assignment logging currently requires the standard "
+                        "token dispatcher"
+                    )
 
     def __init__(
         self,
@@ -265,6 +304,16 @@ class TensorLogging(Configurable):
             if boundary_families
             else None
         )
+        self._offered_assignments_recorder = (
+            OfferedAssignmentsRecorder(
+                model=model,
+                parallel_dims=parallel_dims,
+                layer_ids=config.layer_ids,
+                device=device,
+            )
+            if TensorMetricFamily.OFFERED_ASSIGNMENTS in selected_families
+            else None
+        )
 
         self._is_writer = metrics_processor.has_active_logger
         active_writer_count = torch.tensor(
@@ -296,14 +345,20 @@ class TensorLogging(Configurable):
         output = (
             self._output_batch.collect() if self._output_batch is not None else None
         )
+        offered_assignments = (
+            self._offered_assignments_recorder.collect()
+            if self._offered_assignments_recorder is not None
+            else None
+        )
         local_error = None
-        for snapshot in (parameter, output):
+        for snapshot in (parameter, output, offered_assignments):
             if snapshot is not None and snapshot.local_error is not None:
                 local_error = snapshot.local_error
                 break
         return TensorLoggingSnapshot(
             parameter=parameter,
             output=output,
+            offered_assignments=offered_assignments,
             local_error=local_error,
         )
 
@@ -338,6 +393,14 @@ class TensorLogging(Configurable):
                     window_steps=window_steps,
                 )
             )
+        if snapshot.offered_assignments is not None:
+            assert self._offered_assignments_recorder is not None
+            metrics.update(
+                self._offered_assignments_recorder.derive_metrics(
+                    snapshot.offered_assignments,
+                    window_steps=window_steps,
+                )
+            )
         return metrics
 
     def reset_after_checkpoint_load(self, *, step: int) -> None:
@@ -348,6 +411,8 @@ class TensorLogging(Configurable):
     def close(self) -> None:
         if self._output_batch is not None:
             self._output_batch.close()
+        if self._offered_assignments_recorder is not None:
+            self._offered_assignments_recorder.close()
 
     def complete_publication(
         self,

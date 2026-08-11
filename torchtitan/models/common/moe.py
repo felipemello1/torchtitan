@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -405,6 +406,7 @@ class MoE(Module):
             torch.zeros(num_experts, dtype=torch.float32),
             persistent=False,
         )
+        self.offered_assignments_recorder: Callable[[torch.Tensor], None] | None = None
 
     def forward(self, x_BLD: torch.Tensor) -> torch.Tensor:
         """
@@ -449,6 +451,8 @@ class MoE(Module):
             True,
         )
         num_local_tokens_per_expert_E = routing_map_BLE.sum(dim=(0, 1))
+        if self.offered_assignments_recorder is not None:
+            self.offered_assignments_recorder(num_local_tokens_per_expert_E)
 
         # tokens_per_expert_E will be used to update the expert bias for load balancing,
         # and also to count the expert usage.

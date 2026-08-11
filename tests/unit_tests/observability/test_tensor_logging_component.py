@@ -24,7 +24,7 @@ from torchtitan.distributed.activation_checkpoint import (
 )
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.llama3.config_registry import llama3_debugmodel
-from torchtitan.models.qwen3.config_registry import qwen3_debugmodel
+from torchtitan.models.qwen3.config_registry import qwen3_debugmodel, qwen3_moe_debug
 from torchtitan.observability.tensor_logging import TensorLogging, TensorMetricFamily
 from torchtitan.observability.tensor_logging.families import resolve_families
 from torchtitan.trainer import Trainer
@@ -219,6 +219,30 @@ def test_parameter_only_logging_keeps_validation_support() -> None:
     )
 
 
+def test_offered_assignments_admit_ep_only_as_a_single_family() -> None:
+    config = _enabled_config()
+    config.activation_checkpoint = None
+    config.parallelism.expert_parallel_degree = 2
+    config.tensor_logging.families = (TensorMetricFamily.OFFERED_ASSIGNMENTS,)
+
+    TensorLogging.validate_job_config(
+        config.tensor_logging,
+        trainer_config=config,
+        is_core_trainer=True,
+    )
+
+    config.tensor_logging.families = (
+        TensorMetricFamily.OFFERED_ASSIGNMENTS,
+        TensorMetricFamily.PARAMETER,
+    )
+    with pytest.raises(ValueError, match="expert_parallel_degree=1"):
+        TensorLogging.validate_job_config(
+            config.tensor_logging,
+            trainer_config=config,
+            is_core_trainer=True,
+        )
+
+
 @pytest.mark.parametrize("layer_ids", [(), (0, 0), (-1,), (1.5,)])
 def test_job_config_rejects_invalid_layer_ids(layer_ids) -> None:
     config = _enabled_config()
@@ -267,6 +291,34 @@ def test_ordinary_llama_and_qwen_model_configs_are_supported(config_factory) -> 
         model_spec=config.model_spec,
         model_config=config.model_spec.model,
     )
+
+
+def test_qwen3_moe_offered_assignments_are_supported() -> None:
+    config = qwen3_moe_debug()
+    config.tensor_logging.enable = True
+    config.tensor_logging.families = (TensorMetricFamily.OFFERED_ASSIGNMENTS,)
+    config.tensor_logging.layer_ids = (0,)
+    assert config.model_spec is not None
+
+    TensorLogging.validate_model_config(
+        config.tensor_logging,
+        model_spec=config.model_spec,
+        model_config=config.model_spec.model,
+    )
+
+
+def test_offered_assignments_reject_dense_qwen3() -> None:
+    config = qwen3_debugmodel()
+    config.tensor_logging.enable = True
+    config.tensor_logging.families = (TensorMetricFamily.OFFERED_ASSIGNMENTS,)
+    assert config.model_spec is not None
+
+    with pytest.raises(ValueError, match="ordinary MoE.Config"):
+        TensorLogging.validate_model_config(
+            config.tensor_logging,
+            model_spec=config.model_spec,
+            model_config=config.model_spec.model,
+        )
 
 
 def test_model_config_rejects_invalid_layer_and_converted_projection() -> None:
@@ -513,7 +565,9 @@ def test_nonwriter_derivation_does_not_touch_the_metric_batch() -> None:
     tensor_logging._is_writer = False
     tensor_logging._parameter_batch = Mock()
     tensor_logging._output_batch = Mock()
+    tensor_logging._offered_assignments_recorder = Mock()
 
     assert tensor_logging.derive_metrics(Mock(), step=1) == {}
     tensor_logging._parameter_batch.derive_metrics.assert_not_called()
     tensor_logging._output_batch.derive_metrics.assert_not_called()
+    tensor_logging._offered_assignments_recorder.derive_metrics.assert_not_called()
