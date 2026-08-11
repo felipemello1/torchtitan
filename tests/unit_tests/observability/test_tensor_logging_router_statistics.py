@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -320,15 +321,17 @@ def test_router_distribution_accepts_bias_free_choice_scores() -> None:
 
 
 @pytest.mark.parametrize(
-    ("score_func", "logits"),
+    ("score_func", "logits", "expected_entropy"),
     (
-        ("softmax", [-1000.0, 0.0]),
-        ("sigmoid", [-1000.0, -1000.0]),
+        ("softmax", [-1000.0, 0.0], 0.0),
+        ("sigmoid", [-1000.0, -1000.0], 0.0),
+        ("sigmoid", [-30.0, -30.0], math.log(2.0)),
     ),
 )
 def test_router_distribution_entropy_handles_saturated_logits(
     score_func: str,
     logits: list[float],
+    expected_entropy: float,
 ) -> None:
     model, moe = _build_model(expert_bias=None, score_func=score_func)
     recorder = RouterStatisticsRecorder(
@@ -347,7 +350,9 @@ def test_router_distribution_entropy_handles_saturated_logits(
     )
 
     metrics = recorder.derive_metrics(recorder.collect(), window_steps=1)
-    assert metrics["tensor_metrics/layers.0.moe.router_choice_entropy"] == 0.0
+    assert metrics[
+        "tensor_metrics/layers.0.moe.router_choice_entropy"
+    ] == pytest.approx(expected_entropy)
     recorder.close()
 
 
