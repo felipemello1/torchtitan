@@ -23,6 +23,7 @@ class TensorMetricFamily(str, Enum):
     BOUNDARY_OUTPUT = "boundary_output"
     BOUNDARY_OUTPUT_COTANGENT = "boundary_output_cotangent"
     OFFERED_ASSIGNMENTS = "offered_assignments"
+    EXPERT_COMPUTE_ROWS = "expert_compute_rows"
 
 
 PARAMETER_FAMILIES = (
@@ -35,7 +36,10 @@ BOUNDARY_FAMILIES = (
     TensorMetricFamily.BOUNDARY_OUTPUT_COTANGENT,
 )
 
-INTERNAL_FAMILIES = (TensorMetricFamily.OFFERED_ASSIGNMENTS,)
+INTERNAL_FAMILIES = (
+    TensorMetricFamily.OFFERED_ASSIGNMENTS,
+    TensorMetricFamily.EXPERT_COMPUTE_ROWS,
+)
 
 
 def resolve_families(

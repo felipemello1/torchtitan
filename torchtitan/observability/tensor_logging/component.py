@@ -24,16 +24,16 @@ from torchtitan.models.llama3.model import Llama3Model
 from torchtitan.models.llama3.parallelize import parallelize_llama
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.parallelize import parallelize_qwen3
+from torchtitan.observability.tensor_logging.expert_counts import (
+    ExpertCountRecorder,
+    ExpertCountSnapshot,
+)
 from torchtitan.observability.tensor_logging.families import (
     BOUNDARY_FAMILIES,
     INTERNAL_FAMILIES,
     PARAMETER_FAMILIES,
     resolve_families,
     TensorMetricFamily,
-)
-from torchtitan.observability.tensor_logging.offered_assignments import (
-    OfferedAssignmentsRecorder,
-    OfferedAssignmentsSnapshot,
 )
 from torchtitan.observability.tensor_logging.output_batch import (
     OutputStatisticsBatch,
@@ -53,7 +53,7 @@ class TensorLoggingSnapshot:
 
     parameter: ParameterStatisticsSnapshot | None
     output: OutputStatisticsSnapshot | None
-    offered_assignments: OfferedAssignmentsSnapshot | None
+    expert_counts: ExpertCountSnapshot | None
     local_error: Exception | None
 
 
@@ -71,7 +71,7 @@ class TensorLogging(Configurable):
 
     _parameter_batch: ParameterStatisticsBatch | None
     _output_batch: OutputStatisticsBatch | None
-    _offered_assignments_recorder: OfferedAssignmentsRecorder | None
+    _expert_count_recorder: ExpertCountRecorder | None
     _is_writer: bool
     _outcome_template: torch.Tensor
     _expected_contributors: int
@@ -132,12 +132,19 @@ class TensorLogging(Configurable):
         for name, degree in unsupported_degrees.items():
             if degree != 1:
                 raise ValueError(f"tensor logging requires {name}=1, got {degree}")
-        if parallelism.expert_parallel_degree != 1 and selected_families != (
-            TensorMetricFamily.OFFERED_ASSIGNMENTS,
+        if parallelism.expert_parallel_degree != 1 and any(
+            family not in INTERNAL_FAMILIES for family in selected_families
         ):
             raise ValueError(
                 "tensor logging requires expert_parallel_degree=1 unless "
-                "OFFERED_ASSIGNMENTS is the only family"
+                "only internal MoE families are selected"
+            )
+        if (
+            TensorMetricFamily.EXPERT_COMPUTE_ROWS in selected_families
+            and parallelism.expert_parallel_degree == 1
+        ):
+            raise ValueError(
+                "EXPERT_COMPUTE_ROWS requires expert_parallel_degree greater than 1"
             )
         if parallelism.spmd_backend != "default":
             raise ValueError("tensor logging currently requires spmd_backend='default'")
@@ -202,8 +209,8 @@ class TensorLogging(Configurable):
         boundary_selected = any(
             family in BOUNDARY_FAMILIES for family in selected_families
         )
-        offered_assignments_selected = (
-            TensorMetricFamily.OFFERED_ASSIGNMENTS in selected_families
+        internal_selected = any(
+            family in INTERNAL_FAMILIES for family in selected_families
         )
         expected_model_type: type
         expected_parallelize_fn: object
@@ -248,22 +255,22 @@ class TensorLogging(Configurable):
                         "tensor output logging requires an ordinary Linear.Config at "
                         f"layers.{layer_id}.feed_forward.w2"
                     )
-            if offered_assignments_selected:
+            if internal_selected:
                 if model_spec.name != "qwen3":
                     raise ValueError(
-                        "offered assignment logging currently requires Qwen3"
+                        "internal MoE tensor logging currently requires Qwen3"
                     )
                 moe_config = model_config.layers[layer_id].moe
                 if type(moe_config) is not MoE.Config:
                     raise ValueError(
-                        "offered assignment logging requires an ordinary MoE.Config "
+                        "internal MoE tensor logging requires an ordinary MoE.Config "
                         f"at layers.{layer_id}.moe"
                     )
                 if type(moe_config.routed_experts.token_dispatcher) is not (
                     AllToAllTokenDispatcher.Config
                 ):
                     raise ValueError(
-                        "offered assignment logging currently requires the standard "
+                        "internal MoE tensor logging currently requires the standard "
                         "token dispatcher"
                     )
 
@@ -282,6 +289,9 @@ class TensorLogging(Configurable):
         )
         boundary_families = tuple(
             family for family in selected_families if family in BOUNDARY_FAMILIES
+        )
+        internal_families = tuple(
+            family for family in selected_families if family in INTERNAL_FAMILIES
         )
         self._parameter_batch = (
             ParameterStatisticsBatch(
@@ -304,14 +314,15 @@ class TensorLogging(Configurable):
             if boundary_families
             else None
         )
-        self._offered_assignments_recorder = (
-            OfferedAssignmentsRecorder(
+        self._expert_count_recorder = (
+            ExpertCountRecorder(
                 model=model,
                 parallel_dims=parallel_dims,
                 layer_ids=config.layer_ids,
+                families=internal_families,
                 device=device,
             )
-            if TensorMetricFamily.OFFERED_ASSIGNMENTS in selected_families
+            if internal_families
             else None
         )
 
@@ -345,20 +356,20 @@ class TensorLogging(Configurable):
         output = (
             self._output_batch.collect() if self._output_batch is not None else None
         )
-        offered_assignments = (
-            self._offered_assignments_recorder.collect()
-            if self._offered_assignments_recorder is not None
+        expert_counts = (
+            self._expert_count_recorder.collect()
+            if self._expert_count_recorder is not None
             else None
         )
         local_error = None
-        for snapshot in (parameter, output, offered_assignments):
+        for snapshot in (parameter, output, expert_counts):
             if snapshot is not None and snapshot.local_error is not None:
                 local_error = snapshot.local_error
                 break
         return TensorLoggingSnapshot(
             parameter=parameter,
             output=output,
-            offered_assignments=offered_assignments,
+            expert_counts=expert_counts,
             local_error=local_error,
         )
 
@@ -393,11 +404,11 @@ class TensorLogging(Configurable):
                     window_steps=window_steps,
                 )
             )
-        if snapshot.offered_assignments is not None:
-            assert self._offered_assignments_recorder is not None
+        if snapshot.expert_counts is not None:
+            assert self._expert_count_recorder is not None
             metrics.update(
-                self._offered_assignments_recorder.derive_metrics(
-                    snapshot.offered_assignments,
+                self._expert_count_recorder.derive_metrics(
+                    snapshot.expert_counts,
                     window_steps=window_steps,
                 )
             )
@@ -411,8 +422,8 @@ class TensorLogging(Configurable):
     def close(self) -> None:
         if self._output_batch is not None:
             self._output_batch.close()
-        if self._offered_assignments_recorder is not None:
-            self._offered_assignments_recorder.close()
+        if self._expert_count_recorder is not None:
+            self._expert_count_recorder.close()
 
     def complete_publication(
         self,

@@ -17,9 +17,8 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.models.common.moe import MoE
-from torchtitan.observability.tensor_logging.offered_assignments import (
-    OfferedAssignmentsRecorder,
-)
+from torchtitan.observability.tensor_logging import TensorMetricFamily
+from torchtitan.observability.tensor_logging.expert_counts import ExpertCountRecorder
 
 
 class _Layer(nn.Module):
@@ -39,6 +38,7 @@ def _build_model(*, num_experts: int = 4, top_k: int = 2) -> tuple[_Model, MoE]:
     nn.Module.__init__(moe)
     moe.router = SimpleNamespace(num_experts=num_experts, top_k=top_k)
     moe.offered_assignments_recorder = None
+    moe.routed_experts = SimpleNamespace(expert_compute_rows_recorder=None)
     return _Model(moe), moe
 
 
@@ -63,10 +63,14 @@ class TestOfferedAssignmentsFourRanks(DTensorTestBase):
         )
         ep_dims.build_mesh()
         ep_model, ep_moe = _build_model()
-        ep_batch = OfferedAssignmentsRecorder(
+        ep_batch = ExpertCountRecorder(
             model=ep_model,
             parallel_dims=ep_dims,
             layer_ids=(0,),
+            families=(
+                TensorMetricFamily.OFFERED_ASSIGNMENTS,
+                TensorMetricFamily.EXPERT_COMPUTE_ROWS,
+            ),
             device=device,
         )
         rank_value = self.rank + 1
@@ -80,18 +84,54 @@ class TestOfferedAssignmentsFourRanks(DTensorTestBase):
         )
         assert ep_moe.offered_assignments_recorder is not None
         ep_moe.offered_assignments_recorder(ep_counts)
+        assert ep_moe.routed_experts.expert_compute_rows_recorder is not None
+        ep_moe.routed_experts.expert_compute_rows_recorder(
+            torch.tensor(
+                [self.rank * 10 + 1, self.rank * 10 + 2],
+                dtype=torch.int64,
+                device=device,
+            )
+        )
         ep_snapshot = ep_batch.collect()
 
         assert ep_snapshot.local_error is None
         assert ep_snapshot.values[0, :4].tolist() == [10, 10, 10, 10]
         assert int(ep_snapshot.values[0, 4]) == 2
+        assert ep_snapshot.values[1, :4].tolist() == [22, 24, 42, 44]
+        assert int(ep_snapshot.values[1, 4]) == 2
+        ep_metrics = ep_batch.derive_metrics(ep_snapshot, window_steps=3)
+        prefix = "tensor_metrics/layers.0"
+        assert (
+            ep_metrics[f"{prefix}.experts.0.expert_compute_rows.standard_dropless"]
+            == 22
+        )
+        assert (
+            ep_metrics[f"{prefix}.experts.3.expert_compute_rows.standard_dropless"]
+            == 44
+        )
+        assert (
+            ep_metrics[
+                f"{prefix}.moe.expert_compute_rows.standard_dropless."
+                "observation_count"
+            ]
+            == 2
+        )
+        assert (
+            ep_metrics[
+                f"{prefix}.moe.expert_compute_rows.standard_dropless.window_steps"
+            ]
+            == 3
+        )
         ep_batch.close()
+        assert ep_moe.offered_assignments_recorder is None
+        assert ep_moe.routed_experts.expert_compute_rows_recorder is None
 
         mismatched_model, mismatched_moe = _build_model()
-        mismatched_batch = OfferedAssignmentsRecorder(
+        mismatched_batch = ExpertCountRecorder(
             model=mismatched_model,
             parallel_dims=ep_dims,
             layer_ids=(0,),
+            families=(TensorMetricFamily.OFFERED_ASSIGNMENTS,),
             device=device,
         )
         mismatched_counts = DTensor.from_local(
@@ -120,10 +160,11 @@ class TestOfferedAssignmentsFourRanks(DTensorTestBase):
         )
         replica_dims.build_mesh()
         replica_model, replica_moe = _build_model()
-        replica_batch = OfferedAssignmentsRecorder(
+        replica_batch = ExpertCountRecorder(
             model=replica_model,
             parallel_dims=replica_dims,
             layer_ids=(0,),
+            families=(TensorMetricFamily.OFFERED_ASSIGNMENTS,),
             device=device,
         )
         dp_rank = replica_dims.get_mesh("batch").get_local_rank()
@@ -152,10 +193,11 @@ def test_host_derivations_and_interval_reset() -> None:
         world_size=1,
         get_optional_mesh=lambda _name: None,
     )
-    batch = OfferedAssignmentsRecorder(
+    batch = ExpertCountRecorder(
         model=model,
         parallel_dims=parallel_dims,
         layer_ids=(0,),
+        families=(TensorMetricFamily.OFFERED_ASSIGNMENTS,),
         device=torch.device("cpu"),
     )
     assert moe.offered_assignments_recorder is not None
@@ -197,10 +239,11 @@ def test_invalid_recorder_payload_is_latched() -> None:
         world_size=1,
         get_optional_mesh=lambda _name: None,
     )
-    batch = OfferedAssignmentsRecorder(
+    batch = ExpertCountRecorder(
         model=model,
         parallel_dims=parallel_dims,
         layer_ids=(0,),
+        families=(TensorMetricFamily.OFFERED_ASSIGNMENTS,),
         device=torch.device("cpu"),
     )
     assert moe.offered_assignments_recorder is not None

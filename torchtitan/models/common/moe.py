@@ -134,6 +134,7 @@ class RoutedExperts(Module):
         super().__init__()
         self.inner_experts = config.inner_experts.build()
         self.token_dispatcher = config.token_dispatcher.build()
+        self.expert_compute_rows_recorder: Callable[[torch.Tensor], None] | None = None
 
     def forward(
         self,
@@ -166,6 +167,8 @@ class RoutedExperts(Module):
             topk_expert_ids_TK,
             num_local_tokens_per_expert_E,
         )
+        if self.expert_compute_rows_recorder is not None:
+            self.expert_compute_rows_recorder(num_global_tokens_per_local_expert_e)
         with maybe_set_sparse_mesh():
             routed_output_RD = self.inner_experts(
                 routed_input_RD, num_global_tokens_per_local_expert_e

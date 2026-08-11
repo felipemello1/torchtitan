@@ -219,11 +219,14 @@ def test_parameter_only_logging_keeps_validation_support() -> None:
     )
 
 
-def test_offered_assignments_admit_ep_only_as_a_single_family() -> None:
+def test_internal_moe_families_are_the_only_ep_compatible_families() -> None:
     config = _enabled_config()
     config.activation_checkpoint = None
     config.parallelism.expert_parallel_degree = 2
-    config.tensor_logging.families = (TensorMetricFamily.OFFERED_ASSIGNMENTS,)
+    config.tensor_logging.families = (
+        TensorMetricFamily.OFFERED_ASSIGNMENTS,
+        TensorMetricFamily.EXPERT_COMPUTE_ROWS,
+    )
 
     TensorLogging.validate_job_config(
         config.tensor_logging,
@@ -235,7 +238,20 @@ def test_offered_assignments_admit_ep_only_as_a_single_family() -> None:
         TensorMetricFamily.OFFERED_ASSIGNMENTS,
         TensorMetricFamily.PARAMETER,
     )
-    with pytest.raises(ValueError, match="expert_parallel_degree=1"):
+    with pytest.raises(ValueError, match="only internal MoE families"):
+        TensorLogging.validate_job_config(
+            config.tensor_logging,
+            trainer_config=config,
+            is_core_trainer=True,
+        )
+
+
+def test_expert_compute_rows_require_ep() -> None:
+    config = _enabled_config()
+    config.activation_checkpoint = None
+    config.tensor_logging.families = (TensorMetricFamily.EXPERT_COMPUTE_ROWS,)
+
+    with pytest.raises(ValueError, match="requires expert_parallel_degree"):
         TensorLogging.validate_job_config(
             config.tensor_logging,
             trainer_config=config,
@@ -293,10 +309,13 @@ def test_ordinary_llama_and_qwen_model_configs_are_supported(config_factory) -> 
     )
 
 
-def test_qwen3_moe_offered_assignments_are_supported() -> None:
+def test_qwen3_moe_internal_families_are_supported() -> None:
     config = qwen3_moe_debug()
     config.tensor_logging.enable = True
-    config.tensor_logging.families = (TensorMetricFamily.OFFERED_ASSIGNMENTS,)
+    config.tensor_logging.families = (
+        TensorMetricFamily.OFFERED_ASSIGNMENTS,
+        TensorMetricFamily.EXPERT_COMPUTE_ROWS,
+    )
     config.tensor_logging.layer_ids = (0,)
     assert config.model_spec is not None
 
@@ -307,10 +326,10 @@ def test_qwen3_moe_offered_assignments_are_supported() -> None:
     )
 
 
-def test_offered_assignments_reject_dense_qwen3() -> None:
+def test_internal_moe_families_reject_dense_qwen3() -> None:
     config = qwen3_debugmodel()
     config.tensor_logging.enable = True
-    config.tensor_logging.families = (TensorMetricFamily.OFFERED_ASSIGNMENTS,)
+    config.tensor_logging.families = (TensorMetricFamily.EXPERT_COMPUTE_ROWS,)
     assert config.model_spec is not None
 
     with pytest.raises(ValueError, match="ordinary MoE.Config"):
@@ -565,9 +584,9 @@ def test_nonwriter_derivation_does_not_touch_the_metric_batch() -> None:
     tensor_logging._is_writer = False
     tensor_logging._parameter_batch = Mock()
     tensor_logging._output_batch = Mock()
-    tensor_logging._offered_assignments_recorder = Mock()
+    tensor_logging._expert_count_recorder = Mock()
 
     assert tensor_logging.derive_metrics(Mock(), step=1) == {}
     tensor_logging._parameter_batch.derive_metrics.assert_not_called()
     tensor_logging._output_batch.derive_metrics.assert_not_called()
-    tensor_logging._offered_assignments_recorder.derive_metrics.assert_not_called()
+    tensor_logging._expert_count_recorder.derive_metrics.assert_not_called()
