@@ -25,6 +25,7 @@ from torchtitan.observability.tensor_logging.statistics import (
     finite_statistics,
     FiniteStatistics,
     reduce_finite_statistics,
+    ReductionBatch,
     validate_tp_tensor,
 )
 from torchtitan.protocols.sharding import resolve_placements
@@ -208,7 +209,11 @@ class OutputStatisticsBatch:
         self._failed_rows = [False] * len(self._rows)
         self._local_error = None
 
-    def collect(self) -> OutputStatisticsSnapshot:
+    def collect(
+        self,
+        *,
+        batch: ReductionBatch | None = None,
+    ) -> OutputStatisticsSnapshot:
         """Disable hooks and synchronously reduce the logging-step state."""
         self._active = False
         self._remove_gradient_hooks()
@@ -221,6 +226,7 @@ class OutputStatisticsBatch:
             statistics = reduce_finite_statistics(
                 statistics,
                 self._reduction_meshes,
+                batch=batch,
             )
         return OutputStatisticsSnapshot(
             statistics=statistics,

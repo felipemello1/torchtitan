@@ -24,6 +24,7 @@ from torchtitan.observability.tensor_logging.statistics import (
     finite_statistics,
     FiniteStatistics,
     reduce_finite_statistics,
+    ReductionBatch,
 )
 
 
@@ -88,7 +89,12 @@ class ParameterStatisticsBatch:
         self._parallel_dims = parallel_dims
         self._groups = tuple(groups)
 
-    def collect(self, *, step: int) -> ParameterStatisticsSnapshot:
+    def collect(
+        self,
+        *,
+        step: int,
+        batch: ReductionBatch | None = None,
+    ) -> ParameterStatisticsSnapshot:
         """Build and synchronously reduce one logging-step parameter snapshot."""
         reduced_groups = []
         local_error: Exception | None = None
@@ -156,6 +162,7 @@ class ParameterStatisticsBatch:
                         abs_max=torch.stack(row_maxima),
                     ),
                     group.reduction_meshes,
+                    batch=batch,
                 )
             )
         return ParameterStatisticsSnapshot(

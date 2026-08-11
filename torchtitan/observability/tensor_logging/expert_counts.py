@@ -18,6 +18,7 @@ from torchtitan.models.common.moe import MoE
 from torchtitan.observability.tensor_logging.families import TensorMetricFamily
 from torchtitan.observability.tensor_logging.statistics import (
     reduce_sum,
+    ReductionBatch,
     validate_tp_tensor,
 )
 
@@ -128,12 +129,16 @@ class ExpertCountRecorder:
                     layer_id=layer_ids[row_index],
                 )
 
-    def collect(self) -> ExpertCountSnapshot:
+    def collect(
+        self,
+        *,
+        batch: ReductionBatch | None = None,
+    ) -> ExpertCountSnapshot:
         """Reduce and reset one publication interval."""
         values = self._interval.clone()
         self._interval.zero_()
         if self._world_mesh is not None:
-            values = reduce_sum(values, self._world_mesh)
+            values = reduce_sum(values, self._world_mesh, batch=batch)
         snapshot = ExpertCountSnapshot(values=values, local_error=self._local_error)
         self._local_error = None
         return snapshot

@@ -24,6 +24,7 @@ from torchtitan.observability.tensor_logging.statistics import (
     finite_statistics,
     FiniteStatistics,
     reduce_finite_statistics,
+    ReductionBatch,
 )
 
 
@@ -101,7 +102,12 @@ class WholeGradientStatistics:
         self._parallel_dims = parallel_dims
         self._device = gradients[0].parameter.value.device
 
-    def collect(self, *, step: int) -> WholeGradientSnapshot:
+    def collect(
+        self,
+        *,
+        step: int,
+        batch: ReductionBatch | None = None,
+    ) -> WholeGradientSnapshot:
         """Read completed preclip gradients and reduce each owner cohort."""
         reduced_groups = []
         local_error: Exception | None = None
@@ -150,6 +156,7 @@ class WholeGradientStatistics:
                 reduce_finite_statistics(
                     FiniteStatistics(counts=counts, sums=sums, abs_max=abs_max),
                     group.reduction_meshes,
+                    batch=batch,
                 )
             )
         return WholeGradientSnapshot(

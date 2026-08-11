@@ -19,6 +19,7 @@ from torchtitan.observability.tensor_logging.families import TensorMetricFamily
 from torchtitan.observability.tensor_logging.statistics import (
     reduce_max,
     reduce_sum,
+    ReductionBatch,
     validate_tp_tensor,
 )
 
@@ -140,7 +141,11 @@ class RouterStatisticsRecorder:
                     layer_id=layer_ids[row_index],
                 )
 
-    def collect(self) -> RouterStatisticsSnapshot:
+    def collect(
+        self,
+        *,
+        batch: ReductionBatch | None = None,
+    ) -> RouterStatisticsSnapshot:
         """Reduce and reset one publication interval."""
         distribution_sums = None
         distribution_counts = None
@@ -151,8 +156,12 @@ class RouterStatisticsRecorder:
             self._distribution_sums.zero_()
             self._distribution_counts.zero_()
             if self._world_mesh is not None:
-                distribution_sums = reduce_sum(distribution_sums, self._world_mesh)
-                distribution_counts = reduce_sum(distribution_counts, self._world_mesh)
+                distribution_sums = reduce_sum(
+                    distribution_sums, self._world_mesh, batch=batch
+                )
+                distribution_counts = reduce_sum(
+                    distribution_counts, self._world_mesh, batch=batch
+                )
 
         sequence_floats = None
         sequence_counts = None
@@ -164,7 +173,7 @@ class RouterStatisticsRecorder:
             self._sequence_present.zero_()
             if self._router_is_tp_sharded:
                 assert self._tp_mesh is not None
-                assignments = reduce_sum(assignments, self._tp_mesh)
+                assignments = reduce_sum(assignments, self._tp_mesh, batch=batch)
             sequence_sum = torch.zeros(
                 len(self._layer_ids), dtype=torch.float32, device=assignments.device
             )
@@ -189,9 +198,11 @@ class RouterStatisticsRecorder:
                 sequence_counts[:, 1].copy_(assigned.sum(dim=1) * present)
                 sequence_counts[:, 2].copy_(present)
             if self._world_mesh is not None:
-                sequence_sum = reduce_sum(sequence_sum, self._world_mesh)
-                sequence_max = reduce_max(sequence_max, self._world_mesh)
-                sequence_counts = reduce_sum(sequence_counts, self._world_mesh)
+                sequence_sum = reduce_sum(sequence_sum, self._world_mesh, batch=batch)
+                sequence_max = reduce_max(sequence_max, self._world_mesh, batch=batch)
+                sequence_counts = reduce_sum(
+                    sequence_counts, self._world_mesh, batch=batch
+                )
             sequence_floats = torch.stack((sequence_sum, sequence_max), dim=1)
 
         snapshot = RouterStatisticsSnapshot(

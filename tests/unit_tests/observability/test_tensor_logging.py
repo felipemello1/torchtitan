@@ -18,6 +18,7 @@ from torchtitan.observability.tensor_logging.statistics import (
     FiniteStatistics,
     reduce_max,
     reduce_sum,
+    ReductionBatch,
 )
 
 
@@ -89,6 +90,46 @@ class TestTensorLoggingReductionFourRanks(DTensorTestBase):
     @property
     def world_size(self) -> int:
         return 4
+
+    @with_comms
+    def test_batched_reduction_preserves_mesh_and_operation(self) -> None:
+        parallel_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=2,
+            cp=1,
+            tp=2,
+            pp=1,
+            ep=1,
+            world_size=self.world_size,
+        )
+        parallel_dims.build_mesh()
+        dp_mesh = parallel_dims.get_mesh("batch")
+        tp_mesh = parallel_dims.get_mesh("tp")
+        dp_rank = dp_mesh.get_local_rank()
+        tp_rank = tp_mesh.get_local_rank()
+
+        first_sum = torch.tensor(float(dp_rank + 1), device=self.device_type)
+        second_sum = torch.tensor(float(10 + dp_rank), device=self.device_type)
+        maximum = torch.tensor(float(100 * dp_rank + tp_rank), device=self.device_type)
+        integer_sum = torch.tensor(dp_rank + 1, device=self.device_type)
+        compound_sum = torch.tensor(
+            float(100 * dp_rank + 10 * tp_rank + 1),
+            device=self.device_type,
+        )
+
+        batch = ReductionBatch()
+        batch.sum(first_sum, (dp_mesh,))
+        batch.sum(second_sum, (dp_mesh,))
+        batch.max(maximum, (dp_mesh,))
+        batch.sum(integer_sum, (dp_mesh,))
+        batch.sum(compound_sum, (dp_mesh, tp_mesh))
+        batch.reduce()
+
+        self.assertEqual(first_sum.item(), 3.0)
+        self.assertEqual(second_sum.item(), 21.0)
+        self.assertEqual(maximum.item(), 100.0 + tp_rank)
+        self.assertEqual(integer_sum.item(), 3)
+        self.assertEqual(compound_sum.item(), 224.0)
 
     @with_comms
     def test_requested_axes_and_finite_statistics(self) -> None:

@@ -32,6 +32,7 @@ from torchtitan.observability.tensor_logging.statistics import (
     FiniteStatistics,
     reduce_max,
     reduce_sum,
+    ReductionBatch,
 )
 
 
@@ -196,7 +197,11 @@ class AdamWStatisticsRecorder:
             self._local_error = None
         self._record_next_step = should_log
 
-    def collect(self) -> OptimizerStatisticsSnapshot:
+    def collect(
+        self,
+        *,
+        batch: ReductionBatch | None = None,
+    ) -> OptimizerStatisticsSnapshot:
         """Reduce the optimizer sample after every inner AdamW has stepped."""
         counts = []
         sums = []
@@ -205,11 +210,17 @@ class AdamWStatisticsRecorder:
             reduced_counts = self._counts[group_index].clone()
             reduced_sums = self._sums[group_index].clone()
             reduced_maxima = self._maxima[group_index].clone()
-            for mesh in group.reduction_meshes:
-                reduced_counts = reduce_sum(reduced_counts, mesh)
-                reduced_sums = reduce_sum(reduced_sums, mesh)
+            if batch is None:
+                for mesh in group.reduction_meshes:
+                    reduced_counts = reduce_sum(reduced_counts, mesh)
+                    reduced_sums = reduce_sum(reduced_sums, mesh)
+                    if self._record_distributions:
+                        reduced_maxima = reduce_max(reduced_maxima, mesh)
+            else:
+                batch.sum(reduced_counts, group.reduction_meshes)
+                batch.sum(reduced_sums, group.reduction_meshes)
                 if self._record_distributions:
-                    reduced_maxima = reduce_max(reduced_maxima, mesh)
+                    batch.max(reduced_maxima, group.reduction_meshes)
             counts.append(reduced_counts)
             sums.append(reduced_sums)
             maxima.append(reduced_maxima)

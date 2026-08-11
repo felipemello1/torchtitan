@@ -14,7 +14,10 @@ from torch.distributed.tensor import DTensor, Replicate
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.observability.tensor_logging.families import TensorMetricFamily
-from torchtitan.observability.tensor_logging.statistics import reduce_sum
+from torchtitan.observability.tensor_logging.statistics import (
+    reduce_sum,
+    ReductionBatch,
+)
 
 
 _ALL_TOKEN_COUNT = 0
@@ -132,11 +135,15 @@ class DataStatisticsRecorder:
                     f"invalid data loss sample: {type(error).__name__}: {error}"
                 )
 
-    def collect(self) -> DataStatisticsSnapshot:
+    def collect(
+        self,
+        *,
+        batch: ReductionBatch | None = None,
+    ) -> DataStatisticsSnapshot:
         """Reduce and clear the interval accumulated since the last publication."""
-        integers = reduce_sum(self._integers.clone(), self._world_mesh)
+        integers = reduce_sum(self._integers.clone(), self._world_mesh, batch=batch)
         loss_sum = (
-            reduce_sum(self._loss_sum.clone(), self._world_mesh)
+            reduce_sum(self._loss_sum.clone(), self._world_mesh, batch=batch)
             if self._loss_selected
             else None
         )

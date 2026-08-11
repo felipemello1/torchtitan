@@ -67,6 +67,7 @@ from torchtitan.observability.tensor_logging.router_statistics import (
     RouterStatisticsRecorder,
     RouterStatisticsSnapshot,
 )
+from torchtitan.observability.tensor_logging.statistics import ReductionBatch
 from torchtitan.observability.tensor_logging.whole_gradient import (
     WholeGradientSnapshot,
     WholeGradientStatistics,
@@ -579,34 +580,38 @@ class TensorLogging(Configurable):
             )
 
     def collect(self, *, step: int) -> TensorLoggingSnapshot:
+        batch = ReductionBatch()
         parameter = (
-            self._parameter_batch.collect(step=step)
+            self._parameter_batch.collect(step=step, batch=batch)
             if self._parameter_batch is not None
             else None
         )
         output = (
-            self._output_batch.collect() if self._output_batch is not None else None
+            self._output_batch.collect(batch=batch)
+            if self._output_batch is not None
+            else None
         )
         expert_counts = (
-            self._expert_count_recorder.collect()
+            self._expert_count_recorder.collect(batch=batch)
             if self._expert_count_recorder is not None
             else None
         )
         router = (
-            self._router_statistics_recorder.collect()
+            self._router_statistics_recorder.collect(batch=batch)
             if self._router_statistics_recorder is not None
             else None
         )
         whole_gradient = (
-            self._whole_gradient_statistics.collect(step=step)
+            self._whole_gradient_statistics.collect(step=step, batch=batch)
             if self._whole_gradient_statistics is not None
             else None
         )
         data = (
-            self._data_statistics_recorder.collect()
+            self._data_statistics_recorder.collect(batch=batch)
             if self._data_statistics_recorder is not None
             else None
         )
+        batch.reduce()
         local_error = None
         for snapshot in (
             parameter,
@@ -646,11 +651,13 @@ class TensorLogging(Configurable):
             if self._expert_bias_recorder is not None
             else None
         )
+        batch = ReductionBatch()
         optimizer = (
-            self._optimizer_statistics_recorder.collect()
+            self._optimizer_statistics_recorder.collect(batch=batch)
             if self._optimizer_statistics_recorder is not None
             else None
         )
+        batch.reduce()
         local_error = snapshot.local_error
         if local_error is None and expert_bias is not None:
             local_error = expert_bias.local_error

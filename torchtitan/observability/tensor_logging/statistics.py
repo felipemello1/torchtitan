@@ -23,6 +23,74 @@ class FiniteStatistics:
     abs_max: torch.Tensor
 
 
+@dataclass(frozen=True, slots=True)
+class _ReductionRequest:
+    value: torch.Tensor
+    meshes: tuple[DeviceMesh, ...]
+    operation: str
+
+
+class ReductionBatch:
+    """Pack tensor telemetry reductions by mesh, dtype, and operation."""
+
+    def __init__(self) -> None:
+        self._requests: list[_ReductionRequest] = []
+
+    def sum(
+        self,
+        value: torch.Tensor,
+        meshes: tuple[DeviceMesh, ...],
+    ) -> torch.Tensor:
+        self._requests.append(_ReductionRequest(value, meshes, "sum"))
+        return value
+
+    def max(
+        self,
+        value: torch.Tensor,
+        meshes: tuple[DeviceMesh, ...],
+    ) -> torch.Tensor:
+        self._requests.append(_ReductionRequest(value, meshes, "max"))
+        return value
+
+    def reduce(self) -> None:
+        """Execute at most one collective per stage, mesh, dtype, and operation."""
+        stages = max((len(request.meshes) for request in self._requests), default=0)
+        for stage in range(stages):
+            groups: dict[
+                tuple[object, ...],
+                tuple[DeviceMesh, str, list[torch.Tensor]],
+            ] = {}
+            for request in self._requests:
+                if stage >= len(request.meshes):
+                    continue
+                mesh = request.meshes[stage]
+                mesh_key = (
+                    mesh.device_type,
+                    mesh.mesh_dim_names,
+                    tuple(mesh.mesh.reshape(-1).tolist()),
+                )
+                key = (
+                    mesh_key,
+                    request.value.device,
+                    request.value.dtype,
+                    request.operation,
+                )
+                if key not in groups:
+                    groups[key] = (mesh, request.operation, [])
+                groups[key][2].append(request.value)
+
+            for mesh, operation, values in groups.values():
+                packed = torch.cat([value.reshape(-1) for value in values])
+                packed = funcol.wait_tensor(
+                    funcol.all_reduce(packed, reduceOp=operation, group=mesh)
+                )
+                offset = 0
+                for value in values:
+                    next_offset = offset + value.numel()
+                    value.copy_(packed[offset:next_offset].view_as(value))
+                    offset = next_offset
+
+
 def validate_tp_tensor(
     value: torch.Tensor,
     *,
@@ -176,24 +244,46 @@ def derive_finite_statistics(statistics: FiniteStatistics) -> dict[str, int | fl
     return result
 
 
-def reduce_sum(value: torch.Tensor, mesh: DeviceMesh) -> torch.Tensor:
+def reduce_sum(
+    value: torch.Tensor,
+    mesh: DeviceMesh,
+    *,
+    batch: ReductionBatch | None = None,
+) -> torch.Tensor:
     """Sum a device tensor over one family-resolved mesh."""
+    if batch is not None:
+        return batch.sum(value, (mesh,))
     return funcol.wait_tensor(funcol.all_reduce(value, reduceOp="sum", group=mesh))
 
 
-def reduce_max(value: torch.Tensor, mesh: DeviceMesh) -> torch.Tensor:
+def reduce_max(
+    value: torch.Tensor,
+    mesh: DeviceMesh,
+    *,
+    batch: ReductionBatch | None = None,
+) -> torch.Tensor:
     """Take a device-tensor maximum over one family-resolved mesh."""
+    if batch is not None:
+        return batch.max(value, (mesh,))
     return funcol.wait_tensor(funcol.all_reduce(value, reduceOp="max", group=mesh))
 
 
 def reduce_finite_statistics(
     statistics: FiniteStatistics,
     owner_meshes: tuple[DeviceMesh, ...],
+    *,
+    batch: ReductionBatch | None = None,
 ) -> FiniteStatistics:
     """Reduce one owned snapshot over an ordered sequence of owner meshes."""
     counts = statistics.counts.clone()
     sums = statistics.sums.clone()
     abs_max = statistics.abs_max.clone()
+    if batch is not None:
+        return FiniteStatistics(
+            counts=batch.sum(counts, owner_meshes),
+            sums=batch.sum(sums, owner_meshes),
+            abs_max=batch.max(abs_max, owner_meshes),
+        )
     for mesh in owner_meshes:
         counts = reduce_sum(counts, mesh)
         sums = reduce_sum(sums, mesh)

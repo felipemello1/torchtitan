@@ -173,7 +173,7 @@ def test_parameter_rows_share_one_packed_reduction(fake_world_one: None) -> None
 
     with patch(
         "torchtitan.observability.tensor_logging.parameter_batch.reduce_finite_statistics",
-        side_effect=lambda statistics, owner_meshes: statistics,
+        side_effect=lambda statistics, owner_meshes, batch=None: statistics,
     ) as reduce_batch:
         snapshot = batch.collect(step=1)
 
@@ -207,7 +207,7 @@ def test_two_layers_share_one_packed_reduction(fake_world_one: None) -> None:
 
     with patch(
         "torchtitan.observability.tensor_logging.parameter_batch.reduce_finite_statistics",
-        side_effect=lambda statistics, owner_meshes: statistics,
+        side_effect=lambda statistics, owner_meshes, batch=None: statistics,
     ) as reduce_batch:
         snapshot = batch.collect(step=1)
 
