@@ -215,6 +215,27 @@ def test_parameter_only_logging_keeps_validation_support() -> None:
     )
 
 
+def test_data_only_logging_admits_data_parallel_modes() -> None:
+    config = _enabled_config()
+    config.tensor_logging.families = (
+        TensorMetricFamily.DATASET_LOSS,
+        TensorMetricFamily.DOCUMENT_SEGMENTS,
+        TensorMetricFamily.BLOCK_CAUSAL_MOMENTS,
+    )
+    config.parallelism.context_parallel_degree = 2
+    config.parallelism.data_parallel_replicate_degree = 2
+    config.parallelism.expert_parallel_degree = 2
+    config.parallelism.spmd_backend = "spmd_types"
+    config.activation_checkpoint = SelectiveAC.Config()
+    config.compile = replace(config.compile, enable=True, backend="inductor")
+
+    TensorLogging.validate_job_config(
+        config.tensor_logging,
+        trainer_config=config,
+        is_core_trainer=True,
+    )
+
+
 def test_optimizer_statistics_reject_bf16_state_implementation() -> None:
     config = _enabled_config()
     config.tensor_logging.families = (
@@ -593,6 +614,7 @@ def test_component_requires_one_constructed_metrics_writer() -> None:
                 parallel_dims=Mock(),
                 metrics_processor=processor,
                 local_batch_size=1,
+                dataloader_config=Mock(),
                 device=torch.device("cpu"),
             )
 
@@ -606,6 +628,7 @@ def test_component_requires_one_constructed_metrics_writer() -> None:
                 parallel_dims=Mock(),
                 metrics_processor=processor,
                 local_batch_size=1,
+                dataloader_config=Mock(),
                 device=torch.device("cpu"),
             )
         assert tensor_logging._is_writer

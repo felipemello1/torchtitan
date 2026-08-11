@@ -30,6 +30,9 @@ class TensorMetricFamily(str, Enum):
     EXPERT_BIAS = "expert_bias"
     OPTIMIZER_DISTRIBUTION = "optimizer_distribution"
     MOMENTUM_GRADIENT_COSINE = "momentum_gradient_cosine"
+    DATASET_LOSS = "dataset_loss"
+    DOCUMENT_SEGMENTS = "document_segments"
+    BLOCK_CAUSAL_MOMENTS = "block_causal_moments"
 
 
 PARAMETER_FAMILIES = (
@@ -60,6 +63,12 @@ OPTIMIZER_FAMILIES = (
     TensorMetricFamily.EXPERT_BIAS,
     TensorMetricFamily.OPTIMIZER_DISTRIBUTION,
     TensorMetricFamily.MOMENTUM_GRADIENT_COSINE,
+)
+
+DATA_FAMILIES = (
+    TensorMetricFamily.DATASET_LOSS,
+    TensorMetricFamily.DOCUMENT_SEGMENTS,
+    TensorMetricFamily.BLOCK_CAUSAL_MOMENTS,
 )
 
 

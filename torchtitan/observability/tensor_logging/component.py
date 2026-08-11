@@ -18,6 +18,10 @@ from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.config import Configurable
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.hf_datasets.text_datasets import (
+    HuggingFaceTextDataLoader,
+    InterleavedHuggingFaceTextDataLoader,
+)
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import MoE, TokenChoiceTopKRouter
@@ -26,6 +30,10 @@ from torchtitan.models.llama3.model import Llama3Model
 from torchtitan.models.llama3.parallelize import parallelize_llama
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.parallelize import parallelize_qwen3
+from torchtitan.observability.tensor_logging.data_statistics import (
+    DataStatisticsRecorder,
+    DataStatisticsSnapshot,
+)
 from torchtitan.observability.tensor_logging.expert_bias import (
     ExpertBiasRecorder,
     ExpertBiasSnapshot,
@@ -36,6 +44,7 @@ from torchtitan.observability.tensor_logging.expert_counts import (
 )
 from torchtitan.observability.tensor_logging.families import (
     BOUNDARY_FAMILIES,
+    DATA_FAMILIES,
     EXPERT_COUNT_FAMILIES,
     INTERNAL_FAMILIES,
     JOB_FAMILIES,
@@ -80,6 +89,7 @@ class TensorLoggingSnapshot:
     whole_gradient: WholeGradientSnapshot | None
     expert_bias: ExpertBiasSnapshot | None
     optimizer: OptimizerStatisticsSnapshot | None
+    data: DataStatisticsSnapshot | None
     local_error: Exception | None
 
 
@@ -102,6 +112,7 @@ class TensorLogging(Configurable):
     _whole_gradient_statistics: WholeGradientStatistics | None
     _expert_bias_recorder: ExpertBiasRecorder | None
     _optimizer_statistics_recorder: AdamWStatisticsRecorder | None
+    _data_statistics_recorder: DataStatisticsRecorder | None
     _is_writer: bool
     _outcome_template: torch.Tensor
     _last_successful_publication_step: int
@@ -144,6 +155,9 @@ class TensorLogging(Configurable):
             )
             for family in selected_families
         )
+        non_data_selected = any(
+            family not in DATA_FAMILIES for family in selected_families
+        )
         if not config.layer_ids:
             raise ValueError("tensor_logging.layer_ids must not be empty")
         if len(set(config.layer_ids)) != len(config.layer_ids):
@@ -159,18 +173,28 @@ class TensorLogging(Configurable):
             raise ValueError("tensor logging currently supports only the core Trainer")
 
         parallelism = trainer_config.parallelism
-        unsupported_degrees = {
-            "pipeline_parallel_degree": parallelism.pipeline_parallel_degree,
+        if parallelism.pipeline_parallel_degree != 1:
+            raise ValueError(
+                "tensor logging currently requires pipeline_parallel_degree=1"
+            )
+        data_compatible_degrees = {
             "context_parallel_degree": parallelism.context_parallel_degree,
             "data_parallel_replicate_degree": (
                 parallelism.data_parallel_replicate_degree
             ),
         }
-        for name, degree in unsupported_degrees.items():
-            if degree != 1:
-                raise ValueError(f"tensor logging requires {name}=1, got {degree}")
+        for name, degree in data_compatible_degrees.items():
+            if degree != 1 and non_data_selected:
+                raise ValueError(
+                    f"tensor logging requires {name}=1 unless only data metric "
+                    f"families are selected, got {degree}"
+                )
         ep_families = (
-            INTERNAL_FAMILIES + PARAMETER_FAMILIES + JOB_FAMILIES + OPTIMIZER_FAMILIES
+            INTERNAL_FAMILIES
+            + PARAMETER_FAMILIES
+            + JOB_FAMILIES
+            + OPTIMIZER_FAMILIES
+            + DATA_FAMILIES
         )
         if parallelism.expert_parallel_degree != 1 and any(
             family not in ep_families for family in selected_families
@@ -186,7 +210,7 @@ class TensorLogging(Configurable):
             raise ValueError(
                 "EXPERT_COMPUTE_ROWS requires expert_parallel_degree greater than 1"
             )
-        if parallelism.spmd_backend != "default":
+        if parallelism.spmd_backend != "default" and non_data_selected:
             raise ValueError("tensor logging currently requires spmd_backend='default'")
         if trainer_config.comm.mode != "default":
             raise ValueError("tensor logging currently requires comm.mode='default'")
@@ -210,6 +234,31 @@ class TensorLogging(Configurable):
             raise ValueError(
                 "tensor logging requires metrics.enable_tensorboard or "
                 "metrics.enable_wandb"
+            )
+        dataloader_config = trainer_config.dataloader
+        document_data_selected = any(
+            family
+            in (
+                TensorMetricFamily.DOCUMENT_SEGMENTS,
+                TensorMetricFamily.BLOCK_CAUSAL_MOMENTS,
+            )
+            for family in selected_families
+        )
+        supported_document_dataloader = type(dataloader_config) in (
+            HuggingFaceTextDataLoader.Config,
+            InterleavedHuggingFaceTextDataLoader.Config,
+        )
+        if document_data_selected and not supported_document_dataloader:
+            raise ValueError(
+                "document tensor logging requires a HuggingFace text dataloader"
+            )
+        if (
+            TensorMetricFamily.DATASET_LOSS in selected_families
+            and type(dataloader_config) is not HuggingFaceTextDataLoader.Config
+        ):
+            raise ValueError(
+                "dataset loss tensor logging currently requires one "
+                "HuggingFace text dataset"
             )
         activation_checkpoint = trainer_config.activation_checkpoint
         if (
@@ -353,6 +402,7 @@ class TensorLogging(Configurable):
         parallel_dims: ParallelDims,
         metrics_processor: MetricsProcessor,
         local_batch_size: int,
+        dataloader_config: Any,
         device: torch.device,
     ) -> None:
         selected_families = resolve_families(config.families)
@@ -448,6 +498,24 @@ class TensorLogging(Configurable):
             if adamw_families
             else None
         )
+        data_families = tuple(
+            family for family in selected_families if family in DATA_FAMILIES
+        )
+        dataset_id = (
+            dataloader_config.dataset
+            if type(dataloader_config) is HuggingFaceTextDataLoader.Config
+            else None
+        )
+        self._data_statistics_recorder = (
+            DataStatisticsRecorder(
+                parallel_dims=parallel_dims,
+                families=data_families,
+                dataset_id=dataset_id,
+                device=device,
+            )
+            if data_families
+            else None
+        )
 
         self._is_writer = metrics_processor.has_active_logger
         active_writer_count = torch.tensor(
@@ -480,6 +548,32 @@ class TensorLogging(Configurable):
         if self._optimizer_statistics_recorder is not None:
             self._optimizer_statistics_recorder.bind_optimizer(optimizer)
 
+    def record_data_batch(
+        self,
+        *,
+        labels: torch.Tensor,
+        positions: torch.Tensor | None,
+    ) -> None:
+        """Record one raw batch before context-parallel sharding."""
+        if self._data_statistics_recorder is not None:
+            self._data_statistics_recorder.record_batch(
+                labels=labels,
+                positions=positions,
+            )
+
+    def record_data_loss(
+        self,
+        *,
+        normalized_loss: torch.Tensor,
+        global_valid_tokens: float | torch.Tensor,
+    ) -> None:
+        """Record one loss numerator after forward/backward."""
+        if self._data_statistics_recorder is not None:
+            self._data_statistics_recorder.record_loss(
+                normalized_loss=normalized_loss,
+                global_valid_tokens=global_valid_tokens,
+            )
+
     def collect(self, *, step: int) -> TensorLoggingSnapshot:
         parameter = (
             self._parameter_batch.collect(step=step)
@@ -504,8 +598,20 @@ class TensorLogging(Configurable):
             if self._whole_gradient_statistics is not None
             else None
         )
+        data = (
+            self._data_statistics_recorder.collect()
+            if self._data_statistics_recorder is not None
+            else None
+        )
         local_error = None
-        for snapshot in (parameter, output, expert_counts, router, whole_gradient):
+        for snapshot in (
+            parameter,
+            output,
+            expert_counts,
+            router,
+            whole_gradient,
+            data,
+        ):
             if snapshot is not None and snapshot.local_error is not None:
                 local_error = snapshot.local_error
                 break
@@ -517,6 +623,7 @@ class TensorLogging(Configurable):
             whole_gradient=whole_gradient,
             expert_bias=None,
             optimizer=None,
+            data=data,
             local_error=local_error,
         )
 
@@ -622,6 +729,14 @@ class TensorLogging(Configurable):
                     window_steps=window_steps,
                 )
             )
+        if snapshot.data is not None:
+            assert self._data_statistics_recorder is not None
+            metrics.update(
+                self._data_statistics_recorder.derive_metrics(
+                    snapshot.data,
+                    window_steps=window_steps,
+                )
+            )
         return metrics
 
     def reset_after_checkpoint_load(self, *, step: int) -> None:
@@ -632,6 +747,8 @@ class TensorLogging(Configurable):
             self._expert_bias_recorder.begin_step(should_log=False)
         if self._optimizer_statistics_recorder is not None:
             self._optimizer_statistics_recorder.begin_step(should_log=False)
+        if self._data_statistics_recorder is not None:
+            self._data_statistics_recorder.reset()
 
     def close(self) -> None:
         if self._output_batch is not None:

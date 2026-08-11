@@ -142,6 +142,10 @@ def test_public_adamw_equations_and_cosine(fake_world_one: None) -> None:
     assert snapshot.counts[0].shape == (5, 4)
     assert snapshot.sums[0].shape == (5, 3)
     assert snapshot.maxima[0].shape == (4, 1)
+    torch.testing.assert_close(
+        snapshot.sums[0][4],
+        torch.tensor([0.03125, 0.003125, 0.3125]),
+    )
     metrics = recorder.derive_metrics(snapshot, window_steps=1)
 
     prefix = "tensor_metrics/layers.0.weight.optimizer"

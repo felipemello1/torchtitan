@@ -513,6 +513,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 parallel_dims=parallel_dims,
                 metrics_processor=self.metrics_processor,
                 local_batch_size=config.training.local_batch_size,
+                dataloader_config=config.dataloader,
                 device=self.device,
             )
 
@@ -886,8 +887,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 for key, value in input_dict.items():
                     if isinstance(value, torch.Tensor):
                         input_dict[key] = value.to(self.device)
+                labels = labels.to(self.device)
+                if self.tensor_logging is not None:
+                    self.tensor_logging.record_data_batch(
+                        labels=labels,
+                        positions=input_dict.get("positions"),
+                    )
                 input_dict_mbs.append(input_dict)
-                label_mbs.append(labels.to(self.device))
+                label_mbs.append(labels)
 
             if parallel_dims.pp_enabled:
                 fwd_bwd_input_dict = input_dict_mbs
@@ -902,6 +909,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 labels=fwd_bwd_labels,
                 global_valid_tokens=global_valid_tokens,
             )
+            if self.tensor_logging is not None:
+                self.tensor_logging.record_data_loss(
+                    normalized_loss=loss,
+                    global_valid_tokens=global_valid_tokens,
+                )
             accumulated_losses.append(loss.detach())
 
         tensor_snapshot = (
