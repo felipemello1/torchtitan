@@ -11,6 +11,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.testing._internal.distributed.fake_pg  # noqa: F401
+from torch.distributed.tensor import DTensor, Replicate
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
@@ -77,8 +78,16 @@ def test_exact_loss_document_and_block_moments(fake_world_one: None) -> None:
     )
 
     recorder.record_batch(labels=labels, positions=positions)
+    normalized_loss = DTensor.from_local(
+        torch.tensor(0.25),
+        parallel_dims.get_mesh("fsdp"),
+        (Replicate(),),
+        shape=torch.Size(()),
+        stride=(),
+        run_check=False,
+    )
     recorder.record_loss(
-        normalized_loss=torch.tensor(0.25),
+        normalized_loss=normalized_loss,
         global_valid_tokens=8,
     )
     metrics = recorder.derive_metrics(recorder.collect(), window_steps=3)

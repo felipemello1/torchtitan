@@ -9,6 +9,7 @@
 from dataclasses import dataclass
 
 import torch
+from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed.parallel_dims import ParallelDims
@@ -76,7 +77,7 @@ class DataStatisticsRecorder:
             dtype=torch.int64,
             device=device,
         )
-        self._loss_sum = torch.zeros(1, dtype=torch.float32, device=device)
+        self._loss_sum = torch.zeros((), dtype=torch.float32, device=device)
         self._local_error: Exception | None = None
 
     def record_batch(
@@ -126,12 +127,22 @@ class DataStatisticsRecorder:
         if not self._record_loss or not self._records_loss:
             return
         try:
-            self._loss_sum.add_(
-                (normalized_loss.detach() * global_valid_tokens).float().sum()
-            )
+            local_loss = normalized_loss.detach()
+            if isinstance(local_loss, DTensor):
+                if any(
+                    not isinstance(placement, Replicate)
+                    for placement in local_loss.placements
+                ):
+                    raise ValueError(
+                        "data loss must be replicated across model-parallel axes"
+                    )
+                local_loss = local_loss.to_local()
+            self._loss_sum.add_((local_loss * global_valid_tokens).float().sum())
         except Exception as error:
             if self._local_error is None:
-                self._local_error = ValueError(f"invalid data loss sample: {error}")
+                self._local_error = ValueError(
+                    f"invalid data loss sample: {type(error).__name__}: {error}"
+                )
 
     def collect(self) -> DataStatisticsSnapshot:
         """Reduce and clear the interval accumulated since the last publication."""
