@@ -21,6 +21,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.observability.tensor_logging import optimizer_statistics
 from torchtitan.observability.tensor_logging.families import TensorMetricFamily
 from torchtitan.observability.tensor_logging.optimizer_statistics import (
     AdamWStatisticsRecorder,
@@ -135,8 +136,13 @@ def test_public_adamw_equations_and_cosine(fake_world_one: None) -> None:
     old_weight = weight_dtensor.to_local().clone()
     recorder.begin_step(should_log=True)
 
-    optimizer.step()
-    metrics = recorder.derive_metrics(recorder.collect(), window_steps=1)
+    with patch.object(optimizer_statistics, "_MAX_CHUNK_ELEMENTS", 1):
+        optimizer.step()
+    snapshot = recorder.collect()
+    assert snapshot.counts[0].shape == (5, 4)
+    assert snapshot.sums[0].shape == (5, 3)
+    assert snapshot.maxima[0].shape == (4, 1)
+    metrics = recorder.derive_metrics(snapshot, window_steps=1)
 
     prefix = "tensor_metrics/layers.0.weight.optimizer"
     assert metrics[f"{prefix}.numerator.abs_mean"] == pytest.approx(0.0375)
@@ -177,13 +183,53 @@ def test_zero_gradient_omits_undefined_cosine(fake_world_one: None) -> None:
     )
     recorder.begin_step(should_log=True)
 
-    optimizer.step()
+    with patch.object(optimizer_statistics, "_MAX_CHUNK_ELEMENTS", 1):
+        optimizer.step()
     metrics = recorder.derive_metrics(recorder.collect(), window_steps=3)
 
     prefix = "tensor_metrics/layers.0.weight.optimizer"
     assert f"{prefix}.momentum_gradient_cosine" not in metrics
     assert metrics[f"{prefix}.cosine.observation_count"] == 1
     assert metrics[f"{prefix}.cosine.window_steps"] == 3
+    recorder.close()
+
+
+def test_post_load_hook_reads_live_adamw_group(fake_world_one: None) -> None:
+    parallel_dims = _parallel_dims()
+    model = _model(parallel_dims)
+    optimizers = _optimizer(model)
+    recorder = AdamWStatisticsRecorder(
+        model=model,
+        parallel_dims=parallel_dims,
+        layer_ids=(0,),
+        families=(TensorMetricFamily.OPTIMIZER_DISTRIBUTION,),
+    )
+    recorder.bind_optimizer(optimizers)
+    optimizer = optimizers.optimizers[0]
+    loaded_state = optimizer.state_dict()
+    loaded_state["param_groups"][0]["lr"] = 0.03
+    optimizer.load_state_dict(loaded_state)
+
+    layer = cast(_Layer, model.layers[0])
+    weight = cast(DTensor, layer.weight)
+    layer.weight.grad = DTensor.from_local(
+        torch.tensor([0.5, -0.25]),
+        weight.device_mesh,
+        weight.placements,
+        shape=weight.shape,
+        stride=weight.stride(),
+        run_check=False,
+    )
+    old_weight = weight.to_local().clone()
+    recorder.begin_step(should_log=True)
+
+    optimizers.step()
+    metrics = recorder.derive_metrics(recorder.collect(), window_steps=1)
+
+    prefix = "tensor_metrics/layers.0.weight.optimizer"
+    assert metrics[f"{prefix}.update_pre_apply.abs_mean"] == pytest.approx(0.03)
+    expected_weight = old_weight * (1 - 0.03 * 0.2) + torch.tensor([-0.03, 0.03])
+    torch.testing.assert_close(weight.to_local(), expected_weight)
     recorder.close()
 
 
@@ -293,7 +339,23 @@ class TestAdamWStatisticsFourRanks(DTensorTestBase):
         old_bias = cast(DTensor, bias).to_local().clone()
 
         optimizer.step()
-        metrics = recorder.derive_metrics(recorder.collect(), window_steps=1)
+        with (
+            patch.object(
+                optimizer_statistics,
+                "reduce_sum",
+                wraps=optimizer_statistics.reduce_sum,
+            ) as reduce_sum,
+            patch.object(
+                optimizer_statistics,
+                "reduce_max",
+                wraps=optimizer_statistics.reduce_max,
+            ) as reduce_max,
+        ):
+            snapshot = recorder.collect()
+        # One int64 SUM, one FP32 SUM, and one FP32 MAX per owner cohort.
+        self.assertEqual(reduce_sum.call_count, 4)
+        self.assertEqual(reduce_max.call_count, 2)
+        metrics = recorder.derive_metrics(snapshot, window_steps=1)
 
         weight_prefix = "tensor_metrics/layers.0.weight.optimizer"
         self.assertEqual(metrics[f"{weight_prefix}.numerator.numel"], 16)

@@ -29,7 +29,7 @@ from torchtitan.observability.tensor_logging.statistics import (
     derive_finite_statistics,
     finite_statistics,
     FiniteStatistics,
-    reduce_finite_statistics,
+    reduce_max,
     reduce_sum,
 )
 
@@ -60,9 +60,9 @@ class _ParameterGroup:
 
 @dataclass(frozen=True, slots=True)
 class OptimizerStatisticsSnapshot:
-    distributions: tuple[FiniteStatistics, ...]
-    cosine_sums: tuple[torch.Tensor, ...]
-    cosine_present: tuple[torch.Tensor, ...]
+    counts: tuple[torch.Tensor, ...]
+    sums: tuple[torch.Tensor, ...]
+    maxima: tuple[torch.Tensor, ...]
     local_error: Exception | None
 
 
@@ -150,38 +150,48 @@ class AdamWStatisticsRecorder:
             TensorMetricFamily.OPTIMIZER_DISTRIBUTION in families
         )
         self._record_cosine = TensorMetricFamily.MOMENTUM_GRADIENT_COSINE in families
+        self._distribution_rows = tuple(
+            len(group.parameters) * len(_DISTRIBUTION_NAMES)
+            if self._record_distributions
+            else 0
+            for group in self._groups
+        )
         device = parameters[0].value.device
         self._counts = tuple(
             torch.zeros(
-                (len(group.parameters) * len(_DISTRIBUTION_NAMES), 4),
+                (
+                    distribution_rows
+                    + (len(group.parameters) if self._record_cosine else 0),
+                    4,
+                ),
                 dtype=torch.int64,
                 device=device,
             )
-            for group in self._groups
+            for group, distribution_rows in zip(
+                self._groups, self._distribution_rows, strict=True
+            )
         )
         self._sums = tuple(
             torch.zeros(
-                (len(group.parameters) * len(_DISTRIBUTION_NAMES), 2),
+                (
+                    distribution_rows
+                    + (len(group.parameters) if self._record_cosine else 0),
+                    3,
+                ),
                 dtype=torch.float32,
                 device=device,
             )
-            for group in self._groups
+            for group, distribution_rows in zip(
+                self._groups, self._distribution_rows, strict=True
+            )
         )
         self._maxima = tuple(
             torch.zeros(
-                (len(group.parameters) * len(_DISTRIBUTION_NAMES), 1),
+                (distribution_rows, 1),
                 dtype=torch.float32,
                 device=device,
             )
-            for group in self._groups
-        )
-        self._cosine_sums = tuple(
-            torch.zeros((len(group.parameters), 3), dtype=torch.float32, device=device)
-            for group in self._groups
-        )
-        self._cosine_present = tuple(
-            torch.zeros(len(group.parameters), dtype=torch.int64, device=device)
-            for group in self._groups
+            for distribution_rows in self._distribution_rows
         )
         self._record_next_step = False
         self._local_error: Exception | None = None
@@ -193,8 +203,10 @@ class AdamWStatisticsRecorder:
             raise RuntimeError("AdamW statistics recorder is already bound")
         found: set[int] = set()
         for optimizer in optimizers.optimizers:
-            selected_groups: list[tuple[dict, tuple[_BoundParameter, ...]]] = []
-            for parameter_group in optimizer.param_groups:
+            selected_groups: list[tuple[int, tuple[_BoundParameter, ...]]] = []
+            for optimizer_group_index, parameter_group in enumerate(
+                optimizer.param_groups
+            ):
                 selected_parameters = []
                 parameter_names = parameter_group["param_names"]
                 if len(parameter_names) != len(parameter_group["params"]):
@@ -219,7 +231,9 @@ class AdamWStatisticsRecorder:
                     )
                 self._validate_parameter_group(parameter_group)
                 found.update(id(parameter.value) for parameter in selected_parameters)
-                selected_groups.append((parameter_group, tuple(selected_parameters)))
+                selected_groups.append(
+                    (optimizer_group_index, tuple(selected_parameters))
+                )
             if selected_groups:
                 self._hook_handles.append(
                     optimizer.register_step_post_hook(
@@ -243,48 +257,34 @@ class AdamWStatisticsRecorder:
 
     def begin_step(self, *, should_log: bool) -> None:
         """Arm one optimizer point sample and clear its fixed local state."""
-        for values in (
-            *self._counts,
-            *self._sums,
-            *self._maxima,
-            *self._cosine_sums,
-            *self._cosine_present,
-        ):
+        for values in (*self._counts, *self._sums, *self._maxima):
             values.zero_()
         self._local_error = None
         self._record_next_step = should_log
 
     def collect(self) -> OptimizerStatisticsSnapshot:
         """Reduce the optimizer sample after every inner AdamW has stepped."""
-        distributions = []
-        cosine_sums = []
-        cosine_present = []
+        counts = []
+        sums = []
+        maxima = []
         for group_index, group in enumerate(self._groups):
-            if self._record_distributions:
-                distributions.append(
-                    reduce_finite_statistics(
-                        FiniteStatistics(
-                            counts=self._counts[group_index],
-                            sums=self._sums[group_index],
-                            abs_max=self._maxima[group_index],
-                        ),
-                        group.reduction_meshes,
-                    )
-                )
-            if self._record_cosine:
-                reduced_sums = self._cosine_sums[group_index].clone()
-                reduced_present = self._cosine_present[group_index].clone()
-                for mesh in group.reduction_meshes:
-                    reduced_sums = reduce_sum(reduced_sums, mesh)
-                    reduced_present = reduce_sum(reduced_present, mesh)
-                cosine_sums.append(reduced_sums)
-                cosine_present.append(reduced_present)
+            reduced_counts = self._counts[group_index].clone()
+            reduced_sums = self._sums[group_index].clone()
+            reduced_maxima = self._maxima[group_index].clone()
+            for mesh in group.reduction_meshes:
+                reduced_counts = reduce_sum(reduced_counts, mesh)
+                reduced_sums = reduce_sum(reduced_sums, mesh)
+                if self._record_distributions:
+                    reduced_maxima = reduce_max(reduced_maxima, mesh)
+            counts.append(reduced_counts)
+            sums.append(reduced_sums)
+            maxima.append(reduced_maxima)
 
         self._record_next_step = False
         return OptimizerStatisticsSnapshot(
-            distributions=tuple(distributions),
-            cosine_sums=tuple(cosine_sums),
-            cosine_present=tuple(cosine_present),
+            counts=tuple(counts),
+            sums=tuple(sums),
+            maxima=tuple(maxima),
             local_error=self._local_error,
         )
 
@@ -296,16 +296,18 @@ class AdamWStatisticsRecorder:
     ) -> dict[str, int | float]:
         """Validate owner completeness and derive selected AdamW metrics."""
         metrics: dict[str, int | float] = {}
-        distribution_group_index = 0
-        cosine_group_index = 0
-        for group in self._groups:
+        for group_index, group in enumerate(self._groups):
+            host_counts = snapshot.counts[group_index].cpu()
+            reduced_sums = snapshot.sums[group_index]
+            reduced_maxima = snapshot.maxima[group_index]
+            packed_floats = torch.cat(
+                (reduced_sums.flatten(), reduced_maxima.flatten())
+            ).cpu()
+            sums_elements = reduced_sums.numel()
+            host_sums = packed_floats[:sums_elements].view(reduced_sums.shape)
+            host_maxima = packed_floats[sums_elements:].view(reduced_maxima.shape)
+
             if self._record_distributions:
-                statistics = snapshot.distributions[distribution_group_index]
-                distribution_group_index += 1
-                host_counts = statistics.counts.cpu()
-                host_floats = torch.cat(
-                    (statistics.sums, statistics.abs_max), dim=1
-                ).cpu()
                 for parameter_index, parameter in enumerate(group.parameters):
                     for distribution_index, distribution_name in enumerate(
                         _DISTRIBUTION_NAMES
@@ -322,8 +324,8 @@ class AdamWStatisticsRecorder:
                         )
                         row_statistics = FiniteStatistics(
                             counts=host_counts[row_index, :3],
-                            sums=host_floats[row_index, :2],
-                            abs_max=host_floats[row_index, 2:3],
+                            sums=host_sums[row_index, :2],
+                            abs_max=host_maxima[row_index],
                         )
                         if int(row_statistics.counts[0]) != parameter.numel:
                             raise ValueError(
@@ -346,17 +348,15 @@ class AdamWStatisticsRecorder:
                         )
 
             if self._record_cosine:
-                host_sums = snapshot.cosine_sums[cosine_group_index].cpu()
-                host_present = snapshot.cosine_present[cosine_group_index].cpu()
-                cosine_group_index += 1
                 for parameter_index, parameter in enumerate(group.parameters):
+                    row_index = self._distribution_rows[group_index] + parameter_index
                     self._validate_presence(
                         parameter.fqn,
-                        int(host_present[parameter_index]),
+                        int(host_counts[row_index, 3]),
                         group.expected_contributors,
                     )
                     dot, momentum_square, gradient_square = (
-                        float(value) for value in host_sums[parameter_index]
+                        float(value) for value in host_sums[row_index]
                     )
                     prefix = f"tensor_metrics/{parameter.fqn}.optimizer.cosine"
                     metrics[f"{prefix}.observation_count"] = 1
@@ -436,11 +436,13 @@ class AdamWStatisticsRecorder:
         _args: tuple[object, ...],
         _kwargs: dict[str, object],
         *,
-        selected_groups: tuple[tuple[dict, tuple[_BoundParameter, ...]], ...],
+        selected_groups: tuple[tuple[int, tuple[_BoundParameter, ...]], ...],
     ) -> None:
         if not self._record_next_step:
             return
-        for parameter_group, parameters in selected_groups:
+        for optimizer_group_index, parameters in selected_groups:
+            parameter_group = optimizer.param_groups[optimizer_group_index]
+            self._validate_parameter_group(parameter_group)
             lr = parameter_group["lr"]
             beta1, beta2 = parameter_group["betas"]
             eps = parameter_group["eps"]
@@ -526,18 +528,31 @@ class AdamWStatisticsRecorder:
                         ] = 1
 
                     if self._record_cosine:
-                        momentum = local_exp_avg.float()
-                        gradient_float = local_gradient.float()
-                        self._cosine_sums[group_index][parameter_index].copy_(
-                            torch.stack(
-                                (
-                                    torch.sum(momentum * gradient_float),
-                                    torch.sum(torch.square(momentum)),
-                                    torch.sum(torch.square(gradient_float)),
+                        cosine_row = (
+                            self._distribution_rows[group_index] + parameter_index
+                        )
+                        for moment, gradient_chunk in zip(
+                            bounded_tensor_views(
+                                local_exp_avg,
+                                max_chunk_elements=_MAX_CHUNK_ELEMENTS,
+                            ),
+                            bounded_tensor_views(
+                                local_gradient,
+                                max_chunk_elements=_MAX_CHUNK_ELEMENTS,
+                            ),
+                            strict=True,
+                        ):
+                            gradient_float = gradient_chunk.float()
+                            self._sums[group_index][cosine_row].add_(
+                                torch.stack(
+                                    (
+                                        torch.sum(moment * gradient_float),
+                                        torch.sum(torch.square(moment)),
+                                        torch.sum(torch.square(gradient_float)),
+                                    )
                                 )
                             )
-                        )
-                        self._cosine_present[group_index][parameter_index] = 1
+                        self._counts[group_index][cosine_row, 3] = 1
                 except Exception as error:
                     if self._local_error is None:
                         self._local_error = ValueError(
@@ -554,7 +569,7 @@ class AdamWStatisticsRecorder:
         statistics = finite_statistics(value)
         row_index = parameter_index * len(_DISTRIBUTION_NAMES) + distribution_index
         self._counts[group_index][row_index, :3].add_(statistics.counts)
-        self._sums[group_index][row_index].add_(statistics.sums)
+        self._sums[group_index][row_index, :2].add_(statistics.sums)
         self._maxima[group_index][row_index].copy_(
             torch.maximum(
                 self._maxima[group_index][row_index],
