@@ -88,8 +88,9 @@ class ExpertBiasRecorder:
 
     def begin_step(self, *, should_log: bool) -> None:
         """Arm one point sample for the next optimizer step."""
-        self._values.zero_()
-        self._local_error = None
+        if should_log:
+            self._values.zero_()
+            self._local_error = None
         self._record_next_step = should_log
 
     def collect(self) -> ExpertBiasSnapshot:

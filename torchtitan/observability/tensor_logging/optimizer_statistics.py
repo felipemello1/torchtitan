@@ -190,9 +190,10 @@ class AdamWStatisticsRecorder:
 
     def begin_step(self, *, should_log: bool) -> None:
         """Arm one optimizer point sample and clear its fixed local state."""
-        for values in (*self._counts, *self._sums, *self._maxima):
-            values.zero_()
-        self._local_error = None
+        if should_log:
+            for values in (*self._counts, *self._sums, *self._maxima):
+                values.zero_()
+            self._local_error = None
         self._record_next_step = should_log
 
     def collect(self) -> OptimizerStatisticsSnapshot:
