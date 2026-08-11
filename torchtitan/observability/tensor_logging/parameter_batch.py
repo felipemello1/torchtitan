@@ -13,39 +13,33 @@ from torch.distributed.tensor import DTensor
 
 from torchtitan.components.checkpoint_utils import canonical_fqn
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.observability.tensor_logging.parameter_statistics import (
+from torchtitan.observability.tensor_logging.families import TensorMetricFamily
+from torchtitan.observability.tensor_logging.parameter_ownership import (
     resolve_rowwise_parameter_owner_meshes,
-    validate_reduced_parameter_numel,
 )
-from torchtitan.observability.tensor_logging.recorders import (
+from torchtitan.observability.tensor_logging.statistics import (
     derive_finite_statistics,
     finite_statistics,
     FiniteStatistics,
+    reduce_finite_statistics,
 )
-from torchtitan.observability.tensor_logging.reduction import reduce_finite_statistics
-from torchtitan.observability.tensor_logging.sites import TensorMetricSite
 
 
 @dataclass(frozen=True, slots=True)
 class _BoundParameter:
     fqn: str
     value: torch.Tensor
-    owner_meshes: tuple[DeviceMesh, ...]
     numel: int
 
 
 @dataclass(frozen=True, slots=True)
 class _ParameterRow:
     parameter: _BoundParameter
-    site: TensorMetricSite
+    family: TensorMetricFamily
 
     @property
     def metric_prefix(self) -> str:
-        suffix = (
-            "w"
-            if self.site is TensorMetricSite.ATTENTION_OUTPUT_WEIGHT
-            else "dw_preclip"
-        )
+        suffix = "w" if self.family is TensorMetricFamily.PARAMETER else "dw_preclip"
         return f"tensor_metrics/{self.parameter.fqn}.{suffix}"
 
 
@@ -64,7 +58,7 @@ class ParameterStatisticsBatch:
         model: nn.Module,
         parallel_dims: ParallelDims,
         layer_ids: tuple[int, ...],
-        sites: tuple[TensorMetricSite, ...],
+        families: tuple[TensorMetricFamily, ...],
     ) -> None:
         expected_fqns = tuple(
             f"layers.{layer_id}.attention.wo.weight" for layer_id in layer_ids
@@ -76,6 +70,7 @@ class ParameterStatisticsBatch:
                 matches[fqn].append(parameter)
 
         bound_parameters = []
+        resolved_owner_meshes: list[tuple[DeviceMesh, ...]] = []
         for fqn in expected_fqns:
             parameters = matches[fqn]
             if len(parameters) != 1:
@@ -102,16 +97,16 @@ class ParameterStatisticsBatch:
                 parameter,
                 parallel_dims=parallel_dims,
             )
+            resolved_owner_meshes.append(owner_meshes)
             bound_parameters.append(
                 _BoundParameter(
                     fqn=fqn,
                     value=parameter,
-                    owner_meshes=owner_meshes,
                     numel=parameter.numel(),
                 )
             )
 
-        owner_meshes = bound_parameters[0].owner_meshes
+        owner_meshes = resolved_owner_meshes[0]
         use_world_mesh = (
             len(owner_meshes) == 2
             and parallel_dims.dp_replicate == 1
@@ -125,15 +120,16 @@ class ParameterStatisticsBatch:
                 raise ValueError(
                     "tensor logging compound parameter owners must span WORLD"
                 )
-            self._reduction_meshes = (parallel_dims.world_mesh,)
+            reduction_meshes: tuple[DeviceMesh, ...] = (parallel_dims.world_mesh,)
         else:
-            self._reduction_meshes = owner_meshes
+            reduction_meshes = owner_meshes
+        self._reduction_meshes = reduction_meshes
         self._local_device = bound_parameters[0].value.device
         self._parallel_dims = parallel_dims
         self._rows = tuple(
-            _ParameterRow(parameter=parameter, site=site)
+            _ParameterRow(parameter=parameter, family=family)
             for parameter in bound_parameters
-            for site in sites
+            for family in families
         )
 
     def collect(self, *, step: int) -> ParameterStatisticsSnapshot:
@@ -146,7 +142,7 @@ class ParameterStatisticsBatch:
             parameter = row.parameter
             value = (
                 parameter.value
-                if row.site is TensorMetricSite.ATTENTION_OUTPUT_WEIGHT
+                if row.family is TensorMetricFamily.PARAMETER
                 else parameter.value.grad
             )
             try:
@@ -154,21 +150,19 @@ class ParameterStatisticsBatch:
                     raise ValueError(
                         f"tensor logging sample {row.metric_prefix!r} is absent"
                     )
-                if row.site is TensorMetricSite.ATTENTION_OUTPUT_WEIGHT_GRAD:
+                if row.family is TensorMetricFamily.PRECLIP_GRADIENT:
                     resolve_rowwise_parameter_owner_meshes(
                         value,
                         parallel_dims=self._parallel_dims,
                     )
                 if not isinstance(value, DTensor):
                     raise ValueError("value is not a DTensor")
-                with torch.no_grad():
-                    local_value = value.to_local()
+                local_value = value.to_local()
                 statistics = finite_statistics(local_value)
                 present = statistics.counts.new_ones(1)
             except Exception as error:
                 is_optional_absence = (
-                    value is None
-                    and row.site is TensorMetricSite.ATTENTION_OUTPUT_WEIGHT_GRAD
+                    value is None and row.family is TensorMetricFamily.PRECLIP_GRADIENT
                 )
                 if not is_optional_absence and local_error is None:
                     local_error = ValueError(
@@ -218,7 +212,7 @@ class ParameterStatisticsBatch:
         for index, row in enumerate(self._rows):
             present = int(host_counts[index, 3])
             if present == 0:
-                if row.site is TensorMetricSite.ATTENTION_OUTPUT_WEIGHT:
+                if row.family is TensorMetricFamily.PARAMETER:
                     raise RuntimeError(
                         f"required tensor logging parameter {row.parameter.fqn!r} "
                         "was absent on every owner"
@@ -235,7 +229,12 @@ class ParameterStatisticsBatch:
                 sums=host_floats[index, :2],
                 abs_max=host_floats[index, 2:3],
             )
-            validate_reduced_parameter_numel(statistics, row.parameter.numel)
+            reduced_numel = int(statistics.counts[0])
+            if reduced_numel != row.parameter.numel:
+                raise ValueError(
+                    f"reduced parameter numel is {reduced_numel}, "
+                    f"expected {row.parameter.numel}"
+                )
             derived = derive_finite_statistics(statistics)
             derived["observation_count"] = 1
             derived["window_steps"] = window_steps

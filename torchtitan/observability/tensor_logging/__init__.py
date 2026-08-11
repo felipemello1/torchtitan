@@ -7,6 +7,6 @@
 """Distributed tensor logging for selected TorchTitan model sites."""
 
 from torchtitan.observability.tensor_logging.component import TensorLogging
-from torchtitan.observability.tensor_logging.sites import TensorMetricSite
+from torchtitan.observability.tensor_logging.families import TensorMetricFamily
 
-__all__ = ["TensorLogging", "TensorMetricSite"]
+__all__ = ["TensorLogging", "TensorMetricFamily"]

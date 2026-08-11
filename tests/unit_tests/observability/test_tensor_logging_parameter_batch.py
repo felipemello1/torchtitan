@@ -21,10 +21,10 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 )
 
 from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.observability.tensor_logging.families import TensorMetricFamily
 from torchtitan.observability.tensor_logging.parameter_batch import (
     ParameterStatisticsBatch,
 )
-from torchtitan.observability.tensor_logging.sites import TensorMetricSite
 
 
 class _Projection(nn.Module):
@@ -107,9 +107,9 @@ def _build_batch() -> tuple[ParameterStatisticsBatch, nn.Parameter]:
         model=_Model(weight),
         parallel_dims=parallel_dims,
         layer_ids=(0,),
-        sites=(
-            TensorMetricSite.ATTENTION_OUTPUT_WEIGHT,
-            TensorMetricSite.ATTENTION_OUTPUT_WEIGHT_GRAD,
+        families=(
+            TensorMetricFamily.PARAMETER,
+            TensorMetricFamily.PRECLIP_GRADIENT,
         ),
     )
     return batch, weight
@@ -194,9 +194,9 @@ def test_two_layers_share_one_packed_reduction(fake_world_one: None) -> None:
         model=_Model(weight, second_weight),
         parallel_dims=batch._parallel_dims,
         layer_ids=(0, 1),
-        sites=(
-            TensorMetricSite.ATTENTION_OUTPUT_WEIGHT,
-            TensorMetricSite.ATTENTION_OUTPUT_WEIGHT_GRAD,
+        families=(
+            TensorMetricFamily.PARAMETER,
+            TensorMetricFamily.PRECLIP_GRADIENT,
         ),
     )
 
@@ -221,7 +221,7 @@ def test_parameter_dimensions_must_divide_owner_degrees() -> None:
             model=_Model(weight),
             parallel_dims=parallel_dims,
             layer_ids=(0,),
-            sites=(TensorMetricSite.ATTENTION_OUTPUT_WEIGHT,),
+            families=(TensorMetricFamily.PARAMETER,),
         )
 
 
@@ -245,6 +245,21 @@ def test_writer_derivation_uses_two_packed_host_copies(fake_world_one: None) -> 
         )
 
     assert copy_to_host.call_count == 2
+
+
+def test_writer_derivation_rejects_incomplete_parameter(
+    fake_world_one: None,
+) -> None:
+    batch, _ = _build_batch()
+    snapshot = batch.collect(step=1)
+    snapshot.statistics.counts[0, 0] = 8
+
+    with pytest.raises(ValueError, match="is 8, expected 4"):
+        batch.derive_metrics(
+            snapshot,
+            expected_contributors=1,
+            window_steps=1,
+        )
 
 
 def _build_distributed_batch(
@@ -279,9 +294,9 @@ def _build_distributed_batch(
         model=model,
         parallel_dims=parallel_dims,
         layer_ids=(0,),
-        sites=(
-            TensorMetricSite.ATTENTION_OUTPUT_WEIGHT,
-            TensorMetricSite.ATTENTION_OUTPUT_WEIGHT_GRAD,
+        families=(
+            TensorMetricFamily.PARAMETER,
+            TensorMetricFamily.PRECLIP_GRADIENT,
         ),
     )
     return batch, model

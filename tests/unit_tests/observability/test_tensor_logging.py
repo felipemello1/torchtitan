@@ -12,12 +12,13 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 )
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.observability.tensor_logging.component import TensorLogging
-from torchtitan.observability.tensor_logging.recorders import (
+from torchtitan.observability.tensor_logging.statistics import (
     derive_finite_statistics,
     finite_statistics,
     FiniteStatistics,
+    reduce_max,
+    reduce_sum,
 )
-from torchtitan.observability.tensor_logging.reduction import reduce_max, reduce_sum
 
 
 def test_finite_statistics_uses_the_finite_denominator() -> None:

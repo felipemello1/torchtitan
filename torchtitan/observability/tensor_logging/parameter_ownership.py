@@ -9,7 +9,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.observability.tensor_logging.recorders import FiniteStatistics
 
 
 def resolve_rowwise_parameter_owner_meshes(
@@ -66,17 +65,3 @@ def resolve_rowwise_parameter_owner_meshes(
     if parallel_dims.tp_enabled:
         owner_meshes.append(parallel_dims.get_mesh("tp"))
     return tuple(owner_meshes)
-
-
-def validate_reduced_parameter_numel(
-    statistics: FiniteStatistics,
-    expected_numel: int,
-) -> None:
-    """Require a completed host snapshot to cover one logical parameter."""
-    if statistics.counts.device.type != "cpu":
-        raise ValueError("parameter numel validation requires completed CPU statistics")
-    reduced_numel = int(statistics.counts[0].item())
-    if reduced_numel != expected_numel:
-        raise ValueError(
-            f"reduced parameter numel is {reduced_numel}, expected {expected_numel}"
-        )

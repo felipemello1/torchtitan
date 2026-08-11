@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.testing._internal.distributed.fake_pg  # noqa: F401
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.observability.tensor_logging.reduction import reduce_sum
+from torchtitan.observability.tensor_logging.statistics import reduce_sum
 
 
 def main() -> None:

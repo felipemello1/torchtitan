@@ -7,6 +7,7 @@
 import time
 from dataclasses import dataclass, fields, replace
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock, patch
 
 import pytest
@@ -20,8 +21,8 @@ from torchtitan.distributed.activation_checkpoint import FullAC, MemoryBudgetAC
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.llama3.config_registry import llama3_debugmodel
 from torchtitan.models.qwen3.config_registry import qwen3_debugmodel
-from torchtitan.observability.tensor_logging import TensorLogging, TensorMetricSite
-from torchtitan.observability.tensor_logging.sites import resolve_parameter_sites
+from torchtitan.observability.tensor_logging import TensorLogging, TensorMetricFamily
+from torchtitan.observability.tensor_logging.families import resolve_parameter_families
 from torchtitan.trainer import Trainer
 
 
@@ -32,31 +33,27 @@ def _enabled_config():
     return config
 
 
-def test_parameter_site_selection_is_explicit_and_unique() -> None:
-    selected, omitted = resolve_parameter_sites(None)
+def test_parameter_family_selection_is_explicit_and_unique() -> None:
+    selected = resolve_parameter_families(None)
     assert selected == (
-        TensorMetricSite.ATTENTION_OUTPUT_WEIGHT,
-        TensorMetricSite.ATTENTION_OUTPUT_WEIGHT_GRAD,
+        TensorMetricFamily.PARAMETER,
+        TensorMetricFamily.PRECLIP_GRADIENT,
     )
-    assert omitted[TensorMetricSite.ATTENTION_INPUT] == "not in parameter-first slice"
 
-    selected, omitted = resolve_parameter_sites(
-        (TensorMetricSite.ATTENTION_OUTPUT_WEIGHT_GRAD,)
-    )
-    assert selected == (TensorMetricSite.ATTENTION_OUTPUT_WEIGHT_GRAD,)
-    assert omitted[TensorMetricSite.ATTENTION_OUTPUT_WEIGHT] == "not requested"
+    selected = resolve_parameter_families((TensorMetricFamily.PRECLIP_GRADIENT,))
+    assert selected == (TensorMetricFamily.PRECLIP_GRADIENT,)
 
     with pytest.raises(ValueError, match="must not be empty"):
-        resolve_parameter_sites(())
+        resolve_parameter_families(())
     with pytest.raises(ValueError, match="duplicates"):
-        resolve_parameter_sites(
+        resolve_parameter_families(
             (
-                TensorMetricSite.ATTENTION_OUTPUT_WEIGHT,
-                TensorMetricSite.ATTENTION_OUTPUT_WEIGHT,
+                TensorMetricFamily.PARAMETER,
+                TensorMetricFamily.PARAMETER,
             )
         )
-    with pytest.raises(ValueError, match="not supported"):
-        resolve_parameter_sites((TensorMetricSite.MOE_OFFERED_ASSIGNMENTS,))
+    with pytest.raises(ValueError, match="TensorMetricFamily values"):
+        resolve_parameter_families(cast(tuple[TensorMetricFamily, ...], ("parameter",)))
 
 
 def test_recipe_parser_accepts_the_three_field_surface() -> None:
@@ -67,9 +64,9 @@ def test_recipe_parser_accepts_the_three_field_surface() -> None:
             "--config",
             "llama3_debugmodel",
             "--tensor-logging.enable",
-            "--tensor-logging.sites",
-            "ATTENTION_OUTPUT_WEIGHT",
-            "ATTENTION_OUTPUT_WEIGHT_GRAD",
+            "--tensor-logging.families",
+            "PARAMETER",
+            "PRECLIP_GRADIENT",
             "--tensor-logging.layer-ids",
             "0",
             "2",
@@ -78,9 +75,9 @@ def test_recipe_parser_accepts_the_three_field_surface() -> None:
 
     assert config.tensor_logging == TensorLogging.Config(
         enable=True,
-        sites=(
-            TensorMetricSite.ATTENTION_OUTPUT_WEIGHT,
-            TensorMetricSite.ATTENTION_OUTPUT_WEIGHT_GRAD,
+        families=(
+            TensorMetricFamily.PARAMETER,
+            TensorMetricFamily.PRECLIP_GRADIENT,
         ),
         layer_ids=(0, 2),
     )
@@ -332,7 +329,7 @@ def test_torchft_rejects_tensor_logging() -> None:
 def test_disabled_config_bypasses_tensor_logging_validation() -> None:
     config = llama3_debugmodel()
     config.tensor_logging.layer_ids = ()
-    config.tensor_logging.sites = ()
+    config.tensor_logging.families = ()
 
     TensorLogging.validate_job_config(
         config.tensor_logging,

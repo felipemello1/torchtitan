@@ -23,16 +23,15 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 )
 
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.observability.tensor_logging import reduction
-from torchtitan.observability.tensor_logging.parameter_statistics import (
+from torchtitan.observability.tensor_logging import statistics
+from torchtitan.observability.tensor_logging.parameter_ownership import (
     resolve_rowwise_parameter_owner_meshes,
-    validate_reduced_parameter_numel,
 )
-from torchtitan.observability.tensor_logging.recorders import (
+from torchtitan.observability.tensor_logging.statistics import (
     finite_statistics,
     FiniteStatistics,
+    reduce_finite_statistics,
 )
-from torchtitan.observability.tensor_logging.reduction import reduce_finite_statistics
 
 
 def test_empty_owner_reduction_returns_an_owned_snapshot() -> None:
@@ -64,12 +63,12 @@ def test_finite_stat_reduction_uses_axis_then_lane_order(monkeypatch) -> None:
         calls.append(("max", mesh))
         return value
 
-    monkeypatch.setattr(reduction, "reduce_sum", record_sum)
-    monkeypatch.setattr(reduction, "reduce_max", record_max)
-    statistics = finite_statistics(torch.tensor([1.0]))
+    monkeypatch.setattr(statistics, "reduce_sum", record_sum)
+    monkeypatch.setattr(statistics, "reduce_max", record_max)
+    finite_stats = finite_statistics(torch.tensor([1.0]))
 
-    reduction.reduce_finite_statistics(
-        statistics,
+    reduce_finite_statistics(
+        finite_stats,
         (first_mesh, second_mesh),
     )
 
@@ -81,14 +80,6 @@ def test_finite_stat_reduction_uses_axis_then_lane_order(monkeypatch) -> None:
         ("sum", second_mesh),
         ("max", second_mesh),
     ]
-
-
-def test_reduced_parameter_numel_rejects_an_incomplete_population() -> None:
-    statistics = finite_statistics(torch.ones(4))
-
-    validate_reduced_parameter_numel(statistics, 4)
-    with pytest.raises(ValueError, match="is 4, expected 8"):
-        validate_reduced_parameter_numel(statistics, 8)
 
 
 def _build_rowwise_linear(
@@ -297,7 +288,7 @@ class TestRowwiseParameterSingleton(DTensorTestBase):
         self.assertEqual(host_statistics.counts.tolist(), [64, 0, 0])
         self.assertEqual(host_statistics.sums.tolist(), [128.0, 256.0])
         self.assertEqual(host_statistics.abs_max.tolist(), [2.0])
-        validate_reduced_parameter_numel(host_statistics, parameter.numel())
+        self.assertEqual(int(host_statistics.counts[0]), parameter.numel())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -341,7 +332,7 @@ class TestRowwiseParameterTwoRanks(DTensorTestBase):
         self.assertEqual(len(owner_meshes), 1)
         self.assertIs(owner_meshes[0], expected_mesh)
         _assert_two_shard_statistics(host_statistics)
-        validate_reduced_parameter_numel(host_statistics, parameter.numel())
+        self.assertEqual(int(host_statistics.counts[0]), parameter.numel())
 
     @with_comms
     def test_tp_owns_rowwise_parameter_storage(self) -> None:
@@ -407,7 +398,7 @@ class TestRowwiseParameterFourRanks(DTensorTestBase):
         self.assertEqual(host_statistics.counts.tolist(), [64, 0, 0])
         self.assertEqual(host_statistics.sums.tolist(), [3584.0, 362304.0])
         self.assertEqual(host_statistics.abs_max.tolist(), [111.0])
-        validate_reduced_parameter_numel(host_statistics, parameter.numel())
+        self.assertEqual(int(host_statistics.counts[0]), parameter.numel())
 
         wrong_statistics = _to_cpu(
             reduce_finite_statistics(
@@ -436,7 +427,7 @@ class TestRowwiseParameterFourRanks(DTensorTestBase):
         self.assertEqual(gradient_statistics.counts.tolist(), [64, 0, 0])
         self.assertEqual(gradient_statistics.sums.tolist(), [128.0, 256.0])
         self.assertEqual(gradient_statistics.abs_max.tolist(), [2.0])
-        validate_reduced_parameter_numel(gradient_statistics, parameter.numel())
+        self.assertEqual(int(gradient_statistics.counts[0]), parameter.numel())
 
     @with_comms
     def test_hsdp_excludes_replicas_even_when_numel_would_pass(self) -> None:

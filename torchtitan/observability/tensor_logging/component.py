@@ -21,26 +21,26 @@ from torchtitan.models.llama3.model import Llama3Model
 from torchtitan.models.llama3.parallelize import parallelize_llama
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.parallelize import parallelize_qwen3
+from torchtitan.observability.tensor_logging.families import (
+    resolve_parameter_families,
+    TensorMetricFamily,
+)
 from torchtitan.observability.tensor_logging.parameter_batch import (
     ParameterStatisticsBatch,
     ParameterStatisticsSnapshot,
-)
-from torchtitan.observability.tensor_logging.sites import (
-    resolve_parameter_sites,
-    TensorMetricSite,
 )
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import logger
 
 
 class TensorLogging(Configurable):
-    """Distributed logging for selected built-in tensor sites.
+    """Distributed logging for selected tensor-metric families.
 
     Example:
 
         config.tensor_logging = TensorLogging.Config(
             enable=True,
-            sites=(TensorMetricSite.ATTENTION_OUTPUT_WEIGHT,),
+            families=(TensorMetricFamily.PARAMETER,),
             layer_ids=(0,),
         )
     """
@@ -53,13 +53,13 @@ class TensorLogging(Configurable):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        """Selects the built-in tensor sites and global decoder layers to log."""
+        """Selects tensor-metric families and global decoder layers to log."""
 
         enable: bool = False
         """Whether to collect selected distributed tensor statistics."""
 
-        sites: tuple[TensorMetricSite, ...] | None = None
-        """Built-in semantic sites, or the documented supported default."""
+        families: tuple[TensorMetricFamily, ...] | None = None
+        """Semantic metric families, or the documented supported default."""
 
         layer_ids: tuple[int, ...] = (0,)
         """Global decoder layer IDs to observe."""
@@ -74,7 +74,7 @@ class TensorLogging(Configurable):
         """Fail unsupported public requests before distributed construction."""
         if not config.enable:
             return
-        resolve_parameter_sites(config.sites)
+        resolve_parameter_families(config.families)
         if not config.layer_ids:
             raise ValueError("tensor_logging.layer_ids must not be empty")
         if len(set(config.layer_ids)) != len(config.layer_ids):
@@ -188,12 +188,12 @@ class TensorLogging(Configurable):
         metrics_processor: MetricsProcessor,
         device: torch.device,
     ) -> None:
-        selected_sites, omitted_sites = resolve_parameter_sites(config.sites)
+        selected_families = resolve_parameter_families(config.families)
         self._batch = ParameterStatisticsBatch(
             model=model,
             parallel_dims=parallel_dims,
             layer_ids=config.layer_ids,
-            sites=selected_sites,
+            families=selected_families,
         )
 
         self._is_writer = metrics_processor.has_active_logger
@@ -210,13 +210,8 @@ class TensorLogging(Configurable):
         self._expected_contributors = dist.get_world_size()
         self._last_successful_publication_step = 0
 
-        selected_names = ", ".join(site.name for site in selected_sites)
-        omitted_names = ", ".join(
-            f"{site.name} ({reason})" for site, reason in omitted_sites.items()
-        )
-        logger.info(
-            f"Tensor logging selected: {selected_names}; omitted: {omitted_names}"
-        )
+        selected_names = ", ".join(family.name for family in selected_families)
+        logger.info(f"Tensor logging selected families: {selected_names}")
 
     def collect(self, *, step: int) -> ParameterStatisticsSnapshot:
         return self._batch.collect(step=step)
