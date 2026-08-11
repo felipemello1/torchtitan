@@ -290,7 +290,7 @@ def test_fake_pg_resolves_and_rejects_parameter_signatures(
             parallel_dims=parallel_dims,
         )
 
-    wrong_placement = DTensor.from_local(
+    alternate_fsdp_shard = DTensor.from_local(
         torch.ones(8, 2),
         expected_mesh,
         (Shard(1), Shard(1)),
@@ -298,9 +298,25 @@ def test_fake_pg_resolves_and_rejects_parameter_signatures(
         stride=(8, 1),
         run_check=False,
     )
-    with pytest.raises(ValueError, match="a dim-0 shard on the FSDP axis"):
+    assert resolve_parameter_owner_meshes(
+        alternate_fsdp_shard,
+        parallel_dims=parallel_dims,
+    ) == (
+        parallel_dims.get_mesh("fsdp"),
+        parallel_dims.get_mesh("tp"),
+    )
+
+    unsharded_storage = DTensor.from_local(
+        torch.ones(8, 4),
+        expected_mesh,
+        (Replicate(), Shard(1)),
+        shape=torch.Size((8, 8)),
+        stride=(8, 1),
+        run_check=False,
+    )
+    with pytest.raises(ValueError, match="a shard on the fsdp axis"):
         resolve_parameter_owner_meshes(
-            wrong_placement,
+            unsharded_storage,
             parallel_dims=parallel_dims,
         )
 
@@ -313,7 +329,7 @@ def test_fake_pg_resolves_and_rejects_parameter_signatures(
         stride=(8, 1),
         run_check=False,
     )
-    with pytest.raises(ValueError, match="expected mesh axes"):
+    with pytest.raises(ValueError, match="expected dense mesh axes"):
         resolve_parameter_owner_meshes(
             unnamed_parameter,
             parallel_dims=parallel_dims,
