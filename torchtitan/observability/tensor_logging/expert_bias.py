@@ -115,14 +115,14 @@ class ExpertBiasRecorder:
         window_steps: int,
     ) -> dict[str, int | float]:
         """Derive stable per-expert keys from the selected writer's replica."""
-        values = snapshot.values.cpu()
+        values = snapshot.values.cpu().tolist()
         metrics: dict[str, int | float] = {}
         for row_index, layer_id in enumerate(self._layer_ids):
             prefix = f"tensor_metrics/layers.{layer_id}"
             for expert_id, value in enumerate(values[row_index]):
                 metrics[
                     f"{prefix}.experts.{expert_id}.router_expert_bias_post_update"
-                ] = float(value)
+                ] = value
             metrics[
                 f"{prefix}.moe.router_expert_bias_post_update.observation_count"
             ] = 1

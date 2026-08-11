@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -219,9 +220,20 @@ def derive_finite_statistics(statistics: FiniteStatistics) -> dict[str, int | fl
     ):
         raise ValueError("derive_finite_statistics expects completed CPU statistics")
 
-    numel, nonfinite_count, zero_count = (
-        int(value) for value in statistics.counts.tolist()
+    return derive_finite_statistics_values(
+        statistics.counts.tolist(),
+        statistics.sums.tolist(),
+        statistics.abs_max.item(),
     )
+
+
+def derive_finite_statistics_values(
+    counts: Sequence[int],
+    sums: Sequence[float],
+    abs_max: float,
+) -> dict[str, int | float]:
+    """Derive one row after its packed tensors have moved to the host."""
+    numel, nonfinite_count, zero_count = counts
     result: dict[str, int | float] = {
         "numel": numel,
         "nonfinite_count": nonfinite_count,
@@ -232,9 +244,9 @@ def derive_finite_statistics(statistics: FiniteStatistics) -> dict[str, int | fl
         return result
 
     result["zero_fraction"] = zero_count / finite_count
-    result["abs_max"] = float(statistics.abs_max.item())
+    result["abs_max"] = abs_max
 
-    abs_sum, square_sum = (float(value) for value in statistics.sums.tolist())
+    abs_sum, square_sum = sums
     if math.isfinite(abs_sum):
         result["abs_mean"] = abs_sum / finite_count
     if math.isfinite(square_sum):

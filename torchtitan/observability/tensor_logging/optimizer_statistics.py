@@ -27,9 +27,8 @@ from torchtitan.observability.tensor_logging.parameter_ownership import (
 )
 from torchtitan.observability.tensor_logging.statistics import (
     bounded_tensor_views,
-    derive_finite_statistics,
+    derive_finite_statistics_values,
     finite_statistics,
-    FiniteStatistics,
     reduce_max,
     reduce_sum,
     ReductionBatch,
@@ -242,15 +241,17 @@ class AdamWStatisticsRecorder:
         """Validate owner completeness and derive selected AdamW metrics."""
         metrics: dict[str, int | float] = {}
         for group_index, group in enumerate(self._groups):
-            host_counts = snapshot.counts[group_index].cpu()
+            host_counts = snapshot.counts[group_index].cpu().tolist()
             reduced_sums = snapshot.sums[group_index]
             reduced_maxima = snapshot.maxima[group_index]
             packed_floats = torch.cat(
                 (reduced_sums.flatten(), reduced_maxima.flatten())
             ).cpu()
             sums_elements = reduced_sums.numel()
-            host_sums = packed_floats[:sums_elements].view(reduced_sums.shape)
-            host_maxima = packed_floats[sums_elements:].view(reduced_maxima.shape)
+            host_sums = packed_floats[:sums_elements].view(reduced_sums.shape).tolist()
+            host_maxima = (
+                packed_floats[sums_elements:].view(reduced_maxima.shape).tolist()
+            )
 
             if self._record_distributions:
                 for parameter_index, parameter in enumerate(group.parameters):
@@ -261,24 +262,24 @@ class AdamWStatisticsRecorder:
                             parameter_index * len(_DISTRIBUTION_NAMES)
                             + distribution_index
                         )
-                        present = int(host_counts[row_index, 3])
+                        counts = host_counts[row_index]
+                        present = counts[3]
                         self._validate_presence(
                             parameter.fqn,
                             present,
                             group.expected_contributors,
                         )
-                        row_statistics = FiniteStatistics(
-                            counts=host_counts[row_index, :3],
-                            sums=host_sums[row_index, :2],
-                            abs_max=host_maxima[row_index],
-                        )
-                        if int(row_statistics.counts[0]) != parameter.numel:
+                        if counts[0] != parameter.numel:
                             raise ValueError(
                                 f"reduced optimizer tensor numel for {parameter.fqn!r} "
-                                f"is {int(row_statistics.counts[0])}, expected "
+                                f"is {counts[0]}, expected "
                                 f"{parameter.numel}"
                             )
-                        derived = derive_finite_statistics(row_statistics)
+                        derived = derive_finite_statistics_values(
+                            counts[:3],
+                            host_sums[row_index][:2],
+                            host_maxima[row_index][0],
+                        )
                         derived["observation_count"] = 1
                         derived["window_steps"] = window_steps
                         prefix = (
@@ -297,12 +298,10 @@ class AdamWStatisticsRecorder:
                     row_index = self._distribution_rows[group_index] + parameter_index
                     self._validate_presence(
                         parameter.fqn,
-                        int(host_counts[row_index, 3]),
+                        host_counts[row_index][3],
                         group.expected_contributors,
                     )
-                    dot, momentum_square, gradient_square = (
-                        float(value) for value in host_sums[row_index]
-                    )
+                    dot, momentum_square, gradient_square = host_sums[row_index]
                     prefix = f"tensor_metrics/{parameter.fqn}.optimizer.cosine"
                     metrics[f"{prefix}.observation_count"] = 1
                     metrics[f"{prefix}.window_steps"] = window_steps

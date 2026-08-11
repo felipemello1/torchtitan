@@ -21,7 +21,7 @@ from torchtitan.models.common.attention import GQAttention
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.observability.tensor_logging.families import TensorMetricFamily
 from torchtitan.observability.tensor_logging.statistics import (
-    derive_finite_statistics,
+    derive_finite_statistics_values,
     finite_statistics,
     FiniteStatistics,
     reduce_finite_statistics,
@@ -240,17 +240,19 @@ class OutputStatisticsBatch:
         window_steps: int,
     ) -> dict[str, int | float]:
         """Copy two packed matrices to CPU and derive writer-side scalars."""
-        host_counts = snapshot.statistics.counts.cpu()
-        host_floats = torch.cat(
-            (snapshot.statistics.sums, snapshot.statistics.abs_max), dim=1
-        ).cpu()
+        host_counts = snapshot.statistics.counts.cpu().tolist()
+        host_floats = (
+            torch.cat((snapshot.statistics.sums, snapshot.statistics.abs_max), dim=1)
+            .cpu()
+            .tolist()
+        )
 
         for binding in self._bindings:
             if binding.output_row is None or binding.cotangent_row is None:
                 continue
             output_counts = host_counts[binding.output_row]
             cotangent_counts = host_counts[binding.cotangent_row]
-            if not torch.equal(output_counts[3:6], cotangent_counts[3:6]):
+            if output_counts[3:6] != cotangent_counts[3:6]:
                 raise RuntimeError(
                     f"tensor logging output/cotangent counts differ at {binding.fqn!r}"
                 )
@@ -258,33 +260,32 @@ class OutputStatisticsBatch:
         metrics: dict[str, int | float] = {}
         for index, row in enumerate(self._rows):
             counts = host_counts[index]
-            present = int(counts[_PRESENT])
+            present = counts[_PRESENT]
             if present != self._expected_contributors:
                 raise RuntimeError(
                     f"tensor logging sample {row.metric_prefix!r} was present on "
                     f"{present} of {self._expected_contributors} expected contributors"
                 )
-            call_count = int(counts[_CALL_COUNT])
-            expected_call_count = int(counts[_EXPECTED_CALL_COUNT])
+            call_count = counts[_CALL_COUNT]
+            expected_call_count = counts[_EXPECTED_CALL_COUNT]
             if call_count != expected_call_count:
                 raise RuntimeError(
                     f"tensor logging sample {row.metric_prefix!r} observed "
                     f"{call_count} calls, expected {expected_call_count}"
                 )
-            physical_numel = int(counts[0])
-            expected_numel = int(counts[_EXPECTED_NUMEL])
+            physical_numel = counts[0]
+            expected_numel = counts[_EXPECTED_NUMEL]
             if physical_numel != expected_numel:
                 raise RuntimeError(
                     f"tensor logging sample {row.metric_prefix!r} contains "
                     f"{physical_numel} elements, expected {expected_numel}"
                 )
 
-            derived = derive_finite_statistics(
-                FiniteStatistics(
-                    counts=counts[:3],
-                    sums=host_floats[index, :2],
-                    abs_max=host_floats[index, 2:3],
-                )
+            floats = host_floats[index]
+            derived = derive_finite_statistics_values(
+                counts[:3],
+                floats[:2],
+                floats[2],
             )
             derived["observation_count"] = call_count
             derived["window_steps"] = window_steps

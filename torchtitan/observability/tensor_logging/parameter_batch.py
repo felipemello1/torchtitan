@@ -20,7 +20,7 @@ from torchtitan.observability.tensor_logging.parameter_ownership import (
     local_value_for_owner_group,
 )
 from torchtitan.observability.tensor_logging.statistics import (
-    derive_finite_statistics,
+    derive_finite_statistics_values,
     finite_statistics,
     FiniteStatistics,
     reduce_finite_statistics,
@@ -183,10 +183,14 @@ class ParameterStatisticsBatch:
             snapshot.statistics,
             strict=True,
         ):
-            host_counts = statistics.counts.cpu()
-            host_floats = torch.cat((statistics.sums, statistics.abs_max), dim=1).cpu()
+            host_counts = statistics.counts.cpu().tolist()
+            host_floats = (
+                torch.cat((statistics.sums, statistics.abs_max), dim=1).cpu().tolist()
+            )
             for index, row in enumerate(group.rows):
-                present = int(host_counts[index, 3])
+                counts = host_counts[index]
+                floats = host_floats[index]
+                present = counts[3]
                 if present == 0:
                     if row.family is TensorMetricFamily.PARAMETER:
                         raise RuntimeError(
@@ -200,18 +204,17 @@ class ParameterStatisticsBatch:
                         f"{present} of {group.expected_contributors} expected owners"
                     )
 
-                row_statistics = FiniteStatistics(
-                    counts=host_counts[index, :3],
-                    sums=host_floats[index, :2],
-                    abs_max=host_floats[index, 2:3],
-                )
-                reduced_numel = int(row_statistics.counts[0])
+                reduced_numel = counts[0]
                 if reduced_numel != row.parameter.numel:
                     raise ValueError(
                         f"reduced parameter numel is {reduced_numel}, "
                         f"expected {row.parameter.numel}"
                     )
-                derived = derive_finite_statistics(row_statistics)
+                derived = derive_finite_statistics_values(
+                    counts[:3],
+                    floats[:2],
+                    floats[2],
+                )
                 derived["observation_count"] = 1
                 derived["window_steps"] = window_steps
                 metrics.update(
