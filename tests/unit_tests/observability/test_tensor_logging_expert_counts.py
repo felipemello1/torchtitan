@@ -54,9 +54,9 @@ class TestOfferedAssignmentsFourRanks(DTensorTestBase):
 
         ep_dims = ParallelDims(
             dp_replicate=1,
-            dp_shard=2,
+            dp_shard=1,
             cp=1,
-            tp=2,
+            tp=4,
             pp=1,
             ep=2,
             world_size=self.world_size,
@@ -96,9 +96,9 @@ class TestOfferedAssignmentsFourRanks(DTensorTestBase):
 
         assert ep_snapshot.local_error is None
         assert ep_snapshot.values[0, :4].tolist() == [10, 10, 10, 10]
-        assert int(ep_snapshot.values[0, 4]) == 2
+        assert int(ep_snapshot.values[0, 4]) == 1
         assert ep_snapshot.values[1, :4].tolist() == [22, 24, 42, 44]
-        assert int(ep_snapshot.values[1, 4]) == 2
+        assert int(ep_snapshot.values[1, 4]) == 1
         ep_metrics = ep_batch.derive_metrics(ep_snapshot, window_steps=3)
         prefix = "tensor_metrics/layers.0"
         assert (
@@ -114,7 +114,7 @@ class TestOfferedAssignmentsFourRanks(DTensorTestBase):
                 f"{prefix}.moe.expert_compute_rows.standard_dropless."
                 "observation_count"
             ]
-            == 2
+            == 1
         )
         assert (
             ep_metrics[

@@ -93,14 +93,11 @@ class ExpertCountRecorder:
             or self._tp_mesh is None
             or self._tp_mesh.get_local_rank() == 0
         )
-        self._contributes_offered_observations = (
+        self._contributes_observations = (
             self._tp_mesh is None or self._tp_mesh.get_local_rank() == 0
         )
         self._expert_owner = (
             self._ep_mesh.get_local_rank() if self._ep_mesh is not None else 0
-        )
-        self._contributes_compute_observations = (
-            self._ep_mesh is None or self._expert_owner == 0
         )
         self._world_mesh = (
             parallel_dims.world_mesh if parallel_dims.world_size > 1 else None
@@ -263,7 +260,7 @@ class ExpertCountRecorder:
             local_value = value.to_local() if isinstance(value, DTensor) else value
             if self._contributes_offered_counts:
                 self._interval[row_index, : self._num_experts].add_(local_value)
-            if self._contributes_offered_observations:
+            if self._contributes_observations:
                 self._interval[row_index, self._num_experts].add_(1)
         except Exception as error:
             self._failed[row_index] = True
@@ -290,7 +287,7 @@ class ExpertCountRecorder:
                 row_index,
                 start : start + self._experts_per_owner,
             ].add_(value)
-            if self._contributes_compute_observations:
+            if self._contributes_observations:
                 self._interval[row_index, self._num_experts].add_(1)
         except Exception as error:
             self._failed[row_index] = True
