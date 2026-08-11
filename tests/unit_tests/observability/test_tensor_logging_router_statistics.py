@@ -35,11 +35,15 @@ class _Model(nn.Module):
         self.layers = nn.ModuleList([_Layer(moe)])
 
 
-def _build_model(*, expert_bias: torch.Tensor | None) -> tuple[_Model, MoE]:
+def _build_model(
+    *,
+    expert_bias: torch.Tensor | None,
+    score_func: str = "softmax",
+) -> tuple[_Model, MoE]:
     router = object.__new__(TokenChoiceTopKRouter)
     nn.Module.__init__(router)
     router.num_experts = 2
-    router.score_func = "softmax"
+    router.score_func = score_func
     router.num_expert_groups = None
     router._debug_force_load_balance = False
     router.statistics_recorder = None
@@ -192,6 +196,42 @@ class TestRouterStatisticsFourRanks(DTensorTestBase):
         assert replica_metrics[f"{prefix}.moe.router.observation_count"] == 2
         replica_recorder.close()
 
+    @with_comms
+    def test_ep_without_tp_uses_distinct_dp_sequences(self) -> None:
+        device = torch.device(self.device_type)
+        parallel_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=4,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=4,
+            world_size=self.world_size,
+        )
+        parallel_dims.build_mesh()
+        model, moe = _build_model(expert_bias=None)
+        recorder = RouterStatisticsRecorder(
+            model=model,
+            parallel_dims=parallel_dims,
+            layer_ids=(0,),
+            families=(TensorMetricFamily.PER_SEQUENCE_ROUTING,),
+            local_batch_size=2,
+            device=device,
+        )
+        assert moe.per_sequence_assignments_recorder is not None
+        moe.per_sequence_assignments_recorder(
+            torch.tensor([[1, 0], [0, 1]], dtype=torch.int64, device=device)
+        )
+
+        metrics = recorder.derive_metrics(recorder.collect(), window_steps=1)
+        prefix = "tensor_metrics/layers.0.moe.per_sequence"
+        assert metrics[f"{prefix}.maximum_violation_mean"] == 1.0
+        assert metrics[f"{prefix}.maximum_violation_max"] == 1.0
+        assert metrics[f"{prefix}.sequence_count"] == 8
+        assert metrics[f"{prefix}.assigned_sequence_count"] == 8
+        assert metrics[f"{prefix}.observation_count"] == 4
+        recorder.close()
+
 
 def test_router_distribution_is_token_weighted_and_resets() -> None:
     model, moe = _build_model(expert_bias=torch.tensor([0.2, -0.2]))
@@ -266,6 +306,31 @@ def test_router_distribution_accepts_bias_free_choice_scores() -> None:
     assert metrics[
         "tensor_metrics/layers.0.moe.router_choice_entropy"
     ] == pytest.approx(float(torch.log(torch.tensor(2.0))))
+    recorder.close()
+
+
+@pytest.mark.parametrize("score_func", ("softmax", "sigmoid"))
+def test_router_distribution_entropy_handles_saturated_logits(
+    score_func: str,
+) -> None:
+    model, moe = _build_model(expert_bias=None, score_func=score_func)
+    recorder = RouterStatisticsRecorder(
+        model=model,
+        parallel_dims=_single_rank_dims(ep=1),
+        layer_ids=(0,),
+        families=(TensorMetricFamily.ROUTER_DISTRIBUTION,),
+        local_batch_size=1,
+        device=torch.device("cpu"),
+    )
+    assert moe.router.statistics_recorder is not None
+    moe.router.statistics_recorder(
+        torch.tensor([[[-1000.0, 0.0]]]),
+        torch.tensor([[[0.0, 1.0]]]),
+        None,
+    )
+
+    metrics = recorder.derive_metrics(recorder.collect(), window_steps=1)
+    assert metrics["tensor_metrics/layers.0.moe.router_choice_entropy"] == 0.0
     recorder.close()
 
 

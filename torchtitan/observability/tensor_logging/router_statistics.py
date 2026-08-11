@@ -94,7 +94,7 @@ class RouterStatisticsRecorder:
         self._world_mesh = (
             parallel_dims.world_mesh if parallel_dims.world_size > 1 else None
         )
-        self._router_is_tp_sharded = parallel_dims.ep > 1
+        self._router_is_tp_sharded = parallel_dims.ep > 1 and self._tp_mesh is not None
         self._expected_router_placements = (
             (Shard(1),) if self._router_is_tp_sharded else (Replicate(),)
         )
@@ -243,9 +243,9 @@ class RouterStatisticsRecorder:
                     mean_scores = torch.sigmoid(mean_logits)
                 entropy_probabilities = mean_scores + mean_bias - mean_bias.min()
                 entropy_probabilities /= entropy_probabilities.sum()
-                entropy = -torch.sum(
-                    entropy_probabilities * torch.log(entropy_probabilities)
-                )
+                entropy = -torch.special.xlogy(
+                    entropy_probabilities, entropy_probabilities
+                ).sum()
 
                 prefix = f"tensor_metrics/layers.{layer_id}"
                 for expert_id in range(self._num_experts):
