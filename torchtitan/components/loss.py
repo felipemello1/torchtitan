@@ -737,6 +737,8 @@ class ChunkedLossWrapper(BaseLoss):
                     )
 
                 logits = lm_head(h_chunk)
+                # Decoder registered this key and skips its own lm_head call in
+                # chunked mode, so this is the only recording path that executes.
                 log_fwd_bwd_stats(lm_head, output=logits)
 
                 chunk_inputs = {
