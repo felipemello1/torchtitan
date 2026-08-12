@@ -7,6 +7,7 @@
 # This file provides the util functions to apply activation checkpointing to the model.
 # Technically, this is not a part of distributed, but distributed module is the best place to put it.
 
+import contextlib
 import os
 from dataclasses import dataclass, field
 from typing import Annotated, cast
@@ -19,13 +20,70 @@ from torch._functorch.partitioners import get_default_op_list
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
+from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.checkpoint import (
     CheckpointPolicy,
     create_selective_checkpoint_contexts,
 )
 
 from torchtitan.config import Configurable
+from torchtitan.observability.tensor_logging import (
+    disable as disable_tensor_logging,
+    is_enabled as is_tensor_logging_enabled,
+)
 from torchtitan.tools.logging import logger
+
+
+class _TensorLoggingCheckpointMode(TorchDispatchMode):
+    """Suppress graph-visible metric mutations during FullAC recomputation."""
+
+    _MUTATING_METRIC_OPS = {
+        "torchtitan::accumulate_expert_tokens",
+        "torchtitan::accumulate_tensor_statistics",
+        "torchtitan::store_router_metric",
+    }
+
+    @classmethod
+    def ignore_compile_internals(cls) -> bool:
+        return True
+
+    def __init__(self, *, disable_mutations: bool) -> None:
+        super().__init__()
+        self._disable_mutations = disable_mutations
+        self._disable_context = None
+
+    def __enter__(self):
+        if self._disable_mutations:
+            self._disable_context = disable_tensor_logging()
+            self._disable_context.__enter__()
+        return super().__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return super().__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            if self._disable_context is not None:
+                self._disable_context.__exit__(exc_type, exc_val, exc_tb)
+                self._disable_context = None
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if self._disable_mutations and func._schema.name in self._MUTATING_METRIC_OPS:
+            return None
+        return func(*args, **(kwargs or {}))
+
+
+def _with_tensor_logging_disabled_on_recompute(*, has_moe_side_effects: bool):
+    """Return contexts that suppress metric and MoE recompute mutations."""
+
+    def composed_context_fn():
+        if not has_moe_side_effects and not is_tensor_logging_enabled():
+            return contextlib.nullcontext(), contextlib.nullcontext()
+        return (
+            _TensorLoggingCheckpointMode(disable_mutations=False),
+            _TensorLoggingCheckpointMode(disable_mutations=True),
+        )
+
+    return composed_context_fn
 
 
 def _get_default_save_ops() -> set:
@@ -38,6 +96,15 @@ def _get_default_save_ops() -> set:
     """
     # Ops whose outputs are expensive to recompute (matmuls, attention, etc.)
     compute_ops = [
+        # Tensor logging mutates fixed buffers and must execute only in the
+        # original forward, not selective-checkpoint recomputation.
+        torch.ops.torchtitan.accumulate_tensor_statistics.default,
+        # MoE operational expert counts are another forward side effect that
+        # must execute only once under selective recomputation.
+        (torch.ops, "torchtitan.accumulate_expert_tokens.default"),
+        # Per-sequence router counts retain the last logical forward and are
+        # consumed in one batched topology-aware optimizer hook.
+        (torch.ops, "torchtitan.store_router_metric.default"),
         # SDPA variants
         torch.ops.aten._scaled_dot_product_cudnn_attention.default,
         torch.ops.aten._scaled_dot_product_attention_math.default,
@@ -175,6 +242,9 @@ class FullAC(ActivationCheckpointing):
     ) -> nn.Module:
         return ptd_checkpoint_wrapper(
             module,
+            context_fn=_with_tensor_logging_disabled_on_recompute(
+                has_moe_side_effects=getattr(module, "moe_enabled", False)
+            ),
             preserve_rng_state=self.config.preserve_rng_state,
             determinism_check=self.config.determinism_check,
             early_stop=False,
@@ -216,6 +286,18 @@ class SelectiveAC(ActivationCheckpointing):
     ) -> nn.Module:
         config = cast("SelectiveAC.Config", self.config)
         save_ops = self.get_save_ops()
+        # These state mutations are correctness invariants, not tunable
+        # compute-cache choices. Preserve them even when a subclass customizes
+        # the documented save set.
+        save_ops.add(torch.ops.torchtitan.accumulate_tensor_statistics.default)
+        try:
+            save_ops.add(torch.ops.torchtitan.accumulate_expert_tokens.default)
+        except AttributeError:
+            pass
+        try:
+            save_ops.add(torch.ops.torchtitan.store_router_metric.default)
+        except AttributeError:
+            pass
 
         # Collect weight shapes to force-recompute, stored as mm RHS shape
         # (in_f, out_f). For aten.linear we transpose args[1].shape at lookup

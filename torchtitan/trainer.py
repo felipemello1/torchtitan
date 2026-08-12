@@ -25,7 +25,10 @@ from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhausted
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper, IGNORE_INDEX
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import (
+    log_optimizer_tensor_statistics,
+    OptimizersContainer,
+)
 from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.components.validate import BaseValidator, Validator
@@ -48,7 +51,17 @@ from torchtitan.distributed.context_parallel import prepare_context_parallel_inp
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
 from torchtitan.models.common.attention import FlexAttention, VarlenAttention
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.moe import MoE
 from torchtitan.observability import structured_logger as sl
+from torchtitan.observability.tensor_logging import (
+    init as init_tensor_logging,
+    is_enabled as is_tensor_logging_enabled,
+    log_stats as log_tensor_stats,
+    register as register_tensor_stats,
+    set_enabled as set_tensor_logging_enabled,
+    TensorLoggingRuntime,
+)
+from torchtitan.observability.tensor_logging.data import DataStatistics
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools import utils
@@ -223,6 +236,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     lr_schedulers: LRSchedulersContainer
     validator: BaseValidator
     metrics_processor: MetricsProcessor
+    tensor_logging: TensorLoggingRuntime | None
+    data_statistics: DataStatistics | None
     checkpointer: CheckpointManager
 
     # runtime utilities
@@ -461,6 +476,55 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
                 self.model_parts = [model]
 
+        self.tensor_logging = None
+        if config.metrics.enable_tensor_logging:
+            tensor_logging_freq = config.metrics.tensor_logging_freq
+            if tensor_logging_freq <= 0:
+                raise ValueError("metrics.tensor_logging_freq must be positive")
+            if tensor_logging_freq % config.metrics.log_freq != 0:
+                raise ValueError(
+                    "metrics.tensor_logging_freq must be a multiple of "
+                    "metrics.log_freq"
+                )
+            if parallel_dims.pp_enabled:
+                raise NotImplementedError(
+                    "tensor logging requires stable global names before it can run "
+                    "with pipeline parallelism"
+                )
+            for model_part in self.model_parts:
+                for module in model_part.modules():
+                    if isinstance(module, MoE):
+                        module.init_sequence_expert_counts(
+                            num_sequences=(
+                                config.parallelism.pipeline_parallel_microbatch_size
+                                if parallel_dims.pp_enabled
+                                else config.training.local_batch_size
+                            ),
+                            device=self.device,
+                        )
+                for parameter in model_part.parameters():
+                    if parameter.requires_grad:
+                        parameter_metric_names = [
+                            "w",
+                            "dw",
+                            "normed_dw",
+                            "numerator",
+                            "denominator",
+                        ]
+                        if config.metrics.tensor_logging_optimizer_cosine:
+                            parameter_metric_names.append("cos_sim_m_g")
+                        register_tensor_stats(
+                            parameter,
+                            parameter_metric_names,
+                        )
+            self.tensor_logging = init_tensor_logging(
+                self.model_parts,
+                device=self.device,
+                metrics_filter_regex=(
+                    config.metrics.tensor_logging_metrics_filter_regex
+                ),
+            )
+
         # Set lm_head reference for ChunkedLossWrapper after model construction.
         # Non-PP: single model part always has lm_head.
         # PP: only the last stage has lm_head; non-last stages skip this.
@@ -540,6 +604,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 else None
             ),
         )
+        self.data_statistics = None
+        dataset_id = getattr(config.dataloader, "dataset", None)
+        if self.tensor_logging is not None and not parallel_dims.pp_enabled:
+            if dataset_id is not None:
+                tp_mesh = parallel_dims.get_optional_mesh("tp")
+                cp_mesh = parallel_dims.get_optional_mesh("cp")
+                tp_representative = tp_mesh is None or tp_mesh.get_local_rank() == 0
+                cp_representative = cp_mesh is None or cp_mesh.get_local_rank() == 0
+                self.data_statistics = DataStatistics(
+                    dataset_id=dataset_id,
+                    data_contributor=tp_representative and cp_representative,
+                    loss_contributor=tp_representative,
+                    step_contributor=torch.distributed.get_rank() == 0,
+                    ignore_index=IGNORE_INDEX,
+                    device=self.device,
+                )
 
         # build checkpointer
         self.checkpointer = config.checkpoint.build(
@@ -813,6 +893,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
+        if self.tensor_logging is None:
+            return self._train_step(data_iterator)
+        with set_tensor_logging_enabled(
+            self.step % self.config.metrics.tensor_logging_freq == 0
+        ):
+            return self._train_step(data_iterator)
+
+    def _train_step(
+        self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
+    ):
         self.optimizers.zero_grad()
         # Save per-optimizer-group learning rates for logging
         lr_metrics = self.lr_schedulers.get_metrics()
@@ -852,8 +942,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 for key, value in input_dict.items():
                     if isinstance(value, torch.Tensor):
                         input_dict[key] = value.to(self.device)
+                labels = labels.to(self.device)
+                if self.data_statistics is not None:
+                    self.data_statistics.record_batch(
+                        labels,
+                        input_dict.get("positions"),
+                    )
                 input_dict_mbs.append(input_dict)
-                label_mbs.append(labels.to(self.device))
+                label_mbs.append(labels)
 
             if parallel_dims.pp_enabled:
                 fwd_bwd_input_dict = input_dict_mbs
@@ -871,6 +967,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             accumulated_losses.append(loss.detach())
 
         with sl.log_trace_span("optim"):
+            if is_tensor_logging_enabled():
+                for model_part in self.model_parts:
+                    for parameter in model_part.parameters():
+                        if parameter.grad is not None:
+                            log_tensor_stats(
+                                parameter,
+                                dw=parameter.grad,
+                            )
+
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.model_parts for p in m.parameters()],
                 self.config.training.max_norm,
@@ -878,15 +983,38 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 pp_mesh=parallel_dims.get_optional_mesh("pp"),
                 ep_enabled=parallel_dims.ep_enabled,
             )
+            if is_tensor_logging_enabled():
+                for model_part in self.model_parts:
+                    for parameter in model_part.parameters():
+                        if parameter.grad is not None:
+                            log_tensor_stats(parameter, normed_dw=parameter.grad)
             self.checkpointer.maybe_wait_for_staging()
             self.optimizers.step()
+            log_optimizer_tensor_statistics(
+                self.optimizers,
+                log_cosine=self.config.metrics.tensor_logging_optimizer_cosine,
+            )
             self.lr_schedulers.step()
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
+        if self.data_statistics is not None:
+            self.data_statistics.record_step_loss(loss, global_valid_tokens)
 
         # log metrics
-        if not self.metrics_processor.should_log(self.step):
+        should_log = self.metrics_processor.should_log(self.step)
+        tensor_metrics: dict[str, int | float] = {}
+        if self.tensor_logging is not None and is_tensor_logging_enabled():
+            try:
+                tensor_metrics = self.tensor_logging.buffers_to_metrics(
+                    self.tensor_logging.reduce_buffers()
+                )
+                if self.data_statistics is not None:
+                    tensor_metrics.update(self.data_statistics.collect())
+            finally:
+                self.tensor_logging.clear()
+
+        if not should_log:
             return
 
         with sl.log_trace_span("collect_dist_metrics"):
@@ -934,6 +1062,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,
+            **tensor_metrics,
         }
         self.metrics_processor.log(
             self.step,
@@ -1019,5 +1148,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     def close(self) -> None:
         if hasattr(self, "checkpointer") and self.checkpointer:
             self.checkpointer.close()
+        if hasattr(self, "tensor_logging") and self.tensor_logging:
+            self.tensor_logging.close()
         if hasattr(self, "metrics_processor") and self.metrics_processor:
             self.metrics_processor.close()

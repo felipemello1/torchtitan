@@ -18,6 +18,7 @@ from torchtitan.models.common.attention import (
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
+from torchtitan.observability.tensor_logging import log_fwd_bwd_stats, register_fwd_bwd
 
 
 class Qwen3TransformerBlock(TransformerBlock):
@@ -50,6 +51,10 @@ class Qwen3TransformerBlock(TransformerBlock):
 
         self.attention_norm = config.attention_norm.build()
         self.ffn_norm = config.ffn_norm.build()
+        register_fwd_bwd(
+            self,
+            ["attn_stream", "attn_out", "ffn_stream", "ffn_out"],
+        )
 
     def forward(
         self,
@@ -57,12 +62,22 @@ class Qwen3TransformerBlock(TransformerBlock):
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
     ):
-        x = x + self.attention(self.attention_norm(x), attention_masks, positions)
+        attn_out = self.attention(
+            self.attention_norm(x),
+            attention_masks,
+            positions,
+        )
+        x = log_fwd_bwd_stats(self, attn_stream=x)
+        attn_out = log_fwd_bwd_stats(self, attn_out=attn_out)
+        x = x + attn_out
 
         if self.moe_enabled:
-            x = x + self.moe(self.ffn_norm(x))
+            ffn_out = self.moe(self.ffn_norm(x))
         else:
-            x = x + self.feed_forward(self.ffn_norm(x))
+            ffn_out = self.feed_forward(self.ffn_norm(x))
+        x = log_fwd_bwd_stats(self, ffn_stream=x)
+        ffn_out = log_fwd_bwd_stats(self, ffn_out=ffn_out)
+        x = x + ffn_out
         return x
 
 

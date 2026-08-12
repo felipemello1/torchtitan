@@ -8,12 +8,11 @@ import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, cast, Generic, Literal, overload, Protocol, TypeVar
+from typing import Any, cast, Generic, Literal, overload, TypeVar
 
 import torch
 import torch.distributed.tensor
 import torch.nn as nn
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import Replicate
 from torch.optim import Optimizer
@@ -26,12 +25,18 @@ from torchtitan.components.checkpoint_utils import (
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.flex_shard import build_distributed_muon
+from torchtitan.observability.tensor_logging import is_enabled, log_stats
+from torchtitan.observability.tensor_logging.router import (
+    log_router_statistics,
+    RouterMetricSource,
+)
 from torchtitan.tools.logging import logger
 
 __all__ = [
     "OptimizersContainer",
     "ParamGroupConfig",
     "default_adamw",
+    "log_optimizer_tensor_statistics",
     "register_moe_load_balancing_hook",
 ]
 
@@ -67,12 +72,6 @@ class ParamGroupConfig:
 
 
 T = TypeVar("T", bound=Optimizer)
-
-
-class _MoELike(Protocol):
-    load_balance_coeff: float | None
-    tokens_per_expert_E: torch.Tensor  # noqa: N815
-    expert_bias_E: torch.Tensor  # noqa: N815
 
 
 class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
@@ -398,6 +397,74 @@ def default_adamw(lr: float = 8e-4, **kwargs: Any) -> OptimizersContainer.Config
     )
 
 
+def _momentum_gradient_cosine(
+    momentum: torch.Tensor,
+    gradient: torch.Tensor,
+) -> torch.Tensor:
+    statistics = torch.stack(
+        [
+            (momentum * gradient).sum(),
+            momentum.square().sum(),
+            gradient.square().sum(),
+        ]
+    )
+    if isinstance(statistics, torch.distributed.tensor.DTensor):
+        statistics = statistics.full_tensor()
+    dot_product, momentum_square_sum, gradient_square_sum = statistics
+    denominator = (momentum_square_sum * gradient_square_sum).sqrt().clamp_min(1e-8)
+    return (dot_product / denominator).view(1)
+
+
+@torch.no_grad()
+def log_optimizer_tensor_statistics(
+    optimizers: OptimizersContainer,
+    *,
+    log_cosine: bool = False,
+) -> None:
+    """Record the Adam numerator, denominator, and post-update parameter.
+
+    Args:
+        optimizers: Optimizers whose Adam state should be recorded.
+        log_cosine: Also reconstruct each parameter's momentum/gradient cosine.
+    """
+
+    if not is_enabled():
+        return
+
+    for optimizer in optimizers:
+        if not isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+            continue
+        for group in optimizer.param_groups:
+            beta2 = group["betas"][1]
+            eps = group["eps"]
+            amsgrad = group["amsgrad"]
+            for parameter in group["params"]:
+                if parameter.grad is None:
+                    continue
+                state = optimizer.state[parameter]
+                numerator = state["exp_avg"]
+                second_moment = (
+                    state["max_exp_avg_sq"] if amsgrad else state["exp_avg_sq"]
+                )
+                step = state["step"]
+                bias_correction2 = 1 - beta2**step
+                denominator = second_moment.sqrt() / bias_correction2.sqrt() + eps
+                log_stats(
+                    parameter,
+                    w=parameter,
+                    numerator=numerator,
+                    denominator=denominator,
+                )
+                if log_cosine:
+                    log_stats(
+                        parameter,
+                        cos_sim_m_g=_momentum_gradient_cosine(
+                            numerator,
+                            parameter.grad,
+                        ),
+                    )
+
+
 def register_moe_load_balancing_hook(
     optimizers: OptimizersContainer,
     model_parts: list[nn.Module],
@@ -416,18 +483,20 @@ def register_moe_load_balancing_hook(
 
     def _iter_moe_layers(
         model_parts: list[nn.Module],
-    ) -> Iterator[tuple[nn.Module, _MoELike]]:
+    ) -> Iterator[tuple[nn.Module, RouterMetricSource]]:
         for model_part in model_parts:
             layers = model_part.get_submodule("layers")
             assert isinstance(layers, nn.ModuleDict)
             for transformer_block in layers.values():
                 if getattr(transformer_block, "moe_enabled", False):
-                    yield transformer_block, cast(_MoELike, transformer_block.moe)
+                    yield transformer_block, cast(
+                        RouterMetricSource,
+                        transformer_block.moe,
+                    )
 
-    def _should_register_moe_balancing_hook(model_parts: list[nn.Module]) -> bool:
+    def _moe_load_balancing_enabled(model_parts: list[nn.Module]) -> bool:
         moe_layers = list(_iter_moe_layers(model_parts))
-        if not moe_layers:
-            return False
+        assert moe_layers
 
         load_balance_enabled = moe_layers[0][1].load_balance_coeff is not None
         for _transformer_block, moe in moe_layers[1:]:
@@ -439,29 +508,26 @@ def register_moe_load_balancing_hook(
                 )
         return load_balance_enabled
 
-    # for MoE auxiliary-loss-free load balancing
-    def _is_recomputation_enabled(module):
-        return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
-
     def _update_expert_bias(
         model_parts: list[nn.Module],
         parallel_dims: ParallelDims,
+        load_balance_enabled: bool,
     ):
         loss_mesh = parallel_dims.get_optional_mesh("loss")
         # TODO: Currently this sync is blocking (thus exposed) and happens on the
         # default compute stream. Need to assess if this is OK performance-wise.
-        tokens_per_expert_E_list = []
-        for transformer_block, moe in _iter_moe_layers(model_parts):
-            tokens_per_expert_E = moe.tokens_per_expert_E
-            if _is_recomputation_enabled(transformer_block):
-                # TODO: This is a hack, we assume with full AC, the tokens_per_expert_E is counted twice.
-                # This does not affect to expert choice, but affects the experts usage metrics.
-                # We divide by 2 to correct for this double-counting due to recomputation
-                # TODO: new API to help determine if AC is enabled https://github.com/pytorch/pytorch/pull/160888
-                tokens_per_expert_E = tokens_per_expert_E // 2
-            tokens_per_expert_E_list.append(tokens_per_expert_E)
+        moe_layers = list(_iter_moe_layers(model_parts))
+        tokens_per_expert_E_list = [
+            moe.tokens_per_expert_E for _transformer_block, moe in moe_layers
+        ]
 
         if not tokens_per_expert_E_list:
+            return
+
+        logging_enabled = is_enabled()
+        if not load_balance_enabled and not logging_enabled:
+            for tokens_per_expert_E in tokens_per_expert_E_list:
+                tokens_per_expert_E.zero_()
             return
 
         tokens_per_expert_E_by_layer = torch.vstack(tokens_per_expert_E_list)
@@ -507,37 +573,42 @@ def register_moe_load_balancing_hook(
                     run_check=False,
                 )
 
-        moe_layer_idx = 0
+        if logging_enabled:
+            log_router_statistics(
+                moe_layers,
+                local_tokens_per_expert_by_layer=tokens_per_expert_E_list,
+                global_tokens_per_expert_by_layer=tokens_per_expert_E_by_layer,
+                parallel_dims=parallel_dims,
+            )
+
         with torch.no_grad():
-            for model_part in model_parts:
-                layers = model_part.get_submodule("layers")
-                assert isinstance(layers, nn.ModuleDict)
-                for transformer_block in layers.values():
-                    if not transformer_block.moe_enabled:
-                        continue
-                    moe = cast(_MoELike, transformer_block.moe)
-                    load_balance_coeff = moe.load_balance_coeff
-                    assert load_balance_coeff is not None
-
-                    tokens_per_expert_E = tokens_per_expert_E_by_layer[
-                        moe_layer_idx
-                    ].float()
-                    moe_layer_idx += 1
-
-                    # update the expert bias
-                    # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
+            for (_transformer_block, moe), tokens_per_expert_E in zip(
+                moe_layers,
+                tokens_per_expert_E_by_layer,
+                strict=True,
+            ):
+                tokens_per_expert_E = tokens_per_expert_E.float()
+                load_balance_coeff = moe.load_balance_coeff
+                if load_balance_coeff is not None:
+                    # This is not exactly the same as
+                    # https://arxiv.org/pdf/2408.15664 proposed.
                     expert_bias_delta_E = load_balance_coeff * torch.sign(
                         tokens_per_expert_E.mean() - tokens_per_expert_E
                     )
                     expert_bias_delta_E = (
                         expert_bias_delta_E - expert_bias_delta_E.mean()
                     )
+                    assert moe.expert_bias_E is not None
                     moe.expert_bias_E.add_(expert_bias_delta_E)
-                    moe.tokens_per_expert_E.zero_()
+                moe.tokens_per_expert_E.zero_()
 
-    if _should_register_moe_balancing_hook(model_parts):
+    moe_layers = list(_iter_moe_layers(model_parts))
+    if moe_layers:
+        load_balance_enabled = _moe_load_balancing_enabled(model_parts)
         optimizers.register_step_pre_hook(
             lambda *args, **kwargs: _update_expert_bias(
-                model_parts, parallel_dims=parallel_dims
+                model_parts,
+                parallel_dims=parallel_dims,
+                load_balance_enabled=load_balance_enabled,
             )
         )

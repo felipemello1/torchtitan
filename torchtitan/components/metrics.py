@@ -299,6 +299,18 @@ class MetricsProcessor(Configurable):
         enable_wandb: bool = False
         """Whether to log metrics to Weights & Biases"""
 
+        enable_tensor_logging: bool = False
+        """Whether to record model tensor statistics."""
+
+        tensor_logging_freq: int = 100
+        """How often to record tensor statistics, in iterations."""
+
+        tensor_logging_metrics_filter_regex: str = ""
+        """Allowlist regex over each tensor metric's ``<name>:<statistic>``."""
+
+        tensor_logging_optimizer_cosine: bool = False
+        """Whether to record the per-parameter Adam momentum/gradient cosine."""
+
     config: Config
     logger: BaseLogger
     parallel_dims: ParallelDims

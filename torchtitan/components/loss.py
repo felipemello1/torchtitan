@@ -21,6 +21,7 @@ from torch.distributed.tensor.experimental import local_map
 from torchtitan.config import CompileConfig, Configurable
 from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
 from torchtitan.distributed.utils import get_spmd_backend
+from torchtitan.observability.tensor_logging import log_fwd_bwd_stats
 from torchtitan.tools.logging import logger
 
 # PyTorch's default ignore index for cross-entropy loss
@@ -736,6 +737,7 @@ class ChunkedLossWrapper(BaseLoss):
                     )
 
                 logits = lm_head(h_chunk)
+                logits = log_fwd_bwd_stats(lm_head, output=logits)
 
                 chunk_inputs = {
                     key: chunks[i] if isinstance(chunks, tuple) else chunks
