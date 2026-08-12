@@ -236,7 +236,8 @@ class Decoder(BaseModel):
         # attention_masks slot and break the maskless SDPA backend).
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
-        h = log_fwd_bwd_stats(self, input=h)
+        if self.tok_embeddings is not None:
+            log_fwd_bwd_stats(self, input=h)
 
         for layer in self.layers.values():
             h = layer(h, attention_masks, positions)
@@ -251,7 +252,8 @@ class Decoder(BaseModel):
         if self.lm_head is None:
             return h
         output = self.lm_head(h)
-        return log_fwd_bwd_stats(self.lm_head, output=output)
+        log_fwd_bwd_stats(self.lm_head, output=output)
+        return output
 
     def _create_flex_attention_mask(
         self,

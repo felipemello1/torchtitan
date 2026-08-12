@@ -49,6 +49,7 @@ class _TensorLoggingCheckpointMode(TorchDispatchMode):
 
     def __init__(self, *, disable_mutations: bool) -> None:
         super().__init__()
+        self.supports_higher_order_operators = True
         self._disable_mutations = disable_mutations
         self._disable_context = None
 
@@ -67,7 +68,11 @@ class _TensorLoggingCheckpointMode(TorchDispatchMode):
                 self._disable_context = None
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        if self._disable_mutations and func._schema.name in self._MUTATING_METRIC_OPS:
+        if (
+            self._disable_mutations
+            and isinstance(func, torch._ops.OpOverload)
+            and func._schema.name in self._MUTATING_METRIC_OPS
+        ):
             return None
         return func(*args, **(kwargs or {}))
 
@@ -76,12 +81,19 @@ def _with_tensor_logging_disabled_on_recompute(*, has_moe_side_effects: bool):
     """Return contexts that suppress metric and MoE recompute mutations."""
 
     def composed_context_fn():
-        if not has_moe_side_effects and not is_tensor_logging_enabled():
-            return contextlib.nullcontext(), contextlib.nullcontext()
-        return (
-            _TensorLoggingCheckpointMode(disable_mutations=False),
-            _TensorLoggingCheckpointMode(disable_mutations=True),
-        )
+        if torch.compiler.is_compiling():
+            return (
+                _TensorLoggingCheckpointMode(disable_mutations=False),
+                _TensorLoggingCheckpointMode(disable_mutations=True),
+            )
+        if has_moe_side_effects:
+            return (
+                contextlib.nullcontext(),
+                _TensorLoggingCheckpointMode(disable_mutations=True),
+            )
+        if is_tensor_logging_enabled():
+            return contextlib.nullcontext(), disable_tensor_logging()
+        return contextlib.nullcontext(), contextlib.nullcontext()
 
     return composed_context_fn
 

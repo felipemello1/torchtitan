@@ -55,13 +55,11 @@ class Llama3TransformerBlock(TransformerBlock):
             attention_masks,
             positions,
         )
-        x = log_fwd_bwd_stats(self, attn_stream=x)
-        attn_out = log_fwd_bwd_stats(self, attn_out=attn_out)
+        log_fwd_bwd_stats(self, attn_stream=x, attn_out=attn_out)
         h = x + attn_out
 
         ffn_out = self.feed_forward(self.ffn_norm(h))
-        h = log_fwd_bwd_stats(self, ffn_stream=h)
-        ffn_out = log_fwd_bwd_stats(self, ffn_out=ffn_out)
+        log_fwd_bwd_stats(self, ffn_stream=h, ffn_out=ffn_out)
         out = h + ffn_out
         return out
 

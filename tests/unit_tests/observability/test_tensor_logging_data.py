@@ -31,18 +31,20 @@ def test_weighted_loss_and_document_statistics() -> None:
 
     statistics.record_batch(labels, positions)
     statistics.record_step_loss(torch.tensor(0.25), global_valid_tokens=8)
+    statistics.record_batch(labels, positions)
+    statistics.record_step_loss(torch.tensor(0.75), global_valid_tokens=8)
     metrics = statistics.collect()
 
     dataset = "data/datasets.c4_test"
-    assert metrics[f"{dataset}.loss_mean"] == pytest.approx(0.25)
-    assert metrics[f"{dataset}.valid_token_count"] == 8
-    assert metrics[f"{dataset}.all_token_count"] == 10
+    assert metrics[f"{dataset}.loss_mean"] == pytest.approx(0.5)
+    assert metrics[f"{dataset}.valid_token_count"] == 16
+    assert metrics[f"{dataset}.all_token_count"] == 20
     assert metrics[f"{dataset}.masked_fraction"] == pytest.approx(0.2)
-    assert metrics[f"{dataset}.batch_count"] == 1
-    assert metrics[f"{dataset}.window_steps"] == 1
+    assert metrics[f"{dataset}.batch_count"] == 2
+    assert metrics[f"{dataset}.window_steps"] == 2
     assert metrics["data/documents.segment_length_mean"] == pytest.approx(2.5)
-    assert metrics["data/documents.segment_count"] == 4
-    assert metrics["data/block_causal.sum_length_squared"] == 26
+    assert metrics["data/documents.segment_count"] == 8
+    assert metrics["data/block_causal.sum_length_squared"] == 52
 
     cleared = statistics.collect()
     assert cleared[f"{dataset}.valid_token_count"] == 0

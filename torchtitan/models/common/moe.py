@@ -226,7 +226,7 @@ class RoutedExperts(Module):
             topk_expert_ids_TK,
             num_local_tokens_per_expert_E,
         )
-        routed_input_RD = log_fwd_bwd_stats(
+        log_fwd_bwd_stats(
             self,
             expert_input=routed_input_RD,
         )
@@ -369,12 +369,13 @@ class TokenChoiceTopKRouter(Module):
         with torch.autocast(device_type=x_BLD.device.type, dtype=torch.float32):
             router_logits_BLE = self.gate(x_BLD)
 
-        router_logits_mean_E = router_logits_BLE.mean(dim=(0, 1))
-        log_stats(self, router_logits=router_logits_mean_E)
-        _record_router_metric_once(
-            self._router_logits_mean_E,
-            router_logits_mean_E,
-        )
+        with spmd.no_typecheck():
+            router_logits_mean_E = router_logits_BLE.mean(dim=(0, 1))
+            log_stats(self, router_logits=router_logits_mean_E)
+            _record_router_metric_once(
+                self._router_logits_mean_E,
+                router_logits_mean_E,
+            )
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion.
         # router_logits_BLE is already float32 from the autocast above.
@@ -388,10 +389,11 @@ class TokenChoiceTopKRouter(Module):
         scores_for_choice_BLE = (
             scores_BLE if expert_bias_E is None else scores_BLE + expert_bias_E
         )
-        log_stats(
-            self,
-            router_scores_for_topk=scores_for_choice_BLE.mean(dim=(0, 1)),
-        )
+        with spmd.no_typecheck():
+            log_stats(
+                self,
+                router_scores_for_topk=scores_for_choice_BLE.mean(dim=(0, 1)),
+            )
         # Apply node-limited routing if configured
         if self.num_expert_groups is not None:
             scores_for_choice_BLE = self._get_node_limited_routing_scores(
@@ -532,7 +534,7 @@ class MoE(Module):
         sequence-shards tokens across TP, the caller must provide a TP-divisible
         sequence length.
         """
-        x_BLD = log_fwd_bwd_stats(self, input_normed=x_BLD)
+        log_fwd_bwd_stats(self, input_normed=x_BLD)
         # topk_scores_BLK and topk_expert_ids_BLK shape (B, L, K)
         # scores_BLE shape (B, L, E)
         (
@@ -552,19 +554,20 @@ class MoE(Module):
         )
         num_local_tokens_per_expert_E = routing_map_BLE.sum(dim=(0, 1))
 
-        if self._sequence_expert_counts_BE is not None:
-            _record_router_metric_once(
-                self._sequence_expert_counts_BE,
-                routing_map_BLE.sum(dim=1, dtype=torch.float32),
-            )
+        with spmd.no_typecheck():
+            if self._sequence_expert_counts_BE is not None:
+                _record_router_metric_once(
+                    self._sequence_expert_counts_BE,
+                    routing_map_BLE.sum(dim=1, dtype=torch.float32),
+                )
 
-        # This operational state drives load balancing and expert-usage metrics.
-        # FullAC suppresses the recompute call; SelectiveAC preserves the opaque
-        # mutation as MUST_SAVE, so each logical forward contributes once.
-        _record_expert_tokens_once(
-            self.tokens_per_expert_E,
-            num_local_tokens_per_expert_E,
-        )
+            # This operational state drives load balancing and expert-usage metrics.
+            # FullAC suppresses the recompute call; SelectiveAC preserves the opaque
+            # mutation as MUST_SAVE, so each logical forward contributes once.
+            _record_expert_tokens_once(
+                self.tokens_per_expert_E,
+                num_local_tokens_per_expert_E,
+            )
 
         out_BLD = self.routed_experts(
             x_BLD,
@@ -572,14 +575,14 @@ class MoE(Module):
             topk_expert_ids_BLK,
             num_local_tokens_per_expert_E,
         )
-        out_BLD = log_fwd_bwd_stats(self, routed_output=out_BLD)
+        log_fwd_bwd_stats(self, routed_output=out_BLD)
 
         shared_out_BLD = (
             self.shared_experts(x_BLD) if self.shared_experts is not None else None
         )
 
         if shared_out_BLD is not None:
-            shared_out_BLD = log_fwd_bwd_stats(
+            log_fwd_bwd_stats(
                 self,
                 shared_output=shared_out_BLD,
             )

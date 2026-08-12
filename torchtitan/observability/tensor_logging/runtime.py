@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import contextlib
 import re
-import weakref
 from collections.abc import Iterable, Iterator, Sequence
 from typing import cast, TypeAlias
 
+import spmd_types as spmd
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -22,13 +22,41 @@ from .statistics import accumulate_tensor_statistics, StatisticBuffers
 
 Owner: TypeAlias = nn.Module | nn.Parameter
 ReducedBuffers: TypeAlias = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+StatisticBinding: TypeAlias = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
 
-_registered_keys: weakref.WeakKeyDictionary[
-    Owner, list[str]
-] = weakref.WeakKeyDictionary()
+_REGISTERED_KEYS_ATTR = "_tensor_logging_registered_keys"
+_STATISTIC_BINDINGS_ATTR = "_tensor_logging_statistic_bindings"
 _active_runtime: TensorLoggingRuntime | None = None
 _enabled = False
 _suppression_depth = 0
+
+
+def _registered_keys(owner: Owner) -> list[str] | None:
+    """Return keys stored directly on an owner, without module proxy lookup."""
+
+    return cast(
+        list[str] | None,
+        owner.__dict__.get(_REGISTERED_KEYS_ATTR),
+    )
+
+
+def _statistic_bindings(owner: Owner) -> dict[str, StatisticBinding] | None:
+    return cast(
+        dict[str, StatisticBinding] | None,
+        owner.__dict__.get(_STATISTIC_BINDINGS_ATTR),
+    )
+
+
+def _statistic_binding(owner: Owner, key: str) -> StatisticBinding:
+    try:
+        return owner.__dict__[_STATISTIC_BINDINGS_ATTR][key]
+    except KeyError as error:
+        raise KeyError(f"unregistered tensor logging key: {key}") from error
 
 
 def _physical_tensor(value: torch.Tensor) -> torch.Tensor:
@@ -49,7 +77,11 @@ def register(owner: Owner, keys: Sequence[str]) -> None:
         register(router, ["entropy", "expert_load"])
     """
 
-    _registered_keys.setdefault(owner, []).extend(keys)
+    registered_keys = _registered_keys(owner)
+    if registered_keys is None:
+        registered_keys = []
+        setattr(owner, _REGISTERED_KEYS_ATTR, registered_keys)
+    registered_keys.extend(keys)
 
 
 def register_fwd_bwd(owner: nn.Module, keys: Sequence[str]) -> None:
@@ -86,13 +118,15 @@ def set_enabled(value: bool) -> Iterator[None]:
     _enabled = value
     runtime = _active_runtime
     if runtime is not None:
-        runtime.buffers.enabled.fill_(value)
+        with spmd.no_typecheck():
+            runtime.buffers.enabled.fill_(value)
     try:
         yield
     finally:
         _enabled = previous
         if runtime is not None:
-            runtime.buffers.enabled.fill_(previous)
+            with spmd.no_typecheck():
+                runtime.buffers.enabled.fill_(previous)
 
 
 @contextlib.contextmanager
@@ -155,13 +189,11 @@ def _gather_global_keys(local_keys: set[str]) -> list[str]:
 def _add_statistic_metrics(
     metrics: dict[str, int | float],
     key: str,
-    counts: torch.Tensor,
-    sums: torch.Tensor,
-    maximum: torch.Tensor,
+    counts: Sequence[int],
+    sums: Sequence[float],
+    maximum: float,
 ) -> None:
-    numel, nonfinite_count, zero_count, observation_count = (
-        int(value) for value in counts
-    )
+    numel, nonfinite_count, zero_count, observation_count = counts
     if observation_count == 0:
         return
     finite_count = numel - nonfinite_count
@@ -172,7 +204,7 @@ def _add_statistic_metrics(
     if finite_count == 0:
         return
 
-    absolute_sum, square_sum, fourth_moment_sum = (float(value) for value in sums)
+    absolute_sum, square_sum, fourth_moment_sum = sums
     absolute_mean = absolute_sum / finite_count
     square_mean = square_sum / finite_count
     metrics[prefix + "zero_count"] = zero_count
@@ -181,7 +213,7 @@ def _add_statistic_metrics(
     metrics[prefix + "abs_mean"] = absolute_mean
     metrics[prefix + "square_mean"] = square_mean
     metrics[prefix + "rms"] = square_mean**0.5
-    metrics[prefix + "abs_max"] = float(maximum)
+    metrics[prefix + "abs_max"] = maximum
     if square_mean > 0:
         metrics[prefix + "kurtosis"] = (
             fourth_moment_sum / finite_count / square_mean**2 - 3
@@ -199,7 +231,6 @@ class TensorLoggingRuntime:
         metrics_filter_regex: str = "",
     ) -> None:
         self._owners: list[Owner] = []
-        self._owner_key_to_slot: dict[tuple[int, str], int] = {}
         self._metrics_filter = (
             re.compile(metrics_filter_regex) if metrics_filter_regex else None
         )
@@ -207,10 +238,10 @@ class TensorLoggingRuntime:
         owner_names = _owner_names(roots)
         local_full_keys: set[str] = set()
         local_bindings: list[tuple[Owner, str, str]] = []
-        for owner, keys in _registered_keys.items():
-            if owner not in owner_names:
+        for owner, owner_name in owner_names.items():
+            keys = _registered_keys(owner)
+            if keys is None:
                 continue
-            owner_name = owner_names[owner]
             for key in keys:
                 full_key = ".".join(part for part in (owner_name, key) if part)
                 if full_key in local_full_keys:
@@ -230,14 +261,25 @@ class TensorLoggingRuntime:
             ],
         }
         full_key_to_slot = {key: slot for slot, key in enumerate(self.keys)}
-        for owner, key, full_key in local_bindings:
-            self._owners.append(owner)
-            self._owner_key_to_slot[(id(owner), key)] = full_key_to_slot[full_key]
 
         self.buffers = StatisticBuffers(
             len(self.keys),
             device=device or _infer_device(roots),
         )
+        self._slot_indices = torch.arange(len(self.keys), dtype=torch.int64)
+        for owner, key, full_key in local_bindings:
+            bindings = _statistic_bindings(owner)
+            if bindings is None:
+                bindings = {}
+                setattr(owner, _STATISTIC_BINDINGS_ATTR, bindings)
+                self._owners.append(owner)
+            slot = full_key_to_slot[full_key]
+            bindings[key] = (
+                self.buffers.counts[slot],
+                self.buffers.sums[slot],
+                self.buffers.maxima[slot],
+                self._slot_indices[slot],
+            )
         self._state_owner = roots[0]
         self._state_owner.add_module("_tensor_logging_state", self.buffers)
         self._closed = False
@@ -245,46 +287,28 @@ class TensorLoggingRuntime:
     def _accumulate(self, owner: Owner, key: str, value: torch.Tensor) -> None:
         if self._closed:
             raise RuntimeError("tensor logging runtime is closed")
-        try:
-            slot = self._owner_key_to_slot[(id(owner), key)]
-        except KeyError as error:
-            raise KeyError(f"unregistered tensor logging key: {key}") from error
-        accumulate_tensor_statistics(
-            _physical_tensor(value),
-            self.buffers.counts[slot],
-            self.buffers.sums[slot],
-            self.buffers.maxima[slot],
-            self.buffers.enabled,
-        )
+        binding = _statistic_binding(owner, key)
+        with spmd.no_typecheck():
+            accumulate_tensor_statistics(
+                _physical_tensor(value),
+                *binding[:3],
+                self.buffers.enabled,
+            )
 
     def _statistic_buffers(
         self,
         owner: Owner,
         key: str,
-        *,
-        cotangent: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._closed:
             raise RuntimeError("tensor logging runtime is closed")
-        try:
-            slot = self._owner_key_to_slot[(id(owner), key)]
-        except KeyError as error:
-            raise KeyError(f"unregistered tensor logging key: {key}") from error
-        if cotangent:
-            cotangent_buffers = self.buffers.cotangents[slot]
-            return cast(
-                tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                (
-                    cotangent_buffers.counts,
-                    cotangent_buffers.sums,
-                    cotangent_buffers.maximum,
-                ),
-            )
-        return (
-            self.buffers.counts[slot],
-            self.buffers.sums[slot],
-            self.buffers.maxima[slot],
-        )
+        binding = _statistic_binding(owner, key)
+        return binding[:3]
+
+    def _statistic_slot(self, owner: Owner, key: str) -> torch.Tensor:
+        if self._closed:
+            raise RuntimeError("tensor logging runtime is closed")
+        return _statistic_binding(owner, key)[3]
 
     def clear(self) -> None:
         self.buffers.clear()
@@ -292,22 +316,11 @@ class TensorLoggingRuntime:
     def raw_snapshot(self) -> dict[str, dict[str, torch.Tensor]]:
         """Clone unreduced slots for focused correctness tests."""
 
-        (
-            cotangent_counts,
-            cotangent_sums,
-            cotangent_maxima,
-        ) = self.buffers.stack_cotangents()
-        counts = self.buffers.counts + cotangent_counts
-        sums = self.buffers.sums + cotangent_sums
-        maxima = torch.maximum(
-            self.buffers.maxima,
-            cotangent_maxima,
-        )
         return {
             key: {
-                "counts": counts[index].detach().cpu().clone(),
-                "sums": sums[index].detach().cpu().clone(),
-                "maximum": maxima[index].detach().cpu().clone(),
+                "counts": self.buffers.counts[index].detach().cpu().clone(),
+                "sums": self.buffers.sums[index].detach().cpu().clone(),
+                "maximum": self.buffers.maxima[index].detach().cpu().clone(),
             }
             for index, key in enumerate(self.keys)
         }
@@ -315,17 +328,9 @@ class TensorLoggingRuntime:
     def reduce_buffers(self) -> ReducedBuffers:
         """Clone and reduce every registered key in three packed WORLD slabs."""
 
-        (
-            cotangent_counts,
-            cotangent_sums,
-            cotangent_maxima,
-        ) = self.buffers.stack_cotangents()
-        counts = self.buffers.counts + cotangent_counts
-        sums = self.buffers.sums + cotangent_sums
-        maxima = torch.maximum(
-            self.buffers.maxima,
-            cotangent_maxima,
-        )
+        counts = self.buffers.counts.clone()
+        sums = self.buffers.sums.clone()
+        maxima = self.buffers.maxima.clone()
         if dist.is_initialized():
             dist.all_reduce(counts, op=dist.ReduceOp.SUM)
             dist.all_reduce(sums, op=dist.ReduceOp.SUM)
@@ -339,14 +344,17 @@ class TensorLoggingRuntime:
         """Derive scalar metric leaves from reduced sufficient statistics."""
 
         counts, sums, maxima = (buffer.detach().cpu() for buffer in reduced_buffers)
+        count_rows = cast(list[list[int]], counts.tolist())
+        sum_rows = cast(list[list[float]], sums.tolist())
+        maximum_rows = cast(list[float], maxima.tolist())
         metrics: dict[str, int | float] = {}
         for index, key in enumerate(self.keys):
             _add_statistic_metrics(
                 metrics,
                 key,
-                counts[index],
-                sums[index],
-                maxima[index],
+                count_rows[index],
+                sum_rows[index],
+                maximum_rows[index],
             )
         for key, indices in self._gradient_indices.items():
             if not indices:
@@ -354,9 +362,9 @@ class TensorLoggingRuntime:
             _add_statistic_metrics(
                 metrics,
                 key,
-                counts[indices].sum(dim=0),
-                sums[indices].sum(dim=0),
-                maxima[indices].amax(),
+                cast(list[int], counts[indices].sum(dim=0).tolist()),
+                cast(list[float], sums[indices].sum(dim=0).tolist()),
+                float(maxima[indices].amax()),
             )
         if self._metrics_filter is not None:
             metrics = {
@@ -371,8 +379,9 @@ class TensorLoggingRuntime:
         if self._closed:
             return
         self._closed = True
+        for owner in self._owners:
+            owner.__dict__.pop(_STATISTIC_BINDINGS_ATTR, None)
         self._owners.clear()
-        self._owner_key_to_slot.clear()
         self._state_owner._modules.pop("_tensor_logging_state")
         if _active_runtime is self:
             _active_runtime = None
@@ -416,6 +425,38 @@ def _runtime() -> TensorLoggingRuntime:
     return _active_runtime
 
 
+@torch.library.custom_op(
+    "torchtitan::record_tensor_statistics_cotangent",
+    mutates_args=(),
+)
+def _record_tensor_statistics_cotangent(
+    value: torch.Tensor,
+    slot: torch.Tensor,
+) -> None:
+    """Record one cotangent without exposing mutable buffers to autograd."""
+
+    runtime = _runtime()
+    slot_index = int(slot.item())
+    buffers = (
+        runtime.buffers.counts[slot_index],
+        runtime.buffers.sums[slot_index],
+        runtime.buffers.maxima[slot_index],
+        runtime.buffers.enabled,
+    )
+    accumulate_tensor_statistics(value, *buffers)
+
+
+@_record_tensor_statistics_cotangent.register_fake
+def _(
+    value: torch.Tensor,
+    slot: torch.Tensor,
+) -> None:
+    return None
+
+
+_record_tensor_statistics_cotangent.register_effect(torch.library.EffectType.ORDERED)
+
+
 def log_stats(owner: Owner, **named_tensors: torch.Tensor) -> None:
     """Accumulate current-pass statistics for registered named tensors.
 
@@ -428,102 +469,63 @@ def log_stats(owner: Owner, **named_tensors: torch.Tensor) -> None:
         log_stats(router, entropy=entropy, expert_load=expert_load)
     """
 
-    if not is_enabled():
+    if torch.compiler.is_compiling():
+        if _active_runtime is None:
+            return
+    elif not is_enabled():
         return
     runtime = _runtime()
     for key, value in named_tensors.items():
         runtime._accumulate(owner, key, value)
 
 
-class _RecordForwardAndBackward(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        value: torch.Tensor,
-        forward_counts: torch.Tensor,
-        forward_sums: torch.Tensor,
-        forward_maximum: torch.Tensor,
-        backward_counts: torch.Tensor,
-        backward_sums: torch.Tensor,
-        backward_maximum: torch.Tensor,
-        enabled: torch.Tensor,
-    ) -> torch.Tensor:
-        accumulate_tensor_statistics(
-            _physical_tensor(value),
-            forward_counts,
-            forward_sums,
-            forward_maximum,
-            enabled,
-        )
-        ctx.backward_counts = backward_counts
-        ctx.backward_sums = backward_sums
-        ctx.backward_maximum = backward_maximum
-        ctx.enabled = enabled
-        return value
-
-    @staticmethod
-    # pyrefly: ignore [bad-override]
-    def backward(ctx, gradient: torch.Tensor):
-        accumulate_tensor_statistics(
-            _physical_tensor(gradient),
-            ctx.backward_counts,
-            ctx.backward_sums,
-            ctx.backward_maximum,
-            ctx.enabled,
-        )
-        return gradient, None, None, None, None, None, None, None
-
-
 def log_fwd_bwd_stats(
     owner: nn.Module,
     **named_tensors: torch.Tensor,
-) -> torch.Tensor:
+) -> None:
     """Record one tensor now and its incoming cotangent during backward.
 
     Args:
         owner: Module used during `register_fwd_bwd`.
-        **named_tensors: Exactly one registered base name and tensor.
-
-    Returns:
-        The input tensor with the backward recorder attached.
+        **named_tensors: Registered base names mapped to differentiable tensors.
 
     Example:
 
-        xq = log_fwd_bwd_stats(attention, xq=xq)
+        log_fwd_bwd_stats(attention, xq=xq)
     """
 
-    if len(named_tensors) != 1:
-        raise ValueError("log_fwd_bwd_stats() records exactly one named tensor")
-    key, value = next(iter(named_tensors.items()))
-
-    if not _enabled:
-        return value
-    if not value.requires_grad:
-        raise ValueError(
-            f"log_fwd_bwd_stats({key}=...) requires a differentiable tensor"
-        )
+    if not torch.is_grad_enabled():
+        return
+    if torch.compiler.is_compiling():
+        if _active_runtime is None:
+            return
+    elif not is_enabled():
+        return
 
     runtime = _runtime()
-    forward_counts, forward_sums, forward_maximum = runtime._statistic_buffers(
-        owner,
-        f"{key}.x",
-    )
-    backward_counts, backward_sums, backward_maximum = runtime._statistic_buffers(
-        owner,
-        f"{key}.dx",
-        cotangent=True,
-    )
-    return _RecordForwardAndBackward.apply(
-        value,
-        forward_counts,
-        forward_sums,
-        forward_maximum,
-        backward_counts,
-        backward_sums,
-        backward_maximum,
-        (
-            runtime.buffers.suppressed
-            if _suppression_depth > 0
-            else runtime.buffers.enabled
-        ),
-    )
+    with spmd.no_typecheck():
+        for key, value in named_tensors.items():
+            if not value.requires_grad:
+                raise ValueError(
+                    f"log_fwd_bwd_stats({key}=...) requires a differentiable tensor"
+                )
+            forward_buffers = runtime._statistic_buffers(owner, f"{key}.x")
+            backward_slot = runtime._statistic_slot(owner, f"{key}.dx")
+            accumulate_tensor_statistics(
+                _physical_tensor(value),
+                *forward_buffers,
+                runtime.buffers.enabled,
+            )
+
+            def record_cotangent(
+                cotangent: torch.Tensor,
+                slot=backward_slot,
+            ) -> torch.Tensor:
+                with spmd.no_typecheck():
+                    _record_tensor_statistics_cotangent(
+                        _physical_tensor(cotangent),
+                        slot,
+                    )
+                    return cotangent
+
+            value.register_hook(record_cotangent)

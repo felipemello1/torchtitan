@@ -737,7 +737,7 @@ class ChunkedLossWrapper(BaseLoss):
                     )
 
                 logits = lm_head(h_chunk)
-                logits = log_fwd_bwd_stats(lm_head, output=logits)
+                log_fwd_bwd_stats(lm_head, output=logits)
 
                 chunk_inputs = {
                     key: chunks[i] if isinstance(chunks, tuple) else chunks

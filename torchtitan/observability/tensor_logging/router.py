@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections.abc import Sequence
-from typing import Any, cast, Protocol
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -16,17 +16,9 @@ from torchtitan.distributed import ParallelDims
 from .runtime import log_stats
 
 
-class RouterMetricSource(Protocol):
-    load_balance_coeff: float | None
-    router: nn.Module
-    tokens_per_expert_E: torch.Tensor  # noqa: N815
-    _sequence_expert_counts_BE: torch.Tensor | None  # noqa: N815
-    expert_bias_E: torch.Tensor | None  # noqa: N815
-
-
 @torch.no_grad()
 def log_router_statistics(
-    moe_layers: Sequence[tuple[nn.Module, RouterMetricSource]],
+    moe_layers: Sequence[tuple[nn.Module, Any]],
     *,
     local_tokens_per_expert_by_layer: Sequence[torch.Tensor],
     global_tokens_per_expert_by_layer: torch.Tensor,

@@ -964,17 +964,23 @@ class GQAttention(BaseAttention):
     ) -> torch.Tensor:
         B, L, _ = x_BLD.shape
         xq_BLNH, xk_BLNH, xv_BLNH = self.qkv_linear(x_BLD)
-        xq_BLNH = log_fwd_bwd_stats(self, xq=xq_BLNH)
-        xk_BLNH = log_fwd_bwd_stats(self, xk=xk_BLNH)
-        xv_BLNH = log_fwd_bwd_stats(self, xv=xv_BLNH)
+        log_fwd_bwd_stats(
+            self,
+            xq=xq_BLNH,
+            xk=xk_BLNH,
+            xv=xv_BLNH,
+        )
 
         # Optional QK normalization (before RoPE, per Qwen3)
         if self.q_norm is not None or self.k_norm is not None:
             assert self.q_norm is not None and self.k_norm is not None
             xq_BLNH = self.q_norm(xq_BLNH)
             xk_BLNH = self.k_norm(xk_BLNH)
-            xq_BLNH = log_fwd_bwd_stats(self, xq_normed=xq_BLNH)
-            xk_BLNH = log_fwd_bwd_stats(self, xk_normed=xk_BLNH)
+            log_fwd_bwd_stats(
+                self,
+                xq_normed=xq_BLNH,
+                xk_normed=xk_BLNH,
+            )
 
         # Apply rotary embeddings
         xq_BLNH, xk_BLNH = self.rope(xq_BLNH, xk_BLNH, positions)
@@ -988,6 +994,6 @@ class GQAttention(BaseAttention):
             scale=self.scaling,
             enable_gqa=self.enable_gqa,
         ).contiguous()
-        out_BLNH = log_fwd_bwd_stats(self, head_out=out_BLNH)
+        log_fwd_bwd_stats(self, head_out=out_BLNH)
         out_BLD = out_BLNH.view(B, L, -1)
         return self.wo(out_BLD)

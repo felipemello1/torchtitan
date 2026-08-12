@@ -26,7 +26,7 @@ from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper, IGNORE_INDE
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
 from torchtitan.components.optimizer import (
-    log_optimizer_tensor_statistics,
+    log_adam_tensor_statistics,
     OptimizersContainer,
 )
 from torchtitan.components.quantization.utils import has_quantization
@@ -237,6 +237,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     validator: BaseValidator
     metrics_processor: MetricsProcessor
     tensor_logging: TensorLoggingRuntime | None
+    tensor_logging_freq: int
     data_statistics: DataStatistics | None
     checkpointer: CheckpointManager
 
@@ -481,16 +482,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             tensor_logging_freq = config.metrics.tensor_logging_freq
             if tensor_logging_freq <= 0:
                 raise ValueError("metrics.tensor_logging_freq must be positive")
-            if tensor_logging_freq % config.metrics.log_freq != 0:
-                raise ValueError(
-                    "metrics.tensor_logging_freq must be a multiple of "
-                    "metrics.log_freq"
-                )
-            if parallel_dims.pp_enabled:
+            self.tensor_logging_freq = max(
+                tensor_logging_freq,
+                config.metrics.log_freq,
+            )
+            if parallel_dims.pp_enabled and len(self.model_parts) != 1:
                 raise NotImplementedError(
-                    "tensor logging requires stable global names before it can run "
-                    "with pipeline parallelism"
+                    "tensor logging does not yet support looped pipeline schedules "
+                    "with multiple model parts per rank"
                 )
+            parameter_metric_names = [
+                "w",
+                "dw",
+                "normed_dw",
+                "numerator",
+                "denominator",
+            ]
+            if config.metrics.tensor_logging_adam_momentum_gradient_cosine:
+                parameter_metric_names.append("cos_sim_m_g")
             for model_part in self.model_parts:
                 for module in model_part.modules():
                     if isinstance(module, MoE):
@@ -504,15 +513,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                         )
                 for parameter in model_part.parameters():
                     if parameter.requires_grad:
-                        parameter_metric_names = [
-                            "w",
-                            "dw",
-                            "normed_dw",
-                            "numerator",
-                            "denominator",
-                        ]
-                        if config.metrics.tensor_logging_optimizer_cosine:
-                            parameter_metric_names.append("cos_sim_m_g")
                         register_tensor_stats(
                             parameter,
                             parameter_metric_names,
@@ -605,17 +605,25 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             ),
         )
         self.data_statistics = None
-        dataset_id = getattr(config.dataloader, "dataset", None)
-        if self.tensor_logging is not None and not parallel_dims.pp_enabled:
-            if dataset_id is not None:
+        dataset_id = config.dataloader.dataset
+        if self.tensor_logging is not None:
+            if dataset_id:
                 tp_mesh = parallel_dims.get_optional_mesh("tp")
                 cp_mesh = parallel_dims.get_optional_mesh("cp")
                 tp_representative = tp_mesh is None or tp_mesh.get_local_rank() == 0
                 cp_representative = cp_mesh is None or cp_mesh.get_local_rank() == 0
+                first_pipeline_stage = (
+                    self.pp_has_first_stage if parallel_dims.pp_enabled else True
+                )
+                last_pipeline_stage = (
+                    self.pp_has_last_stage if parallel_dims.pp_enabled else True
+                )
                 self.data_statistics = DataStatistics(
                     dataset_id=dataset_id,
-                    data_contributor=tp_representative and cp_representative,
-                    loss_contributor=tp_representative,
+                    data_contributor=(
+                        first_pipeline_stage and tp_representative and cp_representative
+                    ),
+                    loss_contributor=last_pipeline_stage and tp_representative,
                     step_contributor=torch.distributed.get_rank() == 0,
                     ignore_index=IGNORE_INDEX,
                     device=self.device,
@@ -895,9 +903,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     ):
         if self.tensor_logging is None:
             return self._train_step(data_iterator)
-        with set_tensor_logging_enabled(
-            self.step % self.config.metrics.tensor_logging_freq == 0
-        ):
+        with set_tensor_logging_enabled(self.step % self.tensor_logging_freq == 0):
             return self._train_step(data_iterator)
 
     def _train_step(
@@ -990,9 +996,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                             log_tensor_stats(parameter, normed_dw=parameter.grad)
             self.checkpointer.maybe_wait_for_staging()
             self.optimizers.step()
-            log_optimizer_tensor_statistics(
+            log_adam_tensor_statistics(
                 self.optimizers,
-                log_cosine=self.config.metrics.tensor_logging_optimizer_cosine,
+                log_momentum_gradient_cosine=(
+                    self.config.metrics.tensor_logging_adam_momentum_gradient_cosine
+                ),
             )
             self.lr_schedulers.step()
 
@@ -1005,16 +1013,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         should_log = self.metrics_processor.should_log(self.step)
         tensor_metrics: dict[str, int | float] = {}
         if self.tensor_logging is not None and is_tensor_logging_enabled():
-            try:
+            with sl.log_trace_span("tensor_logging_collect"):
                 tensor_metrics = self.tensor_logging.buffers_to_metrics(
                     self.tensor_logging.reduce_buffers()
                 )
                 if self.data_statistics is not None:
                     tensor_metrics.update(self.data_statistics.collect())
-            finally:
                 self.tensor_logging.clear()
 
         if not should_log:
+            if tensor_metrics:
+                with sl.log_trace_span("metrics_publish"):
+                    self.metrics_processor.logger.log(tensor_metrics, self.step)
             return
 
         with sl.log_trace_span("collect_dist_metrics"):
@@ -1064,13 +1074,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             **lr_metrics,
             **tensor_metrics,
         }
-        self.metrics_processor.log(
-            self.step,
-            global_avg_loss,
-            global_max_loss,
-            float(grad_norm.item()),
-            extra_metrics=extra_metrics,
-        )
+        with sl.log_trace_span("metrics_publish"):
+            self.metrics_processor.log(
+                self.step,
+                global_avg_loss,
+                global_max_loss,
+                float(grad_norm.item()),
+                extra_metrics=extra_metrics,
+            )
 
     @record
     def train(self):

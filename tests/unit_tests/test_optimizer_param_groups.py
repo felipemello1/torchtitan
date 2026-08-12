@@ -11,7 +11,7 @@ import torch.nn as nn
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import (
     default_adamw,
-    log_optimizer_tensor_statistics,
+    log_adam_tensor_statistics,
     OptimizersContainer,
     ParamGroupConfig,
     register_moe_load_balancing_hook,
@@ -340,7 +340,10 @@ class TestParamGroupConfig(unittest.TestCase):
             model.weight.grad = torch.tensor([[2.0, -4.0]])
             with set_enabled(True):
                 container.step()
-                log_optimizer_tensor_statistics(container, log_cosine=True)
+                log_adam_tensor_statistics(
+                    container,
+                    log_momentum_gradient_cosine=True,
+                )
 
             snapshot = runtime.raw_snapshot()
             self.assertEqual(snapshot["weight.w"]["counts"].tolist(), [2, 0, 0, 1])

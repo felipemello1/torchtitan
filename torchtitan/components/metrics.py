@@ -37,8 +37,7 @@ DeviceMemStats = namedtuple(
 
 class DeviceMemoryMonitor:
     def __init__(self, device: str = f"{device_type}:0"):
-        # pyrefly: ignore [read-only]
-        self.device = torch.device(device)  # device object
+        self.device = torch.device(device)  # pyrefly: ignore [read-only]
         self.device_name = device_module.get_device_name(self.device)
         self.device_index = device_module.current_device()
         self.device_capacity = device_module.get_device_properties(
@@ -302,13 +301,15 @@ class MetricsProcessor(Configurable):
         enable_tensor_logging: bool = False
         """Whether to record model tensor statistics."""
 
-        tensor_logging_freq: int = 100
-        """How often to record tensor statistics, in iterations."""
+        tensor_logging_freq: int = 5
+        """Requested tensor-stat cadence; never more frequent than ``log_freq``."""
 
-        tensor_logging_metrics_filter_regex: str = ""
+        tensor_logging_metrics_filter_regex: str = (
+            r"\.w:(?:kurtosis|zero_frac)$" r"|:(?:numel|abs_mean|square_mean|abs_max)$"
+        )
         """Allowlist regex over each tensor metric's ``<name>:<statistic>``."""
 
-        tensor_logging_optimizer_cosine: bool = False
+        tensor_logging_adam_momentum_gradient_cosine: bool = False
         """Whether to record the per-parameter Adam momentum/gradient cosine."""
 
     config: Config
@@ -528,6 +529,9 @@ class MetricsProcessor(Configurable):
         if extra_metrics:
             metrics.update(extra_metrics)
 
+        # Start the next timing window before sink serialization so the next
+        # throughput sample includes the cost of publishing this interval.
+        self.time_last_log = time.perf_counter()
         self.logger.log(metrics, step)
 
         color = self.color
@@ -545,7 +549,6 @@ class MetricsProcessor(Configurable):
 
         self.ntokens_since_last_log = 0
         self.data_loading_times.clear()
-        self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
 
     def log_validation(

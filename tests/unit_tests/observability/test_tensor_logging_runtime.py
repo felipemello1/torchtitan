@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import contextlib
+import copy
 
 import pytest
 import torch
@@ -12,7 +12,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.tensor import DTensor, init_device_mesh, Replicate, Shard
 from torch.nn import functional as F
-from torch.utils.checkpoint import checkpoint, CheckpointPolicy
+from torch.utils.checkpoint import CheckpointPolicy
 
 from torchtitan.config import CompileConfig
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
@@ -26,8 +26,11 @@ from torchtitan.experiments.graph_trainer.memory_policy import tag_sac_policy
 from torchtitan.experiments.graph_trainer.selective_activation_remat import (
     selective_activation_remat_pass,
 )
+from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.llama3.model import Llama3TransformerBlock
+from torchtitan.models.qwen3.model import Qwen3TransformerBlock
 from torchtitan.observability.tensor_logging import (
     disable,
     init,
@@ -69,7 +72,8 @@ class TinyStatsModule(nn.Module):
         hidden = torch.sin(value @ self.weight)
         log_stats(self, hidden=hidden)
         output = hidden.square()
-        return log_fwd_bwd_stats(self, output=output)
+        log_fwd_bwd_stats(self, output=output)
+        return output
 
 
 class CompileStatsModule(nn.Module):
@@ -83,7 +87,8 @@ class CompileStatsModule(nn.Module):
         hidden = torch.sin(value @ self.weight)
         log_stats(self, hidden=hidden)
         output = hidden.square()
-        return log_fwd_bwd_stats(self, output=output)
+        log_fwd_bwd_stats(self, output=output)
+        return output
 
 
 class CompileForwardStatsModule(nn.Module):
@@ -96,15 +101,6 @@ class CompileForwardStatsModule(nn.Module):
         hidden = torch.sin(value @ self.weight)
         log_stats(self, hidden=hidden)
         return hidden.square()
-
-
-class CompileForwardStatsRoot(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.layers = nn.ModuleDict({"0": CompileForwardStatsModule(width=4)})
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        return self.layers["0"](value)
 
 
 class TinyStatsRoot(nn.Module):
@@ -121,6 +117,72 @@ class TinyStatsRoot(nn.Module):
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return self.layers["0"](value)
+
+
+def test_registration_survives_deepcopy() -> None:
+    original = TinyStatsRoot()
+    copied = copy.deepcopy(original)
+    runtime = init(copied)
+    try:
+        value = torch.randn(3, 4, requires_grad=True)
+        with set_enabled(True):
+            copied(value).sum().backward()
+
+        snapshot = runtime.raw_snapshot()
+        assert snapshot["layers.0.hidden"]["counts"][3].item() == 1
+        assert snapshot["layers.0.output.x"]["counts"][3].item() == 1
+        assert snapshot["layers.0.output.dx"]["counts"][3].item() == 1
+    finally:
+        runtime.close()
+
+
+def test_decoder_input_is_emitted_only_by_the_first_pipeline_stage() -> None:
+    for has_embeddings, expected_observations in ((True, 1), (False, 0)):
+        decoder = Decoder.__new__(Decoder)
+        nn.Module.__init__(decoder)
+        decoder.tok_embeddings = nn.Identity() if has_embeddings else None
+        decoder.layers = nn.ModuleDict()
+        decoder.norm = None
+        decoder.lm_head = None
+        register_fwd_bwd(decoder, ["input"])
+
+        runtime = init(decoder)
+        try:
+            value = torch.ones(1, 2, requires_grad=True)
+            with set_enabled(True):
+                decoder(value).sum().backward()
+            assert (
+                runtime.raw_snapshot()["input.x"]["counts"][3].item()
+                == expected_observations
+            )
+        finally:
+            runtime.close()
+
+
+class SquareAttention(nn.Module):
+    def forward(self, value, attention_masks, positions):
+        return value.square()
+
+
+class ZeroFeedForward(nn.Module):
+    def forward(self, value):
+        return value * 0
+
+
+def _residual_block(block_type):
+    block = block_type.__new__(block_type)
+    nn.Module.__init__(block)
+    block.attention = SquareAttention()
+    block.attention_norm = nn.Identity()
+    block.ffn_norm = nn.Identity()
+    block.feed_forward = ZeroFeedForward()
+    if block_type is Qwen3TransformerBlock:
+        block.moe_enabled = False
+    register_fwd_bwd(
+        block,
+        ["attn_stream", "attn_out", "ffn_stream", "ffn_out"],
+    )
+    return block
 
 
 class TinyRouterStatsModule(nn.Module):
@@ -211,28 +273,6 @@ def _log_reconstructed_router_counts(
     )
 
 
-def _run(*, activation_checkpoint: bool) -> tuple[dict, torch.Tensor, int]:
-    torch.manual_seed(0)
-    module = TinyStatsModule(width=4)
-    value = torch.randn(3, 4, requires_grad=True)
-    runtime = init(module)
-    try:
-        with set_enabled(True):
-            if activation_checkpoint:
-                output = checkpoint(
-                    module,
-                    value,
-                    use_reentrant=False,
-                    context_fn=lambda: (contextlib.nullcontext(), disable()),
-                )
-            else:
-                output = module(value)
-            output.sum().backward()
-        return runtime.raw_snapshot(), value.grad.clone(), module.forward_calls
-    finally:
-        runtime.close()
-
-
 def _assert_snapshots_equal(actual: dict, expected: dict) -> None:
     assert actual.keys() == expected.keys()
     for key in actual:
@@ -277,39 +317,6 @@ def _run_two_live_graphs(policy) -> tuple[dict, tuple[torch.Tensor, ...], int]:
         runtime.close()
 
 
-def _run_nested_ac(policy, *, outer_checkpoint: bool) -> tuple[dict, torch.Tensor]:
-    torch.manual_seed(0)
-    root = TinyStatsRoot()
-    policy.build().apply(root)
-    value = torch.randn(3, 4, requires_grad=True)
-    runtime = init(root)
-    try:
-        with set_enabled(True):
-            if outer_checkpoint:
-                output = checkpoint(
-                    root,
-                    value,
-                    use_reentrant=False,
-                    context_fn=lambda: (contextlib.nullcontext(), disable()),
-                )
-            else:
-                output = root(value)
-            output.sum().backward()
-        return runtime.raw_snapshot(), value.grad.clone()
-    finally:
-        runtime.close()
-
-
-def test_eager_records_forward_and_cotangent_once() -> None:
-    snapshot, gradient, forward_calls = _run(activation_checkpoint=False)
-
-    assert forward_calls == 1
-    assert gradient.shape == (3, 4)
-    assert snapshot["hidden"]["counts"].tolist() == [12, 0, 0, 1]
-    assert snapshot["output.x"]["counts"].tolist() == [12, 0, 0, 1]
-    assert snapshot["output.dx"]["counts"].tolist() == [12, 0, 0, 1]
-
-
 def test_source_feed_forward_records_act_out_and_cotangent() -> None:
     module = FeedForward.Config(
         w1=Linear.Config(in_features=4, out_features=8),
@@ -329,18 +336,6 @@ def test_source_feed_forward_records_act_out_and_cotangent() -> None:
         runtime.close()
 
 
-def test_activation_checkpoint_recompute_is_disabled_exactly_once() -> None:
-    eager, eager_gradient, eager_calls = _run(activation_checkpoint=False)
-    checkpointed, checkpointed_gradient, checkpointed_calls = _run(
-        activation_checkpoint=True
-    )
-
-    assert eager_calls == 1
-    assert checkpointed_calls == 2
-    _assert_snapshots_equal(checkpointed, eager)
-    torch.testing.assert_close(checkpointed_gradient, eager_gradient)
-
-
 def test_torchtitan_full_and_selective_ac_record_exactly_once() -> None:
     eager, eager_gradient, eager_calls = _run_torchtitan_ac(None)
     full, full_gradient, full_calls = _run_torchtitan_ac(FullAC.Config())
@@ -349,6 +344,9 @@ def test_torchtitan_full_and_selective_ac_record_exactly_once() -> None:
     )
 
     assert eager_calls == 1
+    assert eager["layers.0.hidden"]["counts"].tolist() == [12, 0, 0, 1]
+    assert eager["layers.0.output.x"]["counts"].tolist() == [12, 0, 0, 1]
+    assert eager["layers.0.output.dx"]["counts"].tolist() == [12, 0, 0, 1]
     assert full_calls == 2
     assert selective_calls == 2
     _assert_snapshots_equal(full, eager)
@@ -378,31 +376,6 @@ def test_repeated_checkpointed_module_with_two_live_graphs_is_exact() -> None:
         torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.parametrize(
-    "policy",
-    [
-        FullAC.Config(),
-        SelectiveAC.Config(force_recompute_mm_shapes_by_fqns=[]),
-    ],
-    ids=["full", "selective"],
-)
-def test_nested_checkpoint_regions_record_exactly_once(policy) -> None:
-    expected, expected_gradient = _run_nested_ac(
-        policy,
-        outer_checkpoint=False,
-    )
-    nested, nested_gradient = _run_nested_ac(
-        policy,
-        outer_checkpoint=True,
-    )
-
-    assert expected["layers.0.hidden"]["counts"].tolist() == [12, 0, 0, 1]
-    assert expected["layers.0.output.x"]["counts"].tolist() == [12, 0, 0, 1]
-    assert expected["layers.0.output.dx"]["counts"].tolist() == [12, 0, 0, 1]
-    _assert_snapshots_equal(nested, expected)
-    torch.testing.assert_close(nested_gradient, expected_gradient)
-
-
 def test_disabled_scope_is_a_noop_and_restores_outer_scope() -> None:
     module = TinyStatsModule(width=2)
     runtime = init(module)
@@ -417,6 +390,25 @@ def test_disabled_scope_is_a_noop_and_restores_outer_scope() -> None:
         assert snapshot["hidden"]["counts"].tolist() == [2, 0, 0, 1]
         assert snapshot["output.x"]["counts"].tolist() == [2, 0, 0, 1]
         assert snapshot["output.dx"]["counts"].tolist() == [2, 0, 0, 1]
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "block_type",
+    [Llama3TransformerBlock, Qwen3TransformerBlock],
+)
+def test_residual_stream_cotangent_includes_skip_and_branch(block_type) -> None:
+    block = _residual_block(block_type)
+    runtime = init(block)
+    try:
+        value = torch.tensor([[2.0]], requires_grad=True)
+        with set_enabled(True):
+            block(value, attention_masks=None).sum().backward()
+
+        snapshot = runtime.raw_snapshot()
+        assert snapshot["attn_stream.dx"]["sums"][0].item() == 5.0
+        assert snapshot["ffn_stream.dx"]["sums"][0].item() == 1.0
     finally:
         runtime.close()
 
@@ -443,6 +435,28 @@ def test_finite_statistics_match_on_cpu_and_cuda(device: str) -> None:
             [1.0, -2.0, 0.0, torch.nan, torch.inf, -torch.inf],
             device=device,
         )
+        with set_enabled(True):
+            log_stats(owner, value=value)
+
+        snapshot = runtime.raw_snapshot()["value"]
+        assert snapshot["counts"].tolist() == [6, 3, 1, 1]
+        assert snapshot["sums"].tolist() == [3.0, 5.0, 17.0]
+        assert snapshot["maximum"].item() == 2.0
+    finally:
+        runtime.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_noncontiguous_cuda_statistics_match_values() -> None:
+    owner = nn.Module().cuda()
+    register(owner, ["value"])
+    runtime = init(owner, device=torch.device("cuda"))
+    try:
+        value = torch.tensor(
+            [[1.0, -2.0, 0.0], [torch.nan, torch.inf, -torch.inf]],
+            device="cuda",
+        ).t()
+        assert not value.is_contiguous()
         with set_enabled(True):
             log_stats(owner, value=value)
 
@@ -537,7 +551,7 @@ def test_dtensor_records_local_forward_and_cotangent(
             run_check=False,
         )
         with set_enabled(True):
-            value = log_fwd_bwd_stats(owner, value=value)
+            log_fwd_bwd_stats(owner, value=value)
             (value * 2).to_local().sum().backward()
 
         snapshot = runtime.raw_snapshot()
@@ -587,7 +601,9 @@ def test_graph_trainer_trace_remat_replay_and_cadence_are_exact(
         traced = _trace_forward_backward_step(module, value)
 
         metric_op = torch.ops.torchtitan.accumulate_tensor_statistics.default
-        assert sum(node.target is metric_op for node in traced.gm.graph.nodes) == 3
+        cotangent_op = torch.ops.torchtitan.record_tensor_statistics_cotangent.default
+        assert sum(node.target is metric_op for node in traced.gm.graph.nodes) == 2
+        assert sum(node.target is cotangent_op for node in traced.gm.graph.nodes) == 1
         assert all(
             count == 0
             for statistic in runtime.raw_snapshot().values()
@@ -595,7 +611,8 @@ def test_graph_trainer_trace_remat_replay_and_cadence_are_exact(
         )
 
         _rematerialize_every_forward_node(traced)
-        assert sum(node.target is metric_op for node in traced.gm.graph.nodes) == 3
+        assert sum(node.target is metric_op for node in traced.gm.graph.nodes) == 2
+        assert sum(node.target is cotangent_op for node in traced.gm.graph.nodes) == 1
 
         runner = run_traced(traced, module=module, _validate_runtime=True)
         with set_enabled(True):
@@ -774,29 +791,8 @@ def test_graph_trainer_cudagraph_replay_obeys_device_cadence() -> None:
         runtime.close()
 
 
-def test_compile_fullgraph_records_forward_statistics() -> None:
-    if not torch.cuda.is_available():
-        return
-
-    module = CompileForwardStatsModule(width=4).cuda()
-    runtime = init(module)
-    try:
-        compiled = torch.compile(module, fullgraph=True)
-        value = torch.randn(3, 4, device="cuda", requires_grad=True)
-        with set_enabled(True):
-            compiled(value).sum().backward()
-
-        snapshot = runtime.raw_snapshot()
-        assert snapshot["hidden"]["counts"].tolist() == [12, 0, 0, 1]
-    finally:
-        runtime.close()
-        torch.compiler.reset()
-
-
-def test_compile_fullgraph_forward_cadence_has_two_stable_graphs() -> None:
-    if not torch.cuda.is_available():
-        return
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_compile_fullgraph_forward_cadence_has_one_stable_graph() -> None:
     compiled_graphs: list[torch.fx.GraphModule] = []
 
     def record_graph(graph_module, _example_inputs):
@@ -812,7 +808,7 @@ def test_compile_fullgraph_forward_cadence_has_two_stable_graphs() -> None:
             with set_enabled(enabled):
                 compiled(value).sum().backward()
 
-        assert len(compiled_graphs) == 2
+        assert len(compiled_graphs) == 1
         snapshot = runtime.raw_snapshot()
         assert snapshot["hidden"]["counts"].tolist() == [36, 0, 0, 3]
     finally:
@@ -820,57 +816,60 @@ def test_compile_fullgraph_forward_cadence_has_two_stable_graphs() -> None:
         torch.compiler.reset()
 
 
-@pytest.mark.parametrize(
-    "policy",
-    [
-        FullAC.Config(),
-        SelectiveAC.Config(force_recompute_mm_shapes_by_fqns=[]),
-    ],
-    ids=["full", "selective"],
-)
-def test_compile_fullgraph_with_ac_records_forward_exactly_once(policy) -> None:
-    if not torch.cuda.is_available():
-        return
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_compile_reuses_one_graph_across_layers_and_validates_without_grad() -> None:
+    compiled_graphs: list[torch.fx.GraphModule] = []
 
-    root = CompileForwardStatsRoot().cuda()
-    policy.build().apply(root)
-    apply_compile(
-        root,
-        CompileConfig(
-            enable=True,
-            components=["model"],
-            backend="aot_eager",
-        ),
-    )
-    runtime = init(root)
+    def record_graph(graph_module, _example_inputs):
+        compiled_graphs.append(graph_module)
+        return graph_module.forward
+
+    layers = nn.ModuleList([CompileStatsModule(width=4).cuda() for _ in range(10)])
+    layer_sequence = tuple(layers)
+    runtime = init(layers)
     try:
+        for layer in layer_sequence:
+            layer.compile(backend=record_graph, fullgraph=True)
+
         value = torch.randn(3, 4, device="cuda", requires_grad=True)
         with set_enabled(True):
-            root(value).sum().backward()
+            output = value
+            for layer in layer_sequence:
+                output = layer(output)
+            output.sum().backward()
 
-        snapshot = runtime.raw_snapshot()
-        assert snapshot["layers.0.hidden"]["counts"].tolist() == [12, 0, 0, 1]
+        with torch.no_grad():
+            output = value.detach()
+            for layer in layer_sequence:
+                output = layer(output)
+
+        assert len(compiled_graphs) == 2
+        assert all(
+            runtime.raw_snapshot()[f"{index}.output.dx"]["counts"][3].item() == 1
+            for index in range(len(layer_sequence))
+        )
     finally:
         runtime.close()
         torch.compiler.reset()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_compile_fullgraph_records_forward_and_cotangent() -> None:
-    if not torch.cuda.is_available():
-        return
-
     module = CompileStatsModule(width=4).cuda()
     runtime = init(module)
     try:
         compiled = torch.compile(module, fullgraph=True)
-        value = torch.randn(3, 4, device="cuda", requires_grad=True)
+        values = tuple(
+            torch.randn(3, 4, device="cuda", requires_grad=True) for _ in range(2)
+        )
         with set_enabled(True):
-            compiled(value).sum().backward()
+            outputs = tuple(compiled(value) for value in values)
+            sum(output.sum() for output in outputs).backward()
 
         snapshot = runtime.raw_snapshot()
-        assert snapshot["hidden"]["counts"].tolist() == [12, 0, 0, 1]
-        assert snapshot["output.x"]["counts"].tolist() == [12, 0, 0, 1]
-        assert snapshot["output.dx"]["counts"].tolist() == [12, 0, 0, 1]
+        assert snapshot["hidden"]["counts"].tolist() == [24, 0, 0, 2]
+        assert snapshot["output.x"]["counts"].tolist() == [24, 0, 0, 2]
+        assert snapshot["output.dx"]["counts"].tolist() == [24, 0, 0, 2]
     finally:
         runtime.close()
         torch.compiler.reset()
@@ -884,10 +883,8 @@ def test_compile_fullgraph_records_forward_and_cotangent() -> None:
     ],
     ids=["full", "selective"],
 )
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_compile_fullgraph_with_ac_records_exactly_once(policy) -> None:
-    if not torch.cuda.is_available():
-        return
-
     root = TinyStatsRoot(track_forward_calls=False).cuda()
     policy.build().apply(root)
     apply_compile(root, CompileConfig(enable=True, components=["model"]))

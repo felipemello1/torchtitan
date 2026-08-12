@@ -67,16 +67,14 @@ class Qwen3TransformerBlock(TransformerBlock):
             attention_masks,
             positions,
         )
-        x = log_fwd_bwd_stats(self, attn_stream=x)
-        attn_out = log_fwd_bwd_stats(self, attn_out=attn_out)
+        log_fwd_bwd_stats(self, attn_stream=x, attn_out=attn_out)
         x = x + attn_out
 
         if self.moe_enabled:
             ffn_out = self.moe(self.ffn_norm(x))
         else:
             ffn_out = self.feed_forward(self.ffn_norm(x))
-        x = log_fwd_bwd_stats(self, ffn_stream=x)
-        ffn_out = log_fwd_bwd_stats(self, ffn_out=ffn_out)
+        log_fwd_bwd_stats(self, ffn_stream=x, ffn_out=ffn_out)
         x = x + ffn_out
         return x
 

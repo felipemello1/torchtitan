@@ -54,7 +54,7 @@ class FeedForward(Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         act_out = F.silu(self.w1(x)) * self.w3(x)
-        act_out = log_fwd_bwd_stats(self, act_out=act_out)
+        log_fwd_bwd_stats(self, act_out=act_out)
         return self.w2(act_out)
 
 

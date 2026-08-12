@@ -8,8 +8,13 @@ import unittest
 from copy import deepcopy
 
 import torch
+from torch._higher_order_ops.wrap import wrap
 from torch.utils.flop_counter import FlopCounterMode
-from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.distributed.activation_checkpoint import (
+    _TensorLoggingCheckpointMode,
+    FullAC,
+    SelectiveAC,
+)
 from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module, ModuleDict
 
@@ -44,6 +49,12 @@ class TransformerBlock(Module):
 
 
 class TestApplyAC(unittest.TestCase):
+    def test_tensor_logging_mode_passes_higher_order_operators(self):
+        value = torch.tensor(1.0)
+        with _TensorLoggingCheckpointMode(disable_mutations=True):
+            result = wrap(lambda tensor: tensor + 1, value)
+        torch.testing.assert_close(result, torch.tensor(2.0))
+
     def test_flops(self):
         def get_bw_flops(model_fn):
             x = torch.randn(512, 512, requires_grad=True)
