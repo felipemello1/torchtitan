@@ -277,6 +277,8 @@ class TensorLoggingRuntime:
                 if previous_owner is not None:
                     explicitly_shared_root = (
                         previous_owner is not owner
+                        and isinstance(previous_owner, nn.Module)
+                        and isinstance(owner, nn.Module)
                         and previous_owner in root_name_overrides
                         and owner in root_name_overrides
                         and root_name_overrides[previous_owner]

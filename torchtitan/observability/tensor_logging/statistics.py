@@ -100,8 +100,8 @@ def _accumulate_tensor_statistics_triton(
         absolute_maximum = tl.max(tl.where(finite, absolute, -float("inf")))
 
     # Atomic row updates merge the private results from every program.
-    tl.atomic_add(counts_ptr + 1, nonfinite_count.to(tl.int64))
-    tl.atomic_add(counts_ptr + 2, zero_count.to(tl.int64))
+    tl.atomic_add(counts_ptr + 1, tl.cast(nonfinite_count, tl.int64))
+    tl.atomic_add(counts_ptr + 2, tl.cast(zero_count, tl.int64))
     # The capped grid keeps each program's partial counters within int32.
     # Program zero supplies the exact total directly to the int64 output.
     if tl.program_id(0) == 0:

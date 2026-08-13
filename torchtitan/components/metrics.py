@@ -121,15 +121,17 @@ class TensorBoardLogger(BaseLogger):
         logger.info(f"TensorBoard logging enabled. Logs will be saved at {log_dir}")
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
-        values = [
-            Summary.Value(
+        summary = Summary()
+        for key, value in metrics.items():
+            summary.value.add(
                 tag=key if self.tag is None else f"{self.tag}/{key}",
                 simple_value=float(value),
             )
-            for key, value in metrics.items()
-        ]
+
         # Submit one event instead of one queue operation per scalar.
-        self.writer._get_file_writer().add_summary(Summary(value=values), step)
+        file_writer = self.writer._get_file_writer()
+        assert file_writer is not None
+        file_writer.add_summary(summary, step)
 
     def close(self) -> None:
         self.writer.close()
