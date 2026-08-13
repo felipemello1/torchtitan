@@ -369,6 +369,9 @@ class TokenChoiceTopKRouter(Module):
         with torch.autocast(device_type=x_BLD.device.type, dtype=torch.float32):
             router_logits_BLE = self.gate(x_BLD)
 
+        # TODO: Avoid the two expert-axis means below when tensor logging is
+        # disabled. They run before log_stats() can no-op, and this path also
+        # performs an opaque buffer store.
         with spmd.no_typecheck():
             router_logits_mean_E = router_logits_BLE.mean(dim=(0, 1))
             log_stats(self, router_logits=router_logits_mean_E)

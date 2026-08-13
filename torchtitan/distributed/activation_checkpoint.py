@@ -201,6 +201,8 @@ class FullAC(ActivationCheckpointing):
     def _wrap_block(
         self, module: nn.Module, *, base_fqn: str | None = None
     ) -> nn.Module:
+        # Save routing decisions and forward mutations so FullAC replay does not
+        # double-count MoE expert assignments or tensor statistics.
         return ptd_checkpoint_wrapper(
             module,
             context_fn=_save_routing_and_forward_side_effects,
