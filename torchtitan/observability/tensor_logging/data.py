@@ -19,7 +19,14 @@ _STEP_COUNT = 6
 
 
 class DataStatistics:
-    """Accumulate weighted loss and document statistics between publications."""
+    """Accumulate exact data counters between tensor-logging publications.
+
+    Example:
+
+        stats.record_batch(labels, positions)
+        stats.record_step_loss(loss, global_valid_tokens)
+        metrics = stats.collect()  # WORLD-reduce, return metrics, then reset
+    """
 
     def __init__(
         self,
@@ -45,8 +52,17 @@ class DataStatistics:
         labels: torch.Tensor,
         positions: torch.Tensor | None,
     ) -> None:
+        """Add token, batch, and packed-document counts from one local batch.
+
+        Args:
+            labels: Token labels with shape `[B, L]`; `ignore_index` marks masked tokens.
+            positions: Optional packed-document positions with shape `[B, L]`, resetting to zero at each segment.
+        """
+
         if not self.data_contributor:
             return
+
+        # Token and batch counts apply whether or not document positions exist.
         self.integers[_ALL_TOKENS].add_(labels.numel())
         self.integers[_VALID_TOKENS].add_(
             torch.count_nonzero(labels != self.ignore_index)
@@ -55,6 +71,8 @@ class DataStatistics:
 
         if positions is None:
             return
+
+        # A segment ends immediately before the next zero position or at row end.
         segment_ends = torch.empty_like(positions, dtype=torch.bool)
         segment_ends[:, :-1] = positions[:, 1:] == 0
         segment_ends[:, -1] = True
@@ -73,6 +91,8 @@ class DataStatistics:
         normalized_loss: torch.Tensor,
         global_valid_tokens: float | torch.Tensor,
     ) -> None:
+        """Accumulate a token-weighted loss numerator and one logical step."""
+
         if self.loss_contributor:
             local_loss = normalized_loss.detach()
             if isinstance(local_loss, DTensor):
@@ -83,6 +103,17 @@ class DataStatistics:
 
     @torch.no_grad()
     def collect(self) -> dict[str, int | float]:
+        """WORLD-reduce the current window, derive metrics, and clear local state.
+
+        Example:
+
+            # After two batches and one optimizer step:
+            metrics = stats.collect()
+            # metrics["data/datasets.c4.window_steps"] == 1
+            # A second collect() starts from an empty window.
+        """
+
+        # Counts and the weighted-loss numerator share one exact reduction.
         packed = torch.cat(
             [
                 self.integers.to(torch.float64),
@@ -91,6 +122,8 @@ class DataStatistics:
         )
         if dist.is_initialized():
             dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+
+        # Publication owns the window boundary: a successful collect starts fresh.
         self.integers.zero_()
         self.loss_sum.zero_()
 
@@ -104,6 +137,7 @@ class DataStatistics:
             step_count,
         ) = (int(value) for value in packed[:7].cpu())
         loss_sum = float(packed[7].cpu())
+        # Ratios are derived only after reducing their numerators and denominators.
         metrics: dict[str, int | float] = {
             f"data/datasets.{self.dataset_id}.all_token_count": all_tokens,
             f"data/datasets.{self.dataset_id}.valid_token_count": valid_tokens,

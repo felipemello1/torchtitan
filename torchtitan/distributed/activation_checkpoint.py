@@ -245,6 +245,13 @@ class SelectiveAC(ActivationCheckpointing):
     def _wrap_block(
         self, module: nn.Module, *, base_fqn: str | None = None
     ) -> nn.Module:
+        """Wrap one block with the configured per-operation recompute policy.
+
+        Example:
+
+            checkpointed = self._wrap_block(block, base_fqn="layers.0")
+        """
+
         config = cast("SelectiveAC.Config", self.config)
         save_ops = self.get_save_ops()
         # These state mutations are correctness invariants, not tunable

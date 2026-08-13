@@ -24,9 +24,12 @@ def _accumulate_tensor_statistics_triton(
     BLOCK_SIZE: tl.constexpr,
     NEEDS_LOOP: tl.constexpr,
 ):
+    """Accumulate one tensor row using a bounded grid of Triton programs."""
+
     if tl.load(enabled_ptr) == 0:
         return
 
+    # Each program first computes private sufficient statistics for its elements.
     nonfinite_count = tl.zeros((), dtype=tl.int32)
     zero_count = tl.zeros((), dtype=tl.int32)
     absolute_sum = tl.zeros((), dtype=tl.float32)
@@ -96,6 +99,7 @@ def _accumulate_tensor_statistics_triton(
         fourth_moment_sum = tl.sum(square * square)
         absolute_maximum = tl.max(tl.where(finite, absolute, -float("inf")))
 
+    # Atomic row updates merge the private results from every program.
     tl.atomic_add(counts_ptr + 1, nonfinite_count.to(tl.int64))
     tl.atomic_add(counts_ptr + 2, zero_count.to(tl.int64))
     # The capped grid keeps each program's partial counters within int32.
@@ -164,7 +168,14 @@ class StatisticBuffers(nn.Module):
 
 
 def _normalize_tensor_layout(value: torch.Tensor) -> torch.Tensor:
-    """Return a memory-ordered view, collapsing contiguous dimensions."""
+    """Return a memory-ordered view, collapsing adjacent dimensions.
+
+    Example:
+
+        value = torch.empty(2, 3, 4).transpose(0, 1)
+        normalized = _normalize_tensor_layout(value)
+        # Logical values stay unchanged while dimensions follow stride order.
+    """
 
     if value.ndim <= 1:
         return value
@@ -244,7 +255,13 @@ def accumulate_tensor_statistics(
     maximum: torch.Tensor,
     enabled: torch.Tensor,
 ) -> None:
-    """Accumulate one tensor through an opaque, compile-safe operation."""
+    """Accumulate one tensor through an opaque, compile-safe operation.
+
+    Example:
+
+        # The output tensors are one preallocated metric row.
+        accumulate_tensor_statistics(value, counts, sums, maximum, enabled)
+    """
 
     if value.is_cuda:
         value = _normalize_tensor_layout(value)
@@ -259,6 +276,7 @@ def accumulate_tensor_statistics(
         )
         return
 
+    # CPU is the readable reference path for tests and non-CUDA execution.
     with torch.no_grad():
         value = value.detach()
         enabled_i64 = enabled.to(torch.int64)

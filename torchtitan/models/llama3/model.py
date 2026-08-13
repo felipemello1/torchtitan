@@ -50,6 +50,9 @@ class Llama3TransformerBlock(TransformerBlock):
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
     ):
+        """Apply attention and FFN residual branches while recording both boundaries."""
+
+        # Record branch inputs and outputs before each residual addition.
         attn_out = self.attention(
             self.attention_norm(x),
             attention_masks,

@@ -230,11 +230,19 @@ class Decoder(BaseModel):
         positions: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
     ):
+        """Run embeddings, decoder layers, normalization, and the LM head.
+
+        Example:
+
+            logits_BLV = decoder(tokens_BL, positions_BL)
+        """
+
         # positions is listed before attention_masks so AutoParallel's input_fn,
         # which returns (tokens, positions) and binds them positionally, maps
         # positions to the right parameter (it would otherwise land in the
         # attention_masks slot and break the maskless SDPA backend).
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
+        # The decoder input boundary exists only on the stage that owns embeddings.
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
         if self.tok_embeddings is not None:
             log_fwd_bwd_stats(self, input=h)
@@ -249,6 +257,7 @@ class Decoder(BaseModel):
         # TODO: fix PP backward upstream to skip non-tensor inputs
         if self._skip_lm_head:
             return h
+        # The output boundary exists only on the stage that owns the LM head.
         if self.lm_head is None:
             return h
         output = self.lm_head(h)

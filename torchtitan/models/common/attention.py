@@ -962,6 +962,15 @@ class GQAttention(BaseAttention):
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Project `[B, L, D]` input through Q/K/V attention back to `[B, L, D]`.
+
+        Example:
+
+            output_BLD = attention(input_BLD, attention_masks=None)
+            assert output_BLD.shape == input_BLD.shape
+        """
+
+        # Project once, then observe the unnormalized Q/K/V boundary.
         B, L, _ = x_BLD.shape
         xq_BLNH, xk_BLNH, xv_BLNH = self.qkv_linear(x_BLD)
         log_fwd_bwd_stats(

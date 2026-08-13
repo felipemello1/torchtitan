@@ -24,9 +24,29 @@ def log_router_statistics(
     global_tokens_per_expert_by_layer: torch.Tensor,
     parallel_dims: ParallelDims,
 ) -> None:
-    """Reconstruct and record router statistics for every MoE layer."""
+    """Reconstruct topology-aware router metrics for every MoE layer.
 
-    # Router scores and rank-local expert imbalance.
+    Args:
+        moe_layers: Ordered `(transformer_block, moe)` pairs for `L` local layers.
+        local_tokens_per_expert_by_layer: `L` local count tensors, each logically
+            `[E]`; these retain local-shard load for diagnostics.
+        global_tokens_per_expert_by_layer: Counts with shape `[L, E]` already reconstructed over every token-sharding axis.
+        parallel_dims: Meshes used to reconstruct router logits and per-sequence counts.
+
+    Example:
+
+        # Two layers and four global experts.
+        global_counts_LE = torch.tensor([[8, 8, 4, 12], [7, 9, 8, 8]])
+        log_router_statistics(
+            moe_layers,
+            local_tokens_per_expert_by_layer=local_counts_by_layer,
+            global_tokens_per_expert_by_layer=global_counts_LE,
+            parallel_dims=parallel_dims,
+        )
+        # Layer 0 records expert_load=[1.0, 1.0, 0.5, 1.5].
+    """
+
+    # Reconstruct router scores over ranks that hold partial token populations.
     router_logits_mean_LE = torch.stack(
         [cast(Any, moe.router)._router_logits_mean_E for _, moe in moe_layers]
     )
@@ -45,6 +65,7 @@ def log_router_statistics(
             op=torch.distributed.ReduceOp.AVG,
         )
 
+    # Derive entropy from reconstructed scores, but retain local expert imbalance.
     ep_mesh = parallel_dims.get_optional_mesh("ep")
     for (_, moe), router_logits_mean_E, local_counts_E in zip(
         moe_layers,
@@ -90,7 +111,7 @@ def log_router_statistics(
             .view(1),
         )
 
-    # Per-sequence imbalance after reconstructing sequence shards.
+    # Reconstruct each sequence across CP (and TP when TP and EP share work).
     sequence_counts_LBE = torch.stack(
         [cast(torch.Tensor, moe._sequence_expert_counts_BE) for _, moe in moe_layers]
     )
@@ -134,7 +155,7 @@ def log_router_statistics(
             seq_expert_imbalance_mean=sequence_imbalance_B.mean().view(1),
         )
 
-    # Globally reconstructed expert load and the bias that produced it.
+    # Derive global expert load and expose the bias that produced the routing.
     ep_size = 1 if ep_mesh is None else ep_mesh.size()
     for (_, moe), tokens_per_expert_E in zip(
         moe_layers,

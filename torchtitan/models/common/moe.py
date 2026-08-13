@@ -468,6 +468,7 @@ class MoE(Module):
     def __init__(self, config: Config):
         super().__init__()
 
+        # Router names cover both raw distributions and topology-derived health.
         num_experts = config.num_experts
         self.routed_experts = config.routed_experts.build()
         self.router = config.router.build()
@@ -488,6 +489,7 @@ class MoE(Module):
         self.shared_experts = (
             config.shared_experts.build() if config.shared_experts is not None else None
         )
+        # MoE activation names are paired with cotangents through one common API.
         moe_tensor_keys = ["input_normed", "routed_output"]
         if self.shared_experts is not None:
             moe_tensor_keys.append("shared_output")

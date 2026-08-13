@@ -406,6 +406,8 @@ def _momentum_gradient_cosine(
     momentum: torch.Tensor,
     gradient: torch.Tensor,
 ) -> torch.Tensor:
+    """Return the global cosine between an Adam first moment and its gradient."""
+
     statistics = torch.stack(
         [
             (momentum * gradient).sum(),
@@ -432,6 +434,11 @@ def log_adam_tensor_statistics(
         optimizers: Optimizers whose Adam state should be recorded.
         log_momentum_gradient_cosine: Also reconstruct each parameter's
             momentum/gradient cosine.
+
+    Example:
+
+        # Called after optimizer.step(), so `w` and Adam state describe the update.
+        log_adam_tensor_statistics(optimizers)
     """
 
     if not is_enabled():
@@ -477,11 +484,13 @@ def _global_moe_expert_counts(
 ) -> torch.Tensor:
     """Reconstruct per-layer expert counts over every token-sharding axis."""
 
+    # Full-DTensor carries every partial placement and can redistribute once.
     if parallel_dims.spmd_backend == "full_dtensor":
         assert isinstance(local_counts_by_layer, torch.distributed.tensor.DTensor)
         mesh = local_counts_by_layer.device_mesh
         return local_counts_by_layer.redistribute(placements=[Replicate()] * mesh.ndim)
 
+    # SPMD-types tensors are local, so reduce only axes that shard token counts.
     if parallel_dims.spmd_backend == "spmd_types":
         # SPMD-types state is physically local. With EP, token counts are
         # partial over TP; DP/CP partials are reduced over the loss mesh.
@@ -500,6 +509,7 @@ def _global_moe_expert_counts(
             )
         return local_counts_by_layer
 
+    # Legacy/default DTensor first resolves its embedded mesh, then the loss mesh.
     dtensor_counts = (
         local_counts_by_layer
         if isinstance(local_counts_by_layer, torch.distributed.tensor.DTensor)
@@ -573,25 +583,35 @@ def register_moe_load_balancing_hook(
         parallel_dims: ParallelDims,
         load_balance_enabled: bool,
     ):
+        """Reconstruct counts, serve their consumers, then clear the window.
+
+        Example:
+
+            # Local counts from all microbatches are consumed once per step.
+            _process_moe_expert_counts(moe_layers, parallel_dims, True)
+        """
+
         # TODO: Currently this sync is blocking (thus exposed) and happens on the
         # default compute stream. Need to assess if this is OK performance-wise.
         tokens_per_expert_E_list = [
             moe.tokens_per_expert_E for _transformer_block, moe in moe_layers
         ]
 
+        # Skip communication when neither bias updates nor logging needs counts.
         logging_enabled = is_enabled()
         if not load_balance_enabled and not logging_enabled:
             for tokens_per_expert_E in tokens_per_expert_E_list:
                 tokens_per_expert_E.zero_()
             return
 
+        # One stacked reconstruction batches topology communication over layers.
         tokens_per_expert_E_by_layer = torch.vstack(tokens_per_expert_E_list)
-
         tokens_per_expert_E_by_layer = _global_moe_expert_counts(
             tokens_per_expert_E_by_layer,
             parallel_dims,
         )
 
+        # Logging derives semantic router metrics without owning bias state.
         if logging_enabled:
             log_router_statistics(
                 moe_layers,
@@ -600,6 +620,7 @@ def register_moe_load_balancing_hook(
                 parallel_dims=parallel_dims,
             )
 
+        # Bias updates and counter reset share the same reconstructed window.
         with torch.no_grad():
             for (_transformer_block, moe), tokens_per_expert_E in zip(
                 moe_layers,

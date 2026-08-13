@@ -62,6 +62,9 @@ class Qwen3TransformerBlock(TransformerBlock):
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
     ):
+        """Apply attention and dense/MoE residual branches with common metric names."""
+
+        # Dense and MoE blocks expose the same two residual-branch boundaries.
         attn_out = self.attention(
             self.attention_norm(x),
             attention_masks,

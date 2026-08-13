@@ -70,6 +70,20 @@ from torchtitan.tools.profiler import Profiler
 
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
+    """Own the process-local components for one distributed training job.
+
+    Construction follows dependency order: meshes, model parallelism,
+    observability, optimizer/data/checkpoint state, then execution contexts.
+
+    Example:
+
+        trainer = Trainer(config)
+        try:
+            trainer.train()
+        finally:
+            trainer.close()
+    """
+
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         """
@@ -477,6 +491,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
                 self.model_parts = [model]
 
+        # Freeze tensor names only after PP splitting and all model wrapping finish.
         self.tensor_logging = None
         if config.metrics.enable_tensor_logging:
             tensor_logging_freq = config.metrics.tensor_logging_freq
@@ -495,6 +510,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             ]
             if config.metrics.tensor_logging_adam_momentum_gradient_cosine:
                 parameter_metric_names.append("cos_sim_m_g")
+            # Allocate semantic MoE state and register every trainable parameter.
             for model_part in self.model_parts:
                 for module in model_part.modules():
                     if isinstance(module, MoE):
@@ -512,6 +528,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                             parameter,
                             parameter_metric_names,
                         )
+            # One global schema binds all stage-local owners to fixed buffer rows.
             self.tensor_logging = init_tensor_logging(
                 self.model_parts,
                 device=self.device,
@@ -901,6 +918,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
+        """Run one optimizer step with tensor recording enabled only on its cadence."""
+
         if self.tensor_logging is None:
             return self._train_step(data_iterator)
         with set_tensor_logging_enabled(self.step % self.tensor_logging_freq == 0):
@@ -909,6 +928,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     def _train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
+        """Execute accumulated forward/backward, optimizer, and metric publication.
+
+        Example:
+
+            # One call consumes every accumulation and PP microbatch for this step.
+            trainer._train_step(data_iterator)
+        """
+
         self.optimizers.zero_grad()
         # Save per-optimizer-group learning rates for logging
         lr_metrics = self.lr_schedulers.get_metrics()
@@ -972,6 +999,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             )
             accumulated_losses.append(loss.detach())
 
+        # Phase 3: observe raw gradients, clip, observe clipped gradients, then step.
         with sl.log_trace_span("optim"):
             if is_tensor_logging_enabled():
                 for model_part in self.model_parts:

@@ -162,10 +162,13 @@ def _owner_names(
     roots: Sequence[nn.Module],
     root_name_overrides: Mapping[nn.Module, str],
 ) -> dict[Owner, str]:
+    """Map every module and direct parameter to its stable metric-name prefix."""
+
     names: dict[Owner, str] = {}
     root_prefixes = (
         [""] if len(roots) == 1 else [f"model_parts.{i}" for i in range(len(roots))]
     )
+    # A split model defaults to local prefixes unless PP supplies global overrides.
     for root, root_prefix in zip(roots, root_prefixes, strict=True):
         root_prefix = root_name_overrides.get(root, root_prefix)
         for module_name, module in root.named_modules():
@@ -198,6 +201,15 @@ def _add_statistic_metrics(
     sums: Sequence[float],
     maximum: float,
 ) -> None:
+    """Derive scalar leaves for one reduced sufficient-statistic row.
+
+    Example:
+
+        _add_statistic_metrics(metrics, "x", [4, 0, 1, 1], [6, 14, 98], 3)
+        # metrics["x.abs_mean"] == 1.5
+        # metrics["x.zero_frac"] == 0.25
+    """
+
     numel, nonfinite_count, zero_count, observation_count = counts
     if observation_count == 0:
         return
@@ -228,7 +240,14 @@ def _add_statistic_metrics(
 
 
 class TensorLoggingRuntime:
-    """Setup-static slots and lifecycle for the active model parts."""
+    """Bind setup-static metric names to packed device-buffer rows.
+
+    Example:
+
+        register(module, ["activation"])
+        runtime = TensorLoggingRuntime([model])
+        # module's `activation` key now writes into one fixed row.
+    """
 
     def __init__(
         self,
@@ -243,6 +262,7 @@ class TensorLoggingRuntime:
             re.compile(metrics_filter_regex) if metrics_filter_regex else None
         )
 
+        # Discover each local `(owner, key)` and its public full name.
         root_name_overrides = root_name_overrides or {}
         owner_names = _owner_names(roots, root_name_overrides)
         local_owner_by_full_key: dict[str, Owner] = {}
@@ -270,6 +290,7 @@ class TensorLoggingRuntime:
                     local_owner_by_full_key[full_key] = owner
                 local_bindings.append((owner, key, full_key))
 
+        # Every rank uses one schema even when PP stages own different keys.
         self.keys = _gather_global_keys(set(local_owner_by_full_key))
         self._gradient_indices = {
             "gradients.all": [
@@ -283,6 +304,7 @@ class TensorLoggingRuntime:
         }
         full_key_to_slot = {key: slot for slot, key in enumerate(self.keys)}
 
+        # Allocate one row per key, then bind local owners directly to row views.
         self.buffers = StatisticBuffers(
             len(self.keys),
             device=device or _infer_device(roots),
@@ -301,6 +323,7 @@ class TensorLoggingRuntime:
                 self.buffers.maxima[slot],
                 self._slot_indices[slot],
             )
+        # Module state makes the slabs visible to compile and Graph Trainer.
         self._state_owner = roots[0]
         self._state_owner.add_module("_tensor_logging_state", self.buffers)
         self._closed = False
@@ -348,8 +371,16 @@ class TensorLoggingRuntime:
         self,
         reduced_buffers: ReducedBuffers,
     ) -> dict[str, int | float]:
-        """Derive scalar metric leaves from reduced sufficient statistics."""
+        """Derive, aggregate, and filter scalar leaves from reduced buffers.
 
+        Example:
+
+            reduced = runtime.reduce_buffers()
+            metrics = runtime.buffers_to_metrics(reduced)
+            # {"layers.0.x.abs_mean": 0.42, ...}
+        """
+
+        # Move three slabs to the host once before deriving individual leaves.
         counts, sums, maxima = (buffer.detach().cpu() for buffer in reduced_buffers)
         count_rows = cast(list[list[int]], counts.tolist())
         sum_rows = cast(list[list[float]], sums.tolist())
@@ -363,6 +394,7 @@ class TensorLoggingRuntime:
                 sum_rows[index],
                 maximum_rows[index],
             )
+        # Whole-model and MoE gradient summaries merge existing `.dw` rows.
         for key, indices in self._gradient_indices.items():
             if not indices:
                 continue
@@ -373,6 +405,7 @@ class TensorLoggingRuntime:
                 cast(list[float], sums[indices].sum(dim=0).tolist()),
                 float(maxima[indices].amax()),
             )
+        # Filtering controls sink volume, not GPU collection.
         if self._metrics_filter is not None:
             metrics = {
                 key: value
@@ -520,6 +553,8 @@ def log_fwd_bwd_stats(
                     f"log_fwd_bwd_stats({key}=...) requires a differentiable tensor"
                 )
             backward_slot = runtime._statistic_slot(owner, f"{key}.dx")
+
+            # Observe forward now; the hook observes the incoming cotangent.
             runtime._accumulate(owner, f"{key}.x", value)
 
             def record_cotangent(
