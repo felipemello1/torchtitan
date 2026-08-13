@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any
 
 import torch
+from tensorboard.compat.proto.summary_pb2 import Summary
 from torch.utils.tensorboard import SummaryWriter
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Configurable
@@ -37,7 +38,8 @@ DeviceMemStats = namedtuple(
 
 class DeviceMemoryMonitor:
     def __init__(self, device: str = f"{device_type}:0"):
-        self.device = torch.device(device)  # pyrefly: ignore [read-only]
+        # pyrefly: ignore [read-only]
+        self.device = torch.device(device)  # device object
         self.device_name = device_module.get_device_name(self.device)
         self.device_index = device_module.current_device()
         self.device_capacity = device_module.get_device_properties(
@@ -119,9 +121,15 @@ class TensorBoardLogger(BaseLogger):
         logger.info(f"TensorBoard logging enabled. Logs will be saved at {log_dir}")
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
-        for k, v in metrics.items():
-            tag = k if self.tag is None else f"{self.tag}/{k}"
-            self.writer.add_scalar(tag, v, step)
+        values = [
+            Summary.Value(
+                tag=key if self.tag is None else f"{self.tag}/{key}",
+                simple_value=float(value),
+            )
+            for key, value in metrics.items()
+        ]
+        # Submit one event instead of one queue operation per scalar.
+        self.writer._get_file_writer().add_summary(Summary(value=values), step)
 
     def close(self) -> None:
         self.writer.close()
@@ -302,12 +310,13 @@ class MetricsProcessor(Configurable):
         """Whether to record model tensor statistics."""
 
         tensor_logging_freq: int = 5
-        """Requested tensor-stat cadence; never more frequent than ``log_freq``."""
+        """Requested tensor-stat cadence; never more frequent than `log_freq`."""
 
         tensor_logging_metrics_filter_regex: str = (
-            r"\.w:(?:kurtosis|zero_frac)$" r"|:(?:numel|abs_mean|square_mean|abs_max)$"
+            r"\.w:(?:kurtosis|zero_frac)$"
+            r"|:(?:numel|nonfinite_count|abs_mean|square_mean|abs_max)$"
         )
-        """Allowlist regex over each tensor metric's ``<name>:<statistic>``."""
+        """Allowlist regex over each tensor metric's `<name>:<statistic>`."""
 
         tensor_logging_adam_momentum_gradient_cosine: bool = False
         """Whether to record the per-parameter Adam momentum/gradient cosine."""

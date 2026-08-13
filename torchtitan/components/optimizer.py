@@ -606,14 +606,15 @@ def register_moe_load_balancing_hook(
                 tokens_per_expert_E_by_layer,
                 strict=True,
             ):
-                tokens_per_expert_E = tokens_per_expert_E.float()
                 load_balance_coeff = moe.load_balance_coeff
                 if load_balance_coeff is not None:
                     # This is not exactly the same as
                     # https://arxiv.org/pdf/2408.15664 proposed.
-                    expert_bias_delta_E = load_balance_coeff * torch.sign(
-                        tokens_per_expert_E.mean() - tokens_per_expert_E
+                    load_balance_sign_E = torch.sign(
+                        tokens_per_expert_E.sum()
+                        - tokens_per_expert_E.numel() * tokens_per_expert_E
                     )
+                    expert_bias_delta_E = load_balance_coeff * load_balance_sign_E
                     expert_bias_delta_E = (
                         expert_bias_delta_E - expert_bias_delta_E.mean()
                     )

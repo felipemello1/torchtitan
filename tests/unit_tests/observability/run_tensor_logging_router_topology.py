@@ -68,7 +68,7 @@ class RouterRoot(nn.Module):
 
 
 def _local_counts(dp_rank: int, cp_rank: int, device: torch.device) -> torch.Tensor:
-    counts = torch.zeros((2, 1, 3), dtype=torch.float32, device=device)
+    counts = torch.zeros((2, 1, 3), dtype=torch.int64, device=device)
     if dp_rank == 0:
         counts[0, 0] = torch.tensor(
             [6, 0, 0] if cp_rank == 0 else [0, 0, 0],
@@ -99,6 +99,8 @@ def _assert_metric_close(metrics: dict[str, int | float], key: str, expected) ->
 
 def main() -> None:
     dist.init_process_group("nccl")
+    if dist.get_world_size() != 4:
+        raise ValueError("router topology oracle requires exactly four ranks")
     rank = dist.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -207,7 +209,7 @@ def main() -> None:
 
         expected_global = torch.tensor(
             [[6, 3, 3], [9, 4, 4]],
-            dtype=torch.float32,
+            dtype=torch.int64,
             device=device,
         )
         torch.testing.assert_close(global_tokens_by_layer, expected_global)
@@ -245,11 +247,7 @@ def main() -> None:
             first_router + ".experts_max_violation.abs_mean",
             0.5,
         )
-        _assert_metric_close(
-            metrics,
-            first_router + ".ep_shard_imbalance.abs_mean",
-            1.0,
-        )
+        assert first_router + ".ep_shard_imbalance.abs_mean" not in metrics
 
         second_router = "layers.1.moe.router"
         _assert_metric_close(metrics, second_router + ".expert_load.abs_mean", 1.0)

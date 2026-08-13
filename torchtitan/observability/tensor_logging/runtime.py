@@ -7,8 +7,9 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import re
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import cast, TypeAlias
 
 import spmd_types as spmd
@@ -157,12 +158,16 @@ def _infer_device(roots: Sequence[nn.Module]) -> torch.device:
     return torch.device("cpu")
 
 
-def _owner_names(roots: Sequence[nn.Module]) -> dict[Owner, str]:
+def _owner_names(
+    roots: Sequence[nn.Module],
+    root_name_overrides: Mapping[nn.Module, str],
+) -> dict[Owner, str]:
     names: dict[Owner, str] = {}
     root_prefixes = (
         [""] if len(roots) == 1 else [f"model_parts.{i}" for i in range(len(roots))]
     )
     for root, root_prefix in zip(roots, root_prefixes, strict=True):
+        root_prefix = root_name_overrides.get(root, root_prefix)
         for module_name, module in root.named_modules():
             module_name = ".".join(
                 part
@@ -205,19 +210,21 @@ def _add_statistic_metrics(
         return
 
     absolute_sum, square_sum, fourth_moment_sum = sums
-    absolute_mean = absolute_sum / finite_count
-    square_mean = square_sum / finite_count
     metrics[prefix + "zero_count"] = zero_count
     metrics[prefix + "zero_frac"] = zero_count / finite_count
-    metrics[prefix + "abs_sum"] = absolute_sum
-    metrics[prefix + "abs_mean"] = absolute_mean
-    metrics[prefix + "square_mean"] = square_mean
-    metrics[prefix + "rms"] = square_mean**0.5
-    metrics[prefix + "abs_max"] = maximum
-    if square_mean > 0:
-        metrics[prefix + "kurtosis"] = (
-            fourth_moment_sum / finite_count / square_mean**2 - 3
-        )
+    if math.isfinite(absolute_sum):
+        metrics[prefix + "abs_sum"] = absolute_sum
+        metrics[prefix + "abs_mean"] = absolute_sum / finite_count
+    if math.isfinite(square_sum):
+        square_mean = square_sum / finite_count
+        metrics[prefix + "square_mean"] = square_mean
+        metrics[prefix + "rms"] = square_mean**0.5
+        if square_mean > 0 and math.isfinite(fourth_moment_sum):
+            kurtosis = fourth_moment_sum / finite_count / square_mean**2 - 3
+            if math.isfinite(kurtosis):
+                metrics[prefix + "kurtosis"] = kurtosis
+    if math.isfinite(maximum):
+        metrics[prefix + "abs_max"] = maximum
 
 
 class TensorLoggingRuntime:
@@ -229,14 +236,16 @@ class TensorLoggingRuntime:
         *,
         device: torch.device | None = None,
         metrics_filter_regex: str = "",
+        root_name_overrides: Mapping[nn.Module, str] | None = None,
     ) -> None:
         self._owners: list[Owner] = []
         self._metrics_filter = (
             re.compile(metrics_filter_regex) if metrics_filter_regex else None
         )
 
-        owner_names = _owner_names(roots)
-        local_full_keys: set[str] = set()
+        root_name_overrides = root_name_overrides or {}
+        owner_names = _owner_names(roots, root_name_overrides)
+        local_owner_by_full_key: dict[str, Owner] = {}
         local_bindings: list[tuple[Owner, str, str]] = []
         for owner, owner_name in owner_names.items():
             keys = _registered_keys(owner)
@@ -244,12 +253,24 @@ class TensorLoggingRuntime:
                 continue
             for key in keys:
                 full_key = ".".join(part for part in (owner_name, key) if part)
-                if full_key in local_full_keys:
-                    raise ValueError(f"tensor logging key registered twice: {full_key}")
-                local_full_keys.add(full_key)
+                previous_owner = local_owner_by_full_key.get(full_key)
+                if previous_owner is not None:
+                    explicitly_shared_root = (
+                        previous_owner is not owner
+                        and previous_owner in root_name_overrides
+                        and owner in root_name_overrides
+                        and root_name_overrides[previous_owner]
+                        == root_name_overrides[owner]
+                    )
+                    if not explicitly_shared_root:
+                        raise ValueError(
+                            f"tensor logging key registered twice: {full_key}"
+                        )
+                else:
+                    local_owner_by_full_key[full_key] = owner
                 local_bindings.append((owner, key, full_key))
 
-        self.keys = _gather_global_keys(local_full_keys)
+        self.keys = _gather_global_keys(set(local_owner_by_full_key))
         self._gradient_indices = {
             "gradients.all": [
                 index for index, key in enumerate(self.keys) if key.endswith(".dw")
@@ -285,8 +306,6 @@ class TensorLoggingRuntime:
         self._closed = False
 
     def _accumulate(self, owner: Owner, key: str, value: torch.Tensor) -> None:
-        if self._closed:
-            raise RuntimeError("tensor logging runtime is closed")
         binding = _statistic_binding(owner, key)
         with spmd.no_typecheck():
             accumulate_tensor_statistics(
@@ -295,19 +314,7 @@ class TensorLoggingRuntime:
                 self.buffers.enabled,
             )
 
-    def _statistic_buffers(
-        self,
-        owner: Owner,
-        key: str,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self._closed:
-            raise RuntimeError("tensor logging runtime is closed")
-        binding = _statistic_binding(owner, key)
-        return binding[:3]
-
     def _statistic_slot(self, owner: Owner, key: str) -> torch.Tensor:
-        if self._closed:
-            raise RuntimeError("tensor logging runtime is closed")
         return _statistic_binding(owner, key)[3]
 
     def clear(self) -> None:
@@ -392,6 +399,7 @@ def init(
     *,
     device: torch.device | None = None,
     metrics_filter_regex: str = "",
+    root_name_overrides: Mapping[nn.Module, str] | None = None,
 ) -> TensorLoggingRuntime:
     """Freeze registrations and install one active runtime for the model roots.
 
@@ -399,6 +407,7 @@ def init(
         roots: Model or model parts whose registered owners should be active.
         device: Device for fixed statistic buffers; inferred when omitted.
         metrics_filter_regex: Publication allowlist over `<name>:<statistic>`.
+        root_name_overrides: Logical names for explicitly split model roots.
 
     Example:
 
@@ -414,6 +423,7 @@ def init(
         root_list,
         device=device,
         metrics_filter_regex=metrics_filter_regex,
+        root_name_overrides=root_name_overrides,
     )
     _active_runtime = runtime
     return runtime
@@ -509,13 +519,8 @@ def log_fwd_bwd_stats(
                 raise ValueError(
                     f"log_fwd_bwd_stats({key}=...) requires a differentiable tensor"
                 )
-            forward_buffers = runtime._statistic_buffers(owner, f"{key}.x")
             backward_slot = runtime._statistic_slot(owner, f"{key}.dx")
-            accumulate_tensor_statistics(
-                _physical_tensor(value),
-                *forward_buffers,
-                runtime.buffers.enabled,
-            )
+            runtime._accumulate(owner, f"{key}.x", value)
 
             def record_cotangent(
                 cotangent: torch.Tensor,

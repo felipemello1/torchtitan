@@ -30,19 +30,19 @@ def _local_sequence_counts(
     tp_rank: int,
     device: torch.device,
 ) -> torch.Tensor:
-    counts = torch.zeros((2, 1, 4), dtype=torch.float32, device=device)
+    counts = torch.zeros((2, 1, 4), dtype=torch.int64, device=device)
     if cp_rank != 0 or tp_rank != 0:
         return counts
     if dp_rank == 0:
         counts[:, 0] = torch.tensor(
             [[8, 0, 0, 0], [0, 4, 4, 0]],
-            dtype=torch.float32,
+            dtype=torch.int64,
             device=device,
         )
     else:
         counts[:, 0] = torch.tensor(
             [[0, 0, 3, 3], [9, 0, 0, 0]],
-            dtype=torch.float32,
+            dtype=torch.int64,
             device=device,
         )
     return counts
@@ -78,13 +78,18 @@ def main() -> None:
     try:
         rank_coded_counts = torch.full(
             (1, 4),
-            rank + 1,
-            dtype=torch.float32,
+            2**24 + rank + 1,
+            dtype=torch.int64,
             device=device,
         )
         torch.testing.assert_close(
             _global_moe_expert_counts(rank_coded_counts, parallel_dims),
-            torch.full((1, 4), 36.0, device=device),
+            torch.full(
+                (1, 4),
+                8 * 2**24 + 36,
+                dtype=torch.int64,
+                device=device,
+            ),
         )
 
         local_sequence_counts = _local_sequence_counts(
@@ -102,7 +107,7 @@ def main() -> None:
             global_tokens_by_layer,
             torch.tensor(
                 [[8, 0, 3, 3], [9, 4, 4, 0]],
-                dtype=torch.float32,
+                dtype=torch.int64,
                 device=device,
             ),
         )

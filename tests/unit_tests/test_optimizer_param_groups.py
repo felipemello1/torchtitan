@@ -208,6 +208,47 @@ class TestParamGroupConfig(unittest.TestCase):
             torch.tensor([0, 0]),
         )
 
+    def test_moe_load_balancing_keeps_counts_exact_above_float32_limit(self):
+        model = FakeMoEModel(load_balance_coeffs=(0.1, 0.2))
+        model.layers["0"].moe.tokens_per_expert_E.copy_(
+            torch.tensor([2**24, 2**24 + 1])
+        )
+        container = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[_DEFAULT_ADAMW],
+        ).build(model_parts=[model])
+        register_moe_load_balancing_hook(container, [model], FakeParallelDims())
+
+        container.step()
+
+        torch.testing.assert_close(
+            model.layers["0"].moe.expert_bias_E,
+            torch.tensor([0.1, -0.1]),
+        )
+
+    def test_router_entropy_is_finite_when_a_probability_underflows_to_zero(self):
+        model = FakeMoEModel()
+        for block in model.layers.values():
+            block.moe.router._router_logits_mean_E.copy_(torch.tensor([0.0, -1000.0]))
+        container = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[_DEFAULT_ADAMW],
+        ).build(model_parts=[model])
+        register_moe_load_balancing_hook(container, [model], FakeParallelDims())
+        runtime = init(model)
+        try:
+            with set_enabled(True):
+                container.step()
+
+            for layer_id in range(2):
+                entropy = runtime.raw_snapshot()[
+                    f"layers.{layer_id}.moe.router.entropy"
+                ]
+                self.assertEqual(entropy["counts"].tolist(), [1, 0, 1, 1])
+                self.assertEqual(entropy["sums"][0].item(), 0.0)
+        finally:
+            runtime.close()
+
     def test_moe_load_balancing_rejects_inconsistent_coeffs(self):
         model = FakeMoEModel(load_balance_coeffs=(None, 0.2))
         config = OptimizersContainer.Config(
@@ -279,6 +320,10 @@ class TestParamGroupConfig(unittest.TestCase):
                 self.assertEqual(
                     snapshot[f"{prefix}.seq_expert_imbalance_mean"]["sums"][0].item(),
                     1.5,
+                )
+                self.assertEqual(
+                    snapshot[f"{prefix}.ep_shard_imbalance"]["counts"].tolist(),
+                    [0, 0, 0, 0],
                 )
         finally:
             runtime.close()

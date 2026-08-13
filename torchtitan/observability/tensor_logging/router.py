@@ -69,7 +69,9 @@ def log_router_statistics(
             dim=-1,
             p=1,
         )
-        entropy = -(normalized_scores_E * normalized_scores_E.log()).sum()
+        entropy = -(
+            normalized_scores_E * normalized_scores_E.clamp_min(1e-12).log()
+        ).sum()
         log_stats(moe.router, entropy=entropy.view(1))
 
         if isinstance(local_counts_E, DTensor):
@@ -121,7 +123,7 @@ def log_router_statistics(
         sequence_counts_LBE,
         strict=True,
     ):
-        local_counts_BE = sequence_counts_BE[:, local_expert_slice]
+        local_counts_BE = sequence_counts_BE[:, local_expert_slice].float()
         average_counts_B1 = local_counts_BE.mean(dim=1, keepdim=True)
         sequence_imbalance_B = (local_counts_BE / average_counts_B1.clamp_min(1)).amax(
             dim=1
@@ -142,16 +144,20 @@ def log_router_statistics(
         tokens_per_expert_E = tokens_per_expert_E.float()
         average_tokens = tokens_per_expert_E.mean().clamp_min(1)
         expert_load_E = tokens_per_expert_E / average_tokens
-        expert_shard_counts = tokens_per_expert_E.reshape(ep_size, -1).sum(dim=-1)
         log_stats(
             moe.router,
             expert_load=expert_load_E,
             experts_max_violation=(expert_load_E.max() - 1).view(1),
-            ep_shard_imbalance=(
-                expert_shard_counts.max().float()
-                * ep_size
-                / tokens_per_expert_E.sum().clamp_min(1).float()
-            ).view(1),
         )
+        if ep_mesh is not None:
+            expert_shard_counts = tokens_per_expert_E.reshape(ep_size, -1).sum(dim=-1)
+            log_stats(
+                moe.router,
+                ep_shard_imbalance=(
+                    expert_shard_counts.max().float()
+                    * ep_size
+                    / tokens_per_expert_E.sum().clamp_min(1).float()
+                ).view(1),
+            )
         if moe.expert_bias_E is not None:
             log_stats(moe.router, expert_bias=moe.expert_bias_E)

@@ -486,11 +486,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 tensor_logging_freq,
                 config.metrics.log_freq,
             )
-            if parallel_dims.pp_enabled and len(self.model_parts) != 1:
-                raise NotImplementedError(
-                    "tensor logging does not yet support looped pipeline schedules "
-                    "with multiple model parts per rank"
-                )
             parameter_metric_names = [
                 "w",
                 "dw",
@@ -522,6 +517,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 device=self.device,
                 metrics_filter_regex=(
                     config.metrics.tensor_logging_metrics_filter_regex
+                ),
+                root_name_overrides=(
+                    {model_part: "" for model_part in self.model_parts}
+                    if parallel_dims.pp_enabled
+                    else None
                 ),
             )
 

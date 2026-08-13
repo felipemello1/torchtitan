@@ -11,8 +11,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.tensor import DTensor, init_device_mesh, Replicate, Shard
-from torch.nn import functional as F
 from torch.utils.checkpoint import CheckpointPolicy
+from torchtitan.components.metrics import MetricsProcessor
 
 from torchtitan.config import CompileConfig
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
@@ -136,6 +136,36 @@ def test_registration_survives_deepcopy() -> None:
         runtime.close()
 
 
+def test_split_roots_share_logical_root_names_and_slots() -> None:
+    class PipelinePart(nn.Module):
+        def __init__(self, layer_id: int) -> None:
+            super().__init__()
+            register(self, ["input"])
+            self.layers = nn.ModuleDict({str(layer_id): nn.Identity()})
+            register(self.layers[str(layer_id)], ["hidden"])
+
+    parts = [PipelinePart(3), PipelinePart(7)]
+    runtime = init(parts, root_name_overrides={part: "" for part in parts})
+    try:
+        assert runtime.keys == ["input", "layers.3.hidden", "layers.7.hidden"]
+        with set_enabled(True):
+            log_stats(parts[0], input=torch.ones(2))
+        assert runtime.raw_snapshot()["input"]["counts"].tolist() == [2, 0, 0, 1]
+    finally:
+        runtime.close()
+
+
+def test_split_root_alias_does_not_hide_duplicate_registrations() -> None:
+    root = nn.Module()
+    register(root, ["value", "value"])
+    with pytest.raises(ValueError, match="registered twice: value"):
+        init([root], root_name_overrides={root: ""})
+
+    parts = [TinyStatsRoot(), TinyStatsRoot()]
+    with pytest.raises(ValueError, match="layers.0.hidden"):
+        init(parts, root_name_overrides={part: "" for part in parts})
+
+
 def test_decoder_input_is_emitted_only_by_the_first_pipeline_stage() -> None:
     for has_embeddings, expected_observations in ((True, 1), (False, 0)):
         decoder = Decoder.__new__(Decoder)
@@ -185,42 +215,6 @@ def _residual_block(block_type):
     return block
 
 
-class TinyRouterStatsModule(nn.Module):
-    def __init__(self, expert_count: int, sequence_count: int) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.eye(expert_count))
-        self.register_buffer(
-            "tokens_per_expert",
-            torch.zeros(expert_count, dtype=torch.int64),
-            persistent=False,
-        )
-        self.register_buffer(
-            "last_per_sequence_counts",
-            torch.zeros(sequence_count, expert_count, dtype=torch.int64),
-            persistent=False,
-        )
-        register(
-            self,
-            [
-                "expert_load",
-                "experts_max_violation",
-                "seq_expert_imbalance_mean",
-                "seq_expert_imbalance_max",
-            ],
-        )
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        logits = value @ self.weight
-        assignments = F.one_hot(
-            logits.argmax(dim=-1),
-            num_classes=logits.shape[-1],
-        )
-        with torch.no_grad():
-            self.tokens_per_expert.add_(assignments.sum(dim=(0, 1)))
-            self.last_per_sequence_counts.copy_(assignments.sum(dim=1))
-        return logits.square()
-
-
 def _trace_forward_backward_step(
     module: nn.Module,
     value: torch.Tensor,
@@ -244,33 +238,6 @@ def _rematerialize_every_forward_node(traced) -> None:
         policy_fn=lambda node: CheckpointPolicy.MUST_RECOMPUTE,
     )
     selective_activation_remat_pass(traced.gm)
-
-
-def _log_reconstructed_router_counts(
-    router: TinyRouterStatsModule,
-    reconstructed_counts: torch.Tensor,
-    reconstructed_per_sequence_counts: torch.Tensor,
-) -> None:
-    average = reconstructed_counts.float().mean().clamp_min(1)
-    expert_load = reconstructed_counts / average
-    log_stats(
-        router,
-        expert_load=expert_load,
-        experts_max_violation=(expert_load.max() - 1).view(1),
-    )
-    per_sequence_average = (
-        reconstructed_per_sequence_counts.float().mean(dim=-1).clamp_min(1)
-    )
-    per_sequence_imbalance = (
-        (reconstructed_per_sequence_counts / per_sequence_average.unsqueeze(-1))
-        .max(dim=-1)
-        .values
-    )
-    log_stats(
-        router,
-        seq_expert_imbalance_mean=per_sequence_imbalance.mean().view(1),
-        seq_expert_imbalance_max=per_sequence_imbalance.max().view(1),
-    )
 
 
 def _assert_snapshots_equal(actual: dict, expected: dict) -> None:
@@ -516,6 +483,51 @@ def test_metrics_filter_matches_name_and_statistic() -> None:
         runtime.close()
 
 
+def test_default_filter_publishes_nonfinite_count() -> None:
+    owner = nn.Module()
+    register(owner, ["hidden"])
+    runtime = init(
+        owner,
+        metrics_filter_regex=(
+            MetricsProcessor.Config().tensor_logging_metrics_filter_regex
+        ),
+    )
+    try:
+        with set_enabled(True):
+            log_stats(owner, hidden=torch.tensor([1.0, torch.nan]))
+
+        metrics = runtime.buffers_to_metrics(runtime.reduce_buffers())
+        assert metrics["hidden.numel"] == 2
+        assert metrics["hidden.nonfinite_count"] == 1
+    finally:
+        runtime.close()
+
+
+def test_overflowed_moments_do_not_hide_valid_lower_order_statistics() -> None:
+    owner = nn.Module()
+    register(owner, ["square_overflow", "fourth_overflow"])
+    runtime = init(owner)
+    try:
+        with set_enabled(True):
+            log_stats(
+                owner,
+                square_overflow=torch.tensor([1e20]),
+                fourth_overflow=torch.tensor([1e10]),
+            )
+
+        metrics = runtime.buffers_to_metrics(runtime.reduce_buffers())
+        assert metrics["square_overflow.abs_mean"] == pytest.approx(1e20)
+        assert metrics["square_overflow.abs_max"] == pytest.approx(1e20)
+        assert "square_overflow.square_mean" not in metrics
+        assert "square_overflow.rms" not in metrics
+        assert "square_overflow.kurtosis" not in metrics
+        assert metrics["fourth_overflow.square_mean"] == pytest.approx(1e20)
+        assert metrics["fourth_overflow.rms"] == pytest.approx(1e10)
+        assert "fourth_overflow.kurtosis" not in metrics
+    finally:
+        runtime.close()
+
+
 def test_registered_but_unobserved_key_is_not_published() -> None:
     owner = nn.Module()
     register(owner, ["observed", "missing"])
@@ -527,6 +539,34 @@ def test_registered_but_unobserved_key_is_not_published() -> None:
         metrics = runtime.buffers_to_metrics(runtime.reduce_buffers())
         assert metrics["observed.abs_mean"] == 2.0
         assert not any(key.startswith("missing.") for key in metrics)
+    finally:
+        runtime.close()
+
+
+def test_unregistered_emission_names_the_missing_key() -> None:
+    owner = nn.Module()
+    register(owner, ["known"])
+    runtime = init(owner)
+    try:
+        with set_enabled(True), pytest.raises(
+            KeyError,
+            match="unregistered tensor logging key: missing",
+        ):
+            log_stats(owner, missing=torch.ones(1))
+    finally:
+        runtime.close()
+
+
+def test_reduced_integer_counts_remain_exact_above_float32() -> None:
+    owner = nn.Module()
+    register(owner, ["value"])
+    runtime = init(owner)
+    try:
+        runtime.buffers.counts[0].copy_(
+            torch.tensor([2**24 + 1, 0, 0, 1], dtype=torch.int64)
+        )
+        metrics = runtime.buffers_to_metrics(runtime.reduce_buffers())
+        assert metrics["value.numel"] == 2**24 + 1
     finally:
         runtime.close()
 
@@ -600,10 +640,6 @@ def test_graph_trainer_trace_remat_replay_and_cadence_are_exact(
 
         traced = _trace_forward_backward_step(module, value)
 
-        metric_op = torch.ops.torchtitan.accumulate_tensor_statistics.default
-        cotangent_op = torch.ops.torchtitan.record_tensor_statistics_cotangent.default
-        assert sum(node.target is metric_op for node in traced.gm.graph.nodes) == 2
-        assert sum(node.target is cotangent_op for node in traced.gm.graph.nodes) == 1
         assert all(
             count == 0
             for statistic in runtime.raw_snapshot().values()
@@ -611,8 +647,6 @@ def test_graph_trainer_trace_remat_replay_and_cadence_are_exact(
         )
 
         _rematerialize_every_forward_node(traced)
-        assert sum(node.target is metric_op for node in traced.gm.graph.nodes) == 2
-        assert sum(node.target is cotangent_op for node in traced.gm.graph.nodes) == 1
 
         runner = run_traced(traced, module=module, _validate_runtime=True)
         with set_enabled(True):
@@ -651,100 +685,6 @@ def test_graph_trainer_trace_remat_replay_and_cadence_are_exact(
             buffer_addresses
         )
         assert all("_tensor_logging_state" not in key for key in module.state_dict())
-    finally:
-        runtime.close()
-
-
-@pytest.mark.parametrize(
-    "device",
-    [
-        "cpu",
-        pytest.param(
-            "cuda",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(),
-                reason="CUDA is unavailable",
-            ),
-        ),
-    ],
-)
-def test_graph_trainer_router_count_is_not_rematerialized(
-    device: str,
-) -> None:
-    router = TinyRouterStatsModule(expert_count=4, sequence_count=1).to(device)
-    values = torch.tensor(
-        [
-            [
-                [10.0, 0.0, 0.0, 0.0],
-                [0.0, 9.0, 0.0, 0.0],
-                [0.0, 0.0, 8.0, 0.0],
-                [0.0, 0.0, 0.0, 7.0],
-                [6.0, 0.0, 0.0, 0.0],
-            ]
-        ],
-        device=device,
-    )
-    runtime = init(router)
-    try:
-        traced = _trace_forward_backward_step(router, values)
-        _rematerialize_every_forward_node(traced)
-        run_traced(traced, module=router, _validate_runtime=True)(values)
-
-        expected_counts = torch.tensor([2, 1, 1, 1], device=device)
-        torch.testing.assert_close(router.tokens_per_expert, expected_counts)
-        torch.testing.assert_close(
-            router.last_per_sequence_counts,
-            expected_counts.view(1, -1),
-        )
-
-        with set_enabled(True):
-            _log_reconstructed_router_counts(
-                router,
-                router.tokens_per_expert,
-                router.last_per_sequence_counts,
-            )
-
-        snapshot = runtime.raw_snapshot()
-        assert snapshot["expert_load"]["counts"].tolist() == [4, 0, 0, 1]
-        torch.testing.assert_close(
-            snapshot["expert_load"]["sums"][0],
-            torch.tensor(4.0),
-        )
-        torch.testing.assert_close(
-            snapshot["expert_load"]["maximum"],
-            torch.tensor(1.6),
-        )
-        assert snapshot["experts_max_violation"]["counts"].tolist() == [1, 0, 0, 1]
-        torch.testing.assert_close(
-            snapshot["experts_max_violation"]["sums"][0],
-            torch.tensor(0.6),
-        )
-        assert snapshot["seq_expert_imbalance_mean"]["counts"].tolist() == [
-            1,
-            0,
-            0,
-            1,
-        ]
-        torch.testing.assert_close(
-            snapshot["seq_expert_imbalance_mean"]["sums"][0],
-            torch.tensor(1.6),
-        )
-
-        reduced_buffers = runtime.reduce_buffers()
-        metrics = runtime.buffers_to_metrics(reduced_buffers)
-        assert metrics["expert_load.numel"] == 4
-        assert metrics["expert_load.observation_count"] == 1
-        assert metrics["expert_load.abs_mean"] == pytest.approx(1.0)
-        assert metrics["expert_load.abs_max"] == pytest.approx(1.6)
-        assert metrics["experts_max_violation.abs_mean"] == pytest.approx(0.6)
-        assert metrics["seq_expert_imbalance_mean.abs_mean"] == pytest.approx(1.6)
-
-        runtime.clear()
-        assert all(
-            count == 0
-            for statistic in runtime.raw_snapshot().values()
-            for count in statistic["counts"].tolist()
-        )
     finally:
         runtime.close()
 

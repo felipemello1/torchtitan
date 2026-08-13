@@ -62,12 +62,12 @@ def _build_source_moe(expert_count: int = 4) -> MoE:
     moe.register_buffer("expert_bias_E", torch.zeros(expert_count))
     moe.register_buffer(
         "tokens_per_expert_E",
-        torch.zeros(expert_count),
+        torch.zeros(expert_count, dtype=torch.int64),
         persistent=False,
     )
     moe.register_buffer(
         "_sequence_expert_counts_BE",
-        torch.zeros(2, expert_count),
+        torch.zeros(2, expert_count, dtype=torch.int64),
         persistent=False,
     )
     return moe
@@ -137,6 +137,8 @@ def test_source_moe_expert_counts_are_exact_once_under_ac() -> None:
     assert full_calls == 2
     assert selective_calls == 2
     assert replacing_calls == 2
+    assert eager.dtype == torch.int64
+    assert eager_sequences.dtype == torch.int64
     assert eager.sum().item() == 6
     torch.testing.assert_close(full, eager)
     torch.testing.assert_close(selective, eager)

@@ -508,7 +508,7 @@ class MoE(Module):
         # tokens_per_expert_E will be used to track expert usage and to update the expert bias for load balancing
         self.register_buffer(
             "tokens_per_expert_E",
-            torch.zeros(num_experts, dtype=torch.float32),
+            torch.zeros(num_experts, dtype=torch.int64),
             persistent=False,
         )
         self.register_buffer(
@@ -558,7 +558,7 @@ class MoE(Module):
             if self._sequence_expert_counts_BE is not None:
                 _record_router_metric_once(
                     self._sequence_expert_counts_BE,
-                    routing_map_BLE.sum(dim=1, dtype=torch.float32),
+                    routing_map_BLE.sum(dim=1, dtype=torch.int64),
                 )
 
             # This operational state drives load balancing and expert-usage metrics.
@@ -597,7 +597,7 @@ class MoE(Module):
 
         with torch.device(buffer_device):
             self.tokens_per_expert_E = torch.zeros(
-                self.routed_experts.inner_experts.num_experts, dtype=torch.float32
+                self.routed_experts.inner_experts.num_experts, dtype=torch.int64
             )
             self._sequence_expert_counts_BE = None
             if self.load_balance_coeff is not None:
@@ -616,6 +616,6 @@ class MoE(Module):
         self._sequence_expert_counts_BE = torch.zeros(
             num_sequences,
             self.routed_experts.inner_experts.num_experts,
-            dtype=torch.float32,
+            dtype=torch.int64,
             device=device,
         )

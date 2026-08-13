@@ -27,9 +27,8 @@ def _accumulate_tensor_statistics_triton(
     if tl.load(enabled_ptr) == 0:
         return
 
-    present_count = tl.zeros((), dtype=tl.int64)
-    nonfinite_count = tl.zeros((), dtype=tl.int64)
-    zero_count = tl.zeros((), dtype=tl.int64)
+    nonfinite_count = tl.zeros((), dtype=tl.int32)
+    zero_count = tl.zeros((), dtype=tl.int32)
     absolute_sum = tl.zeros((), dtype=tl.float32)
     square_sum = tl.zeros((), dtype=tl.float32)
     fourth_moment_sum = tl.zeros((), dtype=tl.float32)
@@ -56,17 +55,15 @@ def _accumulate_tensor_statistics_triton(
             finite_value = tl.where(finite, value, 0.0)
             absolute = tl.abs(finite_value)
             square = finite_value * finite_value
-            present_i64 = present.to(tl.int64)  # pyrefly: ignore [missing-attribute]
             nonfinite = present & ~finite  # pyrefly: ignore [deprecated]
-            nonfinite_i64 = nonfinite.to(  # pyrefly: ignore [missing-attribute]
-                tl.int64
+            nonfinite_i32 = nonfinite.to(  # pyrefly: ignore [missing-attribute]
+                tl.int32
             )
-            zero_i64 = (  # pyrefly: ignore [missing-attribute]
+            zero_i32 = (  # pyrefly: ignore [missing-attribute]
                 finite & (value == 0.0)
-            ).to(tl.int64)
-            present_count += tl.sum(present_i64)
-            nonfinite_count += tl.sum(nonfinite_i64)
-            zero_count += tl.sum(zero_i64)
+            ).to(tl.int32)
+            nonfinite_count += tl.sum(nonfinite_i32)
+            zero_count += tl.sum(zero_i32)
             absolute_sum += tl.sum(absolute)
             square_sum += tl.sum(square)
             fourth_moment_sum += tl.sum(square * square)
@@ -87,24 +84,24 @@ def _accumulate_tensor_statistics_triton(
         finite_value = tl.where(finite, value, 0.0)
         absolute = tl.abs(finite_value)
         square = finite_value * finite_value
-        present_i64 = present.to(tl.int64)  # pyrefly: ignore [missing-attribute]
         nonfinite = present & ~finite  # pyrefly: ignore [deprecated]
-        nonfinite_i64 = nonfinite.to(tl.int64)  # pyrefly: ignore [missing-attribute]
-        zero_i64 = (finite & (value == 0.0)).to(  # pyrefly: ignore [missing-attribute]
-            tl.int64
+        nonfinite_i32 = nonfinite.to(tl.int32)  # pyrefly: ignore [missing-attribute]
+        zero_i32 = (finite & (value == 0.0)).to(  # pyrefly: ignore [missing-attribute]
+            tl.int32
         )
-        present_count = tl.sum(present_i64)
-        nonfinite_count = tl.sum(nonfinite_i64)
-        zero_count = tl.sum(zero_i64)
+        nonfinite_count = tl.sum(nonfinite_i32)
+        zero_count = tl.sum(zero_i32)
         absolute_sum = tl.sum(absolute)
         square_sum = tl.sum(square)
         fourth_moment_sum = tl.sum(square * square)
         absolute_maximum = tl.max(tl.where(finite, absolute, -float("inf")))
 
-    tl.atomic_add(counts_ptr, present_count)
-    tl.atomic_add(counts_ptr + 1, nonfinite_count)
-    tl.atomic_add(counts_ptr + 2, zero_count)
+    tl.atomic_add(counts_ptr + 1, nonfinite_count.to(tl.int64))
+    tl.atomic_add(counts_ptr + 2, zero_count.to(tl.int64))
+    # The capped grid keeps each program's partial counters within int32.
+    # Program zero supplies the exact total directly to the int64 output.
     if tl.program_id(0) == 0:
+        tl.atomic_add(counts_ptr, value_count)
         tl.atomic_add(counts_ptr + 3, 1)
     tl.atomic_add(sums_ptr, absolute_sum)
     tl.atomic_add(sums_ptr + 1, square_sum)
@@ -113,7 +110,14 @@ def _accumulate_tensor_statistics_triton(
 
 
 class StatisticBuffers(nn.Module):
-    """Mutable sufficient-statistic buffers shared by every registered key."""
+    """Packed sufficient statistics with one row per registered key.
+
+    Example:
+
+        counts[key] = [numel, nonfinite_count, zero_count, observation_count]
+        sums[key] = [abs_sum, square_sum, fourth_moment_sum]
+        maxima[key] = abs_max
+    """
 
     counts: torch.Tensor
     sums: torch.Tensor
@@ -229,27 +233,6 @@ def _accumulate_contiguous_tensor_statistics_triton(
     )
 
 
-def _accumulate_normalized_tensor_statistics_triton(
-    value: torch.Tensor,
-    counts: torch.Tensor,
-    sums: torch.Tensor,
-    maximum: torch.Tensor,
-    enabled: torch.Tensor,
-) -> None:
-    """Normalize one GPU tensor and accumulate it with Triton."""
-
-    value = _normalize_tensor_layout(value)
-    if not value.is_contiguous():
-        value = value.contiguous()
-    _accumulate_contiguous_tensor_statistics_triton(
-        value,
-        counts,
-        sums,
-        maximum,
-        enabled,
-    )
-
-
 @torch.library.custom_op(
     "torchtitan::accumulate_tensor_statistics",
     mutates_args={"counts", "sums", "maximum"},
@@ -264,7 +247,10 @@ def accumulate_tensor_statistics(
     """Accumulate one tensor through an opaque, compile-safe operation."""
 
     if value.is_cuda:
-        _accumulate_normalized_tensor_statistics_triton(
+        value = _normalize_tensor_layout(value)
+        if not value.is_contiguous():
+            value = value.contiguous()
+        _accumulate_contiguous_tensor_statistics_triton(
             value,
             counts,
             sums,
