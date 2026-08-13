@@ -15,6 +15,7 @@ from torch.utils.checkpoint import CheckpointPolicy
 from torchtitan.components.metrics import MetricsProcessor
 
 from torchtitan.config import CompileConfig
+from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.distributed.compile import apply_compile
 from torchtitan.experiments.graph_trainer.cudagraph import cudagraph_pass
@@ -827,7 +828,19 @@ def test_compile_fullgraph_records_forward_and_cotangent() -> None:
 def test_compile_fullgraph_with_ac_records_exactly_once(policy) -> None:
     root = TinyStatsRoot(track_forward_calls=False).cuda()
     policy.build().apply(root)
-    apply_compile(root, CompileConfig(enable=True, components=["model"]))
+    apply_compile(
+        root,
+        compile_config=CompileConfig(enable=True, components=["model"]),
+        parallel_dims=ParallelDims(
+            dp_replicate=1,
+            dp_shard=1,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=1,
+        ),
+    )
     runtime = init(root)
     try:
         value = torch.randn(3, 4, device="cuda", requires_grad=True)
