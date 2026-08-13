@@ -8,8 +8,9 @@ import pytest
 import torch
 from torch import nn
 from torch.utils.checkpoint import CheckpointPolicy
-
+from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.distributed.compile import apply_compile, CompileConfig
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     minimal_fx_tracer,
     run_traced,
@@ -151,12 +152,30 @@ def test_source_moe_expert_counts_are_exact_once_under_ac() -> None:
     torch.testing.assert_close(replacing_gradient, eager_gradient)
 
 
-def test_source_moe_metric_mutations_compile_fullgraph() -> None:
-    root = _TinyMoERoot()
-    compiled = torch.compile(root, backend="eager", fullgraph=True)
-    value = torch.randn(2, 3, 4, requires_grad=True)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_source_moe_metric_mutations_compile_fullgraph_with_full_ac() -> None:
+    root = _TinyMoERoot(track_forward_calls=False).cuda()
+    FullAC.Config().build().apply(root)
+    apply_compile(
+        root,
+        compile_config=CompileConfig(
+            enable=True,
+            components=["model"],
+            backend="inductor",
+        ),
+        parallel_dims=ParallelDims(
+            dp_replicate=1,
+            dp_shard=1,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=1,
+        ),
+    )
+    value = torch.randn(2, 3, 4, device="cuda", requires_grad=True)
     try:
-        compiled(value).sum().backward()
+        root(value).sum().backward()
 
         assert root.layers["0"].moe.tokens_per_expert_E.sum().item() == 6
         assert root.layers["0"].moe._sequence_expert_counts_BE.sum().item() == 6

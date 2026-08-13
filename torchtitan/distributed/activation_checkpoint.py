@@ -7,7 +7,6 @@
 # This file provides the util functions to apply activation checkpointing to the model.
 # Technically, this is not a part of distributed, but distributed module is the best place to put it.
 
-import contextlib
 import os
 from dataclasses import dataclass, field
 from typing import Annotated, cast
@@ -20,82 +19,32 @@ from torch._functorch.partitioners import get_default_op_list
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
-from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.checkpoint import (
     CheckpointPolicy,
     create_selective_checkpoint_contexts,
 )
 
 from torchtitan.config import Configurable
-from torchtitan.observability.tensor_logging import (
-    disable as disable_tensor_logging,
-    is_enabled as is_tensor_logging_enabled,
-)
 from torchtitan.tools.logging import logger
 
 
-class _TensorLoggingCheckpointMode(TorchDispatchMode):
-    """Suppress graph-visible metric mutations during FullAC recomputation."""
+def _save_routing_and_forward_side_effects():
+    """Save nondeterministic routing and state mutations during recomputation."""
 
-    _MUTATING_METRIC_OPS = {
+    mutating_ops = {
         "torchtitan::accumulate_expert_tokens",
         "torchtitan::accumulate_tensor_statistics",
         "torchtitan::store_router_metric",
     }
 
-    @classmethod
-    def ignore_compile_internals(cls) -> bool:
-        return True
-
-    def __init__(self, *, disable_mutations: bool) -> None:
-        super().__init__()
-        self.supports_higher_order_operators = True
-        self._disable_mutations = disable_mutations
-        self._disable_context = None
-
-    def __enter__(self):
-        if self._disable_mutations:
-            self._disable_context = disable_tensor_logging()
-            self._disable_context.__enter__()
-        return super().__enter__()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            return super().__exit__(exc_type, exc_val, exc_tb)
-        finally:
-            if self._disable_context is not None:
-                self._disable_context.__exit__(exc_type, exc_val, exc_tb)
-                self._disable_context = None
-
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        if (
-            self._disable_mutations
-            and isinstance(func, torch._ops.OpOverload)
-            and func._schema.name in self._MUTATING_METRIC_OPS
+    def policy_fn(_context, op, *args, **kwargs):
+        if op is torch.ops.aten.topk.default or (
+            isinstance(op, torch._ops.OpOverload) and op._schema.name in mutating_ops
         ):
-            return None
-        return func(*args, **(kwargs or {}))
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
 
-
-def _with_tensor_logging_disabled_on_recompute(*, has_moe_side_effects: bool):
-    """Return contexts that suppress metric and MoE recompute mutations."""
-
-    def composed_context_fn():
-        if torch.compiler.is_compiling():
-            return (
-                _TensorLoggingCheckpointMode(disable_mutations=False),
-                _TensorLoggingCheckpointMode(disable_mutations=True),
-            )
-        if has_moe_side_effects:
-            return (
-                contextlib.nullcontext(),
-                _TensorLoggingCheckpointMode(disable_mutations=True),
-            )
-        if is_tensor_logging_enabled():
-            return contextlib.nullcontext(), disable_tensor_logging()
-        return contextlib.nullcontext(), contextlib.nullcontext()
-
-    return composed_context_fn
+    return create_selective_checkpoint_contexts(policy_fn)
 
 
 def _get_default_save_ops() -> set:
@@ -254,9 +203,7 @@ class FullAC(ActivationCheckpointing):
     ) -> nn.Module:
         return ptd_checkpoint_wrapper(
             module,
-            context_fn=_with_tensor_logging_disabled_on_recompute(
-                has_moe_side_effects=getattr(module, "moe_enabled", False)
-            ),
+            context_fn=_save_routing_and_forward_side_effects,
             preserve_rng_state=self.config.preserve_rng_state,
             determinism_check=self.config.determinism_check,
             early_stop=False,
