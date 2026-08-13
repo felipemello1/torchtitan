@@ -206,15 +206,17 @@ An ordinary tensor should not need a new wrapper, metric family, mesh registry, 
 
 - Ordinary and interleaved pipeline schedules are supported. Multiple local model parts map back to global model paths, so names remain `layers.<global_id>...` instead of depending on rank-local part indices.
 
+- Qwen3 30B-A3B ordinary PP passes 15 steps with FullAC, regional full-graph compile, strict `spmd_types`, gradient accumulation two, and full-bfloat16 training, both with tensor logging disabled and enabled at cadence one. The same default-fp32 recipe exceeds memory after Adam state initialization even with tensor logging disabled.
+
 - The strict `spmd_types` and default DTensor backends are supported on their validated paths. The combined Graph Trainer plus strict-`spmd_types` path is currently blocked by existing Graph Trainer mesh/backend setup before tensor logging initializes.
 
 - CUDA uses a Triton accumulator and CPU uses an eager reference implementation. ROCm has not been validated.
 
 ## Current limitations
 
-- GraphPP ZBV training publishes backward and router metrics, but its forward `.x` accumulator mutations are not yet preserved through the production GraphPP path.
+- GraphPP ZBV training publishes backward, parameter, and post-step router metrics, but graph cloning currently loses 38 in-graph forward keys: 28 activation `.x`, five `router_logits`, and five `router_scores_for_topk`.
 
-- Publication runs synchronously with the training step. A broad filter can produce thousands of sink calls, so use a narrow filter for routine runs and widen it for focused debugging.
+- Publication runs synchronously with the training step. A broad filter can publish thousands of scalar keys, so use a narrow filter for routine runs and widen it for focused debugging.
 
 - The publication regex controls sink volume, not GPU collection work. Increase `tensor_logging_freq` to reduce collection frequency.
 
