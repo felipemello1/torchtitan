@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any
 
 import torch
+from tensorboard.compat.proto.summary_pb2 import Summary
 from torch.utils.tensorboard import SummaryWriter
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Configurable
@@ -120,9 +121,17 @@ class TensorBoardLogger(BaseLogger):
         logger.info(f"TensorBoard logging enabled. Logs will be saved at {log_dir}")
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
-        for k, v in metrics.items():
-            tag = k if self.tag is None else f"{self.tag}/{k}"
-            self.writer.add_scalar(tag, v, step)
+        summary = Summary()
+        for key, value in metrics.items():
+            summary.value.add(
+                tag=key if self.tag is None else f"{self.tag}/{key}",
+                simple_value=float(value),
+            )
+
+        # Submit one event instead of one queue operation per scalar.
+        file_writer = self.writer._get_file_writer()
+        assert file_writer is not None
+        file_writer.add_summary(summary, step)
 
     def close(self) -> None:
         self.writer.close()
@@ -298,6 +307,21 @@ class MetricsProcessor(Configurable):
 
         enable_wandb: bool = False
         """Whether to log metrics to Weights & Biases"""
+
+        enable_tensor_logging: bool = False
+        """Whether to record model tensor statistics."""
+
+        tensor_logging_freq: int = 5
+        """Requested tensor-stat cadence; never more frequent than `log_freq`."""
+
+        tensor_logging_metrics_filter_regex: str = (
+            r"\.w:(?:kurtosis|zero_frac)$"
+            r"|:(?:numel|nonfinite_count|abs_mean|square_mean|abs_max)$"
+        )
+        """Allowlist regex over each tensor metric's `<name>:<statistic>`."""
+
+        tensor_logging_adam_momentum_gradient_cosine: bool = False
+        """Whether to record the per-parameter Adam momentum/gradient cosine."""
 
     config: Config
     logger: BaseLogger
@@ -516,6 +540,9 @@ class MetricsProcessor(Configurable):
         if extra_metrics:
             metrics.update(extra_metrics)
 
+        # Start the next timing window before sink serialization so the next
+        # throughput sample includes the cost of publishing this interval.
+        self.time_last_log = time.perf_counter()
         self.logger.log(metrics, step)
 
         color = self.color
@@ -533,7 +560,6 @@ class MetricsProcessor(Configurable):
 
         self.ntokens_since_last_log = 0
         self.data_loading_times.clear()
-        self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
 
     def log_validation(

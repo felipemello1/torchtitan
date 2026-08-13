@@ -6,10 +6,16 @@
 
 import unittest
 from copy import deepcopy
+from unittest.mock import patch
 
 import torch
+from torch.utils.checkpoint import CheckpointPolicy
 from torch.utils.flop_counter import FlopCounterMode
-from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.distributed.activation_checkpoint import (
+    _save_routing_and_forward_side_effects,
+    FullAC,
+    SelectiveAC,
+)
 from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module, ModuleDict
 
@@ -44,6 +50,26 @@ class TransformerBlock(Module):
 
 
 class TestApplyAC(unittest.TestCase):
+    def test_full_ac_saves_nondeterministic_routing(self):
+        policies = []
+        contexts = object()
+        with patch(
+            "torchtitan.distributed.activation_checkpoint."
+            "create_selective_checkpoint_contexts",
+            side_effect=lambda policy: policies.append(policy) or contexts,
+        ):
+            self.assertIs(_save_routing_and_forward_side_effects(), contexts)
+
+        policy = policies[0]
+        self.assertIs(
+            policy(None, torch.ops.aten.topk.default),
+            CheckpointPolicy.MUST_SAVE,
+        )
+        self.assertIs(
+            policy(None, torch.ops.aten.sin.default),
+            CheckpointPolicy.PREFER_RECOMPUTE,
+        )
+
     def test_flops(self):
         def get_bw_flops(model_fn):
             x = torch.randn(512, 512, requires_grad=True)

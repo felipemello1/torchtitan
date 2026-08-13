@@ -28,6 +28,25 @@ from torchtitan.config import Configurable
 from torchtitan.tools.logging import logger
 
 
+def _save_routing_and_forward_side_effects():
+    """Save nondeterministic routing and state mutations during recomputation."""
+
+    mutating_ops = {
+        "torchtitan::accumulate_expert_tokens",
+        "torchtitan::accumulate_tensor_statistics",
+        "torchtitan::store_router_metric",
+    }
+
+    def policy_fn(_context, op, *args, **kwargs):
+        if op is torch.ops.aten.topk.default or (
+            isinstance(op, torch._ops.OpOverload) and op._schema.name in mutating_ops
+        ):
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    return create_selective_checkpoint_contexts(policy_fn)
+
+
 def _get_default_save_ops() -> set:
     """Returns the default set of ops whose activations should be saved
     (compute + comm).
@@ -38,6 +57,15 @@ def _get_default_save_ops() -> set:
     """
     # Ops whose outputs are expensive to recompute (matmuls, attention, etc.)
     compute_ops = [
+        # Tensor logging mutates fixed buffers and must execute only in the
+        # original forward, not selective-checkpoint recomputation.
+        torch.ops.torchtitan.accumulate_tensor_statistics.default,
+        # MoE operational expert counts are another forward side effect that
+        # must execute only once under selective recomputation.
+        (torch.ops, "torchtitan.accumulate_expert_tokens.default"),
+        # Per-sequence router counts retain the last logical forward and are
+        # consumed in one batched topology-aware optimizer hook.
+        (torch.ops, "torchtitan.store_router_metric.default"),
         # SDPA variants
         torch.ops.aten._scaled_dot_product_cudnn_attention.default,
         torch.ops.aten._scaled_dot_product_attention_math.default,
@@ -173,8 +201,11 @@ class FullAC(ActivationCheckpointing):
     def _wrap_block(
         self, module: nn.Module, *, base_fqn: str | None = None
     ) -> nn.Module:
+        # Save routing decisions and forward mutations so FullAC replay does not
+        # double-count MoE expert assignments or tensor statistics.
         return ptd_checkpoint_wrapper(
             module,
+            context_fn=_save_routing_and_forward_side_effects,
             preserve_rng_state=self.config.preserve_rng_state,
             determinism_check=self.config.determinism_check,
             early_stop=False,
@@ -214,8 +245,27 @@ class SelectiveAC(ActivationCheckpointing):
     def _wrap_block(
         self, module: nn.Module, *, base_fqn: str | None = None
     ) -> nn.Module:
+        """Wrap one block with the configured per-operation recompute policy.
+
+        Example:
+
+            checkpointed = self._wrap_block(block, base_fqn="layers.0")
+        """
+
         config = cast("SelectiveAC.Config", self.config)
         save_ops = self.get_save_ops()
+        # These state mutations are correctness invariants, not tunable
+        # compute-cache choices. Preserve them even when a subclass customizes
+        # the documented save set.
+        save_ops.add(torch.ops.torchtitan.accumulate_tensor_statistics.default)
+        try:
+            save_ops.add(torch.ops.torchtitan.accumulate_expert_tokens.default)
+        except AttributeError:
+            pass
+        try:
+            save_ops.add(torch.ops.torchtitan.store_router_metric.default)
+        except AttributeError:
+            pass
 
         # Collect weight shapes to force-recompute, stored as mm RHS shape
         # (in_f, out_f). For aten.linear we transpose args[1].shape at lookup

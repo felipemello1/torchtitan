@@ -18,6 +18,12 @@ from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_mesh_s
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
+from torchtitan.observability.tensor_logging import (
+    log_fwd_bwd_stats,
+    log_stats,
+    register,
+    register_fwd_bwd,
+)
 from torchtitan.protocols.module import Module
 
 from .token_dispatcher import LocalTokenDispatcher
@@ -30,6 +36,61 @@ from .token_dispatcher import LocalTokenDispatcher
 #       per-local-expert token counts after EP dispatch /_permute),
 #   K = top-k, T = num tokens (B*L flattened),
 #   N = routed tokens (T*K), R = routed tokens assigned to local experts
+
+
+@torch.library.custom_op(
+    "torchtitan::accumulate_expert_tokens",
+    mutates_args={"total"},
+)
+def _accumulate_expert_tokens(
+    total: torch.Tensor,
+    current: torch.Tensor,
+) -> None:
+    """Add one forward's local expert counts to operational state."""
+
+    with torch.no_grad():
+        total.add_(current)
+
+
+@_accumulate_expert_tokens.register_fake
+def _(total: torch.Tensor, current: torch.Tensor) -> None:
+    return None
+
+
+def _record_expert_tokens_once(
+    total: torch.Tensor,
+    current: torch.Tensor,
+) -> None:
+    local_total = total.to_local() if isinstance(total, DTensor) else total
+    local_current = current.to_local() if isinstance(current, DTensor) else current
+    _accumulate_expert_tokens(local_total, local_current)
+
+
+@torch.library.custom_op(
+    "torchtitan::store_router_metric",
+    mutates_args={"destination"},
+)
+def _store_router_metric(
+    destination: torch.Tensor,
+    current: torch.Tensor,
+) -> None:
+    """Retain one last-forward router intermediate in fixed storage."""
+
+    with torch.no_grad():
+        destination.copy_(current)
+
+
+@_store_router_metric.register_fake
+def _(destination: torch.Tensor, current: torch.Tensor) -> None:
+    return None
+
+
+def _record_router_metric_once(
+    destination: torch.Tensor,
+    current: torch.Tensor,
+) -> None:
+    local_current = current.to_local() if isinstance(current, DTensor) else current
+    _store_router_metric(destination, local_current)
 
 
 class GroupedExperts(Module):
@@ -133,6 +194,7 @@ class RoutedExperts(Module):
         super().__init__()
         self.inner_experts = config.inner_experts.build()
         self.token_dispatcher = config.token_dispatcher.build()
+        register_fwd_bwd(self, ["expert_input"])
 
     def forward(
         self,
@@ -163,6 +225,10 @@ class RoutedExperts(Module):
             topk_scores_TK,
             topk_expert_ids_TK,
             num_local_tokens_per_expert_E,
+        )
+        log_fwd_bwd_stats(
+            self,
+            expert_input=routed_input_RD,
         )
         with maybe_set_sparse_mesh():
             routed_output_RD = self.inner_experts(
@@ -221,6 +287,11 @@ class TokenChoiceTopKRouter(Module):
         self.route_norm = config.route_norm
         self.route_scale = config.route_scale
         self._debug_force_load_balance = config._debug_force_load_balance
+        self.register_buffer(
+            "_router_logits_mean_E",
+            torch.zeros(config.num_experts, dtype=torch.float32),
+            persistent=False,
+        )
 
     def _debug_force_load_balance_routing(
         self, scores_BLE: torch.Tensor
@@ -296,20 +367,36 @@ class TokenChoiceTopKRouter(Module):
         """
         # Compute gate in float32 to help stability of expert load balancing.
         with torch.autocast(device_type=x_BLD.device.type, dtype=torch.float32):
-            scores_BLE = self.gate(x_BLD)
+            router_logits_BLE = self.gate(x_BLD)
+
+        # TODO: Avoid the two expert-axis means below when tensor logging is
+        # disabled. They run before log_stats() can no-op, and this path also
+        # performs an opaque buffer store.
+        with spmd.no_typecheck():
+            router_logits_mean_E = router_logits_BLE.mean(dim=(0, 1))
+            log_stats(self, router_logits=router_logits_mean_E)
+            _record_router_metric_once(
+                self._router_logits_mean_E,
+                router_logits_mean_E,
+            )
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion.
-        # scores_BLE is already float32 from the autocast above.
+        # router_logits_BLE is already float32 from the autocast above.
         if self.score_func == "sigmoid":
-            scores_BLE = torch.sigmoid(scores_BLE)
+            scores_BLE = torch.sigmoid(router_logits_BLE)
         elif self.score_func == "softmax":
-            scores_BLE = F.softmax(scores_BLE, dim=-1)
+            scores_BLE = F.softmax(router_logits_BLE, dim=-1)
         else:
             raise NotImplementedError(f"Unknown score function {self.score_func}")
 
         scores_for_choice_BLE = (
             scores_BLE if expert_bias_E is None else scores_BLE + expert_bias_E
         )
+        with spmd.no_typecheck():
+            log_stats(
+                self,
+                router_scores_for_topk=scores_for_choice_BLE.mean(dim=(0, 1)),
+            )
         # Apply node-limited routing if configured
         if self.num_expert_groups is not None:
             scores_for_choice_BLE = self._get_node_limited_routing_scores(
@@ -339,6 +426,15 @@ class TokenChoiceTopKRouter(Module):
             topk_scores_BLK,
             topk_expert_ids_BLK,
             scores_BLE,
+        )
+
+    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
+        if buffer_device is None:
+            buffer_device = self._router_logits_mean_E.device
+        self._router_logits_mean_E = torch.zeros(
+            self.num_experts,
+            dtype=torch.float32,
+            device=buffer_device,
         )
 
 
@@ -372,12 +468,32 @@ class MoE(Module):
     def __init__(self, config: Config):
         super().__init__()
 
+        # Router names cover both raw distributions and topology-derived health.
         num_experts = config.num_experts
         self.routed_experts = config.routed_experts.build()
         self.router = config.router.build()
+        register(
+            self.router,
+            [
+                "expert_load",
+                "experts_max_violation",
+                "entropy",
+                "ep_shard_imbalance",
+                "local_expert_imbalance",
+                "router_logits",
+                "router_scores_for_topk",
+                "seq_expert_imbalance_max",
+                "seq_expert_imbalance_mean",
+            ],
+        )
         self.shared_experts = (
             config.shared_experts.build() if config.shared_experts is not None else None
         )
+        # MoE activation names are paired with cotangents through one common API.
+        moe_tensor_keys = ["input_normed", "routed_output"]
+        if self.shared_experts is not None:
+            moe_tensor_keys.append("shared_output")
+        register_fwd_bwd(self, moe_tensor_keys)
 
         # define fields for auxiliary-loss-free load balancing (https://arxiv.org/abs/2408.15664)
         # NOTE: tokens_per_expert_E is accumulated in the model forward pass.
@@ -391,12 +507,18 @@ class MoE(Module):
                 torch.zeros(num_experts, dtype=torch.float32),
                 persistent=True,
             )
+            register(self.router, ["expert_bias"])
         else:
             self.expert_bias_E = None
         # tokens_per_expert_E will be used to track expert usage and to update the expert bias for load balancing
         self.register_buffer(
             "tokens_per_expert_E",
-            torch.zeros(num_experts, dtype=torch.float32),
+            torch.zeros(num_experts, dtype=torch.int64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_sequence_expert_counts_BE",
+            None,
             persistent=False,
         )
 
@@ -417,6 +539,7 @@ class MoE(Module):
         sequence-shards tokens across TP, the caller must provide a TP-divisible
         sequence length.
         """
+        log_fwd_bwd_stats(self, input_normed=x_BLD)
         # topk_scores_BLK and topk_expert_ids_BLK shape (B, L, K)
         # scores_BLE shape (B, L, E)
         (
@@ -436,13 +559,20 @@ class MoE(Module):
         )
         num_local_tokens_per_expert_E = routing_map_BLE.sum(dim=(0, 1))
 
-        # tokens_per_expert_E will be used to update the expert bias for load balancing,
-        # and also to count the expert usage.
-        # TODO: Activation Checkpointing has the side effect of double counting tokens_per_expert_E --
-        #       first in the forward pass, and then in the backward pass. However, this has no
-        #       effect on the expert bias update thanks to the torch.sign() operator.
-        with torch.no_grad():
-            self.tokens_per_expert_E.add_(num_local_tokens_per_expert_E)
+        with spmd.no_typecheck():
+            if self._sequence_expert_counts_BE is not None:
+                _record_router_metric_once(
+                    self._sequence_expert_counts_BE,
+                    routing_map_BLE.sum(dim=1, dtype=torch.int64),
+                )
+
+            # This operational state drives load balancing and expert-usage metrics.
+            # FullAC suppresses the recompute call; SelectiveAC preserves the opaque
+            # mutation as MUST_SAVE, so each logical forward contributes once.
+            _record_expert_tokens_once(
+                self.tokens_per_expert_E,
+                num_local_tokens_per_expert_E,
+            )
 
         out_BLD = self.routed_experts(
             x_BLD,
@@ -450,12 +580,17 @@ class MoE(Module):
             topk_expert_ids_BLK,
             num_local_tokens_per_expert_E,
         )
+        log_fwd_bwd_stats(self, routed_output=out_BLD)
 
         shared_out_BLD = (
             self.shared_experts(x_BLD) if self.shared_experts is not None else None
         )
 
         if shared_out_BLD is not None:
+            log_fwd_bwd_stats(
+                self,
+                shared_output=shared_out_BLD,
+            )
             out_BLD = out_BLD + shared_out_BLD
         return out_BLD
 
@@ -467,9 +602,25 @@ class MoE(Module):
 
         with torch.device(buffer_device):
             self.tokens_per_expert_E = torch.zeros(
-                self.routed_experts.inner_experts.num_experts, dtype=torch.float32
+                self.routed_experts.inner_experts.num_experts, dtype=torch.int64
             )
+            self._sequence_expert_counts_BE = None
             if self.load_balance_coeff is not None:
                 self.expert_bias_E = torch.zeros(
                     self.routed_experts.inner_experts.num_experts, dtype=torch.float32
                 )
+
+    def init_sequence_expert_counts(
+        self,
+        *,
+        num_sequences: int,
+        device: torch.device,
+    ) -> None:
+        """Allocate the fixed last-microbatch router metric buffer."""
+
+        self._sequence_expert_counts_BE = torch.zeros(
+            num_sequences,
+            self.routed_experts.inner_experts.num_experts,
+            dtype=torch.int64,
+            device=device,
+        )

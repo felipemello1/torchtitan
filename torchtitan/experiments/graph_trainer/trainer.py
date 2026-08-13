@@ -38,6 +38,9 @@ from torchtitan.experiments.graph_trainer.registry import (
     TRACE_CALL_INPUT_PREPARERS,
     TRACE_INPUT_PREPARERS,
 )
+from torchtitan.observability.tensor_logging import (
+    set_enabled as set_tensor_logging_enabled,
+)
 from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
 
@@ -99,6 +102,12 @@ def make_fwd_bwd_step(model, loss_fn):
 
 
 class GraphTrainer(Trainer):
+    """Trace one full training step, transform its FX graph, then replay it.
+
+    Construction builds the ordinary trainer first, then initializes the lazy
+    graph state used by the first real batch.
+    """
+
     @dataclass(kw_only=True, slots=True)
     class Config(Trainer.Config):
         compile: GraphTrainerCompileConfig = field(
@@ -106,6 +115,13 @@ class GraphTrainer(Trainer):
         )
 
     def __init__(self, config):
+        if (
+            config.metrics.enable_tensor_logging
+            and config.compile.precompile_artifact_dir
+        ):
+            raise NotImplementedError(
+                "tensor logging does not yet support Graph Trainer precompiled artifacts"
+            )
         super().__init__(config)
 
         _maybe_apply_numa_binding(self.device.index, self.device.type)
@@ -199,13 +215,29 @@ class GraphTrainer(Trainer):
         params: list[torch.Tensor],
         extra_kwargs: dict[str, Any],
     ) -> torch.Tensor:
+        """Trace and transform the step once, then execute the cached graph.
+
+        Example:
+
+            # First call traces and runs graph passes; later calls only replay.
+            loss = self._make_fx_forward_backward_step(
+                model, inputs, labels, valid_tokens, params, extra_kwargs
+            )
+        """
+
         maybe_register_blockmask_pytree_node()
+
+        # The first real batch supplies shapes for tracing and all graph passes.
         if self._traced_step is None:
             if self.config.compile.precompile_artifact_dir:
                 self._load_precompiled_fx_trace(model)
             else:
                 fwd_bwd_fn = make_fwd_bwd_step(model, self.loss_fn)
-                with self.train_context(), log_timer("minimal_fx_tracer"):
+                with (
+                    self.train_context(),
+                    set_tensor_logging_enabled(self.tensor_logging is not None),
+                    log_timer("minimal_fx_tracer"),
+                ):
                     self._traced_step = minimal_fx_tracer(
                         fwd_bwd_fn,
                         module=model,
@@ -218,6 +250,7 @@ class GraphTrainer(Trainer):
                         extra_kwargs,
                     )
 
+            # Transform the complete forward/loss/backward graph as one unit.
             if self.config.compile.enable_passes:
                 pipeline_fn = PASS_PIPELINE_REGISTRY.get(
                     self.config.compile.pass_pipeline,
@@ -235,6 +268,7 @@ class GraphTrainer(Trainer):
                     passes,
                     compile_config=self.config.compile,
                 )
+        # Replay uses the live module state, including tensor-logging buffers.
         with self.train_context():
             outputs = run_traced(self._traced_step, module=model)(
                 inputs,

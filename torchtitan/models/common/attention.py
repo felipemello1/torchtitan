@@ -44,6 +44,7 @@ from torchtitan.distributed.utils import get_spmd_backend, is_in_batch_invariant
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
+from torchtitan.observability.tensor_logging import log_fwd_bwd_stats, register_fwd_bwd
 from torchtitan.protocols.module import Module
 from torchtitan.tools.utils import round_up
 
@@ -950,20 +951,45 @@ class GQAttention(BaseAttention):
         # Scaling factor (needed when head_dim differs from dim // n_heads)
         self.scaling = self.head_dim**-0.5 if config.head_dim is not None else None
 
+        statistic_names = ["xq", "xk", "xv", "head_out"]
+        if self.q_norm is not None:
+            statistic_names.extend(["xq_normed", "xk_normed"])
+        register_fwd_bwd(self, statistic_names)
+
     def forward(
         self,
         x_BLD: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Project `[B, L, D]` input through Q/K/V attention back to `[B, L, D]`.
+
+        Example:
+
+            output_BLD = attention(input_BLD, attention_masks=None)
+            assert output_BLD.shape == input_BLD.shape
+        """
+
+        # Project once, then observe the unnormalized Q/K/V boundary.
         B, L, _ = x_BLD.shape
         xq_BLNH, xk_BLNH, xv_BLNH = self.qkv_linear(x_BLD)
+        log_fwd_bwd_stats(
+            self,
+            xq=xq_BLNH,
+            xk=xk_BLNH,
+            xv=xv_BLNH,
+        )
 
         # Optional QK normalization (before RoPE, per Qwen3)
         if self.q_norm is not None or self.k_norm is not None:
             assert self.q_norm is not None and self.k_norm is not None
             xq_BLNH = self.q_norm(xq_BLNH)
             xk_BLNH = self.k_norm(xk_BLNH)
+            log_fwd_bwd_stats(
+                self,
+                xq_normed=xq_BLNH,
+                xk_normed=xk_BLNH,
+            )
 
         # Apply rotary embeddings
         xq_BLNH, xk_BLNH = self.rope(xq_BLNH, xk_BLNH, positions)
@@ -977,5 +1003,6 @@ class GQAttention(BaseAttention):
             scale=self.scaling,
             enable_gqa=self.enable_gqa,
         ).contiguous()
+        log_fwd_bwd_stats(self, head_out=out_BLNH)
         out_BLD = out_BLNH.view(B, L, -1)
         return self.wo(out_BLD)
