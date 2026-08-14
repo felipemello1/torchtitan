@@ -102,6 +102,11 @@ def test_trainer_accumulates_reused_cuda_graph_losses():
                     disable_cuda_graphs=False,
                     max_norm=1.0,
                 ),
+                metrics=SimpleNamespace(
+                    tensor_logging=SimpleNamespace(
+                        adam_momentum_gradient_cosine=False,
+                    )
+                ),
             ),
             optimizers=MagicMock(),
             lr_schedulers=SimpleNamespace(

@@ -276,9 +276,12 @@ class TensorLoggingConfig(Configurable.Config):
     """Requested step interval; regular publication follows its LCM with `log_freq`."""
 
     publish_filter_regex: str = (
-        r"\.(?:numel|nonfinite_count|abs_mean|square_mean|abs_max)$"
+        r"\.w\.(?:kurtosis|zero_frac)$"
+        r"|\.(?:numel|nonfinite_count|abs_mean|square_mean|abs_max)$"
     )
     """Regex selecting derived tensor-statistic keys sent to metrics sinks."""
+
+    adam_momentum_gradient_cosine: bool = False
 
     def __post_init__(self) -> None:
         if self.freq <= 0:

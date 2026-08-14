@@ -110,12 +110,14 @@ class TestConfigManager(unittest.TestCase):
                 "2",
                 "--metrics.tensor-logging.publish-filter-regex",
                 r"\.x\.abs_mean$",
+                "--metrics.tensor-logging.adam-momentum-gradient-cosine",
             ]
         )
 
         assert config.metrics.tensor_logging.enabled
         assert config.metrics.tensor_logging.freq == 2
         assert config.metrics.tensor_logging.publish_filter_regex == r"\.x\.abs_mean$"
+        assert config.metrics.tensor_logging.adam_momentum_gradient_cosine
 
     def test_pipeline_microbatch_size_must_divide_local_batch_size(self):
         config_manager = ConfigManager()

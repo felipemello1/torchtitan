@@ -25,7 +25,12 @@ from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhausted
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper, IGNORE_INDEX
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import (
+    log_optimizer_statistics,
+    log_parameter_gradients,
+    OptimizersContainer,
+    register_optimizer_statistics,
+)
 from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.components.validate import BaseValidator, Validator
@@ -591,6 +596,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                             num_sequences=num_sequences,
                             device=self.device,
                         )
+            register_optimizer_statistics(
+                self.optimizers,
+                include_momentum_gradient_cosine=(
+                    tensor_logging_config.adam_momentum_gradient_cosine
+                ),
+            )
 
             # Model buffers and parallel wrappers are final before names are frozen.
             self.tensor_logging = tensor_logging.init(
@@ -1021,6 +1032,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     accumulated_loss.add_(loss)
 
         with sl.log_trace_span("optim"):
+            log_parameter_gradients(self.optimizers, "dw")
+
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.model_parts for p in m.parameters()],
                 self.config.training.max_norm,
@@ -1028,8 +1041,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 pp_mesh=parallel_dims.get_optional_mesh("pp"),
                 ep_enabled=parallel_dims.ep_enabled,
             )
+            log_parameter_gradients(self.optimizers, "normed_dw")
             self.checkpointer.maybe_wait_for_staging()
             self.optimizers.step()
+            log_optimizer_statistics(
+                self.optimizers,
+                log_momentum_gradient_cosine=(
+                    self.config.metrics.tensor_logging.adam_momentum_gradient_cosine
+                ),
+            )
             self.lr_schedulers.step()
 
         # log metrics

@@ -631,6 +631,30 @@ def test_cuda_statistics_support_64_bit_indexing(monkeypatch) -> None:
     assert maximum.item() == 3.0
 
 
+def test_whole_gradient_health_reuses_parameter_sufficient_statistics() -> None:
+    root = nn.Module()
+    root.dense = nn.Linear(2, 1, bias=False)
+    root.moe = nn.Linear(2, 1, bias=False)
+    register(root.dense.weight, ["dw"])
+    register(root.moe.weight, ["dw"])
+    runtime = init(root)
+    try:
+        with set_enabled(True):
+            log_stats(root.dense.weight, dw=torch.tensor([[1.0, -2.0]]))
+            log_stats(root.moe.weight, dw=torch.tensor([[0.0, 3.0]]))
+
+        metrics = runtime.collect()
+        assert metrics["gradients.all.numel"] == 4
+        assert metrics["gradients.all.observation_count"] == 2
+        assert metrics["gradients.all.zero_count"] == 1
+        assert metrics["gradients.all.abs_sum"] == 6.0
+        assert metrics["gradients.all.abs_max"] == 3.0
+        assert metrics["gradients.moe.numel"] == 2
+        assert metrics["gradients.moe.abs_sum"] == 3.0
+    finally:
+        runtime.close()
+
+
 def test_metrics_filter_matches_name_and_statistic() -> None:
     owner = nn.Module()
     register(owner, ["hidden", "other"])
@@ -657,7 +681,9 @@ def test_metrics_filter_matches_name_and_statistic() -> None:
 
 def test_default_filter_publishes_nonfinite_count() -> None:
     owner = nn.Module()
+    owner.weight = nn.Parameter(torch.ones(2))
     register(owner, ["hidden"])
+    register(owner.weight, ["w"])
     runtime = init(
         owner,
         publish_filter_regex=(
@@ -667,6 +693,7 @@ def test_default_filter_publishes_nonfinite_count() -> None:
     try:
         with set_enabled(True):
             log_stats(owner, hidden=torch.tensor([1.0, torch.nan]))
+            log_stats(owner.weight, w=torch.tensor([0.0, 2.0]))
 
         metrics = runtime.collect()
         assert metrics["hidden.numel"] == 2
@@ -674,6 +701,8 @@ def test_default_filter_publishes_nonfinite_count() -> None:
         assert metrics["hidden.abs_mean"] == 1.0
         assert metrics["hidden.square_mean"] == 1.0
         assert metrics["hidden.abs_max"] == 1.0
+        assert metrics["weight.w.zero_frac"] == 0.5
+        assert "weight.w.kurtosis" in metrics
         assert "hidden.kurtosis" not in metrics
     finally:
         runtime.close()

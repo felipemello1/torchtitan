@@ -10,7 +10,7 @@ tensor [0, 1, -2, 3]
        +-> fixed device row -> one packed drain -> TensorBoard/W&B
 ```
 
-Use it to find exploding activations, dead gradients, and imbalanced routing across a distributed training job.
+Use it to find exploding activations, dead gradients, imbalanced routing, and optimizer-state drift across a distributed training job.
 
 ## Mental model
 
@@ -39,7 +39,7 @@ See the [observability README](../README.md) for TensorBoard and Weights & Biase
 
 Tensor work runs only when both its requested cadence and ordinary `metrics.log_freq` select the step. For tensor cadence 15 and scalar cadence 10, tensor metrics publish at steps 30, 60, and so on. Step 1 publishes tensor metrics only when their cadence is 1.
 
-The default tensor cadence is 5. The default publication filter keeps `numel`, `nonfinite_count`, `abs_mean`, `square_mean`, and `abs_max`.
+The default tensor cadence is 5. The default publication filter keeps `numel`, `nonfinite_count`, `abs_mean`, `square_mean`, and `abs_max` for ordinary rows, plus `kurtosis` and `zero_frac` for parameter `.w` rows.
 
 ## Record a tensor
 
@@ -170,6 +170,31 @@ TorchTitan performs one reduction per required group for the layer-stacked buffe
 
 Built-in router coverage includes expert load, maximum violation, entropy, local expert imbalance, EP-shard imbalance, per-sequence imbalance, router logits/scores, and expert bias when present. Entropy and per-sequence imbalance currently summarize the final microbatch's retained router intermediates rather than the full gradient-accumulation window.
 
+## Parameters and optimizer state
+
+Every optimizer-owned trainable parameter records:
+
+```text
+w            post-step parameter value
+dw           raw gradient
+normed_dw    gradient after clipping
+```
+
+Adam and AdamW parameters additionally record:
+
+```text
+exp_avg       first-moment state
+adam_denom    sqrt(bias-corrected second moment) + epsilon
+```
+
+`exp_avg` is not first-moment bias-corrected. The Adam update magnitude is:
+
+```text
+update / lr = exp_avg / (1 - beta1**step) / adam_denom
+```
+
+The optional momentum/gradient cosine is disabled by default because exact sharded reconstruction may communicate per parameter. Whole-model and MoE gradient summaries reuse the already-reduced `.dw` rows; they do not scan gradients or launch another collective.
+
 ## Execution modes
 
 - Full and selective activation checkpointing preserve the original forward mutation so recomputation does not double-count statistics or operational router state.
@@ -186,4 +211,4 @@ Built-in router coverage includes expert load, maximum violation, entropy, local
 - The publication filter does not skip GPU collection.
 - Publication is synchronous with the training step.
 - Separately precompiled Graph Trainer artifacts are unsupported.
-- Optional visualizations, asynchronous publication, and the remaining Llama4x metric tail are follow-up work.
+- Optional visualizations, asynchronous publication, non-Adam optimizer state, and the remaining Llama4x metric tail are follow-up work.

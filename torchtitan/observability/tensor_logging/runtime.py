@@ -371,6 +371,18 @@ class TensorLoggingState:
 
         # PP stages own different modules but must reduce one shared row order.
         self.metric_names = _gather_global_metric_names(set(local_owner_by_full_name))
+        self._gradient_aggregate_rows = {
+            "gradients.all": [
+                index
+                for index, name in enumerate(self.metric_names)
+                if name.endswith(".dw")
+            ],
+            "gradients.moe": [
+                index
+                for index, name in enumerate(self.metric_names)
+                if name.endswith(".dw") and ".moe." in f".{name}."
+            ],
+        }
         row_index_by_full_name = {
             name: row_index for row_index, name in enumerate(self.metric_names)
         }
@@ -462,6 +474,17 @@ class TensorLoggingState:
                 count_rows[index],
                 sum_rows[index],
                 maximum_rows[index],
+            )
+        # Whole-model and MoE summaries reuse the parameter-gradient rows.
+        for aggregate_name, row_indices in self._gradient_aggregate_rows.items():
+            if not row_indices:
+                continue
+            _add_metric_values(
+                metrics,
+                aggregate_name,
+                cast(list[int], counts[row_indices].sum(dim=0).tolist()),
+                cast(list[float], sums[row_indices].sum(dim=0).tolist()),
+                float(maxima[row_indices].amax()),
             )
         # Filtering controls sink volume, not GPU collection.
         if self._publish_filter is not None:

@@ -11,9 +11,11 @@ import torch.nn as nn
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import (
     default_adamw,
+    log_optimizer_statistics,
     OptimizersContainer,
     ParamGroupConfig,
     register_moe_load_balancing_hook,
+    register_optimizer_statistics,
 )
 from torchtitan.observability.tensor_logging import init, register, set_enabled
 
@@ -358,6 +360,63 @@ class TestParamGroupConfig(unittest.TestCase):
         finally:
             runtime.close()
 
+    def test_adamw_records_post_step_equation_tensors(self):
+        model = nn.Linear(2, 1, bias=False)
+        with torch.no_grad():
+            model.weight.copy_(torch.tensor([[1.0, -2.0]]))
+        config = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[
+                ParamGroupConfig(
+                    pattern=r".*",
+                    optimizer_name="AdamW",
+                    optimizer_kwargs={
+                        "lr": 0.1,
+                        "betas": (0.9, 0.95),
+                        "eps": 1e-8,
+                        "weight_decay": 0.0,
+                    },
+                ),
+            ],
+        )
+        container = config.build(model_parts=[model])
+        register(model.weight, ["w", "exp_avg", "adam_denom", "cos_sim_m_g"])
+        runtime = init(model)
+        try:
+            model.weight.grad = torch.tensor([[2.0, -4.0]])
+            with set_enabled(True):
+                container.step()
+                log_optimizer_statistics(
+                    container,
+                    log_momentum_gradient_cosine=True,
+                )
+
+            snapshot = runtime.snapshot_unreduced_statistics()
+            self.assertEqual(snapshot["weight.w"]["counts"].tolist(), [2, 0, 0, 1])
+            self.assertEqual(
+                snapshot["weight.exp_avg"]["counts"].tolist(), [2, 0, 0, 1]
+            )
+            self.assertEqual(
+                snapshot["weight.adam_denom"]["counts"].tolist(), [2, 0, 0, 1]
+            )
+            self.assertEqual(
+                snapshot["weight.cos_sim_m_g"]["counts"].tolist(), [1, 0, 0, 1]
+            )
+            torch.testing.assert_close(
+                snapshot["weight.w"]["sums"][0], torch.tensor(2.8)
+            )
+            torch.testing.assert_close(
+                snapshot["weight.exp_avg"]["sums"][0], torch.tensor(0.6)
+            )
+            torch.testing.assert_close(
+                snapshot["weight.adam_denom"]["sums"][0], torch.tensor(6.0)
+            )
+            torch.testing.assert_close(
+                snapshot["weight.cos_sim_m_g"]["sums"][0], torch.tensor(1.0)
+            )
+        finally:
+            runtime.close()
+
     def test_single_pattern_weight_decay_zero(self):
         """Pattern matching bias params with weight_decay=0."""
         model = SimpleModel()
@@ -676,6 +735,42 @@ class TestMixedOptimizers(unittest.TestCase):
         )
         self.assertEqual(adam.param_groups[0]["lr"], 5e-4)
         self.assertEqual(adam.param_groups[0]["betas"], (0.9, 0.95))
+
+    def test_mixed_adam_optimizers_record_weight_once(self):
+        model = SimpleModel()
+        config = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[
+                ParamGroupConfig(
+                    pattern=r"output\.",
+                    optimizer_name="Adam",
+                    optimizer_kwargs={"lr": 0.0},
+                ),
+                ParamGroupConfig(
+                    pattern=r".*",
+                    optimizer_name="AdamW",
+                    optimizer_kwargs={"lr": 0.0},
+                ),
+            ],
+        )
+        container = config.build(model_parts=[model])
+        register_optimizer_statistics(container)
+        runtime = init(model)
+        try:
+            for parameter in model.parameters():
+                parameter.grad = torch.ones_like(parameter)
+            with set_enabled(True):
+                container.step()
+                log_optimizer_statistics(container)
+
+            snapshots = runtime.snapshot_unreduced_statistics()
+            for name, _parameter in model.named_parameters():
+                self.assertEqual(
+                    snapshots[f"{name}.w"]["counts"][3].item(),
+                    1,
+                )
+        finally:
+            runtime.close()
 
     def test_pattern_not_leaked_to_state_dict(self):
         """Pattern is logging-only; it must not enter the optimizer or state dict."""
