@@ -190,6 +190,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
                     "--metrics.tensor-logging.freq 2",
                     "--training.steps 4",
                     "--training.disable_cuda_graphs",
+                    "--debug.spmd-typechecking",
                     "--parallelism.data_parallel_shard_degree 2",
                     "--parallelism.tensor_parallel_degree 2",
                     "--parallelism.expert_parallel_degree 2",
