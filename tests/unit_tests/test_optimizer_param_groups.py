@@ -317,6 +317,66 @@ class TestParamGroupConfig(unittest.TestCase):
             torch.tensor([[7, 3], [2, 8]]),
         )
 
+    def test_router_metrics_reuse_preallocated_layer_stacks(self):
+        model = FakeMoEModel()
+        container = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[_DEFAULT_ADAMW],
+        ).build(model_parts=[model])
+        captured_stacks = []
+
+        def capture_router_stacks(*args, **kwargs):
+            captured_stacks.append(
+                {
+                    name: (
+                        kwargs[name].data_ptr(),
+                        kwargs[name].clone(),
+                    )
+                    for name in (
+                        "entropy_logits_sum_by_layer",
+                        "entropy_logits_count_by_layer",
+                        "sequence_counts_by_layer",
+                        "sequence_positions_by_layer",
+                    )
+                }
+            )
+
+        with unittest.mock.patch(
+            "torchtitan.components.optimizer.log_router_statistics",
+            side_effect=capture_router_stacks,
+        ):
+            register_moe_load_balancing_hook(container, [model], FakeParallelDims())
+            runtime = init(model)
+            try:
+                with set_enabled(True):
+                    container.step()
+
+                model.layers["0"].moe.router._entropy_logits_sum_E.copy_(
+                    torch.tensor([7.0, 3.0])
+                )
+                model.layers["1"].moe.router._entropy_logits_sum_E.copy_(
+                    torch.tensor([2.0, 8.0])
+                )
+                with set_enabled(True):
+                    container.step()
+            finally:
+                runtime.close()
+
+        self.assertEqual(len(captured_stacks), 2)
+        for name in captured_stacks[0]:
+            self.assertEqual(
+                captured_stacks[0][name][0],
+                captured_stacks[1][name][0],
+            )
+        torch.testing.assert_close(
+            captured_stacks[1]["entropy_logits_sum_by_layer"][1],
+            torch.tensor([[7.0, 3.0], [2.0, 8.0]]),
+        )
+        self.assertEqual(
+            model.layers["0"].moe.router._entropy_logits_sum_E.data_ptr(),
+            captured_stacks[0]["entropy_logits_sum_by_layer"][0],
+        )
+
     def test_ep_shard_imbalance_is_not_pooled_across_ep_groups(self):
         pooled_counts = torch.tensor([[40, 40]])
         for local_counts in (torch.tensor([30, 10]), torch.tensor([10, 30])):
@@ -330,6 +390,18 @@ class TestParamGroupConfig(unittest.TestCase):
                         local_tokens_per_expert_by_layer=[local_counts],
                         ep_group_tokens_per_expert_by_layer=local_counts.unsqueeze(0),
                         global_tokens_per_expert_by_layer=pooled_counts,
+                        entropy_logits_sum_by_layer=moe.router._entropy_logits_sum_E.unsqueeze(
+                            0
+                        ),
+                        entropy_logits_count_by_layer=moe.router._entropy_logits_count.unsqueeze(
+                            0
+                        ),
+                        sequence_counts_by_layer=moe._sequence_expert_counts_SE.unsqueeze(
+                            0
+                        ),
+                        sequence_positions_by_layer=moe._sequence_expert_counts_position.unsqueeze(
+                            0
+                        ),
                         parallel_dims=FakeEPParallelDims(),
                     )
 

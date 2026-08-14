@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections.abc import Sequence
-from typing import cast
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -23,6 +22,10 @@ def log_router_statistics(
     local_tokens_per_expert_by_layer: Sequence[torch.Tensor],
     ep_group_tokens_per_expert_by_layer: torch.Tensor | None,
     global_tokens_per_expert_by_layer: torch.Tensor,
+    entropy_logits_sum_by_layer: torch.Tensor,
+    entropy_logits_count_by_layer: torch.Tensor,
+    sequence_counts_by_layer: torch.Tensor,
+    sequence_positions_by_layer: torch.Tensor,
     parallel_dims: ParallelDims,
 ) -> None:
     """Reconstruct topology-aware router metrics for every MoE layer.
@@ -34,6 +37,10 @@ def log_router_statistics(
         ep_group_tokens_per_expert_by_layer: `[L, E]` counts reduced within each
             EP group, or `None` when EP is disabled.
         global_tokens_per_expert_by_layer: Counts with shape `[L, E]` already reconstructed over every token-sharding axis.
+        entropy_logits_sum_by_layer: Preallocated `[L, E]` whole-step numerators.
+        entropy_logits_count_by_layer: Preallocated `[L, 1]` whole-step denominators.
+        sequence_counts_by_layer: Preallocated `[L, S, E]` per-sequence counts.
+        sequence_positions_by_layer: Preallocated `[L, 1]` valid sequence counts.
         parallel_dims: Meshes used to reconstruct router logits and per-sequence counts.
 
     Example:
@@ -45,18 +52,18 @@ def log_router_statistics(
             local_tokens_per_expert_by_layer=local_counts_by_layer,
             ep_group_tokens_per_expert_by_layer=ep_group_counts_LE,
             global_tokens_per_expert_by_layer=global_counts_LE,
+            entropy_logits_sum_by_layer=entropy_sum_LE,
+            entropy_logits_count_by_layer=entropy_count_L1,
+            sequence_counts_by_layer=sequence_counts_LSE,
+            sequence_positions_by_layer=sequence_positions_L1,
             parallel_dims=parallel_dims,
         )
         # Layer 0 records expert_load=[1.0, 1.0, 0.5, 1.5].
     """
 
     # Reconstruct numerator and denominator over every partial token population.
-    entropy_logits_sum_LE = torch.stack(
-        [cast(torch.Tensor, moe.router._entropy_logits_sum_E) for moe in moe_layers]
-    )
-    entropy_logits_count_L1 = torch.stack(
-        [cast(torch.Tensor, moe.router._entropy_logits_count) for moe in moe_layers]
-    )
+    entropy_logits_sum_LE = entropy_logits_sum_by_layer
+    entropy_logits_count_L1 = entropy_logits_count_by_layer
     tp_mesh = parallel_dims.get_optional_mesh("tp")
     if tp_mesh is not None:
         torch.distributed.all_reduce(
@@ -149,12 +156,8 @@ def log_router_statistics(
             )
 
     # Reconstruct each sequence across CP (and TP when TP and EP share work).
-    sequence_counts_LSE = torch.stack(
-        [cast(torch.Tensor, moe._sequence_expert_counts_SE) for moe in moe_layers]
-    )
-    sequence_positions_L1 = torch.stack(
-        [cast(torch.Tensor, moe._sequence_expert_counts_position) for moe in moe_layers]
-    )
+    sequence_counts_LSE = sequence_counts_by_layer
+    sequence_positions_L1 = sequence_positions_by_layer
     cp_mesh = parallel_dims.get_optional_mesh("cp")
     if cp_mesh is not None:
         torch.distributed.all_reduce(

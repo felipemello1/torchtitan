@@ -572,14 +572,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             f"({device_mem_stats.max_reserved_pct:.2f}%)"
         )
 
-        # build optimizer after applying parallelisms to the model
-        self.optimizers = config.optimizer.build(model_parts=self.model_parts)
-        if model_spec.post_optimizer_build_fn is not None:
-            model_spec.post_optimizer_build_fn(
-                self.optimizers, self.model_parts, parallel_dims
-            )
-
-        self.tensor_logging = None
+        # Allocate one fixed router window per layer before the optimizer's MoE
+        # hook stacks them. The hook then rebinds each layer to a row view, so
+        # selected logging steps reuse the layer stacks instead of allocating.
         tensor_logging_config = config.metrics.tensor_logging
         if tensor_logging_config.enabled:
             effective_freq = math.lcm(
@@ -621,6 +616,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                             device=self.device,
                         )
 
+        # build optimizer after applying parallelisms to the model
+        self.optimizers = config.optimizer.build(model_parts=self.model_parts)
+        if model_spec.post_optimizer_build_fn is not None:
+            model_spec.post_optimizer_build_fn(
+                self.optimizers, self.model_parts, parallel_dims
+            )
+
+        self.tensor_logging = None
+        if tensor_logging_config.enabled:
             # Model buffers and parallel wrappers are final before slots are assigned.
             self.tensor_logging = tensor_logging.init(
                 self.model_parts,

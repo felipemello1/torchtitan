@@ -243,8 +243,8 @@ Separately generated or loaded precompiled artifacts are also rejected: their sa
 The common recording API does not guess TP, CP, DP, or EP semantics. Router statistics reconstruct their semantic population beside the producer:
 
 ```text
-each layer buffers local router state
-        -> stack all local layers
+each layer writes local router state into its preallocated layer row
+        -> use the persistent [layers, ...] buffers
         -> reduce over the groups that shard that population
         -> derive entropy, load, or imbalance
         -> log_stats(router, derived_name=derived_tensor)
@@ -260,9 +260,9 @@ CP rank 1 local expert counts: [0, 2]
 complete sequence counts:      [1, 2]
 ```
 
-TorchTitan performs one reduction per required group for the layer-stacked buffer, not one collective per layer. The derived scalar then follows the ordinary `log_stats()` path.
+TorchTitan performs one reduction per required group for the preallocated layer buffer, not one collective or `torch.stack` allocation per layer or selected step. The derived scalar then follows the ordinary `log_stats()` path.
 
-Built-in router coverage includes expert load, maximum violation, entropy, local expert imbalance, EP-shard imbalance, per-sequence imbalance, router logits/scores, and expert bias when present. Entropy and per-sequence imbalance currently summarize the final microbatch's retained router intermediates rather than the full gradient-accumulation window.
+Built-in router coverage includes expert load, maximum violation, entropy, local expert imbalance, EP-shard imbalance, per-sequence imbalance, router logits/scores, and expert bias when present. Entropy accumulates a numerator and denominator over the complete optimizer step; per-sequence counts append distinct rows from every forward in that same gradient-accumulation window.
 
 ## Execution modes
 

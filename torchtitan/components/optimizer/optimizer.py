@@ -399,7 +399,16 @@ def _global_moe_expert_counts(
     local_counts_by_layer: torch.Tensor,
     parallel_dims: ParallelDims,
 ) -> torch.Tensor:
-    """Reconstruct per-layer expert counts over every token-sharding axis."""
+    """Reconstruct `[layers, experts]` counts over every token-sharding axis.
+
+    Args:
+        local_counts_by_layer: Local or partial expert counts with shape `[L, E]`.
+        parallel_dims: Backend and meshes that describe the partial population.
+
+    Example:
+        Two token-sharding ranks contributing `[[3, 1]]` and `[[2, 4]]`
+        each receive the reconstructed result `[[5, 5]]`.
+    """
 
     # Full-DTensor carries every partial placement and can redistribute once.
     if parallel_dims.spmd_backend == "full_dtensor":
@@ -460,13 +469,16 @@ def register_moe_load_balancing_hook(
     """Register an optimizer pre-hook that consumes MoE expert counts.
 
     The hook optionally updates expert biases and publishes router metrics before
-    each optimizer step. It clears the per-step counters when neither consumer is
-    active.
+    each optimizer step, then clears the complete per-step window.
 
     Args:
         optimizers: The optimizers container to register the hook on.
         model_parts: List of model parts that may contain MoE layers.
         parallel_dims: Parallel dimensions for distributed communication.
+
+    Example:
+        `register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)`
+        consumes all accumulated microbatches immediately before `optimizer.step()`.
     """
 
     def _iter_moe_layers(
@@ -495,6 +507,10 @@ def register_moe_load_balancing_hook(
     def _process_moe_expert_counts(
         moe_layers: list[MoE],
         local_counts_by_layer: torch.Tensor,
+        entropy_logits_sum_by_layer: torch.Tensor | None,
+        entropy_logits_count_by_layer: torch.Tensor | None,
+        sequence_counts_by_layer: torch.Tensor | None,
+        sequence_positions_by_layer: torch.Tensor | None,
         parallel_dims: ParallelDims,
         load_balance_enabled: bool,
     ):
@@ -504,7 +520,14 @@ def register_moe_load_balancing_hook(
 
             # Local counts from all microbatches are consumed once per step.
             _process_moe_expert_counts(
-                moe_layers, local_counts_by_layer, parallel_dims, True
+                moe_layers,
+                local_counts_by_layer,
+                entropy_logits_sum_by_layer,
+                entropy_logits_count_by_layer,
+                sequence_counts_by_layer,
+                sequence_positions_by_layer,
+                parallel_dims,
+                load_balance_enabled=True,
             )
         """
 
@@ -604,11 +627,19 @@ def register_moe_load_balancing_hook(
 
         # Logging derives semantic router metrics without owning bias state.
         if logging_enabled:
+            assert entropy_logits_sum_by_layer is not None
+            assert entropy_logits_count_by_layer is not None
+            assert sequence_counts_by_layer is not None
+            assert sequence_positions_by_layer is not None
             log_router_statistics(
                 moe_layers,
                 local_tokens_per_expert_by_layer=tokens_per_expert_E_list,
                 ep_group_tokens_per_expert_by_layer=ep_group_counts_by_layer,
                 global_tokens_per_expert_by_layer=tokens_per_expert_E_by_layer,
+                entropy_logits_sum_by_layer=entropy_logits_sum_by_layer,
+                entropy_logits_count_by_layer=entropy_logits_count_by_layer,
+                sequence_counts_by_layer=sequence_counts_by_layer,
+                sequence_positions_by_layer=sequence_positions_by_layer,
                 parallel_dims=parallel_dims,
             )
 
@@ -642,10 +673,58 @@ def register_moe_load_balancing_hook(
         local_counts_by_layer = torch.stack(
             [moe.tokens_per_expert_E for moe in moe_layers]
         )
+
+        # Stack router windows once, then make each layer write directly into
+        # its row. The bases stay alive in this hook and are reduced in place.
+        entropy_logits_sum_by_layer = None
+        entropy_logits_count_by_layer = None
+        sequence_counts_by_layer = None
+        sequence_positions_by_layer = None
+        if moe_layers[0].router._entropy_logits_sum_E is not None:
+            entropy_logits_sum_by_layer = torch.stack(
+                [
+                    cast(torch.Tensor, moe.router._entropy_logits_sum_E)
+                    for moe in moe_layers
+                ]
+            )
+            entropy_logits_count_by_layer = torch.stack(
+                [
+                    cast(torch.Tensor, moe.router._entropy_logits_count)
+                    for moe in moe_layers
+                ]
+            )
+            sequence_counts_by_layer = torch.stack(
+                [
+                    cast(torch.Tensor, moe._sequence_expert_counts_SE)
+                    for moe in moe_layers
+                ]
+            )
+            sequence_positions_by_layer = torch.stack(
+                [
+                    cast(torch.Tensor, moe._sequence_expert_counts_position)
+                    for moe in moe_layers
+                ]
+            )
+            for layer_index, moe in enumerate(moe_layers):
+                moe.router._entropy_logits_sum_E = entropy_logits_sum_by_layer[
+                    layer_index
+                ]
+                moe.router._entropy_logits_count = entropy_logits_count_by_layer[
+                    layer_index
+                ]
+                moe._sequence_expert_counts_SE = sequence_counts_by_layer[layer_index]
+                moe._sequence_expert_counts_position = sequence_positions_by_layer[
+                    layer_index
+                ]
+
         optimizers.register_step_pre_hook(
             lambda *args, **kwargs: _process_moe_expert_counts(
                 moe_layers,
                 local_counts_by_layer=local_counts_by_layer,
+                entropy_logits_sum_by_layer=entropy_logits_sum_by_layer,
+                entropy_logits_count_by_layer=entropy_logits_count_by_layer,
+                sequence_counts_by_layer=sequence_counts_by_layer,
+                sequence_positions_by_layer=sequence_positions_by_layer,
                 parallel_dims=parallel_dims,
                 load_balance_enabled=load_balance_enabled,
             )
