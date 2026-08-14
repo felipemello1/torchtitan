@@ -193,6 +193,48 @@ def test_source_moe_metric_mutations_compile_fullgraph_with_full_ac() -> None:
         torch.compiler.reset()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_compiled_full_ac_preserves_expert_counts_without_tensor_logging() -> None:
+    torch.manual_seed(0)
+    eager_root = _TinyMoERoot(track_forward_calls=False).cuda()
+    compiled_root = _TinyMoERoot(track_forward_calls=False).cuda()
+    compiled_root.load_state_dict(eager_root.state_dict())
+    value = torch.randn(2, 3, 4, device="cuda")
+
+    eager_value = value.clone().requires_grad_()
+    eager_root(eager_value).sum().backward()
+
+    FullAC.Config().build().apply(compiled_root)
+    apply_compile(
+        compiled_root,
+        compile_config=CompileConfig(
+            enable=True,
+            components=["model"],
+            backend="inductor",
+        ),
+        parallel_dims=ParallelDims(
+            dp_replicate=1,
+            dp_shard=1,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=1,
+        ),
+    )
+    compiled_value = value.clone().requires_grad_()
+    try:
+        compiled_root(compiled_value).sum().backward()
+
+        torch.testing.assert_close(
+            compiled_root.layers["0"].moe.tokens_per_expert_E,
+            eager_root.layers["0"].moe.tokens_per_expert_E,
+        )
+        torch.testing.assert_close(compiled_value.grad, eager_value.grad)
+    finally:
+        torch.compiler.reset()
+
+
 @pytest.mark.parametrize(
     "device",
     [
