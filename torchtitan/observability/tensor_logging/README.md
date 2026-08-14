@@ -10,7 +10,7 @@ tensor [0, 1, -2, 3]
        +-> fixed buffer slot -> one packed drain -> TensorBoard/W&B
 ```
 
-Use it to find exploding activations and dead gradients across a distributed training job.
+Use it to find exploding activations, dead gradients, and imbalanced routing across a distributed training job.
 
 ## Mental model
 
@@ -237,6 +237,41 @@ Separately generated or loaded precompiled artifacts are also rejected: their sa
 - The Triton kernel scans contiguous storage. Common transposes and permutations become no-copy views; `.contiguous()` is used only when the layout still has gaps.
 - Every additive field shares one SUM all-reduce and every maximum shares one MAX all-reduce, regardless of how many metrics are registered.
 - The all-reduces and scalar derivation run only on logging steps and outside compiled or captured forward/backward.
+
+## Metrics that need topology
+
+The common recording API does not guess TP, CP, DP, or EP semantics. Router statistics reconstruct their semantic population beside the producer:
+
+```text
+each layer buffers local router state
+        -> stack all local layers
+        -> reduce over the groups that shard that population
+        -> derive entropy, load, or imbalance
+        -> log_stats(router, derived_name=derived_tensor)
+        -> ordinary packed WORLD publication
+```
+
+For example, a sequence split across two CP ranks needs a CP sum before computing expert imbalance:
+
+```text
+CP rank 0 local expert counts: [1, 0]
+CP rank 1 local expert counts: [0, 2]
+                              ------- CP SUM
+complete sequence counts:      [1, 2]
+```
+
+TorchTitan performs one reduction per required group for the layer-stacked buffer, not one collective per layer. The derived scalar then follows the ordinary `log_stats()` path.
+
+Built-in router coverage includes expert load, maximum violation, entropy, local expert imbalance, EP-shard imbalance, per-sequence imbalance, router logits/scores, and expert bias when present. Entropy and per-sequence imbalance currently summarize the final microbatch's retained router intermediates rather than the full gradient-accumulation window.
+
+## Execution modes
+
+- Full and selective activation checkpointing preserve the original forward mutation so recomputation does not double-count statistics or operational router state.
+- Regional full-graph `torch.compile` uses a device-resident enabled flag, allowing selected and unselected steps to reuse one graph.
+- Trainer CUDA graphs retain router producers even when warmup or capture occurs off cadence; the device-resident flag suppresses mutations until a selected replay.
+- In-process Graph Trainer tracing and CUDA-graph replay use the live model-owned slots. Separately produced or loaded precompiled artifacts are unsupported because registered sources and live buffers are not portable across artifacts.
+- Pipeline model parts can share global prefixes so names remain model paths such as `layers.7.attention.xq.x`, independent of rank-local part indices.
+- CUDA uses a lazily imported Triton accumulator; CPU uses the eager reference path. ROCm source compatibility is not a hardware-validation claim.
 
 ## Current limitations
 

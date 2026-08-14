@@ -29,7 +29,11 @@ from torchtitan.config import Configurable
 from torchtitan.tools.logging import logger
 
 
-_FORWARD_MUTATION_OP_NAMES = ("accumulate_tensor_statistics",)
+_FORWARD_MUTATION_OP_NAMES = (
+    "accumulate_tensor_statistics",
+    "accumulate_expert_tokens",
+    "store_router_metric",
+)
 _in_activation_checkpoint_recompute = False
 
 
