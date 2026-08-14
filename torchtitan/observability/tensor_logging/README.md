@@ -267,6 +267,7 @@ Built-in router coverage includes expert load, maximum violation, entropy, local
 ## Execution modes
 
 - Full and selective activation checkpointing preserve the original forward mutation so recomputation does not double-count statistics or operational router state.
+- Compiled FullAC saves router `topk` outputs instead of recomputing them so operational expert counts remain exact, including when tensor logging is disabled.
 - Regional full-graph `torch.compile` uses a device-resident enabled flag, allowing selected and unselected steps to reuse one graph.
 - Trainer CUDA graphs retain optional router-statistic computations even when warmup or capture occurs off cadence. The device flag gates packed statistic slots; operational expert counts remain active every step.
 - In-process Graph Trainer tracing and CUDA-graph replay use the live model-owned slots. Separately produced or loaded precompiled artifacts are unsupported because registered sources and live buffers are not portable across artifacts.
