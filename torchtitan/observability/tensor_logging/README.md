@@ -142,7 +142,7 @@ Ordinary rows count physical observations. A replicated tensor contributes once 
 layers.0.attention.xq.x.abs_max
 ```
 
-The filter controls which tensor rows reach TensorBoard/W&B. It does not avoid the GPU statistic calculation, so a narrow filter reduces sink volume but not all collection work.
+The filter controls which tensor rows reach TensorBoard/W&B. It does not avoid the GPU statistic calculation, so a narrow filter reduces sink volume but not all collection work. Compact `data/*` window metrics bypass this ordinary-row filter.
 
 ## Metrics that need topology
 
@@ -196,6 +196,17 @@ update / lr = exp_avg / (1 - beta1**step) / adam_denom
 ```
 
 The optional `adam_momentum_gradient_angle` records `angle_deg_m_g` in `[0, 180]` and is disabled by default because exact sharded reconstruction may communicate per parameter. DTensor carries its own placements; `spmd_types` sums the three angle sufficient statistics over the loss and TP groups before deriving the angle. Whole-model and MoE gradient summaries reuse the already-reduced `.dw` rows; they do not scan gradients or launch another collective. Their absolute counts include physical replica multiplicity, and pooled means weight replicated parameter rows accordingly.
+
+## Data windows
+
+Data statistics accumulate every optimizer step and publish over the interval between tensor-logging events. They include dataset token/mask counts, batch count, packed-document count and mean length, block-causal `sum(length^2)`, token-weighted dataset loss, and window step count.
+
+For two steps with losses/tokens `(2.0, 4)` and `(3.0, 6)`:
+
+```text
+loss_mean = (2*4 + 3*6) / (4+6) = 2.6
+window_steps = 2
+```
 
 ## Execution modes
 

@@ -65,6 +65,7 @@ from torchtitan.models.common.token_dispatcher import (
     MinimalAsyncEPTokenDispatcher,
 )
 from torchtitan.observability import structured_logger as sl, tensor_logging
+from torchtitan.observability.tensor_logging.data import DataWindowStatistics
 from torchtitan.observability.tensor_logging.runtime import _include_recording_calls
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
@@ -277,6 +278,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     metrics_processor: MetricsProcessor
     tensor_logging: tensor_logging.TensorLoggingState | None
     tensor_logging_freq: int
+    data_window_statistics: DataWindowStatistics | None
     checkpointer: CheckpointManager
 
     # runtime utilities
@@ -650,6 +652,30 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 else None
             ),
         )
+        self.data_window_statistics = None
+        dataset_id = config.dataloader.dataset
+        if self.tensor_logging is not None and dataset_id:
+            tp_mesh = parallel_dims.get_optional_mesh("tp")
+            cp_mesh = parallel_dims.get_optional_mesh("cp")
+            tp_representative = tp_mesh is None or tp_mesh.get_local_rank() == 0
+            cp_representative = cp_mesh is None or cp_mesh.get_local_rank() == 0
+            first_pipeline_stage = (
+                self.pp_has_first_stage if parallel_dims.pp_enabled else True
+            )
+            last_pipeline_stage = (
+                self.pp_has_last_stage if parallel_dims.pp_enabled else True
+            )
+            self.data_window_statistics = DataWindowStatistics(
+                dataset_id=dataset_id,
+                data_contributor=(
+                    first_pipeline_stage and tp_representative and cp_representative
+                ),
+                loss_contributor=last_pipeline_stage and tp_representative,
+                step_contributor=torch.distributed.get_rank() == 0,
+                ignore_index=IGNORE_INDEX,
+                device=self.device,
+            )
+
         # build checkpointer
         self.checkpointer = config.checkpoint.build(
             dataloader=self.dataloader,
@@ -999,6 +1025,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # Process each gradient accumulation step, then free its inputs.
         accumulated_loss: torch.Tensor | None = None
+        should_collect_loss = should_log or self.data_window_statistics is not None
         for microbatches in microbatch_groups:
             input_dict_mbs = []
             label_mbs = []
@@ -1006,8 +1033,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 for key, value in input_dict.items():
                     if isinstance(value, torch.Tensor):
                         input_dict[key] = value.to(self.device)
+                labels = labels.to(self.device)
+                if self.data_window_statistics is not None:
+                    self.data_window_statistics.record_batch(
+                        labels,
+                        input_dict.get("positions"),
+                    )
                 input_dict_mbs.append(input_dict)
-                label_mbs.append(labels.to(self.device))
+                label_mbs.append(labels)
 
             if parallel_dims.pp_enabled:
                 fwd_bwd_input_dict = input_dict_mbs
@@ -1022,7 +1055,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 labels=fwd_bwd_labels,
                 global_valid_tokens=global_valid_tokens,
             )
-            if should_log:
+            if should_collect_loss:
                 loss = loss.detach()
                 if accumulated_loss is None:
                     # Take ownership before the next replay overwrites the
@@ -1053,11 +1086,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             )
             self.lr_schedulers.step()
 
+        # Data metrics cover every step in the publication window, not only the
+        # step on which the window is emitted.
+        if self.data_window_statistics is not None:
+            assert accumulated_loss is not None
+            self.data_window_statistics.record_step_loss(
+                accumulated_loss, global_valid_tokens
+            )
+
         # log metrics
         tensor_metrics: dict[str, int | float] = {}
         if self.tensor_logging is not None and tensor_logging.is_enabled():
             with sl.log_trace_span("tensor_logging_collect"):
                 tensor_metrics = self.tensor_logging.collect()
+                if self.data_window_statistics is not None:
+                    tensor_metrics.update(self.data_window_statistics.collect())
         if not should_log:
             return
 
