@@ -163,6 +163,8 @@ def log_router_statistics(
         global_tokens_per_expert_by_layer,
         strict=True,
     ):
+        if isinstance(tokens_per_expert_E, DTensor):
+            tokens_per_expert_E = tokens_per_expert_E.to_local()
         tokens_per_expert_E = tokens_per_expert_E.float()
         average_tokens = tokens_per_expert_E.mean().clamp_min(1)
         expert_load_E = tokens_per_expert_E / average_tokens
