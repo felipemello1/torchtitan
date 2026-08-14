@@ -400,6 +400,8 @@ def default_adamw(lr: float = 8e-4, **kwargs: Any) -> OptimizersContainer.Config
 def _momentum_gradient_angle_degrees(
     momentum: torch.Tensor,
     gradient: torch.Tensor,
+    *,
+    parallel_dims: ParallelDims | None = None,
 ) -> torch.Tensor:
     """Return the global angle in degrees between an Adam moment and gradient."""
 
@@ -412,11 +414,18 @@ def _momentum_gradient_angle_degrees(
     )
     if isinstance(statistics, torch.distributed.tensor.DTensor):
         statistics = statistics.full_tensor()
+    elif parallel_dims is not None and parallel_dims.spmd_backend == "spmd_types":
+        # SPMD-types optimizer state is local. Loss then TP spans every
+        # non-PP rank; uniform parameter replicas cancel in the final ratio.
+        for mesh_name in ("loss", "tp"):
+            mesh = parallel_dims.get_optional_mesh(mesh_name)
+            if mesh is not None:
+                torch.distributed.all_reduce(statistics, group=mesh.get_group())
     dot_product, momentum_square_sum, gradient_square_sum = statistics
     denominator = (momentum_square_sum.sqrt() * gradient_square_sum.sqrt()).clamp_min(
         1e-8
     )
-    cosine = dot_product / denominator
+    cosine = (dot_product / denominator).clamp(-1, 1)
     return torch.rad2deg(torch.arccos(cosine)).view(1)
 
 
@@ -461,12 +470,14 @@ def log_parameter_gradients(
 def log_optimizer_statistics(
     optimizers: OptimizersContainer,
     *,
+    parallel_dims: ParallelDims | None = None,
     log_momentum_gradient_angle: bool = False,
 ) -> None:
     """Record post-step parameters and optimizer-specific state.
 
     Args:
         optimizers: Optimizers whose parameters and state should be recorded.
+        parallel_dims: Meshes used to reconstruct local SPMD-types state.
         log_momentum_gradient_angle: Also reconstruct each parameter's Adam
             momentum/gradient angle in degrees.
 
@@ -511,6 +522,7 @@ def log_optimizer_statistics(
                         angle_deg_m_g=_momentum_gradient_angle_degrees(
                             exp_avg,
                             parameter.grad,
+                            parallel_dims=parallel_dims,
                         ),
                     )
 

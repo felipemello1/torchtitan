@@ -437,6 +437,15 @@ class TestParamGroupConfig(unittest.TestCase):
                     torch.tensor([expected_degrees]),
                 )
 
+        # Parallel first-step Adam state can round the cosine just above one.
+        torch.manual_seed(0)
+        gradient = torch.randn(4096, 512)
+        momentum = 0.1 * gradient
+        torch.testing.assert_close(
+            _momentum_gradient_angle_degrees(momentum, gradient),
+            torch.tensor([0.0]),
+        )
+
     def test_single_pattern_weight_decay_zero(self):
         """Pattern matching bias params with weight_decay=0."""
         model = SimpleModel()

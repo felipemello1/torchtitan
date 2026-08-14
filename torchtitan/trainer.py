@@ -1046,6 +1046,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             self.optimizers.step()
             log_optimizer_statistics(
                 self.optimizers,
+                parallel_dims=parallel_dims,
                 log_momentum_gradient_angle=(
                     self.config.metrics.tensor_logging.adam_momentum_gradient_angle
                 ),

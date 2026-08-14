@@ -205,9 +205,9 @@ def build_features_test_list() -> list[OverrideDefinitions]:
             [
                 [
                     "--metrics.enable_tensorboard",
-                    "--metrics.log-freq 2",
+                    "--metrics.log-freq 1",
                     "--metrics.tensor-logging.enabled",
-                    "--metrics.tensor-logging.freq 2",
+                    "--metrics.tensor-logging.freq 1",
                     "--metrics.tensor-logging.adam-momentum-gradient-angle",
                     "--metrics.tensor-logging.publish-filter-regex "
                     r"'\.(?:w|dw|normed_dw|exp_avg|adam_denom|angle_deg_m_g)\."

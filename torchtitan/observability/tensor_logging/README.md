@@ -195,7 +195,7 @@ adam_denom    sqrt(bias-corrected second moment) + epsilon
 update / lr = exp_avg / (1 - beta1**step) / adam_denom
 ```
 
-The optional `adam_momentum_gradient_angle` records `angle_deg_m_g` in `[0, 180]` and is disabled by default because exact sharded reconstruction may communicate per parameter. Whole-model and MoE gradient summaries reuse the already-reduced `.dw` rows; they do not scan gradients or launch another collective.
+The optional `adam_momentum_gradient_angle` records `angle_deg_m_g` in `[0, 180]` and is disabled by default because exact sharded reconstruction may communicate per parameter. DTensor carries its own placements; `spmd_types` sums the three angle sufficient statistics over the loss and TP groups before deriving the angle. Whole-model and MoE gradient summaries reuse the already-reduced `.dw` rows; they do not scan gradients or launch another collective. Their absolute counts include physical replica multiplicity, and pooled means weight replicated parameter rows accordingly.
 
 ## Execution modes
 

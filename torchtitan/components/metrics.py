@@ -282,6 +282,7 @@ class TensorLoggingConfig(Configurable.Config):
     """Regex selecting derived tensor-statistic keys sent to metrics sinks."""
 
     adam_momentum_gradient_angle: bool = False
+    """Whether to record the global Adam momentum/gradient angle per parameter."""
 
     def __post_init__(self) -> None:
         if self.freq <= 0:
