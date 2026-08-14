@@ -29,7 +29,11 @@ from torchtitan.config import Configurable
 from torchtitan.tools.logging import logger
 
 
-_FORWARD_SIDE_EFFECT_OP_NAMES = ("accumulate_tensor_statistics",)
+_FORWARD_SIDE_EFFECT_OP_NAMES = (
+    "accumulate_tensor_statistics",
+    "accumulate_expert_tokens",
+    "store_router_metric",
+)
 
 
 def _registered_forward_side_effect_ops() -> set[torch._ops.OpOverload]:

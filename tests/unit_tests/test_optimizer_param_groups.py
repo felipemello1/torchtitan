@@ -15,6 +15,7 @@ from torchtitan.components.optimizer import (
     ParamGroupConfig,
     register_moe_load_balancing_hook,
 )
+from torchtitan.observability.tensor_logging import init, register, set_enabled
 
 
 class SimpleModel(nn.Module):
@@ -48,7 +49,29 @@ class FakeMoE(nn.Module):
     def __init__(self, load_balance_coeff, tokens):
         super().__init__()
         self.load_balance_coeff = load_balance_coeff
+        self.router = nn.Identity()
+        self.router.score_func = "softmax"
+        self.router.register_buffer(
+            "_router_logits_mean_E",
+            torch.tensor([0.25, -0.25]),
+        )
+        metric_names = [
+            "entropy",
+            "ep_shard_imbalance",
+            "expert_load",
+            "experts_max_violation",
+            "local_expert_imbalance",
+            "seq_expert_imbalance_max",
+            "seq_expert_imbalance_mean",
+        ]
+        if load_balance_coeff is not None:
+            metric_names.append("expert_bias")
+        register(self.router, metric_names)
         self.register_buffer("tokens_per_expert_E", torch.tensor(tokens))
+        self.register_buffer(
+            "_sequence_expert_counts_BE",
+            torch.tensor([[3.0, 1.0], [1.0, 3.0]]),
+        )
         if load_balance_coeff is not None:
             self.register_buffer("expert_bias_E", torch.zeros(len(tokens)))
         else:
@@ -76,6 +99,8 @@ class FakeMoEModel(nn.Module):
 
 class FakeParallelDims:
     spmd_backend = "none"
+    ep_enabled = False
+    tp_enabled = False
 
     def get_optional_mesh(self, name):
         return None
@@ -182,6 +207,47 @@ class TestParamGroupConfig(unittest.TestCase):
             torch.tensor([0, 0]),
         )
 
+    def test_moe_load_balancing_keeps_counts_exact_above_float32_limit(self):
+        model = FakeMoEModel(load_balance_coeffs=(0.1, 0.2))
+        model.layers["0"].moe.tokens_per_expert_E.copy_(
+            torch.tensor([2**24, 2**24 + 1])
+        )
+        container = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[_DEFAULT_ADAMW],
+        ).build(model_parts=[model])
+        register_moe_load_balancing_hook(container, [model], FakeParallelDims())
+
+        container.step()
+
+        torch.testing.assert_close(
+            model.layers["0"].moe.expert_bias_E,
+            torch.tensor([0.1, -0.1]),
+        )
+
+    def test_router_entropy_is_finite_when_a_probability_underflows_to_zero(self):
+        model = FakeMoEModel()
+        for block in model.layers.values():
+            block.moe.router._router_logits_mean_E.copy_(torch.tensor([0.0, -1000.0]))
+        container = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[_DEFAULT_ADAMW],
+        ).build(model_parts=[model])
+        register_moe_load_balancing_hook(container, [model], FakeParallelDims())
+        runtime = init(model)
+        try:
+            with set_enabled(True):
+                container.step()
+
+            for layer_id in range(2):
+                entropy = runtime.snapshot_unreduced_statistics()[
+                    f"layers.{layer_id}.moe.router.entropy"
+                ]
+                self.assertEqual(entropy["counts"].tolist(), [1, 0, 1, 1])
+                self.assertEqual(entropy["sums"][0].item(), 0.0)
+        finally:
+            runtime.close()
+
     def test_moe_load_balancing_rejects_inconsistent_coeffs(self):
         model = FakeMoEModel(load_balance_coeffs=(None, 0.2))
         config = OptimizersContainer.Config(
@@ -203,6 +269,94 @@ class TestParamGroupConfig(unittest.TestCase):
                 [model],
                 FakeParallelDims(),
             )
+
+    def test_moe_load_balancing_records_reconstructed_router_metrics(self):
+        model = FakeMoEModel()
+        config = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[
+                ParamGroupConfig(
+                    pattern=r".*",
+                    optimizer_name="AdamW",
+                    optimizer_kwargs={"lr": 0.0, "weight_decay": 0.0},
+                ),
+            ],
+        )
+        container = config.build(model_parts=[model])
+        register_moe_load_balancing_hook(container, [model], FakeParallelDims())
+        runtime = init(model)
+        try:
+            with set_enabled(True):
+                container.step()
+
+            snapshot = runtime.snapshot_unreduced_statistics()
+            for layer_id in range(2):
+                prefix = f"layers.{layer_id}.moe.router"
+                self.assertEqual(
+                    snapshot[f"{prefix}.expert_load"]["counts"].tolist(),
+                    [2, 0, 1, 1],
+                )
+                self.assertEqual(
+                    snapshot[f"{prefix}.experts_max_violation"]["counts"].tolist(),
+                    [1, 0, 0, 1],
+                )
+                self.assertEqual(
+                    snapshot[f"{prefix}.experts_max_violation"]["sums"][0].item(),
+                    1.0,
+                )
+                self.assertEqual(
+                    snapshot[f"{prefix}.expert_bias"]["counts"].tolist(),
+                    [2, 0, 2, 1],
+                )
+                self.assertEqual(
+                    snapshot[f"{prefix}.expert_bias"]["sums"][0].item(),
+                    0.0,
+                )
+                self.assertEqual(
+                    snapshot[f"{prefix}.seq_expert_imbalance_max"]["sums"][0].item(),
+                    1.5,
+                )
+                self.assertEqual(
+                    snapshot[f"{prefix}.seq_expert_imbalance_mean"]["sums"][0].item(),
+                    1.5,
+                )
+                self.assertEqual(
+                    snapshot[f"{prefix}.ep_shard_imbalance"]["counts"].tolist(),
+                    [0, 0, 0, 0],
+                )
+        finally:
+            runtime.close()
+
+    def test_router_metrics_do_not_require_expert_bias_updates(self):
+        model = FakeMoEModel(load_balance_coeffs=(None, None))
+        config = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[
+                ParamGroupConfig(
+                    pattern=r".*",
+                    optimizer_name="AdamW",
+                    optimizer_kwargs={"lr": 0.0, "weight_decay": 0.0},
+                ),
+            ],
+        )
+        container = config.build(model_parts=[model])
+        register_moe_load_balancing_hook(container, [model], FakeParallelDims())
+        runtime = init(model)
+        try:
+            with set_enabled(True):
+                container.step()
+
+            snapshot = runtime.snapshot_unreduced_statistics()
+            for layer_id in range(2):
+                prefix = f"layers.{layer_id}.moe.router"
+                assert snapshot[f"{prefix}.expert_load"]["counts"].tolist() == [
+                    2,
+                    0,
+                    1,
+                    1,
+                ]
+        finally:
+            runtime.close()
 
     def test_single_pattern_weight_decay_zero(self):
         """Pattern matching bias params with weight_decay=0."""

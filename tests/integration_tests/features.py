@@ -183,6 +183,26 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--module qwen3 --config qwen3_moe_debug",
+                    "--metrics.enable_tensorboard",
+                    "--metrics.log-freq 2",
+                    "--metrics.tensor-logging.enabled",
+                    "--metrics.tensor-logging.freq 2",
+                    "--training.steps 4",
+                    "--training.disable_cuda_graphs",
+                    "--parallelism.data_parallel_shard_degree 2",
+                    "--parallelism.tensor_parallel_degree 2",
+                    "--parallelism.expert_parallel_degree 2",
+                    "activation-checkpoint:full",
+                ],
+            ],
+            "MoE router tensor logging with TP and EP",
+            "tensor_logging_moe",
+            ngpu=4,
+        ),
+        OverrideDefinitions(
+            [
+                [
                     "--compile.enable",
                 ],
             ],

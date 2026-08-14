@@ -53,6 +53,7 @@ from torchtitan.distributed.cudagraph import (
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
 from torchtitan.models.common.attention import FlexAttention, VarlenAttention
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.token_dispatcher import (
     HybridEPTokenDispatcher,
     LocalTokenDispatcher,
@@ -572,6 +573,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     self.tensor_logging_freq,
                     config.metrics.log_freq,
                 )
+
+            num_sequences = (
+                config.parallelism.pipeline_parallel_microbatch_size
+                if parallel_dims.pp_enabled
+                else config.training.local_batch_size
+            )
+            for model_part in self.model_parts:
+                for module in model_part.modules():
+                    if isinstance(module, MoE):
+                        module.router._router_logits_mean_E = torch.zeros(
+                            module.router.num_experts,
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        module.init_sequence_expert_counts(
+                            num_sequences=num_sequences,
+                            device=self.device,
+                        )
 
             # Model buffers and parallel wrappers are final before names are frozen.
             self.tensor_logging = tensor_logging.init(
