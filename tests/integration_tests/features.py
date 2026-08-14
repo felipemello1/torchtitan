@@ -194,12 +194,33 @@ def build_features_test_list() -> list[OverrideDefinitions]:
                     "--parallelism.data_parallel_shard_degree 2",
                     "--parallelism.tensor_parallel_degree 2",
                     "--parallelism.expert_parallel_degree 2",
+                    "--metrics.tensor-logging.adam-momentum-gradient-angle",
                     "activation-checkpoint:full",
                 ],
             ],
             "MoE router tensor logging with TP and EP",
             "tensor_logging_moe",
             ngpu=4,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--metrics.enable_tensorboard",
+                    "--metrics.log-freq 1",
+                    "--metrics.tensor-logging.enabled",
+                    "--metrics.tensor-logging.freq 1",
+                    "--metrics.tensor-logging.adam-momentum-gradient-angle",
+                    "--metrics.tensor-logging.publish-filter-regex "
+                    r"'\.(?:w|dw|normed_dw|exp_avg|adam_denom|angle_deg_m_g)\."
+                    r"(?:observation_count|abs_mean)$'",
+                    "--training.steps 4",
+                    "--parallelism.tensor_parallel_degree 2",
+                    "activation-checkpoint:full",
+                ],
+            ],
+            "Parameter and Adam tensor logging",
+            "tensor_logging_optimizer",
+            ngpu=2,
         ),
         OverrideDefinitions(
             [

@@ -34,6 +34,9 @@ __all__ = [
     "OptimizersContainer",
     "ParamGroupConfig",
     "default_adamw",
+    "log_optimizer_statistics",
+    "log_parameter_gradients",
+    "register_optimizer_statistics",
     "register_moe_load_balancing_hook",
 ]
 
@@ -392,6 +395,136 @@ def default_adamw(lr: float = 8e-4, **kwargs: Any) -> OptimizersContainer.Config
             )
         ]
     )
+
+
+def _momentum_gradient_angle_degrees(
+    momentum: torch.Tensor,
+    gradient: torch.Tensor,
+    *,
+    parallel_dims: ParallelDims | None = None,
+) -> torch.Tensor:
+    """Return the global angle in degrees between an Adam moment and gradient."""
+
+    statistics = torch.stack(
+        [
+            (momentum * gradient).sum(),
+            momentum.square().sum(),
+            gradient.square().sum(),
+        ]
+    )
+    if isinstance(statistics, torch.distributed.tensor.DTensor):
+        statistics = statistics.full_tensor()
+    elif parallel_dims is not None and parallel_dims.spmd_backend == "spmd_types":
+        # SPMD-types optimizer state is local. Loss then TP spans every
+        # non-PP rank; uniform parameter replicas cancel in the final ratio.
+        for mesh_name in ("loss", "tp"):
+            mesh = parallel_dims.get_optional_mesh(mesh_name)
+            if mesh is not None:
+                torch.distributed.all_reduce(statistics, group=mesh.get_group())
+    dot_product, momentum_square_sum, gradient_square_sum = statistics
+    denominator = (momentum_square_sum.sqrt() * gradient_square_sum.sqrt()).clamp_min(
+        1e-8
+    )
+    cosine = (dot_product / denominator).clamp(-1, 1)
+    return torch.rad2deg(torch.arccos(cosine)).view(1)
+
+
+def register_optimizer_statistics(
+    optimizers: OptimizersContainer,
+    *,
+    include_momentum_gradient_angle: bool = False,
+) -> None:
+    """Register general metrics and state owned by each parameter's optimizer."""
+
+    for optimizer in optimizers:
+        metric_names = ["w", "dw", "normed_dw"]
+        if isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+            metric_names.extend(["exp_avg", "adam_denom"])
+            if include_momentum_gradient_angle:
+                metric_names.append("angle_deg_m_g")
+        for group in optimizer.param_groups:
+            for parameter in group["params"]:
+                tensor_logging.register(parameter, metric_names)
+
+
+@torch.no_grad()
+def log_parameter_gradients(
+    optimizers: OptimizersContainer,
+    metric_name: Literal["dw", "normed_dw"],
+) -> None:
+    """Record one named gradient view for every optimizer-owned parameter."""
+
+    if not tensor_logging.is_enabled():
+        return
+    for optimizer in optimizers:
+        for group in optimizer.param_groups:
+            for parameter in group["params"]:
+                if parameter.grad is not None:
+                    tensor_logging.log_stats(
+                        parameter,
+                        **{metric_name: parameter.grad},
+                    )
+
+
+@torch.no_grad()
+def log_optimizer_statistics(
+    optimizers: OptimizersContainer,
+    *,
+    parallel_dims: ParallelDims | None = None,
+    log_momentum_gradient_angle: bool = False,
+) -> None:
+    """Record post-step parameters and optimizer-specific state.
+
+    Args:
+        optimizers: Optimizers whose parameters and state should be recorded.
+        parallel_dims: Meshes used to reconstruct local SPMD-types state.
+        log_momentum_gradient_angle: Also reconstruct each parameter's Adam
+            momentum/gradient angle in degrees.
+
+    Example:
+
+        optimizers.step()
+        log_optimizer_statistics(optimizers)
+        # `w` and Adam state now describe the same completed update.
+    """
+
+    if not tensor_logging.is_enabled():
+        return
+
+    for optimizer in optimizers:
+        is_adam = isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW))
+        for group in optimizer.param_groups:
+            for parameter in group["params"]:
+                if parameter.grad is None:
+                    continue
+                tensor_logging.log_stats(parameter, w=parameter)
+                if not is_adam:
+                    continue
+
+                # Adam state describes the same post-step parameter recorded above.
+                state = optimizer.state[parameter]
+                exp_avg = state["exp_avg"]
+                second_moment = (
+                    state["max_exp_avg_sq"] if group["amsgrad"] else state["exp_avg_sq"]
+                )
+                bias_correction2 = 1 - group["betas"][1] ** state["step"]
+                adam_denom = (
+                    second_moment.sqrt() / bias_correction2.sqrt() + group["eps"]
+                )
+                tensor_logging.log_stats(
+                    parameter,
+                    exp_avg=exp_avg,
+                    adam_denom=adam_denom,
+                )
+                if log_momentum_gradient_angle:
+                    tensor_logging.log_stats(
+                        parameter,
+                        angle_deg_m_g=_momentum_gradient_angle_degrees(
+                            exp_avg,
+                            parameter.grad,
+                            parallel_dims=parallel_dims,
+                        ),
+                    )
 
 
 def _global_moe_expert_counts(

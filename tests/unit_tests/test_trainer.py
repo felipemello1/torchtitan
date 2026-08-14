@@ -102,6 +102,11 @@ def test_trainer_accumulates_reused_cuda_graph_losses():
                     disable_cuda_graphs=False,
                     max_norm=1.0,
                 ),
+                metrics=SimpleNamespace(
+                    tensor_logging=SimpleNamespace(
+                        adam_momentum_gradient_angle=False,
+                    )
+                ),
             ),
             optimizers=MagicMock(),
             lr_schedulers=SimpleNamespace(
@@ -131,12 +136,27 @@ def test_trainer_accumulates_reused_cuda_graph_losses():
         [({"input": torch.ones(1)}, torch.ones(1, dtype=torch.long))] * 3
     )
 
-    with patch(
-        "torchtitan.trainer.dist_utils.clip_grad_norm_",
-        return_value=torch.tensor(4.0),
+    optimizer_events = []
+    trainer.optimizers.step.side_effect = lambda: optimizer_events.append("step")
+    with (
+        patch(
+            "torchtitan.trainer.log_parameter_gradients",
+            side_effect=lambda _, name: optimizer_events.append(name),
+        ),
+        patch(
+            "torchtitan.trainer.dist_utils.clip_grad_norm_",
+            side_effect=lambda *args, **kwargs: (
+                optimizer_events.append("clip") or torch.tensor(4.0)
+            ),
+        ),
+        patch(
+            "torchtitan.trainer.log_optimizer_statistics",
+            side_effect=lambda *args, **kwargs: optimizer_events.append("optimizer"),
+        ),
     ):
         Trainer._train_step(trainer, data_iterator)
 
+    assert optimizer_events == ["dw", "clip", "normed_dw", "step", "optimizer"]
     metrics_processor.log.assert_called_once_with(
         1,
         6.0,
