@@ -208,6 +208,8 @@ loss_mean = (2*4 + 3*6) / (4+6) = 2.6
 window_steps = 2
 ```
 
+Token and document counters come from the first PP stage on TP rank 0 and CP rank 0. Loss comes from the last PP stage on TP rank 0, retaining DP/CP partials; one WORLD rank contributes `window_steps`. At publication these values share one float64 WORLD sum in addition to the three ordinary tensor-statistic collectives, then ratios are derived and the window resets. `batch_count` counts dataloader yields (pipeline microbatches under PP), while `window_steps` counts optimizer steps.
+
 ## Execution modes
 
 - Full and selective activation checkpointing preserve the original forward mutation so recomputation does not double-count statistics or operational router state.

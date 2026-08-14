@@ -24,22 +24,32 @@ def test_weighted_loss_and_document_statistics() -> None:
         [[0, 1, 2, 0, 1], [0, 1, 0, 1, 2]],
         dtype=torch.int64,
     )
-    labels = torch.tensor(
-        [[1, 2, IGNORE_INDEX, 3, 4], [5, IGNORE_INDEX, 6, 7, 8]],
+    first_labels = torch.tensor(
+        [
+            [1, 2, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX],
+            [3, 4, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX],
+        ],
+        dtype=torch.int64,
+    )
+    second_labels = torch.tensor(
+        [
+            [1, 2, 3, IGNORE_INDEX, IGNORE_INDEX],
+            [4, 5, 6, IGNORE_INDEX, IGNORE_INDEX],
+        ],
         dtype=torch.int64,
     )
 
-    statistics.record_batch(labels, positions)
-    statistics.record_step_loss(torch.tensor(0.25), global_valid_tokens=8)
-    statistics.record_batch(labels, positions)
-    statistics.record_step_loss(torch.tensor(0.75), global_valid_tokens=8)
+    statistics.record_batch(first_labels, positions)
+    statistics.record_step_loss(torch.tensor(2.0), global_valid_tokens=4)
+    statistics.record_batch(second_labels, positions)
+    statistics.record_step_loss(torch.tensor(3.0), global_valid_tokens=6)
     metrics = statistics.collect()
 
     dataset = "data/datasets.c4_test"
-    assert metrics[f"{dataset}.loss_mean"] == pytest.approx(0.5)
-    assert metrics[f"{dataset}.valid_token_count"] == 16
+    assert metrics[f"{dataset}.loss_mean"] == pytest.approx(2.6)
+    assert metrics[f"{dataset}.valid_token_count"] == 10
     assert metrics[f"{dataset}.all_token_count"] == 20
-    assert metrics[f"{dataset}.masked_fraction"] == pytest.approx(0.2)
+    assert metrics[f"{dataset}.masked_fraction"] == pytest.approx(0.5)
     assert metrics[f"{dataset}.batch_count"] == 2
     assert metrics[f"{dataset}.window_steps"] == 2
     assert metrics["data/documents.segment_length_mean"] == pytest.approx(2.5)
