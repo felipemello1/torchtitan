@@ -174,7 +174,7 @@ Built-in router coverage includes expert load, maximum violation, entropy, local
 
 - Full and selective activation checkpointing preserve the original forward mutation so recomputation does not double-count statistics or operational router state.
 - Regional full-graph `torch.compile` uses a device-resident enabled flag, allowing selected and unselected steps to reuse one graph.
-- Trainer CUDA graphs retain router producers even when warmup or capture occurs off cadence; the device-resident flag suppresses mutations until a selected replay.
+- Trainer CUDA graphs retain router producers even when warmup or capture occurs off cadence. The device flag gates packed statistic rows; operational expert counts remain active every step.
 - In-process Graph Trainer tracing and CUDA-graph replay use the live model-owned rows. Separately produced or loaded precompiled artifacts are unsupported because registered owners and live buffers are not portable across artifacts.
 - Pipeline model parts can share global prefixes so names remain model paths such as `layers.7.attention.xq.x`, independent of rank-local part indices.
 - CUDA uses a lazily imported Triton accumulator; CPU uses the eager reference path. ROCm source compatibility is not a hardware-validation claim.

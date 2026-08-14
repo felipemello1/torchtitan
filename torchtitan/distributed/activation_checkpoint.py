@@ -81,17 +81,10 @@ def _save_routing_and_forward_side_effects():
 
 
 def _full_ac_contexts():
-    # Full-graph compile needs mutation ops preserved in its selective cache.
-    from torchtitan.observability.tensor_logging.runtime import _is_installed
-
+    # Operational expert counts remain active when tensor logging is disabled,
+    # so compiled FullAC must preserve registered mutations in either mode.
     if torch.compiler.is_compiling():
-        if _is_installed():
-            return _save_routing_and_forward_side_effects()
-        # A compiled checkpoint context must return TorchDispatchModes even
-        # when tensor logging is disabled. This policy is the no-save form.
-        return create_selective_checkpoint_contexts(
-            lambda _context, _op, *args, **kwargs: CheckpointPolicy.PREFER_RECOMPUTE
-        )
+        return _save_routing_and_forward_side_effects()
 
     # Eager FullAC can suppress replay directly. Keeping this a plain context is
     # important for CP, whose FlexAttention operator is itself compiled and
