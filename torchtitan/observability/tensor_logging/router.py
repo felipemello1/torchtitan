@@ -21,6 +21,7 @@ def log_router_statistics(
     moe_layers: Sequence[MoE],
     *,
     local_tokens_per_expert_by_layer: Sequence[torch.Tensor],
+    ep_group_tokens_per_expert_by_layer: torch.Tensor | None,
     global_tokens_per_expert_by_layer: torch.Tensor,
     parallel_dims: ParallelDims,
 ) -> None:
@@ -30,6 +31,8 @@ def log_router_statistics(
         moe_layers: Ordered MoE modules for `L` local layers.
         local_tokens_per_expert_by_layer: `L` local count tensors, each logically
             `[E]`; these retain local-shard load for diagnostics.
+        ep_group_tokens_per_expert_by_layer: `[L, E]` counts reduced within each
+            EP group, or `None` when EP is disabled.
         global_tokens_per_expert_by_layer: Counts with shape `[L, E]` already reconstructed over every token-sharding axis.
         parallel_dims: Meshes used to reconstruct router logits and per-sequence counts.
 
@@ -40,6 +43,7 @@ def log_router_statistics(
         log_router_statistics(
             moe_layers,
             local_tokens_per_expert_by_layer=local_counts_by_layer,
+            ep_group_tokens_per_expert_by_layer=ep_group_counts_LE,
             global_tokens_per_expert_by_layer=global_counts_LE,
             parallel_dims=parallel_dims,
         )
@@ -81,11 +85,13 @@ def log_router_statistics(
 
     # Derive entropy from reconstructed scores, but retain local expert imbalance.
     ep_mesh = parallel_dims.get_optional_mesh("ep")
-    for moe, router_logits_mean_E, local_counts_E in zip(
-        moe_layers,
-        router_logits_mean_LE,
-        local_tokens_per_expert_by_layer,
-        strict=True,
+    for layer_index, (moe, router_logits_mean_E, local_counts_E) in enumerate(
+        zip(
+            moe_layers,
+            router_logits_mean_LE,
+            local_tokens_per_expert_by_layer,
+            strict=True,
+        )
     ):
         router = moe.router
         if router.score_func == "sigmoid":
@@ -124,6 +130,23 @@ def log_router_statistics(
             .max()
             .view(1),
         )
+        if ep_mesh is not None:
+            assert ep_group_tokens_per_expert_by_layer is not None
+            ep_group_counts_E = ep_group_tokens_per_expert_by_layer[layer_index]
+            if isinstance(ep_group_counts_E, DTensor):
+                ep_group_counts_E = ep_group_counts_E.to_local()
+            ep_group_counts_E = ep_group_counts_E.float()
+            expert_shard_counts = ep_group_counts_E.reshape(ep_mesh.size(), -1).sum(
+                dim=-1
+            )
+            log_stats(
+                moe.router,
+                ep_shard_imbalance=(
+                    expert_shard_counts.max()
+                    * ep_mesh.size()
+                    / ep_group_counts_E.sum().clamp_min(1)
+                ).view(1),
+            )
 
     # Reconstruct each sequence across CP (and TP when TP and EP share work).
     sequence_counts_LSE = torch.stack(
@@ -189,7 +212,6 @@ def log_router_statistics(
         )
 
     # Derive global expert load and expose the bias that produced the routing.
-    ep_size = 1 if ep_mesh is None else ep_mesh.size()
     for moe, tokens_per_expert_E in zip(
         moe_layers,
         global_tokens_per_expert_by_layer,
@@ -205,15 +227,5 @@ def log_router_statistics(
             expert_load=expert_load_E,
             experts_max_violation=(expert_load_E.max() - 1).view(1),
         )
-        if ep_mesh is not None:
-            expert_shard_counts = tokens_per_expert_E.reshape(ep_size, -1).sum(dim=-1)
-            log_stats(
-                moe.router,
-                ep_shard_imbalance=(
-                    expert_shard_counts.max().float()
-                    * ep_size
-                    / tokens_per_expert_E.sum().clamp_min(1).float()
-                ).view(1),
-            )
         if moe.expert_bias_E is not None:
             log_stats(moe.router, expert_bias=moe.expert_bias_E)

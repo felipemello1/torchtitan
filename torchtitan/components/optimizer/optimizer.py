@@ -494,6 +494,7 @@ def register_moe_load_balancing_hook(
 
     def _process_moe_expert_counts(
         moe_layers: list[MoE],
+        local_counts_by_layer: torch.Tensor,
         parallel_dims: ParallelDims,
         load_balance_enabled: bool,
     ):
@@ -502,7 +503,9 @@ def register_moe_load_balancing_hook(
         Example:
 
             # Local counts from all microbatches are consumed once per step.
-            _process_moe_expert_counts(moe_layers, parallel_dims, True)
+            _process_moe_expert_counts(
+                moe_layers, local_counts_by_layer, parallel_dims, True
+            )
         """
 
         # TODO: Currently this sync is blocking (thus exposed) and happens on the
@@ -521,18 +524,90 @@ def register_moe_load_balancing_hook(
                 moe.discard_router_step_state()
             return
 
-        # One stacked reconstruction batches topology communication over layers.
-        tokens_per_expert_E_by_layer = torch.vstack(tokens_per_expert_E_list)
-        tokens_per_expert_E_by_layer = _global_moe_expert_counts(
-            tokens_per_expert_E_by_layer,
-            parallel_dims,
-        )
+        # Copy into stable storage so reconstruction never aliases layer counters.
+        for layer_counts_E, tokens_per_expert_E in zip(
+            local_counts_by_layer,
+            tokens_per_expert_E_list,
+            strict=True,
+        ):
+            layer_counts_E.copy_(tokens_per_expert_E)
+
+        # Keep each EP group's population separate through global reconstruction.
+        ep_group_counts_by_layer = None
+        if logging_enabled and parallel_dims.ep_enabled:
+            ep_complement_mesh = parallel_dims.get_activated_mesh(
+                ["dp_replicate", "efsdp"]
+            )
+            if ep_complement_mesh is None:
+                num_ep_groups = 1
+                ep_group_index = 0
+            else:
+                coordinate = ep_complement_mesh.get_coordinate()
+                assert coordinate is not None
+                num_ep_groups = ep_complement_mesh.size()
+                ep_group_index = 0
+                for axis_index, axis_size in zip(
+                    coordinate,
+                    ep_complement_mesh.shape,
+                    strict=True,
+                ):
+                    ep_group_index = ep_group_index * axis_size + axis_index
+            scattered_shape = (num_ep_groups, *local_counts_by_layer.shape)
+
+            # Ranks write different EP-group slots. Perform that indexed write on
+            # physical storage; a rank-dependent logical DTensor op would violate
+            # its common SPMD contract before the existing reconstruction.
+            physical_counts = (
+                local_counts_by_layer.to_local()
+                if isinstance(
+                    local_counts_by_layer,
+                    torch.distributed.tensor.DTensor,
+                )
+                else local_counts_by_layer
+            )
+            physical_scattered_counts = physical_counts.new_zeros(scattered_shape)
+            physical_scattered_counts[ep_group_index].copy_(physical_counts)
+            if isinstance(
+                local_counts_by_layer,
+                torch.distributed.tensor.DTensor,
+            ):
+                scattered_counts = torch.distributed.tensor.DTensor.from_local(
+                    physical_scattered_counts,
+                    device_mesh=local_counts_by_layer.device_mesh,
+                    placements=local_counts_by_layer.placements,
+                    run_check=False,
+                    shape=torch.Size(scattered_shape),
+                    stride=physical_scattered_counts.stride(),
+                )
+            else:
+                scattered_counts = physical_scattered_counts
+            scattered_counts = _global_moe_expert_counts(
+                scattered_counts,
+                parallel_dims,
+            )
+            tokens_per_expert_E_by_layer = scattered_counts.sum(dim=0)
+
+            # Reconstruction is replicated, but each rank reads its own group.
+            # Select locally so the result is a plain tensor, not rank-different
+            # values incorrectly labeled with a common Replicate placement.
+            ep_group_counts_by_layer = (
+                scattered_counts.to_local()[ep_group_index]
+                if isinstance(scattered_counts, torch.distributed.tensor.DTensor)
+                else scattered_counts[ep_group_index]
+            )
+        else:
+            # One stacked reconstruction batches topology communication over layers.
+            tokens_per_expert_E_by_layer = _global_moe_expert_counts(
+                local_counts_by_layer,
+                parallel_dims,
+            )
 
         # Logging derives semantic router metrics without owning bias state.
         if logging_enabled:
             log_router_statistics(
                 moe_layers,
                 local_tokens_per_expert_by_layer=tokens_per_expert_E_list,
+                ep_group_tokens_per_expert_by_layer=ep_group_counts_by_layer,
                 global_tokens_per_expert_by_layer=tokens_per_expert_E_by_layer,
                 parallel_dims=parallel_dims,
             )
@@ -564,9 +639,13 @@ def register_moe_load_balancing_hook(
     moe_layers = list(_iter_moe_layers(model_parts))
     if moe_layers:
         load_balance_enabled = _moe_load_balancing_enabled(moe_layers)
+        local_counts_by_layer = torch.stack(
+            [moe.tokens_per_expert_E for moe in moe_layers]
+        )
         optimizers.register_step_pre_hook(
             lambda *args, **kwargs: _process_moe_expert_counts(
                 moe_layers,
+                local_counts_by_layer=local_counts_by_layer,
                 parallel_dims=parallel_dims,
                 load_balance_enabled=load_balance_enabled,
             )

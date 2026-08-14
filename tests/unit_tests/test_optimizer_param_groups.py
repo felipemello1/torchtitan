@@ -138,14 +138,29 @@ class FakeEPMesh:
         return 0
 
 
+class FakeEPComplementMesh:
+    shape = (2, 2)
+
+    def size(self):
+        return 4
+
+    def get_coordinate(self):
+        return [1, 0]
+
+
 class FakeEPParallelDims(FakeParallelDims):
     ep_enabled = True
 
     def __init__(self):
         self.ep_mesh = FakeEPMesh()
+        self.ep_complement_mesh = FakeEPComplementMesh()
 
     def get_optional_mesh(self, name):
         return self.ep_mesh if name == "ep" else None
+
+    def get_activated_mesh(self, names):
+        assert names == ["dp_replicate", "efsdp"]
+        return self.ep_complement_mesh
 
 
 # Default AdamW param group for catch-all
@@ -313,6 +328,7 @@ class TestParamGroupConfig(unittest.TestCase):
                     log_router_statistics(
                         [moe],
                         local_tokens_per_expert_by_layer=[local_counts],
+                        ep_group_tokens_per_expert_by_layer=local_counts.unsqueeze(0),
                         global_tokens_per_expert_by_layer=pooled_counts,
                         parallel_dims=FakeEPParallelDims(),
                     )
@@ -323,6 +339,46 @@ class TestParamGroupConfig(unittest.TestCase):
                 self.assertEqual(statistic["sums"][0].item(), 1.5)
             finally:
                 runtime.close()
+
+    def test_ep_shard_imbalance_reduces_counts_within_each_ep_group(self):
+        model = FakeMoEModel()
+        model.layers["0"].moe.tokens_per_expert_E.copy_(torch.tensor([20, 0]))
+        model.layers["1"].moe.tokens_per_expert_E.copy_(torch.tensor([0, 20]))
+        container = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[_DEFAULT_ADAMW],
+        ).build(model_parts=[model])
+        parallel_dims = FakeEPParallelDims()
+        register_moe_load_balancing_hook(container, [model], parallel_dims)
+        runtime = init(model)
+
+        def reconstruct_groups(scattered_counts, _parallel_dims):
+            expected = torch.zeros(4, 2, 2, dtype=torch.int64)
+            expected[2] = torch.tensor([[20, 0], [0, 20]])
+            torch.testing.assert_close(scattered_counts, expected)
+
+            reduced = torch.zeros_like(expected)
+            reduced[0] = torch.tensor([[10, 30], [30, 10]])
+            reduced[2] = torch.tensor([[30, 10], [10, 30]])
+            return reduced
+
+        try:
+            with (
+                unittest.mock.patch(
+                    "torchtitan.components.optimizer._global_moe_expert_counts",
+                    side_effect=reconstruct_groups,
+                ) as reconstruct,
+                set_enabled(True),
+            ):
+                container.step()
+
+            reconstruct.assert_called_once()
+            snapshot = runtime.snapshot_unreduced_statistics()
+            for layer_id in range(2):
+                statistic = snapshot[f"layers.{layer_id}.moe.router.ep_shard_imbalance"]
+                self.assertEqual(statistic["sums"][0].item(), 1.5)
+        finally:
+            runtime.close()
 
     def test_router_entropy_is_finite_when_a_probability_underflows_to_zero(self):
         model = FakeMoEModel()
