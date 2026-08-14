@@ -208,8 +208,9 @@ def build_features_test_list() -> list[OverrideDefinitions]:
                     "--metrics.log-freq 2",
                     "--metrics.tensor-logging.enabled",
                     "--metrics.tensor-logging.freq 2",
+                    "--metrics.tensor-logging.adam-momentum-gradient-angle",
                     "--metrics.tensor-logging.publish-filter-regex "
-                    r"'\.(?:w|dw|normed_dw|exp_avg|adam_denom)\."
+                    r"'\.(?:w|dw|normed_dw|exp_avg|adam_denom|angle_deg_m_g)\."
                     r"(?:observation_count|abs_mean)$'",
                     "--training.steps 4",
                     "--parallelism.tensor_parallel_degree 2",
