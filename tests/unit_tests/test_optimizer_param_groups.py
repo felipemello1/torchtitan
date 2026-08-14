@@ -437,9 +437,9 @@ class TestParamGroupConfig(unittest.TestCase):
                     torch.tensor([expected_degrees]),
                 )
 
-        # Parallel first-step Adam state can round the cosine just above one.
-        torch.manual_seed(0)
-        gradient = torch.randn(4096, 512)
+        # Adam's first step makes the moment parallel to the gradient, and the
+        # fp32 cosine can round just above one.
+        gradient = torch.ones(3)
         momentum = 0.1 * gradient
         torch.testing.assert_close(
             _momentum_gradient_angle_degrees(momentum, gradient),

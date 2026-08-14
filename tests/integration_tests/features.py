@@ -194,6 +194,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
                     "--parallelism.data_parallel_shard_degree 2",
                     "--parallelism.tensor_parallel_degree 2",
                     "--parallelism.expert_parallel_degree 2",
+                    "--metrics.tensor-logging.adam-momentum-gradient-angle",
                     "activation-checkpoint:full",
                 ],
             ],
