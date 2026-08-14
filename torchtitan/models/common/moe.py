@@ -81,7 +81,12 @@ def _accumulate_router_logits(
     """Add one selected forward's router-logit sufficient statistics."""
 
     with torch.no_grad():
-        logits_sum.add_(current_logits_sum * enabled)
+        selected_logits_sum = torch.where(
+            enabled != 0,
+            current_logits_sum,
+            0.0,
+        )
+        logits_sum.add_(selected_logits_sum)
         token_count.add_(enabled.to(token_count.dtype) * current_token_count)
 
 

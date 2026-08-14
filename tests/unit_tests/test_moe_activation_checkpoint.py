@@ -69,11 +69,6 @@ def _build_source_moe(expert_count: int = 4) -> MoE:
         persistent=False,
     )
     moe.register_buffer(
-        "_sequence_expert_counts_BE",
-        torch.zeros(2, expert_count, dtype=torch.int64),
-        persistent=False,
-    )
-    moe.register_buffer(
         "_sequence_expert_counts_SE",
         torch.zeros(4, expert_count, dtype=torch.int64),
         persistent=False,

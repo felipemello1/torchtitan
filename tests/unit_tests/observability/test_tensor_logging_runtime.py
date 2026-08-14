@@ -47,7 +47,10 @@ from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.moe import TokenChoiceTopKRouter
+from torchtitan.models.common.moe import (
+    _accumulate_router_logits,
+    TokenChoiceTopKRouter,
+)
 from torchtitan.models.llama3.model import Llama3TransformerBlock
 from torchtitan.models.qwen3.model import Qwen3TransformerBlock
 from torchtitan.observability.tensor_logging import (
@@ -639,6 +642,29 @@ def test_sum_slab_keeps_all_hand_computed_statistics() -> None:
         runtime.close()
 
 
+def test_disabled_router_logit_gate_discards_nonfinite_values() -> None:
+    logits_sum = torch.zeros(2)
+    token_count = torch.zeros(1, dtype=torch.int64)
+
+    _accumulate_router_logits(
+        logits_sum,
+        token_count,
+        torch.tensor([torch.nan, torch.inf]),
+        2,
+        torch.zeros((), dtype=torch.int32),
+    )
+    _accumulate_router_logits(
+        logits_sum,
+        token_count,
+        torch.tensor([3.0, 1.0]),
+        2,
+        torch.ones((), dtype=torch.int32),
+    )
+
+    torch.testing.assert_close(logits_sum, torch.tensor([3.0, 1.0]))
+    assert token_count.item() == 2
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_router_metric_producer_respects_eager_cadence() -> None:
     router = (
@@ -653,6 +679,7 @@ def test_router_metric_producer_respects_eager_cadence() -> None:
     with torch.no_grad():
         router.gate.weight.copy_(torch.eye(2, device="cuda"))
     value = torch.tensor([[[1.0, 2.0]]], device="cuda")
+    nonfinite_value = torch.tensor([[[torch.nan, torch.inf]]], device="cuda")
 
     router(value)
     assert router._entropy_logits_sum_E is None
@@ -663,8 +690,10 @@ def test_router_metric_producer_respects_eager_cadence() -> None:
     router._entropy_logits_count = torch.zeros(1, dtype=torch.int64, device="cuda")
     runtime = init(router)
     try:
-        with set_enabled(False):
-            router(value)
+        # Captured graphs keep the mutation op on unselected steps. Its device
+        # gate must discard nonfinite values rather than multiplying them by zero.
+        with set_enabled(False), _include_recording_calls():
+            router(nonfinite_value)
         assert router._entropy_logits_sum_E.tolist() == [0.0, 0.0]
         assert router._entropy_logits_count.item() == 0
         assert runtime.snapshot_unreduced_statistics()["router_logits"][

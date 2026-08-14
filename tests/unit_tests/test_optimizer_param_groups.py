@@ -54,10 +54,6 @@ class FakeMoE(nn.Module):
         self.router = nn.Identity()
         self.router.score_func = "softmax"
         self.router.register_buffer(
-            "_router_logits_mean_E",
-            torch.tensor([0.25, -0.25]),
-        )
-        self.router.register_buffer(
             "_entropy_logits_sum_E",
             torch.tensor([1.0, -1.0]),
         )
@@ -78,10 +74,6 @@ class FakeMoE(nn.Module):
             metric_names.append("expert_bias")
         register(self.router, metric_names)
         self.register_buffer("tokens_per_expert_E", torch.tensor(tokens))
-        self.register_buffer(
-            "_sequence_expert_counts_BE",
-            torch.tensor([[3.0, 1.0], [1.0, 3.0]]),
-        )
         self.register_buffer(
             "_sequence_expert_counts_SE",
             torch.tensor(
@@ -480,10 +472,6 @@ class TestParamGroupConfig(unittest.TestCase):
         model = FakeMoEModel()
         for block in model.layers.values():
             moe = block.moe
-            # The old last-forward buffers deliberately describe only forward 2.
-            moe.router._router_logits_mean_E.zero_()
-            moe._sequence_expert_counts_BE.copy_(torch.tensor([[0.0, 4.0], [3.0, 1.0]]))
-
             # Whole-step population: three [1, 0] tokens and one [0, 1] token.
             moe.router._entropy_logits_sum_E.copy_(torch.tensor([3.0, 1.0]))
             moe.router._entropy_logits_count.fill_(4)
