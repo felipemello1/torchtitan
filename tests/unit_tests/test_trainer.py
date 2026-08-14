@@ -127,6 +127,7 @@ def test_trainer_accumulates_reused_cuda_graph_losses():
             model_parts=[],
             checkpointer=SimpleNamespace(maybe_wait_for_staging=MagicMock()),
             metrics_processor=metrics_processor,
+            data_window_statistics=None,
             tensor_logging=None,
             step=1,
             ntokens_seen=3,
