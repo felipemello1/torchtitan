@@ -55,6 +55,14 @@ class FakeMoE(nn.Module):
             "_router_logits_mean_E",
             torch.tensor([0.25, -0.25]),
         )
+        self.router.register_buffer(
+            "_entropy_logits_sum_E",
+            torch.tensor([1.0, -1.0]),
+        )
+        self.router.register_buffer(
+            "_entropy_logits_count",
+            torch.tensor([2], dtype=torch.int64),
+        )
         metric_names = [
             "entropy",
             "ep_shard_imbalance",
@@ -71,6 +79,17 @@ class FakeMoE(nn.Module):
         self.register_buffer(
             "_sequence_expert_counts_BE",
             torch.tensor([[3.0, 1.0], [1.0, 3.0]]),
+        )
+        self.register_buffer(
+            "_sequence_expert_counts_SE",
+            torch.tensor(
+                [[3, 1], [1, 3], [0, 0], [0, 0]],
+                dtype=torch.int64,
+            ),
+        )
+        self.register_buffer(
+            "_sequence_expert_counts_position",
+            torch.tensor([2], dtype=torch.int64),
         )
         if load_balance_coeff is not None:
             self.register_buffer("expert_bias_E", torch.zeros(len(tokens)))
@@ -228,7 +247,8 @@ class TestParamGroupConfig(unittest.TestCase):
     def test_router_entropy_is_finite_when_a_probability_underflows_to_zero(self):
         model = FakeMoEModel()
         for block in model.layers.values():
-            block.moe.router._router_logits_mean_E.copy_(torch.tensor([0.0, -1000.0]))
+            block.moe.router._entropy_logits_sum_E.copy_(torch.tensor([0.0, -1000.0]))
+            block.moe.router._entropy_logits_count.fill_(1)
         container = OptimizersContainer.Config(
             implementation="for-loop",
             param_groups=[_DEFAULT_ADAMW],
@@ -247,6 +267,72 @@ class TestParamGroupConfig(unittest.TestCase):
                 self.assertEqual(entropy["sums"][0].item(), 0.0)
         finally:
             runtime.close()
+
+    def test_router_metrics_cover_the_complete_optimizer_step(self):
+        model = FakeMoEModel()
+        for block in model.layers.values():
+            moe = block.moe
+            # The old last-forward buffers deliberately describe only forward 2.
+            moe.router._router_logits_mean_E.zero_()
+            moe._sequence_expert_counts_BE.copy_(torch.tensor([[0.0, 4.0], [3.0, 1.0]]))
+
+            # Whole-step population: three [1, 0] tokens and one [0, 1] token.
+            moe.router._entropy_logits_sum_E.copy_(torch.tensor([3.0, 1.0]))
+            moe.router._entropy_logits_count.fill_(4)
+            moe._sequence_expert_counts_SE.copy_(
+                torch.tensor(
+                    [[4, 0], [2, 2], [0, 4], [3, 1]],
+                    dtype=torch.int64,
+                )
+            )
+            moe._sequence_expert_counts_position.fill_(4)
+
+        container = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[_DEFAULT_ADAMW],
+        ).build(model_parts=[model])
+        register_moe_load_balancing_hook(container, [model], FakeParallelDims())
+        runtime = init(model)
+        try:
+            with set_enabled(True):
+                container.step()
+
+            snapshot = runtime.snapshot_unreduced_statistics()
+            for layer_id in range(2):
+                prefix = f"layers.{layer_id}.moe.router"
+                self.assertAlmostEqual(
+                    snapshot[f"{prefix}.entropy"]["sums"][0].item(),
+                    0.6628473185791794,
+                    places=6,
+                )
+                self.assertEqual(
+                    snapshot[f"{prefix}.seq_expert_imbalance_mean"]["sums"][0].item(),
+                    1.625,
+                )
+                self.assertEqual(
+                    snapshot[f"{prefix}.seq_expert_imbalance_max"]["sums"][0].item(),
+                    2.0,
+                )
+        finally:
+            runtime.close()
+
+    def test_router_metric_state_resets_on_an_unselected_step(self):
+        model = FakeMoEModel()
+        container = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[_DEFAULT_ADAMW],
+        ).build(model_parts=[model])
+        register_moe_load_balancing_hook(container, [model], FakeParallelDims())
+
+        with set_enabled(False):
+            container.step()
+
+        for block in model.layers.values():
+            moe = block.moe
+            self.assertEqual(moe.router._entropy_logits_sum_E.count_nonzero(), 0)
+            self.assertEqual(moe.router._entropy_logits_count.item(), 0)
+            self.assertEqual(moe._sequence_expert_counts_SE.count_nonzero(), 0)
+            self.assertEqual(moe._sequence_expert_counts_position.item(), 0)
 
     def test_moe_load_balancing_rejects_inconsistent_coeffs(self):
         model = FakeMoEModel(load_balance_coeffs=(None, 0.2))

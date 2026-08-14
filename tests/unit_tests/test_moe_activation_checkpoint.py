@@ -21,6 +21,7 @@ from torchtitan.experiments.graph_trainer.selective_activation_remat import (
 )
 from torchtitan.models.common.moe import MoE
 from torchtitan.observability import tensor_logging
+from torchtitan.observability.tensor_logging.runtime import _include_recording_calls
 
 
 class _DeterministicRouter(nn.Module):
@@ -72,6 +73,16 @@ def _build_source_moe(expert_count: int = 4) -> MoE:
         torch.zeros(2, expert_count, dtype=torch.int64),
         persistent=False,
     )
+    moe.register_buffer(
+        "_sequence_expert_counts_SE",
+        torch.zeros(4, expert_count, dtype=torch.int64),
+        persistent=False,
+    )
+    moe.register_buffer(
+        "_sequence_expert_counts_position",
+        torch.zeros(1, dtype=torch.int64),
+        persistent=False,
+    )
     tensor_logging.register_fwd_bwd(moe, ["input_normed", "routed_output"])
     return moe
 
@@ -120,7 +131,7 @@ def _run(policy) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
             root(value).sum().backward()
         return (
             block.moe.tokens_per_expert_E.clone(),
-            block.moe._sequence_expert_counts_BE.clone(),
+            block.moe._sequence_expert_counts_SE.clone(),
             value.grad.clone(),
             block.forward_calls,
         )
@@ -148,6 +159,7 @@ def test_source_moe_expert_counts_are_exact_once_under_ac() -> None:
     assert eager.dtype == torch.int64
     assert eager_sequences.dtype == torch.int64
     assert eager.sum().item() == 6
+    assert eager_sequences.sum().item() == 6
     torch.testing.assert_close(full, eager)
     torch.testing.assert_close(selective, eager)
     torch.testing.assert_close(replacing_selective, eager)
@@ -157,6 +169,35 @@ def test_source_moe_expert_counts_are_exact_once_under_ac() -> None:
     torch.testing.assert_close(full_gradient, eager_gradient)
     torch.testing.assert_close(selective_gradient, eager_gradient)
     torch.testing.assert_close(replacing_gradient, eager_gradient)
+
+
+def test_source_moe_router_window_appends_only_selected_forwards() -> None:
+    moe = _build_source_moe()
+    forward_1 = torch.tensor(
+        [[[4.0, 0.0, 0.0, 0.0]], [[0.0, 4.0, 0.0, 0.0]]],
+        requires_grad=True,
+    )
+    forward_2 = torch.tensor(
+        [[[0.0, 0.0, 4.0, 0.0]], [[0.0, 0.0, 0.0, 4.0]]],
+        requires_grad=True,
+    )
+    state = tensor_logging.init(moe)
+    try:
+        # Graph capture includes the call on every replay; the device flag decides
+        # whether this optimizer step contributes to the metric window.
+        with _include_recording_calls(), tensor_logging.set_enabled(False):
+            moe(forward_1)
+        with tensor_logging.set_enabled(True):
+            moe(forward_1)
+            moe(forward_2)
+
+        torch.testing.assert_close(
+            moe._sequence_expert_counts_SE,
+            torch.eye(4, dtype=torch.int64),
+        )
+        assert moe._sequence_expert_counts_position.item() == 4
+    finally:
+        state.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
@@ -187,7 +228,7 @@ def test_source_moe_metric_mutations_compile_fullgraph_with_full_ac() -> None:
             root(value).sum().backward()
 
         assert root.layers["0"].moe.tokens_per_expert_E.sum().item() == 6
-        assert root.layers["0"].moe._sequence_expert_counts_BE.sum().item() == 6
+        assert root.layers["0"].moe._sequence_expert_counts_SE.sum().item() == 6
     finally:
         state.close()
         torch.compiler.reset()
@@ -267,7 +308,8 @@ def test_source_moe_expert_counts_are_exact_under_graph_remat(device: str) -> No
         eager_counts = eager_root.layers["0"].moe.tokens_per_expert_E.clone()
         eager_sequence_counts = eager_root.layers[
             "0"
-        ].moe._sequence_expert_counts_BE.clone()
+        ].moe._sequence_expert_counts_SE.clone()
+        assert eager_sequence_counts.sum().item() == 6
     finally:
         eager_state.close()
 
@@ -296,7 +338,7 @@ def test_source_moe_expert_counts_are_exact_under_graph_remat(device: str) -> No
             )(value)
 
         graph_counts = graph_root.layers["0"].moe.tokens_per_expert_E
-        graph_sequence_counts = graph_root.layers["0"].moe._sequence_expert_counts_BE
+        graph_sequence_counts = graph_root.layers["0"].moe._sequence_expert_counts_SE
         torch.testing.assert_close(graph_counts, eager_counts)
         torch.testing.assert_close(graph_sequence_counts, eager_sequence_counts)
         torch.testing.assert_close(graph_result[0], eager_output.sum())
