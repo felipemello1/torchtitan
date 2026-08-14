@@ -180,6 +180,8 @@ dw           raw gradient
 normed_dw    gradient after clipping
 ```
 
+With CUDA graphs enabled, gradients are zeroed rather than freed, so an unused parameter can publish zero-valued gradient rows; with `set_to_none` it publishes no row.
+
 Adam and AdamW parameters additionally record:
 
 ```text
