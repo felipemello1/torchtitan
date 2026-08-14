@@ -200,6 +200,25 @@ def test_source_moe_router_window_appends_only_selected_forwards() -> None:
         state.close()
 
 
+def test_source_moe_expert_counts_ignore_eval_forwards() -> None:
+    root = _TinyMoERoot(track_forward_calls=False)
+    value = torch.tensor(
+        [
+            [[10.0, 0.0, 0.0, 0.0], [0.0, 10.0, 0.0, 0.0]],
+            [[0.0, 0.0, 10.0, 0.0], [0.0, 0.0, 0.0, 10.0]],
+        ]
+    )
+    counts = root.layers["0"].moe.tokens_per_expert_E
+
+    root.eval()
+    root(value)
+    torch.testing.assert_close(counts, torch.zeros(4, dtype=torch.int64))
+
+    root.train()
+    root(value)
+    torch.testing.assert_close(counts, torch.ones(4, dtype=torch.int64))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_source_moe_metric_mutations_compile_fullgraph_with_full_ac() -> None:
     root = _TinyMoERoot(track_forward_calls=False).cuda()

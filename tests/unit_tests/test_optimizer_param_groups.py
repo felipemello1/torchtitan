@@ -17,6 +17,7 @@ from torchtitan.components.optimizer import (
 )
 from torchtitan.models.common.moe import MoE
 from torchtitan.observability.tensor_logging import init, register, set_enabled
+from torchtitan.observability.tensor_logging.router import log_router_statistics
 
 
 class SimpleModel(nn.Module):
@@ -127,6 +128,24 @@ class FakeParallelDims:
 
     def get_optional_mesh(self, name):
         return None
+
+
+class FakeEPMesh:
+    def size(self):
+        return 2
+
+    def get_local_rank(self):
+        return 0
+
+
+class FakeEPParallelDims(FakeParallelDims):
+    ep_enabled = True
+
+    def __init__(self):
+        self.ep_mesh = FakeEPMesh()
+
+    def get_optional_mesh(self, name):
+        return self.ep_mesh if name == "ep" else None
 
 
 # Default AdamW param group for catch-all
@@ -247,6 +266,63 @@ class TestParamGroupConfig(unittest.TestCase):
             model.layers["0"].moe.expert_bias_E,
             torch.tensor([0.1, -0.1]),
         )
+
+    def test_moe_load_balancing_reuses_preallocated_layer_stack(self):
+        model = FakeMoEModel()
+        container = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[_DEFAULT_ADAMW],
+        ).build(model_parts=[model])
+        reconstructed_inputs = []
+
+        def capture_stack(local_counts_by_layer, _parallel_dims):
+            reconstructed_inputs.append(local_counts_by_layer)
+            return local_counts_by_layer
+
+        with unittest.mock.patch(
+            "torchtitan.components.optimizer._global_moe_expert_counts",
+            side_effect=capture_stack,
+        ):
+            register_moe_load_balancing_hook(container, [model], FakeParallelDims())
+            container.step()
+            first_values = reconstructed_inputs[0].clone()
+            first_storage = reconstructed_inputs[0].data_ptr()
+
+            model.layers["0"].moe.tokens_per_expert_E.copy_(torch.tensor([7, 3]))
+            model.layers["1"].moe.tokens_per_expert_E.copy_(torch.tensor([2, 8]))
+            torch.testing.assert_close(
+                reconstructed_inputs[0],
+                first_values,
+            )
+            container.step()
+
+        self.assertEqual(reconstructed_inputs[1].data_ptr(), first_storage)
+        torch.testing.assert_close(
+            reconstructed_inputs[1],
+            torch.tensor([[7, 3], [2, 8]]),
+        )
+
+    def test_ep_shard_imbalance_is_not_pooled_across_ep_groups(self):
+        pooled_counts = torch.tensor([[40, 40]])
+        for local_counts in (torch.tensor([30, 10]), torch.tensor([10, 30])):
+            model = FakeMoEModel()
+            moe = model.layers["0"].moe
+            runtime = init(model)
+            try:
+                with set_enabled(True):
+                    log_router_statistics(
+                        [moe],
+                        local_tokens_per_expert_by_layer=[local_counts],
+                        global_tokens_per_expert_by_layer=pooled_counts,
+                        parallel_dims=FakeEPParallelDims(),
+                    )
+
+                statistic = runtime.snapshot_unreduced_statistics()[
+                    "layers.0.moe.router.ep_shard_imbalance"
+                ]
+                self.assertEqual(statistic["sums"][0].item(), 1.5)
+            finally:
+                runtime.close()
 
     def test_router_entropy_is_finite_when_a_probability_underflows_to_zero(self):
         model = FakeMoEModel()
