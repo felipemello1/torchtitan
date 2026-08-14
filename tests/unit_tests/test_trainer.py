@@ -104,7 +104,7 @@ def test_trainer_accumulates_reused_cuda_graph_losses():
                 ),
                 metrics=SimpleNamespace(
                     tensor_logging=SimpleNamespace(
-                        adam_momentum_gradient_cosine=False,
+                        adam_momentum_gradient_angle=False,
                     )
                 ),
             ),

@@ -397,11 +397,11 @@ def default_adamw(lr: float = 8e-4, **kwargs: Any) -> OptimizersContainer.Config
     )
 
 
-def _momentum_gradient_cosine(
+def _momentum_gradient_angle_degrees(
     momentum: torch.Tensor,
     gradient: torch.Tensor,
 ) -> torch.Tensor:
-    """Return the global cosine between an Adam first moment and its gradient."""
+    """Return the global angle in degrees between an Adam moment and gradient."""
 
     statistics = torch.stack(
         [
@@ -413,14 +413,17 @@ def _momentum_gradient_cosine(
     if isinstance(statistics, torch.distributed.tensor.DTensor):
         statistics = statistics.full_tensor()
     dot_product, momentum_square_sum, gradient_square_sum = statistics
-    denominator = (momentum_square_sum * gradient_square_sum).sqrt().clamp_min(1e-8)
-    return (dot_product / denominator).view(1)
+    denominator = (momentum_square_sum.sqrt() * gradient_square_sum.sqrt()).clamp_min(
+        1e-8
+    )
+    cosine = dot_product / denominator
+    return torch.rad2deg(torch.arccos(cosine)).view(1)
 
 
 def register_optimizer_statistics(
     optimizers: OptimizersContainer,
     *,
-    include_momentum_gradient_cosine: bool = False,
+    include_momentum_gradient_angle: bool = False,
 ) -> None:
     """Register general metrics and state owned by each parameter's optimizer."""
 
@@ -428,8 +431,8 @@ def register_optimizer_statistics(
         metric_names = ["w", "dw", "normed_dw"]
         if isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
             metric_names.extend(["exp_avg", "adam_denom"])
-            if include_momentum_gradient_cosine:
-                metric_names.append("cos_sim_m_g")
+            if include_momentum_gradient_angle:
+                metric_names.append("angle_deg_m_g")
         for group in optimizer.param_groups:
             for parameter in group["params"]:
                 tensor_logging.register(parameter, metric_names)
@@ -458,14 +461,14 @@ def log_parameter_gradients(
 def log_optimizer_statistics(
     optimizers: OptimizersContainer,
     *,
-    log_momentum_gradient_cosine: bool = False,
+    log_momentum_gradient_angle: bool = False,
 ) -> None:
     """Record post-step parameters and optimizer-specific state.
 
     Args:
         optimizers: Optimizers whose parameters and state should be recorded.
-        log_momentum_gradient_cosine: Also reconstruct each parameter's
-            Adam momentum/gradient cosine.
+        log_momentum_gradient_angle: Also reconstruct each parameter's Adam
+            momentum/gradient angle in degrees.
 
     Example:
 
@@ -502,10 +505,10 @@ def log_optimizer_statistics(
                     exp_avg=exp_avg,
                     adam_denom=adam_denom,
                 )
-                if log_momentum_gradient_cosine:
+                if log_momentum_gradient_angle:
                     tensor_logging.log_stats(
                         parameter,
-                        cos_sim_m_g=_momentum_gradient_cosine(
+                        angle_deg_m_g=_momentum_gradient_angle_degrees(
                             exp_avg,
                             parameter.grad,
                         ),

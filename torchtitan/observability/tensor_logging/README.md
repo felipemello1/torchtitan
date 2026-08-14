@@ -172,7 +172,7 @@ Built-in router coverage includes expert load, maximum violation, entropy, local
 
 ## Parameters and optimizer state
 
-Every optimizer-owned trainable parameter records:
+Every optimizer-owned trainable parameter with a gradient on the selected step records:
 
 ```text
 w            post-step parameter value
@@ -193,7 +193,7 @@ adam_denom    sqrt(bias-corrected second moment) + epsilon
 update / lr = exp_avg / (1 - beta1**step) / adam_denom
 ```
 
-The optional momentum/gradient cosine is disabled by default because exact sharded reconstruction may communicate per parameter. Whole-model and MoE gradient summaries reuse the already-reduced `.dw` rows; they do not scan gradients or launch another collective.
+The optional `adam_momentum_gradient_angle` records `angle_deg_m_g` in `[0, 180]` and is disabled by default because exact sharded reconstruction may communicate per parameter. Whole-model and MoE gradient summaries reuse the already-reduced `.dw` rows; they do not scan gradients or launch another collective.
 
 ## Execution modes
 

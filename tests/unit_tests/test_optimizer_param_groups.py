@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import (
+    _momentum_gradient_angle_degrees,
     default_adamw,
     log_optimizer_statistics,
     OptimizersContainer,
@@ -380,7 +381,7 @@ class TestParamGroupConfig(unittest.TestCase):
             ],
         )
         container = config.build(model_parts=[model])
-        register(model.weight, ["w", "exp_avg", "adam_denom", "cos_sim_m_g"])
+        register(model.weight, ["w", "exp_avg", "adam_denom", "angle_deg_m_g"])
         runtime = init(model)
         try:
             model.weight.grad = torch.tensor([[2.0, -4.0]])
@@ -388,7 +389,7 @@ class TestParamGroupConfig(unittest.TestCase):
                 container.step()
                 log_optimizer_statistics(
                     container,
-                    log_momentum_gradient_cosine=True,
+                    log_momentum_gradient_angle=True,
                 )
 
             snapshot = runtime.snapshot_unreduced_statistics()
@@ -400,7 +401,7 @@ class TestParamGroupConfig(unittest.TestCase):
                 snapshot["weight.adam_denom"]["counts"].tolist(), [2, 0, 0, 1]
             )
             self.assertEqual(
-                snapshot["weight.cos_sim_m_g"]["counts"].tolist(), [1, 0, 0, 1]
+                snapshot["weight.angle_deg_m_g"]["counts"].tolist(), [1, 0, 0, 1]
             )
             torch.testing.assert_close(
                 snapshot["weight.w"]["sums"][0], torch.tensor(2.8)
@@ -411,11 +412,30 @@ class TestParamGroupConfig(unittest.TestCase):
             torch.testing.assert_close(
                 snapshot["weight.adam_denom"]["sums"][0], torch.tensor(6.0)
             )
+            expected_angle = _momentum_gradient_angle_degrees(
+                container.optimizers[0].state[model.weight]["exp_avg"],
+                model.weight.grad,
+            )
             torch.testing.assert_close(
-                snapshot["weight.cos_sim_m_g"]["sums"][0], torch.tensor(1.0)
+                snapshot["weight.angle_deg_m_g"]["sums"][0], expected_angle[0]
             )
         finally:
             runtime.close()
+
+    def test_momentum_gradient_angle_degrees(self):
+        momentum = torch.tensor([1.0, 0.0])
+        cases = [
+            (torch.tensor([1.0, 0.0]), 0.0),
+            (torch.tensor([0.0, 1.0]), 90.0),
+            (torch.tensor([-1.0, 0.0]), 180.0),
+        ]
+
+        for gradient, expected_degrees in cases:
+            with self.subTest(expected_degrees=expected_degrees):
+                torch.testing.assert_close(
+                    _momentum_gradient_angle_degrees(momentum, gradient),
+                    torch.tensor([expected_degrees]),
+                )
 
     def test_single_pattern_weight_decay_zero(self):
         """Pattern matching bias params with weight_decay=0."""

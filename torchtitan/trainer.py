@@ -598,8 +598,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                         )
             register_optimizer_statistics(
                 self.optimizers,
-                include_momentum_gradient_cosine=(
-                    tensor_logging_config.adam_momentum_gradient_cosine
+                include_momentum_gradient_angle=(
+                    tensor_logging_config.adam_momentum_gradient_angle
                 ),
             )
 
@@ -1046,8 +1046,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             self.optimizers.step()
             log_optimizer_statistics(
                 self.optimizers,
-                log_momentum_gradient_cosine=(
-                    self.config.metrics.tensor_logging.adam_momentum_gradient_cosine
+                log_momentum_gradient_angle=(
+                    self.config.metrics.tensor_logging.adam_momentum_gradient_angle
                 ),
             )
             self.lr_schedulers.step()
