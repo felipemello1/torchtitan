@@ -15,6 +15,7 @@ from torchtitan.components.optimizer import (
     ParamGroupConfig,
     register_moe_load_balancing_hook,
 )
+from torchtitan.models.common.moe import MoE
 from torchtitan.observability.tensor_logging import init, register, set_enabled
 
 
@@ -95,6 +96,9 @@ class FakeMoE(nn.Module):
             self.register_buffer("expert_bias_E", torch.zeros(len(tokens)))
         else:
             self.expert_bias_E = None
+
+    def discard_router_step_state(self) -> None:
+        MoE.discard_router_step_state(self)
 
 
 class FakeMoEBlock(nn.Module):

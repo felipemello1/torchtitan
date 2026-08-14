@@ -512,8 +512,13 @@ def register_moe_load_balancing_hook(
         # Skip communication when neither bias updates nor logging needs counts.
         logging_enabled = tensor_logging.is_enabled()
         if not load_balance_enabled and not logging_enabled:
-            for tokens_per_expert_E in tokens_per_expert_E_list:
+            for moe, tokens_per_expert_E in zip(
+                moe_layers,
+                tokens_per_expert_E_list,
+                strict=True,
+            ):
                 tokens_per_expert_E.zero_()
+                moe.discard_router_step_state()
             return
 
         # One stacked reconstruction batches topology communication over layers.
@@ -554,6 +559,7 @@ def register_moe_load_balancing_hook(
                     assert moe.expert_bias_E is not None
                     moe.expert_bias_E.add_(expert_bias_delta_E)
                 moe.tokens_per_expert_E.zero_()
+                moe.discard_router_step_state()
 
     moe_layers = list(_iter_moe_layers(model_parts))
     if moe_layers:

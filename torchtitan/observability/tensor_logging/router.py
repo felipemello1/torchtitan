@@ -46,28 +46,41 @@ def log_router_statistics(
         # Layer 0 records expert_load=[1.0, 1.0, 0.5, 1.5].
     """
 
-    # Reconstruct router scores over ranks that hold partial token populations.
-    router_logits_mean_LE = torch.stack(
-        [cast(torch.Tensor, moe.router._router_logits_mean_E) for moe in moe_layers]
+    # Reconstruct numerator and denominator over every partial token population.
+    entropy_logits_sum_LE = torch.stack(
+        [cast(torch.Tensor, moe.router._entropy_logits_sum_E) for moe in moe_layers]
+    )
+    entropy_logits_count_L1 = torch.stack(
+        [cast(torch.Tensor, moe.router._entropy_logits_count) for moe in moe_layers]
     )
     tp_mesh = parallel_dims.get_optional_mesh("tp")
     if tp_mesh is not None:
         torch.distributed.all_reduce(
-            router_logits_mean_LE,
+            entropy_logits_sum_LE,
             group=tp_mesh.get_group(),
-            op=torch.distributed.ReduceOp.AVG,
+            op=torch.distributed.ReduceOp.SUM,
+        )
+        torch.distributed.all_reduce(
+            entropy_logits_count_L1,
+            group=tp_mesh.get_group(),
+            op=torch.distributed.ReduceOp.SUM,
         )
     loss_mesh = parallel_dims.get_optional_mesh("loss")
     if loss_mesh is not None:
         torch.distributed.all_reduce(
-            router_logits_mean_LE,
+            entropy_logits_sum_LE,
             group=loss_mesh.get_group(),
-            op=torch.distributed.ReduceOp.AVG,
+            op=torch.distributed.ReduceOp.SUM,
         )
+        torch.distributed.all_reduce(
+            entropy_logits_count_L1,
+            group=loss_mesh.get_group(),
+            op=torch.distributed.ReduceOp.SUM,
+        )
+    router_logits_mean_LE = entropy_logits_sum_LE / entropy_logits_count_L1.clamp_min(1)
 
     # Derive entropy from reconstructed scores, but retain local expert imbalance.
     ep_mesh = parallel_dims.get_optional_mesh("ep")
-    # Equal local batch×token populations make AVG of local means exact.
     for moe, router_logits_mean_E, local_counts_E in zip(
         moe_layers,
         router_logits_mean_LE,
@@ -113,19 +126,22 @@ def log_router_statistics(
         )
 
     # Reconstruct each sequence across CP (and TP when TP and EP share work).
-    sequence_counts_LBE = torch.stack(
-        [cast(torch.Tensor, moe._sequence_expert_counts_BE) for moe in moe_layers]
+    sequence_counts_LSE = torch.stack(
+        [cast(torch.Tensor, moe._sequence_expert_counts_SE) for moe in moe_layers]
+    )
+    sequence_positions_L1 = torch.stack(
+        [cast(torch.Tensor, moe._sequence_expert_counts_position) for moe in moe_layers]
     )
     cp_mesh = parallel_dims.get_optional_mesh("cp")
     if cp_mesh is not None:
         torch.distributed.all_reduce(
-            sequence_counts_LBE,
+            sequence_counts_LSE,
             group=cp_mesh.get_group(),
             op=torch.distributed.ReduceOp.SUM,
         )
     if parallel_dims.ep_enabled and parallel_dims.tp_enabled:
         torch.distributed.all_reduce(
-            sequence_counts_LBE,
+            sequence_counts_LSE,
             group=parallel_dims.get_mesh("tp").get_group(),
             op=torch.distributed.ReduceOp.SUM,
         )
@@ -133,27 +149,43 @@ def log_router_statistics(
     if ep_mesh is None:
         local_expert_slice = slice(None)
     else:
-        num_experts = sequence_counts_LBE.shape[-1]
+        num_experts = sequence_counts_LSE.shape[-1]
         num_local_experts = num_experts // ep_mesh.size()
         local_expert_start = ep_mesh.get_local_rank() * num_local_experts
         local_expert_slice = slice(
             local_expert_start,
             local_expert_start + num_local_experts,
         )
-    for moe, sequence_counts_BE in zip(
+    for moe, sequence_counts_SE, sequence_position_1 in zip(
         moe_layers,
-        sequence_counts_LBE,
+        sequence_counts_LSE,
+        sequence_positions_L1,
         strict=True,
     ):
-        local_counts_BE = sequence_counts_BE[:, local_expert_slice].float()
-        average_counts_B1 = local_counts_BE.mean(dim=1, keepdim=True)
-        sequence_imbalance_B = (local_counts_BE / average_counts_B1.clamp_min(1)).amax(
+        local_counts_SE = sequence_counts_SE[:, local_expert_slice].float()
+        average_counts_S1 = local_counts_SE.mean(dim=1, keepdim=True)
+        sequence_imbalance_S = (local_counts_SE / average_counts_S1.clamp_min(1)).amax(
             dim=1
+        )
+        valid_sequences_S = (
+            torch.arange(
+                sequence_counts_SE.shape[0],
+                device=sequence_counts_SE.device,
+            )
+            < sequence_position_1
+        )
+        selected_sequence_imbalance_S = torch.where(
+            valid_sequences_S,
+            sequence_imbalance_S,
+            torch.zeros_like(sequence_imbalance_S),
         )
         log_stats(
             moe.router,
-            seq_expert_imbalance_max=sequence_imbalance_B.max().view(1),
-            seq_expert_imbalance_mean=sequence_imbalance_B.mean().view(1),
+            seq_expert_imbalance_max=selected_sequence_imbalance_S.max().view(1),
+            seq_expert_imbalance_mean=(
+                selected_sequence_imbalance_S.sum()
+                / sequence_position_1.clamp_min(1).float()
+            ).view(1),
         )
 
     # Derive global expert load and expose the bias that produced the routing.

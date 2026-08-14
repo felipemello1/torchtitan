@@ -20,6 +20,7 @@ from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
 from torchtitan.observability import tensor_logging
 from torchtitan.observability.tensor_logging.runtime import (
+    _device_write_enabled,
     _metric_side_effects_are_suppressed,
 )
 from torchtitan.protocols.module import Module
@@ -67,32 +68,105 @@ def _record_expert_tokens_once(
 
 
 @torch.library.custom_op(
-    "torchtitan::store_router_metric",
-    mutates_args={"destination"},
+    "torchtitan::accumulate_router_logits",
+    mutates_args={"logits_sum", "token_count"},
 )
-def _store_router_metric(
-    destination: torch.Tensor,
-    current: torch.Tensor,
+def _accumulate_router_logits(
+    logits_sum: torch.Tensor,
+    token_count: torch.Tensor,
+    current_logits_sum: torch.Tensor,
+    current_token_count: int,
+    enabled: torch.Tensor,
 ) -> None:
-    """Retain one last-forward router intermediate in fixed storage."""
+    """Add one selected forward's router-logit sufficient statistics."""
 
     with torch.no_grad():
-        destination.copy_(current)
+        logits_sum.add_(current_logits_sum * enabled)
+        token_count.add_(enabled.to(token_count.dtype) * current_token_count)
 
 
-@_store_router_metric.register_fake
-def _(destination: torch.Tensor, current: torch.Tensor) -> None:
+@_accumulate_router_logits.register_fake
+def _(
+    logits_sum: torch.Tensor,
+    token_count: torch.Tensor,
+    current_logits_sum: torch.Tensor,
+    current_token_count: int,
+    enabled: torch.Tensor,
+) -> None:
     return None
 
 
-def _record_router_metric_once(
+def _record_router_logits_once(
+    logits_sum: torch.Tensor,
+    token_count: torch.Tensor,
+    current_logits_sum: torch.Tensor,
+    current_token_count: int,
+    enabled: torch.Tensor,
+) -> None:
+    if _metric_side_effects_are_suppressed():
+        return
+    local_current_logits_sum = (
+        current_logits_sum.to_local()
+        if isinstance(current_logits_sum, DTensor)
+        else current_logits_sum
+    )
+    _accumulate_router_logits(
+        logits_sum,
+        token_count,
+        local_current_logits_sum,
+        current_token_count,
+        enabled,
+    )
+
+
+@torch.library.custom_op(
+    "torchtitan::append_router_metric_rows",
+    mutates_args={"destination", "position"},
+)
+def _append_router_metric_rows(
     destination: torch.Tensor,
+    position: torch.Tensor,
     current: torch.Tensor,
+    enabled: torch.Tensor,
+) -> None:
+    """Append one selected forward's sequence rows to fixed storage."""
+
+    with torch.no_grad():
+        enabled_int64 = enabled.to(torch.int64)
+        write_position = position * enabled_int64
+        row_indices = (
+            torch.arange(
+                current.shape[0],
+                dtype=position.dtype,
+                device=current.device,
+            )
+            + write_position
+        )
+        # Each selected row is written once into storage zeroed at the step boundary.
+        destination.index_add_(0, row_indices, current * enabled_int64)
+        position.add_(current.shape[0] * enabled_int64)
+
+
+@_append_router_metric_rows.register_fake
+def _(
+    destination: torch.Tensor,
+    position: torch.Tensor,
+    current: torch.Tensor,
+    enabled: torch.Tensor,
+) -> None:
+    return None
+
+
+def _record_router_metric_rows_once(
+    destination: torch.Tensor,
+    position: torch.Tensor,
+    current: torch.Tensor,
+    enabled: torch.Tensor,
 ) -> None:
     if _metric_side_effects_are_suppressed():
         return
     local_current = current.to_local() if isinstance(current, DTensor) else current
-    _store_router_metric(destination, local_current)
+    _append_router_metric_rows(destination, position, local_current, enabled)
 
 
 class GroupedExperts(Module):
@@ -290,7 +364,12 @@ class TokenChoiceTopKRouter(Module):
         self.route_scale = config.route_scale
         self._debug_force_load_balance = config._debug_force_load_balance
         self.register_buffer(
-            "_router_logits_mean_E",
+            "_entropy_logits_sum_E",
+            None,
+            persistent=False,
+        )
+        self.register_buffer(
+            "_entropy_logits_count",
             None,
             persistent=False,
         )
@@ -371,17 +450,37 @@ class TokenChoiceTopKRouter(Module):
         with torch.autocast(device_type=x_BLD.device.type, dtype=torch.float32):
             router_logits_BLE = self.gate(x_BLD)
 
-        # TODO: Compiled unselected replays still form these expert-axis means;
-        # move the means behind the device gate only if a source-real cadence-5
+        # TODO: Compiled unselected replays still form this expert-axis sum;
+        # move the sum behind the device gate only if a source-real cadence-5
         # profile shows this residual producer work is material.
-        if tensor_logging.should_run_producers():
+        if tensor_logging.should_run_logging_calls():
             with spmd.no_typecheck():
-                router_logits_mean_E = router_logits_BLE.mean(dim=(0, 1))
-                tensor_logging.log_stats(self, router_logits=router_logits_mean_E)
-                assert self._router_logits_mean_E is not None
-                _record_router_metric_once(
-                    self._router_logits_mean_E,
-                    router_logits_mean_E,
+                local_router_logits_BLE = (
+                    router_logits_BLE.to_local()
+                    if isinstance(router_logits_BLE, DTensor)
+                    else router_logits_BLE
+                )
+                local_token_count = (
+                    local_router_logits_BLE.shape[0] * local_router_logits_BLE.shape[1]
+                )
+                router_logits_sum_E = router_logits_BLE.sum(dim=(0, 1))
+                local_router_logits_sum_E = (
+                    router_logits_sum_E.to_local()
+                    if isinstance(router_logits_sum_E, DTensor)
+                    else router_logits_sum_E
+                )
+                tensor_logging.log_stats(
+                    self,
+                    router_logits=local_router_logits_sum_E / local_token_count,
+                )
+                assert self._entropy_logits_sum_E is not None
+                assert self._entropy_logits_count is not None
+                _record_router_logits_once(
+                    self._entropy_logits_sum_E,
+                    self._entropy_logits_count,
+                    router_logits_sum_E,
+                    local_token_count,
+                    _device_write_enabled(),
                 )
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion.
@@ -396,7 +495,7 @@ class TokenChoiceTopKRouter(Module):
         scores_for_choice_BLE = (
             scores_BLE if expert_bias_E is None else scores_BLE + expert_bias_E
         )
-        if tensor_logging.should_run_producers():
+        if tensor_logging.should_run_logging_calls():
             with spmd.no_typecheck():
                 tensor_logging.log_stats(
                     self,
@@ -434,7 +533,8 @@ class TokenChoiceTopKRouter(Module):
         )
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
-        self._router_logits_mean_E = None
+        self._entropy_logits_sum_E = None
+        self._entropy_logits_count = None
 
 
 class MoE(Module):
@@ -516,7 +616,12 @@ class MoE(Module):
             persistent=False,
         )
         self.register_buffer(
-            "_sequence_expert_counts_BE",
+            "_sequence_expert_counts_SE",
+            None,
+            persistent=False,
+        )
+        self.register_buffer(
+            "_sequence_expert_counts_position",
             None,
             persistent=False,
         )
@@ -560,12 +665,15 @@ class MoE(Module):
 
         with spmd.no_typecheck():
             if (
-                tensor_logging.should_run_producers()
-                and self._sequence_expert_counts_BE is not None
+                tensor_logging.should_run_logging_calls()
+                and self._sequence_expert_counts_SE is not None
             ):
-                _record_router_metric_once(
-                    self._sequence_expert_counts_BE,
+                assert self._sequence_expert_counts_position is not None
+                _record_router_metric_rows_once(
+                    self._sequence_expert_counts_SE,
+                    self._sequence_expert_counts_position,
                     routing_map_BLE.sum(dim=1, dtype=torch.int64),
+                    _device_write_enabled(),
                 )
 
             # This operational state drives load balancing and expert-usage metrics.
@@ -607,7 +715,8 @@ class MoE(Module):
             self.tokens_per_expert_E = torch.zeros(
                 self.routed_experts.inner_experts.num_experts, dtype=torch.int64
             )
-            self._sequence_expert_counts_BE = None
+            self._sequence_expert_counts_SE = None
+            self._sequence_expert_counts_position = None
             if self.load_balance_coeff is not None:
                 self.expert_bias_E = torch.zeros(
                     self.routed_experts.inner_experts.num_experts, dtype=torch.float32
@@ -619,11 +728,39 @@ class MoE(Module):
         num_sequences: int,
         device: torch.device,
     ) -> None:
-        """Allocate the fixed last-microbatch router metric buffer."""
+        """Allocate the fixed whole-step sequence-routing window.
 
-        self._sequence_expert_counts_BE = torch.zeros(
+        Args:
+            num_sequences: Local sequence rows across one optimizer step.
+            device: Device that runs the router and owns the window.
+
+        Example:
+
+            moe.init_sequence_expert_counts(num_sequences=8, device=device)
+            # counts shape: [8, num_experts]; write position: [1] at zero
+        """
+
+        self._sequence_expert_counts_SE = torch.zeros(
             num_sequences,
             self.routed_experts.inner_experts.num_experts,
             dtype=torch.int64,
             device=device,
         )
+        self._sequence_expert_counts_position = torch.zeros(
+            1,
+            dtype=torch.int64,
+            device=device,
+        )
+
+    def discard_router_step_state(self) -> None:
+        """Clear the router statistics accumulated for one optimizer step."""
+
+        with torch.no_grad():
+            if self.router._entropy_logits_sum_E is not None:
+                self.router._entropy_logits_sum_E.zero_()
+            if self.router._entropy_logits_count is not None:
+                self.router._entropy_logits_count.zero_()
+            if self._sequence_expert_counts_SE is not None:
+                self._sequence_expert_counts_SE.zero_()
+            if self._sequence_expert_counts_position is not None:
+                self._sequence_expert_counts_position.zero_()

@@ -595,16 +595,25 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 )
 
             num_sequences = (
-                config.parallelism.pipeline_parallel_microbatch_size
-                if parallel_dims.pp_enabled
-                else config.training.local_batch_size
+                config.training.local_batch_size * self.gradient_accumulation_steps
             )
+            if parallel_dims.pp_enabled:
+                num_sequences = (
+                    config.parallelism.pipeline_parallel_microbatch_size
+                    * self.num_pipeline_parallel_microbatches
+                    * self.gradient_accumulation_steps
+                )
             for model_part in self.model_parts:
                 for module in model_part.modules():
                     if isinstance(module, MoE):
-                        module.router._router_logits_mean_E = torch.zeros(
+                        module.router._entropy_logits_sum_E = torch.zeros(
                             module.router.num_experts,
                             dtype=torch.float32,
+                            device=self.device,
+                        )
+                        module.router._entropy_logits_count = torch.zeros(
+                            1,
+                            dtype=torch.int64,
                             device=self.device,
                         )
                         module.init_sequence_expert_counts(

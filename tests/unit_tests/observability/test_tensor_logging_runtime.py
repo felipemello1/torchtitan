@@ -655,22 +655,26 @@ def test_router_metric_producer_respects_eager_cadence() -> None:
     value = torch.tensor([[[1.0, 2.0]]], device="cuda")
 
     router(value)
-    assert router._router_logits_mean_E is None
+    assert router._entropy_logits_sum_E is None
+    assert router._entropy_logits_count is None
 
     register(router, ["router_logits", "router_scores_for_topk"])
-    router._router_logits_mean_E = torch.zeros(2, device="cuda")
+    router._entropy_logits_sum_E = torch.zeros(2, device="cuda")
+    router._entropy_logits_count = torch.zeros(1, dtype=torch.int64, device="cuda")
     runtime = init(router)
     try:
         with set_enabled(False):
             router(value)
-        assert router._router_logits_mean_E.tolist() == [0.0, 0.0]
+        assert router._entropy_logits_sum_E.tolist() == [0.0, 0.0]
+        assert router._entropy_logits_count.item() == 0
         assert runtime.snapshot_unreduced_statistics()["router_logits"][
             "counts"
         ].tolist() == [0, 0, 0, 0]
 
         with set_enabled(True):
             router(value)
-        assert router._router_logits_mean_E.tolist() == [1.0, 2.0]
+        assert router._entropy_logits_sum_E.tolist() == [1.0, 2.0]
+        assert router._entropy_logits_count.item() == 1
         assert runtime.snapshot_unreduced_statistics()["router_logits"][
             "counts"
         ].tolist() == [2, 0, 0, 1]
@@ -691,7 +695,8 @@ def test_router_producers_survive_capture_on_an_unselected_step() -> None:
         .cuda()
     )
     register(router, ["router_logits", "router_scores_for_topk"])
-    router._router_logits_mean_E = torch.zeros(4, device="cuda")
+    router._entropy_logits_sum_E = torch.zeros(4, device="cuda")
+    router._entropy_logits_count = torch.zeros(1, dtype=torch.int64, device="cuda")
     runtime = init(router)
     value = torch.randn(2, 3, 8, device="cuda")
 
@@ -712,7 +717,8 @@ def test_router_producers_survive_capture_on_an_unselected_step() -> None:
 
         assert metrics["router_logits.observation_count"] == 1
         assert metrics["router_scores_for_topk.observation_count"] == 1
-        assert torch.count_nonzero(router._router_logits_mean_E).item() > 0
+        assert torch.count_nonzero(router._entropy_logits_sum_E).item() > 0
+        assert router._entropy_logits_count.item() == 6
     finally:
         runtime.close()
         cudagraph_teardown()
