@@ -47,10 +47,13 @@ class SimpleModel(nn.Module):
         return self.output(x)
 
 
-class FakeMoE(nn.Module):
+class FakeMoE(MoE):
     def __init__(self, load_balance_coeff, tokens):
-        super().__init__()
+        nn.Module.__init__(self)
         self.load_balance_coeff = load_balance_coeff
+        self.routed_experts = nn.Module()
+        self.routed_experts.inner_experts = nn.Module()
+        self.routed_experts.inner_experts.num_experts = len(tokens)
         self.router = nn.Identity()
         self.router.score_func = "softmax"
         self.router.register_buffer(
@@ -82,7 +85,7 @@ class FakeMoE(nn.Module):
             ),
         )
         self.register_buffer(
-            "_sequence_expert_counts_position",
+            "_recorded_sequence_count",
             torch.tensor([2], dtype=torch.int64),
         )
         if load_balance_coeff is not None:
@@ -256,6 +259,35 @@ class TestParamGroupConfig(unittest.TestCase):
             torch.tensor([0, 0]),
         )
 
+    def test_moe_hook_consumes_nested_mtp_layer(self):
+        model = FakeMoEModel()
+        model.mtp_layers = nn.ModuleList([FakeMoEBlock(0.3, [8, 0])])
+        container = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[_DEFAULT_ADAMW],
+        ).build(model_parts=[model])
+
+        register_moe_load_balancing_hook(container, [model], FakeParallelDims())
+        container.step()
+
+        mtp_moe = model.mtp_layers[0].moe
+        torch.testing.assert_close(
+            mtp_moe.expert_bias_E,
+            torch.tensor([-0.3, 0.3]),
+        )
+        self.assertEqual(mtp_moe.tokens_per_expert_E.count_nonzero(), 0)
+
+    def test_moe_hook_rejects_mismatched_mtp_expert_count(self):
+        model = FakeMoEModel()
+        model.mtp_layers = nn.ModuleList([FakeMoEBlock(0.3, [1, 2, 3])])
+        container = OptimizersContainer.Config(
+            implementation="for-loop",
+            param_groups=[_DEFAULT_ADAMW],
+        ).build(model_parts=[model])
+
+        with self.assertRaisesRegex(ValueError, "must share num_experts"):
+            register_moe_load_balancing_hook(container, [model], FakeParallelDims())
+
     def test_moe_load_balancing_keeps_counts_exact_above_float32_limit(self):
         model = FakeMoEModel(load_balance_coeffs=(0.1, 0.2))
         model.layers["0"].moe.tokens_per_expert_E.copy_(
@@ -325,10 +357,10 @@ class TestParamGroupConfig(unittest.TestCase):
                         kwargs[name].clone(),
                     )
                     for name in (
-                        "entropy_logits_sum_by_layer",
-                        "entropy_logits_count_by_layer",
-                        "sequence_counts_by_layer",
-                        "sequence_positions_by_layer",
+                        "entropy_logits_sum_LE",
+                        "entropy_token_count_L1",
+                        "sequence_expert_counts_LSE",
+                        "recorded_sequence_count_L1",
                     )
                 }
             )
@@ -361,12 +393,12 @@ class TestParamGroupConfig(unittest.TestCase):
                 captured_stacks[1][name][0],
             )
         torch.testing.assert_close(
-            captured_stacks[1]["entropy_logits_sum_by_layer"][1],
+            captured_stacks[1]["entropy_logits_sum_LE"][1],
             torch.tensor([[7.0, 3.0], [2.0, 8.0]]),
         )
         self.assertEqual(
             model.layers["0"].moe.router._entropy_logits_sum_E.data_ptr(),
-            captured_stacks[0]["entropy_logits_sum_by_layer"][0],
+            captured_stacks[0]["entropy_logits_sum_LE"][0],
         )
 
     def test_ep_shard_imbalance_is_not_pooled_across_ep_groups(self):
@@ -382,16 +414,16 @@ class TestParamGroupConfig(unittest.TestCase):
                         local_tokens_per_expert_by_layer=[local_counts],
                         ep_group_tokens_per_expert_by_layer=local_counts.unsqueeze(0),
                         global_tokens_per_expert_by_layer=pooled_counts,
-                        entropy_logits_sum_by_layer=moe.router._entropy_logits_sum_E.unsqueeze(
+                        entropy_logits_sum_LE=moe.router._entropy_logits_sum_E.unsqueeze(
                             0
                         ),
-                        entropy_logits_count_by_layer=moe.router._entropy_logits_count.unsqueeze(
+                        entropy_token_count_L1=moe.router._entropy_logits_count.unsqueeze(
                             0
                         ),
-                        sequence_counts_by_layer=moe._sequence_expert_counts_SE.unsqueeze(
+                        sequence_expert_counts_LSE=moe._sequence_expert_counts_SE.unsqueeze(
                             0
                         ),
-                        sequence_positions_by_layer=moe._sequence_expert_counts_position.unsqueeze(
+                        recorded_sequence_count_L1=moe._recorded_sequence_count.unsqueeze(
                             0
                         ),
                         parallel_dims=FakeEPParallelDims(),
@@ -481,7 +513,7 @@ class TestParamGroupConfig(unittest.TestCase):
                     dtype=torch.int64,
                 )
             )
-            moe._sequence_expert_counts_position.fill_(4)
+            moe._recorded_sequence_count.fill_(4)
 
         container = OptimizersContainer.Config(
             implementation="for-loop",
@@ -528,7 +560,7 @@ class TestParamGroupConfig(unittest.TestCase):
             self.assertEqual(moe.router._entropy_logits_sum_E.count_nonzero(), 0)
             self.assertEqual(moe.router._entropy_logits_count.item(), 0)
             self.assertEqual(moe._sequence_expert_counts_SE.count_nonzero(), 0)
-            self.assertEqual(moe._sequence_expert_counts_position.item(), 0)
+            self.assertEqual(moe._recorded_sequence_count.item(), 0)
 
     def test_moe_load_balancing_rejects_inconsistent_coeffs(self):
         model = FakeMoEModel(load_balance_coeffs=(None, 0.2))

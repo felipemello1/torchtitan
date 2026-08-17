@@ -240,10 +240,10 @@ Separately generated or loaded precompiled artifacts are also rejected: their sa
 
 ## Metrics that need topology
 
-The common recording API does not guess TP, CP, DP, or EP semantics. Router statistics reconstruct their semantic population beside the producer:
+The common recording API does not guess TP, CP, DP, or EP semantics. Router statistics reconstruct their semantic population beside the callsite:
 
 ```text
-each layer writes local router state into its preallocated layer row
+each layer writes local router state into its preallocated layer slice
         -> use the persistent [layers, ...] buffers
         -> reduce over the groups that shard that population
         -> derive entropy, load, or imbalance

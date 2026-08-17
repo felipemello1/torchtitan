@@ -33,7 +33,7 @@ _FORWARD_MUTATION_OP_NAMES = (
     "accumulate_tensor_statistics",
     "accumulate_expert_tokens",
     "accumulate_router_logits",
-    "append_router_metric_rows",
+    "append_sequence_expert_counts",
 )
 _in_activation_checkpoint_recompute = False
 

@@ -21,7 +21,9 @@ from torchtitan.experiments.graph_trainer.selective_activation_remat import (
 )
 from torchtitan.models.common.moe import MoE
 from torchtitan.observability import tensor_logging
-from torchtitan.observability.tensor_logging.runtime import _include_recording_calls
+from torchtitan.observability.tensor_logging.runtime import (
+    _include_tensor_logging_calls_for_capture,
+)
 
 
 class _DeterministicRouter(nn.Module):
@@ -37,6 +39,15 @@ class _DeterministicRouter(nn.Module):
         scores = value[..., : self.expert_count].sigmoid()
         top_scores, top_indices = scores.topk(1, dim=-1)
         return top_scores, top_indices, scores
+
+
+def test_forward_mutation_op_names_all_resolve() -> None:
+    from torchtitan.distributed.activation_checkpoint import (
+        _FORWARD_MUTATION_OP_NAMES,
+        _registered_forward_mutation_ops,
+    )
+
+    assert len(_registered_forward_mutation_ops()) == len(_FORWARD_MUTATION_OP_NAMES)
 
 
 class _TinyRoutedExperts(nn.Module):
@@ -74,7 +85,7 @@ def _build_source_moe(expert_count: int = 4) -> MoE:
         persistent=False,
     )
     moe.register_buffer(
-        "_sequence_expert_counts_position",
+        "_recorded_sequence_count",
         torch.zeros(1, dtype=torch.int64),
         persistent=False,
     )
@@ -180,7 +191,10 @@ def test_source_moe_router_window_appends_only_selected_forwards() -> None:
     try:
         # Graph capture includes the call on every replay; the device flag decides
         # whether this optimizer step contributes to the metric window.
-        with _include_recording_calls(), tensor_logging.set_enabled(False):
+        with (
+            _include_tensor_logging_calls_for_capture(),
+            tensor_logging.set_enabled(False),
+        ):
             moe(forward_1)
         with tensor_logging.set_enabled(True):
             moe(forward_1)
@@ -190,7 +204,7 @@ def test_source_moe_router_window_appends_only_selected_forwards() -> None:
             moe._sequence_expert_counts_SE,
             torch.eye(4, dtype=torch.int64),
         )
-        assert moe._sequence_expert_counts_position.item() == 4
+        assert moe._recorded_sequence_count.item() == 4
     finally:
         state.close()
 

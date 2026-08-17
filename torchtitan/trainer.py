@@ -573,7 +573,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
 
         # Allocate one fixed router window per layer before the optimizer's MoE
-        # hook stacks them. The hook then rebinds each layer to a row view, so
+        # hook stacks them. The hook then rebinds each layer to a fixed slice, so
         # selected logging steps reuse the layer stacks instead of allocating.
         tensor_logging_config = config.metrics.tensor_logging
         if tensor_logging_config.enabled:
@@ -601,17 +601,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             for model_part in self.model_parts:
                 for module in model_part.modules():
                     if isinstance(module, MoE):
-                        module.router._entropy_logits_sum_E = torch.zeros(
-                            module.router.num_experts,
-                            dtype=torch.float32,
-                            device=self.device,
-                        )
-                        module.router._entropy_logits_count = torch.zeros(
-                            1,
-                            dtype=torch.int64,
-                            device=self.device,
-                        )
-                        module.init_sequence_expert_counts(
+                        module.init_router_step_buffers(
                             num_sequences=num_sequences,
                             device=self.device,
                         )

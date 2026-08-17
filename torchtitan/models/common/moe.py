@@ -14,15 +14,16 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor
 
+from torchtitan.distributed.activation_checkpoint import (
+    _is_activation_checkpoint_recompute,
+)
+
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_mesh_size
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
 from torchtitan.observability import tensor_logging
-from torchtitan.observability.tensor_logging.runtime import (
-    _device_write_enabled,
-    _metric_side_effects_are_suppressed,
-)
+from torchtitan.observability.tensor_logging.runtime import _device_write_enabled
 from torchtitan.protocols.module import Module
 
 from .token_dispatcher import LocalTokenDispatcher
@@ -60,7 +61,7 @@ def _record_expert_tokens_once(
     total: torch.Tensor,
     current: torch.Tensor,
 ) -> None:
-    if _metric_side_effects_are_suppressed():
+    if _is_activation_checkpoint_recompute():
         return
     local_total = total.to_local() if isinstance(total, DTensor) else total
     local_current = current.to_local() if isinstance(current, DTensor) else current
@@ -108,7 +109,7 @@ def _record_router_logits_once(
     current_token_count: int,
     enabled: torch.Tensor,
 ) -> None:
-    if _metric_side_effects_are_suppressed():
+    if _is_activation_checkpoint_recompute():
         return
     local_current_logits_sum = (
         current_logits_sum.to_local()
@@ -125,10 +126,10 @@ def _record_router_logits_once(
 
 
 @torch.library.custom_op(
-    "torchtitan::append_router_metric_rows",
+    "torchtitan::append_sequence_expert_counts",
     mutates_args={"destination", "position"},
 )
-def _append_router_metric_rows(
+def _append_sequence_expert_counts(
     destination: torch.Tensor,
     position: torch.Tensor,
     current: torch.Tensor,
@@ -152,7 +153,7 @@ def _append_router_metric_rows(
         position.add_(current.shape[0] * enabled_int64)
 
 
-@_append_router_metric_rows.register_fake
+@_append_sequence_expert_counts.register_fake
 def _(
     destination: torch.Tensor,
     position: torch.Tensor,
@@ -162,16 +163,16 @@ def _(
     return None
 
 
-def _record_router_metric_rows_once(
+def _record_sequence_expert_counts_once(
     destination: torch.Tensor,
     position: torch.Tensor,
     current: torch.Tensor,
     enabled: torch.Tensor,
 ) -> None:
-    if _metric_side_effects_are_suppressed():
+    if _is_activation_checkpoint_recompute():
         return
     local_current = current.to_local() if isinstance(current, DTensor) else current
-    _append_router_metric_rows(destination, position, local_current, enabled)
+    _append_sequence_expert_counts(destination, position, local_current, enabled)
 
 
 class GroupedExperts(Module):
@@ -626,7 +627,7 @@ class MoE(Module):
             persistent=False,
         )
         self.register_buffer(
-            "_sequence_expert_counts_position",
+            "_recorded_sequence_count",
             None,
             persistent=False,
         )
@@ -673,10 +674,10 @@ class MoE(Module):
                 tensor_logging.should_run_logging_calls()
                 and self._sequence_expert_counts_SE is not None
             ):
-                assert self._sequence_expert_counts_position is not None
-                _record_router_metric_rows_once(
+                assert self._recorded_sequence_count is not None
+                _record_sequence_expert_counts_once(
                     self._sequence_expert_counts_SE,
-                    self._sequence_expert_counts_position,
+                    self._recorded_sequence_count,
                     routing_map_BLE.sum(dim=1, dtype=torch.int64),
                     _device_write_enabled(),
                 )
@@ -721,19 +722,19 @@ class MoE(Module):
                 self.routed_experts.inner_experts.num_experts, dtype=torch.int64
             )
             self._sequence_expert_counts_SE = None
-            self._sequence_expert_counts_position = None
+            self._recorded_sequence_count = None
             if self.load_balance_coeff is not None:
                 self.expert_bias_E = torch.zeros(
                     self.routed_experts.inner_experts.num_experts, dtype=torch.float32
                 )
 
-    def init_sequence_expert_counts(
+    def init_router_step_buffers(
         self,
         *,
         num_sequences: int,
         device: torch.device,
     ) -> None:
-        """Allocate the fixed whole-step sequence-routing window.
+        """Allocate this layer's fixed router windows for one optimizer step.
 
         Args:
             num_sequences: Local sequence rows across one optimizer step.
@@ -741,17 +742,28 @@ class MoE(Module):
 
         Example:
 
-            moe.init_sequence_expert_counts(num_sequences=8, device=device)
-            # counts shape: [8, num_experts]; write position: [1] at zero
+            moe.init_router_step_buffers(num_sequences=8, device=device)
+            # entropy sum: [num_experts]; sequence counts: [8, num_experts]
+            # recorded sequences: [1] at zero
         """
 
+        self.router._entropy_logits_sum_E = torch.zeros(
+            self.router.num_experts,
+            dtype=torch.float32,
+            device=device,
+        )
+        self.router._entropy_logits_count = torch.zeros(
+            1,
+            dtype=torch.int64,
+            device=device,
+        )
         self._sequence_expert_counts_SE = torch.zeros(
             num_sequences,
             self.routed_experts.inner_experts.num_experts,
             dtype=torch.int64,
             device=device,
         )
-        self._sequence_expert_counts_position = torch.zeros(
+        self._recorded_sequence_count = torch.zeros(
             1,
             dtype=torch.int64,
             device=device,
@@ -767,5 +779,5 @@ class MoE(Module):
                 self.router._entropy_logits_count.zero_()
             if self._sequence_expert_counts_SE is not None:
                 self._sequence_expert_counts_SE.zero_()
-            if self._sequence_expert_counts_position is not None:
-                self._sequence_expert_counts_position.zero_()
+            if self._recorded_sequence_count is not None:
+                self._recorded_sequence_count.zero_()

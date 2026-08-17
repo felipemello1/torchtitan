@@ -666,7 +666,7 @@ def test_disabled_router_logit_gate_discards_nonfinite_values() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_router_metric_producer_respects_eager_cadence() -> None:
+def test_router_statistic_computation_respects_eager_cadence() -> None:
     router = (
         TokenChoiceTopKRouter.Config(
             num_experts=2,
@@ -692,7 +692,7 @@ def test_router_metric_producer_respects_eager_cadence() -> None:
     try:
         # Captured graphs keep the mutation op on unselected steps. Its device
         # gate must discard nonfinite values rather than multiplying them by zero.
-        with set_enabled(False), _include_recording_calls():
+        with set_enabled(False), _include_tensor_logging_calls_for_capture():
             router(nonfinite_value)
         assert router._entropy_logits_sum_E.tolist() == [0.0, 0.0]
         assert router._entropy_logits_count.item() == 0
@@ -712,7 +712,7 @@ def test_router_metric_producer_respects_eager_cadence() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_router_producers_survive_capture_on_an_unselected_step() -> None:
+def test_router_statistics_survive_capture_on_an_unselected_step() -> None:
     torch.manual_seed(0)
     router = (
         TokenChoiceTopKRouter.Config(
@@ -730,7 +730,7 @@ def test_router_producers_survive_capture_on_an_unselected_step() -> None:
     value = torch.randn(2, 3, 8, device="cuda")
 
     def step(input_value: torch.Tensor):
-        with _include_recording_calls():
+        with _include_tensor_logging_calls_for_capture():
             return router(input_value, None)
 
     wrapped = CUDAGraphWrapper(step, (value,))
