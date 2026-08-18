@@ -52,6 +52,7 @@ from torchtitan.distributed.cudagraph import (
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
 from torchtitan.models.common.attention import FlexAttention, VarlenAttention
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.token_dispatcher import (
     HybridEPTokenDispatcher,
     LocalTokenDispatcher,
@@ -571,14 +572,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             f"({device_mem_stats.max_reserved_pct:.2f}%)"
         )
 
-        # build optimizer after applying parallelisms to the model
-        self.optimizers = config.optimizer.build(model_parts=self.model_parts)
-        if model_spec.post_optimizer_build_fn is not None:
-            model_spec.post_optimizer_build_fn(
-                self.optimizers, self.model_parts, parallel_dims
-            )
-
-        self.tensor_logging = None
+        # Allocate one fixed router window per layer before the optimizer's MoE
+        # hook stacks them. The hook then rebinds each layer to a fixed slice, so
+        # selected logging steps reuse the layer stacks instead of allocating.
         tensor_logging_config = config.metrics.tensor_logging
         if tensor_logging_config.enabled:
             effective_freq = math.lcm(
@@ -593,6 +589,32 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     f"{config.metrics.log_freq}"
                 )
 
+            num_sequences = (
+                config.training.local_batch_size * self.gradient_accumulation_steps
+            )
+            if parallel_dims.pp_enabled:
+                num_sequences = (
+                    config.parallelism.pipeline_parallel_microbatch_size
+                    * self.num_pipeline_parallel_microbatches
+                    * self.gradient_accumulation_steps
+                )
+            for model_part in self.model_parts:
+                for module in model_part.modules():
+                    if isinstance(module, MoE):
+                        module.init_router_step_buffers(
+                            num_sequences=num_sequences,
+                            device=self.device,
+                        )
+
+        # build optimizer after applying parallelisms to the model
+        self.optimizers = config.optimizer.build(model_parts=self.model_parts)
+        if model_spec.post_optimizer_build_fn is not None:
+            model_spec.post_optimizer_build_fn(
+                self.optimizers, self.model_parts, parallel_dims
+            )
+
+        self.tensor_logging = None
+        if tensor_logging_config.enabled:
             # Model buffers and parallel wrappers are final before slots are assigned.
             self.tensor_logging = tensor_logging.init(
                 self.model_parts,

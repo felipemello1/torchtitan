@@ -108,15 +108,14 @@ _save_routing_and_forward_mutations()
         with forward_context, recompute_context:
             pass
 
-    def test_compiled_full_ac_without_tensor_logging_does_not_save_statistics(self):
+    def test_compiled_full_ac_preserves_registered_moe_side_effects(self):
+        from torchtitan.models.common.moe import _accumulate_expert_tokens
+
+        self.assertIsNotNone(_accumulate_expert_tokens)
         policies = []
         contexts = object()
         with (
             patch("torch.compiler.is_compiling", return_value=True),
-            patch(
-                "torchtitan.observability.tensor_logging.runtime._is_installed",
-                return_value=False,
-            ),
             patch(
                 "torchtitan.distributed.activation_checkpoint."
                 "create_selective_checkpoint_contexts",
@@ -129,9 +128,13 @@ _save_routing_and_forward_mutations()
         self.assertIs(
             policies[0](
                 None,
-                torch.ops.torchtitan.accumulate_tensor_statistics.default,
+                torch.ops.torchtitan.accumulate_expert_tokens.default,
             ),
-            CheckpointPolicy.PREFER_RECOMPUTE,
+            CheckpointPolicy.MUST_SAVE,
+        )
+        self.assertIs(
+            policies[0](None, torch.ops.aten.topk.default),
+            CheckpointPolicy.MUST_SAVE,
         )
 
     def test_flops(self):

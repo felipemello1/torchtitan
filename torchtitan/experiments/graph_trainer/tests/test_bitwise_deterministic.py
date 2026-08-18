@@ -27,6 +27,7 @@ from torch.nn.attention.flex_attention import flex_attention
 
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
+from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.experiments.graph_trainer.common_utils import (
@@ -77,6 +78,12 @@ def _set_deterministic(seed: int = SEED) -> None:
 
 
 _TOKENIZER_PATH = "./tests/assets/tokenizer"
+
+
+def test_qwen3_model_spec_registers_moe_load_balancing_hook() -> None:
+    model_spec = qwen3_model_registry("debugmodel_moe")
+
+    assert model_spec.post_optimizer_build_fn is register_moe_load_balancing_hook
 
 
 # ``test_eager_self_deterministic`` pins eager loss/model/grad to hardcoded

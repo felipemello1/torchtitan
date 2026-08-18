@@ -28,6 +28,7 @@ from torchtitan.config import CompileConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.distributed.compile import apply_compile
+from torchtitan.distributed.cudagraph import cudagraph_teardown, CUDAGraphWrapper
 from torchtitan.distributed.utils import get_spmd_context
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 from torchtitan.experiments.graph_trainer.cudagraph import (
@@ -46,6 +47,10 @@ from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import (
+    _accumulate_router_logits,
+    TokenChoiceTopKRouter,
+)
 from torchtitan.models.llama3.model import Llama3TransformerBlock
 from torchtitan.models.qwen3.model import Qwen3TransformerBlock
 from torchtitan.observability.tensor_logging import (
@@ -635,6 +640,122 @@ def test_sum_slab_keeps_all_hand_computed_statistics() -> None:
         assert snapshot["maximum"].item() == 2.0
     finally:
         runtime.close()
+
+
+def test_disabled_router_logit_gate_discards_nonfinite_values() -> None:
+    logits_sum = torch.zeros(2)
+    token_count = torch.zeros(1, dtype=torch.int64)
+
+    _accumulate_router_logits(
+        logits_sum,
+        token_count,
+        torch.tensor([torch.nan, torch.inf]),
+        2,
+        torch.zeros((), dtype=torch.int32),
+    )
+    _accumulate_router_logits(
+        logits_sum,
+        token_count,
+        torch.tensor([3.0, 1.0]),
+        2,
+        torch.ones((), dtype=torch.int32),
+    )
+
+    torch.testing.assert_close(logits_sum, torch.tensor([3.0, 1.0]))
+    assert token_count.item() == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_router_statistic_computation_respects_eager_cadence() -> None:
+    router = (
+        TokenChoiceTopKRouter.Config(
+            num_experts=2,
+            gate=Linear.Config(in_features=2, out_features=2),
+            score_func="softmax",
+        )
+        .build()
+        .cuda()
+    )
+    with torch.no_grad():
+        router.gate.weight.copy_(torch.eye(2, device="cuda"))
+    value = torch.tensor([[[1.0, 2.0]]], device="cuda")
+    nonfinite_value = torch.tensor([[[torch.nan, torch.inf]]], device="cuda")
+
+    router(value)
+    assert router._entropy_logits_sum_E is None
+    assert router._entropy_logits_count is None
+
+    register(router, ["router_logits", "router_scores_for_topk"])
+    router._entropy_logits_sum_E = torch.zeros(2, device="cuda")
+    router._entropy_logits_count = torch.zeros(1, dtype=torch.int64, device="cuda")
+    runtime = init(router, device=torch.device("cuda"))
+    try:
+        # Captured graphs keep the mutation op on unselected steps. Its device
+        # gate must discard nonfinite values rather than multiplying them by zero.
+        record_nonfinite = _wrap_fwd_bwd_for_tensor_logging_capture(
+            lambda: router(nonfinite_value)
+        )
+        with set_enabled(False):
+            record_nonfinite()
+        assert router._entropy_logits_sum_E.tolist() == [0.0, 0.0]
+        assert router._entropy_logits_count.item() == 0
+        assert runtime.snapshot_unreduced_statistics()["router_logits"][
+            "counts"
+        ].tolist() == [0, 0, 0, 0]
+
+        with set_enabled(True):
+            router(value)
+        assert router._entropy_logits_sum_E.tolist() == [1.0, 2.0]
+        assert router._entropy_logits_count.item() == 1
+        assert runtime.snapshot_unreduced_statistics()["router_logits"][
+            "counts"
+        ].tolist() == [2, 0, 0, 1]
+    finally:
+        runtime.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_router_statistics_survive_capture_on_an_unselected_step() -> None:
+    torch.manual_seed(0)
+    router = (
+        TokenChoiceTopKRouter.Config(
+            num_experts=4,
+            gate=Linear.Config(in_features=8, out_features=4, bias=False),
+            top_k=2,
+        )
+        .build()
+        .cuda()
+    )
+    register(router, ["router_logits", "router_scores_for_topk"])
+    router._entropy_logits_sum_E = torch.zeros(4, device="cuda")
+    router._entropy_logits_count = torch.zeros(1, dtype=torch.int64, device="cuda")
+    runtime = init(router, device=torch.device("cuda"))
+    value = torch.randn(2, 3, 8, device="cuda")
+
+    def step(input_value: torch.Tensor):
+        return router(input_value, None)
+
+    wrapped = CUDAGraphWrapper(
+        _wrap_fwd_bwd_for_tensor_logging_capture(step),
+        (value,),
+    )
+    try:
+        with set_enabled(False):
+            wrapped(value)  # warmup
+            wrapped(value)  # capture
+        runtime.collect()
+
+        with set_enabled(True):
+            wrapped(value)
+        metrics = runtime.collect()
+
+        assert metrics["router_logits.observation_count"] == 1
+        assert metrics["router_scores_for_topk.observation_count"] == 1
+        assert torch.count_nonzero(router._entropy_logits_sum_E).item() > 0
+        assert router._entropy_logits_count.item() == 6
+    finally:
+        runtime.close()
+        cudagraph_teardown()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

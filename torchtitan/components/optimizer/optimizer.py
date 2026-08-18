@@ -6,14 +6,13 @@
 
 import re
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, cast, Generic, Literal, overload, Protocol, TypeVar
+from typing import Any, cast, Generic, Literal, NamedTuple, overload, TypeVar
 
 import torch
 import torch.distributed.tensor
 import torch.nn as nn
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import Replicate
 from torch.optim import Optimizer
@@ -21,6 +20,9 @@ from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.flex_shard import build_dist_muon
+from torchtitan.models.common.moe import MoE
+from torchtitan.observability import tensor_logging
+from torchtitan.observability.tensor_logging.router import log_router_statistics
 from torchtitan.tools.logging import logger
 
 from .utils import (
@@ -68,12 +70,6 @@ class ParamGroupConfig:
 
 
 T = TypeVar("T", bound=Optimizer)
-
-
-class _MoELike(Protocol):
-    load_balance_coeff: float | None
-    tokens_per_expert_E: torch.Tensor  # noqa: N815
-    expert_bias_E: torch.Tensor  # noqa: N815
 
 
 class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
@@ -399,128 +395,339 @@ def default_adamw(lr: float = 8e-4, **kwargs: Any) -> OptimizersContainer.Config
     )
 
 
+def _global_moe_expert_counts(
+    local_counts_by_layer: torch.Tensor,
+    parallel_dims: ParallelDims,
+) -> torch.Tensor:
+    """Reconstruct `[layers, experts]` counts over every token-sharding axis.
+
+    Args:
+        local_counts_by_layer: Local or partial expert counts with shape `[L, E]`.
+        parallel_dims: Backend and meshes that describe the partial population.
+
+    Example:
+        Two token-sharding ranks contributing `[[3, 1]]` and `[[2, 4]]`
+        each receive the reconstructed result `[[5, 5]]`.
+    """
+
+    # Full-DTensor carries every partial placement and can redistribute once.
+    if parallel_dims.spmd_backend == "full_dtensor":
+        assert isinstance(local_counts_by_layer, torch.distributed.tensor.DTensor)
+        mesh = local_counts_by_layer.device_mesh
+        return local_counts_by_layer.redistribute(placements=[Replicate()] * mesh.ndim)
+
+    # SPMD-types tensors are local, so reduce only axes that shard token counts.
+    if parallel_dims.spmd_backend == "spmd_types":
+        # SPMD-types state is physically local. With EP, token counts are
+        # partial over TP; DP/CP partials are reduced over the loss mesh.
+        if parallel_dims.ep_enabled and parallel_dims.tp_enabled:
+            torch.distributed.all_reduce(
+                local_counts_by_layer,
+                group=parallel_dims.get_mesh("tp").get_group(),
+                op=torch.distributed.ReduceOp.SUM,
+            )
+        loss_mesh = parallel_dims.get_optional_mesh("loss")
+        if loss_mesh is not None:
+            torch.distributed.all_reduce(
+                local_counts_by_layer,
+                group=loss_mesh.get_group(),
+                op=torch.distributed.ReduceOp.SUM,
+            )
+        return local_counts_by_layer
+
+    # Legacy/default DTensor first resolves its embedded mesh, then the loss mesh.
+    dtensor_counts = (
+        local_counts_by_layer
+        if isinstance(local_counts_by_layer, torch.distributed.tensor.DTensor)
+        else None
+    )
+    mesh = dtensor_counts.device_mesh if dtensor_counts is not None else None
+    if dtensor_counts is not None:
+        local_counts_by_layer = dtensor_counts.full_tensor()
+    loss_mesh = parallel_dims.get_optional_mesh("loss")
+    if loss_mesh is not None:
+        torch.distributed.all_reduce(
+            local_counts_by_layer,
+            group=loss_mesh.get_group(),
+            op=torch.distributed.ReduceOp.SUM,
+        )
+    if mesh is not None:
+        local_counts_by_layer = torch.distributed.tensor.DTensor.from_local(
+            local_counts_by_layer,
+            device_mesh=mesh,
+            placements=[Replicate()] * mesh.ndim,
+            run_check=False,
+        )
+    return local_counts_by_layer
+
+
+class _RouterStepBuffers(NamedTuple):
+    """Preallocated router statistics stacked over local MoE layers."""
+
+    entropy_logits_sum_LE: torch.Tensor  # noqa: N815
+    entropy_token_count_L1: torch.Tensor  # noqa: N815
+    sequence_expert_counts_LSE: torch.Tensor  # noqa: N815
+    recorded_sequence_count_L1: torch.Tensor  # noqa: N815
+
+
+def _iter_moe_layers(model_parts: Sequence[nn.Module]) -> Iterator[MoE]:
+    """Yield every MoE whose optimizer-step state this hook consumes."""
+
+    for model_part in model_parts:
+        for module in model_part.modules():
+            if isinstance(module, MoE):
+                yield module
+
+
+def _moe_load_balancing_enabled(moe_layers: Sequence[MoE]) -> bool:
+    load_balancing_enabled = moe_layers[0].load_balance_coeff is not None
+    for moe in moe_layers[1:]:
+        if (moe.load_balance_coeff is not None) != load_balancing_enabled:
+            raise ValueError(
+                "MoE load_balance_coeff must be configured consistently across all "
+                "MoE layers, including MTP layers."
+            )
+    return load_balancing_enabled
+
+
+def _validate_moe_layer_shapes(moe_layers: Sequence[MoE]) -> None:
+    expected_num_experts = moe_layers[0].routed_experts.inner_experts.num_experts
+    for moe in moe_layers[1:]:
+        num_experts = moe.routed_experts.inner_experts.num_experts
+        if num_experts != expected_num_experts:
+            raise ValueError(
+                "MoE layers consumed by one optimizer hook must share num_experts; "
+                f"got {expected_num_experts} and {num_experts}. MTP layers are "
+                "included in this reduction."
+            )
+
+
+def _stack_router_step_buffers(
+    moe_layers: Sequence[MoE],
+) -> _RouterStepBuffers | None:
+    """Stack initialized layer windows once and rebind each layer to its slice.
+
+    Example:
+
+        # Two layers, four experts, eight local sequences per optimizer step.
+        buffers = _stack_router_step_buffers(moe_layers)
+        # entropy_logits_sum_LE: [2, 4]
+        # sequence_expert_counts_LSE: [2, 8, 4]
+    """
+
+    buffers_by_layer = [
+        (
+            moe.router._entropy_logits_sum_E,
+            moe.router._entropy_logits_count,
+            moe._sequence_expert_counts_SE,
+            moe._recorded_sequence_count,
+        )
+        for moe in moe_layers
+    ]
+    if all(all(buffer is None for buffer in buffers) for buffers in buffers_by_layer):
+        return None
+    if any(any(buffer is None for buffer in buffers) for buffers in buffers_by_layer):
+        raise RuntimeError(
+            "initialize router step buffers for every MoE layer before building "
+            "the optimizer"
+        )
+
+    router_step_buffers = _RouterStepBuffers(
+        entropy_logits_sum_LE=torch.stack(
+            [cast(torch.Tensor, buffers[0]) for buffers in buffers_by_layer]
+        ),
+        entropy_token_count_L1=torch.stack(
+            [cast(torch.Tensor, buffers[1]) for buffers in buffers_by_layer]
+        ),
+        sequence_expert_counts_LSE=torch.stack(
+            [cast(torch.Tensor, buffers[2]) for buffers in buffers_by_layer]
+        ),
+        recorded_sequence_count_L1=torch.stack(
+            [cast(torch.Tensor, buffers[3]) for buffers in buffers_by_layer]
+        ),
+    )
+    for layer_index, moe in enumerate(moe_layers):
+        moe.router._entropy_logits_sum_E = router_step_buffers.entropy_logits_sum_LE[
+            layer_index
+        ]
+        moe.router._entropy_logits_count = router_step_buffers.entropy_token_count_L1[
+            layer_index
+        ]
+        moe._sequence_expert_counts_SE = router_step_buffers.sequence_expert_counts_LSE[
+            layer_index
+        ]
+        moe._recorded_sequence_count = router_step_buffers.recorded_sequence_count_L1[
+            layer_index
+        ]
+    return router_step_buffers
+
+
+def _consume_moe_router_step(
+    *,
+    moe_layers: Sequence[MoE],
+    local_expert_counts_LE: torch.Tensor,
+    router_step_buffers: _RouterStepBuffers | None,
+    parallel_dims: ParallelDims,
+    load_balancing_enabled: bool,
+) -> None:
+    """Reconstruct, publish, update bias, and clear one router-step window.
+
+    Example:
+
+        # `local_expert_counts_LE` and `router_step_buffers` contain every
+        # microbatch in the gradient-accumulation window for L local layers.
+        _consume_moe_router_step(
+            moe_layers=moe_layers,
+            local_expert_counts_LE=local_counts_LE,
+            router_step_buffers=buffers,
+            parallel_dims=parallel_dims,
+            load_balancing_enabled=True,
+        )
+    """
+
+    # TODO: This synchronization is blocking and runs on the default compute
+    # stream. Measure it under a high-utilization MoE profile before adding overlap.
+    local_expert_counts_by_layer = [moe.tokens_per_expert_E for moe in moe_layers]
+    logging_enabled = tensor_logging.is_enabled()
+    if not load_balancing_enabled and not logging_enabled:
+        for moe, local_expert_counts_E in zip(
+            moe_layers,
+            local_expert_counts_by_layer,
+            strict=True,
+        ):
+            local_expert_counts_E.zero_()
+            moe.discard_router_step_state()
+        return
+
+    for stacked_counts_E, local_expert_counts_E in zip(
+        local_expert_counts_LE,
+        local_expert_counts_by_layer,
+        strict=True,
+    ):
+        stacked_counts_E.copy_(local_expert_counts_E)
+
+    ep_group_expert_counts_LE = None
+    if logging_enabled and parallel_dims.ep_enabled:
+        ep_complement_mesh = parallel_dims.get_activated_mesh(["dp_replicate", "efsdp"])
+        if ep_complement_mesh is None:
+            num_ep_groups = 1
+            ep_group_index = 0
+        else:
+            coordinate = ep_complement_mesh.get_coordinate()
+            assert coordinate is not None
+            num_ep_groups = ep_complement_mesh.size()
+            ep_group_index = 0
+            for axis_index, axis_size in zip(
+                coordinate,
+                ep_complement_mesh.shape,
+                strict=True,
+            ):
+                ep_group_index = ep_group_index * axis_size + axis_index
+        scattered_shape = (num_ep_groups, *local_expert_counts_LE.shape)
+
+        # The indexed write is rank-dependent, so perform it on physical storage
+        # before reconstructing the common logical DTensor value.
+        physical_counts = (
+            local_expert_counts_LE.to_local()
+            if isinstance(local_expert_counts_LE, torch.distributed.tensor.DTensor)
+            else local_expert_counts_LE
+        )
+        physical_scattered_counts = physical_counts.new_zeros(scattered_shape)
+        physical_scattered_counts[ep_group_index].copy_(physical_counts)
+        if isinstance(local_expert_counts_LE, torch.distributed.tensor.DTensor):
+            scattered_counts = torch.distributed.tensor.DTensor.from_local(
+                physical_scattered_counts,
+                device_mesh=local_expert_counts_LE.device_mesh,
+                placements=local_expert_counts_LE.placements,
+                run_check=False,
+                shape=torch.Size(scattered_shape),
+                stride=physical_scattered_counts.stride(),
+            )
+        else:
+            scattered_counts = physical_scattered_counts
+        scattered_counts = _global_moe_expert_counts(scattered_counts, parallel_dims)
+        global_expert_counts_LE = scattered_counts.sum(dim=0)
+        ep_group_expert_counts_LE = (
+            scattered_counts.to_local()[ep_group_index]
+            if isinstance(scattered_counts, torch.distributed.tensor.DTensor)
+            else scattered_counts[ep_group_index]
+        )
+    else:
+        global_expert_counts_LE = _global_moe_expert_counts(
+            local_expert_counts_LE,
+            parallel_dims,
+        )
+
+    if logging_enabled:
+        if router_step_buffers is None:
+            raise RuntimeError("router step buffers were not initialized")
+        log_router_statistics(
+            moe_layers,
+            local_tokens_per_expert_by_layer=local_expert_counts_by_layer,
+            ep_group_tokens_per_expert_by_layer=ep_group_expert_counts_LE,
+            global_tokens_per_expert_by_layer=global_expert_counts_LE,
+            entropy_logits_sum_LE=router_step_buffers.entropy_logits_sum_LE,
+            entropy_token_count_L1=router_step_buffers.entropy_token_count_L1,
+            sequence_expert_counts_LSE=(router_step_buffers.sequence_expert_counts_LSE),
+            recorded_sequence_count_L1=(router_step_buffers.recorded_sequence_count_L1),
+            parallel_dims=parallel_dims,
+        )
+
+    with torch.no_grad():
+        for moe, global_expert_counts_E in zip(
+            moe_layers,
+            global_expert_counts_LE,
+            strict=True,
+        ):
+            load_balance_coeff = moe.load_balance_coeff
+            if load_balance_coeff is not None:
+                # sign(sum - numel * count) == sign(mean - count), while keeping
+                # the operational counts in exact int64 arithmetic.
+                load_balance_sign_E = torch.sign(
+                    global_expert_counts_E.sum()
+                    - global_expert_counts_E.numel() * global_expert_counts_E
+                )
+                expert_bias_delta_E = load_balance_coeff * load_balance_sign_E
+                expert_bias_delta_E -= expert_bias_delta_E.mean()
+                assert moe.expert_bias_E is not None
+                moe.expert_bias_E.add_(expert_bias_delta_E)
+            moe.tokens_per_expert_E.zero_()
+            moe.discard_router_step_state()
+
+
 def register_moe_load_balancing_hook(
     optimizers: OptimizersContainer,
     model_parts: list[nn.Module],
     parallel_dims: ParallelDims,
 ) -> None:
-    """Register an optimizer step pre-hook for MoE auxiliary-loss-free load balancing.
-
-    This function checks if MoE load balancing is enabled and, if so, registers
-    a hook that updates expert biases before each optimizer step.
+    """Consume every MoE layer's complete router window before optimizer steps.
 
     Args:
-        optimizers: The optimizers container to register the hook on.
-        model_parts: List of model parts that may contain MoE layers.
-        parallel_dims: Parallel dimensions for distributed communication.
+        optimizers: Optimizers that own the pre-step hook.
+        model_parts: Local model or PP parts containing MoE layers.
+        parallel_dims: Meshes used to reconstruct global router populations.
+
+    Example:
+
+        register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
+        # Every later `optimizers.step()` drains one gradient-accumulation window.
     """
 
-    def _iter_moe_layers(
-        model_parts: list[nn.Module],
-    ) -> Iterator[tuple[nn.Module, _MoELike]]:
-        for model_part in model_parts:
-            layers = model_part.get_submodule("layers")
-            assert isinstance(layers, nn.ModuleDict)
-            for transformer_block in layers.values():
-                if getattr(transformer_block, "moe_enabled", False):
-                    yield transformer_block, cast(_MoELike, transformer_block.moe)
-
-    def _should_register_moe_balancing_hook(model_parts: list[nn.Module]) -> bool:
-        moe_layers = list(_iter_moe_layers(model_parts))
-        if not moe_layers:
-            return False
-
-        load_balance_enabled = moe_layers[0][1].load_balance_coeff is not None
-        for _transformer_block, moe in moe_layers[1:]:
-            if (moe.load_balance_coeff is not None) != load_balance_enabled:
-                raise ValueError(
-                    "MoE load_balance_coeff must be configured consistently "
-                    "across all MoE layers. Either set it for every MoE layer "
-                    "or leave it unset for all MoE layers."
-                )
-        return load_balance_enabled
-
-    # for MoE auxiliary-loss-free load balancing
-    def _is_recomputation_enabled(module):
-        return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
-
-    def _update_expert_bias(
-        model_parts: list[nn.Module],
-        parallel_dims: ParallelDims,
-    ):
-        loss_mesh = parallel_dims.get_optional_mesh("loss")
-        # TODO: Currently this sync is blocking (thus exposed) and happens on the
-        # default compute stream. Need to assess if this is OK performance-wise.
-        tokens_per_expert_E_list = []
-        dtensor_mesh = None
-        for transformer_block, moe in _iter_moe_layers(model_parts):
-            tokens_per_expert_E = moe.tokens_per_expert_E
-            if isinstance(tokens_per_expert_E, torch.distributed.tensor.DTensor):
-                dtensor_mesh = tokens_per_expert_E.device_mesh
-                tokens_per_expert_E = tokens_per_expert_E.to_local()
-            if _is_recomputation_enabled(transformer_block):
-                # TODO: This is a hack, we assume with full AC, the tokens_per_expert_E is counted twice.
-                # This does not affect to expert choice, but affects the experts usage metrics.
-                # We divide by 2 to correct for this double-counting due to recomputation
-                # TODO: new API to help determine if AC is enabled https://github.com/pytorch/pytorch/pull/160888
-                tokens_per_expert_E = tokens_per_expert_E // 2
-            tokens_per_expert_E_list.append(tokens_per_expert_E)
-
-        if not tokens_per_expert_E_list:
-            return
-
-        tokens_per_expert_E_by_layer = torch.vstack(tokens_per_expert_E_list)
-
-        if parallel_dims.ep_enabled and parallel_dims.tp > 1:
-            torch.distributed.all_reduce(
-                tokens_per_expert_E_by_layer,
-                group=parallel_dims.get_mesh("tp").get_group(),
-            )
-        if loss_mesh is not None:
-            torch.distributed.all_reduce(
-                tokens_per_expert_E_by_layer,
-                group=loss_mesh.get_group(),
-                op=torch.distributed.ReduceOp.SUM,
-            )
-        if dtensor_mesh is not None:
-            tokens_per_expert_E_by_layer = torch.distributed.tensor.DTensor.from_local(
-                tokens_per_expert_E_by_layer,
-                device_mesh=dtensor_mesh,
-                placements=[Replicate()] * dtensor_mesh.ndim,
-                run_check=False,
-            )
-
-        moe_layer_idx = 0
-        with torch.no_grad():
-            for model_part in model_parts:
-                layers = model_part.get_submodule("layers")
-                assert isinstance(layers, nn.ModuleDict)
-                for transformer_block in layers.values():
-                    if not transformer_block.moe_enabled:
-                        continue
-                    moe = cast(_MoELike, transformer_block.moe)
-                    load_balance_coeff = moe.load_balance_coeff
-                    assert load_balance_coeff is not None
-
-                    tokens_per_expert_E = tokens_per_expert_E_by_layer[
-                        moe_layer_idx
-                    ].float()
-                    moe_layer_idx += 1
-
-                    # update the expert bias
-                    # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
-                    expert_bias_delta_E = load_balance_coeff * torch.sign(
-                        tokens_per_expert_E.mean() - tokens_per_expert_E
-                    )
-                    expert_bias_delta_E = (
-                        expert_bias_delta_E - expert_bias_delta_E.mean()
-                    )
-                    moe.expert_bias_E.add_(expert_bias_delta_E)
-                    moe.tokens_per_expert_E.zero_()
-
-    if _should_register_moe_balancing_hook(model_parts):
-        optimizers.register_step_pre_hook(
-            lambda *args, **kwargs: _update_expert_bias(
-                model_parts, parallel_dims=parallel_dims
-            )
+    moe_layers = list(_iter_moe_layers(model_parts))
+    if not moe_layers:
+        return
+    _validate_moe_layer_shapes(moe_layers)
+    load_balancing_enabled = _moe_load_balancing_enabled(moe_layers)
+    local_expert_counts_LE = torch.stack(
+        [moe.tokens_per_expert_E for moe in moe_layers]
+    )
+    router_step_buffers = _stack_router_step_buffers(moe_layers)
+    optimizers.register_step_pre_hook(
+        lambda *_args, **_kwargs: _consume_moe_router_step(
+            moe_layers=moe_layers,
+            local_expert_counts_LE=local_expert_counts_LE,
+            router_step_buffers=router_step_buffers,
+            parallel_dims=parallel_dims,
+            load_balancing_enabled=load_balancing_enabled,
         )
+    )
