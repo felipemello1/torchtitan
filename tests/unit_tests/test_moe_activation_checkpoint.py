@@ -22,7 +22,7 @@ from torchtitan.experiments.graph_trainer.selective_activation_remat import (
 from torchtitan.models.common.moe import MoE
 from torchtitan.observability import tensor_logging
 from torchtitan.observability.tensor_logging.runtime import (
-    _include_tensor_logging_calls_for_capture,
+    _wrap_fwd_bwd_for_tensor_logging_capture,
 )
 
 
@@ -131,7 +131,7 @@ def _run(policy) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         policy.build().apply(root)
 
     value = torch.randn(2, 3, 4, requires_grad=True)
-    state = tensor_logging.init(root)
+    state = tensor_logging.init(root, device=torch.device("cpu"))
     try:
         with tensor_logging.set_enabled(True):
             root(value).sum().backward()
@@ -187,15 +187,13 @@ def test_source_moe_router_window_appends_only_selected_forwards() -> None:
         [[[0.0, 0.0, 4.0, 0.0]], [[0.0, 0.0, 0.0, 4.0]]],
         requires_grad=True,
     )
-    state = tensor_logging.init(moe)
+    state = tensor_logging.init(moe, device=torch.device("cpu"))
     try:
         # Graph capture includes the call on every replay; the device flag decides
         # whether this optimizer step contributes to the metric window.
-        with (
-            _include_tensor_logging_calls_for_capture(),
-            tensor_logging.set_enabled(False),
-        ):
-            moe(forward_1)
+        captured_forward = _wrap_fwd_bwd_for_tensor_logging_capture(moe)
+        with tensor_logging.set_enabled(False):
+            captured_forward(forward_1)
         with tensor_logging.set_enabled(True):
             moe(forward_1)
             moe(forward_2)
@@ -324,7 +322,7 @@ def test_source_moe_expert_counts_are_exact_under_graph_remat(device: str) -> No
     graph_root.load_state_dict(eager_root.state_dict())
     value = torch.randn(2, 3, 4, device=device, requires_grad=True)
 
-    eager_state = tensor_logging.init(eager_root)
+    eager_state = tensor_logging.init(eager_root, device=torch.device(device))
     try:
         eager_value = value.clone().requires_grad_()
         with tensor_logging.set_enabled(True):
@@ -347,7 +345,7 @@ def test_source_moe_expert_counts_are_exact_under_graph_remat(device: str) -> No
         gradients = torch.autograd.grad(loss, tuple(graph_root.parameters()))
         return [loss, *gradients]
 
-    graph_state = tensor_logging.init(graph_root)
+    graph_state = tensor_logging.init(graph_root, device=torch.device(device))
     try:
         with tensor_logging.set_enabled(True):
             traced = minimal_fx_tracer(

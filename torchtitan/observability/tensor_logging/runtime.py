@@ -198,7 +198,7 @@ def is_enabled() -> bool:
 def _device_write_enabled() -> torch.Tensor:
     """Return the device flag used by captured metric mutations."""
 
-    return _state().statistic_buffers.enabled
+    return _get_state().statistic_buffers.enabled
 
 
 def should_run_logging_calls() -> bool:

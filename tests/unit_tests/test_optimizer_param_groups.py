@@ -319,7 +319,7 @@ class TestParamGroupConfig(unittest.TestCase):
             return local_counts_by_layer
 
         with unittest.mock.patch(
-            "torchtitan.components.optimizer._global_moe_expert_counts",
+            "torchtitan.components.optimizer.optimizer._global_moe_expert_counts",
             side_effect=capture_stack,
         ):
             register_moe_load_balancing_hook(container, [model], FakeParallelDims())
@@ -366,11 +366,11 @@ class TestParamGroupConfig(unittest.TestCase):
             )
 
         with unittest.mock.patch(
-            "torchtitan.components.optimizer.log_router_statistics",
+            "torchtitan.components.optimizer.optimizer.log_router_statistics",
             side_effect=capture_router_stacks,
         ):
             register_moe_load_balancing_hook(container, [model], FakeParallelDims())
-            runtime = init(model)
+            runtime = init(model, device=torch.device("cpu"))
             try:
                 with set_enabled(True):
                     container.step()
@@ -406,7 +406,7 @@ class TestParamGroupConfig(unittest.TestCase):
         for local_counts in (torch.tensor([30, 10]), torch.tensor([10, 30])):
             model = FakeMoEModel()
             moe = model.layers["0"].moe
-            runtime = init(model)
+            runtime = init(model, device=torch.device("cpu"))
             try:
                 with set_enabled(True):
                     log_router_statistics(
@@ -446,7 +446,7 @@ class TestParamGroupConfig(unittest.TestCase):
         ).build(model_parts=[model])
         parallel_dims = FakeEPParallelDims()
         register_moe_load_balancing_hook(container, [model], parallel_dims)
-        runtime = init(model)
+        runtime = init(model, device=torch.device("cpu"))
 
         def reconstruct_groups(scattered_counts, _parallel_dims):
             expected = torch.zeros(4, 2, 2, dtype=torch.int64)
@@ -461,7 +461,7 @@ class TestParamGroupConfig(unittest.TestCase):
         try:
             with (
                 unittest.mock.patch(
-                    "torchtitan.components.optimizer._global_moe_expert_counts",
+                    "torchtitan.components.optimizer.optimizer._global_moe_expert_counts",
                     side_effect=reconstruct_groups,
                 ) as reconstruct,
                 set_enabled(True),
@@ -486,7 +486,7 @@ class TestParamGroupConfig(unittest.TestCase):
             param_groups=[_DEFAULT_ADAMW],
         ).build(model_parts=[model])
         register_moe_load_balancing_hook(container, [model], FakeParallelDims())
-        runtime = init(model)
+        runtime = init(model, device=torch.device("cpu"))
         try:
             with set_enabled(True):
                 container.step()
@@ -520,7 +520,7 @@ class TestParamGroupConfig(unittest.TestCase):
             param_groups=[_DEFAULT_ADAMW],
         ).build(model_parts=[model])
         register_moe_load_balancing_hook(container, [model], FakeParallelDims())
-        runtime = init(model)
+        runtime = init(model, device=torch.device("cpu"))
         try:
             with set_enabled(True):
                 container.step()
@@ -598,7 +598,7 @@ class TestParamGroupConfig(unittest.TestCase):
         )
         container = config.build(model_parts=[model])
         register_moe_load_balancing_hook(container, [model], FakeParallelDims())
-        runtime = init(model)
+        runtime = init(model, device=torch.device("cpu"))
         try:
             with set_enabled(True):
                 container.step()
@@ -655,7 +655,7 @@ class TestParamGroupConfig(unittest.TestCase):
         )
         container = config.build(model_parts=[model])
         register_moe_load_balancing_hook(container, [model], FakeParallelDims())
-        runtime = init(model)
+        runtime = init(model, device=torch.device("cpu"))
         try:
             with set_enabled(True):
                 container.step()

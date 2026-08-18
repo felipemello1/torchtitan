@@ -688,12 +688,15 @@ def test_router_statistic_computation_respects_eager_cadence() -> None:
     register(router, ["router_logits", "router_scores_for_topk"])
     router._entropy_logits_sum_E = torch.zeros(2, device="cuda")
     router._entropy_logits_count = torch.zeros(1, dtype=torch.int64, device="cuda")
-    runtime = init(router)
+    runtime = init(router, device=torch.device("cuda"))
     try:
         # Captured graphs keep the mutation op on unselected steps. Its device
         # gate must discard nonfinite values rather than multiplying them by zero.
-        with set_enabled(False), _include_tensor_logging_calls_for_capture():
-            router(nonfinite_value)
+        record_nonfinite = _wrap_fwd_bwd_for_tensor_logging_capture(
+            lambda: router(nonfinite_value)
+        )
+        with set_enabled(False):
+            record_nonfinite()
         assert router._entropy_logits_sum_E.tolist() == [0.0, 0.0]
         assert router._entropy_logits_count.item() == 0
         assert runtime.snapshot_unreduced_statistics()["router_logits"][
@@ -726,14 +729,16 @@ def test_router_statistics_survive_capture_on_an_unselected_step() -> None:
     register(router, ["router_logits", "router_scores_for_topk"])
     router._entropy_logits_sum_E = torch.zeros(4, device="cuda")
     router._entropy_logits_count = torch.zeros(1, dtype=torch.int64, device="cuda")
-    runtime = init(router)
+    runtime = init(router, device=torch.device("cuda"))
     value = torch.randn(2, 3, 8, device="cuda")
 
     def step(input_value: torch.Tensor):
-        with _include_tensor_logging_calls_for_capture():
-            return router(input_value, None)
+        return router(input_value, None)
 
-    wrapped = CUDAGraphWrapper(step, (value,))
+    wrapped = CUDAGraphWrapper(
+        _wrap_fwd_bwd_for_tensor_logging_capture(step),
+        (value,),
+    )
     try:
         with set_enabled(False):
             wrapped(value)  # warmup
