@@ -6,6 +6,7 @@
 
 from dataclasses import fields
 
+from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.experiments.graph_trainer.graph_pp.pipeline import graph_pipeline_llm
 from torchtitan.models.qwen3 import qwen3_configs
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
@@ -36,6 +37,6 @@ def model_registry(
         model=config,
         parallelize_fn=parallelize_qwen3,
         pipelining_fn=graph_pipeline_llm,
-        post_optimizer_build_fn=None,
+        post_optimizer_build_fn=register_moe_load_balancing_hook,
         state_dict_adapter=Qwen3StateDictAdapter,
     )
