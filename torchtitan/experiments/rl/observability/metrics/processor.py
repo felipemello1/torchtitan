@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -218,9 +219,18 @@ class MetricsProcessor(Configurable):
 
     def close(self) -> None:
         for backend in self._backends:
+            backend_name = type(backend).__name__
+            start = time.perf_counter()
+            logger.info("[teardown] metric backend %s close start", backend_name)
             try:
                 backend.close()
             except Exception:
                 logger.exception(
-                    "metric backend %s failed to close", type(backend).__name__
+                    "metric backend %s failed to close", backend_name
+                )
+            finally:
+                logger.info(
+                    "[teardown] metric backend %s close finished in %.3fs",
+                    backend_name,
+                    time.perf_counter() - start,
                 )
