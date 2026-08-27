@@ -160,6 +160,77 @@ def test_async_loop_config_handles_window_fraction_bounds() -> None:
     assert async_loop.window_size == 1
 
 
+class _FakeBootstrapCommand:
+    def __init__(self) -> None:
+        self.program = "/test/python"
+        self.args = ["-m", "bootstrap"]
+        self.env = {}
+
+    def with_env(self, env):
+        self.env.update(env)
+        return self
+
+
+class _FakeHostMesh:
+    def __init__(self) -> None:
+        self.spawn_kwargs = None
+
+    def __len__(self):
+        return 1
+
+    def spawn_procs(self, **kwargs):
+        self.spawn_kwargs = kwargs
+        return "proc_mesh"
+
+
+def test_slurm_proc_spawn_removes_hostname_before_python(monkeypatch) -> None:
+    host_mesh = _FakeHostMesh()
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    monkeypatch.setattr(
+        train, "default_bootstrap_cmd", lambda: _FakeBootstrapCommand()
+    )
+
+    proc_mesh = train._spawn_proc_mesh(
+        host_mesh,
+        role_world_size=1,
+        gpus_per_node=1,
+        bootstrap=lambda: None,
+        role="trainer",
+    )
+
+    assert proc_mesh == "proc_mesh"
+    command = host_mesh.spawn_kwargs["bootstrap_command"]
+    assert command.program == "/usr/bin/env"
+    assert command.args == [
+        "-u",
+        "HOSTNAME",
+        "/test/python",
+        "-m",
+        "bootstrap",
+    ]
+    assert command.env == {"CUDA_VISIBLE_DEVICES": "0"}
+
+
+def test_non_slurm_proc_spawn_keeps_default_command(monkeypatch) -> None:
+    host_mesh = _FakeHostMesh()
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.setattr(
+        train, "default_bootstrap_cmd", lambda: _FakeBootstrapCommand()
+    )
+
+    train._spawn_proc_mesh(
+        host_mesh,
+        role_world_size=1,
+        gpus_per_node=1,
+        bootstrap=lambda: None,
+        role="trainer",
+    )
+
+    command = host_mesh.spawn_kwargs["bootstrap_command"]
+    assert command.program == "/test/python"
+    assert command.args == ["-m", "bootstrap"]
+
+
 def _make_stub_rl_trainer():
     """Create an Controller with a minimal stub config (no VLLMGenerator validation)."""
     from torchtitan.experiments.rl.observability import metrics as m
