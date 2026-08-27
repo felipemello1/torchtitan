@@ -181,23 +181,23 @@ def _spawn_proc_mesh(
     provisioner = PerHostProvisioner(total_gpus=gpus_per_node)
     env = provisioner.allocate(role_gpus_per_node, extra_env=extra_env)
     bootstrap_command = default_bootstrap_cmd().with_env(env)
-    if "SLURM_JOB_ID" in os.environ:
-        # The Monarch workers inherit the batch node's HOSTNAME and would pass
-        # that same value to processes on every node. Strip it before Python
-        # starts so TorchStore initializes it from socket.gethostname().
-        logger.info(
-            "Launching %s processes without inherited HOSTNAME",
-            role,
-        )
-        python_program = bootstrap_command.program
-        python_args = bootstrap_command.args or []
-        bootstrap_command.program = "/usr/bin/env"
-        bootstrap_command.args = [
-            "-u",
-            "HOSTNAME",
-            python_program,
-            *python_args,
-        ]
+    # Remote workers may pass their own HOSTNAME to processes on other nodes.
+    # Strip it before Python starts so TorchStore initializes it from
+    # socket.gethostname(). This also covers an external Slurm controller,
+    # which does not itself have SLURM_JOB_ID set.
+    logger.info(
+        "Launching %s processes without inherited HOSTNAME",
+        role,
+    )
+    python_program = bootstrap_command.program
+    python_args = bootstrap_command.args or []
+    bootstrap_command.program = "/usr/bin/env"
+    bootstrap_command.args = [
+        "-u",
+        "HOSTNAME",
+        python_program,
+        *python_args,
+    ]
     return host_mesh.spawn_procs(
         per_host={"gpus": role_gpus_per_node},
         bootstrap=bootstrap,

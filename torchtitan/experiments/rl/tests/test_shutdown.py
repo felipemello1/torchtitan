@@ -183,9 +183,8 @@ class _FakeHostMesh:
         return "proc_mesh"
 
 
-def test_slurm_proc_spawn_removes_hostname_before_python(monkeypatch) -> None:
+def test_remote_proc_spawn_removes_hostname_before_python(monkeypatch) -> None:
     host_mesh = _FakeHostMesh()
-    monkeypatch.setenv("SLURM_JOB_ID", "123")
     monkeypatch.setattr(
         train, "default_bootstrap_cmd", lambda: _FakeBootstrapCommand()
     )
@@ -209,26 +208,6 @@ def test_slurm_proc_spawn_removes_hostname_before_python(monkeypatch) -> None:
         "bootstrap",
     ]
     assert command.env == {"CUDA_VISIBLE_DEVICES": "0"}
-
-
-def test_non_slurm_proc_spawn_keeps_default_command(monkeypatch) -> None:
-    host_mesh = _FakeHostMesh()
-    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
-    monkeypatch.setattr(
-        train, "default_bootstrap_cmd", lambda: _FakeBootstrapCommand()
-    )
-
-    train._spawn_proc_mesh(
-        host_mesh,
-        role_world_size=1,
-        gpus_per_node=1,
-        bootstrap=lambda: None,
-        role="trainer",
-    )
-
-    command = host_mesh.spawn_kwargs["bootstrap_command"]
-    assert command.program == "/test/python"
-    assert command.args == ["-m", "bootstrap"]
 
 
 def _make_stub_rl_trainer():
