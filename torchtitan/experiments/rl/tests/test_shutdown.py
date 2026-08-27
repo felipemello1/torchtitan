@@ -160,24 +160,52 @@ def test_async_loop_config_handles_window_fraction_bounds() -> None:
     assert async_loop.window_size == 1
 
 
-def test_normalize_slurm_hostname_uses_runtime_host(monkeypatch) -> None:
-    monkeypatch.setenv("SLURM_JOB_ID", "123")
-    monkeypatch.setenv("HOSTNAME", "submission-node")
-    monkeypatch.setattr(train.socket, "gethostname", lambda: "worker-node")
+class _FakeBootstrapCommand:
+    def __init__(self) -> None:
+        self.program = "/test/python"
+        self.args = ["-m", "bootstrap"]
+        self.env = {}
 
-    train._normalize_slurm_hostname()
+    def with_env(self, env):
+        self.env.update(env)
+        return self
 
-    assert train.os.environ["HOSTNAME"] == "worker-node"
+
+class _FakeHostMesh:
+    def __init__(self) -> None:
+        self.spawn_kwargs = None
+
+    def __len__(self):
+        return 1
+
+    def spawn_procs(self, **kwargs):
+        self.spawn_kwargs = kwargs
+        return "proc_mesh"
 
 
-def test_normalize_slurm_hostname_does_not_change_non_slurm_env(monkeypatch) -> None:
-    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
-    monkeypatch.setenv("HOSTNAME", "container-name")
-    monkeypatch.setattr(train.socket, "gethostname", lambda: "kernel-name")
+def test_remote_proc_spawn_removes_hostname_before_python(monkeypatch) -> None:
+    host_mesh = _FakeHostMesh()
+    monkeypatch.setattr(train, "default_bootstrap_cmd", lambda: _FakeBootstrapCommand())
 
-    train._normalize_slurm_hostname()
+    proc_mesh = train._spawn_proc_mesh(
+        host_mesh,
+        role_world_size=1,
+        gpus_per_node=1,
+        bootstrap=lambda: None,
+        role="trainer",
+    )
 
-    assert train.os.environ["HOSTNAME"] == "container-name"
+    assert proc_mesh == "proc_mesh"
+    command = host_mesh.spawn_kwargs["bootstrap_command"]
+    assert command.program == "/usr/bin/env"
+    assert command.args == [
+        "-u",
+        "HOSTNAME",
+        "/test/python",
+        "-m",
+        "bootstrap",
+    ]
+    assert command.env == {"CUDA_VISIBLE_DEVICES": "0"}
 
 
 def _make_stub_rl_trainer():
