@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+_ROLLOUT_REQUEST_DRAIN_TIMEOUT_S = 30.0
 
 
 class Rollouter(Configurable):
@@ -122,6 +123,7 @@ class Rollouter(Configurable):
 
         self._worker_actors: RolloutWorkerActor | None = None
         self._worker_mesh: ProcMesh | None = None
+        self._inflight_rollout_groups: set[asyncio.Future[RolloutGroup]] = set()
 
     # TODO: revisit this abstraction: should it return a sample or a dataset or an iterator?
     def get_training_sample(self) -> object:
@@ -163,9 +165,29 @@ class Rollouter(Configurable):
         """Stop the owned rollout worker proc mesh."""
         worker_mesh = self._worker_mesh
         self._worker_actors = None
-        self._worker_mesh = None
+        requests = tuple(self._inflight_rollout_groups)
+        if requests:
+            done, pending = await asyncio.wait(
+                requests,
+                timeout=_ROLLOUT_REQUEST_DRAIN_TIMEOUT_S,
+            )
+            await asyncio.gather(*done, return_exceptions=True)
+            if pending:
+                logger.warning(
+                    "Forcing rollout worker shutdown with %d requests pending",
+                    len(pending),
+                )
+                for request in pending:
+                    request.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
         if worker_mesh is not None:
             await worker_mesh.stop()
+            self._worker_mesh = None
+
+    def _on_rollout_request_done(self, request: asyncio.Future[RolloutGroup]) -> None:
+        self._inflight_rollout_groups.discard(request)
+        if not request.cancelled():
+            request.exception()
 
     async def sync_log_step(self, step: int) -> None:
         """Propagate the controller log step to every rollout worker."""
@@ -202,13 +224,18 @@ class Rollouter(Configurable):
 
         # Use Monarch `choose` API to randomly select an actor in the mesh, and
         # send the message to its `run_group` endpoint.
-        return await self._worker_actors.run_group.choose(
-            generate_fn=generate_fn,
-            sample=sample,
-            group_id=group_id,
-            group_size=group_size,
-            sampling=sampling,
+        request = asyncio.ensure_future(
+            self._worker_actors.run_group.choose(
+                generate_fn=generate_fn,
+                sample=sample,
+                group_id=group_id,
+                group_size=group_size,
+                sampling=sampling,
+            )
         )
+        self._inflight_rollout_groups.add(request)
+        request.add_done_callback(self._on_rollout_request_done)
+        return await asyncio.shield(request)
 
 
 class RolloutWorker(Configurable):
