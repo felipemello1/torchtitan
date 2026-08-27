@@ -25,7 +25,6 @@ python3 -m torchtitan.experiments.rl.train \
 import asyncio
 import logging
 import os
-import socket
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -39,22 +38,6 @@ from torchtitan.tools.logging import init_logger
 
 
 logger = logging.getLogger(__name__)
-
-
-def _normalize_slurm_hostname() -> None:
-    """Replace a Slurm-inherited hostname with this process's actual host."""
-    if "SLURM_JOB_ID" not in os.environ:
-        return
-
-    runtime_hostname = socket.gethostname()
-    inherited_hostname = os.environ.get("HOSTNAME")
-    os.environ["HOSTNAME"] = runtime_hostname
-    if inherited_hostname != runtime_hostname:
-        logger.warning(
-            "Corrected inherited HOSTNAME from %r to runtime hostname %r",
-            inherited_hostname,
-            runtime_hostname,
-        )
 
 
 def breakable_cudagraph_env(generator_cfg) -> dict[str, str]:
@@ -81,7 +64,6 @@ def breakable_cudagraph_env(generator_cfg) -> dict[str, str]:
 
 def _preimport_torch() -> None:
     """``bootstrap`` setup callable: pre-import torch on the spawned proc."""
-    _normalize_slurm_hostname()
     # TODO: Remove once Monarch/PyTorch fixes concurrent import during unpickling.
     import torch  # noqa: F401
 
@@ -198,10 +180,28 @@ def _spawn_proc_mesh(
     role_gpus_per_node = role_world_size // nodes
     provisioner = PerHostProvisioner(total_gpus=gpus_per_node)
     env = provisioner.allocate(role_gpus_per_node, extra_env=extra_env)
+    bootstrap_command = default_bootstrap_cmd().with_env(env)
+    if "SLURM_JOB_ID" in os.environ:
+        # The Monarch workers inherit the batch node's HOSTNAME and would pass
+        # that same value to processes on every node. Strip it before Python
+        # starts so TorchStore initializes it from socket.gethostname().
+        logger.info(
+            "Launching %s processes without inherited HOSTNAME",
+            role,
+        )
+        python_program = bootstrap_command.program
+        python_args = bootstrap_command.args or []
+        bootstrap_command.program = "/usr/bin/env"
+        bootstrap_command.args = [
+            "-u",
+            "HOSTNAME",
+            python_program,
+            *python_args,
+        ]
     return host_mesh.spawn_procs(
         per_host={"gpus": role_gpus_per_node},
         bootstrap=bootstrap,
-        bootstrap_command=default_bootstrap_cmd().with_env(env),
+        bootstrap_command=bootstrap_command,
     )
 
 
