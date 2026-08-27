@@ -321,7 +321,11 @@ async def run(
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Interrupted; attempting graceful shutdown...")
     finally:
+        sl.log_trace_instant("teardown_train_run_close_start")
+        logger.info("[teardown] train.run entering controller.close")
         await rl_trainer.close()
+        logger.info("[teardown] train.run controller.close returned")
+        sl.log_trace_instant("teardown_train_run_close_finished")
 
 
 async def main():

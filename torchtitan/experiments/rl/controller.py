@@ -477,20 +477,47 @@ class Controller(Configurable):
 
     async def close(self):
         """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
-        logger.info("Closing: tearing down actors and process meshes.")
+        close_start = time.perf_counter()
+        sl.log_trace_instant("teardown_controller_close_start")
+        logger.info(
+            "[teardown] controller.close start: trainer=%s generator_router=%s meshes=%d",
+            self.trainer is not None,
+            self.generator_router is not None,
+            len(self._proc_meshes),
+        )
 
         if self.trainer is not None:
+            phase_start = time.perf_counter()
+            logger.info("[teardown] trainer.close start")
             try:
                 await self.trainer.close.call()
             except Exception:
                 logger.exception("trainer.close failed")
+            finally:
+                phase_elapsed = time.perf_counter() - phase_start
+                logger.info(
+                    "[teardown] trainer.close finished in %.3fs",
+                    phase_elapsed,
+                )
+                sl.log_trace_scalar({"timing/teardown/trainer_close": phase_elapsed})
 
+        phase_start = time.perf_counter()
+        logger.info("[teardown] rollouter.close start")
         try:
             await self._rollouter.close()
         except Exception:
             logger.exception("rollouter.close failed")
+        finally:
+            phase_elapsed = time.perf_counter() - phase_start
+            logger.info(
+                "[teardown] rollouter.close finished in %.3fs",
+                phase_elapsed,
+            )
+            sl.log_trace_scalar({"timing/teardown/rollouter_close": phase_elapsed})
 
         if self.generator_router is not None:
+            phase_start = time.perf_counter()
+            logger.info("[teardown] generator_router.close_generators start")
             try:
                 close_results = await self.generator_router.close_generators.call_one()
                 for idx, result in enumerate(close_results):
@@ -507,18 +534,57 @@ class Controller(Configurable):
                         )
             except Exception:
                 logger.exception("generator_router.close_generators failed")
+            finally:
+                phase_elapsed = time.perf_counter() - phase_start
+                logger.info(
+                    "[teardown] generator_router.close_generators finished in %.3fs",
+                    phase_elapsed,
+                )
+                sl.log_trace_scalar(
+                    {"timing/teardown/generator_router_close": phase_elapsed}
+                )
 
+        phase_start = time.perf_counter()
+        logger.info("[teardown] metrics_processor.close start")
         try:
             self.metrics_processor.close()
         except Exception:
             logger.exception("metrics_processor close failed")
+        finally:
+            phase_elapsed = time.perf_counter() - phase_start
+            logger.info(
+                "[teardown] metrics_processor.close finished in %.3fs",
+                phase_elapsed,
+            )
+            sl.log_trace_scalar(
+                {"timing/teardown/metrics_processor_close": phase_elapsed}
+            )
 
         for i, mesh in enumerate(self._proc_meshes):
+            phase_start = time.perf_counter()
+            logger.info("[teardown] mesh.stop[%d] start: %r", i, mesh)
             try:
                 await mesh.stop()
             except Exception:
                 logger.exception("mesh.stop[%d] failed", i)
+            finally:
+                phase_elapsed = time.perf_counter() - phase_start
+                logger.info(
+                    "[teardown] mesh.stop[%d] finished in %.3fs",
+                    i,
+                    phase_elapsed,
+                )
+                sl.log_trace_scalar(
+                    {f"timing/teardown/mesh_stop_{i}": phase_elapsed}
+                )
         self._proc_meshes = []
+        close_elapsed = time.perf_counter() - close_start
+        logger.info(
+            "[teardown] controller.close finished in %.3fs",
+            close_elapsed,
+        )
+        sl.log_trace_scalar({"timing/teardown/controller_close": close_elapsed})
+        sl.log_trace_instant("teardown_controller_close_finished")
 
     def _get_rank_0_value(self, result):
         """Extract rank 0 result from a Monarch ValueMesh.
@@ -956,12 +1022,44 @@ class Controller(Configurable):
         finally:
             # Graceful first: buffer.close() (awaited) wakes loops blocked on the buffer so they return.
             # Then cancel covers anything blocked on the queue (which close does not wake); gather awaits all.
+            shutdown_start = time.perf_counter()
+            sl.log_trace_instant("teardown_async_loops_start")
+            logger.info("[teardown] async loops: group_buffer.close start")
             await self._group_buffer.close()
+            logger.info(
+                "[teardown] async loops: group_buffer.close finished in %.3fs",
+                time.perf_counter() - shutdown_start,
+            )
             for task in (*background_tasks, trainer_task):
+                logger.info(
+                    "[teardown] async loops: cancel task=%s done=%s",
+                    task.get_name(),
+                    task.done(),
+                )
                 task.cancel()
-            await asyncio.gather(
+            logger.info("[teardown] async loops: gather cancelled tasks start")
+            results = await asyncio.gather(
                 *background_tasks, trainer_task, return_exceptions=True
             )
+            for task, result in zip(
+                (*background_tasks, trainer_task), results, strict=True
+            ):
+                logger.info(
+                    "[teardown] async loops: task=%s result=%s",
+                    task.get_name(),
+                    type(result).__name__,
+                )
+            logger.info(
+                "[teardown] async loops finished in %.3fs",
+                time.perf_counter() - shutdown_start,
+            )
+            sl.log_trace_scalar(
+                {
+                    "timing/teardown/async_loops": time.perf_counter()
+                    - shutdown_start
+                }
+            )
+            sl.log_trace_instant("teardown_async_loops_finished")
 
         # Post-training validation (held-out eval after the final step).
         post_validation = await self._validate_and_log(step=num_training_steps)

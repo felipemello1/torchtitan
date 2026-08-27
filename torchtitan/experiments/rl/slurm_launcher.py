@@ -237,14 +237,18 @@ def main() -> None:
     if maybe_submit_batch_job(tws, gws, config.num_generators):
         return
     host_meshes = acquire_host_meshes(tws, gws, config.num_generators)
-    asyncio.run(
-        run(
-            config,
-            trainer_world_size=tws,
-            per_generator_world_size=gws,
-            host_meshes=host_meshes,
+    logger.info("Starting RL controller run")
+    try:
+        asyncio.run(
+            run(
+                config,
+                trainer_world_size=tws,
+                per_generator_world_size=gws,
+                host_meshes=host_meshes,
+            )
         )
-    )
+    finally:
+        logger.info("[teardown] slurm launcher asyncio.run returned")
 
 
 if __name__ == "__main__":

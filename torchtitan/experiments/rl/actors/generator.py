@@ -1392,21 +1392,34 @@ class VLLMGenerator(Actor, Configurable):
         while Monarch is also trying to stop the same actor mesh, so this endpoint only closes
         renderer-local resources and leaves process teardown to `ProcMesh.stop()`.
         """
+        sl.log_trace_instant(f"teardown_generator_rank_{self._rank}_close_start")
+        logger.info("[teardown] generator rank=%d close start", self._rank)
         if self._rank == 0:
+            logger.info("[teardown] generator rank=0 enqueue CLOSE decision")
             async with self._engine_loop_condition:
                 self._close_request = CloseRequest()
                 self._engine_loop_condition.notify()  # wake the loop so it returns CLOSE
 
         # Let the engine loop process the shutdown.
         if self._engine_loop_task is not None:
+            logger.info(
+                "[teardown] generator rank=%d await engine loop", self._rank
+            )
             try:
                 await self._engine_loop_task
             except Exception:
                 logger.exception("engine loop raised during shutdown")
             self._engine_loop_task = None
+            logger.info("[teardown] generator rank=%d engine loop stopped", self._rank)
 
         # Stop the result-drain task on rank 0.
+        logger.info(
+            "[teardown] generator rank=%d dispatcher shutdown start", self._rank
+        )
         await self._request_dispatcher.shutdown()
+        logger.info(
+            "[teardown] generator rank=%d dispatcher shutdown done", self._rank
+        )
 
         # The loop has stopped; fail any futures it left unresolved so awaiting callers get an
         # exception instead of hanging.
@@ -1421,6 +1434,8 @@ class VLLMGenerator(Actor, Configurable):
                 logger.info("Shutting down vLLM renderer")
                 renderer.shutdown()
             self._engine = None
+        logger.info("[teardown] generator rank=%d close finished", self._rank)
+        sl.log_trace_instant(f"teardown_generator_rank_{self._rank}_close_finished")
 
 
 # ===================== helpers =====================
