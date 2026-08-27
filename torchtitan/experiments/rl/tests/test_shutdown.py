@@ -185,9 +185,7 @@ class _FakeHostMesh:
 
 def test_remote_proc_spawn_removes_hostname_before_python(monkeypatch) -> None:
     host_mesh = _FakeHostMesh()
-    monkeypatch.setattr(
-        train, "default_bootstrap_cmd", lambda: _FakeBootstrapCommand()
-    )
+    monkeypatch.setattr(train, "default_bootstrap_cmd", lambda: _FakeBootstrapCommand())
 
     proc_mesh = train._spawn_proc_mesh(
         host_mesh,
