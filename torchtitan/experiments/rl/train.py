@@ -25,7 +25,6 @@ python3 -m torchtitan.experiments.rl.train \
 import asyncio
 import logging
 import os
-import socket
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -39,22 +38,6 @@ from torchtitan.tools.logging import init_logger
 
 
 logger = logging.getLogger(__name__)
-
-
-def _normalize_slurm_hostname() -> None:
-    """Replace a Slurm-inherited hostname with this process's actual host."""
-    if "SLURM_JOB_ID" not in os.environ:
-        return
-
-    runtime_hostname = socket.gethostname()
-    inherited_hostname = os.environ.get("HOSTNAME")
-    os.environ["HOSTNAME"] = runtime_hostname
-    if inherited_hostname != runtime_hostname:
-        logger.warning(
-            "Corrected inherited HOSTNAME from %r to runtime hostname %r",
-            inherited_hostname,
-            runtime_hostname,
-        )
 
 
 def breakable_cudagraph_env(generator_cfg) -> dict[str, str]:
@@ -81,7 +64,6 @@ def breakable_cudagraph_env(generator_cfg) -> dict[str, str]:
 
 def _preimport_torch() -> None:
     """``bootstrap`` setup callable: pre-import torch on the spawned proc."""
-    _normalize_slurm_hostname()
     # TODO: Remove once Monarch/PyTorch fixes concurrent import during unpickling.
     import torch  # noqa: F401
 

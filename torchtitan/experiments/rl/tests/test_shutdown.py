@@ -160,26 +160,6 @@ def test_async_loop_config_handles_window_fraction_bounds() -> None:
     assert async_loop.window_size == 1
 
 
-def test_normalize_slurm_hostname_uses_runtime_host(monkeypatch) -> None:
-    monkeypatch.setenv("SLURM_JOB_ID", "123")
-    monkeypatch.setenv("HOSTNAME", "submission-node")
-    monkeypatch.setattr(train.socket, "gethostname", lambda: "worker-node")
-
-    train._normalize_slurm_hostname()
-
-    assert train.os.environ["HOSTNAME"] == "worker-node"
-
-
-def test_normalize_slurm_hostname_does_not_change_non_slurm_env(monkeypatch) -> None:
-    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
-    monkeypatch.setenv("HOSTNAME", "container-name")
-    monkeypatch.setattr(train.socket, "gethostname", lambda: "kernel-name")
-
-    train._normalize_slurm_hostname()
-
-    assert train.os.environ["HOSTNAME"] == "container-name"
-
-
 def _make_stub_rl_trainer():
     """Create an Controller with a minimal stub config (no VLLMGenerator validation)."""
     from torchtitan.experiments.rl.observability import metrics as m

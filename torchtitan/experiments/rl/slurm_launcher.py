@@ -47,6 +47,32 @@ from torchtitan.experiments.rl.train import (
 logger = logging.getLogger(__name__)
 
 
+def _apply_without_inherited_hostname(
+    job: SlurmJob, *, client_script: str | None = None
+) -> None:
+    """Submit without exporting the submission host's ``HOSTNAME``.
+
+    Slurm exports the submitter's environment by default. If ``HOSTNAME`` is
+    present, every node inherits the same value and libraries that use it for
+    locality decisions can mistake remote nodes for local ones. Omitting it
+    lets each process fall back to its runtime hostname.
+    """
+    inherited_hostname = os.environ.pop("HOSTNAME", None)
+    if inherited_hostname is not None:
+        logger.info(
+            "Removed inherited HOSTNAME=%r before Slurm submission",
+            inherited_hostname,
+        )
+    try:
+        if client_script is None:
+            job.apply()
+        else:
+            job.apply(client_script=client_script)
+    finally:
+        if inherited_hostname is not None:
+            os.environ["HOSTNAME"] = inherited_hostname
+
+
 def _generator_mesh_names(num_generators: int) -> list[str]:
     """Host-mesh names for the generators.
 
@@ -194,7 +220,7 @@ def maybe_submit_batch_job(
     job, _ = _build_slurm_job(
         trainer_world_size, per_generator_world_size, num_generators
     )
-    job.apply(client_script=_self_command())
+    _apply_without_inherited_hostname(job, client_script=_self_command())
     logger.info(
         "Submitted batch allocation %s; the controller runs inside it. Logs under %s",
         job._slurm_job_id,
@@ -224,7 +250,7 @@ def acquire_host_meshes(
     job, gpus_per_node = _build_slurm_job(
         trainer_world_size, per_generator_world_size, num_generators
     )
-    job.apply()
+    _apply_without_inherited_hostname(job)
     return _host_meshes_from_state(job.state(), num_generators, gpus_per_node)
 
 
