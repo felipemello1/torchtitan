@@ -476,7 +476,7 @@ class Controller(Configurable):
         )
 
     async def close(self):
-        """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
+        """Best-effort: tear down actors and meshes, then close metric backends."""
         close_start = time.perf_counter()
         sl.log_trace_instant("teardown_controller_close_start")
         logger.info(
@@ -491,6 +491,8 @@ class Controller(Configurable):
             logger.info("[teardown] trainer.close start")
             try:
                 await self.trainer.close.call()
+            except asyncio.CancelledError:
+                logger.exception("trainer.close cancelled; continuing teardown")
             except Exception:
                 logger.exception("trainer.close failed")
             finally:
@@ -500,20 +502,6 @@ class Controller(Configurable):
                     phase_elapsed,
                 )
                 sl.log_trace_scalar({"timing/teardown/trainer_close": phase_elapsed})
-
-        phase_start = time.perf_counter()
-        logger.info("[teardown] rollouter.close start")
-        try:
-            await self._rollouter.close()
-        except Exception:
-            logger.exception("rollouter.close failed")
-        finally:
-            phase_elapsed = time.perf_counter() - phase_start
-            logger.info(
-                "[teardown] rollouter.close finished in %.3fs",
-                phase_elapsed,
-            )
-            sl.log_trace_scalar({"timing/teardown/rollouter_close": phase_elapsed})
 
         if self.generator_router is not None:
             phase_start = time.perf_counter()
@@ -532,6 +520,10 @@ class Controller(Configurable):
                             actor_name,
                             exc_info=(type(result), result, result.__traceback__),
                         )
+            except asyncio.CancelledError:
+                logger.exception(
+                    "generator_router.close_generators cancelled; continuing teardown"
+                )
             except Exception:
                 logger.exception("generator_router.close_generators failed")
             finally:
@@ -544,6 +536,47 @@ class Controller(Configurable):
                     {"timing/teardown/generator_router_close": phase_elapsed}
                 )
 
+        phase_start = time.perf_counter()
+        logger.info("[teardown] rollouter.close start")
+        try:
+            # Keep rollout workers alive until generator close has resolved or
+            # failed outstanding generation calls back to their callers.
+            await self._rollouter.close()
+        except asyncio.CancelledError:
+            logger.exception("rollouter.close cancelled; continuing teardown")
+        except Exception:
+            logger.exception("rollouter.close failed")
+        finally:
+            phase_elapsed = time.perf_counter() - phase_start
+            logger.info(
+                "[teardown] rollouter.close finished in %.3fs",
+                phase_elapsed,
+            )
+            sl.log_trace_scalar({"timing/teardown/rollouter_close": phase_elapsed})
+
+        for i, mesh in enumerate(self._proc_meshes):
+            phase_start = time.perf_counter()
+            logger.info("[teardown] mesh.stop[%d] start: %r", i, mesh)
+            try:
+                await mesh.stop()
+            except asyncio.CancelledError:
+                logger.exception("mesh.stop[%d] cancelled; continuing teardown", i)
+            except Exception:
+                logger.exception("mesh.stop[%d] failed", i)
+            finally:
+                phase_elapsed = time.perf_counter() - phase_start
+                logger.info(
+                    "[teardown] mesh.stop[%d] finished in %.3fs",
+                    i,
+                    phase_elapsed,
+                )
+                sl.log_trace_scalar(
+                    {f"timing/teardown/mesh_stop_{i}": phase_elapsed}
+                )
+        self._proc_meshes = []
+
+        # W&B may wait on network uploads. Close it only after actor processes
+        # and GPU meshes are gone, and use WANDB_FINISH_TIMEOUT to bound retries.
         phase_start = time.perf_counter()
         logger.info("[teardown] metrics_processor.close start")
         try:
@@ -560,24 +593,6 @@ class Controller(Configurable):
                 {"timing/teardown/metrics_processor_close": phase_elapsed}
             )
 
-        for i, mesh in enumerate(self._proc_meshes):
-            phase_start = time.perf_counter()
-            logger.info("[teardown] mesh.stop[%d] start: %r", i, mesh)
-            try:
-                await mesh.stop()
-            except Exception:
-                logger.exception("mesh.stop[%d] failed", i)
-            finally:
-                phase_elapsed = time.perf_counter() - phase_start
-                logger.info(
-                    "[teardown] mesh.stop[%d] finished in %.3fs",
-                    i,
-                    phase_elapsed,
-                )
-                sl.log_trace_scalar(
-                    {f"timing/teardown/mesh_stop_{i}": phase_elapsed}
-                )
-        self._proc_meshes = []
         close_elapsed = time.perf_counter() - close_start
         logger.info(
             "[teardown] controller.close finished in %.3fs",

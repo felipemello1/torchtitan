@@ -160,6 +160,26 @@ def test_async_loop_config_handles_window_fraction_bounds() -> None:
     assert async_loop.window_size == 1
 
 
+def test_normalize_slurm_hostname_uses_runtime_host(monkeypatch) -> None:
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    monkeypatch.setenv("HOSTNAME", "submission-node")
+    monkeypatch.setattr(train.socket, "gethostname", lambda: "worker-node")
+
+    train._normalize_slurm_hostname()
+
+    assert train.os.environ["HOSTNAME"] == "worker-node"
+
+
+def test_normalize_slurm_hostname_does_not_change_non_slurm_env(monkeypatch) -> None:
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.setenv("HOSTNAME", "container-name")
+    monkeypatch.setattr(train.socket, "gethostname", lambda: "kernel-name")
+
+    train._normalize_slurm_hostname()
+
+    assert train.os.environ["HOSTNAME"] == "container-name"
+
+
 def _make_stub_rl_trainer():
     """Create an Controller with a minimal stub config (no VLLMGenerator validation)."""
     from torchtitan.experiments.rl.observability import metrics as m
@@ -345,6 +365,25 @@ class _StubMesh:
         self._events.append(self._name)
 
 
+class _StubRollouter:
+    def __init__(self, events, *, cancel=False):
+        self._events = events
+        self._cancel = cancel
+
+    async def close(self):
+        self._events.append("rollouter.close")
+        if self._cancel:
+            raise asyncio.CancelledError()
+
+
+class _StubMetricsProcessor:
+    def __init__(self, events):
+        self._events = events
+
+    def close(self):
+        self._events.append("metrics.close")
+
+
 def _set_generator_router(rl_trainer, generators):
     rl_trainer.generator_router = _StubRouterHandle(
         InterGeneratorRouter(
@@ -359,6 +398,8 @@ def test_shutdown_calls_actor_close_before_mesh_stop():
     rl_trainer = _make_stub_rl_trainer()
     rl_trainer.trainer = _StubActor("trainer.close", events)
     _set_generator_router(rl_trainer, [_StubActor("generator.close", events)])
+    rl_trainer._rollouter = _StubRollouter(events)
+    rl_trainer.metrics_processor = _StubMetricsProcessor(events)
     rl_trainer._proc_meshes = [
         _StubMesh("mesh.stop[0]", events),
         _StubMesh("mesh.stop[1]", events),
@@ -369,8 +410,10 @@ def test_shutdown_calls_actor_close_before_mesh_stop():
     assert events == [
         "trainer.close",
         "generator.close",
+        "rollouter.close",
         "mesh.stop[0]",
         "mesh.stop[1]",
+        "metrics.close",
     ]
     assert rl_trainer._proc_meshes == []
 
@@ -379,6 +422,7 @@ def test_shutdown_closes_all_generators():
     events: list[str] = []
     rl_trainer = _make_stub_rl_trainer()
     rl_trainer.trainer = _StubActor("trainer.close", events)
+    rl_trainer._rollouter = _StubRollouter(events)
     _set_generator_router(
         rl_trainer,
         [
@@ -394,6 +438,7 @@ def test_shutdown_closes_all_generators():
         "trainer.close",
         "generator[0].close",
         "generator[1].close",
+        "rollouter.close",
         "mesh.stop[0]",
     ]
 
@@ -403,18 +448,25 @@ def test_shutdown_continues_after_actor_close_failure():
     rl_trainer = _make_stub_rl_trainer()
     rl_trainer.trainer = _StubActor("trainer.close", events, raises=True)
     _set_generator_router(rl_trainer, [_StubActor("generator.close", events)])
+    rl_trainer._rollouter = _StubRollouter(events)
     rl_trainer._proc_meshes = [_StubMesh("mesh.stop[0]", events)]
 
     asyncio.run(rl_trainer.close())
 
     # trainer.close raised, but every later step still ran.
-    assert events == ["trainer.close", "generator.close", "mesh.stop[0]"]
+    assert events == [
+        "trainer.close",
+        "generator.close",
+        "rollouter.close",
+        "mesh.stop[0]",
+    ]
 
 
 def test_shutdown_continues_after_generator_close_failure():
     events: list[str] = []
     rl_trainer = _make_stub_rl_trainer()
     rl_trainer.trainer = _StubActor("trainer.close", events)
+    rl_trainer._rollouter = _StubRollouter(events)
     _set_generator_router(
         rl_trainer,
         [
@@ -430,5 +482,24 @@ def test_shutdown_continues_after_generator_close_failure():
         "trainer.close",
         "generator[0].close",
         "generator[1].close",
+        "rollouter.close",
+        "mesh.stop[0]",
+    ]
+
+
+def test_shutdown_continues_after_rollouter_close_cancellation():
+    events: list[str] = []
+    rl_trainer = _make_stub_rl_trainer()
+    rl_trainer.trainer = _StubActor("trainer.close", events)
+    _set_generator_router(rl_trainer, [_StubActor("generator.close", events)])
+    rl_trainer._rollouter = _StubRollouter(events, cancel=True)
+    rl_trainer._proc_meshes = [_StubMesh("mesh.stop[0]", events)]
+
+    asyncio.run(rl_trainer.close())
+
+    assert events == [
+        "trainer.close",
+        "generator.close",
+        "rollouter.close",
         "mesh.stop[0]",
     ]
