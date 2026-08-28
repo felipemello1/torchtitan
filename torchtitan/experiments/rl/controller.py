@@ -445,7 +445,7 @@ class Controller(Configurable):
         )
 
     async def close(self):
-        """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
+        """Best-effort: tear down actors and meshes, then close metric backends."""
         logger.info("Closing: tearing down actors and process meshes.")
 
         if self.trainer is not None:
@@ -454,11 +454,9 @@ class Controller(Configurable):
             except Exception:
                 logger.exception("trainer.close failed")
 
-        try:
-            await self._rollouter.close()
-        except Exception:
-            logger.exception("rollouter.close failed")
-
+        # Closing a generator fails its outstanding request futures. Keep the
+        # rollout workers alive until they receive those failures; stopping the
+        # rollouter first makes the generator replies undeliverable.
         if self.generator_router is not None:
             try:
                 close_results = await self.generator_router.close_generators.call_one()
@@ -478,16 +476,30 @@ class Controller(Configurable):
                 logger.exception("generator_router.close_generators failed")
 
         try:
+            await self._rollouter.close()
+        except Exception:
+            logger.exception("rollouter.close failed")
+
+        meshes = self._proc_meshes
+        self._proc_meshes = []
+        stop_results = await asyncio.gather(
+            *(mesh.stop() for mesh in meshes),
+            return_exceptions=True,
+        )
+        for i, result in enumerate(stop_results):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                logger.error(
+                    "mesh.stop[%d] failed",
+                    i,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+
+        try:
             self.metrics_processor.close()
         except Exception:
-            logger.exception("metrics_processor close failed")
-
-        for i, mesh in enumerate(self._proc_meshes):
-            try:
-                await mesh.stop()
-            except Exception:
-                logger.exception("mesh.stop[%d] failed", i)
-        self._proc_meshes = []
+            logger.exception("metrics_processor.close failed")
 
     def _get_rank_0_value(self, result):
         """Extract rank 0 result from a Monarch ValueMesh.

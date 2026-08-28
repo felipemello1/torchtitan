@@ -345,6 +345,22 @@ class _StubMesh:
         self._events.append(self._name)
 
 
+class _StubRollouter:
+    def __init__(self, events):
+        self._events = events
+
+    async def close(self):
+        self._events.append("rollouter.close")
+
+
+class _StubMetricsProcessor:
+    def __init__(self, events):
+        self._events = events
+
+    def close(self):
+        self._events.append("metrics.close")
+
+
 def _set_generator_router(rl_trainer, generators):
     rl_trainer.generator_router = _StubRouterHandle(
         InterGeneratorRouter(
@@ -358,6 +374,8 @@ def test_shutdown_calls_actor_close_before_mesh_stop():
     events: list[str] = []
     rl_trainer = _make_stub_rl_trainer()
     rl_trainer.trainer = _StubActor("trainer.close", events)
+    rl_trainer._rollouter = _StubRollouter(events)
+    rl_trainer.metrics_processor = _StubMetricsProcessor(events)
     _set_generator_router(rl_trainer, [_StubActor("generator.close", events)])
     rl_trainer._proc_meshes = [
         _StubMesh("mesh.stop[0]", events),
@@ -369,8 +387,10 @@ def test_shutdown_calls_actor_close_before_mesh_stop():
     assert events == [
         "trainer.close",
         "generator.close",
+        "rollouter.close",
         "mesh.stop[0]",
         "mesh.stop[1]",
+        "metrics.close",
     ]
     assert rl_trainer._proc_meshes == []
 
@@ -396,6 +416,28 @@ def test_shutdown_closes_all_generators():
         "generator[1].close",
         "mesh.stop[0]",
     ]
+
+
+def test_shutdown_stops_process_meshes_concurrently():
+    async def run() -> None:
+        all_started = asyncio.Event()
+        started = 0
+
+        class _BlockingMesh:
+            async def stop(self):
+                nonlocal started
+                started += 1
+                if started == 2:
+                    all_started.set()
+                await all_started.wait()
+
+        rl_trainer = _make_stub_rl_trainer()
+        rl_trainer._proc_meshes = [_BlockingMesh(), _BlockingMesh()]
+
+        await asyncio.wait_for(rl_trainer.close(), timeout=1)
+        assert started == 2
+
+    asyncio.run(run())
 
 
 def test_shutdown_continues_after_actor_close_failure():
