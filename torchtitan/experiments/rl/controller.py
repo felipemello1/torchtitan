@@ -104,6 +104,7 @@ import tyro
 from monarch.actor import ProcMesh, this_host
 from monarch.spmd import setup_torch_elastic_env_async
 
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import CompileConfig, Configurable
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
@@ -424,7 +425,8 @@ class Controller(Configurable):
             log_dir=config.dump_folder,
             job_config=config.to_dict(),
         )
-        self.renderer = config.renderer.build(tokenizer_path=config.hf_assets_path)
+        self.tokenizer = HuggingFaceTokenizer(tokenizer_path=config.hf_assets_path)
+        self.renderer = config.renderer.build(tokenizer=self.tokenizer)
 
         # Carry the base seed and renderer stop tokens on the sampling config so
         # the generator reads them off each request; the rollouter offsets the
@@ -434,10 +436,6 @@ class Controller(Configurable):
             seed=config.generator.debug.seed,
             stop_token_ids=list(self.renderer.get_stop_token_ids()),
         )
-        # TODO: pass our own tokenizer to the renderer and read pad/eos off it
-        # once `renderers` supports bring-your-own-tokenizer
-        # (https://github.com/PrimeIntellect-ai/renderers/pull/70).
-        # Until then, reach into the renderer's tokenizer for the pad id (eos doubles as pad).
         self._rollouter: Rollouter = config.rollouter.build()
         self.rollout_recorder = config.rollout_recorder.build(
             dump_dir=config.dump_folder
@@ -809,7 +807,7 @@ class Controller(Configurable):
             max_context_length=self.config.trainer.training.max_context_length,
             num_prompts_per_train_step=async_loop.num_prompts_per_train_step,
             dp_degree=self.trainer_dp_degree,
-            pad_id=self.renderer._tokenizer.eos_token_id,
+            pad_id=self.tokenizer.eos_id,
         )
 
         # training_batch_queue

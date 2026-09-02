@@ -31,6 +31,7 @@ from vllm.sampling_params import RequestOutputKind
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.experiments.rl.examples.alphabet_sort import config_registry
 from torchtitan.experiments.rl.models.vllm_registry import (
@@ -187,7 +188,9 @@ def generate() -> None:
 
     logger.debug("vLLM LLMEngine initialized successfully")
 
-    renderer = config.renderer.build(tokenizer_path=model_path)
+    renderer = config.renderer.build(
+        tokenizer=HuggingFaceTokenizer(tokenizer_path=model_path)
+    )
     stop_token_ids = list(renderer.get_stop_token_ids())
 
     # Create sampling parameters from config

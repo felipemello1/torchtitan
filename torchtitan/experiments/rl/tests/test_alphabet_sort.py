@@ -370,7 +370,7 @@ def test_rollouter_builds_one_env_per_group_member(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _RendererConfig:
-        def build(self, *, tokenizer_path: str):
+        def build(self, *, tokenizer):
             return None
 
     _patch_names(monkeypatch)
@@ -382,7 +382,7 @@ def test_rollouter_builds_one_env_per_group_member(
     asyncio.run(
         worker.setup_async(
             renderer_config=_RendererConfig(),
-            hf_assets_path="hf_assets_path",
+            hf_assets_path="tests/assets/tokenizer",
         )
     )
     sample = rollouter.get_training_sample()

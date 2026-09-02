@@ -28,18 +28,12 @@ renderer test asserts equality with ``apply_chat_template`` across roles, tool s
 reasoning states. Treat that test as the spec -- if the template changes upstream, it
 fails first.
 
-Implements the ``renderers.Renderer`` Protocol. ``register()`` installs it into the
-``renderers`` library's public registry (``RENDERER_REGISTRY`` / ``_CONFIG_BY_NAME``),
-which is that library's supported extension path -- no fork or upstream change needed.
-
-Every other TorchTitan model resolves to a renderer that lives in
-PrimeIntellect-ai/renderers. This one ships here because Muse Glimmer is not in that
-library yet.
+Implements the ``renderers.Renderer`` Protocol. TorchTitan registers it in each rollout
+worker because Muse Glimmer is not available in the library yet.
 
 TODO: upstream this to PrimeIntellect-ai/renderers (renderer -> renderers/muse_glimmer.py,
-atem.py -> a tool parser in renderers/parsers.py), then delete both files and
-``register()``, leaving only the ``_RENDERER_BY_MODEL`` entry in
-experiments/rl/renderer.py.
+atem.py -> a tool parser in renderers/parsers.py), then delete both files,
+``register()``, and the ``muse_glimmer`` branch in ``RendererConfig.to_renderers_config``.
 
 It lives under ``experiments/rl`` rather than ``torchtitan/models/muse_glimmer`` because
 RL is its only consumer and ``renderers`` is an RL-only optional dependency; keeping it
@@ -347,8 +341,6 @@ class MuseGlimmerRenderer:
         # ``create_renderer`` can instantiate this from RENDERER_REGISTRY.
         self._tok = tokenizer
         self._config = config or MuseGlimmerRendererConfig()
-        # The controller reads renderer._tokenizer (e.g. for pad_id=eos_token_id).
-        self._tokenizer = tokenizer
         self._bos = tokenizer.bos_token or ""
         # BaseRendererConfig.thinking_retention is the library-wide knob every renderer
         # is expected to honour in its bridge. Muse Glimmer's published chat template
@@ -761,28 +753,13 @@ class MuseGlimmerRenderer:
 
 
 def register() -> None:
-    """Install the muse_glimmer renderer into the ``renderers`` library registry.
-
-    Uses the library's public extension surface -- implement the ``Renderer``
-    Protocol, then add the class to ``RENDERER_REGISTRY`` and its config to
-    ``_CONFIG_BY_NAME`` -- so ``create_renderer(config_from_name("muse_glimmer"))``
-    resolves it. Also maps the ``muse_glimmer`` TorchTitan model name to it, which is what
-    ``RendererConfig(name="muse_glimmer")`` looks up.
-
-    Idempotent. Delete this once the renderer is upstreamed to
-    PrimeIntellect-ai/renderers (only the _RENDERER_BY_MODEL entry stays).
-    """
+    """Register Muse Glimmer in this worker until it is available upstream."""
     from renderers import base as renderers_base, configs as renderers_configs
 
-    from torchtitan.experiments.rl.renderer import _RENDERER_BY_MODEL
-
-    # Populate the library's built-ins first: _populate_registry() early-returns if
-    # RENDERER_REGISTRY is already non-empty, so registering before it runs would
-    # suppress every built-in renderer.
+    # Populate built-ins first; _populate_registry() exits once the registry is nonempty.
     renderers_base._populate_registry()
 
     renderers_configs._CONFIG_BY_NAME.setdefault(
         RENDERER_NAME, MuseGlimmerRendererConfig
     )
     renderers_base.RENDERER_REGISTRY[RENDERER_NAME] = MuseGlimmerRenderer
-    _RENDERER_BY_MODEL["muse_glimmer"] = RENDERER_NAME

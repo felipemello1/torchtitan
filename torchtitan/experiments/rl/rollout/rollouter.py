@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from monarch.actor import ProcMesh, this_host
 
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
 from torchtitan.experiments.rl.environment import MessageEnv, TokenEnv
 from torchtitan.experiments.rl.rollout.advantage import AdvantageEstimator
@@ -245,7 +246,8 @@ class RolloutWorker(Configurable):
         hf_assets_path: str,
     ) -> None:
         """Build runtime dependencies after the worker actor is spawned."""
-        self._renderer = renderer_config.build(tokenizer_path=hf_assets_path)
+        tokenizer = HuggingFaceTokenizer(tokenizer_path=hf_assets_path)
+        self._renderer = renderer_config.build(tokenizer=tokenizer)
 
     def make_env_group(
         self,
