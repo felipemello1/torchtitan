@@ -227,6 +227,10 @@ def _renderer(tokenizer, **overrides):
     return MuseGlimmerRenderer(tokenizer, MuseGlimmerRendererConfig(**overrides))
 
 
+def test_reasoning_strength_defaults_to_low():
+    assert MuseGlimmerRendererConfig().reasoning_strength == "low"
+
+
 def _template_kwargs(config: MuseGlimmerRendererConfig) -> dict:
     """Only forward knobs the caller set, so the template applies its own defaults."""
     return {

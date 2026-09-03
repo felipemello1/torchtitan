@@ -82,13 +82,11 @@ class MuseGlimmerRendererConfig(TorchTitanRendererConfig):
         {"retain_reasoning_in_history", "answer_from_reasoning_fallback"}
     )
 
-    reasoning_strength: str | None = None
+    reasoning_strength: str | None = "low"
     """Sizes the reasoning budget, rendered as ``Reasoning strength: <value>.``
 
-    ``None`` (default) uses the template's own default of ``"high"``. Set ``"low"`` for
-    agentic tasks with a tight token budget: at high strength the model can spend the
-    whole budget reasoning and get truncated before it emits a tool call or an answer,
-    which scores as a failed rollout.
+    Defaults to ``"low"`` so the model reaches a tool call or answer within tight rollout
+    token budgets. Set ``None`` to use the template's own default of ``"high"``.
     """
 
     knowledge_cutoff: str | None = None

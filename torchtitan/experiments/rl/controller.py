@@ -164,7 +164,7 @@ class AsyncLoopConfig(Configurable.Config):
     num_samples_per_prompt: int = 8
     """Sibling rollouts sampled per prompt (the GRPO group)."""
 
-    target_offpolicy_steps: int = 3
+    target_offpolicy_steps: int = 4
     """Target steady-state offpolicy steps used to set the active buffer size to
     `(S + 1) * P`. Observed offpolicy steps are not guaranteed to equal this
     target: when rollout generation is the bottleneck, the buffer may not fill
