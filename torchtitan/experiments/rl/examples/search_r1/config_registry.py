@@ -78,7 +78,7 @@ def rl_grpo_qwen3_1_7b_search_r1() -> Controller.Config:
                 advantage=AdvantageEstimator.Config(should_std_normalize=True),
             ),
         ),
-        renderer=RendererConfig(name="qwen3", enable_thinking=False),
+        renderer=RendererConfig(name="qwen3", options={"enable_thinking": False}),
         metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(
             optimizer=default_adamw(lr=1e-6),
@@ -206,7 +206,9 @@ def rl_grpo_qwen3_30b_a3b_deepep_search_r1_perf() -> Controller.Config:
                 advantage=AdvantageEstimator.Config(should_std_normalize=True),
             ),
         ),
-        renderer=RendererConfig(name="qwen3", enable_thinking=False),  # TODO: TBD
+        renderer=RendererConfig(
+            name="qwen3", options={"enable_thinking": False}
+        ),  # TODO: TBD
         metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(
             optimizer=default_adamw(lr=1e-6),
@@ -280,12 +282,9 @@ def rl_grpo_muse_glimmer_30b_search_r1() -> Controller.Config:
 
     varlen attention is used for both roles so the trainer and the vLLM generator run
     one ModelSpec. The state-dict adapter handles the HF checkpoint's Q/K RoPE layout
-    on load, and the renderer (registered below) handles Muse Glimmer's harmony chat
+    on load, and the renderer handles Muse Glimmer's harmony chat
     format and ATEM tool calls.
     """
-    # Muse Glimmer's renderer ships in torchtitan rather than the `renderers` library;
-    # registering makes RendererConfig(name="muse_glimmer") resolve it.
-
     model_spec = muse_glimmer_model_registry("30B", attn_backend="varlen")
     model_spec = dataclasses.replace(
         model_spec, state_dict_adapter=MuseGlimmerStateDictAdapter
@@ -306,7 +305,7 @@ def rl_grpo_muse_glimmer_30b_search_r1() -> Controller.Config:
                 advantage=AdvantageEstimator.Config(should_std_normalize=True),
             ),
         ),
-        renderer=RendererConfig(name="muse_glimmer", enable_thinking=True),
+        renderer=RendererConfig(name="muse_glimmer"),
         metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(
             optimizer=default_adamw(lr=1e-6),

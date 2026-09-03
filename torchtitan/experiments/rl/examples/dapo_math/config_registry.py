@@ -81,7 +81,7 @@ def _qwen3_4b_dapo_math_config(
                 ),
             ),
         ),
-        renderer=RendererConfig(name="qwen3", enable_thinking=True),
+        renderer=RendererConfig(name="qwen3", options={"enable_thinking": True}),
         num_generators=6,
         generator_router=InterGeneratorRouter.Config(
             strategy=LeastLoadedRoutingStrategy.Config()

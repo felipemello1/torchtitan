@@ -122,7 +122,7 @@ def test_worker_executes_group_without_actor_mesh() -> None:
         worker = _CustomWorker(worker_config)
         await worker.setup_async(
             renderer_config=_Config("renderer"),
-            hf_assets_path="hf_assets_path",
+            hf_assets_path="tests/assets/tokenizer",
         )
         group = await worker.run_group(
             generate_fn=generate_fn,
