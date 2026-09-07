@@ -475,6 +475,7 @@ class GradAccumulator:
         self.num_chunks = num_chunks
         self.seq_dim = seq_dim
         self._next_idx = 0
+        self._next_start = 0
         self.buffer = torch.zeros_like(reference, dtype=dtype)
 
     def add(self, chunk_grad: torch.Tensor) -> None:
@@ -489,7 +490,7 @@ class GradAccumulator:
             chunk_grad = chunk_grad.to(self.buffer.dtype)
 
         chunk_seq_len = chunk_grad.shape[self.seq_dim]
-        start = self._next_idx * chunk_seq_len
+        start = self._next_start
         end = start + chunk_seq_len
 
         slices = [slice(None)] * self.buffer.ndim
@@ -497,25 +498,27 @@ class GradAccumulator:
         self.buffer[tuple(slices)] = chunk_grad
 
         self._next_idx += 1
+        self._next_start = end
 
 
 class ChunkedLossWrapper(BaseLoss):
     """Chunked loss wrapper that splits the sequence dimension to reduce peak memory.
 
     Instead of materializing the full [T, V] logits tensor at once, this splits
-    the hidden states into N chunks along the token dimension and computes
+    the hidden states into chunks of at most ``chunk_len`` tokens and computes
     lm_head + loss on each chunk sequentially. This reduces peak memory
-    from O(T*V) to O(T/N*V).
+    from O(T*V) to O(chunk_len*V).
 
     The inner ``loss_fn`` defaults to ``CrossEntropyLoss`` and is called once per
     chunk on logits from that chunk. ``pred`` and ``labels`` may be aligned
     tuples; their tensor or tuple structure is preserved when calling the inner
     loss. Additional per-token ``loss_inputs`` are chunked along the same
-    sequence dimension and forwarded to the inner loss.
+    sequence dimension and forwarded to the inner loss. Inputs that fit in one
+    chunk use the standard autograd path directly.
 
     The flow:
     1. Model forward with _skip_lm_head=True to get one or more hidden states [T, D]
-    2. Split each hidden state and its labels into N chunks along seq dim
+    2. Split each hidden state and its labels into chunks of up to chunk_len tokens
     3. Detach each hidden-state chunk at the lm_head boundary
     4. Disable FSDP reshard on lm_head across all outputs and chunks
     5. For each chunk: lm_head on each output -> loss_fn(logits, labels, gvt) -> backward()
@@ -545,11 +548,15 @@ class ChunkedLossWrapper(BaseLoss):
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseLoss.Config):
-        num_chunks: int = 8
-        """Number of chunks to split the sequence into."""
+        chunk_len: int = 8192
+        """Maximum number of tokens in each loss chunk."""
 
         loss_fn: BaseLoss.Config = field(default_factory=CrossEntropyLoss.Config)
         """Loss applied to each chunk's logits."""
+
+        def __post_init__(self) -> None:
+            if self.chunk_len <= 0:
+                raise ValueError("chunk_len must be greater than zero")
 
     def __init__(
         self,
@@ -557,7 +564,7 @@ class ChunkedLossWrapper(BaseLoss):
         *,
         compile_config: CompileConfig | None = None,
     ):
-        self.num_chunks = config.num_chunks
+        self.chunk_len = config.chunk_len
         self.loss_fn: BaseLoss = config.loss_fn.build(compile_config=compile_config)
         self.lm_head: nn.Module | None = None
 
@@ -587,7 +594,6 @@ class ChunkedLossWrapper(BaseLoss):
         """
         from torch.distributed._composable.fsdp import FSDPModule
 
-        num_chunks = self.num_chunks
         lm_head = self.lm_head
         assert lm_head is not None, "Set lm_head before calling ChunkedLossWrapper"
         if isinstance(pred, torch.Tensor) and isinstance(labels, torch.Tensor):
@@ -613,18 +619,46 @@ class ChunkedLossWrapper(BaseLoss):
                 "are required."
             )
 
-        # Chunking operates on the local tensor. Equal chunk sizes match
-        # GradAccumulator's sequential slice
-        # writes, which use one chunk length for each write offset.
+        local_seq_len = pred[0].shape[0]
+        if isinstance(local_seq_len, int) and local_seq_len <= self.chunk_len:
+            logits = tuple(lm_head(hidden_state) for hidden_state in pred)
+            return self.loss_fn(
+                logits if is_multi_output else logits[0],
+                labels if is_multi_output else labels[0],
+                global_valid_tokens,
+                **loss_inputs,
+            )
+
+        def _chunk_count(seq_len: int | torch.SymInt) -> int:
+            from torch.fx.experimental.symbolic_shapes import optimization_hint
+
+            seq_len_hint = optimization_hint(seq_len)
+            return (seq_len_hint + self.chunk_len - 1) // self.chunk_len
+
+        # Chunking operates on the local tensor.
         def _chunk_local(t):
             seq_len = t.shape[0]
+            if isinstance(seq_len, int):
+                return tuple(
+                    c.contiguous() for c in torch.split(t, self.chunk_len, dim=0)
+                )
+
+            # A Python tuple cannot have a symbolic number of elements. Keep
+            # symbolic chunks equal-sized so tracing the per-chunk backward does
+            # not introduce data-dependent guards on a symbolic final chunk.
+            chunk_count = _chunk_count(seq_len)
             torch._check(
-                seq_len % num_chunks == 0,
-                lambda: "ChunkedLossWrapper sequence length must be divisible by num_chunks",
+                seq_len <= chunk_count * self.chunk_len,
+                lambda: "Symbolic loss chunks must not exceed chunk_len",
             )
-            chunk_len = seq_len // num_chunks
+            torch._check(
+                seq_len % chunk_count == 0,
+                lambda: "Symbolic sequence length must be divisible by chunk count",
+            )
+            symbolic_chunk_len = seq_len // chunk_count
             return tuple(
-                c.contiguous() for c in torch.split(t, [chunk_len] * num_chunks, dim=0)
+                c.contiguous()
+                for c in torch.split(t, [symbolic_chunk_len] * chunk_count, dim=0)
             )
 
         with spmd.local():
@@ -638,6 +672,7 @@ class ChunkedLossWrapper(BaseLoss):
                 for hidden_state in pred
             )
             label_chunks_per_output = tuple(_chunk_local(label) for label in labels)
+            num_chunks = len(label_chunks_per_output[0])
             input_chunks = {
                 key: _chunk_local(value) if isinstance(value, torch.Tensor) else value
                 for key, value in loss_inputs.items()
