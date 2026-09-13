@@ -30,7 +30,7 @@ The window remains anchored at the oldest active group. Consuming a younger grou
 
 ## Windowed FIFO configuration
 
-The user configures `S`, `P`, and `f` through `target_offpolicy_steps`, `num_prompts_per_train_step`, and `window_fraction`. `window_fraction` defaults to `0.3` following the MiniMax paper.
+The user configures `S` and `f` on the buffer config, `RolloutGroupWorkBuffer.Config(target_offpolicy_steps=S, window_fraction=f)`, and `P` through `num_prompts_per_train_step`. `window_fraction` defaults to `0.3` following the MiniMax paper.
 
 The controller derives:
 

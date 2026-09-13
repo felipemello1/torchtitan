@@ -128,5 +128,5 @@ class WeightSyncManager:
         # Born-fresh: admit the next groups only now that the generators are on `version`, so a new
         # rollout starts at the current version (keeps policy_age within the derived freshness bound).
         await self._group_buffer.release_active_groups(
-            self._num_prompts_per_train_step, reason="trained"
+            self._num_prompts_per_train_step, reason="trained", policy_version=version
         )

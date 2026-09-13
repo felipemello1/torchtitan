@@ -8,12 +8,14 @@
 the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID."""
 
 import asyncio
+import json
 import logging
 
 import pytest
 
 from torchtitan.experiments.rl.components.batcher import Batcher
 from torchtitan.experiments.rl.components.work_buffer import (
+    AdaptiveRolloutGroupWorkBuffer,
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
@@ -308,7 +310,9 @@ def test_rollout_id_to_string_is_callable_and_uses_int_group_id() -> None:
 
 def test_take_finalized_does_not_release_active_slot() -> None:
     async def run() -> None:
-        buffer = RolloutGroupWorkBuffer.Config().build(max_active_rollout_groups=1)
+        buffer = RolloutGroupWorkBuffer.Config(target_offpolicy_steps=0).build(
+            num_prompts_per_train_step=1
+        )
         if not await buffer.wait_for_slot():
             raise RuntimeError("buffer closed unexpectedly")
         await buffer.add_work(RolloutGroupWork(group_id=0, sample=object()))
@@ -327,7 +331,9 @@ def test_take_finalized_does_not_release_active_slot() -> None:
 
 def test_untrainable_group_releases_before_training() -> None:
     async def run() -> None:
-        buffer = RolloutGroupWorkBuffer.Config().build(max_active_rollout_groups=1)
+        buffer = RolloutGroupWorkBuffer.Config(target_offpolicy_steps=0).build(
+            num_prompts_per_train_step=1
+        )
         batcher = Batcher.Config().build(
             num_tokens_per_microbatch_per_dp_rank=16384,
             max_context_length=2048,
@@ -359,7 +365,6 @@ def test_compute_policy_age_metrics_raises_on_consume_time_staleness() -> None:
         compute_policy_age_metrics(
             trainer_policy_version=4,
             min_policy_versions=[0],
-            target_offpolicy_steps=3,
             max_offpolicy_steps=3,
         )
 
@@ -368,7 +373,6 @@ def test_compute_policy_age_metrics_uses_hard_offpolicy_limit() -> None:
     metrics = compute_policy_age_metrics(
         trainer_policy_version=4,
         min_policy_versions=[0],
-        target_offpolicy_steps=3,
         max_offpolicy_steps=4,
     )
     assert any(metric.key == "train_batch/policy_age_max" for metric in metrics)
@@ -377,21 +381,16 @@ def test_compute_policy_age_metrics_uses_hard_offpolicy_limit() -> None:
         compute_policy_age_metrics(
             trainer_policy_version=5,
             min_policy_versions=[0],
-            target_offpolicy_steps=3,
             max_offpolicy_steps=4,
         )
 
 
-def _fifo_buffer(*, capacity: int, window_size: int = 1) -> RolloutGroupWorkBuffer:
-    return RolloutGroupWorkBuffer.Config().build(
-        max_active_rollout_groups=capacity,
-        window_size=window_size,
-    )
-
-
-def test_work_buffer_rejects_window_larger_than_capacity() -> None:
-    with pytest.raises(ValueError, match="window_size"):
-        _fifo_buffer(capacity=2, window_size=3)
+def _fifo_buffer(
+    *, target_offpolicy_steps: int, window_fraction: float | None, num_prompts: int
+) -> RolloutGroupWorkBuffer:
+    return RolloutGroupWorkBuffer.Config(
+        target_offpolicy_steps=target_offpolicy_steps, window_fraction=window_fraction
+    ).build(num_prompts_per_train_step=num_prompts)
 
 
 async def _admit(buffer: RolloutGroupWorkBuffer, group_id: int) -> None:
@@ -406,8 +405,10 @@ async def _finalize(buffer: RolloutGroupWorkBuffer, group_id: int) -> None:
 
 def test_windowed_fifo_takes_within_anchored_window() -> None:
     async def run() -> None:
-        # Window [g0, g3]: g1/g2/g3 may bypass stuck g0; g4 remains blocked.
-        buffer = _fifo_buffer(capacity=8, window_size=4)
+        # capacity (1 + 1) * 4 = 8, window floor(0.5 * 8) = 4: [g0, g3]; g1/g2/g3 may bypass stuck g0; g4 remains blocked.
+        buffer = _fifo_buffer(
+            target_offpolicy_steps=1, window_fraction=0.5, num_prompts=4
+        )
         for group_id in range(5):
             await _admit(buffer, group_id)
         await buffer.claim_next()  # g0 -> INFLIGHT and stuck
@@ -425,5 +426,171 @@ def test_windowed_fifo_takes_within_anchored_window() -> None:
         await _finalize(buffer, 0)
         assert (await taker).group_id == 0
         assert (await buffer.take_finalized()).group_id == 4
+
+    asyncio.run(run())
+
+
+def _adaptive_buffer(
+    *,
+    num_prompts: int,
+    max_offpolicy_steps: int = 4,
+    capacity_ceiling: int = 128,
+    memory_steps: int = 300,
+    **kwargs
+) -> AdaptiveRolloutGroupWorkBuffer:
+    return AdaptiveRolloutGroupWorkBuffer.Config(
+        max_offpolicy_steps=max_offpolicy_steps,
+        capacity_ceiling=capacity_ceiling,
+        memory_steps=memory_steps,
+    ).build(num_prompts_per_train_step=num_prompts, **kwargs)
+
+
+def _metric_value(metrics: list[m.Metric], key: str) -> float:
+    return next(metric.value.value for metric in metrics if metric.key == key)
+
+
+def test_adaptive_buffer_takes_oldest_finalized_and_lets_slow_groups_keep_their_slot() -> None:
+    async def run() -> None:
+        buffer = _adaptive_buffer(num_prompts=2, capacity_ceiling=8)
+        for group_id in range(4):
+            await _admit(buffer, group_id)
+        for _ in range(4):
+            await buffer.claim_next()
+        await _finalize(buffer, 2)
+        await _finalize(buffer, 1)
+
+        # g0 is still INFLIGHT: the batcher gets g1 then g2 without waiting for it
+        assert (await buffer.take_finalized()).group_id == 1
+        assert (await buffer.take_finalized()).group_id == 2
+        taker = asyncio.create_task(buffer.take_finalized())
+        await asyncio.sleep(0)
+        assert not taker.done()
+
+        await _finalize(buffer, 0)
+        assert (await taker).group_id == 0
+        # taking never frees a slot: 4 admitted -> 4 still active
+        assert (
+            _metric_value(buffer.metrics(), "rollout_buffer/active_slots_in_use_peak")
+            == 4
+        )
+
+    asyncio.run(run())
+
+
+def test_adaptive_buffer_drops_groups_past_max_offpolicy_steps() -> None:
+    async def run() -> None:
+        buffer = _adaptive_buffer(
+            num_prompts=2, max_offpolicy_steps=1, capacity_ceiling=8
+        )
+        await _admit(buffer, 0)
+        await _admit(buffer, 1)
+        await buffer.claim_next()  # g0 generates under version 0
+        await buffer.release_active_groups(0, reason="trained", policy_version=0)
+
+        # The trainer starts step 2 (version 1): the batch being assembled trains at version 2 -> g0 would be 2 old
+        buffer.record_step_start(trainer_policy_version=1)
+        await _finalize(buffer, 0)
+        metrics = buffer.metrics()
+        assert _metric_value(metrics, "rollout_buffer/dropped_too_old") == 1
+        assert _metric_value(metrics, "rollout_buffer/num_groups_finalized") == 0
+        # the dropped group's slot is free at once (2 admitted, 1 dropped -> 1 active)
+        assert (
+            _metric_value(metrics, "rollout_buffer/available_active_slots")
+            == buffer._active_capacity() - 1
+        )
+
+        # g1 claimed after a pull to version 1 is fresh enough: age 2 - 1 = 1 <= 1
+        await buffer.release_active_groups(0, reason="trained", policy_version=1)
+        await buffer.claim_next()
+        await _finalize(buffer, 1)
+        assert (await buffer.take_finalized()).group_id == 1
+
+    asyncio.run(run())
+
+
+def test_adaptive_buffer_capacity_follows_the_unavailable_count() -> None:
+    async def run() -> None:
+        # P=4: starts at 5 * P = 20 slots
+        buffer = _adaptive_buffer(num_prompts=4, capacity_ceiling=64, memory_steps=3)
+        assert buffer._active_capacity() == 20
+        for group_id in range(20):
+            await _admit(buffer, group_id)
+        for _ in range(20):
+            await buffer.claim_next()
+
+        # 20 unavailable -> need = 2 * 4 + 20 + 1 = 29; up at most P // 2 = 2 per step
+        capacities = []
+        for _ in range(6):
+            buffer.record_step_start(trainer_policy_version=0)
+            capacities.append(buffer._active_capacity())
+        assert capacities == [22, 24, 26, 28, 29, 29]
+        assert _metric_value(buffer.metrics(), "rollout_buffer/capacity") == 29
+
+        # everything finishes: after the 3-step memory flushes, need = 2 * 4 + 0 + 1 = 9; down by halving the gap
+        for group_id in range(20):
+            await _finalize(buffer, group_id)
+        capacities = []
+        for _ in range(8):
+            buffer.record_step_start(trainer_policy_version=0)
+            capacities.append(buffer._active_capacity())
+        assert capacities == [29, 29, 19, 14, 12, 11, 10, 9]
+
+    asyncio.run(run())
+
+
+def test_adaptive_buffer_never_exceeds_its_ceiling() -> None:
+    async def run() -> None:
+        buffer = _adaptive_buffer(num_prompts=2, capacity_ceiling=6)
+        assert buffer.max_active_rollout_groups == 6
+        for group_id in range(6):
+            await _admit(buffer, group_id)
+        for _ in range(6):
+            await buffer.claim_next()
+        for _ in range(10):
+            buffer.record_step_start(trainer_policy_version=0)
+        assert buffer._active_capacity() == 6
+        waiter = asyncio.create_task(buffer.wait_for_slot())
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        await buffer.close()
+        assert not await waiter
+
+    asyncio.run(run())
+
+
+def test_adaptive_buffer_rejects_a_ceiling_below_two_batches() -> None:
+    with pytest.raises(ValueError, match="capacity_ceiling"):
+        _adaptive_buffer(num_prompts=4, capacity_ceiling=7)
+
+
+def test_work_buffer_writes_one_lifecycle_line_per_group(tmp_path) -> None:
+    async def run() -> None:
+        buffer = RolloutGroupWorkBuffer.Config(
+            target_offpolicy_steps=0, window_fraction=None
+        ).build(
+            num_prompts_per_train_step=1,
+            policy_version=3,
+            lifecycle_log_dir=str(tmp_path),
+        )
+        await _admit(buffer, 0)
+        await buffer.claim_next()
+        await _finalize(buffer, 0)
+        buffer.record_step_start(trainer_policy_version=4)
+        await buffer.take_finalized()
+
+        lines = (tmp_path / "rollout_group_lifecycle.jsonl").read_text().splitlines()
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        assert record["group_id"] == 0
+        assert record["outcome"] == "taken"
+        assert record["policy_version_at_admission"] == 3
+        assert record["policy_version_at_claim"] == 3
+        assert record["trainer_policy_version_at_exit"] == 4
+        assert (
+            record["admitted_at"]
+            <= record["claimed_at"]
+            <= record["finalized_at"]
+            <= record["left_at"]
+        )
 
     asyncio.run(run())

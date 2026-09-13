@@ -11,6 +11,7 @@ import pytest
 
 from torchtitan.experiments.rl import train
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
+from torchtitan.experiments.rl.components.work_buffer import RolloutGroupWorkBuffer
 from torchtitan.experiments.rl.controller import AsyncLoopConfig
 from torchtitan.experiments.rl.rollout_recorder import RolloutSampleRecorder
 from torchtitan.experiments.rl.routing.inter_generator_router import (
@@ -94,70 +95,46 @@ class _FakeConfigManager:
         return self.config
 
 
-def test_async_loop_config_derives_window_and_max_offpolicy_steps() -> None:
-    default_loop = AsyncLoopConfig(
-        num_prompts_per_train_step=3,
-        target_offpolicy_steps=2,
-    )
-    assert default_loop.window_fraction == 0.3
-    assert default_loop.window_size == 2
-    assert default_loop.max_offpolicy_steps == 3
+def test_fifo_buffer_config_derives_window_and_max_offpolicy_steps() -> None:
+    default_buffer = RolloutGroupWorkBuffer.Config(target_offpolicy_steps=2)
+    assert default_buffer.window_fraction == 0.3
+    assert default_buffer.window_size(num_prompts_per_train_step=3) == 2
+    assert default_buffer.max_offpolicy_steps(num_prompts_per_train_step=3) == 3
 
-    strict_loop = AsyncLoopConfig(
-        num_prompts_per_train_step=3,
-        target_offpolicy_steps=2,
-        window_fraction=None,
+    strict_buffer = RolloutGroupWorkBuffer.Config(
+        target_offpolicy_steps=2, window_fraction=None
     )
-    assert strict_loop.window_size == 1
-    assert strict_loop.max_offpolicy_steps == 2
+    assert strict_buffer.window_size(num_prompts_per_train_step=3) == 1
+    assert strict_buffer.max_offpolicy_steps(num_prompts_per_train_step=3) == 2
 
-    async_loop = AsyncLoopConfig(
-        num_prompts_per_train_step=3,
-        target_offpolicy_steps=2,
-        window_fraction=4 / 9,
+    wide_buffer = RolloutGroupWorkBuffer.Config(
+        target_offpolicy_steps=2, window_fraction=4 / 9
     )
-    assert async_loop.max_active_rollout_groups == 9
-    assert async_loop.window_size == 4
-    assert async_loop.max_offpolicy_steps == 3
+    assert wide_buffer.max_active_rollout_groups(num_prompts_per_train_step=3) == 9
+    assert wide_buffer.window_size(num_prompts_per_train_step=3) == 4
+    assert wide_buffer.max_offpolicy_steps(num_prompts_per_train_step=3) == 3
 
-    assert (
-        AsyncLoopConfig(
-            num_prompts_per_train_step=3,
-            target_offpolicy_steps=2,
-            window_fraction=1 / 9,
-        ).window_size
-        == 1
-    )
-    assert (
-        AsyncLoopConfig(
-            num_prompts_per_train_step=3,
-            target_offpolicy_steps=2,
-            window_fraction=1.0,
-        ).window_size
-        == 9
-    )
-    assert (
-        AsyncLoopConfig(
-            num_prompts_per_train_step=8,
-            target_offpolicy_steps=3,
-            window_fraction=1.0,
-        ).window_size
-        == 32
-    )
+    def window(target: int, fraction: float, num_prompts: int) -> int:
+        return RolloutGroupWorkBuffer.Config(
+            target_offpolicy_steps=target, window_fraction=fraction
+        ).window_size(num_prompts_per_train_step=num_prompts)
+
+    assert window(2, 1 / 9, 3) == 1
+    assert window(2, 1.0, 3) == 9
+    assert window(3, 1.0, 8) == 32
 
 
-def test_async_loop_config_handles_window_fraction_bounds() -> None:
+def test_fifo_buffer_config_handles_window_fraction_bounds() -> None:
     with pytest.raises(ValueError, match="window_fraction"):
-        AsyncLoopConfig(window_fraction=0)
+        RolloutGroupWorkBuffer.Config(window_fraction=0)
     with pytest.raises(ValueError, match="window_fraction"):
-        AsyncLoopConfig(window_fraction=1.1)
+        RolloutGroupWorkBuffer.Config(window_fraction=1.1)
     with pytest.warns(UserWarning, match="forcing window_size=1"):
-        async_loop = AsyncLoopConfig(
-            num_prompts_per_train_step=8,
-            target_offpolicy_steps=0,
-            window_fraction=0.01,
-        )
-    assert async_loop.window_size == 1
+        buffer = RolloutGroupWorkBuffer.Config(
+            target_offpolicy_steps=0, window_fraction=0.01
+        ).build(num_prompts_per_train_step=8)
+    assert buffer.max_active_rollout_groups == 8
+    assert buffer.max_offpolicy_steps == 0
 
 
 def _make_stub_rl_trainer():
