@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import auto, Enum
@@ -24,6 +26,8 @@ from torchtitan.experiments.rl.routing.strategies import (
 )
 from torchtitan.experiments.rl.routing.types import RoutingCandidate, RoutingContext
 from torchtitan.observability import structured_logger as sl
+
+logger = logging.getLogger(__name__)
 
 
 class _GeneratorState(Enum):
@@ -215,19 +219,26 @@ class InterGeneratorRouter(Actor, Configurable):
             return_exceptions=return_exceptions,
         )
 
-    async def _pull_model_state_dict(self, *, policy_version: int) -> None:
+    async def _pull_model_state_dict(
+        self, *, policy_version: int
+    ) -> list[dict[str, Any]]:
         """Pull the given policy version's state dict into every generator.
 
         Args:
             policy_version: Trainer policy version whose state dict to pull.
         """
 
-        async def _pull_one(h: _GeneratorHandle) -> None:
+        async def _pull_one(
+            generator_index: int, h: _GeneratorHandle
+        ) -> dict[str, Any]:
+            start = time.perf_counter()
             if self._config.hot_swap:
                 # Hot swap: pull concurrently with in-flight generation, without
                 # draining. Whether the pull is genuinely concurrent and safe is
                 # up to the generator's implementation.
-                await h.rank0_actor.pull_model_state_dict.call_one(policy_version)
+                actor_result = await h.rank0_actor.pull_model_state_dict.call_one(
+                    policy_version
+                )
             else:
                 # Drain: stop routing to this generator and wait for in-flight
                 # work to finish before pulling, then re-admit it.
@@ -235,9 +246,19 @@ class InterGeneratorRouter(Actor, Configurable):
                 try:
                     with sl.log_trace_span("router_drain_wait"):
                         await h.idle.wait()
-                    await h.rank0_actor.pull_model_state_dict.call_one(policy_version)
+                    actor_result = await h.rank0_actor.pull_model_state_dict.call_one(
+                        policy_version
+                    )
                 finally:
                     self._set_state(h, _GeneratorState.SERVING)
+            result = {
+                "generator_index": generator_index,
+                "router_seconds": time.perf_counter() - start,
+            }
+            if actor_result is not None:
+                result.update(actor_result)
+            logger.info("Generator pull result: %s", result)
+            return result
 
         # Start the pulls in parallel. Technically we could do rolling sync to
         # maintain availability during weight sync, but that's not a priority
@@ -245,7 +266,12 @@ class InterGeneratorRouter(Actor, Configurable):
         # TODO(perf): stagger the per-generator fetches when num_generators is large so they don't
         #   all read the trainer's CPU-staged weights at once -- bounds trainer host RAM. Matters for
         #   big models / many generators, not at small scale.
-        await asyncio.gather(*[_pull_one(h) for h in self._generators])
+        return await asyncio.gather(
+            *[
+                _pull_one(generator_index, h)
+                for generator_index, h in enumerate(self._generators)
+            ]
+        )
 
     @concurrent_endpoint
     async def generate(
@@ -286,11 +312,11 @@ class InterGeneratorRouter(Actor, Configurable):
         await self._fanout("sync_log_step", step)
 
     @concurrent_endpoint
-    async def pull_model_state_dict(self, policy_version: int) -> None:
+    async def pull_model_state_dict(self, policy_version: int) -> list[dict[str, Any]]:
         """Pull the given policy version's state dict into every generator."""
         # Wrapper the logic in a private method so we can test it independently
         # without the need to spawn the Monarch actor mesh.
-        await self._pull_model_state_dict(policy_version=policy_version)
+        return await self._pull_model_state_dict(policy_version=policy_version)
 
     @concurrent_endpoint
     async def close_generators(self) -> list[Any | BaseException]:

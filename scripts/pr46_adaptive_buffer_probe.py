@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """Run deterministic probes against PR 46's work-buffer implementation.
 
 This script stubs heavyweight TorchTitan imports so it can exercise the real
@@ -24,9 +30,7 @@ def _load_work_buffer_module():
     experiments_module = types.ModuleType("torchtitan.experiments")
     rl_module = types.ModuleType("torchtitan.experiments.rl")
     components_module = types.ModuleType("torchtitan.experiments.rl.components")
-    observability_package = types.ModuleType(
-        "torchtitan.experiments.rl.observability"
-    )
+    observability_package = types.ModuleType("torchtitan.experiments.rl.observability")
     top_observability_package = types.ModuleType("torchtitan.observability")
     config_module = types.ModuleType("torchtitan.config")
 
@@ -36,9 +40,7 @@ def _load_work_buffer_module():
 
     config_module.Configurable = Configurable
 
-    metrics_module = types.ModuleType(
-        "torchtitan.experiments.rl.observability.metrics"
-    )
+    metrics_module = types.ModuleType("torchtitan.experiments.rl.observability.metrics")
 
     @dataclass
     class _Value:
@@ -78,18 +80,12 @@ def _load_work_buffer_module():
     sys.modules["torchtitan.experiments"] = experiments_module
     sys.modules["torchtitan.experiments.rl"] = rl_module
     sys.modules["torchtitan.experiments.rl.components"] = components_module
-    sys.modules[
-        "torchtitan.experiments.rl.observability"
-    ] = observability_package
+    sys.modules["torchtitan.experiments.rl.observability"] = observability_package
     sys.modules["torchtitan.observability"] = top_observability_package
     sys.modules["torchtitan.config"] = config_module
-    sys.modules[
-        "torchtitan.experiments.rl.observability.metrics"
-    ] = metrics_module
+    sys.modules["torchtitan.experiments.rl.observability.metrics"] = metrics_module
     sys.modules["torchtitan.experiments.rl.rollout"] = rollout_module
-    sys.modules[
-        "torchtitan.observability.structured_logger"
-    ] = structured_logger_module
+    sys.modules["torchtitan.observability.structured_logger"] = structured_logger_module
 
     adaptive_demand_source = (
         Path(__file__).parents[1]
@@ -145,9 +141,7 @@ async def _admit_claim(buffer, group_id: int):
 
 
 async def _record_step_start(buffer, *, trainer_policy_version: int) -> None:
-    result = buffer.record_step_start(
-        trainer_policy_version=trainer_policy_version
-    )
+    result = buffer.record_step_start(trainer_policy_version=trainer_policy_version)
     if inspect.isawaitable(result):
         await result
 
@@ -219,14 +213,10 @@ async def probe_prefetch_depth() -> dict:
     buffer = _buffer(prompts=prompts, generation_capacity=10)
     works = [await _admit_claim(buffer, group_id) for group_id in range(10)]
     for work in works:
-        await buffer.finalize_work(
-            RolloutGroup(group_id=work.group_id, rollouts=[])
-        )
+        await buffer.finalize_work(RolloutGroup(group_id=work.group_id, rollouts=[]))
 
     selected = [await buffer.take_finalized() for _ in range(3 * prompts)]
-    held_outside_buffer = buffer._active_rollout_groups - len(
-        buffer._work_by_group_id
-    )
+    held_outside_buffer = buffer._active_rollout_groups - len(buffer._work_by_group_id)
     return {
         "selected_group_ids": [group.group_id for group in selected],
         "active_slots": buffer._active_rollout_groups,
@@ -242,9 +232,7 @@ async def _future_groups_selected_before_trainer_get(*, gated: bool) -> int:
     buffer = _buffer(prompts=prompts, generation_capacity=10)
     works = [await _admit_claim(buffer, group_id) for group_id in range(10)]
     for work in works:
-        await buffer.finalize_work(
-            RolloutGroup(group_id=work.group_id, rollouts=[])
-        )
+        await buffer.finalize_work(RolloutGroup(group_id=work.group_id, rollouts=[]))
 
     queue = asyncio.Queue(maxsize=1)
     gate = asyncio.Semaphore(1)
@@ -281,7 +269,8 @@ async def probe_controller_prefetch_gate() -> dict:
             await _future_groups_selected_before_trainer_get(gated=True)
         ),
         "groups_per_batch": 2,
-        "worktree_controller_contains_gate": "batch_prefetch_slots" in controller_source,
+        "worktree_controller_contains_gate": "batch_prefetch_slots"
+        in controller_source,
     }
 
 
@@ -291,13 +280,9 @@ async def _pipeline_consumed_ages(*, gated: bool) -> dict:
     # three slots needed to construct the old three-batch schedule.
     buffer._demand_target = 3
     works = [await _admit_claim(buffer, group_id) for group_id in range(3)]
-    claim_versions = {
-        work.group_id: work.policy_version_at_claim for work in works
-    }
+    claim_versions = {work.group_id: work.policy_version_at_claim for work in works}
     for work in works:
-        await buffer.finalize_work(
-            RolloutGroup(group_id=work.group_id, rollouts=[])
-        )
+        await buffer.finalize_work(RolloutGroup(group_id=work.group_id, rollouts=[]))
 
     queue = asyncio.Queue(maxsize=1)
     gate = asyncio.Semaphore(1)
@@ -312,7 +297,7 @@ async def _pipeline_consumed_ages(*, gated: bool) -> dict:
                 consuming_policy_version=next_consuming_version
             )
             assert group is not None
-            await buffer.record_taken_outcome(group.group_id, outcome="taken")
+            await buffer.record_selected_outcomes([group.group_id], outcome="trained")
             next_consuming_version += 1
             await queue.put(group)
             if gated:
@@ -331,9 +316,7 @@ async def _pipeline_consumed_ages(*, gated: bool) -> dict:
             break
         if gated:
             gate.release()
-        consumed_ages.append(
-            trainer_version - claim_versions[group.group_id]
-        )
+        consumed_ages.append(trainer_version - claim_versions[group.group_id])
         for _ in range(5):
             await asyncio.sleep(0)
 
@@ -420,15 +403,15 @@ async def probe_lifecycle_outcome() -> dict:
         selected = await buffer.take_finalized()
         assert selected is not None
         # This is what the controller does when TrainingSampleBuilder rejects it.
-        if hasattr(buffer, "record_taken_outcome"):
-            await buffer.record_taken_outcome(
-                selected.group_id, outcome="untrainable_group"
+        if hasattr(buffer, "record_selected_outcomes"):
+            await buffer.record_selected_outcomes(
+                [selected.group_id], outcome="untrainable_group"
             )
         await buffer.release_active_groups(1, reason="untrainable_group")
         record = json.loads(
-            (
-                Path(log_dir) / "rollout_group_lifecycle.jsonl"
-            ).read_text().splitlines()[0]
+            (Path(log_dir) / "rollout_group_lifecycle.jsonl")
+            .read_text()
+            .splitlines()[0]
         )
         return {
             "downstream_result": "untrainable_group",
@@ -485,7 +468,7 @@ async def probe_fifo_selection_regression() -> dict:
         await buffer.finalize_work(RolloutGroup(group_id=group_id, rollouts=[]))
     selected = await buffer.take_finalized()
     assert selected is not None
-    await buffer.record_taken_outcome(selected.group_id, outcome="taken")
+    await buffer.record_selected_outcomes([selected.group_id], outcome="trained")
     return {
         "selected_group_id": selected.group_id,
         "expected_group_id": 1,
@@ -518,9 +501,7 @@ def probe_simulator_math_conventions() -> dict:
 
     capacity = 10
     need = 9
-    implementation_descent = capacity - __import__("math").ceil(
-        (capacity - need) / 2
-    )
+    implementation_descent = capacity - __import__("math").ceil((capacity - need) / 2)
     simulator_descent = round((capacity + need) / 2)
     return {
         "50_observations_one_outlier": {

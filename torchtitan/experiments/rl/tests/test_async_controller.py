@@ -15,15 +15,15 @@ import pytest
 
 from torchtitan.experiments.rl.components.batcher import Batcher
 from torchtitan.experiments.rl.components.work_buffer import (
+    _estimate_demand_target,
     AdaptiveRolloutGroupWorkBuffer,
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
-    _estimate_demand_target,
 )
 from torchtitan.experiments.rl.controller_metrics import (
-    MetricsTimer,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
+    MetricsTimer,
 )
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.rollout import RolloutGroup
@@ -85,6 +85,7 @@ def test_batcher_counts_trainable_groups_not_rollouts() -> None:
     )
     assert batch is not None
     assert group_is_trainable
+    assert batch.training_group_ids == [0, 1]
 
 
 def test_batcher_carries_metric_only_groups_until_trainable_batch() -> None:
@@ -102,6 +103,7 @@ def test_batcher_carries_metric_only_groups_until_trainable_batch() -> None:
     assert batch is not None
     assert group_is_trainable
     assert batch.num_global_valid_tokens > 0
+    assert batch.training_group_ids == [1]
 
 
 def test_batcher_warns_after_each_batch_of_untrainable_groups(
@@ -324,7 +326,7 @@ def test_take_finalized_does_not_release_active_slot() -> None:
         await buffer.finalize_work(RolloutGroup(group_id=0, rollouts=[]))
         group = await buffer.take_finalized()
         assert group is not None
-        await buffer.record_taken_outcome(group.group_id, outcome="taken")
+        await buffer.record_selected_outcomes([group.group_id], outcome="trained")
 
         waiter = asyncio.create_task(buffer.reserve_slot())
         await asyncio.sleep(0)
@@ -467,18 +469,24 @@ def _metric_value(metrics: list[m.Metric], key: str) -> float:
 
 
 def test_demand_estimate_uses_nearest_rank_and_active_bounds() -> None:
-    assert _estimate_demand_target(
-        unavailable_history=[0] * 14 + [20],
-        num_prompts_per_train_step=4,
-        stall_probability=0.01,
-        max_active_rollout_groups=100,
-    ) == 29
-    assert _estimate_demand_target(
-        unavailable_history=[200],
-        num_prompts_per_train_step=4,
-        stall_probability=0.01,
-        max_active_rollout_groups=40,
-    ) == 40
+    assert (
+        _estimate_demand_target(
+            unavailable_history=[0] * 14 + [20],
+            num_prompts_per_train_step=4,
+            stall_probability=0.01,
+            max_active_rollout_groups=100,
+        )
+        == 29
+    )
+    assert (
+        _estimate_demand_target(
+            unavailable_history=[200],
+            num_prompts_per_train_step=4,
+            stall_probability=0.01,
+            max_active_rollout_groups=40,
+        )
+        == 40
+    )
 
 
 def test_adaptive_buffer_takes_oldest_finalized_and_lets_slow_groups_keep_their_slot() -> None:
@@ -549,9 +557,7 @@ def test_adaptive_buffer_drops_groups_past_max_offpolicy_steps() -> None:
 def test_adaptive_buffer_demand_follows_the_unavailable_count() -> None:
     async def run() -> None:
         # P=4, max age=4: initial demand is the five-step age window = 20.
-        buffer = _adaptive_buffer(
-            num_prompts=4, generation_capacity=20, memory_steps=3
-        )
+        buffer = _adaptive_buffer(num_prompts=4, generation_capacity=20, memory_steps=3)
         assert buffer._active_group_limit() == 20
         for group_id in range(20):
             await _admit(buffer, group_id)
@@ -566,8 +572,7 @@ def test_adaptive_buffer_demand_follows_the_unavailable_count() -> None:
             demands.append(buffer._active_group_limit())
         assert demands == [20, 29, 29, 29, 29, 29]
         assert (
-            _metric_value(buffer.metrics(), "rollout_buffer/demand_target_groups")
-            == 29
+            _metric_value(buffer.metrics(), "rollout_buffer/demand_target_groups") == 29
         )
 
         # After everything finishes and the 3-step maximum history clears,
@@ -608,9 +613,7 @@ def test_adaptive_buffer_never_exceeds_derived_max_demand() -> None:
 
 def test_adaptive_buffer_starts_from_policy_age_window() -> None:
     async def run() -> None:
-        buffer = _adaptive_buffer(
-            num_prompts=2, generation_capacity=10, memory_steps=1
-        )
+        buffer = _adaptive_buffer(num_prompts=2, generation_capacity=10, memory_steps=1)
         for group_id in range(10):
             await _admit(buffer, group_id)
             await buffer.claim_next()
@@ -710,7 +713,7 @@ def test_close_invalidates_uncommitted_admission_reservation() -> None:
     asyncio.run(run())
 
 
-def test_work_buffer_writes_one_lifecycle_line_per_group(tmp_path) -> None:
+def test_work_buffer_writes_terminal_lifecycle_outcome(tmp_path) -> None:
     async def run() -> None:
         buffer = RolloutGroupWorkBuffer.Config(
             target_offpolicy_steps=0, window_fraction=None
@@ -725,13 +728,17 @@ def test_work_buffer_writes_one_lifecycle_line_per_group(tmp_path) -> None:
         await buffer.record_step_start(trainer_policy_version=4)
         group = await buffer.take_finalized(consuming_policy_version=4)
         assert group is not None
-        await buffer.record_taken_outcome(group.group_id, outcome="taken")
+        pending = buffer._selected_lifecycle_awaiting_outcome[group.group_id]
+        assert not hasattr(pending, "rollout_group")
+        assert buffer._active_rollout_groups == 1
+        await buffer.record_selected_outcomes([group.group_id], outcome="trained")
+        assert buffer._active_rollout_groups == 1
 
         lines = (tmp_path / "rollout_group_lifecycle.jsonl").read_text().splitlines()
         assert len(lines) == 1
         record = json.loads(lines[0])
         assert record["group_id"] == 0
-        assert record["outcome"] == "taken"
+        assert record["outcome"] == "trained"
         assert record["policy_version_at_admission"] == 3
         assert record["policy_version_at_claim"] == 3
         assert record["trainer_policy_version_at_exit"] == 4
@@ -742,5 +749,39 @@ def test_work_buffer_writes_one_lifecycle_line_per_group(tmp_path) -> None:
             <= record["finalized_at"]
             <= record["left_at"]
         )
+
+    asyncio.run(run())
+
+
+def test_close_records_unresolved_selected_group_as_closed(tmp_path) -> None:
+    async def run() -> None:
+        buffer = RolloutGroupWorkBuffer.Config(
+            target_offpolicy_steps=1, window_fraction=None
+        ).build(
+            num_prompts_per_train_step=2,
+            lifecycle_log_dir=str(tmp_path),
+        )
+        for group_id in range(2):
+            await _admit(buffer, group_id)
+            await buffer.claim_next()
+            await _finalize(buffer, group_id)
+            selected = await buffer.take_finalized(consuming_policy_version=0)
+            assert selected is not None
+
+        await buffer.record_selected_outcomes([0], outcome="trained")
+        assert buffer._active_rollout_groups == 2
+        await buffer.close()
+
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "rollout_group_lifecycle.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        assert [(record["group_id"], record["outcome"]) for record in records] == [
+            (0, "trained"),
+            (1, "closed"),
+        ]
+        assert buffer._active_rollout_groups == 2
 
     asyncio.run(run())

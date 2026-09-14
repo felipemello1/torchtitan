@@ -243,6 +243,7 @@ class RolloutWorker(Configurable):
         self._token_env_config = config.token_env
         self.advantage_estimator: AdvantageEstimator = config.advantage.build()
         self._renderer: Renderer
+        self._logged_sampling_seed = False
 
     async def setup_async(
         self,
@@ -331,6 +332,15 @@ class RolloutWorker(Configurable):
             group_size=group_size,
         )
 
+        if sampling.seed is not None and not self._logged_sampling_seed:
+            logger.info(
+                "Sampling seed example: base=%d group_id=%d rollout_id=0 derived=%d",
+                sampling.seed,
+                group_id,
+                sampling.seed + group_id * group_size,
+            )
+            self._logged_sampling_seed = True
+
         # TODO(perf): siblings in a group share the first-turn prompt; tokenize it once per group and
         # reuse across the group_size rollouts (truest spot is the worker's first-turn render).
         try:
@@ -350,9 +360,7 @@ class RolloutWorker(Configurable):
                             else replace(
                                 sampling,
                                 seed=(
-                                    sampling.seed
-                                    + group_id * group_size
-                                    + sample_idx
+                                    sampling.seed + group_id * group_size + sample_idx
                                 ),
                             )
                         ),

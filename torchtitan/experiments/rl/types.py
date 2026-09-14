@@ -153,6 +153,8 @@ class TrainingBatch:
     metrics: list[m.Metric]
     # one per packed training_sample; trainer computes policy_age at consume time
     min_policy_versions: list[int]
+    training_group_ids: list[int]
+    """Rollout groups whose samples are trained by this optimizer step."""
 
 
 @dataclass(frozen=True, slots=True)

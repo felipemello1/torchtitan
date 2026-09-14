@@ -31,7 +31,7 @@ RolloutGroupWorkBuffer
 | _data_input_loop  add_work(RolloutGroupWork)                                   WAITING; slot acquired               |
 | _rollout_loop[N]  claim_next()                                                 WAITING -> INFLIGHT                  |
 | _rollout_loop[N]  finalize_work(RolloutGroup)                                  INFLIGHT -> FINALIZED                |
-| _batcher_loop     RolloutGroup = take_finalized()                              FINALIZED -> taken (slot still held) |
+| _batcher_loop     RolloutGroup = take_finalized()                              FINALIZED -> selected (slot held)    |
 | _batcher_loop     release_active_groups(1, "untrainable_group")                slot released                        |
 | _trainer_loop     record_step_start(trainer_policy_version)                    observation point (no state change) |
 | _trainer_loop     release_active_groups(num_prompts_per_train_step, "trained")  slots released after weight pull     |
@@ -91,6 +91,8 @@ _trainer_loop
 import asyncio
 import logging
 import math
+import os
+import socket
 import time
 import warnings
 from dataclasses import dataclass, field, replace
@@ -119,11 +121,11 @@ from torchtitan.experiments.rl.components.work_buffer import (
     RolloutGroupWorkBuffer,
 )
 from torchtitan.experiments.rl.controller_metrics import (
-    MetricsTimer,
     combine_microbatch_metrics,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     compute_rollout_metrics,
+    MetricsTimer,
 )
 from torchtitan.experiments.rl.losses import GRPOLoss
 from torchtitan.experiments.rl.observability import metrics as m
@@ -372,9 +374,18 @@ class Controller(Configurable):
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
         self.start_step = 0
         self._proc_meshes = []
+        resolved_sampling_seed = (
+            config.generator.sampling.seed
+            if config.generator.sampling.seed is not None
+            else config.generator.debug.seed
+        )
+        job_config = config.to_dict()
+        job_config["resolved_runtime"] = {
+            "sampling_base_seed": resolved_sampling_seed,
+        }
         self.metrics_processor: m.MetricsProcessor = config.metrics.build(
             log_dir=config.dump_folder,
-            job_config=config.to_dict(),
+            job_config=job_config,
         )
         self.tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
         self.renderer = config.renderer.build(tokenizer=self.tokenizer)
@@ -384,8 +395,19 @@ class Controller(Configurable):
         # seed per sample. Avoids the generator depending on request_id format.
         self._sampling = replace(
             config.generator.sampling,
-            seed=config.generator.debug.seed,
+            seed=resolved_sampling_seed,
             stop_token_ids=list(self.renderer.get_stop_token_ids()),
+        )
+        logger.info(
+            "Sampling seeds: sampling=%s debug=%s resolved_base=%s",
+            config.generator.sampling.seed,
+            config.generator.debug.seed,
+            resolved_sampling_seed,
+        )
+        logger.info(
+            "Controller host identity: HOSTNAME=%s socket_hostname=%s",
+            os.environ.get("HOSTNAME"),
+            socket.gethostname(),
         )
         self._rollouter: Rollouter = config.rollouter.build()
         self.rollout_recorder = config.rollout_recorder.build(
@@ -744,9 +766,7 @@ class Controller(Configurable):
             lifecycle_log_dir=self.config.dump_folder,
         )
         max_active_rollout_groups = self._group_buffer.max_active_rollout_groups
-        max_concurrent_rollout_groups = (
-            self._group_buffer.max_concurrent_rollout_groups
-        )
+        max_concurrent_rollout_groups = self._group_buffer.max_concurrent_rollout_groups
         logger.info(
             f"{type(self._group_buffer).__name__}: max_active_rollout_groups={max_active_rollout_groups}, "
             f"max_concurrent_rollout_groups={max_concurrent_rollout_groups}, "
@@ -1007,11 +1027,10 @@ class Controller(Configurable):
                     batcher.add_training_samples,
                     training_sample_group=training_sample_group,
                 )
-            await group_buffer.record_taken_outcome(
-                rollout_group.group_id,
-                outcome="taken" if group_is_trainable else "untrainable_group",
-            )
             if not group_is_trainable:
+                await group_buffer.record_selected_outcomes(
+                    [rollout_group.group_id], outcome="untrainable_group"
+                )
                 await group_buffer.release_active_groups(1, reason="untrainable_group")
             if maybe_training_batch is not None:
                 await training_batch_queue.put(maybe_training_batch)
@@ -1114,6 +1133,9 @@ class Controller(Configurable):
                     optim_result = self._get_rank_0_value(
                         await self.trainer.optim_step.call()
                     )
+                await self._group_buffer.record_selected_outcomes(
+                    packed.training_group_ids, outcome="trained"
+                )
                 self._trainer_policy_version = optim_result.policy_version
 
                 # Await generator weight pull to finish before the trainer's next push.

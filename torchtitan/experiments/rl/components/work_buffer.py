@@ -71,11 +71,36 @@ class RolloutGroupWork:
     """Exact trainer version of the batch that selected or rejected this group."""
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingLifecycleRecord:
+    """Lifecycle metadata retained after the rollout payload leaves the buffer."""
+
+    group_id: int
+    admitted_at: float
+    claimed_at: float | None
+    finalized_at: float | None
+    policy_version_at_admission: int
+    policy_version_at_claim: int | None
+    consuming_policy_version: int | None
+
+    @classmethod
+    def from_work(cls, work: RolloutGroupWork) -> "_PendingLifecycleRecord":
+        return cls(
+            group_id=work.group_id,
+            admitted_at=work.admitted_at,
+            claimed_at=work.claimed_at,
+            finalized_at=work.finalized_at,
+            policy_version_at_admission=work.policy_version_at_admission,
+            policy_version_at_claim=work.policy_version_at_claim,
+            consuming_policy_version=work.consuming_policy_version,
+        )
+
+
 class _RolloutGroupLifecycleLog:
-    """Append one JSON line per rollout group when it leaves the buffer (taken, dropped, or closed).
+    """Append one JSON line per rollout group at its terminal lifecycle outcome.
 
     Example line (timestamps are `time.time()` seconds):
-        {"group_id": 12, "outcome": "taken", "admitted_at": 1.7e9, "claimed_at": 1.7e9, "finalized_at": 1.7e9,
+        {"group_id": 12, "outcome": "trained", "admitted_at": 1.7e9, "claimed_at": 1.7e9, "finalized_at": 1.7e9,
          "left_at": 1.7e9, "policy_version_at_admission": 3, "policy_version_at_claim": 3,
          "trainer_policy_version_at_exit": 5}
     """
@@ -91,7 +116,11 @@ class _RolloutGroupLifecycleLog:
         self._file.close()
 
     def record(
-        self, work: RolloutGroupWork, *, outcome: str, trainer_policy_version: int
+        self,
+        work: RolloutGroupWork | _PendingLifecycleRecord,
+        *,
+        outcome: str,
+        trainer_policy_version: int,
     ) -> None:
         self._file.write(
             json.dumps(
@@ -147,6 +176,12 @@ class RolloutGroupWorkBuffer(Configurable):
         reservation = await slot_task
         assert reservation is not None
         await buffer.cancel_reservation(reservation)
+
+    Args:
+        num_prompts_per_train_step: Prompt groups per train step (`P`).
+        policy_version: Version the generators hold at start (the resumed step).
+        lifecycle_log_dir: Where `rollout_group_lifecycle.jsonl` is appended;
+            `None` disables it.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -184,9 +219,7 @@ class RolloutGroupWorkBuffer(Configurable):
             """Active buffer size in prompt groups, ``B = (S + 1) * P``."""
             return (self.target_offpolicy_steps + 1) * num_prompts_per_train_step
 
-        def max_concurrent_rollout_groups(
-            self, num_prompts_per_train_step: int
-        ) -> int:
+        def max_concurrent_rollout_groups(self, num_prompts_per_train_step: int) -> int:
             """Fixed FIFO keeps its historical one-worker-per-active-slot behavior."""
             return self.max_active_rollout_groups(num_prompts_per_train_step)
 
@@ -237,12 +270,6 @@ class RolloutGroupWorkBuffer(Configurable):
         policy_version: int = 0,
         lifecycle_log_dir: str | None = None,
     ) -> None:
-        """
-        Args:
-            num_prompts_per_train_step: Prompt groups per train step (`P`).
-            policy_version: Version the generators hold at start (the resumed step).
-            lifecycle_log_dir: Where `rollout_group_lifecycle.jsonl` is appended; `None` disables it.
-        """
         self._num_prompts_per_train_step = num_prompts_per_train_step
         self._max_active_rollout_groups = config.max_active_rollout_groups(
             num_prompts_per_train_step
@@ -293,7 +320,9 @@ class RolloutGroupWorkBuffer(Configurable):
             if lifecycle_log_dir is not None
             else None
         )
-        self._taken_work_awaiting_outcome: dict[int, RolloutGroupWork] = {}
+        self._selected_lifecycle_awaiting_outcome: dict[
+            int, _PendingLifecycleRecord
+        ] = {}
 
     @property
     def max_active_rollout_groups(self) -> int:
@@ -359,9 +388,7 @@ class RolloutGroupWorkBuffer(Configurable):
             self._admission_reservations.remove(reservation)
             self._condition.notify_all()
 
-    async def add_work(
-        self, work: RolloutGroupWork, *, reservation: int
-    ) -> bool:
+    async def add_work(self, work: RolloutGroupWork, *, reservation: int) -> bool:
         """Commit a reserved slot as WAITING; return false if close won the race."""
         async with self._condition:
             if self._closed:
@@ -454,7 +481,9 @@ class RolloutGroupWorkBuffer(Configurable):
         """Remove an entry from the buffer, log its lifecycle, and wake waiters. Caller holds the condition."""
         del self._work_by_group_id[work.group_id]
         if outcome is None and self._lifecycle_log is not None:
-            self._taken_work_awaiting_outcome[work.group_id] = work
+            self._selected_lifecycle_awaiting_outcome[
+                work.group_id
+            ] = _PendingLifecycleRecord.from_work(work)
         elif self._lifecycle_log is not None:
             self._lifecycle_log.record(
                 work,
@@ -464,22 +493,37 @@ class RolloutGroupWorkBuffer(Configurable):
         self._condition.notify_all()
         return work
 
-    async def record_taken_outcome(self, group_id: int, *, outcome: str) -> None:
-        """Record whether a selected group was trainable after sample building.
+    async def record_selected_outcomes(
+        self, group_ids: Sequence[int], *, outcome: str
+    ) -> None:
+        """Record a terminal outcome for selected rollout groups.
 
         Args:
-            group_id: Selected rollout group's id.
-            outcome: `"taken"` when trainable, otherwise the filter reason.
+            group_ids: Selected rollout group ids.
+            outcome: Terminal result such as `"trained"` or `"untrainable_group"`.
+
+        Example:
+            await buffer.record_selected_outcomes([4, 7], outcome="trained")
         """
         async with self._condition:
             if self._lifecycle_log is None:
                 return
-            work = self._taken_work_awaiting_outcome.pop(group_id)
-            self._lifecycle_log.record(
-                work,
-                outcome=outcome,
-                trainer_policy_version=self._trainer_policy_version,
+            missing_group_ids = [
+                group_id
+                for group_id in group_ids
+                if group_id not in self._selected_lifecycle_awaiting_outcome
+            ]
+            assert not missing_group_ids, (
+                "selected rollout groups have no pending lifecycle record: "
+                f"{missing_group_ids}"
             )
+            for group_id in group_ids:
+                work = self._selected_lifecycle_awaiting_outcome.pop(group_id)
+                self._lifecycle_log.record(
+                    work,
+                    outcome=outcome,
+                    trainer_policy_version=self._trainer_policy_version,
+                )
 
     async def record_step_start(self, *, trainer_policy_version: int) -> None:
         """Trainer loop: called right before it waits for the next training batch.
@@ -532,7 +576,7 @@ class RolloutGroupWorkBuffer(Configurable):
             for work in list(self._work_by_group_id.values()):
                 self._remove_work(work, outcome="closed")
             if self._lifecycle_log is not None:
-                for work in self._taken_work_awaiting_outcome.values():
+                for work in self._selected_lifecycle_awaiting_outcome.values():
                     self._lifecycle_log.record(
                         work,
                         outcome="closed",
@@ -540,7 +584,7 @@ class RolloutGroupWorkBuffer(Configurable):
                     )
                 self._lifecycle_log.close()
                 self._lifecycle_log = None
-            self._taken_work_awaiting_outcome.clear()
+            self._selected_lifecycle_awaiting_outcome.clear()
             self._condition.notify_all()
 
     def metrics(self) -> list[m.Metric]:
@@ -666,13 +710,12 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         def max_active_rollout_groups(self, num_prompts_per_train_step: int) -> int:
             """Maximum useful demand from generation capacity and age window."""
             assert self.generation_capacity is not None
-            return self.generation_capacity + (
-                self.max_offpolicy_steps + 1
-            ) * num_prompts_per_train_step
+            return (
+                self.generation_capacity
+                + (self.max_offpolicy_steps + 1) * num_prompts_per_train_step
+            )
 
-        def max_concurrent_rollout_groups(
-            self, num_prompts_per_train_step: int
-        ) -> int:
+        def max_concurrent_rollout_groups(self, num_prompts_per_train_step: int) -> int:
             del num_prompts_per_train_step
             assert self.generation_capacity is not None
             return self.generation_capacity
@@ -764,9 +807,7 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
             states = [work.state for work in self._work_by_group_id.values()]
             self._unavailable_at_step_start = states.count(
                 _RolloutGroupWorkState.INFLIGHT
-            ) + states.count(
-                _RolloutGroupWorkState.WAITING
-            )
+            ) + states.count(_RolloutGroupWorkState.WAITING)
             self._num_step_start_observations += 1
 
             # Step 1 uses the initial prior. Its unavailable count is a cold-start
@@ -804,6 +845,8 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         ]
         self._dropped_too_old_since_flush = 0
         return out
+
+
 def _slope(values: Sequence[int]) -> float:
     """Least-squares slope of `values` against their index; 0 with fewer than two points."""
     n = len(values)

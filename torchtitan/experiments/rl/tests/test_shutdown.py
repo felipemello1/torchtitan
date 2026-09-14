@@ -137,7 +137,7 @@ def test_fifo_buffer_config_handles_window_fraction_bounds() -> None:
     assert buffer.max_offpolicy_steps == 0
 
 
-def _make_stub_rl_trainer():
+def _make_stub_rl_trainer(*, sampling_seed=None, debug_seed=None):
     """Create an Controller with a minimal stub config (no VLLMGenerator validation)."""
     from torchtitan.experiments.rl.observability import metrics as m
 
@@ -160,7 +160,8 @@ def _make_stub_rl_trainer():
         )
         # __init__ reads generator.sampling (a dataclass, for replace) + generator.debug.seed.
         generator = SimpleNamespace(
-            sampling=SamplingConfig(), debug=SimpleNamespace(seed=None)
+            sampling=SamplingConfig(seed=sampling_seed),
+            debug=SimpleNamespace(seed=debug_seed),
         )
         rollouter = SimpleNamespace(build=lambda: _StubRollouter())
 
@@ -168,6 +169,16 @@ def _make_stub_rl_trainer():
             return {}
 
     return train.Controller(_StubConfig())
+
+
+def test_sampling_seed_prefers_explicit_sampling_config() -> None:
+    controller = _make_stub_rl_trainer(sampling_seed=17, debug_seed=23)
+    assert controller._sampling.seed == 17
+
+
+def test_sampling_seed_falls_back_to_debug_seed() -> None:
+    controller = _make_stub_rl_trainer(sampling_seed=None, debug_seed=23)
+    assert controller._sampling.seed == 23
 
 
 @pytest.fixture
@@ -277,10 +288,7 @@ def test_spawn_proc_mesh_uses_role_specific_local_compiler_cache(monkeypatch):
     )
 
     assert bootstrap.env["TRITON_CACHE_DIR"] == "/tmp/job-7/generator_3/triton"
-    assert (
-        bootstrap.env["TORCHINDUCTOR_CACHE_DIR"]
-        == "/tmp/job-7/generator_3/inductor"
-    )
+    assert bootstrap.env["TORCHINDUCTOR_CACHE_DIR"] == "/tmp/job-7/generator_3/inductor"
 
 
 def test_main_shuts_down_after_train_failure(monkeypatch, stub_mesh_provisioning):

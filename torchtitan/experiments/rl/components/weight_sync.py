@@ -70,6 +70,7 @@ class WeightSyncManager:
         # Wall time of the push and pull of the last completed sync.
         self._last_push_s: float = 0.0
         self._last_pull_s: float = 0.0
+        self._last_per_generator_pull_s: list[float] = []
 
     def start_async_push_pull(self, *, version: int) -> None:
         """Fire push -> pull -> buffer-slot release in the background; returns immediately.
@@ -98,7 +99,16 @@ class WeightSyncManager:
             m.Metric(
                 "timing/weight_sync/generator_pull_model_state_dict",
                 m.NoReduce(self._last_pull_s),
-            )
+            ),
+            *[
+                m.Metric(
+                    f"timing/weight_sync/generator_{generator_index}_pull_model_state_dict",
+                    m.NoReduce(seconds),
+                )
+                for generator_index, seconds in enumerate(
+                    self._last_per_generator_pull_s
+                )
+            ],
         ]
 
     async def wait_inflight_push_pull(self) -> None:
@@ -118,8 +128,13 @@ class WeightSyncManager:
         await push_task
         with sl.log_trace_span("generator_pull_model_state_dict"):
             start = time.perf_counter()
-            await self._generator_router.pull_model_state_dict.call_one(version)
+            pull_results = await self._generator_router.pull_model_state_dict.call_one(
+                version
+            )
             self._last_pull_s = time.perf_counter() - start
+            self._last_per_generator_pull_s = [
+                float(result["router_seconds"]) for result in pull_results
+            ]
         # TODO(perf): pull_model_state_dict awaits ALL generators before we release any buffer slots,
         #   so a generator that finishes its pull early idles until the slowest one. Investigate
         #   per-generator release (router surfaces each pull's completion -> release that generator's
