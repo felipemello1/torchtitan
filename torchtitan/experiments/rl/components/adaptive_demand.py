@@ -68,6 +68,9 @@ class StallDrivenDemand:
         self._dropped.append(dropped)
         self._completed.append(completed)
         self._trainable.append(trainable)
+        # TODO: trigger on the previous step's wait (>= 1 s) instead of the shelf. Identical while pulls pause the
+        #   generators (waits are 0 or > 10 s); with a fast sync it lands 2 points fewer drops at the same stall rate
+        #   (discussions/86 claude/sim/out/compare_wait_trigger.txt). Needs the wait passed into `record_step_start`.
         if ready < P:
             self._comfortable_steps = 0
             drop_share = sum(self._dropped) / max(1, sum(self._completed))
