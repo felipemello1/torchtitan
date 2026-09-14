@@ -15,10 +15,10 @@ import pytest
 
 from torchtitan.experiments.rl.components.batcher import Batcher
 from torchtitan.experiments.rl.components.work_buffer import (
-    _estimate_demand_target,
     AdaptiveRolloutGroupWorkBuffer,
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
+    StallDrivenDemand,
 )
 from torchtitan.experiments.rl.controller_metrics import (
     compute_perf_ratio_metrics,
@@ -454,13 +454,13 @@ def _adaptive_buffer(
     num_prompts: int,
     max_offpolicy_steps: int = 4,
     generation_capacity: int = 64,
-    memory_steps: int = 15,
+    patience_steps: int = 20,
     **kwargs
 ) -> AdaptiveRolloutGroupWorkBuffer:
     return AdaptiveRolloutGroupWorkBuffer.Config(
         max_offpolicy_steps=max_offpolicy_steps,
         generation_capacity=generation_capacity,
-        memory_steps=memory_steps,
+        patience_steps=patience_steps,
     ).build(num_prompts_per_train_step=num_prompts, **kwargs)
 
 
@@ -468,25 +468,75 @@ def _metric_value(metrics: list[m.Metric], key: str) -> float:
     return next(metric.value.value for metric in metrics if metric.key == key)
 
 
-def test_demand_estimate_uses_nearest_rank_and_active_bounds() -> None:
-    assert (
-        _estimate_demand_target(
-            unavailable_history=[0] * 14 + [20],
-            num_prompts_per_train_step=4,
-            stall_probability=0.01,
-            max_active_rollout_groups=100,
-        )
-        == 29
+def test_stall_driven_demand_rises_on_a_short_shelf_and_relaxes_with_patience() -> None:
+    demand = StallDrivenDemand(
+        num_prompts_per_train_step=8,
+        ceiling=168,
+        generation_capacity=128,
+        patience_steps=3,
     )
+    assert demand.demand == 40  # five batches
     assert (
-        _estimate_demand_target(
-            unavailable_history=[200],
-            num_prompts_per_train_step=4,
-            stall_probability=0.01,
-            max_active_rollout_groups=40,
+        demand.observe(ready=5, inflight=30, completed=12, trainable=8, dropped=0) == 44
+    )  # short shelf: + P // 2
+    assert (
+        demand.observe(ready=8, inflight=30, completed=12, trainable=8, dropped=0) == 44
+    )  # one batch: hold
+    for _ in range(2):
+        assert (
+            demand.observe(ready=16, inflight=30, completed=12, trainable=8, dropped=0)
+            == 44
         )
-        == 40
+    assert (
+        demand.observe(ready=16, inflight=30, completed=12, trainable=8, dropped=0)
+        == 43
+    )  # third comfortable step: -1
+    assert (
+        demand.observe(ready=9, inflight=30, completed=12, trainable=8, dropped=0) == 43
+    )  # comfort streak reset
+    assert demand.state == "ok"
+
+
+def test_stall_driven_demand_stays_within_bounds() -> None:
+    demand = StallDrivenDemand(
+        num_prompts_per_train_step=2, ceiling=8, generation_capacity=4
     )
+    for _ in range(10):
+        demand.observe(ready=0, inflight=2, completed=1, trainable=1, dropped=0)
+    assert demand.demand == 8
+    demand = StallDrivenDemand(
+        num_prompts_per_train_step=2, ceiling=8, generation_capacity=4, patience_steps=1
+    )
+    for _ in range(20):
+        demand.observe(ready=4, inflight=2, completed=1, trainable=1, dropped=0)
+    assert demand.demand == 4  # floor: two batches
+
+
+def test_stall_driven_demand_refuses_growth_when_age_limited_or_generation_bound() -> None:
+    demand = StallDrivenDemand(
+        num_prompts_per_train_step=8,
+        ceiling=168,
+        generation_capacity=128,
+        guard_window_steps=2,
+    )
+    demand.observe(
+        ready=0, inflight=10, completed=10, trainable=6, dropped=4
+    )  # window not full yet: grows
+    assert demand.demand == 44 and demand.state == "ok"
+    demand.observe(
+        ready=0, inflight=10, completed=10, trainable=6, dropped=4
+    )  # 8 of 20 dropped > 15%
+    assert demand.demand == 44 and demand.state == "age-limited"
+    demand.observe(
+        ready=0, inflight=10, completed=10, trainable=6, dropped=0
+    )  # 4 of 20 still > 15%
+    assert demand.demand == 44 and demand.state == "age-limited"
+    # drops gone; permits full and only 6 trainable per step for a batch of 8: a bigger shelf cannot be filled
+    demand.observe(ready=0, inflight=128, completed=10, trainable=6, dropped=0)
+    assert demand.demand == 44 and demand.state == "generation-bound"
+    # permits full but 10 trainable per step: extra demand buffers the surplus, so it grows
+    demand.observe(ready=0, inflight=128, completed=14, trainable=10, dropped=0)
+    assert demand.demand == 48 and demand.state == "ok"
 
 
 def test_adaptive_buffer_takes_oldest_finalized_and_lets_slow_groups_keep_their_slot() -> None:
@@ -554,36 +604,44 @@ def test_adaptive_buffer_drops_groups_past_max_offpolicy_steps() -> None:
     asyncio.run(run())
 
 
-def test_adaptive_buffer_demand_follows_the_unavailable_count() -> None:
+def test_adaptive_buffer_measures_the_shelf_and_moves_demand() -> None:
     async def run() -> None:
-        # P=4, max age=4: initial demand is the five-step age window = 20.
-        buffer = _adaptive_buffer(num_prompts=4, generation_capacity=20, memory_steps=3)
+        # P=4: demand starts at five batches = 20; the shelf is what is finished and not held by the trainer.
+        buffer = _adaptive_buffer(
+            num_prompts=4, generation_capacity=40, patience_steps=2
+        )
         assert buffer._active_group_limit() == 20
         for group_id in range(20):
             await _admit(buffer, group_id)
         for _ in range(20):
             await buffer.claim_next()
 
-        # Step 1 holds the prior. Then 20 unavailable gives estimate 29,
-        # which is adopted immediately.
-        demands = []
-        for _ in range(6):
-            await buffer.record_step_start(trainer_policy_version=0)
-            demands.append(buffer._active_group_limit())
-        assert demands == [20, 29, 29, 29, 29, 29]
+        # nothing finished: shelf 0 -> +2 per step start
+        await buffer.record_step_start(trainer_policy_version=0)
+        assert buffer._active_group_limit() == 22
         assert (
-            _metric_value(buffer.metrics(), "rollout_buffer/demand_target_groups") == 29
+            _metric_value(buffer.metrics(), "rollout_buffer/ready_at_step_start") == 0
         )
 
-        # After everything finishes and the 3-step maximum history clears,
-        # estimate 9 is adopted immediately.
-        for group_id in range(20):
+        # ten groups finish; the batcher selects four and the trainer trains them: they leave the shelf
+        for group_id in range(10):
             await _finalize(buffer, group_id)
-        demands = []
-        for _ in range(8):
-            await buffer.record_step_start(trainer_policy_version=0)
-            demands.append(buffer._active_group_limit())
-        assert demands == [29, 29, 9, 9, 9, 9, 9, 9]
+        for _ in range(4):
+            await buffer.take_finalized(consuming_policy_version=0)
+        await buffer.record_selected_outcomes([0, 1, 2, 3], outcome="trained")
+        await buffer.record_step_start(trainer_policy_version=1)
+        assert (
+            _metric_value(buffer.metrics(), "rollout_buffer/ready_at_step_start") == 6
+        )
+        assert buffer._active_group_limit() == 22  # one batch on the shelf: hold
+
+        # the pull releases the trained batch; the shelf still holds six, plus four more finish -> two batches
+        await buffer.release_active_groups(4, reason="trained", policy_version=1)
+        for group_id in range(10, 14):
+            await _finalize(buffer, group_id)
+        await buffer.record_step_start(trainer_policy_version=1)
+        await buffer.record_step_start(trainer_policy_version=1)
+        assert buffer._active_group_limit() == 21  # two comfortable steps: -1
 
     asyncio.run(run())
 
@@ -607,25 +665,6 @@ def test_adaptive_buffer_never_exceeds_derived_max_demand() -> None:
         assert not waiter.done()
         await buffer.close()
         assert await waiter is None
-
-    asyncio.run(run())
-
-
-def test_adaptive_buffer_starts_from_policy_age_window() -> None:
-    async def run() -> None:
-        buffer = _adaptive_buffer(num_prompts=2, generation_capacity=10, memory_steps=1)
-        for group_id in range(10):
-            await _admit(buffer, group_id)
-            await buffer.claim_next()
-
-        # (max_offpolicy_steps + 1) * P = 10. The first observation holds that
-        # prior; the next saturated observation estimates and adopts 15.
-        await buffer.record_step_start(trainer_policy_version=0)
-        assert buffer._active_group_limit() == 10
-        await buffer.record_step_start(trainer_policy_version=0)
-        assert buffer._active_group_limit() == 15
-        await buffer.record_step_start(trainer_policy_version=0)
-        assert buffer._active_group_limit() == 15
 
     asyncio.run(run())
 

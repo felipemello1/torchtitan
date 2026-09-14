@@ -4,27 +4,90 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Pure demand-estimation helpers shared by the adaptive rollout controller."""
+"""Demand rule of the adaptive rollout buffer: how many prompt groups may be in the pipeline."""
 
-import math
-from collections.abc import Sequence
+from collections import deque
+from dataclasses import dataclass, field
 
 
-def estimate_demand_target(
-    *,
-    unavailable_history: Sequence[int],
-    num_prompts_per_train_step: int,
-    stall_probability: float,
-    max_active_rollout_groups: int,
-) -> int:
-    """Estimate total active demand from recent unavailable group counts."""
-    if not unavailable_history:
-        raise ValueError("unavailable_history must not be empty")
-    history = sorted(unavailable_history)
-    rank = max(0, math.ceil((1 - stall_probability) * len(history)) - 1)
-    unavailable_bad_day = history[rank]
-    estimate = 2 * num_prompts_per_train_step + unavailable_bad_day + 1
-    return min(
-        max_active_rollout_groups,
-        max(2 * num_prompts_per_train_step, estimate),
-    )
+@dataclass
+class StallDrivenDemand:
+    """Set the demand from the trainer's own experience: a short shelf adds half a batch, comfort gives one back.
+
+    At each step start the buffer reports the shelf (finished groups not yet trained) and the groups in flight.
+    A shelf below one batch means the trainer is about to wait, so demand rises by `P // 2` at once. A shelf of at
+    least two batches for `patience_steps` consecutive steps lowers demand by one. Demand starts at `5 P` and stays
+    within `[2 P, ceiling]`.
+
+    Growth is refused, and `state` names the reason, when more demand cannot help:
+        "age-limited"       more than `max_drop_share` of the groups completed in the last `guard_window_steps`
+                            were dropped as too old: the age cap binds, extra demand becomes stale work
+        "generation-bound"  the generators hold every permit (`inflight >= generation_capacity`) and still
+                            deliver fewer trainable groups per step than the trainer consumes
+
+    Example:
+        demand = StallDrivenDemand(num_prompts_per_train_step=8, ceiling=168, generation_capacity=128)
+        demand.observe(ready=5, inflight=30, completed=12, trainable=8, dropped=0)   # -> 44: shelf short, +4
+        for _ in range(20):
+            demand.observe(ready=16, inflight=30, completed=12, trainable=8, dropped=0)
+        demand.demand                                                  # -> 43: twenty comfortable steps, -1
+    """
+
+    num_prompts_per_train_step: int
+    ceiling: int
+    generation_capacity: int
+    patience_steps: int = 20
+    max_drop_share: float = 0.15
+    guard_window_steps: int = 10
+    demand: int = field(init=False)
+    state: str = field(default="ok", init=False)
+    _comfortable_steps: int = field(default=0, init=False)
+    _dropped: deque = field(init=False)
+    _completed: deque = field(init=False)
+    _trainable: deque = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.demand = min(self.ceiling, 5 * self.num_prompts_per_train_step)
+        self._dropped = deque(maxlen=self.guard_window_steps)
+        self._completed = deque(maxlen=self.guard_window_steps)
+        self._trainable = deque(maxlen=self.guard_window_steps)
+
+    def observe(
+        self, *, ready: int, inflight: int, completed: int, trainable: int, dropped: int
+    ) -> int:
+        """Update the demand from one step start.
+
+        Args:
+            ready: Finished groups not yet trained (finalized, selected, or queued for the trainer).
+            inflight: Groups generating (waiting or in flight).
+            completed: Groups that finished since the previous step start.
+            trainable: Of those, groups with a learning signal (classified so far).
+            dropped: Groups dropped as too old since the previous step start.
+        """
+        P = self.num_prompts_per_train_step
+        self._dropped.append(dropped)
+        self._completed.append(completed)
+        self._trainable.append(trainable)
+        if ready < P:
+            self._comfortable_steps = 0
+            drop_share = sum(self._dropped) / max(1, sum(self._completed))
+            if (
+                len(self._dropped) == self.guard_window_steps
+                and drop_share > self.max_drop_share
+            ):
+                self.state = "age-limited"
+                return self.demand
+            trainable_per_step = sum(self._trainable) / max(1, len(self._trainable))
+            if inflight >= self.generation_capacity and trainable_per_step < P:
+                self.state = "generation-bound"
+                return self.demand
+            self.state = "ok"
+            self.demand = min(self.ceiling, self.demand + max(1, P // 2))
+        elif ready >= 2 * P:
+            self._comfortable_steps += 1
+            if self._comfortable_steps >= self.patience_steps:
+                self._comfortable_steps = 0
+                self.demand = max(2 * P, self.demand - 1)
+        else:
+            self._comfortable_steps = 0
+        return self.demand
