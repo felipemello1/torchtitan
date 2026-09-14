@@ -9,8 +9,8 @@ NOTE: The buffer holds work slots, and not the finalized RolloutGroups necessari
 
 Two buffers share one interface, so the controller runs either one unchanged:
 
-    RolloutGroupWorkBuffer          fixed capacity `(target_offpolicy_steps + 1) * P`; windowed FIFO; never drops
-    AdaptiveRolloutGroupWorkBuffer  capacity learned from the run; takes the oldest finalized group;
+    RolloutGroupWorkBuffer             fixed `(target_offpolicy_steps + 1) * P`; windowed FIFO; never drops
+    AdaptiveRolloutGroupWorkBuffer  dynamic reservoir demand; takes the oldest finalized group;
                                     drops groups past `max_offpolicy_steps`
 """
 
@@ -26,6 +26,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from torchtitan.config import Configurable
+from torchtitan.experiments.rl.components.adaptive_demand import (
+    estimate_demand_target as _estimate_demand_target,
+)
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.rollout import RolloutGroup
 from torchtitan.observability import structured_logger as sl
@@ -64,6 +67,8 @@ class RolloutGroupWork:
     admitted_at: float = field(default=0.0, init=False)
     claimed_at: float | None = field(default=None, init=False)
     finalized_at: float | None = field(default=None, init=False)
+    consuming_policy_version: int | None = field(default=None, init=False)
+    """Exact trainer version of the batch that selected or rejected this group."""
 
 
 class _RolloutGroupLifecycleLog:
@@ -77,9 +82,13 @@ class _RolloutGroupLifecycleLog:
 
     def __init__(self, log_dir: str) -> None:
         os.makedirs(log_dir, exist_ok=True)
-        self._file = open(
+        self._file = open(  # noqa: SIM115 - held open for the buffer lifetime
             os.path.join(log_dir, "rollout_group_lifecycle.jsonl"), "a", buffering=1
         )
+
+    def close(self) -> None:
+        """Flush and close the lifecycle JSONL file."""
+        self._file.close()
 
     def record(
         self, work: RolloutGroupWork, *, outcome: str, trainer_policy_version: int
@@ -96,6 +105,7 @@ class _RolloutGroupLifecycleLog:
                     "policy_version_at_admission": work.policy_version_at_admission,
                     "policy_version_at_claim": work.policy_version_at_claim,
                     "trainer_policy_version_at_exit": trainer_policy_version,
+                    "consuming_policy_version": work.consuming_policy_version,
                 }
             )
             + "\n"
@@ -125,14 +135,18 @@ class RolloutGroupWorkBuffer(Configurable):
     Example:
         # target_offpolicy_steps=1, num_prompts_per_train_step=2 -> capacity=4
         buffer = RolloutGroupWorkBuffer.Config(target_offpolicy_steps=1).build(num_prompts_per_train_step=2)
-        await buffer.add_work(g0); await buffer.add_work(g1)   # 2/4 active
-        await buffer.add_work(g2); await buffer.add_work(g3)   # 4/4 active (cap)
+        for work in (g0, g1, g2, g3):
+            reservation = await buffer.reserve_slot()
+            assert reservation is not None
+            await buffer.add_work(work, reservation=reservation)  # reaches 4/4 active
         g0 = await buffer.take_finalized()                     # g0 leaves the dict; still 4/4 active
         g1 = await buffer.take_finalized()                     # g1 leaves the dict; still 4/4 active
-        slot_task = asyncio.create_task(buffer.wait_for_slot())  # waits: take_finalized did not free a slot
+        slot_task = asyncio.create_task(buffer.reserve_slot())  # waits: take_finalized did not free a slot
         assert not slot_task.done()
         await buffer.release_active_groups(2, reason="trained", policy_version=1)  # trainer pulled -> slots free
-        assert await slot_task                                   # wait_for_slot now returns
+        reservation = await slot_task
+        assert reservation is not None
+        await buffer.cancel_reservation(reservation)
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -167,8 +181,14 @@ class RolloutGroupWorkBuffer(Configurable):
                 )
 
         def max_active_rollout_groups(self, num_prompts_per_train_step: int) -> int:
-            """Active buffer size in prompt groups, ``B = (S + 1) * P``; also the number of rollout workers."""
+            """Active buffer size in prompt groups, ``B = (S + 1) * P``."""
             return (self.target_offpolicy_steps + 1) * num_prompts_per_train_step
+
+        def max_concurrent_rollout_groups(
+            self, num_prompts_per_train_step: int
+        ) -> int:
+            """Fixed FIFO keeps its historical one-worker-per-active-slot behavior."""
+            return self.max_active_rollout_groups(num_prompts_per_train_step)
 
         def window_size(self, num_prompts_per_train_step: int) -> int:
             """Derive the fixed FIFO look-ahead window from the configured fraction.
@@ -227,6 +247,9 @@ class RolloutGroupWorkBuffer(Configurable):
         self._max_active_rollout_groups = config.max_active_rollout_groups(
             num_prompts_per_train_step
         )
+        self._max_concurrent_rollout_groups = config.max_concurrent_rollout_groups(
+            num_prompts_per_train_step
+        )
         self._window_size = config.window_size(num_prompts_per_train_step)
         self._max_offpolicy_steps = config.max_offpolicy_steps(
             num_prompts_per_train_step
@@ -253,6 +276,8 @@ class RolloutGroupWorkBuffer(Configurable):
         self._active_rollout_groups = 0
         # metric: Per-flush peak active slots; reset on `.metrics()` call.
         self._active_rollout_groups_peak_since_flush = 0
+        self._next_reservation = 0
+        self._admission_reservations: set[int] = set()
         self._work_by_group_id: collections.OrderedDict[
             int, RolloutGroupWork
         ] = collections.OrderedDict()
@@ -268,12 +293,11 @@ class RolloutGroupWorkBuffer(Configurable):
             if lifecycle_log_dir is not None
             else None
         )
-        # TODO(async-rl): warm start — admit a small number of groups at first and grow the effective cap as the
-        # batcher consumes, so a cold start doesn't fill the whole off-policy window at policy version 0.
+        self._taken_work_awaiting_outcome: dict[int, RolloutGroupWork] = {}
 
     @property
     def max_active_rollout_groups(self) -> int:
-        """Most rollout groups ever active at once; the controller spawns one rollout worker per slot."""
+        """Most rollout groups admitted and not yet released at once."""
         return self._max_active_rollout_groups
 
     @property
@@ -281,36 +305,74 @@ class RolloutGroupWorkBuffer(Configurable):
         """Hard consume-time bound on `trainer_policy_version - min_policy_version`."""
         return self._max_offpolicy_steps
 
-    def _active_capacity(self) -> int:
-        """Active slots the buffer may hold right now."""
+    @property
+    def max_concurrent_rollout_groups(self) -> int:
+        """Maximum number of groups admitted to generation at once."""
+        return self._max_concurrent_rollout_groups
+
+    def _active_group_limit(self) -> int:
+        """Active groups the buffer may admit right now."""
         return self._max_active_rollout_groups
 
     def _has_active_slot_available(self) -> bool:
-        return self._active_rollout_groups < self._active_capacity()
+        generation_pending = sum(
+            work.state
+            in (_RolloutGroupWorkState.WAITING, _RolloutGroupWorkState.INFLIGHT)
+            for work in self._work_by_group_id.values()
+        )
+        return (
+            self._active_rollout_groups + len(self._admission_reservations)
+            < self._active_group_limit()
+            and generation_pending + len(self._admission_reservations)
+            < self._max_concurrent_rollout_groups
+        )
 
-    async def wait_for_slot(self) -> bool:
-        """Wait until one more rollout group may enter the active buffer.
+    async def reserve_slot(self) -> int | None:
+        """Atomically reserve one active and generation slot.
 
         Example:
-            # False means the buffer was closed, so the data input loop exits.
+            # None means the buffer was closed, so the data input loop exits.
             group_index = 0
-            while await buffer.wait_for_slot():
-                await buffer.add_work(RolloutGroupWork(group_id=group_index, sample=sample))
+            while (reservation := await buffer.reserve_slot()) is not None:
+                await buffer.add_work(
+                    RolloutGroupWork(group_id=group_index, sample=sample),
+                    reservation=reservation,
+                )
                 group_index += 1
         """
         async with self._condition:
             await self._condition.wait_for(
                 lambda: self._closed or self._has_active_slot_available()
             )
-            return not self._closed
+            if self._closed:
+                return None
+            reservation = self._next_reservation
+            self._next_reservation += 1
+            self._admission_reservations.add(reservation)
+            return reservation
 
-    async def add_work(self, work: RolloutGroupWork) -> None:
-        """Admit one rollout group as WAITING and charge one active slot."""
+    async def cancel_reservation(self, reservation: int) -> None:
+        """Release an unused admission reservation, for example after data-input failure."""
         async with self._condition:
-            if not self._has_active_slot_available():
+            if reservation not in self._admission_reservations:
+                return
+            self._admission_reservations.remove(reservation)
+            self._condition.notify_all()
+
+    async def add_work(
+        self, work: RolloutGroupWork, *, reservation: int
+    ) -> bool:
+        """Commit a reserved slot as WAITING; return false if close won the race."""
+        async with self._condition:
+            if self._closed:
+                self._admission_reservations.discard(reservation)
+                self._condition.notify_all()
+                return False
+            if reservation not in self._admission_reservations:
                 raise RuntimeError(
-                    f"{type(self).__name__}.add_work called without an active slot"
+                    f"unknown or already consumed admission reservation {reservation}"
                 )
+            self._admission_reservations.remove(reservation)
             self._active_rollout_groups += 1
             self._active_rollout_groups_peak_since_flush = max(
                 self._active_rollout_groups_peak_since_flush,
@@ -320,6 +382,7 @@ class RolloutGroupWorkBuffer(Configurable):
             work.admitted_at = time.time()
             self._work_by_group_id[work.group_id] = work
             self._condition.notify_all()
+            return True
 
     async def claim_next(self) -> RolloutGroupWork | None:
         """Rollout loop: claim the oldest WAITING group (WAITING -> INFLIGHT). None once closed."""
@@ -348,8 +411,13 @@ class RolloutGroupWorkBuffer(Configurable):
             self._condition.notify_all()
 
     @sl.log_trace_span("take_finalized")
-    async def take_finalized(self) -> RolloutGroup | None:
+    async def take_finalized(
+        self, *, consuming_policy_version: int | None = None
+    ) -> RolloutGroup | None:
         """Batcher loop: return the oldest FINALIZED group inside the anchored windowed FIFO range.
+
+        ``consuming_policy_version`` is accepted for the shared buffer interface;
+        fixed FIFO does not perform consume-time age eviction.
 
         The window covers group ids ``[head, head + window_size - 1]``. Entries outside the
         window stay blocked even if they are finalized, so taking non-head groups does not slide
@@ -376,13 +444,18 @@ class RolloutGroupWorkBuffer(Configurable):
                             break
                         if work.state is not _RolloutGroupWorkState.FINALIZED:
                             continue
-                        return self._remove_work(work, outcome="taken").rollout_group
+                        work.consuming_policy_version = consuming_policy_version
+                        return self._remove_work(work, outcome=None).rollout_group
                 await self._condition.wait()  # nothing finalized inside the window -> stall
 
-    def _remove_work(self, work: RolloutGroupWork, *, outcome: str) -> RolloutGroupWork:
+    def _remove_work(
+        self, work: RolloutGroupWork, *, outcome: str | None
+    ) -> RolloutGroupWork:
         """Remove an entry from the buffer, log its lifecycle, and wake waiters. Caller holds the condition."""
         del self._work_by_group_id[work.group_id]
-        if self._lifecycle_log is not None:
+        if outcome is None and self._lifecycle_log is not None:
+            self._taken_work_awaiting_outcome[work.group_id] = work
+        elif self._lifecycle_log is not None:
             self._lifecycle_log.record(
                 work,
                 outcome=outcome,
@@ -391,13 +464,31 @@ class RolloutGroupWorkBuffer(Configurable):
         self._condition.notify_all()
         return work
 
-    def record_step_start(self, *, trainer_policy_version: int) -> None:
+    async def record_taken_outcome(self, group_id: int, *, outcome: str) -> None:
+        """Record whether a selected group was trainable after sample building.
+
+        Args:
+            group_id: Selected rollout group's id.
+            outcome: `"taken"` when trainable, otherwise the filter reason.
+        """
+        async with self._condition:
+            if self._lifecycle_log is None:
+                return
+            work = self._taken_work_awaiting_outcome.pop(group_id)
+            self._lifecycle_log.record(
+                work,
+                outcome=outcome,
+                trainer_policy_version=self._trainer_policy_version,
+            )
+
+    async def record_step_start(self, *, trainer_policy_version: int) -> None:
         """Trainer loop: called right before it waits for the next training batch.
 
         Args:
             trainer_policy_version: Version of the weights that will train the batch being waited for.
         """
-        self._trainer_policy_version = trainer_policy_version
+        async with self._condition:
+            self._trainer_policy_version = trainer_policy_version
 
     async def release_active_groups(
         self, count: int, *, reason: str, policy_version: int | None = None
@@ -418,8 +509,6 @@ class RolloutGroupWorkBuffer(Configurable):
         """
         if count < 0:
             raise ValueError(f"count must be non-negative, got {count}")
-        if count == 0:
-            return
         async with self._condition:
             if count > self._active_rollout_groups:
                 raise RuntimeError(
@@ -434,13 +523,24 @@ class RolloutGroupWorkBuffer(Configurable):
     async def close(self) -> None:
         """run() shutdown calls this once. Sets `_closed`, drops buffered work, and wakes every waiter.
 
-        After this, all four waiters unblock and exit their loops: wait_for_slot() returns False, and
+        After this, all four waiters unblock and exit their loops: reserve_slot() returns None, and
         claim_next()/take_finalized() return None.
         """
         async with self._condition:
             self._closed = True
+            self._admission_reservations.clear()
             for work in list(self._work_by_group_id.values()):
                 self._remove_work(work, outcome="closed")
+            if self._lifecycle_log is not None:
+                for work in self._taken_work_awaiting_outcome.values():
+                    self._lifecycle_log.record(
+                        work,
+                        outcome="closed",
+                        trainer_policy_version=self._trainer_policy_version,
+                    )
+                self._lifecycle_log.close()
+                self._lifecycle_log = None
+            self._taken_work_awaiting_outcome.clear()
             self._condition.notify_all()
 
     def metrics(self) -> list[m.Metric]:
@@ -467,7 +567,30 @@ class RolloutGroupWorkBuffer(Configurable):
             m.Metric(
                 "rollout_buffer/available_active_slots",
                 m.NoReduce(
-                    float(self._active_capacity() - self._active_rollout_groups)
+                    float(
+                        self._active_group_limit()
+                        - self._active_rollout_groups
+                        - len(self._admission_reservations)
+                    )
+                ),
+            ),
+            m.Metric(
+                "rollout_buffer/reserved_admission_slots",
+                m.NoReduce(float(len(self._admission_reservations))),
+            ),
+            m.Metric(
+                "rollout_buffer/generation_capacity_groups",
+                m.NoReduce(float(self._max_concurrent_rollout_groups)),
+            ),
+            m.Metric(
+                "rollout_buffer/available_generation_permits",
+                m.NoReduce(
+                    float(
+                        self._max_concurrent_rollout_groups
+                        - states.count(state_enum.WAITING)
+                        - states.count(state_enum.INFLIGHT)
+                        - len(self._admission_reservations)
+                    )
                 ),
             ),
         ]
@@ -477,36 +600,30 @@ class RolloutGroupWorkBuffer(Configurable):
 
 
 class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
-    """Buffer whose capacity is learned from the run instead of set by a target offpolicy step count.
+    """Oldest-ready buffer with exact age eviction and adaptive reservoir demand.
 
     Same callers and lifecycle as `RolloutGroupWorkBuffer`; three rules differ:
 
-    1. Capacity. At every step start the trainer reports in, and the buffer counts the active slots that are
-       not ready (`waiting + inflight`, the "unavailable" slots). It keeps the last `memory_steps` counts and
-       sets the capacity so that on the worst `stall_probability` share of steps one batch is still ready:
-
-           capacity = P (batch being trained) + P (batch that must be ready) + unavailable_bad_day + trend + 1
-
-       where `unavailable_bad_day` is the `1 - stall_probability` percentile of the counts and `trend` is
-       half the window's fitted rise of the inflight count, so a slowly lengthening workload is followed
-       instead of discovered through stalls. The capacity moves up by at most `P // 2` per step and closes
-       half the gap per step on the way down. It never exceeds `capacity_ceiling`.
+    1. Demand. Generator capacity ``C`` is a fixed deployment limit. Reservoir
+       demand adapts from recent unavailable work while admission independently
+       enforces ``C``, so demand cannot silently enlarge vLLM concurrency.
     2. Selection. `take_finalized` returns the oldest FINALIZED group wherever it sits; a slow group never
        blocks younger finished ones and keeps its slot until it finishes.
     3. Age. A finalized group that would be consumed more than `max_offpolicy_steps` versions after it was
        claimed is dropped (slot released at once, prompt not retried). This is the only guarantee on age;
-       the mean age follows the capacity: about `capacity / P - 1` steps when the pipeline is full.
+       the mean age follows demand: about `demand / P - 1` steps when the pipeline is full.
 
     Example:
-        # P=8, max_offpolicy_steps=4: starts at capacity 40; the trainer reports 30 unavailable slots at a
-        # step start -> need = 8 + 8 + 30 + 0 + 1 = 47 -> capacity rises to 44 (at most P // 2 = 4 per step)
-        buffer = AdaptiveRolloutGroupWorkBuffer.Config().build(num_prompts_per_train_step=8)
-        buffer.record_step_start(trainer_policy_version=12)
-        buffer.metrics()  # rollout_buffer/capacity 44, rollout_buffer/unavailable_at_step_start 30
+        buffer = AdaptiveRolloutGroupWorkBuffer.Config(
+            generation_capacity=60
+        ).build(num_prompts_per_train_step=8)
+        await buffer.record_step_start(trainer_policy_version=12)
+        buffer.metrics()
 
         # g0 claimed at version 8; the batch being assembled trains at version 13 -> age 5 > 4 -> dropped
         await buffer.finalize_work(RolloutGroup(group_id=0, rollouts=[...]))
-        # -> slot released with reason "too_old"; take_finalized() skips to the next finalized group
+        await buffer.take_finalized(consuming_policy_version=13)
+        # -> slot released with reason "too_old"; selection skips to the next finalized group
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -516,14 +633,18 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         finalized groups are dropped and their prompt is not retried."""
 
         stall_probability: float = 0.01
-        """Share of step starts allowed to find fewer than one batch ready. Sizes the capacity percentile."""
+        """Share of step starts allowed to find fewer than one batch ready."""
 
-        memory_steps: int = 300
-        """Step starts remembered for the percentile; keep it at least `3 / stall_probability`.
-        TODO(async-rl): a knob to compare against shorter or recency-weighted memories under drift."""
+        memory_steps: int = 15
+        """Most recent step starts used to estimate reservoir demand."""
 
-        capacity_ceiling: int = 128
-        """Most rollout groups ever active (admitted and not yet trained); also the number of rollout workers."""
+        generation_capacity: int | None = None
+        """Fixed maximum prompt groups the generator service can hold.
+
+        This deployment property is separate from learned reservoir demand. It
+        sizes rollout workers and vLLM admission, and must be measured from the
+        generator service rather than inferred from trainer-side demand.
+        """
 
         def __post_init__(self) -> None:
             if self.max_offpolicy_steps < 1:
@@ -536,15 +657,25 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
                 )
             if self.memory_steps < 1:
                 raise ValueError(f"memory_steps must be >= 1, got {self.memory_steps}")
+            if self.generation_capacity is None or self.generation_capacity < 1:
+                raise ValueError(
+                    "generation_capacity must be explicitly set to a positive "
+                    "deployment limit"
+                )
 
         def max_active_rollout_groups(self, num_prompts_per_train_step: int) -> int:
-            """The ceiling: the controller spawns one rollout worker per slot up to it."""
-            if self.capacity_ceiling < 2 * num_prompts_per_train_step:
-                raise ValueError(
-                    f"capacity_ceiling={self.capacity_ceiling} must hold two batches: one training and one ready "
-                    f"(2 * {num_prompts_per_train_step})"
-                )
-            return self.capacity_ceiling
+            """Maximum useful demand from generation capacity and age window."""
+            assert self.generation_capacity is not None
+            return self.generation_capacity + (
+                self.max_offpolicy_steps + 1
+            ) * num_prompts_per_train_step
+
+        def max_concurrent_rollout_groups(
+            self, num_prompts_per_train_step: int
+        ) -> int:
+            del num_prompts_per_train_step
+            assert self.generation_capacity is not None
+            return self.generation_capacity
 
     def __init__(
         self,
@@ -558,41 +689,34 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         self._max_active_rollout_groups = config.max_active_rollout_groups(
             num_prompts_per_train_step
         )
+        self._max_concurrent_rollout_groups = config.max_concurrent_rollout_groups(
+            num_prompts_per_train_step
+        )
         self._max_offpolicy_steps = config.max_offpolicy_steps
         self._stall_probability = config.stall_probability
-        # Start at five batches: one training plus the four-batch reservoir the simulator study started from.
-        self._capacity = min(
-            self._max_active_rollout_groups, 5 * num_prompts_per_train_step
+        self._demand_target = min(
+            self._max_active_rollout_groups,
+            (config.max_offpolicy_steps + 1) * num_prompts_per_train_step,
         )
         self._unavailable_history: collections.deque[int] = collections.deque(
             maxlen=config.memory_steps
         )
-        self._inflight_history: collections.deque[int] = collections.deque(
-            maxlen=config.memory_steps
-        )
-        # metrics: last observation and drops since the last `.metrics()` call
+        self._num_step_start_observations = 0
         self._unavailable_at_step_start = 0
         self._dropped_too_old_since_flush = 0
         self._init_shared_state(
             policy_version=policy_version, lifecycle_log_dir=lifecycle_log_dir
         )
 
-    def _active_capacity(self) -> int:
-        return self._capacity
+    def _active_group_limit(self) -> int:
+        return self._demand_target
 
-    def _consuming_policy_version(self) -> int:
-        """Version that will train the batch the batcher is assembling now.
-
-        The trainer reports its version when it starts waiting for a batch; groups taken after that go into
-        the following batch, trained one optimizer step later. While the trainer is stalled, groups completing
-        the awaited batch train at the reported version, so this overestimates their age by one step.
-        """
-        return self._trainer_policy_version + 1
-
-    def _is_too_old(self, work: RolloutGroupWork) -> bool:
+    def _is_too_old(
+        self, work: RolloutGroupWork, *, consuming_policy_version: int
+    ) -> bool:
         assert work.policy_version_at_claim is not None
         return (
-            self._consuming_policy_version() - work.policy_version_at_claim
+            consuming_policy_version - work.policy_version_at_claim
             > self._max_offpolicy_steps
         )
 
@@ -603,16 +727,10 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         self._dropped_too_old_since_flush += 1
         sl.log_trace_scalar({"rollout_buffer/released/too_old": 1.0})
 
-    async def finalize_work(self, rollout_group: RolloutGroup) -> None:
-        """Rollout loop: store the RolloutGroup (INFLIGHT -> FINALIZED), or drop it now if already too old."""
-        await super().finalize_work(rollout_group)
-        async with self._condition:
-            work = self._work_by_group_id.get(rollout_group.group_id)
-            if work is not None and self._is_too_old(work):
-                self._drop_too_old(work)
-
     @sl.log_trace_span("take_finalized")
-    async def take_finalized(self) -> RolloutGroup | None:
+    async def take_finalized(
+        self, *, consuming_policy_version: int | None = None
+    ) -> RolloutGroup | None:
         """Batcher loop: return the oldest FINALIZED group, dropping any that became too old while waiting.
 
         Example:
@@ -620,6 +738,8 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
             group = await buffer.take_finalized()
             assert group.group_id == 1
         """
+        if consuming_policy_version is None:
+            consuming_policy_version = self._trainer_policy_version
         async with self._condition:
             while True:
                 if self._closed:
@@ -627,49 +747,52 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
                 for work in list(self._work_by_group_id.values()):
                     if work.state is not _RolloutGroupWorkState.FINALIZED:
                         continue
-                    if self._is_too_old(work):
+                    work.consuming_policy_version = consuming_policy_version
+                    if self._is_too_old(
+                        work, consuming_policy_version=consuming_policy_version
+                    ):
                         self._drop_too_old(work)
                         continue
-                    return self._remove_work(work, outcome="taken").rollout_group
+                    return self._remove_work(work, outcome=None).rollout_group
                 await self._condition.wait()  # nothing finalized -> stall
 
-    def record_step_start(self, *, trainer_policy_version: int) -> None:
-        """Trainer loop: observe the unavailable slots and move the capacity toward what the bad days need.
+    async def record_step_start(self, *, trainer_policy_version: int) -> None:
+        """Observe unavailable groups and update reservoir demand."""
+        async with self._condition:
+            self._trainer_policy_version = trainer_policy_version
+            num_prompts = self._num_prompts_per_train_step
+            states = [work.state for work in self._work_by_group_id.values()]
+            self._unavailable_at_step_start = states.count(
+                _RolloutGroupWorkState.INFLIGHT
+            ) + states.count(
+                _RolloutGroupWorkState.WAITING
+            )
+            self._num_step_start_observations += 1
 
-        Example:
-            # P=8, capacity 40, history of unavailable counts whose 99th percentile is 30, flat inflight trend
-            buffer.record_step_start(trainer_policy_version=12)
-            # need = 2 * 8 + 30 + 0 + 1 = 47 > 40 -> capacity 44 (up by at most P // 2 per step)
-        """
-        super().record_step_start(trainer_policy_version=trainer_policy_version)
-        num_prompts = self._num_prompts_per_train_step
-        states = [work.state for work in self._work_by_group_id.values()]
-        num_inflight = states.count(_RolloutGroupWorkState.INFLIGHT)
-        unavailable = num_inflight + states.count(_RolloutGroupWorkState.WAITING)
-        self._unavailable_at_step_start = unavailable
-        self._unavailable_history.append(unavailable)
-        self._inflight_history.append(num_inflight)
+            # Step 1 uses the initial prior. Its unavailable count is a cold-start
+            # tautology, not a steady-state demand observation.
+            if self._num_step_start_observations == 1:
+                return
+            self._unavailable_history.append(self._unavailable_at_step_start)
 
-        # Bad day: the (1 - stall_probability) rank of the remembered counts, plus half the window's fitted rise.
-        history = sorted(self._unavailable_history)
-        rank = max(0, math.ceil((1 - self._stall_probability) * len(history)) - 1)
-        bad_day = history[rank]
-        trend = math.ceil(
-            max(0.0, _slope(self._inflight_history) * len(self._inflight_history) / 2)
-        )
-        need = 2 * num_prompts + bad_day + trend + 1
-        need = min(self._max_active_rollout_groups, max(2 * num_prompts, need))
-
-        # Up fast (at most half a batch per step); down by halving the gap so a stale history does not drain the stock.
-        if need > self._capacity:
-            self._capacity = min(need, self._capacity + max(1, num_prompts // 2))
-        elif need < self._capacity:
-            self._capacity -= math.ceil((self._capacity - need) / 2)
+            estimate = _estimate_demand_target(
+                unavailable_history=self._unavailable_history,
+                num_prompts_per_train_step=num_prompts,
+                stall_probability=self._stall_probability,
+                max_active_rollout_groups=self._max_active_rollout_groups,
+            )
+            previous_demand = self._demand_target
+            self._demand_target = estimate
+            if self._demand_target > previous_demand:
+                self._condition.notify_all()
 
     def metrics(self) -> list[m.Metric]:
         out = [
             *super().metrics(),
-            m.Metric("rollout_buffer/capacity", m.NoReduce(float(self._capacity))),
+            m.Metric(
+                "rollout_buffer/demand_target_groups",
+                m.NoReduce(float(self._demand_target)),
+            ),
             m.Metric(
                 "rollout_buffer/unavailable_at_step_start",
                 m.NoReduce(float(self._unavailable_at_step_start)),
@@ -681,14 +804,8 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         ]
         self._dropped_too_old_since_flush = 0
         return out
-
-
 def _slope(values: Sequence[int]) -> float:
-    """Least-squares slope of `values` against their index; 0 with fewer than two points.
-
-    Example:
-        _slope([10, 12, 14, 16])  # -> 2.0
-    """
+    """Least-squares slope of `values` against their index; 0 with fewer than two points."""
     n = len(values)
     if n < 2:
         return 0.0

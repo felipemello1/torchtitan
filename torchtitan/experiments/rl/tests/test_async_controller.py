@@ -18,11 +18,12 @@ from torchtitan.experiments.rl.components.work_buffer import (
     AdaptiveRolloutGroupWorkBuffer,
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
+    _estimate_demand_target,
 )
 from torchtitan.experiments.rl.controller_metrics import (
+    MetricsTimer,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
-    MetricsTimer,
 )
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.rollout import RolloutGroup
@@ -313,18 +314,26 @@ def test_take_finalized_does_not_release_active_slot() -> None:
         buffer = RolloutGroupWorkBuffer.Config(target_offpolicy_steps=0).build(
             num_prompts_per_train_step=1
         )
-        if not await buffer.wait_for_slot():
+        reservation = await buffer.reserve_slot()
+        if reservation is None:
             raise RuntimeError("buffer closed unexpectedly")
-        await buffer.add_work(RolloutGroupWork(group_id=0, sample=object()))
+        await buffer.add_work(
+            RolloutGroupWork(group_id=0, sample=object()),
+            reservation=reservation,
+        )
         await buffer.finalize_work(RolloutGroup(group_id=0, rollouts=[]))
-        await buffer.take_finalized()
+        group = await buffer.take_finalized()
+        assert group is not None
+        await buffer.record_taken_outcome(group.group_id, outcome="taken")
 
-        waiter = asyncio.create_task(buffer.wait_for_slot())
+        waiter = asyncio.create_task(buffer.reserve_slot())
         await asyncio.sleep(0)
         assert not waiter.done()
 
         await buffer.release_active_groups(1, reason="trained")
-        assert await waiter
+        reservation = await waiter
+        assert reservation is not None
+        await buffer.cancel_reservation(reservation)
 
     asyncio.run(run())
 
@@ -342,9 +351,13 @@ def test_untrainable_group_releases_before_training() -> None:
             pad_id=0,
         )
 
-        if not await buffer.wait_for_slot():
+        reservation = await buffer.reserve_slot()
+        if reservation is None:
             raise RuntimeError("buffer closed unexpectedly")
-        await buffer.add_work(RolloutGroupWork(group_id=0, sample=object()))
+        await buffer.add_work(
+            RolloutGroupWork(group_id=0, sample=object()),
+            reservation=reservation,
+        )
 
         training_sample_group = TrainingSampleGroup(
             group_id=0, training_samples=[], metrics=[]
@@ -394,9 +407,13 @@ def _fifo_buffer(
 
 
 async def _admit(buffer: RolloutGroupWorkBuffer, group_id: int) -> None:
-    if not await buffer.wait_for_slot():
+    reservation = await buffer.reserve_slot()
+    if reservation is None:
         raise RuntimeError("buffer closed unexpectedly")
-    await buffer.add_work(RolloutGroupWork(group_id=group_id, sample=object()))
+    await buffer.add_work(
+        RolloutGroupWork(group_id=group_id, sample=object()),
+        reservation=reservation,
+    )
 
 
 async def _finalize(buffer: RolloutGroupWorkBuffer, group_id: int) -> None:
@@ -434,13 +451,13 @@ def _adaptive_buffer(
     *,
     num_prompts: int,
     max_offpolicy_steps: int = 4,
-    capacity_ceiling: int = 128,
-    memory_steps: int = 300,
+    generation_capacity: int = 64,
+    memory_steps: int = 15,
     **kwargs
 ) -> AdaptiveRolloutGroupWorkBuffer:
     return AdaptiveRolloutGroupWorkBuffer.Config(
         max_offpolicy_steps=max_offpolicy_steps,
-        capacity_ceiling=capacity_ceiling,
+        generation_capacity=generation_capacity,
         memory_steps=memory_steps,
     ).build(num_prompts_per_train_step=num_prompts, **kwargs)
 
@@ -449,9 +466,24 @@ def _metric_value(metrics: list[m.Metric], key: str) -> float:
     return next(metric.value.value for metric in metrics if metric.key == key)
 
 
+def test_demand_estimate_uses_nearest_rank_and_active_bounds() -> None:
+    assert _estimate_demand_target(
+        unavailable_history=[0] * 14 + [20],
+        num_prompts_per_train_step=4,
+        stall_probability=0.01,
+        max_active_rollout_groups=100,
+    ) == 29
+    assert _estimate_demand_target(
+        unavailable_history=[200],
+        num_prompts_per_train_step=4,
+        stall_probability=0.01,
+        max_active_rollout_groups=40,
+    ) == 40
+
+
 def test_adaptive_buffer_takes_oldest_finalized_and_lets_slow_groups_keep_their_slot() -> None:
     async def run() -> None:
-        buffer = _adaptive_buffer(num_prompts=2, capacity_ceiling=8)
+        buffer = _adaptive_buffer(num_prompts=2, generation_capacity=4)
         for group_id in range(4):
             await _admit(buffer, group_id)
         for _ in range(4):
@@ -480,7 +512,7 @@ def test_adaptive_buffer_takes_oldest_finalized_and_lets_slow_groups_keep_their_
 def test_adaptive_buffer_drops_groups_past_max_offpolicy_steps() -> None:
     async def run() -> None:
         buffer = _adaptive_buffer(
-            num_prompts=2, max_offpolicy_steps=1, capacity_ceiling=8
+            num_prompts=2, max_offpolicy_steps=1, generation_capacity=4
         )
         await _admit(buffer, 0)
         await _admit(buffer, 1)
@@ -488,79 +520,194 @@ def test_adaptive_buffer_drops_groups_past_max_offpolicy_steps() -> None:
         await buffer.release_active_groups(0, reason="trained", policy_version=0)
 
         # The trainer starts step 2 (version 1): the batch being assembled trains at version 2 -> g0 would be 2 old
-        buffer.record_step_start(trainer_policy_version=1)
+        await buffer.record_step_start(trainer_policy_version=1)
         await _finalize(buffer, 0)
+        # Finalization alone cannot know whether the batcher is assembling the
+        # current or prefetched batch, so it must not guess the consume version.
         metrics = buffer.metrics()
-        assert _metric_value(metrics, "rollout_buffer/dropped_too_old") == 1
-        assert _metric_value(metrics, "rollout_buffer/num_groups_finalized") == 0
-        # the dropped group's slot is free at once (2 admitted, 1 dropped -> 1 active)
-        assert (
-            _metric_value(metrics, "rollout_buffer/available_active_slots")
-            == buffer._active_capacity() - 1
-        )
+        assert _metric_value(metrics, "rollout_buffer/dropped_too_old") == 0
+        assert _metric_value(metrics, "rollout_buffer/num_groups_finalized") == 1
 
         # g1 claimed after a pull to version 1 is fresh enough: age 2 - 1 = 1 <= 1
         await buffer.release_active_groups(0, reason="trained", policy_version=1)
         await buffer.claim_next()
         await _finalize(buffer, 1)
-        assert (await buffer.take_finalized()).group_id == 1
+        selected = await buffer.take_finalized(consuming_policy_version=2)
+        assert selected is not None
+        assert selected.group_id == 1
+        metrics = buffer.metrics()
+        assert _metric_value(metrics, "rollout_buffer/dropped_too_old") == 1
+        # g0's dropped slot is free (2 admitted, 1 dropped -> 1 active).
+        assert (
+            _metric_value(metrics, "rollout_buffer/available_active_slots")
+            == buffer._active_group_limit() - 1
+        )
 
     asyncio.run(run())
 
 
-def test_adaptive_buffer_capacity_follows_the_unavailable_count() -> None:
+def test_adaptive_buffer_demand_follows_the_unavailable_count() -> None:
     async def run() -> None:
-        # P=4: starts at 5 * P = 20 slots
-        buffer = _adaptive_buffer(num_prompts=4, capacity_ceiling=64, memory_steps=3)
-        assert buffer._active_capacity() == 20
+        # P=4, max age=4: initial demand is the five-step age window = 20.
+        buffer = _adaptive_buffer(
+            num_prompts=4, generation_capacity=20, memory_steps=3
+        )
+        assert buffer._active_group_limit() == 20
         for group_id in range(20):
             await _admit(buffer, group_id)
         for _ in range(20):
             await buffer.claim_next()
 
-        # 20 unavailable -> need = 2 * 4 + 20 + 1 = 29; up at most P // 2 = 2 per step
-        capacities = []
+        # Step 1 holds the prior. Then 20 unavailable gives estimate 29,
+        # which is adopted immediately.
+        demands = []
         for _ in range(6):
-            buffer.record_step_start(trainer_policy_version=0)
-            capacities.append(buffer._active_capacity())
-        assert capacities == [22, 24, 26, 28, 29, 29]
-        assert _metric_value(buffer.metrics(), "rollout_buffer/capacity") == 29
+            await buffer.record_step_start(trainer_policy_version=0)
+            demands.append(buffer._active_group_limit())
+        assert demands == [20, 29, 29, 29, 29, 29]
+        assert (
+            _metric_value(buffer.metrics(), "rollout_buffer/demand_target_groups")
+            == 29
+        )
 
-        # everything finishes: after the 3-step memory flushes, need = 2 * 4 + 0 + 1 = 9; down by halving the gap
+        # After everything finishes and the 3-step maximum history clears,
+        # estimate 9 is adopted immediately.
         for group_id in range(20):
             await _finalize(buffer, group_id)
-        capacities = []
+        demands = []
         for _ in range(8):
-            buffer.record_step_start(trainer_policy_version=0)
-            capacities.append(buffer._active_capacity())
-        assert capacities == [29, 29, 19, 14, 12, 11, 10, 9]
+            await buffer.record_step_start(trainer_policy_version=0)
+            demands.append(buffer._active_group_limit())
+        assert demands == [29, 29, 9, 9, 9, 9, 9, 9]
 
     asyncio.run(run())
 
 
-def test_adaptive_buffer_never_exceeds_its_ceiling() -> None:
+def test_adaptive_buffer_never_exceeds_derived_max_demand() -> None:
     async def run() -> None:
-        buffer = _adaptive_buffer(num_prompts=2, capacity_ceiling=6)
-        assert buffer.max_active_rollout_groups == 6
-        for group_id in range(6):
+        buffer = _adaptive_buffer(
+            num_prompts=2, max_offpolicy_steps=1, generation_capacity=4
+        )
+        # C + (A + 1)P = 4 + 2*2 = 8.
+        assert buffer.max_active_rollout_groups == 8
+        for group_id in range(4):
             await _admit(buffer, group_id)
-        for _ in range(6):
+        for _ in range(4):
             await buffer.claim_next()
         for _ in range(10):
-            buffer.record_step_start(trainer_policy_version=0)
-        assert buffer._active_capacity() == 6
-        waiter = asyncio.create_task(buffer.wait_for_slot())
+            await buffer.record_step_start(trainer_policy_version=0)
+        assert buffer._active_group_limit() == 8
+        waiter = asyncio.create_task(buffer.reserve_slot())
         await asyncio.sleep(0)
         assert not waiter.done()
         await buffer.close()
-        assert not await waiter
+        assert await waiter is None
 
     asyncio.run(run())
 
 
-def test_adaptive_buffer_rejects_a_ceiling_below_two_batches() -> None:
-    with pytest.raises(ValueError, match="capacity_ceiling"):
-        _adaptive_buffer(num_prompts=4, capacity_ceiling=7)
+def test_adaptive_buffer_starts_from_policy_age_window() -> None:
+    async def run() -> None:
+        buffer = _adaptive_buffer(
+            num_prompts=2, generation_capacity=10, memory_steps=1
+        )
+        for group_id in range(10):
+            await _admit(buffer, group_id)
+            await buffer.claim_next()
+
+        # (max_offpolicy_steps + 1) * P = 10. The first observation holds that
+        # prior; the next saturated observation estimates and adopts 15.
+        await buffer.record_step_start(trainer_policy_version=0)
+        assert buffer._active_group_limit() == 10
+        await buffer.record_step_start(trainer_policy_version=0)
+        assert buffer._active_group_limit() == 15
+        await buffer.record_step_start(trainer_policy_version=0)
+        assert buffer._active_group_limit() == 15
+
+    asyncio.run(run())
+
+
+def test_adaptive_buffer_requires_explicit_generation_capacity() -> None:
+    with pytest.raises(ValueError, match="generation_capacity"):
+        AdaptiveRolloutGroupWorkBuffer.Config()
+
+
+def test_adaptive_buffer_does_not_queue_ahead_of_generation() -> None:
+    async def run() -> None:
+        buffer = _adaptive_buffer(num_prompts=2, generation_capacity=2)
+        await _admit(buffer, 0)
+        await _admit(buffer, 1)
+        await buffer.claim_next()
+        await buffer.claim_next()
+
+        third_slot = asyncio.create_task(buffer.reserve_slot())
+        await asyncio.sleep(0)
+        assert not third_slot.done()
+
+        # Finalization releases a generation permit without releasing the
+        # group's active demand slot.
+        await _finalize(buffer, 0)
+        reservation = await third_slot
+        assert reservation is not None
+        await buffer.cancel_reservation(reservation)
+        await buffer.close()
+
+    asyncio.run(run())
+
+
+def test_admission_reservations_are_atomic_across_demand_drop() -> None:
+    async def run() -> None:
+        buffer = _adaptive_buffer(num_prompts=1, generation_capacity=4)
+        reservation = await buffer.reserve_slot()
+        assert reservation is not None
+
+        # Model a controller update while data preparation is in progress.
+        # The already granted reservation remains valid even below the new
+        # target; future reservations wait until occupancy drains.
+        async with buffer._condition:
+            buffer._demand_target = 0
+        assert await buffer.add_work(
+            RolloutGroupWork(group_id=0, sample=object()),
+            reservation=reservation,
+        )
+        assert buffer._active_rollout_groups == 1
+        assert not buffer._admission_reservations
+
+    asyncio.run(run())
+
+
+def test_concurrent_admission_reservations_respect_generation_limit() -> None:
+    async def run() -> None:
+        buffer = _adaptive_buffer(num_prompts=1, generation_capacity=2)
+        first = await buffer.reserve_slot()
+        second = await buffer.reserve_slot()
+        assert first is not None and second is not None
+        third = asyncio.create_task(buffer.reserve_slot())
+        await asyncio.sleep(0)
+        assert not third.done()
+        await buffer.cancel_reservation(first)
+        replacement = await third
+        assert replacement is not None
+        assert len(buffer._admission_reservations) == 2
+        await buffer.cancel_reservation(second)
+        await buffer.cancel_reservation(replacement)
+
+    asyncio.run(run())
+
+
+def test_close_invalidates_uncommitted_admission_reservation() -> None:
+    async def run() -> None:
+        buffer = _adaptive_buffer(num_prompts=1, generation_capacity=2)
+        reservation = await buffer.reserve_slot()
+        assert reservation is not None
+        await buffer.close()
+        assert not await buffer.add_work(
+            RolloutGroupWork(group_id=0, sample=object()),
+            reservation=reservation,
+        )
+        assert buffer._active_rollout_groups == 0
+
+    asyncio.run(run())
 
 
 def test_work_buffer_writes_one_lifecycle_line_per_group(tmp_path) -> None:
@@ -575,8 +722,10 @@ def test_work_buffer_writes_one_lifecycle_line_per_group(tmp_path) -> None:
         await _admit(buffer, 0)
         await buffer.claim_next()
         await _finalize(buffer, 0)
-        buffer.record_step_start(trainer_policy_version=4)
-        await buffer.take_finalized()
+        await buffer.record_step_start(trainer_policy_version=4)
+        group = await buffer.take_finalized(consuming_policy_version=4)
+        assert group is not None
+        await buffer.record_taken_outcome(group.group_id, outcome="taken")
 
         lines = (tmp_path / "rollout_group_lifecycle.jsonl").read_text().splitlines()
         assert len(lines) == 1
@@ -586,6 +735,7 @@ def test_work_buffer_writes_one_lifecycle_line_per_group(tmp_path) -> None:
         assert record["policy_version_at_admission"] == 3
         assert record["policy_version_at_claim"] == 3
         assert record["trainer_policy_version_at_exit"] == 4
+        assert record["consuming_policy_version"] == 4
         assert (
             record["admitted_at"]
             <= record["claimed_at"]

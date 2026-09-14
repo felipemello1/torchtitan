@@ -15,17 +15,17 @@ Detailed diagram:
 
 _data_input_loop                                      _rollout_loop[N] (group workers)
 +--------------------------------------------------+  +--------------------------------------------------+
-| group_buffer.wait_for_slot()                     |  | work = group_buffer.claim_next()                  |
+| reservation = group_buffer.reserve_slot()        |  | work = group_buffer.claim_next()                  |
 | sample = rollouter.get_training_sample()         |  | group = rollouter.run_group_rollouts(work.sample) |
 | work = RolloutGroupWork(group_id, sample)        |  | group_buffer.finalize_work(group)                 |
-| group_buffer.add_work(work)                      |  +-----------------------+--------------------------+
+| group_buffer.add_work(work, reservation)         |  +-----------------------+--------------------------+
 +-----------------------+--------------------------+                          ^ |
                         |                                                     | |
                         | adds work entry                                     | | updates same entry
                         v                                                     | v
 RolloutGroupWorkBuffer
 +---------------------------------------------------------------------------------------------------------------------+
-| active slots = group_buffer capacity: (target_offpolicy_steps + 1) * P for the FIFO buffer, learned for the adaptive |
+| active slots = fixed size for windowed FIFO; dynamic demand target for adaptive                                  |
 |                                                                                                                     |
 | caller            group_buffer call                                            state / active slot                  |
 | _data_input_loop  add_work(RolloutGroupWork)                                   WAITING; slot acquired               |
@@ -64,7 +64,7 @@ _trainer_loop
 Backpressure (each loop: what it consumes/produces, and what gates each side):
 _data_input_loop
   produces: RolloutGroupWork into group_buffer
-    waits for:    a free active slot (group_buffer.wait_for_slot)
+    waits for:    an atomic active/generation reservation (group_buffer.reserve_slot)
     unblocked by: _trainer_loop release_active_groups(num_prompts_per_train_step, "trained") after the pull
                   (and _batcher_loop release_active_groups(1,"untrainable_group"))
 _rollout_loop[N]
@@ -98,10 +98,9 @@ from typing import Annotated
 
 # PYTORCH_CUDA_ALLOC_CONF is set in torchtitan/experiments/rl/__init__.py (before torch is imported)
 # and in train.py; see the note there.
-import torch  # noqa: F401
+import torch
 import torchstore as ts
 import tyro
-
 from monarch.actor import ProcMesh, this_host
 from monarch.spmd import setup_torch_elastic_env_async
 
@@ -120,11 +119,11 @@ from torchtitan.experiments.rl.components.work_buffer import (
     RolloutGroupWorkBuffer,
 )
 from torchtitan.experiments.rl.controller_metrics import (
+    MetricsTimer,
     combine_microbatch_metrics,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     compute_rollout_metrics,
-    MetricsTimer,
 )
 from torchtitan.experiments.rl.losses import GRPOLoss
 from torchtitan.experiments.rl.observability import metrics as m
@@ -153,6 +152,24 @@ class ValidationConfig:
     """Held-out prompts scored greedily (temp=0, n=1) per validation pass. 0 skips validation."""
 
 
+RolloutGroupBufferConfig = (
+    Annotated[
+        RolloutGroupWorkBuffer.Config,
+        tyro.conf.subcommand("windowed-fifo"),
+    ]
+    | Annotated[
+        AdaptiveRolloutGroupWorkBuffer.Config,
+        tyro.conf.subcommand("adaptive"),
+    ]
+)
+"""CLI-selectable rollout-buffer configuration.
+
+The explicit names are required because both implementations conventionally call
+their nested dataclass ``Config``. Without aliases Tyro gives both union members
+the same generated subcommand name and cannot match even a registry default.
+"""
+
+
 @dataclass(kw_only=True, slots=True)
 class AsyncLoopConfig(Configurable.Config):
     num_training_steps: int = 10
@@ -165,11 +182,12 @@ class AsyncLoopConfig(Configurable.Config):
     num_samples_per_prompt: int = 8
     """Sibling rollouts sampled per prompt (the GRPO group)."""
 
-    group_buffer: RolloutGroupWorkBuffer.Config | AdaptiveRolloutGroupWorkBuffer.Config = field(
+    group_buffer: RolloutGroupBufferConfig = field(
         default_factory=RolloutGroupWorkBuffer.Config
     )
-    """Which rollout buffer paces generation: the windowed FIFO sized by `target_offpolicy_steps`
-    (default) or the adaptive one that learns its capacity and drops groups past `max_offpolicy_steps`."""
+    """Which rollout buffer paces generation: the windowed FIFO sized by
+    `target_offpolicy_steps` (default), or the adaptive reservoir that bypasses
+    slow groups and drops groups past `max_offpolicy_steps`."""
     training_sample_builder: TrainingSampleBuilder.Config = field(
         default_factory=TrainingSampleBuilder.Config
     )
@@ -384,11 +402,11 @@ class Controller(Configurable):
             except Exception:
                 logger.exception("trainer.close failed")
 
-        try:
-            await self._rollouter.close()
-        except Exception:
-            logger.exception("rollouter.close failed")
-
+        # Rollout workers can still be awaiting replies from the generator
+        # router after the local rollout tasks have been cancelled. Close the
+        # generators first so those calls resolve while their destination
+        # worker actors are still alive. Stopping the worker mesh first can
+        # turn a late generator reply into a Monarch root-actor failure.
         if self.generator_router is not None:
             try:
                 close_results = await self.generator_router.close_generators.call_one()
@@ -406,6 +424,11 @@ class Controller(Configurable):
                         )
             except Exception:
                 logger.exception("generator_router.close_generators failed")
+
+        try:
+            await self._rollouter.close()
+        except Exception:
+            logger.exception("rollouter.close failed")
 
         try:
             self.metrics_processor.close()
@@ -482,11 +505,13 @@ class Controller(Configurable):
         """
         # Peak concurrent rollout sequences (groups * num_samples_per_prompt, or the validation pass); sizes max_num_seqs below.
         async_loop = self.config.async_loop
-        max_active_rollout_groups = async_loop.group_buffer.max_active_rollout_groups(
-            async_loop.num_prompts_per_train_step
+        max_concurrent_rollout_groups = (
+            async_loop.group_buffer.max_concurrent_rollout_groups(
+                async_loop.num_prompts_per_train_step
+            )
         )
         rollout_concurrency = max(
-            max_active_rollout_groups * async_loop.num_samples_per_prompt,
+            max_concurrent_rollout_groups * async_loop.num_samples_per_prompt,
             async_loop.validation.num_samples,
         )
         config = self.config
@@ -719,8 +744,12 @@ class Controller(Configurable):
             lifecycle_log_dir=self.config.dump_folder,
         )
         max_active_rollout_groups = self._group_buffer.max_active_rollout_groups
+        max_concurrent_rollout_groups = (
+            self._group_buffer.max_concurrent_rollout_groups
+        )
         logger.info(
             f"{type(self._group_buffer).__name__}: max_active_rollout_groups={max_active_rollout_groups}, "
+            f"max_concurrent_rollout_groups={max_concurrent_rollout_groups}, "
             f"max_offpolicy_steps={self._group_buffer.max_offpolicy_steps}"
         )
 
@@ -750,13 +779,14 @@ class Controller(Configurable):
         training_batch_queue: asyncio.Queue[TrainingBatch | None] = asyncio.Queue(
             maxsize=1
         )
+        batch_prefetch_slots = asyncio.Semaphore(1)
 
         # rollout_loop
         generate_fn = self._make_generate_fn(metrics_prefix="generator")
 
-        # One rollout worker per active buffer slot: lets generation fill the whole buffer,
-        # including the cold start (step 0 fills every active slot, not just num_prompts_per_train_step per wave).
-        # TODO: support warm start
+        # Generation concurrency is fixed by the serving deployment. Dynamic
+        # demand may retain additional finalized/held groups, but cannot create
+        # an unbounded request queue inside vLLM.
         rollout_tasks = [
             asyncio.create_task(
                 self._rollout_loop(
@@ -765,7 +795,7 @@ class Controller(Configurable):
                 ),
                 name=f"rollout_worker_{group_worker_id}",
             )
-            for group_worker_id in range(max_active_rollout_groups)
+            for group_worker_id in range(max_concurrent_rollout_groups)
         ]
 
         # data_input_loop
@@ -780,14 +810,16 @@ class Controller(Configurable):
                 training_sample_builder=training_sample_builder,
                 batcher=batcher,
                 training_batch_queue=training_batch_queue,
+                batch_prefetch_slots=batch_prefetch_slots,
             ),
             name="batcher",
         )
-
         # trainer_loop
         trainer_task = asyncio.create_task(
             self._trainer_loop(
-                training_batch_queue, num_training_steps=num_training_steps
+                training_batch_queue,
+                batch_prefetch_slots=batch_prefetch_slots,
+                num_training_steps=num_training_steps,
             ),
             name="trainer",
         )
@@ -847,7 +879,7 @@ class Controller(Configurable):
 
     async def _data_input_loop(self, group_buffer: RolloutGroupWorkBuffer) -> None:
         """produces a RolloutGroupWork into group_buffer.
-        waits for:    a free active slot (group_buffer.wait_for_slot)
+        waits for:    a reserved active slot (group_buffer.reserve_slot)
         unblocked by: _trainer_loop release_active_groups(num_prompts_per_train_step, "trained")
             after the pull (and _batcher_loop release_active_groups(1,"untrainable_group"))
 
@@ -861,16 +893,25 @@ class Controller(Configurable):
         # we could a) increase the number of threads; b) revisit how we release slots and see if
         # we can release them on the batcher while still preserving max offpolicy steps.
         # finally, c) we need to check how will this data input loop truly overlaps with the rollout loop.
-        while await group_buffer.wait_for_slot():
-            with sl.log_trace_span("get_training_sample"):
-                # to_thread: Dont block on dataset reads
-                sample = await asyncio.to_thread(self._rollouter.get_training_sample)
-            await group_buffer.add_work(
-                RolloutGroupWork(
-                    group_id=group_index,
-                    sample=sample,
+        while (reservation := await group_buffer.reserve_slot()) is not None:
+            try:
+                with sl.log_trace_span("get_training_sample"):
+                    # to_thread: Dont block on dataset reads
+                    sample = await asyncio.to_thread(
+                        self._rollouter.get_training_sample
+                    )
+                admitted = await group_buffer.add_work(
+                    RolloutGroupWork(
+                        group_id=group_index,
+                        sample=sample,
+                    ),
+                    reservation=reservation,
                 )
-            )
+            except BaseException:
+                await group_buffer.cancel_reservation(reservation)
+                raise
+            if not admitted:
+                break
             group_index += 1
         logger.info("Buffer closed; data input loop stopping")
 
@@ -931,6 +972,7 @@ class Controller(Configurable):
         training_sample_builder: TrainingSampleBuilder,
         batcher: Batcher,
         training_batch_queue: "asyncio.Queue[TrainingBatch | None]",
+        batch_prefetch_slots: asyncio.Semaphore,
     ) -> None:
         """Take finalized groups, build training_samples, accumulate them, and queue each ready training batch.
 
@@ -944,8 +986,12 @@ class Controller(Configurable):
             waits for:    a free training_batch_queue slot (maxsize=1)
             unblocked by: _trainer_loop training_batch_queue.get()
         """
+        await batch_prefetch_slots.acquire()
+        consuming_policy_version = self.start_step
         while True:
-            rollout_group = await group_buffer.take_finalized()
+            rollout_group = await group_buffer.take_finalized(
+                consuming_policy_version=consuming_policy_version
+            )
             if rollout_group is None:  # closed and drained
                 logger.info("Buffer drained; batcher loop stopping")
                 break
@@ -961,10 +1007,16 @@ class Controller(Configurable):
                     batcher.add_training_samples,
                     training_sample_group=training_sample_group,
                 )
+            await group_buffer.record_taken_outcome(
+                rollout_group.group_id,
+                outcome="taken" if group_is_trainable else "untrainable_group",
+            )
             if not group_is_trainable:
                 await group_buffer.release_active_groups(1, reason="untrainable_group")
             if maybe_training_batch is not None:
                 await training_batch_queue.put(maybe_training_batch)
+                consuming_policy_version += 1
+                await batch_prefetch_slots.acquire()
         await training_batch_queue.put(None)
         # TODO(async-rl): if finite datasets are supported, drain a final partial batch here.
 
@@ -972,6 +1024,7 @@ class Controller(Configurable):
         self,
         training_batch_queue: "asyncio.Queue[TrainingBatch | None]",
         *,
+        batch_prefetch_slots: asyncio.Semaphore,
         num_training_steps: int,
     ) -> None:
         """Run num_training_steps optimizer steps: train one packed batch, publish trainer weights,
@@ -1004,13 +1057,14 @@ class Controller(Configurable):
                 "timing/step/total"
             ):
                 # Waits for a TrainingBatch to be ready (or None on shutdown). The buffer observes this moment.
-                self._group_buffer.record_step_start(
+                await self._group_buffer.record_step_start(
                     trainer_policy_version=self._trainer_policy_version
                 )
                 with sl.log_trace_span("wait_for_training_batch"), step_timer.record(
                     "timing/step/wait_for_training_batch"
                 ):
                     packed = await training_batch_queue.get()
+                    batch_prefetch_slots.release()
 
                 if packed is None:
                     logger.info("Batcher closed and drained; stopping training")

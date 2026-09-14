@@ -40,13 +40,24 @@ class _SetupEndpoint:
         self.calls.append(kwargs)
 
 
+class _CloseEndpoint:
+    def __init__(self, actor_mesh) -> None:
+        self._actor_mesh = actor_mesh
+
+    async def call(self) -> None:
+        self._actor_mesh.drained = True
+
+
 class _WorkerActorMesh:
     def __init__(self) -> None:
         self.setup_async = _SetupEndpoint()
         self.run_group = _ChooseRunGroupEndpoint()
+        self.close = _CloseEndpoint(self)
+        self.drained = False
         self.stopped = False
 
     async def stop(self) -> None:
+        assert self.drained
         self.stopped = True
 
 
@@ -133,6 +144,7 @@ def test_setup_spawns_worker_pool_on_controller_host(monkeypatch) -> None:
             }
         ]
         await rollouter.close()
+        assert worker_mesh.actor_mesh.drained
         assert worker_mesh.actor_mesh.stopped
         assert worker_mesh.stopped
 

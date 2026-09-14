@@ -159,8 +159,8 @@ def test_worker_executes_group_without_actor_mesh() -> None:
             "group=7/rollout=1/turn=0",
         ]
         assert [call[1]["sampling_config"].seed for call in generate_fn.calls] == [
-            11,
-            12,
+            25,
+            26,
         ]
 
     asyncio.run(run())

@@ -24,6 +24,7 @@ python3 -m torchtitan.experiments.rl.train \
 
 import asyncio
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -140,6 +141,8 @@ class HostMeshes:
     trainer: HostMesh
     generators: list[HostMesh]
     gpus_per_node: int
+    trainer_gpu_ids: tuple[int, ...] | None = None
+    generator_gpu_ids: list[tuple[int, ...]] | None = None
 
 
 def _compute_trainer_world_size(p: ParallelismConfig) -> int:
@@ -167,6 +170,7 @@ def _spawn_proc_mesh(
     bootstrap: Callable[[], None],
     role: str,
     extra_env: dict[str, str] | None = None,
+    gpu_ids: tuple[int, ...] | None = None,
 ) -> ProcMesh:
     """Spawn one role's proc mesh on ``host_mesh``, splitting ``role_world_size``
     evenly across the mesh's hosts. ``extra_env`` is applied in each proc's bootstrap.
@@ -177,8 +181,36 @@ def _spawn_proc_mesh(
         f"host count ({nodes})"
     )
     role_gpus_per_node = role_world_size // nodes
-    provisioner = PerHostProvisioner(total_gpus=gpus_per_node)
-    env = provisioner.allocate(role_gpus_per_node, extra_env=extra_env)
+    extra_env = dict(extra_env or {})
+    local_cache_root = os.getenv("TORCHTITAN_LOCAL_COMPILER_CACHE_ROOT")
+    if local_cache_root:
+        # A shared compiler cache is unsafe when several vLLM engines compile
+        # the same Triton key concurrently: one process can replace metadata
+        # while another is reading it. Keep a role-specific cache on node-local
+        # storage. The same path may exist independently on multiple hosts.
+        role_cache = os.path.join(local_cache_root, role)
+        extra_env.update(
+            TRITON_CACHE_DIR=os.path.join(role_cache, "triton"),
+            TORCHINDUCTOR_CACHE_DIR=os.path.join(role_cache, "inductor"),
+        )
+
+    if gpu_ids is None:
+        provisioner = PerHostProvisioner(total_gpus=gpus_per_node)
+        env = provisioner.allocate(role_gpus_per_node, extra_env=extra_env)
+    else:
+        if len(gpu_ids) != role_gpus_per_node:
+            raise ValueError(
+                f"{role} needs {role_gpus_per_node} GPU id(s) per host, got {gpu_ids}"
+            )
+        if len(set(gpu_ids)) != len(gpu_ids) or any(
+            gpu_id < 0 or gpu_id >= gpus_per_node for gpu_id in gpu_ids
+        ):
+            raise ValueError(
+                f"{role} GPU ids {gpu_ids} must be unique and in [0, {gpus_per_node})"
+            )
+        env = {"CUDA_VISIBLE_DEVICES": ",".join(map(str, gpu_ids))}
+        if extra_env:
+            env.update(extra_env)
     return host_mesh.spawn_procs(
         per_host={"gpus": role_gpus_per_node},
         bootstrap=bootstrap,
@@ -219,11 +251,18 @@ def spawn_proc_mesh(
         trainer_host_mesh = host_meshes.trainer
         generator_host_meshes = host_meshes.generators
         gpus_per_node = host_meshes.gpus_per_node
+        trainer_gpu_ids = host_meshes.trainer_gpu_ids
+        generator_gpu_ids = host_meshes.generator_gpu_ids
 
         assert len(generator_host_meshes) == num_generators, (
             f"expected {num_generators} generator host mesh(es), "
             f"got {len(generator_host_meshes)}"
         )
+        if generator_gpu_ids is not None:
+            assert len(generator_gpu_ids) == num_generators, (
+                f"expected {num_generators} generator GPU-id tuple(s), "
+                f"got {len(generator_gpu_ids)}"
+            )
 
         trainer_mesh = _spawn_proc_mesh(
             trainer_host_mesh,
@@ -231,6 +270,7 @@ def spawn_proc_mesh(
             gpus_per_node,
             bootstrap=_preimport_torch,
             role="trainer",
+            gpu_ids=trainer_gpu_ids,
         )
         generator_meshes = [
             _spawn_proc_mesh(
@@ -238,10 +278,13 @@ def spawn_proc_mesh(
                 per_generator_world_size,
                 gpus_per_node,
                 bootstrap=_bootstrap_generator,
-                role="generator",
+                role=f"generator_{idx}",
                 extra_env=generator_env,
+                gpu_ids=(
+                    None if generator_gpu_ids is None else generator_gpu_ids[idx]
+                ),
             )
-            for gen_host_mesh in generator_host_meshes
+            for idx, gen_host_mesh in enumerate(generator_host_meshes)
         ]
     else:
         # Single-node mode: partition GPUs on this_host() via
@@ -271,10 +314,15 @@ def spawn_proc_mesh(
     return trainer_mesh, generator_meshes
 
 
-async def main():
+async def run(
+    config: Controller.Config,
+    *,
+    trainer_world_size: int,
+    per_generator_world_size: int,
+    host_meshes: HostMeshes | None,
+) -> None:
+    """Run RL training on local or caller-provided Monarch host meshes."""
     init_logger()
-    config = ConfigManager().parse_args()
-    assert isinstance(config, Controller.Config)
     sl.init_structured_logger(
         source="rl_controller",
         output_dir=config.dump_folder,
@@ -285,14 +333,10 @@ async def main():
 
     rl_trainer: Controller = config.build()
     try:
-        trainer_world_size = _compute_trainer_world_size(config.trainer.parallelism)
-        per_generator_world_size = _compute_generator_world_size(
-            config.generator.parallelism
-        )
         trainer_mesh, generator_meshes = spawn_proc_mesh(
             trainer_world_size,
             per_generator_world_size,
-            host_meshes=None,
+            host_meshes=host_meshes,
             num_generators=config.num_generators,
             generator_env=breakable_cudagraph_env(config.generator),
         )
@@ -305,6 +349,21 @@ async def main():
         logger.info("Interrupted; attempting graceful shutdown...")
     finally:
         await rl_trainer.close()
+
+
+async def main():
+    config = ConfigManager().parse_args()
+    assert isinstance(config, Controller.Config)
+    trainer_world_size = _compute_trainer_world_size(config.trainer.parallelism)
+    per_generator_world_size = _compute_generator_world_size(
+        config.generator.parallelism
+    )
+    await run(
+        config,
+        trainer_world_size=trainer_world_size,
+        per_generator_world_size=per_generator_world_size,
+        host_meshes=None,
+    )
 
 
 if __name__ == "__main__":

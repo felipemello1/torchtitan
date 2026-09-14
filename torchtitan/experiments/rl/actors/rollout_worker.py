@@ -32,6 +32,9 @@ class RolloutWorkerActor(Actor):
             ThreadPoolExecutor(max_workers=num_threads)
         )
         self._worker: RolloutWorker = worker_config.build()
+        self._active_run_groups = 0
+        self._closing = False
+        self._drained = asyncio.Condition()
 
     @concurrent_endpoint
     async def setup_async(
@@ -57,13 +60,30 @@ class RolloutWorkerActor(Actor):
         group_size: int,
         sampling: Any,
     ) -> RolloutGroup:
-        return await self._worker.run_group(
-            generate_fn=generate_fn,
-            sample=sample,
-            group_id=group_id,
-            group_size=group_size,
-            sampling=sampling,
-        )
+        async with self._drained:
+            if self._closing:
+                raise RuntimeError("rollout worker is closing")
+            self._active_run_groups += 1
+        try:
+            return await self._worker.run_group(
+                generate_fn=generate_fn,
+                sample=sample,
+                group_id=group_id,
+                group_size=group_size,
+                sampling=sampling,
+            )
+        finally:
+            async with self._drained:
+                self._active_run_groups -= 1
+                if self._active_run_groups == 0:
+                    self._drained.notify_all()
+
+    @concurrent_endpoint
+    async def close(self) -> None:
+        """Reject new groups and wait for all active group calls to unwind."""
+        async with self._drained:
+            self._closing = True
+            await self._drained.wait_for(lambda: self._active_run_groups == 0)
 
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:

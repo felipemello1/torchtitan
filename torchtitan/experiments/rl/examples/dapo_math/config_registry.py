@@ -177,11 +177,16 @@ def rl_dapo_qwen3_4b_math_32k() -> Controller.Config:
 
 
 def rl_dapo_qwen3_4b_math_8k_adaptive_buffer() -> Controller.Config:
-    """The 8K recipe with the adaptive rollout buffer: same GPUs and batch, capacity learned from the run,
-    groups dropped once older than 4 steps."""
+    """The 8K recipe with adaptive demand and exact four-step age eviction."""
     return _qwen3_4b_dapo_math_config(
         max_response_tokens=8192,
         max_total_tokens=10240,
         dump_folder="outputs/rl/qwen3_4b_dapo_math_8k_adaptive_buffer",
-        group_buffer=AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=4),
+        group_buffer=AdaptiveRolloutGroupWorkBuffer.Config(
+            max_offpolicy_steps=4,
+            # Broad service-admission ceiling for the next 30-step probe.
+            # Dynamic demand remains the operating control; vLLM independently
+            # enforces the KV-cache limit on scheduled sequences.
+            generation_capacity=128,
+        ),
     )

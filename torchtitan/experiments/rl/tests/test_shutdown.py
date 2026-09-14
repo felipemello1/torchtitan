@@ -219,6 +219,70 @@ def test_main_passes_configured_num_generators(monkeypatch, stub_mesh_provisioni
     ]
 
 
+def test_spawn_proc_mesh_accepts_explicit_gpu_ids(monkeypatch):
+    class _Bootstrap:
+        def with_env(self, env):
+            self.env = env
+            return self
+
+    class _Host:
+        def __len__(self):
+            return 1
+
+        def spawn_procs(self, **kwargs):
+            self.kwargs = kwargs
+            return "proc_mesh"
+
+    bootstrap = _Bootstrap()
+    monkeypatch.setattr(train, "default_bootstrap_cmd", lambda: bootstrap)
+    host = _Host()
+    result = train._spawn_proc_mesh(
+        host,
+        role_world_size=1,
+        gpus_per_node=4,
+        bootstrap=lambda: None,
+        role="generator",
+        extra_env={"EXTRA": "1"},
+        gpu_ids=(2,),
+    )
+
+    assert result == "proc_mesh"
+    assert host.kwargs["per_host"] == {"gpus": 1}
+    assert bootstrap.env == {"CUDA_VISIBLE_DEVICES": "2", "EXTRA": "1"}
+
+
+def test_spawn_proc_mesh_uses_role_specific_local_compiler_cache(monkeypatch):
+    class _Bootstrap:
+        def with_env(self, env):
+            self.env = env
+            return self
+
+    class _Host:
+        def __len__(self):
+            return 1
+
+        def spawn_procs(self, **kwargs):
+            return "proc_mesh"
+
+    bootstrap = _Bootstrap()
+    monkeypatch.setattr(train, "default_bootstrap_cmd", lambda: bootstrap)
+    monkeypatch.setenv("TORCHTITAN_LOCAL_COMPILER_CACHE_ROOT", "/tmp/job-7")
+    train._spawn_proc_mesh(
+        _Host(),
+        role_world_size=1,
+        gpus_per_node=4,
+        bootstrap=lambda: None,
+        role="generator_3",
+        gpu_ids=(1,),
+    )
+
+    assert bootstrap.env["TRITON_CACHE_DIR"] == "/tmp/job-7/generator_3/triton"
+    assert (
+        bootstrap.env["TORCHINDUCTOR_CACHE_DIR"]
+        == "/tmp/job-7/generator_3/inductor"
+    )
+
+
 def test_main_shuts_down_after_train_failure(monkeypatch, stub_mesh_provisioning):
     _FakeConfigManager.config = _FakeConfig(fail_train=True)
     _FakeController.instances = []
@@ -322,6 +386,14 @@ class _StubMesh:
         self._events.append(self._name)
 
 
+class _RecordingRollouter:
+    def __init__(self, events):
+        self._events = events
+
+    async def close(self):
+        self._events.append("rollouter.close")
+
+
 def _set_generator_router(rl_trainer, generators):
     rl_trainer.generator_router = _StubRouterHandle(
         InterGeneratorRouter(
@@ -335,6 +407,7 @@ def test_shutdown_calls_actor_close_before_mesh_stop():
     events: list[str] = []
     rl_trainer = _make_stub_rl_trainer()
     rl_trainer.trainer = _StubActor("trainer.close", events)
+    rl_trainer._rollouter = _RecordingRollouter(events)
     _set_generator_router(rl_trainer, [_StubActor("generator.close", events)])
     rl_trainer._proc_meshes = [
         _StubMesh("mesh.stop[0]", events),
@@ -346,6 +419,7 @@ def test_shutdown_calls_actor_close_before_mesh_stop():
     assert events == [
         "trainer.close",
         "generator.close",
+        "rollouter.close",
         "mesh.stop[0]",
         "mesh.stop[1]",
     ]

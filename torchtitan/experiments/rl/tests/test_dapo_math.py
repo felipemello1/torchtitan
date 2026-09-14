@@ -13,6 +13,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 from datasets import Dataset
 
+from torchtitan.config import ConfigManager
+from torchtitan.experiments.rl.components.work_buffer import (
+    AdaptiveRolloutGroupWorkBuffer,
+    RolloutGroupWorkBuffer,
+)
 from torchtitan.experiments.rl.examples.dapo_math import (
     AIME2025Dataset,
     DapoMathDataset,
@@ -144,3 +149,29 @@ def test_reward_handles_equivalent_latex_and_units() -> None:
     sample = DapoMathSample(prompt="problem", ground_truth=r"336^\circ")
     assert asyncio.run(reward(_rollout(r"work\nAnswer: \boxed{336}"), sample)) == 1.0
     assert asyncio.run(reward(_rollout(r"work\nAnswer: \boxed{335}"), sample)) == 0.0
+
+
+def test_dapo_configs_parse_rollout_buffer_union_defaults() -> None:
+    baseline = ConfigManager().parse_args(
+        ["--module", "dapo_math", "--config", "rl_dapo_qwen3_4b_math_8k"]
+    )
+    adaptive = ConfigManager().parse_args(
+        [
+            "--module",
+            "dapo_math",
+            "--config",
+            "rl_dapo_qwen3_4b_math_8k_adaptive_buffer",
+        ]
+    )
+
+    assert isinstance(baseline.async_loop.group_buffer, RolloutGroupWorkBuffer.Config)
+    assert isinstance(
+        adaptive.async_loop.group_buffer, AdaptiveRolloutGroupWorkBuffer.Config
+    )
+    assert adaptive.async_loop.group_buffer.generation_capacity == 128
+    assert (
+        adaptive.async_loop.group_buffer.max_active_rollout_groups(
+            adaptive.async_loop.num_prompts_per_train_step
+        )
+        == 168
+    )

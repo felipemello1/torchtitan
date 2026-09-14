@@ -163,10 +163,13 @@ class Rollouter(Configurable):
         )
 
     async def close(self) -> None:
-        """Stop the owned rollout worker proc mesh."""
+        """Drain active rollout calls, then stop the owned worker proc mesh."""
+        worker_actors = self._worker_actors
         worker_mesh = self._worker_mesh
         self._worker_actors = None
         self._worker_mesh = None
+        if worker_actors is not None:
+            await worker_actors.close.call()
         if worker_mesh is not None:
             await worker_mesh.stop()
 
@@ -337,12 +340,21 @@ class RolloutWorker(Configurable):
                     self._run_single_rollout(
                         generate_fn=generate_fn,
                         env=env,
-                        # Offset the base seed per sample so a group's n=1
-                        # requests are diverse yet reproducible run-to-run.
+                        # Give every (group, sibling) request a unique stable
+                        # seed. Reusing only `seed + sample_idx` across groups
+                        # correlates all prompt groups through the same small
+                        # set of random streams.
                         sampling=(
                             sampling
                             if sampling.seed is None
-                            else replace(sampling, seed=sampling.seed + sample_idx)
+                            else replace(
+                                sampling,
+                                seed=(
+                                    sampling.seed
+                                    + group_id * group_size
+                                    + sample_idx
+                                ),
+                            )
                         ),
                         group_id=group_id,
                         rollout_id=sample_idx,
