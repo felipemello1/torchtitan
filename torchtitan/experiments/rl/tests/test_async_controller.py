@@ -494,6 +494,12 @@ def test_stall_driven_demand_rises_on_a_short_shelf_and_relaxes_with_patience() 
     assert (
         demand.observe(ready=9, inflight=30, completed=12, trainable=8, dropped=0) == 43
     )  # comfort streak reset
+    for _ in range(2):
+        demand.observe(ready=32, inflight=30, completed=12, trainable=8, dropped=0)
+    assert (
+        demand.observe(ready=32, inflight=30, completed=12, trainable=8, dropped=0)
+        == 40
+    )  # a shelf of four batches gives back one group per batch beyond the first: -3
     assert demand.state == "ok"
 
 

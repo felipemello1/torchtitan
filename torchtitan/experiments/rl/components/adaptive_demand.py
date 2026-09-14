@@ -16,8 +16,9 @@ class StallDrivenDemand:
 
     At each step start the buffer reports the shelf (finished groups not yet trained) and the groups in flight.
     A shelf below one batch means the trainer is about to wait, so demand rises by `P // 2` at once. A shelf of at
-    least two batches for `patience_steps` consecutive steps lowers demand by one. Demand starts at `5 P` and stays
-    within `[2 P, ceiling]`.
+    least two batches for `patience_steps` consecutive steps lowers demand by one group per whole batch on the shelf
+    beyond the first (a shelf of `2 P` gives back 1, of `4 P` gives back 3), so an eased workload is released faster.
+    Demand starts at `5 P` and stays within `[2 P, ceiling]`.
 
     Growth is refused, and `state` names the reason, when more demand cannot help:
         "age-limited"       more than `max_drop_share` of the groups completed in the last `guard_window_steps`
@@ -30,7 +31,10 @@ class StallDrivenDemand:
         demand.observe(ready=5, inflight=30, completed=12, trainable=8, dropped=0)   # -> 44: shelf short, +4
         for _ in range(20):
             demand.observe(ready=16, inflight=30, completed=12, trainable=8, dropped=0)
-        demand.demand                                                  # -> 43: twenty comfortable steps, -1
+        demand.demand                                                  # -> 43: twenty comfortable steps, shelf 2 P, -1
+        for _ in range(20):
+            demand.observe(ready=32, inflight=30, completed=12, trainable=8, dropped=0)
+        demand.demand                                                  # -> 40: twenty more with a shelf of 4 P, -3
     """
 
     num_prompts_per_train_step: int
@@ -91,7 +95,7 @@ class StallDrivenDemand:
             self._comfortable_steps += 1
             if self._comfortable_steps >= self.patience_steps:
                 self._comfortable_steps = 0
-                self.demand = max(2 * P, self.demand - 1)
+                self.demand = max(2 * P, self.demand - max(1, (ready - P) // P))
         else:
             self._comfortable_steps = 0
         return self.demand
