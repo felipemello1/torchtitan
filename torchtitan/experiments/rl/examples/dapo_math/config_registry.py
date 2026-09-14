@@ -20,6 +20,10 @@ from torchtitan.experiments.rl.actors.generator import (
     VLLMGenerator,
 )
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
+from torchtitan.experiments.rl.components.work_buffer import (
+    AdaptiveRolloutGroupWorkBuffer,
+    RolloutGroupWorkBuffer,
+)
 from torchtitan.experiments.rl.controller import (
     AsyncLoopConfig,
     Controller,
@@ -48,6 +52,9 @@ def _qwen3_4b_dapo_math_config(
     max_response_tokens: int,
     max_total_tokens: int,
     dump_folder: str,
+    group_buffer: (
+        RolloutGroupWorkBuffer.Config | AdaptiveRolloutGroupWorkBuffer.Config
+    ) = RolloutGroupWorkBuffer.Config(target_offpolicy_steps=4),
 ) -> Controller.Config:
     """Build the shared Qwen3-4B DAPO-Math configuration."""
     num_validation_samples = 30
@@ -68,7 +75,7 @@ def _qwen3_4b_dapo_math_config(
             num_training_steps=150,
             num_prompts_per_train_step=8,
             num_samples_per_prompt=16,
-            target_offpolicy_steps=4,
+            group_buffer=group_buffer,
             validation=ValidationConfig(
                 num_samples=num_validation_samples,
             ),
@@ -166,4 +173,20 @@ def rl_dapo_qwen3_4b_math_32k() -> Controller.Config:
         max_response_tokens=32768,
         max_total_tokens=34816,
         dump_folder="outputs/rl/qwen3_4b_dapo_math_32k",
+    )
+
+
+def rl_dapo_qwen3_4b_math_8k_adaptive_buffer() -> Controller.Config:
+    """The 8K recipe with adaptive demand and exact four-step age eviction."""
+    return _qwen3_4b_dapo_math_config(
+        max_response_tokens=8192,
+        max_total_tokens=10240,
+        dump_folder="outputs/rl/qwen3_4b_dapo_math_8k_adaptive_buffer",
+        group_buffer=AdaptiveRolloutGroupWorkBuffer.Config(
+            max_offpolicy_steps=4,
+            # Broad service-admission ceiling for the next 30-step probe.
+            # Dynamic demand remains the operating control; vLLM independently
+            # enforces the KV-cache limit on scheduled sequences.
+            generation_capacity=128,
+        ),
     )

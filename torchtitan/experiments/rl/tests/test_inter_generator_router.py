@@ -51,7 +51,17 @@ class _Actor:
         raises_pull: bool = False,
     ):
         self.generate = _Endpoint(name, wait=wait_generate)
-        self.pull_model_state_dict = _Endpoint(None, wait=wait_pull, raises=raises_pull)
+        self.pull_model_state_dict = _Endpoint(
+            {
+                "policy_version": 0,
+                "hostname_env": f"{name}-env",
+                "socket_hostname": f"{name}-socket",
+                "copy_seconds": 0.25,
+                "endpoint_seconds": 0.5,
+            },
+            wait=wait_pull,
+            raises=raises_pull,
+        )
 
     def flatten(self, *args, **kwargs):
         return self
@@ -473,11 +483,17 @@ def test_pull_model_state_dict_pulls_every_generator():
         actors = [_Actor("gen0"), _Actor("gen1")]
         router = _router(actors)
 
-        await router._pull_model_state_dict(policy_version=7)
+        results = await router._pull_model_state_dict(policy_version=7)
 
         assert [actor.pull_model_state_dict.calls for actor in actors] == [
             [((7,), {})],
             [((7,), {})],
         ]
+        assert [result["generator_index"] for result in results] == [0, 1]
+        assert [result["socket_hostname"] for result in results] == [
+            "gen0-socket",
+            "gen1-socket",
+        ]
+        assert all(result["router_seconds"] >= 0 for result in results)
 
     asyncio.run(_run())

@@ -201,7 +201,7 @@ class Batcher(Configurable):
         (
             training_samples,
             metrics,
-            num_rollout_groups,
+            training_group_ids,
             num_metric_only_groups,
         ) = self._take_groups()
         # Next-fit all taken training_samples into rows.
@@ -236,7 +236,7 @@ class Batcher(Configurable):
                 *self._packing_metrics(
                     packed_rows,
                     training_samples,
-                    num_rollout_groups,
+                    len(training_group_ids),
                     num_metric_only_groups,
                     num_microbatches=len(microbatches),
                 ),
@@ -247,34 +247,35 @@ class Batcher(Configurable):
                 training_sample.min_policy_version
                 for training_sample in training_samples
             ],
+            training_group_ids=training_group_ids,
         )
 
     def _take_groups(
         self,
-    ) -> tuple[list[TrainingSample], list[m.Metric], int, int]:
+    ) -> tuple[list[TrainingSample], list[m.Metric], list[int], int]:
         """Pop accumulated groups oldest-first until `num_prompts_per_train_step` are taken."""
         taken_training_samples: list[TrainingSample] = []
         taken_metrics: list[m.Metric] = []
-        num_trainable_groups = 0
+        training_group_ids: list[int] = []
         cut = 0
         for group in self._groups_for_next_batch:
-            if num_trainable_groups >= self._num_prompts_per_train_step:
+            if len(training_group_ids) >= self._num_prompts_per_train_step:
                 break
             cut += 1
 
             taken_metrics.extend(group.metrics)
             if group.training_samples:
-                num_trainable_groups += 1
+                training_group_ids.append(group.group_id)
                 taken_training_samples.extend(group.training_samples)
 
         # surplus carried over
         self._groups_for_next_batch = self._groups_for_next_batch[cut:]
-        num_metric_only_groups: int = cut - num_trainable_groups
+        num_metric_only_groups = cut - len(training_group_ids)
 
         return (
             taken_training_samples,
             taken_metrics,
-            num_trainable_groups,
+            training_group_ids,
             num_metric_only_groups,
         )
 

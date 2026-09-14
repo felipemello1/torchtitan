@@ -15,24 +15,25 @@ Detailed diagram:
 
 _data_input_loop                                      _rollout_loop[N] (group workers)
 +--------------------------------------------------+  +--------------------------------------------------+
-| group_buffer.wait_for_slot()                     |  | work = group_buffer.claim_next()                  |
+| reservation = group_buffer.reserve_slot()        |  | work = group_buffer.claim_next()                  |
 | sample = rollouter.get_training_sample()         |  | group = rollouter.run_group_rollouts(work.sample) |
 | work = RolloutGroupWork(group_id, sample)        |  | group_buffer.finalize_work(group)                 |
-| group_buffer.add_work(work)                      |  +-----------------------+--------------------------+
+| group_buffer.add_work(work, reservation)         |  +-----------------------+--------------------------+
 +-----------------------+--------------------------+                          ^ |
                         |                                                     | |
                         | adds work entry                                     | | updates same entry
                         v                                                     | v
 RolloutGroupWorkBuffer
 +---------------------------------------------------------------------------------------------------------------------+
-| active slots = (target_offpolicy_steps + 1) * num_prompts_per_train_step                                                |
+| active slots = fixed size for windowed FIFO; dynamic demand target for adaptive                                  |
 |                                                                                                                     |
 | caller            group_buffer call                                            state / active slot                  |
 | _data_input_loop  add_work(RolloutGroupWork)                                   WAITING; slot acquired               |
 | _rollout_loop[N]  claim_next()                                                 WAITING -> INFLIGHT                  |
 | _rollout_loop[N]  finalize_work(RolloutGroup)                                  INFLIGHT -> FINALIZED                |
-| _batcher_loop     RolloutGroup = take_finalized()                              FINALIZED -> taken (slot still held) |
+| _batcher_loop     RolloutGroup = take_finalized()                              FINALIZED -> selected (slot held)    |
 | _batcher_loop     release_active_groups(1, "untrainable_group")                slot released                        |
+| _trainer_loop     record_step_start(trainer_policy_version)                    observation point (no state change) |
 | _trainer_loop     release_active_groups(num_prompts_per_train_step, "trained")  slots released after weight pull     |
 +---------------------------------------------------------------------------------------------------------------------+
                                                   |
@@ -63,7 +64,7 @@ _trainer_loop
 Backpressure (each loop: what it consumes/produces, and what gates each side):
 _data_input_loop
   produces: RolloutGroupWork into group_buffer
-    waits for:    a free active slot (group_buffer.wait_for_slot)
+    waits for:    an atomic active/generation reservation (group_buffer.reserve_slot)
     unblocked by: _trainer_loop release_active_groups(num_prompts_per_train_step, "trained") after the pull
                   (and _batcher_loop release_active_groups(1,"untrainable_group"))
 _rollout_loop[N]
@@ -75,8 +76,8 @@ _rollout_loop[N]
     unblocked by: n/a
 
 _batcher_loop
-  consumes: the oldest FINALIZED group allowed by windowed FIFO (group_buffer.take_finalized)
-    waits for:    a group inside the window becoming FINALIZED
+  consumes: the oldest FINALIZED group the buffer's policy allows (group_buffer.take_finalized)
+    waits for:    an allowed group becoming FINALIZED
     unblocked by: _rollout_loop[N] group_buffer.finalize_work()
   produces: TrainingBatch (training_batch_queue.put)
     waits for:    a free training_batch_queue slot (maxsize=1)
@@ -90,6 +91,8 @@ _trainer_loop
 import asyncio
 import logging
 import math
+import os
+import socket
 import time
 import warnings
 from dataclasses import dataclass, field, replace
@@ -97,10 +100,9 @@ from typing import Annotated
 
 # PYTORCH_CUDA_ALLOC_CONF is set in torchtitan/experiments/rl/__init__.py (before torch is imported)
 # and in train.py; see the note there.
-import torch  # noqa: F401
+import torch
 import torchstore as ts
 import tyro
-
 from monarch.actor import ProcMesh, this_host
 from monarch.spmd import setup_torch_elastic_env_async
 
@@ -114,6 +116,7 @@ from torchtitan.experiments.rl.components.training_sample_builder import (
 )
 from torchtitan.experiments.rl.components.weight_sync import WeightSyncManager
 from torchtitan.experiments.rl.components.work_buffer import (
+    AdaptiveRolloutGroupWorkBuffer,
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
@@ -151,6 +154,24 @@ class ValidationConfig:
     """Held-out prompts scored greedily (temp=0, n=1) per validation pass. 0 skips validation."""
 
 
+RolloutGroupBufferConfig = (
+    Annotated[
+        RolloutGroupWorkBuffer.Config,
+        tyro.conf.subcommand("windowed-fifo"),
+    ]
+    | Annotated[
+        AdaptiveRolloutGroupWorkBuffer.Config,
+        tyro.conf.subcommand("adaptive"),
+    ]
+)
+"""CLI-selectable rollout-buffer configuration.
+
+The explicit names are required because both implementations conventionally call
+their nested dataclass ``Config``. Without aliases Tyro gives both union members
+the same generated subcommand name and cannot match even a registry default.
+"""
+
+
 @dataclass(kw_only=True, slots=True)
 class AsyncLoopConfig(Configurable.Config):
     num_training_steps: int = 10
@@ -163,27 +184,12 @@ class AsyncLoopConfig(Configurable.Config):
     num_samples_per_prompt: int = 8
     """Sibling rollouts sampled per prompt (the GRPO group)."""
 
-    target_offpolicy_steps: int = 3
-    """Target steady-state offpolicy steps used to set the active buffer size to
-    `(S + 1) * P`. Observed offpolicy steps are not guaranteed to equal this
-    target: when rollout generation is the bottleneck, the buffer may not fill
-    and observed offpolicy steps will be lower. With strict FIFO, observed
-    offpolicy steps cannot exceed this target. With windowed FIFO, it may exceed
-    this target, up to `max_offpolicy_steps`. See
-    ``torchtitan/experiments/rl/docs/windowed_fifo.md`` for details."""
-
-    window_fraction: float | None = 0.3
-    """FIFO look-ahead window expressed as a fraction of the `RolloutGroupWorkBuffer` size.
-
-    This allows the batcher to bypass an unfinished rollout group at the head of
-    the queue and consume younger groups that are already finished. This may
-    increase the offpoliciness of the bypassed group. Defaults to 0.3 following
-    Section 6.2.4 of https://arxiv.org/pdf/2605.26494. Set to None for strict FIFO;
-    otherwise, must be in `(0, 1]`."""
-
-    group_buffer: RolloutGroupWorkBuffer.Config = field(
+    group_buffer: RolloutGroupBufferConfig = field(
         default_factory=RolloutGroupWorkBuffer.Config
     )
+    """Which rollout buffer paces generation: the windowed FIFO sized by
+    `target_offpolicy_steps` (default), or the adaptive reservoir that bypasses
+    slow groups and drops groups past `max_offpolicy_steps`."""
     training_sample_builder: TrainingSampleBuilder.Config = field(
         default_factory=TrainingSampleBuilder.Config
     )
@@ -196,65 +202,6 @@ class AsyncLoopConfig(Configurable.Config):
                 "num_prompts_per_train_step must be >= 1, got "
                 f"{self.num_prompts_per_train_step}"
             )
-        if self.target_offpolicy_steps < 0:
-            raise ValueError(
-                f"target_offpolicy_steps must be >= 0, got {self.target_offpolicy_steps}"
-            )
-        if self.window_fraction is not None and not (0 < self.window_fraction <= 1):
-            raise ValueError(
-                "window_fraction must be None or in (0, 1], got "
-                f"{self.window_fraction}"
-            )
-        if (
-            self.window_fraction is not None
-            and self.window_fraction * self.max_active_rollout_groups < 1
-        ):
-            warnings.warn(
-                f"window_fraction={self.window_fraction} is too small for "
-                f"active_buffer_size={self.max_active_rollout_groups}; forcing "
-                "window_size=1 (strict FIFO)",
-                stacklevel=2,
-            )
-
-    @property
-    def max_active_rollout_groups(self) -> int:
-        return (self.target_offpolicy_steps + 1) * self.num_prompts_per_train_step
-
-    @property
-    def window_size(self) -> int:
-        """Derive the fixed FIFO look-ahead window from the configured fraction.
-
-        Symbols:
-            ``P``: prompts per train step (``num_prompts_per_train_step``).
-            ``S``: target steady-state offpolicy steps (``target_offpolicy_steps``).
-            ``f``: fraction of the active buffer visible to windowed FIFO
-                (``window_fraction``).
-            ``B``: active buffer size in prompt groups, ``B = (S + 1) * P``.
-
-        Returns:
-            The FIFO look-ahead window size, ``max(1, floor(f * B))``. A value
-            of 1 is strict FIFO.
-        """
-        if self.window_fraction is None:
-            return 1
-        return max(
-            1,
-            math.floor(self.window_fraction * self.max_active_rollout_groups),
-        )
-
-    @property
-    def max_offpolicy_steps(self) -> int:
-        """Return the worst case consume-time offpolicy bound.
-
-        For active buffer size ``B``, window size ``W``, and prompts per
-        train step ``P``, the bound is ``(B + W - 2) // P``.
-
-        See ``torchtitan/experiments/rl/docs/windowed_fifo.md`` for the proof and
-        a worked example.
-        """
-        return (
-            self.max_active_rollout_groups + self.window_size - 2
-        ) // self.num_prompts_per_train_step
 
 
 class Controller(Configurable):
@@ -427,9 +374,18 @@ class Controller(Configurable):
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
         self.start_step = 0
         self._proc_meshes = []
+        resolved_sampling_seed = (
+            config.generator.sampling.seed
+            if config.generator.sampling.seed is not None
+            else config.generator.debug.seed
+        )
+        job_config = config.to_dict()
+        job_config["resolved_runtime"] = {
+            "sampling_base_seed": resolved_sampling_seed,
+        }
         self.metrics_processor: m.MetricsProcessor = config.metrics.build(
             log_dir=config.dump_folder,
-            job_config=config.to_dict(),
+            job_config=job_config,
         )
         self.tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
         self.renderer = config.renderer.build(tokenizer=self.tokenizer)
@@ -439,8 +395,19 @@ class Controller(Configurable):
         # seed per sample. Avoids the generator depending on request_id format.
         self._sampling = replace(
             config.generator.sampling,
-            seed=config.generator.debug.seed,
+            seed=resolved_sampling_seed,
             stop_token_ids=list(self.renderer.get_stop_token_ids()),
+        )
+        logger.info(
+            "Sampling seeds: sampling=%s debug=%s resolved_base=%s",
+            config.generator.sampling.seed,
+            config.generator.debug.seed,
+            resolved_sampling_seed,
+        )
+        logger.info(
+            "Controller host identity: HOSTNAME=%s socket_hostname=%s",
+            os.environ.get("HOSTNAME"),
+            socket.gethostname(),
         )
         self._rollouter: Rollouter = config.rollouter.build()
         self.rollout_recorder = config.rollout_recorder.build(
@@ -457,11 +424,11 @@ class Controller(Configurable):
             except Exception:
                 logger.exception("trainer.close failed")
 
-        try:
-            await self._rollouter.close()
-        except Exception:
-            logger.exception("rollouter.close failed")
-
+        # Rollout workers can still be awaiting replies from the generator
+        # router after the local rollout tasks have been cancelled. Close the
+        # generators first so those calls resolve while their destination
+        # worker actors are still alive. Stopping the worker mesh first can
+        # turn a late generator reply into a Monarch root-actor failure.
         if self.generator_router is not None:
             try:
                 close_results = await self.generator_router.close_generators.call_one()
@@ -479,6 +446,11 @@ class Controller(Configurable):
                         )
             except Exception:
                 logger.exception("generator_router.close_generators failed")
+
+        try:
+            await self._rollouter.close()
+        except Exception:
+            logger.exception("rollouter.close failed")
 
         try:
             self.metrics_processor.close()
@@ -555,9 +527,13 @@ class Controller(Configurable):
         """
         # Peak concurrent rollout sequences (groups * num_samples_per_prompt, or the validation pass); sizes max_num_seqs below.
         async_loop = self.config.async_loop
-        max_active_rollout_groups = async_loop.max_active_rollout_groups
+        max_concurrent_rollout_groups = (
+            async_loop.group_buffer.max_concurrent_rollout_groups(
+                async_loop.num_prompts_per_train_step
+            )
+        )
         rollout_concurrency = max(
-            max_active_rollout_groups * async_loop.num_samples_per_prompt,
+            max_concurrent_rollout_groups * async_loop.num_samples_per_prompt,
             async_loop.validation.num_samples,
         )
         config = self.config
@@ -784,16 +760,17 @@ class Controller(Configurable):
         # Trainer policy version, seeded from the resumed step; advances at each optimizer step.
         self._trainer_policy_version = self.start_step
 
-        # Buffer capacity sets target offpolicy steps; window size sets the hard offpolicy step bound.
-        max_active_rollout_groups = async_loop.max_active_rollout_groups
-        window_size = async_loop.window_size
-        logger.info(
-            f"window_size={window_size}, max_offpolicy_steps={async_loop.max_offpolicy_steps}"
-        )
-
         self._group_buffer = async_loop.group_buffer.build(
-            max_active_rollout_groups=max_active_rollout_groups,
-            window_size=window_size,
+            num_prompts_per_train_step=async_loop.num_prompts_per_train_step,
+            policy_version=self.start_step,
+            lifecycle_log_dir=self.config.dump_folder,
+        )
+        max_active_rollout_groups = self._group_buffer.max_active_rollout_groups
+        max_concurrent_rollout_groups = self._group_buffer.max_concurrent_rollout_groups
+        logger.info(
+            f"{type(self._group_buffer).__name__}: max_active_rollout_groups={max_active_rollout_groups}, "
+            f"max_concurrent_rollout_groups={max_concurrent_rollout_groups}, "
+            f"max_offpolicy_steps={self._group_buffer.max_offpolicy_steps}"
         )
 
         # Overlaps each step's weight handoff (push -> pull -> buffer-slot release) with the next step's fwd/bwd
@@ -822,13 +799,14 @@ class Controller(Configurable):
         training_batch_queue: asyncio.Queue[TrainingBatch | None] = asyncio.Queue(
             maxsize=1
         )
+        batch_prefetch_slots = asyncio.Semaphore(1)
 
         # rollout_loop
         generate_fn = self._make_generate_fn(metrics_prefix="generator")
 
-        # One rollout worker per active buffer slot: lets generation fill the whole windowed FIFO range,
-        # including the cold start (step 0 fills every active slot, not just num_prompts_per_train_step per wave).
-        # TODO: support warm start
+        # Generation concurrency is fixed by the serving deployment. Dynamic
+        # demand may retain additional finalized/held groups, but cannot create
+        # an unbounded request queue inside vLLM.
         rollout_tasks = [
             asyncio.create_task(
                 self._rollout_loop(
@@ -837,7 +815,7 @@ class Controller(Configurable):
                 ),
                 name=f"rollout_worker_{group_worker_id}",
             )
-            for group_worker_id in range(max_active_rollout_groups)
+            for group_worker_id in range(max_concurrent_rollout_groups)
         ]
 
         # data_input_loop
@@ -852,14 +830,16 @@ class Controller(Configurable):
                 training_sample_builder=training_sample_builder,
                 batcher=batcher,
                 training_batch_queue=training_batch_queue,
+                batch_prefetch_slots=batch_prefetch_slots,
             ),
             name="batcher",
         )
-
         # trainer_loop
         trainer_task = asyncio.create_task(
             self._trainer_loop(
-                training_batch_queue, num_training_steps=num_training_steps
+                training_batch_queue,
+                batch_prefetch_slots=batch_prefetch_slots,
+                num_training_steps=num_training_steps,
             ),
             name="trainer",
         )
@@ -919,7 +899,7 @@ class Controller(Configurable):
 
     async def _data_input_loop(self, group_buffer: RolloutGroupWorkBuffer) -> None:
         """produces a RolloutGroupWork into group_buffer.
-        waits for:    a free active slot (group_buffer.wait_for_slot)
+        waits for:    a reserved active slot (group_buffer.reserve_slot)
         unblocked by: _trainer_loop release_active_groups(num_prompts_per_train_step, "trained")
             after the pull (and _batcher_loop release_active_groups(1,"untrainable_group"))
 
@@ -933,16 +913,25 @@ class Controller(Configurable):
         # we could a) increase the number of threads; b) revisit how we release slots and see if
         # we can release them on the batcher while still preserving max offpolicy steps.
         # finally, c) we need to check how will this data input loop truly overlaps with the rollout loop.
-        while await group_buffer.wait_for_slot():
-            with sl.log_trace_span("get_training_sample"):
-                # to_thread: Dont block on dataset reads
-                sample = await asyncio.to_thread(self._rollouter.get_training_sample)
-            await group_buffer.add_work(
-                RolloutGroupWork(
-                    group_id=group_index,
-                    sample=sample,
+        while (reservation := await group_buffer.reserve_slot()) is not None:
+            try:
+                with sl.log_trace_span("get_training_sample"):
+                    # to_thread: Dont block on dataset reads
+                    sample = await asyncio.to_thread(
+                        self._rollouter.get_training_sample
+                    )
+                admitted = await group_buffer.add_work(
+                    RolloutGroupWork(
+                        group_id=group_index,
+                        sample=sample,
+                    ),
+                    reservation=reservation,
                 )
-            )
+            except BaseException:
+                await group_buffer.cancel_reservation(reservation)
+                raise
+            if not admitted:
+                break
             group_index += 1
         logger.info("Buffer closed; data input loop stopping")
 
@@ -1003,6 +992,7 @@ class Controller(Configurable):
         training_sample_builder: TrainingSampleBuilder,
         batcher: Batcher,
         training_batch_queue: "asyncio.Queue[TrainingBatch | None]",
+        batch_prefetch_slots: asyncio.Semaphore,
     ) -> None:
         """Take finalized groups, build training_samples, accumulate them, and queue each ready training batch.
 
@@ -1016,8 +1006,12 @@ class Controller(Configurable):
             waits for:    a free training_batch_queue slot (maxsize=1)
             unblocked by: _trainer_loop training_batch_queue.get()
         """
+        await batch_prefetch_slots.acquire()
+        consuming_policy_version = self.start_step
         while True:
-            rollout_group = await group_buffer.take_finalized()
+            rollout_group = await group_buffer.take_finalized(
+                consuming_policy_version=consuming_policy_version
+            )
             if rollout_group is None:  # closed and drained
                 logger.info("Buffer drained; batcher loop stopping")
                 break
@@ -1034,9 +1028,14 @@ class Controller(Configurable):
                     training_sample_group=training_sample_group,
                 )
             if not group_is_trainable:
+                await group_buffer.record_selected_outcomes(
+                    [rollout_group.group_id], outcome="untrainable_group"
+                )
                 await group_buffer.release_active_groups(1, reason="untrainable_group")
             if maybe_training_batch is not None:
                 await training_batch_queue.put(maybe_training_batch)
+                consuming_policy_version += 1
+                await batch_prefetch_slots.acquire()
         await training_batch_queue.put(None)
         # TODO(async-rl): if finite datasets are supported, drain a final partial batch here.
 
@@ -1044,6 +1043,7 @@ class Controller(Configurable):
         self,
         training_batch_queue: "asyncio.Queue[TrainingBatch | None]",
         *,
+        batch_prefetch_slots: asyncio.Semaphore,
         num_training_steps: int,
     ) -> None:
         """Run num_training_steps optimizer steps: train one packed batch, publish trainer weights,
@@ -1075,11 +1075,15 @@ class Controller(Configurable):
             with sl.log_trace_span("train_step"), step_timer.record(
                 "timing/step/total"
             ):
-                # Waits for a TrainingBatch to be ready (or None on shutdown).
+                # Waits for a TrainingBatch to be ready (or None on shutdown). The buffer observes this moment.
+                await self._group_buffer.record_step_start(
+                    trainer_policy_version=self._trainer_policy_version
+                )
                 with sl.log_trace_span("wait_for_training_batch"), step_timer.record(
                     "timing/step/wait_for_training_batch"
                 ):
                     packed = await training_batch_queue.get()
+                    batch_prefetch_slots.release()
 
                 if packed is None:
                     logger.info("Batcher closed and drained; stopping training")
@@ -1090,10 +1094,7 @@ class Controller(Configurable):
                 policy_age_panel = compute_policy_age_metrics(
                     trainer_policy_version=self._trainer_policy_version,
                     min_policy_versions=packed.min_policy_versions,
-                    target_offpolicy_steps=(
-                        self.config.async_loop.target_offpolicy_steps
-                    ),
-                    max_offpolicy_steps=self.config.async_loop.max_offpolicy_steps,
+                    max_offpolicy_steps=self._group_buffer.max_offpolicy_steps,
                 )
 
                 # TODO(async): can't stream microbatches (interleave pack->train) — the loss is normalized by
@@ -1132,6 +1133,9 @@ class Controller(Configurable):
                     optim_result = self._get_rank_0_value(
                         await self.trainer.optim_step.call()
                     )
+                await self._group_buffer.record_selected_outcomes(
+                    packed.training_group_ids, outcome="trained"
+                )
                 self._trainer_policy_version = optim_result.policy_version
 
                 # Await generator weight pull to finish before the trainer's next push.

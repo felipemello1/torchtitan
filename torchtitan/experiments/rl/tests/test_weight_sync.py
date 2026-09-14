@@ -50,6 +50,10 @@ class _PullEndpoint:
     async def call_one(self, policy_version):
         self._router.pulled_versions.append(policy_version)
         await self._router._on_pull()
+        return [
+            {"generator_index": 0, "router_seconds": 0.125},
+            {"generator_index": 1, "router_seconds": 0.25},
+        ]
 
 
 class _FakeBuffer:
@@ -57,7 +61,7 @@ class _FakeBuffer:
         self.releases: list[tuple[int, str]] = []
         self._events = events
 
-    async def release_active_groups(self, count, *, reason):
+    async def release_active_groups(self, count, *, reason, policy_version=None):
         if self._events is not None:
             self._events.append("release")
         self.releases.append((count, reason))
@@ -99,7 +103,12 @@ def test_push_then_pull_then_buffer_release_in_order() -> None:
         # The pull reads what the push wrote, and the buffer-slot release rides on the pull.
         assert events == ["push", "pull", "release"]
         assert [metric.key for metric in push_metrics] == [TRAINER_PUSH_KEY]
-        assert [metric.key for metric in pull_metrics] == [GENERATOR_PULL_KEY]
+        assert [metric.key for metric in pull_metrics] == [
+            GENERATOR_PULL_KEY,
+            "timing/weight_sync/generator_0_pull_model_state_dict",
+            "timing/weight_sync/generator_1_pull_model_state_dict",
+        ]
+        assert [metric.value.value for metric in pull_metrics[1:]] == [0.125, 0.25]
 
     asyncio.run(run())
 

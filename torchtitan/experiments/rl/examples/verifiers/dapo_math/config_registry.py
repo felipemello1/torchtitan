@@ -20,6 +20,7 @@ from torchtitan.experiments.rl.actors.generator import (
     VLLMGenerator,
 )
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
+from torchtitan.experiments.rl.components.work_buffer import RolloutGroupWorkBuffer
 from torchtitan.experiments.rl.controller import (
     AsyncLoopConfig,
     Controller,
@@ -61,7 +62,7 @@ def _qwen3_4b_verifiers_config(
             num_training_steps=150,
             num_prompts_per_train_step=8,
             num_samples_per_prompt=16,
-            target_offpolicy_steps=4,
+            group_buffer=RolloutGroupWorkBuffer.Config(target_offpolicy_steps=4),
             validation=ValidationConfig(num_samples=num_validation_samples),
         ),
         compile=CompileConfig(enable=True, backend="aot_eager"),

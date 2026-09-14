@@ -7,8 +7,10 @@
 """Unit tests for direct rollout worker execution."""
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
+import pytest
 from renderers import Qwen3RendererConfig
 
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
@@ -111,7 +113,9 @@ class _GenerateFn:
         )
 
 
-def test_worker_executes_group_without_actor_mesh() -> None:
+def test_worker_executes_group_without_actor_mesh(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     async def run() -> None:
         generate_fn = _GenerateFn()
         token_env_config = _TokenEnvConfig()
@@ -132,13 +136,14 @@ def test_worker_executes_group_without_actor_mesh() -> None:
             ),
             hf_assets_path="tests/assets/tokenizer",
         )
-        group = await worker.run_group(
-            generate_fn=generate_fn,
-            sample="sample",
-            group_id=7,
-            group_size=2,
-            sampling=SamplingConfig(seed=11),
-        )
+        with caplog.at_level(logging.INFO):
+            group = await worker.run_group(
+                generate_fn=generate_fn,
+                sample="sample",
+                group_id=7,
+                group_size=2,
+                sampling=SamplingConfig(seed=11),
+            )
 
         assert group.group_id == 7
         assert isinstance(worker, _CustomWorker)
@@ -159,8 +164,9 @@ def test_worker_executes_group_without_actor_mesh() -> None:
             "group=7/rollout=1/turn=0",
         ]
         assert [call[1]["sampling_config"].seed for call in generate_fn.calls] == [
-            11,
-            12,
+            25,
+            26,
         ]
+        assert "base=11 group_id=7 rollout_id=0 derived=25" in caplog.text
 
     asyncio.run(run())

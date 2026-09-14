@@ -12,6 +12,8 @@ import gc
 import logging
 import math
 import os
+import socket
+import time
 from dataclasses import dataclass, field
 from typing import Annotated, Literal
 
@@ -1010,7 +1012,9 @@ class VLLMGenerator(Actor, Configurable):
         self._model_state_dict_pull_request: ModelStateDictPullRequest | None = None
         self._close_request: CloseRequest | None = None
 
-        self._pull_model_state_dict_future: asyncio.Future[int] | None = None
+        self._pull_model_state_dict_future: asyncio.Future[
+            dict[str, float | int | str | None]
+        ] | None = None
 
         # Background asyncio.Task running _engine_loop; None until start_engine_loop starts it.
         self._engine_loop_task: asyncio.Task | None = None
@@ -1295,7 +1299,9 @@ class VLLMGenerator(Actor, Configurable):
 
     @concurrent_endpoint
     @sl.log_trace_span("pull_model_state_dict")
-    async def pull_model_state_dict(self, version: int) -> None:
+    async def pull_model_state_dict(
+        self, version: int
+    ) -> dict[str, float | int | str | None]:
         """Queues a weight pull for `version` and blocks until the engine loop has finished pulling.
 
         NOTE: In-flight requests are NOT drained here — the endpoint never drains; a caller that wants
@@ -1310,8 +1316,9 @@ class VLLMGenerator(Actor, Configurable):
         self._rank0_check_engine_loop_running("pull_model_state_dict")
 
         # A placeholder future for the engine loop to resolve once the pull has been applied.
+        endpoint_start = time.perf_counter()
         pull_model_state_dict_future: asyncio.Future[
-            int
+            dict[str, float | int | str | None]
         ] = asyncio.get_running_loop().create_future()
 
         # `_engine_loop_condition` wakes the engine loop, if asleep, when a pull is queued.
@@ -1323,13 +1330,16 @@ class VLLMGenerator(Actor, Configurable):
             self._engine_loop_condition.notify()  # wakes the engine loop only if it is idle
 
         # Await outside the lock so other generate / pull calls can proceed meanwhile.
-        await pull_model_state_dict_future
+        result = await pull_model_state_dict_future
+        result["endpoint_seconds"] = time.perf_counter() - endpoint_start
+        return result
 
     @sl.log_trace_span("pull_model_state_dict_copy")
     async def _pull_model_state_dict(self, version: int) -> None:
         """ALL RANKS: collectively copy the latest weights from TorchStore, optionally drop the
         prefix cache (so no new request reuses an old-weight prefix), and bump the policy version.
         """
+        pull_start = time.perf_counter()
         # Async RL uses a StorageVolume snapshot so generators do not read
         # live trainer GPU tensors while optimizer steps may be mutating them.
         model = self._get_model()
@@ -1356,7 +1366,14 @@ class VLLMGenerator(Actor, Configurable):
         # Rank 0 holds the pull's future. Until this is resolved,
         # no new requests are admitted or processed.
         if self._rank == 0 and self._pull_model_state_dict_future is not None:
-            self._pull_model_state_dict_future.set_result(version)
+            self._pull_model_state_dict_future.set_result(
+                {
+                    "policy_version": version,
+                    "hostname_env": os.environ.get("HOSTNAME"),
+                    "socket_hostname": socket.gethostname(),
+                    "copy_seconds": time.perf_counter() - pull_start,
+                }
+            )
             self._pull_model_state_dict_future = None
             self._model_state_dict_pull_request = None
 

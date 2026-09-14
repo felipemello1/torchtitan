@@ -11,6 +11,7 @@ import pytest
 
 from torchtitan.experiments.rl import train
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
+from torchtitan.experiments.rl.components.work_buffer import RolloutGroupWorkBuffer
 from torchtitan.experiments.rl.controller import AsyncLoopConfig
 from torchtitan.experiments.rl.rollout_recorder import RolloutSampleRecorder
 from torchtitan.experiments.rl.routing.inter_generator_router import (
@@ -94,73 +95,49 @@ class _FakeConfigManager:
         return self.config
 
 
-def test_async_loop_config_derives_window_and_max_offpolicy_steps() -> None:
-    default_loop = AsyncLoopConfig(
-        num_prompts_per_train_step=3,
-        target_offpolicy_steps=2,
-    )
-    assert default_loop.window_fraction == 0.3
-    assert default_loop.window_size == 2
-    assert default_loop.max_offpolicy_steps == 3
+def test_fifo_buffer_config_derives_window_and_max_offpolicy_steps() -> None:
+    default_buffer = RolloutGroupWorkBuffer.Config(target_offpolicy_steps=2)
+    assert default_buffer.window_fraction == 0.3
+    assert default_buffer.window_size(num_prompts_per_train_step=3) == 2
+    assert default_buffer.max_offpolicy_steps(num_prompts_per_train_step=3) == 3
 
-    strict_loop = AsyncLoopConfig(
-        num_prompts_per_train_step=3,
-        target_offpolicy_steps=2,
-        window_fraction=None,
+    strict_buffer = RolloutGroupWorkBuffer.Config(
+        target_offpolicy_steps=2, window_fraction=None
     )
-    assert strict_loop.window_size == 1
-    assert strict_loop.max_offpolicy_steps == 2
+    assert strict_buffer.window_size(num_prompts_per_train_step=3) == 1
+    assert strict_buffer.max_offpolicy_steps(num_prompts_per_train_step=3) == 2
 
-    async_loop = AsyncLoopConfig(
-        num_prompts_per_train_step=3,
-        target_offpolicy_steps=2,
-        window_fraction=4 / 9,
+    wide_buffer = RolloutGroupWorkBuffer.Config(
+        target_offpolicy_steps=2, window_fraction=4 / 9
     )
-    assert async_loop.max_active_rollout_groups == 9
-    assert async_loop.window_size == 4
-    assert async_loop.max_offpolicy_steps == 3
+    assert wide_buffer.max_active_rollout_groups(num_prompts_per_train_step=3) == 9
+    assert wide_buffer.window_size(num_prompts_per_train_step=3) == 4
+    assert wide_buffer.max_offpolicy_steps(num_prompts_per_train_step=3) == 3
 
-    assert (
-        AsyncLoopConfig(
-            num_prompts_per_train_step=3,
-            target_offpolicy_steps=2,
-            window_fraction=1 / 9,
-        ).window_size
-        == 1
-    )
-    assert (
-        AsyncLoopConfig(
-            num_prompts_per_train_step=3,
-            target_offpolicy_steps=2,
-            window_fraction=1.0,
-        ).window_size
-        == 9
-    )
-    assert (
-        AsyncLoopConfig(
-            num_prompts_per_train_step=8,
-            target_offpolicy_steps=3,
-            window_fraction=1.0,
-        ).window_size
-        == 32
-    )
+    def window(target: int, fraction: float, num_prompts: int) -> int:
+        return RolloutGroupWorkBuffer.Config(
+            target_offpolicy_steps=target, window_fraction=fraction
+        ).window_size(num_prompts_per_train_step=num_prompts)
+
+    assert window(2, 1 / 9, 3) == 1
+    assert window(2, 1.0, 3) == 9
+    assert window(3, 1.0, 8) == 32
 
 
-def test_async_loop_config_handles_window_fraction_bounds() -> None:
+def test_fifo_buffer_config_handles_window_fraction_bounds() -> None:
     with pytest.raises(ValueError, match="window_fraction"):
-        AsyncLoopConfig(window_fraction=0)
+        RolloutGroupWorkBuffer.Config(window_fraction=0)
     with pytest.raises(ValueError, match="window_fraction"):
-        AsyncLoopConfig(window_fraction=1.1)
+        RolloutGroupWorkBuffer.Config(window_fraction=1.1)
     with pytest.warns(UserWarning, match="forcing window_size=1"):
-        async_loop = AsyncLoopConfig(
-            num_prompts_per_train_step=8,
-            target_offpolicy_steps=0,
-            window_fraction=0.01,
-        )
-    assert async_loop.window_size == 1
+        buffer = RolloutGroupWorkBuffer.Config(
+            target_offpolicy_steps=0, window_fraction=0.01
+        ).build(num_prompts_per_train_step=8)
+    assert buffer.max_active_rollout_groups == 8
+    assert buffer.max_offpolicy_steps == 0
 
 
-def _make_stub_rl_trainer():
+def _make_stub_rl_trainer(*, sampling_seed=None, debug_seed=None):
     """Create an Controller with a minimal stub config (no VLLMGenerator validation)."""
     from torchtitan.experiments.rl.observability import metrics as m
 
@@ -183,7 +160,8 @@ def _make_stub_rl_trainer():
         )
         # __init__ reads generator.sampling (a dataclass, for replace) + generator.debug.seed.
         generator = SimpleNamespace(
-            sampling=SamplingConfig(), debug=SimpleNamespace(seed=None)
+            sampling=SamplingConfig(seed=sampling_seed),
+            debug=SimpleNamespace(seed=debug_seed),
         )
         rollouter = SimpleNamespace(build=lambda: _StubRollouter())
 
@@ -191,6 +169,16 @@ def _make_stub_rl_trainer():
             return {}
 
     return train.Controller(_StubConfig())
+
+
+def test_sampling_seed_prefers_explicit_sampling_config() -> None:
+    controller = _make_stub_rl_trainer(sampling_seed=17, debug_seed=23)
+    assert controller._sampling.seed == 17
+
+
+def test_sampling_seed_falls_back_to_debug_seed() -> None:
+    controller = _make_stub_rl_trainer(sampling_seed=None, debug_seed=23)
+    assert controller._sampling.seed == 23
 
 
 @pytest.fixture
@@ -240,6 +228,67 @@ def test_main_passes_configured_num_generators(monkeypatch, stub_mesh_provisioni
         "generator_mesh_0",
         "generator_mesh_1",
     ]
+
+
+def test_spawn_proc_mesh_accepts_explicit_gpu_ids(monkeypatch):
+    class _Bootstrap:
+        def with_env(self, env):
+            self.env = env
+            return self
+
+    class _Host:
+        def __len__(self):
+            return 1
+
+        def spawn_procs(self, **kwargs):
+            self.kwargs = kwargs
+            return "proc_mesh"
+
+    bootstrap = _Bootstrap()
+    monkeypatch.setattr(train, "default_bootstrap_cmd", lambda: bootstrap)
+    host = _Host()
+    result = train._spawn_proc_mesh(
+        host,
+        role_world_size=1,
+        gpus_per_node=4,
+        bootstrap=lambda: None,
+        role="generator",
+        extra_env={"EXTRA": "1"},
+        gpu_ids=(2,),
+    )
+
+    assert result == "proc_mesh"
+    assert host.kwargs["per_host"] == {"gpus": 1}
+    assert bootstrap.env == {"CUDA_VISIBLE_DEVICES": "2", "EXTRA": "1"}
+
+
+def test_spawn_proc_mesh_uses_role_specific_local_compiler_cache(monkeypatch):
+    class _Bootstrap:
+        def with_env(self, env):
+            self.env = env
+            return self
+
+    class _Host:
+        def __len__(self):
+            return 1
+
+        def spawn_procs(self, **kwargs):
+            return "proc_mesh"
+
+    bootstrap = _Bootstrap()
+    monkeypatch.setattr(train, "default_bootstrap_cmd", lambda: bootstrap)
+    monkeypatch.setenv("TORCHTITAN_LOCAL_COMPILER_CACHE_ROOT", "/tmp/job-7")
+    train._spawn_proc_mesh(
+        _Host(),
+        role_world_size=1,
+        gpus_per_node=4,
+        bootstrap=lambda: None,
+        role="generator_3",
+        gpu_ids=(1,),
+    )
+
+    assert bootstrap.env["TRITON_CACHE_DIR"] == "/tmp/job-7/generator_3/triton"
+    assert bootstrap.env["TORCHINDUCTOR_CACHE_DIR"] == "/tmp/job-7/generator_3/inductor"
 
 
 def test_main_shuts_down_after_train_failure(monkeypatch, stub_mesh_provisioning):
@@ -345,6 +394,14 @@ class _StubMesh:
         self._events.append(self._name)
 
 
+class _RecordingRollouter:
+    def __init__(self, events):
+        self._events = events
+
+    async def close(self):
+        self._events.append("rollouter.close")
+
+
 def _set_generator_router(rl_trainer, generators):
     rl_trainer.generator_router = _StubRouterHandle(
         InterGeneratorRouter(
@@ -358,6 +415,7 @@ def test_shutdown_calls_actor_close_before_mesh_stop():
     events: list[str] = []
     rl_trainer = _make_stub_rl_trainer()
     rl_trainer.trainer = _StubActor("trainer.close", events)
+    rl_trainer._rollouter = _RecordingRollouter(events)
     _set_generator_router(rl_trainer, [_StubActor("generator.close", events)])
     rl_trainer._proc_meshes = [
         _StubMesh("mesh.stop[0]", events),
@@ -369,6 +427,7 @@ def test_shutdown_calls_actor_close_before_mesh_stop():
     assert events == [
         "trainer.close",
         "generator.close",
+        "rollouter.close",
         "mesh.stop[0]",
         "mesh.stop[1]",
     ]

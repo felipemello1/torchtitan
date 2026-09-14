@@ -168,7 +168,6 @@ def compute_policy_age_metrics(
     *,
     trainer_policy_version: int,
     min_policy_versions: list[int],
-    target_offpolicy_steps: int,
     max_offpolicy_steps: int,
 ) -> list[m.Metric]:
     """Age of each packed training sample at the moment the trainer consumes the batch.
@@ -179,17 +178,13 @@ def compute_policy_age_metrics(
     Args:
         trainer_policy_version: Policy version that will consume this batch.
         min_policy_versions: Oldest sampled policy version for each packed training sample.
-        target_offpolicy_steps: Target steady-state offpolicy steps used to size
-            the active buffer.
-        max_offpolicy_steps: Hard consume-time offpolicy step limit derived from
-            ``window_fraction``.
+        max_offpolicy_steps: Hard consume-time offpolicy step limit the rollout buffer guarantees.
 
     Example:
         # trainer at v=10; training samples' oldest versions [8, 9] -> ages [2, 1]
         compute_policy_age_metrics(
             trainer_policy_version=10,
             min_policy_versions=[8, 9],
-            target_offpolicy_steps=3,
             max_offpolicy_steps=3,
         )
         # -> train_batch/policy_age mean 1.5, train_batch/policy_age_max 2
@@ -203,7 +198,6 @@ def compute_policy_age_metrics(
         raise RuntimeError(
             "rollout backpressure admitted stale training data: "
             f"max_policy_age={max_policy_age}, "
-            f"target_offpolicy_steps={target_offpolicy_steps}, "
             f"max_offpolicy_steps={max_offpolicy_steps}, "
             f"trainer_policy_version={trainer_policy_version}"
         )

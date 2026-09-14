@@ -260,7 +260,9 @@ def build_inference_engine(config: Controller.Config) -> LLMEngine:
     # (the active-buffer capacity num_group_workers, or the validation pass).
     async_loop = config.async_loop
     gen_dp = max(gen_config.parallelism.data_parallel_degree, 1)
-    num_group_workers = async_loop.max_active_rollout_groups
+    num_group_workers = async_loop.group_buffer.max_concurrent_rollout_groups(
+        async_loop.num_prompts_per_train_step
+    )
     rollout_concurrency = max(
         num_group_workers * async_loop.num_samples_per_prompt,
         async_loop.validation.num_samples,
