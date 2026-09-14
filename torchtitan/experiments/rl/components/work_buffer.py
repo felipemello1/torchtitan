@@ -10,8 +10,8 @@ NOTE: The buffer holds work slots, and not the finalized RolloutGroups necessari
 Two buffers share one interface, so the controller runs either one unchanged:
 
     RolloutGroupWorkBuffer             fixed `(target_offpolicy_steps + 1) * P`; windowed FIFO; never drops
-    AdaptiveRolloutGroupWorkBuffer  demand set by the trainer's stalls; takes the oldest finalized group;
-                                    drops groups past `max_offpolicy_steps`
+    AdaptiveRolloutGroupWorkBuffer  demand set by the trainer's stalls, optionally capped by `target_offpolicy_steps`;
+                                    takes the oldest finalized group; drops groups past `max_offpolicy_steps`
 """
 
 import asyncio
@@ -664,8 +664,9 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
     2. Selection. `take_finalized` returns the oldest FINALIZED group wherever it sits; a slow group never
        blocks younger finished ones and keeps its slot until it finishes.
     3. Age. A finalized group that would be consumed more than `max_offpolicy_steps` versions after it was
-       claimed is dropped (slot released at once, prompt not retried). This is the only guarantee on age;
-       the mean age follows demand: about `demand / P - 1` steps when the pipeline is full.
+       claimed is dropped (slot released at once, prompt not retried). The mean age follows demand, about
+       `demand / P - 1` steps when the pipeline is full; `target_offpolicy_steps`, if set, caps demand at
+       `(target_offpolicy_steps + 1) * P` so the mean age is bounded too, at the price of stalls.
 
     Example:
         buffer = AdaptiveRolloutGroupWorkBuffer.Config(
@@ -683,8 +684,13 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         max_offpolicy_steps: int = 4
-        """Oldest a group may be at consumption, in policy versions since generation started. Older
-        finalized groups are dropped and their prompt is not retried."""
+        """Bounds the age of EVERY trained group: a finalized group older than this at consumption is dropped
+        (prompt not retried). Costs waste, never stalls."""
+
+        target_offpolicy_steps: int | None = None
+        """Bounds the MEAN age: caps the groups in the pipeline at `(target_offpolicy_steps + 1) * P`, the
+        FIFO buffer's cap, so a trained group waited at most that many steps. Costs stalls when generation
+        cannot fill a batch within the cap, never waste. None: demand is bounded by generation capacity only."""
 
         patience_steps: int = 20
         """Consecutive step starts with two batches on the shelf before demand drops by one group.
@@ -719,14 +725,24 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
                     "generation_capacity must be explicitly set to a positive "
                     "deployment limit"
                 )
+            if self.target_offpolicy_steps is not None and self.target_offpolicy_steps < 1:
+                raise ValueError(
+                    f"target_offpolicy_steps must be >= 1 or None, got {self.target_offpolicy_steps}"
+                )
 
         def max_active_rollout_groups(self, num_prompts_per_train_step: int) -> int:
-            """Maximum useful demand from generation capacity and age window."""
+            """Maximum useful demand: generation capacity plus the age window, or the mean-age cap if set."""
             assert self.generation_capacity is not None
-            return (
+            ceiling = (
                 self.generation_capacity
                 + (self.max_offpolicy_steps + 1) * num_prompts_per_train_step
             )
+            if self.target_offpolicy_steps is not None:
+                ceiling = min(
+                    ceiling,
+                    (self.target_offpolicy_steps + 1) * num_prompts_per_train_step,
+                )
+            return ceiling
 
         def max_concurrent_rollout_groups(self, num_prompts_per_train_step: int) -> int:
             del num_prompts_per_train_step

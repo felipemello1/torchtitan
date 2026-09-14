@@ -652,6 +652,25 @@ def test_adaptive_buffer_measures_the_shelf_and_moves_demand() -> None:
     asyncio.run(run())
 
 
+def test_adaptive_buffer_target_offpolicy_steps_caps_demand() -> None:
+    # P=4, target 5: the pipeline may hold (5 + 1) * 4 = 24 groups however hard the trainer stalls
+    config = AdaptiveRolloutGroupWorkBuffer.Config(
+        max_offpolicy_steps=10, generation_capacity=40, target_offpolicy_steps=5
+    )
+    assert config.max_active_rollout_groups(num_prompts_per_train_step=4) == 24
+    buffer = config.build(num_prompts_per_train_step=4)
+    assert buffer._active_group_limit() == 20  # five batches to start, below the cap
+
+    async def run() -> None:
+        for _ in range(10):
+            await buffer.record_step_start(trainer_policy_version=0)  # empty shelf every step: +2 each
+        assert buffer._active_group_limit() == 24
+
+    asyncio.run(run())
+    with pytest.raises(ValueError):
+        AdaptiveRolloutGroupWorkBuffer.Config(generation_capacity=40, target_offpolicy_steps=0)
+
+
 def test_adaptive_buffer_never_exceeds_derived_max_demand() -> None:
     async def run() -> None:
         buffer = _adaptive_buffer(
