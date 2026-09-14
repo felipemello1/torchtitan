@@ -22,8 +22,8 @@ class StallDrivenDemand:
     Growth is refused, and `state` names the reason, when more demand cannot help:
         "age-limited"       more than `max_drop_share` of the groups completed in the last `guard_window_steps`
                             were dropped as too old: the age cap binds, extra demand becomes stale work
-        "generation-bound"  the generators hold every permit (`inflight >= generation_capacity`) and still
-                            deliver fewer trainable groups per step than the trainer consumes
+        "generation-bound"  the generators hold every permit (`inflight >= generation_capacity`) and deliver
+                            clearly fewer trainable groups per step than the trainer consumes (below 0.9 P)
 
     Example:
         demand = StallDrivenDemand(num_prompts_per_train_step=8, ceiling=168, generation_capacity=128)
@@ -78,7 +78,8 @@ class StallDrivenDemand:
                 self.state = "age-limited"
                 return self.demand
             trainable_per_step = sum(self._trainable) / max(1, len(self._trainable))
-            if inflight >= self.generation_capacity and trainable_per_step < P:
+            # bound only when the flow is clearly short: a shelf can still be built from a small surplus
+            if inflight >= self.generation_capacity and trainable_per_step < 0.9 * P:
                 self.state = "generation-bound"
                 return self.demand
             self.state = "ok"
