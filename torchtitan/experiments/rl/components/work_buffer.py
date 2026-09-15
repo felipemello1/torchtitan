@@ -327,13 +327,13 @@ class RolloutGroupWorkBuffer(Configurable):
         ] = {}
 
     @property
-    def max_active_rollout_groups(self) -> int:
-        """Most rollout groups admitted and not yet released at once."""
+    def max_active_rollout_groups(self) -> int | None:
+        """Most rollout groups admitted and not yet released at once; None when nothing bounds it but the demand."""
         return self._max_active_rollout_groups
 
     @property
-    def max_offpolicy_steps(self) -> int:
-        """Hard consume-time bound on `trainer_policy_version - min_policy_version`."""
+    def max_offpolicy_steps(self) -> int | None:
+        """Hard consume-time bound on `trainer_policy_version - min_policy_version`; None when the buffer has none."""
         return self._max_offpolicy_steps
 
     @property
@@ -665,9 +665,10 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
     2. Selection. `take_finalized` returns the oldest FINALIZED group wherever it sits; a slow group never
        blocks younger finished ones and keeps its slot until it finishes.
     3. Age. A finalized group that would be consumed more than `max_offpolicy_steps` versions after it was
-       claimed is dropped (slot released at once, prompt not retried). The mean age is held under
-       `target_offpolicy_steps` if set, else under `max_offpolicy_steps`, by the demand ceiling, at the price of
-       stalls when the workload needs more groups than the ceiling allows.
+       claimed is dropped (slot released at once, prompt not retried); with `max_offpolicy_steps=None` nothing is
+       dropped. The mean age is held under `target_offpolicy_steps` if set, else under `max_offpolicy_steps` if
+       set, by the demand ceiling, at the price of stalls when the workload needs more groups than the ceiling
+       allows. With neither, the demand follows the workload alone.
 
     Example:
         buffer = AdaptiveRolloutGroupWorkBuffer.Config(
@@ -685,14 +686,15 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        max_offpolicy_steps: int = 4
+        max_offpolicy_steps: int | None = 4
         """Bounds the age of EVERY trained group: a finalized group older than this at consumption is dropped
-        (prompt not retried). Without `target_offpolicy_steps`, also the mean age the demand ceiling holds under."""
+        (prompt not retried). Without `target_offpolicy_steps`, also the mean age the demand ceiling holds under.
+        None: nothing is dropped for age."""
 
         target_offpolicy_steps: int | None = None
-        """Bounds the MEAN age at this value, below `max_offpolicy_steps`: demand is capped at the mean-age ceiling
+        """Bounds the MEAN age at this value: demand is capped at the mean-age ceiling
         `target * P + P + generating * untrainable_share`. Costs stalls when generation cannot fill a batch within
-        the cap, never waste. None: the same ceiling is applied at `max_offpolicy_steps`."""
+        the cap, never waste. None: the same ceiling is applied at `max_offpolicy_steps`, if set."""
 
         lookback_steps: int = 10
         """How many of the most recent step starts the demand rule looks back over; older values are forgotten."""
@@ -715,12 +717,16 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         """
 
         def __post_init__(self) -> None:
-            if self.max_offpolicy_steps < 1:
+            if self.max_offpolicy_steps is not None and self.max_offpolicy_steps < 1:
                 raise ValueError(
-                    f"max_offpolicy_steps must be >= 1, got {self.max_offpolicy_steps}"
+                    f"max_offpolicy_steps must be None or >= 1, got {self.max_offpolicy_steps}"
                 )
-            if self.target_offpolicy_steps is not None and not (
-                1 <= self.target_offpolicy_steps <= self.max_offpolicy_steps
+            if self.target_offpolicy_steps is not None and (
+                self.target_offpolicy_steps < 1
+                or (
+                    self.max_offpolicy_steps is not None
+                    and self.target_offpolicy_steps > self.max_offpolicy_steps
+                )
             ):
                 raise ValueError(
                     "target_offpolicy_steps must be None or in [1, max_offpolicy_steps], "
@@ -748,9 +754,11 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
                     "deployment limit"
                 )
 
-        def max_active_rollout_groups(self, num_prompts_per_train_step: int) -> int:
-            """Most groups the pipeline can physically hold: generation capacity plus the age window."""
+        def max_active_rollout_groups(self, num_prompts_per_train_step: int) -> int | None:
+            """Most groups the pipeline can physically hold: generation capacity plus the age window; None without an age cap."""
             assert self.generation_capacity is not None
+            if self.max_offpolicy_steps is None:
+                return None
             return (
                 self.generation_capacity
                 + (self.max_offpolicy_steps + 1) * num_prompts_per_train_step
@@ -806,7 +814,8 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
     ) -> bool:
         assert work.policy_version_at_claim is not None
         return (
-            consuming_policy_version - work.policy_version_at_claim
+            self._max_offpolicy_steps is not None
+            and consuming_policy_version - work.policy_version_at_claim
             > self._max_offpolicy_steps
         )
 

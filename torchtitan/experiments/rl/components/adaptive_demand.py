@@ -41,8 +41,8 @@ the batch in training, plus the slots the rejected groups occupy while they gene
 
     ceiling = A * P + P + generating * untrainable_share
 
-with A = `target_offpolicy_steps` if given, else `max_offpolicy_steps`. When the ceiling binds the trainer may stall
-rather than train on older data; a log line says so.
+with A = `target_offpolicy_steps` if given, else `max_offpolicy_steps` if given; with neither there is no ceiling. When
+the ceiling binds the trainer may stall rather than train on older data; a log line says so.
 
 Example (P = 8, lookback 10, stall probability 5%):
 
@@ -68,10 +68,10 @@ class StallDrivenDemand:
     Args:
         num_prompts_per_train_step: P, groups the trainer consumes per step.
         max_offpolicy_steps: A, the hard limit on policy age; the buffer drops groups older than this. Without a
-            target below, it is also the mean age the ceiling holds under.
+            target below, it is also the mean age the ceiling holds under. None: no hard limit.
         target_offpolicy_steps: optional. If given, the MEAN policy age is held at or under it, at the cost of
             stalling: demand is capped at the mean-age ceiling for this age. None: the ceiling is applied at
-            `max_offpolicy_steps`.
+            `max_offpolicy_steps`, if given; with neither there is no ceiling.
         lookback_steps: how many of the most recent step starts the quantile is taken over; older values are forgotten.
         stall_probability: the share of steps allowed to stall; the quantile is taken at 1 - stall_probability. This
             is what the rule aims for when nothing else limits the demand. It cannot be met when the age ceiling or
@@ -92,7 +92,7 @@ class StallDrivenDemand:
     """
 
     num_prompts_per_train_step: int
-    max_offpolicy_steps: int
+    max_offpolicy_steps: int | None = None
     target_offpolicy_steps: int | None = None
     lookback_steps: int = 10
     stall_probability: float = 0.05
@@ -151,19 +151,20 @@ class StallDrivenDemand:
             if self.target_offpolicy_steps is not None
             else self.max_offpolicy_steps
         )
-        ceiling = mean_age_ceiling(
-            num_prompts_per_train_step=P,
-            mean_age_limit=mean_age_limit,
-            groups_generating=statistics.mean(self._generating),
-            untrainable_share=1.0 - sum(self._trainable) / max(1, sum(self._completed)),
-        )
-        demand_needed, self.state = clamp_demand_needed(
-            demand_needed=demand_needed,
-            cap=math.floor(ceiling),
-            reason=f"to keep the mean policy age under {mean_age_limit} steps",
-            step=step,
-            previous_state=self.state,
-        )
+        if mean_age_limit is not None:
+            ceiling = mean_age_ceiling(
+                num_prompts_per_train_step=P,
+                mean_age_limit=mean_age_limit,
+                groups_generating=statistics.mean(self._generating),
+                untrainable_share=1.0 - sum(self._trainable) / max(1, sum(self._completed)),
+            )
+            demand_needed, self.state = clamp_demand_needed(
+                demand_needed=demand_needed,
+                cap=math.floor(ceiling),
+                reason=f"to keep the mean policy age under {mean_age_limit} steps",
+                step=step,
+                previous_state=self.state,
+            )
 
         # Move part of the way toward demand_needed, the same going up and down
         self.demand = smooth_demand_toward_needed(

@@ -529,6 +529,35 @@ def test_stall_driven_demand_is_capped_by_the_mean_age_ceiling() -> None:
     assert demand.state == "ok"
 
 
+def test_stall_driven_demand_without_a_max_has_no_ceiling_and_drops_nothing() -> None:
+    demand = StallDrivenDemand(num_prompts_per_train_step=2, max_offpolicy_steps=None)
+    for step in range(1, 11):
+        demand.observe(step=step, ready=0, generating=6, completed=0, trainable=0)
+    assert demand.demand > 8 and demand.state == "ok"  # with a max of 1 the ceiling would have held it at 8
+
+    async def run() -> None:
+        buffer = AdaptiveRolloutGroupWorkBuffer.Config(
+            max_offpolicy_steps=None, generation_capacity=4
+        ).build(num_prompts_per_train_step=2)
+        assert buffer.max_offpolicy_steps is None and buffer.max_active_rollout_groups is None
+        await _admit(buffer, 0)
+        await buffer.claim_next()  # g0 generates under version 0
+        await _finalize(buffer, 0)
+        selected = await buffer.take_finalized(consuming_policy_version=50)  # 50 versions old: kept
+        assert selected is not None and selected.group_id == 0
+        assert _metric_value(buffer.metrics(), "rollout_buffer/dropped_too_old") == 0
+
+    asyncio.run(run())
+    with pytest.raises(ValueError, match="target_offpolicy_steps"):
+        AdaptiveRolloutGroupWorkBuffer.Config(
+            max_offpolicy_steps=None, generation_capacity=4, target_offpolicy_steps=0
+        )
+    # a target without a max is allowed: the ceiling holds the mean age, nothing is dropped
+    AdaptiveRolloutGroupWorkBuffer.Config(
+        max_offpolicy_steps=None, generation_capacity=4, target_offpolicy_steps=3
+    )
+
+
 def test_adaptive_buffer_takes_oldest_finalized_and_lets_slow_groups_keep_their_slot() -> None:
     async def run() -> None:
         buffer = _adaptive_buffer(num_prompts=2, generation_capacity=4)
