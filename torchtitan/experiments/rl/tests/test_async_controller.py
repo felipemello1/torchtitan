@@ -454,13 +454,11 @@ def _adaptive_buffer(
     num_prompts: int,
     max_offpolicy_steps: int = 4,
     generation_capacity: int = 64,
-    patience_steps: int = 20,
     **kwargs
 ) -> AdaptiveRolloutGroupWorkBuffer:
     return AdaptiveRolloutGroupWorkBuffer.Config(
         max_offpolicy_steps=max_offpolicy_steps,
         generation_capacity=generation_capacity,
-        patience_steps=patience_steps,
     ).build(num_prompts_per_train_step=num_prompts, **kwargs)
 
 
@@ -468,81 +466,67 @@ def _metric_value(metrics: list[m.Metric], key: str) -> float:
     return next(metric.value.value for metric in metrics if metric.key == key)
 
 
-def test_stall_driven_demand_rises_on_a_short_shelf_and_relaxes_with_patience() -> None:
-    demand = StallDrivenDemand(
-        num_prompts_per_train_step=8,
-        ceiling=168,
-        generation_capacity=128,
-        patience_steps=3,
+def test_stall_driven_demand_quantile_uses_every_point_of_the_lookback() -> None:
+    from torchtitan.experiments.rl.components.adaptive_demand import (
+        estimate_next_unavailable_upper_bound,
+        mean_age_ceiling,
+        prediction_multiplier,
+        smooth_demand_toward_needed,
     )
-    assert demand.demand == 40  # five batches
-    assert (
-        demand.observe(ready=5, inflight=30, completed=12, trainable=8, dropped=0) == 44
-    )  # short shelf: + P // 2
-    assert (
-        demand.observe(ready=8, inflight=30, completed=12, trainable=8, dropped=0) == 44
-    )  # one batch: hold
-    for _ in range(2):
-        assert (
-            demand.observe(ready=16, inflight=30, completed=12, trainable=8, dropped=0)
-            == 44
-        )
-    assert (
-        demand.observe(ready=16, inflight=30, completed=12, trainable=8, dropped=0)
-        == 43
-    )  # third comfortable step: -1
-    assert (
-        demand.observe(ready=9, inflight=30, completed=12, trainable=8, dropped=0) == 43
-    )  # comfort streak reset
-    for _ in range(2):
-        demand.observe(ready=32, inflight=30, completed=12, trainable=8, dropped=0)
-    assert (
-        demand.observe(ready=32, inflight=30, completed=12, trainable=8, dropped=0)
-        == 40
-    )  # a shelf of four batches gives back one group per batch beyond the first: -3
+
+    history = [44, 46, 41, 48, 45, 47, 50, 43, 46, 45]
+    # mean 45.5, sd 2.55, Student-t prediction multiplier for 10 samples at 95% = 1.92 -> 50.4 -> 51 (above the max seen)
+    assert estimate_next_unavailable_upper_bound(history=history, probability=0.95) == 51
+    assert estimate_next_unavailable_upper_bound(history=[45, 45, 45], probability=0.95) == 45
+    assert estimate_next_unavailable_upper_bound(history=[24], probability=0.95) == 24
+    assert round(prediction_multiplier(samples=10, probability=0.95), 3) == 1.923
+    assert round(prediction_multiplier(samples=1000, probability=0.95), 2) == 1.65
+    assert mean_age_ceiling(
+        num_prompts_per_train_step=8, mean_age_limit=4, groups_generating=40, untrainable_share=0.36
+    ) == pytest.approx(54.4)
+    # half the gap, the same up and down, rounded away from the current value
+    assert smooth_demand_toward_needed(current_demand=64, demand_needed=59, damping_factor=0.5) == 61
+    assert smooth_demand_toward_needed(current_demand=64, demand_needed=73, damping_factor=0.5) == 69
+    assert smooth_demand_toward_needed(current_demand=64, demand_needed=65, damping_factor=0.5) == 65
+
+
+def test_stall_driven_demand_starts_at_three_batches_and_moves_half_the_gap() -> None:
+    demand = StallDrivenDemand(num_prompts_per_train_step=8, max_offpolicy_steps=10)
+    assert demand.demand == 24
+    # nothing ready: unavailable 24, one sample -> quantile 24, needed 8 + 24 + 1 = 33, half the gap up: 24 + 5
+    assert demand.observe(step=1, ready=0, generating=24, completed=0, trainable=0) == 29
     assert demand.state == "ok"
+    # a full shelf: unavailable max(0, 29 - 40) = 0; history [24, 0] -> mean 12, sd 17, two samples give a wide
+    # margin (t = 7.5): quantile 128 -> needed 137. The ceiling at the max caps it: 10 x 8 + 8 + mean(24, 0) x
+    # (1 - 40 / 40) = 88. Half the gap up from 29: 29 + 30
+    assert demand.observe(step=2, ready=40, generating=0, completed=40, trainable=40) == 59
+    assert demand.state == "age-limited"
 
 
-def test_stall_driven_demand_stays_within_bounds() -> None:
+def test_stall_driven_demand_is_capped_by_the_mean_age_ceiling() -> None:
+    # target 4 with 40 generating and 36% rejected: ceiling 4 x 8 + 8 + 40 x 0.36 = 54.4 -> 54
     demand = StallDrivenDemand(
-        num_prompts_per_train_step=2, ceiling=8, generation_capacity=4
+        num_prompts_per_train_step=8, max_offpolicy_steps=10, target_offpolicy_steps=4
     )
-    for _ in range(10):
-        demand.observe(ready=0, inflight=2, completed=1, trainable=1, dropped=0)
-    assert demand.demand == 8
-    demand = StallDrivenDemand(
-        num_prompts_per_train_step=2, ceiling=8, generation_capacity=4, patience_steps=1
-    )
-    for _ in range(20):
-        demand.observe(ready=4, inflight=2, completed=1, trainable=1, dropped=0)
-    assert demand.demand == 4  # floor: two batches
-
-
-def test_stall_driven_demand_refuses_growth_when_age_limited_or_generation_bound() -> None:
-    demand = StallDrivenDemand(
-        num_prompts_per_train_step=8,
-        ceiling=168,
-        generation_capacity=128,
-        guard_window_steps=2,
-    )
-    demand.observe(
-        ready=0, inflight=10, completed=10, trainable=6, dropped=4
-    )  # window not full yet: grows
-    assert demand.demand == 44 and demand.state == "ok"
-    demand.observe(
-        ready=0, inflight=10, completed=10, trainable=6, dropped=4
-    )  # 8 of 20 dropped > 15%
-    assert demand.demand == 44 and demand.state == "age-limited"
-    demand.observe(
-        ready=0, inflight=10, completed=10, trainable=6, dropped=0
-    )  # 4 of 20 still > 15%
-    assert demand.demand == 44 and demand.state == "age-limited"
-    # drops gone; permits full and only 6 trainable per step for a batch of 8: a bigger shelf cannot be filled
-    demand.observe(ready=0, inflight=128, completed=10, trainable=6, dropped=0)
-    assert demand.demand == 44 and demand.state == "generation-bound"
-    # permits full but 10 trainable per step: extra demand buffers the surplus, so it grows
-    demand.observe(ready=0, inflight=128, completed=14, trainable=10, dropped=0)
-    assert demand.demand == 48 and demand.state == "ok"
+    path = [
+        demand.observe(step=step, ready=0, generating=40, completed=25, trainable=16)
+        for step in range(1, 9)
+    ]
+    assert path == [29, 42, 48, 51, 53, 54, 54, 54]
+    assert demand.state == "age-limited"
+    # no target: the same ceiling is applied at max_offpolicy_steps
+    demand = StallDrivenDemand(num_prompts_per_train_step=8, max_offpolicy_steps=4)
+    path = [
+        demand.observe(step=step, ready=0, generating=40, completed=25, trainable=16)
+        for step in range(1, 9)
+    ]
+    assert path == [29, 42, 48, 51, 53, 54, 54, 54]
+    assert demand.state == "age-limited"
+    # a ceiling that stops binding is reported: once the lookback holds only step starts with a full shelf
+    # (unavailable 0), the need falls to P + 0 + 1 = 9 and the state returns to "ok"
+    for step in range(9, 21):
+        demand.observe(step=step, ready=100, generating=0, completed=8, trainable=8)
+    assert demand.state == "ok"
 
 
 def test_adaptive_buffer_takes_oldest_finalized_and_lets_slow_groups_keep_their_slot() -> None:
@@ -612,22 +596,21 @@ def test_adaptive_buffer_drops_groups_past_max_offpolicy_steps() -> None:
 
 def test_adaptive_buffer_measures_the_shelf_and_moves_demand() -> None:
     async def run() -> None:
-        # P=4: demand starts at five batches = 20; the shelf is what is finished and not held by the trainer.
-        buffer = _adaptive_buffer(
-            num_prompts=4, generation_capacity=40, patience_steps=2
-        )
-        assert buffer._active_group_limit() == 20
-        for group_id in range(20):
+        # P=4: demand starts at three batches = 12; the shelf is what is finished and not held by the trainer.
+        buffer = _adaptive_buffer(num_prompts=4, generation_capacity=40)
+        assert buffer._active_group_limit() == 12
+        for group_id in range(12):
             await _admit(buffer, group_id)
-        for _ in range(20):
+        for _ in range(12):
             await buffer.claim_next()
 
-        # nothing finished: shelf 0 -> +2 per step start
+        # nothing finished: unavailable 12 -> needed 4 + 12 + 1 = 17 -> half the gap up: 12 + 3
         await buffer.record_step_start(trainer_policy_version=0)
-        assert buffer._active_group_limit() == 22
-        assert (
-            _metric_value(buffer.metrics(), "rollout_buffer/ready_at_step_start") == 0
-        )
+        assert buffer._active_group_limit() == 15
+        metrics = buffer.metrics()
+        assert _metric_value(metrics, "rollout_buffer/ready_at_step_start") == 0
+        assert _metric_value(metrics, "rollout_buffer/generating_at_step_start") == 12
+        assert _metric_value(metrics, "rollout_buffer/demand_age_limited") == 0
 
         # ten groups finish; the batcher selects four and the trainer trains them: they leave the shelf
         for group_id in range(10):
@@ -636,39 +619,40 @@ def test_adaptive_buffer_measures_the_shelf_and_moves_demand() -> None:
             await buffer.take_finalized(consuming_policy_version=0)
         await buffer.record_selected_outcomes([0, 1, 2, 3], outcome="trained")
         await buffer.record_step_start(trainer_policy_version=1)
-        assert (
-            _metric_value(buffer.metrics(), "rollout_buffer/ready_at_step_start") == 6
-        )
-        assert buffer._active_group_limit() == 22  # one batch on the shelf: hold
-
-        # the pull releases the trained batch; the shelf still holds six, plus four more finish -> two batches
-        await buffer.release_active_groups(4, reason="trained", policy_version=1)
-        for group_id in range(10, 14):
-            await _finalize(buffer, group_id)
-        await buffer.record_step_start(trainer_policy_version=1)
-        await buffer.record_step_start(trainer_policy_version=1)
-        assert buffer._active_group_limit() == 21  # two comfortable steps: -1
+        metrics = buffer.metrics()
+        assert _metric_value(metrics, "rollout_buffer/ready_at_step_start") == 6
+        assert _metric_value(metrics, "rollout_buffer/generating_at_step_start") == 2
+        # unavailable 15 - 6 = 9; history [12, 9] -> mean 10.5 + 4.46 x 2.12 -> 20 -> needed 25; ceiling
+        # 4 x 4 + 4 + mean(12, 2) x (1 - 10 / 10) = 20 -> capped at 20 -> half the gap: 15 + 3
+        assert buffer._active_group_limit() == 18
+        assert _metric_value(buffer.metrics(), "rollout_buffer/demand_age_limited") == 1
 
     asyncio.run(run())
 
 
 def test_adaptive_buffer_target_offpolicy_steps_caps_demand() -> None:
-    # P=4, target 5: the pipeline may hold (5 + 1) * 4 = 24 groups however hard the trainer stalls
+    # P=4, target 5 of max 10: the ceiling is 5 x 4 + 4 + generating x untrainable share
     config = AdaptiveRolloutGroupWorkBuffer.Config(
         max_offpolicy_steps=10, generation_capacity=40, target_offpolicy_steps=5
     )
-    assert config.max_active_rollout_groups(num_prompts_per_train_step=4) == 24
+    assert config.max_active_rollout_groups(num_prompts_per_train_step=4) == 84  # physical: 40 + 11 x 4
     buffer = config.build(num_prompts_per_train_step=4)
-    assert buffer._active_group_limit() == 20  # five batches to start, below the cap
+    assert buffer._active_group_limit() == 12  # three batches to start
 
     async def run() -> None:
-        for _ in range(10):
-            await buffer.record_step_start(trainer_policy_version=0)  # empty shelf every step: +2 each
+        for _ in range(12):
+            await buffer.record_step_start(trainer_policy_version=0)  # nothing generating, nothing completed
+        # nothing generating and no completions: ceiling 20 + 4 + 0 = 24, however short the shelf
         assert buffer._active_group_limit() == 24
+        assert buffer._demand.state == "age-limited"
 
     asyncio.run(run())
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="target_offpolicy_steps"):
         AdaptiveRolloutGroupWorkBuffer.Config(generation_capacity=40, target_offpolicy_steps=0)
+    with pytest.raises(ValueError, match="target_offpolicy_steps"):
+        AdaptiveRolloutGroupWorkBuffer.Config(
+            max_offpolicy_steps=4, generation_capacity=40, target_offpolicy_steps=5
+        )
 
 
 def test_adaptive_buffer_never_exceeds_derived_max_demand() -> None:
@@ -684,6 +668,7 @@ def test_adaptive_buffer_never_exceeds_derived_max_demand() -> None:
             await buffer.claim_next()
         for _ in range(10):
             await buffer.record_step_start(trainer_policy_version=0)
+        # nothing has completed, so every generating group counts as untrainable: ceiling 1 x 2 + 2 + 4 x 1.0 = 8
         assert buffer._active_group_limit() == 8
         waiter = asyncio.create_task(buffer.reserve_slot())
         await asyncio.sleep(0)
