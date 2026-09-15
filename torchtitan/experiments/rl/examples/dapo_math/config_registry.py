@@ -190,3 +190,16 @@ def rl_dapo_qwen3_4b_math_8k_adaptive_buffer() -> Controller.Config:
             generation_capacity=128,
         ),
     )
+
+
+def rl_dapo_qwen3_4b_math_8k_adaptive_buffer_age10() -> Controller.Config:
+    """The 8K recipe with adaptive demand and a ten-step age cap: the operating setting; four steps is the stress test."""
+    return _qwen3_4b_dapo_math_config(
+        max_response_tokens=8192,
+        max_total_tokens=10240,
+        dump_folder="outputs/rl/qwen3_4b_dapo_math_8k_adaptive_buffer_age10",
+        group_buffer=AdaptiveRolloutGroupWorkBuffer.Config(
+            max_offpolicy_steps=10,
+            generation_capacity=128,
+        ),
+    )
