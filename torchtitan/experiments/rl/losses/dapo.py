@@ -14,25 +14,29 @@ import torch
 
 from torchtitan.components.loss import BaseLoss, compute_logprobs
 from torchtitan.config import CompileConfig
-
-# Clamp |log(pi_theta/pi_old)| before exp() so a large generator/trainer
-# logprob mismatch cannot overflow exp() to inf/NaN.
-_MAX_LOG_RATIO = 10.0
+from torchtitan.experiments.rl.losses.ops import (
+    aggregate,
+    compute_ratio,
+    normalize_metrics,
+    pg_ppo_clip,
+    policy_stats_metrics,
+    valid_response_mask,
+)
 
 
 class DAPOLoss(BaseLoss):
-    """Per-token clipped surrogate loss with DAPO-style "clip-higher".
+    """DAPO: PPO clip with independent lower/upper bounds, token-level aggregation.
 
-    The same PPO clip as GRPO, but the importance ratio's lower and upper bounds are
-    set independently (https://arxiv.org/abs/2503.14476): a larger upper bound keeps
-    more probability mass on up-weighted tokens, countering entropy collapse. A token
-    whose generator logprob is non-finite (vLLM under cudagraph) is dropped from the
-    loss rather than trained as if it were on-policy.
+    Reference: Yu et al., "DAPO: An Open-Source LLM Reinforcement Learning System at
+    Scale" (https://arxiv.org/abs/2503.14476), Eq. 8.
 
-    The scalar loss is the sum of per-token losses over positions with a finite
-    old-policy logprob divided by ``global_valid_tokens``, so gradient accumulation
-    matches a single large batch. ``logits`` is the current-policy output passed to
-    ``compute_logprobs``.
+        token_loss = -min(r * A, clip(r, 1 - clip_low, 1 + clip_high) * A)
+        loss       = sum(token_loss * mask) / global_valid_tokens
+
+    A larger upper bound keeps more probability mass on up-weighted tokens, countering
+    entropy collapse. Dividing by the batch's response-token count (not per response)
+    lets long responses contribute in proportion to their length. Dynamic sampling and
+    overlong reward shaping live in the rollout path, not here.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -63,6 +67,7 @@ class DAPOLoss(BaseLoss):
         generator_logprobs: torch.Tensor,
         advantages: torch.Tensor,
         loss_mask: torch.Tensor,
+        num_global_training_samples: int,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the per-token clip-higher surrogate loss.
 
@@ -74,63 +79,34 @@ class DAPOLoss(BaseLoss):
             advantages: [T] per-token advantages (0.0 for prompt/padding).
             global_valid_tokens: total response tokens with finite generator logprobs
                 across all microbatches and DP ranks; the loss denominator.
+            num_global_training_samples: unused; every RL loss receives it.
 
         Returns:
             (loss, metrics) where loss is a scalar tensor and metrics is a dict of
             scalar tensors pre-normalized for SUM reduction across DP ranks.
         """
+        del num_global_training_samples
         trainer_logprobs, token_entropy = compute_logprobs(
             logits, labels, return_entropy=True
         )
-        # A non-finite generator logprob (notably under cudagraph) has no valid
-        # old-policy reference, so DROP that token from the loss + denominator (cleaner
-        # than nan->0, which trains it as if it were on-policy).
-        effective_loss_mask = loss_mask & torch.isfinite(generator_logprobs)
-        raw_log_ratio = trainer_logprobs - generator_logprobs
-        masked_log_ratio = torch.where(
-            effective_loss_mask, raw_log_ratio, torch.zeros_like(raw_log_ratio)
+        mask = valid_response_mask(loss_mask, generator_logprobs)
+        ratio, raw_log_ratio = compute_ratio(trainer_logprobs, generator_logprobs, mask)
+
+        token_loss, clip_metrics = pg_ppo_clip(
+            ratio,
+            advantages,
+            mask,
+            clip_low=self.ratio_clip_low,
+            clip_high=self.ratio_clip_high,
         )
-        log_ratio = torch.clamp(masked_log_ratio, -_MAX_LOG_RATIO, _MAX_LOG_RATIO)
-        ratio = torch.exp(log_ratio)
+        loss = aggregate(token_loss, mask, global_valid_tokens)
 
-        clipped_ratio = torch.clamp(
-            ratio, 1 - self.ratio_clip_low, 1 + self.ratio_clip_high
+        metrics = normalize_metrics(
+            {
+                **clip_metrics,
+                **policy_stats_metrics(ratio, raw_log_ratio, token_entropy, mask),
+            },
+            global_valid_tokens,
         )
-        token_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
-
-        masked_loss = token_loss * effective_loss_mask
-        loss_denominator = (
-            max(global_valid_tokens, 1) if global_valid_tokens is not None else 1
-        )
-        loss = masked_loss.sum() / loss_denominator
-
-        with torch.no_grad():
-            diff_for_metrics = torch.where(
-                effective_loss_mask,
-                raw_log_ratio,
-                torch.zeros_like(raw_log_ratio),
-            )
-            masked_ratio = ratio * effective_loss_mask
-            metrics = {
-                "loss/mean": loss.detach(),
-                "loss/ratio_mean": masked_ratio.sum() / loss_denominator,
-                "loss/ratio_clipped_frac": (
-                    (torch.abs(ratio - clipped_ratio) > 1e-6).float()
-                    * effective_loss_mask
-                ).sum()
-                / loss_denominator,
-                # Mean per-token log-ratio (log p_trainer - log q_generator) over
-                # sampled tokens. This is the k1 Monte-Carlo estimate of -KL(q || p).
-                "bit_wise/logprob_diff/mean": diff_for_metrics.float().sum()
-                / loss_denominator,
-                "bit_wise/ratio_tokens_different/mean": (
-                    (diff_for_metrics.abs() > 1e-6).float() * effective_loss_mask
-                ).sum()
-                / loss_denominator,
-                "bit_wise/logprob_diff/max": diff_for_metrics.abs().max(),
-                # Mean trainer-policy entropy H(p) over tokens used by the loss.
-                "trainer/entropy/mean": (token_entropy * effective_loss_mask).sum()
-                / loss_denominator,
-            }
-
+        metrics["loss/mean"] = loss.detach()
         return loss, metrics

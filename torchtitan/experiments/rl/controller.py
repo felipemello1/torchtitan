@@ -124,7 +124,6 @@ from torchtitan.experiments.rl.controller_metrics import (
     compute_rollout_metrics,
     MetricsTimer,
 )
-from torchtitan.experiments.rl.losses import GRPOLoss
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.renderer import RendererConfig
 from torchtitan.experiments.rl.rollout import RolloutGroup
@@ -315,9 +314,7 @@ class Controller(Configurable):
         compile: CompileConfig = field(default_factory=CompileConfig)
         """torch.compile config shared by trainer and generator."""
 
-        trainer: PolicyTrainer.Config = field(
-            default_factory=lambda: PolicyTrainer.Config(loss=GRPOLoss.Config())
-        )
+        trainer: PolicyTrainer.Config = field(default_factory=PolicyTrainer.Config)
         """PolicyTrainer config. Controls optimizer, training, parallelism."""
 
         # TODO: put generator, num generators and generator router in a separate config
@@ -1106,7 +1103,9 @@ class Controller(Configurable):
                     microbatch_metrics = [
                         self._get_rank_0_value(
                             await self.trainer.forward_backward.call(
-                                microbatch, packed.num_global_valid_tokens
+                                microbatch,
+                                packed.num_global_valid_tokens,
+                                packed.num_global_training_samples,
                             )
                         )
                         for microbatch in packed.microbatches

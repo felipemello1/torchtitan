@@ -33,7 +33,7 @@ from torchtitan.distributed.activation_checkpoint import (
     SelectiveAC,
 )
 from torchtitan.distributed.utils import set_batch_invariance
-from torchtitan.experiments.rl.losses import GRPOLoss
+from torchtitan.experiments.rl.losses import DAPOLoss
 from torchtitan.experiments.rl.types import OptimStepOutput, TrainingMicrobatch
 from torchtitan.models.common.attention import FlexInnerAttention
 from torchtitan.observability import structured_logger as sl
@@ -74,7 +74,7 @@ class PolicyTrainer(Actor, Configurable):
         parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
         comm: CommConfig = field(default_factory=CommConfig)
         debug: DebugConfig = field(default_factory=DebugConfig)
-        loss: BaseLoss.Config = field(default_factory=GRPOLoss.Config)
+        loss: BaseLoss.Config = field(default_factory=DAPOLoss.Config)
         ac_config: ActivationCheckpointingConfig = field(
             default_factory=SelectiveAC.Config
         )
@@ -344,6 +344,7 @@ class PolicyTrainer(Actor, Configurable):
         self,
         training_data: list[TrainingMicrobatch],
         num_global_valid_tokens: int,
+        num_global_training_samples: int,
     ) -> dict[str, float]:
         """Run forward pass, compute loss, call backward, and reduce metrics.
 
@@ -352,6 +353,9 @@ class PolicyTrainer(Actor, Configurable):
                 picks training_data[self.dp_rank].
             num_global_valid_tokens: Total response tokens with finite generator
                 logprobs across all DP ranks and microbatches for this step.
+            num_global_training_samples: Training samples across all DP ranks and
+                microbatches for this step; GRPO multiplies it by its configured
+                token normalizer to form the loss denominator.
 
         Returns:
             dict[str, float]: Globally-reduced metrics.
@@ -402,6 +406,7 @@ class PolicyTrainer(Actor, Configurable):
                     generator_logprobs=generator_logprobs,
                     advantages=advantages,
                     loss_mask=loss_mask,
+                    num_global_training_samples=num_global_training_samples,
                 )
 
             with sl.log_trace_span("model_backward"):

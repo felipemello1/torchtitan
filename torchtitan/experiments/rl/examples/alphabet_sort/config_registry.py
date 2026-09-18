@@ -85,6 +85,7 @@ def _qwen3_rl_model_registry(
 
 def rl_grpo_qwen3_0_6b_varlen() -> Controller.Config:
     """GRPO training config for Qwen3-0.6B (6 GPUs: 4 gen + 2 train)."""
+    max_response_tokens = 700
     num_samples_per_prompt = 8
     seq_len = 2048
     return Controller.Config(
@@ -129,7 +130,10 @@ def rl_grpo_qwen3_0_6b_varlen() -> Controller.Config:
                 interval=10,
                 last_save_model_only=False,
             ),
-            loss=ChunkedLossWrapper.Config(num_chunks=8, loss_fn=GRPOLoss.Config()),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=8,
+                loss_fn=GRPOLoss.Config(max_response_tokens=max_response_tokens),
+            ),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -141,7 +145,7 @@ def rl_grpo_qwen3_0_6b_varlen() -> Controller.Config:
             sampling=SamplingConfig(
                 temperature=0.8,
                 top_p=0.95,
-                max_tokens=700,
+                max_tokens=max_response_tokens,
             ),
         ),
     )
@@ -149,6 +153,7 @@ def rl_grpo_qwen3_0_6b_varlen() -> Controller.Config:
 
 def rl_grpo_qwen3_0_6b_flex() -> Controller.Config:
     """GRPO training config for Qwen3-0.6B with flex attention (4 GPUs: 2 gen + 2 train)."""
+    max_response_tokens = 100
     num_samples_per_prompt = 8
     seq_len = 2048
     return Controller.Config(
@@ -189,7 +194,10 @@ def rl_grpo_qwen3_0_6b_flex() -> Controller.Config:
                 interval=10,
                 last_save_model_only=False,
             ),
-            loss=ChunkedLossWrapper.Config(num_chunks=8, loss_fn=GRPOLoss.Config()),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=8,
+                loss_fn=GRPOLoss.Config(max_response_tokens=max_response_tokens),
+            ),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -201,7 +209,7 @@ def rl_grpo_qwen3_0_6b_flex() -> Controller.Config:
             sampling=SamplingConfig(
                 temperature=0.8,
                 top_p=0.95,
-                max_tokens=100,
+                max_tokens=max_response_tokens,
             ),
         ),
     )
@@ -253,6 +261,7 @@ def rl_grpo_gpt_oss_20b_varlen() -> Controller.Config:
     layers use full causal attention; the per-layer window is baked into each
     ``VarlenInnerAttention.window_size``.
     """
+    max_response_tokens = 700
     num_samples_per_prompt = 8
     seq_len = 2048
     return Controller.Config(
@@ -297,7 +306,10 @@ def rl_grpo_gpt_oss_20b_varlen() -> Controller.Config:
                 interval=10,
                 last_save_model_only=False,
             ),
-            loss=ChunkedLossWrapper.Config(num_chunks=8, loss_fn=GRPOLoss.Config()),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=8,
+                loss_fn=GRPOLoss.Config(max_response_tokens=max_response_tokens),
+            ),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -309,7 +321,7 @@ def rl_grpo_gpt_oss_20b_varlen() -> Controller.Config:
             sampling=SamplingConfig(
                 temperature=0.8,
                 top_p=0.95,
-                max_tokens=700,
+                max_tokens=max_response_tokens,
             ),
         ),
     )
@@ -317,6 +329,7 @@ def rl_grpo_gpt_oss_20b_varlen() -> Controller.Config:
 
 def rl_grpo_gpt_oss_debug_varlen() -> Controller.Config:
     """Small GPT-OSS debug config (random init) to exercise the full RL loop."""
+    max_response_tokens = 50
     num_samples_per_prompt = 8
     seq_len = 2048
     return Controller.Config(
@@ -357,7 +370,10 @@ def rl_grpo_gpt_oss_debug_varlen() -> Controller.Config:
                 tensor_parallel_degree=2,
             ),
             checkpoint=CheckpointManager.Config(enable=False),
-            loss=ChunkedLossWrapper.Config(num_chunks=8, loss_fn=GRPOLoss.Config()),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=8,
+                loss_fn=GRPOLoss.Config(max_response_tokens=max_response_tokens),
+            ),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -369,7 +385,7 @@ def rl_grpo_gpt_oss_debug_varlen() -> Controller.Config:
             sampling=SamplingConfig(
                 temperature=0.8,
                 top_p=0.95,
-                max_tokens=50,
+                max_tokens=max_response_tokens,
             ),
         ),
     )
@@ -382,6 +398,7 @@ def rl_grpo_gpt_oss_debug_varlen_batch_invariant() -> Controller.Config:
     (mixed_precision_param="bfloat16", the default) casts them to bf16 for the
     forward (even at data_parallel_shard_degree=1), matching the bf16 generator.
     """
+    max_response_tokens = 50
     batch_invariant_config = DebugConfig(batch_invariant=True, deterministic=True)
     num_samples_per_prompt = 8
     seq_len = 2048
@@ -431,7 +448,10 @@ def rl_grpo_gpt_oss_debug_varlen_batch_invariant() -> Controller.Config:
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             debug=batch_invariant_config,
-            loss=ChunkedLossWrapper.Config(num_chunks=8, loss_fn=GRPOLoss.Config()),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=8,
+                loss_fn=GRPOLoss.Config(max_response_tokens=max_response_tokens),
+            ),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -446,7 +466,7 @@ def rl_grpo_gpt_oss_debug_varlen_batch_invariant() -> Controller.Config:
             sampling=SamplingConfig(
                 temperature=0.8,
                 top_p=0.95,
-                max_tokens=50,
+                max_tokens=max_response_tokens,
             ),
             debug=batch_invariant_config,
         ),
@@ -455,6 +475,7 @@ def rl_grpo_gpt_oss_debug_varlen_batch_invariant() -> Controller.Config:
 
 def rl_grpo_qwen3_1_7b() -> Controller.Config:
     """GRPO training config for Qwen3-1.7B (6 GPUs: 4 gen + 2 train)."""
+    max_response_tokens = 700
     num_samples_per_prompt = 8
     seq_len = 2048
     return Controller.Config(
@@ -494,7 +515,10 @@ def rl_grpo_qwen3_1_7b() -> Controller.Config:
                 interval=10,
                 last_save_model_only=False,
             ),
-            loss=ChunkedLossWrapper.Config(num_chunks=8, loss_fn=GRPOLoss.Config()),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=8,
+                loss_fn=GRPOLoss.Config(max_response_tokens=max_response_tokens),
+            ),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -506,7 +530,7 @@ def rl_grpo_qwen3_1_7b() -> Controller.Config:
             sampling=SamplingConfig(
                 temperature=0.8,
                 top_p=0.95,
-                max_tokens=700,
+                max_tokens=max_response_tokens,
             ),
         ),
     )
@@ -514,6 +538,7 @@ def rl_grpo_qwen3_1_7b() -> Controller.Config:
 
 def rl_grpo_qwen3_14b() -> Controller.Config:
     """GRPO training config for Qwen3-14B (16 GPUs: 8 gen + 8 train)."""
+    max_response_tokens = 700
     num_samples_per_prompt = 8
     seq_len = 2048
     return Controller.Config(
@@ -554,7 +579,10 @@ def rl_grpo_qwen3_14b() -> Controller.Config:
                 interval=10,
                 last_save_model_only=False,
             ),
-            loss=ChunkedLossWrapper.Config(num_chunks=8, loss_fn=GRPOLoss.Config()),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=8,
+                loss_fn=GRPOLoss.Config(max_response_tokens=max_response_tokens),
+            ),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -566,7 +594,7 @@ def rl_grpo_qwen3_14b() -> Controller.Config:
             sampling=SamplingConfig(
                 temperature=0.8,
                 top_p=0.95,
-                max_tokens=700,
+                max_tokens=max_response_tokens,
             ),
         ),
     )
@@ -579,6 +607,7 @@ def rl_grpo_qwen3_moe_debug_varlen() -> Controller.Config:
     Generator uses data_parallel_degree=2 (vLLM pure DP), with TP=2.
     MoE layers use EP=4.
     """
+    max_response_tokens = 50
     num_samples_per_prompt = 8
     seq_len = 2048
     return Controller.Config(
@@ -624,7 +653,10 @@ def rl_grpo_qwen3_moe_debug_varlen() -> Controller.Config:
                 interval=10,
                 last_save_model_only=False,
             ),
-            loss=ChunkedLossWrapper.Config(num_chunks=8, loss_fn=GRPOLoss.Config()),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=8,
+                loss_fn=GRPOLoss.Config(max_response_tokens=max_response_tokens),
+            ),
         ),
         generator=VLLMGenerator.Config(
             # Disable torch.compile + CUDA graph capture: the EP all-to-all
@@ -640,7 +672,7 @@ def rl_grpo_qwen3_moe_debug_varlen() -> Controller.Config:
             sampling=SamplingConfig(
                 temperature=1.0,
                 top_p=0.95,
-                max_tokens=50,
+                max_tokens=max_response_tokens,
             ),
         ),
     )
@@ -705,6 +737,7 @@ def rl_grpo_qwen3_moe_debug_varlen_batch_invariant() -> Controller.Config:
     replicated bf16 dense DP.
 
     """
+    max_response_tokens = 50
     num_samples_per_prompt = 8
     seq_len = 2048
     return Controller.Config(
@@ -761,7 +794,10 @@ def rl_grpo_qwen3_moe_debug_varlen_batch_invariant() -> Controller.Config:
                 last_save_model_only=False,
             ),
             debug=_BATCH_INVARIANT_DEBUG,
-            loss=ChunkedLossWrapper.Config(num_chunks=8, loss_fn=GRPOLoss.Config()),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=8,
+                loss_fn=GRPOLoss.Config(max_response_tokens=max_response_tokens),
+            ),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -775,7 +811,7 @@ def rl_grpo_qwen3_moe_debug_varlen_batch_invariant() -> Controller.Config:
             sampling=SamplingConfig(
                 temperature=1.0,
                 top_p=0.95,
-                max_tokens=50,
+                max_tokens=max_response_tokens,
             ),
             debug=_BATCH_INVARIANT_DEBUG,
         ),
@@ -789,6 +825,7 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> Controller.Config:
 
     Note: Qwen3-30B-A3B has 4 KV heads, so TP degree cannot exceed 4.
     """
+    max_response_tokens = 700
     num_samples_per_prompt = 8
     seq_len = 2048
     return Controller.Config(
@@ -829,7 +866,10 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> Controller.Config:
                 interval=10,
                 last_save_model_only=False,
             ),
-            loss=ChunkedLossWrapper.Config(num_chunks=8, loss_fn=GRPOLoss.Config()),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=8,
+                loss_fn=GRPOLoss.Config(max_response_tokens=max_response_tokens),
+            ),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -843,7 +883,7 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> Controller.Config:
             sampling=SamplingConfig(
                 temperature=0.8,
                 top_p=0.95,
-                max_tokens=700,
+                max_tokens=max_response_tokens,
             ),
         ),
     )
@@ -894,6 +934,7 @@ def rl_grpo_qwen3_0_6b_varlen_batch_invariant() -> Controller.Config:
     wraps the model purely as a mixed-precision boundary), so the trainer
     forward is bitwise identical to the bf16 generator.
     """
+    max_response_tokens = 700
     batch_invariant_config = DebugConfig(batch_invariant=True, deterministic=True)
     num_samples_per_prompt = 8
     seq_len = 2048
@@ -941,7 +982,10 @@ def rl_grpo_qwen3_0_6b_varlen_batch_invariant() -> Controller.Config:
                 last_save_model_only=False,
             ),
             debug=batch_invariant_config,
-            loss=ChunkedLossWrapper.Config(num_chunks=8, loss_fn=GRPOLoss.Config()),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=8,
+                loss_fn=GRPOLoss.Config(max_response_tokens=max_response_tokens),
+            ),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -953,7 +997,7 @@ def rl_grpo_qwen3_0_6b_varlen_batch_invariant() -> Controller.Config:
             sampling=SamplingConfig(
                 temperature=0.8,
                 top_p=0.95,
-                max_tokens=700,
+                max_tokens=max_response_tokens,
             ),
             debug=batch_invariant_config,
         ),
@@ -981,6 +1025,7 @@ def _qwen3_5_rl_model_registry(
 
 def rl_grpo_qwen3_5_9b_varlen() -> Controller.Config:
     """Qwen3.5-9B GRPO with trainer and generator TP=2 (6 GPUs)."""
+    max_response_tokens = 700
     num_samples_per_prompt = 8
     seq_len = 2048
     return Controller.Config(
@@ -1021,7 +1066,10 @@ def rl_grpo_qwen3_5_9b_varlen() -> Controller.Config:
                 interval=10,
                 last_save_model_only=False,
             ),
-            loss=ChunkedLossWrapper.Config(num_chunks=8, loss_fn=GRPOLoss.Config()),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=8,
+                loss_fn=GRPOLoss.Config(max_response_tokens=max_response_tokens),
+            ),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -1035,7 +1083,7 @@ def rl_grpo_qwen3_5_9b_varlen() -> Controller.Config:
             sampling=SamplingConfig(
                 temperature=0.8,
                 top_p=0.95,
-                max_tokens=700,
+                max_tokens=max_response_tokens,
             ),
         ),
     )
@@ -1067,6 +1115,7 @@ def rl_grpo_qwen3_5_9b_varlen_batch_invariant() -> Controller.Config:
 
 def rl_grpo_qwen3_5_debug_varlen() -> Controller.Config:
     """Random-init Qwen3.5 GRPO config for CI."""
+    max_response_tokens = 256
     num_samples_per_prompt = 8
     seq_len = 2048
     return Controller.Config(
@@ -1105,7 +1154,10 @@ def rl_grpo_qwen3_5_debug_varlen() -> Controller.Config:
                 tensor_parallel_degree=2,
             ),
             checkpoint=CheckpointManager.Config(enable=False),  # random-init weights
-            loss=ChunkedLossWrapper.Config(num_chunks=8, loss_fn=GRPOLoss.Config()),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=8,
+                loss_fn=GRPOLoss.Config(max_response_tokens=max_response_tokens),
+            ),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
@@ -1118,7 +1170,7 @@ def rl_grpo_qwen3_5_debug_varlen() -> Controller.Config:
             sampling=SamplingConfig(
                 temperature=0.8,
                 top_p=0.95,
-                max_tokens=256,
+                max_tokens=max_response_tokens,
             ),
         ),
     )
