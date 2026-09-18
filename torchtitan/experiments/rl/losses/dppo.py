@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""DAPO loss: per-token clipped surrogate with asymmetric "clip-higher" bounds."""
+"""DPPO loss: policy gradient inside a probability-divergence trust region."""
 
 from __future__ import annotations
 
@@ -17,36 +17,46 @@ from torchtitan.config import CompileConfig
 from torchtitan.experiments.rl.losses.ops import (
     aggregate,
     compute_ratio,
+    DivergenceType,
     normalize_metrics,
-    pg_ppo_clip,
+    pg_truncated_reinforce,
     policy_stats_metrics,
+    trust_region_mask,
     valid_response_mask,
 )
 
 
-class DAPOLoss(BaseLoss):
-    """DAPO: PPO clip with independent lower/upper bounds, token-level aggregation.
+class DPPOLoss(BaseLoss):
+    """DPPO (Divergence PPO): replace PPO's ratio clip with a mask on how far each
+    sampled token's probability moved away from the generator's.
 
-    Reference: Yu et al., "DAPO: An Open-Source LLM Reinforcement Learning System at
-    Scale" (https://arxiv.org/abs/2503.14476), Eq. 8.
+    Reference: Qi et al., "Rethinking the Trust Region in LLM Reinforcement Learning"
+    (https://arxiv.org/abs/2602.04879), Eq. 12-14 and Eq. 23.
 
-        token_loss = -min(r * A, clip(r, 1 - clip_low, 1 + clip_high) * A)
+        keep       = not (moving away from p_gen in A's direction and D(p_gen, p) > delta)
+        token_loss = -A * sg(min(r, max_ratio)) * log p * keep
         loss       = sum(token_loss * mask) / global_valid_tokens
 
-    A larger upper bound keeps more probability mass on up-weighted tokens, countering
-    entropy collapse. Dividing by the batch's response-token count (not per response)
-    lets long responses contribute in proportion to their length. Dynamic sampling and
-    overlong reward shaping live in the rollout path, not here.
+    PPO's ratio bound ``|r - 1| <= eps`` means ``|p - p_gen| <= eps * p_gen``: a tiny
+    budget for rare tokens (the digits and "Wait"s that get clipped most) and a loose
+    one for confident tokens, whose large moves are what destabilizes training. The
+    divergence budget is the same for every token. The trust region is anchored on the
+    generator's logprobs, which the paper shows is required for stability.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseLoss.Config):
-        ratio_clip_low: float = 0.2
-        """Lower clip: the importance ratio is clamped to ``>= 1 - ratio_clip_low``."""
+        divergence_type: DivergenceType = "binary_tv"
+        """``binary_tv`` bounds ``|p - p_gen|``; ``binary_kl`` bounds the Bernoulli
+        KL(p_gen || p) of the sampled token."""
 
-        ratio_clip_high: float = 0.2
-        """Upper clip: the ratio is clamped to ``<= 1 + ratio_clip_high``. Set larger
-        than ``ratio_clip_low`` for DAPO "clip-higher" (e.g. 0.28)."""
+        divergence_threshold: float | None = None
+        """The paper's ``delta``. None picks its per-variant default: 0.2 for
+        ``binary_tv`` (robust in [0.1, 0.2]), 0.05 for ``binary_kl``."""
+
+        max_ratio: float = 5.0
+        """Truncate the detached importance weight ``p / p_gen`` at this value
+        (paper's scaling runs: 5). Truncation, unlike clipping, keeps the gradient."""
 
     def __init__(
         self,
@@ -55,8 +65,14 @@ class DAPOLoss(BaseLoss):
         compile_config: CompileConfig | None = None,
     ) -> None:
         del compile_config
-        self.ratio_clip_low = config.ratio_clip_low
-        self.ratio_clip_high = config.ratio_clip_high
+        self.divergence_type = config.divergence_type
+        if config.divergence_threshold is not None:
+            self.divergence_threshold = config.divergence_threshold
+        else:
+            self.divergence_threshold = (
+                0.2 if config.divergence_type == "binary_tv" else 0.05
+            )
+        self.max_ratio = config.max_ratio
 
     def __call__(
         self,
@@ -69,7 +85,7 @@ class DAPOLoss(BaseLoss):
         loss_mask: torch.Tensor,
         num_global_training_samples: int,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute the per-token clip-higher surrogate loss.
+        """Compute the trust-region-masked policy gradient loss.
 
         Args:
             logits: [T, V] current-policy output.
@@ -92,18 +108,26 @@ class DAPOLoss(BaseLoss):
         mask = valid_response_mask(loss_mask, generator_logprobs)
         ratio, raw_log_ratio = compute_ratio(trainer_logprobs, generator_logprobs, mask)
 
-        token_loss, clip_metrics = pg_ppo_clip(
-            ratio,
+        keep_mask = trust_region_mask(
+            trainer_logprobs,
+            generator_logprobs,
             advantages,
+            divergence_type=self.divergence_type,
+            divergence_threshold=self.divergence_threshold,
+        )
+        token_loss, trust_region_metrics = pg_truncated_reinforce(
+            ratio,
+            trainer_logprobs,
+            advantages,
+            keep_mask,
             mask,
-            clip_low=self.ratio_clip_low,
-            clip_high=self.ratio_clip_high,
+            max_ratio=self.max_ratio,
         )
         loss = aggregate(token_loss, mask, global_valid_tokens)
 
         metrics = normalize_metrics(
             {
-                **clip_metrics,
+                **trust_region_metrics,
                 **policy_stats_metrics(ratio, raw_log_ratio, token_entropy, mask),
             },
             global_valid_tokens,
