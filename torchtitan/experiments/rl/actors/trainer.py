@@ -447,6 +447,7 @@ class PolicyTrainer(Actor, Configurable):
             )
 
         with sl.log_trace_span("optim"):
+            self.checkpointer.maybe_wait_for_staging()
             self.optimizers.step()
             self.lr_schedulers.step()
             self.optimizers.zero_grad()

@@ -21,6 +21,7 @@ from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.flex_shard import build_dist_muon
 
+from .offload import OptimizerStateOffloadConfig, OptimizerStateOffloader
 from .utils import (
     get_flat_optim_state_dict,
     init_optim_state,
@@ -136,6 +137,9 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         ``ParamGroupConfig.optimizer_kwargs``.
         """
 
+        optimizer_state_offload: OptimizerStateOffloadConfig | None = None
+        """Keep Adam/AdamW moments in pinned CPU memory between optimizer steps."""
+
     optimizers: list[T]
     model_parts: list[nn.Module]
 
@@ -241,7 +245,34 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
 
         if config.implementation == "fused_opt_states_bf16":
             self._register_bf16_optimizer_state_hook()
+        if config.optimizer_state_offload is not None:
+            self._wrap_with_state_offload(config)
         self._post_init(all_params)
+
+    def _wrap_with_state_offload(self, config: Config) -> None:
+        """Replace each Adam/AdamW child with an optimizer-state offload wrapper."""
+        state_dtype = (
+            torch.bfloat16
+            if config.implementation == "fused_opt_states_bf16"
+            else torch.float32
+        )
+        self.optimizers = [
+            OptimizerStateOffloader(
+                optimizer,
+                chunk_size_mb=config.optimizer_state_offload.chunk_size_mb,
+                state_dtype=state_dtype,
+            )
+            if isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW))
+            else optimizer
+            for optimizer in self.optimizers
+        ]
+        if not any(
+            isinstance(optimizer, OptimizerStateOffloader)
+            for optimizer in self.optimizers
+        ):
+            raise ValueError(
+                "optimizer_state_offload is set but no Adam/AdamW optimizer was built"
+            )
 
     def _log_optimizer(
         self, optimizer: Optimizer, part_idx: int, patterns: list[str]

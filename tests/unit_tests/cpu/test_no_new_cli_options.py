@@ -134,6 +134,7 @@ _FROZEN_CLI_OPTIONS = frozenset(
         "metrics.save_tb_folder",
         "optimizer.implementation",
         "optimizer.optimizer_factory_kwargs_by_name",
+        "optimizer.optimizer_state_offload.chunk_size_mb",
         "optimizer.param_groups",
         "optimizer.param_groups.optimizer_kwargs",
         "optimizer.param_groups.optimizer_name",
