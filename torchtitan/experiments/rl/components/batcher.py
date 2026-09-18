@@ -222,6 +222,7 @@ class Batcher(Configurable):
         return TrainingBatch(
             microbatches=microbatches,
             num_global_valid_tokens=num_global_valid_tokens,
+            num_global_training_samples=len(training_samples),
             metrics=[
                 *metrics,
                 # Keep this response-level metric exact without adding a second
