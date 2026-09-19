@@ -140,7 +140,9 @@ class OptimizerStateOffloader(Optimizer):
         params = [param for group in self.param_groups for param in group["params"]]
         _apply_numa_binding(_local(params[0]).device)
         self._chunks = _pack_params_by_state_bytes(
-            params, chunk_size_bytes=chunk_size_mb << 20, state_dtype=state_dtype
+            params,
+            chunk_size_bytes=chunk_size_mb * 1024 * 1024,
+            state_dtype=state_dtype,
         )
         self._allocate_pinned_state(params, state_dtype)
         self._h2d_stream = torch.cuda.Stream()
@@ -156,6 +158,10 @@ class OptimizerStateOffloader(Optimizer):
     @torch.no_grad()
     def step(self, closure: Any = None) -> None:
         """Run one optimizer step while streaming moment chunks through the GPU.
+
+        1. Select parameters with gradients and load the first moment chunk.
+        2. Alternate slots, overlapping each update with the surrounding copies.
+        3. Restore the full parameter groups and wait for CPU moments to be current.
 
         Args:
             closure: Unsupported; it must be ``None``.
