@@ -4,42 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Stream Adam moments through two temporary GPU buffers.
-
-Adam keeps a first and second moment for every weight. In fp32 these add 8 bytes
-per weight—about 112 GB for a 14B model before distributed sharding—even though
-forward and backward never read them.
-
-Definitions:
-    Pinned memory: CPU RAM that CUDA can transfer asynchronously.
-    Chunk: One or more whole local parameter shards grouped by moment size, not
-        by layer boundaries. A local parameter shard is never split.
-    Slot: GPU space for one chunk's first and second moments.
-    NUMA locality: Placing pinned RAM near the GPU's CPU socket for faster copies.
-
-The moments normally live in pinned CPU buffers. ``step()`` alternates between
-two GPU slots::
-
-                   warm-up | iteration 0       | iteration 1       | iteration 2
-    GPU compute:           | update 0 in A     | update 1 in B     | update 2 in A
-    slot A copy:   load 0  |                   | store 0 -> load 2 |
-    slot B copy:           | load 1            |                   | store 1 -> load 3
-
-While one slot is being updated, the other first returns its previous chunk to
-the CPU and then loads the next chunk; those two copies are serial because they
-reuse the same memory, but they overlap the update. CUDA events enforce this
-ordering without blocking the CPU thread.
-
-Mapping moments to weights:
-    Weights remain separate GPU tensors. The offloader records each weight's
-    slice in the contiguous moment buffers, recreates correctly shaped views in
-    ``optimizer.state``, and asks the optimizer to update only that chunk.
-
-Why fused Adam/AdamW:
-    ``step()`` invokes the optimizer once per chunk. The fused path updates the
-    chunk with few kernel launches and bounded temporary memory; the for-loop
-    and ``foreach`` paths do not provide both properties and are unsupported.
-"""
+"""Optimizer-state CPU offload."""
 
 import logging
 from dataclasses import dataclass
@@ -78,19 +43,48 @@ class OptimizerStateOffloadConfig:
 
 
 class OptimizerStateOffloader(Optimizer):
-    """Run fused Adam/AdamW with moments resident in pinned CPU memory.
+    """Run Adam/AdamW while keeping its moment tensors in CPU memory.
+
+    Adam keeps a first and second moment for every weight. In fp32 these add 8
+    bytes per weight, or about 112 GB for a 14B model before distributed
+    sharding. Forward and backward do not use these moments; only
+    ``optimizer.step()`` does.
+
+    Definitions:
+        Pinned memory: CPU RAM that CUDA can transfer asynchronously.
+        Chunk: One or more whole local parameter shards grouped by moment size.
+            A chunk can contain parameters from several layers or only part of
+            one layer, but a single parameter shard is never split.
+        Slot: Temporary GPU memory for one chunk's first and second moments.
+        NUMA locality: Placing pinned RAM near the GPU's CPU socket so transfers
+            do not cross CPU sockets.
+
+    The offloader allocates contiguous pinned CPU buffers for the moments and
+    records each parameter's slice. Before updating a chunk, it places
+    parameter-shaped views of the GPU slot in ``optimizer.state`` so Adam sees
+    the moments that belong to each weight. During ``step()``, it alternates
+    chunks between two GPU slots::
+
+                       warm-up | iteration 0       | iteration 1       | iteration 2
+        GPU compute:           | update 0 in A     | update 1 in B     | update 2 in A
+        slot A copy:   load 0  |                   | store 0 -> load 2 |
+        slot B copy:           | load 1            |                   | store 1 -> load 3
+
+    While one slot is updated, the other returns its previous chunk to the CPU
+    and then loads its next chunk. Separate CUDA streams overlap these copies
+    with the update; events prevent a slot from being reused too early.
+
+    CPU offload does not fundamentally require a fused optimizer. This wrapper
+    was designed and tested around one fused Adam/AdamW update per chunk.
+    Supporting the for-loop or ``foreach`` paths is possible, but their
+    per-parameter launches or additional temporary tensors need separate
+    correctness, memory, and performance validation.
 
     Args:
         optimizer: A `torch.optim.Adam` or `torch.optim.AdamW` built with `fused=True`.
         chunk_size_mb: Target bytes of moments per chunk. A single parameter larger than this
             forms its own chunk.
         state_dtype: dtype of the moments (`torch.bfloat16` under `fused_opt_states_bf16`).
-
-    Example:
-
-        inner = torch.optim.AdamW(param_groups, lr=3e-4, fused=True)
-        optimizer = OptimizerStateOffloader(inner, chunk_size_mb=256, state_dtype=torch.float32)
-        optimizer.step()
 
     Note:
         The wrapper shares ``param_groups`` and ``state`` with the inner optimizer. Each
@@ -105,6 +99,7 @@ class OptimizerStateOffloader(Optimizer):
         chunk_size_mb: int,
         state_dtype: torch.dtype,
     ) -> None:
+        # Reject modes whose correctness or memory behavior this wrapper does not support.
         if chunk_size_mb <= 0:
             raise ValueError("chunk_size_mb must be positive")
         if any(state for state in optimizer.state.values()):
@@ -137,6 +132,8 @@ class OptimizerStateOffloader(Optimizer):
         self.param_groups = optimizer.param_groups
         self.state = optimizer.state
 
+        # Partition parameters, allocate their canonical CPU state, then create the
+        # independent streams that move chunks in each direction.
         params = [param for group in self.param_groups for param in group["params"]]
         _apply_numa_binding(_local(params[0]).device)
         self._chunks = _pack_params_by_state_bytes(
@@ -159,14 +156,12 @@ class OptimizerStateOffloader(Optimizer):
 
         Args:
             closure: Unsupported; it must be ``None``.
-
-        Example:
-
-            optimizer.step()
         """
         assert closure is None, "OptimizerStateOffloader does not support closures"
         compute_stream = torch.cuda.current_stream()
-        # Only parameters with a gradient are updated, so only their moments travel.
+
+        # Select only parameters Adam will update. Complete chunks use one contiguous
+        # slab copy; chunks with missing gradients copy the remaining parameter slices.
         all_params_have_grad = all(
             param.grad is not None for chunk in self._chunks for param in chunk
         )
@@ -224,6 +219,8 @@ class OptimizerStateOffloader(Optimizer):
                         offset += numel
                 return self._h2d_stream.record_event()
 
+        # Prime slot A, then alternate slots so the next H2D and previous D2H overlap
+        # the current chunk's optimizer kernels.
         saved_group_params = [list(group["params"]) for group in self.param_groups]
         h2d_done = h2d(0)
         try:
@@ -272,6 +269,7 @@ class OptimizerStateOffloader(Optimizer):
                             self.state[param][key] = cpu_state[param][key]
                     slot_free[chunk_index % 2] = self._d2h_stream.record_event()
         finally:
+            # The inner optimizer must expose its complete parameter groups outside step().
             for group, params in zip(self.param_groups, saved_group_params):
                 group["params"] = params
         # CPU state is canonical again; checkpoint and state_dict readers need no extra fence.
@@ -284,15 +282,14 @@ class OptimizerStateOffloader(Optimizer):
             state_dict: Integer-keyed optimizer state produced by
                 ``_unflatten_optim_state_dict`` in parameter order.
 
-        Example:
-
-            optimizer.load_state_dict(state_dict)
-
         Note:
             The base optimizer implementation would move state tensors to the parameter
             device. This override preserves the pinned slabs and copies values into them.
         """
         params = [param for group in self.param_groups for param in group["params"]]
+
+        # Copy checkpoint values into the existing slab views instead of replacing
+        # them with independently allocated tensors.
         for param_index, loaded in state_dict["state"].items():
             state = self.state[params[param_index]]
             for key, value in loaded.items():
@@ -306,12 +303,15 @@ class OptimizerStateOffloader(Optimizer):
         self, params: list[torch.Tensor], state_dtype: torch.dtype
     ) -> None:
         """One pinned slab per moment, each parameter's moment a view into it."""
+        # Allocate the only CPU storage owned by the offloader.
         total_numel = sum(_local(param).numel() for param in params)
         self._slabs = {
             key: torch.zeros(total_numel, dtype=state_dtype, pin_memory=True)
             for key in _MOMENT_KEYS
         }
         self._slab_offsets: dict[torch.Tensor, int] = {}
+
+        # Recreate optimizer.state with parameter-shaped views into those slabs.
         offset = 0
         for param in params:
             local = _local(param)
@@ -345,6 +345,8 @@ def _pack_params_by_state_bytes(
     current: list[torch.Tensor] = []
     current_bytes = 0
     oversized: list[torch.Tensor] = []
+
+    # Preserve optimizer order while filling each chunk up to the byte target.
     for param in params:
         param_bytes = _local(param).numel() * bytes_per_element
         if param_bytes > chunk_size_bytes:
@@ -356,6 +358,9 @@ def _pack_params_by_state_bytes(
         current_bytes += param_bytes
     if current:
         chunks.append(current)
+
+    # Oversized parameters remain valid one-parameter chunks, but determine the
+    # minimum possible size of a GPU staging slot.
     if oversized:
         largest = max(oversized, key=lambda param: _local(param).numel())
         logger.warning(
