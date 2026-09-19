@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from .lr_scheduler import LRSchedulersContainer
+from .offload import OptimizerStateOffloadConfig
 from .optimizer import (
     default_adamw,
     OptimizersContainer,
@@ -14,6 +15,7 @@ from .optimizer import (
 
 __all__ = [
     "LRSchedulersContainer",
+    "OptimizerStateOffloadConfig",
     "OptimizersContainer",
     "ParamGroupConfig",
     "default_adamw",
