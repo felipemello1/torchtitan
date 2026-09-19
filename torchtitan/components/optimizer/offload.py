@@ -102,6 +102,9 @@ class OptimizerStateOffloader(Optimizer):
         # Reject modes whose correctness or memory behavior this wrapper does not support.
         if chunk_size_mb <= 0:
             raise ValueError("chunk_size_mb must be positive")
+        # Resuming still starts with an empty optimizer: load_state_dict() fills the
+        # pinned slabs after this wrapper creates them. State here instead means an
+        # already-running optimizer whose moments would be overwritten.
         if any(state for state in optimizer.state.values()):
             raise ValueError(
                 "OptimizerStateOffloader must wrap a fresh optimizer before its first step"
