@@ -56,8 +56,10 @@ class OptimizerStateOffloader(Optimizer):
             A chunk can contain parameters from several layers or only part of
             one layer, but a single parameter shard is never split.
         Slot: Temporary GPU memory for one chunk's first and second moments.
-        NUMA locality: Placing pinned RAM near the GPU's CPU socket so transfers
-            do not cross CPU sockets.
+
+    On multi-socket hosts, bind each rank to its GPU's NUMA node before building
+    the optimizer; pinned slabs inherit that placement. This class does not
+    change process affinity.
 
     The offloader allocates contiguous pinned CPU buffers for the moments and
     records each parameter's slice. Before updating a chunk, it places
@@ -138,7 +140,6 @@ class OptimizerStateOffloader(Optimizer):
         # Partition parameters, allocate their canonical CPU state, then create the
         # independent streams that move chunks in each direction.
         params = [param for group in self.param_groups for param in group["params"]]
-        _apply_numa_binding(_local(params[0]).device)
         self._chunks = _pack_params_by_state_bytes(
             params,
             chunk_size_bytes=chunk_size_mb * 1024 * 1024,
@@ -425,34 +426,3 @@ def _state_like(param: torch.Tensor, local: torch.Tensor) -> torch.Tensor:
         ),
     )
     return DTensor(local, spec, requires_grad=False)
-
-
-def _apply_numa_binding(device: torch.device) -> None:
-    """Best-effort bind CPU threads before allocating pinned optimizer state."""
-    try:
-        from torch.numa.binding import (
-            _bind_all_threads_in_current_process_to_logical_cpus,
-            _get_numa_node_index_for_device_index,
-            _node_get_logical_cpus_to_bind_to,
-        )
-
-        device_index = (
-            device.index if device.index is not None else torch.cuda.current_device()
-        )
-        numa_node = _get_numa_node_index_for_device_index(device_index=device_index)
-        cpus = _node_get_logical_cpus_to_bind_to(device_index=device_index)
-        _bind_all_threads_in_current_process_to_logical_cpus(logical_cpu_indices=cpus)
-    except (
-        ImportError,
-        AttributeError,
-        OSError,
-        TypeError,
-        ValueError,
-        RuntimeError,
-    ) as exc:
-        logger.warning(f"NUMA binding skipped for {device}: {exc}")
-        return
-    logger.info(
-        f"NUMA binding: GPU {device_index} -> node {numa_node}, "
-        f"{len(cpus)} logical CPUs"
-    )

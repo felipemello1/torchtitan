@@ -5,12 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-import sys
 
 import pytest
 import torch
 from torchtitan.components.optimizer.offload import (
-    _apply_numa_binding,
     _pack_params_by_state_bytes,
     OptimizerStateOffloadConfig,
 )
@@ -55,12 +53,3 @@ def test_packer_oversized_param_forms_its_own_chunk_and_warns(
 def test_config_rejects_non_positive_chunk_size() -> None:
     with pytest.raises(ValueError):
         OptimizerStateOffloadConfig(chunk_size_mb=0)
-
-
-def test_numa_binding_is_best_effort(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    monkeypatch.setitem(sys.modules, "torch.numa.binding", None)
-    with caplog.at_level(logging.WARNING):
-        _apply_numa_binding(torch.device("cuda", 0))
-    assert "NUMA binding skipped" in caplog.text
