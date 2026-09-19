@@ -59,9 +59,9 @@ logger = logging.getLogger(__name__)
 def _maybe_apply_numa_binding(device_index: int, device_type: str) -> None:
     """Pin this process to the NUMA node of its GPU for local memory bandwidth.
 
-    On multi-NUMA machines (e.g. GB200 NVLink-C2C), pinned-memory allocations
-    that land on the GPU's local NUMA node get ~350 GB/s D2H bandwidth vs
-    ~120 GB/s cross-NUMA. Must run before any pinned memory is allocated.
+    On multi-NUMA machines, pinned-memory transfer bandwidth can differ
+    meaningfully when allocations land outside the GPU's local node. This must
+    run before any pinned memory is allocated.
     """
     if device_type != "cuda":
         return
