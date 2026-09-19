@@ -405,33 +405,18 @@ async def _finalize(buffer: RolloutGroupWorkBuffer, group_id: int) -> None:
     await buffer.finalize_work(RolloutGroup(group_id=group_id, rollouts=[]))
 
 
-def test_take_finalized_follows_finish_order_not_group_id() -> None:
-    async def run() -> None:
-        buffer = _buffer(capacity=4)
-        for group_id in range(4):
-            await _admit(buffer, group_id)
-        for group_id in (3, 1, 2):
-            await _finalize(buffer, group_id)
-
-        assert (await buffer.take_finalized()).group_id == 3
-        assert (await buffer.take_finalized()).group_id == 1
-        assert (await buffer.take_finalized()).group_id == 2
-
-    asyncio.run(run())
-
-
 def test_finish_order_trains_younger_groups_while_head_never_finishes() -> None:
     async def run() -> None:
-        # S=1, P=4 -> 8 slots. g0 is claimed and never finishes; g1..g4 finish.
+        # S=1, P=4 -> 8 slots. g0 is claimed and never finishes; g1..g4 finish out of id order.
         buffer = _buffer(capacity=8)
         for group_id in range(8):
             await _admit(buffer, group_id)
         await buffer.claim_next()  # g0 -> INFLIGHT, stuck
-        for group_id in (1, 2, 3, 4):
+        for group_id in (3, 1, 4, 2):
             await _finalize(buffer, group_id)
 
-        # One full batch of P=4 younger groups is taken without waiting on g0.
-        for expected_group_id in (1, 2, 3, 4):
+        # One full batch of P=4 younger groups is taken in finish order without waiting on g0.
+        for expected_group_id in (3, 1, 4, 2):
             taker = asyncio.create_task(buffer.take_finalized())
             await asyncio.sleep(0)
             assert taker.done()
