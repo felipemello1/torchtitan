@@ -725,7 +725,7 @@ class Controller(Configurable):
         # Trainer policy version, seeded from the resumed step; advances at each optimizer step.
         self._trainer_policy_version = self.start_step
 
-        # Buffer depth (S + 1) * P sets the mean policy age; groups are consumed in finish order.
+        # Buffer depth (S + 1) * P targets the mean policy age; groups are consumed in finish order.
         max_active_rollout_groups = async_loop.max_active_rollout_groups
         logger.info(
             f"max_active_rollout_groups={max_active_rollout_groups}, "
