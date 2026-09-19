@@ -4,8 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Unit tests for async-controller pieces: batcher group-counting, the active-slot buffer backpressure,
-the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID."""
+"""Unit tests for async-controller pieces: batcher group-counting, active-slot buffer backpressure,
+finish-order consumption, policy-age metrics, the metrics timer drain, and RolloutTurnID."""
 
 import asyncio
 import logging
@@ -354,44 +354,28 @@ def test_untrainable_group_releases_before_training() -> None:
     asyncio.run(run())
 
 
-def test_compute_policy_age_metrics_raises_on_consume_time_staleness() -> None:
-    with pytest.raises(RuntimeError, match="admitted stale training data"):
-        compute_policy_age_metrics(
-            trainer_policy_version=4,
-            min_policy_versions=[0],
+def test_policy_age_s_plus_3_warns_and_does_not_block_training(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        metrics = compute_policy_age_metrics(
+            trainer_policy_version=6,
+            min_policy_versions=[0, 4],
             target_offpolicy_steps=3,
-            max_offpolicy_steps=3,
         )
 
-
-def test_compute_policy_age_metrics_uses_hard_offpolicy_limit() -> None:
-    metrics = compute_policy_age_metrics(
-        trainer_policy_version=4,
-        min_policy_versions=[0],
-        target_offpolicy_steps=3,
-        max_offpolicy_steps=4,
-    )
-    assert any(metric.key == "train_batch/policy_age_max" for metric in metrics)
-
-    with pytest.raises(RuntimeError, match="admitted stale training data"):
-        compute_policy_age_metrics(
-            trainer_policy_version=5,
-            min_policy_versions=[0],
-            target_offpolicy_steps=3,
-            max_offpolicy_steps=4,
-        )
+    aggregated_metrics = m.MetricsProcessor._aggregate_metrics(metrics)
+    assert aggregated_metrics["train_batch/policy_age/mean"] == 4
+    assert aggregated_metrics["train_batch/policy_age_max"] == 6
+    assert aggregated_metrics["train_batch/policy_age_over_target_count"] == 1
+    assert "expected for stragglers" in caplog.text
+    assert "trained and not dropped" in caplog.text
 
 
-def _fifo_buffer(*, capacity: int, window_size: int = 1) -> RolloutGroupWorkBuffer:
+def _work_buffer(*, capacity: int) -> RolloutGroupWorkBuffer:
     return RolloutGroupWorkBuffer.Config().build(
         max_active_rollout_groups=capacity,
-        window_size=window_size,
     )
-
-
-def test_work_buffer_rejects_window_larger_than_capacity() -> None:
-    with pytest.raises(ValueError, match="window_size"):
-        _fifo_buffer(capacity=2, window_size=3)
 
 
 async def _admit(buffer: RolloutGroupWorkBuffer, group_id: int) -> None:
@@ -404,26 +388,37 @@ async def _finalize(buffer: RolloutGroupWorkBuffer, group_id: int) -> None:
     await buffer.finalize_work(RolloutGroup(group_id=group_id, rollouts=[]))
 
 
-def test_windowed_fifo_takes_within_anchored_window() -> None:
+def test_finish_order_trains_younger_groups_while_oldest_is_inflight() -> None:
     async def run() -> None:
-        # Window [g0, g3]: g1/g2/g3 may bypass stuck g0; g4 remains blocked.
-        buffer = _fifo_buffer(capacity=8, window_size=4)
+        num_prompts_per_train_step = 4
+        buffer = _work_buffer(capacity=5)
+        batcher = _build_batcher(num_prompts_per_train_step=num_prompts_per_train_step)
         for group_id in range(5):
             await _admit(buffer, group_id)
-        await buffer.claim_next()  # g0 -> INFLIGHT and stuck
-        for group_id in (1, 2, 3, 4):
+        claimed_group_ids = []
+        for _ in range(5):
+            claimed_work = await buffer.claim_next()
+            assert claimed_work is not None
+            claimed_group_ids.append(claimed_work.group_id)
+        assert claimed_group_ids == [0, 1, 2, 3, 4]
+        # g0 stays INFLIGHT while the four younger groups finish.
+        for group_id in (3, 1, 4, 2):
             await _finalize(buffer, group_id)
 
-        assert (await buffer.take_finalized()).group_id == 1
-        assert (await buffer.take_finalized()).group_id == 2
-        assert (await buffer.take_finalized()).group_id == 3
+        consumed_group_ids = []
+        batch = None
+        for _ in range(num_prompts_per_train_step):
+            rollout_group = await asyncio.wait_for(buffer.take_finalized(), timeout=0.1)
+            assert rollout_group is not None
+            consumed_group_ids.append(rollout_group.group_id)
+            batch, group_is_trainable = batcher.add_training_samples(
+                training_sample_group=_trainable_group(
+                    rollout_group.group_id, num_samples=1
+                )
+            )
+            assert group_is_trainable
 
-        taker = asyncio.create_task(buffer.take_finalized())
-        await asyncio.sleep(0)
-        assert not taker.done()  # g4 is finalized but outside the anchored window
-
-        await _finalize(buffer, 0)
-        assert (await taker).group_id == 0
-        assert (await buffer.take_finalized()).group_id == 4
+        assert consumed_group_ids == [3, 1, 4, 2]
+        assert batch is not None
 
     asyncio.run(run())

@@ -10,11 +10,14 @@
 # but components/ may not be the right home either.
 
 import contextlib
+import logging
 import time
 from collections import defaultdict
 
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.rollout.types import Rollout
+
+logger = logging.getLogger(__name__)
 
 
 class MetricsTimer:
@@ -169,47 +172,51 @@ def compute_policy_age_metrics(
     trainer_policy_version: int,
     min_policy_versions: list[int],
     target_offpolicy_steps: int,
-    max_offpolicy_steps: int,
 ) -> list[m.Metric]:
     """Age of each packed training sample at the moment the trainer consumes the batch.
 
-    Computed in the trainer loop (not at pack time) so the logged age is faithful to the version the
-    batch actually trains against, and so the consume-time freshness invariant is checked here.
+    Computed in the trainer loop so the logged age is faithful to the version the batch trains against.
+    Samples older than the target are counted and trained rather than dropped.
 
     Args:
         trainer_policy_version: Policy version that will consume this batch.
         min_policy_versions: Oldest sampled policy version for each packed training sample.
         target_offpolicy_steps: Target steady-state offpolicy steps used to size
             the active buffer.
-        max_offpolicy_steps: Hard consume-time offpolicy step limit derived from
-            ``window_fraction``.
 
     Example:
-        # trainer at v=10; training samples' oldest versions [8, 9] -> ages [2, 1]
+        # trainer at v=10; oldest sample versions [6, 9] -> ages [4, 1]
         compute_policy_age_metrics(
             trainer_policy_version=10,
-            min_policy_versions=[8, 9],
+            min_policy_versions=[6, 9],
             target_offpolicy_steps=3,
-            max_offpolicy_steps=3,
         )
-        # -> train_batch/policy_age mean 1.5, train_batch/policy_age_max 2
+        # -> policy_age mean 2.5, max 4, over_target_count 1; both samples train
     """
     policy_ages = [
         trainer_policy_version - min_policy_version
         for min_policy_version in min_policy_versions
     ]
     max_policy_age = max(policy_ages, default=0)
-    if max_policy_age > max_offpolicy_steps:
-        raise RuntimeError(
-            "rollout backpressure admitted stale training data: "
-            f"max_policy_age={max_policy_age}, "
-            f"target_offpolicy_steps={target_offpolicy_steps}, "
-            f"max_offpolicy_steps={max_offpolicy_steps}, "
-            f"trainer_policy_version={trainer_policy_version}"
+    over_target_count = sum(
+        policy_age > target_offpolicy_steps for policy_age in policy_ages
+    )
+    if over_target_count:
+        logger.warning(
+            "Training batch includes %d packed samples older than "
+            "target_offpolicy_steps=%d (max_policy_age=%d). This is expected for "
+            "stragglers with finish-order consumption; the samples are trained and not dropped.",
+            over_target_count,
+            target_offpolicy_steps,
+            max_policy_age,
         )
     return [
         m.Metric("train_batch/policy_age", m.Mean.from_list(policy_ages)),
         m.Metric("train_batch/policy_age_max", m.NoReduce(float(max_policy_age))),
+        m.Metric(
+            "train_batch/policy_age_over_target_count",
+            m.NoReduce(float(over_target_count)),
+        ),
     ]
 
 

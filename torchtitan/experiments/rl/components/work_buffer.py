@@ -55,9 +55,8 @@ class RolloutGroupWorkBuffer(Configurable):
     """Buffer of `RolloutGroupWork` shared between the data-input, rollout, and batcher loops.
 
     Each entry is a RolloutGroupWork moving WAITING -> INFLIGHT -> FINALIZED. An active-slot budget caps
-    the pipeline at `max_active_rollout_groups` active slots; the batcher takes finalized groups within
-    a fixed look-ahead window anchored at the oldest entry. A `window_size` of 1
-    gives strict FIFO.
+    the pipeline at `max_active_rollout_groups` active slots; the batcher takes finalized groups in the
+    order they finish. An unfinished older group never blocks a finalized younger group.
 
     For details on the buffer's callers, check the diagram in the controller.py file.
 
@@ -85,25 +84,17 @@ class RolloutGroupWorkBuffer(Configurable):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        """No tunables: capacity and window size are derived by the controller."""
+        """No tunables: the controller supplies the active-slot capacity."""
 
-    def __init__(
-        self, config: Config, *, max_active_rollout_groups: int, window_size: int = 1
-    ) -> None:
-        if not 1 <= window_size <= max_active_rollout_groups:
-            raise ValueError(
-                "window_size must be between 1 and max_active_rollout_groups, got "
-                f"window_size={window_size}, "
-                f"max_active_rollout_groups={max_active_rollout_groups}"
-            )
+    def __init__(self, config: Config, *, max_active_rollout_groups: int) -> None:
         self._max_active_rollout_groups = max_active_rollout_groups
-        self._window_size = window_size
         self._active_rollout_groups = 0
         # metric: Per-flush peak active slots; reset on `.metrics()` call.
         self._active_rollout_groups_peak_since_flush = 0
         self._work_by_group_id: collections.OrderedDict[
             int, RolloutGroupWork
         ] = collections.OrderedDict()
+        self._finalized_group_ids: collections.deque[int] = collections.deque()
         # TODO(async-rl): Current we use a condition that alerts ALL rollout workers. There is no need to
         # alert all of them. Consider changing it to an async queue + event.
 
@@ -169,41 +160,30 @@ class RolloutGroupWorkBuffer(Configurable):
                 return
             work.rollout_group = rollout_group
             work.state = _RolloutGroupWorkState.FINALIZED
+            self._finalized_group_ids.append(rollout_group.group_id)
             self._condition.notify_all()
 
     @sl.log_trace_span("take_finalized")
     async def take_finalized(self) -> RolloutGroup | None:
-        """Batcher loop: return the oldest FINALIZED group inside the anchored windowed FIFO range.
-
-        The window covers group ids ``[head, head + window_size - 1]``. Entries outside the
-        window stay blocked even if they are finalized, so taking non-head groups does not slide
-        the window. A `window_size` of 1 gives strict FIFO.
-
-        This anchored-window policy follows MiniMax's rollout scheduling approach; see
-        Section 6.2.4 of https://arxiv.org/pdf/2605.26494.
+        """Batcher loop: return finalized groups in finish order.
 
         Example:
-            # window_size=3: g0 is INFLIGHT, g1 is WAITING, and g2/g3 are FINALIZED.
-            group = await buffer.take_finalized()
-            assert group.group_id == 2  # g2 is inside the anchored window [g0, g2].
-            # g3 remains blocked because taking g2 does not move the window past g0.
+            # g0 is still INFLIGHT; g2 finishes before g1.
+            await buffer.finalize_work(g2)
+            await buffer.finalize_work(g1)
+            assert (await buffer.take_finalized()).group_id == 2
+            assert (await buffer.take_finalized()).group_id == 1
         """
         async with self._condition:
             while True:
                 if self._closed:
                     return None
-                if self._work_by_group_id:
-                    head_group_id = next(iter(self._work_by_group_id))
-                    window_end = head_group_id + self._window_size - 1
-                    for group_id, work in self._work_by_group_id.items():
-                        if group_id > window_end:
-                            break
-                        if work.state is not _RolloutGroupWorkState.FINALIZED:
-                            continue
-                        del self._work_by_group_id[group_id]
-                        self._condition.notify_all()
-                        return work.rollout_group
-                await self._condition.wait()  # nothing finalized inside the window -> stall
+                if self._finalized_group_ids:
+                    group_id = self._finalized_group_ids.popleft()
+                    work = self._work_by_group_id.pop(group_id)
+                    self._condition.notify_all()
+                    return work.rollout_group
+                await self._condition.wait()
 
     async def release_active_groups(self, count: int, *, reason: str) -> None:
         """Free active slots: the trainer releases trained slots after its weight pull; the batcher
@@ -241,6 +221,7 @@ class RolloutGroupWorkBuffer(Configurable):
         async with self._condition:
             self._closed = True
             self._work_by_group_id.clear()
+            self._finalized_group_ids.clear()
             self._condition.notify_all()
 
     def metrics(self) -> list[m.Metric]:
