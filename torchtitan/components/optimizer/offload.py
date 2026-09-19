@@ -7,7 +7,9 @@
 """Optimizer-state CPU offload."""
 
 import logging
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -140,6 +142,7 @@ class OptimizerStateOffloader(Optimizer):
         # Partition parameters, allocate their canonical CPU state, then create the
         # independent streams that move chunks in each direction.
         params = [param for group in self.param_groups for param in group["params"]]
+        _warn_if_numa_affinity_spans_nodes()
         self._chunks = _pack_params_by_state_bytes(
             params,
             chunk_size_bytes=chunk_size_mb * 1024 * 1024,
@@ -426,3 +429,33 @@ def _state_like(param: torch.Tensor, local: torch.Tensor) -> torch.Tensor:
         ),
     )
     return DTensor(local, spec, requires_grad=False)
+
+
+def _warn_if_numa_affinity_spans_nodes() -> None:
+    """Warn when pinned state may be allocated across multiple NUMA nodes."""
+    try:
+        allowed_cpus = os.sched_getaffinity(0)
+        node_cpu_sets = [
+            _cpu_list_to_set(path.read_text())
+            for path in Path("/sys/devices/system/node").glob("node[0-9]*/cpulist")
+        ]
+    except (AttributeError, OSError, ValueError):
+        return
+
+    if len(node_cpu_sets) > 1 and not any(
+        allowed_cpus <= node_cpus for node_cpus in node_cpu_sets
+    ):
+        logger.warning(
+            "Optimizer-state offload is allocating pinned memory while this process can run "
+            "on CPUs from multiple NUMA nodes. Transfer speed may depend on page placement; "
+            "launch with `torchrun --numa-binding=node` for GPU-local allocation."
+        )
+
+
+def _cpu_list_to_set(cpu_list: str) -> set[int]:
+    """Parse a Linux CPU list such as ``0-2,4`` into ``{0, 1, 2, 4}``."""
+    cpus: set[int] = set()
+    for item in cpu_list.strip().split(","):
+        start, separator, end = item.partition("-")
+        cpus.update(range(int(start), int(end) + 1 if separator else int(start) + 1))
+    return cpus
