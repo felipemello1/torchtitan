@@ -22,7 +22,7 @@ The pipeline has three layers.
 
 **1. Experiment logic.** A `Rollouter` composes training/validation data, a `MessageEnv`, a rubric, and a function to run rollouts. It should be flexible enough to express most custom patterns.
 
-**2. Controller and dataflow.** Independent loops load data, produce rollouts, pack batches, and update the policy. `RolloutGroupWorkBuffer` connects them and bounds policy lag. Set `max_offpolicy_steps=0` for synchronous execution.
+**2. Controller and dataflow.** Independent loops load data, produce rollouts, pack batches, and update the policy. `RolloutGroupWorkBuffer` connects them. Its depth, `(target_offpolicy_steps + 1) * num_prompts_per_train_step` groups, sets the mean policy age; the batcher consumes groups in the order they finish, so a slow group never blocks younger finished ones. The trainer still waits when fewer than one batch of groups is finalized. Set `target_offpolicy_steps=0` for synchronous execution.
 
 **3. Distributed execution.** A router sends requests to one or more vLLM generator replicas. `PolicyTrainer` runs on a separately configured TorchTitan mesh, and TorchStore publishes new weights back to the generators. Training and generation can be scaled independently for the workload.
 

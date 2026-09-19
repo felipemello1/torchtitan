@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """Unit tests for async-controller pieces: batcher group-counting, the active-slot buffer backpressure,
-the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID."""
+finish-order consumption, the policy-age metrics, the metrics timer drain, and RolloutTurnID."""
 
 import asyncio
 import logging
@@ -354,44 +354,45 @@ def test_untrainable_group_releases_before_training() -> None:
     asyncio.run(run())
 
 
-def test_compute_policy_age_metrics_raises_on_consume_time_staleness() -> None:
-    with pytest.raises(RuntimeError, match="admitted stale training data"):
-        compute_policy_age_metrics(
-            trainer_policy_version=4,
-            min_policy_versions=[0],
+def _metric_value(metrics: list[m.Metric], key: str) -> float:
+    (metric,) = [metric for metric in metrics if metric.key == key]
+    return metric.value.value
+
+
+def test_compute_policy_age_metrics_trains_over_target_age_with_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # target S=3; one straggler sample comes back at age S+3=6. It is counted and warned, not raised.
+    with caplog.at_level(logging.WARNING):
+        metrics = compute_policy_age_metrics(
+            trainer_policy_version=10,
+            min_policy_versions=[4, 9, 8],
             target_offpolicy_steps=3,
-            max_offpolicy_steps=3,
         )
 
+    assert _metric_value(metrics, "train_batch/policy_age_max") == 6
+    assert _metric_value(metrics, "train_batch/num_samples_over_target_age") == 1
+    assert "1 training samples are older than target_offpolicy_steps=3" in caplog.text
+    assert "Expected for straggler groups" in caplog.text
 
-def test_compute_policy_age_metrics_uses_hard_offpolicy_limit() -> None:
-    metrics = compute_policy_age_metrics(
-        trainer_policy_version=4,
-        min_policy_versions=[0],
-        target_offpolicy_steps=3,
-        max_offpolicy_steps=4,
-    )
-    assert any(metric.key == "train_batch/policy_age_max" for metric in metrics)
 
-    with pytest.raises(RuntimeError, match="admitted stale training data"):
-        compute_policy_age_metrics(
-            trainer_policy_version=5,
-            min_policy_versions=[0],
+def test_compute_policy_age_metrics_is_quiet_within_target(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        metrics = compute_policy_age_metrics(
+            trainer_policy_version=10,
+            min_policy_versions=[7, 9],
             target_offpolicy_steps=3,
-            max_offpolicy_steps=4,
         )
 
-
-def _fifo_buffer(*, capacity: int, window_size: int = 1) -> RolloutGroupWorkBuffer:
-    return RolloutGroupWorkBuffer.Config().build(
-        max_active_rollout_groups=capacity,
-        window_size=window_size,
-    )
+    assert _metric_value(metrics, "train_batch/policy_age_max") == 3
+    assert _metric_value(metrics, "train_batch/num_samples_over_target_age") == 0
+    assert caplog.text == ""
 
 
-def test_work_buffer_rejects_window_larger_than_capacity() -> None:
-    with pytest.raises(ValueError, match="window_size"):
-        _fifo_buffer(capacity=2, window_size=3)
+def _buffer(*, capacity: int) -> RolloutGroupWorkBuffer:
+    return RolloutGroupWorkBuffer.Config().build(max_active_rollout_groups=capacity)
 
 
 async def _admit(buffer: RolloutGroupWorkBuffer, group_id: int) -> None:
@@ -404,26 +405,43 @@ async def _finalize(buffer: RolloutGroupWorkBuffer, group_id: int) -> None:
     await buffer.finalize_work(RolloutGroup(group_id=group_id, rollouts=[]))
 
 
-def test_windowed_fifo_takes_within_anchored_window() -> None:
+def test_take_finalized_follows_finish_order_not_group_id() -> None:
     async def run() -> None:
-        # Window [g0, g3]: g1/g2/g3 may bypass stuck g0; g4 remains blocked.
-        buffer = _fifo_buffer(capacity=8, window_size=4)
-        for group_id in range(5):
+        buffer = _buffer(capacity=4)
+        for group_id in range(4):
             await _admit(buffer, group_id)
-        await buffer.claim_next()  # g0 -> INFLIGHT and stuck
+        for group_id in (3, 1, 2):
+            await _finalize(buffer, group_id)
+
+        assert (await buffer.take_finalized()).group_id == 3
+        assert (await buffer.take_finalized()).group_id == 1
+        assert (await buffer.take_finalized()).group_id == 2
+
+    asyncio.run(run())
+
+
+def test_finish_order_trains_younger_groups_while_head_never_finishes() -> None:
+    async def run() -> None:
+        # S=1, P=4 -> 8 slots. g0 is claimed and never finishes; g1..g4 finish.
+        buffer = _buffer(capacity=8)
+        for group_id in range(8):
+            await _admit(buffer, group_id)
+        await buffer.claim_next()  # g0 -> INFLIGHT, stuck
         for group_id in (1, 2, 3, 4):
             await _finalize(buffer, group_id)
 
-        assert (await buffer.take_finalized()).group_id == 1
-        assert (await buffer.take_finalized()).group_id == 2
-        assert (await buffer.take_finalized()).group_id == 3
+        # One full batch of P=4 younger groups is taken without waiting on g0.
+        for expected_group_id in (1, 2, 3, 4):
+            taker = asyncio.create_task(buffer.take_finalized())
+            await asyncio.sleep(0)
+            assert taker.done()
+            assert taker.result().group_id == expected_group_id
 
+        # The remaining wait is for generation (g0, g5..g7 unfinished), not for the head.
         taker = asyncio.create_task(buffer.take_finalized())
         await asyncio.sleep(0)
-        assert not taker.done()  # g4 is finalized but outside the anchored window
-
-        await _finalize(buffer, 0)
-        assert (await taker).group_id == 0
-        assert (await buffer.take_finalized()).group_id == 4
+        assert not taker.done()
+        await _finalize(buffer, 6)
+        assert (await taker).group_id == 6
 
     asyncio.run(run())
