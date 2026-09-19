@@ -354,11 +354,6 @@ def test_untrainable_group_releases_before_training() -> None:
     asyncio.run(run())
 
 
-def _metric_value(metrics: list[m.Metric], key: str) -> float:
-    (metric,) = [metric for metric in metrics if metric.key == key]
-    return metric.value.value
-
-
 def test_compute_policy_age_metrics_trains_over_target_age_with_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -370,9 +365,11 @@ def test_compute_policy_age_metrics_trains_over_target_age_with_warning(
             target_offpolicy_steps=3,
         )
 
-    assert _metric_value(metrics, "train_batch/policy_age_max") == 6
-    assert _metric_value(metrics, "train_batch/num_samples_over_target_age") == 1
-    assert "1 training samples are older than target_offpolicy_steps=3" in caplog.text
+    aggregated = m.MetricsProcessor._aggregate_metrics(metrics)
+    assert aggregated["train_batch/policy_age/mean"] == 3
+    assert aggregated["train_batch/policy_age_max"] == 6
+    assert aggregated["train_batch/num_samples_over_target_age"] == 1
+    assert "over-target samples (count=1, target_offpolicy_steps=3" in caplog.text
     assert "Expected for straggler groups" in caplog.text
 
 
@@ -386,8 +383,10 @@ def test_compute_policy_age_metrics_is_quiet_within_target(
             target_offpolicy_steps=3,
         )
 
-    assert _metric_value(metrics, "train_batch/policy_age_max") == 3
-    assert _metric_value(metrics, "train_batch/num_samples_over_target_age") == 0
+    aggregated = m.MetricsProcessor._aggregate_metrics(metrics)
+    assert aggregated["train_batch/policy_age/mean"] == 2
+    assert aggregated["train_batch/policy_age_max"] == 3
+    assert aggregated["train_batch/num_samples_over_target_age"] == 0
     assert caplog.text == ""
 
 
@@ -407,11 +406,12 @@ async def _finalize(buffer: RolloutGroupWorkBuffer, group_id: int) -> None:
 
 def test_finish_order_trains_younger_groups_while_head_never_finishes() -> None:
     async def run() -> None:
-        # S=1, P=4 -> 8 slots. g0 is claimed and never finishes; g1..g4 finish out of id order.
+        # S=1, P=4 -> 8 slots. g0..g4 are INFLIGHT; g0 never finishes, g1..g4 finish out of id order.
         buffer = _buffer(capacity=8)
         for group_id in range(8):
             await _admit(buffer, group_id)
-        await buffer.claim_next()  # g0 -> INFLIGHT, stuck
+        claimed_group_ids = [(await buffer.claim_next()).group_id for _ in range(5)]
+        assert claimed_group_ids == [0, 1, 2, 3, 4]
         for group_id in (3, 1, 4, 2):
             await _finalize(buffer, group_id)
 
@@ -422,11 +422,15 @@ def test_finish_order_trains_younger_groups_while_head_never_finishes() -> None:
             assert taker.done()
             assert taker.result().group_id == expected_group_id
 
-        # The remaining wait is for generation (g0, g5..g7 unfinished), not for the head.
+        # The remaining wait is for generation (nothing finalized), not for the head g0.
         taker = asyncio.create_task(buffer.take_finalized())
         await asyncio.sleep(0)
         assert not taker.done()
+        await buffer.claim_next()  # g5 -> INFLIGHT
+        await buffer.claim_next()  # g6 -> INFLIGHT
         await _finalize(buffer, 6)
-        assert (await taker).group_id == 6
+        await asyncio.sleep(0)
+        assert taker.done()
+        assert taker.result().group_id == 6
 
     asyncio.run(run())

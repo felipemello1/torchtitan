@@ -204,9 +204,9 @@ def compute_policy_age_metrics(
     )
     if num_samples_over_target_age:
         logger.warning(
-            "%d training samples are older than target_offpolicy_steps=%d (max_policy_age=%d, "
-            "trainer_policy_version=%d). Expected for straggler groups: they are trained in finish "
-            "order, not dropped. Frequent hits mean generation is slower than the buffer depth assumes.",
+            "Training batch contains over-target samples (count=%d, target_offpolicy_steps=%d, "
+            "max_policy_age=%d, trainer_policy_version=%d). Expected for straggler groups: they are "
+            "trained in finish order, not dropped. Frequent hits indicate a heavy generation tail.",
             num_samples_over_target_age,
             target_offpolicy_steps,
             max_policy_age,

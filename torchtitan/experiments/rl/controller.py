@@ -164,7 +164,7 @@ class AsyncLoopConfig(Configurable.Config):
     """Sibling rollouts sampled per prompt (the GRPO group)."""
 
     target_offpolicy_steps: int = 3
-    """Sets the active buffer depth to `(S + 1) * P` groups, which holds the steady-state MEAN policy age
+    """Sets the active buffer depth to `(S + 1) * P` groups, which targets a steady-state MEAN policy age
     near S (Little's law). A target for the mean, not a per-group cap: groups train in finish order, so a
     straggler can come back older than S and is trained anyway (`train_batch/num_samples_over_target_age`).
 
@@ -727,7 +727,10 @@ class Controller(Configurable):
 
         # Buffer depth (S + 1) * P sets the mean policy age; groups are consumed in finish order.
         max_active_rollout_groups = async_loop.max_active_rollout_groups
-        logger.info(f"max_active_rollout_groups={max_active_rollout_groups}")
+        logger.info(
+            f"max_active_rollout_groups={max_active_rollout_groups}, "
+            f"target_offpolicy_steps={async_loop.target_offpolicy_steps}"
+        )
 
         self._group_buffer = async_loop.group_buffer.build(
             max_active_rollout_groups=max_active_rollout_groups,

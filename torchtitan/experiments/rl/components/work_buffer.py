@@ -170,8 +170,8 @@ class RolloutGroupWorkBuffer(Configurable):
 
         Finish order is not admission order: a slow group is bypassed by every younger group that
         finishes before it and is taken whenever it lands. The only wait left is for generation
-        itself (no FINALIZED group at all). The slot budget, not this order, bounds the mean
-        policy age (see `AsyncLoopConfig.target_offpolicy_steps`).
+        itself (no FINALIZED group at all). The slot budget, not this order, targets the
+        steady-state mean policy age (see `AsyncLoopConfig.target_offpolicy_steps`).
 
         Example:
             # g0 is INFLIGHT (slow), g1 is WAITING, g3 then g2 finalized (in that order).
