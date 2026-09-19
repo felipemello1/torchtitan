@@ -338,16 +338,23 @@ class OptimizerStateOffloader(Optimizer):
 def _pack_params_by_state_bytes(
     params: list[torch.Tensor], *, chunk_size_bytes: int, state_dtype: torch.dtype
 ) -> list[list[torch.Tensor]]:
-    """Greedily pack params (in optimizer order) so each chunk's moments stay under the target.
+    """Group parameter shards into transfer chunks by Adam-moment bytes.
 
-    Whole parameters are atomic: one larger than the target forms its own chunk.
+    Each local parameter element has two moments, so a parameter contributes
+    ``numel * 2 * state_dtype.itemsize`` bytes. Parameters stay in optimizer
+    order and are never split: the next parameter starts a new chunk if adding
+    it would exceed ``chunk_size_bytes``. A parameter larger than the target
+    occupies its own chunk.
 
     Example:
 
-        # target 256 MiB, fp32 moments (8 B per element); params of 20M, 20M and 40M elements
-        # p0 = 160 MB, p0 + p1 = 320 MB > 256 MiB  -> chunk [p0]
-        # p1 = 160 MB, p1 + p2 = 480 MB > 256 MiB  -> chunk [p1]
-        # p2 = 320 MB > 256 MiB on its own          -> chunk [p2], with a one-time warning
+        # fp32: two 4-byte moments = 8 bytes per parameter element.
+        params = [torch.empty(60_000) for _ in range(3)]
+        chunks = _pack_params_by_state_bytes(
+            params, chunk_size_bytes=1024 * 1024, state_dtype=torch.float32
+        )
+        [len(chunk) for chunk in chunks]
+        # -> [2, 1] because each parameter contributes 480,000 bytes.
     """
     bytes_per_element = len(_MOMENT_KEYS) * state_dtype.itemsize
     chunks: list[list[torch.Tensor]] = []
@@ -374,8 +381,9 @@ def _pack_params_by_state_bytes(
         largest = max(oversized, key=lambda param: _local(param).numel())
         logger.warning(
             f"Optimizer-state offload: {len(oversized)} parameters' moments exceed chunk_size_mb "
-            f"({chunk_size_bytes >> 20} MiB); each forms its own chunk. The largest, shape "
-            f"{tuple(largest.shape)}, stages {_local(largest).numel() * bytes_per_element >> 20} MiB "
+            f"({chunk_size_bytes // (1024 * 1024)} MiB); each forms its own chunk. The largest, shape "
+            f"{tuple(largest.shape)}, stages "
+            f"{_local(largest).numel() * bytes_per_element // (1024 * 1024)} MiB "
             "and sets the GPU staging peak"
         )
     return chunks
