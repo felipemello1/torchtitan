@@ -9,7 +9,10 @@ from functools import partial
 
 import torch.nn as nn
 
-from torchtitan.config.transform import ModelConfigConverter
+from torchtitan.config.transform import (
+    ModelConfigConverter,
+    validate_converter_compatibility,
+)
 
 from torchtitan.models.common import (  # noqa: F401
     Conv1d,
@@ -1131,6 +1134,7 @@ def model_registry(
         ),
     )
     if converters is not None:
+        validate_converter_compatibility(converters)
         for c in converters:
             config = c.build().convert(config)
 

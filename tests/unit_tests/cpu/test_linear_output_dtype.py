@@ -59,3 +59,24 @@ def test_subclass_overriding_linear_rejects_output_dtype():
         RouterGateLinear.Config(
             in_features=8, out_features=4, output_dtype="float32"
         ).build()
+
+
+def test_lm_head_converter_sets_only_lm_head():
+    from torchtitan.config.transform import LMHeadFp32OutputConverter
+    from torchtitan.models.qwen3 import qwen3_configs
+
+    build_config, max_context_length = qwen3_configs["0.6B"]
+    config = build_config(attn_backend="flex", seq_len=max_context_length)
+
+    LMHeadFp32OutputConverter.Config().build().convert(config)
+
+    changed = [
+        fqn
+        for fqn, linear_config, _, _ in config.traverse(Linear.Config)
+        if linear_config.output_dtype != "input"
+    ]
+    assert changed == ["lm_head"]
+
+    config.lm_head = None
+    with pytest.raises(ValueError, match="lm_head"):
+        LMHeadFp32OutputConverter.Config().build().convert(config)

@@ -11,7 +11,10 @@ from functools import partial
 
 import torch.nn as nn
 
-from torchtitan.config.transform import ModelConfigConverter
+from torchtitan.config.transform import (
+    ModelConfigConverter,
+    validate_converter_compatibility,
+)
 from torchtitan.models.common import (
     ComplexRoPE,
     Embedding,
@@ -710,6 +713,7 @@ def model_registry(
         seq_len=context_len,
     )
     if converters is not None:
+        validate_converter_compatibility(converters)
         for c in converters:
             config = c.build().convert(config)
     return config

@@ -11,7 +11,10 @@ from functools import partial
 
 import torch.nn as nn
 
-from torchtitan.config.transform import ModelConfigConverter
+from torchtitan.config.transform import (
+    ModelConfigConverter,
+    validate_converter_compatibility,
+)
 
 from torchtitan.models.common import ComplexRoPE, Embedding, Linear, RowParallelLinear
 from torchtitan.models.common.attention import QKVLinear, VarlenInnerAttention
@@ -534,6 +537,7 @@ def model_registry(
         )
     config = get_config(attn_backend=attn_backend, seq_len=context_len)
     if converters is not None:
+        validate_converter_compatibility(converters)
         for c in converters:
             c.build().convert(config)
     return config

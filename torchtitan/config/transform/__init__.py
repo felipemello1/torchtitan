@@ -11,7 +11,8 @@ from .async_tensor_parallel import AsyncTensorParallelTransform
 from .base import convert_config_type, ModelConfigTransform
 from .batch_invariance import BatchInvariantFlexConverter
 from .context_parallel import ContextParallelTransform
-from .converter import ModelConfigConverter
+from .converter import ModelConfigConverter, validate_converter_compatibility
+from .lm_head_output import LMHeadFp32OutputConverter
 from .lora import LinearLoRAHandler, LoRATransform
 from .quantization import (
     Float8GroupedExpertsConverter,
@@ -31,6 +32,7 @@ __all__ = [
     "convert_config_type",
     "ContextParallelTransform",
     "BatchInvariantFlexConverter",
+    "LMHeadFp32OutputConverter",
     "LinearLoRAHandler",
     "LoRATransform",
     "Float8GroupedExpertsConverter",
@@ -39,4 +41,5 @@ __all__ = [
     "MXFP8LinearConverter",
     "NVFP4LinearConverter",
     "QuantizationConverter",
+    "validate_converter_compatibility",
 ]
