@@ -29,6 +29,38 @@ The Blackwell path is still faster than attn_gym's Triton GDN backward: 6.60 vs 
 
 ## Entries
 
+### 2026-09-25 11:10 — trainer: FA4 >= 4.0.0b32 for hd256 packed attention (keep)
+- Finding: the FairTitan runtime pins FA4 at git `0f3fb00` (2026-09-11). There, the dedicated hd256 kernels (Qwen3.5 attention) size their grid by packed total tokens x number of documents, so packed batches launch mostly empty tiles. Upstream fixed this in flash-attention #2807 (2026-09-14), released in `flash-attn-4` 4.0.0b32.
+- Attention fwd+bwd, hd256, 16 q / 4 kv heads (`/tmp/felipemello/hc/cudnn_varlen.py`):
+  ```text
+  docs x len     FA4 0f3fb00   FA4 b32   cuDNN (aten._cudnn_attention_forward, ragged)
+  4 x 4096        2.88 ms      2.27      2.19
+  16 x 4096      14.69         8.57      8.62
+  64 x 1024      25.94         3.88      4.32
+  1 x 65536     104.3        106.9     101.0
+  ```
+- With b32, FA4 and cuDNN are within ~10% everywhere, so no backend change is needed. cuDNN's forward is up to 3.6x faster on skewed lengths (e.g. 63 x 200 + 1 x 3784: 0.17 vs 0.62 ms), but its backward is slower. So fwd+bwd is about equal, and cuDNN is ~10% better under FullAC (which runs the forward twice).
+- One 4B layer cycle, 16k tokens: attention 2.90 -> 2.24 ms (4 docs), 2.74 -> 1.04 ms (16 docs); cycle -1.6% / -3.5%.
+- Full trainer step, 4B, 16k tokens of packed c4_test, FullAC, compile, 1 GPU (`hc_recipes.qwen35_4b_text_16k`, `trainstep.sh`): 28.7k -> 29.6k tokens/s (+3.0%). Losses match bitwise for 20 steps with `--debug.seed 42`.
+- Caveat: with `max_num_documents` set (fixed-shape metadata for training CUDA graphs), `max_seqlen` is the context length, so the grid stays inflated even on b32 (26.1k vs 27.9k tokens/s in the same test). RL recipes leave it unset.
+- Keep: README minimum bumped to b32 in #60. The FairTitan install script (`launcher/rl/install_titan_rl.sh`) still pins `0f3fb00`. b32 runs with the pinned apache-tvm-ffi 0.1.11, although its metadata asks for >= 0.1.12.
+
+### 2026-09-25 11:10 — trainer: full-step profile, 4B, 16k (findings)
+Profiled step with FA4 b32: 576 ms wall, 90% GPU busy.
+- GEMM 257 ms (at cuBLAS's practical peak, 1.8-2.0 PFLOP/s; inductor max-autotune finds nothing better)
+- chunk GDN 96 ms
+- eager elementwise 46 ms
+- inductor 44 ms
+- optimizer 30 ms
+- attention 20 ms
+- memcpy 15 ms
+- conv 14 ms
+
+Where the rest goes:
+- Idle GPU (44 ms): all of it is in the forward, because the forward is host-bound at 16k tokens. Per layer, FSDP `pre_forward` takes ~1.5 ms of host time (per-parameter casts and copies, even at world size 1) and the attn_gym op wrappers ~1.5 ms, against ~3 ms of GPU work per layer. This disappears at the RL shape (27B, 64k tokens), where GPU work per layer is ~16x larger.
+- Chunked-loss lm_head gradient (13.5 ms, 2.3%): with gradient sync off for chunks 0..6, FSDP accumulates each chunk's bf16 lm_head gradient into an fp32 buffer with `aten::add_` (fp32 += bf16). The mixed dtypes make it a non-vectorized kernel at ~3.3 TB/s, split into two launches because the tensor exceeds 32-bit indexing: 7 chunks x 2 x 0.965 ms. Possible fix: accumulate inside the weight-gradient GEMM (beta=1, fp32 C). At 27B/64k this is ~0.4% of the step, so not pursued yet.
+- FSDP at world size 1 (~38 ms): bf16 casts (729 launches, 14 ms), `chunk_cat` into fp32 (11 ms) and DtoD memcpy (13 ms). These are needed at 8 GPUs.
+
 ### 2026-09-25 10:30 — generator: cheaper GDN metadata build; final medians (keep)
 - Finding: a host-attributed profile (Python stacks) at 4B 32k bs16 puts Titan's `TorchTitanGDNAttentionMetadataBuilder.build` at 2.2 ms/step profiled, against 0 for vLLM's GDN builder on these ops. It launched ~9 small GPU ops per decode step, most only needed by the packed path.
 - Change (#58): on the single-token path, skip the query_start_loc copy/fill and `split_decodes_and_prefills`, and write `has_initial_state` with one `torch.gt(seq_lens, 1, out=...)`.
