@@ -48,6 +48,7 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
         return torch.mm(input_TD, weight_OD.T, out_dtype=torch.float32)
 
     @staticmethod
+    @once_differentiable
     def backward(ctx, grad_output_TO: torch.Tensor):  # pyrefly: ignore[bad-override]
         input_TD, weight_OD = ctx.saved_tensors
         grad_output_TO = grad_output_TO.to(input_TD.dtype)
