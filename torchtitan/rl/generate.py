@@ -39,6 +39,7 @@ from torchtitan.rl.model.vllm_registry import (
     TORCHTITAN_CONFIG_FORMAT,
     TORCHTITAN_WORKER_CLS,
 )
+from torchtitan.rl.model.vllm_worker import use_v2_model_runner
 from torchtitan.tools.utils import has_cuda_capability
 
 
@@ -110,7 +111,10 @@ def generate() -> None:
     ):
         raise ValueError("Only varlen and flex attention backends are supported.")
 
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    use_v2 = use_v2_model_runner(
+        gen_config.parallelism, batch_invariant=gen_config.debug.batch_invariant
+    )
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if use_v2 else "0"
     set_batch_invariance(gen_config.debug.batch_invariant)
     enable_ep = gen_config.parallelism.expert_parallel_degree > 1
 
@@ -160,6 +164,7 @@ def generate() -> None:
         max_num_batched_tokens=gen_config.max_num_batched_tokens,
         expert_sequence_parallel_size=expert_sequence_parallel_size,
         enable_sequence_parallel=gen_config.parallelism.enable_sequence_parallel,
+        graph_prefill=not use_v2,
     )
     if vllm_compilation_config is not None:
         engine_kwargs["compilation_config"] = vllm_compilation_config

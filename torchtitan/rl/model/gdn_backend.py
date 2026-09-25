@@ -69,6 +69,11 @@ class TorchTitanGDNAttentionMetadataBuilder(
             or parallel.enable_dbo
         ):
             return AttentionCGSupport.UNIFORM_BATCH
+        # A FULL graph bakes in the single-token or packed path. The V1 runner's
+        # TorchTitanCudagraphDispatcher keeps decode and mixed FULL graphs apart;
+        # the V2 runner has no such hook, so limit its FULL graphs to decode.
+        if vllm_config.use_v2_model_runner:
+            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
         return AttentionCGSupport.ALWAYS
 
     def __init__(
