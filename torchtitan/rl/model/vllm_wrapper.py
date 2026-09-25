@@ -39,8 +39,9 @@ from torchtitan.distributed.spmd_types import (
     plain_tensor_to_dtensor_state_dict,
 )
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
-from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.models.common.decoder import Decoder
 from torchtitan.protocols.module import Module
+from torchtitan.protocols.sharding import resolve_placements
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from vllm.compilation.decorators import support_torch_compile
@@ -91,7 +92,11 @@ def _replace_vllm_layer_configs(model_config):
 
         delta_net_cfg = getattr(layer_cfg, "delta_net", None)
         if delta_net_cfg is not None:
-            from torchtitan.rl.model.gdn import VLLMInnerGatedDeltaNet
+            from torchtitan.config.transform.base import convert_config_type
+            from torchtitan.rl.model.gdn import (
+                VLLMGatedDeltaNet,
+                VLLMInnerGatedDeltaNet,
+            )
 
             vllm_inner_gdn_cfg = VLLMInnerGatedDeltaNet.Config(
                 layer_idx=layer_idx,
@@ -107,9 +112,12 @@ def _replace_vllm_layer_configs(model_config):
             )
             new_layer_cfg = dataclasses.replace(
                 new_layer_cfg,
-                delta_net=dataclasses.replace(
-                    delta_net_cfg,
-                    inner_gated_delta_net=vllm_inner_gdn_cfg,
+                delta_net=convert_config_type(
+                    dataclasses.replace(
+                        delta_net_cfg,
+                        inner_gated_delta_net=vllm_inner_gdn_cfg,
+                    ),
+                    VLLMGatedDeltaNet,
                 ),
             )
 
@@ -143,7 +151,19 @@ class PlainToDTensorStateDictAdapter(BaseStateDictAdapter):
         )
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
-        return dtensor_to_plain_tensor_state_dict(self.adapter.from_hf(hf_state_dict))
+        state_dict = self.adapter.from_hf(hf_state_dict)
+        # TODO(@andrewor14): Wrap the generator model with FSDP and revisit this
+        # explicit layout restoration once weights load into DTensor parameters.
+        for name, value in state_dict.items():
+            if isinstance(value, DTensor):
+                # Format conversions can reshard tensors, e.g. fused QKV splits.
+                # Restore the model's layout before discarding DTensor metadata.
+                state_dict[name] = value.redistribute(
+                    placements=resolve_placements(
+                        self.state_dict_layouts[name], value.device_mesh
+                    )
+                )
+        return dtensor_to_plain_tensor_state_dict(state_dict)
 
     def get_hf_storage_reader(
         self,
@@ -286,7 +306,7 @@ class VLLMModelWrapper(Module):
     def __init__(
         self,
         *,
-        model_spec: ModelSpec,
+        model_config: Decoder.Config,
         parallelism: InferenceParallelismConfig,
         compile_config: CompileConfig | None,
         checkpointer_config: CheckpointManager.Config | None,
@@ -298,15 +318,11 @@ class VLLMModelWrapper(Module):
 
         assert vllm_config is not None, "vllm_config is required"
 
-        # Store components from model_spec
-        self.state_dict_adapter = model_spec.state_dict_adapter
-        self.parallelize_fn = model_spec.parallelize_fn
-
-        self.config = _replace_vllm_layer_configs(model_spec.model)
+        self.config = _replace_vllm_layer_configs(model_config)
         logger.debug(f"Creating model with config: {self.config.to_dict()}")
 
         # Translate the inference parallelism into torchtitan's full
-        # ParallelismConfig that ParallelDims / parallelize_fn consume.
+        # ParallelismConfig that ParallelDims and model.parallelize consume.
         training_parallelism = parallelism.to_training()
 
         # Build ParallelDims from the translated ParallelismConfig so TP/EP
@@ -320,10 +336,7 @@ class VLLMModelWrapper(Module):
             pp=training_parallelism.pipeline_parallel_degree,
             ep=training_parallelism.expert_parallel_degree,
             world_size=dist.get_world_size(),
-        )
-        self.spmd_context = dist_utils.get_spmd_context(
-            parallel_dims=self.parallel_dims,
-            spmd_typechecking=False,
+            enable_sequence_parallel=training_parallelism.enable_sequence_parallel,
         )
 
         # Fill sharding configs on the config BEFORE build so every sub-module
@@ -353,6 +366,21 @@ class VLLMModelWrapper(Module):
             )
         )
 
+        # update_from_config declares the inner GDN's per-projection inputs;
+        # VLLMGatedDeltaNet feeds it the fused [q|k|v] and conv weight instead.
+        from torchtitan.rl.model.gdn import (
+            fused_inner_sharding_config,
+            VLLMGatedDeltaNet,
+        )
+
+        for layer_cfg in self.config.layers:
+            delta_net_cfg = getattr(layer_cfg, "delta_net", None)
+            if isinstance(delta_net_cfg, VLLMGatedDeltaNet.Config):
+                inner_cfg = delta_net_cfg.inner_gated_delta_net
+                inner_cfg.sharding_config = fused_inner_sharding_config(
+                    inner_cfg.sharding_config
+                )
+
         # Apply config overrides (e.g. the Triton SwiGLU activation) after
         # update_from_config (which fills the sharding the override factories
         # read) and before build
@@ -363,8 +391,7 @@ class VLLMModelWrapper(Module):
         with torch.device("meta"):
             self.model = self.config.build()
 
-        self.model = self.parallelize_fn(
-            model=self.model,
+        self.model = self.model.parallelize(
             parallel_dims=self.parallel_dims,
             training=TrainingConfig(),
             parallelism=training_parallelism,
@@ -383,6 +410,12 @@ class VLLMModelWrapper(Module):
         # Materialize model on GPU — only allocates local shards (not full
         # model) thanks to EP/TP DTensor sharding applied above.
         self.model.to_empty(device=vllm_config.device_config.device)
+        # After materialization (views do not survive to_empty), before loading.
+        from torchtitan.rl.model.gdn import VLLMGatedDeltaNet
+
+        for module in self.model.modules():
+            if isinstance(module, VLLMGatedDeltaNet):
+                module.share_input_storage()
         # HF checkpoints do not necessarily contain every TorchTitan buffer
         # (for example MoE expert_bias_E).
         # TODO: When checkpoint doesn't contains expert_bias_E, check the config
@@ -394,7 +427,7 @@ class VLLMModelWrapper(Module):
             # TODO: Consider an init_non_persistent_buffers contract on the
             # Decoder / Model class so buffer-only init does not need this
             # spmd context.
-            with self.spmd_context():
+            with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
                 self.model.init_weights(buffer_device=None)
         self._maybe_initial_load_weights()
 
@@ -428,7 +461,7 @@ class VLLMModelWrapper(Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """vLLM required API.
         Convert input token IDs to embeddings."""
-        with self.spmd_context():
+        with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
             return self.model.tok_embeddings(input_ids)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -462,7 +495,7 @@ class VLLMModelWrapper(Module):
         if input_ids is None:
             raise ValueError("Either input_ids or inputs_embeds must be provided")
 
-        with self.spmd_context():
+        with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
             # Get embeddings
             h = self.model.tok_embeddings(input_ids)
 
@@ -486,7 +519,7 @@ class VLLMModelWrapper(Module):
         """vLLM required API.
         Compute logits from hidden states."""
 
-        with self.spmd_context():
+        with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
             logits = self.model.lm_head(hidden_states)
 
             # lm_head returns vocab-sharded logits under TP; gather to the
@@ -514,9 +547,10 @@ class VLLMModelWrapper(Module):
         if cfg is None:
             return
 
+        adapter_cls = type(self.model).state_dict_adapter_cls
         sd_adapter = None
-        if self.state_dict_adapter is not None:
-            sd_adapter = self.state_dict_adapter(
+        if adapter_cls is not None:
+            sd_adapter = adapter_cls(
                 model_config=self.config,
                 hf_assets_path=cfg.initial_load_path,
             )
@@ -534,6 +568,7 @@ class VLLMModelWrapper(Module):
             model_parts=[self.model],
             optimizers=None,
             lr_schedulers=None,
+            ema=None,
             states={},
             sd_adapter=sd_adapter,
         )
