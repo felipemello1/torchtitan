@@ -485,6 +485,30 @@ def test_cuda_graph_full_mode_no_compile():
     assert int(cfg.mode) == 0
 
 
+def test_cuda_graph_vllm_compile_enables_inductor():
+    cfg = VLLMCudaGraphConfig(mode="FULL", vllm_compile=True).get_vllm_compilation_config(
+        max_num_seqs=256,
+        expert_sequence_parallel_size=1,
+        enable_sequence_parallel=False,
+    )
+    assert cfg.cudagraph_mode.name == "FULL"
+    assert cfg.mode.name == "VLLM_COMPILE"
+
+
+def test_gdn_forward_is_an_opaque_functional_op():
+    # vLLM compile must see the GDN step as one op with no mutated inputs;
+    # tracing into it bakes in the profiling run's missing attention metadata.
+    import torchtitan.rl.model.gdn  # noqa: F401  (registers the op)
+
+    schema = torch.ops.torchtitan.vllm_gdn_forward.default._schema
+    assert all(not arg.is_write for arg in schema.arguments)
+    mixed_qkv = torch.empty(3, 12, device="meta")
+    out = torch.ops.torchtitan.vllm_gdn_forward(
+        mixed_qkv, mixed_qkv, mixed_qkv, mixed_qkv, mixed_qkv, mixed_qkv, "layer", 2, 5
+    )
+    assert out.shape == (3, 2, 5)
+
+
 def test_cuda_graph_decode_only_capture_sizes_cover_max_num_seqs():
     # FULL_DECODE_ONLY only graphs decode, so capture up to max_num_seqs (plus
     # max_num_seqs itself when not a power of 2).

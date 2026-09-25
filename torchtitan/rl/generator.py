@@ -42,6 +42,7 @@ from torchtitan.observability.logging import init_logger
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.model.batch_invariance import force_logprobs_fn_for_batch_invariance
+from torchtitan.rl.model.inductor_passes import UnfuseResidualAddmmPass
 from torchtitan.rl.model.vllm_registry import (
     register_to_vllm,
     TORCHTITAN_CONFIG_FORMAT,
@@ -184,6 +185,10 @@ class VLLMCudaGraphConfig:
       captured too.
     """
 
+    vllm_compile: bool = False
+    """Run vLLM's inductor compile of the model forward before capturing graphs
+    (``CompilationMode.VLLM_COMPILE``). ``False`` captures the eager forward."""
+
     capture_sizes: list[int] | None = None
     """Explicit CUDA graph capture batch sizes. When ``None`` (default), sizes are
     auto-derived: powers of 2 up to the cap, plus ``max_num_seqs`` and the cap as
@@ -228,7 +233,8 @@ class VLLMCudaGraphConfig:
         ``enable_sequence_parallel`` is forwarded to vLLM's sequence parallelism
         pass. vLLM filters dense-SP CUDA graph sizes using its own TP size.
 
-        All modes capture with ``mode=CompilationMode.NONE`` (no inductor compile).
+        Graph modes use ``CompilationMode.VLLM_COMPILE`` when ``vllm_compile`` is
+        set and ``CompilationMode.NONE`` (no inductor compile) otherwise.
         """
         if self.mode == "NONE":
             return CompilationConfig(
@@ -293,8 +299,25 @@ class VLLMCudaGraphConfig:
 
         return CompilationConfig(
             cudagraph_mode=self.mode,
-            mode=CompilationMode.NONE,
+            mode=(
+                CompilationMode.VLLM_COMPILE
+                if self.vllm_compile
+                else CompilationMode.NONE
+            ),
             cudagraph_capture_sizes=sizes,
+            # A dedicated single-token graph, which UnfuseResidualAddmmPass targets.
+            compile_sizes=[1] if self.vllm_compile else None,
+            inductor_compile_config=(
+                {
+                    "post_grad_custom_post_pass": UnfuseResidualAddmmPass(),
+                    # Materialize the residual stream in the norm that first reads it.
+                    # Otherwise each RMSNorm re-sums the chain of unrealized residual
+                    # adds (4 inputs read twice at bs=1), which undoes the unfuse win.
+                    "realize_reads_threshold": 1,
+                }
+                if self.vllm_compile
+                else {}
+            ),
             pass_config=PassConfig(
                 enable_sp=enable_sequence_parallel,
                 sp_min_token_num=1 if enable_sequence_parallel else None,
