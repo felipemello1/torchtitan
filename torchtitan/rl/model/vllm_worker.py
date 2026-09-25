@@ -9,6 +9,7 @@
 from collections.abc import Set
 from contextlib import nullcontext
 
+from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.model.gdn_backend import TorchTitanGDNAttentionBackend
 from vllm.config import CUDAGraphMode, get_layers_from_vllm_config
 from vllm.forward_context import BatchDescriptor
@@ -18,6 +19,24 @@ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.worker import gpu_model_runner as vllm_gpu_model_runner
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
+
+
+def use_v2_model_runner(
+    parallelism: InferenceParallelismConfig, *, batch_invariant: bool
+) -> bool:
+    """Whether vLLM's V2 model runner replaces ``TorchTitanGPUModelRunner`` (V1).
+
+    V2 is validated for single-GPU engines outside batch-invariant mode, whose
+    bitwise parity is validated on V1. With tensor parallelism, V1 also pads token
+    counts for sequence parallelism.
+    TODO: enable V2 for multi-GPU engines once validated (TP without sequence
+    parallelism needs no V1 hook).
+    """
+    single_gpu = (
+        parallelism.tensor_parallel_degree == 1
+        and parallelism.data_parallel_degree == 1
+    )
+    return single_gpu and not batch_invariant
 
 
 class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
@@ -101,7 +120,10 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
 
 
 class TorchTitanGPUWorker(GPUWorker):
-    """V1 worker that constructs :class:`TorchTitanGPUModelRunner`."""
+    """Worker that constructs :class:`TorchTitanGPUModelRunner` on the V1 runner.
+
+    The V2 runner is used unchanged.
+    """
 
     def _maybe_get_memory_pool_context(self, tag: str):
         # vLLM uses CuMem for model weights and the KV cache.
@@ -115,9 +137,8 @@ class TorchTitanGPUWorker(GPUWorker):
 
     def init_device(self):
         if self.use_v2_model_runner:
-            raise ValueError(
-                "TorchTitan's vLLM integration requires the V1 model runner"
-            )
+            super().init_device()
+            return
 
         # GPUWorker imports its runner class inside init_device and provides no
         # runner factory. Scope the class substitution to that construction.

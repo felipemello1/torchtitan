@@ -205,12 +205,13 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             conv_bias is None
         ), "Attention Gym convolution kernels do not support bias"
         attn_metadata = get_forward_context().attn_metadata
-        # vLLM's profiling/warmup runs have no attention metadata; leave the
-        # zero-filled output.
-        if attn_metadata is None:
+        # vLLM's profiling/warmup runs have no GDN metadata (the V1 runner passes
+        # None, the V2 runner omits Mamba layers); leave the zero-filled output.
+        gdn_metadata = (
+            attn_metadata.get(self.prefix) if isinstance(attn_metadata, dict) else None
+        )
+        if gdn_metadata is None:
             return
-        assert isinstance(attn_metadata, dict)
-        gdn_metadata = attn_metadata[self.prefix]
         assert isinstance(gdn_metadata, TorchTitanGDNAttentionMetadata)
         assert (
             gdn_metadata.spec_sequence_masks is None

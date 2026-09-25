@@ -47,6 +47,7 @@ from torchtitan.rl.model.vllm_registry import (
     TORCHTITAN_CONFIG_FORMAT,
     TORCHTITAN_WORKER_CLS,
 )
+from torchtitan.rl.model.vllm_worker import use_v2_model_runner
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.vllm import StatLoggerContext, VllmOtelStatLogger
 from torchtitan.rl.types import Completion
@@ -857,7 +858,13 @@ class VLLMGenerator(Configurable):
             (VarlenInnerAttention.Config, FlexInnerAttention.Config),
         ), "Only varlen and flex attention backends are allowed."
 
-        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = (
+            "1"
+            if use_v2_model_runner(
+                config.parallelism, batch_invariant=config.debug.batch_invariant
+            )
+            else "0"
+        )
         set_batch_invariance(config.debug.batch_invariant)
         if config.debug.batch_invariant:
             # The vLLM v2 logprob Triton kernel bypasses the aten overrides above;
