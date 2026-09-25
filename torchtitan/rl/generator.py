@@ -161,6 +161,25 @@ def _prepare_generation_request_metrics(
 _DEFAULT_MAX_NUM_BATCHED_TOKENS = 2048
 
 
+def vllm_attention_backend(
+    model_attention: Any, attention_backend: str
+) -> AttentionBackendEnum:
+    """Map the model's attention config + generator choice to a vLLM backend.
+
+    Example:
+
+        vllm_attention_backend(VarlenInnerAttention.Config(), "flashinfer")
+        # -> AttentionBackendEnum.FLASHINFER
+        vllm_attention_backend(FlexInnerAttention.Config(), "flashinfer")
+        # -> AttentionBackendEnum.FLEX_ATTENTION (flex models keep flex)
+    """
+    if isinstance(model_attention, FlexInnerAttention.Config):
+        return AttentionBackendEnum.FLEX_ATTENTION
+    if attention_backend == "flashinfer":
+        return AttentionBackendEnum.FLASHINFER
+    return AttentionBackendEnum.CUSTOM
+
+
 @dataclass(kw_only=True, slots=True)
 class VLLMCudaGraphConfig:
     """CUDA graph capture settings for the vLLM inference engine.
@@ -735,6 +754,18 @@ class VLLMGenerator(Configurable):
         cuda_graph: VLLMCudaGraphConfig = field(default_factory=VLLMCudaGraphConfig)
         """CUDA graph capture settings for the vLLM engine."""
 
+        attention_backend: Literal["torchtitan", "flashinfer"] = "torchtitan"
+        """Full-attention kernel for varlen models, by what decode splits over:
+
+        - ``"torchtitan"``: the trainer's torch ``varlen_attn`` (FA4 on SM100),
+          reached through a custom vLLM backend. Its head_dim=256 kernel has no
+          split-KV, so decode time grows linearly with context. Required for
+          batch-invariant mode.
+        - ``"flashinfer"``: vLLM's FlashInfer backend, which splits long KV across
+          SMs at decode (vLLM's own default on SM100). On SM100 it runs the
+          faster TRT-LLM kernels only if ``flashinfer-cubin`` for the installed
+          FlashInfer version is present (or NVIDIA's artifactory is reachable)."""
+
         checkpointer: Annotated[
             CheckpointManager.Config | None, tyro.conf.AvoidSubcommands
         ] = None
@@ -769,6 +800,11 @@ class VLLMGenerator(Configurable):
         """Optional logger instantiated on TP rank 0 to export vLLM metrics."""
 
         def __post_init__(self):
+            if self.debug.batch_invariant and self.attention_backend != "torchtitan":
+                raise ValueError(
+                    "batch_invariant requires attention_backend='torchtitan' so the "
+                    "generator runs the trainer's attention kernel."
+                )
             # The generator runs vLLM full expert parallelism: vLLM forms the EP
             # group from all DP*TP ranks, so expert_parallel_degree must equal
             # data_parallel_degree * tensor_parallel_degree (or 1 to disable EP).
@@ -898,10 +934,8 @@ class VLLMGenerator(Configurable):
             gpu_memory_utilization=config.gpu_memory_limit,
             enforce_eager=config.cuda_graph.mode == "NONE",
             attention_config=AttentionConfig(
-                backend=(
-                    AttentionBackendEnum.FLEX_ATTENTION
-                    if isinstance(attention_backend, FlexInnerAttention.Config)
-                    else AttentionBackendEnum.CUSTOM
+                backend=vllm_attention_backend(
+                    attention_backend, config.attention_backend
                 ),
             ),
             # Enables RequestOutput.metrics, so generator metrics can be returned

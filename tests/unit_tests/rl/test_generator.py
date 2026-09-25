@@ -31,6 +31,7 @@ import torch.distributed as dist
 from torchtitan.config import CommConfig, DebugConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.models.common.attention import FlexInnerAttention, VarlenInnerAttention
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.distributed.routing.strategies import LeastLoadedRoutingStrategy
@@ -42,6 +43,7 @@ from torchtitan.rl.generator import (
     SamplingConfig,
     VLLMCudaGraphConfig,
     VLLMGenerator,
+    vllm_attention_backend,
 )
 from torchtitan.rl.model.vllm_registry import register_to_vllm
 from torchtitan.rl.model.vllm_worker import (
@@ -51,6 +53,7 @@ from torchtitan.rl.model.vllm_worker import (
 from torchtitan.rl.observability import metrics as m
 from vllm import SamplingParams
 from vllm.sampling_params import RequestOutputKind
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
 class _FakeRenderer:
@@ -304,6 +307,23 @@ def test_batch_invariant_requires_prefix_cache_reset():
             debug=DebugConfig(batch_invariant=True),
             reset_prefix_cache_on_weight_sync=False,
         )
+
+
+def test_batch_invariant_requires_torchtitan_attention():
+    with pytest.raises(ValueError, match="attention_backend"):
+        VLLMGenerator.Config(
+            parallelism=_PARALLELISM,
+            debug=DebugConfig(batch_invariant=True),
+            attention_backend="flashinfer",
+        )
+
+
+def test_vllm_attention_backend_mapping():
+    varlen = VarlenInnerAttention.Config()
+    flex = FlexInnerAttention.Config()
+    assert vllm_attention_backend(varlen, "torchtitan") == AttentionBackendEnum.CUSTOM
+    assert vllm_attention_backend(varlen, "flashinfer") == AttentionBackendEnum.FLASHINFER
+    assert vllm_attention_backend(flex, "flashinfer") == AttentionBackendEnum.FLEX_ATTENTION
 
 
 def test_reset_running_requests_requires_prefix_cache_reset():
