@@ -535,11 +535,11 @@ class RequestDispatcher:
                     f"{len(request_output.outputs)} for {request_output.request_id}"
                 )
 
-            # get logprobs
+            # One flat entry per position (flat_logprobs with logprobs=0): the sampled token's logprob.
             completion_output = request_output.outputs[0]
+            flat_logprobs = completion_output.logprobs
             token_logprobs = [
-                next(iter(logprob_dict.values())).logprob
-                for logprob_dict in completion_output.logprobs
+                flat_logprobs.logprobs[start] for start in flat_logprobs.start_indices
             ]
 
             completions.append(
@@ -1211,13 +1211,14 @@ class VLLMGenerator(Configurable):
                 # Barrier (NCCL): engine.step() runs SPMD in lockstep.
                 # The step burst `max_engine_steps_between_decisions` gives the generator time to buffer
                 # new requests and avoid a prefill in between every engine decode step, which is inefficient.
+                # One span per burst, not per step: each span writes and flushes two JSONL
+                # records on the engine thread, which is on the critical path of every step.
                 with sl.log_trace_span("vllm_engine_step_burst"):
                     for _ in range(self.config.max_engine_steps_between_decisions):
                         if not self._engine.has_unfinished_requests():
                             break
                         with torch.no_grad():
-                            with sl.log_trace_span("vllm_engine_step"):
-                                request_outputs = self._engine.step()
+                            request_outputs = self._engine.step()
                         self._request_dispatcher.process_finished_requests(
                             request_outputs, self.policy_version
                         )
@@ -1289,6 +1290,10 @@ class VLLMGenerator(Configurable):
             stop_token_ids=sampling.stop_token_ids or None,
             seed=sampling.seed,
             logprobs=0,  # return only the sampled token's logprob (for the GRPO ratio)
+            # Token ids in, token ids and logprob floats out: stops are token ids and nothing reads
+            # text, so skip vLLM's per-token detokenization and per-token logprob dicts.
+            detokenize=False,
+            flat_logprobs=True,
             # Return each request's result once, when it is fully done, instead of streaming partial
             # outputs as tokens arrive.
             # TODO(async-rl): use RequestOutputKind.CUMULATIVE for exact per-token
