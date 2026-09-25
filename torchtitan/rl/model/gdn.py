@@ -243,11 +243,10 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         # the builder restages slots and freshness, including null padding.
         if gdn_metadata.execution_path is GDNExecutionPath.SINGLE_TOKEN:
             num_decode_rows = state_indices.numel()
-            # [q|k|v] is a column slice of the fused projection; the conv kernels
-            # need contiguous rows.
-            # TODO: drop the copy once Attention Gym's conv kernels accept a row stride.
+            # Decode reads [q|k|v] in place: a row-strided column slice of the fused
+            # projection (Attention Gym's decode conv accepts a row stride).
             conv_output = causal_conv1d_decode(
-                mixed_qkv[:num_decode_rows].contiguous(),
+                mixed_qkv[:num_decode_rows],
                 conv_weight,
                 self.kv_cache[0],
                 activation="silu",
@@ -281,6 +280,7 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
                 )
             return
 
+        # TODO: drop the copy once Attention Gym's prefill convolution accepts a row stride.
         conv_output = paged_causal_conv1d(
             mixed_qkv[:num_actual_tokens].contiguous().unsqueeze(0),
             conv_weight,
