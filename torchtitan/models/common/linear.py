@@ -15,6 +15,7 @@
 
 import math
 from dataclasses import dataclass
+from typing import Literal
 
 import spmd_types as spmd
 import torch
@@ -22,14 +23,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd.function import once_differentiable
 
-from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.protocols.module import Module
 
-# Shape suffix legend for the router gate:
-#   T = num tokens, D = model dimension, E = num experts
+# Shape suffix legend:
+#   T = num tokens, D = input features, O = output features, E = num experts (router gate)
+
+
+@spmd.register_local_autograd_function
+class _Fp32OutputLinearFunction(torch.autograd.Function):
+    """bf16 GEMM with fp32 accumulation and fp32 output; bf16 backward.
+
+    ``torch.mm(..., out_dtype=...)`` has no autograd formula, hence the Function. The
+    backward rounds ``grad_output`` to bf16: the gradients return in bf16 anyway.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx, input_TD: torch.Tensor, weight_OD: torch.Tensor
+    ) -> torch.Tensor:
+        ctx.save_for_backward(input_TD, weight_OD)
+        return torch.mm(input_TD, weight_OD.T, out_dtype=torch.float32)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output_TO: torch.Tensor):  # pyrefly: ignore[bad-override]
+        input_TD, weight_OD = ctx.saved_tensors
+        grad_output_TO = grad_output_TO.to(input_TD.dtype)
+        grad_input_TD = grad_weight_OD = None
+        if ctx.needs_input_grad[0]:
+            grad_input_TD = torch.mm(grad_output_TO, weight_OD)
+        if ctx.needs_input_grad[1]:
+            grad_weight_OD = torch.mm(grad_output_TO.T, input_TD)
+        return grad_input_TD, grad_weight_OD
 
 
 class Linear(nn.Linear, Module):
@@ -48,6 +76,10 @@ class Linear(nn.Linear, Module):
         out_features: int
         num_linears: int = 1
         bias: bool = False
+        output_dtype: Literal["input", "float32"] = "input"
+        """Output dtype. "float32" with bf16 input and weight on CUDA runs a bf16 GEMM
+        with fp32 accumulation and output (no fp32 weight copy) and a bf16 backward;
+        otherwise it upcasts the operands."""
 
     def __init__(self, config: Config):
         super().__init__(
@@ -55,6 +87,12 @@ class Linear(nn.Linear, Module):
             config.num_linears * config.out_features,
             bias=config.bias,
         )
+        if config.output_dtype != "input" and type(self)._linear is not Linear._linear:
+            raise ValueError(
+                f"{type(self).__qualname__} overrides _linear and ignores "
+                f"output_dtype={config.output_dtype!r}."
+            )
+        self.output_dtype = config.output_dtype
         self.out_features = config.out_features
         self.num_linears = config.num_linears
         if config.num_linears > 1:
@@ -118,54 +156,29 @@ class Linear(nn.Linear, Module):
         Explicit operands let those boundaries adjust an operand's SPMD type
         before invoking the selected local compute implementation.
         """
-        return F.linear(input, weight, bias)
-
-
-class CastLinear(Linear):
-    """``Linear`` whose forward matmul runs in ``compute_dtype``.
-
-    Inputs, weight, and bias are cast to ``compute_dtype`` before
-    ``F.linear`` and the output is returned in that dtype. The stored
-    parameters retain their original dtype, including under weight tying.
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Linear.Config):
-        compute_dtype: str = "float32"
-        """Dtype for the forward matmul (key into ``TORCH_DTYPE_MAP``)."""
-
-    def __init__(self, config: Config):
-        super().__init__(config)
-        self.compute_dtype = TORCH_DTYPE_MAP[config.compute_dtype]
-
-    def _linear(
-        self,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if (
-            self.compute_dtype == torch.float32
-            and not torch.is_grad_enabled()
-            and input.is_cuda
-            and input.dtype in (torch.bfloat16, torch.float16)
-            and weight.dtype == input.dtype
-            and not is_in_batch_invariant_mode()
-        ):
-            # Inference: accumulate the low-precision GEMM directly into fp32
-            # instead of upcasting the full weight on every call. torch.mm has
-            # no autograd formula for out_dtype, so training keeps the cast path.
-            flat_input = input.reshape(-1, input.shape[-1])
-            out = torch.mm(flat_input, weight.t(), out_dtype=torch.float32)
-            if bias is not None:
-                out = out + bias.to(torch.float32)
-            return out.reshape(*input.shape[:-1], -1)
-        # The optimizer updates the weight each step, so training cannot cache
-        # the upcast copy.
-        bias = None if bias is None else bias.to(self.compute_dtype)
-        return F.linear(
-            input.to(self.compute_dtype), weight.to(self.compute_dtype), bias
+        if self.output_dtype == "input":
+            return F.linear(input, weight, bias)
+        bf16_cuda_operands = (
+            input.is_cuda
+            and input.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
         )
+        # Batch-invariant mode can't use _Fp32OutputLinearFunction yet: its cuBLAS
+        # out_dtype GEMM may pick a different algorithm per batch size, so a token's
+        # logits could change with batch composition.
+        # TODO: once batch_invariant_ops' fixed-tile matmul gets a bf16-input,
+        # fp32-output entry point, route this op to it in batch-invariant mode and use
+        # _Fp32OutputLinearFunction here too (same semantics as the default path, and
+        # faster than the upcast).
+        if bf16_cuda_operands and not is_in_batch_invariant_mode():
+            output = _Fp32OutputLinearFunction.apply(
+                input.reshape(-1, input.shape[-1]), weight
+            )
+            output = output.reshape(*input.shape[:-1], -1)
+            return output if bias is None else output + bias.float()
+        # Batch-invariant mode, non-CUDA devices, or fp32 operands: upcast.
+        bias = None if bias is None else bias.float()
+        return F.linear(input.float(), weight.float(), bias)
 
 
 class ColumnParallelLinear(Linear):
@@ -302,6 +315,9 @@ class _RouterGateLinearFunction(torch.autograd.Function):
 class RouterGateLinear(Linear):
     """Router projection with FP32 output and backward compute.
 
+    TODO: fold into ``Linear(output_dtype="float32")`` once ``Linear`` supports an fp32
+    backward; the forward is the same op.
+
     CUDA uses BF16 forward compute when both operands are BF16. All other
     forward paths use FP32 compute.
     """
@@ -323,7 +339,6 @@ class RouterGateLinear(Linear):
 
 
 __all__ = [
-    "CastLinear",
     "ColumnParallelLinear",
     "Linear",
     "RowParallelLinear",

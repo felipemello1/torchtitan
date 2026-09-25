@@ -4,10 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.config.transform import (
-    ModelConfigConverter,
-    validate_converter_compatibility,
-)
+from torchtitan.config.transform import ModelConfigConverter
 from torchtitan.models.qwen3_5 import (
     _27b,
     _35b_a3b,
@@ -59,7 +56,6 @@ def model_registry(
         ),
     )
     if converters is not None:
-        validate_converter_compatibility(converters)
         for converter_config in converters:
             config = converter_config.build().convert(config)
 

@@ -63,6 +63,11 @@ def _validate_quantizable_linear(
             f"Quantization does not support {owner.__qualname__} at {fqn!r}; "
             f"supported Linear classes are {supported}."
         )
+    if config.output_dtype != "input":
+        raise ValueError(
+            f"Quantization does not support output_dtype={config.output_dtype!r} "
+            f"at {fqn!r}."
+        )
 
 
 class QuantizationConverter(ModelConfigConverter):

@@ -32,13 +32,7 @@ from .attention import (
 from .decoder import Decoder, TransformerBlock
 from .embedding import Embedding
 from .feed_forward import compute_ffn_hidden_dim, FeedForward
-from .linear import (
-    CastLinear,
-    ColumnParallelLinear,
-    Linear,
-    RouterGateLinear,
-    RowParallelLinear,
-)
+from .linear import ColumnParallelLinear, Linear, RouterGateLinear, RowParallelLinear
 from .moe import MicrobatchWiseLoadBalanceLoss, MoE
 from .multimodal import MultimodalModel
 from .nn_modules import (
@@ -57,7 +51,6 @@ __all__ = [
     "Conv1d",
     "Conv2d",
     "ComplexRoPE",
-    "CastLinear",
     "ColumnParallelLinear",
     "CosSinRoPE",
     "create_attention_mask",

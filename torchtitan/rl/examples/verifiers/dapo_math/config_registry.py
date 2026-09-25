@@ -20,7 +20,6 @@ from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.components.renderer import from_renderers
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
-from torchtitan.config.transform import LMHeadCastConverter
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.qwen3 import model_registry
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
@@ -97,12 +96,9 @@ def _qwen3_4b_verifiers_config(
 ) -> Controller.Config:
     """Build the Qwen3-4B DAPO-Math configuration using Verifiers."""
     num_validation_samples = 30
-    model_config = model_registry(
-        "4B",
-        seq_len=max_total_tokens,
-        attn_backend="varlen",
-        converters=[LMHeadCastConverter.Config()],
-    )
+    model_config = model_registry("4B", seq_len=max_total_tokens, attn_backend="varlen")
+    # Compute vocabulary logits in fp32; the rest of the forward uses bf16.
+    model_config.lm_head.output_dtype = "float32"
     return Controller.Config(
         model=model_config,
         hf_assets_path="torchtitan/rl/example_checkpoint/Qwen3-4B-Base",
