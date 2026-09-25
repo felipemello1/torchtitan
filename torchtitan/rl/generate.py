@@ -28,12 +28,12 @@ from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.models.common.attention import FlexInnerAttention, VarlenInnerAttention
 from torchtitan.rl.examples.alphabet_sort import config_registry
+from torchtitan.rl.generator import vllm_attention_backend
 from torchtitan.rl.model.vllm_registry import (
     register_to_vllm,
     TORCHTITAN_CONFIG_FORMAT,
@@ -140,10 +140,8 @@ def generate() -> None:
         gpu_memory_utilization=gen_config.gpu_memory_limit,
         enforce_eager=gen_config.cuda_graph.mode == "NONE",
         attention_config=AttentionConfig(
-            backend=(
-                AttentionBackendEnum.FLEX_ATTENTION
-                if isinstance(attention_backend, FlexInnerAttention.Config)
-                else AttentionBackendEnum.CUSTOM
+            backend=vllm_attention_backend(
+                attention_backend, gen_config.attention_backend
             ),
         ),
         disable_log_stats=False,
