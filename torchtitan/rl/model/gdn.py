@@ -19,9 +19,13 @@ Batch-invariant execution has two additional requirements:
 Decode and prefill update the paged convolution and SSM state pools directly.
 """
 
+import dataclasses
 from dataclasses import dataclass
 
+import spmd_types as spmd
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from attn_gym.linear import (
     causal_conv1d_decode,
     gate_transform,
@@ -32,8 +36,15 @@ from attn_gym.linear import (
     recurrent_gdn_decode,
 )
 
+from spmd_types import SpmdType
+
+from torchtitan.distributed.parallel_dims import MeshAxisName
+from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
+from torchtitan.models.common.attention import VarlenMetadata
+from torchtitan.models.qwen3_5.gdn import GatedDeltaNet
 from torchtitan.protocols.module import Module
+from torchtitan.protocols.sharding import ShardingConfig
 from torchtitan.rl.model.gdn_backend import (
     GDNExecutionPath,
     TorchTitanGDNAttentionBackend,
@@ -232,8 +243,11 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         # the builder restages slots and freshness, including null padding.
         if gdn_metadata.execution_path is GDNExecutionPath.SINGLE_TOKEN:
             num_decode_rows = state_indices.numel()
+            # [q|k|v] is a column slice of the fused projection; the conv kernels
+            # need contiguous rows.
+            # TODO: drop the copy once Attention Gym's conv kernels accept a row stride.
             conv_output = causal_conv1d_decode(
-                mixed_qkv[:num_decode_rows],
+                mixed_qkv[:num_decode_rows].contiguous(),
                 conv_weight,
                 self.kv_cache[0],
                 activation="silu",
@@ -268,7 +282,7 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             return
 
         conv_output = paged_causal_conv1d(
-            mixed_qkv[:num_actual_tokens].unsqueeze(0),
+            mixed_qkv[:num_actual_tokens].contiguous().unsqueeze(0),
             conv_weight,
             self.kv_cache[0],
             state_indices,
@@ -349,30 +363,24 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
 
     def forward(
         self,
-        query_TC: torch.Tensor,
-        key_TC: torch.Tensor,
-        value_TC: torch.Tensor,
+        mixed_qkv_TC: torch.Tensor,
         a_TH: torch.Tensor,
         b_TH: torch.Tensor,
-        conv_q_weight_C1W: torch.Tensor,
-        conv_k_weight_C1W: torch.Tensor,
-        conv_v_weight_C1W: torch.Tensor,
+        conv_weight_CW: torch.Tensor,
         A_log_H: torch.Tensor,
         dt_bias_H: torch.Tensor,
         cu_seqlens: torch.Tensor,
         *,
         key_head_dim: int,
         value_head_dim: int,
-        use_varlen_kernels: bool = False,
     ) -> torch.Tensor:
-        """Run the flattened vLLM cache operation on rank-local tensors."""
+        """Run the flattened vLLM cache operation on rank-local tensors.
+
+        ``VLLMGatedDeltaNet`` passes its fused rank-local ``[q|k|v]`` projection and
+        the matching ``[conv_q|conv_k|conv_v]`` weight.
+        """
         assert key_head_dim == self.head_k_dim
         assert value_head_dim == self.head_v_dim
-        mixed_qkv_TC = torch.cat([query_TC, key_TC, value_TC], dim=-1)
-        conv_weight_CW = torch.cat(
-            [conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W],
-            dim=0,
-        ).squeeze(1)
         assert conv_weight_CW.shape[-1] == self.conv_kernel_size
 
         num_tokens = mixed_qkv_TC.shape[0]
@@ -391,3 +399,120 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             output_THV,
         )
         return output_THV
+
+
+class VLLMGatedDeltaNet(GatedDeltaNet):
+    """``GatedDeltaNet`` that runs its six input projections as one GEMM and its convs as one.
+
+    ``share_input_storage`` lays each rank's local shards of ``in_proj_{q,k,v,z,a,b}``
+    and ``conv_{q,k,v}`` out contiguously and re-points the parameters at row views of
+    those buffers. The model definition is unchanged: parameters, state-dict keys and
+    TP layouts are the trainer's, and loading or weight sync writes through the views.
+
+    Example, TP=2 on rank r (each projection is head-sharded on rows):
+
+        in_proj_weight = [q_r | k_r | v_r | z_r | a_r | b_r]   # one local GEMM
+        conv_weight    = [conv_q_r | conv_k_r | conv_v_r]      # one conv over [q_r|k_r|v_r]
+
+    Decode only: in training, the backward of the fused GEMM concatenates six gradients.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(GatedDeltaNet.Config):
+        pass
+
+    def share_input_storage(self) -> None:
+        """Re-point the projection and conv weights at row slices of two local buffers."""
+        projections = (
+            self.in_proj_q,
+            self.in_proj_k,
+            self.in_proj_v,
+            self.in_proj_z,
+            self.in_proj_a,
+            self.in_proj_b,
+        )
+        self.in_proj_weight, self.in_proj_split_sizes = _share_row_storage(projections)
+        convs = (self.conv_q, self.conv_k, self.conv_v)
+        conv_weight_C1W, _ = _share_row_storage(convs)
+        self.conv_weight = conv_weight_C1W.squeeze(1)
+
+    def forward(
+        self,
+        x_TD: torch.Tensor,
+        attention_masks: VarlenMetadata | None = None,
+    ) -> torch.Tensor:
+        tp_group = spmd_mesh_group(MeshAxisName.TP)
+        if tp_group is not None:
+            # All six projections read x: gather it once, like GatedDeltaNet.
+            x_TD = spmd.redistribute(
+                x_TD,
+                tp_group,
+                src=spmd.S(0) if spmd_dense_sp_enabled() else spmd.I,
+                dst=spmd.R,
+            )
+        num_tokens = x_TD.shape[0]
+        # Unused by the vLLM inner GDN, which reads the vLLM GDN metadata instead.
+        cu_seqlens = torch.arange(
+            0, num_tokens + 1, num_tokens, dtype=torch.int32, device=x_TD.device
+        )
+        num_qkv_channels = sum(self.in_proj_split_sizes[:3])
+        with spmd.local():
+            projected_TC = F.linear(x_TD, self.in_proj_weight)
+            # q, k and v are adjacent columns, so [q|k|v] is one row-strided view.
+            mixed_qkv_TC = projected_TC[:, :num_qkv_channels]
+            gate_TC, a_TH, b_TH = projected_TC[:, num_qkv_channels:].split(
+                self.in_proj_split_sizes[3:], dim=-1
+            )
+            gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)
+        output_THV = self.inner_gated_delta_net(
+            mixed_qkv_TC,
+            a_TH,
+            b_TH,
+            self.conv_weight,
+            self.A_log,
+            self.dt_bias,
+            cu_seqlens,
+            key_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+        )
+        output_THV = self.norm(output_THV, gate_THV)
+        return self.out_proj(output_THV.reshape(num_tokens, -1))
+
+
+def fused_inner_sharding_config(sharding_config: ShardingConfig) -> ShardingConfig:
+    """Rename the inner GDN's per-projection inputs to ``VLLMInnerGatedDeltaNet``'s fused ones.
+
+    Example:
+
+        {"query_TC": P, "key_TC": P, "value_TC": P, "conv_q_weight_C1W": W, ...}
+        # -> {"mixed_qkv_TC": P, "conv_weight_CW": W, ...}
+    """
+    renamed = {"query_TC": "mixed_qkv_TC", "conv_q_weight_C1W": "conv_weight_CW"}
+    dropped = {"key_TC", "value_TC", "conv_k_weight_C1W", "conv_v_weight_C1W"}
+
+    def fuse(shardings: dict[str, SpmdType]) -> dict[str, SpmdType]:
+        return {
+            renamed.get(name, name): layout
+            for name, layout in shardings.items()
+            if name not in dropped
+        }
+
+    return dataclasses.replace(
+        sharding_config,
+        in_src_shardings=fuse(sharding_config.in_src_shardings),
+        in_dst_shardings=fuse(sharding_config.in_dst_shardings),
+    )
+
+
+def _share_row_storage(
+    modules: tuple[nn.Module, ...],
+) -> tuple[torch.Tensor, list[int]]:
+    """Concatenate the modules' local weights on dim 0 and make each weight a row view."""
+    buffer = torch.cat([module.weight.detach() for module in modules])
+    split_sizes = [module.weight.shape[0] for module in modules]
+    for module, view in zip(modules, buffer.split(split_sizes), strict=True):
+        shared = nn.Parameter(view, requires_grad=False)
+        # Keep the parameter's SPMD layout annotation (TP head sharding).
+        spmd.assert_type_like(shared, module.weight)
+        module.weight = shared
+    return buffer, split_sizes

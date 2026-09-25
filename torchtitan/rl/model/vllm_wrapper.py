@@ -92,7 +92,11 @@ def _replace_vllm_layer_configs(model_config):
 
         delta_net_cfg = getattr(layer_cfg, "delta_net", None)
         if delta_net_cfg is not None:
-            from torchtitan.rl.model.gdn import VLLMInnerGatedDeltaNet
+            from torchtitan.config.transform.base import convert_config_type
+            from torchtitan.rl.model.gdn import (
+                VLLMGatedDeltaNet,
+                VLLMInnerGatedDeltaNet,
+            )
 
             vllm_inner_gdn_cfg = VLLMInnerGatedDeltaNet.Config(
                 layer_idx=layer_idx,
@@ -108,9 +112,12 @@ def _replace_vllm_layer_configs(model_config):
             )
             new_layer_cfg = dataclasses.replace(
                 new_layer_cfg,
-                delta_net=dataclasses.replace(
-                    delta_net_cfg,
-                    inner_gated_delta_net=vllm_inner_gdn_cfg,
+                delta_net=convert_config_type(
+                    dataclasses.replace(
+                        delta_net_cfg,
+                        inner_gated_delta_net=vllm_inner_gdn_cfg,
+                    ),
+                    VLLMGatedDeltaNet,
                 ),
             )
 
@@ -359,6 +366,21 @@ class VLLMModelWrapper(Module):
             )
         )
 
+        # update_from_config declares the inner GDN's per-projection inputs;
+        # VLLMGatedDeltaNet feeds it the fused [q|k|v] and conv weight instead.
+        from torchtitan.rl.model.gdn import (
+            fused_inner_sharding_config,
+            VLLMGatedDeltaNet,
+        )
+
+        for layer_cfg in self.config.layers:
+            delta_net_cfg = getattr(layer_cfg, "delta_net", None)
+            if isinstance(delta_net_cfg, VLLMGatedDeltaNet.Config):
+                inner_cfg = delta_net_cfg.inner_gated_delta_net
+                inner_cfg.sharding_config = fused_inner_sharding_config(
+                    inner_cfg.sharding_config
+                )
+
         # Apply config overrides (e.g. the Triton SwiGLU activation) after
         # update_from_config (which fills the sharding the override factories
         # read) and before build
@@ -388,6 +410,12 @@ class VLLMModelWrapper(Module):
         # Materialize model on GPU — only allocates local shards (not full
         # model) thanks to EP/TP DTensor sharding applied above.
         self.model.to_empty(device=vllm_config.device_config.device)
+        # After materialization (views do not survive to_empty), before loading.
+        from torchtitan.rl.model.gdn import VLLMGatedDeltaNet
+
+        for module in self.model.modules():
+            if isinstance(module, VLLMGatedDeltaNet):
+                module.share_input_storage()
         # HF checkpoints do not necessarily contain every TorchTitan buffer
         # (for example MoE expert_bias_E).
         # TODO: When checkpoint doesn't contains expert_bias_E, check the config
