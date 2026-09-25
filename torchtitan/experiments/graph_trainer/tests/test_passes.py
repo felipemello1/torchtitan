@@ -154,7 +154,7 @@ class TestDefaultTransformerBlockBuckets(TestCase):
             return SimpleNamespace(
                 compile=GraphTrainerCompileConfig(inductor_compilation="full"),
                 loss=loss,
-                model_spec=SimpleNamespace(model=SimpleNamespace(layers=[0, 1])),
+                model=SimpleNamespace(layers=[0, 1]),
                 parallelism=SimpleNamespace(),
             )
 
@@ -288,6 +288,7 @@ class TestReassignCollectivePgsPass(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
+            enable_sequence_parallel=False,
         )
 
     def _make_fsdp_model(self, dim=16, n_layers=3):
@@ -1785,6 +1786,7 @@ class TestOverlapPgIsolationPass(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
+            enable_sequence_parallel=False,
         )
 
     def _get_fsdp_pg_name(self):
@@ -1935,6 +1937,30 @@ class TestApplySACPass(TestCase):
     def _get_call_function_nodes(self, gm):
         """Return all call_function nodes from the graph."""
         return [n for n in gm.graph.nodes if n.op == "call_function"]
+
+    def test_none_policy_disables_activation_rematerialization(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        fwd = graph.call_function(torch.ops.aten.add.Tensor, args=(x, x))
+        bwd = graph.call_function(torch.ops.aten.mul.Tensor, args=(fwd, 2))
+        bwd.meta["autograd_backward"] = True
+        graph.output(bwd)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        config = SimpleNamespace(
+            compile=GraphTrainerCompileConfig(memory_policy="none")
+        )
+        tag_with_memory_policy_pass(gm, config=config)
+        selective_activation_remat_pass(gm)
+
+        self.assertEqual(fwd.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertFalse(
+            any(
+                node.name.endswith("_recomputed")
+                for node in gm.graph.nodes
+                if node.op == "call_function"
+            )
+        )
 
     def test_non_save_ops_marked_recompute(self):
         """Ops not in the save list should be marked PREFER_RECOMPUTE."""
@@ -2653,11 +2679,11 @@ class TestBucketingPrefetchOrder(FSDPTest):
     def _run_and_get_layer_ids(self, fsdp_reshard_after_forward: str):
         """Run a single forward+backward step and return bucketed AG layer ids."""
         from torchtitan.components.tokenizer import HuggingFaceTokenizer
+        from torchtitan.experiments.graph_trainer.common_utils import (
+            annotate_graph_trainer_model,
+        )
         from torchtitan.experiments.graph_trainer.llama3 import (
             model_registry as llama3_model_registry,
-        )
-        from torchtitan.experiments.graph_trainer.llama3.parallelize import (
-            annotate_llama,
         )
         from torchtitan.experiments.graph_trainer.simple_fsdp import (
             data_parallel,
@@ -2676,16 +2702,16 @@ class TestBucketingPrefetchOrder(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
+            enable_sequence_parallel=False,
         )
 
-        model_spec = llama3_model_registry("debugmodel")
-        model_config = model_spec.model
+        model_config = llama3_model_registry("debugmodel")
         vocab_size = model_config.vocab_size
 
         with torch.device("meta"):
             model = model_config.build()
 
-        annotate_llama(model)
+        annotate_graph_trainer_model(model)
         from torchtitan.experiments.graph_trainer.common_utils import (
             get_simple_fsdp_mesh,
         )
@@ -4225,7 +4251,7 @@ class TestChunkPasses(TestCase):
             graph_state=GraphStateSpec(),
         )
         config = SimpleNamespace(
-            model_spec=SimpleNamespace(model=SimpleNamespace(layers=[object()])),
+            model=SimpleNamespace(layers=[object()]),
             parallelism=SimpleNamespace(
                 expert_parallel_degree=1,
                 fsdp_reshard_after_forward="default",

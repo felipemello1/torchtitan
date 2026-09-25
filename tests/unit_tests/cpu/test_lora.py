@@ -25,7 +25,12 @@ from torchtitan.models.common.decoder_sharding import (
     set_dense_ffn_sharding,
 )
 from torchtitan.models.common.feed_forward import FeedForward
-from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.linear import (
+    ColumnParallelLinear,
+    Linear,
+    RowParallelLinear,
+)
+from torchtitan.models.common.vision_encoder import InvariantRowParallelLinear
 from torchtitan.models.llama3 import model_registry
 from torchtitan.protocols.module import Module
 
@@ -35,9 +40,9 @@ LINEAR_LORA_HANDLERS = (LinearLoRAHandler(),)
 
 def test_lora_model_builds():
     """LoRA debug model builds, has trainable adapters and frozen base."""
-    model_spec = model_registry("debugmodel")
-    model_spec.model = transform_model_config_(
-        model_spec.model,
+    model_config = model_registry("debugmodel")
+    model_config = transform_model_config_(
+        model_config,
         [
             LoRATransform(
                 handlers=LINEAR_LORA_HANDLERS,
@@ -47,8 +52,14 @@ def test_lora_model_builds():
             )
         ],
     )
-    model = model_spec.model.build()
+    model = model_config.build()
     model.init_states()
+
+    for layer in model.layers.values():
+        assert isinstance(layer.attention.qkv_linear.wqkv, ColumnParallelLinear)
+        assert isinstance(layer.attention.wo, RowParallelLinear)
+        assert hasattr(layer.attention.qkv_linear.wqkv, "lora_a")
+        assert hasattr(layer.attention.wo, "lora_a")
 
     lora_params = {
         n for n, p in model.named_parameters() if "lora_a" in n or "lora_b" in n
@@ -81,9 +92,9 @@ def test_lora_model_builds():
 
 def test_lora_forward():
     """LoRA model forward produces correct output shape."""
-    model_spec = model_registry("debugmodel")
-    model_spec.model = transform_model_config_(
-        model_spec.model,
+    model_config = model_registry("debugmodel")
+    model_config = transform_model_config_(
+        model_config,
         [
             LoRATransform(
                 handlers=LINEAR_LORA_HANDLERS,
@@ -93,10 +104,10 @@ def test_lora_forward():
             )
         ],
     )
-    model = model_spec.model.build()
+    model = model_config.build()
     model.init_states()
 
-    vocab_size = model_spec.model.vocab_size
+    vocab_size = model_config.vocab_size
     num_documents, seq_len = 2, 16
     num_tokens = num_documents * seq_len
     tokens = torch.randint(0, vocab_size, (num_tokens,))
@@ -236,7 +247,7 @@ def test_float8_lora_targets_fused_feed_forward_projection():
 
 
 def test_lora_class_is_reused_for_the_same_parent():
-    """Dynamic LoRA class creation is cached per parent class."""
+    """The LoRA class is cached for each parent Linear class."""
     first = LoRATransform(handlers=LINEAR_LORA_HANDLERS, rank=2, alpha=4.0).transform(
         Linear.Config(in_features=4, out_features=3)
     )
@@ -267,6 +278,26 @@ def test_lora_handler_matches_linear_config_subclass():
     assert not model.weight.requires_grad
     assert model.lora_a.weight.requires_grad
     assert model.lora_b.weight.requires_grad
+
+
+def test_lora_preserves_invariant_row_parallel_linear():
+    config = InvariantRowParallelLinear.Config(
+        in_features=4,
+        out_features=3,
+        bias=True,
+    )
+    transformed = LoRATransform(
+        handlers=LINEAR_LORA_HANDLERS,
+        rank=2,
+        alpha=4.0,
+    ).transform(config)
+    linear = transformed.build()
+
+    assert isinstance(linear, InvariantRowParallelLinear)
+    x = torch.randn(5, 4)
+    expected = F.linear(x, linear.weight, linear.bias)
+    expected += 2 * linear.lora_b(linear.lora_a(x))
+    torch.testing.assert_close(linear(x), expected)
 
 
 def test_lora_transform_rejects_duplicate_handler_type():
@@ -325,11 +356,11 @@ def test_lora_rank_validation():
 
 
 def test_multiple_lora_transforms_conflict():
-    model_spec = model_registry("debugmodel")
+    model_config = model_registry("debugmodel")
 
     with pytest.raises(ValueError, match="cannot be combined"):
         transform_model_config_(
-            model_spec.model,
+            model_config,
             [
                 LoRATransform(
                     handlers=LINEAR_LORA_HANDLERS,

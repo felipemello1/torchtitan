@@ -11,6 +11,7 @@ formatters (e.g. the Scuba formatter under ``fb/``).
 """
 
 import datetime as dt
+import functools
 import itertools
 import json
 import logging
@@ -19,6 +20,7 @@ import random
 import socket
 import string
 import threading
+import time
 from timeit import default_timer as timer
 from typing import Any
 
@@ -133,7 +135,7 @@ class TraceJsonlFormatter(logging.Formatter):
         # Caller field for source traceability (file:line:function)
         log_dict[
             "caller"
-        ] = f"{os.path.relpath(record.pathname)}:{record.lineno}:{record.funcName}"
+        ] = f"{_relpath(record.pathname)}:{record.lineno}:{record.funcName}"
         log_dict["log_file"] = record.filename
         log_dict["log_function"] = record.funcName
         log_dict["log_level"] = record.levelname
@@ -166,12 +168,19 @@ class TraceJsonlFormatter(logging.Formatter):
 
 
 class TraceJsonlHandler(logging.FileHandler):
-    """Per-rank JSONL file handler.
+    """Per-rank JSONL file handler that flushes at most once per ``flush_interval_s``.
+
+    ``StreamHandler`` flushes after every record, one ``write`` syscall each: about
+    0.5 ms per record on NFS, paid by the thread that logged. Records between
+    flushes stay in the file buffer; closing the handler (including at interpreter
+    exit via ``logging.shutdown``) writes them out.
 
     File path::
 
         {output_dir}/structured_logs/{source}.global_rank_{rank}.{timestamp}-{random}.jsonl
     """
+
+    flush_interval_s: float = 1.0
 
     def __init__(self, rank: int, source: str, output_dir: str):
         timestamp_str = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -184,6 +193,20 @@ class TraceJsonlHandler(logging.FileHandler):
         super().__init__(filename=filepath)
         self.setFormatter(TraceJsonlFormatter(rank=rank, source=source))
         self.addFilter(TraceEventsOnlyFilter())
+        # The first record flushes immediately, so the file is readable right away.
+        self._last_flush_s = float("-inf")
+
+    def flush(self) -> None:
+        now = time.monotonic()
+        if now - self._last_flush_s >= self.flush_interval_s:
+            self._last_flush_s = now
+            super().flush()
+
+
+@functools.cache
+def _relpath(path: str) -> str:
+    # os.path.relpath calls os.getcwd() on every record; callers repeat a few paths.
+    return os.path.relpath(path)
 
 
 def register_jsonl_handler(

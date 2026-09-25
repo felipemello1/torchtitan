@@ -73,8 +73,10 @@ def reset_context():
 
 
 @pytest.fixture
-def structured_logger_fixture():
+def structured_logger_fixture(monkeypatch):
     """Provide a clean structured logger for testing."""
+    # Tests read the JSONL file right after logging.
+    monkeypatch.setattr(TraceJsonlHandler, "flush_interval_s", 0.0)
     tl = _structured_logger
     root_logger = logging.getLogger()
     orig = (
@@ -644,6 +646,28 @@ class TestInitStructuredLogger:
         parsed = json.loads(line)
         assert parsed["rank"] == 0
         assert parsed["source"] == "trainer"
+
+    def test_flushes_at_most_once_per_interval(
+        self, tmp_path, structured_logger_fixture
+    ):
+        init_structured_logger(rank=0, source="generator", output_dir=str(tmp_path))
+        handler = next(
+            h
+            for h in structured_logger_fixture.handlers
+            if isinstance(h, TraceJsonlHandler)
+        )
+        handler.flush_interval_s = 3600.0
+
+        def read_lines():
+            with open(handler.baseFilename) as f:
+                return f.read().splitlines()
+
+        for step in range(3):
+            structured_logger_fixture.info("x", extra=event_extra("step", step=step))
+        # Only the first record is flushed within the interval.
+        assert len(read_lines()) == 1
+        handler.close()
+        assert [json.loads(line)["step"] for line in read_lines()] == [0, 1, 2]
 
     def test_idempotent(self, tmp_path, structured_logger_fixture):
         output_dir = str(tmp_path)
