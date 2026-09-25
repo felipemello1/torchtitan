@@ -29,6 +29,22 @@ The Blackwell path is still faster than attn_gym's Triton GDN backward: 6.60 vs 
 
 ## Entries
 
+### 2026-09-25 16:10 — generator: TRT-LLM cubins, host overhead, structured-log flushes (keep)
+Full write-up: `investigations/generator/GENERATOR_ANALYSIS_AND_PLAN_20260925.md`.
+- **The 32k:2048 "gap" was prefill-only padding.** #61 now caps V2's auto capture sizes. 27B prefill (bs1, ms): Titan 51.9 / 108.6 / 345.7 / 142.5 / 250.5 vs native 58.0 / 117.3 / 356.0 / 152.3 / 254.4.
+- **Long decode (27B, 4096 tokens):** within 0.6% of native at bs1, 4-5% faster at bs16.
+- **flashinfer-cubin.** vLLM skipped TRT-LLM attention because NVIDIA's artifactory is blocked, then synced `seq_lens.cpu()` every decode step.
+  - With the 0.6.18.post1 cubin wheel from FlashInfer's GitHub release, 27B Titan decode goes 11.21 / 12.31 / 11.55 / 15.83 -> 10.84 / 11.89 / 11.18 / 14.27 ms/token, and prefill 32k:2048 goes 249 -> 159 ms.
+  - Native with cubins: 10.78 / 12.50 / 11.13 / 14.80.
+  - FairTitan #21 (with FA4 b32 and flashinfer-jit-cache).
+- **Generator host overhead (#62).** detokenize=False, flat_logprobs, and one span per burst: 4B bs64 +10%, bs256 +26%.
+- **Structured logger (#63).** Flush at most once per second, cache relpath: 565 -> 30 us per span on NFS. 4B bs64 with logs on NFS: 3.9k -> 9.4k tok/s.
+- **#61 now warms up FlashInfer GDN prefill** during profiling.
+- **Rejected:**
+  - Engine core in its own process: +1.7% at 4B bs256.
+  - FlashInfer mm_bf16 low-M GEMMs: about 1% at 27B bs1.
+  - Inductor PDL for Titan: about 0.6%.
+
 ### 2026-09-25 12:45 — generator prefill: FlashInfer GDN kernel on V2, no prefill-sized graphs (keep, #61)
 - Finding: decode was at parity, but bs1 prefill (time to one token) was 35–64% slower than native at 27B. Measured with the `bench.py --prefill-sweep cached:new` mode, which is new. From a profile of a 2048-token prefill (`--profile-prefill`):
   - on V2, packed GDN runs eagerly, and Titan's path launches ~12 kernels per layer plus Python. Attention Gym's jit-cache `make_runtime_key` / `_canonicalize` costs ~0.3 ms per call under the profiler. The GPU idles ~50 ms per prefill.
