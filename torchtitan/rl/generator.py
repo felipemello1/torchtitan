@@ -762,7 +762,9 @@ class VLLMGenerator(Configurable):
           split-KV, so decode time grows linearly with context. Required for
           batch-invariant mode.
         - ``"flashinfer"``: vLLM's FlashInfer backend, which splits long KV across
-          SMs at decode (vLLM's own default on SM100)."""
+          SMs at decode (vLLM's own default on SM100). On SM100 it runs the
+          faster TRT-LLM kernels only if ``flashinfer-cubin`` for the installed
+          FlashInfer version is present (or NVIDIA's artifactory is reachable)."""
 
         checkpointer: Annotated[
             CheckpointManager.Config | None, tyro.conf.AvoidSubcommands
