@@ -135,6 +135,7 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             and torch.cuda.get_device_capability()[0] == 10
             and self.head_k_dim == 128
         )
+        self._flashinfer_prefill_warmed_up = False
 
         # vLLM populates this via the KV-cache allocator: (conv_state, ssm_state).
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
@@ -225,6 +226,8 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             attn_metadata.get(self.prefix) if isinstance(attn_metadata, dict) else None
         )
         if gdn_metadata is None:
+            if self.use_flashinfer_prefill and not self._flashinfer_prefill_warmed_up:
+                self._warm_up_flashinfer_prefill(mixed_qkv, A_log, dt_bias)
             return
         assert isinstance(gdn_metadata, TorchTitanGDNAttentionMetadata)
         assert (
@@ -336,6 +339,49 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             cu_seqlens,
             state_indices,
             has_initial_state,
+        )
+
+    def _warm_up_flashinfer_prefill(
+        self, mixed_qkv: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor
+    ) -> None:
+        """Compile FlashInfer's prefill kernels during vLLM's profiling run.
+
+        Otherwise the first real prefill compiles them mid-request (~3 s per process),
+        after vLLM has handed most free memory to the KV cache. Like vLLM's native
+        warmup, one 64-token sequence from a zero state.
+        """
+        self._flashinfer_prefill_warmed_up = True
+        num_tokens = 64
+        query, key, value, decay, update_gate = fused_post_conv_prep(
+            conv_output=mixed_qkv.new_zeros(num_tokens, mixed_qkv.shape[-1]),
+            a=mixed_qkv.new_zeros(num_tokens, self.local_num_v_heads),
+            b=mixed_qkv.new_zeros(num_tokens, self.local_num_v_heads),
+            A_log=A_log,
+            dt_bias=dt_bias,
+            num_k_heads=self.local_num_k_heads,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            apply_l2norm=True,
+            output_g_exp=True,
+        )
+        flashinfer_chunk_gated_delta_rule(
+            q=query,
+            k=key,
+            v=value,
+            g=decay,
+            beta=update_gate,
+            scale=self.head_k_dim**-0.5,
+            initial_state=mixed_qkv.new_zeros(
+                1,
+                self.local_num_v_heads,
+                self.head_v_dim,
+                self.head_k_dim,
+                dtype=torch.float32,
+            ),
+            output_final_state=True,
+            cu_seqlens=torch.tensor(
+                [0, num_tokens], device=mixed_qkv.device, dtype=torch.int32
+            ),
         )
 
     def _forward_gdn_flashinfer(
