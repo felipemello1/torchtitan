@@ -163,13 +163,9 @@ class Linear(nn.Linear, Module):
             and input.dtype == torch.bfloat16
             and weight.dtype == torch.bfloat16
         )
-        # Batch-invariant mode can't use _Fp32OutputLinearFunction yet: its cuBLAS
-        # out_dtype GEMM may pick a different algorithm per batch size, so a token's
-        # logits could change with batch composition.
-        # TODO: once batch_invariant_ops' fixed-tile matmul gets a bf16-input,
-        # fp32-output entry point, route this op to it in batch-invariant mode and use
-        # _Fp32OutputLinearFunction here too (same semantics as the default path, and
-        # faster than the upcast).
+        # cuBLAS's out_dtype GEMM isn't batch-invariant, so batch-invariant mode upcasts.
+        # TODO: use _Fp32OutputLinearFunction there too once batch_invariant_ops has a
+        # bf16-input, fp32-output matmul.
         if bf16_cuda_operands and not is_in_batch_invariant_mode():
             output = _Fp32OutputLinearFunction.apply(
                 input.reshape(-1, input.shape[-1]), weight
