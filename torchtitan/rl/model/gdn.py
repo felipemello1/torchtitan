@@ -7,7 +7,8 @@
 """vLLM paged-cache adapter for TorchTitan's Gated DeltaNet.
 
 The enclosing Qwen3.5 module owns all parameters. This adapter runs Attention
-Gym's paging-aware convolution and GDN kernels.
+Gym's paging-aware convolution and GDN kernels. On the V2 runner on Blackwell,
+prefill uses FlashInfer's chunked GDN kernel instead, like vLLM's native Qwen3.5.
 
 Batch-invariant execution has two additional requirements:
 
@@ -32,6 +33,10 @@ from attn_gym.linear import (
     recurrent_gdn_decode,
 )
 
+from flashinfer.gdn_prefill import (
+    chunk_gated_delta_rule as flashinfer_chunk_gated_delta_rule,
+)
+
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.protocols.module import Module
 from torchtitan.rl.model.gdn_backend import (
@@ -47,6 +52,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.third_party.flash_linear_attention.ops import fused_post_conv_prep
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
@@ -121,6 +127,14 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
                 f"got {self.cache_config.mamba_ssm_cache_dtype!r}."
             )
         self.cache_config.mamba_ssm_cache_dtype = "float32"
+        # The V2 runner never captures packed GDN (see
+        # TorchTitanGDNAttentionMetadataBuilder.get_cudagraph_support), so its
+        # prefill can use FlashInfer's Blackwell kernel, which requires head_dim 128.
+        self.use_flashinfer_prefill = (
+            vllm_config.use_v2_model_runner
+            and torch.cuda.get_device_capability()[0] == 10
+            and self.head_k_dim == 128
+        )
 
         # vLLM populates this via the KV-cache allocator: (conv_state, ssm_state).
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
@@ -277,6 +291,24 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             cu_seqlens=cu_seqlens,
             has_initial_state=has_initial_state,
         ).squeeze(0)
+        # Captured graphs keep the capacity-shaped Attention Gym path, since
+        # FlashInfer's inputs are sliced by a host-side request count.
+        if self.use_flashinfer_prefill and not torch.cuda.is_current_stream_capturing():
+            # Empty trailing intervals cost FlashInfer a work tile each, so pass
+            # only the real requests. Padded rows keep the caller's zero fill.
+            num_reqs = gdn_metadata.num_prefills + gdn_metadata.num_decodes
+            self._forward_gdn_flashinfer(
+                conv_output,
+                a[:num_actual_tokens],
+                b[:num_actual_tokens],
+                A_log,
+                dt_bias,
+                output[:num_actual_tokens],
+                cu_seqlens[: num_reqs + 1],
+                state_indices[:num_reqs],
+                has_initial_state[:num_reqs],
+            )
+            return
         self._forward_gdn(
             conv_output,
             a[:num_actual_tokens],
@@ -288,6 +320,52 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             state_indices,
             has_initial_state,
         )
+
+    def _forward_gdn_flashinfer(
+        self,
+        conv_output: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        output: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        slots: torch.Tensor,
+        has_initial_state: torch.Tensor,
+    ) -> None:
+        """Prefill with vLLM's fused split/l2norm/gate kernel and FlashInfer's chunked GDN.
+
+        These are the kernels vLLM's native Qwen3.5 prefill uses on Blackwell.
+        """
+        num_tokens = conv_output.shape[0]
+        query, key, value, decay, update_gate = fused_post_conv_prep(
+            conv_output=conv_output,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            num_k_heads=self.local_num_k_heads,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            apply_l2norm=True,
+            output_g_exp=True,
+        )
+        ssm_state = self.kv_cache[1]
+        initial_state = ssm_state[slots]
+        initial_state.mul_(has_initial_state.view(-1, 1, 1, 1))
+        _, final_state = flashinfer_chunk_gated_delta_rule(
+            q=query,
+            k=key,
+            v=value,
+            g=decay,
+            beta=update_gate,
+            scale=self.head_k_dim**-0.5,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            output=output.view(num_tokens, self.local_num_v_heads, self.head_v_dim),
+        )
+        ssm_state[slots] = final_state
 
     def _forward_gdn(
         self,
