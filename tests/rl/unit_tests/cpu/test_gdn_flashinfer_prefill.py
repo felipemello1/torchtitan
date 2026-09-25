@@ -106,3 +106,32 @@ def test_flashinfer_prefill_matches_attention_gym() -> None:
         assert _relative_error(actual_ssm[slot], expected_ssm[slot]) < 1e-2
     untouched = [0, 2, 4, 5]
     assert torch.equal(actual_ssm[untouched], ssm_pool[untouched])
+
+
+def test_profiling_run_warms_up_flashinfer_prefill() -> None:
+    device = torch.device("cuda")
+    num_k_heads, num_v_heads, head_dim = 16, 32, 128
+    conv_dim = (2 * num_k_heads + num_v_heads) * head_dim
+    layer = gdn.VLLMInnerGatedDeltaNet.__new__(gdn.VLLMInnerGatedDeltaNet)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = "gdn"
+    layer.local_num_k_heads, layer.local_num_v_heads = num_k_heads, num_v_heads
+    layer.head_k_dim = layer.head_v_dim = head_dim
+    layer.use_flashinfer_prefill = True
+    layer._flashinfer_prefill_warmed_up = False
+    output = torch.zeros(8, num_v_heads, head_dim, device=device, dtype=torch.bfloat16)
+    # vLLM's profiling run has no GDN metadata; the output stays zero.
+    context = ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={})
+    with torch.inference_mode(), override_forward_context(context):
+        layer._forward(
+            torch.randn(8, conv_dim, device=device, dtype=torch.bfloat16),
+            torch.randn(8, num_v_heads, device=device, dtype=torch.bfloat16),
+            torch.randn(8, num_v_heads, device=device, dtype=torch.bfloat16),
+            torch.randn(conv_dim, 4, device=device, dtype=torch.bfloat16),
+            None,
+            torch.rand(num_v_heads, device=device, dtype=torch.bfloat16),
+            torch.randn(num_v_heads, device=device, dtype=torch.bfloat16),
+            output,
+        )
+    assert layer._flashinfer_prefill_warmed_up
+    assert not output.count_nonzero()
