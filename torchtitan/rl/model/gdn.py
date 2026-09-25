@@ -22,6 +22,8 @@ Decode and prefill update the paged convolution and SSM state pools directly.
 from dataclasses import dataclass
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from attn_gym.linear import (
     causal_conv1d_decode,
     gate_transform,
@@ -33,6 +35,7 @@ from attn_gym.linear import (
 )
 
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
+from torchtitan.models.qwen3_5.gdn import FusedGatedDeltaNet
 from torchtitan.protocols.module import Module
 from torchtitan.rl.model.gdn_backend import (
     GDNExecutionPath,
@@ -427,8 +430,11 @@ class VLLMFusedInnerGatedDeltaNet(VLLMInnerGatedDeltaNet):
         output_THV = mixed_qkv_TC.new_zeros(
             num_tokens, self.local_num_v_heads, self.head_v_dim
         )
+        # A no-op for a separate [q|k|v] GEMM; copies the column slice from the
+        # single-GEMM VLLMFusedGatedDeltaNet.
+        # TODO: drop the copy once Attention Gym's convolutions accept a row stride.
         self._forward(
-            mixed_qkv_TC,
+            mixed_qkv_TC.contiguous(),
             a_TH,
             b_TH,
             conv_weight_C1W.squeeze(1),
@@ -438,3 +444,45 @@ class VLLMFusedInnerGatedDeltaNet(VLLMInnerGatedDeltaNet):
             output_THV,
         )
         return output_THV
+
+
+class VLLMFusedGatedDeltaNet(FusedGatedDeltaNet):
+    """``FusedGatedDeltaNet`` that runs ``in_proj_qkv`` and ``in_proj_zab`` as one GEMM.
+
+    After ``share_input_projection_storage``, both weights are row views of one
+    ``[q|k|v|z|a|b]`` buffer. The state dict keeps both keys, and loading or weight
+    sync writes through the views into the buffer.
+
+    Decode only: in training, the ``[q|k|v]`` slice copy and the backward
+    concatenation of the six gradients cost more than the saved launch.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(FusedGatedDeltaNet.Config):
+        pass
+
+    def share_input_projection_storage(self) -> None:
+        """Re-point both projection weights at row slices of one buffer."""
+        qkv_weight = self.in_proj_qkv.weight.detach()
+        zab_weight = self.in_proj_zab.weight.detach()
+        self.in_proj_weight = torch.cat([qkv_weight, zab_weight])
+        num_qkv_rows = qkv_weight.shape[0]
+        self.in_proj_qkv.weight = nn.Parameter(
+            self.in_proj_weight[:num_qkv_rows], requires_grad=False
+        )
+        self.in_proj_zab.weight = nn.Parameter(
+            self.in_proj_weight[num_qkv_rows:], requires_grad=False
+        )
+
+    def _project_inputs(
+        self, x_TD: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return F.linear(x_TD, self.in_proj_weight).split(
+            [
+                self.in_proj_qkv.weight.shape[0],
+                self.num_value_heads * self.value_head_dim,
+                self.num_value_heads,
+                self.num_value_heads,
+            ],
+            dim=-1,
+        )

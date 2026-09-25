@@ -92,16 +92,17 @@ def _replace_vllm_layer_configs(model_config):
 
         delta_net_cfg = getattr(layer_cfg, "delta_net", None)
         if delta_net_cfg is not None:
+            from torchtitan.config.transform import convert_config_type
             from torchtitan.models.qwen3_5.gdn import FusedGatedDeltaNet
             from torchtitan.rl.model.gdn import (
+                VLLMFusedGatedDeltaNet,
                 VLLMFusedInnerGatedDeltaNet,
                 VLLMInnerGatedDeltaNet,
             )
 
+            fused = isinstance(delta_net_cfg, FusedGatedDeltaNet.Config)
             vllm_inner_gdn_cls = (
-                VLLMFusedInnerGatedDeltaNet
-                if isinstance(delta_net_cfg, FusedGatedDeltaNet.Config)
-                else VLLMInnerGatedDeltaNet
+                VLLMFusedInnerGatedDeltaNet if fused else VLLMInnerGatedDeltaNet
             )
             vllm_inner_gdn_cfg = vllm_inner_gdn_cls.Config(
                 layer_idx=layer_idx,
@@ -111,13 +112,14 @@ def _replace_vllm_layer_configs(model_config):
                 head_v_dim=delta_net_cfg.value_head_dim,
                 conv_kernel_size=delta_net_cfg.conv_kernel_size,
             )
-            new_layer_cfg = dataclasses.replace(
-                new_layer_cfg,
-                delta_net=dataclasses.replace(
-                    delta_net_cfg,
-                    inner_gated_delta_net=vllm_inner_gdn_cfg,
-                ),
+            delta_net_cfg = dataclasses.replace(
+                delta_net_cfg, inner_gated_delta_net=vllm_inner_gdn_cfg
             )
+            if fused:
+                delta_net_cfg = convert_config_type(
+                    delta_net_cfg, VLLMFusedGatedDeltaNet
+                )
+            new_layer_cfg = dataclasses.replace(new_layer_cfg, delta_net=delta_net_cfg)
 
         new_layers.append(new_layer_cfg)
 
@@ -393,6 +395,12 @@ class VLLMModelWrapper(Module):
         # Materialize model on GPU — only allocates local shards (not full
         # model) thanks to EP/TP DTensor sharding applied above.
         self.model.to_empty(device=vllm_config.device_config.device)
+        # After materialization (views do not survive to_empty), before loading.
+        from torchtitan.rl.model.gdn import VLLMFusedGatedDeltaNet
+
+        for module in self.model.modules():
+            if isinstance(module, VLLMFusedGatedDeltaNet):
+                module.share_input_projection_storage()
         # HF checkpoints do not necessarily contain every TorchTitan buffer
         # (for example MoE expert_bias_E).
         # TODO: When checkpoint doesn't contains expert_bias_E, check the config

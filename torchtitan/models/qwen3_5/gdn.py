@@ -559,11 +559,7 @@ class FusedGatedDeltaNet(Module):
         x_TD, cu_seqlens = _gather_input_and_cu_seqlens(x_TD, attention_masks)
         num_tokens = x_TD.shape[0]
 
-        mixed_qkv_TC = self.in_proj_qkv(x_TD)
-        gate_TC, a_TH, b_TH = self.in_proj_zab(x_TD).split(
-            [self.num_value_heads * self.value_head_dim] + [self.num_value_heads] * 2,
-            dim=-1,
-        )
+        mixed_qkv_TC, gate_TC, a_TH, b_TH = self._project_inputs(x_TD)
         output_THV = self.inner_gated_delta_net(
             mixed_qkv_TC,
             a_TH,
@@ -578,6 +574,17 @@ class FusedGatedDeltaNet(Module):
         gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)
         output_THV = self.norm(output_THV, gate_THV)
         return self.out_proj(output_THV.reshape(num_tokens, -1))
+
+    def _project_inputs(
+        self, x_TD: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(mixed_qkv_TC, gate_TC, a_TH, b_TH)``."""
+        mixed_qkv_TC = self.in_proj_qkv(x_TD)
+        gate_TC, a_TH, b_TH = self.in_proj_zab(x_TD).split(
+            [self.num_value_heads * self.value_head_dim] + [self.num_value_heads] * 2,
+            dim=-1,
+        )
+        return mixed_qkv_TC, gate_TC, a_TH, b_TH
 
 
 def _gather_input_and_cu_seqlens(
