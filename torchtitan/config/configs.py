@@ -27,7 +27,7 @@ The command-line surface is frozen either way, so annotate a new field with
 """
 
 from dataclasses import dataclass, field
-from typing import Annotated, get_args, Literal, TypeAlias
+from typing import Annotated, Any, get_args, Literal, TypeAlias
 
 import torch
 import tyro
@@ -319,6 +319,22 @@ class CompileConfig:
     """Which components to compile"""
 
     backend: str = "inductor"
+
+    inductor_options: Annotated[dict[str, Any], tyro.conf.Suppress] = field(
+        default_factory=lambda: {
+            "max_pointwise_cat_inputs": 0,
+            "max_complex_pointwise_cat_inputs": 0,
+        }
+    )
+    """Inductor config for the compiled transformer blocks (``torch.compile(options=...)``).
+    Ignored for non-inductor backends.
+
+    The default lowers every ``cat``/``stack`` as a ConcatKernel: each producer writes its
+    slice of the output directly. Inductor's pointwise lowering instead reads all inputs
+    through masked, index-branching loads, which halves SwiGLU backward throughput (the
+    gate/up gradient ``stack`` into ``w13``'s gradient).
+    TODO: drop once inductor's cat heuristic prefers ConcatKernel for these cases.
+    """
 
     def __post_init__(self) -> None:
         allowed = frozenset({"model", "loss"})
