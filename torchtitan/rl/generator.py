@@ -184,6 +184,10 @@ class VLLMCudaGraphConfig:
       captured too.
     """
 
+    vllm_compile: bool = False
+    """Run vLLM's inductor compile of the model forward before capturing graphs
+    (``CompilationMode.VLLM_COMPILE``). ``False`` captures the eager forward."""
+
     capture_sizes: list[int] | None = None
     """Explicit CUDA graph capture batch sizes. When ``None`` (default), sizes are
     auto-derived: powers of 2 up to the cap, plus ``max_num_seqs`` and the cap as
@@ -228,7 +232,8 @@ class VLLMCudaGraphConfig:
         ``enable_sequence_parallel`` is forwarded to vLLM's sequence parallelism
         pass. vLLM filters dense-SP CUDA graph sizes using its own TP size.
 
-        All modes capture with ``mode=CompilationMode.NONE`` (no inductor compile).
+        Graph modes use ``CompilationMode.VLLM_COMPILE`` when ``vllm_compile`` is
+        set and ``CompilationMode.NONE`` (no inductor compile) otherwise.
         """
         if self.mode == "NONE":
             return CompilationConfig(
@@ -293,7 +298,11 @@ class VLLMCudaGraphConfig:
 
         return CompilationConfig(
             cudagraph_mode=self.mode,
-            mode=CompilationMode.NONE,
+            mode=(
+                CompilationMode.VLLM_COMPILE
+                if self.vllm_compile
+                else CompilationMode.NONE
+            ),
             cudagraph_capture_sizes=sizes,
             pass_config=PassConfig(
                 enable_sp=enable_sequence_parallel,
