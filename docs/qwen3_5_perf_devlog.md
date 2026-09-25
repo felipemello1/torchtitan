@@ -11,7 +11,7 @@ Generator, decode ms/token (2k bs1 / 2k bs16 / 32k bs1 / 32k bs16), unseeded sam
 4B   Titan        3.56  3.91  3.80  6.11      native V2 3.28 3.96 3.51 6.19    native V1 3.38 4.04 3.69 6.31
 27B  Titan       11.51 12.55 11.89 16.14      native V2 11.15 12.93 11.52 16.47  native V1 11.29 13.06 11.64 16.57
 ```
-Titan must run vLLM's V1 runner, which costs native 0.1–0.19 ms/step. Against native on the same V1 runner, Titan is at 95 / 103 / 97 / 103% (4B) and 98 / 104 / 98 / 103% (27B). A V2-runner port is being investigated separately.
+Titan must run vLLM's V1 runner, which costs native 0.1–0.19 ms/step. Against native on the same V1 runner, Titan is at 95 / 103 / 97 / 103% (4B) and 98 / 104 / 98 / 103% (27B). The V2-runner port is #61 (entry 08:00).
 
 Trainer, one Qwen3.5 GDN layer (fused projections, #57), fwd+bwd, 16k tokens in 4 documents, torch.compile, bf16 (`gdn_train_profile.py`):
 ```text
@@ -34,7 +34,7 @@ The Blackwell path is still faster than attn_gym's Triton GDN backward: 6.60 vs 
 - Change (#58): on the single-token path, skip the query_start_loc copy/fill and `split_decodes_and_prefills`, and write `has_initial_state` with one `torch.gt(seq_lens, 1, out=...)`.
 - Result, pinned, 2 processes: 4B 3.05-3.15 / 3.69-3.71 / 3.31-3.39 / 5.91-5.94 -> 2.96-2.97 / 3.64 / 3.21 / 5.85-5.89 ms.
 - Final medians against native V2: 4B 110 / 108 / 109 / 105%; 27B 99.7 / 105 / 100 / 104% (5 Titan processes, 2 native).
-- Variance: at 27B bs1, 1 of 5 CuMem-pool processes was slow (11.43 vs ~11.16 ms). Four processes without the CuMem pool were all 11.11–11.16.
+- Variance: at 27B bs1, 1 of 5 CuMem-pool processes was slow (11.43 vs ~11.16 ms). Five processes without the CuMem pool were all 11.11–11.16. The CuMem pool is needed for RDMA weight transfer, so this is a caveat, not a fix.
 
 ### 2026-09-25 09:10 — generator bs=1: remove extra kernels, not slow ones (keep)
 - Finding: on vLLM's V2 runner, Titan's decode step has the same GPU busy time as native (27B 2k bs1: 10.79 vs 10.73 ms). But it launches 1183 kernels per step against 1018, and the gaps between CUDA-graph nodes add ~0.26 ms per step (`gpu_gaps.py`: in-step idle 0.40 vs 0.14 ms). The extra kernels:
@@ -88,11 +88,11 @@ The Blackwell path is still faster than attn_gym's Triton GDN backward: 6.60 vs 
 - Keep.
 
 ### Rejected
-- Unfusing the residual `addmm` in the generator (post-grad pass) removes 128 memcpy/step at 27B. But the add then lands in a slower add+RMSNorm kernel (2.9 -> 4.8 us at bs1), and bs16 regresses: 27B 12.69 -> 12.91 ms at 2k/bs16. In training it is neutral: 28.41 vs 28.59 ms per 27B block.
+- Unfusing the residual `addmm` for every batch size: bs16 regresses (27B 12.69 -> 12.91 ms at 2k/bs16), and in training it is neutral (28.41 vs 28.59 ms per 27B block). The kept version is gated to the single-token graph and adds `realize_reads_threshold=1` (entry 09:10).
 - `pattern_matcher=False` for the generator: bs1 slightly better, bs16 worse (loses other fusions). Dropped.
 - vLLM's hand-written custom ops (`custom_ops=all`) on native are 1–3% slower than inductor.
 - Single `[q|k|v|z|a|b]` GEMM in the model: +5% (27B) / +9% (4B) per GDN layer in training. Kept generator-only (#59).
 
 ### Open
-- V2 runner prototype (branch `rl-gen-v2-runner`): bs1 faster (27B 11.51 -> 11.43, 4B 3.56 -> 3.42) but 32k/bs16 slower (27B 16.14 -> 16.59), with equal GPU busy time. Host/scheduling cause not yet found. Not opened as a PR.
+- CuMem-pool variance at bs1: about 1 in 5 processes decodes ~2.5% slower at 27B bs1 (11.43 vs 11.16 ms). A possible follow-up is a separate MemPool without expandable segments for the weights.
 - GQA-native Blackwell GDN backward: the `repeat_interleave` of q/k and the FP32 vector-gate materialization still cost 1.09 ms per 4-layer cycle at 4B (2.7%). Removing them needs CuTe kernel changes in attn_gym (`chunk_kda_bwd_wy_dqkg`, intra, recompute_aqk).
