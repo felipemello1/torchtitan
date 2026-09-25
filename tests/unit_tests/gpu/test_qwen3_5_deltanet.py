@@ -218,6 +218,7 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         self,
         *,
         use_fused: bool = False,
+        fuse_input_projections: bool = False,
         dim: int = 4,
         key_head_dim: int = 2,
         value_head_dim: int = 2,
@@ -229,6 +230,7 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
     ):
         try:
             from torchtitan.models.common import Conv1d, Linear
+            from torchtitan.models.qwen3_5 import _fuse_gdn_input_projections
             from torchtitan.models.qwen3_5.gdn import (
                 GatedDeltaKernel,
                 GatedDeltaNet,
@@ -259,7 +261,7 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
                 bias=False,
             )
 
-        model = GatedDeltaNet.Config(
+        config = GatedDeltaNet.Config(
             key_head_dim=key_head_dim,
             value_head_dim=value_head_dim,
             conv_kernel_size=conv_kernel_size,
@@ -281,7 +283,10 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
                 out_features=dim,
                 bias=False,
             ),
-        ).build()
+        )
+        if fuse_input_projections:
+            config = _fuse_gdn_input_projections(config)
+        model = config.build()
         if not use_fused:
             model.inner_gated_delta_net.kernel = ReferenceGatedDeltaKernel()
 
@@ -377,6 +382,80 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
                 actual = model(x_TD, masks)
             expected = self._main_forward_reference(model, x_TD, masks)
             self.assertTrue(torch.equal(actual, expected))
+
+    def _assert_fused_input_projections_match_separate(self, **model_kwargs):
+        separate = self._make_deltanet(**model_kwargs)
+        fused = self._make_deltanet(fuse_input_projections=True, **model_kwargs)
+        with torch.no_grad():
+            fused.in_proj_qkv.weight.copy_(
+                torch.cat(
+                    [
+                        separate.in_proj_q.weight,
+                        separate.in_proj_k.weight,
+                        separate.in_proj_v.weight,
+                    ]
+                )
+            )
+            fused.in_proj_zab.weight.copy_(
+                torch.cat(
+                    [
+                        separate.in_proj_z.weight,
+                        separate.in_proj_a.weight,
+                        separate.in_proj_b.weight,
+                    ]
+                )
+            )
+            fused.conv1d.weight.copy_(
+                torch.cat(
+                    [
+                        separate.conv_q.weight,
+                        separate.conv_k.weight,
+                        separate.conv_v.weight,
+                    ]
+                )
+            )
+            fused.out_proj.weight.copy_(separate.out_proj.weight)
+
+        device = separate.out_proj.weight.device
+        dtype = separate.out_proj.weight.dtype
+        x_TD = torch.randn(24, separate.out_proj.weight.shape[0], device=device)
+        positions = torch.tensor(
+            [0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 5, 6] + list(range(12)),
+            dtype=torch.int32,
+            device=device,
+        )
+        for masks in (None, create_varlen_metadata_for_document(positions)):
+            torch.testing.assert_close(
+                fused(x_TD.to(dtype), masks), separate(x_TD.to(dtype), masks)
+            )
+
+    def test_fused_input_projections_match_separate_projections(self):
+        torch.manual_seed(42)
+        # 1 key head and 2 value heads so q/k and v blocks differ in width.
+        with mock.patch(
+            "torchtitan.models.qwen3_5.gdn._causal_conv1d_varlen",
+            _reference_causal_conv1d_varlen,
+        ):
+            self._assert_fused_input_projections_match_separate(
+                num_key_heads=1, num_value_heads=2
+            )
+
+    def test_fused_input_projections_match_separate_projections_cuda(self):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is unavailable")
+        torch.manual_seed(42)
+        # The fused chunk kernel requires 128-wide heads.
+        self._assert_fused_input_projections_match_separate(
+            use_fused=True,
+            dim=256,
+            key_head_dim=128,
+            value_head_dim=128,
+            num_key_heads=1,
+            num_value_heads=2,
+            conv_kernel_size=4,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
 
     def _assert_packed_run_matches_per_document(self, model, x, positions, masks):
         """Packed forward under ``masks`` must equal stitched per-doc forwards.

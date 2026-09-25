@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
 from collections.abc import Callable
 from functools import partial
 
@@ -13,7 +14,6 @@ from torchtitan.config.transform import (
     ModelConfigConverter,
     validate_converter_compatibility,
 )
-
 from torchtitan.models.common import (  # noqa: F401
     Conv1d,
     Embedding,
@@ -37,12 +37,17 @@ from torchtitan.models.common.vision_encoder import (
     VisionMLP,
     VisionTransformerBlock,
 )
-
-from .gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet, RMSNormGated
+from .gdn import (
+    FusedGatedDeltaNet,
+    FusedInnerGatedDeltaNet,
+    GatedDeltaKernel,
+    GatedDeltaNet,
+    InnerGatedDeltaNet,
+    RMSNormGated,
+)
 from .model import OffsetRMSNorm, Qwen35Attention, Qwen35Model, Qwen35TransformerBlock
 from .moe import SigmoidGatedFeedForward
 from .rope import MRoPE
-
 from .vision_encoder import PatchMerger, Qwen35VisionEncoder, VisionRotaryEmbedding
 
 __all__ = [
@@ -1115,8 +1120,16 @@ def model_registry(
     seq_len: int | None = None,
     attn_backend: str = "flex",
     moe_comm_backend: str | None = None,
+    fuse_gdn_input_projections: bool = False,
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> Qwen35Model.Config:
+    """Build a Qwen3.5 model config.
+
+    Args:
+        fuse_gdn_input_projections: Use ``FusedGatedDeltaNet`` (2 input GEMMs
+            and 1 conv per GDN layer instead of 6 and 3). Requires
+            tensor_parallel_degree == 1.
+    """
     get_config, max_context_len = qwen3_5_configs[flavor]
     context_len = seq_len or max_context_len
     if context_len > max_context_len:
@@ -1133,9 +1146,55 @@ def model_registry(
             else {}
         ),
     )
+    if fuse_gdn_input_projections:
+        for layer in config.layers:
+            if layer.delta_net is not None:
+                layer.delta_net = _fuse_gdn_input_projections(layer.delta_net)
     if converters is not None:
         validate_converter_compatibility(converters)
         for c in converters:
             config = c.build().convert(config)
 
     return config
+
+
+def _fuse_gdn_input_projections(
+    delta_net: GatedDeltaNet.Config,
+) -> FusedGatedDeltaNet.Config:
+    """Merge a ``GatedDeltaNet.Config``'s input projections and convs.
+
+    Example (Qwen3.5-4B GDN layer, dim 2560):
+
+        in_proj_q/k [2048, 2560], in_proj_v/z [4096, 2560], in_proj_a/b [32, 2560]
+        -> in_proj_qkv [8192, 2560], in_proj_zab [4160, 2560]
+        conv_q/k [2048, 1, 4], conv_v [4096, 1, 4] -> conv1d [8192, 1, 4]
+    """
+    inner = delta_net.inner_gated_delta_net
+    assert isinstance(inner, InnerGatedDeltaNet.Config)
+    qkv_channels = (
+        delta_net.in_proj_q.out_features
+        + delta_net.in_proj_k.out_features
+        + delta_net.in_proj_v.out_features
+    )
+    zab_features = (
+        delta_net.in_proj_z.out_features
+        + delta_net.in_proj_a.out_features
+        + delta_net.in_proj_b.out_features
+    )
+    return FusedGatedDeltaNet.Config(
+        key_head_dim=delta_net.key_head_dim,
+        value_head_dim=delta_net.value_head_dim,
+        conv_kernel_size=delta_net.conv_kernel_size,
+        in_proj_qkv=dataclasses.replace(delta_net.in_proj_q, out_features=qkv_channels),
+        in_proj_zab=dataclasses.replace(delta_net.in_proj_z, out_features=zab_features),
+        conv1d=dataclasses.replace(
+            delta_net.conv_q,
+            in_channels=qkv_channels,
+            out_channels=qkv_channels,
+            groups=qkv_channels,
+        ),
+        inner_gated_delta_net=FusedInnerGatedDeltaNet.Config(kernel=inner.kernel),
+        norm=delta_net.norm,
+        out_proj=delta_net.out_proj,
+        param_init=delta_net.param_init,
+    )

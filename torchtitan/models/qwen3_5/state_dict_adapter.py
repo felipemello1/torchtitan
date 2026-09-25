@@ -29,6 +29,7 @@ import re
 from typing import Any, TYPE_CHECKING
 
 import torch
+from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
 class Qwen35StateDictAdapter(StateDictAdapter):
     def __init__(self, model_config: Qwen35Model.Config, hf_assets_path: str | None):
         super().__init__(model_config, hf_assets_path)
+        self._fused_deltanet_sharding: dict[str, tuple[Any, Any]] = {}
         self.model_config = model_config
         self.hf_language_model_prefix = (
             "model.language_model"
@@ -122,6 +124,95 @@ class Qwen35StateDictAdapter(StateDictAdapter):
                 for hf_key, tt_key in self.from_hf_map.items()
                 if not hf_key.startswith("model.visual.")
             }
+
+    def _native_fused_linears_to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        """Also expose FusedGatedDeltaNet weights as the logical per-projection keys.
+
+        Example (FusedGatedDeltaNet at layer 0):
+
+            layers.0.attn.in_proj_qkv.weight -> layers.0.attn.in_proj_{q,k,v}.weight
+            layers.0.attn.conv1d.weight      -> layers.0.attn.conv_{q,k,v}.weight
+            layers.0.attn.in_proj_zab.weight -> layers.0.attn.in_proj_{z,a,b}.weight
+        """
+        result = super()._native_fused_linears_to_hf(state_dict)
+        for prefix, groups in self._fused_deltanet_groups():
+            for fused_name, logical_names, sizes in groups:
+                fused_key = f"{prefix}{fused_name}.weight"
+                if fused_key not in result:
+                    continue
+                tensor = result.pop(fused_key)
+                if isinstance(tensor, DTensor):
+                    # Split whole q/k/v blocks from a replicated view; restore
+                    # the native placement when merging back after HF loading.
+                    self._fused_deltanet_sharding[fused_key] = (
+                        tensor.device_mesh,
+                        tensor.placements,
+                    )
+                    tensor = tensor.redistribute(
+                        tensor.device_mesh, [Replicate()] * tensor.device_mesh.ndim
+                    )
+                for name, part in zip(
+                    logical_names, tensor.split(sizes, dim=0), strict=True
+                ):
+                    result[f"{prefix}{name}.weight"] = part
+        return result
+
+    def _native_fused_linears_from_hf(
+        self, state_dict: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Merge the logical per-projection keys back into FusedGatedDeltaNet weights."""
+        result = super()._native_fused_linears_from_hf(state_dict)
+        for prefix, groups in self._fused_deltanet_groups():
+            for fused_name, logical_names, _sizes in groups:
+                logical_keys = [f"{prefix}{name}.weight" for name in logical_names]
+                if not all(key in result for key in logical_keys):
+                    continue
+                parts = [result.pop(key) for key in logical_keys]
+                if isinstance(parts[0], DTensor):
+                    parts = [
+                        part.redistribute(
+                            part.device_mesh, [Replicate()] * part.device_mesh.ndim
+                        )
+                        for part in parts
+                    ]
+                fused_key = f"{prefix}{fused_name}.weight"
+                fused = torch.cat(parts, dim=0)
+                if fused_key in self._fused_deltanet_sharding:
+                    assert isinstance(fused, DTensor)
+                    mesh, placements = self._fused_deltanet_sharding[fused_key]
+                    fused = fused.redistribute(mesh, placements)
+                result[fused_key] = fused
+        return result
+
+    def _fused_deltanet_groups(self):
+        """Yield ``(prefix, [(fused, logical names, row sizes), ...])`` per fused layer."""
+        from torchtitan.models.qwen3_5.gdn import FusedGatedDeltaNet
+
+        # pyrefly: ignore [missing-attribute]
+        for layer_idx, layer_config in enumerate(self.model_config.layers):
+            delta_net = layer_config.delta_net
+            if not isinstance(delta_net, FusedGatedDeltaNet.Config):
+                continue
+            key_dim = delta_net.num_key_heads * delta_net.key_head_dim
+            value_dim = delta_net.num_value_heads * delta_net.value_head_dim
+            num_value_heads = delta_net.num_value_heads
+            yield f"layers.{layer_idx}.attn.", [
+                (
+                    "in_proj_qkv",
+                    ("in_proj_q", "in_proj_k", "in_proj_v"),
+                    [key_dim, key_dim, value_dim],
+                ),
+                (
+                    "conv1d",
+                    ("conv_q", "conv_k", "conv_v"),
+                    [key_dim, key_dim, value_dim],
+                ),
+                (
+                    "in_proj_zab",
+                    ("in_proj_z", "in_proj_a", "in_proj_b"),
+                    [value_dim, num_value_heads, num_value_heads],
+                ),
+            ]
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Convert torchtitan state dict to HuggingFace Qwen3.5 format."""
@@ -317,8 +408,8 @@ class Qwen35StateDictAdapter(StateDictAdapter):
                 ):
                     # pyrefly: ignore [missing-attribute]
                     dn = self.model_config.layers[int(idx)].delta_net
-                    kd = dn.in_proj_q.out_features
-                    vd = dn.in_proj_v.out_features
+                    kd = dn.num_key_heads * dn.key_head_dim
+                    vd = dn.num_value_heads * dn.value_head_dim
                     q, k, v = value.split([kd, kd, vd], dim=0)
                     tt_state_dict[f"layers.{idx}.attn.in_proj_q.weight"] = q
                     tt_state_dict[f"layers.{idx}.attn.in_proj_k.weight"] = k
@@ -332,8 +423,8 @@ class Qwen35StateDictAdapter(StateDictAdapter):
                 ):
                     # pyrefly: ignore [missing-attribute]
                     dn = self.model_config.layers[int(idx)].delta_net
-                    kd = dn.in_proj_q.out_features
-                    vd = dn.in_proj_v.out_features
+                    kd = dn.num_key_heads * dn.key_head_dim
+                    vd = dn.num_value_heads * dn.value_head_dim
                     cq, ck, cv = value.split([kd, kd, vd], dim=0)
                     tt_state_dict[f"layers.{idx}.attn.conv_q.weight"] = cq
                     tt_state_dict[f"layers.{idx}.attn.conv_k.weight"] = ck

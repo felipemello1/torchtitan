@@ -391,3 +391,50 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             output_THV,
         )
         return output_THV
+
+
+class VLLMFusedInnerGatedDeltaNet(VLLMInnerGatedDeltaNet):
+    """Paged-cache inner GDN for ``FusedGatedDeltaNet``.
+
+    The enclosing module already provides a fused ``[q|k|v]`` input and one conv
+    weight, so no per-call concatenation is needed.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(VLLMInnerGatedDeltaNet.Config):
+        pass
+
+    def forward(
+        self,
+        mixed_qkv_TC: torch.Tensor,
+        a_TH: torch.Tensor,
+        b_TH: torch.Tensor,
+        conv_weight_C1W: torch.Tensor,
+        A_log_H: torch.Tensor,
+        dt_bias_H: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        *,
+        key_head_dim: int,
+        value_head_dim: int,
+    ) -> torch.Tensor:
+        """Run the flattened vLLM cache operation on rank-local tensors."""
+        assert key_head_dim == self.head_k_dim
+        assert value_head_dim == self.head_v_dim
+        assert conv_weight_C1W.shape[-1] == self.conv_kernel_size
+
+        num_tokens = mixed_qkv_TC.shape[0]
+        # Padded rows must remain defined across vLLM graph replays.
+        output_THV = mixed_qkv_TC.new_zeros(
+            num_tokens, self.local_num_v_heads, self.head_v_dim
+        )
+        self._forward(
+            mixed_qkv_TC,
+            a_TH,
+            b_TH,
+            conv_weight_C1W.squeeze(1),
+            None,
+            A_log_H,
+            dt_bias_H,
+            output_THV,
+        )
+        return output_THV

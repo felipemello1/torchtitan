@@ -55,6 +55,23 @@ def _causal_conv1d_varlen(
     return out_BTD.squeeze(0)
 
 
+def _causal_conv1d_silu(
+    x_TC: torch.Tensor,
+    weight_C1W: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    use_varlen_kernels: bool,
+) -> torch.Tensor:
+    """Depthwise causal conv + SiLU over channels, resetting at document starts."""
+    if use_varlen_kernels:
+        return _causal_conv1d_varlen(x_TC, weight_C1W, cu_seqlens)
+    x_1CT = F.pad(x_TC.transpose(0, 1).unsqueeze(0), [weight_C1W.shape[-1] - 1, 0])
+    return (
+        F.silu(F.conv1d(x_1CT, weight_C1W, None, groups=weight_C1W.shape[0]))
+        .squeeze(0)
+        .transpose(0, 1)
+    )
+
+
 class RMSNormGated(Module):
     """Gated RMSNorm: ``silu(gate) * weight * norm(x)``.
 
@@ -299,33 +316,8 @@ class InnerGatedDeltaNet(Module):
         num_tokens = query_TC.shape[0]
         use_varlen_kernels = cu_seqlens.numel() > 2 or is_in_batch_invariant_mode()
 
-        def causal_conv(
-            x_TC: torch.Tensor,
-            weight_C1W: torch.Tensor,
-        ) -> torch.Tensor:
-            if use_varlen_kernels:
-                return _causal_conv1d_varlen(
-                    x_TC,
-                    weight_C1W,
-                    cu_seqlens,
-                )
-
-            x_1CT = F.pad(
-                x_TC.transpose(0, 1).unsqueeze(0),
-                [weight_C1W.shape[-1] - 1, 0],
-            )
-            return (
-                F.silu(
-                    F.conv1d(
-                        x_1CT,
-                        weight_C1W,
-                        None,
-                        groups=weight_C1W.shape[0],
-                    )
-                )
-                .squeeze(0)
-                .transpose(0, 1)
-            )
+        def causal_conv(x_TC: torch.Tensor, weight_C1W: torch.Tensor) -> torch.Tensor:
+            return _causal_conv1d_silu(x_TC, weight_C1W, cu_seqlens, use_varlen_kernels)
 
         xq_THK = causal_conv(query_TC, conv_q_weight_C1W).reshape(
             num_tokens, -1, key_head_dim
@@ -342,6 +334,61 @@ class InnerGatedDeltaNet(Module):
             xq_THK,
             xk_THK,
             xv_THV,
+            g_TH,
+            beta_TH,
+            cu_seqlens=cu_seqlens if use_varlen_kernels else None,
+        )
+
+
+class FusedInnerGatedDeltaNet(Module):
+    """``InnerGatedDeltaNet`` for a fused ``[q|k|v]`` input and one conv weight.
+
+    One convolution runs over all q, k and v channels (depthwise, so it equals
+    three separate convolutions), then the output is split by channel.
+
+    Example (local heads: 2 key heads of 4, 4 value heads of 4):
+
+        mixed_qkv_TC.shape == (T, 2*4 + 2*4 + 4*4) == (T, 32)
+        # conv -> split [8 | 8 | 16] -> q [T, 2, 4], k [T, 2, 4], v [T, 4, 4]
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        kernel: GatedDeltaKernel.Config
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.kernel = config.kernel.build()
+
+    def forward(
+        self,
+        mixed_qkv_TC: torch.Tensor,
+        a_TH: torch.Tensor,
+        b_TH: torch.Tensor,
+        conv_weight_C1W: torch.Tensor,
+        A_log_H: torch.Tensor,
+        dt_bias_H: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        *,
+        key_head_dim: int,
+        value_head_dim: int,
+    ) -> torch.Tensor:
+        """Run one Q/K/V convolution and the recurrence on local heads."""
+        num_tokens = mixed_qkv_TC.shape[0]
+        use_varlen_kernels = cu_seqlens.numel() > 2 or is_in_batch_invariant_mode()
+        value_dim = A_log_H.shape[0] * value_head_dim
+        key_dim = (mixed_qkv_TC.shape[-1] - value_dim) // 2
+
+        conv_TC = _causal_conv1d_silu(
+            mixed_qkv_TC, conv_weight_C1W, cu_seqlens, use_varlen_kernels
+        )
+        xq_TC, xk_TC, xv_TC = conv_TC.split([key_dim, key_dim, value_dim], dim=-1)
+        g_TH = -torch.exp(A_log_H.float()) * F.softplus(a_TH.float() + dt_bias_H)
+        beta_TH = torch.sigmoid(b_TH)
+        return self.kernel(
+            xq_TC.reshape(num_tokens, -1, key_head_dim),
+            xk_TC.reshape(num_tokens, -1, key_head_dim),
+            xv_TC.reshape(num_tokens, -1, value_head_dim),
             g_TH,
             beta_TH,
             cu_seqlens=cu_seqlens if use_varlen_kernels else None,
@@ -380,6 +427,14 @@ class GatedDeltaNet(Module):
         norm: RMSNormGated.Config
         out_proj: Linear.Config
 
+        @property
+        def num_key_heads(self) -> int:
+            return self.in_proj_q.out_features // self.key_head_dim
+
+        @property
+        def num_value_heads(self) -> int:
+            return self.in_proj_v.out_features // self.value_head_dim
+
     def __init__(self, config: Config):
         super().__init__()
         self.key_head_dim = config.key_head_dim
@@ -410,29 +465,8 @@ class GatedDeltaNet(Module):
         x_TD: torch.Tensor,
         attention_masks: VarlenMetadata | None = None,
     ) -> torch.Tensor:
-        tp_group = spmd_mesh_group(MeshAxisName.TP)
-        if tp_group is not None:
-            # All six input projections consume x, so gather it once before
-            # entering their separate compute paths.
-            x_TD = spmd.redistribute(
-                x_TD,
-                tp_group,
-                src=spmd.S(0) if spmd_dense_sp_enabled() else spmd.I,
-                dst=spmd.R,
-                backward_options={"op_dtype": x_TD.dtype},
-            )
-
+        x_TD, cu_seqlens = _gather_input_and_cu_seqlens(x_TD, attention_masks)
         num_tokens = x_TD.shape[0]
-        if attention_masks is not None:
-            cu_seqlens = attention_masks.cu_seq_q
-        else:
-            cu_seqlens = torch.arange(
-                0,
-                num_tokens + 1,
-                num_tokens,
-                dtype=torch.int32,
-                device=x_TD.device,
-            )
 
         query_TC = self.in_proj_q(x_TD)
         key_TC = self.in_proj_k(x_TD)
@@ -460,3 +494,115 @@ class GatedDeltaNet(Module):
         output_THV = self.norm(output_THV, gate_THV)
         out_TD = output_THV.reshape(num_tokens, -1)
         return self.out_proj(out_TD)
+
+
+class FusedGatedDeltaNet(Module):
+    """``GatedDeltaNet`` with its input projections fused into two GEMMs.
+
+    Same math as ``GatedDeltaNet``, with a layout that matches Hugging Face's
+    ``in_proj_qkv`` and ``conv1d`` weights:
+
+        GatedDeltaNet:       in_proj_{q,k,v,z,a,b} (6 GEMMs), conv_{q,k,v} (3 convs)
+        FusedGatedDeltaNet:  in_proj_qkv, in_proj_zab (2 GEMMs), conv1d (1 conv)
+
+    Requires tensor_parallel_degree == 1: column sharding one ``[q|k|v]`` block
+    would give a rank a mix of q, k and v rows instead of its own heads of each.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        key_head_dim: int
+        value_head_dim: int
+        conv_kernel_size: int = 4
+
+        # Sub-module configs
+        in_proj_qkv: Linear.Config
+        in_proj_zab: Linear.Config
+        conv1d: Conv1d.Config
+        inner_gated_delta_net: Module.Config
+        norm: RMSNormGated.Config
+        out_proj: Linear.Config
+
+        @property
+        def num_value_heads(self) -> int:
+            return self.in_proj_zab.out_features // (self.value_head_dim + 2)
+
+        @property
+        def num_key_heads(self) -> int:
+            value_dim = self.num_value_heads * self.value_head_dim
+            return (self.in_proj_qkv.out_features - value_dim) // (
+                2 * self.key_head_dim
+            )
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.key_head_dim = config.key_head_dim
+        self.value_head_dim = config.value_head_dim
+        self.num_value_heads = config.num_value_heads
+
+        self.in_proj_qkv = config.in_proj_qkv.build()
+        self.in_proj_zab = config.in_proj_zab.build()
+        self.conv1d = config.conv1d.build()
+
+        self.A_log = nn.Parameter(torch.empty(config.num_value_heads))
+        self.dt_bias = nn.Parameter(torch.empty(config.num_value_heads))
+
+        self.norm = config.norm.build()
+        self.out_proj = config.out_proj.build()
+        self.inner_gated_delta_net = config.inner_gated_delta_net.build()
+
+    def forward(
+        self,
+        x_TD: torch.Tensor,
+        attention_masks: VarlenMetadata | None = None,
+    ) -> torch.Tensor:
+        x_TD, cu_seqlens = _gather_input_and_cu_seqlens(x_TD, attention_masks)
+        num_tokens = x_TD.shape[0]
+
+        mixed_qkv_TC = self.in_proj_qkv(x_TD)
+        gate_TC, a_TH, b_TH = self.in_proj_zab(x_TD).split(
+            [self.num_value_heads * self.value_head_dim] + [self.num_value_heads] * 2,
+            dim=-1,
+        )
+        output_THV = self.inner_gated_delta_net(
+            mixed_qkv_TC,
+            a_TH,
+            b_TH,
+            self.conv1d.weight,
+            self.A_log,
+            self.dt_bias,
+            cu_seqlens,
+            key_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+        )
+        gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)
+        output_THV = self.norm(output_THV, gate_THV)
+        return self.out_proj(output_THV.reshape(num_tokens, -1))
+
+
+def _gather_input_and_cu_seqlens(
+    x_TD: torch.Tensor, attention_masks: VarlenMetadata | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather x once for the input projections and return document offsets.
+
+    With no offsets (``attention_masks is None``) the packed sequence is one
+    document: ``cu_seqlens = [0, num_tokens]``.
+    """
+    tp_group = spmd_mesh_group(MeshAxisName.TP)
+    if tp_group is not None:
+        # All input projections consume x, so gather it once before entering
+        # their separate compute paths.
+        x_TD = spmd.redistribute(
+            x_TD,
+            tp_group,
+            src=spmd.S(0) if spmd_dense_sp_enabled() else spmd.I,
+            dst=spmd.R,
+            backward_options={"op_dtype": x_TD.dtype},
+        )
+    num_tokens = x_TD.shape[0]
+    if attention_masks is not None:
+        return x_TD, attention_masks.cu_seq_q
+    cu_seqlens = torch.arange(
+        0, num_tokens + 1, num_tokens, dtype=torch.int32, device=x_TD.device
+    )
+    return x_TD, cu_seqlens

@@ -131,8 +131,8 @@ def _configure_gdn_hybrid_model(model_cls: type, model_config: Decoder.Config) -
 
     state_shapes = {
         (
-            gdn_config.in_proj_q.out_features // gdn_config.key_head_dim,
-            gdn_config.in_proj_v.out_features // gdn_config.value_head_dim,
+            gdn_config.num_key_heads,
+            gdn_config.num_value_heads,
             gdn_config.key_head_dim,
             gdn_config.value_head_dim,
             gdn_config.conv_kernel_size,
