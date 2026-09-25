@@ -29,6 +29,30 @@ The Blackwell path is still faster than attn_gym's Triton GDN backward: 6.60 vs 
 
 ## Entries
 
+### 2026-09-25 12:45 — generator prefill: FlashInfer GDN kernel on V2, no prefill-sized graphs (keep, #61)
+- Finding: decode was at parity, but bs1 prefill (time to one token) was 35–64% slower than native at 27B. Measured with the `bench.py --prefill-sweep cached:new` mode, which is new. From a profile of a 2048-token prefill (`--profile-prefill`):
+  - on V2, packed GDN runs eagerly, and Titan's path launches ~12 kernels per layer plus Python. Attention Gym's jit-cache `make_runtime_key` / `_canonicalize` costs ~0.3 ms per call under the profiler. The GPU idles ~50 ms per prefill.
+  - Attention Gym's chunk kernels take 13.7 ms on the GPU, against 4.1 ms for FlashInfer's single Blackwell GDN kernel (which native uses).
+  - the auto capture sizes (up to `max_num_batched_tokens`) pad prefill batches to the next power of two, although V2 never replays a graph for prefill. No `cudaGraphLaunch` shows up in prefill traces, for Titan or native.
+- Change:
+  - on V2 on Blackwell, prefill uses vLLM's `fused_post_conv_prep` + FlashInfer's `chunk_gated_delta_rule` (the native kernels), fed only the real requests and tokens
+  - `graph_prefill=False` caps V2's auto capture sizes at `max_num_seqs`
+- Why the real-count slicing matters: FlashInfer pays a work tile for each empty interval. At T=512, 73 capacity intervals take 817 us against 46 us for 2. The first prototype passed full capacity and was slower than Attention Gym (2048 tokens: 216 ms against 187 ms).
+- Result, 27B, ms (cached prefix : new tokens):
+  ```text
+                          0:512  0:2048  0:8192  32k:512  32k:2048
+  before                   91.6   187.0   416.4   238.4    351.8
+  + FlashInfer prefill     49.3   117.0   348.2   133.1    276.2
+  + sizes <= 144           49.0   107.5   341.2   140.7    245.0
+  native                   57.0   117.5   356.0   145.7    251.2
+  ```
+  At 4B: 55.6 / 110.3 / 136.9 / 149.5 / 153.0 -> 37.3 / 75.4 / 108.9 / 109.1 / 107.6, against native 43.1 / 85.9 / 113.7 / 116.7 / 122.0.
+- Decode is unchanged across processes.
+- 27B prompt logprobs (512 / 2048 / 6000 tokens of real text):
+  - mean |Δ| between Attention Gym and FlashInfer prefill: 0.011
+  - FlashInfer vs native: 0.015, against 0.016 for Attention Gym vs native
+- Not done: Attention Gym's host overhead itself (`make_runtime_key` on every call). It also makes the trainer's forward host-bound at 16k tokens.
+
 ### 2026-09-25 11:10 — trainer: FA4 >= 4.0.0b32 for hd256 packed attention (keep)
 - Finding: the FairTitan runtime pins FA4 at git `0f3fb00` (2026-09-11). There, the dedicated hd256 kernels (Qwen3.5 attention) size their grid by packed total tokens x number of documents, so packed batches launch mostly empty tiles. Upstream fixed this in flash-attention #2807 (2026-09-14), released in `flash-attn-4` 4.0.0b32.
 - Attention fwd+bwd, hd256, 16 q / 4 kv heads (`/tmp/felipemello/hc/cudnn_varlen.py`):
