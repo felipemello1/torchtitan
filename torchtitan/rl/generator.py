@@ -42,6 +42,7 @@ from torchtitan.observability.logging import init_logger
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.model.batch_invariance import force_logprobs_fn_for_batch_invariance
+from torchtitan.rl.model.inductor_passes import UnfuseResidualAddmmPass
 from torchtitan.rl.model.vllm_registry import (
     register_to_vllm,
     TORCHTITAN_CONFIG_FORMAT,
@@ -304,6 +305,19 @@ class VLLMCudaGraphConfig:
                 else CompilationMode.NONE
             ),
             cudagraph_capture_sizes=sizes,
+            # A dedicated single-token graph, which UnfuseResidualAddmmPass targets.
+            compile_sizes=[1] if self.vllm_compile else None,
+            inductor_compile_config=(
+                {
+                    "post_grad_custom_post_pass": UnfuseResidualAddmmPass(),
+                    # Materialize the residual stream in the norm that first reads it.
+                    # Otherwise each RMSNorm re-sums the chain of unrealized residual
+                    # adds (4 inputs read twice at bs=1), which undoes the unfuse win.
+                    "realize_reads_threshold": 1,
+                }
+                if self.vllm_compile
+                else {}
+            ),
             pass_config=PassConfig(
                 enable_sp=enable_sequence_parallel,
                 sp_min_token_num=1 if enable_sequence_parallel else None,
