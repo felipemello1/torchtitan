@@ -48,7 +48,6 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
         return torch.mm(input_TD, weight_OD.T, out_dtype=torch.float32)
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad_output_TO: torch.Tensor):  # pyrefly: ignore[bad-override]
         input_TD, weight_OD = ctx.saved_tensors
         grad_output_TO = grad_output_TO.to(input_TD.dtype)
@@ -158,15 +157,17 @@ class Linear(nn.Linear, Module):
         """
         if self.output_dtype == "input":
             return F.linear(input, weight, bias)
-        bf16_cuda_operands = (
-            input.is_cuda
-            and input.dtype == torch.bfloat16
-            and weight.dtype == torch.bfloat16
-        )
+        # aten::mm.dtype (bf16 inputs, fp32 output) is only implemented for CUDA/ROCm.
+        out_dtype_mm_available = input.is_cuda
+        bf16_operands = input.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
         # cuBLAS's out_dtype GEMM isn't batch-invariant, so batch-invariant mode upcasts.
         # TODO: use _Fp32OutputLinearFunction there too once batch_invariant_ops has a
         # bf16-input, fp32-output matmul.
-        if bf16_cuda_operands and not is_in_batch_invariant_mode():
+        if (
+            out_dtype_mm_available
+            and bf16_operands
+            and not is_in_batch_invariant_mode()
+        ):
             output = _Fp32OutputLinearFunction.apply(
                 input.reshape(-1, input.shape[-1]), weight
             )
