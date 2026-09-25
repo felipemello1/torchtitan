@@ -25,6 +25,7 @@ from torch.autograd.function import once_differentiable
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
+from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.protocols.module import Module
 
 # Shape suffix legend for the router gate:
@@ -143,8 +144,24 @@ class CastLinear(Linear):
         weight: torch.Tensor,
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
+        if (
+            self.compute_dtype == torch.float32
+            and not torch.is_grad_enabled()
+            and input.is_cuda
+            and input.dtype in (torch.bfloat16, torch.float16)
+            and weight.dtype == input.dtype
+            and not is_in_batch_invariant_mode()
+        ):
+            # Inference: accumulate the low-precision GEMM directly into fp32
+            # instead of upcasting the full weight on every call. torch.mm has
+            # no autograd formula for out_dtype, so training keeps the cast path.
+            flat_input = input.reshape(-1, input.shape[-1])
+            out = torch.mm(flat_input, weight.t(), out_dtype=torch.float32)
+            if bias is not None:
+                out = out + bias.to(torch.float32)
+            return out.reshape(*input.shape[:-1], -1)
         # The optimizer updates the weight each step, so training cannot cache
-        # the upcast copy. Inference may be able to cache it between syncs.
+        # the upcast copy.
         bias = None if bias is None else bias.to(self.compute_dtype)
         return F.linear(
             input.to(self.compute_dtype), weight.to(self.compute_dtype), bias
