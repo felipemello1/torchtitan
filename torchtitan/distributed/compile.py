@@ -71,9 +71,11 @@ def apply_compile(
 
     backend = _maybe_regional_inductor_backend(model, compile_config.backend)
 
+    # A regional-inductor backend is a callable, which torch.compile options do not apply to.
+    options = compile_config.inductor_options if backend == "inductor" else None
     # pyrefly: ignore [missing-attribute]
     for layer_id, transformer_block in model.layers.named_children():
-        transformer_block.compile(backend=backend, fullgraph=True)
+        transformer_block.compile(backend=backend, fullgraph=True, options=options)
 
     logger.info("Compiling each TransformerBlock with torch.compile")
 
