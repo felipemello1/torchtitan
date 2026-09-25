@@ -270,8 +270,11 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
                 )
             return
 
+        # Decode reads a row-strided mixed_qkv (the q|k|v slice of the single-GEMM
+        # projection) in place; the prefill convolution needs a contiguous copy.
+        # TODO: drop the copy once Attention Gym's prefill convolution accepts a row stride.
         conv_output = paged_causal_conv1d(
-            mixed_qkv[:num_actual_tokens].unsqueeze(0),
+            mixed_qkv[:num_actual_tokens].contiguous().unsqueeze(0),
             conv_weight,
             self.kv_cache[0],
             state_indices,
@@ -430,11 +433,8 @@ class VLLMFusedInnerGatedDeltaNet(VLLMInnerGatedDeltaNet):
         output_THV = mixed_qkv_TC.new_zeros(
             num_tokens, self.local_num_v_heads, self.head_v_dim
         )
-        # A no-op for a separate [q|k|v] GEMM; copies the column slice from the
-        # single-GEMM VLLMFusedGatedDeltaNet.
-        # TODO: drop the copy once Attention Gym's convolutions accept a row stride.
         self._forward(
-            mixed_qkv_TC.contiguous(),
+            mixed_qkv_TC,
             a_TH,
             b_TH,
             conv_weight_C1W.squeeze(1),
