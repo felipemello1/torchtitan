@@ -29,6 +29,12 @@ The Blackwell path is still faster than attn_gym's Triton GDN backward: 6.60 vs 
 
 ## Entries
 
+### 2026-09-25 16:45 — generator: TP-compatible GDN fusion (#64 supersedes #57/#59)
+- **Problem:** #57's fused `[q|k|v]` / `[z|a|b]` parameters can't be colwise-sharded, so the model rejected TP>1.
+- **Fix, #64:** keep the per-projection model, so trainer and generator share one definition. The generator lays each rank's local shards out contiguously (parameters become row views) and runs one GEMM and one conv.
+- **Result, 4B:** 2.654 / 3.317 / 2.926 / 5.318 ms/token vs 2.683 / 3.281 / 2.947 / 5.081 for #57 + #59, and 2.650 / 3.929 / 2.966 / 6.279 unfused. Text identical.
+- **Validation:** CPU tests shard like TP=2. A real TP=2 run needs a multi-GPU node.
+
 ### 2026-09-25 16:10 — generator: TRT-LLM cubins, host overhead, structured-log flushes (keep)
 Full write-up: `investigations/generator/GENERATOR_ANALYSIS_AND_PLAN_20260925.md`.
 - **The 32k:2048 "gap" was prefill-only padding.** #61 now caps V2's auto capture sizes. 27B prefill (bs1, ms): Titan 51.9 / 108.6 / 345.7 / 142.5 / 250.5 vs native 58.0 / 117.3 / 356.0 / 152.3 / 254.4.
