@@ -161,9 +161,9 @@ class Linear(nn.Linear, Module):
         # aten::mm.dtype (bf16 inputs, fp32 output) is only implemented for CUDA/ROCm.
         out_dtype_mm_available = input.is_cuda
         bf16_operands = input.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
-        # cuBLAS's out_dtype GEMM isn't batch-invariant, so batch-invariant mode upcasts.
-        # TODO: use _Fp32OutputLinearFunction there too once batch_invariant_ops has a
-        # bf16-input, fp32-output matmul.
+        # TODO: batch-invariant mode can't use this op (cuBLAS's out_dtype GEMM isn't
+        # batch-invariant) and falls back to the upcast. Adding a bf16-input, fp32-output
+        # matmul to batch_invariant_ops would let it use _Fp32OutputLinearFunction too.
         if (
             out_dtype_mm_available
             and bf16_operands
