@@ -58,7 +58,7 @@ CP = MeshAxisName.CP
 TP = MeshAxisName.TP
 
 if TYPE_CHECKING:
-    from torchtitan.models.qwen3_5.gdn import GatedDeltaNet
+    from torchtitan.models.qwen3_5.gdn import FusedGatedDeltaNet, GatedDeltaNet
     from torchtitan.models.qwen3_5.model import (
         Qwen35Attention,
         Qwen35AttentionMaskDict,
@@ -322,7 +322,7 @@ def _set_full_attention_sharding(
 
 
 def _set_deltanet_sharding(
-    deltanet_cfg: "GatedDeltaNet.Config",
+    deltanet_cfg: "GatedDeltaNet.Config | FusedGatedDeltaNet.Config",
     *,
     attention_input_layout: SpmdType,
 ) -> None:
@@ -332,23 +332,34 @@ def _set_deltanet_sharding(
     row-parallel. Conv weights and per-head A_log/dt_bias are Shard(0). The
     recurrence runs on rank-local heads via a single local SPMD boundary.
     """
+    from torchtitan.models.qwen3_5.gdn import FusedGatedDeltaNet
+
+    # FusedGatedDeltaNet is TP=1 only (Qwen35Model.Config rejects TP>1), so its
+    # colwise placements below are trivial; they keep the DP/CP layouts.
+    fused = isinstance(deltanet_cfg, FusedGatedDeltaNet.Config)
+    projection_names = (
+        ("in_proj_qkv", "in_proj_zab")
+        if fused
+        else (
+            "in_proj_q",
+            "in_proj_k",
+            "in_proj_v",
+            "in_proj_z",
+            "in_proj_a",
+            "in_proj_b",
+        )
+    )
+    conv_names = ("conv1d",) if fused else ("conv_q", "conv_k", "conv_v")
+
     replicated_input_layout = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
-    for name in (
-        "in_proj_q",
-        "in_proj_k",
-        "in_proj_v",
-        "in_proj_z",
-        "in_proj_a",
-        "in_proj_b",
-    ):
+    for name in projection_names:
         getattr(deltanet_cfg, name).sharding_config = colwise_config(
             input_layout=replicated_input_layout
         )
 
     # Depthwise conv weights: Shard(0) on out-channels (head-sharded).
-    deltanet_cfg.conv_q.sharding_config = _conv_weight_sharding()
-    deltanet_cfg.conv_k.sharding_config = _conv_weight_sharding()
-    deltanet_cfg.conv_v.sharding_config = _conv_weight_sharding()
+    for name in conv_names:
+        getattr(deltanet_cfg, name).sharding_config = _conv_weight_sharding()
 
     # RowParallelLinear reduce-scatters with SP and all-reduces otherwise.
     deltanet_cfg.out_proj.sharding_config = rowwise_config(
@@ -386,33 +397,26 @@ def _set_deltanet_sharding(
     # The inner GDN is the local SPMD boundary for the head-parallel
     # convolution and recurrence. cu_seqlens_host is keyword-only host metadata
     # and intentionally remains outside the local SPMD positional placements.
+    activation_args = (
+        ("mixed_qkv_TC", "a_TH", "b_TH")
+        if fused
+        else ("query_TC", "key_TC", "value_TC", "a_TH", "b_TH")
+    )
+    conv_weight_args = (
+        ("conv_weight_C1W",)
+        if fused
+        else ("conv_q_weight_C1W", "conv_k_weight_C1W", "conv_v_weight_C1W")
+    )
+    inner_shardings = {
+        **{name: projected_placement for name in activation_args},
+        **{name: parameter_placement for name in conv_weight_args},
+        "A_log_H": parameter_placement,
+        "dt_bias_H": parameter_placement,
+        "cu_seqlens": cu_seqlens_placement,
+    }
     deltanet_cfg.inner_gated_delta_net.sharding_config = ShardingConfig(
-        in_src_shardings={
-            "query_TC": projected_placement,
-            "key_TC": projected_placement,
-            "value_TC": projected_placement,
-            "a_TH": projected_placement,
-            "b_TH": projected_placement,
-            "conv_q_weight_C1W": parameter_placement,
-            "conv_k_weight_C1W": parameter_placement,
-            "conv_v_weight_C1W": parameter_placement,
-            "A_log_H": parameter_placement,
-            "dt_bias_H": parameter_placement,
-            "cu_seqlens": cu_seqlens_placement,
-        },
-        in_dst_shardings={
-            "query_TC": projected_placement,
-            "key_TC": projected_placement,
-            "value_TC": projected_placement,
-            "a_TH": projected_placement,
-            "b_TH": projected_placement,
-            "conv_q_weight_C1W": parameter_placement,
-            "conv_k_weight_C1W": parameter_placement,
-            "conv_v_weight_C1W": parameter_placement,
-            "A_log_H": parameter_placement,
-            "dt_bias_H": parameter_placement,
-            "cu_seqlens": cu_seqlens_placement,
-        },
+        in_src_shardings=inner_shardings,
+        in_dst_shardings=dict(inner_shardings),
         out_src_shardings=head_placement,
         out_dst_shardings=head_placement,
         local_spmd=True,

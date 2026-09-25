@@ -49,7 +49,7 @@ from torchtitan.models.utils import (
 )
 from torchtitan.protocols.module import Module
 
-from .gdn import GatedDeltaNet
+from .gdn import FusedGatedDeltaNet, GatedDeltaNet
 from .rope import MRoPE
 from .sharding import annotate_deltanet_cu_seqlens, set_qwen35_sharding_config
 from .state_dict_adapter import Qwen35StateDictAdapter
@@ -210,7 +210,7 @@ class Qwen35TransformerBlock(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         attention: Qwen35Attention.Config | None = None
-        delta_net: GatedDeltaNet.Config | None = None
+        delta_net: GatedDeltaNet.Config | FusedGatedDeltaNet.Config | None = None
         feed_forward: Module.Config | None = None
         moe: Module.Config | None = None
         attention_norm: OffsetRMSNorm.Config
@@ -341,11 +341,14 @@ class Qwen35Model(MultimodalModel):
                     ),
                     None,
                 )
-                if dn_cfg is not None:
-                    n_key_heads = dn_cfg.in_proj_q.out_features // dn_cfg.key_head_dim
-                    n_value_heads = (
-                        dn_cfg.in_proj_v.out_features // dn_cfg.value_head_dim
+                if isinstance(dn_cfg, FusedGatedDeltaNet.Config):
+                    raise ValueError(
+                        "FusedGatedDeltaNet requires tensor_parallel_degree == 1; "
+                        f"got {tp}. Build the model with fuse_gdn_input_projections=False."
                     )
+                if dn_cfg is not None:
+                    n_key_heads = dn_cfg.num_key_heads
+                    n_value_heads = dn_cfg.num_value_heads
                     if n_key_heads % tp != 0 or n_value_heads % tp != 0:
                         raise ValueError(
                             f"tensor_parallel_degree ({tp}) must divide "
@@ -379,13 +382,12 @@ class Qwen35Model(MultimodalModel):
                         v_head_dim=attention.head_dim,
                         seq_len=seq_len,
                     )
-                elif isinstance(layer.delta_net, GatedDeltaNet.Config):
+                elif isinstance(
+                    layer.delta_net, (GatedDeltaNet.Config, FusedGatedDeltaNet.Config)
+                ):
                     delta_net = layer.delta_net
-                    num_value_heads = (
-                        delta_net.in_proj_v.out_features // delta_net.value_head_dim
-                    )
                     attention_op_flops += delta_rule_flops_per_token(
-                        num_heads=num_value_heads,
+                        num_heads=delta_net.num_value_heads,
                         key_head_dim=delta_net.key_head_dim,
                         v_head_dim=delta_net.value_head_dim,
                     )
