@@ -182,7 +182,8 @@ class VLLMCudaGraphConfig:
     - ``"FULL_DECODE_ONLY"``: graph pure-decode batches; prefill / mixed
       batches run eager. Cheap (no inductor compile).
     - ``"FULL"`` (default): graph the whole forward, prefill included, attention
-      captured too.
+      captured too. On vLLM's V2 runner (single-GPU engines), vLLM limits FULL
+      graphs to decode and prefill runs eagerly.
     """
 
     capture_sizes: list[int] | None = None
@@ -208,6 +209,7 @@ class VLLMCudaGraphConfig:
         expert_sequence_parallel_size: int,
         enable_sequence_parallel: bool,
         max_num_batched_tokens: int | None = None,
+        graph_prefill: bool = True,
     ) -> CompilationConfig:
         """Build a vLLM ``CompilationConfig`` for the generator.
 
@@ -220,6 +222,10 @@ class VLLMCudaGraphConfig:
         ``max_num_batched_tokens`` (the configured value, else
         ``_DEFAULT_MAX_NUM_BATCHED_TOKENS``), so the cap extends to it -- otherwise
         prefill chunks larger than the cap fall back to eager.
+
+        ``graph_prefill=False`` keeps the cap at ``max_num_seqs`` for ``FULL`` too.
+        Pass it for vLLM's V2 runner, whose FULL graphs cover decode only: there,
+        prefill-sized graphs only pad prefill batches up to the next size.
 
         ``expert_sequence_parallel_size`` is the TP-axis shard count used by the
         internally sequence-sharded MoE path. A value greater than one removes
@@ -252,7 +258,7 @@ class VLLMCudaGraphConfig:
         else:
             _max_cuda_graph_capture_size = _DEFAULT_MAX_NUM_BATCHED_TOKENS
         cap = max_num_seqs
-        if self.mode == "FULL":
+        if self.mode == "FULL" and graph_prefill:
             cap = max(cap, _max_cuda_graph_capture_size)
         if self.capture_sizes is not None:
             if not self.capture_sizes or any(s <= 0 for s in self.capture_sizes):
@@ -858,13 +864,10 @@ class VLLMGenerator(Configurable):
             (VarlenInnerAttention.Config, FlexInnerAttention.Config),
         ), "Only varlen and flex attention backends are allowed."
 
-        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = (
-            "1"
-            if use_v2_model_runner(
-                config.parallelism, batch_invariant=config.debug.batch_invariant
-            )
-            else "0"
+        use_v2 = use_v2_model_runner(
+            config.parallelism, batch_invariant=config.debug.batch_invariant
         )
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if use_v2 else "0"
         set_batch_invariance(config.debug.batch_invariant)
         if config.debug.batch_invariant:
             # The vLLM v2 logprob Triton kernel bypasses the aten overrides above;
@@ -931,6 +934,7 @@ class VLLMGenerator(Configurable):
             max_num_batched_tokens=config.max_num_batched_tokens,
             expert_sequence_parallel_size=expert_sequence_parallel_size,
             enable_sequence_parallel=config.parallelism.enable_sequence_parallel,
+            graph_prefill=not use_v2,
         )
         if vllm_compilation_config is not None:
             engine_kwargs["compilation_config"] = vllm_compilation_config

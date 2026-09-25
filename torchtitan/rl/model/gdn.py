@@ -282,6 +282,41 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
                 )
             return
 
+        # Captured graphs keep the capacity-shaped Attention Gym path, since
+        # FlashInfer's inputs are sliced by host-side request and token counts.
+        if self.use_flashinfer_prefill and not torch.cuda.is_current_stream_capturing():
+            # Pass only the real requests and tokens: empty trailing intervals
+            # cost FlashInfer a work tile each, and padded rows keep the
+            # caller's zero fill.
+            num_reqs = gdn_metadata.num_prefills + gdn_metadata.num_decodes
+            num_tokens = (
+                gdn_metadata.num_prefill_tokens + gdn_metadata.num_decode_tokens
+            )
+            cu_seqlens = cu_seqlens[: num_reqs + 1]
+            state_indices = state_indices[:num_reqs]
+            has_initial_state = has_initial_state[:num_reqs]
+            conv_output = paged_causal_conv1d(
+                mixed_qkv[:num_tokens].unsqueeze(0),
+                conv_weight,
+                self.kv_cache[0],
+                state_indices,
+                activation="silu",
+                cu_seqlens=cu_seqlens,
+                has_initial_state=has_initial_state,
+            ).squeeze(0)
+            self._forward_gdn_flashinfer(
+                conv_output,
+                a[:num_tokens],
+                b[:num_tokens],
+                A_log,
+                dt_bias,
+                output[:num_tokens],
+                cu_seqlens,
+                state_indices,
+                has_initial_state,
+            )
+            return
+
         conv_output = paged_causal_conv1d(
             mixed_qkv[:num_actual_tokens].unsqueeze(0),
             conv_weight,
@@ -291,24 +326,6 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             cu_seqlens=cu_seqlens,
             has_initial_state=has_initial_state,
         ).squeeze(0)
-        # Captured graphs keep the capacity-shaped Attention Gym path, since
-        # FlashInfer's inputs are sliced by a host-side request count.
-        if self.use_flashinfer_prefill and not torch.cuda.is_current_stream_capturing():
-            # Empty trailing intervals cost FlashInfer a work tile each, so pass
-            # only the real requests. Padded rows keep the caller's zero fill.
-            num_reqs = gdn_metadata.num_prefills + gdn_metadata.num_decodes
-            self._forward_gdn_flashinfer(
-                conv_output,
-                a[:num_actual_tokens],
-                b[:num_actual_tokens],
-                A_log,
-                dt_bias,
-                output[:num_actual_tokens],
-                cu_seqlens[: num_reqs + 1],
-                state_indices[:num_reqs],
-                has_initial_state[:num_reqs],
-            )
-            return
         self._forward_gdn(
             conv_output,
             a[:num_actual_tokens],

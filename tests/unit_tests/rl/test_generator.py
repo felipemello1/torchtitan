@@ -508,6 +508,17 @@ def test_cuda_graph_full_mode_extends_capture_sizes_to_chunk():
     assert 500 in cfg.cudagraph_capture_sizes  # decode batch captured exactly
 
 
+def test_cuda_graph_full_mode_without_prefill_graphs_caps_at_max_num_seqs():
+    # vLLM's V2 runner graphs decode only, so FULL keeps FULL_DECODE_ONLY's sizes.
+    cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
+        max_num_seqs=500,
+        expert_sequence_parallel_size=1,
+        enable_sequence_parallel=False,
+        graph_prefill=False,
+    )
+    assert cfg.cudagraph_capture_sizes == [1, 2, 4, 8, 16, 32, 64, 128, 256, 500]
+
+
 def test_cuda_graph_rejects_nonpositive_max_num_seqs():
     with pytest.raises(ValueError, match="max_num_seqs must be positive"):
         VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
