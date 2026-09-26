@@ -73,7 +73,7 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
         backward                              time    logprob error   grad_input error
         round grad_output to bf16             12 ms   6.1e-6          2.29e-3
         hi + lo (this)                        20 ms   6.1e-6          1.70e-3
-        RouterGateLinear's (fp32 via BF16x9)  53 ms   6.1e-6          1.66e-3
+        BF16x9 (RouterGateLinear's)           53 ms   6.1e-6          1.66e-3
         exact gradients rounded to bf16                               1.66e-3   <- floor
 
     The split itself loses almost nothing: summing the same hi + lo with an fp32 GEMM gives
