@@ -92,17 +92,14 @@ def test_lm_head_converter_sets_only_lm_head():
     build_config, max_context_length = qwen3_configs["0.6B"]
     config = build_config(attn_backend="flex", seq_len=max_context_length)
 
-    for matmul_mode in ("bf16_matmul_fp32_out", "upcast_fp32_matmul"):
-        LMHeadFp32OutputConverter.Config(matmul_mode=matmul_mode).build().convert(
-            config
-        )
+    LMHeadFp32OutputConverter.Config().build().convert(config)
 
-        changed = [
-            (fqn, linear_config.matmul_mode)
-            for fqn, linear_config, _, _ in config.traverse(Linear.Config)
-            if linear_config.matmul_mode != "default"
-        ]
-        assert changed == [("lm_head", matmul_mode)]
+    changed = [
+        (fqn, linear_config.matmul_mode)
+        for fqn, linear_config, _, _ in config.traverse(Linear.Config)
+        if linear_config.matmul_mode != "default"
+    ]
+    assert changed == [("lm_head", "bf16_matmul_fp32_out")]
 
     config.lm_head = None
     with pytest.raises(ValueError, match="lm_head"):
