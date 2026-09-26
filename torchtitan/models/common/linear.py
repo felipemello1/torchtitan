@@ -78,10 +78,24 @@ class Linear(nn.Linear, Module):
         out_features: int
         num_linears: int = 1
         bias: bool = False
-        output_dtype: Literal["input", "float32"] = "input"
-        """Output dtype. "float32" with bf16 input and weight on CUDA runs a bf16 GEMM
-        with fp32 accumulation and output (no fp32 weight copy) and a bf16 backward;
-        otherwise it upcasts the operands."""
+        matmul_mode: Literal[
+            "default", "bf16_matmul_fp32_out", "upcast_fp32_matmul"
+        ] = "default"
+        """How the matmul treats its operands.
+        "default": F.linear on the operands as given; output in their dtype.
+        "bf16_matmul_fp32_out": bf16 operands as given, fp32 accumulation and output;
+        bf16 backward.
+        "upcast_fp32_matmul": copies both operands to fp32 every call, then an fp32 matmul.
+
+        bf16 operands, 2048x5120 input, 248320x5120 weight (an LM head):
+
+            mode                   output   fwd+bwd   mean logprob error
+            default                bf16     12 ms     8.4e-3
+            bf16_matmul_fp32_out   fp32     12 ms     7.5e-5
+            upcast_fp32_matmul     fp32     76 ms     1.5e-6
+
+        Batch-invariant mode always upcasts.
+        """
 
     def __init__(self, config: Config):
         super().__init__(
@@ -89,13 +103,13 @@ class Linear(nn.Linear, Module):
             config.num_linears * config.out_features,
             bias=config.bias,
         )
-        if config.output_dtype != "input" and type(self)._linear is not Linear._linear:
+        if config.matmul_mode != "default" and type(self)._linear is not Linear._linear:
             raise ValueError(
                 f"{type(self).__qualname__} overrides _linear and ignores "
-                f"output_dtype={config.output_dtype!r}."
+                f"matmul_mode={config.matmul_mode!r}."
             )
 
-        self.output_dtype = config.output_dtype
+        self.matmul_mode = config.matmul_mode
         self.out_features = config.out_features
         self.num_linears = config.num_linears
         if config.num_linears > 1:
@@ -159,30 +173,36 @@ class Linear(nn.Linear, Module):
         Explicit operands let those boundaries adjust an operand's SPMD type
         before invoking the selected local compute implementation.
         """
-        if self.output_dtype == "input":
+        if self.matmul_mode == "default":
             return F.linear(input, weight, bias)
 
-        # aten::mm.dtype (bf16 inputs, fp32 output) is only implemented for CUDA/ROCm.
-        out_dtype_mm_available = input.is_cuda
-        bf16_operands = input.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+        if self.matmul_mode == "upcast_fp32_matmul":
+            bias = None if bias is None else bias.float()
+            return F.linear(input.float(), weight.float(), bias)
 
-        # TODO: batch-invariant mode can't use this op (cuBLAS's out_dtype GEMM isn't
-        # batch-invariant) and falls back to the upcast. Adding a bf16-input, fp32-output
-        # matmul to batch_invariant_ops would let it use _Fp32OutputLinearFunction too.
-        if (
-            out_dtype_mm_available
-            and bf16_operands
-            and not is_in_batch_invariant_mode()
-        ):
+        if self.matmul_mode == "bf16_matmul_fp32_out":
+            # TODO: batch-invariant mode can't use this op (cuBLAS's out_dtype GEMM isn't
+            # batch-invariant) and upcasts instead. A bf16-input, fp32-output matmul in
+            # batch_invariant_ops would let it use _Fp32OutputLinearFunction too.
+            if is_in_batch_invariant_mode():
+                bias = None if bias is None else bias.float()
+                return F.linear(input.float(), weight.float(), bias)
+
+            # aten::mm.dtype (bf16 inputs, fp32 output) is only implemented for CUDA/ROCm.
+            if not (input.is_cuda and input.dtype == weight.dtype == torch.bfloat16):
+                raise ValueError(
+                    'matmul_mode="bf16_matmul_fp32_out" needs bf16 CUDA operands, got '
+                    f"{input.dtype}/{weight.dtype} on {input.device}. "
+                    'Use "upcast_fp32_matmul".'
+                )
+
             output = _Fp32OutputLinearFunction.apply(
                 input.reshape(-1, input.shape[-1]), weight
             )
             output = output.reshape(*input.shape[:-1], -1)
             return output if bias is None else output + bias.float()
 
-        # Batch-invariant mode, non-CUDA devices, or fp32 operands: upcast.
-        bias = None if bias is None else bias.float()
-        return F.linear(input.float(), weight.float(), bias)
+        raise AssertionError(f"unknown matmul_mode {self.matmul_mode!r}")
 
 
 class ColumnParallelLinear(Linear):
@@ -319,7 +339,7 @@ class _RouterGateLinearFunction(torch.autograd.Function):
 class RouterGateLinear(Linear):
     """Router projection with FP32 output and backward compute.
 
-    TODO: fold into ``Linear(output_dtype="float32")`` once ``Linear`` supports an fp32
+    TODO: fold into ``Linear(matmul_mode="bf16_matmul_fp32_out")`` once ``Linear`` supports an fp32
     backward; the forward is the same op.
 
     CUDA uses BF16 forward compute when both operands are BF16. All other

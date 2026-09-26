@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU tests for ``Linear.Config.output_dtype``. CPU takes the upcast path."""
+"""CPU tests for ``Linear.Config.matmul_mode``."""
 
 import pytest
 import torch
@@ -21,7 +21,7 @@ def _bf16_linear(**kwargs) -> Linear:
     )
 
 
-def test_default_output_dtype_is_input_dtype():
+def test_default_mode_keeps_input_dtype():
     linear = _bf16_linear()
     x = torch.randn(2, 4, 8, dtype=torch.bfloat16)
     out = linear(x)
@@ -29,8 +29,8 @@ def test_default_output_dtype_is_input_dtype():
     assert torch.equal(out, F.linear(x, linear.weight))
 
 
-def test_float32_output_upcasts_off_cuda():
-    linear = _bf16_linear(output_dtype="float32")
+def test_upcast_mode_returns_fp32():
+    linear = _bf16_linear(matmul_mode="upcast_fp32_matmul")
     x = torch.randn(2, 4, 8, dtype=torch.bfloat16)
 
     out = linear(x)
@@ -41,8 +41,8 @@ def test_float32_output_upcasts_off_cuda():
     assert linear.weight.dtype == torch.bfloat16
 
 
-def test_float32_output_preserves_stacked_shape():
-    linear = _bf16_linear(output_dtype="float32", num_linears=2, bias=True)
+def test_upcast_mode_preserves_stacked_shape():
+    linear = _bf16_linear(matmul_mode="upcast_fp32_matmul", num_linears=2, bias=True)
     x = torch.randn(2, 4, 8, dtype=torch.bfloat16)
 
     out = linear(x)
@@ -54,10 +54,18 @@ def test_float32_output_preserves_stacked_shape():
     assert torch.equal(out, expected)
 
 
-def test_subclass_overriding_linear_rejects_output_dtype():
-    with pytest.raises(ValueError, match="ignores output_dtype='float32'"):
+def test_bf16_matmul_fp32_out_rejects_cpu_operands():
+    linear = _bf16_linear(matmul_mode="bf16_matmul_fp32_out")
+    x = torch.randn(2, 4, 8, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="needs bf16 CUDA operands"):
+        linear(x)
+
+
+def test_subclass_overriding_linear_rejects_matmul_mode():
+    with pytest.raises(ValueError, match="ignores matmul_mode='upcast_fp32_matmul'"):
         RouterGateLinear.Config(
-            in_features=8, out_features=4, output_dtype="float32"
+            in_features=8, out_features=4, matmul_mode="upcast_fp32_matmul"
         ).build()
 
 
@@ -68,14 +76,17 @@ def test_lm_head_converter_sets_only_lm_head():
     build_config, max_context_length = qwen3_configs["0.6B"]
     config = build_config(attn_backend="flex", seq_len=max_context_length)
 
-    LMHeadFp32OutputConverter.Config().build().convert(config)
+    for matmul_mode in ("bf16_matmul_fp32_out", "upcast_fp32_matmul"):
+        LMHeadFp32OutputConverter.Config(matmul_mode=matmul_mode).build().convert(
+            config
+        )
 
-    changed = [
-        fqn
-        for fqn, linear_config, _, _ in config.traverse(Linear.Config)
-        if linear_config.output_dtype != "input"
-    ]
-    assert changed == ["lm_head"]
+        changed = [
+            (fqn, linear_config.matmul_mode)
+            for fqn, linear_config, _, _ in config.traverse(Linear.Config)
+            if linear_config.matmul_mode != "default"
+        ]
+        assert changed == [("lm_head", matmul_mode)]
 
     config.lm_head = None
     with pytest.raises(ValueError, match="lm_head"):

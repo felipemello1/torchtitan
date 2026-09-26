@@ -110,10 +110,14 @@ def test_quantization_rejects_unsupported_linear_wrapper():
         quantization_transform._validate_quantizable_linear(config, "projection")
 
 
-def test_quantization_rejects_fp32_output_linear():
-    config = Linear.Config(in_features=16, out_features=16, output_dtype="float32")
+def test_quantization_rejects_non_default_matmul_mode():
+    config = Linear.Config(
+        in_features=16, out_features=16, matmul_mode="bf16_matmul_fp32_out"
+    )
 
-    with pytest.raises(ValueError, match="does not support output_dtype='float32'"):
+    with pytest.raises(
+        ValueError, match="does not support matmul_mode='bf16_matmul_fp32_out'"
+    ):
         quantization_transform._validate_quantizable_linear(config, "lm_head")
 
 

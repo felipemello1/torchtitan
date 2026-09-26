@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""GPU tests for ``Linear(output_dtype="float32")``: bf16 GEMM with fp32 output."""
+"""GPU tests for ``Linear(matmul_mode="bf16_matmul_fp32_out")``."""
 
 import pytest
 import torch
@@ -18,7 +18,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 
 def _lm_head(in_features: int = 256, out_features: int = 1024) -> Linear:
     lm_head = Linear.Config(
-        in_features=in_features, out_features=out_features, output_dtype="float32"
+        in_features=in_features,
+        out_features=out_features,
+        matmul_mode="bf16_matmul_fp32_out",
     ).build()
     torch.nn.init.normal_(lm_head.weight, std=0.02)
     return lm_head.to(device="cuda", dtype=torch.bfloat16)

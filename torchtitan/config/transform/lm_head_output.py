@@ -7,6 +7,7 @@
 """Model-config converter for an fp32-output lm_head."""
 
 from dataclasses import dataclass
+from typing import Literal
 
 from torchtitan.models.common.linear import Linear
 
@@ -16,7 +17,7 @@ __all__ = ["LMHeadFp32OutputConverter"]
 
 
 class LMHeadFp32OutputConverter(ModelConfigConverter):
-    """Set ``output_dtype="float32"`` on the decoder's ``lm_head``.
+    """Set an fp32-output ``matmul_mode`` on the decoder's ``lm_head``.
 
     Only the lm_head changes. The same model config backs the trainer and the vLLM
     generator, so both compute fp32 logits with the same op.
@@ -26,7 +27,10 @@ class LMHeadFp32OutputConverter(ModelConfigConverter):
 
     @dataclass(kw_only=True, slots=True)
     class Config(ModelConfigConverter.Config):
-        pass
+        matmul_mode: Literal[
+            "bf16_matmul_fp32_out", "upcast_fp32_matmul"
+        ] = "bf16_matmul_fp32_out"
+        """``Linear.Config.matmul_mode`` for the lm_head; see it for the trade-off."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -35,7 +39,7 @@ class LMHeadFp32OutputConverter(ModelConfigConverter):
         found = False
         for fqn, linear_config, _, _ in model_config.traverse(Linear.Config):
             if fqn.rsplit(".", 1)[-1] == self._TARGET:
-                linear_config.output_dtype = "float32"
+                linear_config.matmul_mode = self.config.matmul_mode
                 found = True
         if not found:
             raise ValueError(
