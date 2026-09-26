@@ -67,20 +67,21 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
     dimension whose two halves are added afterwards. The layout duplicates the smaller tensor:
     an LM head has out_features (vocab) >> tokens, a router has out_features (experts) << tokens.
 
-    Qwen3.5-27B LM head (248320 x 5120 weight), 2048 real tokens, fwd + cross-entropy + bwd:
+    Qwen3.5-27B LM head (248320 x 5120 weight), 2048 real tokens, fwd + cross-entropy + bwd,
+    errors vs fp64 (the forward is the same op in every row, so its error is too):
 
-        backward                            time    grad_input error vs fp64
-        round grad_output to bf16           12 ms   2.29e-3
-        hi + lo (this)                      19 ms   1.70e-3
-        fp32 matmul via BF16x9              54 ms   1.66e-3
-        exact gradients rounded to bf16             1.66e-3   <- floor: gradients return in bf16
+        backward                              time    logprob error   grad_input error
+        round grad_output to bf16             12 ms   6.1e-6          2.29e-3
+        hi + lo (this)                        20 ms   6.1e-6          1.70e-3
+        RouterGateLinear's (fp32 via BF16x9)  53 ms   6.1e-6          1.66e-3
+        exact gradients rounded to bf16                               1.66e-3   <- floor
 
     The split itself loses almost nothing: summing the same hi + lo with an fp32 GEMM gives
     1.66e-3. The extra 2% comes from the bf16 GEMM adding up 248320 products per output in its
     fp32 accumulator; grad_weight (2048 products per output) matches fp32 exactly (1.64e-3).
 
     Qwen3.5-35B-A3B routers (2048 -> 256 experts, 40 layers), 64k tokens, fwd + bwd GPU time:
-    44.7 ms with BF16x9, 14.4 ms with this, same gradient error (1.66e-3).
+    44.8 ms with RouterGateLinear's backward, 14.4 ms with this, same gradient error (1.66e-3).
     """
 
     @staticmethod
@@ -171,7 +172,7 @@ class Linear(nn.Linear, Module):
 
             mode                   output   time    mean logprob error   grad_input error
             default                bf16     12 ms   1.2e-2               1.1e-2
-            bf16_matmul_fp32_out   fp32     19 ms   6.1e-6               1.7e-3
+            bf16_matmul_fp32_out   fp32     20 ms   6.1e-6               1.7e-3
             upcast_fp32_matmul     fp32     77 ms   1.6e-6               1.7e-3
 
         Batch-invariant mode always upcasts.

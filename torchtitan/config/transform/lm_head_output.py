@@ -40,7 +40,7 @@ class LMHeadFp32OutputConverter(ModelConfigConverter):
 
             mode                   output   time    mean logprob error   grad_input error
             default (bf16 head)    bf16     12 ms   1.2e-2               1.1e-2
-            bf16_matmul_fp32_out   fp32     19 ms   6.1e-6               1.7e-3
+            bf16_matmul_fp32_out   fp32     20 ms   6.1e-6               1.7e-3
             upcast_fp32_matmul     fp32     77 ms   1.6e-6               1.7e-3
 
         Batch-invariant mode always upcasts.
