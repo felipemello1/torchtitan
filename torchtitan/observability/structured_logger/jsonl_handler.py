@@ -175,11 +175,10 @@ class TraceJsonlHandler(logging.FileHandler):
         {output_dir}/structured_logs/{source}.global_rank_{rank}.{timestamp}-{random}.jsonl
     """
 
-    # StreamHandler flushes every record (~0.5 ms each on NFS, on the logging thread).
-    # A flush costs the same at any interval, so 1 s costs <0.1% of a thread on NFS and
-    # longer intervals save almost nothing. The interval is how stale the file can be
-    # while running, and how much a hard kill loses; close() writes the rest.
-    flush_interval_s: float = 1.0
+    # StreamHandler flushes every record, ~0.5 ms each on NFS, blocking the logging thread.
+    # A flush every 3 s costs <0.02% of a thread. Longer saves ~nothing, but the file lags
+    # further behind and a hard kill loses more (close() writes the rest).
+    flush_interval_s: float = 3.0
 
     def __init__(self, rank: int, source: str, output_dir: str):
         timestamp_str = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
