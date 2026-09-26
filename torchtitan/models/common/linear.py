@@ -28,7 +28,7 @@ from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.protocols.module import Module
 
 # Shape suffix legend:
-#   T = num tokens, D = input features, O = output features
+#   T = num tokens, D = model dimension, O = output features
 
 
 class Linear(nn.Linear, Module):
