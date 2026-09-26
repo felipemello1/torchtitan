@@ -23,7 +23,7 @@ from torchtitan.components.optimizer import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.spmd_types import set_current_spmd_mesh
-from torchtitan.models.common import RouterGateLinear, Sigmoid
+from torchtitan.models.common import Fp32OutputLinear, Sigmoid
 from torchtitan.models.common.decoder_sharding import (
     dense_activation_placement,
     dense_param_placement,
@@ -67,7 +67,7 @@ class TestQuantileBalancingDistributed(DTensorTestBase):
             router = QuantileBalancedTopKRouter.Config(
                 num_experts=4,
                 top_k=2,
-                gate=RouterGateLinear.Config(
+                gate=Fp32OutputLinear.Config(
                     in_features=4,
                     out_features=4,
                     bias=False,
