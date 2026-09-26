@@ -199,10 +199,12 @@ class RowParallelLinear(Linear):
 
 
 class Fp32OutputLinear(Linear):
-    """``Linear`` that returns fp32, for projections whose output needs fp32 precision.
+    """``Linear`` with fp32 output, close to fp32 precision at close to bf16 speed.
 
-    E.g. an LM head (for accurate logprobs) or a MoE router gate. bf16 operands stay bf16: no
-    fp32 copy of the weight. See ``_Fp32OutputLinearFunction``.
+    Takes bf16 input and weight as they are (no fp32 copies), multiplies them with bf16 GEMMs that
+    accumulate in fp32, and runs a backward that approximates an fp32 one. For projections whose
+    output needs fp32 precision, e.g. an LM head (logprobs) or a MoE router gate.
+    See ``_Fp32OutputLinearFunction``.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -224,23 +226,14 @@ class Fp32OutputLinear(Linear):
 
 @spmd.register_local_autograd_function
 class _Fp32OutputLinearFunction(torch.autograd.Function):
-    """``input @ weight.T`` in fp32 from bf16 operands, at close to bf16 GEMM cost.
+    """Linear op with close to fp32 precision at close to bf16 speed.
 
-    Both passes run bf16 GEMMs that accumulate in fp32. The backward splits its fp32 gradient
-    into two bf16 halves, because an fp32 matmul (BF16x9) costs ~9x and rounding the gradient to
-    bf16 loses precision. Off CUDA, with non-bf16 operands, or in batch-invariant mode, both
-    passes upcast and run in fp32 instead.
+    Forward: bf16 input and weight, a bf16 GEMM that accumulates in fp32, fp32 output.
+    Backward: approximates an fp32 backward with bf16 GEMMs; see ``backward``.
 
-    Qwen3.5-27B LM head (248320 x 5120), 2048 real tokens, fwd + cross-entropy + bwd, vs fp64:
-
-        backward                      time    logprob error   grad_input error
-        round grad_output to bf16     12 ms   6.1e-6          2.29e-3
-        hi + lo (this)                20 ms   6.1e-6          1.70e-3
-        fp32 backward via BF16x9      53 ms   6.1e-6          1.66e-3
-        exact grads rounded to bf16                           1.66e-3   <- floor: grads are bf16
-
-    Qwen3.5-35B-A3B routers (2048 -> 256, 40 layers), 64k tokens, fwd + bwd GPU time: 44.8 ms
-    with an fp32 (BF16x9) backward, 14.4 ms with this, same error (1.66e-3).
+    Off CUDA, with non-bf16 operands, or in batch-invariant mode, both passes fall back to fp32
+    matmuls, which are slower (on Blackwell, TorchTitan runs them as BF16x9: ~9x the bf16 cost).
+    Accuracy and timings: https://github.com/felipemello1/torchtitan/pull/55
     """
 
     @staticmethod
@@ -254,35 +247,45 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
 
             input (bf16) --+
                            +--> bf16 GEMM, fp32 accumulate --> output (fp32)
-            weight (bf16) -+    bf16 x bf16 products are exact in fp32; no fp32 weight copy
+            weight (bf16) -+
+
+        The product of two bf16 numbers is exact in fp32, so upcasting input and weight first
+        would add no precision, only an fp32 copy of the weight. Accumulating in fp32 is enough.
         """
-        # aten::mm.dtype (bf16 inputs, fp32 output) is only implemented for CUDA/ROCm.
-        # TODO: batch-invariant mode can't use it either (cuBLAS's out_dtype GEMM isn't
-        # batch-invariant) and upcasts. A bf16-input, fp32-output matmul in batch_invariant_ops
-        # would let it take the bf16 path too.
         ctx.use_bf16_gemm = (
+            # aten::mm.dtype (bf16 inputs, fp32 output) is only implemented for CUDA/ROCm.
             input_TD.is_cuda
             and input_TD.dtype == weight_OD.dtype == torch.bfloat16
+            # TODO: batch-invariant mode can't use this op (cuBLAS's out_dtype GEMM isn't
+            # batch-invariant), so it takes the slow fallback. A bf16-input, fp32-output matmul
+            # in batch_invariant_ops would let it take the optimized path.
             and not is_in_batch_invariant_mode()
         )
         ctx.save_for_backward(input_TD, weight_OD)
         if ctx.use_bf16_gemm:
             return torch.mm(input_TD, weight_OD.T, out_dtype=torch.float32)
+        # Slow fallback: upcast the input and weight to fp32.
         return torch.mm(input_TD.float(), weight_OD.float().T)
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output_TO: torch.Tensor):  # pyrefly: ignore[bad-override]
-        """``grad_output @ weight`` and ``grad_output.T @ input`` from bf16 GEMMs.
+        """``grad_output @ weight`` and ``grad_output.T @ input``, close to fp32 precision.
 
-        grad_output is fp32, but tensor cores only take bf16, the top half of an fp32:
+        grad_output is fp32 (the output was fp32), but tensor cores only take bf16, the top half
+        of an fp32:
 
             fp32:  [sign | exponent (8 bits) | mantissa (23 bits)]
             bf16:  [sign | exponent (8 bits) | mantissa  (7 bits)]
 
-            round grad_output to bf16   1 GEMM    drops 16 mantissa bits
-            fp32 matmul (BF16x9)        9 GEMMs   splits both operands into 3 bf16 pieces each
-            hi + lo (this)              2 GEMMs   splits only grad_output; input, weight are bf16
+        The naive way rounds grad_output to bf16: fast, but it drops 16 mantissa bits. The slow
+        way is an fp32 matmul; on Blackwell that is BF16x9, which splits both operands into 3 bf16
+        pieces and multiplies all 9 pairs. Here input and weight are already exactly bf16, so only
+        grad_output needs splitting, into 2 pieces:
+
+            round grad_output to bf16   1 GEMM    fast, loses precision
+            fp32 matmul (BF16x9)        9 GEMMs   precise, ~9x the cost
+            hi + lo (this)              2 GEMMs   precise, ~2x the cost
 
             grad_output = hi + lo   hi = top 16 bits (exactly a bf16), lo = bf16(grad_output - hi)
             0.1 = 0.099609375 + 0.000391006     off by 4e-7 (bf16(0.1) alone: off by 1e-4)
@@ -299,15 +302,12 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
             out_features <= tokens (e.g. a router):
                 grad_input:   [hi | lo] @ [W; W]    =  hi @ W + lo @ W       (summed in the GEMM)
                 grad_weight:  hi.T @ x + lo.T @ x                            (two small GEMMs)
-
-        The split loses ~nothing (hi + lo through an fp32 GEMM: 1.66e-3). The extra 2% over an
-        fp32 backward in the class table is the bf16 GEMM summing 248320 products per output.
         """
         input_TD, weight_OD = ctx.saved_tensors
         grad_input_TD = grad_weight_OD = None
 
         if not ctx.use_bf16_gemm:
-            # fp32 path: fp32 matmuls, gradients returned in each operand's dtype.
+            # Slow fallback: fp32 matmuls, gradients returned in each operand's dtype.
             if ctx.needs_input_grad[0]:
                 grad_input_TD = torch.mm(grad_output_TO, weight_OD.float())
                 grad_input_TD = grad_input_TD.to(input_TD.dtype)
