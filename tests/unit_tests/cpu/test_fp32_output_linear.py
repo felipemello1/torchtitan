@@ -126,6 +126,25 @@ class TestFp32OutputLinearSPMD(DTensorTestBase):
             spmd.assert_type(output_TE, {"tp": spmd.V})
 
 
+def test_fp32_output_linear_preserves_stacked_output_shape():
+    layer = (
+        Fp32OutputLinear.Config(in_features=8, out_features=4, num_linears=2, bias=True)
+        .build()
+        .to(torch.bfloat16)
+    )
+    input_BTD = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+
+    output = layer(input_BTD)
+
+    weight_OD = layer.weight.float().flatten(0, -2)
+    expected = (
+        input_BTD.float() @ weight_OD.T + layer.bias.float().flatten()
+    ).unflatten(-1, (2, 4))
+    assert output.shape == (2, 3, 2, 4)
+    assert output.dtype is torch.float32
+    torch.testing.assert_close(output, expected)
+
+
 def test_split_into_bf16_hi_lo_recovers_fp32():
     tensor = torch.randn(1000) * torch.logspace(-8, 8, 1000)
 
