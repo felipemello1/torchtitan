@@ -38,7 +38,7 @@ def validate_converter_compatibility(
     converters: list[ModelConfigConverter.Config],
 ) -> None:
     """Validate converter compatibility before model conversion."""
-    from .lm_head_output import LMHeadFp32OutputConverter
+    from .lm_head_fp32 import LMHeadFp32OutputConverter
     from .quantization import QuantizationConverter
 
     has_quantization = any(
