@@ -314,6 +314,8 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
                 grad_weight:  hi.T @ x + lo.T @ x                            (two small GEMMs)
         """
         input_TD, weight_OD = ctx.saved_tensors
+        # Usually a no-op (the output is fp32); autocast can make the fallback's output bf16.
+        grad_output_TO = grad_output_TO.float()
         grad_input_TD = grad_weight_OD = None
 
         if not ctx.use_bf16_gemm:

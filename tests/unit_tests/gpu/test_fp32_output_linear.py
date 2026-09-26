@@ -144,3 +144,16 @@ def test_batch_invariant_mode_computes_in_fp32(monkeypatch):
 
     assert torch.equal(out, F.linear(x.detach().float(), lm_head.weight.float()))
     assert x.grad.dtype is torch.bfloat16
+
+
+def test_backward_runs_under_autocast_with_fp32_params():
+    # Autocast makes the fp32 fallback's output bf16; the backward must still run.
+    layer = Fp32OutputLinear.Config(in_features=64, out_features=32).build().cuda()
+    x = torch.randn(16, 64, device="cuda", requires_grad=True)
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = layer(x)
+    out.float().sum().backward()
+
+    assert x.grad.dtype is torch.float32
+    assert layer.weight.grad.dtype is torch.float32
