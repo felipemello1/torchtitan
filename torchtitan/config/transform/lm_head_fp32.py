@@ -6,9 +6,9 @@
 
 """Model-config converter for an fp32-output lm_head."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
-from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.linear import Fp32OutputLinear, Linear
 
 from .converter import ModelConfigConverter
 
@@ -16,7 +16,7 @@ __all__ = ["LMHeadFp32OutputConverter"]
 
 
 class LMHeadFp32OutputConverter(ModelConfigConverter):
-    """Set ``matmul_mode="bf16_matmul_fp32_out"`` on the decoder's ``lm_head``.
+    """Swap the decoder lm_head's ``Linear.Config`` to ``Fp32OutputLinear.Config``.
 
     Only the lm_head changes. The same model config backs the trainer and the vLLM
     generator, so both compute fp32 logits with the same op.
@@ -33,10 +33,20 @@ class LMHeadFp32OutputConverter(ModelConfigConverter):
 
     def convert(self, model_config):
         found = False
-        for fqn, linear_config, _, _ in model_config.traverse(Linear.Config):
-            if fqn.rsplit(".", 1)[-1] == self._TARGET:
-                linear_config.matmul_mode = "bf16_matmul_fp32_out"
-                found = True
+        for fqn, linear_config, parent, attr in model_config.traverse(Linear.Config):
+            if fqn.rsplit(".", 1)[-1] != self._TARGET:
+                continue
+            found = True
+            new_config = Fp32OutputLinear.Config(
+                **{
+                    f.name: getattr(linear_config, f.name)
+                    for f in fields(linear_config)
+                }
+            )
+            if isinstance(parent, list):
+                parent[attr] = new_config
+            else:
+                setattr(parent, attr, new_config)
         if not found:
             raise ValueError(
                 f"LMHeadFp32OutputConverter found no Linear named {self._TARGET!r} in "

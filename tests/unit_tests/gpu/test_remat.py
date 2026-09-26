@@ -22,8 +22,8 @@ from torchtitan.models.common.attention import GQAttention
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import (
     ColumnParallelLinear,
+    Fp32OutputLinear,
     Linear,
-    RouterGateLinear,
     RowParallelLinear,
 )
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
@@ -393,7 +393,7 @@ class TestRematRegions(unittest.TestCase):
     def test_router_decision_is_always_saved(self):
         router = TokenChoiceTopKRouter.Config(
             num_experts=4,
-            gate=RouterGateLinear.Config(in_features=4, out_features=4),
+            gate=Fp32OutputLinear.Config(in_features=4, out_features=4),
             score_func=Sigmoid.Config(),
             top_k=1,
         ).build()
