@@ -170,16 +170,15 @@ class TraceJsonlFormatter(logging.Formatter):
 class TraceJsonlHandler(logging.FileHandler):
     """Per-rank JSONL file handler that flushes at most once per ``flush_interval_s``.
 
-    ``StreamHandler`` flushes after every record, one ``write`` syscall each: about
-    0.5 ms per record on NFS, paid by the thread that logged. Records between
-    flushes stay in the file buffer; closing the handler (including at interpreter
-    exit via ``logging.shutdown``) writes them out.
-
     File path::
 
         {output_dir}/structured_logs/{source}.global_rank_{rank}.{timestamp}-{random}.jsonl
     """
 
+    # StreamHandler flushes every record (~0.5 ms each on NFS, on the logging thread).
+    # A flush costs the same at any interval, so 1 s costs <0.1% of a thread on NFS and
+    # longer intervals save almost nothing. The interval is how stale the file can be
+    # while running, and how much a hard kill loses; close() writes the rest.
     flush_interval_s: float = 1.0
 
     def __init__(self, rank: int, source: str, output_dir: str):
