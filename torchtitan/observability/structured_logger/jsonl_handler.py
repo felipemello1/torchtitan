@@ -16,11 +16,13 @@ import itertools
 import json
 import logging
 import os
+import queue
 import random
 import socket
 import string
+import sys
 import threading
-import time
+import traceback
 from timeit import default_timer as timer
 from typing import Any
 
@@ -168,17 +170,17 @@ class TraceJsonlFormatter(logging.Formatter):
 
 
 class TraceJsonlHandler(logging.FileHandler):
-    """Per-rank JSONL file handler that flushes at most once per ``flush_interval_s``.
+    """Per-rank JSONL file handler that writes records on a background thread.
+
+    ``StreamHandler`` writes and flushes each record on the thread that logged, about
+    0.5 ms per record on NFS. Here the logging thread only formats the record (the
+    formatter reads that thread's step state) and queues it; a writer thread writes
+    and flushes it. ``flush()`` and ``close()`` wait for queued records.
 
     File path::
 
         {output_dir}/structured_logs/{source}.global_rank_{rank}.{timestamp}-{random}.jsonl
     """
-
-    # StreamHandler flushes every record, ~0.5 ms each on NFS, blocking the logging thread.
-    # A flush every 3 s costs <0.02% of a thread. Longer saves ~nothing, but the file lags
-    # further behind and a hard kill loses more (close() writes the rest).
-    flush_interval_s: float = 3.0
 
     def __init__(self, rank: int, source: str, output_dir: str):
         timestamp_str = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -191,14 +193,49 @@ class TraceJsonlHandler(logging.FileHandler):
         super().__init__(filename=filepath)
         self.setFormatter(TraceJsonlFormatter(rank=rank, source=source))
         self.addFilter(TraceEventsOnlyFilter())
-        # The first record flushes immediately, so the file is readable right away.
-        self._last_flush_s = float("-inf")
+        # Formatted lines; None tells the writer to stop.
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._writer = threading.Thread(
+            target=self._write_lines, name="trace-jsonl-writer", daemon=True
+        )
+        self._writer.start()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # After close(), or in a forked child where the writer thread doesn't exist,
+        # write synchronously.
+        if not self._writer.is_alive():
+            super().emit(record)
+            return
+        try:
+            self._queue.put(self.format(record) + self.terminator)
+        except Exception:
+            self.handleError(record)
 
     def flush(self) -> None:
-        now = time.monotonic()
-        if now - self._last_flush_s >= self.flush_interval_s:
-            self._last_flush_s = now
-            super().flush()
+        if self._writer.is_alive():
+            self._queue.join()
+        super().flush()
+
+    def close(self) -> None:
+        with self.lock:
+            if self._writer.is_alive():
+                self._queue.put(None)
+                self._writer.join()
+            super().close()
+
+    def _write_lines(self) -> None:
+        while True:
+            line = self._queue.get()
+            try:
+                if line is None:
+                    return
+                self.stream.write(line)
+                self.stream.flush()
+            except Exception:
+                # Same fallback as logging.Handler.handleError: report, keep going.
+                traceback.print_exc(file=sys.stderr)
+            finally:
+                self._queue.task_done()
 
 
 @functools.cache
