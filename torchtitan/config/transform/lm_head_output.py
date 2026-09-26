@@ -30,7 +30,20 @@ class LMHeadFp32OutputConverter(ModelConfigConverter):
         matmul_mode: Literal[
             "bf16_matmul_fp32_out", "upcast_fp32_matmul"
         ] = "bf16_matmul_fp32_out"
-        """``Linear.Config.matmul_mode`` for the lm_head; see it for the trade-off."""
+        """How the lm_head matmul treats its operands.
+        "bf16_matmul_fp32_out": bf16 operands as given, fp32 accumulation and output;
+        bf16 backward.
+        "upcast_fp32_matmul": copies both operands to fp32 every call, then an fp32 matmul.
+
+        bf16 operands, 2048x5120 input, 248320x5120 weight (an LM head):
+
+            mode                   output   fwd+bwd   mean logprob error
+            default (bf16 head)    bf16     12 ms     8.4e-3
+            bf16_matmul_fp32_out   fp32     12 ms     7.5e-5
+            upcast_fp32_matmul     fp32     76 ms     1.5e-6
+
+        Batch-invariant mode always upcasts.
+        """
 
     def __init__(self, config: Config):
         self.config = config
