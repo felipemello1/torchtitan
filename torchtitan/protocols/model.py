@@ -163,6 +163,13 @@ class BaseModel(Module, ABC):
                     training=training,
                     parallelism=parallelism,
                 )
+                if (
+                    training.mixed_precision_grad == "float32"
+                    and training.mixed_precision_param == "bfloat16"
+                ):
+                    from torchtitan.distributed.fsdp import enable_fp32_weight_grads
+
+                    enable_fp32_weight_grads(self)
         return self
 
     @abstractmethod

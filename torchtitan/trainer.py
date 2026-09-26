@@ -82,6 +82,17 @@ class Trainer(Configurable):
 
         def __post_init__(self):
             TrainingEngine.Config.__post_init__(self)
+            if (
+                self.training.mixed_precision_grad == "float32"
+                and self.compile is not None
+                and "model" in self.compile.components
+            ):
+                # TODO: allow once AOTAutograd keeps a parameter's grad_dtype; today the
+                # compiled backward rounds the fp32 weight gradient back to bf16.
+                raise ValueError(
+                    "training.mixed_precision_grad='float32' does not support "
+                    "compile.components with 'model' yet."
+                )
             if self.debug.batch_invariant:
                 raise ValueError(
                     "Batch-invariant mode is not needed in supervised learning."

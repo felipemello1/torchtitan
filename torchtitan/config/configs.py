@@ -113,6 +113,14 @@ class TrainingConfig:
     This feature only takes effect when data_parallel_shard_degree > 1
     """
 
+    mixed_precision_grad: Literal["bfloat16", "float32"] = "bfloat16"
+    """
+    torch dtype of the weight gradients each backward hands to FSDP, when parameters compute in
+    ``mixed_precision_param=bfloat16``. "float32" makes Linear layers write their weight gradient
+    in fp32 instead of rounding it to bf16, and lets FSDP's unsharded parameters accumulate fp32
+    gradients. Not supported with ``compile.components`` containing "model" yet.
+    """
+
     gc_freq: int = 50
     """Python garbage control scheduling interval, in steps"""
 
