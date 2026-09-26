@@ -458,7 +458,10 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.gc_handler.run(self.num_completed_steps + 1)
         self.optimizers.zero_grad(set_to_none=self.config.training.disable_cuda_graphs)
         if isinstance(global_valid_tokens, int):
-            global_valid_tokens = torch.tensor(
+            # torch.full fills on device; torch.tensor(value, device=...) would block
+            # the host until the GPU finishes all queued work.
+            global_valid_tokens = torch.full(
+                (),
                 global_valid_tokens,
                 dtype=torch.int64,
                 device=self.device,

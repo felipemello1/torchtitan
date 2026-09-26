@@ -351,8 +351,11 @@ class Trainer(Configurable):
         sl.log_trace_scalar({"local_valid_tokens": local_valid_tokens})
 
         # Keep the global token count on device so loss normalization does not
-        # introduce a CPU synchronization in the training path.
-        local_valid_tokens_tensor = torch.tensor(
+        # introduce a CPU synchronization in the training path. torch.full, not
+        # torch.tensor: torch.tensor(value, device=...) copies from pageable host
+        # memory and blocks until the GPU finishes all queued work.
+        local_valid_tokens_tensor = torch.full(
+            (),
             local_valid_tokens,
             dtype=torch.int64,
             device=engine.device,
