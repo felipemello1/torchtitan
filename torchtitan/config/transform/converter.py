@@ -48,7 +48,8 @@ def validate_converter_compatibility(
         isinstance(converter, LMHeadFp32OutputConverter.Config)
         for converter in converters
     )
-    # TODO: Allow this combination once linear quantization supports Fp32OutputLinear.
+    # TODO: Allow this combination once linear quantization and Fp32OutputLinear can
+    # preserve each other's config and compute semantics.
     if has_quantization and has_lm_head_fp32:
         raise ValueError(
             "QuantizationConverter and LMHeadFp32OutputConverter cannot be combined."
