@@ -35,7 +35,6 @@ from torchtitan.models.common.decoder_sharding import (
 )
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import (
-    CastLinear,
     ColumnParallelLinear,
     Linear,
     RouterGateLinear,
@@ -104,12 +103,22 @@ def test_quantization_preserves_invariant_row_parallel_linear():
     torch.testing.assert_close(linear(input), expected)
 
 
-@pytest.mark.parametrize("config_cls", [CastLinear.Config, RouterGateLinear.Config])
-def test_quantization_rejects_unsupported_linear_wrapper(config_cls):
-    config = config_cls(in_features=16, out_features=16)
+def test_quantization_rejects_unsupported_linear_wrapper():
+    config = RouterGateLinear.Config(in_features=16, out_features=16)
 
-    with pytest.raises(ValueError, match=f"does not support {config._owner.__name__}"):
+    with pytest.raises(ValueError, match="does not support RouterGateLinear"):
         quantization_transform._validate_quantizable_linear(config, "projection")
+
+
+def test_quantization_rejects_non_default_matmul_mode():
+    config = Linear.Config(
+        in_features=16, out_features=16, matmul_mode="bf16_matmul_fp32_out"
+    )
+
+    with pytest.raises(
+        ValueError, match="does not support matmul_mode='bf16_matmul_fp32_out'"
+    ):
+        quantization_transform._validate_quantizable_linear(config, "lm_head")
 
 
 @pytest.mark.parametrize("parallel_cls", [ColumnParallelLinear, RowParallelLinear])

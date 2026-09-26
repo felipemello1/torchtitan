@@ -63,6 +63,11 @@ def _validate_quantizable_linear(
             f"Quantization does not support {owner.__qualname__} at {fqn!r}; "
             f"supported Linear classes are {supported}."
         )
+    if config.matmul_mode != "default":
+        raise ValueError(
+            f"Quantization does not support matmul_mode={config.matmul_mode!r} "
+            f"at {fqn!r}."
+        )
 
 
 class QuantizationConverter(ModelConfigConverter):

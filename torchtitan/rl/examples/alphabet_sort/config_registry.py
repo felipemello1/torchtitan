@@ -28,7 +28,7 @@ from torchtitan.config import (
 )
 from torchtitan.config.transform import (
     BatchInvariantFlexConverter,
-    LMHeadCastConverter,
+    LMHeadFp32OutputConverter,
     ModelConfigConverter,
 )
 from torchtitan.distributed.activation_checkpoint import FullAC
@@ -79,13 +79,13 @@ def _qwen3_rl_model_registry(
     attn_backend: str,
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> Decoder.Config:
-    """``qwen3.model_registry`` for RL, with the lm_head fp32 cast always on.
+    """``qwen3.model_registry`` for RL, with fp32 lm_head logits.
 
-    RL logprob / KL math needs the lm_head logits in fp32, so every RL config
-    runs ``LMHeadCastConverter`` on top of whatever converters it passes.
+    RL logprob / KL math compares trainer and generator logprobs, so every RL config
+    runs ``LMHeadFp32OutputConverter`` on top of whatever converters it passes.
     """
     converters = list(converters or [])
-    converters.append(LMHeadCastConverter.Config())
+    converters.append(LMHeadFp32OutputConverter.Config())
     spec = model_registry(
         flavor, seq_len=seq_len, attn_backend=attn_backend, converters=converters
     )
@@ -1040,13 +1040,13 @@ def _qwen3_5_rl_model_registry(
     attn_backend: str = "varlen",
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> Decoder.Config:
-    """``qwen3_5.model_registry`` for RL, with the lm_head fp32 cast always on.
+    """``qwen3_5.model_registry`` for RL, with fp32 lm_head logits.
 
-    RL logprob / KL math needs the lm_head logits in fp32, so every RL config
-    runs ``LMHeadCastConverter`` on top of whatever converters it passes.
+    RL logprob / KL math compares trainer and generator logprobs, so every RL config
+    runs ``LMHeadFp32OutputConverter`` on top of whatever converters it passes.
     """
     converters = list(converters or [])
-    converters.append(LMHeadCastConverter.Config())
+    converters.append(LMHeadFp32OutputConverter.Config())
     return qwen3_5_model_registry(
         flavor, seq_len=seq_len, attn_backend=attn_backend, converters=converters
     )
