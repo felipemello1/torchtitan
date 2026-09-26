@@ -64,6 +64,7 @@ See docstrings for full args:
 - `sl.log_trace_scalar(scalars, *, stacklevel=2)` -- emit `metric_value` records from a `{name: number}` dict.
 - `sl.set_step(step, *, relative_step=None)` -- stamp subsequent records with a step; clears previous step's tags.
 - `sl.add_step_tag(tag)` / `sl.clear_step_tags()` -- annotate the current step (e.g. `"gc"`, `"eval"`). `clear_step_tags` is called at `set_step`.
+- `sl.flush_structured_logger(timeout_s=10.0)` -- block until every record logged so far is written; call it before reading the JSONL files from the same process.
 - `TITAN_STRUCT_LOGGER_HANDLERS` -- Define handlers at the env level
 
 ## Flow of information
@@ -71,24 +72,26 @@ See docstrings for full args:
 End-to-end, what happens when user code calls one of the `sl.` helpers:
 
 ```
-user code
+user code  (the thread that logs)
     │   with sl.log_trace_span("fwd_bwd"):
     │       ...
     │
-    │   # On entry, log_trace_span calls:
-    │       _structured_logger.info(
-    │           msg="[step 5] fwd_bwd_start",       ← registers human-readable string
-    │           extra=event_extra(                  ← structured payload
-    │               event_type="fwd_bwd_start",     ← → record.log_type_name
-    │               step=5,                         ← → record.step
-    │               task_name=None,                 ← → record.task_name
-    │           ),
+    │   # On entry, log_trace_span queues a tuple and returns:
+    │       _enqueue(
+    │           "[step 5] fwd_bwd_start",           ← human-readable message
+    │           event_type="fwd_bwd_start",         ← → record.log_type_name
+    │           step=5,                             ← → record.step
+    │           task_name=None,                     ← → record.task_name
     │       )
     │
-    │   # sl.set_step() / sl.add_step_tag() write into a ContextVar and a
-    │   # module global; get_step() / get_step_tags() read them from inside
-    │   # event_extra(...) so every record picks up the current step + tags.
+    │   # The tuple also captures this thread's id, file:line:function, and
+    │   # its step state (sl.set_step() / sl.add_step_tag() write a ContextVar
+    │   # and a module global), because the writer thread can't read them.
     ▼
+_record_queue  (bounded in memory: when 100k records are waiting, new ones
+                are dropped and a structured_logger_dropped record says how many)
+    │
+    ▼  writer thread, one per process, every 0.1 s
 _structured_logger  (logging.Logger, name="torchtitan.structured_logger",
                      propagate=False — records stay out of the root logger)
     │
@@ -101,6 +104,8 @@ TraceEventsOnlyFilter  (drops records that reached the logger WITHOUT a
     └── TraceMyDBHandler*     ──▶  TraceMyDBFormatter     ──▶  MyDB # extra handler defined by user
 ```
 
+A slow or hung sink (NFS, a remote database) only delays the writer thread; `log_trace_*` never waits on it. Records reach the files within ~0.1 s, so call `sl.flush_structured_logger()` before reading them from the same process.
+
 ## Custom handlers
 
 `TITAN_STRUCT_LOGGER_HANDLERS` is a comma-separated list of fully-qualified Python function paths. When set, ONLY the listed factories run.
@@ -110,6 +115,10 @@ export TITAN_STRUCT_LOGGER_HANDLERS="torchtitan.observability.structured_logger.
 ```
 
 A handler factory takes the args `sl.init_structured_logger()` forwards and attaches one handler to `structured_logger`. Example: stream events to a remote database instead of writing to disk, and enrich each record with cluster metadata along the way.
+
+Handlers run on the writer thread, so they may block without slowing training. Two things to know:
+- Read the logging thread's id and step state from `record.logging_thread_state`. Calling `get_step()` or `threading.get_native_id()` inside a handler returns the writer thread's values.
+- Batch I/O in `flush()`, which the writer calls every few dozen records, rather than doing a syscall per record in `emit()`. On a busy process each syscall makes the writer wait for the GIL (see `TraceJsonlHandler`).
 
 ```python
 import logging

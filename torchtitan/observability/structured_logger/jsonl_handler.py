@@ -16,23 +16,14 @@ import itertools
 import json
 import logging
 import os
-import queue
 import random
 import socket
 import string
-import sys
-import threading
-import traceback
-from timeit import default_timer as timer
 from typing import Any
 
-from torchtitan.observability.structured_logger.step_state import (
-    get_relative_step,
-    get_step,
-    get_step_tags,
-)
 from torchtitan.observability.structured_logger.structured_logging import (
     ExtraFields,
+    LoggingThreadState,
     LogType,
     TraceEventsOnlyFilter,
 )
@@ -46,8 +37,9 @@ class TraceJsonlFormatter(logging.Formatter):
     """Format trace records as one JSON line per record.
 
     Per-process fields (rank, source, hostname, local_rank) are captured
-    in ``__init__``; per-step fields (step, relative_step, step_tags)
-    are pulled from :mod:`.step_state` at emit time.
+    in ``__init__``. The thread id and per-step fields (step, relative_step,
+    step_tags) come from ``record.logging_thread_state``, captured by the thread
+    that logged: records are formatted on the structured logger's writer thread.
 
     Subclass to enrich records with backend-specific fields.
 
@@ -67,10 +59,9 @@ class TraceJsonlFormatter(logging.Formatter):
         self._local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self._host_name = socket.gethostname()
         self._seq_counter = itertools.count()
-        # Per-instance threadlocal: prevents delta_ms leakage when multiple
-        # formatters (e.g. default JSONL + custom backend) are attached to
-        # the same logger in the same process.
-        self._thread_local = threading.local()
+        # Last record time per logging thread, for delta_ms. Per instance, so
+        # formatters of different handlers don't see each other's records.
+        self._last_created_by_tid: dict[int, float] = {}
 
     def format(self, record: logging.LogRecord) -> str:
         return json.dumps(self._log_dict(record))
@@ -79,8 +70,13 @@ class TraceJsonlFormatter(logging.Formatter):
         """Build the flat dict emitted as one JSONL line."""
         log_dict: dict[str, Any] = {}
 
-        log_dict["delta_ms"] = self._refresh_event_delta()
-        log_dict["tid"] = threading.get_native_id()
+        # Records built directly on the logger (not through log_trace_*) read it now.
+        thread_state = (
+            getattr(record, "logging_thread_state", None)
+            or LoggingThreadState.current()
+        )
+        log_dict["delta_ms"] = self._event_delta_ms(thread_state.tid, record.created)
+        log_dict["tid"] = thread_state.tid
 
         # Rank/source from self (constants, set once in init_structured_logger)
         log_dict["rank"] = self.rank
@@ -90,16 +86,13 @@ class TraceJsonlFormatter(logging.Formatter):
         log_dict["host_name"] = self._host_name
         log_dict["pid"] = os.getpid()
 
-        # Step/step_tags/relative_step from hybrid ContextVar/globals
-        step = get_step()
-        if step is not None:
-            log_dict["step"] = step
-        relative_step = get_relative_step()
-        if relative_step is not None:
-            log_dict["relative_step"] = relative_step
-        step_tags = get_step_tags()
-        if step_tags:
-            log_dict["step_tags"] = list(step_tags)
+        # Step/step_tags/relative_step as the logging thread saw them
+        if thread_state.step is not None:
+            log_dict["step"] = thread_state.step
+        if thread_state.relative_step is not None:
+            log_dict["relative_step"] = thread_state.relative_step
+        if thread_state.step_tags:
+            log_dict["step_tags"] = list(thread_state.step_tags)
 
         log_dict["time"] = int(record.created)
         log_dict["time_ms"] = int(record.created * 1000)
@@ -161,21 +154,19 @@ class TraceJsonlFormatter(logging.Formatter):
 
         return log_dict
 
-    def _refresh_event_delta(self) -> float:
-        if not hasattr(self._thread_local, "last_event_time"):
-            self._thread_local.last_event_time = timer()
-        event_delta = (timer() - self._thread_local.last_event_time) * 1000
-        self._thread_local.last_event_time = timer()
-        return event_delta
+    def _event_delta_ms(self, tid: int, created: float) -> float:
+        """Milliseconds since the previous record of the same logging thread (0 for its first)."""
+        last = self._last_created_by_tid.get(tid, created)
+        self._last_created_by_tid[tid] = created
+        return (created - last) * 1000
 
 
 class TraceJsonlHandler(logging.FileHandler):
-    """Per-rank JSONL file handler that writes records on a background thread.
+    """Per-rank JSONL file handler that writes a batch of lines per ``flush()``.
 
-    ``StreamHandler`` writes and flushes each record on the thread that logged, about
-    0.5 ms per record on NFS. Here the logging thread only formats the record (the
-    formatter reads that thread's step state) and queues it; a writer thread writes
-    and flushes it. ``flush()`` and ``close()`` wait for queued records.
+    The structured logger's writer thread flushes every few dozen records. One
+    write per batch, not per record, keeps that thread from waiting for the GIL
+    after every record while the process is busy.
 
     File path::
 
@@ -193,49 +184,28 @@ class TraceJsonlHandler(logging.FileHandler):
         super().__init__(filename=filepath)
         self.setFormatter(TraceJsonlFormatter(rank=rank, source=source))
         self.addFilter(TraceEventsOnlyFilter())
-        # Formatted lines; None tells the writer to stop.
-        self._queue: queue.Queue[str | None] = queue.Queue()
-        self._writer = threading.Thread(
-            target=self._write_lines, name="trace-jsonl-writer", daemon=True
-        )
-        self._writer.start()
+        self._pending_lines: list[str] = []
+        # A forked child must not write the lines its parent had not written yet.
+        os.register_at_fork(after_in_child=self._pending_lines.clear)
 
     def emit(self, record: logging.LogRecord) -> None:
-        # After close(), or in a forked child where the writer thread doesn't exist,
-        # write synchronously.
-        if not self._writer.is_alive():
-            super().emit(record)
-            return
         try:
-            self._queue.put(self.format(record) + self.terminator)
+            self._pending_lines.append(self.format(record) + self.terminator)
         except Exception:
             self.handleError(record)
 
     def flush(self) -> None:
-        if self._writer.is_alive():
-            self._queue.join()
-        super().flush()
-
-    def close(self) -> None:
-        with self.lock:
-            if self._writer.is_alive():
-                self._queue.put(None)
-                self._writer.join()
-            super().close()
-
-    def _write_lines(self) -> None:
-        while True:
-            line = self._queue.get()
-            try:
-                if line is None:
-                    return
-                self.stream.write(line)
-                self.stream.flush()
-            except Exception:
-                # Same fallback as logging.Handler.handleError: report, keep going.
-                traceback.print_exc(file=sys.stderr)
-            finally:
-                self._queue.task_done()
+        self.acquire()
+        try:
+            if self._pending_lines:
+                if self.stream is None:
+                    self.stream = self._open()
+                lines = "".join(self._pending_lines)
+                self._pending_lines.clear()
+                self.stream.write(lines)
+            super().flush()
+        finally:
+            self.release()
 
 
 @functools.cache
