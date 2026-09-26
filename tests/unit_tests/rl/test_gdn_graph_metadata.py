@@ -229,9 +229,17 @@ def test_forward_respects_prepared_extent_and_decode_padding(monkeypatch, decode
     context = ForwardContext(
         no_compile_layers={}, attn_metadata={"gdn": metadata}, slot_mapping={}
     )
-    value, output = torch.ones(6, 1), torch.zeros(6, 1)
+    # The output is allocated uninitialized (new_empty), so start from NaN: every
+    # row must be written or zeroed.
+    value, output = torch.ones(6, 1), torch.full((6, 1), float("nan"))
     with override_forward_context(context):
         layer._forward(value, value, value, value, None, value, value, output)
+        # Profiling runs and empty batches zero the whole output.
+        for attn_metadata in (None, {"gdn": replace(metadata, num_actual_tokens=0)}):
+            context.attn_metadata = attn_metadata
+            early_output = torch.full((6, 1), float("nan"))
+            layer._forward(value, value, value, value, None, value, value, early_output)
+            assert torch.equal(early_output, torch.zeros(6, 1))
         # Reject bias even in profiling and empty-batch early returns.
         for attn_metadata in (None, {"gdn": replace(metadata, num_actual_tokens=0)}):
             context.attn_metadata = attn_metadata
