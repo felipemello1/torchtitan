@@ -272,11 +272,10 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
     def backward(ctx, grad_output_TO: torch.Tensor):  # pyrefly: ignore[bad-override]
         """``grad_input = grad_output @ weight``, ``grad_weight = grad_output.T @ input``.
 
-        Runs both as bf16 GEMMs that accumulate in fp32, after splitting the fp32 grad_output into
-        two bf16 halves. The gradients come out close to an fp32 backward's, at ~2x the cost of a
-        plain bf16 backward.
+        Uses only bf16 GEMMs, yet the gradients come out close to an fp32 backward's, at ~2x the
+        cost of a plain bf16 backward.
 
-        Why split: grad_output is fp32 (the output was fp32), but fast GEMMs run on bf16 inputs
+        The problem: grad_output is fp32 (the output was fp32), but fast GEMMs run on bf16 inputs
         (bf16 tensor cores), and bf16 keeps only the top 16 bits of an fp32:
 
             fp32:  [sign | exponent (8 bits) | mantissa (23 bits)]   24 significant bits
