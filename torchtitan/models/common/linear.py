@@ -240,7 +240,7 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
     def forward(  # pyrefly: ignore[bad-override]
         ctx, input_TD: torch.Tensor, weight_OD: torch.Tensor
     ) -> torch.Tensor:
-        """bf16 GEMM with fp32 accumulation and output.
+        """``output = input @ weight.T``: a bf16 GEMM that accumulates in fp32 and returns fp32.
 
         ``torch.mm(..., out_dtype=torch.float32)`` has no autograd formula ("derivative for
         aten::mm is not implemented"), hence this Function:
@@ -270,18 +270,28 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output_TO: torch.Tensor):  # pyrefly: ignore[bad-override]
-        """``grad_output @ weight`` and ``grad_output.T @ input``, close to fp32 precision.
+        """``grad_input = grad_output @ weight``, ``grad_weight = grad_output.T @ input``.
 
-        grad_output is fp32 (the output was fp32), but tensor cores only take bf16, the top half
-        of an fp32:
+        Runs both as bf16 GEMMs that accumulate in fp32, after splitting the fp32 grad_output into
+        two bf16 halves. The gradients come out close to an fp32 backward's, at ~2x the cost of a
+        plain bf16 backward.
 
-            fp32:  [sign | exponent (8 bits) | mantissa (23 bits)]
-            bf16:  [sign | exponent (8 bits) | mantissa  (7 bits)]
+        Why split: grad_output is fp32 (the output was fp32), but fast GEMMs run on bf16 inputs
+        (bf16 tensor cores), and bf16 keeps only the top 16 bits of an fp32:
 
-        The naive way rounds grad_output to bf16: fast, but it drops 16 mantissa bits. The slow
-        way is an fp32 matmul; on Blackwell that is BF16x9, which splits both operands into 3 bf16
-        pieces and multiplies all 9 pairs. Here input and weight are already exactly bf16, so only
-        grad_output needs splitting, into 2 pieces:
+            fp32:  [sign | exponent (8 bits) | mantissa (23 bits)]   24 significant bits
+            bf16:  [sign | exponent (8 bits) | mantissa  (7 bits)]    8 significant bits
+
+        Ways to multiply the fp32 grad_output by the bf16 input and weight:
+        - Naive: round grad_output to bf16, then bf16 GEMMs. Fast, but drops 16 bits.
+        - fp32 matmul: precise but slow. On H100 it runs on CUDA cores (~15x lower peak
+          throughput than bf16 tensor cores). On Blackwell, TorchTitan emulates it with BF16x9:
+          each fp32 operand is split into 3 bf16 pieces (3 x 8 = 24 bits), and all 3 x 3 = 9
+          piece pairs are multiplied.
+        - hi + lo (this): input and weight are already exactly bf16 (a single piece), so only
+          grad_output is split. 2 pieces keep 16 bits, far more than survive the final rounding of
+          the gradients to bf16, so a third piece isn't needed. It only uses bf16 GEMMs, so it
+          isn't Blackwell-specific.
 
             round grad_output to bf16   1 GEMM    fast, loses precision
             fp32 matmul (BF16x9)        9 GEMMs   precise, ~9x the cost
@@ -293,8 +303,9 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
             grad_input  = hi @ weight  + lo @ weight
             grad_weight = hi.T @ input + lo.T @ input
 
-        Each gradient stays one GEMM call; hi and lo are stacked so only the smaller tensor is
-        copied:
+        Written out, that is 4 GEMM calls. Stacking hi and lo into one operand makes it one call
+        per gradient, so the large tensor is read once. The stacking direction is picked so the
+        tensor that gets duplicated (or the output that gets added) is the small one:
 
             out_features > tokens (e.g. an LM head):
                 grad_input:   [hi; lo] @ W          -> [hi @ W; lo @ W], then add the halves
