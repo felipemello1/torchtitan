@@ -36,52 +36,51 @@ from torchtitan.protocols.module import Module
 class _Fp32OutputLinearFunction(torch.autograd.Function):
     """``input @ weight.T`` on bf16 operands, returning fp32, with a backward close to fp32's.
 
-    Why a custom autograd Function: ``torch.mm(..., out_dtype=torch.float32)`` has no autograd
-    formula (calling it on tensors that require grad raises "derivative for aten::mm is not
-    implemented"), so both passes are written here. For ``output = input @ weight.T``:
+    ``torch.mm(..., out_dtype=torch.float32)`` has no autograd formula ("derivative for aten::mm
+    is not implemented"), so both passes are written here:
 
-        grad_input = grad_output @ weight        grad_weight = grad_output.T @ input
+        forward:   input (bf16) --+
+                                  +--> bf16 GEMM, fp32 accumulate --> output (fp32)
+                   weight (bf16) -+    bf16 x bf16 products are exact in fp32; no fp32 weight copy
 
-    Forward: tensor cores multiply bf16 numbers exactly and add the products in fp32, so
-    ``out_dtype=torch.float32`` only skips the final rounding of the result to bf16. No fp32
-    copy of the weight is made.
+        backward:  grad_input  = grad_output @ weight
+                   grad_weight = grad_output.T @ input
 
-    Backward: ``grad_output`` is fp32 (the output was fp32), but tensor cores only take bf16,
-    which keeps 8 significant bits of fp32's 24. Two ways to handle that:
-    - Round ``grad_output`` to bf16: one bf16 GEMM per gradient, but those bits are lost.
-    - An fp32 matmul (on Blackwell, TorchTitan runs these as BF16x9: split both operands into
-      3 bf16 pieces each and run 9 bf16 GEMMs): keeps the bits, ~9x the work.
+    grad_output is fp32, but tensor cores only take bf16, which is the top half of an fp32:
 
-    Here ``input`` and ``weight`` are already exactly bf16; only ``grad_output`` has extra bits.
-    So splitting ``grad_output`` into 2 bf16 pieces is enough, and each gradient is the sum of
-    2 bf16 GEMMs:
+        fp32:  [sign | exponent (8 bits) | mantissa (23 bits)]
+        bf16:  [sign | exponent (8 bits) | mantissa  (7 bits)]
 
-        grad_output = hi + lo     hi: its top 16 bits (exactly a bf16), lo: bf16(grad_output - hi)
-        e.g. 0.1 = 0.099609375 + 0.000391006   (off by 4e-7; bf16(0.1) = 0.1000977 is off by 1e-4)
+        round grad_output to bf16   1 GEMM    drops 16 mantissa bits
+        fp32 matmul (BF16x9)        9 GEMMs   splits both operands into 3 bf16 pieces each
+        hi + lo (this)              2 GEMMs   splits only grad_output; input and weight are bf16
 
-        grad_input  = hi @ weight + lo @ weight
+        grad_output = hi + lo     hi = its top 16 bits (exactly a bf16), lo = bf16(grad_output - hi)
+        0.1         = 0.099609375 + 0.000391006     off by 4e-7 (bf16(0.1) alone: off by 1e-4)
+
+        grad_input  = hi @ weight  + lo @ weight
         grad_weight = hi.T @ input + lo.T @ input
 
-    Each gradient stays one GEMM call: ``[hi; lo]`` is stacked either along the dimension the
-    GEMM sums over (the GEMM adds the two terms in its fp32 accumulator), or along an output
-    dimension whose two halves are added afterwards. The layout duplicates the smaller tensor:
-    an LM head has out_features (vocab) >> tokens, a router has out_features (experts) << tokens.
+    Each gradient stays one GEMM call; hi and lo are stacked so only the smaller tensor is copied:
 
-    Qwen3.5-27B LM head (248320 x 5120 weight), 2048 real tokens, fwd + cross-entropy + bwd,
-    errors vs fp64 (the forward is the same op in every row, so its error is too):
+        LM head, out_features (vocab) >> tokens:
+            grad_input:   [hi; lo] @ W          -> [hi @ W; lo @ W], then add the two halves
+            grad_weight:  [hi; lo].T @ [x; x]   =  hi.T @ x + lo.T @ x   (summed in the GEMM)
+        router, out_features (experts) << tokens:
+            grad_input:   [hi | lo] @ [W; W]    =  hi @ W + lo @ W       (summed in the GEMM)
+            grad_weight:  hi.T @ x + lo.T @ x                            (two small GEMMs)
 
-        backward                              time    logprob error   grad_input error
-        round grad_output to bf16             12 ms   6.1e-6          2.29e-3
-        hi + lo (this)                        20 ms   6.1e-6          1.70e-3
-        BF16x9 (RouterGateLinear's)           53 ms   6.1e-6          1.66e-3
-        exact gradients rounded to bf16                               1.66e-3   <- floor
+    Qwen3.5-27B LM head (248320 x 5120), 2048 real tokens, fwd + cross-entropy + bwd, vs fp64:
 
-    The split itself loses almost nothing: summing the same hi + lo with an fp32 GEMM gives
-    1.66e-3. The extra 2% comes from the bf16 GEMM adding up 248320 products per output in its
-    fp32 accumulator; grad_weight (2048 products per output) matches fp32 exactly (1.64e-3).
+        backward                      time    logprob error   grad_input error
+        round grad_output to bf16     12 ms   6.1e-6          2.29e-3
+        hi + lo (this)                20 ms   6.1e-6          1.70e-3
+        BF16x9 (RouterGateLinear's)   53 ms   6.1e-6          1.66e-3
+        exact grads rounded to bf16                           1.66e-3   <- floor: grads are bf16
 
-    Qwen3.5-35B-A3B routers (2048 -> 256 experts, 40 layers), 64k tokens, fwd + bwd GPU time:
-    44.8 ms with RouterGateLinear's backward, 14.4 ms with this, same gradient error (1.66e-3).
+    The split loses ~nothing (hi + lo through an fp32 GEMM: 1.66e-3); the extra 2% is the bf16
+    GEMM summing 248320 products. Qwen3.5-35B-A3B routers (2048 -> 256, 40 layers), 64k tokens:
+    44.8 ms with BF16x9, 14.4 ms with this, same error (1.66e-3).
     """
 
     @staticmethod
