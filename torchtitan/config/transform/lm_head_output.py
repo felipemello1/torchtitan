@@ -32,15 +32,16 @@ class LMHeadFp32OutputConverter(ModelConfigConverter):
         ] = "bf16_matmul_fp32_out"
         """How the lm_head matmul treats its operands.
         "bf16_matmul_fp32_out": bf16 operands as given, fp32 accumulation and output;
-        bf16 backward.
+        backward within ~2% of an fp32 backward's error.
         "upcast_fp32_matmul": copies both operands to fp32 every call, then an fp32 matmul.
 
-        bf16 operands, 2048x5120 input, 248320x5120 weight (an LM head):
+        Qwen3.5-27B LM head, 2048 real tokens (2048x5120 input, 248320x5120 weight), bf16
+        operands, fwd + cross-entropy + bwd; errors vs fp64:
 
-            mode                   output   fwd+bwd   mean logprob error
-            default (bf16 head)    bf16     12 ms     8.4e-3
-            bf16_matmul_fp32_out   fp32     12 ms     7.5e-5
-            upcast_fp32_matmul     fp32     76 ms     1.5e-6
+            mode                   output   time    mean logprob error   grad_input error
+            default (bf16 head)    bf16     12 ms   1.2e-2               1.1e-2
+            bf16_matmul_fp32_out   fp32     19 ms   6.1e-6               1.7e-3
+            upcast_fp32_matmul     fp32     77 ms   1.6e-6               1.7e-3
 
         Batch-invariant mode always upcasts.
         """

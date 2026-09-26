@@ -10,7 +10,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from torchtitan.models.common.linear import Linear, RouterGateLinear
+from torchtitan.models.common.linear import (
+    _split_into_bf16_hi_lo,
+    Linear,
+    RouterGateLinear,
+)
 
 
 def _bf16_linear(**kwargs) -> Linear:
@@ -27,6 +31,18 @@ def test_default_mode_keeps_input_dtype():
     out = linear(x)
     assert out.dtype == torch.bfloat16
     assert torch.equal(out, F.linear(x, linear.weight))
+
+
+def test_split_into_bf16_hi_lo_recovers_fp32():
+    tensor = torch.randn(1000) * torch.logspace(-8, 8, 1000)
+
+    hi, lo = _split_into_bf16_hi_lo(tensor)
+
+    assert hi.dtype == lo.dtype == torch.bfloat16
+    relative_error = ((hi.float() + lo.float()) - tensor).abs() / tensor.abs()
+    assert relative_error.max() <= 2**-15
+    # One bf16 alone is ~100x worse.
+    assert (tensor.bfloat16().float() - tensor).abs().div(tensor.abs()).max() > 2**-10
 
 
 def test_upcast_mode_returns_fp32():
