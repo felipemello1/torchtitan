@@ -36,8 +36,10 @@ from torchtitan.protocols.module import Module
 class _Fp32OutputLinearFunction(torch.autograd.Function):
     """bf16 GEMM with fp32 accumulation and fp32 output; bf16 backward.
 
-    ``torch.mm(..., out_dtype=...)`` has no autograd formula, hence the Function. The
-    backward rounds ``grad_output`` to bf16: the gradients return in bf16 anyway.
+    Why a custom backward: ``torch.mm(..., out_dtype=...)`` has no autograd formula, so
+    calling it on tensors that require grad raises "derivative for aten::mm is not
+    implemented". The backward rounds ``grad_output`` to bf16: the gradients return in
+    bf16 anyway.
     """
 
     @staticmethod
