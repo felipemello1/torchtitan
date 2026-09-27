@@ -13,6 +13,8 @@
   from ``Configurable.Config``.
 """
 
+import functools
+import logging
 import math
 from dataclasses import dataclass
 
@@ -26,10 +28,14 @@ from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
 from torchtitan.protocols.module import Module
+from torchtitan.tools.utils import device_type
+
+logger = logging.getLogger(__name__)
 
 # Shape suffix legend:
 #   X = leading input dims, T = num tokens, D = input features (model dimension for the router
-#   gate), O = output features, E = num experts
+#   gate), O = output features, E = num experts, R = routed rows grouped by expert,
+#   I = grouped linear input features
 
 
 class Linear(nn.Linear, Module):
@@ -317,6 +323,9 @@ class GroupedLinear(Module):
         out_features: int
         num_linears: int = 1
 
+    fp32_weight_grad: bool = False
+    """Write the weight gradient in fp32 instead of bf16 (see ``enable_fp32_weight_grads``)."""
+
     def __init__(self, config: Config):
         super().__init__()
         self.group_size = config.group_size
@@ -360,11 +369,74 @@ class GroupedLinear(Module):
         offsets_E: torch.Tensor,
     ) -> torch.Tensor:
         """Execute ``input_RI @ weight_EOI.transpose(-2, -1)`` by expert."""
+        if self.fp32_weight_grad:
+            return _Fp32WeightGradGroupedMMFunction.apply(
+                input_RI, weight_EOI.bfloat16(), offsets_E, self.weight
+            )
         return torch._grouped_mm(
             input_RI,
             weight_EOI.bfloat16().transpose(-2, -1),
             offs=offsets_E,
         )
+
+
+@spmd.register_local_autograd_function
+class _Fp32WeightGradGroupedMMFunction(torch.autograd.Function):
+    """``torch._grouped_mm`` whose weight gradient comes out in fp32.
+
+    The grouped counterpart of ``_Fp32WeightGradLinearFunction``: the forward and the input
+    gradient are the grouped GEMMs autograd runs for ``torch._grouped_mm``, and the weight
+    gradient is written in fp32 and returned for ``weight_param`` (``weight_EOI`` may be its
+    flattened view).
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx,
+        input_RI: torch.Tensor,
+        weight_EOI: torch.Tensor,
+        offsets_E: torch.Tensor,
+        weight_param: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(input_RI, weight_EOI, offsets_E)
+        ctx.weight_param_shape = weight_param.shape
+        return torch._grouped_mm(input_RI, weight_EOI.transpose(-2, -1), offs=offsets_E)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output_RO: torch.Tensor):  # pyrefly: ignore[bad-override]
+        input_RI, weight_EOI, offsets_E = ctx.saved_tensors
+        grad_input_RI = grad_weight_param = None
+        if ctx.needs_input_grad[0]:
+            grad_input_RI = torch._grouped_mm(
+                grad_output_RO, weight_EOI, offs=offsets_E
+            )
+        if ctx.needs_input_grad[3]:
+            grad_weight_EOI = torch._grouped_mm(
+                grad_output_RO.transpose(-2, -1),
+                input_RI,
+                offs=offsets_E,
+                out_dtype=torch.float32,
+            )
+            grad_weight_param = grad_weight_EOI.view(ctx.weight_param_shape)
+        return grad_input_RI, None, None, grad_weight_param
+
+
+@functools.cache
+def _grouped_mm_writes_fp32() -> bool:
+    """Whether ``torch._grouped_mm`` writes an fp32 output from bf16 inputs on this device."""
+    # TODO: drop once torch._grouped_mm supports out_dtype=float32 for bf16 inputs upstream.
+    try:
+        input_RI = torch.zeros(16, 16, dtype=torch.bfloat16, device=device_type)
+        offsets_E = torch.full((1,), 16, dtype=torch.int32, device=device_type)
+        torch._grouped_mm(input_RI.T, input_RI, offs=offsets_E, out_dtype=torch.float32)
+    except RuntimeError as error:
+        logger.warning(
+            "GroupedLinear weight gradients stay bf16: torch._grouped_mm cannot write fp32 "
+            f"from bf16 inputs here ({error})"
+        )
+        return False
+    return True
 
 
 @spmd.register_local_autograd_function

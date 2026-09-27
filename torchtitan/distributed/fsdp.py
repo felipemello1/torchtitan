@@ -21,7 +21,11 @@ from torch.distributed.tensor import Shard
 
 from torchtitan.config import FSDPSymmMemScope
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.models.common.linear import GroupedLinear, Linear
+from torchtitan.models.common.linear import (
+    _grouped_mm_writes_fp32,
+    GroupedLinear,
+    Linear,
+)
 
 __all__ = [
     "apply_fsdp_to_decoder",
@@ -143,7 +147,7 @@ def disable_fsdp_gradient_division(model: nn.Module) -> None:
 
 
 def enable_fp32_weight_grads(model: nn.Module) -> None:
-    """Hand FSDP fp32 weight gradients from ``Linear`` layers, instead of bf16 ones.
+    """Hand FSDP fp32 weight gradients from ``Linear`` and ``GroupedLinear``, instead of bf16 ones.
 
     FSDP computes in bf16 (``param_dtype``) and autograd returns each gradient in its
     parameter's dtype, so a ``Linear``'s weight gradient is rounded to bf16 before FSDP's
@@ -156,15 +160,18 @@ def enable_fp32_weight_grads(model: nn.Module) -> None:
     - Each FSDP module's unsharded parameters accumulate fp32 gradients
       (``Tensor.grad_dtype``). All parameters of a module get it, because FSDP reduce-scatters
       one dtype per module; parameters whose layer still computes a bf16 gradient are upcast.
-    - ``Linear`` layers write their weight gradient in fp32 (``Linear.fp32_weight_grad``).
+    - ``Linear`` and ``GroupedLinear`` layers write their weight gradient in fp32
+      (``fp32_weight_grad``). ``GroupedLinear`` needs a ``torch._grouped_mm`` that writes fp32
+      from bf16 inputs; without one, expert weight gradients stay bf16 (with a warning).
 
-    TODO: move the first piece into FSDP (e.g. a ``MixedPrecisionPolicy`` field), and cover
-    ``GroupedLinear`` once ``torch._grouped_mm`` can write fp32 from bf16 inputs.
+    TODO: move the first piece into FSDP (e.g. a ``MixedPrecisionPolicy`` field).
     """
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.register_forward_pre_hook(_accumulate_unsharded_grads_in_fp32)
-        if isinstance(module, Linear):
+        if isinstance(module, Linear) or (
+            isinstance(module, GroupedLinear) and _grouped_mm_writes_fp32()
+        ):
             module.fp32_weight_grad = True
 
 
