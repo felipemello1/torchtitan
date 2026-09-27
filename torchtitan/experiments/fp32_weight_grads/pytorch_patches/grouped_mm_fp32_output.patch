@@ -1,0 +1,226 @@
+diff --git a/aten/src/ATen/native/GroupedMMUtils.h b/aten/src/ATen/native/GroupedMMUtils.h
+index c271f608b4..6324ae346b 100644
+--- a/aten/src/ATen/native/GroupedMMUtils.h
++++ b/aten/src/ATen/native/GroupedMMUtils.h
+@@ -147,7 +147,8 @@ std::optional<c10::ScalarType> out_dtype) {
+ inline c10::ScalarType _resolve_grouped_mm_out_dtype(const Tensor& mat_a, [[maybe_unused]] const Tensor& mat_b,
+ std::optional<c10::ScalarType> out_dtype) {
+   const auto out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
+-  // TODO(future PR): enable float32 output dtype for bfloat16 and float16 inputs
++  // TODO(future PR): enable float32 output dtype for float16 inputs, and for bfloat16
++  // inputs outside the CUDA fast path (_grouped_mm_cuda already allows it on SM90/SM100)
+   TORCH_CHECK(out_dtype_ == mat_a.dtype(), "Grouped gemm output dtype must match `mat_a` dtype");
+   return out_dtype_;
+ }
+diff --git a/aten/src/ATen/native/cuda/GroupMM.cu b/aten/src/ATen/native/cuda/GroupMM.cu
+index 04484a6989..58c04814a4 100644
+--- a/aten/src/ATen/native/cuda/GroupMM.cu
++++ b/aten/src/ATen/native/cuda/GroupMM.cu
+@@ -88,7 +88,8 @@ template <
+     bool PONGOr2SM,
+     typename TB_M,
+     typename TB_N,
+-    typename TB_K>
++    typename TB_K,
++    typename DtypeOutput>
+ void bf16bf16_grouped_gemm_impl_sm90_sm100(
+     at::Tensor mat_a, // bf16
+     at::Tensor mat_b, // bf16
+@@ -97,7 +98,6 @@ void bf16bf16_grouped_gemm_impl_sm90_sm100(
+     at::Tensor& out) {
+   using DtypeA = cutlass::bfloat16_t;
+   using DtypeB = cutlass::bfloat16_t;
+-  using DtypeOutput = cutlass::bfloat16_t;
+   using DtypeAccum = float;
+   using LayoutA = cute::conditional_t<
+       a_row_major,
+@@ -314,7 +314,7 @@ void bf16bf16_grouped_gemm_impl_sm90_sm100(
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+
+-template <bool a_row_major, bool b_row_major>
++template <bool a_row_major, bool b_row_major, typename DtypeOutput>
+ void dispatch_bf16_grouped_kernel_on_tile_size(
+     at::Tensor mat_a, // bf16
+     at::Tensor mat_b, // bf16
+@@ -356,7 +356,8 @@ void dispatch_bf16_grouped_kernel_on_tile_size(
+         /*PONGOr2SM*/ false,
+         cute::_128,
+         cute::_256,
+-        cute::_64>(mat_a, mat_b, offs, bias, out); // Tile shape taken from CUTLASS examples, 64 = 128/sizeof(bfloat16)
++        cute::_64,
++        DtypeOutput>(mat_a, mat_b, offs, bias, out); // Tile shape taken from CUTLASS examples, 64 = 128/sizeof(bfloat16)
+     } else {
+       bf16bf16_grouped_gemm_impl_sm90_sm100<
+         cutlass::arch::Sm100,
+@@ -365,7 +366,8 @@ void dispatch_bf16_grouped_kernel_on_tile_size(
+         /*PONGOr2SM*/ true,
+         cute::_256,
+         cute::_256,
+-        cute::_64>(mat_a, mat_b, offs, bias, out); // Same as above ^
++        cute::_64,
++        DtypeOutput>(mat_a, mat_b, offs, bias, out); // Same as above ^
+     }
+   } else {
+     if(small) {
+@@ -376,7 +378,8 @@ void dispatch_bf16_grouped_kernel_on_tile_size(
+         /*PONGOr2SM*/ true,
+         cute::_64,
+         cute::_128,
+-        cute::_128>(mat_a, mat_b, offs, bias, out);
++        cute::_128,
++        DtypeOutput>(mat_a, mat_b, offs, bias, out);
+     } else {
+       bf16bf16_grouped_gemm_impl_sm90_sm100<
+         cutlass::arch::Sm90,
+@@ -385,11 +388,13 @@ void dispatch_bf16_grouped_kernel_on_tile_size(
+         /*PONGOr2SM*/ false,
+         cute::_128,
+         cute::_256,
+-        cute::_64>(mat_a, mat_b, offs, bias, out);
++        cute::_64,
++        DtypeOutput>(mat_a, mat_b, offs, bias, out);
+     }
+   }
+ }
+
++template <typename DtypeOutput>
+ void dispatch_bf16_grouped_kernel_on_ab_transpose(
+     at::Tensor mat_a, // bf16
+     at::Tensor mat_b, // bf16
+@@ -400,16 +405,16 @@ void dispatch_bf16_grouped_kernel_on_ab_transpose(
+   bool a_row_major = mat_a.stride(-1) == 1;
+   bool b_row_major = mat_b.stride(-1) == 1;
+   if (a_row_major && b_row_major) {
+-    dispatch_bf16_grouped_kernel_on_tile_size<true, true>(
++    dispatch_bf16_grouped_kernel_on_tile_size<true, true, DtypeOutput>(
+         mat_a, mat_b, offs, bias, out);
+   } else if (a_row_major && !b_row_major) {
+-    dispatch_bf16_grouped_kernel_on_tile_size<true, false>(
++    dispatch_bf16_grouped_kernel_on_tile_size<true, false, DtypeOutput>(
+         mat_a, mat_b, offs, bias, out);
+   } else if (!a_row_major && b_row_major) {
+-    dispatch_bf16_grouped_kernel_on_tile_size<false, true>(
++    dispatch_bf16_grouped_kernel_on_tile_size<false, true, DtypeOutput>(
+         mat_a, mat_b, offs, bias, out);
+   } else {
+-    dispatch_bf16_grouped_kernel_on_tile_size<false, false>(
++    dispatch_bf16_grouped_kernel_on_tile_size<false, false, DtypeOutput>(
+         mat_a, mat_b, offs, bias, out);
+   }
+ }
+@@ -426,7 +431,12 @@ void bf16bf16_grouped_mm(
+     std::optional<at::Tensor> bias, // BF16
+     at::Tensor& out) {
+ #if defined(BUILD_GG_KERNEL)
+-  dispatch_bf16_grouped_kernel_on_ab_transpose(mat_a, mat_b, offs, bias, out);
++  if (out.scalar_type() == at::kFloat) {
++    dispatch_bf16_grouped_kernel_on_ab_transpose<float>(mat_a, mat_b, offs, bias, out);
++  } else {
++    dispatch_bf16_grouped_kernel_on_ab_transpose<cutlass::bfloat16_t>(
++        mat_a, mat_b, offs, bias, out);
++  }
+ #else
+   TORCH_CHECK(false, "grouped mm is not supported on your system");
+ #endif
+diff --git a/aten/src/ATen/native/cuda/GroupMM.h b/aten/src/ATen/native/cuda/GroupMM.h
+index 1fc23207a0..c613938c03 100644
+--- a/aten/src/ATen/native/cuda/GroupMM.h
++++ b/aten/src/ATen/native/cuda/GroupMM.h
+@@ -8,5 +8,5 @@ TORCH_API void bf16bf16_grouped_mm(
+     at::Tensor mat_b, // bf16
+     std::optional<at::Tensor> offs,
+     std::optional<at::Tensor> bias, // BF16
+-    at::Tensor& out);
++    at::Tensor& out); // bf16 or fp32
+ } // namespace at::cuda::detail
+diff --git a/aten/src/ATen/native/cuda/GroupedBlas.cpp b/aten/src/ATen/native/cuda/GroupedBlas.cpp
+index 8d4273ee39..6e0a14ee2b 100644
+--- a/aten/src/ATen/native/cuda/GroupedBlas.cpp
++++ b/aten/src/ATen/native/cuda/GroupedBlas.cpp
+@@ -749,8 +749,17 @@ std::optional<c10::ScalarType> out_dtype) {
+     out_dtype.value_or(at::kBFloat16) == at::kBFloat16
+   );
+ #ifndef USE_ROCM
+-  bool use_fast_path = scaled_mm_arch_allowed(/*sm90_only=*/true, /*sm100_only=*/true) && a_b_and_out_are_bf16;
+-  const auto out_dtype_ = _resolve_grouped_mm_out_dtype(mat_a, mat_b, out_dtype);
++  // The CUTLASS kernel also writes fp32 from bf16 inputs (e.g. fp32 weight gradients)
++  bool a_b_are_bf16_and_out_is_fp32 = (
++    mat_a.dtype() == at::kBFloat16 &&
++    mat_b.dtype() == at::kBFloat16 &&
++    out_dtype == at::kFloat
++  );
++  bool use_fast_path = scaled_mm_arch_allowed(/*sm90_only=*/true, /*sm100_only=*/true) &&
++      (a_b_and_out_are_bf16 || a_b_are_bf16_and_out_is_fp32);
++  const auto out_dtype_ = use_fast_path
++      ? out_dtype.value_or(at::kBFloat16)
++      : _resolve_grouped_mm_out_dtype(mat_a, mat_b, out_dtype);
+   Tensor out = create_grouped_gemm_output_tensor(mat_a, mat_b, offs, out_dtype_);
+   if (use_fast_path) {
+     // fast path, no d2h sync needed
+diff --git a/test/test_matmul_cuda.py b/test/test_matmul_cuda.py
+index 992c7b1abb..98fa284026 100644
+--- a/test/test_matmul_cuda.py
++++ b/test/test_matmul_cuda.py
+@@ -1140,6 +1140,31 @@ class TestMatmulCuda(InductorTestCase):
+             C = f(A, B, offs)
+         self.assertEqual(C, C_ref)
+
++    @unittest.skipIf(TEST_WITH_ROCM, "fp32 output uses the CUTLASS grouped GEMM")
++    @unittest.skipIf(
++        not TEST_CUDA or torch.cuda.get_device_capability()[0] not in (9, 10),
++        "CUTLASS grouped GEMM with fp32 output requires SM 9.x or 10.x",
++    )
++    @parametrize("op", ["2d/2d", "2d/3d"])
++    def test_grouped_gemm_bf16_inputs_fp32_output(self, op):
++        # bf16 products are exact in fp32 and the kernel accumulates in fp32, so an fp32 output
++        # keeps the bits a bf16 output rounds away (e.g. for fp32 weight gradients).
++        device = "cuda"
++        m, n, k, ngroups = 64, 48, 32, 4
++        offs = torch.tensor([16, 16, 40, 64], device=device, dtype=torch.int32)
++        if op == "2d/2d":
++            # weight gradient: grad_output.T @ input per group
++            A = torch.randn(m, n, device=device, dtype=torch.bfloat16).t()
++            B = torch.randn(m, k, device=device, dtype=torch.bfloat16)
++        else:
++            # forward: input @ weight.T per group
++            A = torch.randn(m, k, device=device, dtype=torch.bfloat16)
++            B = torch.randn(ngroups, n, k, device=device, dtype=torch.bfloat16).transpose(-2, -1)
++        C = torch._grouped_mm(A, B, offs=offs, out_dtype=torch.float32)
++        C_ref = self.grouped_gemm_reference(A.double(), B.double(), offs)
++        self.assertEqual(C.dtype, torch.float32)
++        self.assertEqual(C.double(), C_ref, atol=1e-5, rtol=1e-5)
++
+     def test_grouped_gemm_doubly_non_contiguous(self):
+         # Verify that doubly-non-contiguous inputs (neither stride is 1)
+         # are rejected by _grouped_mm_validate_inputs.
+diff --git a/torch/_meta_registrations.py b/torch/_meta_registrations.py
+index be16940987..c710783368 100644
+--- a/torch/_meta_registrations.py
++++ b/torch/_meta_registrations.py
+@@ -8950,8 +8950,9 @@ def _meta_grouped_mm_common(
+     else:
+         out_dtype = out_dtype or mat_a.dtype
+         torch._check(
+-            out_dtype == mat_a.dtype,
+-            lambda: "Grouped gemm output dtype must match `mat_a` dtype.",
++            out_dtype == mat_a.dtype
++            or (mat_a.dtype == torch.bfloat16 and out_dtype == torch.float32),
++            lambda: "Grouped gemm output dtype must match `mat_a` dtype, or be float32 for bfloat16 inputs.",
+         )
+
+     return _create_grouped_mm_output_tensor(mat_a, mat_b, offs, out_dtype)
+diff --git a/torch/nn/functional.py b/torch/nn/functional.py
+index c331385400..4fb0b4b9c5 100644
+--- a/torch/nn/functional.py
++++ b/torch/nn/functional.py
+@@ -7194,7 +7194,8 @@ def grouped_mm(
+         bias: Optional tensor that is added to the grouped outputs. Bias is not
+             jagged and must be broadcastable to the result shape of each group.
+         out_dtype: Optional dtype that controls the accumulation/output dtype.
+-            Passing ``torch.float32`` accumulates BF16 inputs in FP32 while keeping
++            Passing ``torch.float32`` accumulates BF16 inputs in FP32 and writes an
++            FP32 output (CUDA devices with :math:`SM` 9.x or 10.x) while keeping
+             the grouped GEMM API non-differentiable.
+
+     Returns:

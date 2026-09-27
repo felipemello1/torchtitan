@@ -1,0 +1,169 @@
+diff --git a/torch/distributed/fsdp/_fully_shard/_fsdp_collectives.py b/torch/distributed/fsdp/_fully_shard/_fsdp_collectives.py
+index f6d78bb..46d47f2 100644
+--- a/torch/distributed/fsdp/_fully_shard/_fsdp_collectives.py
++++ b/torch/distributed/fsdp/_fully_shard/_fsdp_collectives.py
+@@ -594,7 +594,7 @@ def foreach_reduce(
+     *,
+     prepare_reduce_scatter_inputs: Callable = _default_reduce_scatter_input_fn,
+ ) -> tuple[
+-    torch.Tensor,
++    torch.Tensor | list[torch.Tensor],
+     torch.Event,
+     torch.Stream,
+     torch.Event,
+@@ -639,13 +639,37 @@ def foreach_reduce(
+     )
+     reduce_scatter_input_numel = sum(s.numel() for s in padded_unsharded_sizes)
+     reduce_scatter_output_numel = reduce_scatter_input_numel // world_size
+-    reduce_scatter_input = reduce_scatter_comm.allocate(
+-        (reduce_scatter_input_numel,),
+-        dtype=reduce_dtype,
+-        device=device,
++    # Gradients that already have the reduce dtype need no copy-in: each one is
++    # reduce-scattered straight into its slice of the output. Needs a coalesced
++    # reduce-scatter (NCCL, gloo).
++    reduce_scatter_in_place = (
++        type(reduce_scatter_comm) is DefaultReduceScatter
++        and predivide_factor is None
++        and device.type in ("cuda", "cpu")
++        and all(grad.dtype == reduce_dtype for grad in unsharded_grads)
+     )
+-
+-    foreach_reduce_scatter_copy_in(unsharded_grads, reduce_scatter_input, world_size)
++    reduce_scatter_input: torch.Tensor | list[torch.Tensor]
++    if reduce_scatter_in_place:
++        # Returned in place of the copy-in buffer to keep the gradients alive
++        # until the reduce-scatter finishes
++        reduce_scatter_input = []
++        for grad, padded_size in zip(unsharded_grads, padded_unsharded_sizes):
++            if grad.size() != padded_size or not grad.is_contiguous():
++                # Only uneven dim-0 (e.g. small norm weights) or non-contiguous
++                # gradients are copied, padded like the copy-in buffer
++                padded_grad = grad.new_zeros(padded_size)
++                padded_grad[: grad.size(0)].copy_(grad)
++                grad = padded_grad
++            reduce_scatter_input.append(grad)
++    else:
++        reduce_scatter_input = reduce_scatter_comm.allocate(
++            (reduce_scatter_input_numel,),
++            dtype=reduce_dtype,
++            device=device,
++        )
++        foreach_reduce_scatter_copy_in(
++            unsharded_grads, reduce_scatter_input, world_size
++        )
+
+     # Only after the copy-in finishes can we free the gradients
+     unsharded_grads.clear()
+@@ -659,21 +683,32 @@ def foreach_reduce(
+             dtype=reduce_dtype,
+             device=device,
+         )
+-        _div_if_needed(reduce_scatter_input, predivide_factor)
+-        if world_size > 1:
+-            reduce_scatter_comm(
+-                output_tensor=reduce_output,
+-                input_tensor=reduce_scatter_input,
+-                group=reduce_scatter_group,
+-                op=reduce_scatter_op,
++        if isinstance(reduce_scatter_input, list):
++            foreach_reduce_scatter_in_place(
++                reduce_scatter_input,
++                reduce_output,
++                reduce_scatter_comm,
++                reduce_scatter_group,
++                reduce_scatter_op,
++                gradient_divide_factor,
++                world_size,
+             )
+         else:
+-            # For single GPU, just copy the input to output (no actual reduce-scatter needed), and
+-            # account for a possible gradient_divide_factor.
+-            if gradient_divide_factor is not None and gradient_divide_factor != 1.0:
+-                reduce_output.copy_(reduce_scatter_input / gradient_divide_factor)
++            _div_if_needed(reduce_scatter_input, predivide_factor)
++            if world_size > 1:
++                reduce_scatter_comm(
++                    output_tensor=reduce_output,
++                    input_tensor=reduce_scatter_input,
++                    group=reduce_scatter_group,
++                    op=reduce_scatter_op,
++                )
+             else:
+-                reduce_output.copy_(reduce_scatter_input)
++                # For single GPU, just copy the input to output (no actual reduce-scatter needed), and
++                # account for a possible gradient_divide_factor.
++                if gradient_divide_factor is not None and gradient_divide_factor != 1.0:
++                    reduce_output.copy_(reduce_scatter_input / gradient_divide_factor)
++                else:
++                    reduce_output.copy_(reduce_scatter_input)
+         reduce_scatter_event = reduce_scatter_stream.record_event()
+         post_reduce_stream = reduce_scatter_stream
+         if all_reduce_group is not None:  # HSDP or DDP/replicate
+@@ -831,6 +866,38 @@ def foreach_reduce_scatter_copy_in(
+     )
+
+
++def foreach_reduce_scatter_in_place(
++    unsharded_grads: list[torch.Tensor],
++    reduce_output: torch.Tensor,
++    reduce_scatter_comm: ReduceScatter,
++    reduce_scatter_group: dist.ProcessGroup,
++    reduce_scatter_op: _ReduceOp,
++    gradient_divide_factor: float | None,
++    world_size: int,
++) -> None:
++    """
++    Same result as ``foreach_reduce_scatter_copy_in`` followed by one
++    reduce-scatter, without the copy-in: reduce-scatters each gradient into
++    its slice of ``reduce_output``. Each gradient must already have the reduce
++    dtype, be contiguous, and have its dim-0 padded size.
++    """
++    if world_size == 1:
++        torch.cat([grad.view(-1) for grad in unsharded_grads], out=reduce_output)
++        _div_if_needed(reduce_output, gradient_divide_factor)
++        return
++    output_slices = reduce_output.split(
++        [grad.numel() // world_size for grad in unsharded_grads]
++    )
++    with dist._coalescing_manager(group=reduce_scatter_group):
++        for grad, output_slice in zip(unsharded_grads, output_slices):
++            reduce_scatter_comm(
++                output_tensor=output_slice,
++                input_tensor=grad.view(-1),
++                group=reduce_scatter_group,
++                op=reduce_scatter_op,
++            )
++
++
+ def _get_all_gather_input_metadatas(
+     param_all_gather_inputs: list[list[torch.Tensor]],
+ ) -> tuple[list[list[torch.dtype]], list[list[int]], torch.dtype]:
+diff --git a/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py b/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+index e269a6d..abac60d 100644
+--- a/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
++++ b/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
+@@ -173,7 +173,7 @@ class AllGatherState(NamedTuple):
+
+
+ class ReduceScatterState(NamedTuple):
+-    reduce_scatter_input: torch.Tensor
++    reduce_scatter_input: torch.Tensor | list[torch.Tensor]  # keepalive
+     event: torch.Event | None  # reduce-scatter event
+
+
+diff --git a/torch/distributed/fsdp/_fully_shard/_fully_shard.py b/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+index d29ea46..1591acf 100644
+--- a/torch/distributed/fsdp/_fully_shard/_fully_shard.py
++++ b/torch/distributed/fsdp/_fully_shard/_fully_shard.py
+@@ -709,7 +709,9 @@ class FSDPModule:
+     ) -> None:
+         """
+         Sets how many gradient reduce-scatter input buffers may be in flight at
+-        once -- the copy-in (``chunk_cat``) buffer cap-K (experimental).
++        once -- the copy-in (``chunk_cat``) buffer cap-K (experimental). When the
++        gradients already have the reduce dtype, the retained "buffer" is the
++        group's gradients themselves (reduce-scattered without a copy-in).
+
+         FSDP keeps **1** such buffer in flight by default, so the compute stream
+         must wait on the previous reduce-scatter before the next copy-in can
