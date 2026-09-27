@@ -13,6 +13,8 @@
   from ``Configurable.Config``.
 """
 
+import functools
+import logging
 import math
 from dataclasses import dataclass
 
@@ -26,9 +28,14 @@ from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
 from torchtitan.protocols.module import Module
+from torchtitan.tools.utils import device_type
 
-# Shape suffix legend for the router gate:
-#   T = num tokens, D = model dimension, E = num experts
+logger = logging.getLogger(__name__)
+
+# Shape suffix legend:
+#   X = leading input dims, T = num tokens, D = input features (model dimension for the router
+#   gate), O = output features, E = num experts, R = routed rows grouped by expert,
+#   I = grouped linear input features
 
 
 class Linear(nn.Linear, Module):
@@ -47,6 +54,9 @@ class Linear(nn.Linear, Module):
         out_features: int
         num_linears: int = 1
         bias: bool = False
+
+    fp32_weight_grad: bool = False
+    """Write the weight gradient in fp32 instead of bf16 (see ``enable_fp32_weight_grads``)."""
 
     def __init__(self, config: Config):
         super().__init__(
@@ -117,6 +127,8 @@ class Linear(nn.Linear, Module):
         Explicit operands let those boundaries adjust an operand's SPMD type
         before invoking the selected local compute implementation.
         """
+        if self.fp32_weight_grad:
+            return _Fp32WeightGradLinearFunction.apply(input, weight, bias, self.weight)
         return F.linear(input, weight, bias)
 
 
@@ -149,6 +161,61 @@ class CastLinear(Linear):
         return F.linear(
             input.to(self.compute_dtype), weight.to(self.compute_dtype), bias
         )
+
+
+@spmd.register_local_autograd_function
+class _Fp32WeightGradLinearFunction(torch.autograd.Function):
+    """``F.linear`` whose weight and bias gradients come out in fp32.
+
+    With bf16 input and weight, every product in ``grad_output.T @ input`` is exact in fp32 and
+    the GEMM accumulates in fp32, but ``F.linear``'s backward then writes the weight gradient in
+    bf16. Writing it in fp32 keeps those bits for a parameter that accumulates fp32 gradients
+    (``Tensor.grad_dtype``). The forward and the input gradient are the same as ``F.linear``'s.
+
+    ``weight_OD`` may be a flattened view of the stacked ``weight_param``. The weight gradient is
+    returned for ``weight_param`` itself: through the view, autograd would round it back to the
+    view's bf16 dtype.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx,
+        input_XD: torch.Tensor,
+        weight_OD: torch.Tensor,
+        bias_O: torch.Tensor | None,
+        weight_param: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(input_XD, weight_OD)
+        ctx.weight_param_shape = weight_param.shape
+        return F.linear(input_XD, weight_OD, bias_O)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output_XO: torch.Tensor):  # pyrefly: ignore[bad-override]
+        input_XD, weight_OD = ctx.saved_tensors
+        grad_input_XD = grad_weight_OD = grad_bias_O = None
+        grad_output_TO = grad_output_XO.reshape(-1, grad_output_XO.shape[-1])
+
+        if ctx.needs_input_grad[0]:
+            grad_input_XD = grad_output_XO.matmul(weight_OD)
+        if ctx.needs_input_grad[3]:
+            input_TD = input_XD.reshape(-1, input_XD.shape[-1])
+            if grad_output_TO.is_cuda:
+                grad_weight_OD = torch.mm(
+                    grad_output_TO.T, input_TD, out_dtype=torch.float32
+                )
+            else:
+                # aten::mm.dtype (bf16 inputs, fp32 output) is only implemented for CUDA/ROCm.
+                grad_weight_OD = torch.mm(grad_output_TO.T.float(), input_TD.float())
+        if ctx.needs_input_grad[2]:
+            grad_bias_O = grad_output_TO.sum(0, dtype=torch.float32)
+
+        grad_weight_param = (
+            None
+            if grad_weight_OD is None
+            else grad_weight_OD.view(ctx.weight_param_shape)
+        )
+        return grad_input_XD, None, grad_bias_O, grad_weight_param
 
 
 class ColumnParallelLinear(Linear):
@@ -256,6 +323,9 @@ class GroupedLinear(Module):
         out_features: int
         num_linears: int = 1
 
+    fp32_weight_grad: bool = False
+    """Write the weight gradient in fp32 instead of bf16 (see ``enable_fp32_weight_grads``)."""
+
     def __init__(self, config: Config):
         super().__init__()
         self.group_size = config.group_size
@@ -299,6 +369,10 @@ class GroupedLinear(Module):
         offsets_E: torch.Tensor,
     ) -> torch.Tensor:
         """Execute ``input_RI @ weight_EOI.transpose(-2, -1)`` by expert."""
+        if self.fp32_weight_grad:
+            return _Fp32WeightGradGroupedMMFunction.apply(
+                input_RI, weight_EOI.bfloat16(), offsets_E, self.weight
+            )
         return torch._grouped_mm(
             input_RI,
             weight_EOI.bfloat16().transpose(-2, -1),
@@ -307,12 +381,71 @@ class GroupedLinear(Module):
 
 
 @spmd.register_local_autograd_function
+class _Fp32WeightGradGroupedMMFunction(torch.autograd.Function):
+    """``torch._grouped_mm`` whose weight gradient comes out in fp32.
+
+    The grouped counterpart of ``_Fp32WeightGradLinearFunction``: the forward and the input
+    gradient are the grouped GEMMs autograd runs for ``torch._grouped_mm``, and the weight
+    gradient is written in fp32 and returned for ``weight_param`` (``weight_EOI`` may be its
+    flattened view).
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx,
+        input_RI: torch.Tensor,
+        weight_EOI: torch.Tensor,
+        offsets_E: torch.Tensor,
+        weight_param: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(input_RI, weight_EOI, offsets_E)
+        ctx.weight_param_shape = weight_param.shape
+        return torch._grouped_mm(input_RI, weight_EOI.transpose(-2, -1), offs=offsets_E)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output_RO: torch.Tensor):  # pyrefly: ignore[bad-override]
+        input_RI, weight_EOI, offsets_E = ctx.saved_tensors
+        grad_input_RI = grad_weight_param = None
+        if ctx.needs_input_grad[0]:
+            grad_input_RI = torch._grouped_mm(
+                grad_output_RO, weight_EOI, offs=offsets_E
+            )
+        if ctx.needs_input_grad[3]:
+            grad_weight_EOI = torch._grouped_mm(
+                grad_output_RO.transpose(-2, -1),
+                input_RI,
+                offs=offsets_E,
+                out_dtype=torch.float32,
+            )
+            grad_weight_param = grad_weight_EOI.view(ctx.weight_param_shape)
+        return grad_input_RI, None, None, grad_weight_param
+
+
+@functools.cache
+def _grouped_mm_writes_fp32() -> bool:
+    """Whether ``torch._grouped_mm`` writes an fp32 output from bf16 inputs on this device."""
+    # TODO: drop once torch._grouped_mm supports out_dtype=float32 for bf16 inputs upstream.
+    try:
+        input_RI = torch.zeros(16, 16, dtype=torch.bfloat16, device=device_type)
+        offsets_E = torch.full((1,), 16, dtype=torch.int32, device=device_type)
+        torch._grouped_mm(input_RI.T, input_RI, offs=offsets_E, out_dtype=torch.float32)
+    except RuntimeError as error:
+        logger.warning(
+            "GroupedLinear weight gradients stay bf16: torch._grouped_mm cannot write fp32 "
+            f"from bf16 inputs here ({error})"
+        )
+        return False
+    return True
+
+
+@spmd.register_local_autograd_function
 class _RouterGateLinearFunction(torch.autograd.Function):
     """Router projection with FP32 output and backward GEMMs."""
 
     @staticmethod
     def forward(  # pyrefly: ignore[bad-override]
-        ctx, input_TD: torch.Tensor, weight_ED: torch.Tensor
+        ctx, input_TD: torch.Tensor, weight_ED: torch.Tensor, fp32_weight_grad: bool
     ) -> torch.Tensor:
         use_cuda_bf16_forward = (
             input_TD.device.type == "cuda"
@@ -335,7 +468,7 @@ class _RouterGateLinearFunction(torch.autograd.Function):
 
         ctx.save_for_backward(input_forward_TD, weight_forward_ED)
         ctx.input_dtype = input_TD.dtype
-        ctx.weight_dtype = weight_ED.dtype
+        ctx.weight_grad_dtype = torch.float32 if fp32_weight_grad else weight_ED.dtype
         return output_TE
 
     @staticmethod
@@ -354,9 +487,9 @@ class _RouterGateLinearFunction(torch.autograd.Function):
         if ctx.needs_input_grad[1]:
             grad_weight_ED = torch.mm(
                 grad_output_fp32_TE.T, input_forward_TD.float()
-            ).to(ctx.weight_dtype)
+            ).to(ctx.weight_grad_dtype)
 
-        return grad_input_TD, grad_weight_ED
+        return grad_input_TD, grad_weight_ED, None
 
 
 class RouterGateLinear(Linear):
@@ -376,7 +509,9 @@ class RouterGateLinear(Linear):
         weight: torch.Tensor,
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        output_TE = _RouterGateLinearFunction.apply(input, weight)
+        output_TE = _RouterGateLinearFunction.apply(
+            input, weight, self.fp32_weight_grad
+        )
         if bias is not None:
             output_TE = output_TE + bias.float()
         return output_TE
