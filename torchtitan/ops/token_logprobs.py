@@ -13,6 +13,7 @@ passes over ``[T, V]`` tensors, and its backward uses 2 GEMMs instead of hi + lo
 the same gradient error.
 """
 
+import spmd_types as spmd
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
@@ -210,6 +211,25 @@ class TokenLogprobs(torch.autograd.Function):
     ``vocab_start``; the forward all-reduces ``[T]`` statistics, and ``grad_hidden`` is this
     shard's partial sum (reduced by the hidden states' TP redistribute, as for the lm_head).
     """
+
+    @staticmethod
+    def spmd_typecheck(
+        result: tuple[torch.Tensor, torch.Tensor],
+        *,
+        weight_VD: torch.Tensor,
+        labels_T: torch.Tensor,
+        vocab_parallel_group: dist.ProcessGroup | None,
+    ) -> None:
+        """SPMD type: weight S(0)@TP, labels I@TP -> logprobs and entropy I@TP; local without TP."""
+        overrides = {}
+        if vocab_parallel_group is not None:
+            spmd.assert_type(weight_VD, {vocab_parallel_group: spmd.S(0)})
+            spmd.assert_type(labels_T, {vocab_parallel_group: spmd.I})
+            overrides = {vocab_parallel_group: spmd.I}
+        for output_T in result:
+            spmd.assert_local_type_like(
+                output_T, labels_T, overrides  # pyrefly: ignore [bad-argument-type]
+            )
 
     @staticmethod
     # pyrefly: ignore [bad-override]

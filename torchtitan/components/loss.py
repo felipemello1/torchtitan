@@ -423,6 +423,14 @@ class CrossEntropyLoss(TokenLogprobLoss):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         del entropy, kwargs
         loss = -logprobs.sum()
+        # Same annotations as __call__: the local sum is partial over dp/cp.
+        if current_spmd_mesh() is not None:
+            spmd.assert_type(loss, {"dp": spmd.P, "cp": spmd.P})
+            if global_valid_tokens is not None:
+                spmd.assert_type(
+                    global_valid_tokens,
+                    {"dp": spmd.R, "cp": spmd.R, "tp": spmd.I},
+                )
         if global_valid_tokens is not None:
             loss = loss / global_valid_tokens
         return loss, {}
