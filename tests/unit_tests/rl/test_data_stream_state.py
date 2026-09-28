@@ -11,9 +11,15 @@ import logging
 import os
 import pickle
 
+import types
+
 import pytest
 
-from torchtitan.rl.components.data_stream_state import _FILENAME, DataStreamState
+from torchtitan.rl.components.data_stream_state import (
+    _FILENAME,
+    DataStreamState,
+    newest_step_with_data_stream_state,
+)
 from torchtitan.rl.rollout.rollouter import Rollouter
 
 
@@ -118,20 +124,85 @@ def test_load_rejects_an_unknown_version(tmp_path) -> None:
         DataStreamState().load(str(tmp_path), _Rollouter())
 
 
+def _bare_rollouter(train_dataset, validation_dataset, *, seed: int = 42) -> Rollouter:
+    """A Rollouter with only the fields ``state_dict`` / ``load_state_dict`` read."""
+    rollouter = Rollouter.__new__(Rollouter)
+    rollouter._config = types.SimpleNamespace(
+        train_dataset=f"train(seed={seed})", validation_dataset="validation"
+    )
+    rollouter._train_dataset = train_dataset
+    rollouter._validation_dataset = validation_dataset
+    return rollouter
+
+
 def test_rollouter_restores_positions_and_skips_datasets_without_state(
     caplog,
 ) -> None:
-    rollouter = Rollouter.__new__(Rollouter)
-    rollouter._train_dataset = _CountingDataset()
-    rollouter._validation_dataset = iter([0, 1, 2])  # no state_dict
+    rollouter = _bare_rollouter(_CountingDataset(), iter([0, 1, 2]))  # no state_dict
     next(rollouter._train_dataset)
     saved = rollouter.state_dict()
-    assert saved == {"train": {"position": 1}, "validation": None}
+    assert saved["train"] == {"position": 1}
+    assert saved["validation"] is None
 
-    resumed = Rollouter.__new__(Rollouter)
-    resumed._train_dataset = _CountingDataset()
-    resumed._validation_dataset = iter([0, 1, 2])
+    resumed = _bare_rollouter(_CountingDataset(), iter([0, 1, 2]))
     with caplog.at_level(logging.WARNING):
         resumed.load_state_dict(saved)
     assert resumed.get_training_sample() == 1
     assert "validation dataset; it restarts" in caplog.text
+
+
+def test_rollouter_warns_on_positions_saved_for_other_datasets(caplog) -> None:
+    saved = _bare_rollouter(_CountingDataset(), iter([])).state_dict()
+    resumed = _bare_rollouter(_CountingDataset(), iter([]), seed=7)
+    with caplog.at_level(logging.WARNING):
+        resumed.load_state_dict(saved)
+    assert "dataset config differs from the checkpoint's" in caplog.text
+
+
+class _Checkpointer:
+    """``_find_load_step`` / ``_create_checkpoint_id`` over ``step-N`` folders in ``folder``.
+
+    A folder is a resumable trainer checkpoint when it has a ``.metadata`` file.
+    """
+
+    def __init__(self, folder) -> None:
+        self.folder = str(folder)
+
+    def _create_checkpoint_id(self, step: int) -> str:
+        return os.path.join(self.folder, f"step-{step}")
+
+    def _find_load_step(self, max_step: int | None = None) -> int:
+        steps = [
+            int(name.removeprefix("step-"))
+            for name in os.listdir(self.folder)
+            if os.path.isfile(os.path.join(self.folder, name, ".metadata"))
+        ]
+        steps = [s for s in steps if max_step is None or s <= max_step]
+        return max(steps, default=-1)
+
+
+def _write_step(folder, step: int, *, data_stream_state: bool) -> None:
+    step_dir = folder / f"step-{step}"
+    step_dir.mkdir()
+    (step_dir / ".metadata").touch()
+    if data_stream_state:
+        (step_dir / _FILENAME).touch()
+
+
+def test_resume_step_skips_steps_without_data_stream_state(tmp_path, caplog) -> None:
+    _write_step(tmp_path, 2, data_stream_state=True)
+    _write_step(tmp_path, 4, data_stream_state=True)
+    _write_step(tmp_path, 6, data_stream_state=False)  # killed between the two saves
+    with caplog.at_level(logging.WARNING):
+        assert newest_step_with_data_stream_state(_Checkpointer(tmp_path)) == 4
+    assert "resuming from step 4" in caplog.text
+
+
+def test_resume_step_falls_back_to_newest_without_any_data_stream_state(
+    tmp_path,
+) -> None:
+    checkpointer = _Checkpointer(tmp_path)
+    assert newest_step_with_data_stream_state(checkpointer) == -1
+    _write_step(tmp_path, 2, data_stream_state=False)
+    _write_step(tmp_path, 4, data_stream_state=False)
+    assert newest_step_with_data_stream_state(checkpointer) == 4
