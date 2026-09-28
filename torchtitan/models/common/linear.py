@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import spmd_types as spmd
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd.function import once_differentiable
@@ -25,6 +26,7 @@ from torch.autograd.function import once_differentiable
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
+from torchtitan.ops.token_logprobs import TokenLogprobs, TokenLogprobsGradState
 from torchtitan.protocols.module import Module
 
 # Shape suffix legend:
@@ -222,6 +224,32 @@ class Fp32OutputLinear(Linear):
         )
         output = output.reshape(*input.shape[:-1], -1)
         return output if bias is None else output + bias.float()
+
+    def token_logprobs(
+        self,
+        input: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        grad_state: TokenLogprobsGradState | None,
+        return_grad_weight: bool,
+        vocab_start: int = 0,
+        vocab_parallel_group: dist.ProcessGroup | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``log_softmax(output)[label]`` and the entropy of ``softmax(output)``, each ``[T]``.
+
+        Fused with the matmul so the ``[T, V]`` output never leaves this call; see
+        ``TokenLogprobs``. ``ChunkedLossWrapper`` calls it per chunk, and registers it with
+        FSDP so that the weight's gradient hooks run as they do for ``forward``.
+        """
+        return TokenLogprobs.apply(
+            input,
+            self.weight,
+            labels,
+            grad_state,
+            return_grad_weight,
+            vocab_start,
+            vocab_parallel_group,
+        )
 
 
 @spmd.register_local_autograd_function

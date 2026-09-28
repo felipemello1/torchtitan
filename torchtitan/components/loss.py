@@ -18,8 +18,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torchtitan.config import CompileConfig, Configurable
-from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
+from torchtitan.distributed.spmd_types import (
+    current_spmd_mesh,
+    spmd_mesh_group,
+    spmd_mesh_size,
+)
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
+from torchtitan.models.common.linear import Fp32OutputLinear
+from torchtitan.ops.token_logprobs import TokenLogprobsGradState, vocab_shard_start
 
 # PyTorch's default ignore index for cross-entropy loss
 logger = logging.getLogger(__name__)
@@ -445,6 +451,46 @@ def compute_logprobs(
     return logprobs, entropy
 
 
+class TokenLogprobLoss(BaseLoss):
+    """Loss that reads only each token's label logprob, plus its entropy as a metric.
+
+    Subclasses implement ``loss_from_logprobs``. ``__call__`` computes its inputs from
+    logits; ``ChunkedLossWrapper`` instead computes them fused with an ``Fp32OutputLinear``
+    lm_head (``Fp32OutputLinear.token_logprobs``), without materializing logits outside it.
+    """
+
+    global_vocab_size: int | None
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        global_valid_tokens: torch.Tensor | None = None,
+        **loss_inputs: Any,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        logprobs, entropy = compute_logprobs(
+            logits,
+            labels,
+            vocab_parallel_group=spmd_mesh_group("tp"),
+            return_entropy=True,
+            global_vocab_size=self.global_vocab_size,
+        )
+        return self.loss_from_logprobs(
+            logprobs, entropy, global_valid_tokens, **loss_inputs
+        )
+
+    @abstractmethod
+    def loss_from_logprobs(
+        self,
+        logprobs: torch.Tensor,
+        entropy: torch.Tensor,
+        global_valid_tokens: torch.Tensor | None,
+        **loss_inputs: Any,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return the scaled loss and metrics from ``[T]`` label logprobs and entropy."""
+        ...
+
+
 class GradAccumulator:
     """Accumulates chunk gradients into a pre-allocated buffer.
 
@@ -563,7 +609,33 @@ class ChunkedLossWrapper(BaseLoss):
 
     def set_lm_head(self, lm_head: nn.Module) -> None:
         """Set the lm_head module. Must be called before the first __call__."""
+        from torch.distributed.fsdp import FSDPModule, register_fsdp_forward_method
+
         self.lm_head = lm_head
+        if isinstance(lm_head, FSDPModule) and isinstance(lm_head, Fp32OutputLinear):
+            # Run FSDP's unshard and gradient hooks around token_logprobs as around forward.
+            register_fsdp_forward_method(lm_head, "token_logprobs")
+
+    def _uses_token_logprobs(
+        self, hidden_state: torch.Tensor, is_multi_output: bool
+    ) -> bool:
+        """Whether chunks call ``lm_head.token_logprobs`` and ``loss_from_logprobs``.
+
+        Otherwise chunks materialize ``lm_head`` logits and call ``loss_fn`` on them.
+        """
+        lm_head = self.lm_head
+        return (
+            isinstance(self.loss_fn, TokenLogprobLoss)
+            and not is_multi_output
+            # A plain Fp32OutputLinear; LoRA and quantized heads override _linear.
+            and getattr(type(lm_head), "_linear", None) is Fp32OutputLinear._linear
+            and lm_head.bias is None
+            and lm_head.num_linears == 1
+            and hidden_state.is_cuda
+            and hidden_state.dtype == torch.bfloat16
+            # Batch-invariant mode reproduces the generator's logprob ops bitwise.
+            and not is_in_batch_invariant_mode()
+        )
 
     def __call__(
         self,
@@ -612,6 +684,7 @@ class ChunkedLossWrapper(BaseLoss):
                 "All chunked-loss predictions must agree on whether gradients "
                 "are required."
             )
+        use_token_logprobs = self._uses_token_logprobs(pred[0], is_multi_output)
 
         # Chunking operates on the local tensor. Equal chunk sizes match
         # GradAccumulator's sequential slice
@@ -682,6 +755,20 @@ class ChunkedLossWrapper(BaseLoss):
                 with spmd.no_typecheck():
                     lm_head.unshard()
 
+            if use_token_logprobs:
+                vocab_parallel_group = spmd_mesh_group("tp")
+                vocab_start = 0
+                if vocab_parallel_group is not None:
+                    global_vocab_size = self.loss_fn.global_vocab_size
+                    if global_vocab_size is None:
+                        raise ValueError(
+                            "global_vocab_size is required for vocab-parallel policy statistics"
+                        )
+                    vocab_start = vocab_shard_start(
+                        global_vocab_size, vocab_parallel_group
+                    )
+                grad_state = TokenLogprobsGradState() if requires_grad else None
+
             for chunk_index in range(num_chunks):
                 if fsdp_enabled and chunk_index == num_chunks - 1:
                     lm_head.set_requires_gradient_sync(  # pyrefly: ignore[not-callable]
@@ -698,20 +785,34 @@ class ChunkedLossWrapper(BaseLoss):
                     key: chunks[chunk_index] if isinstance(chunks, tuple) else chunks
                     for key, chunks in input_chunks.items()
                 }
-                # TODO(felipemello): compile lm_head together with loss_fn (only loss_fn is
-                # compiled today), so inductor can fuse Fp32OutputLinear's backward split into
-                # the CE backward (27B lm_head: ~20 -> ~16 ms per 2048-token chunk). Mind the
-                # lm_head's FSDP hooks.
-                logits = tuple(lm_head(h_chunk) for h_chunk in h_chunks)
-                if not is_multi_output:
-                    logits = logits[0]
-                    label_chunks = label_chunks[0]
-                chunk_loss, chunk_metrics = self.loss_fn(
-                    logits,  # pyrefly: ignore[bad-argument-type]
-                    label_chunks,  # pyrefly: ignore[bad-argument-type]
-                    global_valid_tokens,
-                    **loss_inputs,
-                )
+                if use_token_logprobs:
+                    logprobs, entropy = lm_head.token_logprobs(
+                        h_chunks[0],
+                        label_chunks[0],
+                        grad_state=grad_state,
+                        # The last chunk's backward hands the accumulated gradient to autograd.
+                        return_grad_weight=chunk_index == num_chunks - 1,
+                        vocab_start=vocab_start,
+                        vocab_parallel_group=vocab_parallel_group,
+                    )
+                    chunk_loss, chunk_metrics = self.loss_fn.loss_from_logprobs(
+                        logprobs, entropy, global_valid_tokens, **loss_inputs
+                    )
+                else:
+                    # TODO(felipemello): compile lm_head together with loss_fn (only loss_fn is
+                    # compiled today), so inductor can fuse Fp32OutputLinear's backward split into
+                    # the CE backward (27B lm_head: ~20 -> ~16 ms per 2048-token chunk). Mind the
+                    # lm_head's FSDP hooks.
+                    logits = tuple(lm_head(h_chunk) for h_chunk in h_chunks)
+                    if not is_multi_output:
+                        logits = logits[0]
+                        label_chunks = label_chunks[0]
+                    chunk_loss, chunk_metrics = self.loss_fn(
+                        logits,  # pyrefly: ignore[bad-argument-type]
+                        label_chunks,  # pyrefly: ignore[bad-argument-type]
+                        global_valid_tokens,
+                        **loss_inputs,
+                    )
                 metrics = self._combine_chunk_metrics(metrics, chunk_metrics)
                 total_loss = total_loss + chunk_loss.detach()
 
