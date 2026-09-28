@@ -7,11 +7,15 @@
 """Tests for torchtitan.observability.structured_logger."""
 
 import asyncio
+import collections
 import functools
 import json
 import logging
 import os
 import pickle
+import subprocess
+import sys
+import threading
 import time
 from unittest import mock
 
@@ -41,6 +45,7 @@ from torchtitan.observability.structured_logger.structured_logging import (
     _structured_logger,
     event_extra,
     ExtraFields,
+    flush_structured_logger,
     init_structured_logger,
     log_trace_instant,
     log_trace_scalar,
@@ -91,7 +96,12 @@ def structured_logger_fixture():
     sl_mod._is_initialized = False
     sl_mod._disabled = False
     sl_mod._structured_logger_subprocess_init_fn = None
+    sl_mod._record_queue = None
     yield tl
+    # Drain into this test's handlers before restoring the previous ones.
+    if sl_mod._record_queue is not None:
+        sl_mod._record_queue.close(timeout_s=5.0)
+        sl_mod._record_queue = None
     (
         tl.handlers,
         tl.level,
@@ -632,6 +642,7 @@ class TestInitStructuredLogger:
             extra=event_extra("step", step=1),
         )
 
+        assert flush_structured_logger()
         structured_logs_dir = os.path.join(output_dir, "structured_logs")
         assert os.path.exists(structured_logs_dir)
         jsonl_files = [
@@ -762,8 +773,7 @@ class TestExternalStructuredLogging:
         )
         logging.getLogger("external_library.worker").info("plain text")
 
-        for handler in structured_logger_fixture.handlers:
-            handler.flush()
+        assert flush_structured_logger()
         trace_dir = os.path.join(str(tmp_path), "structured_logs")
         jsonl_files = [f for f in os.listdir(trace_dir) if f.endswith(".jsonl")]
         with open(os.path.join(trace_dir, jsonl_files[0])) as f:
@@ -776,6 +786,8 @@ class TestExternalStructuredLogging:
         assert lines[0]["step"] == 7
         assert lines[0]["value"] == 12.5
         assert lines[0]["context"] == ["source:test"]
+        # Formatted on the writer thread, but stamped with the thread that logged.
+        assert lines[0]["tid"] == threading.get_native_id()
         assert structured_logger_fixture.propagate is False
 
 
@@ -797,6 +809,7 @@ class TestNoOpFlag:
                 pass
             log_trace_instant("structured_logger_started")
 
+        assert flush_structured_logger()
         trace_dir = tmp_path / "structured_logs"
         lines = []
         if trace_dir.exists():
@@ -827,6 +840,7 @@ class TestNoOpFlag:
             sl_mod._disabled = False
 
         # No structured_logs directory should be created (no handlers attached)
+        assert flush_structured_logger()
         trace_dir = tmp_path / "structured_logs"
         if trace_dir.exists():
             for f in trace_dir.iterdir():
@@ -846,6 +860,7 @@ class TestLogTraceScalar:
         set_step(5)
         log_trace_scalar({"train.loss": 2.5, "train.tflops": 45.6})
 
+        assert flush_structured_logger()
         trace_dir = os.path.join(str(tmp_path), "structured_logs")
         jsonl_files = [f for f in os.listdir(trace_dir) if f.endswith(".jsonl")]
         with open(os.path.join(trace_dir, jsonl_files[0])) as f:
@@ -867,6 +882,7 @@ class TestLogTraceScalar:
         ):
             log_trace_scalar({"should.not.appear": 1.0})
 
+        assert flush_structured_logger()
         trace_dir = tmp_path / "structured_logs"
         lines = []
         if trace_dir.exists():
@@ -878,6 +894,7 @@ class TestLogTraceScalar:
         init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
         log_trace_scalar({})
 
+        assert flush_structured_logger()
         trace_dir = os.path.join(str(tmp_path), "structured_logs")
         jsonl_files = [f for f in os.listdir(trace_dir) if f.endswith(".jsonl")]
         with open(os.path.join(trace_dir, jsonl_files[0])) as f:
@@ -895,6 +912,7 @@ class TestLogTraceInstant:
         init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
         log_trace_instant("structured_logger_started")
 
+        assert flush_structured_logger()
         trace_dir = os.path.join(str(tmp_path), "structured_logs")
         jsonl_files = [f for f in os.listdir(trace_dir) if f.endswith(".jsonl")]
         with open(os.path.join(trace_dir, jsonl_files[0])) as f:
@@ -913,6 +931,7 @@ class TestLogTraceInstant:
         ):
             log_trace_instant("training_start")
 
+        assert flush_structured_logger()
         trace_dir = os.path.join(str(tmp_path), "structured_logs")
         jsonl_files = [f for f in os.listdir(trace_dir) if f.endswith(".jsonl")]
         with open(os.path.join(trace_dir, jsonl_files[0])) as f:
@@ -933,6 +952,7 @@ class TestLogTraceSpan:
         with log_trace_span("fwd_bwd"):
             time.sleep(0.01)
 
+        assert flush_structured_logger()
         trace_dir = os.path.join(str(tmp_path), "structured_logs")
         jsonl_files = [f for f in os.listdir(trace_dir) if f.endswith(".jsonl")]
         with open(os.path.join(trace_dir, jsonl_files[0])) as f:
@@ -959,6 +979,7 @@ class TestLogTraceSpan:
         with log_trace_span("rl_rollout"):
             pass
 
+        assert flush_structured_logger()
         trace_dir = os.path.join(str(tmp_path), "structured_logs")
         jsonl_files = [f for f in os.listdir(trace_dir) if f.endswith(".jsonl")]
         with open(os.path.join(trace_dir, jsonl_files[0])) as f:
@@ -978,6 +999,7 @@ class TestLogTraceSpan:
         with log_trace_span("optim"):
             pass
 
+        assert flush_structured_logger()
         trace_dir = os.path.join(str(tmp_path), "structured_logs")
         jsonl_files = [f for f in os.listdir(trace_dir) if f.endswith(".jsonl")]
         with open(os.path.join(trace_dir, jsonl_files[0])) as f:
@@ -996,6 +1018,7 @@ class TestLogTraceSpan:
 
         optimizer_step()
 
+        assert flush_structured_logger()
         trace_dir = os.path.join(str(tmp_path), "structured_logs")
         jsonl_files = [f for f in os.listdir(trace_dir) if f.endswith(".jsonl")]
         with open(os.path.join(trace_dir, jsonl_files[0])) as f:
@@ -1020,6 +1043,7 @@ class TestLogTraceSpan:
 
         asyncio.run(rollout())
 
+        assert flush_structured_logger()
         trace_dir = os.path.join(str(tmp_path), "structured_logs")
         jsonl_files = [f for f in os.listdir(trace_dir) if f.endswith(".jsonl")]
         with open(os.path.join(trace_dir, jsonl_files[0])) as f:
@@ -1038,6 +1062,7 @@ class TestLogTraceSpan:
             with log_trace_span("step"):
                 raise ValueError("test error")
 
+        assert flush_structured_logger()
         trace_dir = os.path.join(str(tmp_path), "structured_logs")
         jsonl_files = [f for f in os.listdir(trace_dir) if f.endswith(".jsonl")]
         with open(os.path.join(trace_dir, jsonl_files[0])) as f:
@@ -1066,6 +1091,7 @@ class TestLogTraceSpan:
 
         my_fn()
 
+        assert flush_structured_logger()
         trace_dir = os.path.join(str(tmp_path), "structured_logs")
         jsonl_files = [f for f in os.listdir(trace_dir) if f.endswith(".jsonl")]
         with open(os.path.join(trace_dir, jsonl_files[0])) as f:
@@ -1105,6 +1131,7 @@ class TestLogTraceSpan:
 
         asyncio.run(outer())
 
+        assert flush_structured_logger()
         trace_dir = os.path.join(str(tmp_path), "structured_logs")
         jsonl_files = [f for f in os.listdir(trace_dir) if f.endswith(".jsonl")]
         with open(os.path.join(trace_dir, jsonl_files[0])) as f:
@@ -1684,3 +1711,326 @@ class TestRegisterJsonlHandler:
         assert "structured_logs" in filepath
         assert "test_src.global_rank_2" in filepath
         assert filepath.endswith(".jsonl")
+
+
+# ---------------------------------------------------------------------------
+# _RecordQueue: records are written by one writer thread per process
+# ---------------------------------------------------------------------------
+
+
+def _read_jsonl(tmp_path) -> list[dict]:
+    trace_dir = os.path.join(str(tmp_path), "structured_logs")
+    (jsonl_file,) = [f for f in os.listdir(trace_dir) if f.endswith(".jsonl")]
+    with open(os.path.join(trace_dir, jsonl_file)) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+class _BlockingHandler(logging.Handler):
+    """Holds the writer thread inside `emit` until `unblock` is set, like a hung sink."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.unblock = threading.Event()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.entered.set()
+        self.unblock.wait()
+
+
+class TestRecordQueue:
+    def test_queued_records_match_synchronous_records(
+        self, tmp_path, structured_logger_fixture
+    ):
+        """Every field rebuilt on the writer thread equals what a direct `.info` call writes."""
+        init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
+        set_step(7, relative_step=2)
+        add_step_tag("gc")
+
+        # Queued, through the API
+        log_trace_instant("marker")
+        log_trace_scalar({"train.loss": 2.5})
+        with log_trace_span("fwd"):
+            pass
+        # Synchronous, with the fields the API passes
+        structured_logger_fixture.info(
+            "marker", extra=event_extra("marker", log_type=LogType.INSTANT)
+        )
+        structured_logger_fixture.info(
+            "[step 7] train.loss=2.5",
+            extra=event_extra(
+                "metric_value",
+                event_name="train.loss",
+                value=2.5,
+                step=7,
+                log_type=LogType.INSTANT,
+            ),
+        )
+        structured_logger_fixture.info(
+            "[step 7] fwd fwd_start", extra=event_extra("fwd_start", step=7)
+        )
+        assert flush_structured_logger()
+
+        # The two paths write in no fixed order, so pair the records by name.
+        by_name = collections.defaultdict(list)
+        for record in _read_jsonl(tmp_path):
+            by_name[record["log_type_name"]].append(record)
+        volatile = {"time", "time_ms", "time_us", "delta_ms", "seq_id", "caller"}
+        for name in ("marker", "metric_value", "fwd_start"):
+            first, second = by_name[name]
+            assert {k: v for k, v in first.items() if k not in volatile} == {
+                k: v for k, v in second.items() if k not in volatile
+            }
+            assert (
+                first["caller"].rsplit(":", 1)[1]
+                == second["caller"].rsplit(":", 1)[1]
+                == ("test_queued_records_match_synchronous_records")
+            )
+
+    def test_records_carry_logging_thread_state(
+        self, tmp_path, structured_logger_fixture
+    ):
+        init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
+        set_step(3)
+        add_step_tag("gc")
+
+        log_trace_instant("from_main")
+        thread = threading.Thread(target=log_trace_instant, args=("from_thread",))
+        thread.start()
+        thread.join()
+        assert flush_structured_logger()
+
+        records = {r["log_type_name"]: r for r in _read_jsonl(tmp_path)}
+        writer_tid = sl_mod._record_queue._thread.native_id
+        assert records["from_main"]["tid"] == threading.get_native_id() != writer_tid
+        assert records["from_thread"]["tid"] == thread.native_id != writer_tid
+        assert records["from_main"]["step"] == 3
+        assert records["from_main"]["step_tags"] == ["gc"]
+        assert records["from_main"]["caller"].endswith(
+            ":test_records_carry_logging_thread_state"
+        )
+
+    def test_step_state_is_read_at_log_time(self, tmp_path, structured_logger_fixture):
+        init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
+
+        log_trace_instant("before_any_step")
+        set_step(1)
+        log_trace_instant("at_step_1")
+        set_step(2)
+        assert flush_structured_logger()
+
+        records = {r["log_type_name"]: r for r in _read_jsonl(tmp_path)}
+        assert "step" not in records["before_any_step"]
+        assert records["at_step_1"]["step"] == 1
+
+    def test_async_task_tags_stay_isolated(self, tmp_path, structured_logger_fixture):
+        init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
+        set_step(1)
+
+        async def actor(tag: str) -> None:
+            add_step_tag(tag)
+            await asyncio.sleep(0)
+            log_trace_instant(f"{tag}_marker")
+
+        async def run_actors() -> None:
+            await asyncio.gather(actor("gc"), actor("eval"))
+
+        asyncio.run(run_actors())
+        assert flush_structured_logger()
+
+        records = {r["log_type_name"]: r for r in _read_jsonl(tmp_path)}
+        assert records["gc_marker"]["step_tags"] == ["gc"]
+        assert records["eval_marker"]["step_tags"] == ["eval"]
+
+    def test_hung_handler_never_blocks_the_caller(
+        self, tmp_path, structured_logger_fixture
+    ):
+        init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
+        blocking = _BlockingHandler()
+        structured_logger_fixture.addHandler(blocking)
+        try:
+            log_trace_instant("first")
+            assert blocking.entered.wait(5.0)  # the writer is now stuck in emit
+            start = time.perf_counter()
+            for _ in range(1000):
+                with log_trace_span("step"):
+                    pass
+            assert time.perf_counter() - start < 0.5
+        finally:
+            blocking.unblock.set()
+        assert flush_structured_logger()
+        assert len(_read_jsonl(tmp_path)) == 1 + 2000
+
+    def test_full_queue_drops_new_records_and_reports_them(
+        self, tmp_path, structured_logger_fixture, monkeypatch
+    ):
+        monkeypatch.setattr(sl_mod, "_MAX_QUEUED_RECORDS", 5)
+        init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
+        blocking = _BlockingHandler()
+        structured_logger_fixture.addHandler(blocking)
+        try:
+            log_trace_instant("marker_0")
+            assert blocking.entered.wait(5.0)  # the writer holds marker_0
+            for i in range(1, 20):
+                log_trace_instant(f"marker_{i}")
+        finally:
+            blocking.unblock.set()
+        assert flush_structured_logger()
+
+        records = _read_jsonl(tmp_path)
+        markers = [
+            r["log_type_name"]
+            for r in records
+            if r["log_type_name"] != "structured_logger_dropped"
+        ]
+        dropped = [
+            r for r in records if r["log_type_name"] == "structured_logger_dropped"
+        ]
+        # marker_0 was being written and 5 fit in the queue; the newest 14 were dropped.
+        assert markers == [f"marker_{i}" for i in range(6)]
+        assert len(dropped) == 1 and dropped[0]["value"] == 14
+
+    def test_failing_record_does_not_stop_the_writer(
+        self, tmp_path, structured_logger_fixture
+    ):
+        class FailOnce(logging.Filter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.failed = False
+
+            def filter(self, record: logging.LogRecord) -> bool:
+                if not self.failed:
+                    self.failed = True
+                    raise RuntimeError("boom")
+                return True
+
+        init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
+        fail_once = FailOnce()
+        structured_logger_fixture.addFilter(fail_once)
+        try:
+            log_trace_instant("fails")
+            log_trace_instant("written")
+            assert flush_structured_logger()
+        finally:
+            structured_logger_fixture.removeFilter(fail_once)
+
+        records = _read_jsonl(tmp_path)
+        assert [r["log_type_name"] for r in records] == [
+            "written",
+            "structured_logger_dropped",
+        ]
+        assert records[1]["value"] == 1
+
+    def test_flush_returns_false_when_sink_is_stuck(
+        self, tmp_path, structured_logger_fixture
+    ):
+        init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
+        blocking = _BlockingHandler()
+        structured_logger_fixture.addHandler(blocking)
+        try:
+            log_trace_instant("x")
+            assert blocking.entered.wait(5.0)
+            assert flush_structured_logger(timeout_s=0.2) is False
+        finally:
+            blocking.unblock.set()
+
+    def test_flush_from_a_handler_returns_false(
+        self, tmp_path, structured_logger_fixture
+    ):
+        class FlushingHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                self.result = flush_structured_logger(timeout_s=1.0)
+
+        init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
+        flushing = FlushingHandler()
+        structured_logger_fixture.addHandler(flushing)
+        log_trace_instant("x")
+        assert flush_structured_logger()
+        assert flushing.result is False
+
+    def test_set_level_silences_queued_records(
+        self, tmp_path, structured_logger_fixture
+    ):
+        init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
+        structured_logger_fixture.setLevel(logging.WARNING)
+        log_trace_instant("x")
+        assert flush_structured_logger()
+        assert _read_jsonl(tmp_path) == []
+
+    def test_records_after_close_are_written_on_the_caller(
+        self, tmp_path, structured_logger_fixture
+    ):
+        init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
+        sl_mod._record_queue.close(timeout_s=5.0)
+        log_trace_instant("late")
+        # No flush: after close, the record is written before log_trace_instant returns.
+        assert [r["log_type_name"] for r in _read_jsonl(tmp_path)] == ["late"]
+
+    def test_disabled_logger_creates_no_queue(
+        self, tmp_path, structured_logger_fixture
+    ):
+        init_structured_logger(
+            rank=0, source="trainer", output_dir=str(tmp_path), enable=False
+        )
+        assert sl_mod._record_queue is None
+
+    def test_exit_writes_queued_records(self, tmp_path):
+        """A process that exits without flushing still writes everything it logged."""
+        script = (
+            "from torchtitan.observability import structured_logger as sl\n"
+            f"sl.init_structured_logger(source='exit_test', output_dir={str(tmp_path)!r}, rank=0)\n"
+            "for _ in range(100):\n"
+            "    with sl.log_trace_span('step'):\n"
+            "        pass\n"
+        )
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.dirname(sl_mod.__file__)))
+        )
+        env = {**os.environ, "PYTHONPATH": repo_root}
+        subprocess.run([sys.executable, "-c", script], env=env, check=True, timeout=300)
+        assert len(_read_jsonl(tmp_path)) == 200
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_forked_child_writes_its_own_records_once(
+        self, tmp_path, structured_logger_fixture
+    ):
+        init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
+        log_trace_instant("parent")
+        pid = os.fork()
+        if pid == 0:
+            exit_code = 1
+            try:
+                log_trace_instant("child")
+                exit_code = 0 if flush_structured_logger() else 2
+            finally:
+                os._exit(exit_code)
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert flush_structured_logger()
+        assert sorted(r["log_type_name"] for r in _read_jsonl(tmp_path)) == [
+            "child",
+            "parent",
+        ]
+
+    def test_formatter_prefers_logging_thread_state(self):
+        fmt = TraceJsonlFormatter(rank=0, source="test")
+        set_step(1)  # the formatting thread's own step, which must be ignored
+
+        def format_record(tid: int, created: float) -> dict:
+            record = logging.LogRecord(
+                "test", logging.INFO, "test.py", 1, "msg", None, None
+            )
+            for k, v in event_extra("x").items():
+                setattr(record, k, v)
+            record.created = created
+            record.logging_thread_state = sl_mod.LoggingThreadState(
+                tid=tid, step=9, relative_step=None, step_tags=("eval",)
+            )
+            return json.loads(fmt.format(record))
+
+        first = format_record(tid=123, created=10.0)
+        second = format_record(tid=123, created=10.5)
+        other_thread = format_record(tid=456, created=10.6)
+        assert (first["tid"], first["step"], first["step_tags"]) == (123, 9, ["eval"])
+        assert (first["delta_ms"], second["delta_ms"]) == (0.0, 500.0)
+        assert other_thread["delta_ms"] == 0.0
