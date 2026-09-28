@@ -156,6 +156,8 @@ class TrainerStepBatch:
     metrics: list[m.Metric]
     # one per packed training_sample; trainer computes policy_age at consume time
     min_policy_versions: list[int]
+    # every rollout group taken into this batch, trainable or metric-only
+    group_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,3 +166,5 @@ class OptimizerStepOutput:
 
     policy_version: int
     metrics: dict[str, float]
+    checkpoint_saved: bool = False
+    """Whether this step wrote a trainer checkpoint (``step-{policy_version}``)."""
