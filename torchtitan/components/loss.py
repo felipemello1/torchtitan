@@ -354,9 +354,11 @@ class BaseLoss(ABC, Configurable):
 class TokenLogprobLoss(BaseLoss):
     """Loss that reads only each token's label logprob, plus its entropy as a metric.
 
-    Subclasses implement ``loss_from_logprobs``. ``__call__`` computes its inputs from
-    logits; ``ChunkedLossWrapper`` instead computes them fused with an ``Fp32OutputLinear``
-    lm_head (``Fp32OutputLinear.token_logprobs``), without materializing logits outside it.
+    Subclasses implement ``loss_from_logprobs``. ``ChunkedLossWrapper`` computes its inputs fused
+    with an ``Fp32OutputLinear`` head; ``__call__`` computes them from logits.
+
+    Example:
+        CrossEntropyLoss.loss_from_logprobs(logprobs [T], entropy [T], gvt) -> -logprobs.sum() / gvt
     """
 
     global_vocab_size: int | None
@@ -395,8 +397,10 @@ class TokenLogprobLoss(BaseLoss):
     ) -> torch.Tensor | None:
         """``[T]`` bool: tokens whose logprob reaches the loss or its metrics; None keeps all.
 
-        ``ChunkedLossWrapper`` skips the lm_head for the other tokens, at the cost of one
-        host sync per microbatch. None by default: pretraining has nothing to skip.
+        ``ChunkedLossWrapper`` skips the lm_head for the other tokens (one host sync per microbatch).
+
+        Example:
+            DAPO returns ``loss_mask``, so prompt and tool-output tokens skip the head.
         """
         del labels, loss_inputs
         return None

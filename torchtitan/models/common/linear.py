@@ -235,11 +235,15 @@ class Fp32OutputLinear(Linear):
         vocab_start: int = 0,
         vocab_parallel_group: dist.ProcessGroup | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return ``log_softmax(output)[label]`` and the entropy of ``softmax(output)``, each ``[T]``.
+        """``log_softmax(output)[label]`` and the entropy of ``softmax(output)``, each ``[T]``.
 
-        Fused with the matmul so the ``[T, V]`` output never leaves this call; see
-        ``TokenLogprobs``. ``ChunkedLossWrapper`` calls it per chunk, and registers it with
-        FSDP so that the weight's gradient hooks run as they do for ``forward``.
+        The ``[T, V]`` output never leaves this call (see ``TokenLogprobs``). ``ChunkedLossWrapper``
+        registers it with FSDP, so the weight's hooks run as they do for ``forward``.
+
+        Example:
+            logprobs, entropy = head.token_logprobs(
+                hidden, labels, grad_state=state, return_grad_weight=True
+            )
         """
         return TokenLogprobs.apply(
             input,

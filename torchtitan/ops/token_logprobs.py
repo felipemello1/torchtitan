@@ -222,55 +222,43 @@ def _start_hidden_scale(
 
 
 class TokenLogprobsGradState:
-    """Per-microbatch state shared by the chunks' backwards.
+    """Per-microbatch state the chunks' backwards share: the fp16 weight and the fp32 grad_weight.
 
-    The first chunk's forward fills ``weight_fp16`` from the weight it receives (unsharded
-    under FSDP), scaled by ``weight_scale`` and cast once for the fp16 backward GEMMs.
-    ``grad_weight`` accumulates the chunks' weight gradients in fp32; the last chunk returns the
-    sum to autograd in the weight's gradient dtype (bf16, or fp32 with ``Tensor.grad_dtype``), so
-    it is rounded at most once per microbatch. Each chunk's grad_weight unscale reaches the host
-    through the pinned ``hidden_scale_host``.
-
-    Not a dataclass: FSDP's forward-input cast copies dataclass arguments (casting their
-    tensors to the param dtype), which would give each chunk its own accumulator.
+    The first chunk casts the weight once; the last chunk returns the accumulated gradient in the
+    weight's gradient dtype, so it is rounded at most once per microbatch. Not a dataclass: FSDP's
+    forward-input cast copies dataclass arguments, which would give each chunk its own accumulator.
     """
 
     def __init__(self) -> None:
         self.weight_fp16: torch.Tensor | None = None
         self.weight_scale: torch.Tensor | None = None
         self.grad_weight: torch.Tensor | None = None
+        # Each chunk's grad_weight unscale, copied to the host for the addmm alpha.
         self.hidden_scale_host = torch.empty((), dtype=torch.float32, pin_memory=True)
         self.hidden_scale_copied = torch.cuda.Event()
 
 
 class TokenLogprobs(torch.autograd.Function):
-    """``(hidden [T, D], weight [V, D], labels [T]) -> (logprobs [T], entropy [T])``.
+    """Label logprobs and entropy of ``hidden @ weight.T``, with the fp32 logits kept inside the op.
 
-    Forward: ``logits = hidden @ weight.T`` as a bf16 GEMM with fp32 output (the same op as
-    ``Fp32OutputLinear``), then one Triton pass for the softmax statistics (row max, sum of
-    exps), the label logit and entropy.
+    Forward: a bf16 GEMM with fp32 logits, then one Triton pass for the softmax statistics.
+    Backward writes ``M = one_hot - softmax`` once in fp16 (10 mantissa bits to bf16's 7) and runs
+    one GEMM per gradient. ``g = dloss/dlogprob`` stays out of the fp16 operands, since a loss
+    normalized by 1e5 tokens would make them subnormal. Entropy is a metric (no gradient).
 
-    Backward, with ``g = dloss/dlogprobs`` and ``M = (one_hot - softmax)``:
+        grad_hidden = g * (M @ W)            fp16 GEMM, fp32 output
+        grad_weight = M.T @ (g * hidden)     fp16 GEMM, accumulated in fp32 across chunks
 
-        dlogits     = g * M                                 never materialized in fp32
-        grad_hidden = g * (M @ W)                           one fp16 GEMM, fp32 output
-        grad_weight = M.T @ (g * hidden)                    one fp16 GEMM, fp32 output
+    Example:
+        state = TokenLogprobsGradState()
+        for i, (hidden, labels) in enumerate(chunks):  # [T, D] bf16, [T]
+            logprobs, entropy = TokenLogprobs.apply(
+                hidden, weight, labels, state, i == len(chunks) - 1, 0, None
+            )  # [T], [T]
+            loss_fn(logprobs, entropy).backward()  # weight.grad is set at the last chunk
 
-    ``M`` is written once as fp16, which keeps 10 mantissa bits to bf16's 7. Rounding it costs
-    ~8x less gradient error than rounding dlogits to bf16, at the same GEMM speed; with 2^-11
-    relative error per element, the gradients land within ~1% of exact fp64 gradients rounded to
-    bf16 (hi + lo, which ``Fp32OutputLinear`` uses, lands within ~0.5% with twice the GEMMs).
-    ``g`` must stay out of the fp16 operands: a loss normalized by 1e5 tokens makes ``g * M``
-    fp16 subnormal. So each row of ``M`` gets its own scale (its max, the label's entry, becomes
-    exactly 2^15 unless 1 - p < 2^-6), ``g`` scales the fp32 output rows of ``grad_hidden``, and ``g * hidden``
-    gets a power-of-two scale that puts its largest element at the top of fp16's range, which
-    keeps tokens down to ~1e-9 of the largest ``|g|`` as fp16 normals. ``W`` is scaled the same
-    way once per microbatch, so small-init heads do not go subnormal.
-
-    Entropy is a metric: it is non-differentiable and must not receive a gradient.
     With ``vocab_parallel_group``, ``weight`` is this rank's vocab shard starting at
-    ``vocab_start``; the forward all-reduces ``[T]`` statistics, and ``grad_hidden`` is this
-    shard's partial sum (reduced by the hidden states' TP redistribute, as for the lm_head).
+    ``vocab_start``, and ``grad_hidden`` is this shard's partial sum.
     """
 
     @staticmethod
@@ -468,11 +456,12 @@ class TokenLogprobs(torch.autograd.Function):
 class TokenLogprobsFromLogits(torch.autograd.Function):
     """``(logits [T, V], labels [T]) -> (logprobs [T], entropy [T])``, reading the logits once.
 
-    The logits-level counterpart of ``TokenLogprobs``, for heads it does not fuse with (e.g. bf16,
-    soft-capped or LoRA heads). Forward is the same stats pass; backward writes
-    ``g * (one_hot - softmax)`` in the logits' dtype in one pass. It replaces the ~10 passes of
-    log_softmax forward/backward plus a separate entropy softmax. Logits may be bf16 or fp32;
-    statistics are computed in fp32. TP handling matches ``TokenLogprobs``.
+    For heads ``TokenLogprobs`` does not fuse with (bf16, soft-capped, LoRA): the same stats pass,
+    and a backward that writes ``g * (one_hot - softmax)`` in one pass, instead of log_softmax's
+    forward and backward plus an entropy softmax (~10 passes).
+
+    Example:
+        logits [8192, 124160] bf16 -> logprobs, entropy [8192] fp32; backward: dlogits bf16
     """
 
     @staticmethod
