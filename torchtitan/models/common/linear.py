@@ -272,8 +272,8 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
     def backward(ctx, grad_output_TO: torch.Tensor):  # pyrefly: ignore[bad-override]
         """``grad_input = grad_output @ weight``, ``grad_weight = grad_output.T @ input``.
 
-        Uses only 16-bit GEMMs, yet the gradients come out close to an fp32 backward's: at the cost
-        of a plain bf16 backward for wide outputs (fp16 row scales), ~2x for narrow ones (hi + lo).
+        Uses only 16-bit GEMMs, yet the gradients come out close to an fp32 backward's: at ~1.3x the
+        cost of a plain bf16 backward for wide outputs (fp16 row scales), ~2x for narrow ones (hi + lo).
 
         The problem: grad_output is fp32 (the output was fp32), but fast GEMMs run on bf16 inputs
         (bf16 tensor cores), and bf16 keeps only the top 16 bits of an fp32:
@@ -292,10 +292,11 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
           the final rounding of the gradients to bf16, so a third piece isn't needed. It only uses
           bf16 GEMMs, so it isn't Blackwell-specific.
         - fp16 with one scale per row (wide outputs, e.g. an LM head): fp16 keeps 11 bits to bf16's
-          8. Each grad_output row is divided by its max |value| before the cast, so any loss scale
-          fits fp16's range; the row scales are applied to the fp32 GEMM outputs. The input and
-          weight are cast to fp16 (exact for bf16 values in fp16's range); for grad_weight the row
-          scales, normalized by their max, are folded into the input. fp16 GEMMs run at bf16 speed.
+          8. Each grad_output row is scaled so its max |value| becomes exactly 2^15, so any loss
+          scale fits and the largest entry (usually the label's) is exact; the scales are undone on
+          the fp32 GEMM outputs. The weight gets a power-of-two scale to the top of fp16's range;
+          for grad_weight the row scales are undone in the input, which is then scaled as a whole.
+          fp16 GEMMs run at bf16 speed.
 
             round grad_output to bf16   1 GEMM    fast, loses precision
             fp32 matmul (BF16x9)        9 GEMMs   precise, ~9x the cost
@@ -314,9 +315,10 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
             grad_input:   [hi | lo] @ [W; W]    =  hi @ W + lo @ W       (summed in the GEMM)
             grad_weight:  hi.T @ x + lo.T @ x                            (two small GEMMs)
 
-        LM head, 27B shape (8192 tokens, 124160 outputs, 5120 inputs, H100): 73.9 ms with hi + lo,
-        47.8 ms with fp16 row scales; gradient error vs fp64 1.67e-3 vs 1.67e-3 (dh) and 1.72e-3
-        vs 1.73e-3 (dW), where rounding exact gradients to bf16 gives 1.66e-3 / 1.72e-3.
+        LM head, 27B shape (8192 tokens, 124160 outputs, 5120 inputs, H100): 77.7 ms with hi + lo,
+        41.2 ms with fp16 row scales, 31.9 ms rounding grad_output to bf16; gradient error vs fp64
+        1.67e-3 vs 1.67e-3 (dh) and 1.72e-3 vs 1.73e-3 (dW), where rounding exact gradients to bf16
+        gives 1.66e-3 / 1.72e-3.
         """
         input_TD, weight_OD = ctx.saved_tensors
         # Usually a no-op (the output is fp32); autocast can make the fallback's output bf16.
@@ -337,28 +339,58 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
 
         if out_features > num_tokens:
             # Wide output (e.g. an LM head): fp16 with one scale per row, 1 GEMM per gradient.
-            row_max_T1 = grad_output_TO.abs().amax(dim=1, keepdim=True)
-            # All-zero rows (e.g. masked tokens) stay zero: _FP16_ROW_MAX / tiny overflows to inf.
-            row_scale_T1 = torch.where(row_max_T1 > 0, _FP16_ROW_MAX / row_max_T1, 0.0)
-            scaled_TO = (grad_output_TO * row_scale_T1).to(torch.float16)
+            # Each row's max |value| maps to exactly 2^15, which fp16 represents exactly (a
+            # power-of-two scale would round it: 3.1e-4 vs 2.3e-4 grad_input error before the
+            # bf16 cast). The clamp keeps all-zero rows finite. Each torch.mul(..., out=fp16)
+            # scales and casts in one kernel.
+            row_max_T1 = torch.linalg.vector_norm(
+                grad_output_TO, ord=float("inf"), dim=1, keepdim=True
+            )
+            row_scale_T1 = 2.0**15 / row_max_T1.clamp(2.0**-45, 2.0**75)
+            scaled_TO = torch.mul(
+                grad_output_TO,
+                row_scale_T1,
+                out=torch.empty_like(grad_output_TO, dtype=torch.float16),
+            )
             if ctx.needs_input_grad[0]:
+                weight_scale = _fp16_scale(
+                    torch.linalg.vector_norm(weight_OD, ord=float("inf"))
+                )
+                weight_fp16_OD = torch.mul(
+                    weight_OD,
+                    weight_scale,
+                    out=torch.empty_like(weight_OD, dtype=torch.float16),
+                )
                 grad_input_TD = torch.mm(
-                    scaled_TO, weight_OD.to(torch.float16), out_dtype=torch.float32
+                    scaled_TO, weight_fp16_OD, out_dtype=torch.float32
                 )
-                grad_input_TD = grad_input_TD * (row_max_T1 / _FP16_ROW_MAX)
-                grad_input_TD = grad_input_TD.to(input_TD.dtype)
+                grad_input_TD = torch.mul(
+                    grad_input_TD,
+                    (row_scale_T1 * weight_scale).reciprocal(),
+                    out=torch.empty_like(input_TD),
+                )
             if ctx.needs_input_grad[1]:
-                max_row_max = row_max_T1.amax().clamp_min(
-                    torch.finfo(torch.float32).tiny
+                # grad_weight = scaled.T @ (input / row_scale), with input / row_scale scaled
+                # as a whole to the top of fp16's range.
+                input_row_max_T1 = torch.linalg.vector_norm(
+                    input_TD, ord=float("inf"), dim=1, keepdim=True
                 )
-                scaled_input_TD = input_TD.float() * (row_max_T1 / max_row_max)
+                input_scale = _fp16_scale(
+                    (input_row_max_T1.float() / row_scale_T1).amax()
+                )
+                scaled_input_TD = torch.mul(
+                    input_TD,
+                    input_scale / row_scale_T1,
+                    out=torch.empty_like(input_TD, dtype=torch.float16),
+                )
                 grad_weight_OD = torch.mm(
-                    scaled_TO.T,
-                    scaled_input_TD.to(torch.float16),
-                    out_dtype=torch.float32,
+                    scaled_TO.T, scaled_input_TD, out_dtype=torch.float32
                 )
-                grad_weight_OD = grad_weight_OD * (max_row_max / _FP16_ROW_MAX)
-                grad_weight_OD = grad_weight_OD.to(weight_OD.dtype)
+                grad_weight_OD = torch.mul(
+                    grad_weight_OD,
+                    input_scale.reciprocal(),
+                    out=torch.empty_like(weight_OD),
+                )
         else:
             # Narrow output (e.g. a router): stack [hi | lo] along O; only the small weight grows.
             hi_TO, lo_TO = _split_into_bf16_hi_lo(grad_output_TO)
@@ -379,9 +411,19 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
 # The fp32 bits that bf16 keeps: sign, exponent and the top 7 mantissa bits (0xFFFF0000).
 _BF16_BITS_OF_FP32 = -65536
 
-# Each scaled grad_output row lies in [-2^14, 2^14], below fp16's max (65504); entries down to
-# ~4e-9 of the row max stay fp16 normals.
-_FP16_ROW_MAX = 2.0**14
+
+def _fp16_scale(absmax: torch.Tensor) -> torch.Tensor:
+    """Power-of-two scale that moves ``absmax`` into [2^14, 2^15), the top of fp16's range.
+
+    Exact to undo, and values down to ~2^-29 of ``absmax`` stay fp16 normals. Exponents are
+    clamped to [-60, 60], so zero ``absmax`` gets a finite scale and a product or quotient of two
+    scales stays finite in fp32.
+
+    Example:
+        absmax 139.0 (frexp exponent 8) -> scale 2^7, and 139 * 2^7 = 17792
+    """
+    _, exponent = torch.frexp(absmax.float())
+    return torch.exp2((15 - exponent).clamp(-60, 60).float())
 
 
 def _split_into_bf16_hi_lo(
