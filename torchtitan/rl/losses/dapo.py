@@ -14,9 +14,8 @@ from typing import Annotated
 import torch
 import tyro
 
-from torchtitan.components.loss import BaseLoss, compute_logprobs
+from torchtitan.components.loss import TokenLogprobLoss
 from torchtitan.config import CompileConfig
-from torchtitan.distributed.spmd_types import spmd_mesh_group
 
 # Clamp |log(pi_theta/pi_old)| before exp() so a large generator/trainer
 # logprob mismatch cannot overflow exp() to inf/NaN.
@@ -35,7 +34,7 @@ def _normalize(
     return value * global_valid_tokens.clamp_min(1).reciprocal()
 
 
-class DAPOLoss(BaseLoss):
+class DAPOLoss(TokenLogprobLoss):
     """Per-token clipped surrogate loss with DAPO-style "clip-higher".
 
     The same PPO clip as GRPO, but the importance ratio's lower and upper bounds are
@@ -46,12 +45,11 @@ class DAPOLoss(BaseLoss):
 
     The scalar loss is the sum of per-token losses over positions with a finite
     old-policy logprob divided by ``global_valid_tokens``, so gradient accumulation
-    matches a single large batch. ``logits`` is the current-policy output passed to
-    ``compute_logprobs``.
+    matches a single large batch.
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(BaseLoss.Config):
+    class Config(TokenLogprobLoss.Config):
         ratio_clip_low: float = 0.2
         """Lower clip: the importance ratio is clamped to ``>= 1 - ratio_clip_low``."""
 
@@ -74,10 +72,10 @@ class DAPOLoss(BaseLoss):
         self.ratio_clip_high = config.ratio_clip_high
         self.global_vocab_size = config.global_vocab_size
 
-    def __call__(
+    def loss_from_logprobs(
         self,
-        logits: torch.Tensor,
-        labels: torch.Tensor,
+        trainer_logprobs: torch.Tensor,
+        token_entropy: torch.Tensor,
         global_valid_tokens: torch.Tensor | None = None,
         *,
         generator_logprobs: torch.Tensor,
@@ -87,8 +85,8 @@ class DAPOLoss(BaseLoss):
         """Compute the per-token clip-higher surrogate loss.
 
         Args:
-            logits: [T, V] current-policy output.
-            labels: [T] pre-shifted target token ids.
+            trainer_logprobs: [T] current-policy logprobs of the labels.
+            token_entropy: [T] current-policy entropy; a metric, it receives no gradient.
             generator_logprobs: [T] logprobs from the sampling policy.
             loss_mask: [T] bool mask; True for response tokens.
             advantages: [T] per-token advantages (0.0 for prompt/padding).
@@ -99,13 +97,6 @@ class DAPOLoss(BaseLoss):
             (loss, metrics) where loss is a scalar tensor and metrics is a dict of
             scalar tensors pre-normalized for SUM reduction across DP ranks.
         """
-        trainer_logprobs, token_entropy = compute_logprobs(
-            logits,
-            labels,
-            vocab_parallel_group=spmd_mesh_group("tp"),
-            return_entropy=True,
-            global_vocab_size=self.global_vocab_size,
-        )
         # A non-finite generator logprob (notably under CUDA graph) has no valid
         # old-policy reference, so DROP that token from the loss + denominator (cleaner
         # than nan->0, which trains it as if it were on-policy).
