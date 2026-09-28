@@ -18,6 +18,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from torchtitan.components.checkpointer.base import BaseCheckpointManager
     from torchtitan.rl.rollout.rollouter import Rollouter
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,36 @@ class DataStreamState:
             self._next_group_id,
         )
         return True
+
+
+def newest_step_with_data_stream_state(checkpointer: BaseCheckpointManager) -> int:
+    """The newest step to resume from so model and data stream come from the same step.
+
+    The controller writes the data stream state after the trainer checkpoint, so a
+    job killed between the two leaves a ``step-N`` with only the trainer's part.
+    Resuming there would pair step-N weights with a restarted data stream, so this
+    returns the newest resumable step that also has a data stream state. Without
+    any (checkpoints from before data stream states were saved), it returns the
+    newest resumable step; -1 means there is no checkpoint.
+
+    Example: step-2 (both), step-4 (both), step-6 (trainer only) -> 4
+    """
+    newest = checkpointer._find_load_step()
+    step = newest
+    while step > 0:
+        if os.path.isfile(
+            os.path.join(checkpointer._create_checkpoint_id(step), _FILENAME)
+        ):
+            if step != newest:
+                logger.warning(
+                    "Checkpoint step %d has no RL data stream state (the job stopped "
+                    "between the trainer and data saves); resuming from step %d.",
+                    newest,
+                    step,
+                )
+            return step
+        step = checkpointer._find_load_step(max_step=step - 1)
+    return newest
 
 
 def _write_atomically(step_dir: str, payload: bytes) -> None:
