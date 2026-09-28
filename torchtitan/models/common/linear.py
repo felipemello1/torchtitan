@@ -287,14 +287,20 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
           throughput than bf16 tensor cores). On Blackwell, TorchTitan emulates it with BF16x9:
           each fp32 operand is split into 3 bf16 pieces (3 x 8 = 24 bits), and all 3 x 3 = 9
           piece pairs are multiplied.
-        - hi + lo (this): input and weight are already exactly bf16 (a single piece), so only
-          grad_output is split. 2 pieces keep 16 bits, far more than survive the final rounding of
-          the gradients to bf16, so a third piece isn't needed. It only uses bf16 GEMMs, so it
-          isn't Blackwell-specific.
+        - hi + lo (narrow outputs, e.g. a router): input and weight are already exactly bf16 (a
+          single piece), so only grad_output is split. 2 pieces keep 16 bits, far more than survive
+          the final rounding of the gradients to bf16, so a third piece isn't needed. It only uses
+          bf16 GEMMs, so it isn't Blackwell-specific.
+        - fp16 with one scale per row (wide outputs, e.g. an LM head): fp16 keeps 11 bits to bf16's
+          8. Each grad_output row is divided by its max |value| before the cast, so any loss scale
+          fits fp16's range; the row scales are applied to the fp32 GEMM outputs. The input and
+          weight are cast to fp16 (exact for bf16 values in fp16's range); for grad_weight the row
+          scales, normalized by their max, are folded into the input. fp16 GEMMs run at bf16 speed.
 
             round grad_output to bf16   1 GEMM    fast, loses precision
             fp32 matmul (BF16x9)        9 GEMMs   precise, ~9x the cost
-            hi + lo (this)              2 GEMMs   precise, ~2x the cost
+            hi + lo                     2 GEMMs   precise, ~2x the cost
+            fp16 with row scales        1 GEMM    precise; also casts the input and weight to fp16
 
             grad_output = hi + lo   hi = top 16 bits (exactly a bf16), lo = bf16(grad_output - hi)
             0.1 = 0.099609375 + 0.000391006     off by 4e-7 (bf16(0.1) alone: off by 1e-4)
@@ -302,16 +308,15 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
             grad_input  = hi @ weight  + lo @ weight
             grad_weight = hi.T @ input + lo.T @ input
 
-        Written out, that is 4 GEMM calls. Stacking hi and lo into one operand makes it one call
-        per gradient, so the large tensor is read once. The stacking direction is picked so the
-        tensor that gets duplicated (or the output that gets added) is the small one:
+        For a router (out_features <= tokens) the fp16 casts of the [T, D] input would cost more
+        than the extra GEMMs, so it keeps hi + lo, stacked so only the small weight is duplicated:
 
-            out_features > tokens (e.g. an LM head):
-                grad_input:   [hi; lo] @ W          -> [hi @ W; lo @ W], then add the halves
-                grad_weight:  [hi; lo].T @ [x; x]   =  hi.T @ x + lo.T @ x   (summed in the GEMM)
-            out_features <= tokens (e.g. a router):
-                grad_input:   [hi | lo] @ [W; W]    =  hi @ W + lo @ W       (summed in the GEMM)
-                grad_weight:  hi.T @ x + lo.T @ x                            (two small GEMMs)
+            grad_input:   [hi | lo] @ [W; W]    =  hi @ W + lo @ W       (summed in the GEMM)
+            grad_weight:  hi.T @ x + lo.T @ x                            (two small GEMMs)
+
+        LM head, 27B shape (8192 tokens, 124160 outputs, 5120 inputs, H100): 73.9 ms with hi + lo,
+        47.8 ms with fp16 row scales; gradient error vs fp64 1.67e-3 vs 1.67e-3 (dh) and 1.72e-3
+        vs 1.73e-3 (dW), where rounding exact gradients to bf16 gives 1.66e-3 / 1.72e-3.
         """
         input_TD, weight_OD = ctx.saved_tensors
         # Usually a no-op (the output is fp32); autocast can make the fallback's output bf16.
@@ -328,24 +333,34 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
                 grad_weight_OD = grad_weight_OD.to(weight_OD.dtype)
             return grad_input_TD, grad_weight_OD
 
-        hi_TO, lo_TO = _split_into_bf16_hi_lo(grad_output_TO)
-        num_tokens, out_features = hi_TO.shape
+        num_tokens, out_features = grad_output_TO.shape
 
         if out_features > num_tokens:
-            # Wide output (e.g. an LM head): stack [hi; lo] along T; only T-sized tensors grow.
-            stacked_2TO = torch.cat([hi_TO, lo_TO])
+            # Wide output (e.g. an LM head): fp16 with one scale per row, 1 GEMM per gradient.
+            row_max_T1 = grad_output_TO.abs().amax(dim=1, keepdim=True)
+            row_max_T1 = row_max_T1.clamp_min(torch.finfo(torch.float32).tiny)
+            scaled_TO = (grad_output_TO * (_FP16_ROW_MAX / row_max_T1)).to(
+                torch.float16
+            )
             if ctx.needs_input_grad[0]:
-                # [hi; lo] @ W = [hi @ W; lo @ W]: add the two halves.
-                halves_2TD = torch.mm(stacked_2TO, weight_OD, out_dtype=torch.float32)
-                grad_input_TD = halves_2TD[:num_tokens] + halves_2TD[num_tokens:]
+                grad_input_TD = torch.mm(
+                    scaled_TO, weight_OD.to(torch.float16), out_dtype=torch.float32
+                )
+                grad_input_TD = grad_input_TD * (row_max_T1 / _FP16_ROW_MAX)
                 grad_input_TD = grad_input_TD.to(input_TD.dtype)
             if ctx.needs_input_grad[1]:
-                # [hi; lo].T @ [x; x] = hi.T @ x + lo.T @ x, summed in the GEMM.
+                max_row_max = row_max_T1.amax()
+                scaled_input_TD = input_TD.float() * (row_max_T1 / max_row_max)
                 grad_weight_OD = torch.mm(
-                    stacked_2TO.T, torch.cat([input_TD, input_TD])
+                    scaled_TO.T,
+                    scaled_input_TD.to(torch.float16),
+                    out_dtype=torch.float32,
                 )
+                grad_weight_OD = grad_weight_OD * (max_row_max / _FP16_ROW_MAX)
+                grad_weight_OD = grad_weight_OD.to(weight_OD.dtype)
         else:
             # Narrow output (e.g. a router): stack [hi | lo] along O; only the small weight grows.
+            hi_TO, lo_TO = _split_into_bf16_hi_lo(grad_output_TO)
             if ctx.needs_input_grad[0]:
                 # [hi | lo] @ [W; W] = hi @ W + lo @ W, summed in the GEMM.
                 grad_input_TD = torch.mm(
@@ -362,6 +377,10 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
 
 # The fp32 bits that bf16 keeps: sign, exponent and the top 7 mantissa bits (0xFFFF0000).
 _BF16_BITS_OF_FP32 = -65536
+
+# Each scaled grad_output row lies in [-2^14, 2^14], below fp16's max (65504); entries down to
+# ~4e-9 of the row max stay fp16 normals.
+_FP16_ROW_MAX = 2.0**14
 
 
 def _split_into_bf16_hi_lo(
