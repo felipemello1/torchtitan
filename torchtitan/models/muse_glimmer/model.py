@@ -626,6 +626,7 @@ class MuseGlimmerModel(MultimodalModel):
                 padding_mask=padding_mask,
                 max_num_documents=max_num_documents,
                 max_context_length=max_context_length,
+                allow_shared_prefixes=True,
             )
         if not isinstance(inner_attn, FlexInnerAttention.Config):
             raise TypeError(

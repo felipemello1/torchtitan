@@ -312,6 +312,7 @@ class GptOssModel(Decoder):
                 padding_mask=padding_mask,
                 max_num_documents=max_num_documents,
                 max_context_length=max_context_length,
+                allow_shared_prefixes=True,
             )
         elif isinstance(inner_attn, FlexInnerAttention.Config):
             base_mask_mods = [

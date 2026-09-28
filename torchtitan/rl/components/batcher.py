@@ -128,10 +128,27 @@ class Batcher(Configurable):
         When unset, the trainer uses the microbatch token capacity as the
         CUDA-graph-safe metadata bound without imposing a tighter packing cap.
         """
+        share_prompt: bool = False
+        """Pack each prompt once per microbatch; its samples attend to that copy.
+
+        Saves compute when prompts are long relative to completions. Requires
+        varlen attention; see `_pack_training_samples` for the layout. Without
+        activation checkpointing, each layer also saves the gathered prompt K/V.
+        """
 
         def __post_init__(self) -> None:
             if self.max_num_documents is not None and self.max_num_documents <= 0:
                 raise ValueError("max_num_documents must be positive")
+            if self.share_prompt and self.max_num_documents is not None:
+                raise ValueError(
+                    "share_prompt needs data-dependent attention metadata, so it "
+                    "cannot be combined with max_num_documents."
+                )
+            if self.share_prompt and self.per_sample_pad_multiple:
+                raise ValueError(
+                    "share_prompt does not support per_sample_pad_multiple (the "
+                    "batch-invariant flex layout) yet."
+                )
 
     def __init__(
         self,
@@ -157,6 +174,7 @@ class Batcher(Configurable):
         self.pad_id = pad_id
         self._per_sample_pad_multiple = config.per_sample_pad_multiple
         self._max_num_documents = config.max_num_documents
+        self._share_prompt = config.share_prompt
         self._num_prompts_per_train_step = num_prompts_per_train_step
         self._dp_degree = dp_degree
         self._groups_for_next_batch: list[TrainingSampleGroup] = []
@@ -294,7 +312,7 @@ class Batcher(Configurable):
                     ),
                 ),
                 *self._packing_metrics(
-                    assignments,
+                    microbatches,
                     training_samples,
                     num_rollout_groups,
                     num_metric_only_groups,
@@ -349,14 +367,16 @@ class Batcher(Configurable):
     ) -> list[list[list[TrainingSample]]]:
         """Pack samples into an FFD-derived grid and balance its attention work.
 
+        The packing unit is a chunk of samples that share one prompt copy (see
+        `_split_into_chunks`); without `share_prompt`, each chunk is one sample.
         T is the token capacity per DP rank, D the DP degree, and M the number
         of PP microbatches per scheduling step. First-fit decreasing (FFD)
         determines B bins subject to T and max_num_documents. Each step has
         M * D slots, so G = ceil(B / (M * D)) steps form a ``[G][M][D]`` grid.
-        Try longest-processing-time (LPT) packing: place longest samples first in
+        Try longest-processing-time (LPT) packing: place longest chunks first in
         the feasible bin with the highest padding-aware attention work,
         breaking ties by fewer packed tokens. If any
-        sample cannot fit, discard the partial LPT assignment and reuse FFD,
+        chunk cannot fit, discard the partial LPT assignment and reuse FFD,
         splitting its bins to fill the extra slots where possible. Both paths
         have the same grid size and therefore the same total padding fraction.
 
@@ -374,16 +394,16 @@ class Batcher(Configurable):
         num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
 
         # Step 1: find the bin count with FFD, retaining its fallback packing.
-        ordered_samples = sorted(
-            training_samples,
-            key=self.num_tokens_to_pack,
+        ordered_chunks = sorted(
+            self._split_into_chunks(training_samples),
+            key=self._num_tokens_to_pack_chunk,
             reverse=True,
         )
         ffd_bins: list[list[TrainingSample]] = []
         ffd_bin_num_tokens: list[int] = []
 
-        for training_sample in ordered_samples:
-            num_tokens = self.num_tokens_to_pack(training_sample)
+        for chunk in ordered_chunks:
+            num_tokens = self._num_tokens_to_pack_chunk(chunk)
             destination = next(
                 (
                     index
@@ -401,7 +421,7 @@ class Batcher(Configurable):
                 ffd_bin_num_tokens.append(0)
                 destination = len(ffd_bins) - 1
 
-            ffd_bins[destination].append(training_sample)
+            ffd_bins[destination].extend(chunk)
             ffd_bin_num_tokens[destination] += num_tokens
 
         # Step 2: make the [G][M][D] grid rectangular.
@@ -412,7 +432,7 @@ class Batcher(Configurable):
         )
 
         # Step 3: repack across the entire grid, preserving the FFD bin count.
-        bins = self._pack_with_lpt(ordered_samples, target_num_bins=target_num_bins)
+        bins = self._pack_with_lpt(ordered_chunks, target_num_bins=target_num_bins)
         if bins is None:
             bins = ffd_bins
             self._expand_bins_by_splitting(bins, target_num_bins=target_num_bins)
@@ -442,34 +462,42 @@ class Batcher(Configurable):
         ``sum(L**2) + q * seq_len**2 + r**2``. Padding positions reset at
         seq_len, so even an empty bin costs ``(T // seq_len) * seq_len**2``.
         This models the existing padding segments without increasing their
-        number or changing fixed-size varlen metadata.
+        number or changing fixed-size varlen metadata. With `share_prompt`, the
+        shared tokens of a prompt group count once, in tokens and in work.
         """
         # TODO(rl): Account for hybrid sliding-window or linear-attention layers.
-        sample_lengths = [
-            self.num_tokens_to_pack(sample) for sample in training_samples
-        ]
+        prompt_groups = self._group_by_prompt(training_samples)
+        documents_workload = 0
+        for prompt_group in prompt_groups:
+            num_shared_tokens = self._num_shared_tokens(prompt_group)
+            documents_workload += num_shared_tokens**2 + sum(
+                self.num_tokens_to_pack(sample) ** 2 - num_shared_tokens**2
+                for sample in prompt_group
+            )
         num_tokens_per_bin = self._num_rows_per_microbatch * self.seq_len
         num_full_padding_segments, remaining_padding = divmod(
-            num_tokens_per_bin - sum(sample_lengths), self.seq_len
+            num_tokens_per_bin
+            - sum(map(self._num_tokens_to_pack_chunk, prompt_groups)),
+            self.seq_len,
         )
         return (
-            sum(length**2 for length in sample_lengths)
+            documents_workload
             + num_full_padding_segments * self.seq_len**2
             + remaining_padding**2
         )
 
     def _pack_with_lpt(
         self,
-        ordered_samples: list[TrainingSample],
+        ordered_chunks: list[list[TrainingSample]],
         *,
         target_num_bins: int,
     ) -> list[list[TrainingSample]] | None:
-        """Put longest samples in the highest-workload feasible fixed bin.
+        """Put longest chunks in the highest-workload feasible fixed bin.
 
-        Adding a sample cannot increase padding-aware attention work. Break
+        Adding a chunk cannot increase padding-aware attention work. Break
         workload ties by fewer packed tokens to spread full-length documents
         whose work exactly replaces one padding segment.
-        Return None if token or document capacity blocks a sample; the caller
+        Return None if token or document capacity blocks a chunk; the caller
         then discards this partial assignment and uses the FFD fallback.
         """
         num_tokens_per_bin = self._num_rows_per_microbatch * self.seq_len
@@ -477,8 +505,8 @@ class Batcher(Configurable):
         bin_num_tokens = [0] * target_num_bins
         bin_workloads = [self._attention_workload([])] * target_num_bins
 
-        for sample in ordered_samples:
-            num_tokens = self.num_tokens_to_pack(sample)
+        for chunk in ordered_chunks:
+            num_tokens = self._num_tokens_to_pack_chunk(chunk)
             destination = max(
                 (
                     index
@@ -495,7 +523,7 @@ class Batcher(Configurable):
             if destination is None:
                 return None
 
-            bins[destination].append(sample)
+            bins[destination].extend(chunk)
             bin_num_tokens[destination] += num_tokens
             bin_workloads[destination] = self._attention_workload(bins[destination])
 
@@ -612,6 +640,83 @@ class Batcher(Configurable):
             num_tokens = ((num_tokens + multiple - 1) // multiple) * multiple
         return num_tokens
 
+    def _group_by_prompt(
+        self, training_samples: list[TrainingSample]
+    ) -> list[list[TrainingSample]]:
+        """Group samples by prompt, the tokens before their first trained token.
+
+        Without `share_prompt`, every sample is its own group.
+        """
+        if not self._share_prompt:
+            return [[training_sample] for training_sample in training_samples]
+        samples_by_prompt: dict[tuple[int, ...], list[TrainingSample]] = {}
+        for training_sample in training_samples:
+            num_prompt_tokens = training_sample.loss_mask.index(True)
+            prompt = tuple(training_sample.token_ids[:num_prompt_tokens])
+            samples_by_prompt.setdefault(prompt, []).append(training_sample)
+        return list(samples_by_prompt.values())
+
+    def _num_shared_tokens(self, chunk: list[TrainingSample]) -> int:
+        """Input tokens that samples with one prompt pack once: the prompt minus its last token.
+
+        The last prompt token stays in every sample because its label, the
+        sample's first completion token, differs between samples.
+        """
+        if not self._share_prompt:
+            return 0
+        return max(chunk[0].loss_mask.index(True) - 1, 0)
+
+    def _num_tokens_to_pack_chunk(self, chunk: list[TrainingSample]) -> int:
+        """Tokens that samples with one prompt pack: the shared tokens once plus each sample's rest."""
+        num_shared_tokens = self._num_shared_tokens(chunk)
+        return num_shared_tokens + sum(
+            self.num_tokens_to_pack(training_sample) - num_shared_tokens
+            for training_sample in chunk
+        )
+
+    def _split_into_chunks(
+        self, training_samples: list[TrainingSample]
+    ) -> list[list[TrainingSample]]:
+        """Split each prompt group into chunks that fit one microbatch (first-fit decreasing).
+
+        Each chunk packs one copy of the prompt, so fewer, fuller chunks share more.
+
+        Example:
+            # 1000-token prompt; completions of 3000, 2000, and 500 tokens;
+            # 4096 tokens per microbatch.
+            _split_into_chunks(samples)
+            # -> [[3000], [2000, 500]]: 999 + 3000 and 999 + 2500 packed tokens
+        """
+        num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
+        chunks: list[list[TrainingSample]] = []
+        for prompt_group in self._group_by_prompt(training_samples):
+            num_shared_tokens = self._num_shared_tokens(prompt_group)
+            group_chunks: list[list[TrainingSample]] = []
+            group_chunk_num_tokens: list[int] = []
+            for training_sample in sorted(
+                prompt_group, key=self.num_tokens_to_pack, reverse=True
+            ):
+                # Joining a chunk adds only the tokens after the shared prompt.
+                num_new_tokens = (
+                    self.num_tokens_to_pack(training_sample) - num_shared_tokens
+                )
+                destination = next(
+                    (
+                        index
+                        for index, chunk_num_tokens in enumerate(group_chunk_num_tokens)
+                        if chunk_num_tokens + num_new_tokens <= num_tokens_per_rank
+                    ),
+                    None,
+                )
+                if destination is None:
+                    group_chunks.append([training_sample])
+                    group_chunk_num_tokens.append(num_shared_tokens + num_new_tokens)
+                else:
+                    group_chunks[destination].append(training_sample)
+                    group_chunk_num_tokens[destination] += num_new_tokens
+            chunks.extend(group_chunks)
+        return chunks
+
     # TODO(async-rl): make packing pluggable -- a `Packer` protocol on `Batcher.Config` (e.g. `TextPacker`)
     #   so callers swap logic per modality (images, ...).
     def _pack_training_samples(
@@ -621,6 +726,8 @@ class Batcher(Configurable):
 
         - Labels and logits are shifted
         -`positions` restart at 0 per sample
+        - With `share_prompt`, later samples of a prompt skip it and continue its
+          positions, which varlen attention reads as a shared prefix
 
         Example:
 
@@ -628,6 +735,12 @@ class Batcher(Configurable):
             input_ids = [10, 11, 20, 21, 0, 0, 0, 0]
             labels    = [11, 12, 21, 22, 0, 0, 0, 0]
             positions = [ 0,  1,  0,  1, 0, 1, 2, 3]
+
+            # share_prompt: prompt [P0, P1, P2], completions [A0, A1] and [B0, B1].
+            # P2 is packed per sample because it predicts A0 or B0.
+            input_ids = [P0, P1, P2, A0, P2, B0, 0, 0]
+            labels    = [P1, P2, A0, A1, B0, B1, 0, 0]
+            positions = [ 0,  1,  2,  3,  2,  3, 0, 1]
         """
         pad_values = {**_PAD_VALUES, "input_ids": self.pad_id, "labels": self.pad_id}
         keys = list(pad_values)
@@ -635,8 +748,20 @@ class Batcher(Configurable):
         positions: list[int] = []
         padding_mask: list[bool] = []
 
+        # Only the first sample of each prompt group packs the shared tokens.
+        ordered_samples: list[TrainingSample] = []
+        num_skipped_tokens: list[int] = []
+        for prompt_group in self._group_by_prompt(training_samples):
+            num_shared_tokens = self._num_shared_tokens(prompt_group)
+            ordered_samples.extend(prompt_group)
+            num_skipped_tokens.extend(
+                [0] + [num_shared_tokens] * (len(prompt_group) - 1)
+            )
+
         # Shift labels/logits and pad to per_sample_pad_multiple.
-        for training_sample in training_samples:
+        for training_sample, start in zip(
+            ordered_samples, num_skipped_tokens, strict=True
+        ):
             sample = {
                 "input_ids": training_sample.token_ids[:-1],
                 "labels": training_sample.token_ids[1:],
@@ -659,9 +784,9 @@ class Batcher(Configurable):
 
             # extend row
             for key in keys:
-                packed_fields[key].extend(sample[key])
-            positions.extend(range(sample_len))
-            padding_mask.extend([False] * unpadded_len)
+                packed_fields[key].extend(sample[key][start:])
+            positions.extend(range(start, sample_len))
+            padding_mask.extend([False] * (unpadded_len - start))
             padding_mask.extend([True] * (sample_len - unpadded_len))
 
         num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
@@ -692,37 +817,33 @@ class Batcher(Configurable):
             ),
         )
 
-    def _padding_fraction(
-        self,
-        *,
-        num_microbatches: int,
-        training_samples: list[TrainingSample],
-    ) -> float:
-        num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
-        total_slots = num_microbatches * self._dp_degree * num_tokens_per_rank
-        num_real_tokens = sum(len(sample.token_ids) - 1 for sample in training_samples)
-        return (total_slots - num_real_tokens) / total_slots
-
     def _packing_metrics(
         self,
-        assignments: list[list[list[TrainingSample]]],
+        microbatches: list[list[TrainingMicrobatch]],
         training_samples: list[TrainingSample],
         num_rollout_groups: int,
         num_metric_only_groups: int,
     ) -> list[m.Metric]:
         """Per-training-batch packing + count metrics. (policy age is logged at trainer consume time.)"""
-        padding_frac = self._padding_fraction(
-            num_microbatches=len(assignments),
-            training_samples=training_samples,
+        num_packed_tokens = sum(
+            microbatch.padding_mask.numel()
+            for rank_microbatches in microbatches
+            for microbatch in rank_microbatches
         )
-        return [
+        num_real_tokens = sum(
+            int((~microbatch.padding_mask).sum())
+            for rank_microbatches in microbatches
+            for microbatch in rank_microbatches
+        )
+        padding_frac = 1 - num_real_tokens / num_packed_tokens
+        metrics = [
             m.Metric(
                 "train_batch/padding_frac",
                 m.NoReduce(padding_frac),
             ),
             m.Metric(
                 "train_batch/num_microbatches",
-                m.NoReduce(float(len(assignments))),
+                m.NoReduce(float(len(microbatches))),
             ),
             m.Metric(
                 "train_batch/num_rollout_groups", m.NoReduce(float(num_rollout_groups))
@@ -736,3 +857,14 @@ class Batcher(Configurable):
                 m.NoReduce(float(len(training_samples))),
             ),
         ]
+        if self._share_prompt:
+            num_unshared_tokens = sum(
+                len(sample.token_ids) - 1 for sample in training_samples
+            )
+            metrics.append(
+                m.Metric(
+                    "train_batch/share_prompt_saved_token_frac",
+                    m.NoReduce(1 - num_real_tokens / num_unshared_tokens),
+                )
+            )
+        return metrics

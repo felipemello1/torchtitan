@@ -64,6 +64,7 @@ __all__ = [
     "get_document_mask_mod",
     "get_efficient_causal_mask_mod_for_packed_document",
     "get_fixed_block_mask_mod",
+    "get_shared_prefix_starts",
     "get_sliding_window_mask_mod",
     "local_head_split",
 ]
@@ -79,6 +80,10 @@ class VarlenMetadata(NamedTuple):
     cu_seq_k: torch.Tensor
     max_q: int
     max_k: int
+    kv_indices: torch.Tensor | None = None
+    """[num_keys] rows of k/v gathered into the key stream, so one shared prefix
+    serves several segments; `cu_seq_k` and `max_k` then index that stream.
+    None reads k/v as packed."""
 
     _OFFSETS_SPMD_TYPE = spmd.SpmdType(
         {
@@ -93,6 +98,8 @@ class VarlenMetadata(NamedTuple):
         spmd.assert_type(self.cu_seq_q, self._OFFSETS_SPMD_TYPE)
         if self.cu_seq_k is not self.cu_seq_q:
             spmd.assert_type(self.cu_seq_k, self._OFFSETS_SPMD_TYPE)
+        if self.kv_indices is not None:
+            spmd.assert_type(self.kv_indices, self._OFFSETS_SPMD_TYPE)
 
 
 # Mapping (not dict) lets covariant value types accept dictionaries containing
@@ -215,6 +222,10 @@ class VarlenInnerAttention(InnerAttention):
         # Forward enable_gqa from GQAttention when Q and KV head counts differ
         if kwargs.get("enable_gqa", False):
             varlen_kwargs["enable_gqa"] = True
+
+        if attention_masks.kv_indices is not None:
+            k_THK = k_THK.index_select(0, attention_masks.kv_indices)
+            v_THV = v_THV.index_select(0, attention_masks.kv_indices)
 
         varlen_attn_fn = varlen_attn if out_transform is None else varlen_attn_with_lse
 
@@ -619,6 +630,7 @@ def create_varlen_metadata_for_document(
     padding_mask: torch.Tensor | None = None,
     max_num_documents: int | None = None,
     max_context_length: int | None = None,
+    allow_shared_prefixes: bool = False,
 ) -> VarlenMetadata:
     """Creates cumulative sequence length indices needed for variable length attention.
 
@@ -638,10 +650,14 @@ def create_varlen_metadata_for_document(
         max_context_length: Maximum length of one document segment. Required
             with ``max_num_documents`` so the fixed-shape metadata can avoid a
             device-to-host synchronization.
+        allow_shared_prefixes: Read a position drop to `p > 0` as a segment that
+            also attends to its document's first `p` tokens, as packed by
+            `Batcher.Config.share_prompt`. Set it only when `positions` are true
+            positions; e.g. Qwen3.5 passes a 0/1 document-start marker.
 
     Returns:
         VarlenMetadata containing cumulative sequence length indices for q, k,
-        and max_seq_len.
+        and max_seq_len, plus `kv_indices` when segments share a prefix.
     """
     num_tokens = positions.shape[0]
     device = positions.device
@@ -655,6 +671,10 @@ def create_varlen_metadata_for_document(
         real_doc_starts = real_doc_starts & ~padding_mask
         padding_doc_starts = (positions == 0) & padding_mask
         is_doc_start = real_doc_starts | padding_doc_starts
+
+    reuses_prefix = (
+        get_shared_prefix_starts(positions) if allow_shared_prefixes else None
+    )
 
     if max_num_documents is not None:
         if max_context_length is None:
@@ -686,9 +706,16 @@ def create_varlen_metadata_for_document(
         torch._assert_async(real_doc_starts.sum() <= max_num_documents)
         if padding_doc_starts is not None:
             torch._assert_async(padding_doc_starts.sum() <= max_num_padding_segments)
+        if reuses_prefix is not None:
+            # Shared prefixes need data-dependent key lengths, which fixed shapes can't hold.
+            torch._assert_async(~reuses_prefix.any())
         packed_cu_seqlens = packed_cu_seqlens[:num_slots]
         max_seqlen = max_context_length
     else:
+        if reuses_prefix is not None and reuses_prefix.any():
+            return _create_varlen_metadata_with_shared_prefixes(
+                positions, is_doc_start=is_doc_start, reuses_prefix=reuses_prefix
+            )
         doc_starts = is_doc_start.nonzero(as_tuple=True)[0].to(torch.int32)
         packed_cu_seqlens = torch.cat(
             [
@@ -713,6 +740,91 @@ def create_varlen_metadata_for_document(
         cu_seq_k=packed_cu_seqlens,
         max_q=max_seqlen,
         max_k=max_seqlen,
+    )
+
+
+def get_shared_prefix_starts(positions: torch.Tensor) -> torch.Tensor:
+    """Mark segments that also attend to their document's first `p` tokens, `p` being the position they start at.
+
+    Positions normally reset to 0 per document and grow by 1; a drop to `p > 0`
+    marks a segment that shares the document's first `p` tokens, as packed by
+    `Batcher.Config.share_prompt`.
+
+    Example:
+        # Prompt [P0, P1] shared by completions [A0, A1] and [B0, B1], then [D0].
+        get_shared_prefix_starts(torch.tensor([0, 1, 2, 3, 2, 3, 0]))
+        # -> [False, False, False, False, True, False, False]
+    """
+    starts = torch.zeros_like(positions, dtype=torch.bool)
+    starts[1:] = (positions[1:] > 0) & (positions[1:] != positions[:-1] + 1)
+    return starts
+
+
+def _create_varlen_metadata_with_shared_prefixes(
+    positions: torch.Tensor,
+    *,
+    is_doc_start: torch.Tensor,
+    reuses_prefix: torch.Tensor,
+) -> VarlenMetadata:
+    """Varlen metadata where a segment starting at `p` also attends to its document's first `p` tokens.
+
+    `kv_indices` repeats the shared prefix in each segment's keys, so the prefix
+    is packed and projected once.
+
+    Example:
+        # One prompt [P0, P1, P2] shared by completions [A0, A1] and [B0, B1, B2].
+        # tokens     = [P0, P1, P2, A0, A1, B0, B1, B2]
+        # positions  = [ 0,  1,  2,  3,  4,  3,  4,  5]
+        # cu_seq_q   = [0, 5, 8]      # query segments [P0..A1] and [B0..B2]
+        # kv_indices = [0, 1, 2, 3, 4,  0, 1, 2, 5, 6, 7]
+        # cu_seq_k   = [0, 5, 11]     # keys [P0..A1] and [P0, P1, P2, B0, B1, B2]
+    """
+    num_tokens = positions.shape[0]
+    device = positions.device
+    token_index = torch.arange(num_tokens, device=device)
+    segment_starts = (is_doc_start | reuses_prefix).nonzero(as_tuple=True)[0]
+    segment_ends = torch.cat([segment_starts[1:], token_index.new_tensor([num_tokens])])
+    # Latest document start at or before each token.
+    token_doc_starts = torch.cummax(
+        torch.where(is_doc_start, token_index, 0), dim=0
+    ).values
+    segment_doc_starts = token_doc_starts[segment_starts]
+    prefix_lengths = torch.where(
+        reuses_prefix[segment_starts], positions[segment_starts], 0
+    )
+    query_lengths = segment_ends - segment_starts
+    key_lengths = prefix_lengths + query_lengths
+    cu_seq_q = torch.cat([segment_starts, segment_ends[-1:]]).to(torch.int32)
+    cu_seq_k = F.pad(key_lengths.cumsum(0), (1, 0)).to(torch.int32)
+    # host syncs, once per microbatch rather than per layer
+    num_keys, max_q, max_k = torch.stack(
+        [key_lengths.sum(), query_lengths.max(), key_lengths.max()]
+    ).tolist()
+
+    # Key slot j of segment s holds the prefix token doc_start + j while j is
+    # inside the prefix, else the segment's own token.
+    key_segment = torch.repeat_interleave(
+        torch.arange(segment_starts.numel(), device=device),
+        key_lengths,
+        output_size=num_keys,
+    )
+    key_offset = torch.arange(num_keys, device=device) - cu_seq_k[key_segment]
+    key_prefix_length = prefix_lengths[key_segment]
+    kv_indices = torch.where(
+        key_offset < key_prefix_length,
+        segment_doc_starts[key_segment] + key_offset,
+        segment_starts[key_segment] + key_offset - key_prefix_length,
+    )
+
+    if spmd.is_type_checking():
+        for metadata in (cu_seq_q, cu_seq_k, kv_indices):
+            spmd.mutate_type(metadata, "dp", src=spmd.R, dst=spmd.V)
+    return VarlenMetadata(
+        cu_seq_q=cu_seq_q,
+        cu_seq_k=cu_seq_k,
+        max_q=max_q,
+        max_k=max_k,
+        kv_indices=kv_indices,
     )
 
 

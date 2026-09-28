@@ -322,6 +322,11 @@ class Qwen35Model(MultimodalModel):
     class Config(Decoder.Config):
         vision_encoder: Qwen35VisionEncoder.Config | None = None
 
+        @property
+        def reads_shared_prefixes(self) -> bool:
+            """Qwen3.5 builds its masks from a document-start marker, not positions."""
+            return False
+
         def update_from_config(
             self,
             *,

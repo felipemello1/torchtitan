@@ -64,6 +64,53 @@ class TestPackedVarlenMetadata(unittest.TestCase):
         self.assertEqual(metadata.max_q, 4)
         self.assertEqual(metadata.max_k, 4)
 
+    def test_shared_prefix_segments_gather_prefix_keys(self):
+        # Prompt [P0, P1, P2] shared by [A0, A1] and [B0, B1, B2], then padding.
+        positions_T = torch.tensor([0, 1, 2, 3, 4, 3, 4, 5, 0, 1])
+        metadata = create_varlen_metadata_for_document(
+            positions_T, allow_shared_prefixes=True
+        )
+
+        torch.testing.assert_close(
+            metadata.cu_seq_q, torch.tensor([0, 5, 8, 10], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            metadata.cu_seq_k, torch.tensor([0, 5, 11, 13], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            metadata.kv_indices,
+            torch.tensor([0, 1, 2, 3, 4, 0, 1, 2, 5, 6, 7, 8, 9]),
+        )
+        self.assertEqual(metadata.max_q, 5)
+        self.assertEqual(metadata.max_k, 6)
+
+    def test_documents_without_shared_prefix_skip_kv_gather(self):
+        metadata = create_varlen_metadata_for_document(
+            torch.tensor([0, 1, 0, 1, 2]), allow_shared_prefixes=True
+        )
+        self.assertIsNone(metadata.kv_indices)
+        self.assertIs(metadata.cu_seq_k, metadata.cu_seq_q)
+
+    def test_shared_prefixes_are_opt_in(self):
+        # Qwen3.5 passes a 0/1 document-start marker, not true positions.
+        start_marker_T = torch.tensor([0, 1, 1, 1, 0, 1, 1])
+        metadata = create_varlen_metadata_for_document(start_marker_T)
+
+        torch.testing.assert_close(
+            metadata.cu_seq_q, torch.tensor([0, 4, 7], dtype=torch.int32)
+        )
+        self.assertIsNone(metadata.kv_indices)
+
+    def test_only_varlen_decoders_read_shared_prefixes(self):
+        from torchtitan.models.qwen3 import model_registry
+
+        self.assertTrue(
+            model_registry("0.6B", attn_backend="varlen").reads_shared_prefixes
+        )
+        self.assertFalse(
+            model_registry("0.6B", attn_backend="flex").reads_shared_prefixes
+        )
+
     def test_document_cap_produces_fixed_shape_metadata(self):
         three_documents = create_varlen_metadata_for_document(
             torch.tensor([0, 1, 2, 0, 1, 0, 1, 2, 3]),

@@ -107,6 +107,21 @@ class Decoder(BaseModel):
             )
 
         @property
+        def reads_shared_prefixes(self) -> bool:
+            """Whether `get_attention_masks` reads a position drop as a shared prefix.
+
+            True when every layer uses varlen attention, whose metadata builder
+            gathers the shared prefix (`Batcher.Config.share_prompt`).
+            """
+            return all(
+                layer.attention is not None
+                and isinstance(
+                    layer.attention.inner_attention, VarlenInnerAttention.Config
+                )
+                for layer in self.layers
+            )
+
+        @property
         def first_full_attention_backend(self) -> Module.Config | None:
             """Backend config of the first full-attention layer, else None."""
             attention = self.first_attention
@@ -328,6 +343,8 @@ class Decoder(BaseModel):
         attn_config: BaseAttention.Config,
     ) -> BlockMask:
         """Build the standard causal + packed-document flex-attention mask."""
+        # TODO(rl): read shared prefixes (positions dropping to p > 0) like
+        # `create_varlen_metadata_for_document` does, to allow flex with share_prompt.
         return self._create_flex_attention_mask(
             positions,
             attn_config,
@@ -457,6 +474,7 @@ class Decoder(BaseModel):
                 padding_mask=padding_mask,
                 max_num_documents=max_num_documents,
                 max_context_length=max_context_length,
+                allow_shared_prefixes=True,
             )
         else:
             raise TypeError(
