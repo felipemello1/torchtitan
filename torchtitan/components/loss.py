@@ -682,7 +682,9 @@ class ChunkedLossWrapper(BaseLoss):
         """
         token_mask = self.loss_fn.loss_token_mask(labels, **loss_inputs)
         # The count below is a host sync, which CUDA graph capture does not allow.
-        if token_mask is None or torch.cuda.is_current_stream_capturing():
+        if token_mask is None or (
+            token_mask.is_cuda and torch.cuda.is_current_stream_capturing()
+        ):
             return None
         num_tokens = labels.shape[0]
         chunk_len = num_tokens // self.num_chunks
