@@ -392,6 +392,19 @@ class TokenLogprobLoss(BaseLoss):
         """Return the scaled loss and metrics from ``[T]`` label logprobs and entropy."""
         ...
 
+    def loss_token_mask(
+        self, labels: torch.Tensor, **loss_inputs: Any
+    ) -> torch.Tensor | None:
+        """``[T]`` bool: tokens whose logprob reaches the loss or its metrics; None keeps all.
+
+        ``ChunkedLossWrapper`` skips the lm_head for the other tokens (one host sync per microbatch).
+
+        Example:
+            DAPO returns ``loss_mask``, so prompt and tool-output tokens skip the head.
+        """
+        del labels, loss_inputs
+        return None
+
 
 class CrossEntropyLoss(TokenLogprobLoss):
     """Cross-entropy loss with sum reduction for token-based normalization."""
@@ -401,10 +414,28 @@ class CrossEntropyLoss(TokenLogprobLoss):
         global_vocab_size: int | None = None
         """Full vocabulary size, needed for spmd_types loss-parallel CE."""
 
+        skip_ignored_tokens: bool = False
+        """Skip the lm_head for tokens labeled ``IGNORE_INDEX`` (SFT prompts, padding) in
+        ``ChunkedLossWrapper``, at one host sync per microbatch."""
+
     def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
         self.fn: LossFunction = cross_entropy_loss
         self._maybe_compile(compile_config)
         self.global_vocab_size = config.global_vocab_size
+        self.skip_ignored_tokens = config.skip_ignored_tokens
+
+    def loss_token_mask(
+        self, labels: torch.Tensor, **loss_inputs: Any
+    ) -> torch.Tensor | None:
+        del loss_inputs
+        # Class-index labels only; [T, V] class probabilities have no ignored tokens.
+        if (
+            not self.skip_ignored_tokens
+            or labels.dim() != 1
+            or labels.is_floating_point()
+        ):
+            return None
+        return labels != IGNORE_INDEX
 
     def __call__(
         self,
@@ -552,6 +583,17 @@ def compute_logprobs(
     return logprobs, entropy
 
 
+def _select_tokens(value: Any, token_indices: torch.Tensor) -> Any:
+    """Rows ``token_indices`` of a per-token tensor, keeping its SPMD types; non-tensors as is."""
+    if not isinstance(value, torch.Tensor):
+        return value
+    with spmd.no_typecheck():
+        selected = value.index_select(0, token_indices)
+    if spmd.is_type_checking():
+        spmd.assert_local_type_like(selected, value)
+    return selected
+
+
 class GradAccumulator:
     """Accumulates chunk gradients into a pre-allocated buffer.
 
@@ -634,7 +676,8 @@ class ChunkedLossWrapper(BaseLoss):
     fused with the label logprob and entropy, see ``TokenLogprobs``) and
     ``loss_fn.loss_from_logprobs``. The chunks' lm_head gradients accumulate in fp32 and
     reach autograd once, at the last chunk. Batch-invariant mode, LoRA or quantized heads,
-    and multi-output losses keep the logits path.
+    and multi-output losses keep the logits path. On either path, tokens outside
+    ``loss_fn.loss_token_mask`` skip the lm_head.
 
     FSDP2 composability:
         The lm_head's FSDP reshard-after-forward and reshard-after-backward are
@@ -709,6 +752,40 @@ class ChunkedLossWrapper(BaseLoss):
             and not is_in_batch_invariant_mode()
         )
 
+    def _loss_token_indices(
+        self, labels: torch.Tensor, loss_inputs: dict[str, Any]
+    ) -> tuple[torch.Tensor, int] | None:
+        """Indices of the tokens that reach the loss and their chunk count, or None to keep all.
+
+        Chunks keep the configured length (``T / num_chunks``). The loss tokens are padded with
+        skipped tokens, which contribute nothing, to equal 64-aligned chunks.
+
+        Example:
+            T = 64k, num_chunks = 8 (8192-token chunks), 9800 loss tokens
+            -> 9856 indices (the 9800 loss tokens first, then 56 skipped ones), 2 chunks of 4928
+        """
+        token_mask = self.loss_fn.loss_token_mask(  # pyrefly: ignore[missing-attribute]
+            labels, **loss_inputs
+        )
+        # The count below is a host sync, which CUDA graph capture does not allow.
+        if token_mask is None or (
+            token_mask.is_cuda and torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        num_tokens = labels.shape[0]
+        chunk_len = num_tokens // self.num_chunks
+        if chunk_len == 0:
+            return None
+        num_loss_tokens = max(int(token_mask.sum()), 1)
+        num_chunks = -(-num_loss_tokens // chunk_len)
+        alignment = 64 * num_chunks
+        num_kept = -(-num_loss_tokens // alignment) * alignment
+        if num_kept >= num_tokens:
+            return None
+        # Loss tokens first, in order, then skipped tokens as padding.
+        token_indices = torch.argsort(~token_mask, stable=True)[:num_kept]
+        return token_indices, num_chunks
+
     def __call__(
         self,
         pred: torch.Tensor | tuple[torch.Tensor, ...],
@@ -757,6 +834,26 @@ class ChunkedLossWrapper(BaseLoss):
                 "are required."
             )
         use_token_logprobs = self._uses_token_logprobs(pred[0], is_multi_output)
+        # Skipping tokens is valid for any head: the loss defines which tokens it reads.
+        if (
+            isinstance(self.loss_fn, TokenLogprobLoss)
+            and not is_multi_output
+            and not is_in_batch_invariant_mode()
+        ):
+            with spmd.local():
+                with spmd.no_typecheck():
+                    loss_tokens = self._loss_token_indices(labels[0], loss_inputs)
+                if loss_tokens is not None:
+                    token_indices, num_chunks = loss_tokens
+                    # index_select's backward scatters the chunks' gradients back to
+                    # [T, D], with zeros for the skipped tokens.
+                    selected = {"pred": pred[0], "labels": labels[0], **loss_inputs}
+                    selected = {
+                        key: _select_tokens(value, token_indices)
+                        for key, value in selected.items()
+                    }
+                    pred, labels = (selected.pop("pred"),), (selected.pop("labels"),)
+                    loss_inputs = selected
 
         # Chunking operates on the local tensor. Equal chunk sizes match
         # GradAccumulator's sequential slice
