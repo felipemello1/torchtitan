@@ -277,3 +277,22 @@ def test_chunked_loss_rejects_out_of_range_labels():
     )
     assert result.returncode != 0
     assert "labels must be" in result.stderr
+
+
+def test_token_logprobs_frozen_weight_skips_grad_weight():
+    hidden, weight, labels, _ = _inputs(num_tokens=256, dim=128, vocab=5003)
+    grad_logprobs = torch.randn(256, device="cuda") * 1e-5
+    grads = []
+    for weight_requires_grad in (True, False):
+        weight_param = weight.clone().requires_grad_(weight_requires_grad)
+        hidden_input = hidden.clone().requires_grad_()
+        grad_state = TokenLogprobsGradState()
+        logprobs, _ = TokenLogprobs.apply(
+            hidden_input, weight_param, labels, grad_state, True, 0, None
+        )
+        (logprobs * grad_logprobs).sum().backward()
+        grads.append(hidden_input.grad)
+        assert (weight_param.grad is None) != weight_requires_grad
+        if not weight_requires_grad:
+            assert grad_state.grad_weight is None
+    torch.testing.assert_close(grads[1], grads[0], atol=0, rtol=0)

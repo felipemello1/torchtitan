@@ -274,6 +274,10 @@ class TokenLogprobs(torch.autograd.Function):
             dlogits_TV, grad_state.weight_fp16, out_dtype=torch.float32
         )
         grad_hidden_TD = grad_hidden_TD * (grad_T / _DLOGITS_SCALE)[:, None]
+        grad_hidden_TD = grad_hidden_TD.to(hidden_TD.dtype)
+        # A frozen lm_head (e.g. LoRA on the decoder) skips the dW GEMM and its accumulator.
+        if not ctx.needs_input_grad[1]:
+            return grad_hidden_TD, None, None, None, None, None, None
 
         # Normalize g so that g * hidden stays in fp16's range; undo it on the fp32 output.
         grad_max = grad_T.abs().amax().clamp_min(torch.finfo(torch.float32).tiny)
@@ -305,7 +309,7 @@ class TokenLogprobs(torch.autograd.Function):
             num_warps=8,
         )
         return (
-            grad_hidden_TD.to(hidden_TD.dtype),
+            grad_hidden_TD,
             out if ctx.return_grad_weight else None,
             None,
             None,
