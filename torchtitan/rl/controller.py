@@ -380,6 +380,27 @@ class Controller(Configurable):
                         "and has not been validated for determinism."
                     )
 
+            if self.async_loop.batcher.share_prompt:
+                if self.trainer.parallelism.context_parallel_degree > 1:
+                    raise ValueError(
+                        "async_loop.batcher.share_prompt does not support "
+                        "context parallelism."
+                    )
+                # Models whose masks ignore shared prefixes would mix samples.
+                if self.model is not None and not self.model.reads_shared_prefixes:
+                    raise ValueError(
+                        "async_loop.batcher.share_prompt requires a model whose "
+                        "attention reads shared prefixes (varlen attention in "
+                        "every layer)."
+                    )
+                if self.trainer.debug.batch_invariant:
+                    # TODO(rl): validate trainer-generator bitwise parity with
+                    # shared prompts, then allow it.
+                    raise ValueError(
+                        "async_loop.batcher.share_prompt does not support "
+                        "batch_invariant yet."
+                    )
+
             if (
                 not self.generator_router.hot_swap
                 and not self.generator.reset_prefix_cache_on_weight_sync

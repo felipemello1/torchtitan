@@ -336,6 +336,11 @@ class KimiK3Model(MultimodalModel):
         output_res_proj: Linear.Config
         vision_encoder: KimiK3VisionEncoder.Config | None = None
 
+        @property
+        def reads_shared_prefixes(self) -> bool:
+            """KDA offsets ignore shared prefixes; see `Decoder.Config.reads_shared_prefixes`."""
+            return False
+
         def update_from_config(self, *, config, **kwargs) -> None:
             Decoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
