@@ -169,7 +169,12 @@ def test_fp32_output_linear_wide_backward_matches_fp64():
     )
     # A loss normalized by ~1e5 tokens: its gradient would be fp16-subnormal without row scales.
     grad_output_TO = torch.randn(256, 4096, device="cuda") * 1e-6
+    # Masked tokens have all-zero gradient rows; they must not produce NaNs.
+    grad_output_TO[::5] = 0
     layer(input_TD).backward(grad_output_TO)
+    assert (
+        torch.isfinite(input_TD.grad).all() and torch.isfinite(layer.weight.grad).all()
+    )
 
     input_ref = input_TD.detach().double().requires_grad_()
     weight_ref = layer.weight.detach().double().requires_grad_()

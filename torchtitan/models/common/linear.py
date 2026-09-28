@@ -338,10 +338,9 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
         if out_features > num_tokens:
             # Wide output (e.g. an LM head): fp16 with one scale per row, 1 GEMM per gradient.
             row_max_T1 = grad_output_TO.abs().amax(dim=1, keepdim=True)
-            row_max_T1 = row_max_T1.clamp_min(torch.finfo(torch.float32).tiny)
-            scaled_TO = (grad_output_TO * (_FP16_ROW_MAX / row_max_T1)).to(
-                torch.float16
-            )
+            # All-zero rows (e.g. masked tokens) stay zero: _FP16_ROW_MAX / tiny overflows to inf.
+            row_scale_T1 = torch.where(row_max_T1 > 0, _FP16_ROW_MAX / row_max_T1, 0.0)
+            scaled_TO = (grad_output_TO * row_scale_T1).to(torch.float16)
             if ctx.needs_input_grad[0]:
                 grad_input_TD = torch.mm(
                     scaled_TO, weight_OD.to(torch.float16), out_dtype=torch.float32
@@ -349,7 +348,9 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
                 grad_input_TD = grad_input_TD * (row_max_T1 / _FP16_ROW_MAX)
                 grad_input_TD = grad_input_TD.to(input_TD.dtype)
             if ctx.needs_input_grad[1]:
-                max_row_max = row_max_T1.amax()
+                max_row_max = row_max_T1.amax().clamp_min(
+                    torch.finfo(torch.float32).tiny
+                )
                 scaled_input_TD = input_TD.float() * (row_max_T1 / max_row_max)
                 grad_weight_OD = torch.mm(
                     scaled_TO.T,
