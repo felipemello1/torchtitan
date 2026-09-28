@@ -18,8 +18,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torchtitan.config import CompileConfig, Configurable
-from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
+from torchtitan.distributed.spmd_types import (
+    current_spmd_mesh,
+    spmd_mesh_group,
+    spmd_mesh_size,
+)
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
+from torchtitan.ops.token_logprobs import (
+    can_use_token_logprobs_kernels,
+    TokenLogprobsFromLogits,
+    vocab_shard_start,
+)
 
 # PyTorch's default ignore index for cross-entropy loss
 logger = logging.getLogger(__name__)
@@ -40,6 +49,23 @@ def cross_entropy_loss(
     """Cross-entropy over ``pred[T, V]`` and ``labels[T]``."""
     if reduction not in ("sum", "none"):
         raise ValueError(f"Unsupported cross-entropy reduction: {reduction}")
+    # Eager CUDA: compute_logprobs reads the logits once (TokenLogprobsFromLogits), about as fast
+    # as the compiled F.cross_entropy. Under torch.compile, inductor fuses F.cross_entropy itself.
+    if (
+        pred.dim() == 2
+        # Class-index labels; F.cross_entropy also takes [T, V] class probabilities.
+        and labels.dim() == 1
+        and not labels.is_floating_point()
+        and can_use_token_logprobs_kernels(pred)
+        and not is_in_batch_invariant_mode()
+    ):
+        nll = -compute_logprobs(  # pyrefly: ignore[unsupported-operation]
+            pred,
+            labels,
+            vocab_parallel_group=spmd_mesh_group("tp"),
+            global_vocab_size=global_vocab_size,
+        )
+        return nll.sum() if reduction == "sum" else nll
     if spmd_mesh_size("tp") > 1:
         if global_vocab_size is None:
             raise ValueError(
@@ -394,6 +420,22 @@ def compute_logprobs(
     Returns ``logprobs`` when ``return_entropy`` is False, else
     ``(logprobs, entropy)``.
     """
+    if (
+        logits.dim() == 2
+        and labels.dim() == 1
+        and not labels.is_floating_point()
+        and can_use_token_logprobs_kernels(logits)
+        and not is_in_batch_invariant_mode()
+    ):
+        # One stats pass forward and one gradient pass backward over the logits.
+        vocab_start = vocab_shard_start(
+            labels, logits.shape[-1], vocab_parallel_group, global_vocab_size
+        )
+        logprobs, entropy = TokenLogprobsFromLogits.apply(
+            logits, labels, vocab_start, vocab_parallel_group
+        )
+        return (logprobs, entropy) if return_entropy else logprobs
+
     if vocab_parallel_group is not None:
         if global_vocab_size is None:
             raise ValueError(
