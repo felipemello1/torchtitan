@@ -415,9 +415,9 @@ _BF16_BITS_OF_FP32 = -65536
 def _fp16_scale(absmax: torch.Tensor) -> torch.Tensor:
     """Power-of-two scale that moves ``absmax`` into [2^14, 2^15), the top of fp16's range.
 
-    Exact to undo, and values down to ~2^-29 of ``absmax`` stay fp16 normals. Exponents are
-    clamped to [-60, 60], so zero ``absmax`` gets a finite scale and a product or quotient of two
-    scales stays finite in fp32.
+    Exact to undo, and values down to ~2^-29 of ``absmax`` stay fp16 normals. Zero gives 2^15.
+    Exponents are clamped to [-60, 60] so that a product or quotient of two scales stays finite
+    in fp32.
 
     Example:
         absmax 139.0 (frexp exponent 8) -> scale 2^7, and 139 * 2^7 = 17792
