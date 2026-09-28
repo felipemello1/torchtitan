@@ -778,14 +778,14 @@ class TestChunkedLossWrapper(unittest.TestCase):
 
     def test_weighted_multi_output_matches_full_objective(self):
         torch.manual_seed(42)
-        T, D, V, num_chunks = 24, 5, 17, 3
+        T, D, V, chunk_len = 24, 5, 17, 8
         auxiliary_weight = _WeightedTwoOutputLoss.auxiliary_weight
-        model_ref, _ = self._make_model_and_loss(D, V, num_chunks)
-        model_chunked, _ = self._make_model_and_loss(D, V, num_chunks)
+        model_ref, _ = self._make_model_and_loss(D, V, chunk_len)
+        model_chunked, _ = self._make_model_and_loss(D, V, chunk_len)
         model_chunked.output.load_state_dict(model_ref.output.state_dict())
         chunked_loss = ChunkedLossWrapper(
             ChunkedLossWrapper.Config(
-                num_chunks=num_chunks,
+                chunk_len=chunk_len,
                 loss_fn=_WeightedTwoOutputLoss.Config(),
             )
         )
@@ -854,9 +854,9 @@ class TestChunkedLossWrapper(unittest.TestCase):
 
     def test_chunked_mtp_matches_full_objective(self):
         torch.manual_seed(42)
-        seq_len, dim, vocab_size, num_chunks = 8, 5, 17, 2
-        model_ref, _ = self._make_model_and_loss(dim, vocab_size, num_chunks)
-        model_chunked, _ = self._make_model_and_loss(dim, vocab_size, num_chunks)
+        seq_len, dim, vocab_size, chunk_len = 8, 5, 17, 4
+        model_ref, _ = self._make_model_and_loss(dim, vocab_size, chunk_len)
+        model_chunked, _ = self._make_model_and_loss(dim, vocab_size, chunk_len)
         model_chunked.output.load_state_dict(model_ref.output.state_dict())
         loss_config = MTPLoss.Config(
             mtp_scale=0.3,
@@ -865,7 +865,7 @@ class TestChunkedLossWrapper(unittest.TestCase):
         full_loss = MTPLoss(loss_config)
         chunked_loss = ChunkedLossWrapper(
             ChunkedLossWrapper.Config(
-                num_chunks=num_chunks,
+                chunk_len=chunk_len,
                 loss_fn=loss_config,
             )
         )
@@ -922,7 +922,7 @@ class TestChunkedLossWrapper(unittest.TestCase):
         events: list[str] = []
         chunked_loss = ChunkedLossWrapper(
             ChunkedLossWrapper.Config(
-                num_chunks=2,
+                chunk_len=2,
                 loss_fn=_WeightedTwoOutputLoss.Config(),
             )
         )
