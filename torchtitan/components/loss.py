@@ -368,13 +368,16 @@ class TokenLogprobLoss(BaseLoss):
         """Return the scaled loss and metrics from ``[T]`` label logprobs and entropy."""
         ...
 
-    def loss_token_mask(self, labels: torch.Tensor, **loss_inputs: Any) -> torch.Tensor:
-        """``[T]`` bool: tokens whose logprob reaches the loss or its metrics.
+    def loss_token_mask(
+        self, labels: torch.Tensor, **loss_inputs: Any
+    ) -> torch.Tensor | None:
+        """``[T]`` bool: tokens whose logprob reaches the loss or its metrics; None keeps all.
 
-        ``ChunkedLossWrapper`` skips the lm_head for the other tokens.
+        ``ChunkedLossWrapper`` skips the lm_head for the other tokens, at the cost of one
+        host sync per microbatch. None by default: pretraining has nothing to skip.
         """
-        del loss_inputs
-        return labels != IGNORE_INDEX
+        del labels, loss_inputs
+        return None
 
 
 class CrossEntropyLoss(TokenLogprobLoss):
@@ -677,12 +680,12 @@ class ChunkedLossWrapper(BaseLoss):
             T = 64k, num_chunks = 8 (8k-token chunks), 9.8k loss tokens
             -> 10240 indices (9.8k loss tokens first, then skipped ones), 2 chunks of 5120
         """
+        token_mask = self.loss_fn.loss_token_mask(labels, **loss_inputs)
         # The count below is a host sync, which CUDA graph capture does not allow.
-        if torch.cuda.is_current_stream_capturing():
+        if token_mask is None or torch.cuda.is_current_stream_capturing():
             return None
         num_tokens = labels.shape[0]
         chunk_len = num_tokens // self.num_chunks
-        token_mask = self.loss_fn.loss_token_mask(labels, **loss_inputs)
         num_loss_tokens = max(int(token_mask.sum()), 1)
         num_chunks = -(-num_loss_tokens // chunk_len)
         alignment = 64 * num_chunks
