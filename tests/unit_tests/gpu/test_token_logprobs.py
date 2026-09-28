@@ -7,6 +7,7 @@
 import subprocess
 import sys
 import textwrap
+import unittest
 
 import pytest
 import torch
@@ -117,6 +118,8 @@ def test_chunked_loss_token_logprobs_matches_logits_path(loss_config):
     assert _relative_error(fused[3], grad_weight) < 6e-3
 
 
+@pytest.mark.multi_gpu
+@unittest.skipUnless(torch.cuda.device_count() >= 4, "requires four CUDA devices")
 class TestTokenLogprobsDistributed(DTensorTestBase):
     @property
     def world_size(self) -> int:
