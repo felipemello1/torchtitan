@@ -356,6 +356,61 @@ def test_compute_logprobs_from_logits_matches_fp64(dtype):
     assert _relative_error(logits.grad, logits_ref.grad) < tolerance
 
 
+def test_confident_tokens_keep_accurate_logprob_and_gradient():
+    # Logits near 100 with the label 18.4 above the rest: p(label) = 1 - ~1e-5. A single
+    # logsumexp would round to ulp(100) ~ 8e-6 and swamp 1 - p.
+    from torchtitan.ops.token_logprobs import TokenLogprobsFromLogits
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    logits = 100 + torch.randn(64, 1000, device="cuda", generator=generator) * 0.1
+    labels = torch.randint(0, 1000, (64,), device="cuda", generator=generator)
+    logits[torch.arange(64), labels] += 18.4
+    logits.requires_grad_()
+    logprobs, _ = TokenLogprobsFromLogits.apply(logits, labels, 0, None)
+    logprobs.sum().backward()
+
+    logits_ref = logits.detach().double().requires_grad_()
+    logprobs_ref = logits_ref.log_softmax(-1).gather(1, labels[:, None]).squeeze(1)
+    logprobs_ref.sum().backward()
+    torch.testing.assert_close(logprobs.double(), logprobs_ref, atol=1e-6, rtol=0)
+    label_grad = logits.grad.gather(1, labels[:, None]).double()
+    label_grad_ref = logits_ref.grad.gather(1, labels[:, None])
+    torch.testing.assert_close(label_grad, label_grad_ref, atol=0, rtol=5e-2)
+
+
+@pytest.mark.parametrize("case", ["wide_grad_spread", "small_init_weight"])
+def test_token_logprobs_gradient_dynamic_range(case):
+    # The fp16 backward operands get power-of-two scales, so neither per-token gradients far
+    # below the largest one nor a small-init weight fall into fp16 subnormals.
+    hidden, weight, labels, _ = _inputs(num_tokens=1024, dim=128, vocab=5003)
+    grad_logprobs = torch.full((1024,), 1e-6, device="cuda")
+    grad_logprobs[0] = 1.0
+    if case == "small_init_weight":
+        grad_logprobs = torch.randn(1024, device="cuda") * 1e-5
+        weight = (weight.float() * 1e-5).bfloat16()
+    hidden_ref = hidden.double().requires_grad_()
+    weight_ref = weight.double().requires_grad_()
+    logprobs_ref = -F.cross_entropy(
+        hidden_ref @ weight_ref.T, labels, reduction="none", ignore_index=-100
+    )
+    (logprobs_ref * grad_logprobs).sum().backward()
+
+    hidden = hidden.clone().requires_grad_()
+    weight = weight.clone().requires_grad_()
+    weight.grad_dtype = torch.float32
+    logprobs, _ = TokenLogprobs.apply(
+        hidden, weight, labels, TokenLogprobsGradState(), True, 0, None
+    )
+    (logprobs * grad_logprobs).sum().backward()
+
+    assert _relative_error(hidden.grad, hidden_ref.grad) < 4e-3
+    # Per weight row, over rows holding at least 1% of the median row norm.
+    row_norm = weight_ref.grad.norm(dim=1)
+    rows = row_norm >= 1e-2 * row_norm.median()
+    row_error = (weight.grad.double() - weight_ref.grad).norm(dim=1) / row_norm
+    assert row_error[rows].max() < 1e-2
+
+
 def test_token_logprobs_fp32_weight_falls_back_to_fp32_matmuls():
     # e.g. an fp32 weight with bf16 activations under autocast: no dtype error, fp32 accuracy.
     hidden, weight, labels, _ = _inputs(num_tokens=256, dim=128, vocab=5003)
