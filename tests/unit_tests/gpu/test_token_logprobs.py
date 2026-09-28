@@ -183,3 +183,43 @@ class TestTokenLogprobsDistributed(DTensorTestBase):
             torch.testing.assert_close(fused[1][key], value, atol=1e-6, rtol=1e-5)
         assert _relative_error(fused[2], grad_hidden) < 4e-3
         assert _relative_error(fused[3], grad_weight) < 4e-3
+
+
+@pytest.mark.parametrize("loss_token_frac", [0.1, 0.0])
+def test_chunked_loss_skips_non_loss_tokens(loss_token_frac):
+    num_tokens, dim, vocab = 4096, 128, 5003
+    hidden, weight, labels, loss_inputs = _inputs(num_tokens, dim, vocab)
+    loss_inputs["loss_mask"] = (
+        torch.arange(num_tokens, device="cuda") % 100 < 100 * loss_token_frac
+    )
+    global_valid_tokens = torch.tensor(float(num_tokens), device="cuda")
+    lm_head = Fp32OutputLinear.Config(in_features=dim, out_features=vocab).build()
+    lm_head = lm_head.to(device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        lm_head.weight.copy_(weight)
+
+    results = []
+    for skip in (False, True):
+        wrapper = ChunkedLossWrapper(
+            ChunkedLossWrapper.Config(num_chunks=4, loss_fn=DAPOLoss.Config())
+        )
+        wrapper.set_lm_head(lm_head)
+        if skip:
+            assert wrapper._loss_token_indices(labels, loss_inputs) is not None
+        else:
+            wrapper._loss_token_indices = lambda *args: None
+        lm_head.weight.grad = None
+        hidden_input = hidden.clone().requires_grad_()
+        loss, metrics = wrapper(
+            hidden_input, labels, global_valid_tokens, **loss_inputs
+        )
+        loss.backward()
+        results.append((loss, metrics, hidden_input.grad, lm_head.weight.grad))
+
+    (loss, metrics, grad_hidden, grad_weight), skipped = results
+    torch.testing.assert_close(skipped[0], loss, atol=1e-8, rtol=1e-5)
+    for key, value in metrics.items():
+        torch.testing.assert_close(skipped[1][key], value, atol=1e-7, rtol=1e-5)
+    assert torch.all(skipped[2][~loss_inputs["loss_mask"]] == 0)
+    torch.testing.assert_close(skipped[2], grad_hidden, atol=1e-6, rtol=1e-2)
+    torch.testing.assert_close(skipped[3], grad_weight, atol=1e-6, rtol=1e-2)
