@@ -4,17 +4,20 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Sampled-token logprobs and entropy from ``[T, V]`` logits, reading the logits once.
+"""Sampled-token logprobs and entropy, from ``[T, V]`` logits or fused with the LM head.
 
-``compute_logprobs`` and eager ``cross_entropy_loss`` use it: one Triton pass for the softmax
-statistics forward and one for the gradient backward, instead of ~10 passes over ``[T, V]``
-(log_softmax forward and backward plus a separate entropy softmax).
+``TokenLogprobsFromLogits`` reads materialized logits once (``compute_logprobs``, eager
+``cross_entropy_loss``). ``TokenLogprobs`` also runs the ``Fp32OutputLinear`` matmul, keeping the
+fp32 logits inside the op; ``ChunkedLossWrapper`` uses it for losses that only read
+``log p(label)`` and entropy.
 """
 
 import spmd_types as spmd
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
+
+from torchtitan.ops.scale_cast import scale_cast
 
 try:
     import triton
@@ -25,9 +28,17 @@ except ImportError:  # CPU-only installs (e.g. torch's CPU wheels); callers keep
     _HAS_TRITON = False
 
 # Shape suffix legend:
-#   T = num tokens, V = local vocab size
+#   T = num tokens, D = model dimension, V = local vocab size
 
 IGNORE_INDEX = -100
+
+# M = one_hot - softmax is written as fp16 with one scale per row (g = dloss/dlogprob stays out,
+# so any loss scale fits). A row's max |M| is 1 - p(label), so 2^15 / (1 - p(label)) makes the
+# label's entry exactly 2^15, under fp16's 65504. The floor caps the scale for confident tokens
+# (1 - p < 2^-6), whose label entry keeps fp32's rounding of 1 - p, as in log_softmax.
+_M_LABEL_ENTRY = 2.0**15
+_ONE_MINUS_P_FLOOR = 2.0**-6
+
 
 if _HAS_TRITON:
 
@@ -179,11 +190,271 @@ def _softmax_stats(
     return row_max, sum_exp, logprobs, entropy
 
 
+def _fp16_scale(absmax: torch.Tensor) -> torch.Tensor:
+    """Power-of-two scale that moves ``absmax`` into [2^14, 2^15), the top of fp16's range.
+
+    Exact to undo, and values down to ~2^-29 of ``absmax`` stay fp16 normals. Zero gives 2^15; the
+    clamp keeps a tiny nonzero ``absmax`` (below ~2^-85) from overflowing the scale.
+
+    Example:
+        absmax 139.0 (frexp exponent 8) -> scale 2^7, and 139 * 2^7 = 17792
+    """
+    _, exponent = torch.frexp(absmax.float())
+    return torch.exp2((15 - exponent).clamp(max=100).float())
+
+
+def _start_hidden_scale(
+    hidden_TD: torch.Tensor,
+    grad_scale_T: torch.Tensor,
+    grad_state: "TokenLogprobsGradState",
+) -> tuple[torch.Tensor, bool]:
+    """Power-of-two scale for ``hidden * grad_scale``; starts copying it to the host.
+
+    Called before the grad_hidden GEMM is queued, so waiting on the copy later does not stall the
+    GPU. Returns ``(scale, copied)``; under CUDA graph capture nothing is copied.
+    """
+    hidden_absmax_T = torch.linalg.vector_norm(hidden_TD, ord=float("inf"), dim=1)
+    hidden_scale = _fp16_scale((hidden_absmax_T.float() * grad_scale_T.abs()).amax())
+    if torch.cuda.is_current_stream_capturing():
+        return hidden_scale, False
+    grad_state.hidden_scale_host.copy_(hidden_scale, non_blocking=True)
+    grad_state.hidden_scale_copied.record()
+    return hidden_scale, True
+
+
+class TokenLogprobsGradState:
+    """Per-microbatch state the chunks' backwards share: the fp16 weight and the fp32 grad_weight.
+
+    The first chunk casts the weight once; the last chunk returns the accumulated gradient in the
+    weight's gradient dtype, so it is rounded at most once per microbatch. Not a dataclass: FSDP's
+    forward-input cast copies dataclass arguments, which would give each chunk its own accumulator.
+    """
+
+    def __init__(self) -> None:
+        self.weight_fp16: torch.Tensor | None = None
+        self.weight_scale: torch.Tensor | None = None
+        self.grad_weight: torch.Tensor | None = None
+        # Each chunk's grad_weight unscale, copied to the host for the addmm alpha.
+        self.hidden_scale_host = torch.empty((), dtype=torch.float32, pin_memory=True)
+        self.hidden_scale_copied = torch.cuda.Event()
+
+
+class TokenLogprobs(torch.autograd.Function):
+    """Label logprobs and entropy of ``hidden @ weight.T``, with the fp32 logits kept inside the op.
+
+    Forward: a bf16 GEMM with fp32 logits, then one Triton pass for the softmax statistics.
+    Backward writes ``M = one_hot - softmax`` once in fp16 (10 mantissa bits to bf16's 7) and runs
+    one GEMM per gradient. ``g = dloss/dlogprob`` stays out of the fp16 operands, since a loss
+    normalized by 1e5 tokens would make them subnormal. Entropy is a metric (no gradient).
+
+        grad_hidden = g * (M @ W)            fp16 GEMM, fp32 output
+        grad_weight = M.T @ (g * hidden)     fp16 GEMM, accumulated in fp32 across chunks
+
+    Example:
+        state = TokenLogprobsGradState()
+        for i, (hidden, labels) in enumerate(chunks):  # [T, D] bf16, [T]
+            logprobs, entropy = TokenLogprobs.apply(
+                hidden, weight, labels, state, i == len(chunks) - 1, 0, None
+            )  # [T], [T]
+            loss_fn(logprobs, entropy).backward()  # weight.grad is set at the last chunk
+
+    With ``vocab_parallel_group``, ``weight`` is this rank's vocab shard starting at
+    ``vocab_start``, and ``grad_hidden`` is this shard's partial sum.
+    """
+
+    @staticmethod
+    def spmd_typecheck(
+        result: tuple[torch.Tensor, torch.Tensor],
+        *,
+        weight_VD: torch.Tensor,
+        labels_T: torch.Tensor,
+        vocab_parallel_group: dist.ProcessGroup | None,
+    ) -> None:
+        """SPMD type: weight S(0)@TP, labels I@TP -> logprobs and entropy I@TP; local without TP."""
+        overrides = {}
+        if vocab_parallel_group is not None:
+            spmd.assert_type(weight_VD, {vocab_parallel_group: spmd.S(0)})
+            spmd.assert_type(labels_T, {vocab_parallel_group: spmd.I})
+            overrides = {vocab_parallel_group: spmd.I}
+        for output_T in result:
+            spmd.assert_local_type_like(
+                output_T, labels_T, overrides  # pyrefly: ignore [bad-argument-type]
+            )
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def forward(
+        ctx,
+        hidden_TD: torch.Tensor,
+        weight_VD: torch.Tensor,
+        labels_T: torch.Tensor,
+        grad_state: TokenLogprobsGradState | None,
+        return_grad_weight: bool,
+        vocab_start: int,
+        vocab_parallel_group: dist.ProcessGroup | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Slow fallback for non-bf16 operands (e.g. an fp32 weight under autocast): fp32 matmuls,
+        # as in Fp32OutputLinear.
+        ctx.use_bf16_gemm = hidden_TD.dtype == weight_VD.dtype == torch.bfloat16
+        if ctx.use_bf16_gemm:
+            if grad_state is not None and grad_state.weight_fp16 is None:
+                grad_state.weight_scale = _fp16_scale(
+                    torch.linalg.vector_norm(weight_VD.detach(), ord=float("inf"))
+                )
+                grad_state.weight_fp16 = scale_cast(
+                    weight_VD.detach(), grad_state.weight_scale, torch.float16
+                )
+            logits_TV = torch.mm(hidden_TD, weight_VD.T, out_dtype=torch.float32)
+        else:
+            logits_TV = torch.mm(hidden_TD.float(), weight_VD.float().T)
+        labels_T = labels_T.contiguous()
+        row_max_T, sum_exp_T, logprobs_T, entropy_T = _softmax_stats(
+            logits_TV, labels_T, vocab_start, vocab_parallel_group
+        )
+        one_minus_p_T = -torch.expm1(logprobs_T)
+        m_row_scale_T = _M_LABEL_ENTRY / one_minus_p_T.clamp_min(_ONE_MINUS_P_FLOOR)
+        ctx.save_for_backward(
+            hidden_TD, weight_VD, labels_T, row_max_T, sum_exp_T, m_row_scale_T
+        )
+        # Kept off save_for_backward so backward can free the [T, V] fp32 logits before its GEMMs.
+        ctx.logits_TV = logits_TV
+        ctx.grad_state = grad_state
+        ctx.return_grad_weight = return_grad_weight
+        ctx.vocab_start = vocab_start
+        # fp32 when FSDP's unsharded weight accumulates fp32 gradients (Tensor.grad_dtype, which
+        # only leaf tensors have).
+        grad_dtype = weight_VD.grad_dtype if weight_VD.is_leaf else None
+        ctx.grad_weight_dtype = grad_dtype or weight_VD.dtype
+        ctx.mark_non_differentiable(entropy_T)
+        ctx.set_materialize_grads(False)
+        return logprobs_T, entropy_T
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def backward(ctx, grad_logprobs_T: torch.Tensor, grad_entropy_T: None):
+        assert grad_entropy_T is None, "entropy is a metric and has no gradient"
+        (
+            hidden_TD,
+            weight_VD,
+            labels_T,
+            row_max_T,
+            sum_exp_T,
+            m_row_scale_T,
+        ) = ctx.saved_tensors
+        logits_TV, ctx.logits_TV = ctx.logits_TV, None
+        grad_state = ctx.grad_state
+        assert grad_state is not None, "backward needs a TokenLogprobsGradState"
+        num_tokens, vocab_size = logits_TV.shape
+        grad_T = grad_logprobs_T.float().contiguous()
+
+        # bf16 path: M = (one_hot - softmax) * m_row_scale in fp16, with g applied outside the
+        # GEMMs. Fallback: dlogits = g * (one_hot - softmax) in fp32.
+        dlogits_TV = torch.empty(
+            num_tokens,
+            vocab_size,
+            device=logits_TV.device,
+            dtype=torch.float16 if ctx.use_bf16_gemm else torch.float32,
+        )
+        block = 4096
+        torch.library.wrap_triton(_dlogits_kernel)[
+            (num_tokens, triton.cdiv(vocab_size, block))
+        ](
+            logits_TV,
+            labels_T,
+            row_max_T,
+            sum_exp_T,
+            m_row_scale_T if ctx.use_bf16_gemm else grad_T,
+            dlogits_TV,
+            vocab_size,
+            ctx.vocab_start,
+            logits_TV.stride(0),
+            dlogits_TV.stride(0),
+            IGNORE=IGNORE_INDEX,
+            BLOCK=block,
+            num_warps=8,
+        )
+        del logits_TV
+
+        if not ctx.use_bf16_gemm:
+            grad_hidden_TD = torch.mm(dlogits_TV, weight_VD.float()).to(hidden_TD.dtype)
+            if not ctx.needs_input_grad[1]:
+                return grad_hidden_TD, None, None, None, None, None, None
+            grad_weight_VD = torch.mm(dlogits_TV.T, hidden_TD.float())
+            if grad_state.grad_weight is None:
+                grad_state.grad_weight = grad_weight_VD
+            else:
+                grad_state.grad_weight += grad_weight_VD
+            out = None
+            if ctx.return_grad_weight:
+                out = grad_state.grad_weight.to(ctx.grad_weight_dtype)
+                grad_state.grad_weight = None
+            return grad_hidden_TD, out, None, None, None, None, None
+
+        # Per-token factor that undoes M's row scale and applies g.
+        grad_scale_T = grad_T / m_row_scale_T
+        hidden_scale, scale_copied = _start_hidden_scale(
+            hidden_TD, grad_scale_T, grad_state
+        )
+        grad_hidden_TD = torch.mm(
+            dlogits_TV, grad_state.weight_fp16, out_dtype=torch.float32
+        )
+        grad_hidden_TD = (
+            grad_hidden_TD * (grad_scale_T / grad_state.weight_scale)[:, None]
+        )
+        grad_hidden_TD = grad_hidden_TD.to(hidden_TD.dtype)
+        # A frozen lm_head (e.g. LoRA on the decoder) skips the dW GEMM and its accumulator.
+        if not ctx.needs_input_grad[1]:
+            return grad_hidden_TD, None, None, None, None, None, None
+
+        scaled_hidden_TD = scale_cast(
+            hidden_TD, grad_scale_T * hidden_scale, torch.float16
+        )
+        # Accumulate this chunk's gradient into the fp32 accumulator. The unscale 1 / hidden_scale
+        # is a host alpha, so cuBLAS computes alpha * M.T @ hidden + acc in one pass.
+        accumulated = grad_state.grad_weight
+        if not scale_copied:
+            # Graph capture cannot wait on the host: unscale on the device instead.
+            grad_weight_VD = torch.mm(
+                dlogits_TV.T, scaled_hidden_TD, out_dtype=torch.float32
+            ).mul_(hidden_scale.reciprocal())
+            if accumulated is None:
+                accumulated = grad_weight_VD
+            else:
+                accumulated += grad_weight_VD
+        else:
+            beta = 1.0
+            if accumulated is None:
+                # beta=0: cuBLAS does not read the empty buffer.
+                accumulated, beta = (
+                    torch.empty_like(weight_VD, dtype=torch.float32),
+                    0.0,
+                )
+            grad_state.hidden_scale_copied.synchronize()
+            torch.addmm(
+                accumulated,
+                dlogits_TV.T,
+                scaled_hidden_TD,
+                beta=beta,
+                alpha=1.0 / grad_state.hidden_scale_host.item(),
+                out_dtype=torch.float32,
+                out=accumulated,
+            )
+        grad_state.grad_weight = accumulated
+        if not ctx.return_grad_weight:
+            return grad_hidden_TD, None, None, None, None, None, None
+        # A no-op for fp32 gradients. Dropping the state's references lets autograd take the
+        # buffer without a copy.
+        out = accumulated.to(ctx.grad_weight_dtype)
+        grad_state.grad_weight = grad_state.weight_fp16 = grad_state.weight_scale = None
+        return grad_hidden_TD, out, None, None, None, None, None
+
+
 class TokenLogprobsFromLogits(torch.autograd.Function):
     """``(logits [T, V], labels [T]) -> (logprobs [T], entropy [T])``, reading the logits once.
 
-    One stats pass forward, and a backward that writes ``g * (one_hot - softmax)`` in one pass,
-    instead of log_softmax's forward and backward plus an entropy softmax (~10 passes).
+    For heads ``TokenLogprobs`` does not fuse with (bf16, soft-capped, LoRA): the same stats pass,
+    and a backward that writes ``g * (one_hot - softmax)`` in one pass, instead of log_softmax's
+    forward and backward plus an entropy softmax (~10 passes).
 
     Example:
         logits [8192, 124160] bf16 -> logprobs, entropy [8192] fp32; backward: dlogits bf16
