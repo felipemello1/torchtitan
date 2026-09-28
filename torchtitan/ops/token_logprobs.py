@@ -110,13 +110,22 @@ def _dlogits_kernel(
 
 
 @triton.jit
-def _scaled_add_kernel(out_ptr, src_ptr, scale_ptr, numel, BLOCK: tl.constexpr):
-    """out += src * scale, with scale read from device memory (no host sync)."""
+def _scaled_add_kernel(
+    out_ptr,
+    src_ptr,
+    acc_ptr,
+    scale_ptr,
+    numel,
+    ACCUMULATE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """out = src * scale (+ acc if ACCUMULATE), cast to out's dtype; scale is read on device."""
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < numel
-    out = tl.load(out_ptr + offsets, mask=mask)
-    src = tl.load(src_ptr + offsets, mask=mask)
-    tl.store(out_ptr + offsets, out + src * tl.load(scale_ptr), mask=mask)
+    value = tl.load(src_ptr + offsets, mask=mask) * tl.load(scale_ptr)
+    if ACCUMULATE:
+        value += tl.load(acc_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, value.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 def _softmax_stats(
@@ -162,10 +171,10 @@ def _softmax_stats(
 class TokenLogprobsGradState:
     """Per-microbatch state shared by the chunks' backwards.
 
-    The first chunk's forward fills it from the weight it receives (unsharded under FSDP):
-    ``weight_fp16`` is that weight cast once for the fp16 backward GEMMs, and
-    ``grad_weight`` accumulates every chunk's weight gradient in fp32. The last chunk returns
-    it to autograd in the weight's dtype, so it is rounded once per microbatch.
+    The first chunk's forward fills ``weight_fp16`` from the weight it receives (unsharded
+    under FSDP), cast once for the fp16 backward GEMMs. ``grad_weight`` accumulates the chunks'
+    weight gradients in fp32; the last chunk returns the sum to autograd in the weight's dtype,
+    so it is rounded once per microbatch.
 
     Not a dataclass: FSDP's forward-input cast copies dataclass arguments (casting their
     tensors to the param dtype), which would give each chunk its own accumulator.
@@ -216,7 +225,6 @@ class TokenLogprobs(torch.autograd.Function):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if grad_state is not None and grad_state.weight_fp16 is None:
             grad_state.weight_fp16 = weight_VD.detach().to(torch.float16)
-            grad_state.grad_weight = torch.zeros_like(weight_VD, dtype=torch.float32)
         logits_TV = torch.mm(hidden_TD, weight_VD.T, out_dtype=torch.float32)
         logsumexp_T, logprobs_T, entropy_T = _softmax_stats(
             logits_TV, labels_T, vocab_start, vocab_parallel_group
@@ -272,23 +280,30 @@ class TokenLogprobs(torch.autograd.Function):
         grad_weight_VD = torch.mm(
             dlogits_TV.T, scaled_hidden_TD, out_dtype=torch.float32
         )
-        grad_weight = grad_state.grad_weight
-        numel = grad_weight.numel()
+        # The first chunk's scaled gradient becomes the fp32 accumulator; the last chunk adds
+        # its own and casts the sum to the weight's dtype in the same pass.
+        accumulated = grad_state.grad_weight
+        if ctx.return_grad_weight:
+            out = torch.empty_like(grad_weight_VD, dtype=ctx.weight_dtype)
+        else:
+            out = grad_state.grad_weight = (
+                grad_weight_VD if accumulated is None else accumulated
+            )
+        numel = out.numel()
         add_block = 8192
         _scaled_add_kernel[(triton.cdiv(numel, add_block),)](
-            grad_weight,
+            out,
             grad_weight_VD,
+            grad_weight_VD if accumulated is None else accumulated,
             grad_max / _DLOGITS_SCALE,
             numel,
+            ACCUMULATE=accumulated is not None,
             BLOCK=add_block,
             num_warps=8,
         )
-        grad_weight_out = (
-            grad_weight.to(ctx.weight_dtype) if ctx.return_grad_weight else None
-        )
         return (
             grad_hidden_TD.to(hidden_TD.dtype),
-            grad_weight_out,
+            out if ctx.return_grad_weight else None,
             None,
             None,
             None,
