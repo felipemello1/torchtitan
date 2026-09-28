@@ -1313,6 +1313,13 @@ class TestLossTokenIndices(unittest.TestCase):
             )
         )
 
+    def test_empty_microbatch_keeps_every_token(self):
+        wrapper = self._wrapper(_MaskedTokenLoss.Config())
+        empty = torch.zeros(0, dtype=torch.long)
+        self.assertIsNone(
+            wrapper._loss_token_indices(empty, {"loss_mask": empty.bool()})
+        )
+
     def test_cross_entropy_keeps_every_token_without_a_host_sync(self):
         # CrossEntropyLoss.loss_token_mask is None: pretraining skips nothing.
         wrapper = self._wrapper(CrossEntropyLoss.Config())

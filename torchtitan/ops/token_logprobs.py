@@ -145,6 +145,7 @@ def _softmax_stats(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return ``(logsumexp, label logprob, entropy)``, each ``[T]``, over the full vocab."""
     num_tokens, vocab_size = logits_TV.shape
+    labels_T = labels_T.contiguous()
     row_max, sum_exp, sum_exp_logit, label_logit = torch.empty(
         4, num_tokens, device=logits_TV.device, dtype=torch.float32
     )
@@ -251,13 +252,22 @@ class TokenLogprobs(torch.autograd.Function):
         vocab_start: int,
         vocab_parallel_group: dist.ProcessGroup | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if grad_state is not None and grad_state.weight_fp16 is None:
-            grad_state.weight_fp16 = weight_VD.detach().to(torch.float16)
-        logits_TV = torch.mm(hidden_TD, weight_VD.T, out_dtype=torch.float32)
+        # Slow fallback for non-bf16 operands (e.g. an fp32 weight under autocast): fp32 matmuls,
+        # as in Fp32OutputLinear.
+        ctx.use_bf16_gemm = hidden_TD.dtype == weight_VD.dtype == torch.bfloat16
+        if ctx.use_bf16_gemm:
+            if grad_state is not None and grad_state.weight_fp16 is None:
+                grad_state.weight_fp16 = weight_VD.detach().to(torch.float16)
+            logits_TV = torch.mm(hidden_TD, weight_VD.T, out_dtype=torch.float32)
+        else:
+            logits_TV = torch.mm(hidden_TD.float(), weight_VD.float().T)
+        labels_T = labels_T.contiguous()
         logsumexp_T, logprobs_T, entropy_T = _softmax_stats(
             logits_TV, labels_T, vocab_start, vocab_parallel_group
         )
-        ctx.save_for_backward(hidden_TD, labels_T, logits_TV, logsumexp_T)
+        ctx.save_for_backward(hidden_TD, weight_VD, labels_T, logsumexp_T)
+        # Kept off save_for_backward so backward can free the [T, V] fp32 logits before its GEMMs.
+        ctx.logits_TV = logits_TV
         ctx.grad_state = grad_state
         ctx.return_grad_weight = return_grad_weight
         ctx.vocab_start = vocab_start
@@ -273,33 +283,54 @@ class TokenLogprobs(torch.autograd.Function):
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_logprobs_T: torch.Tensor, grad_entropy_T: None):
         assert grad_entropy_T is None, "entropy is a metric and has no gradient"
-        hidden_TD, labels_T, logits_TV, logsumexp_T = ctx.saved_tensors
+        hidden_TD, weight_VD, labels_T, logsumexp_T = ctx.saved_tensors
+        logits_TV, ctx.logits_TV = ctx.logits_TV, None
         grad_state = ctx.grad_state
         assert grad_state is not None, "backward needs a TokenLogprobsGradState"
         num_tokens, vocab_size = logits_TV.shape
+        grad_T = grad_logprobs_T.float().contiguous()
 
+        # bf16 path: M = (one_hot - softmax) * 2^14 in fp16, with g applied outside the GEMMs.
+        # Fallback: dlogits = g * (one_hot - softmax) in fp32.
         dlogits_TV = torch.empty(
-            num_tokens, vocab_size, device=logits_TV.device, dtype=torch.float16
+            num_tokens,
+            vocab_size,
+            device=logits_TV.device,
+            dtype=torch.float16 if ctx.use_bf16_gemm else torch.float32,
         )
         block = 4096
         _dlogits_kernel[(num_tokens, triton.cdiv(vocab_size, block))](
             logits_TV,
             labels_T,
             logsumexp_T,
-            logsumexp_T,  # unused: no row scale
+            grad_T,
             dlogits_TV,
             vocab_size,
             ctx.vocab_start,
             logits_TV.stride(0),
             dlogits_TV.stride(0),
-            _DLOGITS_SCALE,
-            HAS_ROW_SCALE=False,
+            _DLOGITS_SCALE if ctx.use_bf16_gemm else 1.0,
+            HAS_ROW_SCALE=not ctx.use_bf16_gemm,
             IGNORE=IGNORE_INDEX,
             BLOCK=block,
             num_warps=8,
         )
         del logits_TV
-        grad_T = grad_logprobs_T.float()
+
+        if not ctx.use_bf16_gemm:
+            grad_hidden_TD = torch.mm(dlogits_TV, weight_VD.float()).to(hidden_TD.dtype)
+            if not ctx.needs_input_grad[1]:
+                return grad_hidden_TD, None, None, None, None, None, None
+            grad_weight_VD = torch.mm(dlogits_TV.T, hidden_TD.float())
+            if grad_state.grad_weight is None:
+                grad_state.grad_weight = grad_weight_VD
+            else:
+                grad_state.grad_weight += grad_weight_VD
+            out = None
+            if ctx.return_grad_weight:
+                out = grad_state.grad_weight.to(ctx.grad_weight_dtype)
+                grad_state.grad_weight = None
+            return grad_hidden_TD, out, None, None, None, None, None
 
         grad_hidden_TD = torch.mm(
             dlogits_TV, grad_state.weight_fp16, out_dtype=torch.float32
@@ -339,15 +370,11 @@ class TokenLogprobs(torch.autograd.Function):
             BLOCK=add_block,
             num_warps=8,
         )
-        return (
-            grad_hidden_TD,
-            out if ctx.return_grad_weight else None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        if not ctx.return_grad_weight:
+            return grad_hidden_TD, None, None, None, None, None, None
+        # Drop the state's references so autograd can take the buffer without a copy.
+        grad_state.grad_weight = grad_state.weight_fp16 = None
+        return grad_hidden_TD, out, None, None, None, None, None
 
 
 class TokenLogprobsFromLogits(torch.autograd.Function):
@@ -388,7 +415,7 @@ class TokenLogprobsFromLogits(torch.autograd.Function):
         vocab_start: int,
         vocab_parallel_group: dist.ProcessGroup | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        logits_TV = logits_TV.contiguous()
+        logits_TV, labels_T = logits_TV.contiguous(), labels_T.contiguous()
         logsumexp_T, logprobs_T, entropy_T = _softmax_stats(
             logits_TV, labels_T, vocab_start, vocab_parallel_group
         )
@@ -425,10 +452,63 @@ class TokenLogprobsFromLogits(torch.autograd.Function):
         return dlogits_TV, None, None, None
 
 
+def can_use_token_logprobs_kernels(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` can go to the Triton kernels: an eager, plain CUDA tensor.
+
+    Excludes DTensors, fake and functional tensors, and tracing (torch.compile, make_fx), where a
+    raw kernel launch fails or is not recorded.
+    """
+    from torch._subclasses.fake_tensor import FakeTensor
+    from torch._subclasses.functional_tensor import FunctionalTensor
+    from torch.distributed.tensor import DTensor
+    from torch.fx.experimental.proxy_tensor import get_proxy_mode
+
+    return (
+        tensor.is_cuda
+        and not isinstance(tensor, (DTensor, FakeTensor, FunctionalTensor))
+        and not torch.compiler.is_compiling()
+        and get_proxy_mode() is None
+    )
+
+
 def vocab_shard_start(
-    global_vocab_size: int, vocab_parallel_group: dist.ProcessGroup
+    labels_T: torch.Tensor,
+    local_vocab_size: int,
+    vocab_parallel_group: dist.ProcessGroup | None,
+    global_vocab_size: int | None,
 ) -> int:
-    """First vocab id of this rank's shard, matching ``_LossParallelCrossEntropy``."""
-    tp_size = dist.get_world_size(vocab_parallel_group)
-    shard_size = (global_vocab_size + tp_size - 1) // tp_size
-    return min(global_vocab_size, shard_size * dist.get_rank(vocab_parallel_group))
+    """Return this rank's first vocab id, after checking the shard layout and the labels.
+
+    Shards follow ``_LossParallelCrossEntropy``: ``ceil(V / tp)`` rows each, the last possibly
+    fewer. The kernels would read an out-of-range label as "on another vocab shard", so labels
+    are device-asserted (no host sync) to be ``IGNORE_INDEX`` or in ``[0, V)``.
+
+    Example:
+        V = 151936, tp = 2, rank 1, local_vocab_size = 75968 -> 75968
+        global_vocab_size = 151669 with the same shard -> ValueError (rank 1 expects 75701)
+    """
+    vocab_start, num_classes = 0, local_vocab_size
+    if vocab_parallel_group is not None:
+        if global_vocab_size is None:
+            raise ValueError(
+                "global_vocab_size is required for vocab-parallel policy statistics"
+            )
+        tp_size = dist.get_world_size(vocab_parallel_group)
+        shard_size = (global_vocab_size + tp_size - 1) // tp_size
+        vocab_start = min(
+            global_vocab_size, shard_size * dist.get_rank(vocab_parallel_group)
+        )
+        expected = min(global_vocab_size, vocab_start + shard_size) - vocab_start
+        if local_vocab_size != expected or expected == 0:
+            raise ValueError(
+                f"expected a non-empty local vocab shard of {expected} for global vocab "
+                f"size {global_vocab_size}, got {local_vocab_size}"
+            )
+        num_classes = global_vocab_size
+    torch._assert_async(
+        torch.all(
+            (labels_T == IGNORE_INDEX) | ((labels_T >= 0) & (labels_T < num_classes))
+        ),
+        f"labels must be {IGNORE_INDEX} or in [0, {num_classes})",
+    )
+    return vocab_start

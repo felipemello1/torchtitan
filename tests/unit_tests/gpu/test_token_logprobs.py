@@ -188,6 +188,31 @@ class TestTokenLogprobsDistributed(DTensorTestBase):
         assert _relative_error(fused[2], grad_hidden) < 4e-3
         assert _relative_error(fused[3], grad_weight) < 4e-3
 
+    @with_comms
+    def test_vocab_shard_mismatch_raises(self):
+        from torchtitan.components.loss import compute_logprobs
+
+        tp_mesh = ParallelDims(
+            dp_replicate=1,
+            dp_shard=1,
+            cp=1,
+            tp=4,
+            pp=1,
+            ep=1,
+            world_size=4,
+            enable_sequence_parallel=False,
+        ).get_mesh("tp")
+        # 1000 classes over 4 ranks: 250 rows each. A wrong global size shifts the shards.
+        logits = torch.randn(8, 250, device="cuda")
+        labels = torch.zeros(8, dtype=torch.long, device="cuda")
+        with self.assertRaisesRegex(ValueError, "local vocab shard"):
+            compute_logprobs(
+                logits,
+                labels,
+                vocab_parallel_group=tp_mesh.get_group(),
+                global_vocab_size=990,
+            )
+
 
 @pytest.mark.parametrize("loss_token_frac", [0.1, 0.0])
 def test_chunked_loss_skips_non_loss_tokens(loss_token_frac):
@@ -329,3 +354,57 @@ def test_compute_logprobs_from_logits_matches_fp64(dtype):
     # bf16 logits get a bf16 gradient, like F.cross_entropy's backward.
     tolerance = 5e-3 if dtype is torch.bfloat16 else 1e-6
     assert _relative_error(logits.grad, logits_ref.grad) < tolerance
+
+
+def test_token_logprobs_fp32_weight_falls_back_to_fp32_matmuls():
+    # e.g. an fp32 weight with bf16 activations under autocast: no dtype error, fp32 accuracy.
+    hidden, weight, labels, _ = _inputs(num_tokens=256, dim=128, vocab=5003)
+    grad_logprobs = torch.randn(256, device="cuda") * 1e-5
+    weight_param = weight.float().requires_grad_()
+    hidden_input = hidden.clone().requires_grad_()
+    logprobs, _ = TokenLogprobs.apply(
+        hidden_input, weight_param, labels, TokenLogprobsGradState(), True, 0, None
+    )
+    (logprobs * grad_logprobs).sum().backward()
+    assert hidden_input.grad.dtype is torch.bfloat16
+    assert weight_param.grad.dtype is torch.float32
+
+    hidden_ref = hidden.double().requires_grad_()
+    weight_ref = weight_param.detach().double().requires_grad_()
+    logprobs_ref = -F.cross_entropy(
+        hidden_ref @ weight_ref.T, labels, reduction="none", ignore_index=-100
+    )
+    (logprobs_ref * grad_logprobs).sum().backward()
+    torch.testing.assert_close(logprobs.double(), logprobs_ref, atol=1e-5, rtol=0)
+    assert _relative_error(weight_param.grad, weight_ref.grad) < 1e-5
+    assert _relative_error(hidden_input.grad, hidden_ref.grad) < 4e-3
+
+
+def test_compute_logprobs_strided_labels():
+    from torchtitan.components.loss import compute_logprobs
+
+    logits = torch.randn(256, 1000, device="cuda")
+    token_ids = torch.randint(0, 1000, (256, 3), device="cuda")
+    strided = compute_logprobs(logits, token_ids[:, 1], vocab_parallel_group=None)
+    contiguous = compute_logprobs(
+        logits, token_ids[:, 1].contiguous(), vocab_parallel_group=None
+    )
+    torch.testing.assert_close(strided, contiguous, atol=0, rtol=0)
+
+
+def test_chunked_loss_keeps_logits_path_for_overridden_call():
+    class _WeightedCrossEntropy(CrossEntropyLoss):
+        def __call__(self, pred, labels, global_valid_tokens=None, **kwargs):
+            loss, metrics = super().__call__(pred, labels, global_valid_tokens)
+            return 2 * loss, metrics
+
+    hidden, weight, _, _ = _inputs(num_tokens=64, dim=128, vocab=512)
+    lm_head = Fp32OutputLinear.Config(in_features=128, out_features=512).build()
+    lm_head = lm_head.to(device="cuda", dtype=torch.bfloat16)
+    wrapper = ChunkedLossWrapper(
+        ChunkedLossWrapper.Config(num_chunks=2, loss_fn=CrossEntropyLoss.Config())
+    )
+    wrapper.set_lm_head(lm_head)
+    assert wrapper._uses_token_logprobs(hidden, is_multi_output=False)
+    wrapper.loss_fn = _WeightedCrossEntropy(CrossEntropyLoss.Config())
+    assert not wrapper._uses_token_logprobs(hidden, is_multi_output=False)

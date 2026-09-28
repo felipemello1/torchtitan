@@ -26,6 +26,7 @@ from torchtitan.distributed.spmd_types import (
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.models.common.linear import Fp32OutputLinear
 from torchtitan.ops.token_logprobs import (
+    can_use_token_logprobs_kernels,
     TokenLogprobsFromLogits,
     TokenLogprobsGradState,
     vocab_shard_start,
@@ -53,9 +54,8 @@ def cross_entropy_loss(
     # Eager CUDA: compute_logprobs reads the logits once (TokenLogprobsFromLogits), about as fast
     # as the compiled F.cross_entropy. Under torch.compile, inductor fuses F.cross_entropy itself.
     if (
-        pred.is_cuda
-        and pred.dim() == 2
-        and not torch.compiler.is_compiling()
+        pred.dim() == 2
+        and can_use_token_logprobs_kernels(pred)
         and not is_in_batch_invariant_mode()
     ):
         nll = -compute_logprobs(
@@ -491,23 +491,14 @@ def compute_logprobs(
     Returns ``logprobs`` when ``return_entropy`` is False, else
     ``(logprobs, entropy)``.
     """
-    if logits.is_cuda and logits.dim() == 2 and not is_in_batch_invariant_mode():
+    if (
+        logits.dim() == 2
+        and can_use_token_logprobs_kernels(logits)
+        and not is_in_batch_invariant_mode()
+    ):
         # One stats pass forward and one gradient pass backward over the logits.
-        vocab_start = 0
-        num_classes = logits.shape[-1]
-        if vocab_parallel_group is not None:
-            if global_vocab_size is None:
-                raise ValueError(
-                    "global_vocab_size is required for vocab-parallel policy statistics"
-                )
-            vocab_start = vocab_shard_start(global_vocab_size, vocab_parallel_group)
-            num_classes = global_vocab_size
-        # The kernels would read an out-of-range label as "on another vocab shard".
-        torch._assert_async(
-            torch.all(
-                (labels == IGNORE_INDEX) | ((labels >= 0) & (labels < num_classes))
-            ),
-            f"labels must be {IGNORE_INDEX} or in [0, {num_classes})",
+        vocab_start = vocab_shard_start(
+            labels, logits.shape[-1], vocab_parallel_group, global_vocab_size
         )
         logprobs, entropy = TokenLogprobsFromLogits.apply(
             logits, labels, vocab_start, vocab_parallel_group
@@ -563,6 +554,17 @@ def compute_logprobs(
             torch.softmax(logits, dim=-1) * logits
         ).sum(dim=-1)
     return logprobs, entropy
+
+
+def _select_tokens(value: Any, token_indices: torch.Tensor) -> Any:
+    """Rows ``token_indices`` of a per-token tensor, keeping its SPMD types; non-tensors as is."""
+    if not isinstance(value, torch.Tensor):
+        return value
+    with spmd.no_typecheck():
+        selected = value.index_select(0, token_indices)
+    if spmd.is_type_checking():
+        spmd.assert_local_type_like(selected, value)
+    return selected
 
 
 class GradAccumulator:
@@ -707,12 +709,15 @@ class ChunkedLossWrapper(BaseLoss):
         lm_head = self.lm_head
         return (
             isinstance(self.loss_fn, TokenLogprobLoss)
+            # A subclass that overrides __call__ (e.g. to add a term) must keep the logits path.
+            and type(self.loss_fn).__call__
+            in (TokenLogprobLoss.__call__, CrossEntropyLoss.__call__)
             and not is_multi_output
             # A plain Fp32OutputLinear; LoRA and quantized heads override _linear.
             and getattr(type(lm_head), "_linear", None) is Fp32OutputLinear._linear
             and lm_head.bias is None
             and lm_head.num_linears == 1
-            and hidden_state.is_cuda
+            and can_use_token_logprobs_kernels(hidden_state)
             and hidden_state.dtype == torch.bfloat16
             # Batch-invariant mode reproduces the generator's logprob ops bitwise.
             and not is_in_batch_invariant_mode()
@@ -727,8 +732,8 @@ class ChunkedLossWrapper(BaseLoss):
         skipped tokens, which contribute nothing, to equal 64-aligned chunks.
 
         Example:
-            T = 64k, num_chunks = 8 (8k-token chunks), 9.8k loss tokens
-            -> 10240 indices (9.8k loss tokens first, then skipped ones), 2 chunks of 5120
+            T = 64k, num_chunks = 8 (8192-token chunks), 9800 loss tokens
+            -> 9856 indices (the 9800 loss tokens first, then 56 skipped ones), 2 chunks of 4928
         """
         token_mask = self.loss_fn.loss_token_mask(labels, **loss_inputs)
         # The count below is a host sync, which CUDA graph capture does not allow.
@@ -738,6 +743,8 @@ class ChunkedLossWrapper(BaseLoss):
             return None
         num_tokens = labels.shape[0]
         chunk_len = num_tokens // self.num_chunks
+        if chunk_len == 0:
+            return None
         num_loss_tokens = max(int(token_mask.sum()), 1)
         num_chunks = -(-num_loss_tokens // chunk_len)
         alignment = 64 * num_chunks
@@ -797,20 +804,20 @@ class ChunkedLossWrapper(BaseLoss):
             )
         use_token_logprobs = self._uses_token_logprobs(pred[0], is_multi_output)
         if use_token_logprobs:
-            with spmd.local(), spmd.no_typecheck():
-                loss_tokens = self._loss_token_indices(labels[0], loss_inputs)
+            with spmd.local():
+                with spmd.no_typecheck():
+                    loss_tokens = self._loss_token_indices(labels[0], loss_inputs)
                 if loss_tokens is not None:
                     token_indices, num_chunks = loss_tokens
                     # index_select's backward scatters the chunks' gradients back to
                     # [T, D], with zeros for the skipped tokens.
-                    pred = (pred[0].index_select(0, token_indices),)
-                    labels = (labels[0].index_select(0, token_indices),)
-                    loss_inputs = {
-                        key: value.index_select(0, token_indices)
-                        if isinstance(value, torch.Tensor)
-                        else value
-                        for key, value in loss_inputs.items()
+                    selected = {"pred": pred[0], "labels": labels[0], **loss_inputs}
+                    selected = {
+                        key: _select_tokens(value, token_indices)
+                        for key, value in selected.items()
                     }
+                    pred, labels = (selected.pop("pred"),), (selected.pop("labels"),)
+                    loss_inputs = selected
 
         # Chunking operates on the local tensor. Equal chunk sizes match
         # GradAccumulator's sequential slice
@@ -888,25 +895,13 @@ class ChunkedLossWrapper(BaseLoss):
 
             if use_token_logprobs:
                 vocab_parallel_group = spmd_mesh_group("tp")
-                vocab_start = 0
-                # The full vocab: FSDP's sharded DTensor and its unsharded weight both report [V, D].
-                global_vocab_size = lm_head.weight.shape[0]
-                if vocab_parallel_group is not None:
-                    global_vocab_size = self.loss_fn.global_vocab_size
-                    if global_vocab_size is None:
-                        raise ValueError(
-                            "global_vocab_size is required for vocab-parallel policy statistics"
-                        )
-                    vocab_start = vocab_shard_start(
-                        global_vocab_size, vocab_parallel_group
-                    )
-                # The fused kernels would read an out-of-range label as "on another vocab shard".
-                torch._assert_async(
-                    torch.all(
-                        (labels[0] == IGNORE_INDEX)
-                        | ((labels[0] >= 0) & (labels[0] < global_vocab_size))
-                    ),
-                    f"labels must be {IGNORE_INDEX} or in [0, {global_vocab_size})",
+                # This rank's vocab rows: FSDP's sharded DTensor and the unsharded weight both
+                # report the full [V_local, D].
+                vocab_start = vocab_shard_start(
+                    labels[0],
+                    lm_head.weight.shape[0],
+                    vocab_parallel_group,
+                    self.loss_fn.global_vocab_size,
                 )
                 grad_state = TokenLogprobsGradState() if requires_grad else None
 
