@@ -17,8 +17,14 @@ import spmd_types as spmd
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
-import triton
-import triton.language as tl
+
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except ImportError:  # CPU-only installs (e.g. torch's CPU wheels); the fused path is then off.
+    _HAS_TRITON = False
 
 # Shape suffix legend:
 #   T = num tokens, D = model dimension, V = local vocab size
@@ -33,97 +39,100 @@ _M_LABEL_ENTRY = 2.0**15
 _ONE_MINUS_P_FLOOR = 2.0**-6
 
 
-@triton.jit
-def _partial_softmax_stats_kernel(
-    logits_ptr,
-    labels_ptr,
-    max_ptr,
-    sum_exp_ptr,
-    sum_exp_shifted_ptr,
-    label_logit_ptr,
-    vocab_size,
-    vocab_start,
-    stride_row,
-    BLOCK: tl.constexpr,
-):
-    """One pass over a row: max, sum(exp(x - max)), sum(exp(x - max) * (x - max)), x[label]."""
-    row = tl.program_id(0).to(tl.int64)
-    row_ptr = logits_ptr + row * stride_row
-    # Per-lane online softmax; lanes are combined once after the loop.
-    max_lanes = tl.full([BLOCK], -1e30, tl.float32)
-    sum_exp_lanes = tl.zeros([BLOCK], tl.float32)
-    sum_exp_shifted_lanes = tl.zeros([BLOCK], tl.float32)
-    for start in range(0, vocab_size, BLOCK):
-        offsets = start + tl.arange(0, BLOCK)
+if _HAS_TRITON:
+
+    @triton.jit  # pyrefly: ignore[unbound-name]
+    def _partial_softmax_stats_kernel(
+        logits_ptr,
+        labels_ptr,
+        max_ptr,
+        sum_exp_ptr,
+        sum_exp_shifted_ptr,
+        label_logit_ptr,
+        vocab_size,
+        vocab_start,
+        stride_row,
+        BLOCK: tl.constexpr,
+    ):
+        """One pass over a row: max, sum(exp(x - max)), sum(exp(x - max) * (x - max)), x[label]."""
+        row = tl.program_id(0).to(tl.int64)
+        row_ptr = logits_ptr + row * stride_row
+        # Per-lane online softmax; lanes are combined once after the loop.
+        max_lanes = tl.full([BLOCK], -1e30, tl.float32)
+        sum_exp_lanes = tl.zeros([BLOCK], tl.float32)
+        sum_exp_shifted_lanes = tl.zeros([BLOCK], tl.float32)
+        for start in range(0, vocab_size, BLOCK):
+            offsets = start + tl.arange(0, BLOCK)
+            logits = tl.load(
+                row_ptr + offsets, mask=offsets < vocab_size, other=float("-inf")
+            ).to(tl.float32)
+            new_max = tl.maximum(max_lanes, logits)
+            rescale = tl.exp(max_lanes - new_max)
+            exp_logits = tl.exp(logits - new_max)
+            # Re-center the old sum on the new max: x - new = (x - old) + (old - new). exp(-inf) * -inf
+            # is NaN, so masked and padded logits contribute 0.
+            sum_exp_shifted_lanes = rescale * (
+                sum_exp_shifted_lanes + (max_lanes - new_max) * sum_exp_lanes
+            ) + tl.where(exp_logits > 0, exp_logits * (logits - new_max), 0.0)
+            sum_exp_lanes = sum_exp_lanes * rescale + exp_logits
+            max_lanes = new_max
+        row_max = tl.max(max_lanes, 0)
+        lane_rescale = tl.exp(max_lanes - row_max)
+        tl.store(max_ptr + row, row_max)
+        tl.store(sum_exp_ptr + row, tl.sum(sum_exp_lanes * lane_rescale, 0))
+        lane_shift = (max_lanes - row_max) * sum_exp_lanes
+        tl.store(
+            sum_exp_shifted_ptr + row,
+            tl.sum((sum_exp_shifted_lanes + lane_shift) * lane_rescale, 0),
+        )
+        # 0 when the label is ignored (-100) or lives on another vocab shard, so shards can be summed.
+        local_label = tl.load(labels_ptr + row) - vocab_start
+        is_local = (local_label >= 0) & (local_label < vocab_size)
+        label_logit = tl.load(row_ptr + tl.where(is_local, local_label, 0)).to(
+            tl.float32
+        )
+        tl.store(label_logit_ptr + row, tl.where(is_local, label_logit, 0.0))
+
+    @triton.jit  # pyrefly: ignore[unbound-name]
+    def _dlogits_kernel(
+        logits_ptr,
+        labels_ptr,
+        row_max_ptr,
+        sum_exp_ptr,
+        row_scale_ptr,
+        dlogits_ptr,
+        vocab_size,
+        vocab_start,
+        stride_row,
+        stride_out,
+        IGNORE: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """dlogits[row] = (one_hot(label) - softmax(logits[row])) * row_scale[row].
+
+        0 for ignored labels.
+        """
+        row = tl.program_id(0).to(tl.int64)
+        offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < vocab_size
         logits = tl.load(
-            row_ptr + offsets, mask=offsets < vocab_size, other=float("-inf")
+            logits_ptr + row * stride_row + offsets, mask=mask, other=float("-inf")
         ).to(tl.float32)
-        new_max = tl.maximum(max_lanes, logits)
-        rescale = tl.exp(max_lanes - new_max)
-        exp_logits = tl.exp(logits - new_max)
-        # Re-center the old sum on the new max: x - new = (x - old) + (old - new). exp(-inf) * -inf
-        # is NaN, so masked and padded logits contribute 0.
-        sum_exp_shifted_lanes = rescale * (
-            sum_exp_shifted_lanes + (max_lanes - new_max) * sum_exp_lanes
-        ) + tl.where(exp_logits > 0, exp_logits * (logits - new_max), 0.0)
-        sum_exp_lanes = sum_exp_lanes * rescale + exp_logits
-        max_lanes = new_max
-    row_max = tl.max(max_lanes, 0)
-    lane_rescale = tl.exp(max_lanes - row_max)
-    tl.store(max_ptr + row, row_max)
-    tl.store(sum_exp_ptr + row, tl.sum(sum_exp_lanes * lane_rescale, 0))
-    lane_shift = (max_lanes - row_max) * sum_exp_lanes
-    tl.store(
-        sum_exp_shifted_ptr + row,
-        tl.sum((sum_exp_shifted_lanes + lane_shift) * lane_rescale, 0),
-    )
-    # 0 when the label is ignored (-100) or lives on another vocab shard, so shards can be summed.
-    local_label = tl.load(labels_ptr + row) - vocab_start
-    is_local = (local_label >= 0) & (local_label < vocab_size)
-    label_logit = tl.load(row_ptr + tl.where(is_local, local_label, 0)).to(tl.float32)
-    tl.store(label_logit_ptr + row, tl.where(is_local, label_logit, 0.0))
-
-
-@triton.jit
-def _dlogits_kernel(
-    logits_ptr,
-    labels_ptr,
-    row_max_ptr,
-    sum_exp_ptr,
-    row_scale_ptr,
-    dlogits_ptr,
-    vocab_size,
-    vocab_start,
-    stride_row,
-    stride_out,
-    IGNORE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """dlogits[row] = (one_hot(label) - softmax(logits[row])) * row_scale[row].
-
-    0 for ignored labels.
-    """
-    row = tl.program_id(0).to(tl.int64)
-    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < vocab_size
-    logits = tl.load(
-        logits_ptr + row * stride_row + offsets, mask=mask, other=float("-inf")
-    ).to(tl.float32)
-    row_max = tl.load(row_max_ptr + row)
-    inv_sum_exp = 1.0 / tl.load(sum_exp_ptr + row)
-    label = tl.load(labels_ptr + row)
-    scale = tl.load(row_scale_ptr + row)
-    one_hot = (offsets + vocab_start == label).to(tl.float32)
-    dlogits = tl.where(
-        label != IGNORE,
-        (one_hot - tl.exp(logits - row_max) * inv_sum_exp) * scale,
-        0.0,
-    )
-    tl.store(
-        dlogits_ptr + row * stride_out + offsets,
-        dlogits.to(dlogits_ptr.dtype.element_ty),
-        mask=mask,
-    )
+        row_max = tl.load(row_max_ptr + row)
+        inv_sum_exp = 1.0 / tl.load(sum_exp_ptr + row)
+        label = tl.load(labels_ptr + row)
+        scale = tl.load(row_scale_ptr + row)
+        one_hot = (offsets + vocab_start == label).to(tl.float32)
+        dlogits = tl.where(
+            label != IGNORE,
+            (one_hot - tl.exp(logits - row_max) * inv_sum_exp) * scale,
+            0.0,
+        )
+        tl.store(
+            dlogits_ptr + row * stride_out + offsets,
+            dlogits.to(dlogits_ptr.dtype.element_ty),
+            mask=mask,
+        )
 
 
 def _softmax_stats(
@@ -538,6 +547,8 @@ def can_use_token_logprobs_kernels(tensor: torch.Tensor) -> bool:
     Excludes DTensors, fake and functional tensors, and tracing (torch.compile, make_fx), where a
     raw kernel launch fails or is not recorded.
     """
+    if not _HAS_TRITON:
+        return False
     from torch._subclasses.fake_tensor import FakeTensor
     from torch._subclasses.functional_tensor import FunctionalTensor
     from torch.distributed.tensor import DTensor
