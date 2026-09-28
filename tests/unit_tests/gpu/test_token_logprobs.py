@@ -366,13 +366,17 @@ def test_confident_tokens_keep_accurate_logprob_and_gradient():
     labels = torch.randint(0, 1000, (64,), device="cuda", generator=generator)
     logits[torch.arange(64), labels] += 18.4
     logits.requires_grad_()
-    logprobs, _ = TokenLogprobsFromLogits.apply(logits, labels, 0, None)
+    logprobs, entropy = TokenLogprobsFromLogits.apply(logits, labels, 0, None)
     logprobs.sum().backward()
 
     logits_ref = logits.detach().double().requires_grad_()
-    logprobs_ref = logits_ref.log_softmax(-1).gather(1, labels[:, None]).squeeze(1)
+    log_softmax_ref = logits_ref.log_softmax(-1)
+    logprobs_ref = log_softmax_ref.gather(1, labels[:, None]).squeeze(1)
     logprobs_ref.sum().backward()
+    entropy_ref = -(log_softmax_ref.exp() * log_softmax_ref).sum(-1).detach()
     torch.testing.assert_close(logprobs.double(), logprobs_ref, atol=1e-6, rtol=0)
+    # Entropy ~2e-4 here; logsumexp - E[logits] would cancel at ulp(100).
+    torch.testing.assert_close(entropy.double(), entropy_ref, atol=1e-6, rtol=0)
     label_grad = logits.grad.gather(1, labels[:, None]).double()
     label_grad_ref = logits_ref.grad.gather(1, labels[:, None])
     torch.testing.assert_close(label_grad, label_grad_ref, atol=0, rtol=5e-2)
@@ -409,6 +413,40 @@ def test_token_logprobs_gradient_dynamic_range(case):
     rows = row_norm >= 1e-2 * row_norm.median()
     row_error = (weight.grad.double() - weight_ref.grad).norm(dim=1) / row_norm
     assert row_error[rows].max() < 1e-2
+
+
+def test_token_logprobs_cuda_graph_matches_eager():
+    # Under graph capture, grad_weight is unscaled on the device instead of by a host alpha.
+    hidden, weight, labels, _ = _inputs(num_tokens=256, dim=128, vocab=5003)
+    grad_logprobs = torch.randn(256, device="cuda") * 1e-5
+    hidden = hidden.clone().requires_grad_()
+    weight = weight.clone().requires_grad_()
+
+    def step():
+        grad_state = TokenLogprobsGradState()
+        for chunk, is_last in ((slice(0, 128), False), (slice(128, 256), True)):
+            logprobs, _ = TokenLogprobs.apply(
+                hidden[chunk], weight, labels[chunk], grad_state, is_last, 0, None
+            )
+            (logprobs * grad_logprobs[chunk]).sum().backward()
+
+    step()
+    eager_grads = hidden.grad.clone(), weight.grad.clone()
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        hidden.grad = weight.grad = None
+        step()
+    torch.cuda.current_stream().wait_stream(side_stream)
+    hidden.grad = weight.grad = None
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert _relative_error(hidden.grad, eager_grads[0]) < 1e-3
+    assert _relative_error(weight.grad, eager_grads[1]) < 1e-3
 
 
 def test_token_logprobs_fp32_weight_falls_back_to_fp32_matmuls():

@@ -27,7 +27,8 @@ IGNORE_INDEX = -100
 
 # M = one_hot - softmax is written as fp16 with one scale per row (g = dloss/dlogprob stays out,
 # so any loss scale fits). A row's max |M| is 1 - p(label), so 2^15 / (1 - p(label)) makes the
-# label's entry exactly 2^15, under fp16's 65504. The floor caps the scale for confident tokens.
+# label's entry exactly 2^15, under fp16's 65504. The floor caps the scale for confident tokens
+# (1 - p < 2^-6), whose label entry keeps fp32's rounding of 1 - p, as in log_softmax.
 _M_LABEL_ENTRY = 2.0**15
 _ONE_MINUS_P_FLOOR = 2.0**-6
 
@@ -38,20 +39,20 @@ def _partial_softmax_stats_kernel(
     labels_ptr,
     max_ptr,
     sum_exp_ptr,
-    sum_exp_logit_ptr,
+    sum_exp_shifted_ptr,
     label_logit_ptr,
     vocab_size,
     vocab_start,
     stride_row,
     BLOCK: tl.constexpr,
 ):
-    """One pass over a row: max, sum(exp(x - max)), sum(exp(x - max) * x), and x[label]."""
+    """One pass over a row: max, sum(exp(x - max)), sum(exp(x - max) * (x - max)), x[label]."""
     row = tl.program_id(0).to(tl.int64)
     row_ptr = logits_ptr + row * stride_row
     # Per-lane online softmax; lanes are combined once after the loop.
     max_lanes = tl.full([BLOCK], -1e30, tl.float32)
     sum_exp_lanes = tl.zeros([BLOCK], tl.float32)
-    sum_exp_logit_lanes = tl.zeros([BLOCK], tl.float32)
+    sum_exp_shifted_lanes = tl.zeros([BLOCK], tl.float32)
     for start in range(0, vocab_size, BLOCK):
         offsets = start + tl.arange(0, BLOCK)
         logits = tl.load(
@@ -60,17 +61,22 @@ def _partial_softmax_stats_kernel(
         new_max = tl.maximum(max_lanes, logits)
         rescale = tl.exp(max_lanes - new_max)
         exp_logits = tl.exp(logits - new_max)
+        # Re-center the old sum on the new max: x - new = (x - old) + (old - new). exp(-inf) * -inf
+        # is NaN, so masked and padded logits contribute 0.
+        sum_exp_shifted_lanes = rescale * (
+            sum_exp_shifted_lanes + (max_lanes - new_max) * sum_exp_lanes
+        ) + tl.where(exp_logits > 0, exp_logits * (logits - new_max), 0.0)
         sum_exp_lanes = sum_exp_lanes * rescale + exp_logits
-        # exp(-inf) * -inf is NaN; masked and padded logits contribute 0.
-        sum_exp_logit_lanes = sum_exp_logit_lanes * rescale + tl.where(
-            exp_logits > 0, exp_logits * logits, 0.0
-        )
         max_lanes = new_max
     row_max = tl.max(max_lanes, 0)
     lane_rescale = tl.exp(max_lanes - row_max)
     tl.store(max_ptr + row, row_max)
     tl.store(sum_exp_ptr + row, tl.sum(sum_exp_lanes * lane_rescale, 0))
-    tl.store(sum_exp_logit_ptr + row, tl.sum(sum_exp_logit_lanes * lane_rescale, 0))
+    lane_shift = (max_lanes - row_max) * sum_exp_lanes
+    tl.store(
+        sum_exp_shifted_ptr + row,
+        tl.sum((sum_exp_shifted_lanes + lane_shift) * lane_rescale, 0),
+    )
     # 0 when the label is ignored (-100) or lives on another vocab shard, so shards can be summed.
     local_label = tl.load(labels_ptr + row) - vocab_start
     is_local = (local_label >= 0) & (local_label < vocab_size)
@@ -125,24 +131,25 @@ def _softmax_stats(
     labels_T: torch.Tensor,
     vocab_start: int,
     vocab_parallel_group: dist.ProcessGroup | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return ``(row_max, sum_exp, label logprob, entropy)``, each ``[T]``, over the full vocab.
 
     ``softmax = exp(logits - row_max) / sum_exp``. The two stay apart because a single
     logsumexp rounds to ulp(row_max) (~2e-6 at logit 23), which swamps ``1 - p`` for confident
-    labels; the logprob is ``(label_logit - row_max) - log(sum_exp)`` for the same reason.
+    labels; the logprob is ``(label_logit - row_max) - log(sum_exp)`` and the entropy
+    ``log(sum_exp) - sum(exp(x - row_max) * (x - row_max)) / sum_exp`` for the same reason.
     """
     num_tokens, vocab_size = logits_TV.shape
     labels_T = labels_T.contiguous()
-    row_max, sum_exp, sum_exp_logit, label_logit = torch.empty(
+    row_max, sum_exp, sum_exp_shifted, label_logit = torch.empty(
         4, num_tokens, device=logits_TV.device, dtype=torch.float32
     )
-    _partial_softmax_stats_kernel[(num_tokens,)](
+    torch.library.wrap_triton(_partial_softmax_stats_kernel)[(num_tokens,)](
         logits_TV,
         labels_T,
         row_max,
         sum_exp,
-        sum_exp_logit,
+        sum_exp_shifted,
         label_logit,
         vocab_size,
         vocab_start,
@@ -158,8 +165,9 @@ def _softmax_stats(
             funcol.all_reduce(row_max, "max", group=vocab_parallel_group)
         )
         rescale = torch.exp(row_max - global_max)
-        sums = torch.stack([sum_exp * rescale, sum_exp_logit * rescale, label_logit])
-        sum_exp, sum_exp_logit, label_logit = funcol.wait_tensor(
+        shifted = sum_exp_shifted + (row_max - global_max) * sum_exp
+        sums = torch.stack([sum_exp * rescale, shifted * rescale, label_logit])
+        sum_exp, sum_exp_shifted, label_logit = funcol.wait_tensor(
             funcol.all_reduce(sums, "sum", group=vocab_parallel_group)
         )
         row_max = global_max
@@ -167,51 +175,52 @@ def _softmax_stats(
     logprobs = torch.where(
         labels_T != IGNORE_INDEX, (label_logit - row_max) - log_sum_exp, 0.0
     )
-    # H(p) = logsumexp - sum(p * logits)
-    entropy = row_max + log_sum_exp - sum_exp_logit / sum_exp
+    # H(p) = -sum(p * (x - row_max - log_sum_exp))
+    entropy = log_sum_exp - sum_exp_shifted / sum_exp
     return row_max, sum_exp, logprobs, entropy
 
 
 def _fp16_scale(absmax: torch.Tensor) -> torch.Tensor:
     """Power-of-two scale that moves ``absmax`` into [2^14, 2^15), the top of fp16's range.
 
-    Exact to undo, and values down to ~2^-29 of ``absmax`` stay fp16 normals. Exponents are
-    clamped to [-60, 60], so zero ``absmax`` gets a finite scale and a product or quotient of two
-    scales stays finite in fp32.
+    Exact to undo, and values down to ~2^-29 of ``absmax`` stay fp16 normals. Zero gives 2^15; the
+    clamp keeps a tiny nonzero ``absmax`` (below ~2^-85) from overflowing the scale.
 
     Example:
         absmax 139.0 (frexp exponent 8) -> scale 2^7, and 139 * 2^7 = 17792
     """
     _, exponent = torch.frexp(absmax.float())
-    return torch.exp2((15 - exponent).clamp(-60, 60).float())
+    return torch.exp2((15 - exponent).clamp(max=100).float())
 
 
 def _start_hidden_scale(
-    hidden_TD: torch.Tensor, grad_scale_T: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.cuda.Event | None]:
-    """Power-of-two scale for ``hidden * grad_scale``, and its pinned host copy in flight.
+    hidden_TD: torch.Tensor,
+    grad_scale_T: torch.Tensor,
+    grad_state: "TokenLogprobsGradState",
+) -> tuple[torch.Tensor, bool]:
+    """Power-of-two scale for ``hidden * grad_scale``; starts copying it to the host.
 
-    Called before the dlogits and grad_hidden work is queued, so waiting on the copy later does
-    not stall the GPU. Under CUDA graph capture there is no host copy.
+    Called before the grad_hidden GEMM is queued, so waiting on the copy later does not stall the
+    GPU. Returns ``(scale, copied)``; under CUDA graph capture nothing is copied.
     """
     hidden_absmax_T = torch.linalg.vector_norm(hidden_TD, ord=float("inf"), dim=1)
     hidden_scale = _fp16_scale((hidden_absmax_T.float() * grad_scale_T.abs()).amax())
     if torch.cuda.is_current_stream_capturing():
-        return hidden_scale, None, None
-    hidden_scale_host = torch.empty((), dtype=torch.float32, pin_memory=True)
-    hidden_scale_host.copy_(hidden_scale, non_blocking=True)
-    copied = torch.cuda.Event()
-    copied.record()
-    return hidden_scale, hidden_scale_host, copied
+        return hidden_scale, False
+    grad_state.hidden_scale_host.copy_(hidden_scale, non_blocking=True)
+    grad_state.hidden_scale_copied.record()
+    return hidden_scale, True
 
 
 class TokenLogprobsGradState:
     """Per-microbatch state shared by the chunks' backwards.
 
     The first chunk's forward fills ``weight_fp16`` from the weight it receives (unsharded
-    under FSDP), cast once for the fp16 backward GEMMs after scaling by ``weight_scale``. ``grad_weight`` accumulates the chunks'
-    weight gradients in fp32; the last chunk returns the sum to autograd in the weight's gradient
-    dtype (bf16, or fp32 with ``Tensor.grad_dtype``), so it is rounded at most once per microbatch.
+    under FSDP), scaled by ``weight_scale`` and cast once for the fp16 backward GEMMs.
+    ``grad_weight`` accumulates the chunks' weight gradients in fp32; the last chunk returns the
+    sum to autograd in the weight's gradient dtype (bf16, or fp32 with ``Tensor.grad_dtype``), so
+    it is rounded at most once per microbatch. Each chunk's grad_weight unscale reaches the host
+    through the pinned ``hidden_scale_host``.
 
     Not a dataclass: FSDP's forward-input cast copies dataclass arguments (casting their
     tensors to the param dtype), which would give each chunk its own accumulator.
@@ -221,13 +230,16 @@ class TokenLogprobsGradState:
         self.weight_fp16: torch.Tensor | None = None
         self.weight_scale: torch.Tensor | None = None
         self.grad_weight: torch.Tensor | None = None
+        self.hidden_scale_host = torch.empty((), dtype=torch.float32, pin_memory=True)
+        self.hidden_scale_copied = torch.cuda.Event()
 
 
 class TokenLogprobs(torch.autograd.Function):
     """``(hidden [T, D], weight [V, D], labels [T]) -> (logprobs [T], entropy [T])``.
 
     Forward: ``logits = hidden @ weight.T`` as a bf16 GEMM with fp32 output (the same op as
-    ``Fp32OutputLinear``), then one Triton pass for logsumexp, the label logit and entropy.
+    ``Fp32OutputLinear``), then one Triton pass for the softmax statistics (row max, sum of
+    exps), the label logit and entropy.
 
     Backward, with ``g = dloss/dlogprobs`` and ``M = (one_hot - softmax)``:
 
@@ -241,7 +253,7 @@ class TokenLogprobs(torch.autograd.Function):
     bf16 (hi + lo, which ``Fp32OutputLinear`` uses, lands within ~0.5% with twice the GEMMs).
     ``g`` must stay out of the fp16 operands: a loss normalized by 1e5 tokens makes ``g * M``
     fp16 subnormal. So each row of ``M`` gets its own scale (its max, the label's entry, becomes
-    exactly 2^15), ``g`` scales the fp32 output rows of ``grad_hidden``, and ``g * hidden``
+    exactly 2^15 unless 1 - p < 2^-6), ``g`` scales the fp32 output rows of ``grad_hidden``, and ``g * hidden``
     gets a power-of-two scale that puts its largest element at the top of fp16's range, which
     keeps tokens down to ~1e-9 of the largest ``|g|`` as fp16 normals. ``W`` is scaled the same
     way once per microbatch, so small-init heads do not go subnormal.
@@ -304,8 +316,10 @@ class TokenLogprobs(torch.autograd.Function):
         row_max_T, sum_exp_T, logprobs_T, entropy_T = _softmax_stats(
             logits_TV, labels_T, vocab_start, vocab_parallel_group
         )
+        one_minus_p_T = -torch.expm1(logprobs_T)
+        m_row_scale_T = _M_LABEL_ENTRY / one_minus_p_T.clamp_min(_ONE_MINUS_P_FLOOR)
         ctx.save_for_backward(
-            hidden_TD, weight_VD, labels_T, row_max_T, sum_exp_T, logprobs_T
+            hidden_TD, weight_VD, labels_T, row_max_T, sum_exp_T, m_row_scale_T
         )
         # Kept off save_for_backward so backward can free the [T, V] fp32 logits before its GEMMs.
         ctx.logits_TV = logits_TV
@@ -330,7 +344,7 @@ class TokenLogprobs(torch.autograd.Function):
             labels_T,
             row_max_T,
             sum_exp_T,
-            logprobs_T,
+            m_row_scale_T,
         ) = ctx.saved_tensors
         logits_TV, ctx.logits_TV = ctx.logits_TV, None
         grad_state = ctx.grad_state
@@ -338,19 +352,8 @@ class TokenLogprobs(torch.autograd.Function):
         num_tokens, vocab_size = logits_TV.shape
         grad_T = grad_logprobs_T.float().contiguous()
 
-        # bf16 path: M = (one_hot - softmax) * row_scale in fp16, with g applied outside the GEMMs.
-        # Fallback: dlogits = g * (one_hot - softmax) in fp32.
-        if ctx.use_bf16_gemm:
-            one_minus_p_T = -torch.expm1(logprobs_T)
-            row_scale_T = _M_LABEL_ENTRY / one_minus_p_T.clamp_min(_ONE_MINUS_P_FLOOR)
-            # Per-token factor that undoes M's row scale and applies g.
-            grad_scale_T = grad_T / row_scale_T
-            if ctx.needs_input_grad[1]:
-                hidden_scale, hidden_scale_host, scale_copied = _start_hidden_scale(
-                    hidden_TD, grad_scale_T
-                )
-        else:
-            row_scale_T = grad_T
+        # bf16 path: M = (one_hot - softmax) * m_row_scale in fp16, with g applied outside the
+        # GEMMs. Fallback: dlogits = g * (one_hot - softmax) in fp32.
         dlogits_TV = torch.empty(
             num_tokens,
             vocab_size,
@@ -358,12 +361,14 @@ class TokenLogprobs(torch.autograd.Function):
             dtype=torch.float16 if ctx.use_bf16_gemm else torch.float32,
         )
         block = 4096
-        _dlogits_kernel[(num_tokens, triton.cdiv(vocab_size, block))](
+        torch.library.wrap_triton(_dlogits_kernel)[
+            (num_tokens, triton.cdiv(vocab_size, block))
+        ](
             logits_TV,
             labels_T,
             row_max_T,
             sum_exp_T,
-            row_scale_T,
+            m_row_scale_T if ctx.use_bf16_gemm else grad_T,
             dlogits_TV,
             vocab_size,
             ctx.vocab_start,
@@ -390,6 +395,11 @@ class TokenLogprobs(torch.autograd.Function):
                 grad_state.grad_weight = None
             return grad_hidden_TD, out, None, None, None, None, None
 
+        # Per-token factor that undoes M's row scale and applies g.
+        grad_scale_T = grad_T / m_row_scale_T
+        hidden_scale, scale_copied = _start_hidden_scale(
+            hidden_TD, grad_scale_T, grad_state
+        )
         grad_hidden_TD = torch.mm(
             dlogits_TV, grad_state.weight_fp16, out_dtype=torch.float32
         )
@@ -409,7 +419,7 @@ class TokenLogprobs(torch.autograd.Function):
         # Accumulate this chunk's gradient into the fp32 accumulator. The unscale 1 / hidden_scale
         # is a host alpha, so cuBLAS computes alpha * M.T @ hidden + acc in one pass.
         accumulated = grad_state.grad_weight
-        if hidden_scale_host is None:
+        if not scale_copied:
             # Graph capture cannot wait on the host: unscale on the device instead.
             grad_weight_VD = torch.mm(
                 dlogits_TV.T, scaled_hidden_TD, out_dtype=torch.float32
@@ -426,13 +436,13 @@ class TokenLogprobs(torch.autograd.Function):
                     torch.empty_like(weight_VD, dtype=torch.float32),
                     0.0,
                 )
-            scale_copied.synchronize()
+            grad_state.hidden_scale_copied.synchronize()
             torch.addmm(
                 accumulated,
                 dlogits_TV.T,
                 scaled_hidden_TD,
                 beta=beta,
-                alpha=1.0 / hidden_scale_host.item(),
+                alpha=1.0 / grad_state.hidden_scale_host.item(),
                 out_dtype=torch.float32,
                 out=accumulated,
             )
@@ -442,7 +452,7 @@ class TokenLogprobs(torch.autograd.Function):
         # A no-op for fp32 gradients. Dropping the state's references lets autograd take the
         # buffer without a copy.
         out = accumulated.to(ctx.grad_weight_dtype)
-        grad_state.grad_weight = grad_state.weight_fp16 = None
+        grad_state.grad_weight = grad_state.weight_fp16 = grad_state.weight_scale = None
         return grad_hidden_TD, out, None, None, None, None, None
 
 
@@ -502,7 +512,9 @@ class TokenLogprobsFromLogits(torch.autograd.Function):
         num_tokens, vocab_size = logits_TV.shape
         dlogits_TV = torch.empty_like(logits_TV)
         block = 4096
-        _dlogits_kernel[(num_tokens, triton.cdiv(vocab_size, block))](
+        torch.library.wrap_triton(_dlogits_kernel)[
+            (num_tokens, triton.cdiv(vocab_size, block))
+        ](
             logits_TV,
             labels_T,
             row_max_T,

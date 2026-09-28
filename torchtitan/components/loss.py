@@ -61,7 +61,7 @@ def cross_entropy_loss(
         and can_use_token_logprobs_kernels(pred)
         and not is_in_batch_invariant_mode()
     ):
-        nll = -compute_logprobs(
+        nll = -compute_logprobs(  # pyrefly: ignore[unsupported-operation]
             pred,
             labels,
             vocab_parallel_group=spmd_mesh_group("tp"),
@@ -713,7 +713,8 @@ class ChunkedLossWrapper(BaseLoss):
         """
         lm_head = self.lm_head
         return (
-            isinstance(self.loss_fn, TokenLogprobLoss)
+            lm_head is not None
+            and isinstance(self.loss_fn, TokenLogprobLoss)
             # A subclass that overrides __call__ (e.g. to add a term) must keep the logits path.
             and type(self.loss_fn).__call__
             in (TokenLogprobLoss.__call__, CrossEntropyLoss.__call__)
@@ -740,7 +741,9 @@ class ChunkedLossWrapper(BaseLoss):
             T = 64k, num_chunks = 8 (8192-token chunks), 9800 loss tokens
             -> 9856 indices (the 9800 loss tokens first, then 56 skipped ones), 2 chunks of 4928
         """
-        token_mask = self.loss_fn.loss_token_mask(labels, **loss_inputs)
+        token_mask = self.loss_fn.loss_token_mask(  # pyrefly: ignore[missing-attribute]
+            labels, **loss_inputs
+        )
         # The count below is a host sync, which CUDA graph capture does not allow.
         if token_mask is None or (
             token_mask.is_cuda and torch.cuda.is_current_stream_capturing()
@@ -898,15 +901,17 @@ class ChunkedLossWrapper(BaseLoss):
                 with spmd.no_typecheck():
                     lm_head.unshard()
 
+            vocab_parallel_group, vocab_start, grad_state = None, 0, None
             if use_token_logprobs:
                 vocab_parallel_group = spmd_mesh_group("tp")
                 # This rank's vocab rows: FSDP's sharded DTensor and the unsharded weight both
                 # report the full [V_local, D].
                 vocab_start = vocab_shard_start(
                     labels[0],
+                    # pyrefly: ignore[bad-index, bad-argument-type]
                     lm_head.weight.shape[0],
                     vocab_parallel_group,
-                    self.loss_fn.global_vocab_size,
+                    self.loss_fn.global_vocab_size,  # pyrefly: ignore[missing-attribute]
                 )
                 grad_state = TokenLogprobsGradState() if requires_grad else None
 
@@ -927,6 +932,7 @@ class ChunkedLossWrapper(BaseLoss):
                     for key, chunks in input_chunks.items()
                 }
                 if use_token_logprobs:
+                    # pyrefly: ignore[not-callable]
                     logprobs, entropy = lm_head.token_logprobs(
                         h_chunks[0],
                         label_chunks[0],
@@ -936,6 +942,7 @@ class ChunkedLossWrapper(BaseLoss):
                         vocab_start=vocab_start,
                         vocab_parallel_group=vocab_parallel_group,
                     )
+                    # pyrefly: ignore[missing-attribute]
                     chunk_loss, chunk_metrics = self.loss_fn.loss_from_logprobs(
                         logprobs, entropy, global_valid_tokens, **loss_inputs
                     )
