@@ -31,6 +31,7 @@ from torchtitan.models.common.attention import (
     BaseAttention,
     create_varlen_metadata_for_document,
     FlexInnerAttention,
+    get_shared_prefix_starts,
     HybridAttentionMetadata,
     VarlenInnerAttention,
 )
@@ -51,7 +52,7 @@ from torchtitan.models.utils import (
 )
 from torchtitan.protocols.module import Module
 
-from .gdn import GatedDeltaNet
+from .gdn import create_deltanet_shared_prefix_metadata, GatedDeltaNet
 from .rope import MRoPE
 from .sharding import annotate_deltanet_cu_seqlens, set_qwen35_sharding_config
 from .state_dict_adapter import Qwen35StateDictAdapter
@@ -324,8 +325,17 @@ class Qwen35Model(MultimodalModel):
 
         @property
         def reads_shared_prefixes(self) -> bool:
-            """Qwen3.5 builds its masks from a document-start marker, not positions."""
-            return False
+            """Varlen attention gathers the shared prefix; Gated DeltaNet continues its state."""
+            return all(
+                layer.delta_net is not None
+                or (
+                    layer.attention is not None
+                    and isinstance(
+                        layer.attention.inner_attention, VarlenInnerAttention.Config
+                    )
+                )
+                for layer in self.layers
+            )
 
         def update_from_config(
             self,
@@ -523,6 +533,34 @@ class Qwen35Model(MultimodalModel):
         max_context_length: int | None = None,
     ) -> HybridAttentionMetadata:
         attn_config = self.config.first_attention
+
+        # Segments that share a packed prefix (`Batcher.Config.share_prompt`):
+        # attention gathers the prefix's keys, and GDN continues the prefix's state.
+        # Fixed-shape (CUDA-graph) metadata can't hold them; skip the `.any()` sync.
+        if max_num_documents is None and get_shared_prefix_starts(positions).any():
+            delta_net = next(
+                (
+                    layer.delta_net
+                    for layer in self.config.layers
+                    if layer.delta_net is not None
+                ),
+                None,
+            )
+            # pyrefly: ignore [bad-return]
+            return {
+                "quadratic_attention": create_varlen_metadata_for_document(
+                    positions,
+                    padding_mask=padding_mask,
+                    allow_shared_prefixes=True,
+                ),
+                "deltanet": (
+                    None
+                    if delta_net is None
+                    else create_deltanet_shared_prefix_metadata(
+                        positions, conv_kernel_size=delta_net.conv_kernel_size
+                    )
+                ),
+            }
 
         # Multimodal padding uses position 0 for every padded token. A real
         # document start is position 0 followed by position 1; keep index 0 as

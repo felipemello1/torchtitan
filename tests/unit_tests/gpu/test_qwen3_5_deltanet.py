@@ -103,11 +103,14 @@ def _reference_causal_conv1d_varlen(
     x_TD: torch.Tensor,
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    *,
+    initial_state: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-document depthwise causal conv + silu, matching the model's Attention
     Gym varlen conv (which is CUDA-only). Patched over
     ``gdn._causal_conv1d_varlen`` for CPU runs.
     """
+    assert initial_state is None, "shared prompts are covered by the fused tests"
     conv_kernel_size = weight.shape[-1]
     out_segments_BTD: list[torch.Tensor] = []
     cu_seqlens_list = cu_seqlens.tolist()
@@ -144,7 +147,9 @@ class ReferenceGatedDeltaKernel(nn.Module):
         beta_TH: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None = None,
+        shared_prefix: None = None,
     ) -> torch.Tensor:
+        assert shared_prefix is None, "shared prompts are covered by the fused tests"
         if xq_THK.shape[1] != xv_THV.shape[1]:
             assert xv_THV.shape[1] % xq_THK.shape[1] == 0
             repeat = xv_THV.shape[1] // xq_THK.shape[1]
@@ -582,6 +587,113 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         for parameter in model.parameters():
             self.assertIsNotNone(parameter.grad)
             self.assertTrue(torch.isfinite(parameter.grad).all())
+
+    def test_get_attention_masks_builds_shared_prefix_metadata(self):
+        try:
+            from torchtitan.models.qwen3_5 import qwen3_5_configs
+            from torchtitan.models.qwen3_5.gdn import DeltaNetSharedPrefixMetadata
+        except ModuleNotFoundError as exc:
+            raise unittest.SkipTest(
+                f"Qwen3.5 optional dependency unavailable: {exc.name}"
+            ) from exc
+
+        with torch.device("meta"):
+            build_config, max_context_length = qwen3_5_configs["debugmodel"]
+            config = build_config("varlen", enable_sp=True, seq_len=max_context_length)
+            model = config.build()
+        # Prompt [P0, P1] with completions [A0, A1] and [B0], then document [D0, D1].
+        attention_masks = model.get_attention_masks(torch.tensor([0, 1, 2, 3, 2, 0, 1]))
+
+        self.assertTrue(config.reads_shared_prefixes)
+        self.assertEqual(
+            attention_masks["quadratic_attention"].kv_indices.tolist(),
+            [0, 1, 2, 3, 0, 1, 4, 5, 6],
+        )
+        self.assertIsInstance(attention_masks["deltanet"], DeltaNetSharedPrefixMetadata)
+        self.assertEqual(
+            attention_masks["deltanet"].permutation.tolist(), [0, 1, 5, 6, 2, 3, 4]
+        )
+
+    def test_shared_prompt_metadata_orders_roots_before_completions(self):
+        try:
+            from torchtitan.models.qwen3_5.gdn import (
+                create_deltanet_shared_prefix_metadata,
+            )
+        except ModuleNotFoundError as exc:
+            raise unittest.SkipTest(
+                f"Qwen3.5 optional dependency unavailable: {exc.name}"
+            ) from exc
+
+        # Rows P0 P1 A0 A1 B0 D0 D1: prompt [P0, P1] with completions [A0, A1]
+        # and [B0], then document [D0, D1].
+        metadata = create_deltanet_shared_prefix_metadata(
+            torch.tensor([0, 1, 2, 3, 2, 0, 1]), conv_kernel_size=2
+        )
+
+        self.assertEqual(metadata.permutation.tolist(), [0, 1, 5, 6, 2, 3, 4])
+        self.assertEqual(metadata.cu_seqlens.tolist(), [0, 2, 4, 6, 7])
+        self.assertEqual((metadata.num_roots, metadata.num_root_tokens), (2, 4))
+        self.assertEqual(metadata.completion_roots.tolist(), [0, 0])
+        self.assertEqual(metadata.completion_conv_rows.tolist(), [[1], [1]])
+
+    def test_fused_shared_prompt_matches_independent_sample_forwards(self):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is unavailable")
+        from torchtitan.models.qwen3_5.gdn import create_deltanet_shared_prefix_metadata
+
+        torch.manual_seed(42)
+        model = self._make_deltanet(
+            use_fused=True,
+            dim=256,
+            key_head_dim=128,
+            value_head_dim=128,
+            num_key_heads=1,
+            num_value_heads=2,
+            conv_kernel_size=4,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        # A 70-token prompt shared by completions of 40, 1, and 90 tokens, then an
+        # unshared 30-token document. The 1-token completion starts one row after
+        # the prompt's state is handed over.
+        prompt_len, completion_lens, document_len = 70, [40, 1, 90], 30
+        positions = list(range(prompt_len + completion_lens[0]))
+        for completion_len in completion_lens[1:]:
+            positions += range(prompt_len, prompt_len + completion_len)
+        positions += range(document_len)
+        num_tokens = len(positions)
+        x_TD = torch.randn(num_tokens, 256, device="cuda", dtype=torch.bfloat16)
+        shared_x_TD = x_TD.clone().requires_grad_()
+        x_TD.requires_grad_()
+
+        metadata = create_deltanet_shared_prefix_metadata(
+            torch.tensor(positions, device="cuda"), conv_kernel_size=4
+        )
+        actual = model(shared_x_TD, metadata)
+
+        # Reference: each [prompt, completion] and the document on their own.
+        expected = torch.empty_like(actual)
+        start = prompt_len
+        for completion_len in completion_lens:
+            rows = torch.cat(
+                [
+                    torch.arange(prompt_len),
+                    torch.arange(start, start + completion_len),
+                ]
+            ).cuda()
+            out = model(x_TD[rows])
+            expected[start : start + completion_len] = out[prompt_len:]
+            if start == prompt_len:
+                expected[:prompt_len] = out[:prompt_len]
+            start += completion_len
+        expected[start:] = model(x_TD[start:])
+
+        # BF16 tolerance absorbs the recurrence restarting at the prompt boundary.
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        # The prompt's gradient sums over every completion that continued it.
+        actual.float().square().mean().backward()
+        expected.float().square().mean().backward()
+        torch.testing.assert_close(shared_x_TD.grad, x_TD.grad, atol=2e-2, rtol=2e-2)
 
     def test_fused_varlen_matches_independent_document_forwards(self):
         # BF16 tolerance absorbs differing packed and per-document chunk boundaries.

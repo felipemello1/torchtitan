@@ -33,6 +33,7 @@ from attn_gym.linear import (
 )
 
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
+from torchtitan.models.qwen3_5.gdn import DeltaNetSharedPrefixMetadata
 from torchtitan.protocols.module import Module
 from torchtitan.rl.model.gdn_backend import (
     GDNExecutionPath,
@@ -364,10 +365,13 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         key_head_dim: int,
         value_head_dim: int,
         use_varlen_kernels: bool = False,
+        shared_prefix: DeltaNetSharedPrefixMetadata | None = None,
     ) -> torch.Tensor:
         """Run the flattened vLLM cache operation on rank-local tensors."""
         assert key_head_dim == self.head_k_dim
         assert value_head_dim == self.head_v_dim
+        # Shared prefixes are a trainer packing layout; generation never builds one.
+        assert shared_prefix is None
         mixed_qkv_TC = torch.cat([query_TC, key_TC, value_TC], dim=-1)
         conv_weight_CW = torch.cat(
             [conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W],
