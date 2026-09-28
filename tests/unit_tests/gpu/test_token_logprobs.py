@@ -408,3 +408,15 @@ def test_chunked_loss_keeps_logits_path_for_overridden_call():
     assert wrapper._uses_token_logprobs(hidden, is_multi_output=False)
     wrapper.loss_fn = _WeightedCrossEntropy(CrossEntropyLoss.Config())
     assert not wrapper._uses_token_logprobs(hidden, is_multi_output=False)
+
+
+def test_cross_entropy_loss_soft_targets_keep_f_cross_entropy():
+    from torchtitan.components.loss import cross_entropy_loss
+
+    # [T, V] class-probability targets are an F.cross_entropy feature, not a label index.
+    logits = torch.randn(8, 8, device="cuda")
+    targets = torch.randn(8, 8, device="cuda").softmax(-1)
+    torch.testing.assert_close(
+        cross_entropy_loss(logits, targets),
+        F.cross_entropy(logits, targets, reduction="sum"),
+    )

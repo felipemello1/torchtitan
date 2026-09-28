@@ -55,6 +55,9 @@ def cross_entropy_loss(
     # as the compiled F.cross_entropy. Under torch.compile, inductor fuses F.cross_entropy itself.
     if (
         pred.dim() == 2
+        # Class-index labels; F.cross_entropy also takes [T, V] class probabilities.
+        and labels.dim() == 1
+        and not labels.is_floating_point()
         and can_use_token_logprobs_kernels(pred)
         and not is_in_batch_invariant_mode()
     ):
@@ -493,6 +496,8 @@ def compute_logprobs(
     """
     if (
         logits.dim() == 2
+        and labels.dim() == 1
+        and not labels.is_floating_point()
         and can_use_token_logprobs_kernels(logits)
         and not is_in_batch_invariant_mode()
     ):
