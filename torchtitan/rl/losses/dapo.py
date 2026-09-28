@@ -61,6 +61,10 @@ class DAPOLoss(TokenLogprobLoss):
         """Full vocabulary size from the model spec, set when building RL configs.
         Leave unset for batch-invariant mode to retain the full-gather path."""
 
+        temperature: float = 1.0
+        """Trainer logprobs are of ``softmax(logits / temperature)``. Must equal the sampling
+        temperature when the generator returns tempered logprobs (``logprobs_mode``)."""
+
     def __init__(
         self,
         config: Config,
@@ -71,6 +75,7 @@ class DAPOLoss(TokenLogprobLoss):
         self.ratio_clip_low = config.ratio_clip_low
         self.ratio_clip_high = config.ratio_clip_high
         self.global_vocab_size = config.global_vocab_size
+        self.temperature = config.temperature
 
     def loss_token_mask(
         self, labels: torch.Tensor, *, loss_mask: torch.Tensor, **loss_inputs

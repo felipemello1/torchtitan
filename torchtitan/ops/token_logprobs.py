@@ -53,9 +53,11 @@ if _HAS_TRITON:
         vocab_size,
         vocab_start,
         stride_row,
+        inv_temperature,
         BLOCK: tl.constexpr,
     ):
-        """One pass over a row: max, sum(exp(x - max)), sum(exp(x - max) * (x - max)), x[label]."""
+        """One pass over x = logits[row] / temperature: max, sum(exp(x - max)),
+        sum(exp(x - max) * (x - max)), and x[label]."""
         row = tl.program_id(0).to(tl.int64)
         row_ptr = logits_ptr + row * stride_row
         # Per-lane online softmax; lanes are combined once after the loop.
@@ -64,9 +66,12 @@ if _HAS_TRITON:
         sum_exp_shifted_lanes = tl.zeros([BLOCK], tl.float32)
         for start in range(0, vocab_size, BLOCK):
             offsets = start + tl.arange(0, BLOCK)
-            logits = tl.load(
-                row_ptr + offsets, mask=offsets < vocab_size, other=float("-inf")
-            ).to(tl.float32)
+            logits = (
+                tl.load(
+                    row_ptr + offsets, mask=offsets < vocab_size, other=float("-inf")
+                ).to(tl.float32)
+                * inv_temperature
+            )
             new_max = tl.maximum(max_lanes, logits)
             rescale = tl.exp(max_lanes - new_max)
             exp_logits = tl.exp(logits - new_max)
@@ -92,6 +97,7 @@ if _HAS_TRITON:
         label_logit = tl.load(row_ptr + tl.where(is_local, local_label, 0)).to(
             tl.float32
         )
+        label_logit = label_logit * inv_temperature
         tl.store(label_logit_ptr + row, tl.where(is_local, label_logit, 0.0))
 
     @triton.jit  # pyrefly: ignore[unbound-name]
@@ -106,19 +112,23 @@ if _HAS_TRITON:
         vocab_start,
         stride_row,
         stride_out,
+        inv_temperature,
         IGNORE: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        """dlogits[row] = (one_hot(label) - softmax(logits[row])) * row_scale[row].
+        """dlogits[row] = (one_hot(label) - softmax(logits[row] / temperature)) * row_scale[row].
 
         0 for ignored labels.
         """
         row = tl.program_id(0).to(tl.int64)
         offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         mask = offsets < vocab_size
-        logits = tl.load(
-            logits_ptr + row * stride_row + offsets, mask=mask, other=float("-inf")
-        ).to(tl.float32)
+        logits = (
+            tl.load(
+                logits_ptr + row * stride_row + offsets, mask=mask, other=float("-inf")
+            ).to(tl.float32)
+            * inv_temperature
+        )
         row_max = tl.load(row_max_ptr + row)
         inv_sum_exp = 1.0 / tl.load(sum_exp_ptr + row)
         label = tl.load(labels_ptr + row)
@@ -141,8 +151,10 @@ def _softmax_stats(
     labels_T: torch.Tensor,
     vocab_start: int,
     vocab_parallel_group: dist.ProcessGroup | None,
+    inv_temperature: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return ``(row_max, sum_exp, label logprob, entropy)``, each ``[T]``, over the full vocab.
+    """Return ``(row_max, sum_exp, label logprob, entropy)`` of ``softmax(logits / temperature)``,
+    each ``[T]``, over the full vocab.
 
     ``softmax = exp(logits - row_max) / sum_exp``. The two stay apart because a single
     logsumexp rounds to ulp(row_max) (~2e-6 at logit 23), which swamps ``1 - p`` for confident
@@ -164,6 +176,7 @@ def _softmax_stats(
         vocab_size,
         vocab_start,
         logits_TV.stride(0),
+        inv_temperature,
         BLOCK=2048,
         num_warps=8,
     )
@@ -292,6 +305,7 @@ class TokenLogprobs(torch.autograd.Function):
         return_grad_weight: bool,
         vocab_start: int,
         vocab_parallel_group: dist.ProcessGroup | None,
+        inv_temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Slow fallback for non-bf16 operands (e.g. an fp32 weight under autocast): fp32 matmuls,
         # as in Fp32OutputLinear.
@@ -309,7 +323,7 @@ class TokenLogprobs(torch.autograd.Function):
             logits_TV = torch.mm(hidden_TD.float(), weight_VD.float().T)
         labels_T = labels_T.contiguous()
         row_max_T, sum_exp_T, logprobs_T, entropy_T = _softmax_stats(
-            logits_TV, labels_T, vocab_start, vocab_parallel_group
+            logits_TV, labels_T, vocab_start, vocab_parallel_group, inv_temperature
         )
         one_minus_p_T = -torch.expm1(logprobs_T)
         m_row_scale_T = _M_LABEL_ENTRY / one_minus_p_T.clamp_min(_ONE_MINUS_P_FLOOR)
@@ -321,6 +335,7 @@ class TokenLogprobs(torch.autograd.Function):
         ctx.grad_state = grad_state
         ctx.return_grad_weight = return_grad_weight
         ctx.vocab_start = vocab_start
+        ctx.inv_temperature = inv_temperature
         # fp32 when FSDP's unsharded weight accumulates fp32 gradients (Tensor.grad_dtype, which
         # only leaf tensors have).
         grad_dtype = weight_VD.grad_dtype if weight_VD.is_leaf else None
@@ -363,12 +378,13 @@ class TokenLogprobs(torch.autograd.Function):
             labels_T,
             row_max_T,
             sum_exp_T,
-            m_row_scale_T if ctx.use_bf16_gemm else grad_T,
+            m_row_scale_T if ctx.use_bf16_gemm else grad_T * ctx.inv_temperature,
             dlogits_TV,
             vocab_size,
             ctx.vocab_start,
             logits_TV.stride(0),
             dlogits_TV.stride(0),
+            ctx.inv_temperature,
             IGNORE=IGNORE_INDEX,
             BLOCK=block,
             num_warps=8,
@@ -378,7 +394,7 @@ class TokenLogprobs(torch.autograd.Function):
         if not ctx.use_bf16_gemm:
             grad_hidden_TD = torch.mm(dlogits_TV, weight_VD.float()).to(hidden_TD.dtype)
             if not ctx.needs_input_grad[1]:
-                return grad_hidden_TD, None, None, None, None, None, None
+                return grad_hidden_TD, None, None, None, None, None, None, None
             grad_weight_VD = torch.mm(dlogits_TV.T, hidden_TD.float())
             if grad_state.grad_weight is None:
                 grad_state.grad_weight = grad_weight_VD
@@ -388,10 +404,10 @@ class TokenLogprobs(torch.autograd.Function):
             if ctx.return_grad_weight:
                 out = grad_state.grad_weight.to(ctx.grad_weight_dtype)
                 grad_state.grad_weight = None
-            return grad_hidden_TD, out, None, None, None, None, None
+            return grad_hidden_TD, out, None, None, None, None, None, None
 
-        # Per-token factor that undoes M's row scale and applies g.
-        grad_scale_T = grad_T / m_row_scale_T
+        # Per-token factor that undoes M's row scale and applies g and d(logits / T)/d(logits).
+        grad_scale_T = grad_T * ctx.inv_temperature / m_row_scale_T
         hidden_scale, scale_copied = _start_hidden_scale(
             hidden_TD, grad_scale_T, grad_state
         )
@@ -404,7 +420,7 @@ class TokenLogprobs(torch.autograd.Function):
         grad_hidden_TD = grad_hidden_TD.to(hidden_TD.dtype)
         # A frozen lm_head (e.g. LoRA on the decoder) skips the dW GEMM and its accumulator.
         if not ctx.needs_input_grad[1]:
-            return grad_hidden_TD, None, None, None, None, None, None
+            return grad_hidden_TD, None, None, None, None, None, None, None
 
         scaled_hidden_TD = scale_cast(
             hidden_TD, grad_scale_T * hidden_scale, torch.float16
@@ -441,12 +457,12 @@ class TokenLogprobs(torch.autograd.Function):
             )
         grad_state.grad_weight = accumulated
         if not ctx.return_grad_weight:
-            return grad_hidden_TD, None, None, None, None, None, None
+            return grad_hidden_TD, None, None, None, None, None, None, None
         # A no-op for fp32 gradients. Dropping the state's references lets autograd take the
         # buffer without a copy.
         out = accumulated.to(ctx.grad_weight_dtype)
         grad_state.grad_weight = grad_state.weight_fp16 = grad_state.weight_scale = None
-        return grad_hidden_TD, out, None, None, None, None, None
+        return grad_hidden_TD, out, None, None, None, None, None, None
 
 
 class TokenLogprobsFromLogits(torch.autograd.Function):
@@ -487,13 +503,15 @@ class TokenLogprobsFromLogits(torch.autograd.Function):
         labels_T: torch.Tensor,
         vocab_start: int,
         vocab_parallel_group: dist.ProcessGroup | None,
+        inv_temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         logits_TV, labels_T = logits_TV.contiguous(), labels_T.contiguous()
         row_max_T, sum_exp_T, logprobs_T, entropy_T = _softmax_stats(
-            logits_TV, labels_T, vocab_start, vocab_parallel_group
+            logits_TV, labels_T, vocab_start, vocab_parallel_group, inv_temperature
         )
         ctx.save_for_backward(logits_TV, labels_T, row_max_T, sum_exp_T)
         ctx.vocab_start = vocab_start
+        ctx.inv_temperature = inv_temperature
         ctx.mark_non_differentiable(entropy_T)
         ctx.set_materialize_grads(False)
         return logprobs_T, entropy_T
@@ -513,17 +531,18 @@ class TokenLogprobsFromLogits(torch.autograd.Function):
             labels_T,
             row_max_T,
             sum_exp_T,
-            grad_logprobs_T.float().contiguous(),
+            grad_logprobs_T.float().contiguous() * ctx.inv_temperature,
             dlogits_TV,
             vocab_size,
             ctx.vocab_start,
             logits_TV.stride(0),
             dlogits_TV.stride(0),
+            ctx.inv_temperature,
             IGNORE=IGNORE_INDEX,
             BLOCK=block,
             num_warps=8,
         )
-        return dlogits_TV, None, None, None
+        return dlogits_TV, None, None, None, None
 
 
 def can_use_token_logprobs_kernels(tensor: torch.Tensor) -> bool:

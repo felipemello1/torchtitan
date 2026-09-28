@@ -1325,3 +1325,20 @@ class TestLossTokenIndices(unittest.TestCase):
         wrapper = self._wrapper(CrossEntropyLoss.Config())
         labels = torch.full((8192,), IGNORE_INDEX)
         self.assertIsNone(wrapper._loss_token_indices(labels, {}))
+
+
+def test_compute_logprobs_temperature_on_the_torch_path():
+    # CPU logits take the torch path: logprobs and entropy of softmax(logits / temperature).
+    from torchtitan.components.loss import compute_logprobs
+
+    torch.manual_seed(0)
+    logits = torch.randn(16, 50) * 3
+    labels = torch.randint(0, 50, (16,))
+    logprobs, entropy = compute_logprobs(
+        logits, labels, vocab_parallel_group=None, return_entropy=True, temperature=0.7
+    )
+    log_softmax = (logits.double() / 0.7).log_softmax(-1)
+    expected_logprobs = log_softmax.gather(1, labels[:, None]).squeeze(1)
+    expected_entropy = -(log_softmax.exp() * log_softmax).sum(-1)
+    torch.testing.assert_close(logprobs.double(), expected_logprobs, atol=1e-5, rtol=0)
+    torch.testing.assert_close(entropy.double(), expected_entropy, atol=1e-5, rtol=0)

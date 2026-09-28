@@ -621,3 +621,64 @@ def test_vllm_uneven_decode_tp_padding():
         torch.cuda.empty_cache()
         if temporary_dump_folder is not None:
             shutil.rmtree(temporary_dump_folder, ignore_errors=True)
+
+
+def _dapo_config_with(*, logprobs_mode, loss_temperature, sampling_temperature, top_p):
+    import dataclasses
+
+    from torchtitan.rl.examples.dapo_math.config_registry import (
+        rl_dapo_qwen3_4b_math_8k,
+    )
+
+    config = rl_dapo_qwen3_4b_math_8k()
+    loss = config.trainer.loss
+    return dataclasses.replace(
+        config,
+        trainer=dataclasses.replace(
+            config.trainer,
+            loss=dataclasses.replace(
+                loss,
+                loss_fn=dataclasses.replace(loss.loss_fn, temperature=loss_temperature),
+            ),
+        ),
+        generator=dataclasses.replace(
+            config.generator,
+            logprobs_mode=logprobs_mode,
+            sampling=dataclasses.replace(
+                config.generator.sampling,
+                temperature=sampling_temperature,
+                top_p=top_p,
+            ),
+        ),
+    )
+
+
+def test_tempered_logprobs_match_between_trainer_and_generator():
+    # Tempered generator logprobs with the same loss temperature (and top_p=1) are consistent.
+    _dapo_config_with(
+        logprobs_mode="processed_logprobs",
+        loss_temperature=0.7,
+        sampling_temperature=0.7,
+        top_p=1.0,
+    )
+    with pytest.raises(ValueError, match="top_p=1.0"):
+        _dapo_config_with(
+            logprobs_mode="processed_logprobs",
+            loss_temperature=1.0,
+            sampling_temperature=0.7,
+            top_p=1.0,
+        )
+    with pytest.raises(ValueError, match="top_p=1.0"):
+        _dapo_config_with(
+            logprobs_mode="processed_logprobs",
+            loss_temperature=0.7,
+            sampling_temperature=0.7,
+            top_p=0.95,
+        )
+    with pytest.raises(ValueError, match="processed_logprobs"):
+        _dapo_config_with(
+            logprobs_mode="raw_logprobs",
+            loss_temperature=0.7,
+            sampling_temperature=0.7,
+            top_p=1.0,
+        )

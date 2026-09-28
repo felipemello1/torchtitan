@@ -79,7 +79,10 @@ def test_token_logprobs_matches_fp64():
     assert _relative_error(weight.grad, weight_ref.grad) < 4e-3
 
 
-@pytest.mark.parametrize("loss_config", [DAPOLoss.Config(), CrossEntropyLoss.Config()])
+@pytest.mark.parametrize(
+    "loss_config",
+    [DAPOLoss.Config(), DAPOLoss.Config(temperature=0.7), CrossEntropyLoss.Config()],
+)
 def test_chunked_loss_token_logprobs_matches_logits_path(loss_config):
     num_tokens, dim, vocab = 512, 128, 5003
     hidden, weight, labels, loss_inputs = _inputs(num_tokens, dim, vocab)
@@ -291,6 +294,62 @@ def test_cross_entropy_skip_ignored_tokens(head_cls):
     # A bf16 head accumulates dW in bf16 chunk by chunk; fewer chunks round differently.
     assert _relative_error(skipped[1], grad_hidden) < 5e-3
     assert _relative_error(skipped[2], grad_weight) < 5e-3
+
+
+@pytest.mark.parametrize("temperature", [0.7, 1.3])
+def test_token_logprobs_temperature_matches_fp64(temperature):
+    # Logprobs, entropy and gradients of softmax(logits / temperature), fused and from logits.
+    from torchtitan.components.loss import compute_logprobs
+
+    hidden, weight, labels, _ = _inputs(num_tokens=256, dim=128, vocab=5003)
+    grad_logprobs = torch.randn(256, device="cuda") * 1e-5
+    hidden_ref = hidden.double().requires_grad_()
+    weight_ref = weight.double().requires_grad_()
+    logits_ref = hidden_ref @ weight_ref.T / temperature
+    logprobs_ref = -F.cross_entropy(
+        logits_ref, labels, reduction="none", ignore_index=-100
+    )
+    (logprobs_ref * grad_logprobs).sum().backward()
+    log_softmax_ref = logits_ref.detach().log_softmax(-1)
+    entropy_ref = -(log_softmax_ref.exp() * log_softmax_ref).sum(-1)
+
+    fused_hidden = hidden.clone().requires_grad_()
+    fused_weight = weight.clone().requires_grad_()
+    logprobs, entropy = TokenLogprobs.apply(
+        fused_hidden,
+        fused_weight,
+        labels,
+        TokenLogprobsGradState(),
+        True,
+        0,
+        None,
+        1.0 / temperature,
+    )
+    (logprobs * grad_logprobs).sum().backward()
+    torch.testing.assert_close(logprobs.double(), logprobs_ref, atol=1e-5, rtol=0)
+    torch.testing.assert_close(entropy.double(), entropy_ref, atol=1e-4, rtol=0)
+    assert _relative_error(fused_hidden.grad, hidden_ref.grad) < 4e-3
+    assert _relative_error(fused_weight.grad, weight_ref.grad) < 4e-3
+
+    logits = torch.mm(hidden, weight.T, out_dtype=torch.float32).requires_grad_()
+    logprobs, entropy = compute_logprobs(
+        logits,
+        labels,
+        vocab_parallel_group=None,
+        return_entropy=True,
+        temperature=temperature,
+    )
+    (logprobs * grad_logprobs).sum().backward()
+    torch.testing.assert_close(logprobs.double(), logprobs_ref, atol=1e-5, rtol=0)
+    torch.testing.assert_close(entropy.double(), entropy_ref, atol=1e-4, rtol=0)
+    logits_ref64 = logits.detach().double().requires_grad_()
+    (
+        -F.cross_entropy(
+            logits_ref64 / temperature, labels, reduction="none", ignore_index=-100
+        )
+        * grad_logprobs
+    ).sum().backward()
+    assert _relative_error(logits.grad, logits_ref64.grad) < 1e-6
 
 
 def test_token_logprobs_returns_fp32_weight_grad_for_fp32_grad_dtype():
