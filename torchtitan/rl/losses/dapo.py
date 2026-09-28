@@ -72,6 +72,12 @@ class DAPOLoss(TokenLogprobLoss):
         self.ratio_clip_high = config.ratio_clip_high
         self.global_vocab_size = config.global_vocab_size
 
+    def loss_token_mask(
+        self, labels: torch.Tensor, *, loss_mask: torch.Tensor, **loss_inputs
+    ) -> torch.Tensor:
+        del labels, loss_inputs
+        return loss_mask
+
     def loss_from_logprobs(
         self,
         trainer_logprobs: torch.Tensor,

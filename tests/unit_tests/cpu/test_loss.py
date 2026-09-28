@@ -31,6 +31,7 @@ from torchtitan.components.loss import (
     CrossEntropyLoss,
     GradAccumulator,
     IGNORE_INDEX,
+    TokenLogprobLoss,
 )
 from torchtitan.distributed.spmd_types import set_current_spmd_mesh
 from torchtitan.models.deepseek_v3.mtp import MTPDecoder, MTPLoss, roll_mtp_sequence
@@ -1252,3 +1253,75 @@ class TestChunkedLossWrapperSPMD(DTensorTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _MaskedTokenLoss(TokenLogprobLoss):
+    """A TokenLogprobLoss whose loss tokens come from a ``loss_mask`` input."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(TokenLogprobLoss.Config):
+        pass
+
+    def __init__(self, config: Config, *, compile_config=None):
+        del config, compile_config
+        self.global_vocab_size = None
+
+    def loss_token_mask(self, labels, *, loss_mask, **loss_inputs):
+        return loss_mask
+
+    def loss_from_logprobs(self, logprobs, entropy, global_valid_tokens, **inputs):
+        return -logprobs.sum(), {}
+
+
+class TestLossTokenIndices(unittest.TestCase):
+    def _wrapper(self, loss_config, num_chunks=8):
+        return ChunkedLossWrapper(
+            ChunkedLossWrapper.Config(num_chunks=num_chunks, loss_fn=loss_config)
+        )
+
+    def test_keeps_loss_tokens_in_order_then_pads_with_skipped_tokens(self):
+        # 16384 tokens in 8 chunks -> 2048-token chunks; 3000 loss tokens -> 2 chunks,
+        # padded to a multiple of 64 * 2 = 128: 3072 indices.
+        num_tokens = 16384
+        loss_mask = torch.zeros(num_tokens, dtype=torch.bool)
+        loss_positions = torch.randperm(num_tokens)[:3000].sort().values
+        loss_mask[loss_positions] = True
+        wrapper = self._wrapper(_MaskedTokenLoss.Config())
+        token_indices, num_chunks = wrapper._loss_token_indices(
+            torch.zeros(num_tokens, dtype=torch.long), {"loss_mask": loss_mask}
+        )
+        self.assertEqual(num_chunks, 2)
+        self.assertEqual(token_indices.numel(), 3072)
+        torch.testing.assert_close(token_indices[:3000], loss_positions)
+        self.assertFalse(loss_mask[token_indices[3000:]].any())
+        self.assertEqual(token_indices.unique().numel(), 3072)
+
+    def test_all_masked_microbatch_keeps_one_aligned_chunk(self):
+        loss_mask = torch.zeros(8192, dtype=torch.bool)
+        wrapper = self._wrapper(_MaskedTokenLoss.Config())
+        token_indices, num_chunks = wrapper._loss_token_indices(
+            torch.zeros(8192, dtype=torch.long), {"loss_mask": loss_mask}
+        )
+        self.assertEqual((token_indices.numel(), num_chunks), (64, 1))
+
+    def test_keeps_every_token_when_nothing_would_be_skipped(self):
+        wrapper = self._wrapper(_MaskedTokenLoss.Config())
+        loss_mask = torch.ones(8192, dtype=torch.bool)
+        self.assertIsNone(
+            wrapper._loss_token_indices(
+                torch.zeros(8192, dtype=torch.long), {"loss_mask": loss_mask}
+            )
+        )
+
+    def test_empty_microbatch_keeps_every_token(self):
+        wrapper = self._wrapper(_MaskedTokenLoss.Config())
+        empty = torch.zeros(0, dtype=torch.long)
+        self.assertIsNone(
+            wrapper._loss_token_indices(empty, {"loss_mask": empty.bool()})
+        )
+
+    def test_cross_entropy_keeps_every_token_without_a_host_sync(self):
+        # CrossEntropyLoss.loss_token_mask is None: pretraining skips nothing.
+        wrapper = self._wrapper(CrossEntropyLoss.Config())
+        labels = torch.full((8192,), IGNORE_INDEX)
+        self.assertIsNone(wrapper._loss_token_indices(labels, {}))
