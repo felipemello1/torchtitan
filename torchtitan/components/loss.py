@@ -581,6 +581,13 @@ class ChunkedLossWrapper(BaseLoss):
     6. Assemble one full gradient [T, D] per output via GradAccumulator
     7. Backward through the decoder once with all accumulated gradients
 
+    Token-logprob losses: when ``loss_fn`` is a ``TokenLogprobLoss`` and ``lm_head`` is a
+    plain ``Fp32OutputLinear``, step 5 instead calls ``lm_head.token_logprobs`` (the matmul
+    fused with the label logprob and entropy, see ``TokenLogprobs``) and
+    ``loss_fn.loss_from_logprobs``. The chunks' lm_head gradients accumulate in fp32 and
+    reach autograd once, at the last chunk. Batch-invariant mode, LoRA or quantized heads,
+    and multi-output losses keep the logits path.
+
     FSDP2 composability:
         The lm_head's FSDP reshard-after-forward and reshard-after-backward are
         temporarily disabled during the chunked loop so that the weight stays
