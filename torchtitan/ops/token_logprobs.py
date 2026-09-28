@@ -173,8 +173,8 @@ class TokenLogprobsGradState:
 
     The first chunk's forward fills ``weight_fp16`` from the weight it receives (unsharded
     under FSDP), cast once for the fp16 backward GEMMs. ``grad_weight`` accumulates the chunks'
-    weight gradients in fp32; the last chunk returns the sum to autograd in the weight's dtype,
-    so it is rounded once per microbatch.
+    weight gradients in fp32; the last chunk returns the sum to autograd in the weight's gradient
+    dtype (bf16, or fp32 with ``Tensor.grad_dtype``), so it is rounded at most once per microbatch.
 
     Not a dataclass: FSDP's forward-input cast copies dataclass arguments (casting their
     tensors to the param dtype), which would give each chunk its own accumulator.
@@ -233,8 +233,10 @@ class TokenLogprobs(torch.autograd.Function):
         ctx.grad_state = grad_state
         ctx.return_grad_weight = return_grad_weight
         ctx.vocab_start = vocab_start
-        # fp32 when FSDP's unsharded weight accumulates fp32 gradients (Tensor.grad_dtype).
-        ctx.grad_weight_dtype = weight_VD.grad_dtype or weight_VD.dtype
+        # fp32 when FSDP's unsharded weight accumulates fp32 gradients (Tensor.grad_dtype, which
+        # only leaf tensors have).
+        grad_dtype = weight_VD.grad_dtype if weight_VD.is_leaf else None
+        ctx.grad_weight_dtype = grad_dtype or weight_VD.dtype
         ctx.mark_non_differentiable(entropy_T)
         ctx.set_materialize_grads(False)
         return logprobs_T, entropy_T

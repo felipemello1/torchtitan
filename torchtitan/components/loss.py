@@ -837,7 +837,7 @@ class ChunkedLossWrapper(BaseLoss):
             if use_token_logprobs:
                 vocab_parallel_group = spmd_mesh_group("tp")
                 vocab_start = 0
-                # Under FSDP the weight is a DTensor whose shape is the full [V, D].
+                # The full vocab: FSDP's sharded DTensor and its unsharded weight both report [V, D].
                 global_vocab_size = lm_head.weight.shape[0]
                 if vocab_parallel_group is not None:
                     global_vocab_size = self.loss_fn.global_vocab_size
