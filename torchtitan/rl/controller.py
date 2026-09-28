@@ -112,6 +112,7 @@ from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.moe import MoE
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.components.batcher import Batcher
+from torchtitan.rl.components.data_stream_state import DataStreamState
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.components.work_buffer import (
     RolloutGroupWork,
@@ -440,6 +441,7 @@ class Controller(Configurable):
         self.generator_router: InterGeneratorRouter | None = None
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
         self.start_step = 0
+        self._data_stream = DataStreamState()
         self._proc_meshes = []
         self.metrics_processor: m.MetricsProcessor = config.metrics.build(
             log_dir=config.dump_folder,
@@ -505,6 +507,19 @@ class Controller(Configurable):
             except Exception:
                 logger.exception("mesh.stop[%d] failed", i)
         self._proc_meshes = []
+
+    def _checkpoint_step_dir(self, step: int) -> str | None:
+        """The trainer's checkpoint folder for ``step``, or None without a checkpointer.
+
+        Example: dump_folder="outputs/rl", checkpointer.folder="checkpoint", step=10
+            -> "outputs/rl/checkpoint/step-10"
+        """
+        checkpointer = self.config.trainer.checkpointer
+        if checkpointer is None:
+            return None
+        return os.path.join(
+            self.config.dump_folder, checkpointer.folder, f"step-{step}"
+        )
 
     def _get_rank_0_value(self, result):
         """Extract rank 0 result from a Monarch ValueMesh.
@@ -685,14 +700,16 @@ class Controller(Configurable):
 
         # Resume: __init__ ran CheckpointManager.load(); read back the restored policy_version
         # (0 if fresh) so the loop resumes at the right step and generators pull at that version.
-        # TODO(resume): only model/optimizer/policy_version are restored. The active-slot rollout
-        #   buffer (in-flight rollouts) and the dataset stream position are NOT restored -- a resumed
-        #   run refills the buffer and re-reads data from the start. Need to recycle prompts.
+        # The data stream (dataset positions, untrained prompts, group ids) is restored from the
+        # same step-N folder. Partially generated rollouts are not; their prompts are regenerated.
         self.start_step = self._get_rank_0_value(
             await self.trainer.get_policy_version.call()
         )
         if self.start_step > 0:
             logger.info(f"Resuming RL training from step {self.start_step}")
+            step_dir = self._checkpoint_step_dir(self.start_step)
+            if step_dir is not None:
+                self._data_stream.load(step_dir, self._rollouter)
 
         # Start each generator's engine loop on all ranks once, before any
         # rank-0-only generate / pull (rank 0 drives the followers through this
@@ -805,12 +822,20 @@ class Controller(Configurable):
         """
         async_loop = self.config.async_loop
         num_training_steps = async_loop.num_training_steps
-        logger.info(
-            f"Running pre-training validation; then {num_training_steps} steps of async RL training"
-        )
-
-        sl.log_trace_instant("validation_start")
-        pre_validation = await self._validate_and_log(step=self.start_step)
+        if self.start_step == 0:
+            logger.info(
+                f"Running pre-training validation; then {num_training_steps} steps of async RL training"
+            )
+            sl.log_trace_instant("validation_start")
+            pre_validation = await self._validate_and_log(step=0)
+        else:
+            # The pre-training baseline was measured by the first run. Re-validating on every
+            # restart would cost a full validation pass each time a preempted job resumes.
+            logger.info(
+                f"Resuming at step {self.start_step}: skipping pre-training validation; "
+                f"training through step {num_training_steps}"
+            )
+            pre_validation = {}
         sl.log_trace_instant("training_start")
 
         # Trainer policy version, seeded from the resumed step; advances at each optimizer step.
@@ -962,24 +987,25 @@ class Controller(Configurable):
         Separate from `_rollout_loop`, so slow data prep (e.g. on-the-fly question generation) overlaps
         generation instead of serializing in front of it.
         """
-        # TODO(resume): persist dataset position so a restarted job continues the data stream, not from scratch.
-        group_index = 0
+
+        async def read_training_sample() -> object:
+            with sl.log_trace_span("get_training_sample"):
+                # to_thread: Dont block on dataset reads
+                return await asyncio.to_thread(self._rollouter.get_training_sample)
 
         # TODO(perf): Slots are current released in batches, while this loop is a single producer.
         # we could a) increase the number of threads; b) revisit how we release slots and see if
         # we can release them on the batcher while still preserving max offpolicy steps.
         # finally, c) we need to check how will this data input loop truly overlaps with the rollout loop.
         while await group_buffer.wait_for_slot():
-            with sl.log_trace_span("get_training_sample"):
-                # to_thread: Dont block on dataset reads
-                sample = await asyncio.to_thread(self._rollouter.get_training_sample)
+            # After a resume, prompts that were admitted but not trained come back first.
+            group_id, sample = await self._data_stream.admit_next(read_training_sample)
             await group_buffer.add_work(
                 RolloutGroupWork(
-                    group_id=group_index,
+                    group_id=group_id,
                     sample=sample,
                 )
             )
-            group_index += 1
         logger.info("Buffer closed; data input loop stopping")
 
     async def _rollout_loop(
@@ -1174,6 +1200,14 @@ class Controller(Configurable):
                         )
                     )
                 self._trainer_policy_version = optimizer_result.policy_version
+                self._data_stream.consume(packed.group_ids)
+                if optimizer_result.checkpoint_saved:
+                    step_dir = self._checkpoint_step_dir(step)
+                    assert (
+                        step_dir is not None
+                    ), "a checkpoint was saved without a checkpointer"
+                    with sl.log_trace_span("save_data_stream_state"):
+                        await self._data_stream.save(step_dir, self._rollouter)
 
                 # Await generator weight pull to finish before the trainer's next push.
                 with (

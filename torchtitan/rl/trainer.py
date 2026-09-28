@@ -284,7 +284,7 @@ class Trainer(Configurable):
             has_quantization=engine.has_quantization,
         )
 
-        engine.save_checkpoint(last_step=last_step)
+        checkpoint_saved = engine.save_checkpoint(last_step=last_step)
         engine.step_profiler()
         device_mem_stats = engine.device_memory_monitor.get_peak_stats()
         engine.device_memory_monitor.reset_peak_stats()
@@ -296,6 +296,7 @@ class Trainer(Configurable):
 
         return OptimizerStepOutput(
             policy_version=self.policy_version,
+            checkpoint_saved=checkpoint_saved,
             metrics={
                 "trainer/grad_norm/mean": float(grad_norm.item()),
                 **{f"trainer/{key}": value for key, value in lr_metrics.items()},

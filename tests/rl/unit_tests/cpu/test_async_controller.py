@@ -165,6 +165,8 @@ def test_batcher_carries_metric_only_groups_until_trainable_batch() -> None:
     assert group_is_trainable
     assert batch.global_loss_token_counts[0] > 0
     assert batch.global_routing_token_counts.shape == (1,)
+    # Both groups are consumed by this batch, so neither is replayed after a resume.
+    assert batch.group_ids == (0, 1)
 
 
 def test_batcher_prepares_per_depth_mtp_token_counts() -> None:
