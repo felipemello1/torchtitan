@@ -134,6 +134,55 @@ class Rollouter(Configurable):
         """Get one validation sample (the env input) from the validation dataset."""
         return next(self._validation_dataset)
 
+    def state_dict(self) -> dict[str, object]:
+        """Dataset stream positions, saved with each checkpoint so a resumed run continues them.
+
+        A dataset without ``state_dict`` / ``load_state_dict`` maps to None and
+        restarts from its first sample on resume. ``datasets_config`` identifies the
+        datasets the positions belong to.
+        """
+        return {
+            "datasets_config": self._datasets_config(),
+            **{
+                name: dataset.state_dict() if hasattr(dataset, "state_dict") else None
+                for name, dataset in self._datasets()
+            },
+        }
+
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+        """Restore the dataset stream positions returned by ``state_dict``.
+
+        Warns when the datasets are configured differently from the run that saved
+        the positions: the config may differ only in fields that do not change the
+        samples, but if the datasets changed, the positions may not match them.
+        """
+        if state_dict["datasets_config"] != self._datasets_config():
+            logger.warning(
+                "The train/validation dataset config differs from the checkpoint's; "
+                "restoring its dataset positions anyway.\n  checkpoint: %s\n  current:    %s",
+                state_dict["datasets_config"],
+                self._datasets_config(),
+            )
+        for name, dataset in self._datasets():
+            dataset_state = state_dict.get(name)
+            if dataset_state is None:
+                logger.warning(
+                    "No saved position for the %s dataset; it restarts from its "
+                    "first sample.",
+                    name,
+                )
+                continue
+            dataset.load_state_dict(dataset_state)
+
+    def _datasets_config(self) -> str:
+        return repr((self._config.train_dataset, self._config.validation_dataset))
+
+    def _datasets(self) -> tuple[tuple[str, object], ...]:
+        return (
+            ("train", self._train_dataset),
+            ("validation", self._validation_dataset),
+        )
+
     async def setup_async(
         self,
         *,

@@ -26,6 +26,9 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.observability.metrics import compute_training_performance_metrics
 from torchtitan.protocols.model import BaseModel
+from torchtitan.rl.components.data_stream_state import (
+    newest_step_with_data_stream_state,
+)
 from torchtitan.rl.observability.controller import combine_microbatch_metrics
 from torchtitan.rl.types import OptimizerStepOutput, TrainingMicrobatch
 from torchtitan.tools import utils
@@ -132,7 +135,13 @@ class Trainer(Configurable):
         )
         self.model = engine.model_parts[0]
 
-        engine.load_checkpoint()
+        if config.checkpointer is not None and config.checkpointer.load_step == -1:
+            # Automatic resume: pick a step whose data stream the controller can restore too.
+            engine.checkpointer.load(
+                step=newest_step_with_data_stream_state(engine.checkpointer)
+            )
+        else:
+            engine.load_checkpoint()
         if config.checkpointer is None:
             logger.warning(
                 "Checkpoint disabled, skip weight loading and use random-initialized weights. "
@@ -293,7 +302,7 @@ class Trainer(Configurable):
             has_quantization=engine.has_quantization,
         )
 
-        engine.save_checkpoint(last_step=last_step)
+        checkpoint_saved = engine.save_checkpoint(last_step=last_step)
         engine.step_profiler()
         device_mem_stats = engine.device_memory_monitor.get_peak_stats()
         engine.device_memory_monitor.reset_peak_stats()
@@ -305,6 +314,7 @@ class Trainer(Configurable):
 
         return OptimizerStepOutput(
             policy_version=self.policy_version,
+            checkpoint_saved=checkpoint_saved,
             metrics={
                 "trainer/grad_norm/mean": float(grad_norm.item()),
                 **{f"trainer/{key}": value for key, value in lr_metrics.items()},

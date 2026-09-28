@@ -259,6 +259,7 @@ class Batcher(Configurable):
             metrics,
             num_rollout_groups,
             num_metric_only_groups,
+            group_ids,
         ) = self._take_groups()
         assignments = self._assign_training_samples_to_microbatches(training_samples)
         microbatches = [
@@ -306,11 +307,12 @@ class Batcher(Configurable):
                 training_sample.min_policy_version
                 for training_sample in training_samples
             ],
+            group_ids=group_ids,
         )
 
     def _take_groups(
         self,
-    ) -> tuple[list[TrainingSample], list[m.Metric], int, int]:
+    ) -> tuple[list[TrainingSample], list[m.Metric], int, int, tuple[int, ...]]:
         """Pop accumulated groups oldest-first until `num_prompts_per_train_step` are taken."""
         taken_training_samples: list[TrainingSample] = []
         taken_metrics: list[m.Metric] = []
@@ -325,9 +327,10 @@ class Batcher(Configurable):
                 num_trainable_groups += 1
 
         # Pack in group-id order so on-policy runs stay reproducible whatever the finish order.
-        for group in sorted(
+        taken_groups = sorted(
             self._groups_for_next_batch[:cut], key=lambda taken: taken.group_id
-        ):
+        )
+        for group in taken_groups:
             taken_training_samples.extend(group.training_samples)
 
         # surplus carried over
@@ -339,6 +342,7 @@ class Batcher(Configurable):
             taken_metrics,
             num_trainable_groups,
             num_metric_only_groups,
+            tuple(group.group_id for group in taken_groups),
         )
 
     def _assign_training_samples_to_microbatches(
