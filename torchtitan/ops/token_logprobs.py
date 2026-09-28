@@ -8,8 +8,9 @@
 
 Used by ``ChunkedLossWrapper`` for losses that only read ``log p(label)`` (and entropy
 as a metric), e.g. the RL policy-gradient losses. Compared with ``Fp32OutputLinear``
-followed by ``compute_logprobs``, it reads the ``[T, V]`` logits twice instead of ~20
-times, and its backward uses 2 GEMMs instead of hi + lo's 4 at the same gradient error.
+followed by ``compute_logprobs``, it reads the ``[T, V]`` logits twice instead of making ~15
+passes over ``[T, V]`` tensors, and its backward uses 2 GEMMs instead of hi + lo's 4 at about
+the same gradient error.
 """
 
 import torch
@@ -40,7 +41,6 @@ def _partial_softmax_stats_kernel(
     vocab_size,
     vocab_start,
     stride_row,
-    IGNORE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """One pass over a row: max, sum(exp(x - max)), sum(exp(x - max) * x), and x[label]."""
@@ -69,7 +69,7 @@ def _partial_softmax_stats_kernel(
     tl.store(max_ptr + row, row_max)
     tl.store(sum_exp_ptr + row, tl.sum(sum_exp_lanes * lane_rescale, 0))
     tl.store(sum_exp_logit_ptr + row, tl.sum(sum_exp_logit_lanes * lane_rescale, 0))
-    # 0 when the label is ignored or lives on another vocab shard, so shards can be summed.
+    # 0 when the label is ignored (-100) or lives on another vocab shard, so shards can be summed.
     local_label = tl.load(labels_ptr + row) - vocab_start
     is_local = (local_label >= 0) & (local_label < vocab_size)
     label_logit = tl.load(row_ptr + tl.where(is_local, local_label, 0))
@@ -140,7 +140,6 @@ def _softmax_stats(
         vocab_size,
         vocab_start,
         logits_TV.stride(0),
-        IGNORE=IGNORE_INDEX,
         BLOCK=2048,
         num_warps=8,
     )
