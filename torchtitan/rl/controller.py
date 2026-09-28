@@ -380,6 +380,31 @@ class Controller(Configurable):
                         "and has not been validated for determinism."
                     )
 
+            # The generator's logprobs are the importance ratio's denominator, so the trainer
+            # must compute logprobs of the same distribution.
+            loss_config = getattr(self.trainer.loss, "loss_fn", self.trainer.loss)
+            loss_temperature = getattr(loss_config, "temperature", 1.0)
+            sampling = self.generator.sampling
+            if self.generator.logprobs_mode == "processed_logprobs":
+                if loss_temperature != sampling.temperature or sampling.top_p != 1.0:
+                    raise ValueError(
+                        "generator.logprobs_mode='processed_logprobs' returns logprobs "
+                        "after temperature and top-p, so it needs sampling.top_p=1.0 and "
+                        "the loss temperature equal to sampling.temperature. Got top_p="
+                        f"{sampling.top_p}, sampling.temperature={sampling.temperature}, "
+                        f"loss temperature={loss_temperature}."
+                    )
+                if self.trainer.debug.batch_invariant:
+                    raise ValueError(
+                        "batch_invariant mode matches raw logprobs only; keep "
+                        "generator.logprobs_mode='raw_logprobs'."
+                    )
+            elif loss_temperature != 1.0:
+                raise ValueError(
+                    f"loss temperature={loss_temperature} needs tempered generator "
+                    "logprobs: set generator.logprobs_mode='processed_logprobs'."
+                )
+
             if (
                 not self.generator_router.hot_swap
                 and not self.generator.reset_prefix_cache_on_weight_sync

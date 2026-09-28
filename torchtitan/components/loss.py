@@ -362,6 +362,8 @@ class TokenLogprobLoss(BaseLoss):
     """
 
     global_vocab_size: int | None
+    temperature: float = 1.0
+    """Logprobs are of ``softmax(logits / temperature)``; set by losses that support it."""
 
     def __call__(
         self,
@@ -376,6 +378,7 @@ class TokenLogprobLoss(BaseLoss):
             vocab_parallel_group=spmd_mesh_group("tp"),
             return_entropy=True,
             global_vocab_size=self.global_vocab_size,
+            temperature=self.temperature,
         )
         return self.loss_from_logprobs(
             logprobs, entropy, global_valid_tokens, **loss_inputs
@@ -499,8 +502,9 @@ def compute_logprobs(
     vocab_parallel_group: dist.ProcessGroup | None,
     return_entropy: bool = False,
     global_vocab_size: int | None = None,
+    temperature: float = 1.0,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Per-token logprobs from ``logits[T, V]`` and ``labels[T]``.
+    """Per-token logprobs from ``logits[T, V] / temperature`` and ``labels[T]``.
 
     When ``return_entropy`` is set, also returns per-token Shannon entropy
     ``H(p) = logsumexp(logits) - sum(softmax(logits) * logits)``, with shape
@@ -528,9 +532,11 @@ def compute_logprobs(
             labels, logits.shape[-1], vocab_parallel_group, global_vocab_size
         )
         logprobs, entropy = TokenLogprobsFromLogits.apply(
-            logits, labels, vocab_start, vocab_parallel_group
+            logits, labels, vocab_start, vocab_parallel_group, 1.0 / temperature
         )
         return (logprobs, entropy) if return_entropy else logprobs
+    if temperature != 1.0:
+        logits = logits / temperature
 
     if vocab_parallel_group is not None:
         if global_vocab_size is None:
@@ -930,6 +936,7 @@ class ChunkedLossWrapper(BaseLoss):
                     lm_head.unshard()
 
             vocab_parallel_group, vocab_start, grad_state = None, 0, None
+            temperature = 1.0
             if use_token_logprobs:
                 vocab_parallel_group = spmd_mesh_group("tp")
                 # This rank's vocab rows: FSDP's sharded DTensor and the unsharded weight both
@@ -942,6 +949,8 @@ class ChunkedLossWrapper(BaseLoss):
                     self.loss_fn.global_vocab_size,  # pyrefly: ignore[missing-attribute]
                 )
                 grad_state = TokenLogprobsGradState() if requires_grad else None
+                # pyrefly: ignore[missing-attribute]
+                temperature = self.loss_fn.temperature
 
             for chunk_index in range(num_chunks):
                 if coalesce_gradient_sync and chunk_index == num_chunks - 1:
@@ -969,6 +978,7 @@ class ChunkedLossWrapper(BaseLoss):
                         return_grad_weight=chunk_index == num_chunks - 1,
                         vocab_start=vocab_start,
                         vocab_parallel_group=vocab_parallel_group,
+                        temperature=temperature,
                     )
                     # pyrefly: ignore[missing-attribute]
                     chunk_loss, chunk_metrics = self.loss_fn.loss_from_logprobs(

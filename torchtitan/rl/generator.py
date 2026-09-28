@@ -704,6 +704,12 @@ class VLLMGenerator(Configurable):
         sampling: SamplingConfig = field(default_factory=SamplingConfig)
         """Default sampling parameters for generation."""
 
+        logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = "raw_logprobs"
+        """Which logprob of each sampled token vLLM returns: of the model's distribution
+        (``raw_logprobs``), or after temperature and top-p (``processed_logprobs``). The trainer
+        must compute the same one: ``processed_logprobs`` needs ``top_p=1`` and the loss's
+        ``temperature`` equal to ``sampling.temperature``."""
+
         override: OverrideConfig = field(default_factory=OverrideConfig)
         """Config overrides (e.g. ``torchtitan.overrides.fused_swiglu.fused_swiglu``)
         applied to this generator's model spec after ``update_from_config`` and before build.
@@ -909,6 +915,7 @@ class VLLMGenerator(Configurable):
             enable_cumem_allocator=config.enable_cumem_allocator,
         )
         engine_kwargs["max_model_len"] = model_config.max_context_length
+        engine_kwargs["logprobs_mode"] = config.logprobs_mode
         engine_kwargs["max_num_seqs"] = self._max_num_seqs
         if config.max_num_batched_tokens is not None:
             engine_kwargs["max_num_batched_tokens"] = config.max_num_batched_tokens
