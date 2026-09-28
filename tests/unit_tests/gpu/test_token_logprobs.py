@@ -296,3 +296,36 @@ def test_token_logprobs_frozen_weight_skips_grad_weight():
         if not weight_requires_grad:
             assert grad_state.grad_weight is None
     torch.testing.assert_close(grads[1], grads[0], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_compute_logprobs_from_logits_matches_fp64(dtype):
+    from torchtitan.components.loss import compute_logprobs
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    logits = torch.randn(512, 5003, device="cuda", generator=generator) * 3
+    logits = logits.to(dtype).requires_grad_()
+    labels = torch.randint(0, 5003, (512,), device="cuda", generator=generator)
+    labels[::7] = -100
+    grad_logprobs = torch.randn(512, device="cuda", generator=generator)
+
+    logprobs, entropy = compute_logprobs(
+        logits, labels, vocab_parallel_group=None, return_entropy=True
+    )
+    (logprobs * grad_logprobs).sum().backward()
+
+    logits_ref = logits.detach().double().requires_grad_()
+    logprobs_ref = -F.cross_entropy(
+        logits_ref, labels, reduction="none", ignore_index=-100
+    )
+    (logprobs_ref * grad_logprobs).sum().backward()
+    log_softmax_ref = logits_ref.detach().log_softmax(-1)
+    entropy_ref = -(log_softmax_ref.exp() * log_softmax_ref).sum(-1)
+
+    assert logprobs.dtype is torch.float32 and not entropy.requires_grad
+    torch.testing.assert_close(logprobs.double(), logprobs_ref, atol=1e-5, rtol=0)
+    torch.testing.assert_close(entropy.double(), entropy_ref, atol=1e-4, rtol=0)
+    assert logits.grad.dtype is dtype
+    # bf16 logits get a bf16 gradient, like F.cross_entropy's backward.
+    tolerance = 5e-3 if dtype is torch.bfloat16 else 1e-6
+    assert _relative_error(logits.grad, logits_ref.grad) < tolerance

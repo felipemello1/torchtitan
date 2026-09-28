@@ -25,7 +25,11 @@ from torchtitan.distributed.spmd_types import (
 )
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.models.common.linear import Fp32OutputLinear
-from torchtitan.ops.token_logprobs import TokenLogprobsGradState, vocab_shard_start
+from torchtitan.ops.token_logprobs import (
+    TokenLogprobsFromLogits,
+    TokenLogprobsGradState,
+    vocab_shard_start,
+)
 
 # PyTorch's default ignore index for cross-entropy loss
 logger = logging.getLogger(__name__)
@@ -46,6 +50,21 @@ def cross_entropy_loss(
     """Cross-entropy over ``pred[T, V]`` and ``labels[T]``."""
     if reduction not in ("sum", "none"):
         raise ValueError(f"Unsupported cross-entropy reduction: {reduction}")
+    # Eager CUDA: compute_logprobs reads the logits once (TokenLogprobsFromLogits), about as fast
+    # as the compiled F.cross_entropy. Under torch.compile, inductor fuses F.cross_entropy itself.
+    if (
+        pred.is_cuda
+        and pred.dim() == 2
+        and not torch.compiler.is_compiling()
+        and not is_in_batch_invariant_mode()
+    ):
+        nll = -compute_logprobs(
+            pred,
+            labels,
+            vocab_parallel_group=spmd_mesh_group("tp"),
+            global_vocab_size=global_vocab_size,
+        )
+        return nll.sum() if reduction == "sum" else nll
     if spmd_mesh_size("tp") > 1:
         if global_vocab_size is None:
             raise ValueError(
@@ -472,6 +491,29 @@ def compute_logprobs(
     Returns ``logprobs`` when ``return_entropy`` is False, else
     ``(logprobs, entropy)``.
     """
+    if logits.is_cuda and logits.dim() == 2 and not is_in_batch_invariant_mode():
+        # One stats pass forward and one gradient pass backward over the logits.
+        vocab_start = 0
+        num_classes = logits.shape[-1]
+        if vocab_parallel_group is not None:
+            if global_vocab_size is None:
+                raise ValueError(
+                    "global_vocab_size is required for vocab-parallel policy statistics"
+                )
+            vocab_start = vocab_shard_start(global_vocab_size, vocab_parallel_group)
+            num_classes = global_vocab_size
+        # The kernels would read an out-of-range label as "on another vocab shard".
+        torch._assert_async(
+            torch.all(
+                (labels == IGNORE_INDEX) | ((labels >= 0) & (labels < num_classes))
+            ),
+            f"labels must be {IGNORE_INDEX} or in [0, {num_classes})",
+        )
+        logprobs, entropy = TokenLogprobsFromLogits.apply(
+            logits, labels, vocab_start, vocab_parallel_group
+        )
+        return (logprobs, entropy) if return_entropy else logprobs
+
     if vocab_parallel_group is not None:
         if global_vocab_size is None:
             raise ValueError(

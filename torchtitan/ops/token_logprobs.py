@@ -55,7 +55,7 @@ def _partial_softmax_stats_kernel(
         offsets = start + tl.arange(0, BLOCK)
         logits = tl.load(
             row_ptr + offsets, mask=offsets < vocab_size, other=float("-inf")
-        )
+        ).to(tl.float32)
         new_max = tl.maximum(max_lanes, logits)
         rescale = tl.exp(max_lanes - new_max)
         exp_logits = tl.exp(logits - new_max)
@@ -73,7 +73,7 @@ def _partial_softmax_stats_kernel(
     # 0 when the label is ignored (-100) or lives on another vocab shard, so shards can be summed.
     local_label = tl.load(labels_ptr + row) - vocab_start
     is_local = (local_label >= 0) & (local_label < vocab_size)
-    label_logit = tl.load(row_ptr + tl.where(is_local, local_label, 0))
+    label_logit = tl.load(row_ptr + tl.where(is_local, local_label, 0)).to(tl.float32)
     tl.store(label_logit_ptr + row, tl.where(is_local, label_logit, 0.0))
 
 
@@ -82,29 +82,37 @@ def _dlogits_kernel(
     logits_ptr,
     labels_ptr,
     logsumexp_ptr,
+    row_scale_ptr,
     dlogits_ptr,
     vocab_size,
     vocab_start,
     stride_row,
+    stride_out,
     scale,
+    HAS_ROW_SCALE: tl.constexpr,
     IGNORE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """dlogits[row] = (one_hot(label) - softmax(logits[row])) * scale, 0 for ignored labels."""
+    """dlogits[row] = (one_hot(label) - softmax(logits[row])) * scale (* row_scale[row]).
+
+    0 for ignored labels.
+    """
     row = tl.program_id(0).to(tl.int64)
     offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < vocab_size
     logits = tl.load(
         logits_ptr + row * stride_row + offsets, mask=mask, other=float("-inf")
-    )
+    ).to(tl.float32)
     logsumexp = tl.load(logsumexp_ptr + row)
     label = tl.load(labels_ptr + row)
+    if HAS_ROW_SCALE:
+        scale = scale * tl.load(row_scale_ptr + row)
     one_hot = (offsets + vocab_start == label).to(tl.float32)
     dlogits = tl.where(
         label != IGNORE, (one_hot - tl.exp(logits - logsumexp)) * scale, 0.0
     )
     tl.store(
-        dlogits_ptr + row * vocab_size + offsets,
+        dlogits_ptr + row * stride_out + offsets,
         dlogits.to(dlogits_ptr.dtype.element_ty),
         mask=mask,
     )
@@ -278,11 +286,14 @@ class TokenLogprobs(torch.autograd.Function):
             logits_TV,
             labels_T,
             logsumexp_T,
+            logsumexp_T,  # unused: no row scale
             dlogits_TV,
             vocab_size,
             ctx.vocab_start,
             logits_TV.stride(0),
+            dlogits_TV.stride(0),
             _DLOGITS_SCALE,
+            HAS_ROW_SCALE=False,
             IGNORE=IGNORE_INDEX,
             BLOCK=block,
             num_warps=8,
@@ -337,6 +348,81 @@ class TokenLogprobs(torch.autograd.Function):
             None,
             None,
         )
+
+
+class TokenLogprobsFromLogits(torch.autograd.Function):
+    """``(logits [T, V], labels [T]) -> (logprobs [T], entropy [T])``, reading the logits once.
+
+    The logits-level counterpart of ``TokenLogprobs``, for heads it does not fuse with (e.g. bf16,
+    soft-capped or LoRA heads). Forward is the same stats pass; backward writes
+    ``g * (one_hot - softmax)`` in the logits' dtype in one pass. It replaces the ~10 passes of
+    log_softmax forward/backward plus a separate entropy softmax. Logits may be bf16 or fp32;
+    statistics are computed in fp32. TP handling matches ``TokenLogprobs``.
+    """
+
+    @staticmethod
+    def spmd_typecheck(
+        result: tuple[torch.Tensor, torch.Tensor],
+        *,
+        logits_TV: torch.Tensor,
+        labels_T: torch.Tensor,
+        vocab_parallel_group: dist.ProcessGroup | None,
+    ) -> None:
+        """SPMD type: logits S(-1)@TP, labels I@TP -> logprobs and entropy I@TP; local without TP."""
+        overrides = {}
+        if vocab_parallel_group is not None:
+            spmd.assert_type(logits_TV, {vocab_parallel_group: spmd.S(1)})
+            spmd.assert_type(labels_T, {vocab_parallel_group: spmd.I})
+            overrides = {vocab_parallel_group: spmd.I}
+        for output_T in result:
+            spmd.assert_local_type_like(
+                output_T, labels_T, overrides  # pyrefly: ignore [bad-argument-type]
+            )
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def forward(
+        ctx,
+        logits_TV: torch.Tensor,
+        labels_T: torch.Tensor,
+        vocab_start: int,
+        vocab_parallel_group: dist.ProcessGroup | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits_TV = logits_TV.contiguous()
+        logsumexp_T, logprobs_T, entropy_T = _softmax_stats(
+            logits_TV, labels_T, vocab_start, vocab_parallel_group
+        )
+        ctx.save_for_backward(logits_TV, labels_T, logsumexp_T)
+        ctx.vocab_start = vocab_start
+        ctx.mark_non_differentiable(entropy_T)
+        ctx.set_materialize_grads(False)
+        return logprobs_T, entropy_T
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def backward(ctx, grad_logprobs_T: torch.Tensor, grad_entropy_T: None):
+        assert grad_entropy_T is None, "entropy is a metric and has no gradient"
+        logits_TV, labels_T, logsumexp_T = ctx.saved_tensors
+        num_tokens, vocab_size = logits_TV.shape
+        dlogits_TV = torch.empty_like(logits_TV)
+        block = 4096
+        _dlogits_kernel[(num_tokens, triton.cdiv(vocab_size, block))](
+            logits_TV,
+            labels_T,
+            logsumexp_T,
+            grad_logprobs_T.float().contiguous(),
+            dlogits_TV,
+            vocab_size,
+            ctx.vocab_start,
+            logits_TV.stride(0),
+            dlogits_TV.stride(0),
+            1.0,
+            HAS_ROW_SCALE=True,
+            IGNORE=IGNORE_INDEX,
+            BLOCK=block,
+            num_warps=8,
+        )
+        return dlogits_TV, None, None, None
 
 
 def vocab_shard_start(
