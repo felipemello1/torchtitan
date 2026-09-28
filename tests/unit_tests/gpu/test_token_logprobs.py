@@ -4,6 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import subprocess
+import sys
+import textwrap
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -248,3 +252,28 @@ def test_token_logprobs_returns_fp32_weight_grad_for_fp32_grad_dtype():
         errors[grad_dtype] = _relative_error(weight_param.grad, weight_ref.grad)
     # Skipping the final bf16 rounding leaves only the fp16 dlogits error (~3e-4).
     assert errors[torch.float32] < 1e-3 < errors[torch.bfloat16]
+
+
+def test_chunked_loss_rejects_out_of_range_labels():
+    # A device-side assert poisons the CUDA context, so run it in a subprocess.
+    code = textwrap.dedent(
+        """
+        import torch
+        from torchtitan.components.loss import ChunkedLossWrapper
+        from torchtitan.models.common.linear import Fp32OutputLinear
+
+        head = Fp32OutputLinear.Config(in_features=64, out_features=100).build()
+        head = head.to(device="cuda", dtype=torch.bfloat16)
+        wrapper = ChunkedLossWrapper(ChunkedLossWrapper.Config(num_chunks=2))
+        wrapper.set_lm_head(head)
+        labels = torch.full((256,), 100, device="cuda")
+        hidden = torch.randn(256, 64, device="cuda", dtype=torch.bfloat16)
+        loss, _ = wrapper(hidden.requires_grad_(), labels)
+        torch.cuda.synchronize()
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True
+    )
+    assert result.returncode != 0
+    assert "labels must be" in result.stderr

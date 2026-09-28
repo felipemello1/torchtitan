@@ -837,6 +837,8 @@ class ChunkedLossWrapper(BaseLoss):
             if use_token_logprobs:
                 vocab_parallel_group = spmd_mesh_group("tp")
                 vocab_start = 0
+                # Under FSDP the weight is a DTensor whose shape is the full [V, D].
+                global_vocab_size = lm_head.weight.shape[0]
                 if vocab_parallel_group is not None:
                     global_vocab_size = self.loss_fn.global_vocab_size
                     if global_vocab_size is None:
@@ -846,6 +848,14 @@ class ChunkedLossWrapper(BaseLoss):
                     vocab_start = vocab_shard_start(
                         global_vocab_size, vocab_parallel_group
                     )
+                # The fused kernels would read an out-of-range label as "on another vocab shard".
+                torch._assert_async(
+                    torch.all(
+                        (labels[0] == IGNORE_INDEX)
+                        | ((labels[0] >= 0) & (labels[0] < global_vocab_size))
+                    ),
+                    f"labels must be {IGNORE_INDEX} or in [0, {global_vocab_size})",
+                )
                 grad_state = TokenLogprobsGradState() if requires_grad else None
 
             for chunk_index in range(num_chunks):
