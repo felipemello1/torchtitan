@@ -1,0 +1,129 @@
+{
+  "cuda_version": "13.0",
+  "device": "NVIDIA GB300",
+  "dtype": "bfloat16",
+  "iterations": 10,
+  "regions": {
+    "gdn_rmsnorm_gated": {
+      "compile": {
+        "max_ms": 0.8279039859771729,
+        "mean_ms": 0.8113632023334503,
+        "median_ms": 0.8093920052051544,
+        "min_ms": 0.8005120158195496,
+        "trace": "gdn_rmsnorm_gated__compile.json.gz"
+      },
+      "eager": {
+        "max_ms": 11.300415992736816,
+        "mean_ms": 11.28082571029663,
+        "median_ms": 11.280256271362305,
+        "min_ms": 11.267616271972656,
+        "trace": "gdn_rmsnorm_gated__eager.json.gz"
+      },
+      "fla": {
+        "max_ms": 0.8986560106277466,
+        "mean_ms": 0.8505376040935516,
+        "median_ms": 0.8436800241470337,
+        "min_ms": 0.8283519744873047,
+        "trace": "gdn_rmsnorm_gated__fla.json.gz"
+      }
+    },
+    "offset_rmsnorm": {
+      "compile": {
+        "max_ms": 0.5450559854507446,
+        "mean_ms": 0.5069088011980056,
+        "median_ms": 0.5042400062084198,
+        "min_ms": 0.48495998978614807,
+        "trace": "offset_rmsnorm__compile.json.gz"
+      },
+      "eager": {
+        "max_ms": 7.192383766174316,
+        "mean_ms": 7.186159992218018,
+        "median_ms": 7.186239957809448,
+        "min_ms": 7.1763200759887695,
+        "trace": "offset_rmsnorm__eager.json.gz"
+      },
+      "triton": {
+        "error": "CompilationError: at 12:14:\ndef _offset_rms_norm_weight_grad_reduce_kernel(\n    partial_grad_weight_ptr,\n    grad_weight_ptr,\n    num_partials,\n    num_cols: tl.constexpr,\n    BLOCK_M: tl.constexpr,\n    BLOCK_N: tl.constexpr,\n) -> None:\n    col_block_idx = tl.program_id(0)\n    partial_offsets = tl.arange(0, BLOCK_M)\n    col_offsets = col_block_idx * BLOCK_N + tl.arange(0, BLOCK_N)\n    offsets = partial_offsets[:, None] * num_cols + col_offsets[None, :]\n              ^\nValueError('numel (2097152) exceeds triton maximum tensor numel (1048576)')"
+      }
+    },
+    "partial_rope": {
+      "compile": {
+        "max_ms": 0.7573760151863098,
+        "mean_ms": 0.7415808081626892,
+        "median_ms": 0.7387680113315582,
+        "min_ms": 0.7282559871673584,
+        "trace": "partial_rope__compile.json.gz"
+      },
+      "eager": {
+        "max_ms": 4.860447883605957,
+        "mean_ms": 4.854377508163452,
+        "median_ms": 4.854063987731934,
+        "min_ms": 4.846015930175781,
+        "trace": "partial_rope__eager.json.gz"
+      },
+      "helion": {
+        "max_ms": 2.9985599517822266,
+        "mean_ms": 2.9663487911224364,
+        "median_ms": 2.9606080055236816,
+        "min_ms": 2.946079969406128,
+        "trace": "partial_rope__helion.json.gz"
+      }
+    },
+    "residual_ffn_rmsnorm": {
+      "compile": {
+        "max_ms": 0.8326079845428467,
+        "mean_ms": 0.8172288060188293,
+        "median_ms": 0.8155040144920349,
+        "min_ms": 0.8047680258750916,
+        "trace": "residual_ffn_rmsnorm__compile.json.gz"
+      },
+      "eager": {
+        "max_ms": 6.279327869415283,
+        "mean_ms": 6.271404695510864,
+        "median_ms": 6.271359920501709,
+        "min_ms": 6.264319896697998,
+        "trace": "residual_ffn_rmsnorm__eager.json.gz"
+      },
+      "fla": {
+        "max_ms": 1.0545920133590698,
+        "mean_ms": 0.95207359790802,
+        "median_ms": 0.930079996585846,
+        "min_ms": 0.898464024066925,
+        "trace": "residual_ffn_rmsnorm__fla.json.gz"
+      }
+    },
+    "swiglu": {
+      "compile": {
+        "max_ms": 2.6059839725494385,
+        "mean_ms": 2.5861311674118044,
+        "median_ms": 2.5850719213485718,
+        "min_ms": 2.5720319747924805,
+        "trace": "swiglu__compile.json.gz"
+      },
+      "eager": {
+        "max_ms": 8.286239624023438,
+        "mean_ms": 8.262713432312012,
+        "median_ms": 8.258768081665039,
+        "min_ms": 8.255711555480957,
+        "trace": "swiglu__eager.json.gz"
+      },
+      "triton": {
+        "max_ms": 2.6374080181121826,
+        "mean_ms": 2.6221087694168093,
+        "median_ms": 2.6235039234161377,
+        "min_ms": 2.606368064880371,
+        "trace": "swiglu__triton.json.gz"
+      },
+      "triton_packed": {
+        "max_ms": 1.74835205078125,
+        "mean_ms": 1.74345920085907,
+        "median_ms": 1.7431840300559998,
+        "min_ms": 1.7397119998931885,
+        "trace": "swiglu__triton_packed.json.gz"
+      }
+    }
+  },
+  "tokens": 40960,
+  "torch_version": "2.15.0.dev20260908+cu130",
+  "warmups": 3
+}
