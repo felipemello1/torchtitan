@@ -134,6 +134,55 @@ if _HAS_TRITON:
             mask=mask,
         )
 
+    @triton.jit  # pyrefly: ignore[unbound-name]
+    def _scale_to_fp16_kernel(
+        x_ptr,
+        scale_ptr,
+        out_ptr,
+        num_cols,
+        stride_row,
+        ROW_SCALE: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """out[row] = fp16(x[row] * scale), with one scale per row if ROW_SCALE."""
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < num_cols
+        if ROW_SCALE:
+            scale = tl.load(scale_ptr + row)
+        else:
+            scale = tl.load(scale_ptr)
+        x = tl.load(x_ptr + row * stride_row + cols, mask=mask).to(tl.float32)
+        tl.store(out_ptr + row * num_cols + cols, (x * scale).to(tl.float16), mask=mask)
+
+
+def _scale_to_fp16(x_RC: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """``fp16(x * scale)`` in one pass; ``scale`` is a scalar or one value per row.
+
+    ``torch.mul(..., out=fp16)`` with mixed dtypes takes a slower casting path (~1.2 vs ~2.2 TB/s).
+
+    Example:
+        weight [124160, 5120] bf16, scale 2^16 (0-dim) -> fp16 [124160, 5120]: 1.2 ms on H100
+    """
+    if x_RC.stride(1) != 1:
+        x_RC = x_RC.contiguous()
+    num_rows, num_cols = x_RC.shape
+    out_RC = torch.empty(num_rows, num_cols, device=x_RC.device, dtype=torch.float16)
+    block = 4096
+    torch.library.wrap_triton(_scale_to_fp16_kernel)[
+        (num_rows, triton.cdiv(num_cols, block))
+    ](
+        x_RC,
+        scale,
+        out_RC,
+        num_cols,
+        x_RC.stride(0),
+        ROW_SCALE=scale.numel() > 1,
+        BLOCK=block,
+        num_warps=8,
+    )
+    return out_RC
+
 
 def _softmax_stats(
     logits_TV: torch.Tensor,
@@ -300,11 +349,8 @@ class TokenLogprobs(torch.autograd.Function):
                 grad_state.weight_scale = _fp16_scale(
                     torch.linalg.vector_norm(weight_VD.detach(), ord=float("inf"))
                 )
-                # Scale and cast in one kernel, without a [V, D] bf16 temporary.
-                grad_state.weight_fp16 = torch.mul(
-                    weight_VD.detach(),
-                    grad_state.weight_scale,
-                    out=torch.empty_like(weight_VD, dtype=torch.float16),
+                grad_state.weight_fp16 = _scale_to_fp16(
+                    weight_VD.detach(), grad_state.weight_scale
                 )
             logits_TV = torch.mm(hidden_TD, weight_VD.T, out_dtype=torch.float32)
         else:
@@ -408,11 +454,7 @@ class TokenLogprobs(torch.autograd.Function):
         if not ctx.needs_input_grad[1]:
             return grad_hidden_TD, None, None, None, None, None, None
 
-        scaled_hidden_TD = torch.mul(
-            hidden_TD,
-            (grad_scale_T * hidden_scale)[:, None],
-            out=torch.empty_like(hidden_TD, dtype=torch.float16),
-        )
+        scaled_hidden_TD = _scale_to_fp16(hidden_TD, grad_scale_T * hidden_scale)
         # Accumulate this chunk's gradient into the fp32 accumulator. The unscale 1 / hidden_scale
         # is a host alpha, so cuBLAS computes alpha * M.T @ hidden + acc in one pass.
         accumulated = grad_state.grad_weight
