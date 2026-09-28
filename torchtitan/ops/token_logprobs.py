@@ -25,10 +25,14 @@ import triton.language as tl
 
 IGNORE_INDEX = -100
 
-# dlogits = g * (one_hot - softmax) is written as fp16 (one_hot - softmax) * 2^15, where g is
-# the per-token gradient of the logprob. Factoring g out keeps each row's values in [-2^15, 2^15]
-# (under fp16's 65504) whatever the loss scale; probabilities down to ~2e-9 stay fp16 normals.
-_DLOGITS_SCALE = 2.0**15
+# The fp16 backward writes M = (one_hot - softmax) with one scale per row, keeping the per-token
+# gradient g = dloss/dlogprob out, so any loss scale fits. A row's max |M| is 1 - p(label), since
+# the other probabilities sum to it: the scale 2^15 / (1 - p(label)) makes the label's entry
+# exactly 2^15, under fp16's 65504. The floor caps the scale for confident tokens (their entries
+# are all small), which keeps the fp32 rounding of 1 - p negligible and moves little range into
+# the hidden operand of the grad_weight GEMM.
+_M_LABEL_ENTRY = 2.0**15
+_ONE_MINUS_P_FLOOR = 2.0**-6
 
 
 @triton.jit
@@ -89,12 +93,10 @@ def _dlogits_kernel(
     vocab_start,
     stride_row,
     stride_out,
-    scale,
-    HAS_ROW_SCALE: tl.constexpr,
     IGNORE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """dlogits[row] = (one_hot(label) - softmax(logits[row])) * scale (* row_scale[row]).
+    """dlogits[row] = (one_hot(label) - softmax(logits[row])) * row_scale[row].
 
     0 for ignored labels.
     """
@@ -107,8 +109,7 @@ def _dlogits_kernel(
     row_max = tl.load(row_max_ptr + row)
     inv_sum_exp = 1.0 / tl.load(sum_exp_ptr + row)
     label = tl.load(labels_ptr + row)
-    if HAS_ROW_SCALE:
-        scale = scale * tl.load(row_scale_ptr + row)
+    scale = tl.load(row_scale_ptr + row)
     one_hot = (offsets + vocab_start == label).to(tl.float32)
     dlogits = tl.where(
         label != IGNORE,
@@ -196,14 +197,15 @@ def _softmax_stats(
 def _fp16_scale(absmax: torch.Tensor) -> torch.Tensor:
     """Power-of-two scale that moves ``absmax`` into [2^14, 2^15), the top of fp16's range.
 
-    Exact to undo, and values down to ~2^-29 of ``absmax`` stay fp16 normals. The clamp keeps
-    zero or tiny ``absmax`` from overflowing the scale.
+    Exact to undo, and values down to ~2^-29 of ``absmax`` stay fp16 normals. Exponents are
+    clamped to [-60, 60], so zero ``absmax`` gets a finite scale and a product or quotient of two
+    scales stays finite in fp32.
 
     Example:
         absmax 139.0 (frexp exponent 8) -> scale 2^7, and 139 * 2^7 = 17792
     """
     _, exponent = torch.frexp(absmax.float())
-    return torch.exp2((15 - exponent).clamp(max=100).float())
+    return torch.exp2((15 - exponent).clamp(-60, 60).float())
 
 
 class TokenLogprobsGradState:
@@ -241,7 +243,8 @@ class TokenLogprobs(torch.autograd.Function):
     relative error per element, the gradients land within ~1% of exact fp64 gradients rounded to
     bf16 (hi + lo, which ``Fp32OutputLinear`` uses, lands within ~0.5% with twice the GEMMs).
     ``g`` must stay out of the fp16 operands: a loss normalized by 1e5 tokens makes ``g * M``
-    fp16 subnormal. So ``g`` scales the fp32 output rows of ``grad_hidden``, and ``g * hidden``
+    fp16 subnormal. So each row of ``M`` gets its own scale (its max, the label's entry, becomes
+    exactly 2^15), ``g`` scales the fp32 output rows of ``grad_hidden``, and ``g * hidden``
     gets a power-of-two scale that puts its largest element at the top of fp16's range, which
     keeps tokens down to ~1e-9 of the largest ``|g|`` as fp16 normals. ``W`` is scaled the same
     way once per microbatch, so small-init heads do not go subnormal.
@@ -304,7 +307,9 @@ class TokenLogprobs(torch.autograd.Function):
         row_max_T, sum_exp_T, logprobs_T, entropy_T = _softmax_stats(
             logits_TV, labels_T, vocab_start, vocab_parallel_group
         )
-        ctx.save_for_backward(hidden_TD, weight_VD, labels_T, row_max_T, sum_exp_T)
+        ctx.save_for_backward(
+            hidden_TD, weight_VD, labels_T, row_max_T, sum_exp_T, logprobs_T
+        )
         # Kept off save_for_backward so backward can free the [T, V] fp32 logits before its GEMMs.
         ctx.logits_TV = logits_TV
         ctx.grad_state = grad_state
@@ -322,15 +327,27 @@ class TokenLogprobs(torch.autograd.Function):
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_logprobs_T: torch.Tensor, grad_entropy_T: None):
         assert grad_entropy_T is None, "entropy is a metric and has no gradient"
-        hidden_TD, weight_VD, labels_T, row_max_T, sum_exp_T = ctx.saved_tensors
+        (
+            hidden_TD,
+            weight_VD,
+            labels_T,
+            row_max_T,
+            sum_exp_T,
+            logprobs_T,
+        ) = ctx.saved_tensors
         logits_TV, ctx.logits_TV = ctx.logits_TV, None
         grad_state = ctx.grad_state
         assert grad_state is not None, "backward needs a TokenLogprobsGradState"
         num_tokens, vocab_size = logits_TV.shape
         grad_T = grad_logprobs_T.float().contiguous()
 
-        # bf16 path: M = (one_hot - softmax) * 2^15 in fp16, with g applied outside the GEMMs.
+        # bf16 path: M = (one_hot - softmax) * row_scale in fp16, with g applied outside the GEMMs.
         # Fallback: dlogits = g * (one_hot - softmax) in fp32.
+        if ctx.use_bf16_gemm:
+            one_minus_p_T = -torch.expm1(logprobs_T)
+            row_scale_T = _M_LABEL_ENTRY / one_minus_p_T.clamp_min(_ONE_MINUS_P_FLOOR)
+        else:
+            row_scale_T = grad_T
         dlogits_TV = torch.empty(
             num_tokens,
             vocab_size,
@@ -343,14 +360,12 @@ class TokenLogprobs(torch.autograd.Function):
             labels_T,
             row_max_T,
             sum_exp_T,
-            grad_T,
+            row_scale_T,
             dlogits_TV,
             vocab_size,
             ctx.vocab_start,
             logits_TV.stride(0),
             dlogits_TV.stride(0),
-            _DLOGITS_SCALE if ctx.use_bf16_gemm else 1.0,
-            HAS_ROW_SCALE=not ctx.use_bf16_gemm,
             IGNORE=IGNORE_INDEX,
             BLOCK=block,
             num_warps=8,
@@ -375,21 +390,24 @@ class TokenLogprobs(torch.autograd.Function):
         grad_hidden_TD = torch.mm(
             dlogits_TV, grad_state.weight_fp16, out_dtype=torch.float32
         )
+        # Per-token factor that undoes M's row scale and applies g.
+        grad_scale_T = grad_T / row_scale_T
         grad_hidden_TD = (
-            grad_hidden_TD
-            * (grad_T / (_DLOGITS_SCALE * grad_state.weight_scale))[:, None]
+            grad_hidden_TD * (grad_scale_T / grad_state.weight_scale)[:, None]
         )
         grad_hidden_TD = grad_hidden_TD.to(hidden_TD.dtype)
         # A frozen lm_head (e.g. LoRA on the decoder) skips the dW GEMM and its accumulator.
         if not ctx.needs_input_grad[1]:
             return grad_hidden_TD, None, None, None, None, None, None
 
-        # Scale g * hidden to the top of fp16's range; undo it on the fp32 output.
+        # Scale grad_scale * hidden to the top of fp16's range; undo it on the fp32 output.
         hidden_absmax_T = torch.linalg.vector_norm(hidden_TD, ord=float("inf"), dim=1)
-        hidden_scale = _fp16_scale((hidden_absmax_T.float() * grad_T.abs()).amax())
+        hidden_scale = _fp16_scale(
+            (hidden_absmax_T.float() * grad_scale_T.abs()).amax()
+        )
         scaled_hidden_TD = torch.mul(
             hidden_TD,
-            (grad_T * hidden_scale)[:, None],
+            (grad_scale_T * hidden_scale)[:, None],
             out=torch.empty_like(hidden_TD, dtype=torch.float16),
         )
         grad_weight_VD = torch.mm(
@@ -410,7 +428,7 @@ class TokenLogprobs(torch.autograd.Function):
             out,
             grad_weight_VD,
             grad_weight_VD if accumulated is None else accumulated,
-            (hidden_scale * _DLOGITS_SCALE).reciprocal(),
+            hidden_scale.reciprocal(),
             numel,
             ACCUMULATE=accumulated is not None,
             BLOCK=add_block,
@@ -490,8 +508,6 @@ class TokenLogprobsFromLogits(torch.autograd.Function):
             ctx.vocab_start,
             logits_TV.stride(0),
             dlogits_TV.stride(0),
-            1.0,
-            HAS_ROW_SCALE=True,
             IGNORE=IGNORE_INDEX,
             BLOCK=block,
             num_warps=8,
