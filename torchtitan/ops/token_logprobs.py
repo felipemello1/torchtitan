@@ -25,12 +25,9 @@ import triton.language as tl
 
 IGNORE_INDEX = -100
 
-# The fp16 backward writes M = (one_hot - softmax) with one scale per row, keeping the per-token
-# gradient g = dloss/dlogprob out, so any loss scale fits. A row's max |M| is 1 - p(label), since
-# the other probabilities sum to it: the scale 2^15 / (1 - p(label)) makes the label's entry
-# exactly 2^15, under fp16's 65504. The floor caps the scale for confident tokens (their entries
-# are all small), which keeps the fp32 rounding of 1 - p negligible and moves little range into
-# the hidden operand of the grad_weight GEMM.
+# M = one_hot - softmax is written as fp16 with one scale per row (g = dloss/dlogprob stays out,
+# so any loss scale fits). A row's max |M| is 1 - p(label), so 2^15 / (1 - p(label)) makes the
+# label's entry exactly 2^15, under fp16's 65504. The floor caps the scale for confident tokens.
 _M_LABEL_ENTRY = 2.0**15
 _ONE_MINUS_P_FLOOR = 2.0**-6
 
