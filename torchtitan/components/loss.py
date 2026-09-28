@@ -751,6 +751,10 @@ class ChunkedLossWrapper(BaseLoss):
             metrics: dict[str, torch.Tensor] = {}
 
             fsdp_enabled = isinstance(lm_head, FSDPModule)
+            # Coalescing gradient sync into the final chunk is only needed when every chunk
+            # produces an lm_head gradient. token_logprobs produces one, at the last chunk,
+            # so it leaves sync as the trainer or pipeline schedule set it.
+            coalesce_gradient_sync = fsdp_enabled and not use_token_logprobs
             # Disable FSDP reshard on lm_head to keep its weight unsharded across
             # all outputs and chunks, avoiding repeated all-gathers. Coalesce
             # gradient synchronization into one reduce-scatter at the final chunk
@@ -758,7 +762,8 @@ class ChunkedLossWrapper(BaseLoss):
             if fsdp_enabled:
                 lm_head.set_reshard_after_forward(False)
                 lm_head.set_reshard_after_backward(False)
-                lm_head.set_requires_gradient_sync(False, recurse=False)
+                if coalesce_gradient_sync:
+                    lm_head.set_requires_gradient_sync(False, recurse=False)
                 # An implicit unshard stores an all-gather event in FSDP's shared
                 # all_gather_state for the next FSDP module to consume. Since
                 # lm_head is the final FSDP forward in this loop, eager warmup
@@ -783,7 +788,7 @@ class ChunkedLossWrapper(BaseLoss):
                 grad_state = TokenLogprobsGradState() if requires_grad else None
 
             for chunk_index in range(num_chunks):
-                if fsdp_enabled and chunk_index == num_chunks - 1:
+                if coalesce_gradient_sync and chunk_index == num_chunks - 1:
                     lm_head.set_requires_gradient_sync(  # pyrefly: ignore[not-callable]
                         True, recurse=False
                     )
