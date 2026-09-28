@@ -229,7 +229,7 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
     """Linear op with close to fp32 precision at close to bf16 speed.
 
     Forward: bf16 input and weight, a bf16 GEMM that accumulates in fp32, fp32 output.
-    Backward: approximates an fp32 backward with bf16 GEMMs; see ``backward``.
+    Backward: approximates an fp32 backward with bf16 or fp16 GEMMs; see ``backward``.
 
     Off CUDA, with non-bf16 operands, or in batch-invariant mode, both passes fall back to fp32
     matmuls, which are slower (on Blackwell, TorchTitan runs them as BF16x9: ~9x the bf16 cost).
@@ -272,8 +272,8 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
     def backward(ctx, grad_output_TO: torch.Tensor):  # pyrefly: ignore[bad-override]
         """``grad_input = grad_output @ weight``, ``grad_weight = grad_output.T @ input``.
 
-        Uses only bf16 GEMMs, yet the gradients come out close to an fp32 backward's, at ~2x the
-        cost of a plain bf16 backward.
+        Uses only 16-bit GEMMs, yet the gradients come out close to an fp32 backward's: at the cost
+        of a plain bf16 backward for wide outputs (fp16 row scales), ~2x for narrow ones (hi + lo).
 
         The problem: grad_output is fp32 (the output was fp32), but fast GEMMs run on bf16 inputs
         (bf16 tensor cores), and bf16 keeps only the top 16 bits of an fp32:
