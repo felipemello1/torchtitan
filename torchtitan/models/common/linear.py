@@ -25,6 +25,7 @@ from torch.autograd.function import once_differentiable
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
+from torchtitan.ops.scale_cast import scale_cast
 from torchtitan.protocols.module import Module
 
 # Shape suffix legend:
@@ -272,7 +273,7 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
     def backward(ctx, grad_output_TO: torch.Tensor):  # pyrefly: ignore[bad-override]
         """``grad_input = grad_output @ weight``, ``grad_weight = grad_output.T @ input``.
 
-        Uses only 16-bit GEMMs, yet the gradients come out close to an fp32 backward's: at ~1.3x the
+        Uses only 16-bit GEMMs, yet the gradients come out close to an fp32 backward's: at ~1.1x the
         cost of a plain bf16 backward for wide outputs (fp16 row scales), ~2x for narrow ones (hi + lo).
 
         The problem: grad_output is fp32 (the output was fp32), but fast GEMMs run on bf16 inputs
@@ -316,7 +317,7 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
             grad_weight:  hi.T @ x + lo.T @ x                            (two small GEMMs)
 
         LM head, 27B shape (8192 tokens, 124160 outputs, 5120 inputs, H100): 77.7 ms with hi + lo,
-        41.2 ms with fp16 row scales, 31.9 ms rounding grad_output to bf16; gradient error vs fp64
+        37.2 ms with fp16 row scales, ~33 ms rounding grad_output to bf16; gradient error vs fp64
         1.67e-3 vs 1.67e-3 (dh) and 1.72e-3 vs 1.73e-3 (dW), where rounding exact gradients to bf16
         gives 1.66e-3 / 1.72e-3.
         """
@@ -341,33 +342,25 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
             # Wide output (e.g. an LM head): fp16 with one scale per row, 1 GEMM per gradient.
             # Each row's max |value| maps to exactly 2^15, which fp16 represents exactly (a
             # power-of-two scale would round it: 3.1e-4 vs 2.3e-4 grad_input error before the
-            # bf16 cast). The clamp keeps all-zero rows finite. Each torch.mul(..., out=fp16)
-            # scales and casts in one kernel.
+            # bf16 cast). The clamp keeps all-zero rows finite. Each scale_cast scales and casts
+            # in one pass.
             row_max_T1 = torch.linalg.vector_norm(
                 grad_output_TO, ord=float("inf"), dim=1, keepdim=True
             )
             row_scale_T1 = 2.0**15 / row_max_T1.clamp(2.0**-45, 2.0**75)
-            scaled_TO = torch.mul(
-                grad_output_TO,
-                row_scale_T1,
-                out=torch.empty_like(grad_output_TO, dtype=torch.float16),
-            )
+            scaled_TO = scale_cast(grad_output_TO, row_scale_T1, torch.float16)
             if ctx.needs_input_grad[0]:
                 weight_scale = _fp16_scale(
                     torch.linalg.vector_norm(weight_OD, ord=float("inf"))
                 )
-                weight_fp16_OD = torch.mul(
-                    weight_OD,
-                    weight_scale,
-                    out=torch.empty_like(weight_OD, dtype=torch.float16),
-                )
+                weight_fp16_OD = scale_cast(weight_OD, weight_scale, torch.float16)
                 grad_input_TD = torch.mm(
                     scaled_TO, weight_fp16_OD, out_dtype=torch.float32
                 )
-                grad_input_TD = torch.mul(
+                grad_input_TD = scale_cast(
                     grad_input_TD,
                     (row_scale_T1 * weight_scale).reciprocal(),
-                    out=torch.empty_like(input_TD),
+                    input_TD.dtype,
                 )
             if ctx.needs_input_grad[1]:
                 # grad_weight = scaled.T @ (input / row_scale), with input / row_scale scaled
@@ -378,18 +371,14 @@ class _Fp32OutputLinearFunction(torch.autograd.Function):
                 input_scale = _fp16_scale(
                     (input_row_max_T1.float() / row_scale_T1).amax()
                 )
-                scaled_input_TD = torch.mul(
-                    input_TD,
-                    input_scale / row_scale_T1,
-                    out=torch.empty_like(input_TD, dtype=torch.float16),
+                scaled_input_TD = scale_cast(
+                    input_TD, input_scale / row_scale_T1, torch.float16
                 )
                 grad_weight_OD = torch.mm(
                     scaled_TO.T, scaled_input_TD, out_dtype=torch.float32
                 )
-                grad_weight_OD = torch.mul(
-                    grad_weight_OD,
-                    input_scale.reciprocal(),
-                    out=torch.empty_like(weight_OD),
+                grad_weight_OD = scale_cast(
+                    grad_weight_OD, input_scale.reciprocal(), weight_OD.dtype
                 )
         else:
             # Narrow output (e.g. a router): stack [hi | lo] along O; only the small weight grows.
