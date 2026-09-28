@@ -329,11 +329,51 @@ class BaseLoss(ABC, Configurable):
         return loss, {}
 
 
-class CrossEntropyLoss(BaseLoss):
+class TokenLogprobLoss(BaseLoss):
+    """Loss that reads only each token's label logprob, plus its entropy as a metric.
+
+    Subclasses implement ``loss_from_logprobs``. ``__call__`` computes its inputs from
+    logits; ``ChunkedLossWrapper`` instead computes them fused with an ``Fp32OutputLinear``
+    lm_head (``Fp32OutputLinear.token_logprobs``), without materializing logits outside it.
+    """
+
+    global_vocab_size: int | None
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        global_valid_tokens: torch.Tensor | None = None,
+        **loss_inputs: Any,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        logprobs, entropy = compute_logprobs(
+            logits,
+            labels,
+            vocab_parallel_group=spmd_mesh_group("tp"),
+            return_entropy=True,
+            global_vocab_size=self.global_vocab_size,
+        )
+        return self.loss_from_logprobs(
+            logprobs, entropy, global_valid_tokens, **loss_inputs
+        )
+
+    @abstractmethod
+    def loss_from_logprobs(
+        self,
+        logprobs: torch.Tensor,
+        entropy: torch.Tensor,
+        global_valid_tokens: torch.Tensor | None,
+        **loss_inputs: Any,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return the scaled loss and metrics from ``[T]`` label logprobs and entropy."""
+        ...
+
+
+class CrossEntropyLoss(TokenLogprobLoss):
     """Cross-entropy loss with sum reduction for token-based normalization."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(BaseLoss.Config):
+    class Config(TokenLogprobLoss.Config):
         global_vocab_size: int | None = None
         """Full vocabulary size, needed for spmd_types loss-parallel CE."""
 
@@ -359,6 +399,19 @@ class CrossEntropyLoss(BaseLoss):
                     global_valid_tokens,
                     {"dp": spmd.R, "cp": spmd.R, "tp": spmd.I},
                 )
+        if global_valid_tokens is not None:
+            loss = loss / global_valid_tokens
+        return loss, {}
+
+    def loss_from_logprobs(
+        self,
+        logprobs: torch.Tensor,
+        entropy: torch.Tensor,
+        global_valid_tokens: torch.Tensor | None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        del entropy, kwargs
+        loss = -logprobs.sum()
         if global_valid_tokens is not None:
             loss = loss / global_valid_tokens
         return loss, {}
@@ -449,46 +502,6 @@ def compute_logprobs(
             torch.softmax(logits, dim=-1) * logits
         ).sum(dim=-1)
     return logprobs, entropy
-
-
-class TokenLogprobLoss(BaseLoss):
-    """Loss that reads only each token's label logprob, plus its entropy as a metric.
-
-    Subclasses implement ``loss_from_logprobs``. ``__call__`` computes its inputs from
-    logits; ``ChunkedLossWrapper`` instead computes them fused with an ``Fp32OutputLinear``
-    lm_head (``Fp32OutputLinear.token_logprobs``), without materializing logits outside it.
-    """
-
-    global_vocab_size: int | None
-
-    def __call__(
-        self,
-        logits: torch.Tensor,
-        labels: torch.Tensor,
-        global_valid_tokens: torch.Tensor | None = None,
-        **loss_inputs: Any,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        logprobs, entropy = compute_logprobs(
-            logits,
-            labels,
-            vocab_parallel_group=spmd_mesh_group("tp"),
-            return_entropy=True,
-            global_vocab_size=self.global_vocab_size,
-        )
-        return self.loss_from_logprobs(
-            logprobs, entropy, global_valid_tokens, **loss_inputs
-        )
-
-    @abstractmethod
-    def loss_from_logprobs(
-        self,
-        logprobs: torch.Tensor,
-        entropy: torch.Tensor,
-        global_valid_tokens: torch.Tensor | None,
-        **loss_inputs: Any,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Return the scaled loss and metrics from ``[T]`` label logprobs and entropy."""
-        ...
 
 
 class GradAccumulator:
