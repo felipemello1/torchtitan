@@ -223,3 +223,28 @@ def test_chunked_loss_skips_non_loss_tokens(loss_token_frac):
     assert torch.all(skipped[2][~loss_inputs["loss_mask"]] == 0)
     torch.testing.assert_close(skipped[2], grad_hidden, atol=1e-6, rtol=1e-2)
     torch.testing.assert_close(skipped[3], grad_weight, atol=1e-6, rtol=1e-2)
+
+
+def test_token_logprobs_returns_fp32_weight_grad_for_fp32_grad_dtype():
+    hidden, weight, labels, _ = _inputs(num_tokens=512, dim=128, vocab=5003)
+    grad_logprobs = torch.randn(512, device="cuda") * 1e-5
+    weight_ref = weight.double().requires_grad_()
+    logprobs_ref = -F.cross_entropy(
+        hidden.double() @ weight_ref.T, labels, reduction="none", ignore_index=-100
+    )
+    (logprobs_ref * grad_logprobs).sum().backward()
+
+    errors = {}
+    for grad_dtype in (torch.bfloat16, torch.float32):
+        weight_param = weight.clone().requires_grad_()
+        weight_param.grad_dtype = grad_dtype
+        grad_state = TokenLogprobsGradState()
+        for chunk, is_last in ((slice(0, 256), False), (slice(256, 512), True)):
+            logprobs, _ = TokenLogprobs.apply(
+                hidden[chunk], weight_param, labels[chunk], grad_state, is_last, 0, None
+            )
+            (logprobs * grad_logprobs[chunk]).sum().backward()
+        assert weight_param.grad.dtype is grad_dtype
+        errors[grad_dtype] = _relative_error(weight_param.grad, weight_ref.grad)
+    # Skipping the final bf16 rounding leaves only the fp16 dlogits error (~3e-4).
+    assert errors[torch.float32] < 1e-3 < errors[torch.bfloat16]

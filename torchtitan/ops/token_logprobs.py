@@ -233,7 +233,8 @@ class TokenLogprobs(torch.autograd.Function):
         ctx.grad_state = grad_state
         ctx.return_grad_weight = return_grad_weight
         ctx.vocab_start = vocab_start
-        ctx.weight_dtype = weight_VD.dtype
+        # fp32 when FSDP's unsharded weight accumulates fp32 gradients (Tensor.grad_dtype).
+        ctx.grad_weight_dtype = weight_VD.grad_dtype or weight_VD.dtype
         ctx.mark_non_differentiable(entropy_T)
         ctx.set_materialize_grads(False)
         return logprobs_T, entropy_T
@@ -280,11 +281,11 @@ class TokenLogprobs(torch.autograd.Function):
         grad_weight_VD = torch.mm(
             dlogits_TV.T, scaled_hidden_TD, out_dtype=torch.float32
         )
-        # The first chunk's scaled gradient becomes the fp32 accumulator; the last chunk adds
-        # its own and casts the sum to the weight's dtype in the same pass.
+        # The first chunk's scaled gradient becomes the fp32 accumulator. The last chunk adds its
+        # own and, unless the weight takes fp32 gradients, casts the sum in the same pass.
         accumulated = grad_state.grad_weight
-        if ctx.return_grad_weight:
-            out = torch.empty_like(grad_weight_VD, dtype=ctx.weight_dtype)
+        if ctx.return_grad_weight and ctx.grad_weight_dtype != torch.float32:
+            out = torch.empty_like(grad_weight_VD, dtype=ctx.grad_weight_dtype)
         else:
             out = grad_state.grad_weight = (
                 grad_weight_VD if accumulated is None else accumulated
