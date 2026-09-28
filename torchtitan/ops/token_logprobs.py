@@ -120,25 +120,6 @@ def _dlogits_kernel(
     )
 
 
-@triton.jit
-def _scaled_add_kernel(
-    out_ptr,
-    src_ptr,
-    acc_ptr,
-    scale_ptr,
-    numel,
-    ACCUMULATE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """out = src * scale (+ acc if ACCUMULATE), cast to out's dtype; scale is read on device."""
-    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < numel
-    value = tl.load(src_ptr + offsets, mask=mask) * tl.load(scale_ptr)
-    if ACCUMULATE:
-        value += tl.load(acc_ptr + offsets, mask=mask)
-    tl.store(out_ptr + offsets, value.to(out_ptr.dtype.element_ty), mask=mask)
-
-
 def _softmax_stats(
     logits_TV: torch.Tensor,
     labels_T: torch.Tensor,
@@ -203,6 +184,25 @@ def _fp16_scale(absmax: torch.Tensor) -> torch.Tensor:
     """
     _, exponent = torch.frexp(absmax.float())
     return torch.exp2((15 - exponent).clamp(-60, 60).float())
+
+
+def _start_hidden_scale(
+    hidden_TD: torch.Tensor, grad_scale_T: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.cuda.Event | None]:
+    """Power-of-two scale for ``hidden * grad_scale``, and its pinned host copy in flight.
+
+    Called before the dlogits and grad_hidden work is queued, so waiting on the copy later does
+    not stall the GPU. Under CUDA graph capture there is no host copy.
+    """
+    hidden_absmax_T = torch.linalg.vector_norm(hidden_TD, ord=float("inf"), dim=1)
+    hidden_scale = _fp16_scale((hidden_absmax_T.float() * grad_scale_T.abs()).amax())
+    if torch.cuda.is_current_stream_capturing():
+        return hidden_scale, None, None
+    hidden_scale_host = torch.empty((), dtype=torch.float32, pin_memory=True)
+    hidden_scale_host.copy_(hidden_scale, non_blocking=True)
+    copied = torch.cuda.Event()
+    copied.record()
+    return hidden_scale, hidden_scale_host, copied
 
 
 class TokenLogprobsGradState:
@@ -343,6 +343,12 @@ class TokenLogprobs(torch.autograd.Function):
         if ctx.use_bf16_gemm:
             one_minus_p_T = -torch.expm1(logprobs_T)
             row_scale_T = _M_LABEL_ENTRY / one_minus_p_T.clamp_min(_ONE_MINUS_P_FLOOR)
+            # Per-token factor that undoes M's row scale and applies g.
+            grad_scale_T = grad_T / row_scale_T
+            if ctx.needs_input_grad[1]:
+                hidden_scale, hidden_scale_host, scale_copied = _start_hidden_scale(
+                    hidden_TD, grad_scale_T
+                )
         else:
             row_scale_T = grad_T
         dlogits_TV = torch.empty(
@@ -387,8 +393,6 @@ class TokenLogprobs(torch.autograd.Function):
         grad_hidden_TD = torch.mm(
             dlogits_TV, grad_state.weight_fp16, out_dtype=torch.float32
         )
-        # Per-token factor that undoes M's row scale and applies g.
-        grad_scale_T = grad_T / row_scale_T
         grad_hidden_TD = (
             grad_hidden_TD * (grad_scale_T / grad_state.weight_scale)[:, None]
         )
@@ -397,43 +401,47 @@ class TokenLogprobs(torch.autograd.Function):
         if not ctx.needs_input_grad[1]:
             return grad_hidden_TD, None, None, None, None, None, None
 
-        # Scale grad_scale * hidden to the top of fp16's range; undo it on the fp32 output.
-        hidden_absmax_T = torch.linalg.vector_norm(hidden_TD, ord=float("inf"), dim=1)
-        hidden_scale = _fp16_scale(
-            (hidden_absmax_T.float() * grad_scale_T.abs()).amax()
-        )
         scaled_hidden_TD = torch.mul(
             hidden_TD,
             (grad_scale_T * hidden_scale)[:, None],
             out=torch.empty_like(hidden_TD, dtype=torch.float16),
         )
-        grad_weight_VD = torch.mm(
-            dlogits_TV.T, scaled_hidden_TD, out_dtype=torch.float32
-        )
-        # The first chunk's scaled gradient becomes the fp32 accumulator. The last chunk adds its
-        # own and, unless the weight takes fp32 gradients, casts the sum in the same pass.
+        # Accumulate this chunk's gradient into the fp32 accumulator. The unscale 1 / hidden_scale
+        # is a host alpha, so cuBLAS computes alpha * M.T @ hidden + acc in one pass.
         accumulated = grad_state.grad_weight
-        if ctx.return_grad_weight and ctx.grad_weight_dtype != torch.float32:
-            out = torch.empty_like(grad_weight_VD, dtype=ctx.grad_weight_dtype)
+        if hidden_scale_host is None:
+            # Graph capture cannot wait on the host: unscale on the device instead.
+            grad_weight_VD = torch.mm(
+                dlogits_TV.T, scaled_hidden_TD, out_dtype=torch.float32
+            ).mul_(hidden_scale.reciprocal())
+            if accumulated is None:
+                accumulated = grad_weight_VD
+            else:
+                accumulated += grad_weight_VD
         else:
-            out = grad_state.grad_weight = (
-                grad_weight_VD if accumulated is None else accumulated
+            beta = 1.0
+            if accumulated is None:
+                # beta=0: cuBLAS does not read the empty buffer.
+                accumulated, beta = (
+                    torch.empty_like(weight_VD, dtype=torch.float32),
+                    0.0,
+                )
+            scale_copied.synchronize()
+            torch.addmm(
+                accumulated,
+                dlogits_TV.T,
+                scaled_hidden_TD,
+                beta=beta,
+                alpha=1.0 / hidden_scale_host.item(),
+                out_dtype=torch.float32,
+                out=accumulated,
             )
-        numel = out.numel()
-        add_block = 8192
-        _scaled_add_kernel[(triton.cdiv(numel, add_block),)](
-            out,
-            grad_weight_VD,
-            grad_weight_VD if accumulated is None else accumulated,
-            hidden_scale.reciprocal(),
-            numel,
-            ACCUMULATE=accumulated is not None,
-            BLOCK=add_block,
-            num_warps=8,
-        )
+        grad_state.grad_weight = accumulated
         if not ctx.return_grad_weight:
             return grad_hidden_TD, None, None, None, None, None, None
-        # Drop the state's references so autograd can take the buffer without a copy.
+        # A no-op for fp32 gradients. Dropping the state's references lets autograd take the
+        # buffer without a copy.
+        out = accumulated.to(ctx.grad_weight_dtype)
         grad_state.grad_weight = grad_state.weight_fp16 = None
         return grad_hidden_TD, out, None, None, None, None, None
 
