@@ -157,3 +157,70 @@ def test_backward_runs_under_autocast_with_fp32_params():
 
     assert x.grad.dtype is torch.float32
     assert layer.weight.grad.dtype is torch.float32
+
+
+def test_fp32_output_linear_wide_backward_matches_fp64():
+    """Wide outputs (an LM head) take the fp16 row-scaled backward; tiny loss scales must survive."""
+    torch.manual_seed(0)
+    layer = Fp32OutputLinear.Config(in_features=128, out_features=4096).build()
+    layer = layer.to(device="cuda", dtype=torch.bfloat16)
+    input_TD = torch.randn(
+        256, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    # A loss normalized by ~1e5 tokens: its gradient would be fp16-subnormal without row scales.
+    grad_output_TO = torch.randn(256, 4096, device="cuda") * 1e-6
+    # Masked tokens have all-zero gradient rows; they must not produce NaNs.
+    grad_output_TO[::5] = 0
+    layer(input_TD).backward(grad_output_TO)
+    assert (
+        torch.isfinite(input_TD.grad).all() and torch.isfinite(layer.weight.grad).all()
+    )
+
+    input_ref = input_TD.detach().double().requires_grad_()
+    weight_ref = layer.weight.detach().double().requires_grad_()
+    F.linear(input_ref, weight_ref).backward(grad_output_TO.double())
+
+    def relative_error(actual, expected):
+        return ((actual.double() - expected).norm() / expected.norm()).item()
+
+    # Rounding exact gradients to bf16 alone gives ~2e-3.
+    assert relative_error(input_TD.grad, input_ref.grad) < 4e-3
+    assert relative_error(layer.weight.grad, weight_ref.grad) < 4e-3
+
+
+@pytest.mark.parametrize(
+    "case", ["tiny_row_with_zeros", "row_magnitude_spread", "small_init_weight"]
+)
+def test_fp32_output_linear_wide_backward_dynamic_range(case):
+    """fp16 scales must not overflow (NaN) or push small rows / small weights to subnormals."""
+    torch.manual_seed(0)
+    input_TD = torch.randn(256, 128, device="cuda", dtype=torch.bfloat16)
+    weight_OD = (torch.randn(4096, 128, device="cuda") * 0.1).bfloat16()
+    grad_output_TO = torch.randn(256, 4096, device="cuda") * 1e-4
+    columns = slice(None)
+    if case == "tiny_row_with_zeros":
+        # A row max near fp32's bottom: an unclamped 2^15 / row_max overflows to inf, 0 * inf = NaN.
+        grad_output_TO[3] = 0
+        grad_output_TO[3, :10] = 1e-36
+    elif case == "row_magnitude_spread":
+        # Every row but the first is 1e-8 smaller; the first 100 columns only see the small rows.
+        grad_output_TO[1:] *= 1e-8
+        grad_output_TO[0, :100] = 0
+        columns = slice(0, 100)
+    else:
+        weight_OD = (weight_OD.float() * 1e-5).bfloat16()
+    layer = Fp32OutputLinear.Config(in_features=128, out_features=4096).build()
+    layer = layer.to(device="cuda", dtype=torch.bfloat16)
+    layer.weight.data.copy_(weight_OD)
+    input_TD.requires_grad_()
+    layer(input_TD).backward(grad_output_TO)
+
+    input_ref = input_TD.detach().double().requires_grad_()
+    weight_ref = weight_OD.double().requires_grad_()
+    F.linear(input_ref, weight_ref).backward(grad_output_TO.double())
+
+    def relative_error(actual, expected):
+        return ((actual.double() - expected).norm() / expected.norm()).item()
+
+    assert relative_error(input_TD.grad, input_ref.grad) < 4e-3
+    assert relative_error(layer.weight.grad[columns], weight_ref.grad[columns]) < 4e-3
