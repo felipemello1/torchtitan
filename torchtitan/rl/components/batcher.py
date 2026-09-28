@@ -132,7 +132,8 @@ class Batcher(Configurable):
         """Pack each prompt once per microbatch; its samples attend to that copy.
 
         Saves compute when prompts are long relative to completions. Requires
-        varlen attention; see `_pack_training_samples` for the layout. Without
+        varlen attention (and Gated DeltaNet for Qwen3.5); see
+        `_pack_training_samples` for the layout. Without
         activation checkpointing, each layer also saves the gathered prompt K/V.
         """
 

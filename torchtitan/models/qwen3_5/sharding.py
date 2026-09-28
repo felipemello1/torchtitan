@@ -49,6 +49,7 @@ from torchtitan.models.common.vision_encoder_sharding import (
     vision_invariant_linear_config,
     vision_rowwise_config,
 )
+from torchtitan.models.qwen3_5.gdn import DeltaNetSharedPrefixMetadata
 from torchtitan.models.qwen3_5.moe import SigmoidGatedFeedForward
 from torchtitan.protocols.sharding import ShardingConfig
 
@@ -71,12 +72,15 @@ def annotate_deltanet_cu_seqlens(
 ) -> None:
     """Annotate the nested GatedDeltaNet ``cu_seq_q`` offsets as DP-varying.
 
-    ``cu_seq_q`` sits inside a ``VarlenMetadata`` inside the attention-mask
-    dict, so it is unreachable by name through ``input_sharding``; the caller
-    invokes this under the dense SPMD mesh.
+    ``cu_seq_q`` sits inside a ``VarlenMetadata`` (or the index tensors inside a
+    ``DeltaNetSharedPrefixMetadata``) inside the attention-mask dict, so it is
+    unreachable by name through ``input_sharding``; the caller invokes this
+    under the dense SPMD mesh.
     """
     deltanet_metadata = attention_masks.get("deltanet")
-    if not isinstance(deltanet_metadata, VarlenMetadata):
+    if not isinstance(
+        deltanet_metadata, (VarlenMetadata, DeltaNetSharedPrefixMetadata)
+    ):
         return
     deltanet_metadata.annotate_spmd_types()
 
