@@ -127,6 +127,28 @@ def qwen3_0_6b_local_sampled(
     return config
 
 
+def qwen3_0_6b_local_tied_baseline(
+    seq_len: int | None = 4096,
+) -> SampledSoftmaxTrainer.Config:
+    """Stock Qwen3-0.6B head: lm_head tied to the token embeddings."""
+    config = qwen3_0_6b_local_baseline(seq_len)
+    config.model.enable_weight_tying = True
+    config.model.tok_embeddings.param_init = qwen3_0_6b(
+        seq_len=seq_len
+    ).model.tok_embeddings.param_init
+    return config
+
+
+def qwen3_0_6b_local_tied_sampled(
+    seq_len: int | None = 4096,
+) -> SampledSoftmaxTrainer.Config:
+    config = qwen3_0_6b_local_tied_baseline(seq_len)
+    config.loss = _sampled_loss(
+        config, schedule=[(0.57, 16384), (0.81, 24576), (0.93, 49152)]
+    )
+    return config
+
+
 def qwen3_0_6b_local_short_baseline(
     seq_len: int | None = 4096,
 ) -> SampledSoftmaxTrainer.Config:
