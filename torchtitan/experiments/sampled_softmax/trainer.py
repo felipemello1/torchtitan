@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Trainer that logs the sampled-softmax loss metrics next to the standard ones."""
+"""Trainer that drives the sampled-softmax schedule and logs its metrics next to the standard ones."""
 
 from dataclasses import dataclass
 from typing import Any
@@ -46,6 +46,14 @@ class SampledSoftmaxTrainer(Trainer):
                         else float(value)
                     )
                 extra[key] = value
-            base_log(step, global_avg_loss, global_max_loss, grad_norm, extra_metrics=extra)
+            base_log(
+                step, global_avg_loss, global_max_loss, grad_norm, extra_metrics=extra
+            )
 
         self.metrics_processor.log = log  # pyrefly: ignore[bad-assignment]
+
+    def train_step(self, data_iterator):
+        loss_fn = self.engine.loss_fn
+        if isinstance(loss_fn, SampledSoftmaxChunkedLoss):
+            loss_fn.step = self.engine.num_completed_steps + 1
+        super().train_step(data_iterator)

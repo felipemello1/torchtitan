@@ -6,8 +6,8 @@
 
 """Configs for the sampled-softmax experiment.
 
-Local (1 GPU): Qwen3-0.6B on local c4 shards, for accuracy A/B runs.
-8xH100 devgpu: Qwen3-30B-A3B, dp4 tp2 ep2, DeepEP, the baseline run's shape.
+Local (1 GPU): Qwen3-0.6B with an untied lm_head (like the 30B) on local c4 shards, for accuracy A/B runs.
+8xH100: Qwen3-30B-A3B, dp4 tp2 ep2, DeepEP, the baseline run's shape.
 
 Each shape has a baseline (stock ChunkedLossWrapper) and sampled variants. Scalars
 such as ``--loss.correction importance`` or ``--loss.fused_full_softmax`` can be
@@ -15,26 +15,35 @@ overridden on the command line.
 """
 
 import dataclasses
+from functools import partial
 
-from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
-from torchtitan.components.validate import Validator
-from torchtitan.experiments.sampled_softmax.loss import SampledSoftmaxChunkedLoss
-from torchtitan.experiments.sampled_softmax.trainer import SampledSoftmaxTrainer
+import torch.nn as nn
+
 from torchtitan.components.data.dataset import SingleDatasetConfig
 from torchtitan.components.data.loader import GrainDataLoader
 from torchtitan.components.data.packing import ConcatThenSplitPackingConfig
 from torchtitan.components.data.sources import HuggingFaceRandomAccessSource
+
+from torchtitan.components.loss import ChunkedLossWrapper
+from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
+from torchtitan.components.validate import Validator
+from torchtitan.experiments.sampled_softmax.loss import SampledSoftmaxChunkedLoss
+from torchtitan.experiments.sampled_softmax.trainer import SampledSoftmaxTrainer
 from torchtitan.hf_datasets.text_datasets import DATASETS, TextProcessor
 from torchtitan.models.qwen3 import model_registry
 from torchtitan.models.qwen3.config_registry import qwen3_0_6b, qwen3_30b_a3b
 from torchtitan.trainer import Trainer
 
-# Local runs (GB300 login pod) and the 8xH100 devgpu keep the Qwen3 tokenizer in different places;
-# the H100 path is the one baseline run 2uo7gfn9 used.
-LOCAL_TOKENIZER_PATH = "/home/felipemello/fp32grads/qwen3_tokenizer"
-H100_TOKENIZER_PATH = "/home/felipemello/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca"
-LOCAL_C4 = "/home/felipemello/data/c4_en"
+# The tokenizer baseline run 2uo7gfn9 used, and the c4 shards cached on the devgpu
+# (train shards 0-2 for training, shard 4 held out for validation).
+H100_TOKENIZER_PATH = (
+    "/home/felipemello/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/"
+    "c1899de289a04d12100db370d81485cdf75e47ca"
+)
+LOCAL_C4 = (
+    "/home/felipemello/.cache/huggingface/hub/datasets--allenai--c4/snapshots/"
+    "1588ec454efa1a09f29cd18ddd04fe05fc8653a2/en"
+)
 
 
 def _local_c4(split_files: list[str]) -> SingleDatasetConfig:
@@ -42,7 +51,9 @@ def _local_c4(split_files: list[str]) -> SingleDatasetConfig:
         source=HuggingFaceRandomAccessSource.Config(
             path="json",
             split="train",
-            load_dataset_kwargs={"data_files": [f"{LOCAL_C4}/{f}" for f in split_files]},
+            load_dataset_kwargs={
+                "data_files": [f"{LOCAL_C4}/{f}" for f in split_files]
+            },
         ),
         processor=TextProcessor.Config(),
         post_filters=(lambda sample: sample is not None,),
@@ -50,7 +61,9 @@ def _local_c4(split_files: list[str]) -> SingleDatasetConfig:
 
 
 def _as_experiment(config: Trainer.Config) -> SampledSoftmaxTrainer.Config:
-    fields = {f.name: getattr(config, f.name) for f in dataclasses.fields(Trainer.Config)}
+    fields = {
+        f.name: getattr(config, f.name) for f in dataclasses.fields(Trainer.Config)
+    }
     return SampledSoftmaxTrainer.Config(**fields)
 
 
@@ -67,9 +80,16 @@ def _sampled_loss(config: Trainer.Config, **kwargs) -> SampledSoftmaxChunkedLoss
 # ---- Local: Qwen3-0.6B, 1 GPU ------------------------------------------------
 
 
-def qwen3_0_6b_local_baseline(seq_len: int | None = 4096) -> SampledSoftmaxTrainer.Config:
+def qwen3_0_6b_local_baseline(
+    seq_len: int | None = 4096,
+) -> SampledSoftmaxTrainer.Config:
     config = qwen3_0_6b(seq_len=seq_len)
-    config.hf_assets_path = LOCAL_TOKENIZER_PATH
+    config.hf_assets_path = H100_TOKENIZER_PATH
+    # Untie the lm_head so its gradient is as sparse as the 30B's under sampling.
+    config.model.enable_weight_tying = False
+    config.model.tok_embeddings.param_init = {
+        "weight": partial(nn.init.normal_, std=0.02)
+    }
     config.dataloader = GrainDataLoader.Config(
         dataset=ConcatThenSplitPackingConfig(
             dataset=_local_c4([f"c4-train.0000{i}-of-01024.json.gz" for i in range(3)])
@@ -87,7 +107,7 @@ def qwen3_0_6b_local_baseline(seq_len: int | None = 4096) -> SampledSoftmaxTrain
         steps=24,
         dataloader=GrainDataLoader.Config(
             dataset=ConcatThenSplitPackingConfig(
-                dataset=_local_c4(["c4-validation.00000-of-00008.json.gz"])
+                dataset=_local_c4(["c4-train.00004-of-01024.json.gz"])
             ),
             repeat=True,
             shuffle=False,
@@ -96,16 +116,32 @@ def qwen3_0_6b_local_baseline(seq_len: int | None = 4096) -> SampledSoftmaxTrain
     return _as_experiment(config)
 
 
-def qwen3_0_6b_local_sampled(seq_len: int | None = 4096) -> SampledSoftmaxTrainer.Config:
+def qwen3_0_6b_local_sampled(
+    seq_len: int | None = 4096,
+) -> SampledSoftmaxTrainer.Config:
+    """Twice the per-TP-rank budgets of the 30B run: the same global budget on one GPU."""
     config = qwen3_0_6b_local_baseline(seq_len)
-    config.loss = _sampled_loss(config)
+    config.loss = _sampled_loss(
+        config, schedule=[(0.57, 16384), (0.81, 24576), (0.93, 49152)]
+    )
+    return config
+
+
+def qwen3_0_6b_local_fused_full(
+    seq_len: int | None = 4096,
+) -> SampledSoftmaxTrainer.Config:
+    """Kernel-only arm: full softmax every step through the fused CE (no sampling)."""
+    config = qwen3_0_6b_local_baseline(seq_len)
+    config.loss = _sampled_loss(config, schedule=[])
     return config
 
 
 # ---- 8xH100 devgpu: Qwen3-30B-A3B, dp4 tp2 ep2, DeepEP ------------------------------
 
 
-def qwen3_30b_a3b_deepep_baseline(seq_len: int | None = 4096) -> SampledSoftmaxTrainer.Config:
+def qwen3_30b_a3b_deepep_baseline(
+    seq_len: int | None = 4096,
+) -> SampledSoftmaxTrainer.Config:
     """The shape of wandb run 2uo7gfn9 (qwen3_30b_a3b_c4_ep2_tp2_dp4_deepep) plus validation."""
     config = qwen3_30b_a3b(seq_len=seq_len)
     config.model = model_registry("30B-A3B", seq_len=seq_len, moe_comm_backend="deepep")
@@ -129,14 +165,18 @@ def qwen3_30b_a3b_deepep_baseline(seq_len: int | None = 4096) -> SampledSoftmaxT
     return _as_experiment(config)
 
 
-def qwen3_30b_a3b_deepep_sampled(seq_len: int | None = 4096) -> SampledSoftmaxTrainer.Config:
+def qwen3_30b_a3b_deepep_sampled(
+    seq_len: int | None = 4096,
+) -> SampledSoftmaxTrainer.Config:
     config = qwen3_30b_a3b_deepep_baseline(seq_len)
     config.loss = _sampled_loss(config)
     return config
 
 
-def qwen3_30b_a3b_deepep_fused_full(seq_len: int | None = 4096) -> SampledSoftmaxTrainer.Config:
+def qwen3_30b_a3b_deepep_fused_full(
+    seq_len: int | None = 4096,
+) -> SampledSoftmaxTrainer.Config:
     """Kernel-only arm: full softmax every step through the fused CE (no sampling)."""
     config = qwen3_30b_a3b_deepep_baseline(seq_len)
-    config.loss = _sampled_loss(config, schedule=[], fused_full_softmax=True)
+    config.loss = _sampled_loss(config, schedule=[])
     return config
