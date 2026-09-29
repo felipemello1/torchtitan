@@ -142,7 +142,7 @@ def qwen3_0_6b_local_fused_full(
 def qwen3_30b_a3b_deepep_baseline(
     seq_len: int | None = 4096,
 ) -> SampledSoftmaxTrainer.Config:
-    """The shape of wandb run 2uo7gfn9 (qwen3_30b_a3b_c4_ep2_tp2_dp4_deepep) plus validation."""
+    """Wandb run 2uo7gfn9 (qwen3_30b_a3b_c4_ep2_tp2_dp4_deepep, 32768 tokens per DP rank)."""
     config = qwen3_30b_a3b(seq_len=seq_len)
     config.model = model_registry("30B-A3B", seq_len=seq_len, moe_comm_backend="deepep")
     config.hf_assets_path = H100_TOKENIZER_PATH
@@ -153,15 +153,6 @@ def qwen3_30b_a3b_deepep_baseline(
     config.training.steps = 100
     config.training.num_tokens_per_microbatch_per_dp_rank = 32768
     config.training.disable_cuda_graphs = True
-    config.validator = Validator.Config(
-        freq=25,
-        steps=8,
-        dataloader=GrainDataLoader.Config(
-            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_validation"]),
-            repeat=True,
-            shuffle=False,
-        ),
-    )
     return _as_experiment(config)
 
 
@@ -179,4 +170,32 @@ def qwen3_30b_a3b_deepep_fused_full(
     """Kernel-only arm: full softmax every step through the fused CE (no sampling)."""
     config = qwen3_30b_a3b_deepep_baseline(seq_len)
     config.loss = _sampled_loss(config, schedule=[])
+    return config
+
+
+def qwen3_30b_a3b_deepep_baseline_val(
+    seq_len: int | None = 4096,
+) -> SampledSoftmaxTrainer.Config:
+    return _with_c4_validation(qwen3_30b_a3b_deepep_baseline(seq_len))
+
+
+def qwen3_30b_a3b_deepep_sampled_val(
+    seq_len: int | None = 4096,
+) -> SampledSoftmaxTrainer.Config:
+    return _with_c4_validation(qwen3_30b_a3b_deepep_sampled(seq_len))
+
+
+def _with_c4_validation(
+    config: SampledSoftmaxTrainer.Config,
+) -> SampledSoftmaxTrainer.Config:
+    """Full-vocab CE on c4 validation every 25 steps (8 steps of 32768 tokens per DP rank)."""
+    config.validator = Validator.Config(
+        freq=25,
+        steps=8,
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_validation"]),
+            repeat=True,
+            shuffle=False,
+        ),
+    )
     return config
