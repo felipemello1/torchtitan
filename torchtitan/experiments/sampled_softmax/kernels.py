@@ -68,6 +68,7 @@ def _row_stats_kernel(
 @triton.jit
 def _softmax_grad_kernel(
     logits_ptr,
+    out_ptr,
     bias_ptr,
     labels_ptr,
     lse_ptr,
@@ -79,6 +80,7 @@ def _softmax_grad_kernel(
 ):
     row = tl.program_id(0).to(tl.int64)
     row_ptr = logits_ptr + row * stride_row
+    out_row_ptr = out_ptr + row * stride_row
     lse = tl.load(lse_ptr + row)
     label = tl.load(labels_ptr + row)
     valid = tl.load(valid_ptr + row)
@@ -91,7 +93,7 @@ def _softmax_grad_kernel(
             z += tl.where(cols == label, 0.0, bias)
         g = tl.exp(z - lse) - tl.where(cols == label, 1.0, 0.0)
         g = tl.where(valid, g, 0.0)
-        tl.store(row_ptr + cols, g.to(logits_ptr.dtype.element_ty), mask=mask)
+        tl.store(out_row_ptr + cols, g.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 def _block_and_warps(num_cols: int) -> tuple[int, int]:
@@ -129,12 +131,16 @@ def softmax_grad_(
     labels: torch.Tensor,
     lse: torch.Tensor,
     valid: torch.Tensor,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Overwrite ``logits`` with the summed-NLL gradient; returns ``logits``."""
+    """Write the summed-NLL gradient into ``out`` (default: over ``logits``) and return it."""
     num_rows, num_cols = logits.shape
+    out = logits if out is None else out
+    assert out.stride() == logits.stride()
     block, num_warps = _block_and_warps(num_cols)
     _softmax_grad_kernel[(num_rows,)](
         logits,
+        out,
         bias if bias is not None else logits,
         labels,
         lse,
@@ -145,4 +151,4 @@ def softmax_grad_(
         BLOCK=block,
         num_warps=num_warps,
     )
-    return logits
+    return out

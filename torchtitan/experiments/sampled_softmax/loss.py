@@ -68,6 +68,10 @@ class SampledSoftmaxChunkedLoss(ChunkedLossWrapper):
         negatives: str = "uniform"
         """``uniform`` (record #360) or ``frequent``; see the module docstring."""
 
+        correct_hidden_grad: bool = True
+        """False: the correction only shapes the lm_head gradient; the hidden-state
+        gradient and the logged loss use the uncorrected candidate softmax."""
+
         negative_count_power: float = 0.75
         """``frequent`` negatives are drawn with probability ~ ``count ** power``."""
 
@@ -195,7 +199,12 @@ class SampledSoftmaxChunkedLoss(ChunkedLossWrapper):
                     lm_head.set_requires_gradient_sync(True, recurse=False)
                 chunk = slice(i * chunk_len, (i + 1) * chunk_len)
                 h_chunk = pred[chunk].detach().requires_grad_()
-                self._active = (cands.chunk(chunk), tp_group, lse_T[chunk])
+                self._active = (
+                    cands.chunk(chunk),
+                    tp_group,
+                    lse_T[chunk],
+                    self.config.correct_hidden_grad,
+                )
                 nll = lm_head(h_chunk)
                 self._active = None
                 chunk_loss = nll / global_valid_tokens
@@ -445,6 +454,9 @@ class _CandidateHeadCrossEntropy(torch.autograd.Function):
 
     The forward pass overwrites the bf16 logits with their gradient, so backward is
     two GEMMs and a dense row scatter. ``lse_out_T`` receives each token's normalizer.
+    With ``correct_hidden_grad=False`` the correction (column bias, meanfield logit)
+    only shapes the lm_head gradient; the hidden-state gradient and the returned NLL
+    use the uncorrected candidate softmax.
     """
 
     @staticmethod
@@ -456,6 +468,7 @@ class _CandidateHeadCrossEntropy(torch.autograd.Function):
         cands: CandidateSet,
         tp_group: dist.ProcessGroup | None,
         lse_out_T: torch.Tensor,
+        correct_hidden_grad: bool,
     ) -> torch.Tensor:
         rows_P = cands.rows
         weight_PD = weight_VD if rows_P is None else weight_VD.index_select(0, rows_P)
@@ -487,21 +500,56 @@ class _CandidateHeadCrossEntropy(torch.autograd.Function):
         # Tokens whose target overflowed the budget on its shard leave the loss on every shard.
         valid_T = cands.valid * has_target_T
         lse_out_T.copy_(lse_T)
-        nll = ((lse_T - target_T) * valid_T).sum()
-        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
-            grad_logits_TP = kernels.softmax_grad_(
-                logits_TP, cands.col_bias, cands.labels, lse_T, valid_T
+        decoupled = not correct_hidden_grad and (
+            cands.col_bias is not None or cands.num_rest > 0
+        )
+        hidden_lse_T = lse_T
+        if decoupled:
+            hidden_max_T, hidden_sumexp_T, _ = kernels.row_stats(
+                logits_TP, None, cands.labels
             )
+            hidden_lse_T, _, _ = _combine_vocab_parallel_stats(
+                row_max_T=hidden_max_T,
+                row_sumexp_T=hidden_sumexp_T,
+                target_T=torch.zeros_like(hidden_max_T),
+                has_target_T=torch.zeros_like(hidden_max_T),
+                tp_group=tp_group,
+            )
+        nll = ((hidden_lse_T - target_T) * valid_T).sum()
+        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
+            if decoupled:
+                grad_weight_logits_TP = kernels.softmax_grad_(
+                    logits_TP,
+                    cands.col_bias,
+                    cands.labels,
+                    lse_T,
+                    valid_T,
+                    out=torch.empty_like(logits_TP),
+                )
+                grad_hidden_logits_TP = kernels.softmax_grad_(
+                    logits_TP, None, cands.labels, hidden_lse_T, valid_T
+                )
+            else:
+                grad_hidden_logits_TP = grad_weight_logits_TP = kernels.softmax_grad_(
+                    logits_TP, cands.col_bias, cands.labels, lse_T, valid_T
+                )
             rest_prob_T = (
                 None
                 if rest_logit_T is None
                 else (torch.exp(rest_logit_T - lse_T) * valid_T).to(h_TD.dtype)
             )
             ctx.save_for_backward(
-                h_TD, weight_PD, grad_logits_TP, rows_P, rest_mean_D, rest_prob_T
+                h_TD,
+                weight_PD,
+                grad_hidden_logits_TP,
+                grad_weight_logits_TP,
+                rows_P,
+                rest_mean_D,
+                rest_prob_T,
             )
             ctx.num_weight_rows = weight_VD.shape[0]
             ctx.num_rest = cands.num_rest
+            ctx.decoupled = decoupled
         return nll
 
     @staticmethod
@@ -509,14 +557,15 @@ class _CandidateHeadCrossEntropy(torch.autograd.Function):
         (
             h_TD,
             weight_PD,
-            grad_logits_TP,
+            grad_hidden_logits_TP,
+            grad_weight_logits_TP,
             rows_P,
             rest_mean_D,
             rest_prob_T,
         ) = ctx.saved_tensors
         grad_output = grad_output.to(h_TD.dtype)
-        grad_h_TD = torch.mm(grad_logits_TP, weight_PD)
-        grad_weight_PD = torch.mm(grad_logits_TP.t(), h_TD).mul_(grad_output)
+        grad_h_TD = torch.mm(grad_hidden_logits_TP, weight_PD)
+        grad_weight_PD = torch.mm(grad_weight_logits_TP.t(), h_TD).mul_(grad_output)
         if rows_P is None:
             grad_weight_VD = grad_weight_PD
         elif rest_prob_T is None:
@@ -526,7 +575,8 @@ class _CandidateHeadCrossEntropy(torch.autograd.Function):
             grad_weight_VD.index_copy_(0, rows_P, grad_weight_PD)
         else:
             # The meanfield logit is h @ mean(W[R]): every row of R gets the same gradient.
-            grad_h_TD.addr_(rest_prob_T, rest_mean_D)
+            if not ctx.decoupled:
+                grad_h_TD.addr_(rest_prob_T, rest_mean_D)
             grad_rest_row_D = torch.mv(h_TD.t(), rest_prob_T).mul_(
                 grad_output / ctx.num_rest
             )
@@ -534,7 +584,7 @@ class _CandidateHeadCrossEntropy(torch.autograd.Function):
                 ctx.num_weight_rows, -1
             ).contiguous()
             grad_weight_VD.index_copy_(0, rows_P, grad_weight_PD)
-        return grad_h_TD.mul_(grad_output), grad_weight_VD, None, None, None
+        return grad_h_TD.mul_(grad_output), grad_weight_VD, None, None, None, None
 
 
 def _combine_vocab_parallel_stats(
