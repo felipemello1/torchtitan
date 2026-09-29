@@ -127,6 +127,29 @@ def qwen3_0_6b_local_sampled(
     return config
 
 
+def qwen3_0_6b_local_short_baseline(
+    seq_len: int | None = 4096,
+) -> SampledSoftmaxTrainer.Config:
+    """100 steps with the 30B run's optimizer and LR schedule (7-step full-softmax tail when sampled)."""
+    config = qwen3_0_6b_local_baseline(seq_len)
+    reference = qwen3_30b_a3b_deepep_baseline(seq_len)
+    config.optimizer = reference.optimizer
+    config.lr_scheduler = reference.lr_scheduler
+    config.training.steps = reference.training.steps
+    config.validator.freq = 25
+    return config
+
+
+def qwen3_0_6b_local_short_sampled(
+    seq_len: int | None = 4096,
+) -> SampledSoftmaxTrainer.Config:
+    config = qwen3_0_6b_local_short_baseline(seq_len)
+    config.loss = _sampled_loss(
+        config, schedule=[(0.57, 16384), (0.81, 24576), (0.93, 49152)]
+    )
+    return config
+
+
 def qwen3_0_6b_local_fused_full(
     seq_len: int | None = 4096,
 ) -> SampledSoftmaxTrainer.Config:
