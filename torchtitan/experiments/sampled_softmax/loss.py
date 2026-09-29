@@ -18,6 +18,10 @@ Corrections, i.e. how the loss accounts for the rows ``R`` outside ``C``:
 * ``none``: record #360, the normalizer is ``Z_C`` and rows of ``R`` get no gradient.
 * ``importance``: uniform negatives get ``log(num_nontargets / num_negatives)`` added
   to their logits, so their summed ``exp`` estimates the mass of every non-target.
+* ``logq``: every column gets ``-log(inclusion probability)``, where a row enters ``C``
+  as a target of some token in the batch (running frequency) or as a sampled negative.
+  A token's own target column is exempt. This removes the bias toward rare tokens,
+  which are pushed up whenever they are targets but pushed down only when in ``C``.
 * ``meanfield``: one extra logit per token, ``log|R| + h @ mean(W[R])``, stands for
   all of ``R``. Its gradient reaches every row of ``R`` as one shared rank-1 update.
 
@@ -59,7 +63,7 @@ class SampledSoftmaxChunkedLoss(ChunkedLossWrapper):
         The default mirrors record #360's ramp and ends 7% of steps early."""
 
         correction: str = "none"
-        """``none`` (record #360), ``importance``, or ``meanfield``; see the module docstring."""
+        """``none`` (record #360), ``importance``, ``logq``, or ``meanfield``; see the module docstring."""
 
         negatives: str = "uniform"
         """``uniform`` (record #360) or ``frequent``; see the module docstring."""
@@ -83,20 +87,22 @@ class SampledSoftmaxChunkedLoss(ChunkedLossWrapper):
 
     def __init__(self, config: Config, *, compile_config=None):
         super().__init__(config, compile_config=compile_config)
-        if config.correction not in ("none", "importance", "meanfield"):
+        if config.correction not in ("none", "importance", "logq", "meanfield"):
             raise ValueError(f"Unknown sampled-softmax correction {config.correction}")
         if config.negatives not in ("uniform", "frequent"):
             raise ValueError(f"Unknown sampled-softmax negatives {config.negatives}")
-        if config.correction == "importance" and config.negatives != "uniform":
-            raise ValueError("importance weights assume uniform negatives")
+        if (
+            config.correction in ("importance", "logq")
+            and config.negatives != "uniform"
+        ):
+            raise ValueError(f"{config.correction} weights assume uniform negatives")
         self.config = config
         self.step = 1
         """1-indexed training step, set by the trainer before each step."""
         self.step_metrics: dict[str, torch.Tensor | float] = {}
         self._active: tuple | None = None
-        self._stride: int | None = None
         self._target_counts_V: torch.Tensor | None = None
-        self._generator: torch.Generator | None = None
+        self._tokens_seen: torch.Tensor | None = None
 
     def set_lm_head(self, lm_head: nn.Module) -> None:
         super().set_lm_head(lm_head)
@@ -242,101 +248,159 @@ class SampledSoftmaxChunkedLoss(ChunkedLossWrapper):
 
         Targets come first. If the microbatch has more distinct local targets than
         ``budget``, the highest target rows are dropped and their tokens leave the
-        loss (``labels_T = -1``); ``dropped_tokens`` counts them.
+        loss (label -1); ``dropped_tokens`` counts them.
 
         Example: 4 local rows, budget 3, targets {2}, uniform negatives visiting
-        rows 3, 2, 0, 1 -> rows_P [0, 2, 3], a target of row 2 maps to column 1.
+        rows 3, 2, 0, 1 -> rows [0, 2, 3], a target of row 2 maps to column 1.
         """
-        device = labels_T.device
-        valid_T = labels_T != IGNORE_INDEX
-        local_T = labels_T - vocab_start
-        in_shard_T = valid_T & (local_T >= 0) & (local_T < num_rows)
-        # Out-of-shard labels write the sentinel row num_rows, dropped below.
-        safe_local_T = torch.where(in_shard_T, local_T, num_rows)
-        is_target_V = torch.zeros(num_rows + 1, dtype=torch.bool, device=device)
-        is_target_V[safe_local_T] = True
-        is_target_V = is_target_V[:num_rows]
-        num_targets = is_target_V.sum()
-        if self.config.negatives == "frequent":
-            if self._target_counts_V is None:
-                self._target_counts_V = torch.zeros(num_rows + 1, device=device)
-            self._target_counts_V.index_add_(
-                0, safe_local_T, torch.ones_like(safe_local_T, dtype=torch.float32)
-            )
+        config = self.config
         if budget <= 0 or budget >= num_rows:
+            local_T = labels_T - vocab_start
+            in_shard_T = (
+                (labels_T != IGNORE_INDEX) & (local_T >= 0) & (local_T < num_rows)
+            )
             return CandidateSet(
                 rows=None,
                 labels=torch.where(in_shard_T, local_T, -1),
-                valid=valid_T.float(),
+                valid=(labels_T != IGNORE_INDEX).float(),
                 col_bias=None,
-                num_targets=num_targets,
-                num_dropped=torch.zeros_like(num_targets),
+                num_targets=torch.zeros((), device=labels_T.device),
+                num_dropped=torch.zeros((), device=labels_T.device),
                 num_rest=0,
             )
-
-        num_negatives = (budget - num_targets).clamp(min=0)
-        is_negative_V = self._pick_negatives(
-            is_target_V, num_negatives=num_negatives, budget=budget
+        if self._target_counts_V is None and (
+            config.negatives == "frequent" or config.correction == "logq"
+        ):
+            self._target_counts_V = torch.zeros(num_rows + 1, device=labels_T.device)
+            self._tokens_seen = torch.zeros((), device=labels_T.device)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        (
+            rows_P,
+            labels_P_T,
+            valid_T,
+            col_bias_P,
+            num_targets,
+            num_dropped,
+        ) = _select_candidates(
+            labels_T,
+            self._target_counts_V,
+            self._tokens_seen,
+            budget=budget,
+            num_rows=num_rows,
+            vocab_start=vocab_start,
+            # A tensor, so a new step does not recompile.
+            seed=torch.tensor(
+                (self.step * budget + rank * 7919 * budget) & 0xFFFFFFFF,
+                device=labels_T.device,
+            ),
+            negatives=config.negatives,
+            count_power=config.negative_count_power,
+            correction=config.correction,
         )
-        is_candidate_V = is_target_V | is_negative_V
-        rows_P = torch.nonzero_static(is_candidate_V, size=budget).squeeze(1)
-        column_V = torch.cumsum(is_candidate_V, 0) - 1
-        column_T = column_V[safe_local_T.clamp(max=num_rows - 1)]
-        is_kept_T = column_T < budget
-        labels_local_T = torch.where(in_shard_T & is_kept_T, column_T, -1)
-
-        col_bias_P = None
-        if self.config.correction == "importance":
-            # Negatives are a uniform sample of the non-target rows; weighting them by
-            # num_nontargets / num_negatives makes sum(exp) estimate the missing mass.
-            log_weight = torch.log(
-                (num_rows - num_targets).float() / num_negatives.clamp(min=1).float()
-            )
-            col_bias_P = torch.where(is_target_V[rows_P], 0.0, log_weight).float()
         return CandidateSet(
             rows=rows_P,
-            labels=labels_local_T,
-            valid=valid_T.float(),
+            labels=labels_P_T,
+            valid=valid_T,
             col_bias=col_bias_P,
             num_targets=num_targets,
-            num_dropped=(in_shard_T & ~is_kept_T).sum(),
-            num_rest=num_rows - budget if self.config.correction == "meanfield" else 0,
+            num_dropped=num_dropped,
+            num_rest=num_rows - budget if config.correction == "meanfield" else 0,
         )
 
-    def _pick_negatives(
-        self, is_target_V: torch.Tensor, *, num_negatives: torch.Tensor, budget: int
-    ) -> torch.Tensor:
-        """Mark ``num_negatives`` non-target rows, different every step and rank."""
-        num_rows = is_target_V.shape[0]
-        device = is_target_V.device
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        if self.config.negatives == "uniform":
-            # The first num_negatives non-targets along a stride permutation of the
-            # shard, starting at a per-step, per-rank offset.
-            if self._stride is None:
-                self._stride = _coprime_stride(num_rows)
-            offset = (self.step * budget + rank * 7919 * budget) % num_rows
-            order_V = (
-                offset + torch.arange(num_rows, device=device) * self._stride
-            ) % num_rows
-            nontarget_V = ~is_target_V[order_V]
-            take_V = nontarget_V & (torch.cumsum(nontarget_V, 0) <= num_negatives)
-        else:
-            # Gumbel top-k draws rows without replacement with probability ~ count ** power.
-            if self._generator is None:
-                self._generator = torch.Generator(device=device)
-            self._generator.manual_seed(self.step * 1_000_003 + rank)
-            uniform_V = torch.rand(num_rows, device=device, generator=self._generator)
-            assert self._target_counts_V is not None
-            keys_V = self.config.negative_count_power * torch.log1p(
-                self._target_counts_V[:num_rows]
-            ) - torch.log(-torch.log(uniform_V))
-            keys_V = keys_V.masked_fill(is_target_V, float("-inf"))
-            order_V = torch.topk(keys_V, budget).indices
-            take_V = torch.arange(budget, device=device) < num_negatives
-        is_negative_V = torch.zeros_like(is_target_V)
-        is_negative_V[order_V] = take_V
-        return is_negative_V
+
+@torch.compile
+def _select_candidates(
+    labels_T: torch.Tensor,
+    target_counts_V: torch.Tensor | None,
+    tokens_seen: torch.Tensor | None,
+    *,
+    budget: int,
+    num_rows: int,
+    vocab_start: int,
+    seed: torch.Tensor,
+    negatives: str,
+    count_power: float,
+    correction: str,
+) -> tuple[torch.Tensor, ...]:
+    """Return ``(rows_P, labels_T, valid_T, col_bias_P, num_targets, num_dropped)``.
+
+    ``labels_T`` in the output are columns into ``rows_P`` (-1 if not a local
+    candidate). Adds this microbatch's targets to ``target_counts_V`` and
+    ``tokens_seen`` in place when they are given.
+    """
+    device = labels_T.device
+    valid_T = labels_T != IGNORE_INDEX
+    local_T = labels_T - vocab_start
+    in_shard_T = valid_T & (local_T >= 0) & (local_T < num_rows)
+    # Out-of-shard labels write the sentinel row num_rows, dropped below.
+    safe_local_T = torch.where(in_shard_T, local_T, num_rows)
+    is_target_V = torch.zeros(num_rows + 1, dtype=torch.bool, device=device)
+    is_target_V[safe_local_T] = True
+    is_target_V = is_target_V[:num_rows]
+    num_targets = is_target_V.sum()
+    if target_counts_V is not None:
+        target_counts_V.index_add_(
+            0, safe_local_T, torch.ones_like(safe_local_T, dtype=torch.float32)
+        )
+        tokens_seen.add_(valid_T.sum())
+    num_negatives = (budget - num_targets).clamp(min=0)
+
+    # Negatives: num_negatives non-target rows, different every step and rank.
+    if negatives == "uniform":
+        # The first num_negatives non-targets along a stride permutation of the shard.
+        order_V = (
+            seed + torch.arange(num_rows, device=device) * _coprime_stride(num_rows)
+        ) % num_rows
+        nontarget_V = ~is_target_V[order_V]
+        take_V = nontarget_V & (torch.cumsum(nontarget_V, 0) <= num_negatives)
+    else:
+        # Gumbel top-k draws rows without replacement with probability ~ count ** power.
+        gumbel_V = -torch.log(
+            -torch.log(_hash_uniform(num_rows, seed=seed, device=device))
+        )
+        keys_V = count_power * torch.log1p(target_counts_V[:num_rows]) + gumbel_V
+        order_V = torch.topk(
+            keys_V.masked_fill(is_target_V, float("-inf")), budget
+        ).indices
+        take_V = torch.arange(budget, device=device) < num_negatives
+    is_negative_V = torch.zeros_like(is_target_V)
+    is_negative_V[order_V] = take_V
+
+    is_candidate_V = is_target_V | is_negative_V
+    rows_P = torch.nonzero_static(is_candidate_V, size=budget).squeeze(1)
+    column_V = torch.cumsum(is_candidate_V, 0) - 1
+    column_T = column_V[safe_local_T.clamp(max=num_rows - 1)]
+    is_kept_T = column_T < budget
+    labels_P_T = torch.where(in_shard_T & is_kept_T, column_T, -1)
+    num_dropped = (in_shard_T & ~is_kept_T).sum()
+
+    col_bias_P = None
+    num_nontargets = (num_rows - num_targets).float()
+    if correction == "importance":
+        # Negatives are a uniform sample of the non-target rows; weighting them by
+        # num_nontargets / num_negatives makes sum(exp) estimate the missing mass.
+        log_weight = torch.log(num_nontargets / num_negatives.clamp(min=1).float())
+        col_bias_P = torch.where(is_target_V[rows_P], 0.0, log_weight)
+    elif correction == "logq":
+        # Horvitz-Thompson: a column enters C as a target of some token in the batch
+        # (from its running frequency) or as a sampled negative.
+        freq_P = target_counts_V[rows_P] / tokens_seen
+        in_batch_prob_P = -torch.expm1(valid_T.sum() * torch.log1p(-freq_P))
+        sample_rate = num_negatives.float() / num_nontargets
+        col_bias_P = -torch.log(in_batch_prob_P + (1 - in_batch_prob_P) * sample_rate)
+    return rows_P, labels_P_T, valid_T.float(), col_bias_P, num_targets, num_dropped
+
+
+def _hash_uniform(
+    num_rows: int, *, seed: torch.Tensor, device: torch.device
+) -> torch.Tensor:
+    """Uniform (0, 1) noise per row from a PCG hash of ``row + seed``; stateless, so it compiles."""
+    mask = 0xFFFFFFFF
+    rows_V = torch.arange(num_rows, device=device, dtype=torch.int64)
+    state_V = ((rows_V + seed) * 747796405 + 2891336453) & mask
+    word_V = (((state_V >> ((state_V >> 28) + 4)) ^ state_V) * 277803737) & mask
+    word_V = (word_V >> 22) ^ word_V
+    return ((word_V >> 8).float() + 0.5) / 2**24
 
 
 @dataclass

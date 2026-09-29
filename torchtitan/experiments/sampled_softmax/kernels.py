@@ -15,8 +15,8 @@ statistics can sit between them:
    summed NLL. The logits buffer is reused, so the op never holds an fp32
    ``[T, P]`` tensor.
 
-``b`` is an optional per-column fp32 bias (log importance weights for sampled
-negatives). Labels are column indices into the local logits, ``-1`` when the
+``b`` is an optional per-column fp32 bias (log importance weights), not added
+to a row's own target column. Labels are column indices into the local logits, ``-1`` when the
 target is not a local column. ``valid`` marks rows whose global label is not
 ``IGNORE_INDEX``.
 """
@@ -41,6 +41,7 @@ def _row_stats_kernel(
 ):
     row = tl.program_id(0).to(tl.int64)
     row_ptr = logits_ptr + row * stride_row
+    label = tl.load(labels_ptr + row)
     running_max = tl.full((BLOCK,), float("-inf"), tl.float32)
     running_sum = tl.zeros((BLOCK,), tl.float32)
     for start in range(0, num_cols, BLOCK):
@@ -48,17 +49,15 @@ def _row_stats_kernel(
         mask = cols < num_cols
         z = tl.load(row_ptr + cols, mask=mask, other=float("-inf")).to(tl.float32)
         if HAS_BIAS:
-            z += tl.load(bias_ptr + cols, mask=mask, other=0.0)
+            bias = tl.load(bias_ptr + cols, mask=mask, other=0.0)
+            z += tl.where(cols == label, 0.0, bias)
         new_max = tl.maximum(running_max, z)
         # Lanes that have only seen -inf keep a zero sum (avoid inf - inf).
         scale = tl.where(new_max == float("-inf"), 0.0, tl.exp(running_max - new_max))
-        running_sum = running_sum * scale + tl.where(
-            mask, tl.exp(z - new_max), 0.0
-        )
+        running_sum = running_sum * scale + tl.where(mask, tl.exp(z - new_max), 0.0)
         running_max = new_max
     row_max = tl.max(running_max, axis=0)
     row_sum = tl.sum(running_sum * tl.exp(running_max - row_max), axis=0)
-    label = tl.load(labels_ptr + row)
     target = tl.load(row_ptr + tl.maximum(label, 0)).to(tl.float32)
     target = tl.where(label >= 0, target, 0.0)
     tl.store(max_ptr + row, row_max)
@@ -88,7 +87,8 @@ def _softmax_grad_kernel(
         mask = cols < num_cols
         z = tl.load(row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         if HAS_BIAS:
-            z += tl.load(bias_ptr + cols, mask=mask, other=0.0)
+            bias = tl.load(bias_ptr + cols, mask=mask, other=0.0)
+            z += tl.where(cols == label, 0.0, bias)
         g = tl.exp(z - lse) - tl.where(cols == label, 1.0, 0.0)
         g = tl.where(valid, g, 0.0)
         tl.store(row_ptr + cols, g.to(logits_ptr.dtype.element_ty), mask=mask)
