@@ -127,6 +127,50 @@ class _SampledHeadCrossEntropy(torch.autograd.Function):
         return grad_h_TD, grad_weight_VD, None, None, None, None, None
 
 
+def _probe_full_softmax(
+    *,
+    h_TD: torch.Tensor,
+    weight_VD: torch.Tensor,
+    labels_T: torch.Tensor,
+    cand_P: torch.Tensor | None,
+    vocab_start: int,
+    tp_group: dist.ProcessGroup | None,
+) -> dict[str, torch.Tensor]:
+    """Full-vocab CE and the probability mass outside the candidate set, on a token slice.
+
+    ``missing_mass`` is ``1 - r_C`` with ``r_C = Z_C / Z``; the logit-gradient L1 error of
+    the sampled loss is ``2 * (1 - r_C)`` per token.
+    """
+    num_rows = weight_VD.shape[0]
+    local_T = labels_T - vocab_start
+    in_shard_T = (local_T >= 0) & (local_T < num_rows)
+    valid_T = (labels_T != IGNORE_INDEX).float()
+    num_valid = valid_T.sum().clamp(min=1)
+    logits_TV = torch.mm(h_TD, weight_VD.t())
+    row_max_T, row_sumexp_T, target_T = kernels.row_stats(
+        logits_TV, None, torch.where(in_shard_T, local_T, -1)
+    )
+    lse_T, target_T = _combine_vocab_parallel_stats(
+        row_max_T, row_sumexp_T, target_T, tp_group
+    )
+    metrics = {
+        "sampled_softmax/probe_full_ce": ((lse_T - target_T) * valid_T).sum() / num_valid
+    }
+    if cand_P is not None:
+        no_label_T = torch.full_like(labels_T, -1)
+        cand_max_T, cand_sumexp_T, _ = kernels.row_stats(
+            logits_TV.index_select(1, cand_P), None, no_label_T
+        )
+        cand_lse_T, _ = _combine_vocab_parallel_stats(
+            cand_max_T, cand_sumexp_T, torch.zeros_like(cand_max_T), tp_group
+        )
+        missing_mass_T = 1 - torch.exp(cand_lse_T - lse_T)
+        metrics["sampled_softmax/probe_missing_mass"] = (
+            missing_mass_T * valid_T
+        ).sum() / num_valid
+    return metrics
+
+
 def _coprime_stride(n: int) -> int:
     """A stride near n * 0.618 with gcd(stride, n) == 1, so k * stride mod n is a permutation."""
     stride = int(n * 0.6180339887) | 1
@@ -325,16 +369,16 @@ class SampledSoftmaxChunkedLoss(ChunkedLossWrapper):
             )
 
             probe = self.config.full_ce_probe_tokens if budget > 0 else 0
-            probe_nll = None
+            probe_metrics = {}
             if probe > 0:
                 with torch.no_grad():
-                    probe_nll = _SampledHeadCrossEntropy.apply(
-                        pred[:probe].detach(), weight.detach(), None,
-                        torch.where(
-                            (labels[:probe] >= vocab_start) & (labels[:probe] < vocab_start + num_rows),
-                            labels[:probe] - vocab_start, -1,
-                        ),
-                        (labels[:probe] != IGNORE_INDEX).float(), None, tp_group,
+                    probe_metrics = _probe_full_softmax(
+                        h_TD=pred[:probe].detach(),
+                        weight_VD=weight.detach(),
+                        labels_T=labels[:probe],
+                        cand_P=cands.cand_P,
+                        vocab_start=vocab_start,
+                        tp_group=tp_group,
                     )
 
             seq_len = pred.shape[0]
@@ -367,9 +411,8 @@ class SampledSoftmaxChunkedLoss(ChunkedLossWrapper):
             "sampled_softmax/num_cols": float(cands.num_cols),
             "sampled_softmax/num_targets": cands.num_targets.float(),
         }
-        if probe_nll is not None:
-            num_probe = (labels[:probe] != IGNORE_INDEX).sum().clamp(min=1)
-            self.step_metrics["sampled_softmax/probe_full_ce"] = probe_nll / num_probe
+        if probe_metrics:
+            self.step_metrics.update(probe_metrics)
             self.step_metrics["sampled_softmax/train_ce"] = total_loss.detach() * (
                 global_valid_tokens / (labels != IGNORE_INDEX).sum().clamp(min=1)
             )
