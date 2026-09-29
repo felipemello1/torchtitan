@@ -103,6 +103,8 @@ class SampledSoftmaxChunkedLoss(ChunkedLossWrapper):
         self._active: tuple | None = None
         self._target_counts_V: torch.Tensor | None = None
         self._tokens_seen: torch.Tensor | None = None
+        self._stride_order_V: torch.Tensor | None = None
+        self._generator: torch.Generator | None = None
 
     def set_lm_head(self, lm_head: nn.Module) -> None:
         super().set_lm_head(lm_head)
@@ -273,7 +275,26 @@ class SampledSoftmaxChunkedLoss(ChunkedLossWrapper):
         ):
             self._target_counts_V = torch.zeros(num_rows + 1, device=labels_T.device)
             self._tokens_seen = torch.zeros((), device=labels_T.device)
+        # Negatives differ every step and rank. Their order is built here in eager:
+        # inductor computed `arange * stride` in int32, which overflows.
         rank = dist.get_rank() if dist.is_initialized() else 0
+        negative_order_V = uniform_V = None
+        if config.negatives == "uniform":
+            if self._stride_order_V is None:
+                self._stride_order_V = (
+                    torch.arange(num_rows, device=labels_T.device)
+                    * _coprime_stride(num_rows)
+                    % num_rows
+                )
+            offset = (self.step * budget + rank * 7919 * budget) % num_rows
+            negative_order_V = (self._stride_order_V + offset) % num_rows
+        else:
+            if self._generator is None:
+                self._generator = torch.Generator(device=labels_T.device)
+            self._generator.manual_seed(self.step * 1_000_003 + rank)
+            uniform_V = torch.rand(
+                num_rows, device=labels_T.device, generator=self._generator
+            )
         (
             rows_P,
             labels_P_T,
@@ -285,15 +306,11 @@ class SampledSoftmaxChunkedLoss(ChunkedLossWrapper):
             labels_T,
             self._target_counts_V,
             self._tokens_seen,
+            negative_order_V,
+            uniform_V,
             budget=budget,
             num_rows=num_rows,
             vocab_start=vocab_start,
-            # A tensor, so a new step does not recompile.
-            seed=torch.tensor(
-                (self.step * budget + rank * 7919 * budget) & 0xFFFFFFFF,
-                device=labels_T.device,
-            ),
-            negatives=config.negatives,
             count_power=config.negative_count_power,
             correction=config.correction,
         )
@@ -313,20 +330,21 @@ def _select_candidates(
     labels_T: torch.Tensor,
     target_counts_V: torch.Tensor | None,
     tokens_seen: torch.Tensor | None,
+    negative_order_V: torch.Tensor | None,
+    uniform_V: torch.Tensor | None,
     *,
     budget: int,
     num_rows: int,
     vocab_start: int,
-    seed: torch.Tensor,
-    negatives: str,
     count_power: float,
     correction: str,
 ) -> tuple[torch.Tensor, ...]:
     """Return ``(rows_P, labels_T, valid_T, col_bias_P, num_targets, num_dropped)``.
 
-    ``labels_T`` in the output are columns into ``rows_P`` (-1 if not a local
-    candidate). Adds this microbatch's targets to ``target_counts_V`` and
-    ``tokens_seen`` in place when they are given.
+    Negatives are the first non-targets along ``negative_order_V`` (a permutation
+    of the rows), or a Gumbel top-k draw with ``uniform_V`` noise. ``labels_T`` in
+    the output are columns into ``rows_P`` (-1 if not a local candidate). Adds this
+    microbatch's targets to ``target_counts_V`` and ``tokens_seen`` in place when given.
     """
     device = labels_T.device
     valid_T = labels_T != IGNORE_INDEX
@@ -345,19 +363,13 @@ def _select_candidates(
         tokens_seen.add_(valid_T.sum())
     num_negatives = (budget - num_targets).clamp(min=0)
 
-    # Negatives: num_negatives non-target rows, different every step and rank.
-    if negatives == "uniform":
-        # The first num_negatives non-targets along a stride permutation of the shard.
-        order_V = (
-            seed + torch.arange(num_rows, device=device) * _coprime_stride(num_rows)
-        ) % num_rows
-        nontarget_V = ~is_target_V[order_V]
+    if negative_order_V is not None:
+        nontarget_V = ~is_target_V[negative_order_V]
+        order_V = negative_order_V
         take_V = nontarget_V & (torch.cumsum(nontarget_V, 0) <= num_negatives)
     else:
         # Gumbel top-k draws rows without replacement with probability ~ count ** power.
-        gumbel_V = -torch.log(
-            -torch.log(_hash_uniform(num_rows, seed=seed, device=device))
-        )
+        gumbel_V = -torch.log(-torch.log(uniform_V))
         keys_V = count_power * torch.log1p(target_counts_V[:num_rows]) + gumbel_V
         order_V = torch.topk(
             keys_V.masked_fill(is_target_V, float("-inf")), budget
@@ -389,18 +401,6 @@ def _select_candidates(
         sample_rate = num_negatives.float() / num_nontargets
         col_bias_P = -torch.log(in_batch_prob_P + (1 - in_batch_prob_P) * sample_rate)
     return rows_P, labels_P_T, valid_T.float(), col_bias_P, num_targets, num_dropped
-
-
-def _hash_uniform(
-    num_rows: int, *, seed: torch.Tensor, device: torch.device
-) -> torch.Tensor:
-    """Uniform (0, 1) noise per row from a PCG hash of ``row + seed``; stateless, so it compiles."""
-    mask = 0xFFFFFFFF
-    rows_V = torch.arange(num_rows, device=device, dtype=torch.int64)
-    state_V = ((rows_V + seed) * 747796405 + 2891336453) & mask
-    word_V = (((state_V >> ((state_V >> 28) + 4)) ^ state_V) * 277803737) & mask
-    word_V = (word_V >> 22) ^ word_V
-    return ((word_V >> 8).float() + 0.5) / 2**24
 
 
 @dataclass
