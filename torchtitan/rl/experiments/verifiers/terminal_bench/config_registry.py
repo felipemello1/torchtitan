@@ -18,7 +18,12 @@ from renderers import Qwen35RendererConfig
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper
-from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
+from torchtitan.components.optim import (
+    AdamW,
+    LRSchedulersContainer,
+    Optim,
+    OptimizersContainer,
+)
 from torchtitan.components.renderer import from_renderers
 from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.config.transform import LMHeadCastConverter
@@ -88,14 +93,21 @@ def rl_grpo_qwen35_9b_terminal_bench() -> Controller.Config:
             ],
         ),
         trainer=Trainer.Config(
-            optimizer=default_adamw(
-                lr=1e-6,
-                betas=(0.9, 0.999),
-                weight_decay=0.0,
-            ),
-            lr_scheduler=LRSchedulersContainer.Config(
-                warmup_steps=0,
-                min_lr_factor=1.0,
+            optim=Optim.Config(
+                optimizer=OptimizersContainer.Config(
+                    optimizers=[
+                        AdamW.Config(
+                            pattern=r".*",
+                            lr=1e-6,
+                            betas=(0.9, 0.999),
+                            weight_decay=0.0,
+                        )
+                    ]
+                ),
+                lr_scheduler=LRSchedulersContainer.Config(
+                    warmup_steps=0,
+                    min_lr_factor=1.0,
+                ),
             ),
             training=TrainingConfig(
                 disable_cuda_graphs=True,
@@ -204,14 +216,21 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
             ],
         ),
         trainer=Trainer.Config(
-            optimizer=default_adamw(
-                lr=1e-6,
-                betas=(0.9, 0.999),
-                weight_decay=0.0,
-            ),
-            lr_scheduler=LRSchedulersContainer.Config(
-                warmup_steps=0,
-                min_lr_factor=1.0,
+            optim=Optim.Config(
+                optimizer=OptimizersContainer.Config(
+                    optimizers=[
+                        AdamW.Config(
+                            pattern=r".*",
+                            lr=1e-6,
+                            betas=(0.9, 0.999),
+                            weight_decay=0.0,
+                        )
+                    ]
+                ),
+                lr_scheduler=LRSchedulersContainer.Config(
+                    warmup_steps=0,
+                    min_lr_factor=1.0,
+                ),
             ),
             training=TrainingConfig(
                 disable_cuda_graphs=True,

@@ -17,7 +17,7 @@ pytest.importorskip("verifiers")
 
 import verifiers.v1 as vf
 
-from torchtitan.config.manager import ConfigManager
+from torchtitan.config import ConfigLoader
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.rl.controller import Controller
 from torchtitan.rl.experiments.verifiers.terminal_bench import taskset
@@ -105,7 +105,7 @@ def _terminal_bench_config(
 ) -> Controller.Config:
     monkeypatch.setenv("TERMINAL_BENCH_TRAIN_DATASET", TRAIN_DATASET)
     monkeypatch.setenv("TERMINAL_BENCH_EVAL_DATASET", EVAL_DATASET)
-    return ConfigManager().parse_args(
+    return ConfigLoader().load(
         [
             "--module",
             "torchtitan.rl.experiments.verifiers.terminal_bench",
@@ -125,7 +125,7 @@ def test_training_recipe_uses_separate_datasets(
     assert config.trainer.training.dtype == "float32"
     assert config.trainer.training.mixed_precision_param == "bfloat16"
     assert config.trainer.training.mixed_precision_reduce == "float32"
-    assert config.trainer.optimizer.implementation == "fused"
+    assert config.trainer.optim.optimizer.optimizers[0].fused
     assert config.async_loop.training_sample_builder.drop_zero_std_reward_groups
     assert isinstance(config.trainer.activation_checkpoint, FullAC.Config)
     assert config.trainer.checkpointer.interval == 20
@@ -140,7 +140,7 @@ def test_recipes_require_both_dataset_ids(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delenv("TERMINAL_BENCH_TRAIN_DATASET", raising=False)
     monkeypatch.delenv("TERMINAL_BENCH_EVAL_DATASET", raising=False)
     with pytest.raises(KeyError, match="TERMINAL_BENCH_TRAIN_DATASET"):
-        ConfigManager().parse_args(
+        ConfigLoader().load(
             [
                 "--module",
                 "torchtitan.rl.experiments.verifiers.terminal_bench",

@@ -20,11 +20,12 @@ export TERMINAL_BENCH_EVAL_DATASET=org/terminal-bench-2-1@<ref>
 
 python -m torchtitan.rl.train \
   --module torchtitan.rl.experiments.verifiers.terminal_bench \
-  --config rl_grpo_qwen35_9b_terminal_bench \
-  --hf_assets_path /path/to/Qwen3.5-9B
+  --config rl_grpo_qwen35_9b_terminal_bench
 ```
 
-TitanRL's CLI defaults to a single host; placing the meshes across hosts needs a
+The recipes read the checkpoint from `torchtitan/rl/example_checkpoint/`; to load it
+from elsewhere, set `hf_assets_path` in your own config function
+(`torchtitan/config/README.md`). TitanRL's CLI defaults to a single host; placing the meshes across hosts needs a
 caller-provided `HostMeshes` launcher.
 
 ## Datasets
