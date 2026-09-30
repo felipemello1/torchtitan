@@ -1329,9 +1329,9 @@ class _MaskedCrossEntropyLoss(BaseLoss):
 
 class TestSkipNonLossTokens(unittest.TestCase):
     def test_skipped_tokens_match_full_loss(self):
-        # 0.0 and 1.0 have nothing to skip, so every token goes through the lm_head.
+        # 0.003 keeps fewer tokens than chunks; 0.0 and 1.0 have nothing to skip.
         num_tokens, dim, vocab = 1024, 16, 64
-        for loss_token_frac in (0.1, 0.5, 0.0, 1.0):
+        for loss_token_frac in (0.1, 0.5, 0.003, 0.0, 1.0):
             with self.subTest(loss_token_frac=loss_token_frac):
                 torch.manual_seed(42)
                 hidden = torch.randn(num_tokens, dim)

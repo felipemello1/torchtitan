@@ -637,7 +637,8 @@ class ChunkedLossWrapper(BaseLoss):
             num_tokens, num_kept = labels[0].shape[0], len(loss_token_indices)
             if 0 < num_kept < num_tokens:
                 is_masked = True
-                # The fewest chunks of at most T / num_chunks tokens.
+                # Keep chunks of up to T / num_chunks tokens: fewer chunks, not smaller or empty
+                # ones (each chunk pays a fixed [V, D] cost).
                 num_chunks = -(-num_kept * num_chunks // num_tokens)
                 pred = (pred[0][loss_token_indices],)
                 labels = (labels[0][loss_token_indices],)
@@ -650,11 +651,10 @@ class ChunkedLossWrapper(BaseLoss):
                     for key, value in loss_inputs.items()
                 }
 
-        # Chunking operates on the local tensor. Without skipped tokens, chunks are
-        # equal: the sequence length must be divisible by num_chunks.
+        # Chunking operates on the local tensor. The kept tokens get balanced chunks; the full
+        # sequence keeps pretraining's equal split, so its length must divide by num_chunks.
         def _chunk_local(t):
             if is_masked:
-                # Balanced chunks, which may differ by one token.
                 return tuple(c.contiguous() for c in torch.tensor_split(t, num_chunks))
             seq_len = t.shape[0]
             torch._check(
