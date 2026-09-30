@@ -18,6 +18,7 @@ import sys
 from collections.abc import Iterator
 from typing import Any
 
+import httpx
 from openai import AsyncOpenAI
 from pydantic import Field
 from verifiers.v1.clients import ModelContext
@@ -94,7 +95,14 @@ class AgentOutsideHarness(Harness[AgentOutsideHarnessConfig]):
         elif prompt is not None:
             messages.extend(message_to_wire(message) for message in prompt)
 
-        async with AsyncOpenAI(base_url=endpoint, api_key=secret) as client:
+        # A 16k-token turn on a slow generator outlives openai's 600 s read
+        # timeout, and its retry would resend the turn. The rollout deadline
+        # bounds the call instead, as in Verifiers' own `null` harness.
+        async with AsyncOpenAI(
+            base_url=endpoint,
+            api_key=secret,
+            timeout=httpx.Timeout(None, connect=5.0),
+        ) as client:
             while True:
                 completion = await client.chat.completions.create(
                     model=ctx.model, messages=messages, tools=[BASH_TOOL]

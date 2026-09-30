@@ -65,9 +65,11 @@ class _ScriptedOpenAI:
     def __init__(self, completions: list[ChatCompletion]) -> None:
         self.completions = completions
         self.requests: list[list[dict]] = []
+        self.client_kwargs: dict = {}
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
-    def __call__(self, *, base_url: str, api_key: str) -> "_ScriptedOpenAI":
+    def __call__(self, **client_kwargs: object) -> "_ScriptedOpenAI":
+        self.client_kwargs = client_kwargs
         return self
 
     async def __aenter__(self) -> "_ScriptedOpenAI":
@@ -122,6 +124,8 @@ def _run_agent_outside(
     )
     assert result.exit_code == 0
     assert not client.completions
+    # No read timeout: a long turn must not be cut off and resent.
+    assert client.client_kwargs["timeout"].read is None
     return client.requests
 
 
