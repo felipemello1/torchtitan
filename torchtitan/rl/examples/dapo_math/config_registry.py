@@ -4,11 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Single-node Qwen3-4B-Base DAPO-Math recipes."""
+"""DAPO-Math recipes for Qwen3-4B-Base and Qwen3.6-35B-A3B."""
 
 from __future__ import annotations
 
-from renderers import Qwen3RendererConfig
+from renderers import Qwen35RendererConfig, Qwen3RendererConfig
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper
@@ -19,11 +19,14 @@ from torchtitan.components.optim import (
     OptimizersContainer,
 )
 from torchtitan.components.renderer import from_renderers
-from torchtitan.config import CompileConfig, TrainingConfig
+from torchtitan.config import CompileConfig, OverrideConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import LMHeadCastConverter
+from torchtitan.distributed.activation_checkpoint import RegionAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.models.common.dist_moe import DistMoeRuntime
 from torchtitan.models.qwen3 import model_registry
+from torchtitan.models.qwen3_6 import model_registry as qwen3_6_model_registry
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
@@ -192,4 +195,130 @@ def rl_dapo_qwen3_4b_math_32k() -> Controller.Config:
         max_response_tokens=32768,
         max_total_tokens=34816,
         dump_folder="outputs/rl/qwen3_4b_dapo_math_32k",
+    )
+
+
+def rl_dapo_qwen3_6_35b_a3b_math_dist_moe() -> Controller.Config:
+    """Run Qwen3.6-35B-A3B with Dist-MoE in the trainer only (SM100+, 2 x 4 GPUs).
+
+    Trainer: FSDP=2 x TP=2 with EP=4 on one host. Generator: one DP=2 x TP=2,
+    EP=4 replica on a second host that keeps the stock ``RoutedExperts``. EP
+    stays inside a host, so Dist-MoE's symmetric memory never crosses hosts.
+    """
+    max_response_tokens = 8192
+    max_total_tokens = 10240
+    expert_parallel_degree = 4
+    num_validation_samples = 30
+    validation_dataset = AIME2025Dataset.Config(num_samples=num_validation_samples)
+    model_config = qwen3_6_model_registry(
+        "35B-A3B",
+        seq_len=max_total_tokens,
+        attn_backend="varlen",
+        converters=[LMHeadCastConverter.Config()],
+    )
+    return Controller.Config(
+        model=model_config,
+        hf_assets_path="torchtitan/rl/example_checkpoint/Qwen3.6-35B-A3B",
+        dump_folder="outputs/rl/qwen3_6_35b_a3b_dapo_math_dist_moe",
+        async_loop=AsyncLoopConfig(
+            num_training_steps=150,
+            num_prompts_per_train_step=8,
+            num_samples_per_prompt=16,
+            target_offpolicy_steps=4,
+            validation=ValidationConfig(num_samples=num_validation_samples),
+        ),
+        # Dist-MoE supports make_fx and CUDA graphs, not full torch.compile.
+        compile=None,
+        rollouter=_dapo_math_rollouter_config(
+            validation_dataset=validation_dataset,
+            token_env=TokenEnv.Config(
+                max_rollout_tokens=max_total_tokens,
+                max_num_turns=1,
+            ),
+        ),
+        renderer=from_renderers(Qwen35RendererConfig(enable_thinking=True)),
+        num_generators=1,
+        metrics=MetricsProcessor.Config(
+            enable_wandb=True,
+            console_log_keys_validation=[
+                "validation_reward/_mean",
+                "validation_reward/_max",
+                "validation/response_length/mean",
+                "timing/validate",
+            ],
+        ),
+        trainer=Trainer.Config(
+            optim=Optim.Config(
+                optimizer=OptimizersContainer.Config(
+                    optimizers=[
+                        AdamW.Config(
+                            pattern=r".*",
+                            lr=1e-6,
+                            betas=(0.9, 0.98),
+                            weight_decay=0.1,
+                        )
+                    ]
+                ),
+                lr_scheduler=LRSchedulersContainer.Config(
+                    warmup_steps=0,
+                    min_lr_factor=1.0,
+                ),
+            ),
+            training=TrainingConfig(
+                disable_cuda_graphs=True,
+                num_tokens_per_microbatch_per_dp_rank=max_total_tokens,
+                max_context_length=max_total_tokens,
+                # fp32 master weights; Dist-MoE consumes the bf16 FSDP unshard.
+                dtype="float32",
+                mixed_precision_param="bfloat16",
+            ),
+            parallelism=ParallelismConfig(
+                data_parallel_shard_degree=2,
+                tensor_parallel_degree=2,
+                expert_parallel_degree=expert_parallel_degree,
+            ),
+            # Keep the Dist-MoE call out of recompute: its region is
+            # recompute=False, and everything else in the block is recomputed.
+            activation_checkpoint=RegionAC.Config(save_regions=[]),
+            # Swap in Dist-MoE experts on the trainer's model copy only.
+            override=OverrideConfig(
+                imports=["torchtitan.overrides.dist_moe.dist_moe_routed_experts"]
+            ),
+            # Scratch factor EP covers every rank routing all tokens to one
+            # rank; scratch overflow is an illegal memory access.
+            dist_moe=DistMoeRuntime.Config(
+                device_scratch_capacity_factor=float(expert_parallel_degree)
+            ),
+            checkpointer=CheckpointManager.Config(
+                initial_load_in_hf=True,
+                interval=100,
+                last_save_model_only=False,
+                keep_latest_k=2,
+            ),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=8,
+                loss_fn=DAPOLoss.Config(
+                    ratio_clip_low=0.2,
+                    ratio_clip_high=0.28,
+                    global_vocab_size=decoder_vocab_size(model_config),
+                ),
+            ),
+        ),
+        generator=VLLMGenerator.Config(
+            model_dtype="bfloat16",
+            parallelism=InferenceParallelismConfig(
+                data_parallel_degree=2,
+                tensor_parallel_degree=2,
+                expert_parallel_degree=expert_parallel_degree,
+            ),
+            # The stock all-to-all dispatcher syncs with the host, so the
+            # generator cannot capture CUDA graphs.
+            cuda_graph=VLLMCudaGraphConfig(mode="NONE"),
+            checkpointer=None,
+            sampling=SamplingConfig(
+                temperature=1.0,
+                top_p=1.0,
+                max_tokens=max_response_tokens,
+            ),
+        ),
     )
