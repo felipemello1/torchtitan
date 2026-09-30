@@ -14,6 +14,7 @@ import spmd_types as spmd
 import torch
 import torch.distributed.checkpoint.stateful
 from torch.distributed.fsdp import FSDPModule
+from torch.distributed.pipelining.schedules import _PipelineScheduleRuntime
 
 from torchtitan.components.checkpointer import BaseCheckpointManager, CheckpointManager
 from torchtitan.components.data.loader import BaseDataLoader
@@ -41,6 +42,7 @@ from torchtitan.distributed.cuda_graph import (
     wrap_fwd_bwd_with_cuda_graph,
 )
 from torchtitan.models.common.aux_loss import AuxLoss
+from torchtitan.models.common.dist_moe import DistMoeRuntime
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.metrics import (
     build_device_memory_monitor,
@@ -120,8 +122,15 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         debug: DebugConfig = field(default_factory=DebugConfig)
         override: OverrideConfig = field(default_factory=OverrideConfig)
         loss: BaseLoss.Config = field(default_factory=BaseLoss.Config)
+        dist_moe: DistMoeRuntime.Config | None = None
+        """Rank-wide Dist-MoE memory and pipeline activation-slot policy."""
 
         def __post_init__(self) -> None:
+            if (
+                self.dist_moe is not None
+                and self.training.mixed_precision_param != "bfloat16"
+            ):
+                raise ValueError("Dist-MoE requires mixed_precision_param='bfloat16'")
             if (
                 self.debug.spmd_typechecking
                 and self.parallelism.pipeline_parallel_degree > 1
@@ -197,6 +206,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     device_memory_monitor: DeviceMemoryMonitor
     model_device_mem_stats: DeviceMemStats
     _run_forward_backward: _ForwardBackwardFn
+    dist_moe_runtime: DistMoeRuntime | None
 
     def __init__(
         self,
@@ -217,6 +227,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.num_completed_steps = 0
         self.ntokens_seen = 0
         self.sdc_replayer = None
+        self.dist_moe_runtime = None
+        self._dist_moe_forward_context_handles: list[Any] = []
+        self.pp_schedule: Any | None = None
         self.preprocess_inputs_kwargs: dict[str, Any] = {}
         self.loss_metrics = {}
         self._initialize_distributed_runtime()
@@ -346,12 +359,18 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             self.pp_has_first_stage = True
             self.pp_has_last_stage = True
 
-        with self.parallelism_context.activate_spmd():
-            for model_part in self.model_parts:
-                model_part.to_empty(device=init_device)
-                with torch.no_grad():
-                    model_part.init_weights(buffer_device=buffer_device)
-                model_part.train()
+        try:
+            with self.parallelism_context.activate_spmd():
+                for model_part in self.model_parts:
+                    model_part.to_empty(device=init_device)
+                    with torch.no_grad():
+                        model_part.init_weights(buffer_device=buffer_device)
+                    model_part.train()
+            if not create_seed_checkpoint and self.config.dist_moe is not None:
+                self._initialize_dist_moe_runtime()
+        except Exception:
+            self._close_dist_moe_runtime()
+            raise
 
         if isinstance(self.loss_fn, ChunkedLossWrapper) and (
             not self.parallelism_context.pp_enabled or self.pp_has_last_stage
@@ -374,6 +393,51 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             f"Model {type(self.model_config).__qualname__} size: "
             f"{self.model_param_count:,} total parameters"
         )
+
+    def _initialize_dist_moe_runtime(self) -> None:
+        """Build Dist-MoE state and connect its pipeline slot selector."""
+        dist_moe_config = self.config.dist_moe
+        assert dist_moe_config is not None
+
+        from torchtitan.experiments.graph_trainer.graph_pp.runner import GraphRuntime
+
+        graph_runtime = (
+            self.pp_schedule if isinstance(self.pp_schedule, GraphRuntime) else None
+        )
+        if graph_runtime is not None:
+            liveness_schedule = graph_runtime.pipeline_liveness_schedule
+        elif self.parallelism_context.pp_enabled:
+            liveness_schedule = self.pp_schedule
+        else:
+            liveness_schedule = None
+
+        runtime = dist_moe_config.build(
+            model_parts=self.model_parts,
+            parallelism_context=self.parallelism_context,
+            device=self.device,
+            num_tokens_per_microbatch_per_dp_rank=(
+                self.config.training.num_tokens_per_microbatch_per_dp_rank
+            ),
+            pp_schedule=liveness_schedule,
+        )
+        self.dist_moe_runtime = runtime
+
+        if graph_runtime is not None:
+            graph_runtime.set_dist_moe_forward_context(runtime.forward_context)
+        elif self.parallelism_context.pp_enabled:
+            runtime_schedule = cast(_PipelineScheduleRuntime, self.pp_schedule)
+            for stage in runtime_schedule._stages:
+                handle = stage.register_forward_context(runtime.forward_context)
+                self._dist_moe_forward_context_handles.append(handle)
+
+    def _close_dist_moe_runtime(self) -> None:
+        """Remove pipeline hooks and release the rank-wide Dist-MoE context."""
+        for handle in reversed(self._dist_moe_forward_context_handles):
+            handle.remove()
+        self._dist_moe_forward_context_handles.clear()
+        if self.dist_moe_runtime is not None:
+            self.dist_moe_runtime.close()
+            self.dist_moe_runtime = None
 
     def _initialize_optim(self) -> None:
         """Construct the parameter update and its state."""
@@ -676,7 +740,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             typechecking=self.config.debug.spmd_typechecking,
         ):
             losses = [] if self.pp_has_last_stage else None
-            self.pp_schedule.step(
+            pp_schedule = self.pp_schedule
+            assert pp_schedule is not None
+            pp_schedule.step(
                 arg_mbs=inputs,
                 kwarg_mbs=model_kwargs,
                 target_mbs=labels,
@@ -748,5 +814,6 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.close_profiler()
         if not self.config.training.disable_cuda_graphs:
             cuda_graph_teardown()
+        self._close_dist_moe_runtime()
         if hasattr(self, "checkpointer"):
             self.checkpointer.close()

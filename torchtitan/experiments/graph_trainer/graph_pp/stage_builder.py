@@ -63,6 +63,7 @@ class _GraphTrainerStageGraphs(SplitStageGraphs, Protocol):
         *,
         unsharded_param_values: list[Any],
         flat_buffer_values: list[Any],
+        activation_slot_id_1: torch.Tensor | None = None,
         runtime_validate: bool = False,
     ) -> list[Any]: ...
 
@@ -109,6 +110,7 @@ class GraphTrainerOverlapGraphs(OverlapStageGraphs):
         forward_loss_kwargs: dict[str, Any],
         forward_unsharded_param_values: list[Any],
         forward_flat_buffer_values: list[Any],
+        forward_activation_slot_id_1: torch.Tensor | None = None,
         runtime_validate: bool = False,
     ) -> tuple[list[Any], list[Any], Any, tuple[Any, ...]]:
         """Run one multiplexed backward/forward graph.
@@ -135,6 +137,7 @@ class GraphTrainerOverlapGraphs(OverlapStageGraphs):
             forward_loss_kwargs,
             unsharded_param_values=forward_unsharded_param_values,
             flat_buffer_values=forward_flat_buffer_values,
+            activation_slot_id_1=forward_activation_slot_id_1,
             runtime_validate=runtime_validate,
         )
         multiplex_args: list[Any] = []
@@ -291,6 +294,7 @@ def _example_args_from_stage_metadata(stage: GraphPipelineStage) -> tuple[Any, .
 def _trace_args_for_stage(
     stage: GraphPipelineStage,
     ctx: _PipelineContext,
+    microbatch_index: int = 0,
 ) -> tuple[Any, ...]:
     """Return representative positional inputs for a stage trace.
 
@@ -302,14 +306,15 @@ def _trace_args_for_stage(
     if stage.is_first:
         if ctx.arg_mbs is None:
             return ()
-        return tuple(ctx.arg_mbs[0])
+        return tuple(ctx.arg_mbs[microbatch_index])
     return _example_args_from_stage_metadata(stage)
 
 
 def _trace_target_from_context(
     stage: GraphPipelineStage,
     ctx: _PipelineContext,
+    microbatch_index: int = 0,
 ) -> Any:
     if not stage.is_last or ctx.target_mbs is None:
         return None
-    return ctx.target_mbs[0]
+    return ctx.target_mbs[microbatch_index]

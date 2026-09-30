@@ -17,5 +17,4 @@ except ImportError as import_error:
     MXFP8Linear = None
     _mxfp8_linear_import_error = import_error
 
-
 __all__ = ["MXFP8Linear"]
