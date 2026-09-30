@@ -4,10 +4,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Bash-tool agent that runs on the controller and sends only commands to the sandbox."""
+"""Bash-tool agent that runs on the controller and sends only commands to the sandbox.
+
+Shared by the Terminal-Bench and SWE-rebench experiments. `sandoq_task_context`
+is what their envs need when the sandbox is a Sandoq VM.
+"""
 
 import asyncio
+import contextlib
 import json
+import os
+import sys
+from collections.abc import Iterator
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -19,6 +27,11 @@ from verifiers.v1.harness import Harness
 from verifiers.v1.runtimes import ProgramResult, Runtime
 from verifiers.v1.task import TaskData
 from verifiers.v1.trace import Trace
+
+# Verifiers resolves a harness id by importing a top-level module, and a dotted
+# id fails that lookup, so importing this module registers it under an alias.
+HARNESS_ID = __name__.replace(".", "_").lower()
+sys.modules.setdefault(HARNESS_ID, sys.modules[__name__])
 
 BASH_TOOL = {
     "type": "function",
@@ -141,6 +154,32 @@ class AgentOutsideHarness(Harness[AgentOutsideHarnessConfig]):
         if len(content) > limit:
             return "[output truncated]\n" + content[-limit:]
         return content
+
+
+@contextlib.contextmanager
+def sandoq_task_context(**task_fields: object) -> Iterator[None]:
+    """Hand the Sandoq provider this rollout's task fields while its sandbox is leased.
+
+    The provider (`sandoq_provider`, from `ram_prime_rl`) serves `vf.PrimeConfig`
+    when `VF_SANDBOX_PROVIDER=oci-runner` and reads the task's image and workdir
+    from this context; otherwise this is a no-op.
+
+    Example::
+
+        with sandoq_task_context(requested_image="org/task:1", working_dir="/app"):
+            await super().run(task, agents)
+    """
+    if os.environ.get("VF_SANDBOX_PROVIDER") != "oci-runner":
+        yield
+        return
+    from sandoq_provider import install, registry
+
+    install()
+    token = registry.bind_task_context(task_fields)
+    try:
+        yield
+    finally:
+        registry.reset_task_context(token)
 
 
 __all__ = ["AgentOutsideHarness"]

@@ -13,7 +13,6 @@ registers both harness aliases in that process too, which Verifiers needs to
 resolve the harness id.
 """
 
-import os
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -26,16 +25,16 @@ from verifiers.v1.tasksets.harbor import (
     HarborTaskset,
 )
 
-from torchtitan.rl.experiments.verifiers.terminal_bench import agent_outside, harness
-from torchtitan.rl.experiments.verifiers.terminal_bench.agent_outside import (
+from torchtitan.rl.experiments.verifiers.agent_outside import (
     AgentOutsideHarnessConfig,
+    sandoq_task_context,
 )
+from torchtitan.rl.experiments.verifiers.terminal_bench import harness
 from torchtitan.rl.experiments.verifiers.terminal_bench.harness import (
     register_harness_alias,
 )
 
 register_harness_alias(harness.__name__)
-register_harness_alias(agent_outside.__name__)
 
 _WORKDIR_DIRECTIVE = re.compile(r"\s*WORKDIR\s+(\S+)", re.IGNORECASE)
 
@@ -72,25 +71,12 @@ class TerminalBenchEnv(HarborEnv):
         )
 
     async def run(self, task: vf.Task, agents: vf.Agents) -> None:
-        if os.environ.get("VF_SANDBOX_PROVIDER") != "oci-runner":
+        with sandoq_task_context(
+            instance_id=task.data.name,
+            requested_image=task.data.image,
+            working_dir=task.data.workdir or self.config.agent.runtime.workdir,
+        ):
             await super().run(task, agents)
-            return
-        # The Sandoq provider serves `vf.PrimeConfig`; when it leases a VM for
-        # this rollout, it reads the task's image and workdir from this context.
-        from sandoq_provider import install, registry
-
-        install()
-        token = registry.bind_task_context(
-            {
-                "instance_id": task.data.name,
-                "requested_image": task.data.image,
-                "working_dir": task.data.workdir or self.config.agent.runtime.workdir,
-            }
-        )
-        try:
-            await super().run(task, agents)
-        finally:
-            registry.reset_task_context(token)
 
 
 def image_workdir(task_dir: Path) -> str | None:
