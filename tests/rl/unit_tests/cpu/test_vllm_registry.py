@@ -7,7 +7,42 @@
 import sys
 from types import ModuleType, SimpleNamespace
 
-from torchtitan.rl.model.vllm_registry import _configure_gdn_hybrid_model
+from torchtitan.config import OverrideConfig
+from torchtitan.models.qwen3 import model_registry
+from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
+from torchtitan.rl.model.vllm_registry import (
+    _configure_gdn_hybrid_model,
+    register_to_vllm,
+    TORCHTITAN_CONFIG_FORMAT,
+)
+
+from vllm.sampling_params import SamplingParams
+from vllm.transformers_utils.config import try_get_generation_config
+
+
+def test_missing_generation_config_adds_no_stop_token(tmp_path):
+    """Without generation_config.json, vLLM reads eos from our config; it must add no stop id."""
+    register_to_vllm(
+        model_registry("debugmodel", attn_backend="varlen"),
+        parallelism=InferenceParallelismConfig(),
+        compile_config=None,
+        checkpointer_config=None,
+        override=OverrideConfig(),
+    )
+    # tmp_path has no generation_config.json, like the Qwen/Qwen3.5-9B HF repo.
+    generation_config = try_get_generation_config(
+        str(tmp_path),
+        trust_remote_code=False,
+        config_format=TORCHTITAN_CONFIG_FORMAT,
+    )
+    renderer_stop_ids = [248046, 248044]
+    sampling_params = SamplingParams(stop_token_ids=list(renderer_stop_ids))
+
+    sampling_params.update_from_generation_config(
+        generation_config.to_diff_dict(), eos_token_id=renderer_stop_ids[0]
+    )
+
+    assert sorted(sampling_params.stop_token_ids) == sorted(renderer_stop_ids)
 
 
 def test_gdn_hybrid_model_registers_state_copy_funcs(monkeypatch):

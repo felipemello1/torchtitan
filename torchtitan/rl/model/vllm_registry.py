@@ -96,7 +96,8 @@ def model_config_to_hf_config_dict(cfg: Decoder.Config) -> dict[str, Any]:
             cfg, "enable_weight_tying", False
         ),  # multimodal/GGUF only; wrapper ties weights
         "bos_token_id": 0,  # Fuyu-only; engine reads tokenizer/sampling tokens
-        "eos_token_id": 1,  # per-model files only; engine reads tokenizer/sampling tokens
+        # None: without generation_config.json, vLLM adds this id as a stop token
+        "eos_token_id": None,
     }
 
     if ffn is not None:
