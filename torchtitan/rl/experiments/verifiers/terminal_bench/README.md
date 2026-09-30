@@ -11,8 +11,8 @@ tests live here; TitanRL's core is unchanged.
 
 Install the TorchTitan RL dependencies and this directory's `requirements.txt` in one
 Python 3.12 environment (Verifiers 0.3.1 needs MCP 1.x), and let the user run Docker
-on the controller host. The agent runs **inside** the task's container, so do not use
-`SubprocessConfig` for untrusted tasks.
+on the controller host. By default (`TERMINAL_BENCH_SANDBOX=docker`) the agent runs
+**inside** the task's container, so do not use `SubprocessConfig` for untrusted tasks.
 
 ```bash
 export TERMINAL_BENCH_TRAIN_DATASET=org/train-tasks@<ref>
@@ -25,8 +25,43 @@ python -m torchtitan.rl.train \
 
 The recipes read the checkpoint from `torchtitan/rl/example_checkpoint/`; to load it
 from elsewhere, set `hf_assets_path` in your own config function
-(`torchtitan/config/README.md`). TitanRL's CLI defaults to a single host; placing the meshes across hosts needs a
-caller-provided `HostMeshes` launcher.
+(`torchtitan/config/README.md`). TitanRL's CLI defaults to a single host; placing the
+meshes across hosts needs a caller-provided `HostMeshes` launcher.
+
+## Run without Docker on the controller
+
+`TERMINAL_BENCH_SANDBOX=sandoq` is for a controller that cannot run the task images,
+such as an aarch64 host (85 of the 89 Terminal-Bench 2.1 images are amd64-only). The
+agent then runs **outside** the sandbox, and only its commands cross over:
+
+```text
+controller, env-server worker                          Sandoq Firecracker VM (x86)
+  AgentOutsideHarness --chat--> GenerationServer
+      | each bash tool call
+      +-- runtime.run(["bash", "-lc", command]) -----> podman task container
+                                                       (tests/test.sh grades here)
+```
+
+The agent is a bash-tool loop (`agent_outside.py`), not Terminus-2, so its prompt
+format differs from the Docker path. The runtime is `vf.PrimeConfig`; the
+`sandoq_provider` package from `ram_prime_rl` (`extensions/sandoq`, with its pinned
+`sandoq-client`) rebinds it to Sandoq's OCI runner and reads its settings from the
+environment. The recipe fails at config time without the first two:
+
+```bash
+export VF_SANDBOX_PROVIDER=oci-runner
+export OCI_RUNNER_TASK_NETWORK=host  # test.sh installs pytest; without it every reward is 0
+export TERMINAL_BENCH_SANDBOX=sandoq
+export PYTHONPATH=/path/to/ram_prime_rl/extensions/sandoq:$PYTHONPATH
+export OCI_RUNNER_ENVIRONMENT=oci-runner-firecracker-medium
+export OCI_RUNNER_TOKEN_FILE=/path/to/firecracker-token  # mode 0600
+export OCI_RUNNER_POOL_SIZE=128  # the recipe runs 8 x 16 rollouts at once
+export OCI_RUNNER_ECR_REGISTRY=168653207203.dkr.ecr.us-east-2.amazonaws.com
+export OCI_RUNNER_ECR_UCLOUD=ucloud  # or OCI_RUNNER_ECR_TOKEN_FILE=/path/to/ecr-password
+```
+
+Each task starts in its image's `WORKDIR`, read from its Dockerfile, since Harbor
+parses none and a Sandoq session fails when its workdir is missing.
 
 ## Datasets
 
