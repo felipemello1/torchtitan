@@ -50,7 +50,6 @@ def _stock_config(*, dim: int = 32) -> RoutedExperts.Config:
         num_experts=4,
         top_k=2,
         param_init=_parameter_initializers(),
-        comm_backend="standard",
     )
 
 
@@ -309,6 +308,13 @@ def test_dist_moe_transform_rejects_lora() -> None:
             config,
             [DistMoeTransform(), LoRATransform(handlers=())],
         )
+
+
+def test_apply_transforms_replaces_every_routed_expert() -> None:
+    """The transform pipeline passes its context and rewrites every MoE layer."""
+    config = apply_transforms(deepseek_v3_debugmodel(), [DistMoeTransform()])
+    assert not list(config.model.traverse(RoutedExperts.Config))
+    assert list(config.model.traverse(DistMoeRoutedExperts.Config))
 
 
 def test_engine_config_owns_dist_moe_runtime() -> None:
