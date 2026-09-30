@@ -8,6 +8,7 @@ import copy
 import unittest
 import unittest.mock
 
+import spmd_types as spmd
 import torch
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
@@ -279,6 +280,91 @@ class TestPermute(unittest.TestCase):
             set(permuted_indices.tolist()),
             set(range(total)),
         )
+
+
+class TestAllGatherDispatch(unittest.TestCase):
+    """Test AllToAllTokenDispatcher's CUDA graph (all-gather) dispatch and combine.
+
+    The collectives are mocked, so each call sees the tensors of all EP ranks.
+    """
+
+    num_experts = 4
+    ep_size = 2
+
+    def _dispatch_and_combine(self, ep_rank, x_GD, scores_GK, expert_ids_GK):
+        """Run one rank with experts ``y = (global_expert_id + 1) * x``; return its partial sum."""
+        dispatcher = AllToAllTokenDispatcher.Config(
+            num_experts=self.num_experts, top_k=expert_ids_GK.shape[1]
+        ).build()
+        mock_mesh = unittest.mock.MagicMock()
+        mock_mesh.size.return_value = self.ep_size
+        mock_mesh.get_local_rank.return_value = ep_rank
+        num_tokens = x_GD.shape[0] // self.ep_size
+        local_slice = slice(ep_rank * num_tokens, (ep_rank + 1) * num_tokens)
+        partial_outs = []
+        with (
+            unittest.mock.patch.object(
+                AllToAllTokenDispatcher,
+                "ep_mesh",
+                new_callable=unittest.mock.PropertyMock,
+                return_value=mock_mesh,
+            ),
+            unittest.mock.patch.object(
+                spmd, "all_gather", side_effect=[x_GD, scores_GK, expert_ids_GK]
+            ),
+            unittest.mock.patch.object(
+                spmd,
+                "reduce_scatter",
+                side_effect=lambda x, *args, **kwargs: partial_outs.append(x) or x,
+            ),
+        ):
+            (
+                routed_input_ND,
+                num_tokens_per_local_expert_e,
+                metadata,
+            ) = dispatcher._all_gather_dispatch(
+                x_GD[local_slice], scores_GK[local_slice], expert_ids_GK[local_slice]
+            )
+            num_local_experts = self.num_experts // self.ep_size
+            # Rows past the local ones get id num_local_experts; combine drops them.
+            local_expert_ids_N = torch.searchsorted(
+                num_tokens_per_local_expert_e.cumsum(0),
+                torch.arange(routed_input_ND.shape[0]),
+                right=True,
+            )
+            routed_output_ND = routed_input_ND * (
+                ep_rank * num_local_experts + local_expert_ids_N + 1
+            ).unsqueeze(-1)
+            dispatcher.combine(routed_output_ND, metadata, x_GD[local_slice])
+        return metadata, num_tokens_per_local_expert_e, partial_outs[0]
+
+    def test_docstring_example_on_rank_1(self):
+        x_GD = torch.arange(4.0).reshape(4, 1)
+        expert_ids_GK = torch.tensor([[3], [0], [2], [1]])
+        metadata, num_tokens_per_local_expert_e, _ = self._dispatch_and_combine(
+            1, x_GD, torch.ones(4, 1), expert_ids_GK
+        )
+
+        torch.testing.assert_close(
+            metadata.token_indices_experts_sorted_N, torch.tensor([2, 0, 4, 4])
+        )
+        torch.testing.assert_close(num_tokens_per_local_expert_e, torch.tensor([1, 1]))
+
+    def test_partial_sums_add_up_to_routed_output(self):
+        # 3 tokens per rank, top-2; token 5 routes both picks to rank 0.
+        x_GD = torch.arange(1.0, 7.0).reshape(6, 1)
+        scores_GK = torch.tensor(
+            [[0.5, 0.25], [1.0, 2.0], [0.75, 0.5], [2.0, 1.0], [0.25, 0.5], [1.0, 1.0]]
+        )
+        expert_ids_GK = torch.tensor([[0, 3], [1, 2], [2, 3], [3, 0], [1, 2], [0, 1]])
+
+        partial_sums = [
+            self._dispatch_and_combine(ep_rank, x_GD, scores_GK, expert_ids_GK)[2]
+            for ep_rank in range(self.ep_size)
+        ]
+
+        expected_GD = (scores_GK * (expert_ids_GK + 1)).sum(-1, keepdim=True) * x_GD
+        torch.testing.assert_close(sum(partial_sums), expected_GD)
 
 
 if __name__ == "__main__":
