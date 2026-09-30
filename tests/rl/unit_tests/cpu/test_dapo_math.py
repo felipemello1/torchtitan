@@ -9,12 +9,18 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 from datasets import Dataset
 
+from torchtitan.config import apply_overrides
+from torchtitan.config.validation import validate_model_training_config
+from torchtitan.distributed.activation_checkpoint import RegionAC
+from torchtitan.models.common.dist_moe import DistMoeRoutedExperts
+from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.rl.examples.dapo_math import (
     AIME2025Dataset,
     DapoMathDataset,
@@ -24,6 +30,9 @@ from torchtitan.rl.examples.dapo_math import (
     RewardMathVerify,
     rubric as math_rubric,
     score_math_response,
+)
+from torchtitan.rl.examples.dapo_math.config_registry import (
+    rl_dapo_qwen3_6_35b_a3b_math_dist_moe,
 )
 from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
 from torchtitan.rl.types import RolloutTurnID
@@ -170,3 +179,39 @@ def test_reward_handles_equivalent_latex_and_units() -> None:
     sample = DapoMathSample(prompt="problem", ground_truth=r"336^\circ")
     assert asyncio.run(reward(_rollout(r"work\nAnswer: \boxed{336}"), sample)) == 1.0
     assert asyncio.run(reward(_rollout(r"work\nAnswer: \boxed{335}"), sample)) == 0.0
+
+
+def test_qwen3_6_35b_a3b_dist_moe_recipe_is_trainer_only() -> None:
+    """The generator keeps stock MoE; the trainer's model copy gets Dist-MoE."""
+    config = rl_dapo_qwen3_6_35b_a3b_math_dist_moe()
+    # The controller serializes the config at startup to log and save it.
+    config.to_dict()
+    trainer = config.trainer
+    expert_parallel_degree = trainer.parallelism.expert_parallel_degree
+    assert expert_parallel_degree == config.generator.parallelism.expert_parallel_degree
+    assert trainer.dist_moe is not None
+    assert trainer.dist_moe.device_scratch_capacity_factor == expert_parallel_degree
+    assert isinstance(trainer.activation_checkpoint, RegionAC.Config)
+    assert trainer.activation_checkpoint.save_regions == []
+    assert trainer.training.dtype == "float32"
+    assert trainer.training.mixed_precision_param == "bfloat16"
+    assert config.generator.override.imports == []
+    num_moe_layers = len(list(config.model.traverse(RoutedExperts.Config)))
+    assert num_moe_layers == 40
+
+    # Prepare the trainer's model copy the way Trainer.__init__ does.
+    model_config = copy.deepcopy(config.model)
+    model_config.set_sharding_(trainer.parallelism)
+    apply_overrides(trainer.override, model_config)
+    validate_model_training_config(
+        model_config,
+        parallelism=trainer.parallelism,
+        training=trainer.training,
+        debug=trainer.debug,
+        activation_checkpoint=trainer.activation_checkpoint,
+        max_num_documents=config.async_loop.batcher.max_num_documents,
+    )
+
+    assert not list(model_config.traverse(RoutedExperts.Config))
+    assert len(list(model_config.traverse(DistMoeRoutedExperts.Config))) == 40
+    assert len(list(config.model.traverse(RoutedExperts.Config))) == num_moe_layers
