@@ -29,7 +29,7 @@ def test_loss_normalization_uses_mutable_tensor_denominator() -> None:
     "loss_config", [DAPOLoss.Config(ratio_clip_high=0.28), GRPOLoss.Config()]
 )
 def test_chunked_loss_skips_tokens_outside_loss_mask(loss_config) -> None:
-    # Same loss, metrics and gradients as running the lm_head on every token.
+    # Same loss, metrics and gradients as the loss on every token's logits.
     torch.manual_seed(42)
     num_tokens, dim, vocab = 1024, 16, 64
     hidden = torch.randn(num_tokens, dim)
@@ -44,32 +44,28 @@ def test_chunked_loss_skips_tokens_outside_loss_mask(loss_config) -> None:
     }
     global_valid_tokens = loss_mask.sum().float()
     lm_head = nn.Linear(dim, vocab, bias=False)
+    chunked_loss = ChunkedLossWrapper.Config(num_chunks=4, loss_fn=loss_config).build()
+    chunked_loss.set_lm_head(lm_head)
+
+    hidden_ref = hidden.clone().requires_grad_()
+    loss_ref, metrics_ref = chunked_loss.loss_fn(
+        lm_head(hidden_ref), labels, global_valid_tokens, **loss_inputs
+    )
+    loss_ref.backward()
+    grad_weight_ref, lm_head.weight.grad = lm_head.weight.grad, None
+
     lm_head_rows = []
     lm_head.register_forward_hook(
         lambda module, args, output: lm_head_rows.append(args[0].shape[0])
     )
+    hidden_input = hidden.clone().requires_grad_()
+    loss, metrics = chunked_loss(
+        hidden_input, labels, global_valid_tokens, **loss_inputs
+    )
+    loss.backward()
 
-    results = []
-    for skip in (False, True):
-        chunked_loss = ChunkedLossWrapper.Config(
-            num_chunks=4, loss_fn=loss_config
-        ).build()
-        chunked_loss.set_lm_head(lm_head)
-        token_indices = chunked_loss._loss_token_indices(labels, loss_inputs)
-        if not skip:
-            chunked_loss._loss_token_indices = lambda *args: None
-        lm_head.weight.grad = None
-        lm_head_rows.clear()
-        hidden_input = hidden.clone().requires_grad_()
-        loss, metrics = chunked_loss(
-            hidden_input, labels, global_valid_tokens, **loss_inputs
-        )
-        loss.backward()
-        assert sum(lm_head_rows) == (token_indices.numel() if skip else num_tokens)
-        results.append((loss, metrics, hidden_input.grad, lm_head.weight.grad))
-
-    (loss, metrics, grad_hidden, grad_weight), skipped = results
-    torch.testing.assert_close(skipped[0], loss)
-    torch.testing.assert_close(skipped[1], metrics)
-    torch.testing.assert_close(skipped[2], grad_hidden)
-    torch.testing.assert_close(skipped[3], grad_weight)
+    assert sum(lm_head_rows) == int(loss_mask.sum())
+    torch.testing.assert_close(loss, loss_ref)
+    torch.testing.assert_close(metrics, metrics_ref)
+    torch.testing.assert_close(hidden_input.grad, hidden_ref.grad)
+    torch.testing.assert_close(lm_head.weight.grad, grad_weight_ref)

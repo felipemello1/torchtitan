@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Annotated, Any
+from typing import Annotated
 
 import torch
 import tyro
@@ -73,12 +73,6 @@ class DAPOLoss(BaseLoss):
         self.ratio_clip_low = config.ratio_clip_low
         self.ratio_clip_high = config.ratio_clip_high
         self.global_vocab_size = config.global_vocab_size
-
-    def loss_token_mask(
-        self, labels: torch.Tensor, *, loss_mask: torch.Tensor, **loss_inputs: Any
-    ) -> torch.Tensor:
-        del labels, loss_inputs
-        return loss_mask
 
     def __call__(
         self,

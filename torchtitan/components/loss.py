@@ -322,20 +322,6 @@ class BaseLoss(ABC, Configurable):
             loss = loss / global_valid_tokens
         return loss, {}
 
-    def loss_token_mask(
-        self, labels: torch.Tensor, **loss_inputs: Any
-    ) -> torch.Tensor | None:
-        """``[T]`` bool: tokens whose logits reach the loss or its metrics; None keeps all.
-
-        ``ChunkedLossWrapper`` skips the lm_head for the other tokens (one host sync per microbatch).
-
-        Example:
-            loss_mask = [F, F, T, T, F, T]  (prompt, prompt, answer, answer, tool output, answer)
-            DAPO returns it, so the lm_head runs on tokens 2, 3 and 5 only.
-        """
-        del labels, loss_inputs
-        return None
-
 
 class CrossEntropyLoss(BaseLoss):
     """Cross-entropy loss with sum reduction for token-based normalization."""
@@ -459,17 +445,6 @@ def compute_logprobs(
     return logprobs, entropy
 
 
-def _select_tokens(value: Any, token_indices: torch.Tensor) -> Any:
-    """Rows ``token_indices`` of a per-token tensor, keeping its SPMD types; non-tensors as is."""
-    if not isinstance(value, torch.Tensor):
-        return value
-    with spmd.no_typecheck():
-        selected = value.index_select(0, token_indices)
-    if spmd.is_type_checking():
-        spmd.assert_local_type_like(selected, value)
-    return selected
-
-
 class GradAccumulator:
     """Accumulates chunk gradients into a pre-allocated buffer.
 
@@ -540,9 +515,9 @@ class ChunkedLossWrapper(BaseLoss):
     loss. Additional per-token ``loss_inputs`` are chunked along the same
     sequence dimension and forwarded to the inner loss.
 
-    Tokens outside ``loss_fn.loss_token_mask`` (e.g. RL prompt and tool-output
-    tokens) skip the lm_head and get zero gradient: fewer chunks run, each no longer
-    than before. The default None mask (pretraining) keeps every token.
+    A per-token ``loss_mask`` in ``loss_inputs`` (RL) marks the only tokens that reach
+    the loss: the others (prompt, tool outputs, padding) skip the lm_head and get zero
+    gradient, and fewer chunks run, each no longer than before.
 
     The flow:
     1. Model forward with _skip_lm_head=True to get one or more hidden states [T, D]
@@ -596,32 +571,6 @@ class ChunkedLossWrapper(BaseLoss):
         """Set the lm_head module. Must be called before the first __call__."""
         self.lm_head = lm_head
 
-    def _loss_token_indices(
-        self, labels: torch.Tensor, loss_inputs: dict[str, Any]
-    ) -> torch.Tensor | None:
-        """Indices of the tokens in ``loss_fn.loss_token_mask``; None keeps every token."""
-        token_mask = self.loss_fn.loss_token_mask(labels, **loss_inputs)
-        # nonzero is a host sync, which CUDA graph capture does not allow.
-        if token_mask is None or (
-            token_mask.is_cuda and torch.cuda.is_current_stream_capturing()
-        ):
-            return None
-        if token_mask.shape != labels.shape:
-            raise ValueError(
-                f"loss_token_mask shape {tuple(token_mask.shape)} must match labels "
-                f"{tuple(labels.shape)}"
-            )
-        # Keep every token so that _chunk_local raises for a non-divisible length on step 1.
-        if labels.shape[0] % self.num_chunks != 0:
-            return None
-        token_indices = token_mask.nonzero().squeeze(1)
-        if token_indices.numel() == labels.shape[0]:
-            return None
-        # An all-masked microbatch still runs one chunk, so every rank's FSDP reduce-scatters.
-        if token_indices.numel() == 0:
-            return token_indices.new_zeros(1)
-        return token_indices
-
     def __call__(
         self,
         pred: torch.Tensor | tuple[torch.Tensor, ...],
@@ -670,35 +619,34 @@ class ChunkedLossWrapper(BaseLoss):
                 "are required."
             )
 
-        # Only the tokens in the loss's mask go through the lm_head. Multi-output losses
-        # and batch-invariant mode (bitwise checks, not speed) keep every token.
-        chunk_sizes = None
-        if not is_multi_output and not is_in_batch_invariant_mode():
-            with spmd.local():
-                with spmd.no_typecheck():
-                    token_indices = self._loss_token_indices(labels[0], loss_inputs)
-                if token_indices is not None:
-                    # The fewest balanced chunks of at most T / num_chunks tokens.
-                    num_kept = token_indices.numel()
-                    num_chunks = -(-num_kept * num_chunks // labels[0].shape[0])
-                    chunk_sizes = [
-                        num_kept // num_chunks + (i < num_kept % num_chunks)
-                        for i in range(num_chunks)
-                    ]
-                    # index_select's backward scatters the chunks' gradients back to
-                    # [T, D], with zeros for the skipped tokens.
-                    pred = (_select_tokens(pred[0], token_indices),)
-                    labels = (_select_tokens(labels[0], token_indices),)
-                    loss_inputs = {
-                        key: _select_tokens(value, token_indices)
-                        for key, value in loss_inputs.items()
-                    }
+        # Counting the loss tokens is a host sync, which CUDA graph capture does not allow.
+        # Multi-output losses and batch-invariant mode (bitwise checks) keep every token.
+        loss_mask = loss_inputs.get("loss_mask")
+        is_masked = False
+        if (
+            loss_mask is not None
+            and not is_multi_output
+            and not is_in_batch_invariant_mode()
+            and not (loss_mask.is_cuda and torch.cuda.is_current_stream_capturing())
+        ):
+            num_tokens, num_kept = len(loss_mask), int(loss_mask.sum())
+            if 0 < num_kept < num_tokens:
+                is_masked = True
+                # The fewest chunks of at most T / num_chunks tokens.
+                num_chunks = -(-num_kept * num_chunks // num_tokens)
+                pred = (pred[0][loss_mask],)
+                labels = (labels[0][loss_mask],)
+                loss_inputs = {
+                    key: value[loss_mask] if isinstance(value, torch.Tensor) else value
+                    for key, value in loss_inputs.items()
+                }
 
         # Chunking operates on the local tensor. Without skipped tokens, chunks are
         # equal: the sequence length must be divisible by num_chunks.
         def _chunk_local(t):
-            if chunk_sizes is not None:
-                return tuple(c.contiguous() for c in torch.split(t, chunk_sizes, dim=0))
+            if is_masked:
+                # Balanced chunks, which may differ by one token.
+                return tuple(c.contiguous() for c in torch.tensor_split(t, num_chunks))
             seq_len = t.shape[0]
             torch._check(
                 seq_len % num_chunks == 0,
