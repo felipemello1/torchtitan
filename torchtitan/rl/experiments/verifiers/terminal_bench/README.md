@@ -63,6 +63,10 @@ export OCI_RUNNER_ECR_UCLOUD=ucloud  # or OCI_RUNNER_ECR_TOKEN_FILE=/path/to/ecr
 Each task starts in its image's `WORKDIR`, read from its Dockerfile, since Harbor
 parses none and a Sandoq session fails when its workdir is missing.
 
+Without a readable token file every rollout ends in `SandboxError` with zero turns.
+The rollout error only says the OCI runner pool broker "did not bind"; the broker's
+own traceback in the controller log names the token file.
+
 ## Datasets
 
 Tasks come from Harbor datasets selected by id, the usual Verifiers way: the `harbor`

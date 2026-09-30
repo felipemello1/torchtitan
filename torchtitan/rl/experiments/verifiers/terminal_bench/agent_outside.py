@@ -51,10 +51,10 @@ class AgentOutsideHarnessConfig(HarnessConfig):
 class AgentOutsideHarness(Harness[AgentOutsideHarnessConfig]):
     """Call the model from this process and run each `bash` tool call in the sandbox.
 
-    Nothing is installed in the task container and it never calls the model, so
-    the sandbox can be a remote VM with no route back to the generator. The loop
-    has no turn limit of its own: Verifiers ends it at `max_turns` by refusing
-    the next model call.
+    Nothing is installed in the task container, and the container never calls
+    the model, so the sandbox can be a remote VM with no route back to the
+    generator. The loop has no turn limit of its own: Verifiers ends it at
+    `max_turns` by refusing the next model call.
     """
 
     APPENDS_SYSTEM_PROMPT = True
