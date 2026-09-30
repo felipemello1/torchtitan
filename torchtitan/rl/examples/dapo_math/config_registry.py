@@ -311,9 +311,7 @@ def rl_dapo_qwen3_6_35b_a3b_math_dist_moe() -> Controller.Config:
                 tensor_parallel_degree=2,
                 expert_parallel_degree=expert_parallel_degree,
             ),
-            # The stock all-to-all dispatcher syncs with the host, so the
-            # generator cannot capture CUDA graphs.
-            cuda_graph=VLLMCudaGraphConfig(mode="NONE"),
+            cuda_graph=VLLMCudaGraphConfig(mode="FULL"),
             checkpointer=None,
             sampling=SamplingConfig(
                 temperature=1.0,

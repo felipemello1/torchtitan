@@ -710,7 +710,7 @@ def rl_grpo_qwen3_moe_debug_varlen() -> Controller.Config:
             ),
         ),
         # MoE EP all-to-all path issues unpinned D2H copies that block
-        # torch.compile and CUDA graph capture; disable both.
+        # torch.compile.
         compile=None,
         rollouter=_alphabet_sort_rollouter_config(),
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
@@ -745,10 +745,7 @@ def rl_grpo_qwen3_moe_debug_varlen() -> Controller.Config:
             ),
         ),
         generator=VLLMGenerator.Config(
-            # Disable torch.compile + CUDA graph capture: the EP all-to-all
-            # path issues an unpinned D2H copy of split sizes that the
-            # piecewise/full graph capture rejects.
-            cuda_graph=VLLMCudaGraphConfig(mode="NONE"),
+            cuda_graph=VLLMCudaGraphConfig(mode="FULL"),
             parallelism=InferenceParallelismConfig(
                 data_parallel_degree=2,
                 tensor_parallel_degree=2,
@@ -769,10 +766,9 @@ def rl_grpo_qwen3_moe_debug_deepep() -> Controller.Config:
     (8 GPUs: 4 gen + 4 train).
 
     Same EP/TP/DP layout as ``rl_grpo_qwen3_moe_debug_varlen`` (trainer FSDP=2/TP=2/EP=4,
-    generator DP=2/TP=2/EP=4), but the MoE uses the DeepEP v2 comm backend. Unlike the
-    standard all-to-all -- whose unpinned D2H split-size copy blocks CUDA graph capture, so
-    that config disables it -- DeepEP v2's inference dispatch is a static, host-sync-free
-    EXPAND layout, so this generator enables CUDA graph capture.
+    generator DP=2/TP=2/EP=4), but the MoE uses the DeepEP v2 comm backend. DeepEP v2's
+    inference dispatch is a static, host-sync-free EXPAND layout, so this generator
+    captures CUDA graphs.
 
     Per-role config from one shared model config: the trainer uses it as-is (compact,
     host-synced, backward-able DeepEP path), while the generator applies per-actor
@@ -863,7 +859,7 @@ def rl_grpo_qwen3_moe_debug_varlen_batch_invariant(
             ),
         ),
         # MoE EP all-to-all path issues unpinned D2H copies that block
-        # torch.compile and CUDA graph capture; disable both.
+        # torch.compile.
         compile=None,
         rollouter=_alphabet_sort_rollouter_config(),
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
@@ -903,6 +899,8 @@ def rl_grpo_qwen3_moe_debug_varlen_batch_invariant(
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
+            # Eager keeps the all-to-all combine, which matches the trainer bitwise;
+            # CUDA graphs combine through an fp32 reduce-scatter.
             cuda_graph=VLLMCudaGraphConfig(mode="NONE"),
             parallelism=InferenceParallelismConfig(
                 data_parallel_degree=2,
@@ -983,7 +981,7 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> Controller.Config:
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
-            cuda_graph=VLLMCudaGraphConfig(mode="NONE"),
+            cuda_graph=VLLMCudaGraphConfig(mode="FULL"),
             parallelism=InferenceParallelismConfig(
                 data_parallel_degree=2,
                 tensor_parallel_degree=2,
