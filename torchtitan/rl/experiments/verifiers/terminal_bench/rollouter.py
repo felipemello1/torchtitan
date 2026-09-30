@@ -4,9 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Run Terminus-2 and Harbor grading inside one sandbox per rollout."""
+"""Run Harbor tasks through Verifiers, one sandbox per rollout."""
 
+import os
 from dataclasses import dataclass
+from typing import Literal
 
 import verifiers.v1 as vf
 from verifiers.v1.configs.agent import TimeoutConfig as AgentTimeoutConfig
@@ -20,6 +22,10 @@ from torchtitan.rl.examples.verifiers import (
     VerifiersTaskDataset,
 )
 from torchtitan.rl.examples.verifiers.data import register_local_taskset_alias
+from torchtitan.rl.experiments.verifiers.terminal_bench import agent_outside, harness
+from torchtitan.rl.experiments.verifiers.terminal_bench.agent_outside import (
+    AgentOutsideHarnessConfig,
+)
 from torchtitan.rl.experiments.verifiers.terminal_bench.harness import (
     NUM_AGENT_TURNS,
     register_harness_alias,
@@ -48,13 +54,53 @@ class TerminalBenchRollouter(VerifiersRollouter):
 
 
 def terminal_bench_rollouter_config(
-    train_dataset: str, validation_dataset: str
+    train_dataset: str,
+    validation_dataset: str,
+    *,
+    sandbox: Literal["docker", "sandoq"] = "docker",
 ) -> TerminalBenchRollouter.Config:
-    """Select Harbor datasets by id; never mix benchmark tasks into training."""
+    """Select Harbor datasets by id and where each rollout's commands run.
+
+    Args:
+        train_dataset: Harbor dataset id to train on.
+        validation_dataset: Harbor dataset id to validate on; must differ.
+        sandbox: ``"docker"`` runs Terminus-2 inside a Docker container on the
+            controller host. ``"sandoq"`` keeps a bash-tool agent loop on the
+            controller and sends only its commands to a Sandoq Firecracker VM,
+            for a controller that cannot run the task images.
+    """
     if train_dataset == validation_dataset:
         raise ValueError(
             "Training and Terminal-Bench evaluation must use different datasets"
         )
+
+    if sandbox == "docker":
+        harness_config = TerminalBenchTerminusHarnessConfig(
+            id=register_harness_alias(harness.__name__), version="0.22.0"
+        )
+        runtime = vf.DockerConfig()
+        # Every container runs on the controller host.
+        pool, max_concurrent = vf.StaticPoolConfig(num_workers=4), 4
+    elif sandbox == "sandoq":
+        # The Sandoq provider (`sandoq_provider`) serves `vf.PrimeConfig` only
+        # when selected. Each task's test.sh installs pytest over the network, so
+        # a VM without host networking silently scores every rollout 0.
+        if os.environ.get("VF_SANDBOX_PROVIDER") != "oci-runner":
+            raise ValueError("sandbox='sandoq' needs VF_SANDBOX_PROVIDER=oci-runner")
+        if os.environ.get("OCI_RUNNER_TASK_NETWORK") != "host":
+            raise ValueError(
+                "sandbox='sandoq' needs OCI_RUNNER_TASK_NETWORK=host, or every "
+                "reward is 0"
+            )
+        harness_config = AgentOutsideHarnessConfig(
+            id=register_harness_alias(agent_outside.__name__)
+        )
+        runtime = vf.PrimeConfig(idle_timeout=3600)
+        # Rollouts only wait on the model and remote VMs; size
+        # OCI_RUNNER_POOL_SIZE to this 8 x 16 = 128.
+        pool, max_concurrent = vf.StaticPoolConfig(num_workers=8), 16
+    else:
+        raise ValueError(f"unknown sandbox {sandbox!r}")
 
     taskset_id = register_local_taskset_alias(TerminalTasksetConfig.__module__)
     return TerminalBenchRollouter.Config(
@@ -75,21 +121,20 @@ def terminal_bench_rollouter_config(
         verifiers_env_server=VerifiersEnvServer.Config(
             environment=HarborEnvConfig(
                 agent=vf.AgentConfig(
-                    harness=TerminalBenchTerminusHarnessConfig(
-                        id=register_harness_alias(), version="0.22.0"
-                    ),
-                    runtime=vf.DockerConfig(),
+                    harness=harness_config,
+                    runtime=runtime,
                     max_turns=NUM_AGENT_TURNS,
                     timeout=AgentTimeoutConfig(
-                        setup=600,
+                        # Covers a cold image pull into a fresh sandbox.
+                        setup=1500,
                         rollout=7200,
                         scoring=12000,
                     ),
                 ),
             ),
             serve=vf.ServeConfig(
-                pool=vf.StaticPoolConfig(num_workers=4),
-                max_concurrent=4,
+                pool=pool,
+                max_concurrent=max_concurrent,
                 address="tcp://127.0.0.1:0",
             ),
         ),

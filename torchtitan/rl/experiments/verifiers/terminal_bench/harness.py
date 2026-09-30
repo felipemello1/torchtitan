@@ -6,6 +6,7 @@
 
 """Configure Verifiers' Terminus-2 program for the XML terminal-agent policy."""
 
+import importlib
 import logging
 import sys
 
@@ -102,10 +103,10 @@ class TerminalBenchTerminusHarness(
                 )
 
 
-def register_harness_alias() -> str:
-    """Make the local harness importable in spawned Verifiers worker processes."""
-    module = sys.modules[__name__]
-    alias = __name__.replace(".", "_").lower()
+def register_harness_alias(module_name: str) -> str:
+    """Make a local harness module importable in spawned Verifiers worker processes."""
+    module = importlib.import_module(module_name)
+    alias = module_name.replace(".", "_").lower()
     existing = sys.modules.get(alias)
     if existing is not None and existing is not module:
         raise ValueError(f"harness alias {alias!r} is already registered")

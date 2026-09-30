@@ -10,6 +10,8 @@ Both recipes read the same two environment variables, each a Harbor dataset id
 (``org/name`` or ``org/name@ref``, downloaded and cached by the ``harbor`` CLI):
 ``TERMINAL_BENCH_TRAIN_DATASET`` for training and ``TERMINAL_BENCH_EVAL_DATASET``
 for the Terminal-Bench 2.1 validation set. They must differ.
+``TERMINAL_BENCH_SANDBOX`` (``docker`` or ``sandoq``, default ``docker``) picks
+where rollouts run; see ``terminal_bench_rollouter_config``.
 """
 
 import os
@@ -72,6 +74,7 @@ def rl_grpo_qwen35_9b_terminal_bench() -> Controller.Config:
         rollouter=terminal_bench_rollouter_config(
             os.environ["TERMINAL_BENCH_TRAIN_DATASET"],
             os.environ["TERMINAL_BENCH_EVAL_DATASET"],
+            sandbox=os.environ.get("TERMINAL_BENCH_SANDBOX", "docker"),
         ),
         renderer=from_renderers(
             Qwen35RendererConfig(
@@ -195,6 +198,7 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
         rollouter=terminal_bench_rollouter_config(
             os.environ["TERMINAL_BENCH_TRAIN_DATASET"],
             os.environ["TERMINAL_BENCH_EVAL_DATASET"],
+            sandbox=os.environ.get("TERMINAL_BENCH_SANDBOX", "docker"),
         ),
         renderer=from_renderers(
             Qwen35RendererConfig(
