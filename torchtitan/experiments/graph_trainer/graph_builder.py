@@ -30,7 +30,10 @@ import torch
 import torch.fx as fx
 import torch.nn as nn
 import torch.utils._pytree as pytree
+from dist_moe._blockscaled import _block_scaled_forward_op
+from dist_moe.api import _bf16_forward_op, _bf16_forward_with_clip_stats_op
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.pipelining import PipelineStageInfo
 from torch.distributed.pipelining.schedules import (
     _PipelineContext,
     _PipelineScheduleRuntime,
@@ -107,6 +110,7 @@ from torchtitan.experiments.graph_trainer.wgrad_accumulation import (
     fuse_wgrad_accumulation_pass,
     insert_graph_gradient_accumulation,
 )
+from torchtitan.models.common.dist_moe.runtime import _DistMoeForwardContext
 from torchtitan.protocols.model import BaseModel
 
 
@@ -115,6 +119,14 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# The annex's registered forward schemas keep the activation slot positional;
+# importing the exact overloads avoids matching unrelated operators by name.
+_DIST_MOE_FORWARD_SLOT_ARGUMENTS = (
+    (_bf16_forward_op._opoverload, 14),
+    (_bf16_forward_with_clip_stats_op._opoverload, 14),
+    (_block_scaled_forward_op._opoverload, 15),
+)
 
 
 def make_fwd_bwd_step(model, loss_fn):
@@ -250,6 +262,7 @@ class _StageGraphMeta:
     partition: PartitionGraphMeta
     fwd_input_names: tuple[str, ...]
     fwd_flat_input_indices: tuple[int, ...]
+    uses_dist_moe_activation_slot: bool = False
     bw_no_fsdp_output_names: tuple[str, ...] = ()
     reduce_grad_input_names: tuple[str, ...] = ()
     unshard_flat_param_indices: tuple[int, ...] = ()
@@ -463,6 +476,7 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
         *,
         unsharded_param_values: list[Any],
         flat_buffer_values: list[Any],
+        activation_slot_id_1: torch.Tensor | None = None,
         runtime_validate: bool = False,
     ) -> list[Any]:
         """Pack forward parameter, state, and user inputs in placeholder order."""
@@ -473,8 +487,15 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
             target,
             loss_kwargs,
         )
+        if self.meta.uses_dist_moe_activation_slot:
+            if activation_slot_id_1 is None:
+                raise ValueError("GraphPP Dist-MoE forward requires an activation slot")
+            runtime_values = [activation_slot_id_1]
+        else:
+            runtime_values = []
         # Calling convention:
-        # (*forward_param_inputs, *selected_state_and_user_inputs)
+        # (*forward_param_inputs, *selected_state_and_user_inputs,
+        #  [activation_slot_id_1])
         return _pack_graph_args(
             graph_name="GraphPP forward",
             input_names=self.meta.fwd_input_names,
@@ -483,7 +504,11 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
             num_flat_param_values=self.meta.num_flat_param_values,
             unshard_extracted=self.modules.unshard is not None,
             unsharded_param_values=unsharded_param_values,
-            flat_non_param_inputs=[*flat_buffer_values, *flat_user_inputs],
+            flat_non_param_inputs=[
+                *flat_buffer_values,
+                *flat_user_inputs,
+                *runtime_values,
+            ],
             runtime_validate=runtime_validate,
         )
 
@@ -514,6 +539,7 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
         *,
         unsharded_param_values: list[Any],
         flat_buffer_values: list[Any],
+        activation_slot_id_1: torch.Tensor | None = None,
         runtime_validate: bool = False,
     ) -> tuple[Any, tuple[Any, ...]]:
         """Return ``(stage_output, saved_values_for_backward)``."""
@@ -525,6 +551,7 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
             loss_kwargs,
             unsharded_param_values=unsharded_param_values,
             flat_buffer_values=flat_buffer_values,
+            activation_slot_id_1=activation_slot_id_1,
             runtime_validate=runtime_validate,
         )
         placeholders = self.modules.fw.graph.find_nodes(op="placeholder")
@@ -765,6 +792,7 @@ class GraphTrainerJointStageGraphs(JointStageGraphs):
     module: nn.Module
     num_param_grads: int
     runtime_meshes: list[DeviceMesh] | None = None
+    uses_dist_moe_activation_slot: bool = False
     _run: Callable[..., Any] = dataclasses.field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -814,15 +842,21 @@ class GraphTrainerJointStageGraphs(JointStageGraphs):
         *,
         unsharded_param_values: list[Any],
         flat_buffer_values: list[Any],
+        activation_slot_id_1: torch.Tensor | None = None,
         runtime_validate: bool = False,
     ) -> tuple[Any, list[Any]]:
         global_valid_tokens = loss_kwargs["global_valid_tokens"]
-        outputs = self._run(
+        runtime_args = [
             self._model_input(args),
             target,
             global_valid_tokens,
             kwargs,
-        )
+        ]
+        if self.uses_dist_moe_activation_slot:
+            if activation_slot_id_1 is None:
+                raise ValueError("GraphPP Dist-MoE forward requires an activation slot")
+            runtime_args.append(activation_slot_id_1)
+        outputs = self._run(*runtime_args)
         if len(outputs) != self.num_param_grads + 1:
             raise ValueError(
                 "PP=1 joint forward/backward output count mismatch: "
@@ -861,6 +895,7 @@ class _ScheduledJointGraphMeta:
     reduce_grad_input_names: tuple[str, ...]
     unshard_flat_param_indices: tuple[int, ...]
     num_full_param_inputs: int
+    uses_dist_moe_activation_slot: bool = False
 
 
 @dataclasses.dataclass(slots=True)
@@ -931,15 +966,20 @@ class GraphTrainerScheduledJointStageGraphs(JointStageGraphs):
         *,
         unsharded_param_values: list[Any],
         flat_buffer_values: list[Any],
+        activation_slot_id_1: torch.Tensor | None,
         runtime_validate: bool,
     ) -> list[Any]:
-        runtime_args = (
+        runtime_args = [
             self._model_input(args),
             target,
             loss_kwargs["global_valid_tokens"],
             kwargs,
-        )
-        user_inputs, _ = pytree.tree_flatten((runtime_args, {}))
+        ]
+        if self.meta.uses_dist_moe_activation_slot:
+            if activation_slot_id_1 is None:
+                raise ValueError("GraphPP Dist-MoE forward requires an activation slot")
+            runtime_args.append(activation_slot_id_1)
+        user_inputs, _ = pytree.tree_flatten((tuple(runtime_args), {}))
         full_args = _pack_graph_args(
             graph_name="Scheduled joint graph",
             input_names=self.meta.full_input_names,
@@ -967,6 +1007,7 @@ class GraphTrainerScheduledJointStageGraphs(JointStageGraphs):
         *,
         unsharded_param_values: list[Any],
         flat_buffer_values: list[Any],
+        activation_slot_id_1: torch.Tensor | None = None,
         runtime_validate: bool = False,
     ) -> tuple[Any, list[Any]]:
         full_args = self._full_args(
@@ -976,6 +1017,7 @@ class GraphTrainerScheduledJointStageGraphs(JointStageGraphs):
             loss_kwargs,
             unsharded_param_values=unsharded_param_values,
             flat_buffer_values=flat_buffer_values,
+            activation_slot_id_1=activation_slot_id_1,
             runtime_validate=runtime_validate,
         )
         placeholders = self.modules.full_fwd_bwd.graph.find_nodes(op="placeholder")
@@ -1342,6 +1384,7 @@ def _build_joint_stage_graph(
     extract_fsdp_grad_reduction: bool = False,
     accumulate_gradients_in_graph: bool = False,
     fuse_wgrad_accumulation: bool = False,
+    activation_slot_id_1: torch.Tensor | None = None,
 ) -> None:
     """Build the monolithic PP=1 graph with optional FSDP boundary extraction."""
     if not stage.is_first or not stage.is_last or len(args) != 1:
@@ -1357,6 +1400,8 @@ def _build_joint_stage_graph(
         loss_kwargs["global_valid_tokens"],
         kwargs,
     )
+    if activation_slot_id_1 is not None:
+        runtime_args = (*runtime_args, activation_slot_id_1)
     requires_graph_extraction = (
         extract_fsdp_param_unshard
         or extract_fsdp_grad_reduction
@@ -1393,10 +1438,35 @@ def _build_joint_stage_graph(
         )
     else:
         full_forward_backward_step = make_fwd_bwd_step(stage.submod, loss_fn)
+        if activation_slot_id_1 is not None:
+
+            def full_forward_backward_step_with_slot(
+                inputs,
+                labels,
+                global_valid_tokens,
+                extra_kwargs,
+                activation_slot_id_1,
+            ):
+                return full_forward_backward_step(
+                    inputs,
+                    labels,
+                    global_valid_tokens,
+                    extra_kwargs,
+                )
+
+            trace_step = full_forward_backward_step_with_slot
+        else:
+            trace_step = full_forward_backward_step
+
         traced = minimal_fx_tracer(
-            full_forward_backward_step,
+            trace_step,
             module=stage.submod,
         )(*runtime_args)
+    if activation_slot_id_1 is not None:
+        _rewrite_dist_moe_activation_slot_input(
+            traced,
+            input_index=len(traced.example_inputs) - 1,
+        )
     num_param_grads = sum(
         parameter.requires_grad
         for _, parameter in stage.submod.named_parameters(remove_duplicate=False)
@@ -1420,6 +1490,7 @@ def _build_joint_stage_graph(
             module=stage.submod,
             num_param_grads=num_param_grads,
             runtime_meshes=runtime_meshes,
+            uses_dist_moe_activation_slot=activation_slot_id_1 is not None,
         )
         return
 
@@ -1552,9 +1623,53 @@ def _build_joint_stage_graph(
             reduce_grad_input_names=fsdp_grads.reduce_grad_input_names,
             unshard_flat_param_indices=fsdp_full.unshard_flat_param_indices,
             num_full_param_inputs=fsdp_full.num_compute_param_inputs,
+            uses_dist_moe_activation_slot=activation_slot_id_1 is not None,
         ),
         grad_accumulators=grad_accumulators,
     )
+
+
+def _rewrite_dist_moe_activation_slot_input(
+    traced: TracedResult,
+    *,
+    input_index: int,
+) -> None:
+    """Connect the explicit stage slot input to every Dist-MoE forward op."""
+    placeholders = list(traced.gm.graph.find_nodes(op="placeholder"))
+    if input_index >= len(placeholders):
+        raise ValueError(
+            "GraphPP Dist-MoE slot input index is out of range: "
+            f"{input_index} >= {len(placeholders)}"
+        )
+    activation_slot_id_1 = placeholders[input_index]
+    captured_slot_nodes: set[fx.Node] = set()
+    num_rewritten = 0
+    for op, argument_index in _DIST_MOE_FORWARD_SLOT_ARGUMENTS:
+        for node in traced.gm.graph.find_nodes(op="call_function", target=op):
+            if argument_index >= len(node.args):
+                raise ValueError(
+                    f"{op} has no activation-slot operand at index {argument_index}"
+                )
+            node_args = list(node.args)
+            captured_slot = node_args[argument_index]
+            if not isinstance(captured_slot, fx.Node):
+                raise ValueError(
+                    f"{op} captured a non-node activation slot: {captured_slot!r}"
+                )
+            captured_slot_nodes.add(captured_slot)
+            node_args[argument_index] = activation_slot_id_1
+            node.args = tuple(node_args)
+            num_rewritten += 1
+    if num_rewritten == 0:
+        raise ValueError(
+            "GraphPP received a Dist-MoE activation slot but traced no Dist-MoE "
+            "forward operation"
+        )
+    for captured_slot in captured_slot_nodes:
+        if not captured_slot.users and captured_slot.op == "get_attr":
+            traced.gm.graph.erase_node(captured_slot)
+    traced.gm.graph.lint()
+    traced.gm.recompile()
 
 
 def _build_stage_graphs(
@@ -1573,6 +1688,7 @@ def _build_stage_graphs(
     extract_fsdp_grad_reduction: bool = True,
     accumulate_gradients_in_graph: bool = False,
     fuse_wgrad_accumulation: bool = False,
+    activation_slot_id_1: torch.Tensor | None = None,
 ) -> None:
     """Trace one stage-local train step and attach bound GraphPP graphs."""
     maybe_register_blockmask_pytree_node()
@@ -1612,7 +1728,13 @@ def _build_stage_graphs(
                 "GraphPP last-stage graph construction requires a loss function."
             )
 
-        def stage_step(stage_args, stage_kwargs, target, loss_kwargs):
+        def stage_step(
+            stage_args,
+            stage_kwargs,
+            target,
+            loss_kwargs,
+            activation_slot_id_1,
+        ):
             pred = stage.submod(*stage_args, **stage_kwargs)
             loss = compute_annotated_loss(
                 loss_fn,
@@ -1658,12 +1780,18 @@ def _build_stage_graphs(
             stage_kwargs,
             target,
             loss_kwargs,
+            activation_slot_id_1,
         )
         backward_only_indices = ()
     else:
         output_grads = stage_builder._flat_output_grads_from_stage_metadata(stage)
 
-        def stage_step(stage_args, stage_kwargs, output_grads_from_next):
+        def stage_step(
+            stage_args,
+            stage_kwargs,
+            activation_slot_id_1,
+            output_grads_from_next,
+        ):
             output = stage.submod(*stage_args, **stage_kwargs)
             flat_outputs, _ = pytree.tree_flatten(output)
             flat_output_grads, _ = pytree.tree_flatten(output_grads_from_next)
@@ -1704,16 +1832,30 @@ def _build_stage_graphs(
         traced = minimal_fx_tracer(stage_step, module=stage.submod)(
             stage_args,
             stage_kwargs,
+            activation_slot_id_1,
             output_grads,
         )
         state_flat, _ = pytree.tree_flatten(extract_module_state(stage.submod))
-        prefix_user_flat, _ = pytree.tree_flatten(((stage_args, stage_kwargs), {}))
+        prefix_user_flat, _ = pytree.tree_flatten(
+            ((stage_args, stage_kwargs, activation_slot_id_1), {})
+        )
         backward_only_start = len(
             flatten_graph_values([*state_flat, *prefix_user_flat])
         )
         backward_only_count = len(flatten_graph_values(list(output_grads)))
         backward_only_indices = tuple(
             range(backward_only_start, backward_only_start + backward_only_count)
+        )
+
+    if activation_slot_id_1 is not None:
+        slot_input_index = (
+            len(traced.example_inputs) - 1
+            if stage.is_last
+            else min(backward_only_indices) - 1
+        )
+        _rewrite_dist_moe_activation_slot_input(
+            traced,
+            input_index=slot_input_index,
         )
 
     # 3. Validate the grouped trace output before any graph extraction. The
@@ -1867,6 +2009,7 @@ def _build_stage_graphs(
         partition=partition_meta,
         fwd_input_names=fsdp_fw.compute_input_names,
         fwd_flat_input_indices=fsdp_fw.compute_flat_input_indices,
+        uses_dist_moe_activation_slot=activation_slot_id_1 is not None,
         bw_no_fsdp_output_names=fsdp_bw.compute_output_names,
         reduce_grad_input_names=fsdp_bw.reduce_grad_input_names,
         unshard_flat_param_indices=fsdp_fw.unshard_flat_param_indices,
@@ -1906,10 +2049,30 @@ def _build_graph_pp_overlap_graphs(
     )
 
 
-def _trace_kwargs_from_context(ctx: _PipelineContext) -> dict[str, Any]:
+def _trace_kwargs_from_context(
+    ctx: _PipelineContext,
+    microbatch_index: int = 0,
+) -> dict[str, Any]:
     if ctx.kwarg_mbs is None:
         return {}
-    return ctx.kwarg_mbs[0]
+    return ctx.kwarg_mbs[microbatch_index]
+
+
+def _dist_moe_activation_slot_id_1(
+    forward_context: _DistMoeForwardContext | None,
+    *,
+    stage_index: int,
+    microbatch_index: int = 0,
+) -> torch.Tensor | None:
+    """Resolve the representative Dist-MoE slot used to trace one stage."""
+    if forward_context is None:
+        return None
+    return forward_context.activation_slot_id_1(
+        PipelineStageInfo(
+            stage_index=stage_index,
+            microbatch_index=microbatch_index,
+        )
+    )
 
 
 @dataclasses.dataclass(slots=True)
@@ -1973,8 +2136,9 @@ class GraphTrainerStageGraphProvider:
         ctx: _PipelineContext,
         *,
         loss_kwargs: dict[str, Any],
+        dist_moe_forward_context: _DistMoeForwardContext | None = None,
     ) -> dict[tuple[int, int], OverlapStageGraphs]:
-        """Build, multiplex, and compile all local GraphPP graphs for one step."""
+        """Build one graph per stage with its optional Dist-MoE slot input."""
         graph_stages = [cast(GraphPipelineStage, stage) for stage in schedule._stages]
         maybe_register_blockmask_pytree_node()
         trace_ctx = ctx
@@ -2037,6 +2201,10 @@ class GraphTrainerStageGraphProvider:
                     extract_fsdp_grad_reduction=self.extract_fsdp_grad_reduction,
                     accumulate_gradients_in_graph=self.accumulate_gradients_in_graph,
                     fuse_wgrad_accumulation=self.fuse_wgrad_accumulation,
+                    activation_slot_id_1=_dist_moe_activation_slot_id_1(
+                        dist_moe_forward_context,
+                        stage_index=stage.stage_index,
+                    ),
                 )
             return {}
 
@@ -2045,9 +2213,9 @@ class GraphTrainerStageGraphProvider:
                 continue
             _build_stage_graphs(
                 stage,
-                stage_builder._trace_args_for_stage(stage, trace_ctx),
-                _trace_kwargs_from_context(trace_ctx),
-                stage_builder._trace_target_from_context(stage, trace_ctx),
+                stage_builder._trace_args_for_stage(stage, trace_ctx, 0),
+                _trace_kwargs_from_context(trace_ctx, 0),
+                stage_builder._trace_target_from_context(stage, trace_ctx, 0),
                 loss_kwargs,
                 loss_fn=self.loss_fn,
                 compile_config=self.compile_config,
@@ -2058,6 +2226,10 @@ class GraphTrainerStageGraphProvider:
                 extract_fsdp_grad_reduction=self.extract_fsdp_grad_reduction,
                 accumulate_gradients_in_graph=self.accumulate_gradients_in_graph,
                 fuse_wgrad_accumulation=self.fuse_wgrad_accumulation,
+                activation_slot_id_1=_dist_moe_activation_slot_id_1(
+                    dist_moe_forward_context,
+                    stage_index=stage.stage_index,
+                ),
             )
 
         required_overlap_pairs = stage_builder._required_multiplex_pairs(schedule)
