@@ -331,7 +331,7 @@ class BaseLoss(ABC, Configurable):
 
         Example:
             loss_mask = [F, F, T, T, F, T]  (prompt, prompt, answer, answer, tool output, answer)
-            DAPO returns it, so the lm_head runs on tokens 2, 3 and 5 (plus padding).
+            DAPO returns it, so the lm_head runs on tokens 2, 3 and 5 only.
         """
         del labels, loss_inputs
         return None
@@ -500,6 +500,7 @@ class GradAccumulator:
         self.num_chunks = num_chunks
         self.seq_dim = seq_dim
         self._next_idx = 0
+        self._next_offset = 0
         self.buffer = torch.zeros_like(reference, dtype=dtype)
 
     def add(self, chunk_grad: torch.Tensor) -> None:
@@ -514,7 +515,7 @@ class GradAccumulator:
             chunk_grad = chunk_grad.to(self.buffer.dtype)
 
         chunk_seq_len = chunk_grad.shape[self.seq_dim]
-        start = self._next_idx * chunk_seq_len
+        start = self._next_offset
         end = start + chunk_seq_len
 
         slices = [slice(None)] * self.buffer.ndim
@@ -522,6 +523,7 @@ class GradAccumulator:
         self.buffer[tuple(slices)] = chunk_grad
 
         self._next_idx += 1
+        self._next_offset = end
 
 
 class ChunkedLossWrapper(BaseLoss):
@@ -596,18 +598,10 @@ class ChunkedLossWrapper(BaseLoss):
 
     def _loss_token_indices(
         self, labels: torch.Tensor, loss_inputs: dict[str, Any]
-    ) -> tuple[torch.Tensor, int] | None:
-        """Indices of the loss tokens plus padding, and their chunk count; None keeps all tokens.
-
-        Uses the fewest chunks of at most ``T / num_chunks`` tokens. The loss tokens are padded
-        with skipped tokens, which contribute nothing, to equal 64-aligned chunks.
-
-        Example:
-            T = 64k, num_chunks = 8 (8192-token chunks), 9800 loss tokens
-            -> 9856 indices (the 9800 loss tokens first, then 56 skipped ones), 2 chunks of 4928
-        """
+    ) -> torch.Tensor | None:
+        """Indices of the tokens in ``loss_fn.loss_token_mask``; None keeps every token."""
         token_mask = self.loss_fn.loss_token_mask(labels, **loss_inputs)
-        # The count below is a host sync, which CUDA graph capture does not allow.
+        # nonzero is a host sync, which CUDA graph capture does not allow.
         if token_mask is None or (
             token_mask.is_cuda and torch.cuda.is_current_stream_capturing()
         ):
@@ -617,20 +611,16 @@ class ChunkedLossWrapper(BaseLoss):
                 f"loss_token_mask shape {tuple(token_mask.shape)} must match labels "
                 f"{tuple(labels.shape)}"
             )
-        num_tokens = labels.shape[0]
         # Keep every token so that _chunk_local raises for a non-divisible length on step 1.
-        if num_tokens == 0 or num_tokens % self.num_chunks != 0:
+        if labels.shape[0] % self.num_chunks != 0:
             return None
-        chunk_len = num_tokens // self.num_chunks
-        num_loss_tokens = max(int(token_mask.sum()), 1)
-        num_chunks = -(-num_loss_tokens // chunk_len)
-        alignment = 64 * num_chunks
-        num_kept = -(-num_loss_tokens // alignment) * alignment
-        if num_kept >= num_tokens:
+        token_indices = token_mask.nonzero().squeeze(1)
+        if token_indices.numel() == labels.shape[0]:
             return None
-        # Loss tokens first, in order, then skipped tokens as padding.
-        token_indices = torch.argsort(~token_mask, stable=True)[:num_kept]
-        return token_indices, num_chunks
+        # An all-masked microbatch still runs one chunk, so every rank's FSDP reduce-scatters.
+        if token_indices.numel() == 0:
+            return token_indices.new_zeros(1)
+        return token_indices
 
     def __call__(
         self,
@@ -682,12 +672,19 @@ class ChunkedLossWrapper(BaseLoss):
 
         # Only the tokens in the loss's mask go through the lm_head. Multi-output losses
         # and batch-invariant mode (bitwise checks, not speed) keep every token.
+        chunk_sizes = None
         if not is_multi_output and not is_in_batch_invariant_mode():
             with spmd.local():
                 with spmd.no_typecheck():
-                    loss_tokens = self._loss_token_indices(labels[0], loss_inputs)
-                if loss_tokens is not None:
-                    token_indices, num_chunks = loss_tokens
+                    token_indices = self._loss_token_indices(labels[0], loss_inputs)
+                if token_indices is not None:
+                    # The fewest balanced chunks of at most T / num_chunks tokens.
+                    num_kept = token_indices.numel()
+                    num_chunks = -(-num_kept * num_chunks // labels[0].shape[0])
+                    chunk_sizes = [
+                        num_kept // num_chunks + (i < num_kept % num_chunks)
+                        for i in range(num_chunks)
+                    ]
                     # index_select's backward scatters the chunks' gradients back to
                     # [T, D], with zeros for the skipped tokens.
                     pred = (_select_tokens(pred[0], token_indices),)
@@ -697,10 +694,11 @@ class ChunkedLossWrapper(BaseLoss):
                         for key, value in loss_inputs.items()
                     }
 
-        # Chunking operates on the local tensor. Equal chunk sizes match
-        # GradAccumulator's sequential slice
-        # writes, which use one chunk length for each write offset.
+        # Chunking operates on the local tensor. Without skipped tokens, chunks are
+        # equal: the sequence length must be divisible by num_chunks.
         def _chunk_local(t):
+            if chunk_sizes is not None:
+                return tuple(c.contiguous() for c in torch.split(t, chunk_sizes, dim=0))
             seq_len = t.shape[0]
             torch._check(
                 seq_len % num_chunks == 0,

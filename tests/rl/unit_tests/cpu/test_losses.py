@@ -55,7 +55,7 @@ def test_chunked_loss_skips_tokens_outside_loss_mask(loss_config) -> None:
             num_chunks=4, loss_fn=loss_config
         ).build()
         chunked_loss.set_lm_head(lm_head)
-        token_indices, _ = chunked_loss._loss_token_indices(labels, loss_inputs)
+        token_indices = chunked_loss._loss_token_indices(labels, loss_inputs)
         if not skip:
             chunked_loss._loss_token_indices = lambda *args: None
         lm_head.weight.grad = None
