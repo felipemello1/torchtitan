@@ -1288,7 +1288,11 @@ class TestChunkedLossWrapperSPMD(DTensorTestBase):
                 )
                 chunked_loss.set_lm_head(lm_head)
                 loss, _ = chunked_loss(
-                    hidden_input, labels, global_valid_tokens, loss_mask=loss_mask
+                    hidden_input,
+                    labels,
+                    global_valid_tokens,
+                    loss_mask=loss_mask,
+                    loss_token_indices=loss_mask.nonzero().squeeze(1),
                 )
             else:
                 loss, _ = chunked_loss.loss_fn(
@@ -1358,7 +1362,11 @@ class TestSkipNonLossTokens(unittest.TestCase):
                 )
                 hidden_input = hidden.clone().requires_grad_()
                 loss, metrics = chunked_loss(
-                    hidden_input, labels, global_valid_tokens, loss_mask=loss_mask
+                    hidden_input,
+                    labels,
+                    global_valid_tokens,
+                    loss_mask=loss_mask,
+                    loss_token_indices=loss_mask.nonzero().squeeze(1),
                 )
                 loss.backward()
 
@@ -1373,7 +1381,7 @@ class TestSkipNonLossTokens(unittest.TestCase):
                 torch.testing.assert_close(lm_head.weight.grad, grad_weight_ref)
 
     def test_cross_entropy_keeps_every_token(self):
-        # Pretraining passes no loss_mask: even IGNORE_INDEX tokens go through the lm_head.
+        # Pretraining passes no loss_token_indices: even IGNORE_INDEX tokens go through the lm_head.
         lm_head = nn.Linear(16, 64, bias=False)
         lm_head_rows = []
         lm_head.register_forward_hook(
@@ -1384,6 +1392,30 @@ class TestSkipNonLossTokens(unittest.TestCase):
         labels = torch.full((1024,), IGNORE_INDEX)
         labels[:10] = 1
         chunked_loss(torch.randn(1024, 16), labels)
+        self.assertEqual(lm_head_rows, [256] * 4)
+
+    def test_skip_non_loss_tokens_false_keeps_every_token(self):
+        lm_head = nn.Linear(16, 64, bias=False)
+        lm_head_rows = []
+        lm_head.register_forward_hook(
+            lambda module, args, output: lm_head_rows.append(args[0].shape[0])
+        )
+        chunked_loss = ChunkedLossWrapper(
+            ChunkedLossWrapper.Config(
+                num_chunks=4,
+                loss_fn=_MaskedCrossEntropyLoss.Config(),
+                skip_non_loss_tokens=False,
+            )
+        )
+        chunked_loss.set_lm_head(lm_head)
+        loss_mask = torch.arange(1024) < 100
+        chunked_loss(
+            torch.randn(1024, 16),
+            torch.randint(0, 64, (1024,)),
+            torch.tensor(100.0),
+            loss_mask=loss_mask,
+            loss_token_indices=loss_mask.nonzero().squeeze(1),
+        )
         self.assertEqual(lm_head_rows, [256] * 4)
 
 

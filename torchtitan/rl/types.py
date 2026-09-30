@@ -134,6 +134,8 @@ class TrainingMicrobatch(TokenizedTrainingMicrobatch):
             "generator_logprobs": self.generator_logprobs,
             "loss_mask": self.loss_mask,
             "advantages": self.advantages,
+            # Counted on the host, so ChunkedLossWrapper can skip the other tokens without a sync.
+            "loss_token_indices": self.loss_mask.nonzero().squeeze(1),
         }
 
 

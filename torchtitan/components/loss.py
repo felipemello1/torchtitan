@@ -515,9 +515,10 @@ class ChunkedLossWrapper(BaseLoss):
     loss. Additional per-token ``loss_inputs`` are chunked along the same
     sequence dimension and forwarded to the inner loss.
 
-    A per-token ``loss_mask`` in ``loss_inputs`` (RL) marks the only tokens that reach
-    the loss: the others (prompt, tool outputs, padding) skip the lm_head and get zero
-    gradient, and fewer chunks run, each no longer than before.
+    A ``loss_token_indices`` loss input (RL: the positions of ``loss_mask``, built on
+    the host) marks the only tokens that reach the loss. With ``skip_non_loss_tokens``,
+    the others (prompt, tool outputs, padding) skip the lm_head and get zero gradient,
+    and fewer chunks run, each no longer than before.
 
     The flow:
     1. Model forward with _skip_lm_head=True to get one or more hidden states [T, D]
@@ -557,6 +558,10 @@ class ChunkedLossWrapper(BaseLoss):
         loss_fn: BaseLoss.Config = field(default_factory=CrossEntropyLoss.Config)
         """Loss applied to each chunk's logits."""
 
+        skip_non_loss_tokens: bool = True
+        """Run the lm_head only on the ``loss_token_indices`` tokens (RL passes them); no
+        effect without them (pretraining)."""
+
     def __init__(
         self,
         config: Config,
@@ -564,6 +569,7 @@ class ChunkedLossWrapper(BaseLoss):
         compile_config: CompileConfig | None = None,
     ):
         self.num_chunks = config.num_chunks
+        self.skip_non_loss_tokens = config.skip_non_loss_tokens
         self.loss_fn: BaseLoss = config.loss_fn.build(compile_config=compile_config)
         self.lm_head: nn.Module | None = None
 
@@ -619,25 +625,28 @@ class ChunkedLossWrapper(BaseLoss):
                 "are required."
             )
 
-        # Counting the loss tokens is a host sync, which CUDA graph capture does not allow.
         # Multi-output losses and batch-invariant mode (bitwise checks) keep every token.
-        loss_mask = loss_inputs.get("loss_mask")
+        loss_token_indices = loss_inputs.pop("loss_token_indices", None)
         is_masked = False
         if (
-            loss_mask is not None
+            self.skip_non_loss_tokens
+            and loss_token_indices is not None
             and not is_multi_output
             and not is_in_batch_invariant_mode()
-            and not (loss_mask.is_cuda and torch.cuda.is_current_stream_capturing())
         ):
-            num_tokens, num_kept = len(loss_mask), int(loss_mask.sum())
+            num_tokens, num_kept = labels[0].shape[0], len(loss_token_indices)
             if 0 < num_kept < num_tokens:
                 is_masked = True
                 # The fewest chunks of at most T / num_chunks tokens.
                 num_chunks = -(-num_kept * num_chunks // num_tokens)
-                pred = (pred[0][loss_mask],)
-                labels = (labels[0][loss_mask],)
+                pred = (pred[0][loss_token_indices],)
+                labels = (labels[0][loss_token_indices],)
                 loss_inputs = {
-                    key: value[loss_mask] if isinstance(value, torch.Tensor) else value
+                    key: (
+                        value[loss_token_indices]
+                        if isinstance(value, torch.Tensor)
+                        else value
+                    )
                     for key, value in loss_inputs.items()
                 }
 

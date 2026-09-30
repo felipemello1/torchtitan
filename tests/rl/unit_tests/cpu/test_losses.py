@@ -11,6 +11,7 @@ import torch.nn as nn
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.rl.losses import DAPOLoss, GRPOLoss
 from torchtitan.rl.losses.dapo import _normalize
+from torchtitan.rl.types import TrainingMicrobatch
 
 
 def test_loss_normalization_uses_mutable_tensor_denominator() -> None:
@@ -29,19 +30,24 @@ def test_loss_normalization_uses_mutable_tensor_denominator() -> None:
     "loss_config", [DAPOLoss.Config(ratio_clip_high=0.28), GRPOLoss.Config()]
 )
 def test_chunked_loss_skips_tokens_outside_loss_mask(loss_config) -> None:
-    # Same loss, metrics and gradients as the loss on every token's logits.
+    # Same loss, metrics and gradients as the unchunked loss, which also gets the RL loss kwargs.
     torch.manual_seed(42)
     num_tokens, dim, vocab = 1024, 16, 64
     hidden = torch.randn(num_tokens, dim)
-    labels = torch.randint(0, vocab, (num_tokens,))
     loss_mask = torch.rand(num_tokens) < 0.2
     generator_logprobs = -5 * torch.rand(num_tokens)
     generator_logprobs[:8] = float("-inf")
-    loss_inputs = {
-        "generator_logprobs": generator_logprobs,
-        "advantages": torch.randn(num_tokens) * loss_mask,
-        "loss_mask": loss_mask,
-    }
+    microbatch = TrainingMicrobatch(
+        input=torch.zeros(num_tokens, dtype=torch.long),
+        labels=torch.randint(0, vocab, (num_tokens,)),
+        positions=torch.arange(num_tokens),
+        padding_mask=torch.zeros(num_tokens, dtype=torch.bool),
+        num_valid_tokens=int(loss_mask.sum()),
+        generator_logprobs=generator_logprobs,
+        loss_mask=loss_mask,
+        advantages=torch.randn(num_tokens) * loss_mask,
+    )
+    labels, loss_kwargs = microbatch.labels, microbatch.loss_kwargs()
     global_valid_tokens = loss_mask.sum().float()
     lm_head = nn.Linear(dim, vocab, bias=False)
     chunked_loss = ChunkedLossWrapper.Config(num_chunks=4, loss_fn=loss_config).build()
@@ -49,7 +55,7 @@ def test_chunked_loss_skips_tokens_outside_loss_mask(loss_config) -> None:
 
     hidden_ref = hidden.clone().requires_grad_()
     loss_ref, metrics_ref = chunked_loss.loss_fn(
-        lm_head(hidden_ref), labels, global_valid_tokens, **loss_inputs
+        lm_head(hidden_ref), labels, global_valid_tokens, **loss_kwargs
     )
     loss_ref.backward()
     grad_weight_ref, lm_head.weight.grad = lm_head.weight.grad, None
@@ -60,7 +66,7 @@ def test_chunked_loss_skips_tokens_outside_loss_mask(loss_config) -> None:
     )
     hidden_input = hidden.clone().requires_grad_()
     loss, metrics = chunked_loss(
-        hidden_input, labels, global_valid_tokens, **loss_inputs
+        hidden_input, labels, global_valid_tokens, **loss_kwargs
     )
     loss.backward()
 
