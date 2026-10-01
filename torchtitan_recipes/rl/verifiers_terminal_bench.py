@@ -206,6 +206,14 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench_smoke() -> Controller.Config:
     return config
 
 
+def rl_grpo_qwen3_6_35b_a3b_terminal_bench_smoke_four_generators() -> Controller.Config:
+    """The smoke recipe with four one-GPU generators, each with every expert, on the generator host."""
+    config = rl_grpo_qwen3_6_35b_a3b_terminal_bench_smoke()
+    config.num_generators = 4
+    config.generator.parallelism = InferenceParallelismConfig()
+    return config
+
+
 def _terminal_bench_rollouter_config(
     *, train_dataset: str, validation_dataset: str
 ) -> VerifiersRollouter.Config:
