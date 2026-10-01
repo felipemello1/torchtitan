@@ -4,10 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import importlib.metadata
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
 import spmd_types as spmd
 import torch
 import torch.distributed as dist
@@ -26,6 +28,7 @@ from torchtitan.models.qwen3_5.model import Qwen35Model
 from torchtitan.models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
 from torchtitan.protocols.sharding import ShardingConfig
 
+from torchtitan.rl.model.attention import _fa4_splits_paged_kv
 from torchtitan.rl.model.vllm_wrapper import (
     _replace_vllm_layer_configs,
     PlainToDTensorStateDictAdapter,
@@ -237,3 +240,17 @@ def test_hf_adapter_restores_local_shards(tmp_path: Path) -> None:
         nprocs=2,
         join=True,
     )
+
+
+@pytest.mark.parametrize(
+    ("fa4_version", "splits"), [("4.0.0b33", False), ("4.0.0b34.dev10+g33985c6", True)]
+)
+def test_fa4_splits_paged_kv_only_from_the_version_that_supports_it(
+    fa4_version: str, splits: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: fa4_version)
+    _fa4_splits_paged_kv.cache_clear()
+    try:
+        assert _fa4_splits_paged_kv() is splits
+    finally:
+        _fa4_splits_paged_kv.cache_clear()

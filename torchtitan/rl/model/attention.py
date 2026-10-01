@@ -4,12 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
+import importlib.metadata
 import itertools
 import logging
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+from packaging.version import Version
 from torch.nn.attention import (
     activate_flash_attention_impl,
     current_flash_attention_impl,
@@ -222,9 +225,10 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         # num_splits=1 in batch-invariant mode (determinism).
         if fa_impl in (None, "FA2") or is_in_batch_invariant_mode():
             extra_kwargs["num_splits"] = 1
-        elif fa_impl == "FA4" and self.head_size == 256:
+        elif fa_impl == "FA4" and self.head_size == 256 and _fa4_splits_paged_kv():
             # torch's FA4 wrapper turns num_splits=None into 1 split; -1 runs FA4's
-            # split-KV heuristic, 3-48x faster for paged decode at 8K-32K context.
+            # split-KV heuristic: 3-48x faster paged decode at 8K-32K context
+            # (head_dim 256, GB300, FA4 4.0.0b34.dev10).
             # TODO: enable for other head sizes once their split-KV path is validated.
             extra_kwargs["num_splits"] = -1
 
@@ -373,3 +377,18 @@ class VLLMAttentionWrapper(Module):
         num_tokens, _, head_dim = q_THK.shape
         out_TD = out_TD.narrow(0, 0, num_tokens)
         return out_TD.view(num_tokens, -1, head_dim)
+
+
+@functools.cache
+def _fa4_splits_paged_kv() -> bool:
+    """Whether FA4 can split the KV of vLLM's paged cache for Qwen3.5/3.6 page sizes.
+
+    FA4 4.0.0b33 asserts on 16-token pages with `num_splits=-1`; Dao-AILab 33985c6
+    (4.0.0b34.dev10) handles them.
+    """
+    try:
+        return Version(importlib.metadata.version("flash-attn-4")) >= Version(
+            "4.0.0b34.dev0"
+        )
+    except importlib.metadata.PackageNotFoundError:
+        return False
