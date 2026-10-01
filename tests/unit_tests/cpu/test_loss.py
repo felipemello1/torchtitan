@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from spmd_types._checker import typecheck
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import distribute_tensor, DTensor, Replicate, Shard
 from torch.distributed.tensor.parallel import loss_parallel
 from torch.testing._internal.distributed._tensor.common_dtensor import (
@@ -292,6 +294,14 @@ class TestGradAccumulator(unittest.TestCase):
 
         result = acc.buffer
         torch.testing.assert_close(result, reference)
+
+    def test_accumulate_unequal_chunks_matches_cat(self):
+        """Chunks may differ in length, e.g. the kept tokens after skipping."""
+        reference = torch.randn(10, 16)
+        acc = GradAccumulator(reference, num_chunks=3, dtype=reference.dtype)
+        for chunk in torch.split(reference, [4, 3, 3], dim=0):
+            acc.add(chunk)
+        torch.testing.assert_close(acc.buffer, reference)
 
     def test_accumulate_with_dtype_conversion(self):
         """Verify fp32 accumulation from bf16 chunks."""
@@ -1248,6 +1258,165 @@ class TestChunkedLossWrapperSPMD(DTensorTestBase):
         h_grad_spmd = h_spmd.grad.clone()
         dist.all_reduce(h_grad_spmd, group=tp_group)
         torch.testing.assert_close(h_grad_spmd, h_grad_ref)
+
+    @with_comms
+    def test_fsdp_dp_ranks_with_different_chunk_counts(self):
+        """Rank 0 runs 2 chunks and rank 1 runs 5: no hang, and the full loss's numbers."""
+        mesh = init_device_mesh(self.device_type, (2,), mesh_dim_names=("dp",))
+        num_tokens, dim, vocab = 4096, 32, 128
+        torch.manual_seed(42)
+        reference_lm_head = nn.Linear(dim, vocab, bias=False)
+        torch.manual_seed(self.rank)
+        hidden = torch.randn(num_tokens, dim)
+        labels = torch.randint(0, vocab, (num_tokens,))
+        loss_mask = torch.rand(num_tokens) < (0.15, 0.6)[self.rank]
+        global_valid_tokens = loss_mask.sum().float()
+        chunked_loss = ChunkedLossWrapper(
+            ChunkedLossWrapper.Config(
+                num_chunks=8, loss_fn=_MaskedCrossEntropyLoss.Config()
+            )
+        )
+        lm_head_rows = []
+
+        results = []
+        for chunked in (False, True):
+            lm_head = fully_shard(copy.deepcopy(reference_lm_head), mesh=mesh)
+            hidden_input = hidden.clone().requires_grad_()
+            if chunked:
+                lm_head.register_forward_hook(
+                    lambda module, args, output: lm_head_rows.append(args[0].shape[0])
+                )
+                chunked_loss.set_lm_head(lm_head)
+                loss, _ = chunked_loss(
+                    hidden_input,
+                    labels,
+                    global_valid_tokens,
+                    loss_mask=loss_mask,
+                    loss_token_indices=loss_mask.nonzero().squeeze(1),
+                )
+            else:
+                loss, _ = chunked_loss.loss_fn(
+                    lm_head(hidden_input),
+                    labels,
+                    global_valid_tokens,
+                    loss_mask=loss_mask,
+                )
+            loss.backward()
+            results.append((loss, hidden_input.grad, lm_head.weight.grad.full_tensor()))
+
+        self.assertEqual(len(lm_head_rows), (2, 5)[self.rank])
+        (loss, grad_hidden, grad_weight), chunked = results
+        torch.testing.assert_close(chunked[0], loss)
+        torch.testing.assert_close(chunked[1], grad_hidden)
+        torch.testing.assert_close(chunked[2], grad_weight)
+
+
+class _MaskedCrossEntropyLoss(BaseLoss):
+    """Cross-entropy summed over the ``loss_mask`` tokens."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseLoss.Config):
+        pass
+
+    def __init__(self, config: Config, *, compile_config=None):
+        del config, compile_config
+
+    def __call__(self, pred, labels, global_valid_tokens=None, *, loss_mask):
+        token_loss = F.cross_entropy(pred, labels, reduction="none") * loss_mask
+        loss = token_loss.sum() / global_valid_tokens
+        return loss, {"loss/mean": loss.detach(), "token_loss/max": token_loss.max()}
+
+
+class TestSkipNonLossTokens(unittest.TestCase):
+    def test_skipped_tokens_match_full_loss(self):
+        # 0.003 keeps fewer tokens than chunks; 0.0 and 1.0 have nothing to skip.
+        num_tokens, dim, vocab = 1024, 16, 64
+        for loss_token_frac in (0.1, 0.5, 0.003, 0.0, 1.0):
+            with self.subTest(loss_token_frac=loss_token_frac):
+                torch.manual_seed(42)
+                hidden = torch.randn(num_tokens, dim)
+                labels = torch.randint(0, vocab, (num_tokens,))
+                loss_mask = torch.rand(num_tokens) < loss_token_frac
+                global_valid_tokens = loss_mask.sum().clamp_min(1).float()
+                lm_head = nn.Linear(dim, vocab, bias=False)
+                chunked_loss = ChunkedLossWrapper(
+                    ChunkedLossWrapper.Config(
+                        num_chunks=4, loss_fn=_MaskedCrossEntropyLoss.Config()
+                    )
+                )
+                chunked_loss.set_lm_head(lm_head)
+
+                hidden_ref = hidden.clone().requires_grad_()
+                loss_ref, metrics_ref = chunked_loss.loss_fn(
+                    lm_head(hidden_ref),
+                    labels,
+                    global_valid_tokens,
+                    loss_mask=loss_mask,
+                )
+                loss_ref.backward()
+                grad_weight_ref, lm_head.weight.grad = lm_head.weight.grad, None
+
+                lm_head_rows = []
+                lm_head.register_forward_hook(
+                    lambda module, args, output: lm_head_rows.append(args[0].shape[0])
+                )
+                hidden_input = hidden.clone().requires_grad_()
+                loss, metrics = chunked_loss(
+                    hidden_input,
+                    labels,
+                    global_valid_tokens,
+                    loss_mask=loss_mask,
+                    loss_token_indices=loss_mask.nonzero().squeeze(1),
+                )
+                loss.backward()
+
+                num_kept = int(loss_mask.sum())
+                self.assertEqual(
+                    sum(lm_head_rows),
+                    num_kept if 0 < num_kept < num_tokens else num_tokens,
+                )
+                torch.testing.assert_close(loss, loss_ref)
+                torch.testing.assert_close(metrics, metrics_ref)
+                torch.testing.assert_close(hidden_input.grad, hidden_ref.grad)
+                torch.testing.assert_close(lm_head.weight.grad, grad_weight_ref)
+
+    def test_cross_entropy_keeps_every_token(self):
+        # Pretraining passes no loss_token_indices: even IGNORE_INDEX tokens go through the lm_head.
+        lm_head = nn.Linear(16, 64, bias=False)
+        lm_head_rows = []
+        lm_head.register_forward_hook(
+            lambda module, args, output: lm_head_rows.append(args[0].shape[0])
+        )
+        chunked_loss = ChunkedLossWrapper(ChunkedLossWrapper.Config(num_chunks=4))
+        chunked_loss.set_lm_head(lm_head)
+        labels = torch.full((1024,), IGNORE_INDEX)
+        labels[:10] = 1
+        chunked_loss(torch.randn(1024, 16), labels)
+        self.assertEqual(lm_head_rows, [256] * 4)
+
+    def test_skip_non_loss_tokens_false_keeps_every_token(self):
+        lm_head = nn.Linear(16, 64, bias=False)
+        lm_head_rows = []
+        lm_head.register_forward_hook(
+            lambda module, args, output: lm_head_rows.append(args[0].shape[0])
+        )
+        chunked_loss = ChunkedLossWrapper(
+            ChunkedLossWrapper.Config(
+                num_chunks=4,
+                loss_fn=_MaskedCrossEntropyLoss.Config(),
+                skip_non_loss_tokens=False,
+            )
+        )
+        chunked_loss.set_lm_head(lm_head)
+        loss_mask = torch.arange(1024) < 100
+        chunked_loss(
+            torch.randn(1024, 16),
+            torch.randint(0, 64, (1024,)),
+            torch.tensor(100.0),
+            loss_mask=loss_mask,
+            loss_token_indices=loss_mask.nonzero().squeeze(1),
+        )
+        self.assertEqual(lm_head_rows, [256] * 4)
 
 
 if __name__ == "__main__":

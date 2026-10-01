@@ -475,6 +475,7 @@ class GradAccumulator:
         self.num_chunks = num_chunks
         self.seq_dim = seq_dim
         self._next_idx = 0
+        self._next_offset = 0
         self.buffer = torch.zeros_like(reference, dtype=dtype)
 
     def add(self, chunk_grad: torch.Tensor) -> None:
@@ -489,7 +490,7 @@ class GradAccumulator:
             chunk_grad = chunk_grad.to(self.buffer.dtype)
 
         chunk_seq_len = chunk_grad.shape[self.seq_dim]
-        start = self._next_idx * chunk_seq_len
+        start = self._next_offset
         end = start + chunk_seq_len
 
         slices = [slice(None)] * self.buffer.ndim
@@ -497,6 +498,7 @@ class GradAccumulator:
         self.buffer[tuple(slices)] = chunk_grad
 
         self._next_idx += 1
+        self._next_offset = end
 
 
 class ChunkedLossWrapper(BaseLoss):
@@ -512,6 +514,11 @@ class ChunkedLossWrapper(BaseLoss):
     tuples; their tensor or tuple structure is preserved when calling the inner
     loss. Additional per-token ``loss_inputs`` are chunked along the same
     sequence dimension and forwarded to the inner loss.
+
+    A ``loss_token_indices`` loss input (RL: the positions of ``loss_mask``, built on
+    the host) marks the only tokens that reach the loss. With ``skip_non_loss_tokens``,
+    the others (prompt, tool outputs, padding) skip the lm_head and get zero gradient,
+    and fewer chunks run, each no longer than before.
 
     The flow:
     1. Model forward with _skip_lm_head=True to get one or more hidden states [T, D]
@@ -551,6 +558,10 @@ class ChunkedLossWrapper(BaseLoss):
         loss_fn: BaseLoss.Config = field(default_factory=CrossEntropyLoss.Config)
         """Loss applied to each chunk's logits."""
 
+        skip_non_loss_tokens: bool = True
+        """Run the lm_head only on the ``loss_token_indices`` tokens (RL passes them); no
+        effect without them (pretraining)."""
+
     def __init__(
         self,
         config: Config,
@@ -558,6 +569,7 @@ class ChunkedLossWrapper(BaseLoss):
         compile_config: CompileConfig | None = None,
     ):
         self.num_chunks = config.num_chunks
+        self.skip_non_loss_tokens = config.skip_non_loss_tokens
         self.loss_fn: BaseLoss = config.loss_fn.build(compile_config=compile_config)
         self.lm_head: nn.Module | None = None
 
@@ -613,10 +625,36 @@ class ChunkedLossWrapper(BaseLoss):
                 "are required."
             )
 
-        # Chunking operates on the local tensor. Equal chunk sizes match
-        # GradAccumulator's sequential slice
-        # writes, which use one chunk length for each write offset.
+        # Multi-output losses (MTP) keep every token: the indices select one output's tokens.
+        loss_token_indices = loss_inputs.pop("loss_token_indices", None)
+        is_masked = False
+        if (
+            self.skip_non_loss_tokens
+            and loss_token_indices is not None
+            and not is_multi_output
+        ):
+            num_tokens, num_kept = labels[0].shape[0], len(loss_token_indices)
+            if 0 < num_kept < num_tokens:
+                is_masked = True
+                # Keep chunks of up to T / num_chunks tokens: fewer chunks, not smaller or empty
+                # ones (each chunk pays a fixed [V, D] cost).
+                num_chunks = -(-num_kept * num_chunks // num_tokens)
+                pred = (pred[0][loss_token_indices],)
+                labels = (labels[0][loss_token_indices],)
+                loss_inputs = {
+                    key: (
+                        value[loss_token_indices]
+                        if isinstance(value, torch.Tensor)
+                        else value
+                    )
+                    for key, value in loss_inputs.items()
+                }
+
+        # Chunking operates on the local tensor. The kept tokens get balanced chunks; the full
+        # sequence keeps pretraining's equal split, so its length must divide by num_chunks.
         def _chunk_local(t):
+            if is_masked:
+                return tuple(c.contiguous() for c in torch.tensor_split(t, num_chunks))
             seq_len = t.shape[0]
             torch._check(
                 seq_len % num_chunks == 0,

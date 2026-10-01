@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Annotated
+from typing import Annotated, Any
 
 import torch
 import tyro
@@ -83,6 +83,7 @@ class DAPOLoss(BaseLoss):
         generator_logprobs: torch.Tensor,
         advantages: torch.Tensor,
         loss_mask: torch.Tensor,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the per-token clip-higher surrogate loss.
 
@@ -94,11 +95,13 @@ class DAPOLoss(BaseLoss):
             advantages: [T] per-token advantages (0.0 for prompt/padding).
             global_valid_tokens: total response tokens with finite generator logprobs
                 across all microbatches and DP ranks; the loss denominator.
+            kwargs: loss inputs for ``ChunkedLossWrapper``, unused here.
 
         Returns:
             (loss, metrics) where loss is a scalar tensor and metrics is a dict of
             scalar tensors pre-normalized for SUM reduction across DP ranks.
         """
+        del kwargs
         trainer_logprobs, token_entropy = compute_logprobs(
             logits,
             labels,
