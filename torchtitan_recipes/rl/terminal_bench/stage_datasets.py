@@ -36,14 +36,14 @@ TMAX_REGISTRY = "PrimeIntellect-ai/prime-envs@8797af59115e6a5af7b2834996f8559e35
 TMAX_IMAGES_REPO = "allenai/tmax-15k-open-instruct"
 TMAX_IMAGES_REVISION = "7b090eca98bf351356bc1c64290c5c4a09f2f98c"
 TMAX_WORKDIR = "/home/user"
-# Short tasks are mostly solved by every rollout of a group (no reward variance), and
-# intricate ones expect 30-60 commands, more than the recipes' 20 turns.
+# Short tasks are mostly solved by every rollout of a group (no reward variance);
+# intricate ones expect 30-60 commands.
 TMAX_COMPLEXITIES = ("moderate task", "complex task")
 NUM_TMAX_TASKS = 1024
 TMAX_OUTPUT = "tmax-mc1024_27de1c1b"
 
-# Terminal-Bench 2.1, Harbor Hub revision 6: the tasks of
-# harbor-framework/terminal-bench-2-1@7131e437.
+# Terminal-Bench 2.1, Harbor Hub revision 6: the tasks of harbor-framework/terminal-bench-2-1@7131e437
+# (the git copy differs only in how sanitize-git-repo's test splits its fake token literals).
 TERMINAL_BENCH_DATASET = "terminal-bench/terminal-bench-2-1@6"
 # These three do not run in a remote Firecracker VM sandbox.
 TERMINAL_BENCH_EXCLUDED = ("qemu-alpine-ssh", "qemu-startup", "protein-assembly")

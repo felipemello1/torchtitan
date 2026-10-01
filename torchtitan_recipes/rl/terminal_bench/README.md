@@ -30,7 +30,8 @@ downloads nothing when that directory exists. The recipe's two ids are built, no
 
 - `tmax-mc1024@27de1c1b`: 1,024 moderate and complex TMax-15K tasks (`random.Random(0)` sample),
   from prime-envs' git-backed Harbor registry, each pointed at its public Docker Hub image
-  (`allenai/tmax-15k-open-instruct`) and started in `/home/user`.
+  (`hamishi740/swerl-tmax-v3:<tag>`, from the `allenai/tmax-15k-open-instruct` image map) and
+  started in `/home/user`.
 - `tb21-86@7131e437`: Terminal-Bench 2.1 (harbor-framework/terminal-bench-2-1@7131e437) without
   `qemu-alpine-ssh`, `qemu-startup` and `protein-assembly`.
 
@@ -39,16 +40,27 @@ pip install -r torchtitan_recipes/rl/terminal_bench/requirements.txt
 python -m torchtitan_recipes.rl.terminal_bench.stage_datasets --out ~/.cache/harbor   # ~1 min
 ```
 
+A launcher that stages the trees itself can ship each as one archive holding that top-level
+directory, e.g. `tar --zstd -cf tmax-mc1024_27de1c1b.tar.zst -C ~/.cache/harbor tmax-mc1024_27de1c1b`,
+and extract it into `$HOME/.cache/harbor` on the host that runs the env server.
+
 ## Run with TitanRL
 
+Follow the [RL environment setup](../../../torchtitan/rl/README.md), then download the checkpoint:
+
 ```bash
+python scripts/download_hf_assets.py --repo_id Qwen/Qwen3.6-35B-A3B \
+  --local_dir torchtitan/rl/example_checkpoint --all
 python -m torchtitan.rl.train --module torchtitan_recipes.rl.verifiers_terminal_bench \
   --config rl_grpo_qwen3_6_35b_a3b_terminal_bench
 ```
 
-- The recipe needs the Qwen3.6-35B-A3B checkpoint in `torchtitan/rl/example_checkpoint/` and
-  `dist_moe`: this branch carries the Dist-MoE adapter (pytorch/torchtitan#4541), which every
-  torchtitan process imports.
+- Hardware: 8 SM100 GPUs (B200 / GB300): one 8-GPU host (trainer GPUs 0-3, generators 4-7) or two
+  4-GPU hosts through a launcher. The trainer's Dist-MoE experts need SM100. The runs used FA4
+  `4.0.0b34.dev10` (Dao-AILab `33985c6`).
+- `dist_moe`: every torchtitan process on this branch imports it (the Dist-MoE adapter,
+  pytorch/torchtitan#4541), and it is not public yet (`meta-pytorch/dist_moe` returns 404). Until
+  #4541 makes the import optional, this branch runs only where `dist_moe` is installed.
 - Without more settings, task containers run on this host through the `docker` CLI.
 - A remote VM per rollout (Verifiers' `oci-runner` provider, not public yet) needs
   `VF_SANDBOX_PROVIDER=oci-runner`, `OCI_RUNNER_TASK_NETWORK=host` (tests install pytest at grading
