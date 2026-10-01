@@ -22,10 +22,11 @@ from torchtitan.rl.examples.verifiers import (
     VerifiersTaskDataset,
 )
 from torchtitan.rl.examples.verifiers.data import register_local_taskset_alias
-from torchtitan.rl.experiments.verifiers.terminal_bench import agent_outside, harness
-from torchtitan.rl.experiments.verifiers.terminal_bench.agent_outside import (
+from torchtitan.rl.experiments.verifiers.agent_outside import (
     AgentOutsideHarnessConfig,
+    HARNESS_ID as AGENT_OUTSIDE_HARNESS_ID,
 )
+from torchtitan.rl.experiments.verifiers.terminal_bench import harness
 from torchtitan.rl.experiments.verifiers.terminal_bench.harness import (
     NUM_AGENT_TURNS,
     register_harness_alias,
@@ -92,9 +93,7 @@ def terminal_bench_rollouter_config(
                 "sandbox='sandoq' needs OCI_RUNNER_TASK_NETWORK=host, or every "
                 "reward is 0"
             )
-        harness_config = AgentOutsideHarnessConfig(
-            id=register_harness_alias(agent_outside.__name__)
-        )
+        harness_config = AgentOutsideHarnessConfig(id=AGENT_OUTSIDE_HARNESS_ID)
         runtime = vf.PrimeConfig(idle_timeout=3600)
         # Rollouts only wait on the model and remote VMs; size
         # OCI_RUNNER_POOL_SIZE to this 8 x 16 = 128.

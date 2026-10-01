@@ -42,7 +42,7 @@ controller, env-server worker                          Sandoq Firecracker VM (x8
                                                        (tests/test.sh grades here)
 ```
 
-The agent is a bash-tool loop (`agent_outside.py`), not Terminus-2, so its prompt
+The agent is a bash-tool loop (`../agent_outside.py`), not Terminus-2, so its prompt
 format differs from the Docker path. The runtime is `vf.PrimeConfig`; the
 `sandoq_provider` package from `ram_prime_rl` (`extensions/sandoq`, with its pinned
 `sandoq-client`) rebinds it to Sandoq's OCI runner and reads its settings from the
