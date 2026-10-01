@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""DAPO-Math recipes for two 4-GPU hosts: the trainer fills one host, one generator the other.
+"""RL recipes for two 4-GPU hosts: the trainer fills one host, one generator the other.
 
 Checkpoints are read from ``/mnt/torchtrain_datasets/tree/<family>/<model>``; the
 launcher mounts that directory on every host. W&B is off because the hosts have no
@@ -22,12 +22,20 @@ from torchtitan.config.transform import LMHeadCastConverter
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.qwen3_5 import model_registry as qwen3_5_model_registry
 from torchtitan.models.qwen3_6 import model_registry as qwen3_6_model_registry
-from torchtitan.rl.controller import Controller
+from torchtitan.rl.controller import Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.examples.dapo_math.config_registry import (
     rl_dapo_qwen3_4b_math_8k,
     rl_dapo_qwen3_6_35b_a3b_math_dist_moe,
 )
+from torchtitan.rl.experiments.verifiers.swe_rebench_v2.config_registry import (
+    rl_grpo_qwen35_9b_swe_rebench_v2_smoke,
+    rl_grpo_qwen36_35b_a3b_swe_rebench_v2_dist_moe,
+)
+from torchtitan.rl.experiments.verifiers.terminal_bench.config_registry import (
+    rl_grpo_qwen35_35b_a3b_terminal_bench,
+)
+from torchtitan.rl.generator import VLLMCudaGraphConfig
 
 _CHECKPOINT_ROOT = "/mnt/torchtrain_datasets/tree"
 
@@ -105,6 +113,49 @@ def dapo_qwen36_35b_a3b_dist_moe() -> Controller.Config:
     config.renderer = from_renderers(Qwen35RendererConfig(enable_thinking=False))
     config.hf_assets_path = f"{_CHECKPOINT_ROOT}/qwen3_5/Qwen3.6-35B-A3B"
     config.async_loop.num_training_steps = 5
+    config.metrics.enable_wandb = False
+    config.metrics.enable_tensorboard = True
+    return config
+
+
+def tb_qwen35_35b_a3b_smoke() -> Controller.Config:
+    """Terminal-Bench smoke: 2 prompts x 4 samples, trainer FSDP=2 x TP=2 x EP=4, generator EP=4.
+
+    Reads ``TERMINAL_BENCH_{TRAIN,EVAL}_DATASET`` and ``TERMINAL_BENCH_SANDBOX`` like the
+    base recipe. The Qwen3.6-35B-A3B checkpoint has the Qwen3.5-35B-A3B architecture.
+    """
+    config = rl_grpo_qwen35_35b_a3b_terminal_bench()
+    config.hf_assets_path = f"{_CHECKPOINT_ROOT}/qwen3_5/Qwen3.6-35B-A3B"
+    config.dump_folder = "outputs/rl/tb_qwen35_35b_a3b_smoke"
+    config.async_loop.num_prompts_per_train_step = 2
+    config.async_loop.num_samples_per_prompt = 4
+    config.async_loop.validation = ValidationConfig(num_samples=0)
+    config.num_generators = 1
+    config.trainer.parallelism = ParallelismConfig(
+        data_parallel_shard_degree=2,
+        tensor_parallel_degree=2,
+        expert_parallel_degree=4,
+    )
+    config.generator.cuda_graph = VLLMCudaGraphConfig(mode="FULL")
+    config.metrics.enable_wandb = False
+    config.metrics.enable_tensorboard = True
+    return config
+
+
+def swe_rebench_v2_qwen35_9b_smoke() -> Controller.Config:
+    """``rl_grpo_qwen35_9b_swe_rebench_v2_smoke`` with the mounted checkpoint."""
+    config = rl_grpo_qwen35_9b_swe_rebench_v2_smoke()
+    config.hf_assets_path = f"{_CHECKPOINT_ROOT}/qwen3_5/Qwen3.5-9B"
+    config.metrics.enable_wandb = False
+    config.metrics.enable_tensorboard = True
+    return config
+
+
+def swe_rebench_v2_qwen36_35b_a3b_dist_moe() -> Controller.Config:
+    """``rl_grpo_qwen36_35b_a3b_swe_rebench_v2_dist_moe`` with the mounted checkpoint and FULL graphs."""
+    config = rl_grpo_qwen36_35b_a3b_swe_rebench_v2_dist_moe()
+    config.hf_assets_path = f"{_CHECKPOINT_ROOT}/qwen3_5/Qwen3.6-35B-A3B"
+    config.generator.cuda_graph = VLLMCudaGraphConfig(mode="FULL")
     config.metrics.enable_wandb = False
     config.metrics.enable_tensorboard = True
     return config
