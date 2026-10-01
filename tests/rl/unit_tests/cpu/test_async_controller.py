@@ -10,6 +10,8 @@ the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID
 import asyncio
 import json
 import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -18,6 +20,8 @@ from torchtitan.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
+from torchtitan.rl.controller import Controller, ValidationConfig
+from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
@@ -736,3 +740,27 @@ def test_no_window_takes_oldest_ready_group_past_a_stuck_head() -> None:
         assert taker.result().group_id == 6
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("greedy", "expected_temperature"), [(True, 0.0), (False, 1.0)]
+)
+def test_validation_samples_greedily_or_like_training(
+    greedy: bool, expected_temperature: float
+) -> None:
+    """Greedy validation runs at temperature 0; otherwise it reuses the training sampling."""
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(
+            validation=ValidationConfig(num_samples=2, greedy=greedy)
+        )
+    )
+    controller._sampling = SamplingConfig(temperature=1.0, top_p=1.0, max_tokens=4096)
+    controller._collect_validation_rollouts = AsyncMock(return_value=([], []))
+    controller.rollout_recorder = Mock()
+
+    asyncio.run(controller.validate(step=25))
+
+    sampling = controller._collect_validation_rollouts.call_args.kwargs["sampling"]
+    assert sampling.temperature == expected_temperature
+    assert sampling.max_tokens == 4096

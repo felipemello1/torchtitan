@@ -141,12 +141,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True, slots=True)
 class ValidationConfig:
-    """Held-out validation that runs at the start and end of training"""
-
-    # TODO: enable periodic validation with proper overlapping
+    """Held-out validation that runs before training, every `interval_steps`, and after the last step."""
 
     num_samples: int = 20
-    """Held-out prompts scored greedily (temp=0, n=1) per validation pass. 0 skips validation."""
+    """Held-out prompts per validation pass, one rollout each. 0 skips validation."""
+
+    interval_steps: int | None = None
+    """Also validate after every `interval_steps` train steps; None validates only before and after."""
+
+    greedy: bool = True
+    """Sample at temperature 0; False samples like training (the generator's sampling config)."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -669,7 +673,7 @@ class Controller(Configurable):
     async def _collect_validation_rollouts(
         self, *, num_groups: int, sampling: SamplingConfig, step: int
     ) -> tuple[list[RolloutGroup], list[m.Metric]]:
-        """Sample held-out prompts, run each greedily (n=1) concurrently, and emit validation metrics."""
+        """Sample held-out prompts, run each once (n=1) concurrently, and emit validation metrics."""
         # TODO: group_size=1 (best-of-1) only. Support best-of-N.
         generate = self._make_generate_fn(metrics_prefix="validation_generator")
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
@@ -718,7 +722,7 @@ class Controller(Configurable):
     # but what if i want to run the entire dataset?
     @sl.log_trace_span("validate")
     async def validate(self, *, step: int) -> list[m.Metric]:
-        """Run greedy validation on held-out prompts.
+        """Run one rollout per held-out prompt.
 
         Args:
             step: Training step this validation pass belongs to (0 for the
@@ -730,13 +734,17 @@ class Controller(Configurable):
         """
         # TODO: investigate using pass@k for validation.
         t_validate_start = time.perf_counter()
-        num_samples = self.config.async_loop.validation.num_samples
-        if num_samples == 0:  # skip validation (e.g. loss guard CI)
+        validation = self.config.async_loop.validation
+        if validation.num_samples == 0:  # skip validation (e.g. loss guard CI)
             return []
-        greedy = replace(self._sampling, temperature=0.0, top_p=1.0)
+        sampling = (
+            replace(self._sampling, temperature=0.0, top_p=1.0)
+            if validation.greedy
+            else self._sampling
+        )
 
         rollout_groups, validation_metrics = await self._collect_validation_rollouts(
-            num_groups=num_samples, sampling=greedy, step=step
+            num_groups=validation.num_samples, sampling=sampling, step=step
         )
 
         self.rollout_recorder.record(is_validation=True, rollout_groups=rollout_groups)
@@ -1162,6 +1170,18 @@ class Controller(Configurable):
                         ),
                     ],
                 )
+
+            interval_steps = self.config.async_loop.validation.interval_steps
+            if (
+                interval_steps
+                and step % interval_steps == 0
+                and step < num_training_steps
+            ):
+                # Pause the trainer until validation ends. It is the only weight syncer, so
+                # every validation rollout samples this step's policy; training rollouts
+                # keep generating meanwhile.
+                await self._weight_sync.wait_inflight_push_pull()
+                await self._validate_and_log(step=step)
 
         # Finish the last in-flight sync so generators hold the final weights for post-validation.
         await self._weight_sync.wait_inflight_push_pull()
