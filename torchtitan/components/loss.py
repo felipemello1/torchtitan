@@ -625,14 +625,13 @@ class ChunkedLossWrapper(BaseLoss):
                 "are required."
             )
 
-        # Multi-output losses and batch-invariant mode (bitwise checks) keep every token.
+        # Multi-output losses (MTP) keep every token: the indices select one output's tokens.
         loss_token_indices = loss_inputs.pop("loss_token_indices", None)
         is_masked = False
         if (
             self.skip_non_loss_tokens
             and loss_token_indices is not None
             and not is_multi_output
-            and not is_in_batch_invariant_mode()
         ):
             num_tokens, num_kept = labels[0].shape[0], len(loss_token_indices)
             if 0 < num_kept < num_tokens:
