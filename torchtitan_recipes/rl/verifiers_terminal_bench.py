@@ -48,6 +48,7 @@ from torchtitan.rl.examples.verifiers import (
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
 from torchtitan.rl.losses import GRPOLoss
 from torchtitan.rl.observability.metrics import MetricsProcessor
+from torchtitan.rl.observability.vllm import VllmOtelStatLogger
 from torchtitan.rl.rubric import Rubric
 from torchtitan.rl.trainer import Trainer
 from verifiers.v1.configs.agent import TimeoutConfig as AgentTimeoutConfig
@@ -187,6 +188,12 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
                 temperature=1.0,
                 top_p=1.0,
                 max_tokens=MAX_TOKENS_PER_TURN,
+            ),
+            # vLLM engine stats (KV-cache usage, running requests) when an exporter is set.
+            vllm_stat_logger=(
+                VllmOtelStatLogger.Config()
+                if os.environ.get("OTEL_METRICS_EXPORTER")
+                else None
             ),
         ),
     )
