@@ -142,14 +142,15 @@ def _compute_generator_world_size(p: InferenceParallelismConfig) -> int:
 def _spawn_proc_mesh(
     host_mesh: HostMesh,
     role_world_size: int,
-    gpus_per_node: int,
+    provisioner: PerHostProvisioner,
     *,
     bootstrap: Callable[[], None],
     role: str,
     extra_env: dict[str, str] | None = None,
 ) -> ProcMesh:
     """Spawn one role's proc mesh on ``host_mesh``, splitting ``role_world_size``
-    evenly across the mesh's hosts. ``extra_env`` is applied in each proc's bootstrap.
+    evenly across the mesh's hosts on GPUs from ``provisioner``. ``extra_env`` is
+    applied in each proc's bootstrap.
     """
     nodes = len(host_mesh)
     assert role_world_size % nodes == 0, (
@@ -157,7 +158,6 @@ def _spawn_proc_mesh(
         f"host count ({nodes})"
     )
     role_gpus_per_node = role_world_size // nodes
-    provisioner = PerHostProvisioner(total_gpus=gpus_per_node)
     env = provisioner.allocate(role_gpus_per_node, extra_env=extra_env)
     return host_mesh.spawn_procs(
         per_host={"gpus": role_gpus_per_node},
@@ -180,7 +180,8 @@ def spawn_proc_mesh(
         trainer_world_size: Number of GPU procs to spawn for the trainer.
         per_generator_world_size: Number of GPU procs to spawn for each generator.
         host_meshes: Caller-provided trainer/generator host meshes. When
-            provided, each role is spawned on its provided host mesh. None means
+            provided, each role is spawned on its provided host mesh; roles given
+            the same host mesh get non-overlapping GPU ranges on it. None means
             both roles are spawned on ``this_host()`` by using non-overlapping
             GPU ranges.
         num_generators: Number of generator proc meshes to spawn.
@@ -205,10 +206,18 @@ def spawn_proc_mesh(
             f"got {len(generator_host_meshes)}"
         )
 
+        # One GPU allocator per host mesh, e.g. 4 one-GPU generators on one 4-GPU host.
+        provisioners: dict[int, PerHostProvisioner] = {}
+
+        def provisioner_for(host_mesh: HostMesh) -> PerHostProvisioner:
+            return provisioners.setdefault(
+                id(host_mesh), PerHostProvisioner(total_gpus=gpus_per_node)
+            )
+
         trainer_mesh = _spawn_proc_mesh(
             trainer_host_mesh,
             trainer_world_size,
-            gpus_per_node,
+            provisioner_for(trainer_host_mesh),
             bootstrap=_preimport_torch,
             role="trainer",
         )
@@ -216,7 +225,7 @@ def spawn_proc_mesh(
             _spawn_proc_mesh(
                 gen_host_mesh,
                 per_generator_world_size,
-                gpus_per_node,
+                provisioner_for(gen_host_mesh),
                 bootstrap=_bootstrap_generator,
                 role="generator",
                 extra_env=generator_env,
