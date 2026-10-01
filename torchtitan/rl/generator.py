@@ -191,11 +191,6 @@ class VLLMCudaGraphConfig:
     sequence parallelism is enabled, capture sizes that are not multiples of
     its degree are removed."""
 
-    # TODO: Validate CUDA graph capture with MoE / Expert Parallelism.
-    # MoE routing produces dynamic shapes that may conflict with full
-    # CUDA graph capture despite being torch.compile-compatible
-    # post https://github.com/pytorch/torchtitan/pull/3142
-
     # TODO: Explore applying CUDA graph capture on the torchtitan trainer
     # side as well (not just the vLLM generator).
     # https://github.com/pytorch/torchtitan/issues/3175
