@@ -71,7 +71,7 @@ def test_recipe_trains_on_tmax_and_validates_on_terminal_bench(
 def test_recipe_layout_fits_two_four_gpu_hosts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Trainer EP stays inside one host; the generator's EP spans its DP x TP ranks."""
+    """Trainer EP stays inside one host; four one-GPU generators fill the other host."""
     _select_oci_runner(monkeypatch)
     config = _load("rl_grpo_qwen3_6_35b_a3b_terminal_bench")
     trainer = config.trainer.parallelism
@@ -79,9 +79,9 @@ def test_recipe_layout_fits_two_four_gpu_hosts(
 
     assert trainer.data_parallel_shard_degree * trainer.tensor_parallel_degree == 4
     assert trainer.expert_parallel_degree == 4
-    assert config.num_generators == 1
-    assert generator.data_parallel_degree * generator.tensor_parallel_degree == 4
-    assert generator.expert_parallel_degree == 4
+    assert config.num_generators == 4
+    assert generator.data_parallel_degree * generator.tensor_parallel_degree == 1
+    assert generator.expert_parallel_degree == 1
     assert config.generator.cuda_graph.mode == "FULL"
     assert config.trainer.override.imports == [
         "torchtitan_recipes.overrides.dist_moe.dist_moe_routed_experts"

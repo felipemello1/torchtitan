@@ -76,9 +76,9 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
     """Qwen3.6-35B-A3B: 50 steps on TMax tasks, Terminal-Bench 2.1 pass@1 at steps 0, 25, 50.
 
     8 GB300 GPUs on two hosts. Trainer: FSDP=2 x TP=2, EP=4, with Dist-MoE experts
-    (SM100+). Generator: one DP=2 x TP=2, EP=4 replica with FULL CUDA graphs and
-    the stock experts. 16 tasks x 8 rollouts per step, each rollout up to 30 turns
-    and 65,536 tokens.
+    (SM100+). Generators: four one-GPU replicas, each with every expert, FULL CUDA
+    graphs. 16 tasks x 8 rollouts per step, each rollout up to 30 turns and 65,536
+    tokens.
     """
     expert_parallel_degree = 4
     model_config = build_model_config(
@@ -110,7 +110,9 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
             validation_dataset=TERMINAL_BENCH_2_1_86,
         ),
         renderer=from_renderers(Qwen36RendererConfig(enable_thinking=False)),
-        num_generators=1,
+        # Independent one-GPU engines: no expert-parallel collectives or lockstep
+        # between data-parallel ranks in each decode step.
+        num_generators=4,
         metrics=MetricsProcessor.Config(
             enable_wandb=True,
             console_log_keys_validation=[
@@ -175,11 +177,7 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
-            parallelism=InferenceParallelismConfig(
-                data_parallel_degree=2,
-                tensor_parallel_degree=2,
-                expert_parallel_degree=expert_parallel_degree,
-            ),
+            parallelism=InferenceParallelismConfig(),
             # Each turn prefills its new tool output (up to 16,384 chars); fit one
             # in a single engine step instead of vLLM's default 2,048 tokens.
             max_num_batched_tokens=8192,
@@ -207,11 +205,13 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench_smoke() -> Controller.Config:
     return config
 
 
-def rl_grpo_qwen3_6_35b_a3b_terminal_bench_smoke_four_generators() -> Controller.Config:
-    """The smoke recipe with four one-GPU generators, each with every expert, on the generator host."""
-    config = rl_grpo_qwen3_6_35b_a3b_terminal_bench_smoke()
-    config.num_generators = 4
-    config.generator.parallelism = InferenceParallelismConfig()
+def rl_grpo_qwen3_6_35b_a3b_terminal_bench_one_generator() -> Controller.Config:
+    """`rl_grpo_qwen3_6_35b_a3b_terminal_bench` with one DP=2 x TP=2, EP=4 generator replica."""
+    config = rl_grpo_qwen3_6_35b_a3b_terminal_bench()
+    config.num_generators = 1
+    config.generator.parallelism = InferenceParallelismConfig(
+        data_parallel_degree=2, tensor_parallel_degree=2, expert_parallel_degree=4
+    )
     return config
 
 
