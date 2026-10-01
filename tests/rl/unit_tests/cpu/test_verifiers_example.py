@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import multiprocessing
 from types import SimpleNamespace
 
 import pytest
@@ -23,8 +25,11 @@ from torchtitan.config import ConfigLoader
 from torchtitan.rl.examples.dapo_math import DapoMathSample
 from torchtitan.rl.examples.verifiers import VerifiersRollouter, VerifiersTaskDataset
 from torchtitan.rl.examples.verifiers.dapo_math import data
+from torchtitan.rl.examples.verifiers.env_server import _run_env_server_process
 from torchtitan_recipes.rl.verifiers_dapo_math import _verifiers_math_rollouter_config
 from verifiers.v1.harnesses.null import NullHarnessConfig as VerifiersNullHarnessConfig
+from verifiers.v1.serve import env_config_data
+from verifiers.v1.utils.loaders import taskset_class
 
 
 def test_verifiers_task_scores_math_response() -> None:
@@ -107,3 +112,34 @@ def test_verifiers_config_keeps_dapo_training_recipe() -> None:
     assert isinstance(config.renderer, RenderersConfigAdapter)
     assert config.renderer.renderers_config.name == "qwen3"
     assert config.renderer.renderers_config.enable_thinking
+
+
+def test_spawned_pool_worker_resolves_local_taskset(monkeypatch) -> None:
+    """A spawned Verifiers pool worker imports the local taskset by its plugin ID."""
+    config = _verifiers_math_rollouter_config(max_rollout_tokens=10240)
+    server_config = config.verifiers_env_server
+    serve_env_kwargs = {}
+    monkeypatch.setattr(
+        "torchtitan.rl.examples.verifiers.env_server.serve_env", serve_env_kwargs.update
+    )
+    # _run_env_server_process sets these; monkeypatch restores them after the test.
+    monkeypatch.setenv("no_proxy", "")
+    monkeypatch.setenv("NO_PROXY", "")
+    _run_env_server_process(
+        environment=env_config_data(server_config.environment),
+        serve=server_config.serve,
+        local_taskset_module=server_config.local_taskset_module,
+        address_queue=None,
+        death_pipe=None,
+    )
+
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=1,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=serve_env_kwargs["log_setup"],
+    ) as executor:
+        worker_taskset = executor.submit(
+            taskset_class, taskset_id=server_config.environment.taskset.id
+        ).result(timeout=120)
+
+    assert worker_taskset is data.VerifiersMathTaskset
