@@ -127,9 +127,10 @@ class StickySessionRoutingStrategy(RoutingStrategy):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        max_sessions: int = 4096
+        max_sessions: int = 65536
         """Maximum number of session-to-candidate assignments to retain,
-        evicting least-recently-used sessions first."""
+        evicting least-recently-used sessions first. Keep it above the rollouts in
+        flight, or live sessions get evicted and lose their cached KV."""
 
         fallback_strategy: RoutingStrategy.Config = field(
             default_factory=LeastLoadedRoutingStrategy.Config
