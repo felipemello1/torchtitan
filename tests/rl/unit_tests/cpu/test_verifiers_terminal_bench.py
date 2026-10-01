@@ -59,7 +59,7 @@ def test_recipe_trains_on_tmax_and_validates_on_terminal_bench(
     assert isinstance(agent.runtime, vf.PrimeConfig)
     assert agent.max_turns == 20
     assert agent.harness.max_tool_output_chars == 16384
-    assert serve.pool.num_workers * serve.max_concurrent == 128
+    assert serve.pool.num_workers * serve.max_concurrent == 384
     assert config.generator.sampling.max_tokens == 4096
     assert config.trainer.training.max_context_length == 32768
     assert rollouter.generation_server.max_rollout_tokens == 32768

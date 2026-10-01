@@ -64,8 +64,8 @@ from torchtitan_recipes.rl.terminal_bench.taskset import (
 )
 
 # Harbor dataset ids, read from $HOME/.cache/harbor/<id with "/" and "@" as "_">.
-# 1,024 short and moderate TMax-15K tasks (a seeded sample).
-TMAX_1K = "tmax-a2a@27de1c1b"
+# 1,024 moderate and complex TMax-15K tasks (a seeded sample).
+TMAX_1K = "tmax-mc1024@27de1c1b"
 # Terminal-Bench 2.1 (harbor-framework/terminal-bench-2-1@7131e437) without
 # qemu-alpine-ssh, qemu-startup and protein-assembly: 86 tasks.
 TERMINAL_BENCH_2_1_86 = "tb21-86@7131e437"
@@ -79,7 +79,7 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
 
     8 GB300 GPUs on two hosts. Trainer: FSDP=2 x TP=2, EP=4, with Dist-MoE experts
     (SM100+). Generator: one DP=2 x TP=2, EP=4 replica with FULL CUDA graphs and
-    the stock experts. 4 tasks x 8 rollouts per step, each rollout up to 20 turns
+    the stock experts. 16 tasks x 8 rollouts per step, each rollout up to 20 turns
     and 32,768 tokens.
     """
     expert_parallel_degree = 4
@@ -95,7 +95,7 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
         dump_folder="outputs/rl/qwen3_6_35b_a3b_terminal_bench",
         async_loop=AsyncLoopConfig(
             num_training_steps=50,
-            num_prompts_per_train_step=4,
+            num_prompts_per_train_step=16,
             num_samples_per_prompt=8,
             target_offpolicy_steps=1,
             validation=ValidationConfig(
@@ -269,10 +269,11 @@ def _terminal_bench_rollouter_config(
                     timeout=AgentTimeoutConfig(setup=1500, rollout=1800, scoring=1500),
                 ),
             ),
-            # 8 x 16 = 128 rollouts in flight; size the sandbox pool to match.
+            # 16 x 24 = 384 rollouts in flight: 256 training (2 steps of 16 x 8)
+            # plus a validation pass. Size the sandbox pool to match.
             serve=vf.ServeConfig(
-                pool=vf.StaticPoolConfig(num_workers=8),
-                max_concurrent=16,
+                pool=vf.StaticPoolConfig(num_workers=16),
+                max_concurrent=24,
                 address="tcp://127.0.0.1:0",
             ),
         ),
