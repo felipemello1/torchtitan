@@ -182,6 +182,9 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
                 tensor_parallel_degree=2,
                 expert_parallel_degree=expert_parallel_degree,
             ),
+            # Each turn prefills its new tool output (up to 16,384 chars); fit one
+            # in a single engine step instead of vLLM's default 2,048 tokens.
+            max_num_batched_tokens=8192,
             cuda_graph=VLLMCudaGraphConfig(mode="FULL"),
             checkpointer=None,
             sampling=SamplingConfig(
@@ -200,11 +203,9 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
 
 
 def rl_grpo_qwen3_6_35b_a3b_terminal_bench_smoke() -> Controller.Config:
-    """``rl_grpo_qwen3_6_35b_a3b_terminal_bench`` with 2 validation tasks, validated every 2 steps."""
+    """``rl_grpo_qwen3_6_35b_a3b_terminal_bench`` without validation, for short runs."""
     config = rl_grpo_qwen3_6_35b_a3b_terminal_bench()
-    config.async_loop.validation = ValidationConfig(
-        num_samples=2, interval_steps=2, greedy=False
-    )
+    config.async_loop.validation = ValidationConfig(num_samples=0)
     return config
 
 
