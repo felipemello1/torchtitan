@@ -397,3 +397,41 @@ def test_shutdown_continues_after_generator_close_failure():
         "generator[1].close",
         "mesh.stop[0]",
     ]
+
+
+class _FakeHostMesh:
+    """One host; records the CUDA_VISIBLE_DEVICES of each proc mesh spawned on it."""
+
+    def __init__(self):
+        self.visible_devices = []
+
+    def __len__(self):
+        return 1
+
+    def spawn_procs(self, *, per_host, bootstrap, bootstrap_command):
+        self.visible_devices.append(bootstrap_command["CUDA_VISIBLE_DEVICES"])
+        return f"proc_mesh_{len(self.visible_devices)}"
+
+
+def test_spawn_proc_mesh_packs_generators_sharing_a_host(monkeypatch):
+    """Generators given the same host mesh get disjoint GPUs; another host starts at GPU 0."""
+    monkeypatch.setattr(
+        train,
+        "default_bootstrap_cmd",
+        lambda: SimpleNamespace(with_env=lambda env: env),
+    )
+    trainer_host, generator_host = _FakeHostMesh(), _FakeHostMesh()
+
+    train.spawn_proc_mesh(
+        4,
+        1,
+        train.HostMeshes(
+            trainer=trainer_host,
+            generators=[generator_host] * 4,
+            gpus_per_node=4,
+        ),
+        num_generators=4,
+    )
+
+    assert trainer_host.visible_devices == ["0,1,2,3"]
+    assert generator_host.visible_devices == ["0", "1", "2", "3"]
