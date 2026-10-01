@@ -68,7 +68,7 @@ TMAX_1K = "tmax-mc1024@27de1c1b"
 # qemu-alpine-ssh, qemu-startup and protein-assembly: 86 tasks.
 TERMINAL_BENCH_2_1_86 = "tb21-86@7131e437"
 
-MAX_ROLLOUT_TOKENS = 32768
+MAX_ROLLOUT_TOKENS = 65536
 MAX_TOKENS_PER_TURN = 4096
 
 
@@ -77,8 +77,8 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
 
     8 GB300 GPUs on two hosts. Trainer: FSDP=2 x TP=2, EP=4, with Dist-MoE experts
     (SM100+). Generator: one DP=2 x TP=2, EP=4 replica with FULL CUDA graphs and
-    the stock experts. 16 tasks x 8 rollouts per step, each rollout up to 20 turns
-    and 32,768 tokens.
+    the stock experts. 16 tasks x 8 rollouts per step, each rollout up to 30 turns
+    and 65,536 tokens.
     """
     expert_parallel_degree = 4
     model_config = build_model_config(
@@ -165,7 +165,8 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
             ),
             checkpointer=CheckpointManager.Config(initial_load_in_hf=True),
             loss=ChunkedLossWrapper.Config(
-                num_chunks=8,
+                # 4,096-token chunks bound the fp32 logits of one chunk.
+                num_chunks=16,
                 loss_fn=GRPOLoss.Config(
                     clip_eps=0.2,
                     global_vocab_size=decoder_vocab_size(model_config),
@@ -249,7 +250,7 @@ def _terminal_bench_rollouter_config(
                         max_tool_output_chars=16384,
                     ),
                     runtime=_sandbox_runtime(),
-                    max_turns=20,
+                    max_turns=30,
                     timeout=AgentTimeoutConfig(setup=1500, rollout=1800, scoring=1500),
                 ),
             ),
