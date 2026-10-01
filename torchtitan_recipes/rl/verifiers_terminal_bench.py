@@ -165,7 +165,12 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
             dist_moe=DistMoeRuntime.Config(
                 device_scratch_capacity_factor=float(expert_parallel_degree)
             ),
-            checkpointer=CheckpointManager.Config(initial_load_in_hf=True),
+            # The last step saves the policy as bf16 HF safetensors, ready for vLLM.
+            checkpointer=CheckpointManager.Config(
+                initial_load_in_hf=True,
+                last_save_in_hf=True,
+                export_dtype="bfloat16",
+            ),
             loss=ChunkedLossWrapper.Config(
                 # 4,096-token chunks bound the fp32 logits of one chunk.
                 num_chunks=16,
