@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import multiprocessing
 import os
 from dataclasses import dataclass, field
@@ -27,9 +28,16 @@ from torchtitan.config import Configurable
 from torchtitan.rl.examples.verifiers.data import register_local_taskset_alias
 
 
-def _setup_env_server_process() -> None:
-    """Configure logging in the spawned environment-server process."""
+def _setup_env_server_process(local_taskset_module: str | None) -> None:
+    """Configure logging and the local taskset alias in a spawned env-server process.
+
+    Verifiers runs this in its server and in every pool worker it spawns. A
+    spawned worker does not inherit the parent's ``sys.modules`` alias, so it
+    could not otherwise import a local taskset by its plugin ID.
+    """
     setup_logging("INFO")
+    if local_taskset_module is not None:
+        register_local_taskset_alias(local_taskset_module)
 
 
 def _run_env_server_process(
@@ -56,7 +64,7 @@ def _run_env_server_process(
         address=serve.address,
         address_queue=address_queue,
         death_pipe=death_pipe,
-        log_setup=_setup_env_server_process,
+        log_setup=functools.partial(_setup_env_server_process, local_taskset_module),
         config_data=env_config_data(env_config),
         max_concurrent=serve.max_concurrent,
     )

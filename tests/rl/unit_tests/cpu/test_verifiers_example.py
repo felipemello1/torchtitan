@@ -9,6 +9,9 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import functools
+import multiprocessing
 from types import SimpleNamespace
 
 import pytest
@@ -23,8 +26,10 @@ from torchtitan.config import ConfigLoader
 from torchtitan.rl.examples.dapo_math import DapoMathSample
 from torchtitan.rl.examples.verifiers import VerifiersRollouter, VerifiersTaskDataset
 from torchtitan.rl.examples.verifiers.dapo_math import data
+from torchtitan.rl.examples.verifiers.env_server import _setup_env_server_process
 from torchtitan_recipes.rl.verifiers_dapo_math import _verifiers_math_rollouter_config
 from verifiers.v1.harnesses.null import NullHarnessConfig as VerifiersNullHarnessConfig
+from verifiers.v1.utils.loaders import import_taskset
 
 
 def test_verifiers_task_scores_math_response() -> None:
@@ -106,3 +111,23 @@ def test_verifiers_config_keeps_dapo_training_recipe() -> None:
     assert isinstance(config.renderer, RenderersConfigAdapter)
     assert config.renderer.renderers_config.name == "qwen3"
     assert config.renderer.renderers_config.enable_thinking
+
+
+def _import_taskset_after_setup(log_setup, taskset_id: str) -> str:
+    """Run Verifiers' per-process setup, then resolve a taskset as a pool worker does."""
+    log_setup()
+    return import_taskset(taskset_id).__name__
+
+
+def test_spawned_pool_worker_resolves_local_taskset() -> None:
+    """A spawned Verifiers pool worker imports the local taskset by its plugin ID."""
+    taskset_id = data.__name__.replace(".", "_").lower()
+    log_setup = functools.partial(_setup_env_server_process, data.__name__)
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=1, mp_context=multiprocessing.get_context("spawn")
+    ) as executor:
+        module_name = executor.submit(
+            _import_taskset_after_setup, log_setup, taskset_id
+        ).result(timeout=120)
+
+    assert module_name == data.__name__
