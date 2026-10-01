@@ -4,10 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import importlib.metadata
+
+import pytest
 import torch
 
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.qwen3_5 import build_model_config
+from torchtitan.rl.model.attention import _fa4_splits_paged_kv
 from torchtitan.rl.model.vllm_wrapper import (
     _replace_vllm_layer_configs,
     VLLMModelWrapper,
@@ -94,3 +98,17 @@ def test_routers_expose_routed_experts_to_vllm_capture():
         assert not hasattr(model.layers["0"].feed_forward, "layer_id")
         assert len(captured) == 1 and captured[0].shape == (gathered_rows, 2)
         assert torch.equal(captured[0][:3], topk_expert_ids_TK)
+
+
+@pytest.mark.parametrize(
+    ("fa4_version", "splits"), [("4.0.0b33", False), ("4.0.0b34.dev10+g33985c6", True)]
+)
+def test_fa4_splits_paged_kv_only_from_the_version_that_supports_it(
+    fa4_version: str, splits: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: fa4_version)
+    _fa4_splits_paged_kv.cache_clear()
+    try:
+        assert _fa4_splits_paged_kv() is splits
+    finally:
+        _fa4_splits_paged_kv.cache_clear()
