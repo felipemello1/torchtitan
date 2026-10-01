@@ -122,6 +122,22 @@ def test_state_dict_layouts_include_native_grouped_linear_weights():
     assert layouts["experts.w2.weight"] is rowwise
 
 
+def test_state_dict_layouts_mark_unsharded_routed_experts():
+    """Routed experts without expert parallelism have no sharding config; their weights are unsharded."""
+    model = torch.nn.Module()
+    model.experts = torch.nn.Module()
+    model.experts.w13 = GroupedLinear.Config(
+        group_size=4, in_features=16, out_features=32, num_linears=2
+    ).build()
+    wrapper = VLLMModelWrapper.__new__(VLLMModelWrapper)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.model = model
+
+    layouts = wrapper.get_state_dict_layouts()
+
+    assert layouts["experts.w13.weight"] == spmd.SpmdType({})
+
+
 def test_vllm_replacements_preserve_resolved_sharding():
     model_config = build_model_config("debugmodel", attn_backend="flex")
     model_config.set_sharding_(

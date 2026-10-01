@@ -528,6 +528,11 @@ class VLLMModelWrapper(Module):
             if sharding_config is not None:
                 for state_name, layout in sharding_config.state_shardings.items():
                     layouts[f"{module_prefix}{state_name}"] = layout
+            else:
+                # No sharding config: the parameters are unsharded, e.g. routed
+                # experts without expert parallelism.
+                for param_name, _ in module.named_parameters(recurse=False):
+                    layouts[f"{module_prefix}{param_name}"] = SpmdType({})
 
             if module_fqn.rsplit(".", 1)[-1] == "vllm_attn":
                 for buffer_name, _ in module.named_buffers(recurse=False):
