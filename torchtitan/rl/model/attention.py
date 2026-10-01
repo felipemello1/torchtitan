@@ -242,6 +242,11 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         # num_splits=1 in batch-invariant mode (determinism).
         if fa_impl in (None, "FA2") or is_in_batch_invariant_mode():
             extra_kwargs["num_splits"] = 1
+        elif fa_impl == "FA4" and self.head_size == 256:
+            # torch's FA4 wrapper turns num_splits=None into 1 split; -1 runs FA4's
+            # split-KV heuristic, 3-48x faster for paged decode at 8K-32K context.
+            # TODO: enable for other head sizes once their split-KV path is validated.
+            extra_kwargs["num_splits"] = -1
 
         if self.enable_gqa:
             extra_kwargs["enable_gqa"] = True
