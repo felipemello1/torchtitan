@@ -12,6 +12,7 @@
 # S = state slots, W = convolution kernel width.
 
 from dataclasses import dataclass
+from typing import Literal
 
 import spmd_types as spmd
 import torch
@@ -207,10 +208,12 @@ class GatedDeltaKernel(Module):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        pass
+        chunk_backend: Literal["fused", "cudnn"] = "fused"
+        """Attention Gym backend for the chunked kernel; "cudnn" needs SM100+ and `attn-gym[cudnn]`."""
 
     def __init__(self, config: Config):
         super().__init__()
+        self.chunk_backend = config.chunk_backend
 
     def forward(
         self,
@@ -249,6 +252,7 @@ class GatedDeltaKernel(Module):
             cu_seqlens=cu_seqlens,
             scale=xq_BTHK.shape[-1] ** -0.5,
             impl="fused",
+            kernel_options={"backend": self.chunk_backend},
         )
         return output.squeeze(0)
 

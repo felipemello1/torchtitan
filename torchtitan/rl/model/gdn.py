@@ -20,6 +20,7 @@ Decode and prefill update the paged convolution and SSM state pools directly.
 """
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 from attn_gym.linear import (
@@ -69,6 +70,8 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         head_k_dim: int
         head_v_dim: int
         conv_kernel_size: int = 4
+        chunk_backend: Literal["fused", "cudnn"] = "fused"
+        """Attention Gym backend for prefill; matches `GatedDeltaKernel.Config.chunk_backend`."""
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -91,6 +94,7 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         self.head_k_dim = config.head_k_dim
         self.head_v_dim = config.head_v_dim
         self.conv_kernel_size = config.conv_kernel_size
+        self.chunk_backend = config.chunk_backend
 
         # vLLM's state-shape calculator takes global head counts, while the
         # computation and allocated cache use local head counts.
@@ -344,6 +348,7 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
                 cu_seqlens=cu_seqlens,
                 has_initial_state=has_initial_state,
                 scale=self.head_k_dim**-0.5,
+                kernel_options={"backend": self.chunk_backend},
             )
         output.copy_(recurrent_output[0].to(output.dtype))
 
