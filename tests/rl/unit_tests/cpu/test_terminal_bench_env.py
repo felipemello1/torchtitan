@@ -28,8 +28,9 @@ from torchtitan_recipes.rl.terminal_bench import agent_outside, taskset
 from torchtitan_recipes.rl.terminal_bench.agent_outside import (
     AgentOutsideHarness,
     AgentOutsideHarnessConfig,
-    sandoq_task_context,
 )
+from torchtitan_recipes.rl.terminal_bench.stage_datasets import set_environment
+from torchtitan_recipes.rl.terminal_bench.taskset import oci_runner_task_context
 from verifiers.v1.runtimes import ProgramResult
 from verifiers.v1.task import TaskData
 from verifiers.v1.tasksets.harbor import (
@@ -196,7 +197,7 @@ def test_agent_outside_reports_a_command_timeout_to_the_model(
 
 
 @pytest.mark.parametrize("provider_selected", [True, False])
-def test_sandoq_task_context_binds_only_when_the_provider_is_selected(
+def test_oci_runner_task_context_binds_only_when_the_provider_is_selected(
     provider_selected: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     if provider_selected:
@@ -214,7 +215,7 @@ def test_sandoq_task_context_binds_only_when_the_provider_is_selected(
     )
     monkeypatch.setitem(sys.modules, "sandoq_provider", sandoq_provider)
 
-    with sandoq_task_context(requested_image="org/task:1", working_dir="/app"):
+    with oci_runner_task_context(requested_image="org/task:1", working_dir="/app"):
         inside = task_context.get()
     assert task_context.get() is None
     assert inside == (
@@ -350,3 +351,11 @@ def test_taskset_starts_each_task_in_its_workdir(
 
 def test_importing_the_taskset_registers_its_verifiers_alias() -> None:
     assert sys.modules[taskset.TASKSET_ID] is taskset
+
+
+def test_stage_datasets_points_a_task_at_its_image_and_workdir() -> None:
+    task_toml = '[task]\nname = "tmax/t"\n\n[environment]\nworkdir = "/app"\ncpus = 1\n'
+    assert set_environment(task_toml, docker_image="org/t:1", workdir="/home/user") == (
+        '[task]\nname = "tmax/t"\n\n[environment]\ndocker_image = "org/t:1"\n'
+        'workdir = "/home/user"\ncpus = 1\n'
+    )

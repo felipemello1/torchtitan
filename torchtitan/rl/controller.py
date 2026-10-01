@@ -1177,9 +1177,8 @@ class Controller(Configurable):
                 and step % interval_steps == 0
                 and step < num_training_steps
             ):
-                # Pause the trainer until validation ends. It is the only weight syncer, so
-                # every validation rollout samples this step's policy; training rollouts
-                # keep generating meanwhile.
+                # Validate on this step's weights: the trainer is the only weight syncer and
+                # waits here, so the policy is frozen; training rollouts keep generating.
                 await self._weight_sync.wait_inflight_push_pull()
                 await self._validate_and_log(step=step)
 

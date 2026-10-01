@@ -1,0 +1,7 @@
+# The Terminal-Bench env package imports none of torchtitan, so trainers that ship
+# their own torchtitan (or none) can run the same agent code.
+verifiers==0.3.1
+harbor==0.22.0
+# stage_datasets.py only
+huggingface_hub
+pyarrow

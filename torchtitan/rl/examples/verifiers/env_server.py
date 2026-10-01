@@ -29,11 +29,9 @@ from torchtitan.rl.examples.verifiers.data import register_local_taskset_alias
 
 
 def _setup_env_server_process(local_taskset_module: str | None) -> None:
-    """Configure logging and the local taskset alias in a spawned env-server process.
+    """Set up logging and the local taskset alias in each spawned env-server process.
 
-    Verifiers runs this in its server and in every pool worker it spawns. A
-    spawned worker does not inherit the parent's ``sys.modules`` alias, so it
-    could not otherwise import a local taskset by its plugin ID.
+    Verifiers runs this in its server and in every pool worker; spawned workers do not inherit `sys.modules`.
     """
     setup_logging("INFO")
     if local_taskset_module is not None:

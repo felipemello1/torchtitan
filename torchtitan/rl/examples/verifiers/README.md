@@ -46,7 +46,9 @@ that placement mode.
 
 ## Add an experiment
 
-Create one package per task, with its own dependency list:
+Task code that other trainers must also import, without torchtitan, can live outside
+`torchtitan/`, like `torchtitan_recipes/rl/terminal_bench/`. Otherwise, create one package per
+task, with its own dependency list:
 
 ```text
 verifiers/

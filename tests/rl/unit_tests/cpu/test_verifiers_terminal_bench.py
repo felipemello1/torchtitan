@@ -17,6 +17,7 @@ from torchtitan.rl.controller import Controller
 from torchtitan_recipes.rl.terminal_bench.agent_outside import AgentOutsideHarnessConfig
 from torchtitan_recipes.rl.terminal_bench.taskset import TerminalBenchEnv
 from torchtitan_recipes.rl.verifiers_terminal_bench import (
+    _sandbox_runtime,
     _terminal_bench_rollouter_config,
     TERMINAL_BENCH_2_1_86,
     TMAX_1K,
@@ -30,8 +31,7 @@ def _load(name: str) -> Controller.Config:
     )
 
 
-def _select_sandoq(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("TERMINAL_BENCH_SANDBOX", "sandoq")
+def _select_oci_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VF_SANDBOX_PROVIDER", "oci-runner")
     monkeypatch.setenv("OCI_RUNNER_TASK_NETWORK", "host")
 
@@ -39,7 +39,7 @@ def _select_sandoq(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_recipe_trains_on_tmax_and_validates_on_terminal_bench(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _select_sandoq(monkeypatch)
+    _select_oci_runner(monkeypatch)
     config = _load("rl_grpo_qwen3_6_35b_a3b_terminal_bench")
     rollouter = config.rollouter
     agent = rollouter.verifiers_env_server.environment.agent
@@ -72,7 +72,7 @@ def test_recipe_layout_fits_two_four_gpu_hosts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Trainer EP stays inside one host; the generator's EP spans its DP x TP ranks."""
-    _select_sandoq(monkeypatch)
+    _select_oci_runner(monkeypatch)
     config = _load("rl_grpo_qwen3_6_35b_a3b_terminal_bench")
     trainer = config.trainer.parallelism
     generator = config.generator.parallelism
@@ -93,25 +93,18 @@ def test_training_cannot_read_validation_data() -> None:
         _terminal_bench_rollouter_config(
             train_dataset=TERMINAL_BENCH_2_1_86,
             validation_dataset=TERMINAL_BENCH_2_1_86,
-            sandbox="docker",
         )
 
 
-@pytest.mark.parametrize(
-    ("unset", "match"),
-    [
-        ("VF_SANDBOX_PROVIDER", "VF_SANDBOX_PROVIDER=oci-runner"),
-        ("OCI_RUNNER_TASK_NETWORK", "OCI_RUNNER_TASK_NETWORK=host"),
-    ],
-)
-def test_sandoq_requires_the_provider_and_host_network(
-    unset: str, match: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _select_sandoq(monkeypatch)
-    monkeypatch.delenv(unset)
-    with pytest.raises(ValueError, match=match):
-        _terminal_bench_rollouter_config(
-            train_dataset=TMAX_1K,
-            validation_dataset=TERMINAL_BENCH_2_1_86,
-            sandbox="sandoq",
-        )
+def test_sandbox_runtime_follows_the_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VF_SANDBOX_PROVIDER", raising=False)
+    assert isinstance(_sandbox_runtime(), vf.DockerConfig)
+    _select_oci_runner(monkeypatch)
+    assert isinstance(_sandbox_runtime(), vf.PrimeConfig)
+
+
+def test_oci_runner_requires_host_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    _select_oci_runner(monkeypatch)
+    monkeypatch.delenv("OCI_RUNNER_TASK_NETWORK")
+    with pytest.raises(ValueError, match="OCI_RUNNER_TASK_NETWORK=host"):
+        _sandbox_runtime()

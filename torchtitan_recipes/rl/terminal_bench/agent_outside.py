@@ -4,17 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Bash-tool agent that runs next to the trainer and sends only commands to the sandbox.
-
-`sandoq_task_context` is what the env needs when the sandbox is a Sandoq VM.
-"""
+"""Bash-tool agent that runs next to the trainer and sends only commands to the sandbox."""
 
 import asyncio
-import contextlib
 import json
-import os
 import sys
-from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -28,8 +22,7 @@ from verifiers.v1.runtimes import ProgramResult, Runtime
 from verifiers.v1.task import TaskData
 from verifiers.v1.trace import Trace
 
-# Verifiers resolves a harness id by importing a top-level module, and a dotted
-# id fails that lookup, so importing this module registers it under an alias.
+# Verifiers resolves plugin ids by top-level module name; register this module under one.
 HARNESS_ID = __name__.replace(".", "_").lower()
 sys.modules.setdefault(HARNESS_ID, sys.modules[__name__])
 
@@ -62,12 +55,9 @@ class AgentOutsideHarnessConfig(HarnessConfig):
 
 
 class AgentOutsideHarness(Harness[AgentOutsideHarnessConfig]):
-    """Call the model from this process and run each `bash` tool call in the sandbox.
+    """Run the chat loop in this process and send each `bash` call to the sandbox.
 
-    Nothing is installed in the task container, and the container never calls
-    the model, so the sandbox can be a remote VM with no route back to the
-    generator. The loop has no turn limit of its own: Verifiers ends it at
-    `max_turns` by refusing the next model call.
+    The sandbox never calls the model, so it can be a remote VM. Verifiers ends the loop at `max_turns`.
     """
 
     APPENDS_SYSTEM_PROMPT = True
@@ -163,30 +153,5 @@ class AgentOutsideHarness(Harness[AgentOutsideHarnessConfig]):
         return content
 
 
-@contextlib.contextmanager
-def sandoq_task_context(**task_fields: object) -> Iterator[None]:
-    """Hand the Sandoq provider this rollout's task fields while its sandbox is leased.
-
-    The provider (`sandoq_provider`, from `ram_prime_rl`) serves `vf.PrimeConfig`
-    when `VF_SANDBOX_PROVIDER=oci-runner` and reads the task's image and workdir
-    from this context; otherwise this is a no-op.
-
-    Example::
-
-        with sandoq_task_context(requested_image="org/task:1", working_dir="/app"):
-            await super().run(task, agents)
-    """
-    if os.environ.get("VF_SANDBOX_PROVIDER") != "oci-runner":
-        yield
-        return
-    from sandoq_provider import install, registry
-
-    install()
-    token = registry.bind_task_context(task_fields)
-    try:
-        yield
-    finally:
-        registry.reset_task_context(token)
-
-
+# prime-rl loads the harness through a module that re-exports __all__.
 __all__ = ["AgentOutsideHarness"]

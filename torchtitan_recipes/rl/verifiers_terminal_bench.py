@@ -7,14 +7,12 @@
 """Terminal-agent RL recipes: train on Harbor tasks, validate on Terminal-Bench 2.1.
 
 The environment (bash-tool agent, Harbor taskset) is the framework-agnostic
-``torchtitan_recipes.rl.terminal_bench`` package; this module wires it into
-TitanRL. ``TERMINAL_BENCH_SANDBOX`` picks where each rollout's commands run:
-``docker`` (default) starts task containers on this host, ``sandoq`` leases a
-remote Firecracker VM per rollout.
+`torchtitan_recipes.rl.terminal_bench` package; this module wires it into TitanRL.
+Each rollout's commands run in a Docker container on this host, or in a remote VM
+when `VF_SANDBOX_PROVIDER=oci-runner`.
 """
 
 import os
-from typing import Literal
 
 import verifiers.v1 as vf
 from renderers import Qwen36RendererConfig
@@ -110,7 +108,6 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
         rollouter=_terminal_bench_rollouter_config(
             train_dataset=TMAX_1K,
             validation_dataset=TERMINAL_BENCH_2_1_86,
-            sandbox=os.environ.get("TERMINAL_BENCH_SANDBOX", "docker"),
         ),
         renderer=from_renderers(Qwen36RendererConfig(enable_thinking=False)),
         num_generators=1,
@@ -152,8 +149,8 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
                 tensor_parallel_degree=2,
                 expert_parallel_degree=expert_parallel_degree,
             ),
-            # Keep the Dist-MoE call out of recompute: its region is
-            # recompute=False, and everything else in the block is recomputed.
+            # Recompute every op in the block except the Dist-MoE call, whose region
+            # is never recomputed.
             activation_checkpoint=RegionAC.Config(save_regions=[]),
             # Swap in Dist-MoE experts on the trainer's model copy only.
             override=OverrideConfig(
@@ -161,8 +158,8 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
                     "torchtitan_recipes.overrides.dist_moe.dist_moe_routed_experts"
                 ]
             ),
-            # Scratch factor EP covers every rank routing all tokens to one
-            # rank; scratch overflow is an illegal memory access.
+            # Worst case: every EP rank routes all its tokens to one rank; too small a
+            # scratch buffer is an illegal memory access.
             dist_moe=DistMoeRuntime.Config(
                 device_scratch_capacity_factor=float(expert_parallel_degree)
             ),
@@ -203,45 +200,23 @@ def rl_grpo_qwen3_6_35b_a3b_terminal_bench() -> Controller.Config:
 
 
 def rl_grpo_qwen3_6_35b_a3b_terminal_bench_smoke() -> Controller.Config:
-    """``rl_grpo_qwen3_6_35b_a3b_terminal_bench`` without validation, for short runs."""
+    """`rl_grpo_qwen3_6_35b_a3b_terminal_bench` without validation, for short runs."""
     config = rl_grpo_qwen3_6_35b_a3b_terminal_bench()
     config.async_loop.validation = ValidationConfig(num_samples=0)
     return config
 
 
 def _terminal_bench_rollouter_config(
-    *,
-    train_dataset: str,
-    validation_dataset: str,
-    sandbox: Literal["docker", "sandoq"],
+    *, train_dataset: str, validation_dataset: str
 ) -> VerifiersRollouter.Config:
     """Run each rollout's agent loop in the env server and its commands in a sandbox.
 
     Args:
         train_dataset: Harbor dataset id to train on.
         validation_dataset: Harbor dataset id to validate on; must differ.
-        sandbox: ``"docker"`` runs each task's container on this host;
-            ``"sandoq"`` leases a Sandoq Firecracker VM per rollout.
     """
     if train_dataset == validation_dataset:
         raise ValueError("Training and validation must use different datasets")
-
-    if sandbox == "docker":
-        runtime = vf.DockerConfig()
-    elif sandbox == "sandoq":
-        # The Sandoq provider (`sandoq_provider`) serves `vf.PrimeConfig` only
-        # when selected. Each task's test.sh installs pytest over the network, so
-        # a VM without host networking silently scores every rollout 0.
-        if os.environ.get("VF_SANDBOX_PROVIDER") != "oci-runner":
-            raise ValueError("sandbox='sandoq' needs VF_SANDBOX_PROVIDER=oci-runner")
-        if os.environ.get("OCI_RUNNER_TASK_NETWORK") != "host":
-            raise ValueError(
-                "sandbox='sandoq' needs OCI_RUNNER_TASK_NETWORK=host, or every "
-                "reward is 0"
-            )
-        runtime = vf.PrimeConfig(idle_timeout=3600)
-    else:
-        raise ValueError(f"unknown sandbox {sandbox!r}")
 
     return VerifiersRollouter.Config(
         train_dataset=VerifiersTaskDataset.Config(
@@ -257,6 +232,7 @@ def _terminal_bench_rollouter_config(
             shuffle=False,
         ),
         verifiers_env_server=VerifiersEnvServer.Config(
+            # Verifiers builds TerminalBenchEnv from this config (the taskset module's __all__).
             environment=HarborEnvConfig(
                 agent=vf.AgentConfig(
                     harness=AgentOutsideHarnessConfig(
@@ -264,7 +240,7 @@ def _terminal_bench_rollouter_config(
                         command_timeout_sec=300,
                         max_tool_output_chars=16384,
                     ),
-                    runtime=runtime,
+                    runtime=_sandbox_runtime(),
                     max_turns=20,
                     timeout=AgentTimeoutConfig(setup=1500, rollout=1800, scoring=1500),
                 ),
@@ -285,3 +261,17 @@ def _terminal_bench_rollouter_config(
             max_rollout_tokens=MAX_ROLLOUT_TOKENS
         ),
     )
+
+
+def _sandbox_runtime() -> vf.DockerConfig | vf.PrimeConfig:
+    """Docker on this host, or one remote VM per rollout when `VF_SANDBOX_PROVIDER=oci-runner`."""
+    if os.environ.get("VF_SANDBOX_PROVIDER") != "oci-runner":
+        return vf.DockerConfig()
+    # Each task's tests install pytest over the network; without host networking
+    # every reward is a silent 0.
+    if os.environ.get("OCI_RUNNER_TASK_NETWORK") != "host":
+        raise ValueError(
+            "VF_SANDBOX_PROVIDER=oci-runner needs OCI_RUNNER_TASK_NETWORK=host"
+        )
+    # The oci-runner provider serves Verifiers' Prime runtime with its own VMs.
+    return vf.PrimeConfig(idle_timeout=3600)
