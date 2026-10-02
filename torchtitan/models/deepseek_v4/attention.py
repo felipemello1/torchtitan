@@ -338,10 +338,7 @@ class Attention(BaseAttention):
         o = self._inverse_partial_rope(o, positions)
 
         with spmd.local():
-            n_local_heads = o.shape[1]
-            n_local_groups = self.n_groups // (self.n_heads // n_local_heads)
-            o = o.view(num_tokens, n_local_groups, -1)
-            _assert_spmd_attention_type(o, tp=spmd.S(1))
+            n_local_groups = o.shape[1]  # o is (T, G, heads/G * D) from the region
             wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
             if spmd.is_type_checking():
                 spmd.assert_type(
@@ -384,9 +381,32 @@ class Attention(BaseAttention):
     def _inverse_partial_rope(
         self, o: torch.Tensor, positions: torch.Tensor | None
     ) -> torch.Tensor:
-        """Undo the rotation of the last ``rope_head_dim`` channels of the attention output."""
+        """Undo the rotation of the last ``rope_head_dim`` channels and group heads for ``wo_a``.
+
+        Example (flash, local heads H=64 in G=8 groups, T tokens):
+
+            o (T, 64, 512) -> (T, 8, 4096), stored group-major
+            (strides (4096, T * 4096, 1))
+        """
         o_nope, o_rope = torch.split(
             o, [self.head_dim - self.rope_head_dim, self.rope_head_dim], dim=-1
         )
         o_rope = self.rope(o_rope, positions=positions, inverse=True)
-        return torch.cat([o_nope, o_rope], dim=-1)
+        with spmd.local():
+            num_tokens, n_local_heads = o.shape[:2]
+            n_local_groups = self.n_groups // (self.n_heads // n_local_heads)
+            # Concatenate straight into group-major storage [G, T, heads/G, D]:
+            # the grouped wo_a einsum then runs a plain bmm and its input
+            # gradient comes back in this layout, so o is never transposed in
+            # memory (1 GB at 16k tokens on flash). View the cat inputs, not the
+            # output: transposing after the cat costs a separate copy.
+            o_nope_GTHD = o_nope.view(
+                num_tokens, n_local_groups, -1, o_nope.shape[-1]
+            ).transpose(0, 1)
+            o_rope_GTHD = o_rope.view(
+                num_tokens, n_local_groups, -1, o_rope.shape[-1]
+            ).transpose(0, 1)
+            o_GTHD = torch.cat([o_nope_GTHD, o_rope_GTHD], dim=-1)
+            o = o_GTHD.flatten(2).transpose(0, 1)
+            _assert_spmd_attention_type(o, tp=spmd.S(1))
+        return o
