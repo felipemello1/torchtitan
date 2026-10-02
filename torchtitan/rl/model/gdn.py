@@ -34,6 +34,7 @@ from attn_gym.linear import (
 )
 
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
+from torchtitan.models.qwen3_5.gdn import resolve_chunk_backend
 from torchtitan.protocols.module import Module
 from torchtitan.rl.model.gdn_backend import (
     GDNExecutionPath,
@@ -70,8 +71,8 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         head_k_dim: int
         head_v_dim: int
         conv_kernel_size: int = 4
-        chunk_backend: Literal["fused", "cudnn"] = "fused"
-        """Attention Gym backend for prefill; matches `GatedDeltaKernel.Config.chunk_backend`."""
+        chunk_backend: Literal["fused", "cudnn"] | None = None
+        """Attention Gym prefill kernel; same as `GatedDeltaKernel.Config.chunk_backend`."""
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -94,7 +95,7 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         self.head_k_dim = config.head_k_dim
         self.head_v_dim = config.head_v_dim
         self.conv_kernel_size = config.conv_kernel_size
-        self.chunk_backend = config.chunk_backend
+        self.chunk_backend = resolve_chunk_backend(config.chunk_backend)
 
         # vLLM's state-shape calculator takes global head counts, while the
         # computation and allocated cache use local head counts.
