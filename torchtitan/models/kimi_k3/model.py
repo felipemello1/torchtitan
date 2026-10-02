@@ -16,7 +16,7 @@ from torch import nn
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
-from torchtitan.distributed.local_compile import LocalCompileConfig
+from torchtitan.distributed.local_compile import local_compile, LocalCompileConfig
 from torchtitan.distributed.parallelism_context import MeshAxisName, ParallelismContext
 from torchtitan.distributed.spmd_types import (
     annotate_input_spmd_types,
@@ -172,27 +172,73 @@ class KimiMLAAttention(BaseAttention):
 
 
 def _apply_attention_residual(
-    partial_block_TD: torch.Tensor | None,
+    partial_block_TD: torch.Tensor,
     block_residual_TND: torch.Tensor,
     projection: Linear,
     norm: RMSNorm,
 ) -> torch.Tensor:
     """Apply Kimi's block-level attention residual in FP32."""
     assert norm.eps is not None
-
-    values_TND = (
-        block_residual_TND
-        if partial_block_TD is None
-        else torch.cat((block_residual_TND, partial_block_TD.unsqueeze(1)), dim=1)
+    return _attention_residual(
+        partial_block_TD,
+        block_residual_TND,
+        projection.weight.squeeze(0),
+        norm.weight,
+        norm.eps,
     )
-    values_float = values_TND.float()
-    variance = values_float.pow(2).mean(dim=-1, keepdim=True)
-    keys_TND = values_float * torch.rsqrt(variance + norm.eps)
-    score_weight_D = norm.weight.float() * projection.weight.squeeze(0).float()
-    scores_TN = (keys_TND * score_weight_D).sum(dim=-1)
-    probs_T1N = torch.softmax(scores_TN, dim=-1).unsqueeze(1)
-    output_TD = torch.matmul(probs_T1N, values_float).squeeze(1)
-    return output_TD.to(values_TND.dtype)
+
+
+# The stack width (1-8) and the token count become dynamic; non-strict mode keeps
+# Inductor's mix-order-reduction heuristic from guarding on T >= 4096, which
+# otherwise adds graphs for short batches and fills the recompile limit.
+@local_compile(
+    "attention_residual",
+    batch_invariant=False,
+    options={"triton.mix_order_reduction_non_strict_mode": True},
+)
+def _attention_residual(
+    partial_block_TD: torch.Tensor,
+    block_residual_TND: torch.Tensor,
+    projection_D: torch.Tensor,
+    norm_weight_D: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Softmax-weighted sum over the values ``[*block_residual, partial]``.
+
+    Each value is scored by the dot product of its RMS-normalized self with
+    ``norm_weight * projection``.
+
+    Example (T tokens, N=7 stack entries, D=7168):
+
+        partial (T, 7168), block_residual (T, 7, 7168) -> (T, 7168)
+    """
+    score_weight_D = norm_weight_D.float() * projection_D.float()
+    if not torch.compiler.is_compiling():
+        values_float = torch.cat(
+            (block_residual_TND, partial_block_TD.unsqueeze(1)), dim=1
+        ).float()
+        variance = values_float.pow(2).mean(dim=-1, keepdim=True)
+        keys_TND = values_float * torch.rsqrt(variance + eps)
+        scores_TN = (keys_TND * score_weight_D).sum(dim=-1)
+        probs_T1N = torch.softmax(scores_TN, dim=-1).unsqueeze(1)
+        output_TD = torch.matmul(probs_T1N, values_float).squeeze(1)
+        return output_TD.to(partial_block_TD.dtype)
+
+    # Compiled: score and sum the stack and the partial separately, so the
+    # region reads each source twice and never materializes the concatenated
+    # values or their FP32 copy (the bmm above would force both).
+    stack_TND = block_residual_TND.float()
+    partial_TD = partial_block_TD.float()
+
+    def score(values):
+        keys = values * torch.rsqrt(values.pow(2).mean(dim=-1, keepdim=True) + eps)
+        return (keys * score_weight_D).sum(dim=-1)
+
+    scores_TN = torch.cat((score(stack_TND), score(partial_TD).unsqueeze(1)), dim=1)
+    probs_TN = torch.softmax(scores_TN, dim=-1)
+    output_TD = (probs_TN[:, :-1, None] * stack_TND).sum(dim=1)
+    output_TD = output_TD + probs_TN[:, -1:] * partial_TD
+    return output_TD.to(partial_block_TD.dtype)
 
 
 class KimiK3TransformerBlock(Module):
@@ -265,23 +311,22 @@ class KimiK3TransformerBlock(Module):
         *,
         padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.first_layer_in_block:
-            block_residual_TND = torch.cat(
-                (block_residual_TND, x_TD.unsqueeze(1)), dim=1
-            )
-            partial_block_TD = None
-        else:
-            partial_block_TD = x_TD
-
         if self.attention_res_proj is None:
             h_TD = x_TD
         else:
             assert self.attention_res_norm is not None
+            # At a block's first layer x is the previous block's sum and joins
+            # the stack below; (old stack, partial=x) is the same value list as
+            # the grown stack, and gives the compiled region one signature.
             h_TD = _apply_attention_residual(
-                partial_block_TD,
+                x_TD,
                 block_residual_TND,
                 self.attention_res_proj,
                 self.attention_res_norm,
+            )
+        if self.first_layer_in_block:
+            block_residual_TND = torch.cat(
+                (block_residual_TND, x_TD.unsqueeze(1)), dim=1
             )
         h_TD = self.attention_norm(h_TD)
         layer_mask = (

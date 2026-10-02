@@ -30,6 +30,7 @@ from torchtitan.distributed.flex_shard import (
     ComputeLayout,
     Owned,
 )
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
 from torchtitan.hf_datasets.multimodal.mm_datasets import (
@@ -94,6 +95,12 @@ def kimi_k3_debugmodel(
     parallelism = ParallelismConfig()
     model_config = build_model_config("debugmodel", seq_len=seq_len)
     return _KimiK3TrainerConfig(
+        compile=LocalCompileConfig(
+            regions=[
+                *LocalCompileConfig().regions,
+                "attention_residual",
+            ]
+        ),
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
                 global_vocab_size=decoder_vocab_size(model_config),
