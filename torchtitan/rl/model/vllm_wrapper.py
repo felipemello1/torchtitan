@@ -402,6 +402,7 @@ class VLLMModelWrapper(Module):
             with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
                 self.model.init_weights(buffer_device=None)
         self._maybe_initial_load_weights()
+        self.copy_gdn_gate_params()
 
         # Give each gpt-oss attention's vLLM backend its sink rescale.
         # Need to do it here after parallelize + weight load so sinks are
@@ -508,6 +509,15 @@ class VLLMModelWrapper(Module):
                 )
 
         return logits
+
+    def copy_gdn_gate_params(self) -> None:
+        """Refresh every GDN layer's fp32 decode copies of `A_log`/`dt_bias`; call after each weight load."""
+        from torchtitan.rl.model.gdn import VLLMInnerGatedDeltaNet
+
+        for module in self.model.modules():
+            inner = getattr(module, "inner_gated_delta_net", None)
+            if isinstance(inner, VLLMInnerGatedDeltaNet):
+                inner.copy_gate_params(module.A_log, module.dt_bias)
 
     def _maybe_initial_load_weights(self) -> None:
         """Load initial HF weights via CheckpointManager.

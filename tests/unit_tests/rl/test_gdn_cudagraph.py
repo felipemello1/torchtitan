@@ -154,6 +154,7 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
     weight = torch.randn(6144, 4, device=device, dtype=torch.bfloat16)
     a, b = torch.randn(2, 4, 16, device=device)
     A_log, bias = torch.randn(2, 16, device=device)
+    layer.A_log_fp32, layer.dt_bias_fp32 = A_log, bias
     output = torch.zeros(4, 16, 128, device=device, dtype=torch.bfloat16)
 
     def forward():

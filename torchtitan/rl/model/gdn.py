@@ -91,6 +91,9 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         self.head_k_dim = config.head_k_dim
         self.head_v_dim = config.head_v_dim
         self.conv_kernel_size = config.conv_kernel_size
+        # fp32 copies for the decode kernel, which requires fp32; see `copy_gate_params`.
+        self.A_log_fp32: torch.Tensor | None = None
+        self.dt_bias_fp32: torch.Tensor | None = None
 
         # vLLM's state-shape calculator takes global head counts, while the
         # computation and allocated cache use local head counts.
@@ -246,9 +249,8 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
                     conv_output,
                     a[:num_decode_rows].unsqueeze(0),
                     b[:num_decode_rows].unsqueeze(0),
-                    # Read in fp32 inside the kernel, so no per-step cast.
-                    A_log,
-                    dt_bias,
+                    self.A_log_fp32,
+                    self.dt_bias_fp32,
                     self.kv_cache[1],
                     state_indices,
                     has_initial_state=has_initial_state,
@@ -292,6 +294,18 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             has_initial_state,
         )
         output[num_actual_tokens:].zero_()
+
+    @torch.no_grad()
+    def copy_gate_params(self, A_log: torch.Tensor, dt_bias: torch.Tensor) -> None:
+        """Refresh the fp32 decode copies of `A_log`/`dt_bias` after a weight load.
+
+        Updates in place after the first call: decode CUDA graphs capture these addresses.
+        """
+        if self.A_log_fp32 is None:
+            self.A_log_fp32, self.dt_bias_fp32 = A_log.float(), dt_bias.float()
+        else:
+            self.A_log_fp32.copy_(A_log)
+            self.dt_bias_fp32.copy_(dt_bias)
 
     def _forward_gdn(
         self,
