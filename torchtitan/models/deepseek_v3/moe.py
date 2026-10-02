@@ -15,6 +15,26 @@ from torchtitan.models.common.moe import TokenChoiceTopKRouter
 #   P = num experts per group, Q = two experts, L = num selected groups
 
 
+def _topk_ids_by_argmax(scores: torch.Tensor, k: int) -> torch.Tensor:
+    """Return the ids of the ``k`` largest entries on the last dim; ties go to the lower id.
+
+    Compiled replacement for ``torch.topk(...).indices``: Inductor lowers ``topk``
+    to an ATen fallback (a radix-select kernel), while ``k`` masked argmax rounds
+    fuse with the surrounding pointwise code into one kernel.
+
+    Example:
+        >>> _topk_ids_by_argmax(torch.tensor([[0.1, 0.9, 0.5, 0.9]]), 2)
+        tensor([[1, 3]])
+    """
+    ids = torch.arange(scores.size(-1), device=scores.device)
+    topk_ids = []
+    for _ in range(k):
+        top_id = scores.argmax(dim=-1, keepdim=True)
+        topk_ids.append(top_id)
+        scores = scores.masked_fill(ids == top_id, float("-inf"))
+    return torch.cat(topk_ids, dim=-1)
+
+
 class DeepSeekV3Router(TokenChoiceTopKRouter):
     """DeepSeek V3 router with optional group-limited expert selection."""
 
@@ -62,19 +82,34 @@ class DeepSeekV3Router(TokenChoiceTopKRouter):
         scores_TGP = scores_for_choice_TE.unflatten(
             -1, (self.num_expert_groups, num_experts_per_group)
         )
-        top2_scores_TGQ = scores_TGP.topk(2, dim=-1).values
-        group_scores_TG = top2_scores_TGQ.sum(dim=-1)
-        selected_group_ids_TL = torch.topk(
-            group_scores_TG,
-            k=self.num_limited_groups,
-            dim=-1,
-            sorted=False,
-        ).indices
+        if torch.compiler.is_compiling():
+            # Same group scores; ties pick the lower id (topk's order is unspecified).
+            first_id_TG1 = scores_TGP.argmax(dim=-1, keepdim=True)
+            second_scores_TG = scores_TGP.masked_fill(
+                torch.arange(num_experts_per_group, device=scores_TGP.device)
+                == first_id_TG1,
+                float("-inf"),
+            ).amax(dim=-1)
+            group_scores_TG = scores_TGP.amax(dim=-1) + second_scores_TG
+            selected_group_ids_TL = _topk_ids_by_argmax(
+                group_scores_TG, self.num_limited_groups
+            )
+        else:
+            top2_scores_TGQ = scores_TGP.topk(2, dim=-1).values
+            group_scores_TG = top2_scores_TGQ.sum(dim=-1)
+            selected_group_ids_TL = torch.topk(
+                group_scores_TG,
+                k=self.num_limited_groups,
+                dim=-1,
+                sorted=False,
+            ).indices
         unselected_groups_TG = torch.ones_like(group_scores_TG, dtype=torch.bool)
         unselected_groups_TG.scatter_(-1, selected_group_ids_TL, False)
         scores_for_choice_TE = scores_TGP.masked_fill(
             unselected_groups_TG.unsqueeze(-1), float("-inf")
         ).flatten(-2)
+        if torch.compiler.is_compiling():
+            return _topk_ids_by_argmax(scores_for_choice_TE, self.top_k)
         return torch.topk(
             scores_for_choice_TE,
             k=self.top_k,
