@@ -186,8 +186,10 @@ class ComplexRoPE(RoPE):
     class Config(RoPE.Config):
         pass
 
-    # Lower the real/imag stack as per-half copies: Inductor's default masked
-    # pointwise stack kernel is about 1.7x slower here (GB300).
+    # Lower the real/imag stack in _rotate_pairs as per-half copies instead of
+    # Inductor's masked pointwise stack: 1.09-1.24x faster fwd+bwd across RoPE
+    # shapes (GB300). It relies on the per-half cast there; without it the
+    # option adds an fp32 -> bf16 copy and is slower.
     @local_compile(
         "complex_rope",
         batch_invariant=True,
@@ -306,29 +308,31 @@ class ComplexRoPE(RoPE):
         key_out = torch.view_as_real(xk_ * rope_cache).flatten(-2).type_as(key)
         return query_out, key_out
 
-
-def _rotate_pairs(
-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> torch.Tensor:
-    """Rotate each ``(x[2i], x[2i + 1])`` pair by the angle with ``cos[i]``, ``sin[i]``."""
-    x_pairs = x.float().unflatten(-1, (-1, 2))
-    x_real, x_imag = x_pairs[..., 0], x_pairs[..., 1]
-    # Cast each half before the stack so the stack writes the output dtype directly.
-    rotated = torch.stack(
-        (
-            (x_real * cos - x_imag * sin).type_as(x),
-            (x_real * sin + x_imag * cos).type_as(x),
-        ),
-        dim=-1,
-    )
-    return rotated.flatten(-2)
+    @staticmethod
+    def _rotate_pairs(
+        x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        """Rotate each ``(x[2i], x[2i + 1])`` pair by the angle with ``cos[i]``, ``sin[i]``."""
+        x_pairs = x.float().unflatten(-1, (-1, 2))
+        x_real, x_imag = x_pairs[..., 0], x_pairs[..., 1]
+        # Cast each half before the stack so the stack writes the output dtype directly.
+        rotated = torch.stack(
+            (
+                (x_real * cos - x_imag * sin).type_as(x),
+                (x_real * sin + x_imag * cos).type_as(x),
+            ),
+            dim=-1,
+        )
+        return rotated.flatten(-2)
 
 
 class _RotatePairs(torch.autograd.Function):
-    """``_rotate_pairs``; the gradient of a rotation is the rotation by the opposite angle.
+    """``ComplexRoPE._rotate_pairs`` with a backward that is also one rotation kernel.
 
-    Spelled out so the backward is one strided-copy kernel like the forward,
-    instead of the masked ``select_backward`` kernel autograd would build.
+    The gradient of a rotation is the rotation by the opposite angle; written
+    out, the backward is the same strided kernel as the forward instead of the
+    masked ``select_backward`` kernel autograd would build. ``cos`` and ``sin``
+    get no gradient: RoPE caches are buffers.
     """
 
     @staticmethod
@@ -336,12 +340,12 @@ class _RotatePairs(torch.autograd.Function):
         ctx, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> torch.Tensor:
         ctx.save_for_backward(cos, sin)
-        return _rotate_pairs(x, cos, sin)
+        return ComplexRoPE._rotate_pairs(x, cos, sin)
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):  # pyrefly: ignore[bad-override]
         cos, sin = ctx.saved_tensors
-        return _rotate_pairs(grad, cos, -sin), None, None
+        return ComplexRoPE._rotate_pairs(grad, cos, -sin), None, None
 
 
 class CosSinRoPE(RoPE):
