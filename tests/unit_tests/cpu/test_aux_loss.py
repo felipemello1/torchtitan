@@ -175,6 +175,29 @@ class TestMicrobatchWiseLoadBalanceLoss(_AuxLossTestCase):
         )
         self.assertEqual(loss.instance_acc.item(), 0.0)
 
+    def test_traced_graph_reads_each_step_denominator(self):
+        """A graph traced once (as GraphTrainer does) scales the injected
+        gradient by the current step's denominator, not the trace-time one."""
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        loss = _make_loss(self.coeff, self.denominator)
+        scores_TE, _, routing_map_TE = _make_inputs(self.T, self.E, self.K)
+        ids_TK = torch.topk(scores_TE.detach(), k=self.K, dim=-1).indices
+
+        def scores_grad(scores_TE, ids_TK, routing_map_TE):
+            carrier_TK = scores_TE.gather(dim=-1, index=ids_TK)
+            out_TK = loss(scores_TE, routing_map_TE, carrier=carrier_TK)
+            return torch.autograd.grad(out_TK.sum(), scores_TE)[0]
+
+        traced = make_fx(scores_grad)(scores_TE, ids_TK, routing_map_TE)
+        for denominator in (2, 32):
+            AuxLoss.set_step_denominator(
+                torch.tensor(float(denominator), dtype=torch.float64)
+            )
+            expected = scores_grad(scores_TE, ids_TK, routing_map_TE)
+            actual = traced(scores_TE, ids_TK, routing_map_TE)
+            self.assertLess((actual - expected).abs().max().item(), 1e-12)
+
     def test_masked_routing_rows_do_not_affect_aux_loss(self):
         scores_TE, carrier_TK, routing_map_TE = _make_inputs(self.T, self.E, self.K)
         full_routing_map_TE = routing_map_TE.clone()
