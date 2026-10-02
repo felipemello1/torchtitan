@@ -10,6 +10,7 @@ import spmd_types as spmd
 import torch
 from attn_gym.sparse.gather_attn import gather_attn
 
+from torchtitan.distributed.local_compile import local_compile
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
 from torchtitan.models.common.attention import (
@@ -285,22 +286,15 @@ class Attention(BaseAttention):
             )
 
         num_tokens = x.size(0)
-        rd = self.rope_head_dim
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr)
         with spmd.local():
             q = q.view(num_tokens, -1, self.head_dim)
             _assert_spmd_attention_type(q, tp=spmd.S(1))
-        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.norm_eps)
-        q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
 
         kv = self.kv_norm(self.wkv(x))
-        kv_nope, kv_rope = torch.split(kv, [self.head_dim - rd, rd], dim=-1)
-
-        q_rope, kv_rope = self.rope(q_rope, kv_rope.unsqueeze(1), positions)
-        q = torch.cat([q_nope, q_rope], dim=-1)
-        kv = torch.cat([kv_nope, kv_rope.squeeze(1)], dim=-1)
+        q, kv = self._q_norm_rope(q, kv, positions)
 
         cu_seqlens = _packed_cu_seqlens(attention_masks)
         cmp_k = idx_q = idx_k = idx_w = None
@@ -341,9 +335,7 @@ class Attention(BaseAttention):
                 attention_masks=attention_masks,
             )
 
-        o_nope, o_rope = torch.split(o, [self.head_dim - rd, rd], dim=-1)
-        o_rope = self.rope(o_rope, positions=positions, inverse=True)
-        o = torch.cat([o_nope, o_rope], dim=-1)
+        o = self._inverse_partial_rope(o, positions)
 
         with spmd.local():
             n_local_heads = o.shape[1]
@@ -361,3 +353,40 @@ class Attention(BaseAttention):
             o = o.reshape(num_tokens, -1)
             _assert_spmd_attention_type(o, tp=spmd.S(1))
         return self.wo_b(o)
+
+    @local_compile("q_norm_rope", batch_invariant=False)
+    def _q_norm_rope(
+        self, q: torch.Tensor, kv: torch.Tensor, positions: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """RMS-normalize each query head, then rotate the last ``rope_head_dim`` channels of q and kv.
+
+        Example (flash, local heads H=64, head_dim 512, rope_head_dim 64):
+
+            q (T, 64, 512), kv (T, 512) -> same shapes, channels [448, 512) rotated
+        """
+        nope_head_dim = self.head_dim - self.rope_head_dim
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.norm_eps)
+        q_nope, q_rope = torch.split(q, [nope_head_dim, self.rope_head_dim], dim=-1)
+        kv_nope, kv_rope = torch.split(kv, [nope_head_dim, self.rope_head_dim], dim=-1)
+        q_rope, kv_rope = self.rope(q_rope, kv_rope.unsqueeze(1), positions)
+        q = torch.cat([q_nope, q_rope], dim=-1)
+        kv = torch.cat([kv_nope, kv_rope.squeeze(1)], dim=-1)
+        return q, kv
+
+    # Lower the cat as per-input copies: on GB300 Inductor's default single
+    # masked pointwise cat kernel is about 2x slower here (it is not a global
+    # option: it made Qwen3.5's partial RoPE slower).
+    @local_compile(
+        "partial_rope",
+        batch_invariant=True,
+        options={"max_pointwise_cat_inputs": 0, "max_complex_pointwise_cat_inputs": 0},
+    )
+    def _inverse_partial_rope(
+        self, o: torch.Tensor, positions: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Undo the rotation of the last ``rope_head_dim`` channels of the attention output."""
+        o_nope, o_rope = torch.split(
+            o, [self.head_dim - self.rope_head_dim, self.rope_head_dim], dim=-1
+        )
+        o_rope = self.rope(o_rope, positions=positions, inverse=True)
+        return torch.cat([o_nope, o_rope], dim=-1)
