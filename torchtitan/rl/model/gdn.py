@@ -236,6 +236,8 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         # the builder restages slots and freshness, including null padding.
         if gdn_metadata.execution_path is GDNExecutionPath.SINGLE_TOKEN:
             num_decode_rows = state_indices.numel()
+            # Decode reads [q|k|v] in place: after share_input_storage it is a
+            # row-strided column view, which Attention Gym's decode conv accepts.
             conv_output = causal_conv1d_decode(
                 mixed_qkv[:num_decode_rows],
                 conv_weight,
@@ -368,30 +370,26 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
 
     def forward(
         self,
-        query_TC: torch.Tensor,
-        key_TC: torch.Tensor,
-        value_TC: torch.Tensor,
+        mixed_qkv_TC: torch.Tensor,
         a_TH: torch.Tensor,
         b_TH: torch.Tensor,
-        conv_q_weight_C1W: torch.Tensor,
-        conv_k_weight_C1W: torch.Tensor,
-        conv_v_weight_C1W: torch.Tensor,
+        conv_weight_C1W: torch.Tensor,
         A_log_H: torch.Tensor,
         dt_bias_H: torch.Tensor,
         cu_seqlens: torch.Tensor,
         *,
         key_head_dim: int,
         value_head_dim: int,
-        use_varlen_kernels: bool = False,
     ) -> torch.Tensor:
-        """Run the flattened vLLM cache operation on rank-local tensors."""
+        """Run the flattened vLLM cache operation on rank-local tensors.
+
+        `GatedDeltaNet` passes the rank-local `[q|k|v]` projection (a row-strided
+        column view after `share_input_storage`) and the matching
+        `[conv_q|conv_k|conv_v]` weight.
+        """
         assert key_head_dim == self.head_k_dim
         assert value_head_dim == self.head_v_dim
-        mixed_qkv_TC = torch.cat([query_TC, key_TC, value_TC], dim=-1)
-        conv_weight_CW = torch.cat(
-            [conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W],
-            dim=0,
-        ).squeeze(1)
+        conv_weight_CW = conv_weight_C1W.squeeze(1)
         assert conv_weight_CW.shape[-1] == self.conv_kernel_size
 
         num_tokens = mixed_qkv_TC.shape[0]
