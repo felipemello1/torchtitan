@@ -36,6 +36,9 @@ def deepseek_v4_local_compile_config() -> LocalCompileConfig:
         regions=[
             *LocalCompileConfig().regions,
             "mhc",
+            "complex_rope",
+            "q_norm_rope",
+            "partial_rope",
         ]
     )
 
