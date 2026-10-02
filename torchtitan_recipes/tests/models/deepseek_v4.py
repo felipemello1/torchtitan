@@ -16,6 +16,7 @@ from torchtitan.components.optim import (
 )
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.models.common.config_utils import (
     decoder_vocab_size,
@@ -29,11 +30,22 @@ from torchtitan.observability.profiler import Profiler
 from torchtitan.trainer import Trainer
 
 
+def deepseek_v4_local_compile_config() -> LocalCompileConfig:
+    """Return the default local compile regions plus DeepSeek V4's own."""
+    return LocalCompileConfig(
+        regions=[
+            *LocalCompileConfig().regions,
+            "mhc",
+        ]
+    )
+
+
 def deepseek_v4_debugmodel(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
 ) -> Trainer.Config:
     model_config = build_model_config("debugmodel", seq_len=seq_len)
     return Trainer.Config(
+        compile=deepseek_v4_local_compile_config(),
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
                 global_vocab_size=decoder_vocab_size(model_config),
@@ -92,6 +104,7 @@ def deepseek_v4_mtp_debugmodel(
 ) -> Trainer.Config:
     model_config = build_model_config("debugmodel", seq_len=seq_len, n_mtp_layers=1)
     return Trainer.Config(
+        compile=deepseek_v4_local_compile_config(),
         loss=MTPLoss.Config(
             global_vocab_size=decoder_vocab_size(model_config),
         ),
@@ -133,6 +146,7 @@ def deepseek_v4_mtp_debugmodel(
 def deepseek_v4_flash(seq_len: int | None = None) -> Trainer.Config:
     model_config = build_model_config("deepseek_v4_flash", seq_len=seq_len)
     return Trainer.Config(
+        compile=deepseek_v4_local_compile_config(),
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
                 global_vocab_size=decoder_vocab_size(model_config),
@@ -176,6 +190,7 @@ def deepseek_v4_flash(seq_len: int | None = None) -> Trainer.Config:
 def deepseek_v4_pro(seq_len: int | None = None) -> Trainer.Config:
     model_config = build_model_config("deepseek_v4_pro", seq_len=seq_len)
     return Trainer.Config(
+        compile=deepseek_v4_local_compile_config(),
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
                 global_vocab_size=decoder_vocab_size(model_config),
