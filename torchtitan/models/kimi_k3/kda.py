@@ -28,6 +28,10 @@ from torchtitan.models.common.attention import (
     VarlenMetadata,
 )
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.linear_attention import (
+    ChunkBackend,
+    resolve_chunk_backend,
+)
 from torchtitan.models.common.nn_modules import Conv1d
 from torchtitan.models.common.norm import GatedRMSNorm
 from torchtitan.protocols.module import Module
@@ -59,6 +63,8 @@ class KDAKernel(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         lower_bound: float = -5.0
+        chunk_backend: ChunkBackend = "auto"
+        """Attention Gym chunk kernel; "auto" picks "cudnn" for fp16/bf16 on SM100/SM103, else "fused"."""
 
         def __post_init__(self):
             if not -5.0 <= self.lower_bound < 0.0:
@@ -70,6 +76,7 @@ class KDAKernel(Module):
     def __init__(self, config: Config):
         super().__init__()
         self.lower_bound = config.lower_bound
+        self.chunk_backend = config.chunk_backend
 
     def forward(
         self,
@@ -102,6 +109,9 @@ class KDAKernel(Module):
             gate_1THK,
             raw_beta_1TH.float().sigmoid(),
             cu_seqlens=cu_seqlens,
+            kernel_options={
+                "backend": resolve_chunk_backend(self.chunk_backend, q_1THK)
+            },
         )
         return output_1THV
 
