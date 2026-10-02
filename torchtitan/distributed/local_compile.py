@@ -16,16 +16,21 @@ import torch
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 
 
+# Regions defined in code every model imports (models/common, components/loss.py).
+# A region defined in one model's files (e.g. Qwen3.5's offset_rmsnorm) goes in that model's Config default.
+DEFAULT_LOCAL_COMPILE_REGIONS = (
+    "gated_rmsnorm",
+    "loss",
+    "swiglu",
+    "situglu",
+    "cos_sin_rope",
+)
+
+
 @dataclass(kw_only=True, slots=True)
 class LocalCompileConfig:
     regions: list[str] = field(
-        default_factory=lambda: [
-            "gated_rmsnorm",
-            "loss",
-            "swiglu",
-            "situglu",
-            "cos_sin_rope",
-        ]
+        default_factory=lambda: list(DEFAULT_LOCAL_COMPILE_REGIONS)
     )
     """Named regions to compile independently with ``torch.compile``.
 
@@ -35,13 +40,16 @@ class LocalCompileConfig:
     """
 
     def apply_local_compile(self) -> None:
-        """Bind registered functions to eager or compiled implementations."""
+        """Bind registered functions to eager or compiled implementations.
+
+        Process-wide: a later call replaces this choice for every model in the process.
+        """
         unknown = [
             name for name in self.regions if name not in _LOCAL_COMPILE_CALLBACKS
         ]
         if unknown:
             raise ValueError(
-                f"Unknown compile.regions entries {unknown}; "
+                f"Unknown local_compile.regions entries {unknown}; "
                 f"registered values are {sorted(_LOCAL_COMPILE_CALLBACKS)}"
             )
 
@@ -83,7 +91,7 @@ def local_compile(
             if enabled and batch_invariant_mode and not batch_invariant:
                 raise ValueError(
                     f"Local compile region {name!r} does not support "
-                    "batch-invariant mode; remove it from compile.regions."
+                    "batch-invariant mode; remove it from local_compile.regions."
                 )
             if enabled:
                 fn = torch.compile(reference, fullgraph=True, **compile_kwargs)
@@ -100,4 +108,4 @@ def local_compile(
     return decorate
 
 
-__all__ = ["local_compile", "LocalCompileConfig"]
+__all__ = ["DEFAULT_LOCAL_COMPILE_REGIONS", "local_compile", "LocalCompileConfig"]

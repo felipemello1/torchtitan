@@ -252,14 +252,12 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     def initialize(
         self,
         *,
-        compile_config: LocalCompileConfig,
         hf_assets_path: str,
         dataloader: BaseDataLoader | None = None,
         create_seed_checkpoint: bool = False,
     ) -> None:
         """Initialize model execution and the state required to train it."""
         self._initialize_model(
-            compile_config=compile_config,
             hf_assets_path=hf_assets_path,
             create_seed_checkpoint=create_seed_checkpoint,
         )
@@ -274,7 +272,6 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     def _initialize_model(
         self,
         *,
-        compile_config: LocalCompileConfig,
         hf_assets_path: str,
         create_seed_checkpoint: bool = False,
     ) -> None:
@@ -320,7 +317,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 parallelism_context=self.parallelism_context,
                 training=config.training,
                 parallelism=config.parallelism,
-                compile_config=compile_config,
+                compile_config=self._compile_config(),
                 ac_config=config.activation_checkpoint,
                 dump_folder=self.output_dir,
                 device=self.device,
@@ -334,7 +331,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                     parallelism_context=self.parallelism_context,
                     training=config.training,
                     parallelism=config.parallelism,
-                    compile_config=compile_config,
+                    compile_config=self._compile_config(),
                     ac_config=config.activation_checkpoint,
                     dump_folder=self.output_dir,
                 )
@@ -370,6 +367,14 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             f"Model {type(self.model_config).__qualname__} size: "
             f"{self.model_param_count:,} total parameters"
         )
+
+    def _compile_config(self) -> LocalCompileConfig:
+        """Return what ``model.parallelize(compile_config=...)`` expects for this engine's models.
+
+        Regular models expect ``LocalCompileConfig`` (compiled regions); GraphTrainer overrides this to
+        return ``GraphTrainerCompileConfig`` (whole-step compile).
+        """
+        return self.model_config.local_compile
 
     def _initialize_optim(self) -> None:
         """Construct the parameter update and its state."""

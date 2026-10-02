@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import spmd_types as spmd
@@ -17,7 +17,11 @@ from torch import nn
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
-from torchtitan.distributed.local_compile import local_compile, LocalCompileConfig
+from torchtitan.distributed.local_compile import (
+    DEFAULT_LOCAL_COMPILE_REGIONS,
+    local_compile,
+    LocalCompileConfig,
+)
 from torchtitan.distributed.parallelism_context import MeshAxisName, ParallelismContext
 from torchtitan.distributed.spmd_types import (
     annotate_input_spmd_types,
@@ -325,6 +329,11 @@ class Qwen35Model(MultimodalModel):
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
         vision_encoder: Qwen35VisionEncoder.Config | None = None
+        local_compile: LocalCompileConfig = field(
+            default_factory=lambda: LocalCompileConfig(
+                regions=[*DEFAULT_LOCAL_COMPILE_REGIONS, "offset_rmsnorm"]
+            )
+        )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
