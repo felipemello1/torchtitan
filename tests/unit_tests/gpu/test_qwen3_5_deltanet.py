@@ -587,8 +587,11 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         self._assert_fused_varlen_matches_per_document(atol=2e-2, rtol=2e-2)
 
     def test_cudnn_varlen_matches_independent_document_forwards(self):
-        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
-            raise unittest.SkipTest("the cuDNN GDN backend needs SM100+")
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+            (10, 0),
+            (10, 3),
+        ):
+            raise unittest.SkipTest("the cuDNN GDN backend needs SM100 or SM103")
         self._assert_fused_varlen_matches_per_document(
             atol=2e-2, rtol=2e-2, chunk_backend="cudnn"
         )
