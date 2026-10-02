@@ -18,5 +18,6 @@ def test_qwen35_family_default_local_compile_regions() -> None:
             "swiglu",
             "situglu",
             "cos_sin_rope",
+            "complex_rope",
             "offset_rmsnorm",
         ]
