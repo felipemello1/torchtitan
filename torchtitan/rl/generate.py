@@ -17,6 +17,7 @@ Run: torchrun --nproc_per_node=4 \
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 
 # Must set spawn method before any CUDA operations or vLLM imports
@@ -85,6 +86,10 @@ def generate() -> None:
     model_config = config.model
     if model_config is None:
         raise ValueError("RL config must define a model.")
+    if gen_config.local_compile is not None:
+        model_config = dataclasses.replace(
+            model_config, local_compile=gen_config.local_compile
+        )
     model_path = config.hf_assets_path
     max_num_seqs = args.max_num_seqs
     is_rank0 = os.environ.get("RANK", "0") == "0"
@@ -93,7 +98,6 @@ def generate() -> None:
     register_to_vllm(
         model_config,
         parallelism=gen_config.parallelism,
-        local_compile_config=config.compile,
         checkpointer_config=CheckpointManager.Config(
             initial_load_in_hf=True,
             initial_load_path=model_path,

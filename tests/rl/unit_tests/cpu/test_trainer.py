@@ -69,7 +69,6 @@ def test_rl_trainer_validates_model_training_config_before_initialization() -> N
             Trainer(
                 config,
                 model_config=model_config,
-                local_compile_config=LocalCompileConfig(),
                 max_num_documents=None,
                 output_dir="",
             )
@@ -80,9 +79,33 @@ def test_rl_trainer_validates_model_training_config_before_initialization() -> N
         training=config.training,
         debug=config.debug,
         activation_checkpoint=config.activation_checkpoint,
-        local_compile_config=LocalCompileConfig(),
         max_num_documents=None,
     )
+
+
+def test_rl_trainer_local_compile_replaces_model_local_compile() -> None:
+    class ValidationReachedError(Exception):
+        pass
+
+    trainer_local_compile = LocalCompileConfig(regions=["loss"])
+    config = Trainer.Config(
+        training=TrainingConfig(disable_cuda_graphs=True),
+        local_compile=trainer_local_compile,
+    )
+
+    with patch(
+        "torchtitan.rl.trainer.validate_model_training_config",
+        side_effect=ValidationReachedError,
+    ) as validate:
+        with pytest.raises(ValidationReachedError):
+            Trainer(
+                config,
+                model_config=MagicMock(),
+                max_num_documents=None,
+                output_dir="",
+            )
+
+    assert validate.call_args.args[0].local_compile is trainer_local_compile
 
 
 def test_forward_backward_uses_global_token_count() -> None:

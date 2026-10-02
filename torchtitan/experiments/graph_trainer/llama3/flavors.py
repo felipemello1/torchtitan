@@ -8,6 +8,7 @@
 
 from dataclasses import fields
 
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.models.llama3 import MODEL_FLAVORS
 
 from ..common_utils import build_decoder_config_for_backend
@@ -33,4 +34,6 @@ def build_model_config(
     config = GraphTrainerLlama3Model.Config(
         **{f.name: getattr(base, f.name) for f in fields(base)}
     )
+    # GraphTrainer traces the whole step, so it rejects local compile regions.
+    config.local_compile = LocalCompileConfig(regions=[])
     return config

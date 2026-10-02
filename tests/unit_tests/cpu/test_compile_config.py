@@ -4,6 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -27,6 +30,19 @@ def test_local_compile_config_default() -> None:
         "situglu",
         "cos_sin_rope",
     ]
+
+
+def test_default_regions_are_registered_by_shared_code() -> None:
+    # A fresh process imports only shared code, so a model-only region would be unknown.
+    code = (
+        "import torchtitan.components.loss, torchtitan.models.common\n"
+        "from torchtitan.distributed.local_compile import LocalCompileConfig\n"
+        "LocalCompileConfig().apply_local_compile()\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_local_compile_config_loss_only() -> None:
@@ -117,7 +133,9 @@ def test_local_compile_rejects_non_batch_invariant_region(monkeypatch) -> None:
         "torchtitan.distributed.local_compile.is_in_batch_invariant_mode",
         lambda: True,
     )
-    with pytest.raises(ValueError, match=r"test_non_batch_invariant.*compile.regions"):
+    with pytest.raises(
+        ValueError, match=r"test_non_batch_invariant.*local_compile.regions"
+    ):
         LocalCompileConfig(regions=["test_non_batch_invariant"]).apply_local_compile()
 
 

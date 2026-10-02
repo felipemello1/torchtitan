@@ -13,7 +13,7 @@ import logging
 import math
 import os
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 import cloudpickle
@@ -166,9 +166,9 @@ _DEFAULT_MAX_NUM_BATCHED_TOKENS = 2048
 class VLLMCudaGraphConfig:
     """CUDA graph capture settings for the vLLM inference engine.
 
-    torch.compile is configured separately via ``LocalCompileConfig`` at the
-    ``Controller`` level, shared by both trainer and generator.  Only CUDA
-    graph capture, which is vLLM-specific, is controlled here.
+    Local compile regions come from the model config's ``local_compile``, which
+    ``VLLMGenerator.Config.local_compile`` can replace. Only CUDA graph capture,
+    which is vLLM-specific, is controlled here.
 
     ``mode`` selects which vLLM CUDA graph mode to capture; see that field and
     ``get_vllm_compilation_config`` for the per-mode trade-offs. The default,
@@ -680,7 +680,6 @@ class VLLMGenerator(Configurable):
         config: Generator-specific configuration.
         model_config: TorchTitan model configuration.
         model_path: Path to the HF model checkpoint.
-        local_compile_config: Local compile configuration shared with the trainer.
         max_num_seqs: vLLM's upper bound on concurrently scheduled sequences (vLLM admits fewer if KV
             is tight); also sets the CUDA-graph capture sizes.
         output_dir: Structured-logger output directory.
@@ -719,6 +718,9 @@ class VLLMGenerator(Configurable):
 
         model_dtype: str = "bfloat16"
         """Data type for model weights, passed directly to vLLM (auto, float16, bfloat16, float32)."""
+
+        local_compile: LocalCompileConfig | None = None
+        """Replaces the model config's ``local_compile`` in the generator; ``None`` keeps it."""
 
         gpu_memory_limit: float = 0.9
         """Fraction of GPU memory to use for the vLLM engine (0.0 to 1.0)."""
@@ -812,7 +814,6 @@ class VLLMGenerator(Configurable):
         *,
         model_config: Decoder.Config,
         model_path: str,
-        local_compile_config: LocalCompileConfig,
         max_num_seqs: int,
         output_dir: str,
         rank: int | None = None,
@@ -830,6 +831,8 @@ class VLLMGenerator(Configurable):
         )
         sl.log_trace_instant("structured_logger_started")
 
+        if config.local_compile is not None:
+            model_config = replace(model_config, local_compile=config.local_compile)
         self.config = config
         self.model_config = model_config
 
@@ -846,7 +849,6 @@ class VLLMGenerator(Configurable):
         register_to_vllm(
             model_config,
             parallelism=config.parallelism,
-            local_compile_config=local_compile_config,
             checkpointer_config=config.checkpointer,
             override=config.override,
         )

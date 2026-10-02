@@ -8,6 +8,7 @@
 
 from dataclasses import fields
 
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.models.muse_glimmer import (
     build_model_config as build_muse_glimmer_model_config,
 )
@@ -26,4 +27,6 @@ def build_model_config(
     config = GraphTrainerMuseGlimmerModel.Config(
         **{f.name: getattr(base, f.name) for f in fields(base)}
     )
+    # GraphTrainer traces the whole step, so it rejects local compile regions.
+    config.local_compile = LocalCompileConfig(regions=[])
     return config

@@ -604,6 +604,25 @@ def test_graph_training_engine_rejects_optimizer_cuda_graph() -> None:
     init.assert_not_called()
 
 
+def test_graph_training_engine_rejects_local_compile_regions() -> None:
+    config = SimpleNamespace(optim=SimpleNamespace(enable_cuda_graph=False))
+
+    with (
+        patch.object(TrainingEngine, "__init__") as init,
+        pytest.raises(ValueError, match="local_compile.regions"),
+    ):
+        GraphTrainingEngine(
+            config,
+            model_config=SimpleNamespace(
+                local_compile=LocalCompileConfig(regions=["loss"])
+            ),
+            max_num_documents=None,
+            output_dir="",
+        )
+
+    init.assert_not_called()
+
+
 def test_optim_update_clips_before_parameter_update() -> None:
     events = []
     optimizers = MagicMock()
@@ -884,7 +903,6 @@ def test_initialize_preserves_phase_order():
     )
     TrainingEngine.initialize(
         engine,
-        compile_config=LocalCompileConfig(regions=[]),
         hf_assets_path="",
         create_seed_checkpoint=True,
     )
@@ -898,7 +916,6 @@ def test_initialize_preserves_phase_order():
     ]
     assert engine.model_device_mem_stats is model_mem_stats
     engine._initialize_model.assert_called_once_with(
-        compile_config=LocalCompileConfig(regions=[]),
         hf_assets_path="",
         create_seed_checkpoint=True,
     )

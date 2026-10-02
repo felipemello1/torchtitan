@@ -51,6 +51,9 @@ class Trainer(Configurable):
     class Config(TrainingEngine.Config):
         """Trainer configuration for optimizer, training, and parallelism."""
 
+        local_compile: LocalCompileConfig | None = None
+        """Replaces the model config's ``local_compile`` in the trainer; ``None`` keeps it."""
+
         def __post_init__(self) -> None:
             TrainingEngine.Config.__post_init__(self)
             if self.parallelism.pipeline_parallel_degree > 1:
@@ -65,7 +68,6 @@ class Trainer(Configurable):
         config: Config,
         *,
         model_config: BaseModel.Config,
-        local_compile_config: LocalCompileConfig,
         max_num_documents: int | None,
         hf_assets_path: str = "",
         generator_dtype: str = "",
@@ -85,6 +87,8 @@ class Trainer(Configurable):
         self.config = config
         model_config = copy.deepcopy(model_config)
         model_config.set_sharding_(config.parallelism)
+        if config.local_compile is not None:
+            model_config.local_compile = config.local_compile
 
         if config.override.imports:
             apply_overrides(config.override, model_config)
@@ -95,7 +99,6 @@ class Trainer(Configurable):
             training=config.training,
             debug=config.debug,
             activation_checkpoint=config.activation_checkpoint,
-            local_compile_config=local_compile_config,
             max_num_documents=max_num_documents,
         )
 
@@ -117,7 +120,6 @@ class Trainer(Configurable):
             engine.device_memory_monitor.device_name
         )
         engine.initialize(
-            compile_config=local_compile_config,
             hf_assets_path=hf_assets_path,
         )
 

@@ -76,6 +76,11 @@ class GraphTrainingEngine(TrainingEngine):
     ) -> None:
         if config.optim.enable_cuda_graph:
             raise ValueError("Optim CUDA graphs are not supported with GraphTrainer.")
+        if model_config.local_compile.regions:
+            raise ValueError(
+                "GraphTrainer traces the whole step into one graph; set "
+                f"model.local_compile.regions = [] (got {model_config.local_compile.regions})."
+            )
         validate_memory_policy_config(config.compile)
         super().__init__(
             config,
@@ -84,6 +89,9 @@ class GraphTrainingEngine(TrainingEngine):
             output_dir=output_dir,
         )
         self._pinned_pool_ctx = None
+
+    def _compile_config(self) -> GraphTrainerCompileConfig:
+        return self.config.compile
 
     def _initialize_forward_backward(self) -> None:
         if self.config.parallelism.fsdp_defer_gradient_reduction:

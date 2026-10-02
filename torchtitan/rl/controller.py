@@ -108,7 +108,6 @@ from torchtitan.components.renderer import RendererConfig
 
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
-from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.components.batcher import Batcher
@@ -284,9 +283,6 @@ class Controller(Configurable):
         )
         """JSONL recorder to save sampled rollouts to disk for further inspection and debugging."""
 
-        compile: LocalCompileConfig = field(default_factory=LocalCompileConfig)
-        """torch.compile config shared by trainer and generator."""
-
         trainer: Trainer.Config
         """Trainer config. Controls optimizer, training, parallelism."""
 
@@ -387,6 +383,19 @@ class Controller(Configurable):
                     raise ValueError(
                         f"batch_invariant requires bfloat16 generator dtype, "
                         f"got {self.generator.model_dtype!r}"
+                    )
+                model_local_compile = self.model.local_compile if self.model else None
+                trainer_local_compile = (
+                    self.trainer.local_compile or model_local_compile
+                )
+                generator_local_compile = (
+                    self.generator.local_compile or model_local_compile
+                )
+                if trainer_local_compile != generator_local_compile:
+                    raise ValueError(
+                        "batch_invariant requires the trainer and generator to compile "
+                        f"the same local regions; got trainer={trainer_local_compile}, "
+                        f"generator={generator_local_compile}."
                     )
                 if self.trainer.parallelism.enable_sequence_parallel:
                     raise ValueError(
@@ -589,7 +598,6 @@ class Controller(Configurable):
                 model_config=config.model,
                 hf_assets_path=config.hf_assets_path,
                 generator_dtype=config.generator.model_dtype,
-                local_compile_config=config.compile,
                 max_num_documents=config.async_loop.batcher.max_num_documents,
                 output_dir=config.dump_folder,
             )
@@ -606,7 +614,6 @@ class Controller(Configurable):
                     config.generator,
                     model_config=config.model,
                     model_path=config.hf_assets_path,
-                    local_compile_config=config.compile,
                     max_num_seqs=max_num_seqs,
                     output_dir=config.dump_folder,
                 )

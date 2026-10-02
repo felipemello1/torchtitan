@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar, Self, TYPE_CHECKING
 
 import torch
@@ -87,6 +87,9 @@ class BaseModel(Module, ABC):
 
         Subclasses define model-specific hyperparameters.
         """
+
+        local_compile: LocalCompileConfig = field(default_factory=LocalCompileConfig)
+        """Local compile regions, loss included; ``regions=[]`` runs them all eager."""
 
         def set_sharding_(self, parallelism: ParallelismConfig) -> None:
             """Set model-specific sharding in place for one runtime consumer."""
