@@ -462,8 +462,8 @@ class TestLossParallelCrossEntropy(DTensorTestBase):
             ((2, 2), ("dp", "tp"), (Shard(0), Shard(1)), (Shard(0), Replicate())),
         )
         cases = (
-            (128, torch.float32, False),
-            (131, torch.bfloat16, True),
+            (128, torch.float32, False, None),
+            (131, torch.bfloat16, True, 0.7),
         )
 
         for mesh_shape, axis_names, logits_placements, label_placements in mesh_configs:
@@ -471,7 +471,7 @@ class TestLossParallelCrossEntropy(DTensorTestBase):
                 self.device_type, mesh_shape, mesh_dim_names=axis_names
             )
             tp_group = mesh.get_group("tp")
-            for vocab_size, dtype, ignore in cases:
+            for vocab_size, dtype, ignore, temperature in cases:
                 with self.subTest(
                     mesh_shape=mesh_shape,
                     vocab_size=vocab_size,
@@ -509,6 +509,11 @@ class TestLossParallelCrossEntropy(DTensorTestBase):
                         global_logits.detach().clone().requires_grad_(True)
                     )
                     reference_logits_fp32 = reference_logits.float()
+                    global_temperature = torch.full((T,), temperature or 1.0)
+                    if temperature is not None:
+                        reference_logits_fp32 = (
+                            reference_logits_fp32 / global_temperature[:, None]
+                        )
                     reference_logprobs = -F.cross_entropy(
                         reference_logits_fp32,
                         global_labels,
@@ -552,6 +557,14 @@ class TestLossParallelCrossEntropy(DTensorTestBase):
                         labels_type[dp_group] = spmd.S(0)
                     spmd.assert_type(local_logits, logits_type)
                     spmd.assert_type(local_labels, labels_type)
+                    local_temperature = None
+                    if temperature is not None:
+                        local_temperature = distribute_tensor(
+                            global_temperature, mesh, label_placements
+                        ).to_local()
+                        spmd.assert_type(
+                            local_temperature, {**labels_type, tp_group: spmd.R}
+                        )
 
                     with set_current_spmd_mesh(mesh):
                         with typecheck(strict_mode="strict"):
@@ -561,6 +574,7 @@ class TestLossParallelCrossEntropy(DTensorTestBase):
                                 vocab_parallel_group=tp_group,
                                 return_entropy=True,
                                 global_vocab_size=vocab_size,
+                                temperature=local_temperature,
                             )
 
                     self.assertIs(spmd.get_axis_local_type(logprobs, tp_group), spmd.I)

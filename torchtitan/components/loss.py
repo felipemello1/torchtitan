@@ -370,8 +370,12 @@ def compute_logprobs(
     vocab_parallel_group: dist.ProcessGroup | None,
     return_entropy: bool = False,
     global_vocab_size: int | None = None,
+    temperature: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Per-token logprobs from ``logits[T, V]`` and ``labels[T]``.
+
+    ``temperature[T]`` (fp32), when given, makes logprobs and entropy those of
+    ``softmax(logits / temperature)``.
 
     When ``return_entropy`` is set, also returns per-token Shannon entropy
     ``H(p) = logsumexp(logits) - sum(softmax(logits) * logits)``, with shape
@@ -387,6 +391,10 @@ def compute_logprobs(
     Returns ``logprobs`` when ``return_entropy`` is False, else
     ``(logprobs, entropy)``.
     """
+    if temperature is not None:
+        # Divide in fp32 by a per-token tensor, as vLLM's sampler does, so batch-invariant
+        # runs stay bitwise equal to the generator.
+        logits = logits / temperature.unsqueeze(-1)
     if vocab_parallel_group is not None:
         if global_vocab_size is None:
             raise ValueError(
