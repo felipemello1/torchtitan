@@ -189,8 +189,8 @@ uv pip install "flash-attn-4[cu13]>=4.0.0b33"
 TorchTitan selects FA4 on Blackwell, FA3 on Hopper, and the FA2 implementation
 bundled with PyTorch on older GPUs such as A100.
 
-Qwen3.5's Gated DeltaNet runs Attention Gym's cuDNN chunk kernels on Blackwell
-and its fused kernels elsewhere (`GatedDeltaKernel.Config.chunk_backend`). The
+Qwen3.5's Gated DeltaNet runs Attention Gym's cuDNN chunk kernels on SM100/SM103
+(B200/B300/GB200/GB300) and its fused kernels elsewhere (`GatedDeltaKernel.Config.chunk_backend`). The
 `attn-gym[linear,cudnn]` dependency brings in what the cuDNN kernels need
 (`nvidia-cutlass-dsl>=4.7`).
 
