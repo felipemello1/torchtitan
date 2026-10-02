@@ -14,7 +14,7 @@ from torchtitan.components.optim import (
     Optim,
     OptimizersContainer,
 )
-from torchtitan.config import TrainingConfig
+from torchtitan.config import OverrideConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.local_compile import LocalCompileConfig
@@ -22,6 +22,10 @@ from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.deepseek_v3 import build_model_config
 from torchtitan.trainer import Trainer
+
+# Opt-in Triton kernels for the MLA q/k/v RoPE assembly, requested by the *_perf
+# recipes (see torchtitan_recipes/overrides/fused_mla.py).
+_FUSED_MLA = "torchtitan_recipes.overrides.fused_mla.fused_mla"
 
 
 def deepseek_v3_16b(seq_len: int | None = None) -> Trainer.Config:
@@ -105,3 +109,27 @@ def deepseek_v3_671b(seq_len: int | None = None) -> Trainer.Config:
         activation_checkpoint=SelectiveAC.Config(),
         compile=LocalCompileConfig(),
     )
+
+
+def deepseek_v3_16b_perf(seq_len: int | None = None) -> Trainer.Config:
+    """``deepseek_v3_16b`` with the fused MLA override (Triton q/kv RoPE assembly).
+
+    The override matches the stock attention bitwise and keeps the checkpoint
+    layout; it is CUDA-only. It is already listed here, so don't also pass
+    ``--override torchtitan_recipes.overrides.fused_mla.fused_mla``.
+    """
+    config = deepseek_v3_16b(seq_len=seq_len)
+    config.override = OverrideConfig(imports=[_FUSED_MLA])
+    return config
+
+
+def deepseek_v3_671b_perf(seq_len: int | None = None) -> Trainer.Config:
+    """``deepseek_v3_671b`` with the fused MLA override (Triton q/kv RoPE assembly).
+
+    The override matches the stock attention bitwise and keeps the checkpoint
+    layout; it is CUDA-only. It is already listed here, so don't also pass
+    ``--override torchtitan_recipes.overrides.fused_mla.fused_mla``.
+    """
+    config = deepseek_v3_671b(seq_len=seq_len)
+    config.override = OverrideConfig(imports=[_FUSED_MLA])
+    return config

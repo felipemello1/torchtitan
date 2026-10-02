@@ -12,6 +12,9 @@ Activate with::
 
     --override torchtitan_recipes.overrides.fused_mla.fused_mla
 
+or use the ``deepseek_v3_16b_perf`` / ``deepseek_v3_671b_perf`` recipes, which
+already list it.
+
 Scope and limitations
 ---------------------
 This override is specific to TorchTitan's DeepSeek-V3 ``Attention`` module and

@@ -21,6 +21,12 @@ from torchtitan.config import apply_overrides, OverrideConfig
 from torchtitan.models.common.attention import FlexInnerAttention
 from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.models.deepseek_v3.model import Attention, DeepSeekV3Model
+from torchtitan_recipes.models.deepseek_v3 import (
+    deepseek_v3_16b,
+    deepseek_v3_16b_perf,
+    deepseek_v3_671b,
+    deepseek_v3_671b_perf,
+)
 from torchtitan_recipes.overrides.fused_mla import (
     _fused_k_rope_kernel,
     _fused_kv_backward_kernel,
@@ -73,6 +79,19 @@ class TestFusedMLAOverrideConfig(unittest.TestCase):
         # restore it between candidate runs or every trial past the first
         # measures (and leaves behind) doubly rotated data.
         self.assertEqual(_fused_q_rope_kernel.restore_value, ["q"])
+
+    def test_perf_recipes_fuse_every_attention_and_base_recipes_do_not(self):
+        for base_recipe, perf_recipe in (
+            (deepseek_v3_16b, deepseek_v3_16b_perf),
+            (deepseek_v3_671b, deepseek_v3_671b_perf),
+        ):
+            with self.subTest(recipe=perf_recipe.__name__):
+                base_config, perf_config = base_recipe(), perf_recipe()
+                self.assertEqual(apply_overrides(base_config.override, base_config), [])
+                apply_overrides(perf_config.override, perf_config)
+                model_config = cast(DeepSeekV3Model.Config, perf_config.model)
+                for layer in (*model_config.layers, *model_config.mtp_layers):
+                    self.assertIsInstance(layer.attention, FusedMLAAttention.Config)
 
     def test_override_replaces_all_debug_attention_configs(self):
         config = deepseek_v3_debugmodel(seq_len=2048)
