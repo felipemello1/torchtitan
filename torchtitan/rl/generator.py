@@ -308,10 +308,9 @@ class VLLMCudaGraphConfig:
 class SamplingConfig:
     """Sampling parameters passed to vLLM's SamplingParams."""
 
-    # TODO: vLLM samples at this temperature, but generator and trainer logprobs are both at T=1,
-    # so T != 1 biases the gradient. Fix: vLLM processed logprobs and trainer logits / T.
     temperature: float = 0.8
-    """Sampling temperature. 0.0 = greedy, higher = more random."""
+    """Sampling temperature. The trainer divides its logits by it, so every trained request must
+    sample at it and it must be > 0 (greedy 0.0 is for validation)."""
 
     top_p: float = 1.0
     """Nucleus sampling threshold. Must be 1.0: the trainer scores tokens over the full vocabulary,
@@ -928,6 +927,9 @@ class VLLMGenerator(Configurable):
             skip_tokenizer_init=True,
         )
         engine_kwargs["max_model_len"] = model_config.max_context_length
+        # Logprobs of the distribution vLLM sampled from (after temperature), which the
+        # trainer reproduces by dividing its logits by the sampling temperature.
+        engine_kwargs["logprobs_mode"] = "processed_logprobs"
         engine_kwargs["max_num_seqs"] = self._max_num_seqs
         if config.max_num_batched_tokens is not None:
             engine_kwargs["max_num_batched_tokens"] = config.max_num_batched_tokens
