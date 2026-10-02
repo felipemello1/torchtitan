@@ -275,9 +275,8 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             output[num_decode_rows:].zero_()
             return
 
-        # TODO: drop the copy once Attention Gym's prefill convolution accepts a row stride.
         conv_output = paged_causal_conv1d(
-            mixed_qkv[:num_actual_tokens].contiguous().unsqueeze(0),
+            mixed_qkv[:num_actual_tokens].unsqueeze(0),
             conv_weight,
             self.kv_cache[0],
             state_indices,
