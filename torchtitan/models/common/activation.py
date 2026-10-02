@@ -125,6 +125,27 @@ class SqrtSoftplus(UnaryActivationFn):
         return F.softplus(x).sqrt()
 
 
+# Each hidden size gets one graph per grad mode and per static/dynamic row
+# count. Routed calls with 0 rows (an EP rank that receives no tokens) or 1 row
+# also specialize, since Dynamo never treats sizes 0 and 1 as dynamic. So these
+# regions can need more than torch.compile's default limit of 8 graphs.
+_GLU_RECOMPILE_LIMIT = 16
+
+
+def _mark_hidden_dim_static(gate: torch.Tensor, up: torch.Tensor) -> None:
+    """Keep the hidden size static when one compiled function sees several.
+
+    Example: Kimi K3's situglu serves the dense FFN (33792), the shared expert
+    (6144) and the routed experts (3072). Without the mark, automatic dynamic
+    shapes make the hidden size symbolic once a second size arrives, and the
+    kernel indexes with a runtime divisor. With it, each hidden size gets its
+    own graph.
+    """
+    if torch.compiler.is_compiling():
+        torch._dynamo.mark_static(gate, -1)
+        torch._dynamo.mark_static(up, -1)
+
+
 class SwiGLU(BinaryActivationFn):
     """SwiGLU activation."""
 
@@ -135,7 +156,7 @@ class SwiGLU(BinaryActivationFn):
     def __init__(self, config: Config) -> None:
         pass
 
-    @local_compile("swiglu", batch_invariant=True)
+    @local_compile("swiglu", batch_invariant=True, recompile_limit=_GLU_RECOMPILE_LIMIT)
     def __call__(
         self,
         gate: torch.Tensor,
@@ -143,6 +164,7 @@ class SwiGLU(BinaryActivationFn):
         **kwargs: Any,
     ) -> torch.Tensor:
         del kwargs
+        _mark_hidden_dim_static(gate, up)
         return F.silu(gate) * up
 
 
@@ -158,7 +180,9 @@ class SiTUGLU(BinaryActivationFn):
         self.beta = config.beta
         self.linear_beta = config.linear_beta
 
-    @local_compile("situglu", batch_invariant=True)
+    @local_compile(
+        "situglu", batch_invariant=True, recompile_limit=_GLU_RECOMPILE_LIMIT
+    )
     def __call__(
         self,
         gate: torch.Tensor,
@@ -166,6 +190,7 @@ class SiTUGLU(BinaryActivationFn):
         **kwargs: Any,
     ) -> torch.Tensor:
         del kwargs
+        _mark_hidden_dim_static(gate, up)
         input_dtype = gate.dtype
         gate = gate.float()
         up = up.float()
