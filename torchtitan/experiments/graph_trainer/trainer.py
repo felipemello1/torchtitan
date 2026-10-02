@@ -76,11 +76,23 @@ class GraphTrainingEngine(TrainingEngine):
     ) -> None:
         if config.optim.enable_cuda_graph:
             raise ValueError("Optim CUDA graphs are not supported with GraphTrainer.")
-        if model_config.local_compile.regions:
-            raise ValueError(
-                "GraphTrainer traces the whole step into one graph; set "
-                f"model.local_compile.regions = [] (got {model_config.local_compile.regions})."
+        regions = model_config.local_compile.regions
+        if regions and (
+            not config.compile.enable_passes
+            or (
+                config.compile.inductor_compilation == "regional"
+                and "regional_inductor_pass" in config.compile.disable_passes
             )
+        ):
+            raise ValueError(
+                f"model.local_compile.regions {regions} trace compile-only code "
+                "that only GraphTrainer's Inductor pass compiles; enable "
+                "compile.enable_passes and regional_inductor_pass, or set the "
+                "regions to []."
+            )
+        # The step is traced into one graph, so local compile regions are tagged
+        # for its Inductor passes instead of compiled with torch.compile.
+        model_config.local_compile.apply_local_compile(tag_regions=True)
         validate_memory_policy_config(config.compile)
         super().__init__(
             config,
@@ -272,7 +284,7 @@ class GraphTrainer(Trainer):
         compile: GraphTrainerCompileConfig = field(
             default_factory=GraphTrainerCompileConfig
         )
-        """Whole-step compile. GraphTrainer ignores ``model.local_compile``, whose regions must be empty."""
+        """Whole-step compile. Regions listed in ``model.local_compile`` are compiled inside the traced graph."""
 
     engine_cls = GraphTrainingEngine
     engine: GraphTrainingEngine

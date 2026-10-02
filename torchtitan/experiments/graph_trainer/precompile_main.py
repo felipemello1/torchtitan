@@ -144,6 +144,8 @@ def _common_setup(config):
         torch.tensor(num_tokens_per_train_step, dtype=torch.int64, device=device)
     )
 
+    # Same binding as GraphTrainingEngine: tag local compile regions for Inductor.
+    model_config.local_compile.apply_local_compile(tag_regions=True)
     logger.info(f"Building {type(model_config).__qualname__} on meta device")
     with (
         parallelism_context.activate_spmd(),

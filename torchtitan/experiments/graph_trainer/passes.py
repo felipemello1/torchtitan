@@ -75,6 +75,7 @@ from torchtitan.experiments.graph_trainer.inductor_passes import (
     annotate_flex_attention_for_regional_inductor_pass,
     full_inductor_compilation_pass,
     regional_inductor_pass,
+    strip_inductor_tags_from_collectives_pass,
 )
 from torchtitan.experiments.graph_trainer.make_fx_tracer import TracedResult
 from torchtitan.experiments.graph_trainer.memory_policy import (
@@ -135,7 +136,10 @@ def async_tensor_parallel_pass(
 
 def construct_mandatory_graph_passes() -> list[Callable]:
     """Return correctness passes that run even when optional passes are disabled."""
-    return [remove_parameter_gradient_markers_pass]
+    return [
+        remove_parameter_gradient_markers_pass,
+        strip_inductor_tags_from_collectives_pass,
+    ]
 
 
 def compile_time_passes(

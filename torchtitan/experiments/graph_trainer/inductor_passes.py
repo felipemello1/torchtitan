@@ -22,6 +22,7 @@ from torch.fx.passes.regional_inductor import _dummy_wrapper, regional_inductor
 from torchtitan.experiments.graph_trainer.common_utils import (
     set_graph_module_boxed_codegen,
 )
+from torchtitan.experiments.graph_trainer.simple_fsdp import FSDP_PARAM_FQNS_META
 
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,39 @@ def standalone_inductor_compilation_pass(
     return _wrap_compiled_artifact_as_graph_module(
         gm, compiled_fn, used_placeholder_indices
     )
+
+
+def strip_inductor_tags_from_collectives_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple,
+) -> torch.fx.GraphModule:
+    """Keep collectives and SimpleFSDP parameter chains out of tagged regions.
+
+    A local compile region tags every node traced inside it, including the
+    all-gather of a parameter it reads and, through the forward metadata copied
+    to backward nodes, that parameter's reduce-scatter. Compiled inside a
+    region, those collectives could not be bucketed, prefetched or overlapped.
+    Runs before FSDP bucketing, which copies a member's ``custom`` metadata
+    onto its bucket.
+    """
+    del example_inputs
+    for node in gm.graph.nodes:
+        custom = node.meta.get("custom")
+        if not custom or "compile_with_inductor" not in custom:
+            continue
+        is_collective = (
+            isinstance(node.target, torch._ops.OpOverload)
+            and node.target.namespace == "_c10d_functional"
+        )
+        if is_collective or FSDP_PARAM_FQNS_META in custom:
+            # Copy: nodes traced in one annotation share the dict. Delete the
+            # key, because regional_inductor treats any present key as tagged.
+            node.meta["custom"] = {
+                key: value
+                for key, value in custom.items()
+                if key != "compile_with_inductor"
+            }
+    return gm
 
 
 def regional_inductor_pass(

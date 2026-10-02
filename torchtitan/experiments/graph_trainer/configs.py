@@ -268,9 +268,10 @@ def to_graph_trainer_config(
     """Convert a base Trainer.Config to a GraphTrainer.Config.
 
     Copies all fields from the base config and converts its model config to the
-    GraphTrainer model config class, without local compile regions because
-    GraphTrainer traces the whole step. The ``compile`` field keeps the
-    GraphTrainer.Config default; callers should explicitly set it.
+    GraphTrainer model config class, without local compile regions (a recipe
+    opts in by listing them; GraphTrainer compiles them inside its graph). The
+    ``compile`` field keeps the GraphTrainer.Config default; callers should
+    explicitly set it.
     """
     from .trainer import GraphTrainer
 
@@ -281,7 +282,7 @@ def to_graph_trainer_config(
             for f in fields(base_config.model)
         }
     )
-    # GraphTrainer compiles the whole step (config.compile), so it drops the model's local compile regions.
+    # Regions are opt-in under GraphTrainer, which compiles listed ones inside its graph.
     graph_model.local_compile = LocalCompileConfig(regions=[])
     d["model"] = graph_model
 

@@ -151,3 +151,45 @@ def test_loss_functions_use_local_compile(monkeypatch) -> None:
     LocalCompileConfig(regions=["loss"]).apply_local_compile()
 
     assert compiled_names == [cross_entropy_loss.__name__, mse_loss.__name__]
+
+
+def test_tag_regions_tags_traced_nodes_with_compile_path() -> None:
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    @local_compile(
+        "test_tag_regions", batch_invariant=True, options={"max_autotune": True}
+    )
+    def region(x: torch.Tensor) -> torch.Tensor:
+        # A compile-only path that is easy to tell apart from eager.
+        return x * 3 if torch.compiler.is_compiling() else x + x
+
+    def step(x: torch.Tensor) -> torch.Tensor:
+        return region(x).sum()
+
+    LocalCompileConfig(regions=["test_tag_regions"]).apply_local_compile(
+        tag_regions=True
+    )
+    try:
+        assert torch.equal(region(torch.ones(2)), torch.full((2,), 2.0))
+        with (
+            torch.compiler._non_strict_tracing_context(),
+            torch.fx.traceback.preserve_node_meta(),
+        ):
+            graph = make_fx(step)(torch.ones(2)).graph
+    finally:
+        LocalCompileConfig(regions=[]).apply_local_compile()
+
+    tags = {
+        node.target: node.meta.get("custom", {}).get("compile_with_inductor")
+        for node in graph.nodes
+        if node.op == "call_function"
+    }
+    # aten.mul (not aten.add) also guards the private
+    # torch.compiler._compile_session_context that tag mode relies on.
+    assert tags == {
+        torch.ops.aten.mul.Tensor: {
+            "inductor_region": "test_tag_regions",
+            "inductor_configs": {"max_autotune": True},
+        },
+        torch.ops.aten.sum.default: None,
+    }
