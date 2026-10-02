@@ -161,8 +161,28 @@ class AuxLoss(Module):
         The trainer calls this once per step with the same dp-summed token
         count the main loss normalizes by, so auxiliary losses stay on the
         same scale as the main loss and independent of parallelism degrees.
+
+        The value is copied into one persistent tensor rather than rebinding
+        the attribute, so a graph traced or captured once and replayed every
+        step (GraphTrainer's make_fx graph, a CUDA graph) reads each step's
+        count. A call with a different dtype or device than the stored tensor
+        replaces it, and graphs that captured the old tensor keep the old value.
+
+        Example:
+            AuxLoss.set_step_denominator(torch.tensor(8192, device="cuda"))
+            # Same tensor, new value: a traced graph now divides by 6000.
+            AuxLoss.set_step_denominator(torch.tensor(6000, device="cuda"))
         """
-        cls._step_denominator = denominator
+        current = cls._step_denominator
+        if (
+            current is None
+            or current.dtype != denominator.dtype
+            or current.device != denominator.device
+        ):
+            # Own the storage: later steps write into it.
+            cls._step_denominator = denominator.detach().clone()
+        else:
+            current.copy_(denominator)
 
     def inject(self, raw_sum: torch.Tensor, *, carrier: torch.Tensor) -> torch.Tensor:
         """Inject the aux-loss gradient on ``carrier``; accumulate the scaled metric.
