@@ -188,6 +188,61 @@ def _apply_attention_residual(
     )
 
 
+# Kimi K3 has at most ceil(num_layers / attn_res_block_size) = ceil(93 / 12) = 8
+# stack entries. A config with more still runs, but takes the plain looped sum in
+# _attention_residual.
+_MAX_STACK_ENTRIES = 8
+
+
+class _StackWeightedSum(torch.autograd.Function):
+    """``sum_n probs[:, n] * stack[:, n] + probs[:, -1] * partial`` for a dynamic stack width.
+
+    The forward always sums ``_MAX_STACK_ENTRIES`` terms: slots past the real
+    width read the last entry with zero weight, so Inductor emits one pointwise
+    kernel instead of a looped reduction over the symbolic width. The backward
+    is pointwise over the stack plus one dot product per entry. Shape suffix
+    ``M`` is ``_MAX_STACK_ENTRIES``.
+
+    Example (T tokens, N=3 stack entries, D=7168):
+
+        probs (T, 4), stack (T, 3, 7168), partial (T, 7168) -> (T, 7168)
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx,
+        probs_TN: torch.Tensor,
+        stack_TND: torch.Tensor,
+        partial_TD: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(probs_TN, stack_TND, partial_TD)
+        num_entries = stack_TND.shape[1]
+        # Zero-padded with index_select of clamped slots and a mask, not F.pad: when
+        # Inductor inlines the softmax into the sum, F.pad masks every slot's loads.
+        slot_M = torch.arange(_MAX_STACK_ENTRIES, device=probs_TN.device)
+        stack_probs_TM = probs_TN.index_select(1, slot_M.clamp(max=num_entries - 1)) * (
+            slot_M < num_entries
+        )
+        output_TD = probs_TN[:, -1:] * partial_TD
+        for i in range(_MAX_STACK_ENTRIES):
+            entry_TD = stack_TND.select(1, torch.sym_min(i, num_entries - 1))
+            output_TD = output_TD + stack_probs_TM[:, i : i + 1] * entry_TD
+        return output_TD
+
+    @staticmethod
+    def backward(ctx, grad_TD: torch.Tensor):  # pyrefly: ignore[bad-override]
+        probs_TN, stack_TND, partial_TD = ctx.saved_tensors
+        grad_stack_TND = probs_TN[:, :-1, None] * grad_TD.unsqueeze(1)
+        grad_probs_TN = torch.cat(
+            (
+                (grad_TD.unsqueeze(1) * stack_TND).sum(dim=-1),
+                (grad_TD * partial_TD).sum(dim=-1, keepdim=True),
+            ),
+            dim=1,
+        )
+        return grad_probs_TN, grad_stack_TND, probs_TN[:, -1:] * grad_TD
+
+
 # The stack width (1-8) and the token count become dynamic; non-strict mode keeps
 # Inductor's mix-order-reduction heuristic from guarding on T >= 4096, which
 # otherwise adds graphs for short batches and fills the recompile limit.
@@ -236,8 +291,15 @@ def _attention_residual(
 
     scores_TN = torch.cat((score(stack_TND), score(partial_TD).unsqueeze(1)), dim=1)
     probs_TN = torch.softmax(scores_TN, dim=-1)
-    output_TD = (probs_TN[:, :-1, None] * stack_TND).sum(dim=1)
-    output_TD = output_TD + probs_TN[:, -1:] * partial_TD
+    # With a symbolic stack width the plain sum compiles to a looped reduction;
+    # _StackWeightedSum sums a fixed number of terms in one pointwise kernel. A
+    # one-entry stack always gets its own static graph, where the plain sum is
+    # already a single term.
+    if 1 < block_residual_TND.shape[1] <= _MAX_STACK_ENTRIES:
+        output_TD = _StackWeightedSum.apply(probs_TN, stack_TND, partial_TD)
+    else:
+        output_TD = (probs_TN[:, :-1, None] * stack_TND).sum(dim=1)
+        output_TD = output_TD + probs_TN[:, -1:] * partial_TD
     return output_TD.to(partial_block_TD.dtype)
 
 

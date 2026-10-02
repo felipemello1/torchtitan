@@ -42,16 +42,25 @@ class TestAttentionResidualLocalCompile(unittest.TestCase):
                 torch.randn(TOKENS, DIM, device="cuda").bfloat16(),
                 torch.randn(TOKENS, num_entries, DIM, device="cuda").bfloat16(),
             )
-            for num_entries in (1, 7, 3)
+            for num_entries in (1, 7, 3, 8)
         ]
         LocalCompileConfig(regions=[]).apply_local_compile()
         eager = [self._run(*case, projection, norm_weight) for case in cases]
-        # One binding for all widths, so widths 7 and 3 run the dynamic-width graph.
+        # One binding for all widths, so widths 7, 3 and 8 run the dynamic-width graph.
         LocalCompileConfig(regions=["attention_residual"]).apply_local_compile()
         compiled = [self._run(*case, projection, norm_weight) for case in cases]
         for compiled_tensors, eager_tensors in zip(compiled, eager, strict=True):
             for actual, expected in zip(compiled_tensors, eager_tensors, strict=True):
                 torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        # no_grad (validation, generation) compiles separate graphs.
+        with torch.no_grad():
+            for (partial, stack), eager_tensors in zip(cases, eager, strict=True):
+                actual = _attention_residual(
+                    partial, stack, projection, norm_weight, EPS
+                )
+                torch.testing.assert_close(
+                    actual, eager_tensors[0], atol=2e-2, rtol=2e-2
+                )
 
 
 if __name__ == "__main__":
