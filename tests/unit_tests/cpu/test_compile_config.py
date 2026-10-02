@@ -7,7 +7,7 @@
 import pytest
 import torch
 
-from torchtitan.components.loss import cross_entropy_loss, mse_loss
+from torchtitan.components.loss import compute_logprobs, cross_entropy_loss, mse_loss
 from torchtitan.distributed.local_compile import (
     apply_local_compile,
     DEFAULT_LOCAL_COMPILE_REGIONS,
@@ -126,4 +126,8 @@ def test_loss_functions_use_local_compile(monkeypatch) -> None:
     monkeypatch.setattr(torch, "compile", fake_compile)
     apply_local_compile(["loss"])
 
-    assert compiled_names == [cross_entropy_loss.__name__, mse_loss.__name__]
+    assert compiled_names == [
+        cross_entropy_loss.__name__,
+        mse_loss.__name__,
+        compute_logprobs.__name__,
+    ]
