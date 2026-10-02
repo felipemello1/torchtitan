@@ -19,6 +19,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 from torchtitan.distributed.spmd_types import set_current_spmd_mesh
 from torchtitan.models.common.linear import (
     _split_into_bf16_pieces,
+    fp32_output_linear,
     FP32OutputLinear,
     Linear,
 )
@@ -143,6 +144,31 @@ def test_fp32_output_linear_preserves_stacked_output_shape():
     assert output.shape == (2, 3, 2, 4)
     assert output.dtype is torch.float32
     torch.testing.assert_close(output, expected)
+
+
+def test_fp32_output_linear_function_matches_module():
+    layer = (
+        FP32OutputLinear.Config(
+            in_features=8, out_features=4, bias=False, exact_grad_output_split=False
+        )
+        .build()
+        .to(torch.bfloat16)
+    )
+    weight_OD = layer.weight.detach().clone().requires_grad_()
+    input_BTD = torch.randn(2, 3, 8, dtype=torch.bfloat16, requires_grad=True)
+    input_copy_BTD = input_BTD.detach().clone().requires_grad_()
+
+    expected = layer(input_BTD)
+    output = fp32_output_linear(
+        input_copy_BTD, weight_OD, exact_grad_output_split=False
+    )
+    expected.sum().backward()
+    output.sum().backward()
+
+    assert output.dtype is torch.float32
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(input_copy_BTD.grad, input_BTD.grad, rtol=0, atol=0)
+    torch.testing.assert_close(weight_OD.grad, layer.weight.grad, rtol=0, atol=0)
 
 
 def test_split_into_bf16_pieces_recovers_fp32():
