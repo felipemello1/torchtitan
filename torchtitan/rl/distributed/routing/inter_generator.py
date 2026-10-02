@@ -275,6 +275,7 @@ class InterGeneratorRouter(Actor, Configurable):
             routing_ctx=RoutingContext(
                 estimated_cost=1,
                 session_id=routing_session_id,
+                group_id=group_id,
             ),
         )
 

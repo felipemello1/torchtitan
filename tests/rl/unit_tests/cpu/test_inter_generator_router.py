@@ -249,6 +249,30 @@ def test_sticky_session_assigns_new_generator_when_sticky_target_is_syncing():
     asyncio.run(_run())
 
 
+def test_sticky_session_places_new_group_sessions_on_the_group_generator():
+    async def _run():
+        actors = [_Actor(f"gen{i}", wait_generate=True) for i in range(2)]
+        router = _router(
+            actors, strategy=StickySessionRoutingStrategy.Config(group_slack=1)
+        )
+
+        # Four siblings of group 0 start together. The group's first candidate
+        # (gen0) takes siblings while it is at most 1 call above the least loaded.
+        turns = []
+        for rollout_id in range(4):
+            ctx = RoutingContext(session_id=f"group=0/rollout={rollout_id}", group_id=0)
+            turns.append(
+                asyncio.create_task(router._route("generate", routing_ctx=ctx))
+            )
+            await asyncio.sleep(0)
+
+        actors[0].generate.release.set()
+        actors[1].generate.release.set()
+        assert await asyncio.gather(*turns) == ["gen0", "gen0", "gen1", "gen0"]
+
+    asyncio.run(_run())
+
+
 def test_sticky_session_can_use_round_robin_for_new_sessions():
     async def _run():
         actors = [_Actor("gen0"), _Actor("gen1")]

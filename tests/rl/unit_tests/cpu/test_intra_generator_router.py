@@ -100,6 +100,18 @@ def test_sticky_pins_session_to_dp_rank():
     assert router.reserve("r2", routing_session_id="s1") != first
 
 
+def test_sticky_group_slack_places_siblings_on_one_dp_rank():
+    router = IntraGeneratorRouter.Config(
+        strategy=StickySessionRoutingStrategy.Config(group_slack=1)
+    ).build(dp_degree=2)
+    # DP rank 0 takes siblings while it is at most 1 request above the least loaded.
+    ranks = [
+        router.reserve(f"r{i}", routing_session_id=f"group=0/rollout={i}", group_id=0)
+        for i in range(4)
+    ]
+    assert ranks == [0, 0, 1, 0]
+
+
 @pytest.mark.parametrize("dp_degree", [0, 1])
 def test_rejects_dp_degree_without_routing(dp_degree: int):
     with pytest.raises(ValueError, match="dp_degree must be > 1"):
