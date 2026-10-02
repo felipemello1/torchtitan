@@ -12,6 +12,7 @@ import spmd_types as spmd
 import torch
 import torch_remat as remat
 
+from torchtitan.distributed.local_compile import local_compile
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import (
     spmd_dense_sp_enabled,
@@ -76,6 +77,13 @@ class SigmoidGatedFeedForward(FeedForward):
             recompute=self.remat_should_recompute("w2"),
         )(self.activation_fn(gate_TF, up_TF))
         remat.recompute_needs_tensor(out_TD, gate_out_T1)
+        return self._gate_output(gate_out_T1, out_TD)
+
+    @local_compile("shared_expert_gate", batch_invariant=False)
+    def _gate_output(
+        self, gate_out_T1: torch.Tensor, out_TD: torch.Tensor
+    ) -> torch.Tensor:
+        """Scale each token's shared-expert output by its sigmoid gate."""
         return torch.sigmoid(gate_out_T1) * out_TD
 
 
