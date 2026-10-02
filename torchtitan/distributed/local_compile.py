@@ -24,6 +24,7 @@ DEFAULT_LOCAL_COMPILE_REGIONS = (
     "swiglu",
     "situglu",
     "cos_sin_rope",
+    "complex_rope",
 )
 
 
@@ -34,8 +35,8 @@ class LocalCompileConfig:
     )
     """Named regions to compile independently with ``torch.compile``.
 
-    Gated RMSNorm, loss, SwiGLU, SiTUGLU, and cos/sin RoPE compilation are
-    enabled by default.
+    Gated RMSNorm, loss, SwiGLU, SiTUGLU, cos/sin RoPE, and complex RoPE
+    compilation are enabled by default.
     FlexAttention manages its own compilation and is not controlled by this list.
     """
 

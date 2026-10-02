@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast, TYPE_CHECKING
 
 import torch
@@ -12,6 +12,10 @@ from torch import nn
 
 from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.local_compile import (
+    DEFAULT_LOCAL_COMPILE_REGIONS,
+    LocalCompileConfig,
+)
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.common.attention import (
     AttentionMasksType,
@@ -167,6 +171,20 @@ class DeepSeekV4Model(Decoder):
         norm_eps: float = 1e-6
         hc_head: HcHead.Config
         mtp_layers: list["MTPBlock.Config"] | None = None
+        # Compiled alone, complex_rope needs more graphs here than the recompile
+        # limit allows (Compressor, Indexer, attention, inverse rotation): 8 graphs
+        # in training, then FailOnRecompileLimitHit at the first no_grad pass.
+        # TODO: drop this override when the DSv4 attention regions (#107) enable
+        # complex_rope together with the glue that absorbs those calls.
+        local_compile: LocalCompileConfig = field(
+            default_factory=lambda: LocalCompileConfig(
+                regions=[
+                    region
+                    for region in DEFAULT_LOCAL_COMPILE_REGIONS
+                    if region != "complex_rope"
+                ]
+            )
+        )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int

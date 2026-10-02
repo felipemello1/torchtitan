@@ -12,6 +12,9 @@ import torch
 
 from torchtitan.components.loss import cross_entropy_loss, mse_loss
 from torchtitan.distributed.local_compile import local_compile, LocalCompileConfig
+from torchtitan.models.deepseek_v4 import (
+    build_model_config as build_deepseek_v4_model_config,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -29,7 +32,13 @@ def test_local_compile_config_default() -> None:
         "swiglu",
         "situglu",
         "cos_sin_rope",
+        "complex_rope",
     ]
+
+
+def test_deepseek_v4_default_excludes_complex_rope() -> None:
+    config = build_deepseek_v4_model_config("debugmodel")
+    assert "complex_rope" not in config.local_compile.regions
 
 
 def test_default_regions_are_registered_by_shared_code() -> None:
