@@ -25,6 +25,7 @@ from transformers.modeling_utils import AttentionInterface, PreTrainedModel
 
 from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.local_compile import DEFAULT_LOCAL_COMPILE_REGIONS
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.models.common.attention import (
@@ -280,6 +281,7 @@ class HFTransformerModel(BaseModel):
                 None  # noqa: this sets Config.param_init, not Module._param_init
             )
             self.sharding_config = None
+            self.local_compile_regions = list(DEFAULT_LOCAL_COMPILE_REGIONS)
 
             assert model_config is not None, "model_config is required"
 

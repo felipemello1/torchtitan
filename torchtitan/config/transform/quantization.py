@@ -222,7 +222,7 @@ class Float8GroupedLinearConverter(QuantizationConverter):
         if not self.config.model_compile_enabled:
             logger.warning(
                 "Compile is required for high performance float8 MoE training; "
-                "configure LocalCompileConfig in the recipe"
+                "compile the model (GraphTrainer) and set model_compile_enabled=True"
             )
 
     def convert(self, model_config):

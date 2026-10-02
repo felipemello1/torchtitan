@@ -247,9 +247,6 @@ model_spec = build_model_config(
         ),
     ],
 )
-
-# In your Trainer.Config:
-compile=LocalCompileConfig(),
 ```
 
 ### Performance
