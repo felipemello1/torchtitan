@@ -33,6 +33,8 @@ from attn_gym.linear import (
 )
 
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
+from torchtitan.models.common.linear_attention import resolve_chunk_backend
+from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel
 from torchtitan.protocols.module import Module
 from torchtitan.rl.model.gdn_backend import (
     GDNExecutionPath,
@@ -68,6 +70,7 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         num_v_heads: int
         head_k_dim: int
         head_v_dim: int
+        kernel: GatedDeltaKernel.Config
         conv_kernel_size: int = 4
 
     def __init__(self, config: Config) -> None:
@@ -91,6 +94,7 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         self.head_k_dim = config.head_k_dim
         self.head_v_dim = config.head_v_dim
         self.conv_kernel_size = config.conv_kernel_size
+        self.chunk_backend = config.kernel.chunk_backend
 
         # vLLM's state-shape calculator takes global head counts, while the
         # computation and allocated cache use local head counts.
@@ -344,6 +348,9 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
                 cu_seqlens=cu_seqlens,
                 has_initial_state=has_initial_state,
                 scale=self.head_k_dim**-0.5,
+                kernel_options={
+                    "backend": resolve_chunk_backend(self.chunk_backend, query)
+                },
             )
         output.copy_(recurrent_output[0].to(output.dtype))
 

@@ -218,6 +218,7 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         self,
         *,
         use_fused: bool = False,
+        chunk_backend: str = "fused",
         dim: int = 4,
         key_head_dim: int = 2,
         value_head_dim: int = 2,
@@ -272,7 +273,7 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
             conv_k=conv(key_dim),
             conv_v=conv(value_dim),
             inner_gated_delta_net=InnerGatedDeltaNet.Config(
-                kernel=GatedDeltaKernel.Config(),
+                kernel=GatedDeltaKernel.Config(chunk_backend=chunk_backend),
             ),
             norm=GatedRMSNorm.Config(
                 dim=value_head_dim,
@@ -489,7 +490,7 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         )
 
     def _assert_fused_varlen_matches_per_document(
-        self, *, atol: float, rtol: float
+        self, *, atol: float, rtol: float, chunk_backend: str = "fused"
     ) -> None:
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is unavailable")
@@ -501,6 +502,7 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         # head counts also exercise grouped-head execution.
         model = self._make_deltanet(
             use_fused=True,
+            chunk_backend=chunk_backend,
             dim=256,
             key_head_dim=128,
             value_head_dim=128,
@@ -583,6 +585,16 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
     def test_fused_varlen_matches_independent_document_forwards(self):
         # BF16 tolerance absorbs differing packed and per-document chunk boundaries.
         self._assert_fused_varlen_matches_per_document(atol=2e-2, rtol=2e-2)
+
+    def test_cudnn_varlen_matches_independent_document_forwards(self):
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+            (10, 0),
+            (10, 3),
+        ):
+            raise unittest.SkipTest("the cuDNN GDN backend needs SM100 or SM103")
+        self._assert_fused_varlen_matches_per_document(
+            atol=2e-2, rtol=2e-2, chunk_backend="cudnn"
+        )
 
     def test_batch_invariant_recurrent_matches_paged_attention_gym(self):
         if not torch.cuda.is_available():
