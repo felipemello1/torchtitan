@@ -136,6 +136,12 @@ class StickySessionRoutingStrategy(RoutingStrategy):
         )
         """Routing strategy used for new sessions and requests without a session."""
 
+        group_slack: int | None = None
+        """When set, a new session joins its group's first candidate, so siblings share
+        the group's prompt KV, unless that candidate's load exceeds the fallback's
+        choice by more than `group_slack`. None places every new session with
+        `fallback_strategy`."""
+
         def __post_init__(self):
             if self.max_sessions <= 0:
                 raise ValueError(
@@ -145,7 +151,10 @@ class StickySessionRoutingStrategy(RoutingStrategy):
     def __init__(self, config: Config):
         self._max_sessions = config.max_sessions
         self._fallback_strategy = config.fallback_strategy.build()
+        self._group_slack = config.group_slack
         self._sessions: OrderedDict[str, RoutingCandidate] = OrderedDict()
+        # group_id -> the candidate of the group's first session (only with group_slack).
+        self._group_candidates: OrderedDict[int, RoutingCandidate] = OrderedDict()
 
     def choose(
         self,
@@ -179,6 +188,20 @@ class StickySessionRoutingStrategy(RoutingStrategy):
         # New session, or the pinned candidate is unavailable: choose via the
         # fallback and (re)pin the session to that candidate.
         chosen = self._fallback_strategy.choose(routing_ctx, candidates)
+        if self._group_slack is not None and routing_ctx.group_id is not None:
+            # Join the group's first candidate while it is within group_slack of the
+            # fallback's choice, so siblings share the group's prompt KV.
+            group_candidate = self._group_candidates.setdefault(
+                routing_ctx.group_id, chosen
+            )
+            if (
+                any(h is group_candidate for h in candidates)
+                and group_candidate.reserved_load
+                <= chosen.reserved_load + self._group_slack
+            ):
+                chosen = group_candidate
+            if len(self._group_candidates) > self._max_sessions:
+                self._group_candidates.popitem(last=False)
         self._sessions[routing_ctx.session_id] = chosen
         # End of the dict means it's the most-recently-used session.
         self._sessions.move_to_end(routing_ctx.session_id)

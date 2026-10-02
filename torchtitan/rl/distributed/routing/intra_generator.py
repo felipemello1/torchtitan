@@ -65,7 +65,13 @@ class IntraGeneratorRouter(Configurable):
         # free the load on the same rank when the request's completion resolves.
         self._reservations: dict[str, int] = {}
 
-    def reserve(self, request_id: str, *, routing_session_id: str | None) -> int:
+    def reserve(
+        self,
+        request_id: str,
+        *,
+        routing_session_id: str | None,
+        group_id: int | None = None,
+    ) -> int:
         """Pick a DP rank for one request and reserve one load unit on it.
 
         Records the choice under ``request_id`` so a later ``release`` frees the
@@ -76,7 +82,7 @@ class IntraGeneratorRouter(Configurable):
             request_id not in self._reservations
         ), f"request_id {request_id!r} already has a reservation"
 
-        ctx = RoutingContext(session_id=routing_session_id)
+        ctx = RoutingContext(session_id=routing_session_id, group_id=group_id)
         handle = self._strategy.choose(ctx, self._handles)
         handle.reserved_load += 1
         self._reservations[request_id] = handle.dp_rank

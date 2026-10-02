@@ -448,6 +448,7 @@ class RequestDispatcher:
                 dp_rank = self._rank0_dp_router.reserve(
                     request.request_id,
                     routing_session_id=request.routing_session_id,
+                    group_id=request.group_id,
                 )
             requests_per_dp_rank[dp_rank].append(request)
 
