@@ -18,4 +18,5 @@ def test_qwen35_architecture_enables_offset_rmsnorm_local_compile() -> None:
             "loss",
             "cos_sin_rope",
             "offset_rmsnorm",
+            "shared_expert_gate",
         ]
