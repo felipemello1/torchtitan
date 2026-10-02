@@ -31,7 +31,6 @@ from torchtitan.models.common import Conv1d, Linear
 from torchtitan.models.common.attention import local_head_split, VarlenMetadata
 from torchtitan.models.common.norm import GatedRMSNorm
 from torchtitan.protocols.module import Module
-from torchtitan.tools.utils import has_cuda_capability
 
 # The Attention Gym kernels run on rank-local heads inside local SPMD regions
 # with no collectives. They mix tokens along the sequence, which is only correct
@@ -210,7 +209,7 @@ class GatedDeltaKernel(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         chunk_backend: Literal["fused", "cudnn"] | None = None
-        """Attention Gym chunk kernel. None picks "cudnn" on SM100+ and "fused" elsewhere."""
+        """Attention Gym chunk kernel. None picks "cudnn" on SM100/SM103 and "fused" elsewhere."""
 
     def __init__(self, config: Config):
         super().__init__()
@@ -261,10 +260,12 @@ class GatedDeltaKernel(Module):
 def resolve_chunk_backend(
     chunk_backend: Literal["fused", "cudnn"] | None,
 ) -> Literal["fused", "cudnn"]:
-    """Attention Gym's cuDNN chunk kernel runs only on SM100+ (Blackwell)."""
+    """Attention Gym's cuDNN chunk kernel runs only on SM100 and SM103."""
     if chunk_backend is not None:
         return chunk_backend
-    return "cudnn" if has_cuda_capability(10, 0) else "fused"
+    return (
+        "cudnn" if torch.cuda.get_device_capability() in ((10, 0), (10, 3)) else "fused"
+    )
 
 
 class InnerGatedDeltaNet(Module):
