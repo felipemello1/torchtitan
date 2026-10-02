@@ -183,8 +183,9 @@ class VLLMCudaGraphConfig:
     - ``"FULL_DECODE_ONLY"``: graph pure-decode batches; prefill / mixed
       batches run eager. Cheap (no inductor compile).
     - ``"FULL"`` (default): graph the whole forward, prefill included, attention
-      captured too. On vLLM's V2 runner (single-GPU engines), vLLM limits FULL
-      graphs to decode and prefill runs eagerly.
+      captured too. On vLLM's V2 runner (single-GPU engines), FULL graphs cover
+      decode only; prefill runs piecewise graphs with ``vllm_compile`` and runs
+      eagerly without it.
     """
 
     vllm_compile: bool = False
@@ -214,7 +215,7 @@ class VLLMCudaGraphConfig:
         expert_sequence_parallel_size: int,
         enable_sequence_parallel: bool,
         max_num_batched_tokens: int | None = None,
-        graph_prefill: bool = True,
+        v2_model_runner: bool = False,
     ) -> CompilationConfig:
         """Build a vLLM ``CompilationConfig`` for the generator.
 
@@ -228,9 +229,11 @@ class VLLMCudaGraphConfig:
         ``_DEFAULT_MAX_NUM_BATCHED_TOKENS``), so the cap extends to it -- otherwise
         prefill chunks larger than the cap fall back to eager.
 
-        ``graph_prefill=False`` keeps the cap at ``max_num_seqs`` for ``FULL`` too.
-        Pass it for vLLM's V2 runner, whose FULL graphs cover decode only: there,
-        prefill-sized graphs only pad prefill batches up to the next size.
+        ``v2_model_runner=True`` is for vLLM's V2 runner, whose FULL graphs cover
+        decode only. With ``vllm_compile``, ``FULL`` requests ``FULL_AND_PIECEWISE``
+        so prefill runs piecewise graphs. Without it, prefill runs eagerly and the
+        cap stays at ``max_num_seqs``: prefill-sized graphs would only pad prefill
+        batches up to the next size.
 
         ``expert_sequence_parallel_size`` is the TP-axis shard count used by the
         internally sequence-sharded MoE path. A value greater than one removes
@@ -263,8 +266,14 @@ class VLLMCudaGraphConfig:
             _max_cuda_graph_capture_size = max_num_batched_tokens
         else:
             _max_cuda_graph_capture_size = _DEFAULT_MAX_NUM_BATCHED_TOKENS
+        # TorchTitan GDN limits the V2 runner's FULL graphs to decode, so vLLM
+        # resolves FULL to FULL_AND_PIECEWISE, but only after compiling, too late to
+        # wrap the compiled pieces in CUDA graphs. Request it before compiling.
+        cudagraph_mode = self.mode
+        if self.mode == "FULL" and v2_model_runner and self.vllm_compile:
+            cudagraph_mode = "FULL_AND_PIECEWISE"
         cap = max_num_seqs
-        if self.mode == "FULL" and graph_prefill:
+        if self.mode == "FULL" and (not v2_model_runner or self.vllm_compile):
             cap = max(cap, _max_cuda_graph_capture_size)
         if self.capture_sizes is not None:
             if not self.capture_sizes or any(s <= 0 for s in self.capture_sizes):
@@ -305,7 +314,7 @@ class VLLMCudaGraphConfig:
                 )
 
         return CompilationConfig(
-            cudagraph_mode=self.mode,
+            cudagraph_mode=cudagraph_mode,
             mode=(
                 CompilationMode.VLLM_COMPILE
                 if self.vllm_compile
@@ -957,7 +966,7 @@ class VLLMGenerator(Configurable):
             max_num_batched_tokens=config.max_num_batched_tokens,
             expert_sequence_parallel_size=expert_sequence_parallel_size,
             enable_sequence_parallel=config.parallelism.enable_sequence_parallel,
-            graph_prefill=not use_v2,
+            v2_model_runner=use_v2,
         )
         if vllm_compilation_config is not None:
             engine_kwargs["compilation_config"] = vllm_compilation_config

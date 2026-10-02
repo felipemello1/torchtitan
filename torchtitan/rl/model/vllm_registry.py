@@ -120,6 +120,7 @@ def _configure_gdn_hybrid_model(model_cls: type, model_config: Decoder.Config) -
 
     vLLM exposes one model-level recurrent-state shape. GDN layers may differ
     otherwise, but every field that determines that state shape must match.
+    Also makes the GDN op a vLLM splitting op.
     """
     gdn_configs = [
         layer.delta_net
@@ -145,11 +146,19 @@ def _configure_gdn_hybrid_model(model_cls: type, model_config: Decoder.Config) -
         )
     (state_shape,) = state_shapes
 
+    from vllm.config import CompilationConfig
     from vllm.model_executor.layers.mamba.mamba_utils import (
         MambaStateCopyFuncCalculator,
         MambaStateDtypeCalculator,
         MambaStateShapeCalculator,
     )
+
+    # Split vLLM's compiled graph at the GDN step, as vLLM does for its own GDN op
+    # (`vllm::qwen_gdn_attention_core`), so piecewise CUDA graphs can run prefill.
+    # vLLM reads this list when it builds the engine config, before the model
+    # (and `gdn.py`) is imported.
+    if "torchtitan::vllm_gdn_forward" not in CompilationConfig._attention_ops:
+        CompilationConfig._attention_ops.append("torchtitan::vllm_gdn_forward")
 
     num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_size = state_shape
 

@@ -495,18 +495,14 @@ def test_cuda_graph_vllm_compile_enables_inductor():
     assert cfg.mode.name == "VLLM_COMPILE"
 
 
-def test_gdn_forward_is_an_opaque_functional_op():
-    # vLLM compile must see the GDN step as one op with no mutated inputs;
-    # tracing into it bakes in the profiling run's missing attention metadata.
+def test_gdn_forward_is_an_opaque_op_that_writes_its_output():
+    # vLLM compile must see the GDN step as one op; tracing into it bakes in the
+    # profiling run's missing attention metadata. vLLM runs the op between piecewise
+    # graphs, so it must write into an output the previous graph allocated.
     import torchtitan.rl.model.gdn  # noqa: F401  (registers the op)
 
     schema = torch.ops.torchtitan.vllm_gdn_forward.default._schema
-    assert all(not arg.is_write for arg in schema.arguments)
-    mixed_qkv = torch.empty(3, 12, device="meta")
-    out = torch.ops.torchtitan.vllm_gdn_forward(
-        mixed_qkv, mixed_qkv, mixed_qkv, mixed_qkv, mixed_qkv, mixed_qkv, "layer", 2, 5
-    )
-    assert out.shape == (3, 2, 5)
+    assert [arg.name for arg in schema.arguments if arg.is_write] == ["output"]
 
 
 def test_cuda_graph_decode_only_capture_sizes_cover_max_num_seqs():
@@ -532,15 +528,31 @@ def test_cuda_graph_full_mode_extends_capture_sizes_to_chunk():
     assert 500 in cfg.cudagraph_capture_sizes  # decode batch captured exactly
 
 
-def test_cuda_graph_full_mode_without_prefill_graphs_caps_at_max_num_seqs():
-    # vLLM's V2 runner graphs decode only, so FULL keeps FULL_DECODE_ONLY's sizes.
+def test_cuda_graph_full_mode_on_v2_runner_caps_at_max_num_seqs():
+    # Without vLLM compile, vLLM's V2 runner graphs decode only, so FULL keeps
+    # FULL_DECODE_ONLY's sizes.
     cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
         max_num_seqs=500,
         expert_sequence_parallel_size=1,
         enable_sequence_parallel=False,
-        graph_prefill=False,
+        v2_model_runner=True,
     )
     assert cfg.cudagraph_capture_sizes == [1, 2, 4, 8, 16, 32, 64, 128, 256, 500]
+
+
+def test_cuda_graph_full_mode_on_v2_runner_with_vllm_compile_graphs_prefill():
+    # vLLM compile lets the V2 runner graph prefill piecewise; vLLM must know before
+    # compiling to wrap the compiled pieces.
+    cfg = VLLMCudaGraphConfig(
+        mode="FULL", vllm_compile=True
+    ).get_vllm_compilation_config(
+        max_num_seqs=500,
+        expert_sequence_parallel_size=1,
+        enable_sequence_parallel=False,
+        v2_model_runner=True,
+    )
+    assert cfg.cudagraph_mode.name == "FULL_AND_PIECEWISE"
+    assert cfg.cudagraph_capture_sizes[-1] == 2048
 
 
 def test_cuda_graph_rejects_nonpositive_max_num_seqs():
