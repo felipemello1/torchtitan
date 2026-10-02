@@ -5,13 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
-from importlib.metadata import version
 from unittest import mock
 
 import torch
 import torch.nn.functional as F
 from attn_gym.linear import l2norm, recurrent_gdn
-from packaging.version import Version
 from torch import nn
 
 from torchtitan.models.common.attention import (
@@ -589,8 +587,8 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         self._assert_fused_varlen_matches_per_document(atol=2e-2, rtol=2e-2)
 
     def test_cudnn_varlen_matches_independent_document_forwards(self):
-        if Version(version("nvidia-cutlass-dsl")) < Version("4.7"):
-            raise unittest.SkipTest("cuDNN GDN backend needs attn-gym[cudnn]")
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+            raise unittest.SkipTest("the cuDNN GDN backend needs SM100+")
         self._assert_fused_varlen_matches_per_document(
             atol=2e-2, rtol=2e-2, chunk_backend="cudnn"
         )

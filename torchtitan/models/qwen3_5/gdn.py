@@ -31,6 +31,7 @@ from torchtitan.models.common import Conv1d, Linear
 from torchtitan.models.common.attention import local_head_split, VarlenMetadata
 from torchtitan.models.common.norm import GatedRMSNorm
 from torchtitan.protocols.module import Module
+from torchtitan.tools.utils import has_cuda_capability
 
 # The Attention Gym kernels run on rank-local heads inside local SPMD regions
 # with no collectives. They mix tokens along the sequence, which is only correct
@@ -208,12 +209,12 @@ class GatedDeltaKernel(Module):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        chunk_backend: Literal["fused", "cudnn"] = "fused"
-        """Attention Gym backend for the chunked kernel; "cudnn" needs SM100+ and `attn-gym[cudnn]`."""
+        chunk_backend: Literal["fused", "cudnn"] | None = None
+        """Attention Gym chunk kernel. None picks "cudnn" on SM100+ and "fused" elsewhere."""
 
     def __init__(self, config: Config):
         super().__init__()
-        self.chunk_backend = config.chunk_backend
+        self.chunk_backend = resolve_chunk_backend(config.chunk_backend)
 
     def forward(
         self,
@@ -255,6 +256,15 @@ class GatedDeltaKernel(Module):
             kernel_options={"backend": self.chunk_backend},
         )
         return output.squeeze(0)
+
+
+def resolve_chunk_backend(
+    chunk_backend: Literal["fused", "cudnn"] | None,
+) -> Literal["fused", "cudnn"]:
+    """Attention Gym's cuDNN chunk kernel runs only on SM100+ (Blackwell)."""
+    if chunk_backend is not None:
+        return chunk_backend
+    return "cudnn" if has_cuda_capability(10, 0) else "fused"
 
 
 class InnerGatedDeltaNet(Module):
