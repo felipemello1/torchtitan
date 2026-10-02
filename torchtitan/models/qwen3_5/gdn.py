@@ -11,6 +11,7 @@
 # H = attention heads, K = query/key head dimension, V = value head dimension,
 # S = state slots, W = convolution kernel width.
 
+import functools
 from dataclasses import dataclass
 from typing import Literal
 
@@ -208,12 +209,12 @@ class GatedDeltaKernel(Module):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        chunk_backend: Literal["fused", "cudnn"] | None = None
-        """Attention Gym chunk kernel. None picks "cudnn" on SM100/SM103 and "fused" elsewhere."""
+        chunk_backend: Literal["auto", "fused", "cudnn"] = "auto"
+        """Attention Gym chunk kernel; "auto" picks "cudnn" on SM100/SM103, else "fused"."""
 
     def __init__(self, config: Config):
         super().__init__()
-        self.chunk_backend = resolve_chunk_backend(config.chunk_backend)
+        self.chunk_backend = config.chunk_backend
 
     def forward(
         self,
@@ -252,20 +253,27 @@ class GatedDeltaKernel(Module):
             cu_seqlens=cu_seqlens,
             scale=xq_BTHK.shape[-1] ** -0.5,
             impl="fused",
-            kernel_options={"backend": self.chunk_backend},
+            kernel_options={
+                "backend": resolve_chunk_backend(self.chunk_backend, xq_THK.device)
+            },
         )
         return output.squeeze(0)
 
 
 def resolve_chunk_backend(
-    chunk_backend: Literal["fused", "cudnn"] | None,
+    chunk_backend: Literal["auto", "fused", "cudnn"], device: torch.device
 ) -> Literal["fused", "cudnn"]:
-    """Attention Gym's cuDNN chunk kernel runs only on SM100 and SM103."""
-    if chunk_backend is not None:
+    """Resolve "auto" for the device the kernel runs on."""
+    if chunk_backend != "auto":
         return chunk_backend
-    return (
-        "cudnn" if torch.cuda.get_device_capability() in ((10, 0), (10, 3)) else "fused"
-    )
+    return _auto_chunk_backend(device.index)
+
+
+@functools.cache
+def _auto_chunk_backend(device_index: int) -> Literal["fused", "cudnn"]:
+    # Attention Gym's cuDNN chunk kernel runs only on SM100 and SM103.
+    capability = torch.cuda.get_device_capability(device_index)
+    return "cudnn" if capability in ((10, 0), (10, 3)) else "fused"
 
 
 class InnerGatedDeltaNet(Module):
