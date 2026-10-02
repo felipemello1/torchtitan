@@ -33,7 +33,8 @@ from attn_gym.linear import (
 )
 
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
-from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel, resolve_chunk_backend
+from torchtitan.models.common.linear_attention import resolve_chunk_backend
+from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel
 from torchtitan.protocols.module import Module
 from torchtitan.rl.model.gdn_backend import (
     GDNExecutionPath,
@@ -348,7 +349,7 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
                 has_initial_state=has_initial_state,
                 scale=self.head_k_dim**-0.5,
                 kernel_options={
-                    "backend": resolve_chunk_backend(self.chunk_backend, query.device)
+                    "backend": resolve_chunk_backend(self.chunk_backend, query)
                 },
             )
         output.copy_(recurrent_output[0].to(output.dtype))

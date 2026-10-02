@@ -11,9 +11,7 @@
 # H = attention heads, K = query/key head dimension, V = value head dimension,
 # S = state slots, W = convolution kernel width.
 
-import functools
 from dataclasses import dataclass
-from typing import Literal
 
 import spmd_types as spmd
 import torch
@@ -30,6 +28,10 @@ from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_g
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.models.common import Conv1d, Linear
 from torchtitan.models.common.attention import local_head_split, VarlenMetadata
+from torchtitan.models.common.linear_attention import (
+    ChunkBackend,
+    resolve_chunk_backend,
+)
 from torchtitan.models.common.norm import GatedRMSNorm
 from torchtitan.protocols.module import Module
 
@@ -209,8 +211,8 @@ class GatedDeltaKernel(Module):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        chunk_backend: Literal["auto", "fused", "cudnn"] = "auto"
-        """Attention Gym chunk kernel; "auto" picks "cudnn" on SM100/SM103, else "fused"."""
+        chunk_backend: ChunkBackend = "auto"
+        """Attention Gym chunk kernel; "auto" picks "cudnn" for fp16/bf16 on SM100/SM103, else "fused"."""
 
     def __init__(self, config: Config):
         super().__init__()
@@ -254,26 +256,10 @@ class GatedDeltaKernel(Module):
             scale=xq_BTHK.shape[-1] ** -0.5,
             impl="fused",
             kernel_options={
-                "backend": resolve_chunk_backend(self.chunk_backend, xq_THK.device)
+                "backend": resolve_chunk_backend(self.chunk_backend, xq_THK)
             },
         )
         return output.squeeze(0)
-
-
-def resolve_chunk_backend(
-    chunk_backend: Literal["auto", "fused", "cudnn"], device: torch.device
-) -> Literal["fused", "cudnn"]:
-    """Resolve "auto" for the device the kernel runs on."""
-    if chunk_backend != "auto":
-        return chunk_backend
-    return _auto_chunk_backend(device.index)
-
-
-@functools.cache
-def _auto_chunk_backend(device_index: int) -> Literal["fused", "cudnn"]:
-    # Attention Gym's cuDNN chunk kernel runs only on SM100 and SM103.
-    capability = torch.cuda.get_device_capability(device_index)
-    return "cudnn" if capability in ((10, 0), (10, 3)) else "fused"
 
 
 class InnerGatedDeltaNet(Module):
