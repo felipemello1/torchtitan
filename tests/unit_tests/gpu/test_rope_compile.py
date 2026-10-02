@@ -12,6 +12,12 @@ from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.models.common.rope import CosSinRoPE
 from torchtitan.models.qwen3_5.rope import MRoPE
 
+# Inductor's Triton kernel contracts ``x * cos + rotate_half(x) * sin`` into an FMA,
+# which removes one fp32 rounding (two roundings vs eager's three). Under
+# cancellation that moves the bf16 result by 1 ulp, so compiled and eager agree to
+# about one bf16 ulp (2**-7 relative), not bitwise.
+ABOUT_ONE_BF16_ULP = {"rtol": 2**-7, "atol": 1e-6}
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestRoPELocalCompile(unittest.TestCase):
@@ -112,7 +118,7 @@ class TestRoPELocalCompile(unittest.TestCase):
             (*eager_outputs, *eager_grads),
             strict=True,
         ):
-            torch.testing.assert_close(compiled, eager, rtol=0, atol=0)
+            torch.testing.assert_close(compiled, eager, **ABOUT_ONE_BF16_ULP)
 
     def test_forward_and_backward_are_batch_invariant(self):
         torch.manual_seed(42)
@@ -238,7 +244,7 @@ class TestRoPELocalCompile(unittest.TestCase):
             (*eager_outputs, *eager_grads),
             strict=True,
         ):
-            torch.testing.assert_close(compiled, eager, rtol=0, atol=0)
+            torch.testing.assert_close(compiled, eager, **ABOUT_ONE_BF16_ULP)
 
 
 if __name__ == "__main__":
