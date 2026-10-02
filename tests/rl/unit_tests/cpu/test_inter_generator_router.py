@@ -249,7 +249,7 @@ def test_sticky_session_assigns_new_generator_when_sticky_target_is_syncing():
     asyncio.run(_run())
 
 
-def test_sticky_session_places_new_group_sessions_on_the_group_candidate():
+def test_sticky_session_places_new_group_sessions_on_the_group_generator():
     async def _run():
         actors = [_Actor(f"gen{i}", wait_generate=True) for i in range(2)]
         router = _router(

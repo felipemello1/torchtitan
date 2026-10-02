@@ -137,10 +137,10 @@ class StickySessionRoutingStrategy(RoutingStrategy):
         """Routing strategy used for new sessions and requests without a session."""
 
         group_slack: int | None = None
-        """When set, a new session joins its group's first candidate, so siblings share
-        the group's prompt KV, unless that candidate's load exceeds the fallback's
-        choice by more than `group_slack`. None places every new session with
-        `fallback_strategy`."""
+        """When set, a new session joins the candidate of its group's first session (so
+        siblings share the group's prompt KV) while that candidate's load is within
+        `group_slack` of the least loaded, e.g. `num_samples_per_prompt - 1`. With
+        generator DP > 1, set it on both routing layers. None disables it."""
 
         def __post_init__(self):
             if self.max_sessions <= 0:
@@ -164,7 +164,8 @@ class StickySessionRoutingStrategy(RoutingStrategy):
         """Return the session's assigned candidate, or assign a new one.
 
         Unpinned requests (no ``session_id``) and first-seen sessions defer to
-        the fallback strategy; a session's first assignment is then remembered so
+        the fallback strategy, or with ``group_slack`` first try their group's
+        candidate; a session's first assignment is then remembered so
         every later request with that key reuses the same candidate. If a
         session's pinned candidate is no longer available (e.g. a mesh draining
         for a weight sync), the request falls back and the session is re-pinned to
@@ -185,23 +186,26 @@ class StickySessionRoutingStrategy(RoutingStrategy):
                 self._sessions.move_to_end(routing_ctx.session_id)
                 return sticky_candidate
 
-        # New session, or the pinned candidate is unavailable: choose via the
-        # fallback and (re)pin the session to that candidate.
-        chosen = self._fallback_strategy.choose(routing_ctx, candidates)
-        if self._group_slack is not None and routing_ctx.group_id is not None:
-            # Join the group's first candidate while it is within group_slack of the
-            # fallback's choice, so siblings share the group's prompt KV.
-            group_candidate = self._group_candidates.setdefault(
-                routing_ctx.group_id, chosen
-            )
-            if (
-                any(h is group_candidate for h in candidates)
-                and group_candidate.reserved_load
-                <= chosen.reserved_load + self._group_slack
-            ):
-                chosen = group_candidate
-            if len(self._group_candidates) > self._max_sessions:
-                self._group_candidates.popitem(last=False)
+        # New session, or the pinned candidate is unavailable: join the group's
+        # candidate while it is still a candidate and within group_slack of the least
+        # loaded, else choose via the fallback; then (re)pin the session.
+        group_candidate = self._group_candidates.get(routing_ctx.group_id)
+        if (
+            group_candidate is not None
+            and any(h is group_candidate for h in candidates)
+            and group_candidate.reserved_load
+            <= min(h.reserved_load for h in candidates) + self._group_slack
+        ):
+            chosen = group_candidate
+        else:
+            # Only consult the fallback when its pick is used, so its state (e.g. the
+            # least-loaded tie-break) tracks real placements.
+            chosen = self._fallback_strategy.choose(routing_ctx, candidates)
+            if self._group_slack is not None and routing_ctx.group_id is not None:
+                # The group's first session seeds its candidate; oldest groups go first.
+                self._group_candidates.setdefault(routing_ctx.group_id, chosen)
+                if len(self._group_candidates) > self._max_sessions:
+                    self._group_candidates.popitem(last=False)
         self._sessions[routing_ctx.session_id] = chosen
         # End of the dict means it's the most-recently-used session.
         self._sessions.move_to_end(routing_ctx.session_id)
