@@ -99,6 +99,7 @@ def kimi_k3_debugmodel(
             regions=[
                 *LocalCompileConfig().regions,
                 "attention_residual",
+                "moe_dispatch_combine",
             ]
         ),
         loss=ChunkedLossWrapper.Config(
