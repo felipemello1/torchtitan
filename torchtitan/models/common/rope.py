@@ -186,7 +186,13 @@ class ComplexRoPE(RoPE):
     class Config(RoPE.Config):
         pass
 
-    @local_compile("complex_rope", batch_invariant=True)
+    # Lower the real/imag stack as per-half copies: Inductor's default masked
+    # pointwise stack kernel is about 1.7x slower here (GB300).
+    @local_compile(
+        "complex_rope",
+        batch_invariant=True,
+        options={"max_pointwise_cat_inputs": 0, "max_complex_pointwise_cat_inputs": 0},
+    )
     def forward(
         self,
         query: torch.Tensor,
@@ -283,10 +289,10 @@ class ComplexRoPE(RoPE):
             cos, sin = cache[..., 0], cache[..., 1]
             if inverse:
                 sin = -sin
-            query_out = ComplexRoPE._rotate_pairs(query, cos, sin)
+            query_out = _RotatePairs.apply(query, cos, sin)
             if key is None:
                 return query_out
-            return query_out, ComplexRoPE._rotate_pairs(key, cos, sin)
+            return query_out, _RotatePairs.apply(key, cos, sin)
 
         if inverse:
             rope_cache = rope_cache.conj()
@@ -300,17 +306,42 @@ class ComplexRoPE(RoPE):
         key_out = torch.view_as_real(xk_ * rope_cache).flatten(-2).type_as(key)
         return query_out, key_out
 
+
+def _rotate_pairs(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """Rotate each ``(x[2i], x[2i + 1])`` pair by the angle with ``cos[i]``, ``sin[i]``."""
+    x_pairs = x.float().unflatten(-1, (-1, 2))
+    x_real, x_imag = x_pairs[..., 0], x_pairs[..., 1]
+    # Cast each half before the stack so the stack writes the output dtype directly.
+    rotated = torch.stack(
+        (
+            (x_real * cos - x_imag * sin).type_as(x),
+            (x_real * sin + x_imag * cos).type_as(x),
+        ),
+        dim=-1,
+    )
+    return rotated.flatten(-2)
+
+
+class _RotatePairs(torch.autograd.Function):
+    """``_rotate_pairs``; the gradient of a rotation is the rotation by the opposite angle.
+
+    Spelled out so the backward is one strided-copy kernel like the forward,
+    instead of the masked ``select_backward`` kernel autograd would build.
+    """
+
     @staticmethod
-    def _rotate_pairs(
-        x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> torch.Tensor:
-        """Rotate each ``(x[2i], x[2i + 1])`` pair by the angle with ``cos[i]``, ``sin[i]``."""
-        x_pairs = x.float().unflatten(-1, (-1, 2))
-        x_real, x_imag = x_pairs[..., 0], x_pairs[..., 1]
-        rotated = torch.stack(
-            (x_real * cos - x_imag * sin, x_real * sin + x_imag * cos), dim=-1
-        )
-        return rotated.flatten(-2).type_as(x)
+        ctx.save_for_backward(cos, sin)
+        return _rotate_pairs(x, cos, sin)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):  # pyrefly: ignore[bad-override]
+        cos, sin = ctx.saved_tensors
+        return _rotate_pairs(grad, cos, -sin), None, None
 
 
 class CosSinRoPE(RoPE):
