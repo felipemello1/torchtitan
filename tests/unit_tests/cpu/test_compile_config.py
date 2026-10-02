@@ -4,11 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
+import re
+
 import pytest
 import torch
 
 from torchtitan.components.loss import cross_entropy_loss, mse_loss
 from torchtitan.distributed.local_compile import local_compile, LocalCompileConfig
+from torchtitan.models.common.activation import SiTUGLU, SwiGLU
 
 
 @pytest.fixture(autouse=True)
@@ -133,3 +137,49 @@ def test_loss_functions_use_local_compile(monkeypatch) -> None:
     LocalCompileConfig(regions=["loss"]).apply_local_compile()
 
     assert compiled_names == [cross_entropy_loss.__name__, mse_loss.__name__]
+
+
+@pytest.mark.parametrize(
+    "region, activation",
+    [("swiglu", SwiGLU.Config()), ("situglu", SiTUGLU.Config(beta=4.0))],
+)
+def test_glu_regions_keep_hidden_size_static(monkeypatch, region, activation) -> None:
+    graph_gate_shapes = []
+
+    def record_gate_shape(gm, example_inputs):
+        del example_inputs
+        gate = next(
+            node.meta["example_value"]
+            for node in gm.graph.find_nodes(op="placeholder")
+            if isinstance(node.meta["example_value"], torch.Tensor)
+        )
+        # "(s68, 48)" -> "(s, 48)": symbol names vary across runs.
+        shape = str(tuple(gate.shape))
+        graph_gate_shapes.append(re.sub(r"s\d+", "s", shape))
+        return gm.forward
+
+    torch._dynamo.reset()
+    try:
+        monkeypatch.setattr(
+            torch,
+            "compile",
+            functools.partial(torch.compile, backend=record_gate_shape),
+        )
+        LocalCompileConfig(regions=[region]).apply_local_compile()
+        act = activation.build()
+
+        def call(rows: int, hidden: int) -> None:
+            gate, up = torch.randn(rows, 2, hidden).unbind(-2)
+            act(gate, up)
+
+        # Two hidden sizes (e.g. dense and shared expert) at two token counts.
+        for tokens in (8, 4):
+            for _ in range(2):
+                call(tokens, 48)
+                call(tokens, 16)
+
+        # The hidden size stays static: one graph per hidden size, first with a
+        # static and then with a dynamic token count.
+        assert graph_gate_shapes == ["(8, 48)", "(8, 16)", "(s, 48)", "(s, 16)"]
+    finally:
+        torch._dynamo.reset()
