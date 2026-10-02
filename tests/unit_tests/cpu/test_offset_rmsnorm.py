@@ -18,4 +18,5 @@ def test_qwen35_architecture_enables_offset_rmsnorm_local_compile() -> None:
             "cos_sin_rope",
             "gated_rmsnorm",
             "offset_rmsnorm",
+            "partial_rope",
         ]
