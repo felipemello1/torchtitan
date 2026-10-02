@@ -22,7 +22,7 @@ _HAS_ATTENTION_GYM_KDA = (
 )
 
 
-def _kda_config() -> KDA.Config:
+def _kda_config(chunk_backend: str) -> KDA.Config:
     def linear(in_features: int, out_features: int) -> Linear.Config:
         return Linear.Config(
             in_features=in_features,
@@ -57,7 +57,7 @@ def _kda_config() -> KDA.Config:
         output_gate=linear(32, projection_dim),
         inner_kda=InnerKDA.Config(
             head_dim=128,
-            kernel=KDAKernel.Config(),
+            kernel=KDAKernel.Config(chunk_backend=chunk_backend),
         ),
         output_norm=GatedRMSNorm.Config(
             dim=128,
@@ -72,8 +72,8 @@ def _kda_config() -> KDA.Config:
     _HAS_ATTENTION_GYM_KDA, "KDA requires Attention Gym on CUDA capability 9.0+"
 )
 class TestKDA(unittest.TestCase):
-    def _make_kda(self):
-        model = _kda_config().build()
+    def _make_kda(self, chunk_backend: str):
+        model = _kda_config(chunk_backend).build()
         model = model.to(device="cuda", dtype=torch.bfloat16)
         torch.manual_seed(1)
         with torch.no_grad():
@@ -89,6 +89,14 @@ class TestKDA(unittest.TestCase):
         return torch.randn(tokens, 32, device="cuda", dtype=torch.bfloat16)
 
     def test_varlen_matches_independent_documents(self):
+        self._assert_varlen_matches_independent_documents("fused")
+
+    def test_cudnn_varlen_matches_independent_documents(self):
+        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+            raise unittest.SkipTest("the cuDNN KDA backend needs SM100 or SM103")
+        self._assert_varlen_matches_independent_documents("cudnn")
+
+    def _assert_varlen_matches_independent_documents(self, chunk_backend: str):
         lengths = (37, 64, 91)
         x_TD = self._inputs(seed=2, tokens=sum(lengths)).requires_grad_()
         positions_T = torch.tensor(
@@ -98,7 +106,7 @@ class TestKDA(unittest.TestCase):
         )
         masks = create_varlen_metadata_for_document(positions_T)
 
-        model = self._make_kda()
+        model = self._make_kda(chunk_backend)
         packed_TD = model(x_TD, masks)
         independent_TD = torch.cat(
             [model(document_TD, None) for document_TD in x_TD.split(lengths)]
