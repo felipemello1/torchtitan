@@ -63,6 +63,9 @@ class TestAttentionRoPELocalCompile(unittest.TestCase):
         )
         for actual, expected in zip(compiled, eager, strict=True):
             torch.testing.assert_close(actual, expected)
+        # o is stored group-major so wo_a's einsum runs a plain bmm.
+        self.assertTrue(compiled[0].transpose(0, 1).is_contiguous())
+        self.assertTrue(eager[0].transpose(0, 1).is_contiguous())
 
 
 if __name__ == "__main__":
