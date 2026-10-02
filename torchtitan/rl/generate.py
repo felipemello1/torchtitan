@@ -164,7 +164,7 @@ def generate() -> None:
         max_num_batched_tokens=gen_config.max_num_batched_tokens,
         expert_sequence_parallel_size=expert_sequence_parallel_size,
         enable_sequence_parallel=gen_config.parallelism.enable_sequence_parallel,
-        graph_prefill=not use_v2,
+        v2_model_runner=use_v2,
     )
     if vllm_compilation_config is not None:
         engine_kwargs["compilation_config"] = vllm_compilation_config
