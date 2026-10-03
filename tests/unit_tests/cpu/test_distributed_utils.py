@@ -364,7 +364,7 @@ def test_mesh_stack_compiles_with_checkpoint_on_fresh_thread() -> None:
             output = compiled_forward(input)
             output.sum().backward()
             results.append(torch.equal(output, input + 1))
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             results.append(error)
 
     thread = threading.Thread(target=run)

@@ -54,10 +54,11 @@ __all__ = [
 class _MeshTLS(local):
     """Per-thread mesh state whose ``mesh_stack`` exists in every thread.
 
-    Creating the stack lazily (``getattr`` then store) is a side effect that
-    Dynamo cannot trace inside a ``torch.utils.checkpoint`` region, so a
-    compiled, checkpointed function that runs before any eager mesh activation
-    in its thread would graph break.
+    Creating the stack lazily (``getattr`` then store) breaks compiled code that
+    reaches it inside a ``torch.utils.checkpoint`` region first: to allow the
+    store, Dynamo reads the attribute's current value, which does not exist yet.
+    Under ``fullgraph=True`` that is an error; otherwise Dynamo runs the whole
+    frame eagerly on every call.
     """
 
     def __init__(self) -> None:
