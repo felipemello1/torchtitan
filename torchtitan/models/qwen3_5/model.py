@@ -81,8 +81,39 @@ class OffsetRMSNorm(Module):
         self.eps = config.eps
         self.weight = nn.Parameter(torch.empty(config.dim))
 
-    @local_compile("offset_rmsnorm", batch_invariant=False)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # maybe_mark_dynamic is not allowed inside a Dynamo trace (e.g. whole-block compile).
+        if not torch.compiler.is_compiling():
+            # Mark T dynamic, so _normalize keeps one graph per layout.
+            # It sees three layouts (Qwen3.5-35B-A3B shapes):
+            #
+            #     attention_norm, ffn_norm, norm:  x [T, 2048]
+            #     q_norm:                          x [T, 16, 256], strided (a chunk of wq's output)
+            #     k_norm:                          x [T, 2, 256]
+            #
+            # Without the mark, layouts recompile when T changes, and the 9th graph
+            # is an error (limit 8, fullgraph=True):
+            #
+            #     train    T=16k  3 graphs  one per layout
+            #     train    T=8k   5         T changed: recompile for any T
+            #     train    T=2k   6         T < 4096: see _normalize
+            #     no_grad  T=16k  9         grad mode changed -> FailOnRecompileLimitHit
+            #
+            # With the mark and non-strict mode, each layout compiles once for any T >= 2:
+            # 3 layouts x 2 grad modes = 6 graphs.
+            torch._dynamo.maybe_mark_dynamic(x, 0)
+            # Keep the normalized dim constant; a 2D -> 3D change can make it dynamic.
+            torch._dynamo.mark_static(x, x.ndim - 1)  # -1 is not resolved
+        return self._normalize(x)
+
+    # Inductor fuses the backward's reductions only for large inputs (T >= 4096 at dim 2048)
+    # and guards the graph on that check; non-strict mode skips it, so short batches reuse it.
+    @local_compile(
+        "offset_rmsnorm",
+        batch_invariant=False,
+        options={"triton.mix_order_reduction_non_strict_mode": True},
+    )
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
         # Upcast to float32 for numerical stability in pow/rsqrt
         input_dtype = x.dtype
         x = x.float()

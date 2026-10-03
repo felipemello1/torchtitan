@@ -92,6 +92,40 @@ class TestOffsetRMSNormCompile(unittest.TestCase):
         torch.testing.assert_close(grad_x, reference_grad_x)
         torch.testing.assert_close(grad_weight, reference_grad_weight)
 
+    def test_layer_and_qk_norms_fit_recompile_limit(self):
+        # Qwen3.5-35B-A3B call sites: [T, D] layer norms, the q norm on a strided
+        # chunk of wq's output and the k norm, for several T, then no_grad.
+        dim, n_heads, n_kv_heads, head_dim = 2048, 16, 2, 256
+        layer_norm = OffsetRMSNorm.Config(dim=dim).build().cuda().to(torch.bfloat16)
+        qk_norm = OffsetRMSNorm.Config(dim=head_dim).build().cuda().to(torch.bfloat16)
+
+        def run(num_tokens: int, requires_grad: bool) -> None:
+            def rand(*shape: int) -> torch.Tensor:
+                return torch.randn(
+                    *shape,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    requires_grad=requires_grad,
+                )
+
+            q, _ = rand(num_tokens, n_heads, 2 * head_dim).chunk(2, dim=-1)
+            outputs = [
+                layer_norm(rand(num_tokens, dim)),
+                qk_norm(q),
+                qk_norm(rand(num_tokens, n_kv_heads, head_dim)),
+            ]
+            if requires_grad:
+                sum(output.float().sum() for output in outputs).backward()
+
+        # One graph per call-site layout and grad mode: 3 x 2, the expected count
+        # (the default limit is 8).
+        with torch._dynamo.config.patch(recompile_limit=6):
+            for num_tokens in (16384, 8192, 2048):
+                run(num_tokens, requires_grad=True)
+            with torch.no_grad():
+                for num_tokens in (16384, 4096, 2048):
+                    run(num_tokens, requires_grad=False)
+
 
 @unittest.skipUnless(torch.cuda.device_count() >= 2, "requires two CUDA devices")
 class TestOffsetRMSNormTensorParallel(DTensorTestBase):
