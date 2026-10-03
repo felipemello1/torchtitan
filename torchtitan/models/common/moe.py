@@ -275,10 +275,11 @@ class TokenChoiceTopKRouter(Module):
             routing_map_TE,
         )
 
-    # Off by default: QuantileBalancedTopKRouter's selection keeps remat state and
-    # buffer updates that this region has not been validated with. The expert counts
-    # and the aux loss stay in forward: under compile torch_remat.is_recomputing() is
-    # always False, so a RegionAC recompute pass would count them twice.
+    # Compiled only when "router" is listed in compile.regions (not a default region).
+    # Not validated with QuantileBalancedTopKRouter, whose selection keeps remat state
+    # and buffer updates. The expert counts and the aux loss stay in forward: under
+    # compile torch_remat.is_recomputing() is always False, so a RegionAC recompute
+    # pass would count them twice.
     @local_compile("router", batch_invariant=False)
     def _route(
         self,
@@ -295,6 +296,13 @@ class TokenChoiceTopKRouter(Module):
             topk_scores_TK: Routing scores ``(T, K)``.
             topk_expert_ids_TK: Expert indices ``(T, K)``.
             routing_map_TE: One-hot boolean routing map ``(T, E)``.
+
+        Example:
+            >>> scores_TE, scores_TK, ids_TK, map_TE = router._route(
+            ...     x_TD, expert_bias_E, padding_mask_T=None
+            ... )
+            >>> map_TE.sum(dim=-1)  # K experts per token
+            tensor([8, 8, ..., 8])
         """
         # RouterGateLinear returns FP32, so configured scoring runs in FP32.
         scores_TE = self.score_func(self.gate(x_TD))
@@ -639,6 +647,11 @@ class MicrobatchWiseLoadBalanceLoss(AuxLoss):
         Returns:
             counts_E: Routed-token count per expert ``(E,)``, in the scores' dtype.
             probs_E: Sum over tokens of the L1-normalized scores ``(E,)``.
+
+        Example:
+            >>> counts_E, probs_E = loss._token_sums(scores_TE, routing_map_TE, None)
+            >>> counts_E.sum() == routing_map_TE.sum(), probs_E.sum() == len(scores_TE)
+            (tensor(True), tensor(True))
         """
         # The map is cast to float before the reduction: casting a Partial
         # tensor is non-linear and rejected by spmd_types.

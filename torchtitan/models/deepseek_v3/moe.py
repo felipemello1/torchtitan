@@ -47,6 +47,17 @@ class DeepSeekV3Router(TokenChoiceTopKRouter):
         super().__init__(config)
         self.num_expert_groups = config.num_expert_groups
         self.num_limited_groups = config.num_limited_groups
+        if self.num_expert_groups is not None and self.num_limited_groups is not None:
+            # The masked top-k needs top_k finite candidates in the selected groups.
+            num_candidates = self.num_limited_groups * (
+                self.num_experts // self.num_expert_groups
+            )
+            if num_candidates < self.top_k:
+                raise ValueError(
+                    f"num_limited_groups ({self.num_limited_groups}) groups of "
+                    f"{self.num_experts // self.num_expert_groups} experts hold fewer "
+                    f"than top_k ({self.top_k}) experts"
+                )
 
     def _select_experts(
         self,
