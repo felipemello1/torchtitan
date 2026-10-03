@@ -187,7 +187,7 @@ class ComplexRoPE(RoPE):
         pass
 
     # Lower the real/imag stack in _rotate_pairs as per-half copies instead of
-    # Inductor's masked pointwise stack: 1.09-1.24x faster fwd+bwd across RoPE
+    # Inductor's masked pointwise stack: 1.08-1.20x faster fwd+bwd across RoPE
     # shapes (GB300). It relies on the per-half cast there; without it the
     # option adds an fp32 -> bf16 copy and is slower.
     @local_compile(
