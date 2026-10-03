@@ -16,6 +16,11 @@ from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
 )
+from torch.utils.checkpoint import (
+    checkpoint,
+    CheckpointPolicy,
+    create_selective_checkpoint_contexts,
+)
 
 from torchtitan.config import apply_overrides, OverrideConfig
 from torchtitan.models.common.attention import FlexInnerAttention
@@ -570,6 +575,80 @@ class TestFusedMLANumerics(unittest.TestCase):
                 reduction=True,
                 msg=f"parameter gradient differs: {name}",
             )
+
+    def test_selective_checkpointing_matches_no_checkpointing(self):
+        """Selective AC caches the Q projection output for recompute.
+
+        Q RoPE must then rotate out of place: rotating the cached output in
+        place would rotate it again during recompute.
+        """
+        torch.manual_seed(42)
+        config = deepseek_v3_debugmodel(seq_len=2048)
+        apply_overrides(
+            OverrideConfig(
+                imports=["torchtitan_recipes.overrides.fused_mla.fused_mla"]
+            ),
+            config,
+        )
+        model_config = cast(DeepSeekV3Model.Config, config.model)
+        attention_config = cast(Attention.Config, model_config.layers[0].attention)
+        attention = attention_config.build().to(self.positions.device)
+        with torch.no_grad():
+            for name, parameter in attention.named_parameters():
+                if "norm.weight" in name:
+                    parameter.fill_(1.0)
+                else:
+                    parameter.normal_(mean=0.0, std=0.02)
+        attention_mask = create_block_mask(
+            lambda batch_idx, head_idx, query_idx, key_value_idx: (
+                query_idx >= key_value_idx
+            ),
+            B=None,
+            H=None,
+            Q_LEN=self.num_tokens,
+            KV_LEN=self.num_tokens,
+            device=self.positions.device,
+        )
+        x = torch.randn(
+            self.num_tokens,
+            attention_config.dim,
+            device=self.positions.device,
+            dtype=torch.float32,
+        )
+        grad_out = torch.randn_like(x)
+
+        def save_matmuls(ctx, func, *args, **kwargs) -> CheckpointPolicy:
+            if func in (torch.ops.aten.mm.default, torch.ops.aten.addmm.default):
+                return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.PREFER_RECOMPUTE
+
+        def forward_backward(selective_checkpointing: bool):
+            attention.zero_grad(set_to_none=True)
+            x_leaf = x.clone().requires_grad_()
+
+            def run(inputs: torch.Tensor) -> torch.Tensor:
+                return attention(
+                    inputs, attention_masks=attention_mask, positions=self.positions
+                )
+
+            if selective_checkpointing:
+                output = checkpoint(
+                    run,
+                    x_leaf,
+                    use_reentrant=False,
+                    context_fn=lambda: create_selective_checkpoint_contexts(
+                        save_matmuls
+                    ),
+                )
+            else:
+                output = run(x_leaf)
+            output.backward(grad_out)
+            return [x_leaf.grad] + [p.grad for p in attention.parameters()]
+
+        for expected, actual in zip(
+            forward_backward(False), forward_backward(True), strict=True
+        ):
+            self.assert_dtype_close(actual, expected, torch.float32, reduction=True)
 
 
 instantiate_parametrized_tests(TestFusedMLANumerics)

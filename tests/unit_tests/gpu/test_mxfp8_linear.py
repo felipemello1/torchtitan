@@ -15,7 +15,10 @@ pytest.importorskip("torchao.prototype.moe_training.kernels.mxfp8")
 
 import torchtitan.quantization.mxfp8.linear as mxfp8_linear  # noqa: E402
 from torchtitan.quantization._fsdp_tensor import _UnshardedFSDPTensor  # noqa: E402
-from torchtitan.quantization.mxfp8.linear import MXFP8Linear  # noqa: E402
+from torchtitan.quantization.mxfp8.linear import (  # noqa: E402
+    mxfp8_linears_shared_input,
+    MXFP8Linear,
+)
 from torchtitan.quantization.mxfp8.tensor import (  # noqa: E402
     _LinearShardedTensorWithMXFP8Compute,
 )
@@ -624,3 +627,56 @@ def test_mxfp8_fused_wgrad_accum_matches_ordinary_accumulation(num_linears, grad
 
     relative_error = (fused - ordinary).norm() / ordinary.norm()
     assert relative_error < 1e-2, f"relative L2 error {relative_error:.5f}"
+
+
+@pytest.mark.parametrize("input_activation_format_for_backward", ["bf16", "mxfp8"])
+def test_mxfp8_linears_shared_input_matches_separate_linears(
+    input_activation_format_for_backward,
+):
+    """Sharing the input's quantization changes no output or gradient.
+
+    The second backward folds WGRAD into the running ``.grad`` in place.
+    """
+    torch.manual_seed(0)
+    out_features = (96, 64)
+    separate = [
+        _make_sharded_mxfp8_linear(
+            out_features=size,
+            bias=False,
+            input_activation_format_for_backward=input_activation_format_for_backward,
+        )
+        for size in out_features
+    ]
+    shared = [
+        _make_sharded_mxfp8_linear(
+            out_features=size,
+            bias=False,
+            input_activation_format_for_backward=input_activation_format_for_backward,
+        )
+        for size in out_features
+    ]
+    for shared_linear, separate_linear in zip(shared, separate, strict=True):
+        shared_linear.load_state_dict(separate_linear.state_dict())
+    for linear in (*separate, *shared):
+        _install_unsharded_weight(linear)
+
+    x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    grad_outputs = [
+        torch.randn(64, size, device="cuda", dtype=torch.bfloat16)
+        for size in out_features
+    ]
+    separate_x = x.clone().requires_grad_()
+    shared_x = x.clone().requires_grad_()
+    for _ in range(2):
+        separate_outputs = [linear(separate_x) for linear in separate]
+        shared_outputs = mxfp8_linears_shared_input(shared_x, shared)
+        torch.autograd.backward(separate_outputs, grad_outputs)
+        torch.autograd.backward(shared_outputs, grad_outputs)
+        for separate_output, shared_output in zip(
+            separate_outputs, shared_outputs, strict=True
+        ):
+            assert torch.equal(separate_output, shared_output)
+
+    assert torch.equal(separate_x.grad, shared_x.grad)
+    for separate_linear, shared_linear in zip(separate, shared, strict=True):
+        assert torch.equal(separate_linear.weight.grad, shared_linear.weight.grad)

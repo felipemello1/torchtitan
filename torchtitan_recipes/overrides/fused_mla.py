@@ -58,9 +58,13 @@ The implementation differs from Megatron Core in several important ways:
 The override keeps the stock Attention parameters and state-dict layout.  It
 only replaces the Q/KV layout boundary around ComplexRoPE:
 
-* Q RoPE rotates the positional tail of the Q projection into a new tensor.
-  The backward rotates its gradient in place, which is safe because
-  once_differentiable runs it outside the autograd graph.
+* Q RoPE rotates the positional tail of the Q projection in place when the
+  projection output is its own tensor and no activation checkpointing or
+  tracing mode is active, and into a new tensor otherwise. The backward
+  rotates its gradient in place, which is safe because once_differentiable
+  runs it outside the autograd graph.
+* With MXFP8 projections, the two down projections that read the attention
+  input (``wq_a`` or ``wq``, and ``wkv_a``) share one quantization of it.
 * K RoPE, head expansion, and final K materialization are one Triton kernel.
 * V remains a view of the packed KV projection (no extra forward copy).
 * KV backward packs dK-nope and dV while reducing/inverse-rotating dK-pos.
@@ -79,11 +83,13 @@ from torchtitan.config import derive, override
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.rope import _maybe_check_max_pos, ComplexRoPE
 from torchtitan.models.deepseek_v3.model import Attention
+from torchtitan.quantization.mxfp8 import mxfp8_linears_shared_input, MXFP8Linear
 
 __all__ = [
     "FusedMLAAttention",
     "fused_mla",
     "fused_mla_q",
+    "fused_mla_q_",
     "fused_mla_kv",
 ]
 
@@ -833,6 +839,51 @@ class _FusedMLAQ(torch.autograd.Function):
         return grad_q, None, None, None
 
 
+class _FusedMLAQInPlace(torch.autograd.Function):
+    """``_FusedMLAQ`` rotating a 2D ``(L, H * D)`` query projection in place.
+
+    Skips the full Q copy ``_FusedMLAQ`` makes. Only valid when ``q`` is the
+    projection's own output (no view) and no activation checkpointing has
+    cached it; see ``_can_rotate_q_in_place``.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        rope_cache_real: torch.Tensor,
+        positions: torch.Tensor,
+        q_head_dim: int,
+        q_nope_dim: int,
+    ) -> torch.Tensor:
+        ctx.q_head_dim = q_head_dim
+        ctx.q_nope_dim = q_nope_dim
+        ctx.save_for_backward(rope_cache_real, positions)
+        _fused_mla_q_rope_op(
+            q.view(1, q.shape[0], -1, q_head_dim),
+            rope_cache_real,
+            positions,
+            q_nope_dim,
+            False,
+        )
+        ctx.mark_dirty(q)
+        return q
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_q: torch.Tensor):
+        rope_cache_real, positions = ctx.saved_tensors
+        grad_q = grad_q.contiguous()
+        _fused_mla_q_rope_op(
+            grad_q.view(1, grad_q.shape[0], -1, ctx.q_head_dim),
+            rope_cache_real,
+            positions,
+            ctx.q_nope_dim,
+            True,
+        )
+        return grad_q, None, None, None, None
+
+
 class _FusedMLAKV(torch.autograd.Function):
     @staticmethod
     def spmd_typecheck(
@@ -926,6 +977,51 @@ def fused_mla_q(
     return _FusedMLAQ.apply(q, cache_real, positions_local, q_nope_dim)
 
 
+def fused_mla_q_(
+    q: torch.Tensor,
+    rope_cache: torch.Tensor,
+    positions: torch.Tensor | None,
+    q_head_dim: int,
+    q_nope_dim: int,
+) -> torch.Tensor:
+    """In-place ``fused_mla_q`` on a 2D ``(L, H * D)`` query projection.
+
+    Args:
+        q: Query projection output; must pass ``_can_rotate_q_in_place``.
+        rope_cache: Complex-valued rotary cache.
+        positions: Optional token positions.
+        q_head_dim: Dimensions per query head.
+        q_nope_dim: Non-positional dimensions in each query head.
+
+    Returns:
+        ``q``, with each head's positional tail rotated.
+    """
+    positions_local = _resolve_positions(positions, q.unsqueeze(0))
+    cache_real = torch.view_as_real(rope_cache).contiguous()
+    return _FusedMLAQInPlace.apply(
+        q, cache_real, positions_local, q_head_dim, q_nope_dim
+    )
+
+
+def _can_rotate_q_in_place(q: torch.Tensor) -> bool:
+    """Whether ``fused_mla_q_`` may rotate the query projection output ``q``.
+
+    In place needs ``q`` to be the projection's own contiguous output: on a
+    view, autograd records a ``CopySlices`` (see ``_FusedMLAQ``). It also needs
+    no TorchDispatchMode, because selective and full activation checkpointing
+    run forward under one that may cache the projection output for recompute,
+    and tracing modes record the out-of-place op instead. Type checking keeps
+    the 4D layout ``_FusedMLAQ`` checks.
+    """
+    return (
+        q._base is None
+        and q.is_contiguous()
+        and torch._C._len_torch_dispatch_stack() == 0
+        and not torch.compiler.is_compiling()
+        and not spmd.is_type_checking()
+    )
+
+
 def fused_mla_kv(
     kv: torch.Tensor,
     k_pe: torch.Tensor,
@@ -971,33 +1067,47 @@ class FusedMLAAttention(Attention):
 
         x = self._gather_tp_input(x)
         num_tokens = x.shape[0]
-        if self.q_lora_rank == 0:
-            q = self.wq(x)
+        # Both down projections read x. As MXFP8 linears they quantize it once
+        # and sum their input gradients in the GEMM epilogue.
+        q_down_proj = self.wq if self.q_lora_rank == 0 else self.wq_a
+        if MXFP8Linear is not None and all(
+            isinstance(proj, MXFP8Linear) for proj in (q_down_proj, self.wkv_a)
+        ):
+            q, kv_down = mxfp8_linears_shared_input(x, (q_down_proj, self.wkv_a))
         else:
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
-
-        with spmd.local():
-            q = q.view(num_tokens, -1, self.qk_head_dim)
-            if spmd.is_type_checking():
-                spmd.assert_type(
-                    q,
-                    spmd.V,
-                    spmd.PartitionSpec(("dp", "cp"), "tp", None),
-                )
+            q, kv_down = q_down_proj(x), self.wkv_a(x)
+        if self.q_lora_rank > 0:
+            q = self.wq_b(self.q_norm(q))
 
         if positions is not None:
             _maybe_check_max_pos(
                 positions,
                 max_valid_pos=self.rope.cache.shape[0] - 1,
             )
-        q = fused_mla_q(
-            q.unsqueeze(0),
-            self.rope.cache,
-            positions,
-            self.qk_nope_head_dim,
-        ).squeeze(0)
+        if _can_rotate_q_in_place(q):
+            q = fused_mla_q_(
+                q,
+                self.rope.cache,
+                positions,
+                self.qk_head_dim,
+                self.qk_nope_head_dim,
+            ).view(num_tokens, -1, self.qk_head_dim)
+        else:
+            with spmd.local():
+                q = q.view(num_tokens, -1, self.qk_head_dim)
+                if spmd.is_type_checking():
+                    spmd.assert_type(
+                        q,
+                        spmd.V,
+                        spmd.PartitionSpec(("dp", "cp"), "tp", None),
+                    )
+            q = fused_mla_q(
+                q.unsqueeze(0),
+                self.rope.cache,
+                positions,
+                self.qk_nope_head_dim,
+            ).squeeze(0)
 
-        kv_down = self.wkv_a(x)
         kv_latent, k_pe = torch.split(
             kv_down,
             [self.kv_lora_rank, self.qk_rope_head_dim],
