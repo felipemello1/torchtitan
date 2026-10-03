@@ -48,8 +48,9 @@ class DeepSeekV3Router(TokenChoiceTopKRouter):
         self.num_expert_groups = config.num_expert_groups
         self.num_limited_groups = config.num_limited_groups
         if self.num_expert_groups is not None and self.num_limited_groups is not None:
-            # Eager topk raises on these; the compiled argmax rounds would silently
-            # repeat ids. The masked top-k needs top_k finite candidates.
+            # Under compile the argmax rounds would repeat ids where eager topk raises
+            # (more limited groups than groups) or picks masked experts (fewer than
+            # top_k experts in the selected groups).
             if self.num_limited_groups > self.num_expert_groups:
                 raise ValueError(
                     f"num_limited_groups ({self.num_limited_groups}) must be <= "
