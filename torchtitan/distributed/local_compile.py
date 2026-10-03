@@ -45,7 +45,8 @@ def local_compile(
 
     Args:
         name: Name used to enable the function in a model's ``local_compile_regions``.
-        batch_invariant: Whether the compiled function preserves batch invariance.
+        batch_invariant: Whether the compiled function preserves batch invariance;
+            if ``False``, it runs eager in batch-invariant mode.
         **compile_kwargs: Additional ``torch.compile`` keyword arguments;
             ``fullgraph`` is fixed to ``True`` so each function forms one complete
             compile region.
@@ -58,13 +59,9 @@ def local_compile(
 
         def bind_local_compile(regions: list[str]) -> None:
             nonlocal fn
-            enabled = name in regions
-            batch_invariant_mode = is_in_batch_invariant_mode()
-            if enabled and batch_invariant_mode and not batch_invariant:
-                raise ValueError(
-                    f"Local compile region {name!r} does not support "
-                    "batch-invariant mode; remove it from local_compile_regions."
-                )
+            enabled = name in regions and (
+                batch_invariant or not is_in_batch_invariant_mode()
+            )
             if enabled:
                 fn = torch.compile(reference, fullgraph=True, **compile_kwargs)
             else:

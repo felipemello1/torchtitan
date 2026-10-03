@@ -257,8 +257,6 @@ def rl_grpo_qwen3_0_6b_flex_batch_invariant() -> Controller.Config:
         attn_backend="flex",
         converters=[BatchInvariantFlexConverter.Config()],
     )
-    # Local compile regions do not support batch-invariant mode.
-    config.model.local_compile_regions = []
     block_size = config.model.layers[0].attention.inner_attention.block_size
     config.async_loop.batcher = dataclasses.replace(
         config.async_loop.batcher, per_sample_pad_multiple=block_size
@@ -450,8 +448,6 @@ def rl_grpo_gpt_oss_debug_varlen_batch_invariant() -> Controller.Config:
     model_config = build_gpt_oss_model_config(
         "debugmodel", seq_len=seq_len, attn_backend="varlen"
     )
-    # Local compile regions do not support batch-invariant mode.
-    model_config.local_compile_regions = []
     return Controller.Config(
         model=model_config,
         hf_assets_path="tests/assets/tokenizer",
@@ -822,8 +818,6 @@ def rl_grpo_qwen3_moe_debug_varlen_batch_invariant(
         seq_len=seq_len,
         attn_backend="varlen",
     )
-    # Local compile regions do not support batch-invariant mode.
-    model_config.local_compile_regions = []
     return Controller.Config(
         model=model_config,
         hf_assets_path="tests/assets/tokenizer",
@@ -1017,8 +1011,6 @@ def rl_grpo_qwen3_0_6b_varlen_batch_invariant(
     model_config = _build_qwen3_rl_model_config(
         "0.6B", seq_len=seq_len, attn_backend="varlen"
     )
-    # Local compile regions do not support batch-invariant mode.
-    model_config.local_compile_regions = []
     return Controller.Config(
         model=model_config,
         hf_assets_path="torchtitan/rl/example_checkpoint/Qwen3-0.6B",
@@ -1198,9 +1190,6 @@ def rl_grpo_qwen3_5_9b_varlen() -> Controller.Config:
 def rl_grpo_qwen3_5_9b_varlen_batch_invariant() -> Controller.Config:
     """On-policy, batch-invariant Qwen3.5-9B GRPO with matching TP=2."""
     config = rl_grpo_qwen3_5_9b_varlen()
-    assert config.model is not None
-    # Local compile regions do not support batch-invariant mode.
-    config.model.local_compile_regions = []
     config.async_loop = dataclasses.replace(config.async_loop, target_offpolicy_steps=0)
     config.trainer = dataclasses.replace(
         config.trainer,
@@ -1295,9 +1284,6 @@ def rl_grpo_qwen3_5_debug_varlen_batch_invariant(
 ) -> Controller.Config:
     """On-policy, batch-invariant Qwen3.5 GRPO config for CI."""
     config = rl_grpo_qwen3_5_debug_varlen(seq_len=seq_len)
-    assert config.model is not None
-    # Local compile regions do not support batch-invariant mode.
-    config.model.local_compile_regions = []
     config.async_loop = dataclasses.replace(config.async_loop, target_offpolicy_steps=0)
     config.trainer = dataclasses.replace(
         config.trainer,

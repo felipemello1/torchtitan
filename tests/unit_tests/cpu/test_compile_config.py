@@ -87,19 +87,32 @@ def test_local_compile_rejects_fullgraph_false() -> None:
         )
 
 
-def test_local_compile_rejects_non_batch_invariant_region(monkeypatch) -> None:
+def test_batch_invariant_mode_runs_non_batch_invariant_regions_eager(
+    monkeypatch,
+) -> None:
+    compiled_calls = []
+
     @local_compile("test_non_batch_invariant", batch_invariant=False)
-    def fn(value: int) -> int:
+    def eager_fn(value: int) -> int:
         return value
 
+    @local_compile("test_batch_invariant", batch_invariant=True)
+    def compiled_fn(value: int) -> int:
+        return value
+
+    def fake_compile(reference, **kwargs):
+        del kwargs
+        compiled_calls.append(reference.__name__)
+        return reference
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
     monkeypatch.setattr(
         "torchtitan.distributed.local_compile.is_in_batch_invariant_mode",
         lambda: True,
     )
-    with pytest.raises(
-        ValueError, match=r"test_non_batch_invariant.*local_compile_regions"
-    ):
-        apply_local_compile(["test_non_batch_invariant"])
+    apply_local_compile(["test_non_batch_invariant", "test_batch_invariant"])
+
+    assert compiled_calls == ["compiled_fn"]
 
 
 def test_loss_functions_use_local_compile(monkeypatch) -> None:
