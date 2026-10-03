@@ -129,7 +129,13 @@ class HcPost(Module):
     def __init__(self, config: Config):
         super().__init__()
 
-    @local_compile("mhc", batch_invariant=False)
+    # Coordinate-descent tuning speeds up the grad-of-comb reduction and the
+    # forward kernel. Off in deterministic mode (see local_compile).
+    @local_compile(
+        "mhc",
+        batch_invariant=False,
+        options={"coordinate_descent_tuning": True},
+    )
     def forward(self, x, residual, post, comb):
         """Apply HC post mixing.
 

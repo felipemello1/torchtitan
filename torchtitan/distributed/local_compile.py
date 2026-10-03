@@ -86,7 +86,19 @@ def local_compile(
                     "batch-invariant mode; remove it from compile.regions."
                 )
             if enabled:
-                fn = torch.compile(reference, fullgraph=True, **compile_kwargs)
+                kwargs: dict[str, Any] = compile_kwargs
+                options = kwargs.get("options") or {}
+                if (
+                    options.get("coordinate_descent_tuning")
+                    and torch.are_deterministic_algorithms_enabled()
+                ):
+                    # Coordinate descent picks kernel configs by measured time,
+                    # so results can differ across runs and ranks. Turn it off in
+                    # deterministic mode, as set_determinism does for FlexAttention.
+                    # The flag must be set before the regions are bound.
+                    options = {**options, "coordinate_descent_tuning": False}
+                    kwargs = {**kwargs, "options": options}
+                fn = torch.compile(reference, fullgraph=True, **kwargs)
             else:
                 fn = reference
 
