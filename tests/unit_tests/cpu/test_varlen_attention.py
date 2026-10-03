@@ -198,6 +198,28 @@ class TestPackedVarlenInnerAttention(unittest.TestCase):
 
         self.assertEqual(out_THV.shape, q_THK.shape)
 
+    def test_batch_invariant_fa4_passes_fixed_kv_split(self):
+        """With FA4, batch-invariant mode, and a split size, the trainer asks for a fixed
+        KV partition instead of num_splits=1."""
+        q_THK = torch.randn(5, 2, 4)
+        metadata = create_varlen_metadata_for_document(torch.tensor([0, 1, 0, 1, 2]))
+        inner_attention = VarlenInnerAttention.Config().build()
+        attention = "torchtitan.models.common.attention"
+        with (
+            patch(f"{attention}.current_flash_attention_impl", return_value="FA4"),
+            patch(f"{attention}.is_in_batch_invariant_mode", return_value=True),
+            patch(
+                "torchtitan.distributed.batch_invariant._batch_invariant_kv_split", 128
+            ),
+            patch(
+                f"{attention}._varlen_attn", side_effect=lambda q, *a, **kw: q
+            ) as varlen,
+        ):
+            inner_attention(q_THK, q_THK, q_THK, attention_masks=metadata)
+
+        self.assertEqual(varlen.call_args.kwargs["num_splits"], 2)
+        self.assertEqual(varlen.call_args.kwargs["seqlen_k_per_split"], 128)
+
     def test_llama_decoder_preserves_td_shape(self):
         from torchtitan.models.llama3 import MODEL_FLAVORS
 

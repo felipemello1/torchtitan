@@ -110,7 +110,10 @@ def generate() -> None:
         raise ValueError("Only varlen and flex attention backends are supported.")
 
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-    set_batch_invariance(gen_config.debug.batch_invariant)
+    set_batch_invariance(
+        gen_config.debug.batch_invariant,
+        kv_split=gen_config.debug.batch_invariant_kv_split,
+    )
     enable_ep = gen_config.parallelism.expert_parallel_degree > 1
 
     logger.debug("Initializing vLLM LLMEngine with TorchTitan model")

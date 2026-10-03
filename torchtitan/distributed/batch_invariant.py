@@ -15,11 +15,29 @@ logger = logging.getLogger(__name__)
 
 _batch_invariant_enabled: bool = False
 _batch_invariant_extra_lib: torch.library.Library | None = None
+_batch_invariant_kv_split: int | None = None
 
 
 def is_in_batch_invariant_mode() -> bool:
     """Return whether batch-invariant mode is active."""
     return _batch_invariant_enabled
+
+
+def batch_invariant_varlen_kwargs(max_k: int) -> dict[str, int]:
+    """Return FA4 split-KV kwargs for ``varlen_attn`` in batch-invariant mode.
+
+    With ``debug.batch_invariant_kv_split=S``, every sequence's keys split at the same
+    absolute positions (multiples of S). A sequence then gets the same bits in any batch,
+    and the trainer forward matches generator decode when both use the same S. Without S,
+    split-KV stays off.
+
+    Example:
+        varlen_attn(q, k, v, ..., **batch_invariant_varlen_kwargs(max_k))
+    """
+    if _batch_invariant_kv_split is None:
+        return {"num_splits": 1}
+    num_splits = max(2, -(-max_k // _batch_invariant_kv_split))
+    return {"num_splits": num_splits, "seqlen_k_per_split": _batch_invariant_kv_split}
 
 
 def _sum_dim_batch_invariant(
@@ -70,7 +88,7 @@ def _sum_dim_batch_invariant(
     return result.to(output_dtype)
 
 
-def set_batch_invariance(enable: bool) -> None:
+def set_batch_invariance(enable: bool, *, kv_split: int | None = None) -> None:
     """Enable batch-invariant mode for reproducible RL training.
 
     Delegates ATen operator overrides to the ``batch_invariant_ops`` package
@@ -81,11 +99,15 @@ def set_batch_invariance(enable: bool) -> None:
     - NCCL env vars for deterministic inter-GPU collectives
     - Disables reduced-precision reductions and TF32
 
+    ``kv_split`` is ``debug.batch_invariant_kv_split``; see
+    ``batch_invariant_varlen_kwargs``.
+
     Note: callers must set ``debug.deterministic=True`` separately.
     """
-    global _batch_invariant_enabled, _batch_invariant_extra_lib
+    global _batch_invariant_enabled, _batch_invariant_extra_lib, _batch_invariant_kv_split
     if not enable or _batch_invariant_enabled:
         return
+    _batch_invariant_kv_split = kv_split
 
     # Register batch-invariant ATen overrides via upstream package
     # https://github.com/thinking-machines-lab/batch_invariant_ops

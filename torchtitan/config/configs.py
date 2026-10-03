@@ -166,6 +166,12 @@ class DebugConfig:
     """Enable batch-invariant mode to use batch-invariant ops in model
     forward and deterministic NCCL collective reduction order"""
 
+    batch_invariant_kv_split: int | None = None
+    """FA4 with ``batch_invariant``: split each sequence's keys at multiples of this many
+    tokens (a multiple of 128) instead of turning split-KV off, for faster long-context
+    decode. The RL trainer and generator must use the same value. Needs torch's
+    ``varlen_attn(seqlen_k_per_split=...)``. None keeps ``num_splits=1``."""
+
     print_config: bool = False
     """Print the job configs to terminal"""
 
