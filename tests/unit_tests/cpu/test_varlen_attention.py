@@ -194,6 +194,30 @@ class TestPackedVarlenInnerAttention(unittest.TestCase):
 
         self.assertEqual(cudnn_enabled, [True, False])
 
+    def test_old_cudnn_with_different_head_dims_pins_fa4(self):
+        q_THK = torch.randn(5, 2, 4)
+        v_THV = torch.randn(5, 2, 3)
+        metadata = create_varlen_metadata_for_document(torch.tensor([0, 1, 0, 1, 2]))
+        cudnn_enabled = []
+
+        def _record_cudnn_enabled(q, k, v, *args, **kwargs):
+            cudnn_enabled.append(torch.backends.cuda.cudnn_sdp_enabled())
+            return v
+
+        with patch(
+            "torchtitan.models.common.attention.current_flash_attention_impl",
+            return_value="FA4",
+        ), patch(
+            "torchtitan.models.common.attention._varlen_attn",
+            side_effect=_record_cudnn_enabled,
+        ):
+            for cudnn_version in (92301, 92501):
+                with patch("torch.backends.cudnn.version", return_value=cudnn_version):
+                    inner_attention = VarlenInnerAttention.Config().build()
+                inner_attention(q_THK, q_THK, v_THV, attention_masks=metadata)
+
+        self.assertEqual(cudnn_enabled, [False, True])
+
     def test_out_transform_receives_th_lse(self):
         num_tokens, num_heads, head_dim = 5, 2, 4
         q_THK = torch.randn(num_tokens, num_heads, head_dim)
