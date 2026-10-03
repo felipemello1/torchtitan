@@ -96,7 +96,9 @@ class Compressor(Module):
         rd = self.rope_head_dim
         ratio = self.compress_ratio
         dtype = x.dtype
-        with torch.autocast(device_type=x.device.type, dtype=torch.float32):
+        # FP32OutputLinear returns fp32; an outer bf16 autocast would downcast its
+        # fp32 fallback (fp32 operands, e.g. without FSDP mixed precision).
+        with torch.autocast(device_type=x.device.type, enabled=False):
             kv = self.wkv(x)
             score = self.wgate(x)
         if seqlen % ratio != 0:

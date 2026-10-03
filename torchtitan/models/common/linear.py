@@ -303,11 +303,25 @@ class FP32OutputLinear(Linear):
         weight: torch.Tensor,
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        output = _FP32OutputLinearFunction.apply(
-            input.reshape(-1, input.shape[-1]), weight, self.exact_grad_output_split
+        output = fp32_output_linear(
+            input, weight, exact_grad_output_split=self.exact_grad_output_split
         )
-        output = output.reshape(*input.shape[:-1], -1)
         return output if bias is None else output + bias.float()
+
+
+def fp32_output_linear(
+    input: torch.Tensor, weight: torch.Tensor, *, exact_grad_output_split: bool
+) -> torch.Tensor:
+    """``input @ weight.T`` with ``FP32OutputLinear``'s precision, for weights held outside a
+    ``Linear``. ``exact_grad_output_split`` as in ``FP32OutputLinear.Config``.
+
+    Example:
+        input (T, 4 * D) bf16, weight (24, 4 * D) bf16 -> output (T, 24) fp32
+    """
+    output = _FP32OutputLinearFunction.apply(
+        input.reshape(-1, input.shape[-1]), weight, exact_grad_output_split
+    )
+    return output.reshape(*input.shape[:-1], -1)
 
 
 @spmd.register_local_autograd_function
@@ -525,6 +539,7 @@ __all__ = [
     "ColumnParallelLinear",
     "GroupedLinear",
     "FP32OutputLinear",
+    "fp32_output_linear",
     "Linear",
     "RowParallelLinear",
 ]

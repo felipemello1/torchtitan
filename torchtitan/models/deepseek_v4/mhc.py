@@ -7,9 +7,9 @@
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
+from torchtitan.models.common.linear import fp32_output_linear
 from torchtitan.protocols.module import Module
 
 
@@ -107,9 +107,16 @@ class HcPre(Module):
             ``post``/``comb`` are consumed by ``HcPost``.
         """
         shape, dtype = x.size(), x.dtype
-        x = x.flatten(-2).float()
+        x_flat = x.flatten(-2)
+        x = x_flat.float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, self.hc_fn.float()) * rsqrt
+        # No autocast guard, unlike the Compressor: under an outer bf16 autocast
+        # (fp32 hc_fn) the forward keeps running in bf16 as F.linear did; the
+        # backward runs in fp32.
+        mixes = (
+            fp32_output_linear(x_flat, self.hc_fn, exact_grad_output_split=False)
+            * rsqrt
+        )
         pre, post, comb = self.sinkhorn(
             mixes.float(), self.hc_scale.float(), self.hc_base.float()
         )
@@ -176,9 +183,16 @@ class HcHead(Module):
             Hidden states of shape ``[T, D]``.
         """
         shape, dtype = x.size(), x.dtype
-        x = x.flatten(-2).float()
+        x_flat = x.flatten(-2)
+        x = x_flat.float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, self.hc_fn.float()) * rsqrt
+        # No autocast guard, unlike the Compressor: under an outer bf16 autocast
+        # (fp32 hc_fn) the forward keeps running in bf16 as F.linear did; the
+        # backward runs in fp32.
+        mixes = (
+            fp32_output_linear(x_flat, self.hc_fn, exact_grad_output_split=False)
+            * rsqrt
+        )
         pre = torch.sigmoid(mixes * self.hc_scale + self.hc_base) + self.eps
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=-2)
         return y.to(dtype)

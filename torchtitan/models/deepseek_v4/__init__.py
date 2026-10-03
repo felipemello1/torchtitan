@@ -105,17 +105,20 @@ def _make_compressor_config(
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
-        wkv=Linear.Config(
+        # 2 grad_output pieces: the gradients' final bf16 rounding hides a third piece.
+        wkv=FP32OutputLinear.Config(
             in_features=dim,
             out_features=coff * head_dim,
             bias=False,
             param_init=_LINEAR_INIT,
+            exact_grad_output_split=False,
         ),
-        wgate=Linear.Config(
+        wgate=FP32OutputLinear.Config(
             in_features=dim,
             out_features=coff * head_dim,
             bias=False,
             param_init=_LINEAR_INIT,
+            exact_grad_output_split=False,
         ),
         norm=RMSNorm.Config(
             normalized_shape=head_dim,
