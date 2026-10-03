@@ -731,6 +731,16 @@ class VLLMGenerator(Configurable):
         cuda_graph: VLLMCudaGraphConfig = field(default_factory=VLLMCudaGraphConfig)
         """CUDA graph capture settings for the vLLM engine."""
 
+        cascade_attention: bool = False
+        """Decode the samples of a prompt with one attention pass over their shared cached prompt.
+
+        Requests that share at least 1024 cached prompt tokens are grouped: each group attends
+        its prefix once, each request attends its own tokens, and the two merge by LSE (see
+        ``torchtitan/rl/model/cascade_attention.py``). Works with FULL CUDA graphs; off in
+        batch-invariant mode. On Qwen3.5-4B it cuts decode steps by 11-14% for RL groups and
+        costs 0.1-0.2 ms per step when no request shares a prompt.
+        """
+
         checkpointer: CheckpointManager.Config | None = None
         """Optional initial-weight loader for the vLLM wrapper.
 
@@ -921,6 +931,8 @@ class VLLMGenerator(Configurable):
         # Continuous batching requires FCFS scheduling: admission order must equal the
         # broadcast order on every rank
         engine_kwargs["scheduling_policy"] = "fcfs"
+        # TorchTitan's attention backend reads this switch for its own cascade.
+        engine_kwargs["disable_cascade_attn"] = not config.cascade_attention
         # FA2 requires block_size to be a multiple of 256
         if not has_cuda_capability(9, 0):
             engine_kwargs["block_size"] = 256

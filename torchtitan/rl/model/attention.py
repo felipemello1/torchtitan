@@ -6,7 +6,7 @@
 
 import itertools
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 import torch
@@ -19,7 +19,14 @@ from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.observability.logging import warn_once
 from torchtitan.protocols.module import Module
+from torchtitan.rl.model.cascade_attention import (
+    cascade_decode,
+    CascadePlan,
+    plan_cascade,
+)
 from torchtitan.tools.utils import get_cuda_flash_attention_impl
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
@@ -32,6 +39,59 @@ from vllm.v1.attention.backends.flash_attn import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
 logger = logging.getLogger(__name__)
+
+# Groups sharing fewer cached prompt tokens decode without the cascade.
+_CASCADE_MIN_PREFIX_TOKENS = 1024
+# Splits for the shared-prefix call (see cascade_decode).
+_CASCADE_PREFIX_NUM_SPLITS = 32
+
+
+@dataclass
+class TorchTitanAttentionMetadata(FlashAttentionMetadata):
+    cascade: bool = False
+    """Decode with the shared-prefix cascade (see ``cascade_attention.py``)."""
+    cascade_plan: CascadePlan | None = None
+    """Built by the step's first attention layer and reused by the others."""
+
+
+def _decode_only_graph_or_eager() -> bool:
+    forward_context = get_forward_context()
+    return (
+        forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL
+        or forward_context.batch_descriptor.uniform
+    )
+
+
+class TorchTitanVarlenInnerAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
+    _cudagraph_support = AttentionCGSupport.ALWAYS
+
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device) -> None:
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # vLLM's cascade switch turns on TorchTitan's cascade instead (see use_cascade_attention).
+        self.cascade = not vllm_config.model_config.disable_cascade_attn
+
+    def build(
+        self, common_prefix_len, common_attn_metadata, fast_build: bool = False
+    ) -> TorchTitanAttentionMetadata:
+        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        # One decode token per request, so query tokens and requests line up. Batch-invariant
+        # mode keeps the plain decode: the cascade changes the reduction order.
+        cascade = (
+            self.cascade
+            and metadata.max_query_len == 1
+            and metadata.num_actual_tokens == common_attn_metadata.num_reqs
+            and not is_in_batch_invariant_mode()
+        )
+        return TorchTitanAttentionMetadata(
+            **{field.name: getattr(metadata, field.name) for field in fields(metadata)},
+            cascade=cascade,
+        )
+
+    def use_cascade_attention(self, *args, **kwargs) -> bool:
+        # vLLM's cascade needs one prefix shared by the whole batch and runs those steps
+        # without FULL CUDA graphs. TorchTitan's cascade groups requests by shared prefix
+        # inside the graph (TorchTitanVarlenInnerAttentionImpl.forward).
+        return False
 
 
 @register_backend(AttentionBackendEnum.CUSTOM)
@@ -59,11 +119,6 @@ class TorchTitanVarlenInnerAttentionBackend(FlashAttentionBackend):
 
     @staticmethod
     def get_builder_cls():
-        class TorchTitanVarlenInnerAttentionMetadataBuilder(
-            FlashAttentionMetadataBuilder
-        ):
-            _cudagraph_support = AttentionCGSupport.ALWAYS
-
         return TorchTitanVarlenInnerAttentionMetadataBuilder
 
 
@@ -111,7 +166,7 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
+        attn_metadata: TorchTitanAttentionMetadata,
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
@@ -228,6 +283,38 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
 
         if self.enable_gqa:
             extra_kwargs["enable_gqa"] = True
+
+        # The cascade merges two partial outputs by LSE: no sink epilogue, no sliding window.
+        # vLLM captures FULL graphs for mixed batches from one-token-per-request dummy
+        # batches, so only FULL graphs keyed uniform (decode only) may capture it.
+        if (
+            attn_metadata.cascade
+            and fa_impl == "FA4"
+            and self.out_transform is None
+            and sliding_window_size == (-1, 0)
+            and _decode_only_graph_or_eager()
+        ):
+            if attn_metadata.cascade_plan is None:
+                attn_metadata.cascade_plan = plan_cascade(
+                    block_table,
+                    seqused_k,
+                    page_size=key_cache.shape[1],
+                    min_prefix_tokens=_CASCADE_MIN_PREFIX_TOKENS,
+                )
+            cascade_decode(
+                output[:num_actual_tokens],
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                block_table,
+                attn_metadata.cascade_plan,
+                max_seqlen_k=max_seqlen_k,
+                scale=self.scale,
+                enable_gqa=self.enable_gqa,
+                num_splits=extra_kwargs["num_splits"],
+                prefix_num_splits=_CASCADE_PREFIX_NUM_SPLITS,
+            )
+            return output[:num_actual_tokens]
 
         if self.out_transform is not None:
             extra_kwargs["return_aux"] = AuxRequest(lse=True)
