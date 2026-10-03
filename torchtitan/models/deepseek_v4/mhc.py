@@ -129,8 +129,8 @@ class HcPost(Module):
     def __init__(self, config: Config):
         super().__init__()
 
-    # Coordinate-descent tuning of the backward reductions (grad of comb and
-    # residual): 1.24x faster fwd+bwd at 16k tokens (GB300).
+    # Coordinate-descent tuning speeds up the grad-of-comb reduction and the
+    # forward kernel. Off in deterministic mode (see local_compile).
     @local_compile(
         "mhc",
         batch_invariant=False,
