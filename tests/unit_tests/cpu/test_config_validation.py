@@ -11,9 +11,11 @@ import pytest
 
 from torchtitan.components.validate import Validator
 from torchtitan.config import DebugConfig, ParallelismConfig, TrainingConfig
+from torchtitan.models.common.attention import VarlenInnerAttention
 from torchtitan.models.common.token_dispatcher import HybridEPTokenDispatcher
 from torchtitan.observability.sdc_replayer import SDCReplayer
 from torchtitan.training_engine import TrainingEngine
+from torchtitan_recipes.models.deepseek_v3 import deepseek_v3_16b, deepseek_v3_671b
 from torchtitan_recipes.tests.models.deepseek_v3 import (
     deepseek_v3_debugmodel,
     deepseek_v3_debugmodel_hybridep,
@@ -148,3 +150,16 @@ def test_varlen_cuda_graphs_require_document_bound() -> None:
         config.__post_init__()
     with _cuda_graphs_supported(False):
         config.__post_init__()
+
+
+@pytest.mark.parametrize("recipe", [deepseek_v3_16b, deepseek_v3_671b])
+def test_deepseek_v3_recipes_use_varlen_on_blackwell(recipe) -> None:
+    with mock.patch(
+        "torchtitan_recipes.models.deepseek_v3.has_cuda_capability", return_value=True
+    ), _cuda_graphs_supported(True):
+        config = recipe()
+
+    assert all(
+        isinstance(layer.attention.inner_attention, VarlenInnerAttention.Config)
+        for layer in config.model.layers
+    )
