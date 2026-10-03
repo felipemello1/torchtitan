@@ -129,7 +129,13 @@ class HcPost(Module):
     def __init__(self, config: Config):
         super().__init__()
 
-    @local_compile("mhc", batch_invariant=False)
+    # Coordinate-descent tuning of the backward reductions (grad of comb and
+    # residual): 1.24x faster fwd+bwd at 16k tokens (GB300).
+    @local_compile(
+        "mhc",
+        batch_invariant=False,
+        options={"coordinate_descent_tuning": True},
+    )
     def forward(self, x, residual, post, comb):
         """Apply HC post mixing.
 
