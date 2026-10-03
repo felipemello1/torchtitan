@@ -261,6 +261,15 @@ def validate_ep_overlap_config(
     return chunk_dim, module_fqn
 
 
+def compiles_full_graph(compile_config: GraphTrainerCompileConfig) -> bool:
+    """Whether GraphTrainer compiles the whole traced step with Inductor."""
+    return (
+        compile_config.enable_passes
+        and compile_config.inductor_compilation == "full"
+        and "full_inductor_compilation_pass" not in compile_config.disable_passes
+    )
+
+
 def to_graph_trainer_config(
     base_config: Trainer.Config,
     model_config_cls: type[BaseModel.Config],
