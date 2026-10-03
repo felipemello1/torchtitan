@@ -909,6 +909,52 @@ class TestChunkedLossWrapper(unittest.TestCase):
             model_ref.output.weight.grad,
         )
 
+    def test_multi_output_concatenates_chunks_only_when_rows_fit(self):
+        # Two predictions, 2 chunks of 4 rows each: 8 rows per lm_head call fit
+        # in dim=16 (one call per chunk) but not in dim=4 (one call per prediction).
+        for dim, expected_calls in ((16, 2), (4, 4)):
+            for requires_grad in (True, False):
+                with self.subTest(dim=dim, requires_grad=requires_grad):
+                    self._check_concatenated_chunks(dim, expected_calls, requires_grad)
+
+    def _check_concatenated_chunks(self, dim, expected_calls, requires_grad):
+        torch.manual_seed(0)
+        seq_len, vocab_size, num_chunks = 8, 17, 2
+        lm_head = nn.Linear(dim, vocab_size, bias=False)
+        reference_head = nn.Linear(dim, vocab_size, bias=False)
+        reference_head.load_state_dict(lm_head.state_dict())
+        calls = []
+        lm_head.register_forward_hook(lambda *_: calls.append(1))
+        loss_config = MTPLoss.Config(mtp_scale=0.3, global_vocab_size=vocab_size)
+        chunked_loss = ChunkedLossWrapper(
+            ChunkedLossWrapper.Config(num_chunks=num_chunks, loss_fn=loss_config)
+        )
+        chunked_loss.set_lm_head(lm_head)
+        labels = (
+            torch.randint(0, vocab_size, (seq_len,)),
+            torch.randint(0, vocab_size, (seq_len,)),
+        )
+        hidden = tuple(torch.randn(seq_len, dim) for _ in range(2))
+        chunked_hidden = tuple(h.clone().requires_grad_(requires_grad) for h in hidden)
+        reference_hidden = tuple(h.clone().requires_grad_(True) for h in hidden)
+        global_valid_tokens = torch.tensor(float(seq_len))
+
+        chunked_value, _ = chunked_loss(chunked_hidden, labels, global_valid_tokens)
+        reference_value, _ = MTPLoss(loss_config)(
+            tuple(reference_head(h) for h in reference_hidden),
+            labels,
+            global_valid_tokens,
+        )
+        self.assertEqual(len(calls), expected_calls)
+        torch.testing.assert_close(chunked_value, reference_value.detach())
+        if not requires_grad:
+            return
+        chunked_value.backward()
+        reference_value.backward()
+        for actual, expected in zip(chunked_hidden, reference_hidden, strict=True):
+            torch.testing.assert_close(actual.grad, expected.grad)
+        torch.testing.assert_close(lm_head.weight.grad, reference_head.weight.grad)
+
     def test_multi_output_fsdp_lifecycle_spans_all_terms(self):
         events: list[str] = []
         chunked_loss = ChunkedLossWrapper(
@@ -933,7 +979,8 @@ class TestChunkedLossWrapper(unittest.TestCase):
             chunked_loss(predictions, labels)
 
         self.assertEqual(events.count("unshard"), 1)
-        self.assertEqual(events.count("forward"), 4)
+        # One lm_head call per chunk: the two predictions' chunks are concatenated.
+        self.assertEqual(events.count("forward"), 2)
         self.assertEqual(events.count("gradient_sync(True)"), 1)
         self.assertEqual(events.count("reshard"), 1)
 

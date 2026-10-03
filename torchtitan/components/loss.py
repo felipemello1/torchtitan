@@ -491,6 +491,21 @@ class GradAccumulator:
         self._next_idx += 1
 
 
+def _share_lm_head_call(h_chunks: tuple[torch.Tensor, ...]) -> bool:
+    """Whether several predictions' chunks ``[rows_i, D]`` should share one lm_head call.
+
+    Sharing saves (n - 1) ``[V, D]`` weight-gradient temporaries and adds per chunk but
+    adds one ``[sum(rows_i), V]`` dlogits concatenation in the backward. Conservative
+    bound for logits and weight of the same dtype (fp32 logits on a bf16 weight halve it).
+
+    Example:
+        DeepSeek-V3 MTP, D=7168: two [512, D] chunks (4k tokens, 8 chunks) share a call;
+        two [8192, D] chunks (64k tokens, 8 chunks) don't (16384 > 7168).
+    """
+    rows = sum(h_chunk.shape[0] for h_chunk in h_chunks)
+    return 1 < len(h_chunks) and rows <= (len(h_chunks) - 1) * h_chunks[0].shape[-1]
+
+
 class ChunkedLossWrapper(BaseLoss):
     """Chunked loss wrapper that splits the sequence dimension to reduce peak memory.
 
@@ -564,6 +579,8 @@ class ChunkedLossWrapper(BaseLoss):
         Every prediction represented by ``pred`` must come from model forward
         with ``_skip_lm_head=True``. Tensor inputs must be paired with tensor
         labels; tuple inputs must contain one labels tensor per prediction.
+        Several predictions' chunks may go through one lm_head call
+        (``_share_lm_head_call``).
 
         When ``pred`` does not require grad (e.g. validation), runs chunked
         forward only -- no per-chunk backward or gradient accumulation.
@@ -685,7 +702,14 @@ class ChunkedLossWrapper(BaseLoss):
                     key: chunks[chunk_index] if isinstance(chunks, tuple) else chunks
                     for key, chunks in input_chunks.items()
                 }
-                logits = tuple(lm_head(h_chunk) for h_chunk in h_chunks)
+                if _share_lm_head_call(h_chunks):
+                    # Assumes a row-separable lm_head: a tensorwise-scaled quantized
+                    # head would compute one scale over all predictions' rows.
+                    logits = lm_head(torch.cat(h_chunks, dim=0)).split(
+                        [h_chunk.shape[0] for h_chunk in h_chunks], dim=0
+                    )
+                else:
+                    logits = tuple(lm_head(h_chunk) for h_chunk in h_chunks)
                 if not is_multi_output:
                     logits = logits[0]
                     label_chunks = label_chunks[0]
