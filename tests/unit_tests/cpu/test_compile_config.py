@@ -99,8 +99,9 @@ def test_local_compile_forwards_compile_kwargs(monkeypatch) -> None:
     }
 
 
-def test_local_compile_drops_coordinate_descent_in_deterministic_mode(
-    monkeypatch,
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_local_compile_coordinate_descent_off_only_in_deterministic_mode(
+    monkeypatch, deterministic: bool
 ) -> None:
     compiled_calls = []
 
@@ -117,10 +118,14 @@ def test_local_compile_drops_coordinate_descent_in_deterministic_mode(
         return reference
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
+    monkeypatch.setattr(
+        torch, "are_deterministic_algorithms_enabled", lambda: deterministic
+    )
     LocalCompileConfig(regions=["test_deterministic_options"]).apply_local_compile()
 
-    assert compiled_calls[0]["options"] == {"coordinate_descent_tuning": False}
+    assert compiled_calls[0]["options"] == {
+        "coordinate_descent_tuning": not deterministic
+    }
 
 
 def test_local_compile_rejects_fullgraph_false() -> None:

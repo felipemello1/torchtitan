@@ -87,7 +87,7 @@ def local_compile(
                 )
             if enabled:
                 kwargs: dict[str, Any] = compile_kwargs
-                options = kwargs.get("options", {})
+                options = kwargs.get("options") or {}
                 if (
                     options.get("coordinate_descent_tuning")
                     and torch.are_deterministic_algorithms_enabled()
@@ -95,6 +95,7 @@ def local_compile(
                     # Coordinate descent picks kernel configs by measured time,
                     # so results can differ across runs and ranks. Turn it off in
                     # deterministic mode, as set_determinism does for FlexAttention.
+                    # The flag must be set before the regions are bound.
                     options = {**options, "coordinate_descent_tuning": False}
                     kwargs = {**kwargs, "options": options}
                 fn = torch.compile(reference, fullgraph=True, **kwargs)
