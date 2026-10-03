@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import importlib.util
 import types
 import unittest
 from unittest.mock import patch
@@ -184,6 +185,20 @@ class TestDeepSeekV3Router(unittest.TestCase):
         assert shared_experts is not None
         self.assertIs(type(shared_experts.w13), ColumnParallelLinear.Config)
         self.assertIs(type(shared_experts.w2), SharedExpertRowParallelLinear.Config)
+
+    def test_671b_recipe_compiles_the_router_region(self):
+        from torchtitan_recipes.models.deepseek_v3 import deepseek_v3_671b
+
+        self.assertIn("router", deepseek_v3_671b().model.local_compile_regions)
+        # The model default stays without it: Kimi K2.x inherits that default.
+        self.assertNotIn("router", build_model_config("671B").local_compile_regions)
+
+    @unittest.skipUnless(importlib.util.find_spec("dist_moe"), "dist_moe not installed")
+    def test_671b_dist_moe_recipe_compiles_the_router_region(self):
+        from torchtitan_recipes.models.deepseek_v3 import deepseek_v3_671b_dist_moe_bf16
+
+        config = deepseek_v3_671b_dist_moe_bf16()
+        self.assertIn("router", config.model.local_compile_regions)
 
     def test_attention_owns_input_gather_and_wo_owns_output_reduction(self):
         build_config, _ = MODEL_FLAVORS["debugmodel"]
