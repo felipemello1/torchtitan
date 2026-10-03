@@ -65,12 +65,11 @@ class FeedForward(Module):
             self.remat_region_name("w13"),
             recompute=self.remat_should_recompute("w13"),
         )(x)
-        gate_TF, up_TF = gate_up_T2F.unbind(-2)
-        remat.recompute_needs_tensor(gate_TF, up_TF)
+        remat.recompute_needs_tensor(gate_up_T2F)
         out_TD = remat.region(
             self.w2,
             self.remat_region_name("w2"),
             recompute=self.remat_should_recompute("w2"),
-        )(self.activation_fn(gate_TF, up_TF))
+        )(self.activation_fn.apply_gate_up(gate_up_T2F))
         remat.recompute_needs_tensor(out_TD)
         return out_TD

@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from torchtitan.distributed.local_compile import apply_local_compile
-from torchtitan.models.common.activation import SwiGLU
+from torchtitan.models.common.activation import SiTUGLU, SwiGLU
 from torchtitan.models.gpt_oss.moe import GptOssSwiGLU
 
 
@@ -40,6 +40,35 @@ class TestSwiGLULocalCompile(unittest.TestCase):
 
         self.assertGreaterEqual(sum("triton" in code for code in codes), 2)
         self.assertTrue(any("sigmoid" in code for code in codes))
+
+    def test_apply_gate_up_writes_one_gate_up_gradient(self):
+        apply_local_compile(["swiglu", "situglu"])
+        for activation_fn in (
+            SwiGLU.Config().build(),
+            GptOssSwiGLU.Config().build(),
+            SiTUGLU.Config(beta=4.0, linear_beta=25.0).build(),
+        ):
+            with self.subTest(type(activation_fn).__name__):
+                gate_up = torch.randn(
+                    64, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+                )
+                grad_output = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+
+                output = activation_fn.apply_gate_up(gate_up)
+                # One gradient edge: no eager UnbindBackward0 stacks two gradients.
+                next_functions = output.grad_fn.next_functions
+                self.assertEqual(
+                    [type(fn).__name__ for fn, _ in next_functions], ["AccumulateGrad"]
+                )
+                (grad_gate_up,) = torch.autograd.grad(output, gate_up, grad_output)
+
+                reference_gate_up = gate_up.detach().clone().requires_grad_()
+                reference_output = activation_fn(*reference_gate_up.unbind(-2))
+                (reference_grad_gate_up,) = torch.autograd.grad(
+                    reference_output, reference_gate_up, grad_output
+                )
+                self.assertTrue(torch.equal(output, reference_output))
+                self.assertTrue(torch.equal(grad_gate_up, reference_grad_gate_up))
 
     def test_forward_and_backward_match_reference(self):
         swiglu = SwiGLU.Config().build()

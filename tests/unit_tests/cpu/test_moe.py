@@ -99,9 +99,9 @@ class _AddOneW13(nn.Module):
 
 
 class _SelectGate(nn.Module):
-    def forward(self, gate_RD, up_RD, *, offsets):
-        del up_RD, offsets
-        return gate_RD
+    def apply_gate_up(self, gate_up_R2D, *, offsets):
+        del offsets
+        return gate_up_R2D[:, 0]
 
 
 class _IdentityW2(nn.Module):
