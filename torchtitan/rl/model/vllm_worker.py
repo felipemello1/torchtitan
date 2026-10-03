@@ -23,7 +23,8 @@ from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
     """Keep native FULL descriptors distinct for packed GDN and fused decode.
 
-    Currently installed only for TorchTitan's Attention Gym GDN wrapper.
+    Installed for TorchTitan's Attention Gym GDN wrapper and for its cascade
+    attention, which only FULL graphs keyed as decode may capture.
     vLLM at c6fa1f0 erases the uniform-decode discriminator in FULL mode:
     four one-token decodes collide with one four-token prefill. Attention Gym's
     different numerical paths need distinct keys. Delegate decode keys to the
@@ -80,7 +81,7 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)
-        if any(
+        if not self.vllm_config.model_config.disable_cascade_attn or any(
             layer.get_attn_backend() is TorchTitanGDNAttentionBackend
             for layer in get_layers_from_vllm_config(
                 self.vllm_config, MambaBase
