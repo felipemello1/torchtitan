@@ -364,6 +364,17 @@ class Controller(Configurable):
                     )
                 if not self.trainer.debug.deterministic:
                     raise ValueError("batch_invariant requires deterministic=True")
+                kv_split = self.trainer.debug.batch_invariant_kv_split
+                if kv_split != self.generator.debug.batch_invariant_kv_split:
+                    raise ValueError(
+                        "debug.batch_invariant_kv_split must match between trainer "
+                        f"and generator, got {kv_split} and "
+                        f"{self.generator.debug.batch_invariant_kv_split}"
+                    )
+                if kv_split is not None and kv_split % 128 != 0:
+                    raise ValueError(
+                        f"debug.batch_invariant_kv_split must be a multiple of 128, got {kv_split}"
+                    )
                 # The trainer forward must compute in bf16 to match the bf16
                 # generator, via FSDP mixed precision. The trainer always wraps
                 # the model in FSDP (even at data_parallel_shard_degree=1, where

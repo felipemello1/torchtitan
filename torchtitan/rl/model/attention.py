@@ -15,7 +15,10 @@ from torch.nn.attention import (
     current_flash_attention_impl,
 )
 from torch.nn.attention.varlen import AuxRequest
-from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
+from torchtitan.distributed.batch_invariant import (
+    batch_invariant_varlen_kwargs,
+    is_in_batch_invariant_mode,
+)
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.observability.logging import warn_once
 from torchtitan.protocols.module import Module
@@ -240,7 +243,11 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         # upstream. current_flash_attention_impl() returns None when FA2
         # is the implicit default (SM < 9.0). For FA3, only force
         # num_splits=1 in batch-invariant mode (determinism).
-        if fa_impl in (None, "FA2") or is_in_batch_invariant_mode():
+        if fa_impl == "FA4" and is_in_batch_invariant_mode():
+            # Under CUDA graphs max_seqlen_k is the capture bound, so the split count
+            # covers every replay.
+            extra_kwargs.update(batch_invariant_varlen_kwargs(max_seqlen_k))
+        elif fa_impl in (None, "FA2") or is_in_batch_invariant_mode():
             extra_kwargs["num_splits"] = 1
 
         if self.enable_gqa:

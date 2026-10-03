@@ -40,7 +40,10 @@ from torch.nn.attention.varlen import (
     varlen_attn as _varlen_attn,
 )
 
-from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
+from torchtitan.distributed.batch_invariant import (
+    batch_invariant_varlen_kwargs,
+    is_in_batch_invariant_mode,
+)
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
@@ -206,7 +209,9 @@ class VarlenInnerAttention(InnerAttention):
         # to prevent non-deterministic split-k reductions.
         # ROCm's _flash_attention_forward rejects num_splits entirely.
         fa_impl = current_flash_attention_impl()
-        if (
+        if fa_impl == "FA4" and is_in_batch_invariant_mode():
+            varlen_kwargs.update(batch_invariant_varlen_kwargs(max_k))
+        elif (
             fa_impl in (None, "FA2") or is_in_batch_invariant_mode()
         ) and torch.version.hip is None:
             varlen_kwargs["num_splits"] = 1

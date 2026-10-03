@@ -854,7 +854,9 @@ class VLLMGenerator(Configurable):
         ), "Only varlen and flex attention backends are allowed."
 
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-        set_batch_invariance(config.debug.batch_invariant)
+        set_batch_invariance(
+            config.debug.batch_invariant, kv_split=config.debug.batch_invariant_kv_split
+        )
         if config.debug.batch_invariant:
             # The vLLM v2 logprob Triton kernel bypasses the aten overrides above;
             # route it through trainer's function to match the trainer exactly.

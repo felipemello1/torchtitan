@@ -229,7 +229,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
         config = self.config
-        set_batch_invariance(config.debug.batch_invariant)
+        set_batch_invariance(
+            config.debug.batch_invariant, kv_split=config.debug.batch_invariant_kv_split
+        )
         with sl.log_trace_span("torch_distributed_init"):
             topology = dist_utils.init_distributed(
                 config.comm,
