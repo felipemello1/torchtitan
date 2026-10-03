@@ -22,6 +22,50 @@ from torchtitan.observability import structured_logger as sl
 
 logger = logging.getLogger(__name__)
 
+_trace_compile_friendly = False
+
+
+def compile_friendly() -> bool:
+    """Whether to take a formulation written for Inductor instead of the eager one.
+
+    Rewrites that keep two formulations (one Inductor fuses well, one cheaper in
+    eager) used to switch on ``torch.compiler.is_compiling()``, which is False
+    while GraphTrainer traces a step with non-strict make_fx, so GraphTrainer
+    traced the eager one even when it compiles the whole step with Inductor.
+    ``compile_friendly()`` is True under ``torch.compile`` and ``torch.export``,
+    and inside a non-strict make_fx trace run under
+    ``trace_compile_friendly(True)``, which GraphTrainer enters when Inductor
+    compiles the whole step. Eager calls always get False. A rewritten branch
+    must trace under fake tensors with static int sizes: no data-dependent
+    Python control flow, no ``.item()`` or ``data_ptr()``.
+
+    Example:
+        if compile_friendly():
+            out = _rotate_pairs(x, cos, sin)  # fuses under Inductor
+        else:
+            out = _rotate_complex(x, cache)  # fewer kernels in eager
+    """
+    return torch.compiler.is_compiling() or (
+        _trace_compile_friendly and torch.compiler._is_non_strict_tracing()
+    )
+
+
+@contextlib.contextmanager
+def trace_compile_friendly(enabled: bool = True) -> Generator[None, None, None]:
+    """Make ``compile_friendly()`` True inside non-strict make_fx traces in this block.
+
+    Example:
+        with trace_compile_friendly(), torch.compiler._non_strict_tracing_context():
+            graph = make_fx(step)(*args).graph
+    """
+    global _trace_compile_friendly
+    previous = _trace_compile_friendly
+    _trace_compile_friendly = enabled
+    try:
+        yield
+    finally:
+        _trace_compile_friendly = previous
+
 
 def round_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
