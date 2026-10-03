@@ -78,10 +78,14 @@ class LocalTokenDispatcher(Module):
             token_indices_experts_sorted_N: ``(N,)`` token-to-original mapping
             topk_scores_experts_sorted_N: ``(N,)`` scores in expert-sorted order
         """
-        # Reorder the token indices to match the order of the experts where N = T*K
-        token_indices_experts_sorted_N = torch.argsort(
-            topk_expert_ids_TK.view(-1), stable=True
-        )
+        # Reorder the token indices to match the order of the experts where N = T*K.
+        # On CUDA the radix sort runs one pass per 8 key bits, so sorting int16 ids
+        # instead of int64 takes 2 passes instead of 8 and gives the same stable
+        # order. The ids come from the router's topk over num_experts.
+        expert_ids_N = topk_expert_ids_TK.view(-1)
+        if self.num_experts <= torch.iinfo(torch.int16).max:
+            expert_ids_N = expert_ids_N.to(torch.int16)
+        token_indices_experts_sorted_N = torch.argsort(expert_ids_N, stable=True)
         topk_scores_experts_sorted_N = topk_scores_TK.view(-1)[
             token_indices_experts_sorted_N
         ]
