@@ -32,6 +32,7 @@ from torchtitan.distributed import ParallelismContext, utils as dist_utils
 from torchtitan.experiments.graph_trainer.common_utils import (
     maybe_register_blockmask_pytree_node,
 )
+from torchtitan.experiments.graph_trainer.configs import compiles_full_graph
 from torchtitan.experiments.graph_trainer.memory_policy import (
     validate_memory_policy_config,
 )
@@ -285,7 +286,11 @@ def _precompile_aot_fx_trace(
     maybe_register_blockmask_pytree_node()
 
     logger.info("Tracing fwd+loss+bwd via make_fx...")
-    with parallelism_context.activate_spmd(), loss_parallel_ctx:
+    with (
+        parallelism_context.activate_spmd(),
+        loss_parallel_ctx,
+        utils.trace_compile_friendly(compiles_full_graph(compile_config)),
+    ):
         traced_result = minimal_fx_tracer(
             fwd_bwd_fn,
             module=model,

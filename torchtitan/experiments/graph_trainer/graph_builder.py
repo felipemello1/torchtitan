@@ -47,7 +47,10 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     ensure_boxed_graph_module,
     maybe_register_blockmask_pytree_node,
 )
-from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
+from torchtitan.experiments.graph_trainer.configs import (
+    compiles_full_graph,
+    GraphTrainerCompileConfig,
+)
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
     joint_transformer_block_bucketing_reordering_pass,
     merge_all_all_gathers,
@@ -122,6 +125,7 @@ from torchtitan.experiments.graph_trainer.wgrad_accumulation import (
     fuse_wgrad_accumulation_pass,
 )
 from torchtitan.protocols.model import BaseModel
+from torchtitan.tools.utils import trace_compile_friendly
 
 
 if TYPE_CHECKING:
@@ -1714,10 +1718,11 @@ def _trace_joint_stage_graph(
         stage.submod,
         loss_fn,
     )
-    traced = minimal_fx_tracer(
-        full_forward_backward_step,
-        module=stage.submod,
-    )(*runtime_args)
+    with trace_compile_friendly(compiles_full_graph(compile_config)):
+        traced = minimal_fx_tracer(
+            full_forward_backward_step,
+            module=stage.submod,
+        )(*runtime_args)
     return traced, runtime_meshes
 
 
@@ -2302,12 +2307,13 @@ def _build_stage_graphs(
                 tuple(grads[len(grad_params) :]),
             )
 
-        traced = minimal_fx_tracer(stage_step, module=stage.submod)(
-            stage_args,
-            stage_kwargs,
-            target,
-            loss_kwargs,
-        )
+        with trace_compile_friendly(compiles_full_graph(compile_config)):
+            traced = minimal_fx_tracer(stage_step, module=stage.submod)(
+                stage_args,
+                stage_kwargs,
+                target,
+                loss_kwargs,
+            )
         backward_only_indices = ()
     else:
         output_grads = stage_builder._flat_output_grads_from_stage_metadata(stage)
@@ -2350,11 +2356,12 @@ def _build_stage_graphs(
                 tuple(grads[len(grad_params) :]),
             )
 
-        traced = minimal_fx_tracer(stage_step, module=stage.submod)(
-            stage_args,
-            stage_kwargs,
-            output_grads,
-        )
+        with trace_compile_friendly(compiles_full_graph(compile_config)):
+            traced = minimal_fx_tracer(stage_step, module=stage.submod)(
+                stage_args,
+                stage_kwargs,
+                output_grads,
+            )
         state_flat, _ = pytree.tree_flatten(extract_module_state(stage.submod))
         prefix_user_flat, _ = pytree.tree_flatten(((stage_args, stage_kwargs), {}))
         backward_only_start = len(
