@@ -81,8 +81,26 @@ class OffsetRMSNorm(Module):
         self.eps = config.eps
         self.weight = nn.Parameter(torch.empty(config.dim))
 
-    @local_compile("offset_rmsnorm", batch_invariant=False)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # The [T, D] layer norms and the [T, H, K] q/k norms (q is a strided chunk
+        # of wq's output) share the offset_rmsnorm region. A dynamic T and a static
+        # normalized dim from the first call keep it at one graph per call-site
+        # layout and grad mode, however many token counts it sees. The marks run
+        # here, before the region, because maybe_mark_dynamic is not allowed inside
+        # a Dynamo trace; mark_static takes a non-negative dim (-1 is not resolved).
+        if not torch.compiler.is_compiling():
+            torch._dynamo.maybe_mark_dynamic(x, 0)
+            torch._dynamo.mark_static(x, x.ndim - 1)
+        return self._normalize(x)
+
+    # Non-strict mode keeps Inductor's mix-order reduction heuristic from guarding
+    # on T, which would add graphs for batches under 4096 tokens.
+    @local_compile(
+        "offset_rmsnorm",
+        batch_invariant=False,
+        options={"triton.mix_order_reduction_non_strict_mode": True},
+    )
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
         # Upcast to float32 for numerical stability in pow/rsqrt
         input_dtype = x.dtype
         x = x.float()
