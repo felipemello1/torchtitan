@@ -24,6 +24,11 @@ from torchtitan.models.deepseek_v3 import build_model_config
 from torchtitan.trainer import Trainer
 
 
+def deepseek_v3_local_compile_config() -> LocalCompileConfig:
+    """Return the default local compile regions plus the MoE router region."""
+    return LocalCompileConfig(regions=[*LocalCompileConfig().regions, "router"])
+
+
 def deepseek_v3_16b(seq_len: int | None = None) -> Trainer.Config:
     model_config = build_model_config("16B", seq_len=seq_len, attn_backend="flex")
     return Trainer.Config(
@@ -59,7 +64,7 @@ def deepseek_v3_16b(seq_len: int | None = None) -> Trainer.Config:
         ),
         checkpointer=None,
         activation_checkpoint=SelectiveAC.Config(),
-        compile=LocalCompileConfig(),
+        compile=deepseek_v3_local_compile_config(),
     )
 
 
@@ -103,5 +108,5 @@ def deepseek_v3_671b(seq_len: int | None = None) -> Trainer.Config:
         ),
         checkpointer=None,
         activation_checkpoint=SelectiveAC.Config(),
-        compile=LocalCompileConfig(),
+        compile=deepseek_v3_local_compile_config(),
     )
