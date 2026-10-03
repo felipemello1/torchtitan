@@ -51,7 +51,21 @@ __all__ = [
 ]
 
 
-_MESH_TLS = local()
+class _MeshTLS(local):
+    """Per-thread mesh state whose ``mesh_stack`` exists in every thread.
+
+    Creating the stack lazily (``getattr`` then store) is a side effect that
+    Dynamo cannot trace inside a ``torch.utils.checkpoint`` region, so a
+    compiled, checkpointed function that runs before any eager mesh activation
+    in its thread would graph break.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mesh_stack: list[DeviceMesh | None] = []
+
+
+_MESH_TLS = _MeshTLS()
 
 
 def spmd_axes(layout: spmd.SpmdType) -> tuple[MeshAxisName, ...]:
@@ -140,11 +154,7 @@ def spmd_sparse_mesh() -> DeviceMesh | None:
 
 
 def _spmd_mesh_stack() -> list[DeviceMesh | None]:
-    stack = getattr(_MESH_TLS, "mesh_stack", None)
-    if stack is None:
-        stack = []
-        _MESH_TLS.mesh_stack = stack
-    return stack
+    return _MESH_TLS.mesh_stack
 
 
 def current_spmd_mesh() -> DeviceMesh | None:

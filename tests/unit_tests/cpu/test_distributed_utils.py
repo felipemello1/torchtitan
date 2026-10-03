@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
+import threading
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -17,7 +18,11 @@ from torch.utils.checkpoint import checkpoint
 from torchtitan.config import CommConfig
 from torchtitan.distributed import DistributedTopology, utils as dist_utils
 from torchtitan.distributed.parallelism_context import ParallelismContext
-from torchtitan.distributed.spmd_types import set_spmd_meshes, spmd_dense_sp_enabled
+from torchtitan.distributed.spmd_types import (
+    set_spmd_meshes,
+    spmd_dense_sp_enabled,
+    spmd_local_context,
+)
 from torchtitan.distributed.utils import init_distributed
 
 
@@ -334,3 +339,36 @@ def test_dense_sp_state_compiles_with_checkpoint() -> None:
         sparse_mesh=None,
         dense_sp_enabled=False,
     )
+
+
+def test_mesh_stack_compiles_with_checkpoint_on_fresh_thread() -> None:
+    def checkpointed_forward(input):
+        def forward(value):
+            with spmd_local_context("dp"):
+                return value + 1
+
+        return checkpoint(forward, input, use_reentrant=False)
+
+    compiled_forward = torch.compile(
+        checkpointed_forward,
+        backend="eager",
+        fullgraph=True,
+    )
+    results = []
+
+    def run() -> None:
+        # A new thread starts with fresh thread-local mesh state, as a fresh
+        # process does before any eager mesh activation.
+        input = torch.randn(2, 3, requires_grad=True)
+        try:
+            output = compiled_forward(input)
+            output.sum().backward()
+            results.append(torch.equal(output, input + 1))
+        except Exception as error:  # noqa: BLE001
+            results.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join()
+
+    assert results == [True]
