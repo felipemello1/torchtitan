@@ -172,19 +172,8 @@ class Qwen35Attention(BaseAttention):
         xq_THK = self.q_norm(xq_THK)
         xk_THK = self.k_norm(xk_THK)
 
-        # Partial RoPE: only first rotary_dim elements get positional encoding
-        assert self.rotary_dim <= self.head_dim
-        xq_THR, xq_THP = (
-            xq_THK[..., : self.rotary_dim],
-            xq_THK[..., self.rotary_dim :],
-        )
-        xk_THR, xk_THP = (
-            xk_THK[..., : self.rotary_dim],
-            xk_THK[..., self.rotary_dim :],
-        )
-        xq_THR, xk_THR = self.rope(xq_THR, xk_THR, positions)
-        xq_THK = torch.cat([xq_THR, xq_THP], dim=-1)
-        xk_THK = torch.cat([xk_THR, xk_THP], dim=-1)
+        # Partial RoPE: the rope cache is rotary_dim wide, so only those channels rotate.
+        xq_THK, xk_THK = self.rope(xq_THK, xk_THK, positions)
 
         out_THV = self.inner_attention(
             xq_THK,

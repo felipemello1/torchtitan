@@ -353,21 +353,28 @@ class CosSinRoPE(RoPE):
         *,
         inverse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Apply cos/sin RoPE using the rotate-half convention."""
+        """Apply cos/sin RoPE using the rotate-half convention.
+
+        Rotates the first ``rope_cache.shape[-1] // 2`` channels of each head and keeps
+        the rest, so a cache narrower than the head gives partial RoPE (e.g. Qwen3.5).
+        """
         if inverse:
             raise NotImplementedError("CosSinRoPE does not support inverse rotation.")
 
-        head_dim = query.shape[-1]
-        cos = rope_cache[..., :head_dim]
-        sin = rope_cache[..., head_dim:]
-        query_f = query.float()
-        xq_out = (query_f * cos) + (CosSinRoPE._rotate_half(query_f) * sin)
-        if key is None:
-            return xq_out.type_as(query)
+        rotary_dim = rope_cache.shape[-1] // 2
+        cos = rope_cache[..., :rotary_dim]
+        sin = rope_cache[..., rotary_dim:]
 
-        key_f = key.float()
-        xk_out = (key_f * cos) + (CosSinRoPE._rotate_half(key_f) * sin)
-        return xq_out.type_as(query), xk_out.type_as(key)
+        def rotate(x: torch.Tensor) -> torch.Tensor:
+            x_rot = x[..., :rotary_dim].float()
+            x_rot = ((x_rot * cos) + (CosSinRoPE._rotate_half(x_rot) * sin)).type_as(x)
+            if rotary_dim == x.shape[-1]:
+                return x_rot
+            return torch.cat([x_rot, x[..., rotary_dim:]], dim=-1)
+
+        if key is None:
+            return rotate(query)
+        return rotate(query), rotate(key)
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
