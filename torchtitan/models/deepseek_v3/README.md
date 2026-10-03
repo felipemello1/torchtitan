@@ -42,6 +42,15 @@ MODULE=torchtitan_recipes.models.deepseek_v3 CONFIG=deepseek_v3_671b ./run_train
   --override torchtitan_recipes.overrides.fused_swiglu.fused_swiglu
 ```
 
+The `deepseek_v3_16b_perf` and `deepseek_v3_671b_perf` recipes already enable
+`fused_mla`; pass only the remaining overrides on top (naming an override twice
+is an error):
+
+```bash
+MODULE=torchtitan_recipes.models.deepseek_v3 CONFIG=deepseek_v3_671b_perf ./run_train.sh \
+  --override torchtitan_recipes.overrides.fused_swiglu.fused_swiglu
+```
+
 ## HuggingFace -> DCP Checkpoint Conversion
 
 We implemented StateDictAdapter to perform HuggingFace safetensor to DCP format conversion. Currently, we only support conversion from HF checkpoints to DCP checkpoints offline (using CPU plain tensor).
