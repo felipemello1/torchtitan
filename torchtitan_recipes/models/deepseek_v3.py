@@ -23,7 +23,7 @@ from torchtitan.config.transform import apply_transforms, MXFP8LinearConverter
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.models.common.config_utils import decoder_vocab_size
-from torchtitan.models.deepseek_v3 import build_model_config
+from torchtitan.models.deepseek_v3 import build_model_config, DeepSeekV3Model
 from torchtitan.trainer import Trainer
 
 
@@ -76,11 +76,24 @@ def deepseek_v3_mxfp8_linear_converter_config(
     )
 
 
+def _with_router_region(model_config: DeepSeekV3Model.Config) -> DeepSeekV3Model.Config:
+    """Compile the MoE router as one region next to the model's default regions.
+
+    Example:
+        >>> _with_router_region(build_model_config("671B")).local_compile_regions
+        ['loss', 'swiglu', 'router']
+    """
+    model_config.local_compile_regions = [*model_config.local_compile_regions, "router"]
+    return model_config
+
+
 def deepseek_v3_671b(seq_len: int | None = None) -> Trainer.Config:
-    model_config = build_model_config(
-        "671B",
-        seq_len=seq_len,
-        attn_backend="flex",
+    model_config = _with_router_region(
+        build_model_config(
+            "671B",
+            seq_len=seq_len,
+            attn_backend="flex",
+        )
     )
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
@@ -125,10 +138,12 @@ def deepseek_v3_671b_dist_moe_bf16(seq_len: int = 4096) -> Trainer.Config:
     from torchtitan.config.transform.dist_moe import DistMoeTransform
 
     config = deepseek_v3_671b(seq_len=seq_len)
-    config.model = build_model_config(
-        "671B",
-        seq_len=seq_len,
-        attn_backend="varlen",
+    config.model = _with_router_region(
+        build_model_config(
+            "671B",
+            seq_len=seq_len,
+            attn_backend="varlen",
+        )
     )
     config.loss = CrossEntropyLoss.Config(
         global_vocab_size=decoder_vocab_size(config.model)
@@ -167,13 +182,15 @@ def deepseek_v3_671b_dist_moe_mxfp8(seq_len: int = 4096) -> Trainer.Config:
     from torchtitan.config.transform.dist_moe import DistMoeTransform
 
     config = deepseek_v3_671b(seq_len=seq_len)
-    config.model = build_model_config(
-        "671B",
-        seq_len=seq_len,
-        attn_backend="varlen",
-        converters=[
-            deepseek_v3_mxfp8_linear_converter_config(include_lm_head=True),
-        ],
+    config.model = _with_router_region(
+        build_model_config(
+            "671B",
+            seq_len=seq_len,
+            attn_backend="varlen",
+            converters=[
+                deepseek_v3_mxfp8_linear_converter_config(include_lm_head=True),
+            ],
+        )
     )
     config.loss = CrossEntropyLoss.Config(
         global_vocab_size=decoder_vocab_size(config.model)
