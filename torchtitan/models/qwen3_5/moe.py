@@ -69,12 +69,11 @@ class SigmoidGatedFeedForward(FeedForward):
             recompute=self.remat_should_recompute("input_projections"),
         )(x)
         remat.recompute_needs_tensor(gate_up_T2F)
-        gate_TF, up_TF = gate_up_T2F.unbind(-2)
         out_TD = remat.region(
             self.w2,
             self.remat_region_name("w2"),
             recompute=self.remat_should_recompute("w2"),
-        )(self.activation_fn(gate_TF, up_TF))
+        )(self.activation_fn.apply_gate_up(gate_up_T2F))
         remat.recompute_needs_tensor(out_TD, gate_out_T1)
         return torch.sigmoid(gate_out_T1) * out_TD
 

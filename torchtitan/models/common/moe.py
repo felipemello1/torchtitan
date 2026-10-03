@@ -136,8 +136,7 @@ class RoutedExperts(Module):
                 recompute=self.remat_should_recompute("w13"),
             )(routed_input_RD.bfloat16(), offsets_E)
             remat.recompute_needs_tensor(gate_up_R2F)
-            gate_RF, up_RF = gate_up_R2F.unbind(dim=-2)
-            hidden_RF = self.activation_fn(gate_RF, up_RF, offsets=offsets_E)
+            hidden_RF = self.activation_fn.apply_gate_up(gate_up_R2F, offsets=offsets_E)
             routed_output_RD = remat.region(
                 self.w2,
                 self.remat_region_name("w2"),

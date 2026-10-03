@@ -40,6 +40,11 @@ class GptOssSwiGLU(BinaryActivationFn):
         silu_RF = gate_RF * torch.sigmoid(1.702 * gate_RF)
         return torch.addcmul(silu_RF, silu_RF, up_RF)
 
+    @local_compile("swiglu", batch_invariant=True)
+    def apply_gate_up(self, gate_up_R2F: torch.Tensor, **kwargs) -> torch.Tensor:
+        del kwargs
+        return super().apply_gate_up(gate_up_R2F)
+
 
 class GptOssGroupedLinear(GroupedLinear):
     """Grouped linear with GPT-OSS per-expert bias."""

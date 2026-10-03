@@ -32,6 +32,25 @@ class BinaryActivationFn(Function[torch.Tensor], ABC):
     ) -> torch.Tensor:
         pass
 
+    def apply_gate_up(self, gate_up: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """Apply the activation to gate and up stacked on dim -2, as `w13` returns them.
+
+        Compiled activations override this under their region, so backward writes one
+        `[..., 2, F]` gradient instead of autograd stacking the gate and up gradients.
+
+        Example:
+
+            gate_up_T2F = w13(x_TD)  # [T, 2, F]
+            hidden_TF = activation_fn.apply_gate_up(gate_up_T2F)
+            # same as activation_fn(*gate_up_T2F.unbind(-2))
+        """
+        if gate_up.requires_grad:
+            # Several F per region (dense vs experts) make F symbolic and backward ~2x
+            # slower. Not done without backward: per-F graphs can hit recompile_limit.
+            torch._dynamo.mark_static(gate_up, -1)
+        gate, up = gate_up.unbind(-2)
+        return self(gate, up, **kwargs)
+
 
 class UnaryActivationFn(Function[torch.Tensor], ABC):
     """Base class for configurable one-input activation functions."""
@@ -145,6 +164,11 @@ class SwiGLU(BinaryActivationFn):
         del kwargs
         return F.silu(gate) * up
 
+    @local_compile("swiglu", batch_invariant=True)
+    def apply_gate_up(self, gate_up: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        del kwargs
+        return super().apply_gate_up(gate_up)
+
 
 # TODO: move to models/kimi_k3, its only user.
 class SiTUGLU(BinaryActivationFn):
@@ -174,3 +198,8 @@ class SiTUGLU(BinaryActivationFn):
         if self.linear_beta is not None:
             up = self.linear_beta * torch.tanh(up / self.linear_beta)
         return (gate * up).to(input_dtype)
+
+    @local_compile("situglu", batch_invariant=True)
+    def apply_gate_up(self, gate_up: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        del kwargs
+        return super().apply_gate_up(gate_up)
