@@ -128,6 +128,18 @@ class TestDeepSeekV3Router(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fewer than top_k"):
             config.build()
 
+    def test_rejects_more_limited_groups_than_groups(self):
+        config = DeepSeekV3Router.Config(
+            num_experts=16,
+            gate=RouterGateLinear.Config(in_features=4, out_features=16),
+            score_func=Sigmoid.Config(),
+            num_expert_groups=4,
+            num_limited_groups=5,
+            top_k=4,
+        )
+        with self.assertRaisesRegex(ValueError, "must be <= num_expert_groups"):
+            config.build()
+
     def test_compiled_route_counts_experts_once_under_region_ac(self):
         router = DeepSeekV3Router.Config(
             num_experts=64,
