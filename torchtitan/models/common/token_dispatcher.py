@@ -18,6 +18,7 @@ from torchtitan.ops.scatter_add import deterministic_scatter_add
 from torchtitan.protocols.module import Module
 
 
+@spmd.register_local_autograd_function
 class _PermuteRows(torch.autograd.Function):
     """Gather rows by a permutation; the backward gathers by the inverse permutation.
 
@@ -51,7 +52,9 @@ def _inverse_permutation(perm_R: torch.Tensor) -> torch.Tensor:
         >>> _inverse_permutation(torch.tensor([2, 0, 1]))
         tensor([1, 2, 0])
     """
-    positions_R = torch.arange(perm_R.shape[0], device=perm_R.device)
+    positions_R = torch.arange(
+        perm_R.shape[0], device=perm_R.device, dtype=perm_R.dtype
+    )
     return torch.empty_like(perm_R).scatter_(0, perm_R, positions_R)
 
 
