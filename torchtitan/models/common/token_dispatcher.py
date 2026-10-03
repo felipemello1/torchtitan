@@ -24,7 +24,7 @@ class _PermuteRows(torch.autograd.Function):
 
     For a permutation, ``x[perm]``'s autograd backward (``index_put_`` with
     accumulation: a sort plus a zero fill) and ``out[perm] = y`` (a
-    non-vectorized scatter) are both plain gathers.
+    non-vectorized scatter) can both be plain gathers.
 
     Example:
         >>> perm_R = torch.tensor([2, 0, 1])
