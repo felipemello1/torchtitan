@@ -24,6 +24,7 @@ class LocalDispatchMetadata:
     """Metadata returned by LocalTokenDispatcher.dispatch() for use in combine()."""
 
     token_indices_experts_sorted_N: torch.Tensor  # noqa: N815
+    # Flat (token, k) choice index of each row; token = index // top_k.
     topk_indices_experts_sorted_N: torch.Tensor  # noqa: N815
     topk_scores_experts_sorted_N: torch.Tensor  # noqa: N815
 
@@ -105,11 +106,12 @@ class _CombineTokenRows(torch.autograd.Function):
 
 
 def _token_order(topk_indices_experts_sorted_N: torch.Tensor) -> torch.Tensor:
-    """Expert-sorted row of each flattened ``(token, k)`` choice: the inverse of the expert sort.
+    """Expert-sorted row of each flattened ``(token, k)`` choice (inverse of the expert sort).
 
-    Example (T=2, top_k=2): topk_indices_experts_sorted_N = [2, 0, 3, 1]
-    (row 0 holds choice 2 = token 1's first, ...) -> [1, 3, 0, 2]: token 0's
-    rows are 1 and 3, token 1's rows are 0 and 2.
+    Example (T=2, top_k=2; choices 0, 1 are token 0's, 2, 3 are token 1's):
+        topk_indices_experts_sorted_N = [2, 0, 3, 1]  # row r holds choice [r]
+        _token_order(...)             = [1, 3, 0, 2]  # choice c sits in row [c]
+        .view(2, 2)                   = [[1, 3], [0, 2]]  # rows of token 0, token 1
     """
     token_order_N = torch.empty_like(topk_indices_experts_sorted_N)
     token_order_N[topk_indices_experts_sorted_N] = torch.arange(
@@ -121,8 +123,8 @@ def _token_order(topk_indices_experts_sorted_N: torch.Tensor) -> torch.Tensor:
 # Every token owns exactly top_k routed rows. Compiled, dispatch and combine use
 # that to replace the index backward and the scatter_add custom op (both run
 # aten's sort-based deterministic index_put accumulate, ~2.7 ms per call at
-# Kimi K3's 16k-token shape) with per-token sums in a fixed order: no atomics,
-# FP32 accumulation. Eager is unchanged.
+# Kimi K3's 16k-token shape) with per-token sums in a fixed order (each token's
+# top-k order): no atomics, FP32 accumulation. Eager is unchanged.
 @local_compile("moe_dispatch_combine", batch_invariant=False)
 def _gather_routed_rows(
     x_TD: torch.Tensor,
