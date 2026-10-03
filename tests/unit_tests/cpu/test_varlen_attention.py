@@ -168,6 +168,32 @@ class TestPackedVarlenInnerAttention(unittest.TestCase):
             _per_axis_types((sharding.in_src_shardings or {})["k_THK"]),
         )
 
+    def test_deterministic_mode_pins_fa4(self):
+        q_THK = torch.randn(5, 2, 4)
+        metadata = create_varlen_metadata_for_document(torch.tensor([0, 1, 0, 1, 2]))
+        inner_attention = VarlenInnerAttention.Config().build()
+        cudnn_enabled = []
+
+        def _record_cudnn_enabled(q, *args, **kwargs):
+            cudnn_enabled.append(torch.backends.cuda.cudnn_sdp_enabled())
+            return q
+
+        with patch(
+            "torchtitan.models.common.attention.current_flash_attention_impl",
+            return_value="FA4",
+        ), patch(
+            "torchtitan.models.common.attention._varlen_attn",
+            side_effect=_record_cudnn_enabled,
+        ):
+            for deterministic in (False, True):
+                torch.use_deterministic_algorithms(deterministic)
+                try:
+                    inner_attention(q_THK, q_THK, q_THK, attention_masks=metadata)
+                finally:
+                    torch.use_deterministic_algorithms(False)
+
+        self.assertEqual(cudnn_enabled, [True, False])
+
     def test_out_transform_receives_th_lse(self):
         num_tokens, num_heads, head_dim = 5, 2, 4
         q_THK = torch.randn(num_tokens, num_heads, head_dim)

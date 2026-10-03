@@ -12,6 +12,7 @@
 #       the variable name xq/xk/xv disambiguates),
 #   K = query/key head dimension, V = value head dimension.
 
+import contextlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, NamedTuple
@@ -217,18 +218,26 @@ class VarlenInnerAttention(InnerAttention):
 
         varlen_attn_fn = varlen_attn if out_transform is None else varlen_attn_with_lse
 
-        result = varlen_attn_fn(
-            q_THK.to(torch.bfloat16),
-            k_THK.to(torch.bfloat16),
-            v_THV.to(torch.bfloat16),
-            cu_seq_q,
-            cu_seq_k,
-            max_q,
-            max_k,
-            scale=scale,
-            window_size=self.window_size,
-            **varlen_kwargs,
+        # varlen_attn prefers cuDNN when eligible, but cuDNN's varlen backward
+        # is not deterministic even in deterministic mode; FA4's is.
+        backend_context = (
+            sdpa_kernel(SDPBackend.FLASH_ATTENTION)
+            if fa_impl == "FA4" and torch.are_deterministic_algorithms_enabled()
+            else contextlib.nullcontext()
         )
+        with backend_context:
+            result = varlen_attn_fn(
+                q_THK.to(torch.bfloat16),
+                k_THK.to(torch.bfloat16),
+                v_THV.to(torch.bfloat16),
+                cu_seq_q,
+                cu_seq_k,
+                max_q,
+                max_k,
+                scale=scale,
+                window_size=self.window_size,
+                **varlen_kwargs,
+            )
 
         # varlen_attn returns the packed output (T, H, V), plus the LSE when an
         # out_transform epilogue was requested.
