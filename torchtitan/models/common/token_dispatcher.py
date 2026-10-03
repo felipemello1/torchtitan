@@ -24,6 +24,8 @@ class LocalDispatchMetadata:
     """Metadata returned by LocalTokenDispatcher.dispatch() for use in combine()."""
 
     token_indices_experts_sorted_N: torch.Tensor  # noqa: N815
+    # Flat (token, k) choice index of each row; token = index // top_k.
+    topk_indices_experts_sorted_N: torch.Tensor  # noqa: N815
     topk_scores_experts_sorted_N: torch.Tensor  # noqa: N815
 
 
@@ -103,19 +105,37 @@ class _CombineTokenRows(torch.autograd.Function):
         return grad_routed_ND, grad_scores_N, None, None
 
 
+def _token_order(topk_indices_experts_sorted_N: torch.Tensor) -> torch.Tensor:
+    """Expert-sorted row of each flattened ``(token, k)`` choice (inverse of the expert sort).
+
+    Example (T=2, top_k=2; choices 0, 1 are token 0's, 2, 3 are token 1's):
+        topk_indices_experts_sorted_N = [2, 0, 3, 1]  # row r holds choice [r]
+        _token_order(...)             = [1, 3, 0, 2]  # choice c sits in row [c]
+        .view(2, 2)                   = [[1, 3], [0, 2]]  # rows of token 0, token 1
+    """
+    token_order_N = torch.empty_like(topk_indices_experts_sorted_N)
+    token_order_N[topk_indices_experts_sorted_N] = torch.arange(
+        topk_indices_experts_sorted_N.numel(), device=token_order_N.device
+    )
+    return token_order_N
+
+
 # Every token owns exactly top_k routed rows. Compiled, dispatch and combine use
 # that to replace the index backward and the scatter_add custom op (both run
 # aten's sort-based deterministic index_put accumulate, ~2.7 ms per call at
-# Kimi K3's 16k-token shape) with per-token sums in a fixed order: no atomics,
-# FP32 accumulation. Eager is unchanged.
+# Kimi K3's 16k-token shape) with per-token sums in a fixed order (each token's
+# top-k order): no atomics, FP32 accumulation. Eager is unchanged.
 @local_compile("moe_dispatch_combine", batch_invariant=False)
 def _gather_routed_rows(
-    x_TD: torch.Tensor, token_indices_experts_sorted_N: torch.Tensor, top_k: int
+    x_TD: torch.Tensor,
+    token_indices_experts_sorted_N: torch.Tensor,
+    topk_indices_experts_sorted_N: torch.Tensor,
+    top_k: int,
 ) -> torch.Tensor:
     """Copy each token to its ``top_k`` routed rows (``x_TD[token_indices]``)."""
     if not torch.compiler.is_compiling():
         return x_TD[token_indices_experts_sorted_N]
-    token_order_TK = torch.argsort(token_indices_experts_sorted_N, stable=True)
+    token_order_TK = _token_order(topk_indices_experts_sorted_N)
     return _GatherTokenRows.apply(
         x_TD, token_indices_experts_sorted_N, token_order_TK.view(x_TD.shape[0], top_k)
     )
@@ -126,6 +146,7 @@ def _score_and_combine(
     x_TD: torch.Tensor,
     routed_output_ND: torch.Tensor,
     token_indices_experts_sorted_N: torch.Tensor,
+    topk_indices_experts_sorted_N: torch.Tensor,
     topk_scores_experts_sorted_N: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
@@ -147,7 +168,7 @@ def _score_and_combine(
             token_indices_experts_sorted_N.reshape(-1, 1).expand(-1, x_TD.shape[-1]),
             routed_output_ND,
         )
-    token_order_TK = torch.argsort(token_indices_experts_sorted_N, stable=True)
+    token_order_TK = _token_order(topk_indices_experts_sorted_N)
     return _CombineTokenRows.apply(
         routed_output_ND,
         topk_scores_experts_sorted_N,
@@ -181,7 +202,7 @@ class LocalTokenDispatcher(Module):
         x_TD: torch.Tensor,
         topk_scores_TK: torch.Tensor,
         topk_expert_ids_TK: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reorder tokens by expert assignment for local expert computation.
 
         Groups tokens by expert index via argsort. Routing scores are applied
@@ -196,23 +217,29 @@ class LocalTokenDispatcher(Module):
             routed_input_ND: ``(N, D)`` where N = T*K. Tokens in expert-sorted
                 order.
             token_indices_experts_sorted_N: ``(N,)`` token-to-original mapping
+            topk_indices_experts_sorted_N: ``(N,)`` index of each row's choice in
+                the flattened ``(T, K)`` top-k arrays
             topk_scores_experts_sorted_N: ``(N,)`` scores in expert-sorted order
         """
         # Reorder the token indices to match the order of the experts where N = T*K
-        token_indices_experts_sorted_N = torch.argsort(
+        topk_indices_experts_sorted_N = torch.argsort(
             topk_expert_ids_TK.view(-1), stable=True
         )
         topk_scores_experts_sorted_N = topk_scores_TK.view(-1)[
-            token_indices_experts_sorted_N
+            topk_indices_experts_sorted_N
         ]
-        token_indices_experts_sorted_N = token_indices_experts_sorted_N // self.top_k
+        token_indices_experts_sorted_N = topk_indices_experts_sorted_N // self.top_k
         routed_input_ND = _gather_routed_rows(
-            x_TD, token_indices_experts_sorted_N, self.top_k
+            x_TD,
+            token_indices_experts_sorted_N,
+            topk_indices_experts_sorted_N,
+            self.top_k,
         )
 
         return (
             routed_input_ND,
             token_indices_experts_sorted_N,
+            topk_indices_experts_sorted_N,
             topk_scores_experts_sorted_N,
         )
 
@@ -241,10 +268,12 @@ class LocalTokenDispatcher(Module):
         (
             routed_input_RD,
             token_indices_experts_sorted_N,
+            topk_indices_experts_sorted_N,
             topk_scores_experts_sorted_N,
         ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)
         metadata = LocalDispatchMetadata(
             token_indices_experts_sorted_N=token_indices_experts_sorted_N,
+            topk_indices_experts_sorted_N=topk_indices_experts_sorted_N,
             topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,
         )
         return routed_input_RD, num_local_tokens_per_expert_E, metadata
@@ -268,6 +297,7 @@ class LocalTokenDispatcher(Module):
             x_TD,
             routed_output_RD,
             metadata.token_indices_experts_sorted_N,
+            metadata.topk_indices_experts_sorted_N,
             metadata.topk_scores_experts_sorted_N,
             self.top_k,
         )
@@ -510,6 +540,7 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
         (
             routed_input_ND,
             token_indices_experts_sorted_N,
+            topk_indices_experts_sorted_N,
             topk_scores_experts_sorted_N,
         ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)
 
@@ -585,6 +616,7 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
 
         metadata = AllToAllDispatchMetadata(
             token_indices_experts_sorted_N=token_indices_experts_sorted_N,
+            topk_indices_experts_sorted_N=topk_indices_experts_sorted_N,
             topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,
             input_shape=input_shape,
             permuted_indices=permuted_indices,
@@ -708,6 +740,7 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
             x_TD,
             routed_output_RD,
             metadata.token_indices_experts_sorted_N,
+            metadata.topk_indices_experts_sorted_N,
             metadata.topk_scores_experts_sorted_N,
             self.top_k,
         )
@@ -759,6 +792,7 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
         (
             routed_input_ND,
             token_indices_experts_sorted_N,
+            topk_indices_experts_sorted_N,
             topk_scores_experts_sorted_N,
         ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)
 
@@ -771,6 +805,7 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
 
         metadata = AllToAllDispatchMetadata(
             token_indices_experts_sorted_N=token_indices_experts_sorted_N,
+            topk_indices_experts_sorted_N=topk_indices_experts_sorted_N,
             topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,
             input_shape=input_shape,
             permuted_indices=permuted_indices,
@@ -805,6 +840,7 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
             x_TD,
             routed_output_RD,
             metadata.token_indices_experts_sorted_N,
+            metadata.topk_indices_experts_sorted_N,
             metadata.topk_scores_experts_sorted_N,
             self.top_k,
         )

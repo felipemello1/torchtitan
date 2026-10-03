@@ -47,6 +47,7 @@ from torchtitan.models.common.moe_sharding import (
     set_moe_sharding_config,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.common.token_dispatcher import _token_order
 
 
 class _PassthroughRoutedExperts(nn.Module):
@@ -344,6 +345,20 @@ class TestMoE(unittest.TestCase):
 
         self.assertEqual(moe.router.tokens_per_expert_E.sum().item(), 3)
         self.assertEqual(moe.routed_experts.num_tokens_per_expert_E.sum().item(), 6)
+
+    def test_token_order_inverts_the_expert_sort(self):
+        self.assertEqual(
+            _token_order(torch.tensor([2, 0, 3, 1])).tolist(), [1, 3, 0, 2]
+        )
+
+        # Duplicate expert ids: each token's rows hold its own choices, in top-k order.
+        T, K = 64, 4
+        ids_TK = torch.randint(0, 8, (T, K), generator=torch.Generator().manual_seed(0))
+        topk_indices_N = torch.argsort(ids_TK.view(-1), stable=True)
+        order_TK = _token_order(topk_indices_N).view(T, K)
+        self.assertTrue(
+            torch.equal(topk_indices_N[order_TK], torch.arange(T * K).view(T, K))
+        )
 
     def test_router_masks_padding_only_for_aux_loss(self):
         router = make_router_config(
