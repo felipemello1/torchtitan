@@ -6,9 +6,11 @@
 
 import contextlib
 import os
+import sys
 import warnings
 from functools import partial
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -45,6 +47,13 @@ from torchtitan.observability.sdc_replayer import SDCReplayer
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
+requires_h100 = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.version.hip is not None
+    or torch.cuda.get_device_capability() != (9, 0),
+    reason="split_mm uses Hopper wgmma",
+)
 
 
 @pytest.mark.parametrize("grad_output_pieces", [2, 3])
@@ -677,9 +686,12 @@ def test_sdc_replayer_checks_captured_chunked_loss_steps(accumulate, monkeypatch
 
 
 # out_features > num_tokens takes the LM-head layout, out_features < num_tokens the router one.
+@pytest.mark.parametrize(
+    "fused_split_gemm", [False, pytest.param(True, marks=requires_h100)]
+)
 @pytest.mark.parametrize("num_tokens,out_features", [(64, 1024), (512, 16)])
 def test_fp32_input_matches_the_bf16_forward_and_gets_an_fp32_grad_input(
-    num_tokens, out_features
+    num_tokens, out_features, fused_split_gemm
 ):
     # TP hands the lm_head an upcast bf16 input, so it can sum the partial grad_inputs in fp32.
     x = torch.randn(num_tokens, 256, device="cuda").bfloat16()
@@ -687,7 +699,9 @@ def test_fp32_input_matches_the_bf16_forward_and_gets_an_fp32_grad_input(
     grad_output = torch.randn(num_tokens, out_features, device="cuda")
     x_fp32 = x.float().requires_grad_()
 
-    output = linear_module._FP32OutputLinearFunction.apply(x_fp32, weight, 2)
+    output = linear_module._FP32OutputLinearFunction.apply(
+        x_fp32, weight, 2, fused_split_gemm
+    )
     output.backward(grad_output)
 
     assert torch.equal(
@@ -966,3 +980,458 @@ def test_backward_runs_under_autocast_with_fp32_params():
 
     assert x.grad.dtype is torch.float32
     assert layer.weight.grad.dtype is torch.float32
+
+
+@requires_h100
+@pytest.mark.parametrize("num_pieces", [2, 3])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_split_mm_accumulates_long_k_in_fp32(num_pieces, transposed):
+    # An LM head's grad_input: a CE gradient (softmax - one_hot) over a 64k vocab times the head.
+    # One cuBLAS GEMM over the pieces loses precision to tensor-core accumulation (7.3e-6 here,
+    # 2.9e-4 on real Qwen3-8B data). This small output takes 64-way split-K, summed in fp32
+    # (2 pieces: unpromoted within each split); test_split_mm_promotes_long_k covers promotion.
+    from torchtitan.models.common.split_mm import split_mm
+
+    torch.manual_seed(0)
+    num_tokens, vocab, dim = 136, 65536, 200
+    logits = torch.randn(num_tokens, vocab, device="cuda") * 4
+    targets = torch.randint(vocab, (num_tokens,), device="cuda")
+    grad_output = logits.softmax(-1) - F.one_hot(targets, vocab).float()
+    if transposed:
+        grad_output = grad_output.T.contiguous().T
+    weight = (torch.randn(vocab, dim, device="cuda") * 0.02).bfloat16()
+    exact = grad_output.double() @ weight.double()
+    pieces = linear_module._split_into_bf16_pieces(
+        grad_output.contiguous(), grad_output_pieces=num_pieces
+    )
+    torch_path = sum(torch.mm(p, weight, out_dtype=torch.float32) for p in pieces)
+
+    out = split_mm(grad_output, weight, num_pieces, torch.float32)
+
+    assert torch.equal(out, split_mm(grad_output, weight, num_pieces, torch.float32))
+    assert _relative_error(out, exact) < 0.5 * _relative_error(torch_path, exact)
+
+
+@requires_h100
+@pytest.mark.parametrize("num_pieces", [2, 3])
+def test_split_mm_promotes_long_k(num_pieces):
+    # The LM head's grad_input kernel: promoted, one split (2048 x 4096 outputs fill the GPU).
+    # Unpromoted, 2 pieces sum K = 65536 in the tensor core: 0.64x the torch path's error.
+    from torchtitan.models.common import split_mm as split_mm_module
+
+    torch.manual_seed(0)
+    num_tokens, vocab, dim = 2048, 65536, 4096
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    num_splits, _, promote, _, _ = split_mm_module._plan(
+        num_tokens, dim, vocab, num_pieces, False, num_sms
+    )
+    assert (num_splits, promote) == (1, True)
+    logits = torch.randn(num_tokens, vocab, device="cuda") * 4
+    targets = torch.randint(vocab, (num_tokens,), device="cuda")
+    grad_output = logits.softmax(-1) - F.one_hot(targets, vocab).float()
+    del logits
+    weight = (torch.randn(vocab, dim, device="cuda") * 0.02).bfloat16()
+    exact = grad_output.double() @ weight.double()
+    pieces = linear_module._split_into_bf16_pieces(
+        grad_output, grad_output_pieces=num_pieces
+    )
+    torch_path = sum(torch.mm(p, weight, out_dtype=torch.float32) for p in pieces)
+
+    out = split_mm_module.split_mm(grad_output, weight, num_pieces, torch.float32)
+
+    assert _relative_error(out, exact) < 0.1 * _relative_error(torch_path, exact)
+
+
+@requires_h100
+@pytest.mark.parametrize("num_pieces", [2, 3])
+@pytest.mark.parametrize("transposed", [False, True])
+# K = 512: one unpromoted sum for 2 pieces; K = 8192: promoted (1024 rows: one split).
+@pytest.mark.parametrize("k", [512, 8192])
+def test_split_mm_splits_like_split_into_bf16_pieces(num_pieces, transposed, k):
+    # Times the identity, each output is the sum of split_mm's in-register pieces of one input.
+    from torchtitan.models.common import split_mm as split_mm_module
+
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    num_splits, _, promote, _, _ = split_mm_module._plan(
+        1024, k, k, num_pieces, transposed, num_sms
+    )
+    assert (num_splits, promote) == (1, num_pieces == 3 or k == 8192)
+    torch.manual_seed(0)
+    a = torch.randn(1024, k, device="cuda") * torch.logspace(-20, 20, k, device="cuda")
+    pieces = linear_module._split_into_bf16_pieces(a, grad_output_pieces=num_pieces)
+    eye = torch.eye(k, device="cuda", dtype=torch.bfloat16)
+
+    out = split_mm_module.split_mm(
+        a.T.contiguous().T if transposed else a, eye, num_pieces, torch.float32
+    )
+
+    assert torch.equal(out, sum(piece.float() for piece in reversed(pieces)))
+
+
+@requires_h100
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.mem_get_info()[0] < 12 * 2**30,
+    reason="needs 12 GiB free",
+)
+def test_split_mm_writes_more_than_2_31_outputs():
+    # grad_weight of a 532,480 x 4096 head (2.18e9 elements): int32 offsets overflowed here.
+    from torchtitan.models.common.split_mm import split_mm
+
+    torch.manual_seed(0)
+    num_tokens, vocab, dim = 64, 532480, 4096
+    grad_output = torch.randn(num_tokens, vocab, device="cuda") * 1e-3
+    x = torch.randn(num_tokens, dim, device="cuda").bfloat16()
+
+    out = split_mm(grad_output.T, x, 2, torch.float32)
+
+    last_rows = slice(vocab - 1024, vocab)
+    exact = grad_output[:, last_rows].T.double() @ x.double()
+    assert _relative_error(out[last_rows], exact) < 1e-5
+
+
+@requires_h100
+@pytest.mark.parametrize("transposed", [False, True])
+def test_split_mm_copies_a_misaligned_start(transposed):
+    # 4 bytes into its storage, `a` can't be a TMA base: split_mm copies it first.
+    from torchtitan.models.common.split_mm import split_mm
+
+    torch.manual_seed(0)
+    storage = torch.randn(1 + 256 * 1000, device="cuda")
+    a = storage[1:].view(1000, 256).T if transposed else storage[1:].view(256, 1000)
+    b = torch.randn(1000, 136, device="cuda").bfloat16()
+    aligned = a.T.contiguous().T if transposed else a.contiguous()
+    assert linear_module._split_mm_supported(a, b) and a.data_ptr() % 16 == 4
+
+    assert torch.equal(
+        split_mm(a, b, 2, torch.float32), split_mm(aligned, b, 2, torch.float32)
+    )
+
+
+@requires_h100
+def test_split_mm_copies_a_misaligned_padded_operand():
+    # 130 fp32 per row padded to 132 (16-byte rows), 4 bytes in: the copy keeps the padded stride.
+    from torchtitan.models.common.split_mm import split_mm
+
+    torch.manual_seed(0)
+    storage = torch.randn(1 + 130 * 132, device="cuda")
+    a = storage[1:].view(130, 132)[:, :130]
+    aligned = torch.zeros(130, 132, device="cuda")[:, :130].copy_(a)
+    b = torch.randn(130, 136, device="cuda").bfloat16()
+    assert linear_module._split_mm_supported(a, b) and a.data_ptr() % 16 == 4
+
+    assert torch.equal(
+        split_mm(a, b, 2, torch.float32), split_mm(aligned, b, 2, torch.float32)
+    )
+
+
+@requires_h100
+def test_fused_backward_takes_the_torch_path_for_expanded_rows():
+    # cat's backward hands the head's sum(0) a grad 4 bytes into its storage; sum(0)'s backward
+    # expands it to strides (0, 1). Copying that misaligned start with its strides would fail.
+    grads = []
+    for fused in (False, True):
+        torch.manual_seed(0)
+        layer = FP32OutputLinear.Config(
+            in_features=256, out_features=1024, fused_split_gemm=fused
+        ).build()
+        layer = layer.to(device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(
+            64, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        weights = torch.randn(1025, device="cuda")
+
+        logits_sum = layer(x).sum(0)
+        (
+            torch.cat([torch.zeros(1, device="cuda"), logits_sum]) * weights
+        ).sum().backward()
+
+        grads.append((x.grad, layer.weight.grad))
+
+    assert torch.equal(grads[0][0], grads[1][0])
+    assert torch.equal(grads[0][1], grads[1][1])
+
+
+@requires_h100
+def test_fused_backward_handles_zero_tokens():
+    # A contiguous [0, V] grad_output takes the fused path (an expanded one, from .sum(), doesn't).
+    x = torch.empty(0, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(
+        1024, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    grad_output = torch.empty(0, 1024, device="cuda")
+    assert linear_module._split_mm_supported(grad_output, weight)
+
+    linear_module._FP32OutputLinearFunction.apply(x, weight, 2, True).backward(
+        grad_output
+    )
+
+    assert x.grad.shape == x.shape
+    assert torch.equal(weight.grad, torch.zeros_like(weight.grad))
+
+
+def _fused_lm_head(grad_output_pieces: int = 3) -> FP32OutputLinear:
+    layer = FP32OutputLinear.Config(
+        in_features=256,
+        out_features=1024,
+        grad_output_pieces=grad_output_pieces,
+        fused_split_gemm=True,
+    ).build()
+    return layer.to(device="cuda", dtype=torch.bfloat16)
+
+
+@requires_h100
+@pytest.mark.parametrize("grad_output_pieces", [2, 3])
+def test_fused_backward_calls_split_mm(grad_output_pieces):
+    from torchtitan.models.common import split_mm as split_mm_module
+
+    layer = _fused_lm_head(grad_output_pieces)
+    x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    with mock.patch.object(
+        split_mm_module, "split_mm", wraps=split_mm_module.split_mm
+    ) as spy:
+        layer(x).backward(torch.randn(64, 1024, device="cuda"))
+
+    assert [call.args[2] for call in spy.call_args_list] == [grad_output_pieces] * 2
+
+
+@requires_h100
+def test_compiled_fused_backward_calls_split_mm():
+    from torch._inductor.utils import run_and_get_code
+
+    torch._dynamo.reset()
+    compiled = torch.compile(_fused_lm_head(), fullgraph=True)
+    x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    _, codes = run_and_get_code(
+        lambda: compiled(x).backward(torch.randn(64, 1024, device="cuda"))
+    )
+
+    calls = sum(code.count("torch.ops.torchtitan.split_mm.default(") for code in codes)
+    assert calls == 2
+
+
+def test_fused_backward_never_imports_the_kernel_on_other_gpus(monkeypatch):
+    # The flag on an A100 must not import Gluon, an experimental Triton API that may not import.
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (8, 0))
+    monkeypatch.setitem(sys.modules, "triton.experimental.gluon", None)
+    monkeypatch.delitem(sys.modules, "torchtitan.models.common.split_mm", raising=False)
+    x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    weight = (torch.randn(1024, 256, device="cuda") * 0.02).bfloat16()
+    grad_output = torch.randn(64, 1024, device="cuda")
+
+    grads = []
+    for fused in (False, True):
+        x_leaf, weight_leaf = (
+            x.clone().requires_grad_(),
+            weight.clone().requires_grad_(),
+        )
+        linear_module._FP32OutputLinearFunction.apply(
+            x_leaf, weight_leaf, 2, fused
+        ).backward(grad_output)
+        grads.append((x_leaf.grad, weight_leaf.grad))
+
+    assert torch.equal(grads[0][0], grads[1][0])
+    assert torch.equal(grads[0][1], grads[1][1])
+
+
+@requires_h100
+@pytest.mark.parametrize(
+    "compile",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="AOTAutograd rounds grad_weight to bf16 (pytorch/pytorch#197381)",
+            ),
+        ),
+    ],
+)
+def test_fused_weight_grad_keeps_fp32_values(compile):
+    # Compiled, weight.grad is still fp32 in dtype, but every value is a bf16 number.
+    torch._dynamo.reset()
+    layer = _fused_lm_head()
+    layer.weight.grad_dtype = torch.float32
+    x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    grad_output = torch.randn(64, 1024, device="cuda")
+
+    (torch.compile(layer, fullgraph=True) if compile else layer)(x).backward(
+        grad_output
+    )
+
+    exact = grad_output.double().T @ x.double()
+    floor = _relative_error(exact.bfloat16(), exact)
+    assert layer.weight.grad.dtype == torch.float32
+    assert _relative_error(layer.weight.grad, exact) < 0.01 * floor
+
+
+@requires_h100
+@pytest.mark.parametrize("grad_output_pieces", [2, 3])
+@pytest.mark.parametrize(
+    "num_tokens,in_features,out_features", [(64, 256, 1024), (512, 256, 16)]
+)
+def test_fused_backward_stays_at_bf16_rounding_floor(
+    num_tokens, in_features, out_features, grad_output_pieces
+):
+    ratios = _backward_errors_vs_bf16_floor(
+        lambda input, weight: linear_module._FP32OutputLinearFunction.apply(
+            input, weight, grad_output_pieces, True
+        ),
+        num_tokens,
+        in_features,
+        out_features,
+    )
+    assert max(ratios) < 1.05, ratios
+
+
+@requires_h100
+# out_features > num_tokens takes the LM-head layout, out_features < num_tokens the router one.
+@pytest.mark.parametrize("num_tokens,out_features", [(64, 1024), (512, 16)])
+def test_fused_backward_compiles_and_matches_eager(num_tokens, out_features):
+    # Earlier tests compile the same forward with other configs; start under the recompile limit.
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    layer = FP32OutputLinear.Config(
+        in_features=256, out_features=out_features, fused_split_gemm=True
+    ).build()
+    layer = layer.to(device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(num_tokens, 256, device="cuda", dtype=torch.bfloat16)
+    grad_output = torch.randn(num_tokens, out_features, device="cuda")
+
+    grads = []
+    for forward in (layer, torch.compile(layer, fullgraph=True)):
+        x_leaf = x.clone().requires_grad_()
+        forward(x_leaf).backward(grad_output)
+        grads.append((x_leaf.grad, layer.weight.grad))
+        layer.weight.grad = None
+
+    assert torch.equal(grads[0][0], grads[1][0])
+    assert torch.equal(grads[0][1], grads[1][1])
+
+
+@requires_h100
+def test_fused_backward_falls_back_on_unaligned_vocab():
+    # 1023 fp32 columns = 4092-byte rows, not 16-byte aligned for TMA: the torch path runs.
+    x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    weight = (torch.randn(1023, 256, device="cuda") * 0.02).bfloat16()
+    grad_output = torch.randn(64, 1023, device="cuda")
+
+    grads = []
+    for fused in (False, True):
+        x_leaf, weight_leaf = (
+            x.clone().requires_grad_(),
+            weight.clone().requires_grad_(),
+        )
+        linear_module._FP32OutputLinearFunction.apply(
+            x_leaf, weight_leaf, 2, fused
+        ).backward(grad_output)
+        grads.append((x_leaf.grad, weight_leaf.grad))
+
+    assert torch.equal(grads[0][0], grads[1][0])
+    assert torch.equal(grads[0][1], grads[1][1])
+
+
+@requires_h100
+@pytest.mark.parametrize("num_tokens,out_features", [(64, 1024), (512, 16)])
+def test_fused_backward_cuda_graph_replay_matches_eager(num_tokens, out_features):
+    torch.manual_seed(0)
+    layer = FP32OutputLinear.Config(
+        in_features=256, out_features=out_features, fused_split_gemm=True
+    ).build()
+    layer = layer.to(device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(
+        num_tokens, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    grad_output = torch.randn(num_tokens, out_features, device="cuda")
+
+    def step():
+        x.grad = layer.weight.grad = None
+        layer(x).backward(grad_output)
+
+    # Compile the kernels outside the capture, on a side stream as capture requires.
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        step()
+    torch.cuda.current_stream().wait_stream(side_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    # New values in the captured inputs: the replay must recompute, not return the capture's.
+    with torch.no_grad():
+        x.copy_(torch.randn_like(x))
+        grad_output.copy_(torch.randn_like(grad_output))
+    graph.replay()
+    replayed_grads = (x.grad.clone(), layer.weight.grad.clone())
+
+    step()
+
+    assert torch.equal(replayed_grads[0], x.grad)
+    assert torch.equal(replayed_grads[1], layer.weight.grad)
+
+
+def _run_fsdp_fused_matches_torch_path(rank, world_size, port):
+    from torchtitan.models.common import split_mm as split_mm_module
+
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    try:
+        mesh = init_device_mesh("cuda", (world_size,))
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+        )
+        # (num_tokens, out_features, grad_output_pieces): the LM head ships 2 pieces, routers 3.
+        for num_tokens, out_features, grad_output_pieces in (
+            (64, 1024, 2),
+            (512, 16, 3),
+        ):
+            # Same data on every rank, so FSDP's average is the local gradient.
+            torch.manual_seed(0)
+            x = torch.randn(num_tokens, 256, device="cuda").bfloat16()
+            grad_output = torch.randn(num_tokens, out_features, device="cuda")
+            grads = []
+            for fused_split_gemm in (False, True):
+                torch.manual_seed(1)
+                layer = FP32OutputLinear.Config(
+                    in_features=256,
+                    out_features=out_features,
+                    grad_output_pieces=grad_output_pieces,
+                    fused_split_gemm=fused_split_gemm,
+                ).build()
+                layer = layer.cuda()
+                torch.nn.init.normal_(layer.weight, std=0.02)
+                fully_shard(layer, mesh=mesh, mp_policy=mp_policy)
+
+                with mock.patch.object(
+                    split_mm_module, "split_mm", wraps=split_mm_module.split_mm
+                ) as spy:
+                    layer(x).backward(grad_output)
+
+                # grad_weight only: x needs no grad.
+                assert spy.call_count == int(fused_split_gemm)
+                grads.append(layer.weight.grad.full_tensor())
+            torch_grad, fused_grad = grads
+            exact_grad = grad_output.double().T @ x.double()
+            floor = _relative_error(exact_grad.bfloat16(), exact_grad)
+            assert fused_grad.dtype == torch.float32
+            assert _relative_error(fused_grad, exact_grad) < 0.01 * floor
+            assert _relative_error(fused_grad, torch_grad.double()) < 0.01 * floor
+    finally:
+        dist.destroy_process_group()
+
+
+@requires_h100
+@pytest.mark.multi_gpu
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+def test_fsdp_fused_split_gemm_matches_torch_path():
+    # fp32 reduce: the fused grad_weight stays fp32 through FSDP, like the torch path's.
+    mp.spawn(
+        _run_fsdp_fused_matches_torch_path,
+        args=(2, get_free_port()),
+        nprocs=2,
+        join=True,
+    )

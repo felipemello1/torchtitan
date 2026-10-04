@@ -219,6 +219,9 @@ def test_lm_head_converter_swaps_only_lm_head():
     converter = LMHeadFP32OutputConverter.Config(grad_output_pieces=3).build()
     converter.convert(config)
     assert config.lm_head.grad_output_pieces == 3
+    config.lm_head = lm_head_before
+    LMHeadFP32OutputConverter.Config(fused_split_gemm=True).build().convert(config)
+    assert config.lm_head.fused_split_gemm is True
 
     config.lm_head = None
     with pytest.raises(ValueError, match="lm_head"):
