@@ -587,6 +587,8 @@ class ChunkedLossWrapper(BaseLoss):
         """
         from torch.distributed._composable.fsdp import FSDPModule
 
+        from torchtitan.models.common.linear import accumulate_into_weight_grad
+
         num_chunks = self.num_chunks
         lm_head = self.lm_head
         assert lm_head is not None, "Set lm_head before calling ChunkedLossWrapper"
@@ -701,7 +703,10 @@ class ChunkedLossWrapper(BaseLoss):
                 # TODO(felipemello): one lm_head + loss_fn graph: 1.2 GiB less peak, and 0.8 ms less
                 # beyond linear.py's ConcatKernel options, per Qwen3-8B chunk (H100). Blocked: FSDP2
                 # hooks break fullgraph; AOTAutograd rounds grad_weight (pytorch/pytorch#197381).
-                logits = tuple(lm_head(h_chunk) for h_chunk in h_chunks)
+                # A traced lm_head would also turn off the in-GEMM .grad add below.
+                # chunk_loss.backward() below is plain, so lm_head may add to .grad inside the GEMM.
+                with accumulate_into_weight_grad():
+                    logits = tuple(lm_head(h_chunk) for h_chunk in h_chunks)
                 if not is_multi_output:
                     logits = logits[0]
                     label_chunks = label_chunks[0]
