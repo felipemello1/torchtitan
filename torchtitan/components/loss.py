@@ -700,24 +700,15 @@ class ChunkedLossWrapper(BaseLoss):
                     key: chunks[chunk_index] if isinstance(chunks, tuple) else chunks
                     for key, chunks in input_chunks.items()
                 }
-                # TODO(felipemello): one lm_head + loss_fn graph: 1.2 GiB less peak, and 0.8 ms less
-                # beyond linear.py's ConcatKernel options, per Qwen3-8B chunk (H100). Blocked: FSDP2
-                # hooks break fullgraph; AOTAutograd rounds grad_weight (pytorch/pytorch#197381).
-                # A traced lm_head would also turn off the in-GEMM .grad add below.
                 # chunk_loss.backward() below is plain, so lm_head may add to .grad inside the GEMM.
                 with accumulate_into_weight_grad():
-                    logits = tuple(lm_head(h_chunk) for h_chunk in h_chunks)
-                if not is_multi_output:
-                    logits = logits[0]
-                    label_chunks = label_chunks[0]
-                chunk_loss, chunk_metrics = self.loss_fn(
-                    logits,  # pyrefly: ignore[bad-argument-type]
-                    label_chunks,  # pyrefly: ignore[bad-argument-type]
-                    global_valid_tokens,
-                    **loss_inputs,
-                )
-                # Free this chunk's logits before its backward: 1.16 GiB per 2048-token Qwen3-8B chunk.
-                del logits
+                    chunk_loss, chunk_metrics = self._lm_head_and_loss(
+                        h_chunks,
+                        label_chunks,
+                        global_valid_tokens,
+                        is_multi_output=is_multi_output,
+                        **loss_inputs,
+                    )
                 metrics = self._combine_chunk_metrics(metrics, chunk_metrics)
                 total_loss = total_loss + chunk_loss.detach()
 
@@ -752,6 +743,34 @@ class ChunkedLossWrapper(BaseLoss):
                 total_loss,
             )
         return loss, metrics
+
+    def _lm_head_and_loss(
+        self,
+        h_chunks: tuple[torch.Tensor, ...],
+        label_chunks: tuple[torch.Tensor, ...],
+        global_valid_tokens: torch.Tensor | None,
+        *,
+        is_multi_output: bool,
+        **loss_inputs: Any,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Run lm_head and loss_fn on one chunk of every output. Subclasses may fuse the two."""
+        assert self.lm_head is not None
+        # TODO(felipemello): one lm_head + loss_fn graph: 1.2 GiB less peak, and 0.8 ms less
+        # beyond linear.py's ConcatKernel options, per Qwen3-8B chunk (H100). Blocked: FSDP2
+        # hooks break fullgraph; AOTAutograd rounds grad_weight (pytorch/pytorch#197381).
+        # A traced lm_head would also turn off the in-GEMM .grad add.
+        # Local, so this chunk's logits are freed on return, before its backward.
+        logits = tuple(self.lm_head(h_chunk) for h_chunk in h_chunks)
+        if not is_multi_output:
+            return self.loss_fn(
+                logits[0], label_chunks[0], global_valid_tokens, **loss_inputs
+            )
+        return self.loss_fn(
+            logits,  # pyrefly: ignore[bad-argument-type]
+            label_chunks,  # pyrefly: ignore[bad-argument-type]
+            global_valid_tokens,
+            **loss_inputs,
+        )
 
     @staticmethod
     def _combine_chunk_metrics(
