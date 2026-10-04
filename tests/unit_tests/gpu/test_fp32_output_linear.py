@@ -11,9 +11,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.elastic.utils.distributed import get_free_port
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.fx.experimental.proxy_tensor import make_fx
 
 from torchtitan.models.common import linear as linear_module
 from torchtitan.models.common.linear import FP32OutputLinear
@@ -134,7 +136,10 @@ def test_compiled_backward_keeps_lo_half():
     def linear(input, weight):
         return linear_module._FP32OutputLinearFunction.apply(input, weight, 2)
 
-    ratios = _backward_errors_vs_bf16_floor(torch.compile(linear), 64, 256, 1024)
+    # fullgraph=True: the LM-head backward must trace without a break (its split guard).
+    ratios = _backward_errors_vs_bf16_floor(
+        torch.compile(linear, fullgraph=True), 64, 256, 1024
+    )
     assert max(ratios) < 1.05, ratios
 
 
@@ -163,6 +168,115 @@ def test_third_piece_keeps_what_two_pieces_drop(
 
     expected = 2**-20 if grad_output_pieces == 3 else 0.0
     assert torch.equal(x.grad, torch.full_like(x.grad, expected))
+
+
+@pytest.mark.parametrize("grad_output_pieces", [2, 3])
+def test_compiled_split_matches_eager_split(grad_output_pieces):
+    # The LM-head layout's split is compiled. It must give the eager pieces bit for bit, including
+    # signed zeros, ties (1 + 2^-8 sits halfway between two bf16s) and tiny and huge values.
+    # Earlier tests fill the split's Dynamo cache; past the recompile limit it would run eagerly.
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    grad_output = torch.randn(64, 1024, device="cuda")
+    grad_output *= torch.logspace(-30, 30, 1024, device="cuda")
+    grad_output[0, :4] = torch.tensor([0.0, -0.0, 1 + 2**-8, -(1 + 2**-8)])
+    pieces = linear_module._split_into_bf16_pieces(
+        grad_output, grad_output_pieces=grad_output_pieces
+    )
+
+    stacked = linear_module._compiled_split_into_stacked_bf16_pieces(
+        grad_output, grad_output_pieces=grad_output_pieces
+    )
+
+    assert torch.equal(stacked.view(torch.int16), torch.cat(pieces).view(torch.int16))
+
+
+def test_compiled_split_runs_eagerly_past_the_recompile_limit():
+    # Each call below needs a new graph (a new piece count, or a token count without the backward's
+    # mark). Past Dynamo's recompile limit it must run eagerly; with fullgraph=True it would raise
+    # inside backward.
+    torch.manual_seed(0)
+    with torch._dynamo.config.patch(recompile_limit=1):
+        for num_tokens, grad_output_pieces in ((64, 2), (96, 2), (64, 3), (1, 3)):
+            grad_output = torch.randn(num_tokens, 1024, device="cuda")
+            pieces = linear_module._split_into_bf16_pieces(
+                grad_output, grad_output_pieces=grad_output_pieces
+            )
+
+            stacked = linear_module._compiled_split_into_stacked_bf16_pieces(
+                grad_output, grad_output_pieces=grad_output_pieces
+            )
+
+            assert torch.equal(
+                stacked.view(torch.int16), torch.cat(pieces).view(torch.int16)
+            )
+    # Past the limit, Dynamo never compiles the split again in this process.
+    torch._dynamo.reset()
+
+
+def test_lm_head_backward_compiles_once_for_all_token_counts():
+    # Chunk token counts change between steps (RL). The eager backward must run the compiled split,
+    # with one graph for all counts.
+    torch._dynamo.reset()
+    counters = torch._dynamo.utils.counters
+    counters.clear()
+    weight = torch.randn(
+        1024, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    for num_tokens in (64, 65, 100, 128, 200, 333, 500, 512, 700, 999):
+        x = torch.randn(
+            num_tokens, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        _lm_head_forward_backward(
+            x, weight, torch.randn(num_tokens, 1024, device="cuda")
+        )
+
+    assert counters["stats"]["unique_graphs"] == 1
+
+
+def _lm_head_forward_backward(x, weight, grad_output):
+    output = linear_module._FP32OutputLinearFunction.apply(x, weight, 2)
+    return torch.autograd.grad(output, (x, weight), grad_output)
+
+
+@pytest.mark.parametrize("tracing_mode", ["real", "fake", "symbolic"])
+def test_lm_head_backward_traces_with_make_fx(tracing_mode):
+    # make_fx can't trace into the compiled split: fake and symbolic tracing would fail, and real
+    # tracing would bake the split's result into the graph.
+    x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(
+        1024, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    traced = make_fx(_lm_head_forward_backward, tracing_mode=tracing_mode)(
+        x, weight, torch.randn(64, 1024, device="cuda")
+    )
+
+    grad_output = torch.randn(64, 1024, device="cuda")
+    for actual, expected in zip(
+        traced(x, weight, grad_output),
+        _lm_head_forward_backward(x, weight, grad_output),
+    ):
+        assert torch.equal(actual, expected)
+
+
+def test_lm_head_backward_runs_under_fake_tensor_mode():
+    # Memory estimators run forward + backward under a bare FakeTensorMode, where the compiled
+    # split's kernel would read fake data pointers.
+    with FakeTensorMode():
+        x = torch.randn(
+            64, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        weight = torch.randn(
+            1024, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        grad_input, grad_weight = _lm_head_forward_backward(
+            x, weight, torch.randn(64, 1024, device="cuda")
+        )
+    # Surface an illegal memory access in this test, not a later one.
+    torch.cuda.synchronize()
+
+    assert grad_input.shape == x.shape
+    assert grad_weight.shape == weight.shape
 
 
 # out_features > num_tokens takes the LM-head layout, out_features < num_tokens the router one.
