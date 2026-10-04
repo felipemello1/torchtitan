@@ -24,6 +24,7 @@ Example:
 """
 
 import argparse
+import os
 import statistics
 from collections import defaultdict
 
@@ -54,6 +55,8 @@ def main():
     args = parser.parse_args()
 
     print(header("Compiled vs eager split of grad_output"))
+    if os.environ.get("TORCH_COMPILE_DISABLE") == "1":
+        print("TORCH_COMPILE_DISABLE=1: every split and CE below runs eagerly")
     if "kernels" in args.sections:
         print_kernels()
     if "dynamic" in args.sections:
