@@ -5,10 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 import spmd_types as spmd
+import torch
 from spmd_types import SpmdType
 
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.models.common.attention import GQAttention
+from torchtitan.models.common.linear import FP32OutputLinear
 from torchtitan.protocols.sharding import ShardingConfig
 
 DP = MeshAxisName.DP
@@ -192,13 +194,22 @@ def norm_config(*, enable_sp: bool) -> ShardingConfig:
     )
 
 
-def pre_lm_head_norm_config(*, enable_sp: bool) -> ShardingConfig:
+def pre_lm_head_norm_config(
+    *, enable_sp: bool, out_dst_grad_dtype: torch.dtype | None = None
+) -> ShardingConfig:
     """Root decoder norm sharding before ``lm_head`` / chunked CE loss.
 
     Decoder blocks emit sequence-sharded hidden states when sequence
     parallelism is enabled. The root norm is the last clean module boundary to
     all-gather the TP sequence shard back to replicated hidden states before
     either the model forward or ``ChunkedLossWrapper`` applies ``lm_head``.
+
+    This boundary's backward sums the TP ranks' partial lm_head grad_inputs
+    (all-reduce, or reduce-scatter with SP). ``out_dst_grad_dtype=torch.float32``
+    keeps an ``FP32OutputLinear`` head's partials in fp32 through that sum, so
+    grad_input is rounded to bf16 once. Qwen3-8B head, TP=2, H100: 81% -> 97% of
+    grad_input elements correctly rounded, for +0.1-0.5% head step time and +160 MiB
+    per rank at 16k tokens.
     """
     activation = (
         dense_sequence_parallel_placement()
@@ -212,6 +223,7 @@ def pre_lm_head_norm_config(*, enable_sp: bool) -> ShardingConfig:
         in_src_shardings={"input": activation},
         out_src_shardings=activation,
         out_dst_shardings=dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
+        out_dst_grad_dtype=out_dst_grad_dtype,
     )
 
 
@@ -325,7 +337,14 @@ def set_decoder_sharding_config(config, *, enable_sp: bool) -> None:
         out_dst_shardings=activation_layout,
         local_spmd=True,
     )
-    config.norm.sharding_config = pre_lm_head_norm_config(enable_sp=enable_sp)
+    config.norm.sharding_config = pre_lm_head_norm_config(
+        enable_sp=enable_sp,
+        out_dst_grad_dtype=(
+            torch.float32
+            if isinstance(config.lm_head, FP32OutputLinear.Config)
+            else None
+        ),
+    )
 
     config.lm_head.sharding_config = ShardingConfig(
         state_shardings={"weight": dense_param_placement(tp=spmd.S(0))},

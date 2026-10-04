@@ -173,6 +173,10 @@ def _set_deepseek_v3_mtp_sharding(
         )
         mtp_layer_cfg.enorm.sharding_config = norm
         mtp_layer_cfg.hnorm.sharding_config = norm
+        # TODO: set out_dst_grad_dtype=torch.float32 on the last depth's mtp_norm for an
+        # FP32OutputLinear lm_head, as set_decoder_sharding_config does. Not on earlier depths:
+        # their mtp_norm output also feeds the next depth's hnorm and eh_proj, a bf16 Linear
+        # that can't take fp32. Not done yet: no config combines MTP with that lm_head.
         mtp_layer_cfg.mtp_norm.sharding_config = pre_lm_head_norm_config(
             enable_sp=enable_sp
         )

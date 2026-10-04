@@ -15,6 +15,7 @@ meshes.
 from dataclasses import dataclass, field
 
 import spmd_types as spmd
+import torch
 from spmd_types import SpmdType
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import Partial, Placement, Replicate, Shard
@@ -37,7 +38,7 @@ class ShardingConfig:
     ``_parallelize()`` time, parameters and buffers are locally sharded and
     annotated, while activation layouts drive explicit redistributions.
 
-    Completely dtype-agnostic at this moment — quantization (Float8/MXFP8) is
+    Dtype-agnostic except ``out_dst_grad_dtype`` — quantization (Float8/MXFP8) is
     orthogonal.
 
     Redistribution is expressed as a (source, destination) pair: src declares
@@ -67,6 +68,11 @@ class ShardingConfig:
         out_dst_shardings: Desired output placement after redistribution.
             e.g. ``{TP: Shard(1)}`` for reduce-scatter to sequence-parallel.
             ``None`` means no output redistribution.
+        out_dst_grad_dtype: Dtype of the redistributed output's gradient, and
+            of its backward reduction, e.g. ``torch.float32`` to sum fp32 partial
+            grad_inputs. When a gradient will flow, the output is cast to it,
+            since autograd returns a gradient in its tensor's dtype; no-grad
+            forwards keep the output's dtype. ``None``: no cast.
         local_spmd: If true, wraps forward with ``spmd.no_typecheck()`` using
             input types from ``in_dst_shardings`` and output types from
             ``out_src_shardings``.
@@ -77,6 +83,7 @@ class ShardingConfig:
     in_dst_shardings: dict[str, SpmdType] | None = None
     out_src_shardings: SpmdType | tuple[SpmdType, ...] | None = None
     out_dst_shardings: SpmdType | None = None
+    out_dst_grad_dtype: torch.dtype | None = None
     local_spmd: bool = False
 
     def to_dict(self) -> dict:

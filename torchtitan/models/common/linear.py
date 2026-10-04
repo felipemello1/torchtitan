@@ -288,9 +288,14 @@ class FP32OutputLinear(Linear):
     Under `accumulate_into_weight_grad` (ChunkedLossWrapper), an LM head's eager backward adds
     into an existing weight.grad.
 
+    An fp32 input is rounded to bf16 for the GEMMs and gets an fp32 gradient. The rounding is
+    exact for a bf16 upcast to fp32, which TP hands the lm_head so it can sum the partial
+    grad_inputs in fp32 (``pre_lm_head_norm_config``). For any other fp32 input it adds ~1.7e-3
+    error to the output and grad_weight (fp32 matmuls: ~1.5e-7, H100).
+
     Falls back to slower fp32 matmuls when:
     (a) the input is not on CUDA,
-    (b) the input or the weight is not bf16, or
+    (b) the weight is not bf16, or the input is neither bf16 nor fp32, or
     (c) batch-invariant mode is on.
 
     Accuracy and timings: https://github.com/pytorch/torchtitan/pull/4923
@@ -377,7 +382,8 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
         ctx.use_bf16_gemm = (
             # aten::mm.dtype (bf16 inputs, fp32 output) is only implemented for CUDA/ROCm.
             input_TD.is_cuda
-            and input_TD.dtype == weight_OD.dtype == torch.bfloat16
+            and weight_OD.dtype == torch.bfloat16
+            and input_TD.dtype in (torch.bfloat16, torch.float32)
             # TODO: batch-invariant mode can't use this op (cuBLAS's out_dtype GEMM isn't
             # batch-invariant), so it takes the slow fallback. A bf16-input, fp32-output matmul
             # in batch_invariant_ops would let it take the optimized path.
@@ -391,10 +397,14 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
         is_tracing = torch.compiler.is_compiling() or get_proxy_mode() is not None
         accumulate = not is_tracing and _ACCUMULATE_INTO_WEIGHT_GRAD.get()
         ctx.weight_param = weight_OD if accumulate and weight_OD.is_leaf else None
-        ctx.save_for_backward(input_TD, weight_OD)
+        ctx.input_dtype = input_TD.dtype
         if ctx.use_bf16_gemm:
+            # A no-op for bf16. TP's fp32 lm_head input is an upcast bf16, so rounding it is exact.
+            input_TD = input_TD.to(torch.bfloat16)
+            ctx.save_for_backward(input_TD, weight_OD)
             return torch.mm(input_TD, weight_OD.T, out_dtype=torch.float32)
         # Slow fallback: upcast the input and weight to fp32.
+        ctx.save_for_backward(input_TD, weight_OD)
         return torch.mm(input_TD.float(), weight_OD.float().T)
 
     @staticmethod
@@ -479,7 +489,7 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
         if not ctx.use_bf16_gemm:
             if needs_grad_input:
                 grad_input_TD = torch.mm(grad_output_TO, weight_OD.float())
-                grad_input_TD = grad_input_TD.to(input_TD.dtype)
+                grad_input_TD = grad_input_TD.to(ctx.input_dtype)
             if needs_grad_weight:
                 grad_weight_OD = torch.mm(grad_output_TO.T, input_TD.float())
             return grad_input_TD, grad_weight_OD, None
@@ -513,7 +523,7 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
                     stacked_PTO, weight_OD, out_dtype=torch.float32
                 )
                 grad_input_PTD = grad_input_PTD.unflatten(0, (num_pieces, num_tokens))
-                grad_input_TD = grad_input_PTD.sum(dim=0).to(input_TD.dtype)
+                grad_input_TD = grad_input_PTD.sum(dim=0).to(ctx.input_dtype)
             if needs_grad_weight:
                 # Copying x (0.02 ms) makes this 1.4x faster than one GEMM per piece + add.
                 input_PTD = torch.cat([input_TD] * num_pieces)
@@ -543,7 +553,9 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
             )
             if needs_grad_input:
                 grad_input_TD = torch.mm(
-                    torch.cat(pieces_TO, dim=1), torch.cat([weight_OD] * num_pieces)
+                    torch.cat(pieces_TO, dim=1),
+                    torch.cat([weight_OD] * num_pieces),
+                    out_dtype=ctx.input_dtype,
                 )
             if needs_grad_weight:
                 grad_weight_OD = torch.mm(

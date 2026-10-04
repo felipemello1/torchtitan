@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import fields
+from types import SimpleNamespace
 
 import pytest
 import spmd_types as spmd
@@ -59,7 +60,7 @@ def test_fp32_output_linear_forward_and_backward_contract_cpu():
         (torch.bfloat16, torch.float32),
     ],
 )
-def test_fp32_output_linear_uses_fp32_if_either_operand_is_fp32(
+def test_fp32_output_linear_cpu_fallback_matches_an_fp32_matmul(
     input_dtype, weight_dtype
 ):
     torch.manual_seed(0)
@@ -223,3 +224,40 @@ def test_lm_head_converter_swaps_only_lm_head():
     config.lm_head = None
     with pytest.raises(ValueError, match="lm_head"):
         LMHeadFP32OutputConverter.Config().build().convert(config)
+
+
+@pytest.mark.parametrize("enable_sp", [False, True])
+def test_fp32_output_lm_head_gets_an_fp32_tp_boundary(enable_sp):
+    from torchtitan.config.parallelism import ParallelismConfig
+    from torchtitan.config.transform import LMHeadFP32OutputConverter
+    from torchtitan.models.qwen3 import model_registry
+
+    # The trainer's order: model_registry runs the converters, then update_from_config sets the
+    # sharding.
+    runtime = SimpleNamespace(
+        parallelism=ParallelismConfig(enable_sequence_parallel=enable_sp)
+    )
+    config = model_registry("0.6B")
+    config.update_from_config(config=runtime)
+    assert config.norm.sharding_config.out_dst_grad_dtype is None
+
+    config = model_registry("0.6B", converters=[LMHeadFP32OutputConverter.Config()])
+    config.update_from_config(config=runtime)
+
+    # The root norm's TP boundary sums the lm_head's partial grad_inputs, in fp32.
+    assert config.norm.sharding_config.out_dst_grad_dtype is torch.float32
+
+
+def test_lora_fp32_output_linear_takes_an_fp32_input():
+    from torchtitan.config.transform.lora import LinearLoRAHandler
+
+    config = FP32OutputLinear.Config(in_features=8, out_features=16)
+    layer = LinearLoRAHandler().make_config(config, rank=4, alpha=8.0).build()
+    layer = layer.to(torch.bfloat16)
+    torch.nn.init.normal_(layer.lora_b.weight)  # lora_b starts at zero
+    input_TD = torch.randn(3, 8, dtype=torch.bfloat16)
+    # What TP's root norm hands an FP32OutputLinear lm_head: an fp32 copy of a bf16 tensor.
+    output = layer(input_TD.float().requires_grad_())
+    output.sum().backward()
+
+    assert torch.equal(output, layer(input_TD))
