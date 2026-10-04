@@ -295,8 +295,8 @@ class FP32OutputLinear(Linear):
         exact_grad_output_split: bool = True
         """Backward splits the fp32 grad_output into bf16 pieces; see ``backward``.
         True: 3 pieces, exact. False: 2 pieces, 16 of fp32's 24 bits.
-        The third piece costs 37-53% more backward time. It cuts a MoE router's grad_input error
-        12x, but adds very little for an LM head."""
+        The third piece makes the backward 1.4-1.6x slower. It cuts a MoE router's grad_input
+        error 7x, but doesn't help an LM head."""
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -374,8 +374,8 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
         Both have 8 exponent bits, so 3 bf16 pieces hold an fp32 exactly (8 + 8 + 8 = 24 bits),
         and 2 pieces hold 16 of its 24 bits (bit picture in ``_split_into_bf16_pieces``):
 
-            3 pieces, exact:  0.1 = 0.099609375 + 0.000389099 + 0.000001527   (hi + mid + lo)
-            2 pieces:         0.1 ~ 0.099609375 + 0.000391006                 (hi + lo, off by 4e-7)
+            3 pieces, exact:  0.1 = 0.100097656 - 0.000097752 + 0.000000097   (hi + mid + lo)
+            2 pieces:         0.1 ~ 0.100097656 - 0.000097752                 (hi + lo, off by 1e-7)
 
         We want, accumulated in fp32:
             grad_input  = grad_output @ weight     rounded once to the input's dtype
@@ -403,16 +403,16 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
 
                                     relative error             backward time
                                     grad_input  grad_weight    eager   compiled
-            LM head (Qwen3-8B, 2048 tokens; bf16 backward: 7.1 ms)
+            LM head (Qwen3-8B, 2048 tokens; bf16 backward: 7.2 ms)
               bf16 grad_output      1.5e-3      1.2e-3          1.0x    1.0x
-              2 pieces              2.9e-4      1.4e-5          3.1x    2.5x
-              3 pieces              2.9e-4      1.5e-5          4.5x    3.9x
-              fp32 matmul (IEEE)    1.2e-4      1.8e-6         13.7x   13.5x
-            router (2048 -> 128; errors on 16k tokens, times on 64k; bf16 backward: 0.29 ms)
+              2 pieces              2.9e-4      7.6e-6          3.1x    2.5x
+              3 pieces              2.9e-4      8.1e-6          4.7x    4.0x
+              fp32 matmul (IEEE)    1.2e-4      1.8e-6         13.3x   14.0x
+            router (2048 -> 128; errors on 16k tokens, times on 64k; bf16 backward: 0.30 ms)
               bf16 grad_output      1.7e-3      1.4e-3          1.0x    1.0x
-              2 pieces              4.9e-6      5.5e-6          2.1x    1.7x
-              3 pieces              4.0e-7      4.2e-6          3.0x    2.3x
-              fp32 matmul (IEEE)    5.3e-8      3.4e-7          5.5x    5.5x
+              2 pieces              2.5e-6      4.5e-6          2.2x    1.7x
+              3 pieces              3.6e-7      4.1e-6          3.3x    2.3x
+              fp32 matmul (IEEE)    5.3e-8      3.4e-7          5.5x    5.4x
 
         Stacking: each piece needs a GEMM against the same weight or input. Stacking the pieces
         into one operand runs one GEMM per gradient instead, but copies the operand they share.
@@ -501,25 +501,44 @@ _BF16_BITS_OF_FP32 = -65536
 
 
 def _split_into_bf16_pieces(tensor: torch.Tensor, *, exact: bool) -> list[torch.Tensor]:
-    """Split fp32 into bf16 pieces that sum to it: [hi, mid, lo] if exact, else [hi, lo].
+    """Split an fp32 tensor into bf16 pieces that sum back to it: [hi, mid, lo] if exact, else
+    [hi, lo].
 
-        0.1 = 1.1001100 11001100 11001101 x 2^-4     (24 significant bits)
-              hi        mid      lo
-        exact:      0.099609375 + 0.000389099 + 0.000001527 = 0.1
-        not exact:  0.099609375 + 0.000391006, with lo = bf16(x - hi): off by 4e-7
+    A bf16 keeps only the top 8 of an fp32's 24 significant bits. To keep more, cut the fp32
+    into pieces: take the nearest bf16, subtract it, and repeat on what is left. Each
+    subtraction is exact in fp32, so only the last piece loses anything.
 
-    hi and mid are cut with a bit mask: torch.compile folds a ``.to(bfloat16)`` round trip away.
-    We truncate rather than round to nearest (as Triton and XLA do): rounding costs 5-30% more
-    eager backward, gains little (LM-head grad_weight 1.4e-5 -> 7.6e-6), and is exact down to
-    the same 2^-110.
+    Example, x = 0.1:
+        hi  = nearest bf16 to x            =  0.100097656   (a bit too big)
+        mid = nearest bf16 to x - hi       = -0.000097752   (negative: corrects hi)
+        lo  = x - hi - mid                 =  0.000000097
+
+        3 pieces: hi + mid + lo == x exactly.
+        2 pieces: stop after the second piece, so hi + lo = 0.100097656 - 0.000097752 is off
+        by 1e-7.
+
+    3 pieces are exact for |x| >= 2^-110, the range where bf16 can still hold the last piece.
+    Rounding to nearest, as Triton and XLA do, gives later pieces mixed signs, which the GEMM
+    sums more accurately than same-sign pieces: LM-head grad_weight error 1.4e-5 (truncating)
+    -> 7.6e-6 (H100).
     """
-    hi = (tensor.view(torch.int32) & _BF16_BITS_OF_FP32).view(torch.float32)
+    # TODO: use .to(torch.bfloat16) once Inductor stops dropping bf16 round trips in fused kernels
+    # (simpler, and faster in eager). Today x - x.to(bf16).float() compiles to 0, so the pieces
+    # use integer bit ops. https://github.com/pytorch/pytorch/issues/179561 was closed, but still
+    # reproduces on the 2026-10-02 nightly.
+    hi = _round_to_bf16(tensor)
     rest = tensor - hi
     if not exact:
         return [hi.to(torch.bfloat16), rest.to(torch.bfloat16)]
-    mid = (rest.view(torch.int32) & _BF16_BITS_OF_FP32).view(torch.float32)
+    mid = _round_to_bf16(rest)
     lo = rest - mid
     return [hi.to(torch.bfloat16), mid.to(torch.bfloat16), lo.to(torch.bfloat16)]
+
+
+def _round_to_bf16(tensor: torch.Tensor) -> torch.Tensor:
+    """Nearest bf16 value, ties away from zero, kept in fp32: add half a bf16 ulp, then cut."""
+    bits = tensor.view(torch.int32)
+    return ((bits + 0x8000) & _BF16_BITS_OF_FP32).view(torch.float32)
 
 
 __all__ = [

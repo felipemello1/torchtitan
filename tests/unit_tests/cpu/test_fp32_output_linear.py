@@ -160,6 +160,17 @@ def test_split_into_bf16_pieces_recovers_fp32():
     assert sum(piece.double() for piece in pieces).equal(tensor.double())
 
 
+def test_split_into_bf16_pieces_rounds_to_nearest():
+    # 1 + 3 * 2^-9 is 0.75 of a bf16 step above 1, so hi rounds up and mid is negative.
+    tensor = torch.tensor([1 + 3 * 2**-9])
+
+    hi, mid, lo = _split_into_bf16_pieces(tensor, exact=True)
+
+    assert hi.item() == 1 + 2**-7
+    assert mid.item() == -(2**-9)
+    assert lo.item() == 0.0
+
+
 def test_lora_wraps_fp32_output_linear():
     from torchtitan.config.transform.lora import LinearLoRAHandler
 
