@@ -4,12 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Standalone timing of the two Triton kernels Inductor generated for request 14's weighted sum
-(T static vs T dynamic). The sources (14b_kernel_static.py, 14b_kernel_masked.py) are identical
+"""Standalone timing of the two Triton kernels Inductor generated for request 13's weighted sum
+(T static vs T dynamic). The sources (13b_kernel_static.py, 13b_kernel_masked.py) are identical
 except for `xmask = xindex < xnumel` on every load; both carry tt.divisibility=16 on xnumel.
 Swept over XBLOCK / num_warps, so the slowdown is not an autotuning artifact. For Triton triage.
 
-Expected on 1x GB300 (torch 2.15.0.dev20260926+cu130, triton 3.8.0; see ../README.md request 14):
+Expected on 1x GB300 (torch 2.15.0.dev20260926+cu130, triton 3.8.0; see ../README.md request 13):
 unmasked 308-563 us, masked 597-832 us across XBLOCK / num_warps.
 """
 import importlib.util
@@ -24,8 +24,8 @@ T, N, D = 16384, 7, 7168
 xnumel = T * D
 kernels = {}
 for label, filename in (
-    ("unmasked (T static)", "14b_kernel_static.py"),
-    ("masked (T dynamic)", "14b_kernel_masked.py"),
+    ("unmasked (T static)", "13b_kernel_static.py"),
+    ("masked (T dynamic)", "13b_kernel_masked.py"),
 ):
     src = (
         "import triton\nimport triton.language as tl\n"

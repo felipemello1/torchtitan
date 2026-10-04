@@ -6,7 +6,7 @@
 
 - GB300 (SM103), torch 2.15.0.dev20260926+cu130, triton 3.8.0. TorchTitan with `local_compile` regions: small named functions compiled with `fullgraph=True` and the default `recompile_limit=8`, no eager fallback, the rest of the model eager.
 - Models: DeepSeek-V4 flash, Kimi K3, Qwen3.5-MoE, DeepSeek-V3 671B (including DistMoE).
-- For DeepSeek-V4 and Kimi K3, the shipped regions left 40-56% of layer time on the table versus compiling whole layers. Closing the gap took rewrites Inductor could have found itself, plus guard and recompile workarounds.
+- For DeepSeek-V4 and Kimi K3, upstream's default regions left 40-56% of layer time on the table versus compiling whole layers. Closing the gap took rewrites Inductor could have found itself, plus guard and recompile workarounds.
 - This doc lists 32 things torch.compile could not figure out on its own, as 27 requests. Each has numbers at real shapes, the workaround we used where there is one, and (for 25 of the 32) a minimal pure-torch repro in `repros/`.
 - Biggest costs, in ms per 16k-token fwd+bwd microbatch: ~290 ms (Kimi K3) without a traceable deterministic scatter-add; ~240 ms (Kimi K3) from symbolic strides on views plus every call site running the newest, symbolic graph; up to ~230 ms (Kimi K3) from small reductions that are not unrolled.
 - Root-cause themes:
@@ -19,72 +19,98 @@
 
 Repros: `repros/` (pure torch; `./repros/run_all.sh cpu` runs the CPU ones, `./repros/run_all.sh gpu` the rest). Raw outputs: `repros/logs/`.
 
+## Terms
+
+- region: a function decorated with TorchTitan's `@local_compile`, bound to `torch.compile(fn, fullgraph=True, **options)` while the rest of the model runs eager.
+- block compile: `torch.compile` of a whole transformer layer.
+- SAC (SelectiveAC): selective activation checkpointing, i.e. `torch.utils.checkpoint` with a policy that saves some ops and recomputes the rest in backward.
+- HOP: a higher-order op, a Dynamo operator that traces a function body as a subgraph (e.g. `torch.utils.checkpoint` becomes `tag_activation_checkpoint`).
+- make_fx: torch's FX tracer. GraphTrainer, TorchTitan's experimental trainer, traces the whole training step with non-strict `make_fx`.
+- Models: DSv4 = DeepSeek-V4 flash, DSv3 = DeepSeek-V3 671B, Kimi K3, Qwen3.5 (Qwen3.5-MoE, Qwen3.5-35B-A3B).
+- Kimi residual (attention residual): Kimi K3's block-level residual, a softmax-weighted sum over a stack of N <= 8 earlier block outputs `[T, N, 7168]` plus the current partial sum `[T, 7168]` (the "partial"). 2 calls per layer, 186 per forward.
+- mHC: DeepSeek-V4's hyper-connections. HcPre mixes 4 residual streams into one per token, with a 20-step Sinkhorn normalization of a `[T, 4, 4]` matrix. HcPost expands the output back to 4 streams.
+- MLA: multi-head latent attention, the attention of DeepSeek-V3 and Kimi K3 (q, k and v come from low-rank projections).
+- GDN: Gated DeltaNet, Qwen3.5's linear-attention layer (attn-gym kernels).
+- FA4: FlashAttention 4 (CuTe DSL).
+- DistMoE: the fused distributed routed-expert backend TorchTitan uses for DeepSeek-V3 671B. Its kernels are torch.library custom ops.
+- EP / TP / PP: expert / tensor / pipeline parallelism. "Rank-local shapes" are one EP rank's shapes.
+- WGRAD: the weight-gradient GEMMs of the backward. In-place WGRAD (TorchTitan's `inplace_wgrad_accum`, on by default) accumulates them directly into the existing `.grad`.
+- BF16x9 (`torch.backends.cuda.matmul.fp32_precision = "bfx9"`): fp32 matmuls emulated with bf16 tensor-core GEMMs. TorchTitan enables it on SM100+.
+- Shapes: T = tokens per microbatch (per rank), D = hidden size, F = FFN or expert hidden size, H = heads, K = routed experts per token (top-k), N = Kimi residual stack width. "16k" = 16384 tokens; fwd+bwd = forward + backward.
+- packed training: several documents concatenated into a fixed-length microbatch, so T is fixed per step (in RL it varies).
+
 ## What compile leaves on the table
 
-As compiled vs our rewrite or option, one GB300. Request numbers refer to the sections below. In this table, `#N` is the fork PR `https://github.com/felipemello1/torchtitan/pull/N`, and `attn-gym #10` is https://github.com/felipemello1/attention-gym/pull/10.
+As compiled vs our rewrite or option, one GB300. Request numbers refer to the sections below. In this doc's code blocks, `#N` is the fork PR `https://github.com/felipemello1/torchtitan/pull/N`, and `attn-gym #10` is https://github.com/felipemello1/attention-gym/pull/10.
 
 ```text
-req  issue                                             as compiled           with rewrite / option            type
-  1  mix-order heuristic installs shape guards        3 graphs              2 graphs (non_strict_mode)       design disagreement
-  2  FX graph cache ignores a custom op's fake        stale stride assert   fresh cache dir                  bug
-  3  make_fx captures attribute tensor as const       rebinding ignored     in-place update (#117)           bug (TorchTitan) / doc
-  4  SAC + wrapped regions after a recompile          wrong saved outputs   flag off (regions recomputed)    bug (crash)
-       on recompute: RuntimeError / assert
-  5  no_grad pass recompiles every region             +1 graph per class    -                                feature request
-     one norm region, mixed call sites, no_grad       9 graphs (limit 8)    6 marks + option (#128)          feature request
-     size-0/1 dims always specialize                  +1 graph              mark_unbacked                    doc / design
-  6  new outer attr stored in a HOP: wrong error      Observed exception    create state outside (#136)      error-message bug
-  7  autograd.Fn reads a view._base/grad_dtype        BackendCompilerFailed inplace_wgrad_accum=False        bug (crash)
-  8  opaque custom op (deterministic scatter_add)     4248 us               1102 us per-token Function       feature request
-  9  packed views: symbolic stride/offset;            601 us                361 us static F                  feature request
+req  issue                                          as compiled                        with rewrite / option            type
+  1  mix-order heuristic installs shape guards      3 graphs                           2 graphs (non_strict_mode)       design disagreement
+  2  FX graph cache ignores a custom op's fake      stale stride assert                fresh cache dir                  bug
+  3  make_fx captures attribute tensor as const     rebinding ignored                  in-place update (#117)           bug (TorchTitan) / doc
+  4  SAC + wrapped regions after a recompile        wrong saved outputs on             flag off (regions recomputed)    bug (crash)
+                                                    recompute: RuntimeError / assert
+  5  no_grad pass recompiles every region           +1 graph per class                 -                                feature request
+     one norm region, mixed call sites, no_grad     9 graphs (limit 8)                 6 marks + option (#128)          feature request
+     size-0/1 dims always specialize                +1 graph                           mark_unbacked                    doc / design
+  6  new outer attr stored in a HOP: wrong error    Observed exception                 create state outside (#136)      error-message bug
+  7  autograd.Fn reads a view._base/grad_dtype      BackendCompilerFailed              inplace_wgrad_accum=False        bug (crash)
+  8  opaque custom op (deterministic scatter_add)   4248 us                            1102 us per-token Function       feature request
+  9  packed views: symbolic stride/offset;          601 us                             361 us static F                  feature request
        newest symbolic graph serves every call
- 10  small reduction not unrolled (N=8, symbolic)     1574 / 1245 us        314 us (N=7) / 353 us thresh 9   feature request
-     small non-innermost reduction off bandwidth      1354 us               290 us thresh 17 (ideal 281)     default/feature
- 11  tiny-K bmm -> extern cuBLAS + fp32 copy          3475 us               2155 us sum / 2357 us pass       default/doc
- 12  producer inlined + recomputed per element        1225 us               278 us realize first             feature request
- 13  pointwise-cat lowering vs ConcatKernel (a)       2155 us               781 us ConcatKernel              feature request
-       ... and the other way for (b)                  1026 us               1502 us ConcatKernel
-     masked cat inside a persistent reduction         4 row re-loads        -                                feature request
- 14  masked loads with symbolic T (18 loads)          663 us                314 us static T                  Triton triage
- 15  symbolic size args typed int64 by design         1918 us               1816 us assume_32bit_indexing    feature request
- 16  Sinkhorn [T,4,4] realizes every step             289-316 us (159 k)    86 us per-entry (32 kernels)     feature request
- 17  complex mul: no Inductor codegen                 444 us (7 kernels)    199 us real arithmetic           feature request
- 18  topk falls back to ATen                          97 / 378 us (4k/16k)  triton.decompose_sort_ops        default
- 19  region options lost when inlined                 option ignored        hand rewrite (#109, #110)        feature request (obs)
-     functional region: no alias / in-place grad      419 us v-grad copy    Triton override (DSv3)           feature request (obs)
- 20  FMA contraction: compiled != eager by 1 ulp      81 / 4.2M elements    0 (emulate_precision_casts)      doc
- 21  maybe_mark_dynamic forbidden in graph            AssertionError        guard with is_compiling()        doc
- 22  functools.cache under fake tensors               eager breaks          no cache                         doc
- 23  make_fx specializes Python ints                  silent wrong size     fixed-capacity metadata          doc
- 24  Dynamo/make_fx fakes forbid data_ptr             FA4 trace fails       custom-op fake (attn-gym #10)    doc (obs)
- 25  regional_inductor merges regions, tags comms     regions merge         inductor_region key              bug / doc (obs)
- 26  row gather does not exploit row reuse            649 us sequential     - (floor ~281 us)                observation
- 27  regional_inductor partitioning superlinear       382 s DSv4 4 layers   -                                perf bug (compile time)
+ 10  small reduction not unrolled (N=8, symbolic)   1574 / 1245 us                     314 us (N=7) / 353 us thresh 9   feature request
+     small non-innermost reduction off bandwidth    1354 us                            290 us thresh 17 (ideal 281)     default/feature
+ 11  tiny-K bmm -> extern cuBLAS + fp32 copy        3475 us                            2155 us sum / 2357 us pass       default/doc
+ 12  producer inlined + recomputed per element      1225 us                            278 us realize first             feature request
+ 13  masked loads with symbolic T (18 loads)        663 us                             314 us static T                  Triton triage
+ 14  pointwise-cat lowering vs ConcatKernel (a)     2155 us                            781 us ConcatKernel              feature request
+       ... and the other way for (b)                1026 us                            1502 us ConcatKernel
+     masked cat inside a persistent reduction       4 row re-loads                     -                                feature request
+ 15  symbolic size args typed int64 by design       1918 us                            1816 us assume_32bit_indexing    feature request
+ 16  Sinkhorn [T,4,4] realizes every step           289-316 us (159 kernels)           86 us per-entry (32 kernels)     feature request
+ 17  complex mul: no Inductor codegen               444 us (7 kernels)                 199 us real arithmetic           feature request
+ 18  region options lost when inlined               option ignored                     hand rewrite (#109, #110)        feature request (obs)
+     functional region: no alias / in-place grad    419 us v-grad copy                 Triton override (DSv3)           feature request (obs)
+ 19  topk falls back to ATen                        97 / 378 us (4k/16k)               triton.decompose_sort_ops        default
+ 20  FMA contraction: compiled != eager by 1 ulp    81 / 4.2M elements                 0 (emulate_precision_casts)      doc
+ 21  maybe_mark_dynamic forbidden in graph          AssertionError                     guard with is_compiling()        doc
+ 22  functools.cache under fake tensors             eager breaks                       no cache                         doc
+ 23  make_fx specializes Python ints                silent wrong size                  fixed-capacity metadata          doc
+ 24  Dynamo/make_fx fakes forbid data_ptr           FA4 trace fails                    custom-op fake (attn-gym #10)    doc (obs)
+ 25  regional_inductor merges regions, tags comms   regions merge                      inductor_region key              bug / doc (obs)
+ 26  row gather does not exploit row reuse          649 us sequential                  - (floor ~281 us)                observation
+ 27  regional_inductor partitioning superlinear     382 s DSv4 4 layers                -                                perf bug (compile time)
 ```
 
 ## Requests, by impact
 
-Unit for the performance requests: ms saved per 16k-token forward+backward microbatch of the model the request hits (rank-local shapes as measured), counting only the calls we measured. Per-call numbers are in each section. Requests that fix the same op are marked as alternatives and do not add.
+Unit for the performance requests: ms saved per 16k fwd+bwd training microbatch of the model the request hits (rank-local shapes as measured), counting only the calls we measured. Tags in another unit say so (per call, per 16k forward, per 4k microbatch). Per-call numbers are in each section. Requests that fix the same op are marked as alternatives and do not add. Order: requests 1-7 are crashes and hard failures; 8-19 are performance, by the stated figure (where a request names two models, by the measured one); 20-26 are docs and observations; 27 is compile time.
+
+For scale, estimated 16k fwd+bwd microbatch times on one GB300 (2-layer harness wall, no activation checkpointing, times the layer count; excludes embedding, head, optimizer and communication):
+
+- Kimi K3: ~15 s (2 layers 324-331 ms without EP, request 9; 93 layers). So ~290 ms (request 8) is ~2% of a microbatch.
+- DeepSeek-V4 flash: ~2.2-2.5 s (2 layers 103.6-114.5 ms; 43 layers; https://github.com/felipemello1/torchtitan/pull/137).
+- DeepSeek-V3 671B (EP8 rank shapes, fused MLA override): ~3.3 s at 16k and ~0.83 s at 4k (2 MoE layers 109.1 / 27.2 ms; 61 layers; https://github.com/felipemello1/torchtitan/pull/110).
 
 1. **[hard failure under fullgraph]** Never install guards in performance heuristics (mix-order reduction)
 2. **[bug, silently stale]** Key the FX graph cache on a custom op's fake output metadata
 3. **[bug, silently wrong]** make_fx: warn on, or lift, an attribute tensor captured as a constant
-4. **[crash: every TorchTitan MoE model at step 1, with the flag on]** SelectiveAC with `wrap_inductor_compiled_regions`: recompute is served from a different graph after a recompile
-5. **[hard failure: `FailOnRecompileLimitHit`]** Graph budgets: a no_grad pass doubles every region's graphs; one region shared by call sites of different rank or layout
-6. **[hard failure under fullgraph, error message]** A new attribute stored on an outer-scope object inside a HOP fails with a generic "Observed exception"
+4. **[crash with the flag on]** SelectiveAC with `wrap_inductor_compiled_regions`: recompute is served from a different graph after a recompile
+5. **[hard failure: `FailOnRecompileLimitHit`]** Graph budgets under fullgraph
+6. **[hard failure under fullgraph, misleading error]** A new attribute stored on an outer-scope object inside a HOP fails with a generic "Observed exception"
 7. **[crash]** An `autograd.Function` forward that reads `._base` and `grad_dtype` of a weight view crashes aot_eager and inductor
-8. **[~290 ms per Kimi K3 microbatch]** A traceable fixed-order segmented sum (deterministic scatter-add)
-9. **[~240 ms per Kimi K3 microbatch, fixed T]** Keep views' stride and offset static, and do not route every call site to the newest, symbolic graph
-10. **[up to ~230 ms per Kimi K3 microbatch as compiled; ~46 ms left after our rewrite; ~90 ms for MoE dispatch/combine]** Unroll small reductions
-11. **[alternative to request 10: 1.1-1.3 ms per residual call at 16k]** Decompose memory-bound batched GEMVs by default
-12. **[~175 ms per Kimi K3 16k forward, no_grad]** Inline a producer only when the consumer's broadcast factor is small
-13. **[~59 ms per DeepSeek-V4 flash microbatch]** A cost model or autotuning for cat/stack lowering
-14. **[~65 ms per Kimi K3 16k forward, RL only]** Triton: masked loads halve a many-load kernel on SM103
-15. **[up to ~26 ms per Kimi K3 microbatch, part of request 10's remaining gap]** int32 indexing for bounded symbolic sizes
-16. **[~20 ms per DeepSeek-V4 flash microbatch]** Fuse tiny-block reductions across steps (Sinkhorn)
-17. **[~11 ms per DeepSeek-V4 flash microbatch]** Complex-multiply codegen
-18. **[~3 ms per DeepSeek-V3 671B 4k microbatch]** Lower small-k `topk` by default
-19. **[~10 ms Kimi K3 MLA, ~24 ms DeepSeek-V3 MLA per 16k microbatch]** Region semantics: keep options through inlining; let functional regions alias outputs and update gradients in place
+8. **[~290 ms, Kimi K3]** A traceable fixed-order segmented sum (deterministic scatter-add)
+9. **[~240-300 ms, Kimi K3, fixed T]** Keep views' stride and offset static, and do not route every call site to the newest, symbolic graph
+10. **[up to ~230 ms, Kimi K3]** Unroll small reductions
+11. **[1.1-1.3 ms per call, Kimi K3; alternative to request 10]** Decompose memory-bound batched GEMVs by default
+12. **[~175 ms per 16k no_grad forward, Kimi K3]** Inline a producer only when the consumer's broadcast factor is small
+13. **[~65 ms per 16k forward, Kimi K3, RL only]** Triton: masked loads halve a many-load kernel on SM103
+14. **[~59 ms, DeepSeek-V4 flash]** A cost model or autotuning for cat/stack lowering
+15. **[up to ~26 ms, Kimi K3; part of request 10]** int32 indexing for bounded symbolic sizes
+16. **[~20 ms, DeepSeek-V4 flash]** Fuse tiny-block reductions across steps (Sinkhorn)
+17. **[~11 ms, DeepSeek-V4 flash]** Complex-multiply codegen
+18. **[~10 ms Kimi K3; ~24 ms DeepSeek-V3, estimate]** Region semantics: options and aliasing
+19. **[~3 ms per 4k microbatch, DeepSeek-V3 671B]** Lower small-k `topk` by default
 20. **[doc]** FP contraction: compiled is not bitwise vs eager for fused pointwise math
 21. **[doc]** `maybe_mark_dynamic` is forbidden in graphs
 22. **[doc]** `functools.cache` under fake-tensor tracing
@@ -99,7 +125,7 @@ Unit for the performance requests: ms saved per 16k-token forward+backward micro
 ### 1. Never install guards in performance heuristics (mix-order reduction)
 
 - **Request:** a mode in which performance heuristics never add guards (`statically_known_true` / `guard_or_false`, taking the non-fused schedule when unknown), or a documented interaction with fullgraph and the recompile limit.
-- **Estimated impact:** correctness of fullgraph regions. Under `fullgraph=True` each guard is a graph against `recompile_limit=8`, ending in a hard `FailOnRecompileLimitHit`. The Kimi residual reached exactly 8 in the worst call order, and Qwen3.5's shared norm region 8 of 8 even with the option (request 5).
+- **Estimated impact:** hard failures of fullgraph regions. Under `fullgraph=True` each guard is a graph against `recompile_limit=8`, ending in a hard `FailOnRecompileLimitHit`. The Kimi residual reached exactly 8 in the worst call order, and Qwen3.5's shared norm region 8 of 8 even with the option (request 5).
 - **Type:** design disagreement: a performance heuristic becomes a hard failure under fullgraph.
 - **Context:**
   1. The scheduler checks `nrow * ncol >= 5M` and `nrow >= 4096` with `evaluate_expr(..., size_oblivious=True, fallback_value=False)` (`torch/_inductor/scheduler.py:470-494`). That installs a guard on a symbolic size, so a later short batch recompiles.
@@ -174,11 +200,14 @@ warm (both graphs compiled before the checkpoint):
   3. In forward, call 1 runs graph G1 (static) and call 2 compiles G2 (automatic dynamic). In recompute, Dynamo serves call 1 from the newest matching entry (request 9), G2, which pops call 2's saved outputs. Call 2 then finds G2's queue empty.
   4. General condition: any cache entry added between a checkpointed forward and its recompute. Examples: the automatic-dynamic recompile on step 1, a new token count, a later layer's recompile.
   5. In TorchTitan's MoE the routed experts (`[T*K, F]`) and the shared expert (`[T, F]`) call one activation region per block. So the wrong `[T, F]` tensor reaches the next grouped GEMM before the RuntimeError can fire: `GroupMMCommon.cuh:89` `offset <= tensor_ShapeA[0]`.
-  6. With the flag on, every variant we ran crashed at step 1 before writing a result row: DeepSeek-V3 regions, DeepSeek-V4 (https://github.com/felipemello1/torchtitan/pull/105 to https://github.com/felipemello1/torchtitan/pull/108 plus https://github.com/felipemello1/torchtitan/pull/110), Kimi K3 (https://github.com/felipemello1/torchtitan/pull/109 plus https://github.com/felipemello1/torchtitan/pull/110), and Qwen3.5-35B-A3B (https://github.com/felipemello1/torchtitan/pull/110). The crash is in SAC's backward recompute (`checkpoint.py unpack_hook -> recompute_fn`), with `GroupMMCommon.cuh:89 prepare_grouped_gemm_data: Assertion offset <= tensor_ShapeA[0]`.
+  6. With the flag on, every variant we ran crashed at step 1 before writing a result row: DeepSeek-V3, DeepSeek-V4, Kimi K3 and Qwen3.5-35B-A3B, each with its regions.
+     - The crash is in SAC's backward recompute (`checkpoint.py unpack_hook -> recompute_fn`).
+     - The error: `GroupMMCommon.cuh:89 prepare_grouped_gemm_data: Assertion offset <= tensor_ShapeA[0]`.
+     - Trees: DeepSeek-V4 on https://github.com/felipemello1/torchtitan/pull/105 to https://github.com/felipemello1/torchtitan/pull/108 plus https://github.com/felipemello1/torchtitan/pull/110; Kimi K3 on https://github.com/felipemello1/torchtitan/pull/109 plus https://github.com/felipemello1/torchtitan/pull/110; Qwen3.5-35B-A3B on https://github.com/felipemello1/torchtitan/pull/110.
 - **Workaround:** none practical. TorchTitan keeps the flag off, so compiled regions are invisible to SAC and are recomputed under its policy instead of being saved. The SAC rows of every region PR above include the regions' recompute.
 - **Repro:** `python repros/04_sac_wrapped_region_recompile.py cold` and `... warm` (GPU; add `--cpu` to run on CPU). Expected: the block above; raw output in `repros/logs/04_sac_wrapped_region_recompile.txt`.
 
-### 5. Graph budgets: a no_grad pass doubles every region's graphs; one region shared by call sites of different rank or layout
+### 5. Graph budgets under fullgraph
 
 - **Request:**
   - let a no_grad call reuse the grad-mode graph's forward, or count signatures per grad mode;
@@ -231,7 +260,10 @@ mark_unbacked on the width, widths 1 then 4:            1 graph
   4. Measured graph accounting for the Kimi residual (all 93 layers' widths): training at two token counts uses 4 graphs ({N = 1, dynamic N} x {first T static, then dynamic}). A no_grad pass adds 2 (part (a)), and request 1's `T >= 4096` guard adds up to 2 more, reaching the limit of 8. With the mix-order option, 6.
 - **Workarounds:**
   - (a) https://github.com/felipemello1/torchtitan/pull/106 / https://github.com/felipemello1/torchtitan/pull/107: enable `complex_rope` for DeepSeek-V4 only together with the glue regions that absorb most of its call signatures. Budgets were measured with a no_grad pass for every region (all <= 6 of 8).
-  - (b) https://github.com/felipemello1/torchtitan/pull/128 (48280e292): neither fix alone is enough on GPU (the region option alone: 8 of 8 at model level; the eager-side marks alone: 8 in the repro). https://github.com/felipemello1/torchtitan/pull/128 does both. The eager `forward` marks T dynamic and the normalized dim static (guarded by `is_compiling()`, request 21), and calls the region with `triton.mix_order_reduction_non_strict_mode`, leaving one graph per layout and grad mode (6). A contiguous q (an eager copy) would save one more.
+  - (b) https://github.com/felipemello1/torchtitan/pull/128 (48280e292). Neither fix alone is enough on GPU: the region option alone gives 8 of 8 at model level, and the eager-side marks alone give 8 in the repro. So https://github.com/felipemello1/torchtitan/pull/128 does both:
+    - the eager `forward` marks T dynamic and the normalized dim static (guarded by `is_compiling()`, request 21);
+    - it calls the region with `triton.mix_order_reduction_non_strict_mode`;
+    - that leaves one graph per layout and grad mode (6). A contiguous q (an eager copy) would save one more.
   - (c) https://github.com/felipemello1/torchtitan/pull/109: one call signature (the partial is always a tensor) plus request 1's option.
 - **Repros:** `python repros/05a_grad_mode_guard.py` (GPU), `python repros/05b_shared_norm_call_sites.py` (GPU), `python repros/05c_shared_norm_call_sites_cpu.py` (CPU), `python repros/05d_size1_specialization.py` (GPU). Expected: the blocks above.
 
@@ -301,7 +333,7 @@ innermost torch frames of the aot_eager failure:
 ### 8. A traceable fixed-order segmented sum (deterministic scatter-add)
 
 - **Request:** a traceable deterministic scatter-add lowering when each output row has a fixed set of contributors, or a "fixed-order segmented sum" primitive Inductor can fuse.
-- **Estimated impact:** ~290 ms per Kimi K3 microbatch (3.1 ms x 92 MoE layers).
+- **Estimated impact:** ~290 ms per Kimi K3 16k fwd+bwd microbatch (3.1 ms x 92 MoE layers).
 - **Type:** feature request.
 - **Context:**
   1. The repro is the Kimi K3 MoE combine: 262144 expert-sorted rows x 3584 bf16, summed into 16384 tokens through a `torch.library.custom_op` deterministic `scatter_add`, fwd+bwd:
@@ -322,7 +354,7 @@ compiled per-token rewrite   1102 us    2 kernels   ideal 827 us
   - (a) keep a view's stride and offset static when they are fixed multiples of a static or specialized size;
   - (b) a way to mark strides and offsets static alongside sizes;
   - (c) prefer a static graph that accepts the inputs over the newest symbolic one, or specialize a dim that takes a handful of large distinct values.
-- **Estimated impact:** ~240-300 ms per Kimi K3 16k microbatch with fixed T: ~2.6 ms (EP estimate) to 3.3 ms (measured, 2 layers without EP) per MoE layer x 92 MoE layers. Partly worked around in https://github.com/felipemello1/torchtitan/pull/113.
+- **Estimated impact:** ~240-300 ms per Kimi K3 16k fwd+bwd microbatch with fixed T: ~2.6 ms (EP estimate) to 3.3 ms (measured, 2 layers without EP) per MoE layer x 92 MoE layers. Partly worked around in https://github.com/felipemello1/torchtitan/pull/113.
 - **Type:** feature request.
 - **Context:**
   1. The repro runs SwiGLU on `gate, up = unbind(-2)` views of a packed `[16384, 2, 6144]` bf16 projection, fwd+bwd. It is compiled at F = 6144 only (static) vs at F = 3072 first and then F = 6144 (automatic dynamic, as Kimi K3's routed and then shared experts):
@@ -344,7 +376,7 @@ model, Kimi K3 situglu, shared expert T x 6144:
 
 - **Request:** unroll when a symbol's upper bound (value range) is below `unroll_reductions_threshold`. Raise or autotune the threshold (8, strict `<`) for reductions over a non-innermost dim, or improve the persistent-reduction schedule for that layout.
 - **Estimated impact:**
-  - Up to ~230 ms per Kimi K3 microbatch for the residual as compiled on https://github.com/felipemello1/torchtitan/pull/109: up to 1.2 ms per call x 186 calls, the static-vs-dynamic gap. That is an upper bound: width-1 calls are static and not in the gap.
+  - Up to ~230 ms per Kimi K3 16k fwd+bwd microbatch for the residual as compiled on https://github.com/felipemello1/torchtitan/pull/109: up to 1.2 ms per call x 186 calls, the static-vs-dynamic gap. That is an upper bound: width-1 calls are static and not in the gap.
   - The hand-written `autograd.Function` of https://github.com/felipemello1/torchtitan/pull/131 closes most of it (16k fwd+bwd 3642 -> 2652 us vs 2403 static). That leaves ~0.25 ms per call (up to ~46 ms, same upper bound); request 15 is part of it.
   - Separately, ~90 ms for MoE dispatch/combine at K = 16 (~1 ms x 92 layers; worked around in https://github.com/felipemello1/torchtitan/pull/110).
 - **Type:** feature request (symbolic sizes); default / feature request (non-innermost dim). One root cause: `unroll_reductions_threshold`.
@@ -401,7 +433,10 @@ T=2048   explicit sum               276 us    4 kernels                         
 
   2. As written, Inductor sends the batched GEMV to cuBLAS, so the bf16 -> fp32 upcast of `[T, 8, 7168]` (1.9 GB at 16k) is materialized instead of fused into the reduction.
   3. Inductor's `decompose_mm_pass` already handles this shape (`torch/_inductor/fx_passes/decompose_mem_bound_mm.py:62-90`: `mat1.shape[0] >= 10240` and 2 of m, k, n < 32). But it is opt-in (`post_grad_fusion_options={"decompose_mm_pass": {}}`), and its first-dim floor excludes 2k-token prefill and decode.
-  4. In the trainer the pass is not an option as is. `should_decompose_bmm` returns False for an fp32 bmm when `torch.backends.cuda.matmul.fp32_precision == "bfx9"` (`fx_passes/decompose_mem_bound_mm.py:68-73`, `torch/_inductor/utils.py:3486-3495`: BF16x9 emulation must stay an ATen extern), and TorchTitan enables bfx9 on SM100+ (`torchtitan/distributed/utils.py:255-266`, called at `:477`). The trainer's baseline is therefore a BF16x9 cuBLAS bmm; the repro runs with the default fp32 precision.
+  4. In the trainer the pass is not an option as is:
+     - `should_decompose_bmm` returns False for an fp32 bmm when `torch.backends.cuda.matmul.fp32_precision == "bfx9"`, because BF16x9 emulation must stay an ATen extern (`fx_passes/decompose_mem_bound_mm.py:68-73`, `torch/_inductor/utils.py:3486-3495`).
+     - TorchTitan enables bfx9 on SM100+ (`torchtitan/distributed/utils.py:255-266`, called at `:477`).
+     - So the trainer's baseline is a BF16x9 cuBLAS bmm. The repro runs with the default fp32 precision.
   5. The 10240 floor is configurable (`post_grad_fusion_options={"decompose_mm_pass": {"min_first_dimension_decomposition": ...}}`, `decompose_mem_bound_mm.py:34-36`), so the ask is a default change.
 - **Workaround** (https://github.com/felipemello1/torchtitan/pull/109): the explicit weighted sum `(probs[..., None] * values.float()).sum(1)`, 9% faster than the pass and also effective at small T. A region-scoped `post_grad_fusion_options` would have been a simpler alternative at large T.
 - **Repro:** `python repros/11_extern_gemv.py` (GPU). Expected: the block above.
@@ -424,31 +459,7 @@ realize_reads_threshold=1     278 us   the [T, 8] probs are realized first      
 - **Workaround:** the `autograd.Function` of https://github.com/felipemello1/torchtitan/pull/131 saves the padded probs, so they are realized in training (fwd+bwd 2399 vs 3234 us, measured on its branch at the time). no_grad still takes the slow kernel.
 - **Repro:** `python repros/12_inline_recompute.py` (GPU). Expected: the block above.
 
-### 13. A cost model or autotuning for cat/stack lowering
-
-- **Request:** a cost model for cat lowering that accounts for input layouts and downstream reductions, or autotuning between the two lowerings. Also lower an interleave/cat consumed by a reduction without re-loading the row per branch.
-- **Estimated impact:** ~59 ms per DeepSeek-V4 flash microbatch (1.37 ms x 43 layers, inverse RoPE alone). Worked around per region.
-- **Type:** feature request.
-- **Context, (a) pointwise-cat lowering is right for some shapes and 2-3x wrong for others on GB300:**
-  1. The repro splits, rotates the last 64 of 512 channels, and cats, on DeepSeek-V4 attention shapes `[16384, 64, 512]` bf16, fwd+bwd:
-
-```text
-(a) inverse rope on o        default cat 2155 us (2 kernels) | ConcatKernel  781 us (5 kernels)   ideal 605 us
-(b) per-head RMS norm + rope  default cat 1026 us (2 kernels) | ConcatKernel 1502 us (7 kernels)   ideal 756 us
-```
-
-  2. The default lowering fuses the cat into one masked pointwise kernel with per-element index math. On GB300 that is 2.8x slower than per-input copies for (a). It is faster for (b), where it lets the cat fuse into the RMS norm's persistent reduction (ConcatKernel splits them).
-  3. The repro matches the model: (a) 2177 vs 791 us, (b) 1044 vs 1542 us. (The first version of this repro fed a transposed view of o, as the model does; that only adds an eager 1.2 ms gradient layout copy outside the region to both variants.)
-  4. In an earlier H100 study, the same ConcatKernel option made Qwen3.5's partial RoPE 24-26% slower in training and 3x slower at decode, so no global setting is right.
-- **Context, (b) a masked cat/stack inside a persistent reduction re-loads the row per branch** (no standalone repro):
-  1. DeepSeek-V4 `q_norm_rope`, 16k: the forward kernel takes 455 us for 2.15 GB (ideal 302 us).
-  2. Inductor's output code for `triton_per_fused__to_copy_add_cat_mean_mul_pow_rsqrt_select_split_with_sizes_stack_sub_view_0` lowers the split + interleaved-pair stack + cat as masked pointwise code inside the RMS norm's persistent reduction. The q row is re-loaded 4 times under different masks, with int64 `%` / `//` index math. The ConcatKernel alternative cannot fuse into the reduction (part (a), row (b): 1542 vs 1044 us fwd+bwd).
-  3. Region options tried: `coordinate_descent_tuning` 483 vs 485 us; `persistent_reductions=False` 1056 us; a cat-free rewrite 528 us.
-  4. A related case: the real-arithmetic RoPE's `torch.stack((re, im), -1)` lowers as a masked cat (per element `x % 2`, then 8 masked loads). Casting each half before the stack, plus a rotation-by-minus-angle backward, took DeepSeek-V4 RoPE 217 -> 143 us (https://github.com/felipemello1/torchtitan/pull/115).
-- **Workaround** (https://github.com/felipemello1/torchtitan/pull/107): `options={"max_pointwise_cat_inputs": 0, "max_complex_pointwise_cat_inputs": 0}` on the inverse-RoPE region only.
-- **Repro:** `python repros/13_cat_lowering.py` (GPU). Expected: part (a)'s block.
-
-### 14. Triton: masked loads halve a many-load kernel on SM103
+### 13. Triton: masked loads halve a many-load kernel on SM103
 
 - **Request:** Triton triage with the standalone kernels. On the Inductor side, the mask is provably unnecessary only when XBLOCK divides 7168 (true for XBLOCK <= 1024, not for 2048, which autotuning can pick).
 - **Estimated impact:** ~65 ms per Kimi K3 16k forward, RL only (dynamic T; 0.35 ms x 186).
@@ -467,12 +478,40 @@ standalone, us by XBLOCK/num_warps:
   2. The generated sources differ only by `xmask = xindex < xnumel` on 18 loads (8 broadcast loads of per-token softmax values). Both carry `tt.divisibility=16` on xnumel.
   3. The standalone sweep shows the slowdown at every XBLOCK / num_warps, so it is not autotuning. The mechanism (predication of broadcast loads vs register pressure) is not established; it looks like Triton codegen on SM103 rather than an Inductor decision.
 - **Workaround:** none needed in packed training (T is fixed per microbatch). It matters for RL, where T varies.
-- **Repros:** `python repros/14a_masked_loads_symbolic_T.py` (Inductor) and `python repros/14b_standalone_masked_kernels.py` (the two generated kernels, `14b_kernel_static.py` and `14b_kernel_masked.py`; GPU). Expected: the block above.
+- **Repros:** `python repros/13a_masked_loads_symbolic_T.py` (Inductor) and `python repros/13b_standalone_masked_kernels.py` (the two generated kernels, `13b_kernel_static.py` and `13b_kernel_masked.py`; GPU). Expected: the block above.
+
+### 14. A cost model or autotuning for cat/stack lowering
+
+- **Request:** a cost model for cat lowering that accounts for input layouts and downstream reductions, or autotuning between the two lowerings. Also lower an interleave/cat consumed by a reduction without re-loading the row per branch.
+- **Estimated impact:** ~59 ms per DeepSeek-V4 flash 16k fwd+bwd microbatch (1.37 ms x 43 layers, inverse RoPE alone). Worked around per region.
+- **Type:** feature request.
+- **Context, (a) pointwise-cat lowering is right for some shapes and 2-3x wrong for others on GB300:**
+  1. The repro splits, rotates the last 64 of 512 channels, and cats, on DeepSeek-V4 attention shapes `[16384, 64, 512]` bf16, fwd+bwd:
+
+```text
+(a) inverse rope on o        default cat 2155 us (2 kernels) | ConcatKernel  781 us (5 kernels)   ideal 605 us
+(b) per-head RMS norm + rope  default cat 1026 us (2 kernels) | ConcatKernel 1502 us (7 kernels)   ideal 756 us
+```
+
+  2. The default lowering fuses the cat into one masked pointwise kernel with per-element index math. On GB300 that is 2.8x slower than per-input copies for (a). It is faster for (b), where it lets the cat fuse into the RMS norm's persistent reduction (ConcatKernel splits them).
+  3. The repro matches the model: (a) 2177 vs 791 us, (b) 1044 vs 1542 us. (The first version of this repro fed a transposed view of o, as the model does; that only adds an eager 1.2 ms gradient layout copy outside the region to both variants.)
+  4. In an earlier H100 study, the same ConcatKernel option made Qwen3.5's partial RoPE 24-26% slower in training and 3x slower at decode, so no global setting is right.
+- **Context, (b) a masked cat/stack inside a persistent reduction re-loads the row per branch** (no standalone repro):
+  1. DeepSeek-V4 `q_norm_rope`, 16k: the forward kernel takes 455 us for 2.15 GB (ideal 302 us).
+  2. Inductor's output code for `triton_per_fused__to_copy_add_cat_mean_mul_pow_rsqrt_select_split_with_sizes_stack_sub_view_0` lowers the split + interleaved-pair stack + cat as masked pointwise code inside the RMS norm's persistent reduction. The q row is re-loaded 4 times under different masks, with int64 `%` / `//` index math. The ConcatKernel alternative cannot fuse into the reduction (part (a), row (b): 1542 vs 1044 us fwd+bwd).
+  3. Region options tried: `coordinate_descent_tuning` 483 vs 485 us; `persistent_reductions=False` 1056 us; a cat-free rewrite 528 us.
+  4. A related case: the real-arithmetic RoPE's `torch.stack((re, im), -1)` lowers as a masked cat (per element `x % 2`, then 8 masked loads). Casting each half before the stack, plus a rotation-by-minus-angle backward, took DeepSeek-V4 RoPE 217 -> 143 us (https://github.com/felipemello1/torchtitan/pull/115).
+- **Workaround** (https://github.com/felipemello1/torchtitan/pull/107): `options={"max_pointwise_cat_inputs": 0, "max_complex_pointwise_cat_inputs": 0}` on the inverse-RoPE region only.
+- **Repro:** `python repros/14_cat_lowering.py` (GPU). Expected: part (a)'s block.
 
 ### 15. int32 indexing for bounded symbolic sizes
 
 - **Request:** decide int32 vs int64 per index expression from value ranges, honoring `torch._check` bounds (today they are ignored), and/or select an int32 kernel at runtime when the sizes fit. Either avoids the hard failure a global `assume_32bit_indexing` hits (below). A per-expression decision alone recovers the cost only where T is bounded, because the costly expressions index the full `[T, N, D]` stack and T has no upper bound.
-- **Estimated impact:** up to ~26 ms per Kimi K3 16k microbatch on top of https://github.com/felipemello1/torchtitan/pull/131 (0.14 ms per call x 186 residual calls). That is an upper bound: it assumes every call takes the dynamic-width graph, while width-1 calls are static and unaffected. Today's only knob, `assume_32bit_indexing`, also slows the forward and fails to compile above ~37k tokens at width 8. Part of request 10's remaining gap, not additive.
+- **Estimated impact:**
+  - Up to ~26 ms per Kimi K3 16k fwd+bwd microbatch on top of https://github.com/felipemello1/torchtitan/pull/131 (0.14 ms per call x 186 residual calls).
+  - That is an upper bound: it assumes every call takes the dynamic-width graph, while width-1 calls are static and unaffected.
+  - Part of request 10's remaining gap, not additive.
+  - Today's only knob, `assume_32bit_indexing`, also slows the forward and fails to compile above ~37k tokens at width 8.
 - **Type:** feature request.
 - **Context:**
   1. The repro is the residual's weighted sum with N dynamic, fwd+bwd:
@@ -492,7 +531,7 @@ assume_32bit_indexing=True   1816 us
 ### 16. Fuse tiny-block reductions across steps (Sinkhorn)
 
 - **Request:** fuse reductions over a tiny trailing block (4 x 4 per token) across steps, e.g. by keeping the block in registers.
-- **Estimated impact:** ~20 ms per DeepSeek-V4 flash microbatch (0.20-0.23 ms x 86 HcPre calls).
+- **Estimated impact:** ~20 ms per DeepSeek-V4 flash 16k fwd+bwd microbatch (0.20-0.23 ms x 86 HcPre calls).
 - **Type:** feature request.
 - **Context:**
   1. The repro is the DeepSeek-V4 mHC Sinkhorn: 20 iterations of row then column normalization of `[16384, 4, 4]` fp32, fwd+bwd:
@@ -503,13 +542,13 @@ assume_32bit_indexing=True   1816 us
 ```
 
   2. Each column normalization reads the previous step at transposed indices (`sum(-2)` after `sum(-1)`), so Inductor cannot fuse consecutive steps and realizes every intermediate. With each of the 16 entries as its own `[T]` tensor, every read is same-index and the steps fuse.
-- **Workaround** (https://github.com/felipemello1/torchtitan/pull/120, draft): the 16 per-entry `[T]` tensors in the compiled branch (309 -> 105 us in context).
+- **Workaround** (https://github.com/felipemello1/torchtitan/pull/120, draft): the 16 per-entry `[T]` tensors in the compiled branch. In context 309 -> 105 us; in that PR, Sinkhorn alone fwd+bwd at 16k goes 303 -> 97 us kernel time (medians of 3 processes).
 - **Repro:** `python repros/16_sinkhorn_transposed_reads.py` (GPU). Expected: the block above.
 
 ### 17. Complex-multiply codegen
 
 - **Request:** lower complex `mul` (with `view_as_complex` / `view_as_real`) to real arithmetic.
-- **Estimated impact:** ~11 ms per DeepSeek-V4 flash microbatch (0.25 ms x 43 attention RoPE calls; the Compressor and Indexer calls add more).
+- **Estimated impact:** ~11 ms per DeepSeek-V4 flash 16k fwd+bwd microbatch (0.25 ms x 43 attention RoPE calls; the Compressor and Indexer calls add more).
 - **Type:** feature request.
 - **Context:**
   1. The repro is DeepSeek-V4 RoPE on q `[16384, 64, 64]` bf16 with a complex64 cache `[16384, 1, 32]`, fwd+bwd:
@@ -524,24 +563,12 @@ compiled real arithmetic   199.0 us   2 kernels   (same math on view_as_real(cac
 - **Workaround** (https://github.com/felipemello1/torchtitan/pull/106): `ComplexRoPE.apply_rotary_emb` takes a real-arithmetic branch under `torch.compiler.is_compiling()`; eager keeps the complex ops. With the glue in the same region (https://github.com/felipemello1/torchtitan/pull/107), DeepSeek-V4 q norm + RoPE went 1497 -> 1044 us.
 - **Repro:** `python repros/17_complex_ops.py` (GPU). Expected: the block above.
 
-### 18. Lower small-k `topk` by default
-
-- **Request:** lower small-k `topk` by default, or by a size heuristic.
-- **Estimated impact:** ~3 ms per DeepSeek-V3 671B 4k-token microbatch (0.054 ms x 58 MoE layers; router glue 160 -> 106 us at 4k, the production shape). Per 16k not measured.
-- **Type:** default.
-- **Context:**
-  1. DeepSeek-V3 router glue (scores, group top-2, top-4 groups, top-8 of 256 experts) at 4k tokens: eager 325.5 us (72 kernels), compiled 159.7 us (21), compiled with `triton.decompose_sort_ops` 106.4 us (17).
-  2. The compiled glue is dominated by ATen `topk` (`sbtopk::gatherTopK`, top-8 of 256: 96.9 us at 4k, 378 us at 16k), which Inductor lowers only with the option (`torch/_inductor/lowering.py:8490-8493`). Ideal for the whole glue: 1.8 / 7.1 us at 4k / 16k.
-  3. A sort-and-slice rewrite with default options was faster still (selection 56.2 vs 78.4 us at 4k with the option).
-- **Workaround** (https://github.com/felipemello1/torchtitan/pull/132): a DeepSeek-V3 router region whose compiled branch selects experts with argmax rounds instead of ATen `topk`.
-- **Repro:** none standalone.
-
-### 19. Region semantics: keep options through inlining; let functional regions alias outputs and update gradients in place
+### 18. Region semantics: options and aliasing
 
 - **Request:**
   - carry an inlined compiled function's options as a region hint for the outer compile, or document that they are dropped;
   - let regions return views of their inputs without a gradient copy, and allow in-place updates of an incoming gradient that is not used elsewhere.
-- **Estimated impact:** these block replacing hand rewrites and Triton overrides with compile. Kimi K3 MLA ~10 ms per 16k microbatch (0.42 ms x 24 MLA layers); DeepSeek-V3 MLA ~24 ms per 16k microbatch (~0.4 ms between the region's floor and the override x 61 layers, estimate).
+- **Estimated impact:** these block replacing hand rewrites and Triton overrides with compile. Kimi K3 MLA ~10 ms per 16k fwd+bwd microbatch (0.42 ms x 24 MLA layers); DeepSeek-V3 MLA ~24 ms per 16k fwd+bwd microbatch (~0.4 ms between the region's floor and the override x 61 layers, estimate).
 - **Type:** feature request (observation, no standalone repro).
 - **Context, (a) region-scoped options are lost when the region is inlined under an outer compile:**
   1. A region-scoped `unroll_reductions_threshold=17` makes `gather + .sum(1)` identical in speed and bits to the hand-unrolled loop of https://github.com/felipemello1/torchtitan/pull/110 (Kimi combine 1104.5 vs 1107.2 us, dispatch 995.1 vs 996.8 us).
@@ -551,6 +578,18 @@ compiled real arithmetic   199.0 us   2 kernels   (same math on view_as_real(cac
   1. Kimi K3 MLA k/v assembly (16k fwd+bwd): eager 2664.0 us; a region returning v as a view of kv 854.4-854.9 us over 3 processes. Of that, a 419 us eager copy of v's gradient remains (AOTAutograd's handling of an output that aliases an input).
   2. DeepSeek-V3 MLA: TorchTitan's opt-in fused Triton override (torch.library ops) runs fwd+bwd in 1024 us at 16k, bitwise vs eager, by keeping v a view and rotating the incoming q gradient in place. A compile region can do neither (AOTAutograd's backward writes a fresh grad_q): estimated region floor ~1.4 ms, measured 2.1 ms with the complex RoPE fallback.
 - **Workarounds:** (a) hand rewrites in https://github.com/felipemello1/torchtitan/pull/109 and https://github.com/felipemello1/torchtitan/pull/110. (b) The hand-written override for DeepSeek-V3 (https://github.com/felipemello1/torchtitan/pull/124 adds recipes that turn it on); the Kimi region (https://github.com/felipemello1/torchtitan/pull/122) accepts the copy.
+- **Repro:** none standalone.
+
+### 19. Lower small-k `topk` by default
+
+- **Request:** lower small-k `topk` by default, or by a size heuristic.
+- **Estimated impact:** ~3 ms per DeepSeek-V3 671B 4k-token fwd+bwd microbatch (0.054 ms x 58 MoE layers; router glue 160 -> 106 us at 4k, the production shape). Per 16k not measured.
+- **Type:** default.
+- **Context:**
+  1. DeepSeek-V3 router glue (scores, group top-2, top-4 groups, top-8 of 256 experts) at 4k tokens: eager 325.5 us (72 kernels), compiled 159.7 us (21), compiled with `triton.decompose_sort_ops` 106.4 us (17).
+  2. The compiled glue is dominated by ATen `topk` (`sbtopk::gatherTopK`, top-8 of 256: 96.9 us at 4k, 378 us at 16k), which Inductor lowers only with the option (`torch/_inductor/lowering.py:8490-8493`). Ideal for the whole glue: 1.8 / 7.1 us at 4k / 16k.
+  3. A sort-and-slice rewrite with default options was faster still (selection 56.2 vs 78.4 us at 4k with the option).
+- **Workaround** (https://github.com/felipemello1/torchtitan/pull/132): a DeepSeek-V3 router region whose compiled branch selects experts with argmax rounds instead of ATen `topk`.
 - **Repro:** none standalone.
 
 ### 20. FP contraction: compiled is not bitwise vs eager for fused pointwise math
@@ -632,7 +671,7 @@ guarded by is_compiling():   compiled fine
 
 ### 25. `regional_inductor` merges unkeyed regions and tags collectives
 
-- **Request:** document how `regional_inductor` groups annotated nodes without an `inductor_region` key, and that `fx.traceback.annotate` tags collectives created inside the context.
+- **Request:** change, or document, how `regional_inductor` groups annotated nodes without an `inductor_region` key; and document that `fx.traceback.annotate` tags collectives created inside the context.
 - **Estimated impact:** adjacent regions merge into one partition, and collectives lose overlap.
 - **Type:** bug / doc (observation; `torch.fx.passes.regional_inductor`, used by GraphTrainer).
 - **Context:**
@@ -690,8 +729,12 @@ extrapolations (labelled, not measured):
 - **Gradient-accumulation adds fold into GEMM epilogues only under whole-graph compile.** Qwen3.5-35B-A3B, 2 layers: 61 bf16 add launches with regions vs 36 under block compile, where cuBLAS `*_bx_*` (beta != 0) variants absorb them. Grouped-GEMM weight gradients have no accumulate-in-place path at all, so autograd's standalone bf16 AccumulateGrad adds remain with regions: ~1.3 ms per DeepSeek-V3 MoE layer at any token count (8.5 GB per add).
 - **Whole-layer Inductor is slower than the region boundary in two places** (DeepSeek-V3 671B layers, 4096 tokens, GraphTrainer full Inductor vs the same regions; repro `repros/obs_whole_graph_vs_region.py`, GPU):
   - Harness note: the GraphTrainer-trace rows below ran with the layer input `x` detached, so the first layer's input gradient (its RMSNorm dx and the residual add into `x`) was not computed. Every compared variant skips the same work, so the comparisons hold; absolute times are slightly low. The repro's numbers keep `requires_grad=True` and are unaffected.
-  - The routed SwiGLU backward: the backward of `unbind(-2)` is lowered as a masked pointwise cat fused into it (`triton_poi_fused_mul_silu_silu_backward_stack_unbind_view`), 0.298 ms per layer vs 0.113 ms with ConcatKernel lowering (knob `max_complex_pointwise_cat_inputs`; request 13's lowering choice). On GB300 ConcatKernel halves this kernel class: 0.755 -> 0.368 ms on the Llama3-8B FFN (https://github.com/felipemello1/torchtitan/pull/60).
-  - The MoE dispatch backward per-token sum: `triton_poi_fused__to_copy_add_div_gather_index_mul_select_sigmoid_unsqueeze_view` recomputes the router's sigmoid and divide through 4 dependent index loads, with 5 bounds asserts per expert per element: 0.42 ms per layer vs 0.075 ms for the region of https://github.com/felipemello1/torchtitan/pull/110 (0.26 ms without the asserts). The repro's `token_sum_chain` gives 0.206 ms in one graph, 0.115 ms without index asserts, 0.079 ms with the scores passed in (ideal 0.074). Same producer-inlining pattern as request 12.
+  - The routed SwiGLU backward: the backward of `unbind(-2)` is lowered as a masked pointwise cat fused into it (`triton_poi_fused_mul_silu_silu_backward_stack_unbind_view`), 0.298 ms per layer vs 0.113 ms with ConcatKernel lowering (knob `max_complex_pointwise_cat_inputs`; request 14's lowering choice). On GB300 ConcatKernel halves this kernel class: 0.755 -> 0.368 ms on the Llama3-8B FFN (https://github.com/felipemello1/torchtitan/pull/60).
+  - The MoE dispatch backward per-token sum:
+    - `triton_poi_fused__to_copy_add_div_gather_index_mul_select_sigmoid_unsqueeze_view` recomputes the router's sigmoid and divide through 4 dependent index loads, with 5 bounds asserts per expert per element.
+    - 0.42 ms per layer vs 0.075 ms for the region of https://github.com/felipemello1/torchtitan/pull/110 (0.26 ms without the asserts).
+    - The repro's `token_sum_chain` gives 0.206 ms in one graph, 0.115 ms without index asserts, 0.079 ms with the scores passed in (ideal 0.074).
+    - Same producer-inlining pattern as request 12.
   - Full-Inductor knobs that recover both: `max_pointwise_cat_inputs=0` + `max_complex_pointwise_cat_inputs=0` (2 MoE layers 27.09 -> 26.03 ms), plus `assert_indirect_indexing=False` (25.52 ms), passed through GraphTrainer's `full_inductor_compilation_pass(inductor_configs=...)`.
 - **Multi-output reductions are partitioned by output shape.** The DeepSeek-V4 HcPost backward (16k) is 3 kernels, 558 us (ideal ~265). Inductor splits `grad_comb [T,4,4]`, `grad_residual [T,4,D]` and `grad_x [T,D]` into separate kernels, so the gradient is read 3 times and the residual twice (a ~474 us schedule). The 285 us `grad_comb` kernel computes T*16 separate 4096-long dot products. One kernel producing all three outputs from one read is not generated.
 - **Harness note: `torch.compile` of a SelectiveAC-wrapped DeepSeek-V4 block produced 0 graphs** (silent fallback with `fullgraph=False`). Our harness wrapped attn-gym's `gather_attn` in `torch.compiler.disable` inside the checkpointed region; Kimi K3's SAC-wrapped block compiles. Not isolated further.
@@ -700,23 +743,9 @@ extrapolations (labelled, not measured):
 
 ## Background
 
-**Problem.** TorchTitan compiles small named regions and runs the rest of the model eager. Each region is compiled with `fullgraph=True` and the default `recompile_limit=8`, with no eager fallback. For DeepSeek-V4 and Kimi K3, the shipped regions left 40-56% of layer time on the table versus compiling whole layers; closing the gap took rewrites Inductor could have found itself, plus guard and recompile workarounds. This doc answers: which compiler behaviors forced hand rewrites or region-scoped options, how big each is at real shapes, and what we did instead.
+**Problem.** TorchTitan compiles small named regions and runs the rest of the model eager. Each region is compiled with `fullgraph=True` and the default `recompile_limit=8`, with no eager fallback. For DeepSeek-V4 and Kimi K3, upstream's default regions left 40-56% of layer time on the table versus compiling whole layers; closing the gap took rewrites Inductor could have found itself, plus guard and recompile workarounds. This doc answers: which compiler behaviors forced hand rewrites or region-scoped options, how big each is at real shapes, and what we did instead.
 
-**Terms:**
-
-- region: a function decorated with TorchTitan's `@local_compile`, bound to `torch.compile(fn, fullgraph=True, **options)` while the rest of the model runs eager;
-- block compile: `torch.compile` of a whole transformer layer;
-- SAC: selective activation checkpointing (`torch.utils.checkpoint` with a policy that saves some ops);
-- GraphTrainer: TorchTitan's experimental trainer that traces the whole training step with non-strict `make_fx`;
-- FA4: FlashAttention 4 (CuTe DSL); DSv4: DeepSeek-V4; DSv3: DeepSeek-V3;
-- Kimi residual (attention residual): Kimi K3's block-level residual, a softmax-weighted sum over a stack of N <= 8 earlier block outputs `[T, N, 7168]` plus the current partial sum `[T, 7168]` (the "partial"); 2 calls per layer, 186 per forward;
-- mHC: DeepSeek-V4's hyper-connections. HcPre mixes 4 residual streams into one per token (with a 20-step Sinkhorn normalization of a `[T, 4, 4]` matrix); HcPost expands the output back to 4 streams;
-- GDN: Gated DeltaNet, Qwen3.5's linear-attention layer (attn-gym kernels);
-- HOP: a higher-order op, a Dynamo operator that traces a function body as a subgraph (e.g. `torch.utils.checkpoint` becomes `tag_activation_checkpoint`);
-- DistMoE: the fused distributed routed-expert backend TorchTitan uses for DeepSeek-V3 671B; its kernels are torch.library custom ops;
-- packed training: several documents concatenated into a fixed-length microbatch, so the token count T is fixed per step (in RL it varies).
-
-**Grouping of the requests by kind:** codegen gaps (8, 9, 10, 11, 14, 15, 17), guards and recompiles (1, 5), lowering and scheduling choices (10, 12, 13, 16, 18, 26), numerics (20), tracing and caching (2, 3, 6, 7, 21, 22, 23, 24, 25), regions, checkpointing and functionalization (4, 19), compile time (27). Request 10's two parts share one root cause (`unroll_reductions_threshold`).
+**Grouping of the requests by kind:** codegen gaps (8, 9, 10, 11, 13, 15, 17), guards and recompiles (1, 5), lowering and scheduling choices (10, 12, 14, 16, 19, 26), numerics (20), tracing and caching (2, 3, 6, 7, 21, 22, 23, 24, 25), regions, checkpointing and functionalization (4, 18), compile time (27). Request 10's two parts share one root cause (`unroll_reductions_threshold`).
 
 **How we measured:**
 
@@ -741,8 +770,36 @@ extrapolations (labelled, not measured):
 
 ## References
 
-- torch (2.15.0.dev20260926): `torch/_inductor/scheduler.py:470-494`, `torch/_inductor/ir.py:1903-1908`, `torch/_inductor/fx_passes/decompose_mem_bound_mm.py:34-36,62-90`, `torch/_inductor/utils.py:3486-3495,4689-4704`, `torch/_inductor/config.py:1825-1829`, `torch/_inductor/codegen/triton_utils.py:259-278`, `torch/_inductor/codegen/triton.py:7492`, `torch/_inductor/lowering.py:8490-8493`, `torch/_dynamo/side_effects.py:335-383,549-561`, `torch/_dynamo/decorators.py:1347`, `torch/_dynamo/variables/functions.py:3095-3110`, `torch/_dynamo/output_graph.py:817`, `torch/fx/experimental/proxy_tensor.py:3078`, `torch/fx/passes/regional_inductor.py:143-160,177-183`, `torch/fx/passes/infra/partitioner.py:50-58`, `torch/utils/checkpoint.py:1554-1568`, `torch/_functorch/aot_autograd.py:596`, `torch/_functorch/_aot_autograd/utils.py:660`.
+- torch (2.15.0.dev20260926):
+  - Inductor: `torch/_inductor/scheduler.py:470-494`, `ir.py:1903-1908`, `fx_passes/decompose_mem_bound_mm.py:34-36,62-90`, `utils.py:3486-3495,4689-4704`, `config.py:1825-1829`, `codegen/triton_utils.py:259-278`, `codegen/triton.py:7492`, `lowering.py:8490-8493`.
+  - Dynamo: `torch/_dynamo/side_effects.py:335-383,549-561`, `decorators.py:1347`, `variables/functions.py:3095-3110`, `output_graph.py:817`.
+  - FX and AOTAutograd: `torch/fx/experimental/proxy_tensor.py:3078`, `torch/fx/passes/regional_inductor.py:143-160,177-183`, `torch/fx/passes/infra/partitioner.py:50-58`, `torch/_functorch/aot_autograd.py:596`, `torch/_functorch/_aot_autograd/utils.py:660`.
+  - Checkpointing: `torch/utils/checkpoint.py:1554-1568`.
 - TorchTitan (upstream `db050eb3f`): `torchtitan/models/common/aux_loss.py:165`, `torchtitan/training_engine.py:470-482`, `torchtitan/distributed/utils.py:255-266,477`, `torchtitan/distributed/spmd_types.py:142-147`, `torchtitan/distributed/parallelism_context.py:451`, `torchtitan/experiments/graph_trainer/make_fx_tracer.py:167`.
 - Other code: FA4 `flash_attn/cute/interface.py:1482-1501`, `cute_dsl_utils.py:163`; DistMoE (`dist_moe` at ab56bce) `dist_moe/api.py:3614`, `dist_moe/_execution.py:409,478`.
-- TorchTitan fork PRs (ours): https://github.com/felipemello1/torchtitan/pull/60, https://github.com/felipemello1/torchtitan/pull/97, https://github.com/felipemello1/torchtitan/pull/99, https://github.com/felipemello1/torchtitan/pull/105, https://github.com/felipemello1/torchtitan/pull/106, https://github.com/felipemello1/torchtitan/pull/107, https://github.com/felipemello1/torchtitan/pull/108, https://github.com/felipemello1/torchtitan/pull/109, https://github.com/felipemello1/torchtitan/pull/110, https://github.com/felipemello1/torchtitan/pull/111, https://github.com/felipemello1/torchtitan/pull/113, https://github.com/felipemello1/torchtitan/pull/115, https://github.com/felipemello1/torchtitan/pull/117, https://github.com/felipemello1/torchtitan/pull/118, https://github.com/felipemello1/torchtitan/pull/120, https://github.com/felipemello1/torchtitan/pull/122, https://github.com/felipemello1/torchtitan/pull/124, https://github.com/felipemello1/torchtitan/pull/128, https://github.com/felipemello1/torchtitan/pull/131, https://github.com/felipemello1/torchtitan/pull/132, https://github.com/felipemello1/torchtitan/pull/136.
-- attention-gym fork PRs (ours): https://github.com/felipemello1/attention-gym/pull/9, https://github.com/felipemello1/attention-gym/pull/10.
+- TorchTitan fork PRs (ours):
+  - https://github.com/felipemello1/torchtitan/pull/60
+  - https://github.com/felipemello1/torchtitan/pull/97
+  - https://github.com/felipemello1/torchtitan/pull/99
+  - https://github.com/felipemello1/torchtitan/pull/105
+  - https://github.com/felipemello1/torchtitan/pull/106
+  - https://github.com/felipemello1/torchtitan/pull/107
+  - https://github.com/felipemello1/torchtitan/pull/108
+  - https://github.com/felipemello1/torchtitan/pull/109
+  - https://github.com/felipemello1/torchtitan/pull/110
+  - https://github.com/felipemello1/torchtitan/pull/111
+  - https://github.com/felipemello1/torchtitan/pull/113
+  - https://github.com/felipemello1/torchtitan/pull/115
+  - https://github.com/felipemello1/torchtitan/pull/117
+  - https://github.com/felipemello1/torchtitan/pull/118
+  - https://github.com/felipemello1/torchtitan/pull/120
+  - https://github.com/felipemello1/torchtitan/pull/122
+  - https://github.com/felipemello1/torchtitan/pull/124
+  - https://github.com/felipemello1/torchtitan/pull/128
+  - https://github.com/felipemello1/torchtitan/pull/131
+  - https://github.com/felipemello1/torchtitan/pull/132
+  - https://github.com/felipemello1/torchtitan/pull/136
+  - https://github.com/felipemello1/torchtitan/pull/137
+- attention-gym fork PRs (ours):
+  - https://github.com/felipemello1/attention-gym/pull/9
+  - https://github.com/felipemello1/attention-gym/pull/10

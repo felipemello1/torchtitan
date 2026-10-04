@@ -6,7 +6,7 @@ after training at 3 token counts: graphs = 2
 after a no_grad validation pass: graphs = 3
 last guard failure: 0/0: GLOBAL_STATE changed: grad_mode
 no failure
-== 13_cat_lowering.py
+== 14_cat_lowering.py
 (a) inverse rope   fwd+bwd: default cat  3373.8 us (3 kernels) | ConcatKernel  1983.1 us (6 kernels)
 (b) q norm + rope  fwd+bwd: default cat  1026.0 us (2 kernels) | ConcatKernel  1501.8 us (7 kernels)
 ideal (a): 605 us, (b): 756 us

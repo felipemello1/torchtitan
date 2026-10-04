@@ -21,11 +21,13 @@ if [ "$MODE" = cpu ] || [ "$MODE" = all ]; then
     run 04_sac_wrapped_region_recompile.py warm --cpu
 fi
 
+# obs_whole_graph_vs_region.py backs the "Observations" section of ../README.md, not a request, so it is
+# not part of this list; run it directly: python obs_whole_graph_vs_region.py (GPU).
 if [ "$MODE" = gpu ] || [ "$MODE" = all ]; then
     for f in 01_mix_order_guards.py 02_cache_ignores_fake.py 05a_grad_mode_guard.py 05b_shared_norm_call_sites.py \
              05d_size1_specialization.py 08_opaque_custom_op.py 09_symbolic_hidden_dim.py 10a_symbolic_small_dim.py \
-             10b_small_k_in_tile.py 11_extern_gemv.py 12_inline_recompute.py 13_cat_lowering.py \
-             14a_masked_loads_symbolic_T.py 14b_standalone_masked_kernels.py 15_int64_indexing_symbolic.py \
+             10b_small_k_in_tile.py 11_extern_gemv.py 12_inline_recompute.py 14_cat_lowering.py \
+             13a_masked_loads_symbolic_T.py 13b_standalone_masked_kernels.py 15_int64_indexing_symbolic.py \
              16_sinkhorn_transposed_reads.py 17_complex_ops.py 20_fma_bitwise.py 21_maybe_mark_dynamic_traced.py; do
         run "$f"
     done
