@@ -26,8 +26,6 @@ class LMHeadFP32OutputConverter(ModelConfigConverter):
 
     @dataclass(kw_only=True, slots=True)
     class Config(ModelConfigConverter.Config):
-        # TODO: 3 may make a difference once grad_input sums the vocab in chunks (split-K, see the
-        # TODO in FP32OutputLinear's backward).
         grad_output_pieces: int = 2
         """``FP32OutputLinear.Config.grad_output_pieces`` for the lm_head. 2: summed over the
         vocab, the GEMM's own error is larger than what a third piece fixes, and the third piece

@@ -166,6 +166,105 @@ def test_compiled_backward_keeps_lo_half():
     assert max(ratios) < 1.05, ratios
 
 
+def _wide_case_spanning_five_k_slices():
+    """Wide-layout x, weight and grad_output: out_features is 4 full K slices plus 64.
+
+    Positive operands, like an LM head's softmax grad_output, make one long GEMM's truncation add
+    up. The output is large so that cuBLAS doesn't split K by itself, as it does for small outputs.
+    """
+    num_tokens, out_features = 1024, 4 * linear_module._MAX_K_PER_GEMM + 64
+    x = torch.randn(
+        num_tokens, 2048, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    weight = torch.rand(out_features, 2048, device="cuda").bfloat16()
+    grad_output = torch.rand(num_tokens, out_features, device="cuda")
+    return x, weight, grad_output
+
+
+@pytest.mark.parametrize("weight_requires_grad", [False, True])
+@pytest.mark.parametrize("grad_output_pieces", [2, 3])
+def test_wide_backward_sums_out_features_in_k_slices(
+    grad_output_pieces, weight_requires_grad
+):
+    max_k = linear_module._MAX_K_PER_GEMM
+    x, weight, grad_output = _wide_case_spanning_five_k_slices()
+    pieces = linear_module._split_into_bf16_pieces(
+        grad_output, grad_output_pieces=grad_output_pieces
+    )
+    stacked = torch.cat(pieces)
+    # One GEMM per K slice, added in fp32 in order; addmm(out=) does the same add inside the GEMM.
+    expected = torch.mm(stacked[:, :max_k], weight[:max_k], out_dtype=torch.float32)
+    for start in range(max_k, weight.shape[0], max_k):
+        stop = start + max_k
+        expected += torch.mm(
+            stacked[:, start:stop], weight[start:stop], out_dtype=torch.float32
+        )
+    expected = expected.unflatten(0, (len(pieces), x.shape[0])).sum(dim=0).bfloat16()
+
+    # A frozen weight runs only the grad_input GEMM; a trained one (the usual LM head) both.
+    weight_leaf = weight.clone().requires_grad_(weight_requires_grad)
+    linear_module._FP32OutputLinearFunction.apply(
+        x, weight_leaf, grad_output_pieces
+    ).backward(grad_output)
+
+    assert torch.equal(x.grad, expected)
+    # With K up to one slice, it is one plain GEMM.
+    a, b = stacked[:, :max_k], weight[:max_k]
+    assert torch.equal(
+        linear_module._mm_fp32_split_k(a, b), torch.mm(a, b, out_dtype=torch.float32)
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="the one-GEMM baseline must not use cuBLAS's own split-K; checked on H100",
+)
+def test_split_k_rounds_more_of_grad_input_correctly():
+    x, weight, grad_output = _wide_case_spanning_five_k_slices()
+    correctly_rounded = (grad_output.double() @ weight.double()).bfloat16()
+    pieces = linear_module._split_into_bf16_pieces(grad_output, grad_output_pieces=2)
+    one_gemm = torch.mm(torch.cat(pieces), weight, out_dtype=torch.float32)
+    one_gemm = one_gemm.unflatten(0, (2, x.shape[0])).sum(dim=0).bfloat16()
+
+    linear_module._FP32OutputLinearFunction.apply(x, weight, 2).backward(grad_output)
+
+    # Not correctly rounded (H100): 0.5% of grad_input with split-K, 2.8% with one GEMM.
+    wrong_split_k = (x.grad != correctly_rounded).float().mean()
+    assert wrong_split_k < 0.5 * (one_gemm != correctly_rounded).float().mean()
+
+
+def test_mm_fp32_split_k_passes_opcheck():
+    # Schema, autograd registration, fake impl, and AOTAutograd tracing with dynamic shapes.
+    k = 2 * linear_module._MAX_K_PER_GEMM + 64
+    a = torch.randn(64, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(k, 32, device="cuda", dtype=torch.bfloat16)
+    torch.library.opcheck(torch.ops.torchtitan.mm_fp32_split_k.default, (a, b))
+
+
+@pytest.mark.parametrize("grad_output_pieces", [2, 3])
+def test_compiled_split_k_grad_input_matches_eager(grad_output_pieces):
+    # out_features spans three K slices, the last one partial.
+    out_features = 2 * linear_module._MAX_K_PER_GEMM + 64
+    x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    weight = (torch.randn(out_features, 256, device="cuda") * 0.02).bfloat16()
+    grad_output = torch.randn(64, out_features, device="cuda")
+
+    def linear(input, weight):
+        return linear_module._FP32OutputLinearFunction.apply(
+            input, weight, grad_output_pieces
+        )
+
+    grad_inputs = []
+    for fn in (linear, torch.compile(linear, fullgraph=True)):
+        # A trained weight, so the compiled backward also runs grad_weight on the same pieces.
+        x_leaf = x.clone().requires_grad_()
+        weight_leaf = weight.clone().requires_grad_()
+        fn(x_leaf, weight_leaf).backward(grad_output)
+        grad_inputs.append(x_leaf.grad)
+
+    assert torch.equal(grad_inputs[0], grad_inputs[1])
+
+
 @pytest.mark.parametrize("compile", [False, True])
 # 1 token takes the LM-head layout, 4 tokens the router one.
 @pytest.mark.parametrize("num_tokens", [1, 4])
