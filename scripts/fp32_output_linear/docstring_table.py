@@ -21,6 +21,7 @@ Times are fwd + bwd minus fwd, random data, as multiples of a bf16 Linear's, med
 Example:
     python scripts/fp32_output_linear/docstring_table.py --cache-dir ~/.cache/fp32_output_linear
     python scripts/fp32_output_linear/docstring_table.py --runs 1 --skip-errors
+    python scripts/fp32_output_linear/docstring_table.py --runs 0  # errors only
 """
 
 import argparse
@@ -66,7 +67,8 @@ def main():
     print(header("FP32OutputLinear backward docstring table"))
     if not args.skip_errors:
         print_errors(args.cache_dir)
-    print_times(args.runs)
+    if args.runs > 0:
+        print_times(args.runs)
 
 
 # ======================================== Errors ========================================
