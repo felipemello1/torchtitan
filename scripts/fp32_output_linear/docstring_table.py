@@ -13,7 +13,8 @@ Errors are relative to fp64 on the same fp32 grad_output (data from prepare_data
     rounded ok:  % of the returned bf16 grad_input equal to the exact value rounded to bf16.
     grad_weight: as returned, in fp32 (weight.grad_dtype = fp32).
 
-Times are fwd + bwd minus fwd, random data, as multiples of a bf16 Linear's, median of --runs:
+Times are fwd + bwd minus fwd (medians of interleaved rounds), random data, as multiples of a bf16
+Linear's, median of --runs runs:
     eager:       the Function as it ships (its split is compiled, behind a custom op).
     eager split: the same, with ``_split_into_bf16_pieces_eager`` (what TORCH_COMPILE_DISABLE=1 runs).
     compiled:    the Function inside torch.compile.
@@ -39,7 +40,7 @@ from common import (  # noqa: E402
     DEFAULT_CACHE_DIR,
     head_grads,
     header,
-    mean_ms,
+    interleaved_median_ms,
     patched_split,
     relative_error,
     router_grads,
@@ -191,10 +192,9 @@ def one_run() -> dict:
                 else linear._split_into_bf16_pieces
             )
             with patched_split(split):
-                for name, (fn, a, b, g) in variants.items():
-                    times[(label, mode, name)] = backward_ms(
-                        fn, a, b, g, compiled=mode == "compiled"
-                    )
+                mode_times = backward_times(variants, compiled=mode == "compiled")
+            for name, ms in mode_times.items():
+                times[(label, mode, name)] = ms
             base = times[(label, mode, "bf16 Linear")]
             print(
                 f"  {label:30s} {mode:12s} "
@@ -218,23 +218,33 @@ def three_pieces(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return linear._FP32OutputLinearFunction.apply(x, weight, True)
 
 
-def backward_ms(fn, x, weight, grad_output, compiled: bool) -> float:
-    """fwd + bwd minus fwd. Leaves keep the default grad_dtype: a bf16 weight gets a bf16 .grad."""
+def backward_times(variants: dict, compiled: bool, rounds: int = 20) -> dict:
+    """{variant: backward ms}, as the median fwd + bwd minus the median fwd over interleaved rounds.
+
+    Leaves keep the default grad_dtype: a bf16 weight gets a bf16 .grad.
+    """
     # Compile from a clean state: no shape seen before, so every dim stays static.
     torch._dynamo.reset()
-    fn = torch.compile(fn) if compiled else fn
-    x = x.clone().requires_grad_()
-    weight = weight.clone().requires_grad_()
+    fns = {}
+    for name, (fn, x, weight, grad_output) in variants.items():
+        fn = torch.compile(fn) if compiled else fn
+        x = x.clone().requires_grad_()
+        weight = weight.clone().requires_grad_()
 
-    def forward():
-        with torch.no_grad():
-            fn(x, weight)
+        def forward(fn=fn, x=x, weight=weight):
+            with torch.no_grad():
+                fn(x, weight)
 
-    def forward_backward():
-        fn(x, weight).backward(grad_output)
-        x.grad = weight.grad = None
+        def forward_backward(fn=fn, x=x, weight=weight, grad_output=grad_output):
+            fn(x, weight).backward(grad_output)
+            x.grad = weight.grad = None
 
-    return mean_ms(forward_backward) - mean_ms(forward)
+        fns[(name, "fwd")] = forward
+        fns[(name, "fwd + bwd")] = forward_backward
+    times = interleaved_median_ms(fns, rounds=rounds)
+    return {
+        name: times[(name, "fwd + bwd")] - times[(name, "fwd")] for name in variants
+    }
 
 
 if __name__ == "__main__":

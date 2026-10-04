@@ -10,9 +10,9 @@ Three ways to pick each piece. The pieces always sum to grad_output; only which 
     truncate:   bits & 0xFFFF0000                                    (before review 3)
     half-away:  (bits + 0x8000) & 0xFFFF0000                         (round, ties away from 0: ships)
     RNE:        (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000    (round, ties to even)
-Errors as in docstring_table.py. Times: fwd + bwd minus fwd of the shipped Function with its split
-swapped, run eagerly and compiled (the shipped split is always compiled). Also prints the 0.1 example
-of the backward docstring and where 3 pieces stop being exact.
+Errors as in docstring_table.py. Times: fwd + bwd minus fwd (medians of interleaved rounds) of the
+shipped Function with its split swapped, run eagerly and compiled (the shipped split is compiled).
+Also prints the backward docstring's 0.1 example and where 3 pieces stop being exact.
 
 Example:
     python scripts/fp32_output_linear/rounding.py --cache-dir ~/.cache/fp32_output_linear
@@ -26,7 +26,7 @@ from common import (
     DEFAULT_CACHE_DIR,
     head_grads,
     header,
-    mean_ms,
+    interleaved_median_ms,
     patched_split,
     relative_error,
     router_grads,
@@ -236,13 +236,14 @@ def print_times():
         grad_output = torch.randn(num_tokens, out_features, device="cuda") * 1e-3
         for hp in (False, True):
             for mode in ("split eager", "split compiled"):
-                times = {}
-                for split_name, split in SPLITS.items():
-                    torch._dynamo.reset()
-                    if mode == "split compiled":
-                        split = compiled_like_shipped(split)
-                    with patched_split(split):
-                        times[split_name] = backward_ms(x, weight, grad_output, hp)
+                torch._dynamo.reset()
+                splits = {
+                    name: compiled_like_shipped(split)
+                    if mode == "split compiled"
+                    else split
+                    for name, split in SPLITS.items()
+                }
+                times = backward_times(splits, x, weight, grad_output, hp)
                 base = times["truncate"]
                 cells = "  ".join(
                     f"{name} {ms:6.2f} ({ms / base - 1:+5.1%})"
@@ -264,7 +265,9 @@ def compiled_like_shipped(split):
     return run
 
 
-def backward_ms(x, weight, grad_output, higher_precision_bwd) -> float:
+def backward_times(splits, x, weight, grad_output, higher_precision_bwd) -> dict:
+    """{split name: backward ms}: median fwd + bwd with that split, minus the median fwd, over
+    interleaved rounds."""
     x = x.clone().requires_grad_()
     weight = weight.clone().requires_grad_()
 
@@ -272,12 +275,20 @@ def backward_ms(x, weight, grad_output, higher_precision_bwd) -> float:
         with torch.no_grad():
             linear._FP32OutputLinearFunction.apply(x, weight, higher_precision_bwd)
 
-    def forward_backward():
-        output = linear._FP32OutputLinearFunction.apply(x, weight, higher_precision_bwd)
-        output.backward(grad_output)
+    def forward_backward(split):
+        with patched_split(split):
+            output = linear._FP32OutputLinearFunction.apply(
+                x, weight, higher_precision_bwd
+            )
+            output.backward(grad_output)
         x.grad = weight.grad = None
 
-    return mean_ms(forward_backward) - mean_ms(forward)
+    fns = {
+        name: lambda split=split: forward_backward(split)
+        for name, split in splits.items()
+    }
+    times = interleaved_median_ms({"fwd": forward, **fns}, rounds=20)
+    return {name: times[name] - times["fwd"] for name in splits}
 
 
 if __name__ == "__main__":
