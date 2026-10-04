@@ -399,14 +399,15 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
         - grad_weight sums over tokens, so a third piece adds very little to either.
 
         Relative error vs fp64 (grad_input before its bf16 rounding), and backward time as a
-        multiple of a bf16 Linear's (H100):
+        multiple of a bf16 Linear's (H100; the eager column runs the LM head's split compiled, see
+        ``_compiled_split_into_stacked_bf16_pieces``):
 
                                     relative error             backward time
                                     grad_input  grad_weight    eager   compiled
             LM head (Qwen3-8B, 2048 tokens; bf16 backward: 7.2 ms)
               bf16 grad_output      1.5e-3      1.2e-3          1.0x    1.0x
-              2 pieces              2.9e-4      7.6e-6          3.1x    2.5x
-              3 pieces              2.9e-4      8.1e-6          4.7x    4.0x
+              2 pieces              2.9e-4      7.6e-6          2.5x    2.5x
+              3 pieces              2.9e-4      8.1e-6          3.5x    4.0x
               fp32 matmul (IEEE)    1.2e-4      1.8e-6         13.3x   14.0x
             router (2048 -> 128; errors on 16k tokens, times on 64k; bf16 backward: 0.30 ms)
               bf16 grad_output      1.7e-3      1.4e-3          1.0x    1.0x
@@ -442,19 +443,27 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
                 grad_weight_OD = torch.mm(grad_output_TO.T, input_TD.float())
             return grad_input_TD, grad_weight_OD, None
 
-        # ======== Split grad_output into bf16 pieces ========
-        pieces_TO = _split_into_bf16_pieces(
-            grad_output_TO, exact=ctx.exact_grad_output_split
-        )
-        num_pieces = len(pieces_TO)
+        num_pieces = 3 if ctx.exact_grad_output_split else 2
         num_tokens, out_features = grad_output_TO.shape
 
         if out_features > num_tokens:
             # ======== Wide (e.g. an LM head): stack along tokens, copy the input ========
-            # TODO: split straight into one [P * T, O] buffer instead of cat: 5.66 -> 4.47 ms per
-            # eager Qwen3-8B chunk, bitwise equal. Moot once the split is compiled (1.66 ms).
-            stacked_PTO = torch.cat(pieces_TO)
-            del pieces_TO  # free them before allocating the fp32 [O, D] grad_weight
+            # Dispatch modes (make_fx, FakeTensorMode, FlopCounterMode) can't see into the compiled
+            # kernel, so they take the eager split. is_compiling() goes first: Dynamo graph-breaks
+            # on the dispatch-stack check.
+            if (
+                torch.compiler.is_compiling()
+                or torch._C._len_torch_dispatch_stack() > 0
+            ):
+                stacked_PTO = _split_into_stacked_bf16_pieces(
+                    grad_output_TO, exact=ctx.exact_grad_output_split
+                )
+            else:
+                # Chunk token counts change between steps (RL): one dynamic-T graph serves them all.
+                torch._dynamo.maybe_mark_dynamic(grad_output_TO, 0)
+                stacked_PTO = _compiled_split_into_stacked_bf16_pieces(
+                    grad_output_TO, exact=ctx.exact_grad_output_split
+                )
             if needs_grad_input:
                 # TODO: summing all out_features in one GEMM sets this error. Summing 8192 at a time
                 # in fp32 (addmm(out=)): 95% -> 99.5% correctly rounded, +7-13% GEMM time (H100).
@@ -477,6 +486,9 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
                 )
         else:
             # ======== Narrow (e.g. a router): stack along out_features, copy the weight ========
+            pieces_TO = _split_into_bf16_pieces(
+                grad_output_TO, exact=ctx.exact_grad_output_split
+            )
             if needs_grad_input:
                 grad_input_TD = torch.mm(
                     torch.cat(pieces_TO, dim=1), torch.cat([weight_OD] * num_pieces)
@@ -533,6 +545,27 @@ def _split_into_bf16_pieces(tensor: torch.Tensor, *, exact: bool) -> list[torch.
     mid = _round_to_bf16(rest)
     lo = rest - mid
     return [hi.to(torch.bfloat16), mid.to(torch.bfloat16), lo.to(torch.bfloat16)]
+
+
+def _split_into_stacked_bf16_pieces(
+    tensor_TO: torch.Tensor, *, exact: bool
+) -> torch.Tensor:
+    """``_split_into_bf16_pieces``, stacked along tokens: fp32 [T, O] -> bf16 [P * T, O]."""
+    return torch.cat(_split_into_bf16_pieces(tensor_TO, exact=exact))
+
+
+# One kernel splits grad_output into the stacked pieces: 1.66 vs 6.80 ms eager (Qwen3-8B LM-head
+# chunk, 2 pieces, H100). Always compiled, like FlexAttention, so compile-off and RL runs (whose
+# loss region is never compiled) get it too; an opt-in compile region would leave them eager.
+# - Only the split: compiling the Function rounds grad_weight to bf16 (TODO at the end of backward).
+# - No fullgraph: with it, TORCH_COMPILE_DISABLE=1 and the recompile limit raise inside backward.
+# - No dynamic=True: a symbolic vocab dim is 15-40% slower; backward marks only the token dim.
+# TODO: Inductor's ConcatKernel lowering reads grad_output once, 1.66 -> 1.14 ms (options
+# max_pointwise_cat_inputs=1, max_complex_pointwise_cat_inputs=1). Not used: these internal knobs
+# change across releases, and an unknown option fails at import.
+_compiled_split_into_stacked_bf16_pieces = torch.compile(
+    _split_into_stacked_bf16_pieces
+)
 
 
 def _round_to_bf16(tensor: torch.Tensor) -> torch.Tensor:
