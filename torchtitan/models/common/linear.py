@@ -354,11 +354,23 @@ class FP32OutputLinear(Linear):
         grad_output_pieces: int = 3
         """How many bf16 pieces backward splits the fp32 grad_output into (see ``backward``): 3
         is exact, 2 keeps about 16 of its 24 significant bits. The third piece makes the backward
-        1.4-1.6x slower; it cuts a MoE router's grad_input error 7x, but doesn't help an LM head."""
+        1.4-1.6x slower; it cuts a MoE router's grad_input error 7x, but doesn't help an LM head
+        (with ``fused_split_gemm=False``)."""
+
+        fused_split_gemm: bool = False
+        """Backward GEMMs on H100. True: ``split_mm`` kernels split grad_output in registers and
+        add the tensor core's partial sums in fp32. False: cuBLAS GEMMs on stacked pieces.
+        Qwen3-8B head, 2048 tokens, 2 pieces: grad_input error 1.3e-5 -> 2.4e-6 (bf16 correctly
+        rounded 99.6% -> 99.8%), first-chunk backward with a bf16 .grad 18.6 ms vs 18.2 for False
+        (3 pieces: 28.6 vs 26.2). True doesn't add into weight.grad inside the GEMM under
+        ``accumulate_into_weight_grad``: ``split_mm`` has no accumulator input. Other GPUs and
+        unaligned shapes take the False path. ``FusedLMHeadCrossEntropyLoss`` ignores the flag
+        and runs its own cuBLAS GEMMs."""
 
     def __init__(self, config: Config):
         super().__init__(config)
         self.grad_output_pieces = config.grad_output_pieces
+        self.fused_split_gemm = config.fused_split_gemm
 
     def _linear(
         self,
@@ -369,7 +381,10 @@ class FP32OutputLinear(Linear):
         # torch.mm takes 2D inputs, so flatten the input: [B, S, D] -> [B * S, D]. The weight is
         # already 2D: Linear.forward flattens a stacked [num_linears, O, D] to [num_linears * O, D].
         output = _FP32OutputLinearFunction.apply(
-            input.reshape(-1, input.shape[-1]), weight, self.grad_output_pieces
+            input.reshape(-1, input.shape[-1]),
+            weight,
+            self.grad_output_pieces,
+            self.fused_split_gemm,
         )
         output = output.reshape(*input.shape[:-1], -1)
         return output if bias is None else output + bias.float()
@@ -382,7 +397,8 @@ _ACCUMULATE_INTO_WEIGHT_GRAD = ContextVar("accumulate_into_weight_grad", default
 def accumulate_into_weight_grad() -> Iterator[None]:
     """Let FP32OutputLinear calls made here add grad_weight into an existing weight.grad inside the
     backward GEMM, instead of in autograd's separate add. Only the eager wide backward (an LM head)
-    does it; a router, the fp32 fallback and a traced call (torch.compile, make_fx) don't.
+    does it; a router, the fp32 fallback, ``fused_split_gemm`` and a traced call (torch.compile,
+    make_fx) don't.
 
     The backward then returns no grad_weight, so enter it only around calls whose backward is a
     plain `.backward()`, as ChunkedLossWrapper's per-chunk one is, and outside compiled code (Dynamo
@@ -425,6 +441,7 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
         input_TD: torch.Tensor,
         weight_OD: torch.Tensor,
         grad_output_pieces: int,
+        fused_split_gemm: bool = False,
     ) -> torch.Tensor:
         """``output = input @ weight.T``: a bf16 GEMM that accumulates in fp32 and returns fp32.
 
@@ -449,6 +466,7 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
             and not is_in_batch_invariant_mode()
         )
         ctx.grad_output_pieces = grad_output_pieces
+        ctx.fused_split_gemm = fused_split_gemm
         # The wide backward may add into this parameter's .grad; see `accumulate_into_weight_grad`.
         # On ctx, not saved: saved-tensor hooks may unpack a copy.
         ctx.weight_param = weight_to_accumulate_into(weight_OD)
@@ -545,7 +563,7 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
                 grad_weight = hi.T @ x + lo.T @ x                    one small GEMM per piece
         """
         input_TD, weight_OD = ctx.saved_tensors
-        needs_grad_input, needs_grad_weight, _ = ctx.needs_input_grad
+        needs_grad_input, needs_grad_weight = ctx.needs_input_grad[:2]
         # .float() is a no-op unless autocast made the fallback's output bf16.
         grad_output_TO = grad_output_TO.float()
         grad_input_TD = grad_weight_OD = None
@@ -557,7 +575,26 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
                 grad_input_TD = grad_input_TD.to(ctx.input_dtype)
             if needs_grad_weight:
                 grad_weight_OD = torch.mm(grad_output_TO.T, input_TD.float())
-            return grad_input_TD, grad_weight_OD, None
+            return grad_input_TD, grad_weight_OD, None, None
+
+        # ==== Fused (H100): split in registers, fp32 accumulation, no pieces in memory ====
+        if (
+            ctx.fused_split_gemm
+            and _split_mm_supported(grad_output_TO, weight_OD)
+            and _split_mm_supported(grad_output_TO.T, input_TD)
+        ):
+            # Imported only where it runs: the kernel uses Gluon, an experimental Triton API.
+            from torchtitan.models.common.split_mm import split_mm
+
+            if needs_grad_input:
+                grad_input_TD = split_mm(
+                    grad_output_TO, weight_OD, ctx.grad_output_pieces, ctx.input_dtype
+                )
+            if needs_grad_weight:
+                grad_weight_OD = split_mm(
+                    grad_output_TO.T, input_TD, ctx.grad_output_pieces, torch.float32
+                )
+            return grad_input_TD, grad_weight_OD, None, None
 
         num_pieces = ctx.grad_output_pieces
         num_tokens, out_features = grad_output_TO.shape
@@ -582,10 +619,6 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
                     grad_output_TO, grad_output_pieces=ctx.grad_output_pieces
                 )
             if needs_grad_input:
-                # TODO: a kernel that adds each 64-long partial sum in fp32 outside the tensor core
-                # got 5.3e-6 in a Triton prototype (split-K: 1.3e-5), but ran ~33% slower than this
-                # path did before split-K, and it's a custom GEMM to maintain. vLLM does this for a
-                # one-sided router GEMM: https://github.com/vllm-project/vllm/pull/55899
                 grad_input_PTD = _mm_fp32_split_k(stacked_PTO, weight_OD)
                 grad_input_PTD = grad_input_PTD.unflatten(0, (num_pieces, num_tokens))
                 grad_input_TD = grad_input_PTD.sum(dim=0).to(ctx.input_dtype)
@@ -637,7 +670,7 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
         # - inside a torch.compile region: https://github.com/pytorch/pytorch/pull/197381
         # - for a non-leaf weight, e.g. SimpleFSDP's or num_linears > 1:
         #   https://github.com/pytorch/pytorch/issues/189633
-        return grad_input_TD, grad_weight_OD, None
+        return grad_input_TD, grad_weight_OD, None, None
 
 
 # The fp32 bits that bf16 keeps: sign, exponent and the top 7 mantissa bits (0xFFFF0000).
@@ -711,6 +744,34 @@ def _round_to_bf16(tensor: torch.Tensor) -> torch.Tensor:
     """Nearest bf16 value, ties away from zero, kept in fp32: add half a bf16 ulp, then cut."""
     bits = tensor.view(torch.int32)
     return ((bits + 0x8000) & _BF16_BITS_OF_FP32).view(torch.float32)
+
+
+def _split_mm_supported(a_MK: torch.Tensor, b_KN: torch.Tensor) -> bool:
+    """Whether ``split_mm`` runs these operands: an NVIDIA H100, fp32 x bf16, TMA-compatible strides.
+
+    ``a_MK`` may be row-major or the transpose of a row-major tensor (grad_output.T for grad_weight).
+    Reads only metadata, so it also runs on ``torch.compile``'s fake tensors, and only needs torch,
+    so other GPUs never import the kernel.
+    """
+    if not (
+        a_MK.is_cuda
+        # AMD GPUs report a capability too (gfx90a: (9, 0)).
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(a_MK.device) == (9, 0)
+    ):
+        return False
+    if a_MK.dtype != torch.float32 or b_KN.dtype != torch.bfloat16 or a_MK.dim() != 2:
+        return False
+    # TMA: the last dim is contiguous and the other stride is 16-byte aligned. (`split_mm` copies an
+    # operand whose start is not 16-byte aligned, keeping its strides; expanded rows, e.g. the grad
+    # of y.sum(0), can't be copied that way and take the torch path.)
+    a_rows = a_MK if a_MK.stride(1) == 1 else a_MK.T
+    return all(
+        tensor.stride(1) == 1
+        and tensor.stride(0) != 0
+        and (tensor.stride(0) * tensor.element_size()) % 16 == 0
+        for tensor in (a_rows, b_KN)
+    )
 
 
 # A GEMM's fp32 accumulator truncates as it sums, so its error grows with the length of the sum.

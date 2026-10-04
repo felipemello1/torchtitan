@@ -28,8 +28,11 @@ class LMHeadFP32OutputConverter(ModelConfigConverter):
     class Config(ModelConfigConverter.Config):
         grad_output_pieces: int = 2
         """``FP32OutputLinear.Config.grad_output_pieces`` for the lm_head. 2: summed over the
-        vocab, the GEMM's own error is larger than what a third piece fixes, and the third piece
-        costs ~1.5x the backward time."""
+        vocab, the GEMM's own error is larger than what a third piece fixes (with
+        ``fused_split_gemm=False``), and the third piece costs ~1.5x the backward time."""
+
+        fused_split_gemm: bool = False
+        """``FP32OutputLinear.Config.fused_split_gemm`` for the lm_head."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -44,6 +47,7 @@ class LMHeadFP32OutputConverter(ModelConfigConverter):
                 f.name: getattr(linear_config, f.name) for f in fields(linear_config)
             }
             kwargs["grad_output_pieces"] = self.config.grad_output_pieces
+            kwargs["fused_split_gemm"] = self.config.fused_split_gemm
             new_config = FP32OutputLinear.Config(**kwargs)
             if isinstance(parent, list):
                 parent[attr] = new_config
