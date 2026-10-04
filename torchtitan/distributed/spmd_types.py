@@ -450,12 +450,17 @@ def spmd_redistribute_per_axis(
     mesh: DeviceMesh | None,
     src: spmd.SpmdType,
     dst: spmd.SpmdType,
+    *,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Redistribute a local tensor along axes whose SPMD type changes.
 
     Iterates over *dst_types* and issues a per-axis ``spmd.redistribute``
     for each axis where src and dst differ. Each call is a single collective
     (all-reduce, reduce-scatter, or all-gather) on that axis's process group.
+
+    ``out_dtype`` casts the result and runs the backward collective in that
+    dtype; ``None`` keeps ``x.dtype``. It is applied only when an axis changes.
 
     TODO(pianpwk): Move into ``spmd_types`` as a version that takes
     per-axis types + ``PartitionSpec``, so the library handles multi-axis
@@ -482,7 +487,8 @@ def spmd_redistribute_per_axis(
             mesh.get_group(axis),
             src=src_t,
             dst=dst_t,
-            backward_options={"op_dtype": x.dtype},
+            out_dtype=out_dtype,
+            backward_options={"op_dtype": out_dtype or x.dtype},
         )
     return x
 
