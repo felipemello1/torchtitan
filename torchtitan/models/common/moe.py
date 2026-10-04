@@ -37,7 +37,7 @@ from torchtitan.models.common.activation import (
 )
 from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.feed_forward import FeedForward
-from torchtitan.models.common.linear import GroupedLinear, RouterGateLinear
+from torchtitan.models.common.linear import FP32OutputLinear, GroupedLinear
 from torchtitan.protocols.module import Module
 
 from .token_dispatcher import LocalTokenDispatcher
@@ -163,7 +163,7 @@ class TokenChoiceTopKRouter(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         num_experts: int
-        gate: RouterGateLinear.Config
+        gate: FP32OutputLinear.Config
         score_func: UnaryActivationFn.Config
         top_k: int = 1
         route_norm: bool = False
@@ -230,7 +230,7 @@ class TokenChoiceTopKRouter(Module):
             topk_expert_ids_TK: Expert indices ``(T, K)``.
             routing_map_TE: One-hot boolean routing map ``(T, E)``.
         """
-        # RouterGateLinear returns FP32, so configured scoring runs in FP32.
+        # FP32OutputLinear returns FP32, so configured scoring runs in FP32.
         scores_TE = self.score_func(self.gate(x_TD))
 
         if padding_mask_T is not None:
