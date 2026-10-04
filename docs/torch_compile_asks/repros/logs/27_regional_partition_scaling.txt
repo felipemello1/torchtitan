@@ -1,0 +1,26 @@
+== 27_regional_partition_scaling.py (01:47, CPU)
+one inductor_region per layer
+tagged nodes   200  regions   25  scoop_regions     0.05 s
+tagged nodes   400  regions   50  scoop_regions     0.17 s  x3.5 vs half
+tagged nodes   800  regions  100  scoop_regions     1.16 s  x6.9 vs half
+tagged nodes  1600  regions  200  scoop_regions     7.79 s  x6.7 vs half
+tagged nodes  3200  regions  400  scoop_regions    63.99 s  x8.2 vs half
+one shared region (no inductor_region key)
+tagged nodes   200  regions    1  scoop_regions     0.05 s
+tagged nodes   400  regions    1  scoop_regions     0.24 s  x4.7 vs half
+tagged nodes   800  regions    1  scoop_regions     1.44 s  x6.1 vs half
+tagged nodes  1600  regions    1  scoop_regions    10.95 s  x7.6 vs half
+== cProfile, 800 tagged nodes, one region id per layer: total 1.78 s (profiled)
+   cumulative   0.78 s  calls    100  fx/passes/infra/partitioner.py:66(__init__)
+   cumulative   0.78 s  calls    100  fx/passes/infra/partitioner.py:52(__init__)
+   cumulative   0.62 s  calls    100  fx/passes/infra/partitioner.py:92(propose_partitions)
+   cumulative   0.25 s  calls      1  fx/passes/utils/fuser_utils.py:302(fuse_by_partitions)
+   cumulative   0.19 s  calls   1500  fx/passes/infra/partitioner.py:114(downstream_partitions)
+   cumulative   0.15 s  calls    700  fx/passes/infra/partitioner.py:135(maybe_merge_partition)
+== cProfile, 800 tagged nodes, one shared region: total 2.30 s (profiled)
+   cumulative   2.07 s  calls      1  fx/passes/infra/partitioner.py:92(propose_partitions)
+   cumulative   1.73 s  calls  45448  fx/passes/infra/partitioner.py:135(maybe_merge_partition)
+   cumulative   1.22 s  calls  45448  fx/passes/infra/partitioner.py:140(dfs_iter_find_cycle)
+   cumulative   0.77 s  calls   1500  fx/passes/infra/partitioner.py:114(downstream_partitions)
+   cumulative   0.23 s  calls      1  fx/passes/utils/fuser_utils.py:302(fuse_by_partitions)
+   cumulative   0.13 s  calls    100  fx/passes/utils/fuser_utils.py:97(fuse_as_graphmodule)

@@ -1,0 +1,16 @@
+== 09 EMULATE_PRECISION_CASTS=0
+emulate_precision_casts = False
+(a) complex eager vs real compiled mismatched     44 / 4194304  max abs diff 7.81e-03
+(a') real eager vs real compiled mismatched     92 / 4194304  max abs diff 1.56e-02
+(b) rotate-half eager vs compiled mismatched     81 / 4194304  max abs diff 7.81e-03
+== 09 EMULATE_PRECISION_CASTS=1
+emulate_precision_casts = True
+(a) complex eager vs real compiled mismatched     90 / 4194304  max abs diff 1.56e-02
+(a') real eager vs real compiled mismatched      0 / 4194304  max abs diff 0.00e+00
+(b) rotate-half eager vs compiled mismatched      0 / 4194304  max abs diff 0.00e+00
+== 07
+W1002 17:19:37.949000 1311360 /storage/home/felipemello/venvs/fp32grads-0926/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py:2060] [0/8] To diagnose recompilation issues, see https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.recompilation.html
+after training at 3 token counts: graphs = 2
+after a no_grad validation pass: graphs = 3
+last guard failure: 0/0: GLOBAL_STATE changed: grad_mode
+5 ranks x 2 grad modes: FailOnRecompileLimitHit at signature 9 (recompile_limit=8)

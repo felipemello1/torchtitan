@@ -1,0 +1,8 @@
+== 03_make_fx_tensor_constant.py (CPU)
+graph constants: ['_tensor_constant0']
+traced, denominator 2:           2.0
+after in-place fill_(4):          1.0  eager 1.0
+after rebinding to tensor(8):     1.0  eager 0.5
+== 13 and 14 (CPU)
+eager call after a fake trace: AssertionError Please convert all Tensors to FakeTensors first or instantiate FakeTensorMode with 'allow_non_fake_inputs'. [... output truncated by the repro]
+traced with n=3, called with n=5 -> [0.0, 2.0, 4.0]

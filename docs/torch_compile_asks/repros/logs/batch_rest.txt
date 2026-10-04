@@ -1,0 +1,33 @@
+== 01_mix_order_guards.py
+non_strict=False: graphs=3; guard failures: ["0/0: tensor 'stack' size mismatch at index 0. expected 16384, actual 8192", '0/1: 4096 <= stack.size()[0] <= 268435456  # (_inductor/scheduler.py:492 in can_fuse) and (_inductor/codegen/s', "0/0: tensor 'stack' size mismatch at index 0. expected 16384, actual 2048"]
+non_strict=True: graphs=2; guard failures: ["0/0: tensor 'stack' size mismatch at index 0. expected 16384, actual 8192"]
+== 05a_grad_mode_guard.py
+after training at 3 token counts: graphs = 2
+after a no_grad validation pass: graphs = 3
+last guard failure: 0/0: GLOBAL_STATE changed: grad_mode
+no failure
+== 13_cat_lowering.py
+(a) inverse rope   fwd+bwd: default cat  3373.8 us (3 kernels) | ConcatKernel  1983.1 us (6 kernels)
+(b) q norm + rope  fwd+bwd: default cat  1026.0 us (2 kernels) | ConcatKernel  1501.8 us (7 kernels)
+ideal (a): 605 us, (b): 756 us
+== 20_fma_bitwise.py
+TRITON_DEFAULT_FP_FUSION = unset (default on)
+(a) complex eager vs real compiled mismatched     44 / 4194304  max abs diff 7.81e-03
+(a') real eager vs real compiled mismatched     92 / 4194304  max abs diff 1.56e-02
+(b) rotate-half eager vs compiled mismatched     81 / 4194304  max abs diff 7.81e-03
+== 10b_small_k_in_tile.py
+reduction over K        1354.4 us  1 kernels  top [('triton_per_fused__to_copy_index_sum_view_0', 1354.4)]
+unrolled loop over K     290.3 us  1 kernels  top [('triton_poi_fused__to_copy_add_index_select_0', 290.3)]
+ideal (read T*K*D + write T*D, bf16): 281 us
+== 21_maybe_mark_dynamic_traced.py
+AssertionError Attempt to trace forbidden callable <function maybe_mark_dynamic at 0xefdde024bb00>
+== 05d_size1_specialization.py
+graphs over widths 1,2,3,5,8,1: 2
+graphs with maybe_mark_dynamic on the size-1 dim, widths 1 then 4: 2
+== 20_fma_bitwise.py (TRITON_DEFAULT_FP_FUSION=0)
+TRITON_DEFAULT_FP_FUSION = 0
+(a) complex eager vs real compiled mismatched     44 / 4194304  max abs diff 7.81e-03
+(a') real eager vs real compiled mismatched     92 / 4194304  max abs diff 1.56e-02
+(b) rotate-half eager vs compiled mismatched     81 / 4194304  max abs diff 7.81e-03
+== 17_complex_ops.py (caches off, for the warning)
+inductor warnings: ['Torchinductor does not support code generation for complex operators. Performance may be w']

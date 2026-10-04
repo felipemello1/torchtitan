@@ -1,0 +1,19 @@
+== 16_sinkhorn_transposed_reads.py (19:23)
+[T,4,4] tensor form        fwd+bwd   315.6 us  159 kernels  rel vs fp64 8.8e-08
+16 per-entry [T] tensors   fwd+bwd    85.9 us   32 kernels  rel vs fp64 8.8e-08
+== 09_symbolic_hidden_dim.py (19:24)
+F static   fwd+bwd   236.3 us  2 kernels
+F dynamic  fwd+bwd   234.8 us  2 kernels
+ideal (read 2, write 1 fwd; read 3, write 2 bwd; bf16): 227 us
+== 12_inline_recompute.py (19:24)
+default                      no_grad fwd  1224.7 us  2 kernels  top ('triton_poi_fused__softmax__to_copy_add_constant_pad_nd_mul_select_slic', 1218.7)
+realize_reads_threshold=1    no_grad fwd   277.7 us  3 kernels  top ('triton_poi_fused__to_copy_add_mul_select_slice_2', 269.7)
+ideal (read stack, write out, bf16): 265 us
+== 15_int64_indexing_symbolic.py (19:25)
+default                      fwd+bwd  1917.5 us  5 kernels
+torch._check(N <= 8)         fwd+bwd  1914.0 us  5 kernels
+assume_32bit_indexing=True   fwd+bwd  1815.9 us  5 kernels
+== done 19:25
+== 09_symbolic_hidden_dim.py (rev 2, 19:33)
+F static (compiled at 6144 only)     fwd+bwd   360.7 us  3 kernels
+F dynamic (3072 first, then 6144)    fwd+bwd   601.4 us  3 kernels

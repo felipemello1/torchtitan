@@ -1,0 +1,56 @@
+== 02_cache_ignores_fake.py (18:59)
+fresh cache A  -> fake v1: AssertionError: expected size 32==32, stride 64==1 at dim=0; expected size 64==64, stride 1==32 at dim=1
+same cache A   -> fake v2: AssertionError: expected size 32==32, stride 64==1 at dim=0; expected size 64==64, stride 1==32 at dim=1
+fresh cache B  -> fake v2: ok
+== 21_maybe_mark_dynamic_traced.py (19:00)
+unguarded: AssertionError: Attempt to trace forbidden callable <function maybe_mark_dynamic at 0xec0d73e4bce0>
+guarded by is_compiling(): compiled fine
+== 05d_size1_specialization.py (19:00)
+default, widths 1,2,3,5,8,1: 2 graphs
+maybe_mark_dynamic on the size-1 dim, widths 1 then 4: 2 graphs
+mark_unbacked on the width, widths 1 then 4: 1 graphs
+== 10b_small_k_in_tile.py (19:00)
+gather, .sum over K (default threshold 8)     1354.3 us  1 kernels  triton_per_fused__to_copy_index_sum_view
+gather, .sum over K, threshold 16             1353.9 us  1 kernels  triton_per_fused__to_copy_index_sum_view
+gather, .sum over K, threshold 17              290.4 us  1 kernels  triton_poi_fused__to_copy_index_sum_view
+gather, unrolled Python loop                   290.4 us  1 kernels  triton_poi_fused__to_copy_add_index_sele
+contiguous [T,K,D], .sum over K                999.2 us  1 kernels  triton_per_fused__to_copy_sum_0
+contiguous [T,K,D], threshold 17               278.0 us  1 kernels  triton_poi_fused__to_copy_sum_0
+ideal (read T*K*D + write T*D, bf16): 281 us
+== 10a_symbolic_small_dim.py (19:01)
+N=7 static                   fwd   314.0 us (ideal 298)  kernel kinds ['triton_per', 'triton_poi']
+N=8 static                   fwd  1573.9 us (ideal 331)  kernel kinds ['triton_per']
+N=8 static, threshold 9      fwd   353.1 us (ideal 331)  kernel kinds ['triton_per', 'triton_poi']
+N=7 dynamic                  fwd  1245.0 us (ideal 298)  kernel kinds ['triton_red']
+N=7 dynamic, threshold 64    fwd  1245.1 us (ideal 298)  kernel kinds ['triton_red']
+== 11_extern_gemv.py (19:01)
+T=16384 bmm as written           fwd+bwd   3475.2 us  10 kernels  forward externs ['extern_kernels.bmm']  top [('void gemv2N_kernel<int, int, float, float, float, float, 128, 1, 2, 2,', 1226.1), ('triton_poi_fused__to_copy_1', 789.2)]
+T=16384 bmm + decompose_mm_pass  fwd+bwd   2356.7 us   5 kernels  forward externs []  top [('triton_per_fused__softmax__to_copy_bmm_squeeze_unsqueeze_1', 1352.3), ('triton_red_fused__softmax__to_copy_bmm_transpose_unsqueeze_1', 899.6)]
+T=16384 explicit sum             fwd+bwd   2155.2 us   4 kernels  forward externs []  top [('triton_per_fused__softmax__to_copy_mul_sum_unsqueeze_1', 1511.1), ('triton_red_fused__softmax__to_copy_expand_mul_sum_unsqueeze_0', 639.2)]
+T=16384 ideal fwd+bwd (read values 2x + write grad, bf16): 794 us
+T= 2048 bmm as written           fwd+bwd    459.2 us  10 kernels  forward externs ['extern_kernels.bmm']  top [('void gemv2N_kernel<int, int, float, float, float, float, 128, 1, 2, 2,', 156.8), ('triton_poi_fused__to_copy_1', 100.5)]
+T= 2048 bmm + decompose_mm_pass  fwd+bwd    459.4 us  10 kernels  forward externs ['extern_kernels.bmm']  top [('void gemv2N_kernel<int, int, float, float, float, float, 128, 1, 2, 2,', 156.3), ('triton_poi_fused__to_copy_1', 100.3)]
+T= 2048 explicit sum             fwd+bwd    276.4 us   4 kernels  forward externs []  top [('triton_per_fused__softmax__to_copy_mul_sum_unsqueeze_1', 191.0), ('triton_red_fused__softmax__to_copy_expand_mul_sum_unsqueeze_0', 80.4)]
+T= 2048 ideal fwd+bwd (read values 2x + write grad, bf16): 99 us
+== 13_cat_lowering.py (19:01)
+(a) inverse rope   fwd+bwd: default cat  2155.0 us (2 kernels) | ConcatKernel   781.2 us (5 kernels)
+(b) q norm + rope  fwd+bwd: default cat  1026.2 us (2 kernels) | ConcatKernel  1501.6 us (7 kernels)
+ideal (a): 605 us, (b): 756 us
+== 14b_standalone_masked_kernels.py (19:01)
+unmasked (T static)  us by XBLOCK/num_warps: 512/4: 315, 512/8: 563, 1024/4: 322, 1024/8: 317, 2048/4: 308, 2048/8: 328
+masked (T dynamic)   us by XBLOCK/num_warps: 512/4: 597, 512/8: 642, 1024/4: 697, 1024/8: 605, 2048/4: 832, 2048/8: 743
+== 17_complex_ops.py (19:01)
+eager complex              fwd+bwd    445.5 us    7 kernels  top [('void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_imp', 214.4), ('void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16', 115.1), ('void at::native::vectorized_elementwise_kernel<8, at::native::bfloat16', 112.5)]
+compiled complex           fwd+bwd    443.7 us    7 kernels  top [('void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_imp', 214.2), ('triton_poi_fused__to_copy_view_view_as_complex_0', 114.0), ('triton_poi_fused__to_copy_view_1', 112.3)]
+compiled real arithmetic   fwd+bwd    199.0 us    2 kernels  top [('triton_poi_fused__to_copy_add_mul_select_stack_sub_view_0', 105.7), ('triton_poi_fused__to_copy_add_mul_neg_select_select_backward_view_0', 93.3)]
+== 08_opaque_custom_op.py (19:02)
+eager as written             fwd+bwd  13539.7 us   42 kernels  top [('void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_imp', 4818.1), ('void (anonymous namespace)::indexing_backward_kernel<c10::BFloat16, 4>', 2699.4), ('void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16', 1582.8)]
+compiled as written          fwd+bwd   4248.4 us   27 kernels  top [('void (anonymous namespace)::indexing_backward_kernel<c10::BFloat16, 4>', 2721.8), ('triton_red_fused__to_copy_expand_gather_mul_sum_unsqueeze_0', 833.5), ('triton_poi_fused__to_copy_deterministic_scatter_add_expand_mul_unsquee', 559.7)]
+compiled per-token rewrite   fwd+bwd   1102.2 us    2 kernels  top [('triton_red_fused__to_copy_index_mul_sum_unsqueeze_0', 775.5), ('triton_poi_fused__to_copy_add_index_mul_select_unsqueeze_0', 326.7)]
+ideal (bytes / 7.1 TB/s): 827 us
+== 14a_masked_loads_symbolic_T.py (19:02)
+residual weighted sum  fwd: T static   314.1 us | T dynamic   662.6 us
+swiglu (control)       fwd: T static   133.9 us | T dynamic   133.8 us
+== 17_complex_ops.py, caches disabled (warning)
+inductor warnings: ['Torchinductor does not support code generation for complex operators. Performance may be w']
+== done 19:02
