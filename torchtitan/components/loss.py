@@ -696,6 +696,9 @@ class ChunkedLossWrapper(BaseLoss):
                     global_valid_tokens,
                     **loss_inputs,
                 )
+                # Free this chunk's logits before its backward: 1.16 GiB per 2048-token Qwen3-8B chunk
+                # with fp32 logits, 0.58 GiB with bf16 ones.
+                del logits
                 metrics = self._combine_chunk_metrics(metrics, chunk_metrics)
                 total_loss = total_loss + chunk_loss.detach()
 
