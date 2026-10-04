@@ -8,7 +8,7 @@
 - Models: DeepSeek-V4 flash, Kimi K3, Qwen3.5-MoE, DeepSeek-V3 671B (including DistMoE).
 - For DeepSeek-V4 and Kimi K3, upstream's default regions left 40-56% of layer time on the table versus compiling whole layers. Closing the gap took rewrites Inductor could have found itself, plus guard and recompile workarounds.
 - This doc lists 32 things torch.compile could not figure out on its own, as 27 requests. Each has numbers at real shapes, the workaround we used where there is one, and (for 25 of the 32) a minimal pure-torch repro in `repros/`.
-- Biggest costs, in ms per 16k-token fwd+bwd microbatch: ~290 ms (Kimi K3) without a traceable deterministic scatter-add; ~240 ms (Kimi K3) from symbolic strides on views plus every call site running the newest, symbolic graph; up to ~230 ms (Kimi K3) from small reductions that are not unrolled.
+- Biggest costs, in ms per 16k-token fwd+bwd microbatch: ~290 ms (Kimi K3) without a traceable deterministic scatter-add; ~240-300 ms (Kimi K3) from symbolic strides on views plus every call site running the newest, symbolic graph; up to ~230 ms (Kimi K3) from small reductions that are not unrolled.
 - Root-cause themes:
   - symbolic shapes cost even when bounded: symbolic strides and offsets, int64 indexing, masked loads, no unrolling, the newest graph serving every call;
   - fixed thresholds and lowering choices with no cost model: the unroll threshold of 8, cat lowering, producer inlining, `topk`;
@@ -84,13 +84,14 @@ req  issue                                          as compiled                 
 
 ## Requests, by impact
 
-Unit for the performance requests: ms saved per 16k fwd+bwd training microbatch of the model the request hits (rank-local shapes as measured), counting only the calls we measured. Tags in another unit say so (per call, per 16k forward, per 4k microbatch). Per-call numbers are in each section. Requests that fix the same op are marked as alternatives and do not add. Order: requests 1-7 are crashes and hard failures; 8-19 are performance, by the stated figure (where a request names two models, by the measured one); 20-26 are docs and observations; 27 is compile time.
+- Unit for the performance requests: ms saved per 16k fwd+bwd training microbatch of the model the request hits (rank-local shapes as measured), counting only the calls we measured. Tags in another unit say so (per call, per 16k forward, per 4k microbatch). Per-call numbers are in each section. Requests that fix the same op are marked as alternatives and do not add.
+- Order: requests 1-7 are crashes and hard failures; 8-19 are performance, by the stated figure (where a request names two models, by the measured one); 20-26 are docs and observations; 27 is compile time.
 
-For scale, estimated 16k fwd+bwd microbatch times on one GB300 (2-layer harness wall, no activation checkpointing, times the layer count; excludes embedding, head, optimizer and communication):
+For scale, estimated 16k fwd+bwd microbatch times on one GB300 (2-layer harness wall, no activation checkpointing, times the layer count; excludes embedding, head, optimizer and communication). Each line names the tree it scales:
 
-- Kimi K3: ~15 s (2 layers 324-331 ms without EP, request 9; 93 layers). So ~290 ms (request 8) is ~2% of a microbatch.
-- DeepSeek-V4 flash: ~2.2-2.5 s (2 layers 103.6-114.5 ms; 43 layers; https://github.com/felipemello1/torchtitan/pull/137).
-- DeepSeek-V3 671B (EP8 rank shapes, fused MLA override): ~3.3 s at 16k and ~0.83 s at 4k (2 MoE layers 109.1 / 27.2 ms; 61 layers; https://github.com/felipemello1/torchtitan/pull/110).
+- Kimi K3, upstream main's default regions: ~15 s (2 layers 331 ms, 324 ms with https://github.com/felipemello1/torchtitan/pull/113, request 9; EP8 rank-local shapes with 112 local experts, no EP communication; 93 layers). So ~290 ms (request 8) is ~2% of a microbatch.
+- DeepSeek-V4 flash, our region stack (fork PRs 105-108 plus 110): ~2.2-2.5 s (2 layers 103.6-114.5 ms; 43 layers; https://github.com/felipemello1/torchtitan/pull/137). On upstream main's default regions its 2 layers take 233.3 ms (https://github.com/felipemello1/torchtitan/pull/105), ~5.0 s per microbatch.
+- DeepSeek-V3 671B, fused MLA override plus our regions (EP8 rank shapes): ~3.3 s at 16k and ~0.83 s at 4k (2 MoE layers 109.1 / 27.2 ms; 61 layers, its 3 dense layers counted as MoE layers; https://github.com/felipemello1/torchtitan/pull/110).
 
 1. **[hard failure under fullgraph]** Never install guards in performance heuristics (mix-order reduction)
 2. **[bug, silently stale]** Key the FX graph cache on a custom op's fake output metadata
@@ -766,7 +767,7 @@ extrapolations (labelled, not measured):
 - `repros/logs/06_hop_outer_attr_store.txt`: request 6 (CPU).
 - `repros/logs/07_autograd_fn_param_base.txt`: request 7 (CPU: backend results, explain output, innermost frames).
 - `repros/logs/27_regional_partition_scaling.txt`: request 27 (CPU timings and cProfile).
-- Requests without a repro (13 (b), 18, 19, 24-26 and the observations) cite measurements from TorchTitan model and PR runs.
+- Requests without a repro (14 (b), 18, 19, 24-26 and the observations) cite measurements from TorchTitan model and PR runs.
 
 ## References
 
