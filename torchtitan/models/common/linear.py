@@ -33,6 +33,7 @@ from torchtitan.protocols.module import Module
 
 # Shape suffix legend:
 #   T = num tokens, D = model dimension, O = output features, P = grad_output pieces (2 or 3)
+#   M, K, N = a generic GEMM's dims: a_MK @ b_KN -> out_MN
 
 
 class Linear(nn.Linear, Module):
@@ -446,7 +447,8 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
         2 or 3 pieces: a GEMM loses precision as it accumulates, more for longer sums. A third piece
         only helps where that loss is smaller than what 2 pieces drop:
         - a router's grad_input sums over ~128 experts, so a router would benefit from 3;
-        - an LM head's grad_input sums over the ~150k vocab, so a third piece adds very little;
+        - an LM head's grad_input sums over the ~150k vocab, 8192 per GEMM, so a third piece adds
+          very little;
         - grad_weight sums over tokens, so a third piece adds very little to either.
 
         Relative error vs fp64 (grad_input before its bf16 rounding), and backward time as a
@@ -457,8 +459,8 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
                                     grad_input  grad_weight    eager   compiled
             LM head (Qwen3-8B, 2048 tokens; bf16 backward: 7.2 ms)
               bf16 grad_output      1.5e-3      1.2e-3          1.0x    1.0x
-              2 pieces              2.9e-4      7.6e-6          2.5x    2.5x
-              3 pieces              2.9e-4      8.1e-6          3.5x    4.0x
+              2 pieces              1.3e-5      7.6e-6          2.3x    2.6x
+              3 pieces              1.3e-5      8.1e-6          3.7x    4.0x
               fp32 matmul (IEEE)    1.2e-4      1.8e-6         13.3x   14.0x
             router (2048 -> 128; errors on 16k tokens, times on 64k; bf16 backward: 0.30 ms)
               bf16 grad_output      1.7e-3      1.4e-3          1.0x    1.0x
@@ -516,12 +518,7 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
                     grad_output_TO, exact=ctx.exact_grad_output_split
                 )
             if needs_grad_input:
-                # TODO: summing all out_features in one GEMM sets this error. Summing 8192 at a time
-                # in fp32 (addmm(out=)): 95% -> 99.5% correctly rounded, +7-13% GEMM time (H100).
-                # Compiled, addmm(out_dtype=) fails to lower until pytorch/pytorch#190936.
-                grad_input_PTD = torch.mm(
-                    stacked_PTO, weight_OD, out_dtype=torch.float32
-                )
+                grad_input_PTD = _mm_fp32_split_k(stacked_PTO, weight_OD)
                 grad_input_PTD = grad_input_PTD.unflatten(0, (num_pieces, num_tokens))
                 grad_input_TD = grad_input_PTD.sum(dim=0).to(ctx.input_dtype)
             if needs_grad_weight:
@@ -636,6 +633,52 @@ def _round_to_bf16(tensor: torch.Tensor) -> torch.Tensor:
     """Nearest bf16 value, ties away from zero, kept in fp32: add half a bf16 ulp, then cut."""
     bits = tensor.view(torch.int32)
     return ((bits + 0x8000) & _BF16_BITS_OF_FP32).view(torch.float32)
+
+
+# A GEMM's fp32 accumulator truncates as it sums, so its error grows with the length of the sum.
+# The wide grad_input sums over out_features (152k for an LM head), so each GEMM sums at most this
+# many. Keep it a multiple of 8: K slices that aren't 16-byte aligned make cuBLAS 2-3x slower.
+_MAX_K_PER_GEMM = 8192
+
+
+# A custom op, so torch.compile runs this loop as written. Inductor can't lower addmm(out_dtype=)
+# (pytorch/pytorch#190936), and it fuses the adds of out = out + mm(...) into one kernel that holds
+# 17 of the 19 Qwen3-8B GEMM results at once (1.0 GiB): compiled backward +6% instead of +4% (H100).
+@torch.library.custom_op(
+    "torchtitan::mm_fp32_split_k",
+    mutates_args=(),
+    device_types="cuda",
+    # Any strides work. With the default (exact strides), Inductor writes the 2-piece stack twice,
+    # once for this op and once for the grad_weight GEMM: +0.5 ms per compiled Qwen3-8B backward.
+    tags=torch.Tag.flexible_layout,
+)
+def _mm_fp32_split_k(a_MK: torch.Tensor, b_KN: torch.Tensor) -> torch.Tensor:
+    """``a @ b`` in fp32: one bf16 GEMM per ``_MAX_K_PER_GEMM`` slice of K, added in fp32.
+
+    Example: K = 151936 -> 18 GEMMs over 8192 and one over 4480; K <= 8192 -> one GEMM.
+
+    Qwen3-8B LM head grad_input (2 pieces, 2048 tokens, H100), by K per GEMM:
+
+                        fp32 result      bf16 grad_input     backward time
+                        relative error   correctly rounded   eager   compiled
+        all of K        2.9e-4           95.2%               1.00x   1.00x
+        16384           2.7e-5           99.3%               1.02x   1.03x
+        8192            1.3e-5           99.6%               1.03x   1.04x
+        4096            6.6e-6           99.7%               1.07x   1.09x
+    """
+    a_slices = a_MK.split(_MAX_K_PER_GEMM, dim=1)
+    b_slices = b_KN.split(_MAX_K_PER_GEMM)
+    out_MN = torch.mm(a_slices[0], b_slices[0], out_dtype=torch.float32)
+    for a_slice, b_slice in zip(a_slices[1:], b_slices[1:]):
+        # out= adds into out_MN inside the GEMM. A functional addmm copies out_MN first, which
+        # more than doubles the cost of splitting (Qwen3-8B backward: +7% instead of +3%).
+        torch.addmm(out_MN, a_slice, b_slice, out_dtype=torch.float32, out=out_MN)
+    return out_MN
+
+
+@_mm_fp32_split_k.register_fake
+def _(a_MK: torch.Tensor, b_KN: torch.Tensor) -> torch.Tensor:
+    return a_MK.new_empty(a_MK.shape[0], b_KN.shape[1], dtype=torch.float32)
 
 
 __all__ = [
