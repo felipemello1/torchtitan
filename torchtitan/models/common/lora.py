@@ -97,7 +97,8 @@ class _LoRALinearMixin(_LoRAMixin):
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
         base_out_XO = super()._linear(input, weight, bias)  # type: ignore[misc]
-        lora_out_XO = self.lora_b(self.lora_a(input))
+        # TP hands an FP32OutputLinear lm_head an fp32 copy of its bf16 input.
+        lora_out_XO = self.lora_b(self.lora_a(input.to(self.lora_a.weight.dtype)))
         if self.num_linears > 1:
             lora_out_XO = lora_out_XO.flatten(-2)
         return base_out_XO + self._lora_scaling * lora_out_XO

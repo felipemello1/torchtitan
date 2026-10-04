@@ -578,11 +578,14 @@ class Module(nn.Module, Configurable):
 
         if out_dst is None:
             return outputs
+        # The cast only serves the gradient's reduction: skip it when no gradient flows back.
+        needs_grad = torch.is_grad_enabled() and outputs.requires_grad
         return spmd_redistribute_per_axis(
             outputs,
             current_spmd_mesh(),
             out_src,
             out_dst,
+            out_dtype=sharding_config.out_dst_grad_dtype if needs_grad else None,
         )
 
 

@@ -8,6 +8,7 @@ import contextlib
 import os
 import warnings
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,14 +25,21 @@ from torch.distributed.pipelining._backward import (
 )
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from torchtitan.components.loss import ChunkedLossWrapper
+from torchtitan.components.loss import (
+    ChunkedLossWrapper,
+    cross_entropy_loss,
+    CrossEntropyLoss,
+)
 from torchtitan.distributed.cuda_graph import (
     cuda_graph_teardown,
     run_eager_on_cuda_graph_stream,
     wrap_with_cuda_graph,
 )
+from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.common import linear as linear_module
+from torchtitan.models.common.decoder_sharding import set_decoder_sharding_config
 from torchtitan.models.common.linear import FP32OutputLinear
+from torchtitan.models.common.nn_modules import Identity
 from torchtitan.models.deepseek_v3.mtp import MTPLoss
 from torchtitan.observability.sdc_replayer import SDCReplayer
 
@@ -569,6 +577,28 @@ def test_sdc_replayer_checks_captured_chunked_loss_steps(accumulate, monkeypatch
         cuda_graph_teardown()
 
 
+# out_features > num_tokens takes the LM-head layout, out_features < num_tokens the router one.
+@pytest.mark.parametrize("num_tokens,out_features", [(64, 1024), (512, 16)])
+def test_fp32_input_matches_the_bf16_forward_and_gets_an_fp32_grad_input(
+    num_tokens, out_features
+):
+    # TP hands the lm_head an upcast bf16 input, so it can sum the partial grad_inputs in fp32.
+    x = torch.randn(num_tokens, 256, device="cuda").bfloat16()
+    weight = (torch.randn(out_features, 256, device="cuda") * 0.02).bfloat16()
+    grad_output = torch.randn(num_tokens, out_features, device="cuda")
+    x_fp32 = x.float().requires_grad_()
+
+    output = linear_module._FP32OutputLinearFunction.apply(x_fp32, weight, 2)
+    output.backward(grad_output)
+
+    assert torch.equal(
+        output, linear_module._FP32OutputLinearFunction.apply(x, weight, 2)
+    )
+    exact = grad_output.double() @ weight.double()
+    floor = _relative_error(exact.bfloat16(), exact)
+    assert _relative_error(x_fp32.grad, exact) < 0.01 * floor
+
+
 def test_backward_handles_zero_tokens():
     x = torch.empty(0, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(
@@ -639,6 +669,114 @@ def test_fsdp_keeps_fp32_weight_grad(compile):
     mp.spawn(
         _run_fsdp_keeps_fp32_weight_grad,
         args=(2, get_free_port(), compile),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _run_tp_sums_lm_head_grad_input_in_fp32(rank, world_size, port, enable_sp, chunked):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    try:
+        parallelism_context = ParallelismContext(
+            dp_replicate=1,
+            dp_shard=1,
+            cp=1,
+            tp=world_size,
+            pp=1,
+            ep=1,
+            world_size=world_size,
+            enable_sequence_parallel=enable_sp,
+        )
+        parallelism_context.build_mesh()
+        # The decoder's root norm and lm_head; an identity norm keeps the hidden state as is.
+        num_tokens, dim, vocab = 64, 256, 4096
+        config = SimpleNamespace(
+            tok_embeddings=SimpleNamespace(),
+            norm=Identity.Config(),
+            lm_head=FP32OutputLinear.Config(
+                in_features=dim, out_features=vocab, grad_output_pieces=2
+            ),
+        )
+        set_decoder_sharding_config(config, enable_sp=enable_sp)
+        norm = config.norm.build()
+        # Same data on every rank.
+        torch.manual_seed(0)
+        lm_head = config.lm_head.build()
+        torch.nn.init.normal_(lm_head.weight, std=0.02)
+        lm_head = lm_head.to(device="cuda", dtype=torch.bfloat16)
+        weight = lm_head.weight.detach().clone()
+        norm._parallelize(parallelism_context)
+        lm_head._parallelize(parallelism_context)
+        x = torch.randn(num_tokens, dim, device="cuda").bfloat16()
+        labels = torch.randint(0, vocab, (num_tokens,), device="cuda")
+        x_local = x.chunk(world_size)[rank] if enable_sp else x
+        grad_logits = []
+
+        def save_grad_logits(module, args, logits):
+            logits.register_hook(grad_logits.append)
+
+        lm_head.register_forward_hook(save_grad_logits)
+
+        def step():
+            grad_logits.clear()
+            lm_head.weight.grad = None
+            x_leaf = x_local.clone().requires_grad_()
+            with parallelism_context.activate_spmd():
+                with torch.no_grad():
+                    # No gradient to reduce, e.g. a generator: the boundary keeps bf16.
+                    assert norm(x_leaf).dtype == torch.bfloat16
+                # Nor for an input that doesn't require grad, e.g. a frozen reference model.
+                assert norm(x_local).dtype == torch.bfloat16
+                hidden = norm(x_leaf)
+                if chunked:
+                    loss_fn = ChunkedLossWrapper.Config(
+                        num_chunks=4,
+                        loss_fn=CrossEntropyLoss.Config(global_vocab_size=vocab),
+                    ).build()
+                    loss_fn.set_lm_head(lm_head)
+                    loss, _ = loss_fn(hidden, labels)
+                else:
+                    loss = cross_entropy_loss(
+                        lm_head(hidden), labels, global_vocab_size=vocab
+                    )
+                loss.backward()
+            return hidden.dtype, loss, x_leaf.grad, lm_head.weight.grad
+
+        hidden_dtype, loss, grad_input, grad_weight = step()
+        # Exact grad_input: the fp32 grad_logits of every vocab shard, times the full weight.
+        grad_logits_local = torch.cat(grad_logits)
+        grad_logits_shards = [
+            torch.empty_like(grad_logits_local) for _ in range(world_size)
+        ]
+        dist.all_gather(grad_logits_shards, grad_logits_local)
+        exact = torch.cat(grad_logits_shards, dim=1).double() @ weight.double()
+        exact = exact.chunk(world_size)[rank] if enable_sp else exact
+        assert hidden_dtype == torch.float32
+        # Summing bf16 partials rounds each rank's partial too: ~1.4x the floor at TP=2.
+        floor = _relative_error(exact.bfloat16(), exact)
+        assert _relative_error(grad_input, exact) < 1.05 * floor
+
+        # Only grad_input changes: the bf16 boundary gives the same loss and grad_weight.
+        norm._sharding_config.out_dst_grad_dtype = None
+        hidden_dtype, bf16_loss, _, bf16_grad_weight = step()
+        assert hidden_dtype == torch.bfloat16
+        assert torch.equal(loss, bf16_loss)
+        assert torch.equal(grad_weight, bf16_grad_weight)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("enable_sp", [False, True])
+def test_tp_sums_lm_head_grad_input_in_fp32(enable_sp, chunked):
+    mp.spawn(
+        _run_tp_sums_lm_head_grad_input_in_fp32,
+        args=(2, get_free_port(), enable_sp, chunked),
         nprocs=2,
         join=True,
     )
