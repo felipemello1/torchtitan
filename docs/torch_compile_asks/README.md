@@ -90,7 +90,7 @@ req  issue                                          as compiled                 
 For scale, estimated 16k fwd+bwd microbatch times on one GB300 (2-layer harness wall, no activation checkpointing, times the layer count; excludes embedding, head, optimizer and communication). Each line names the tree it scales:
 
 - Kimi K3, upstream main's default regions: ~15 s (2 layers 331 ms, 324 ms with https://github.com/felipemello1/torchtitan/pull/113, request 9; EP8 rank-local shapes with 112 local experts, no EP communication; 93 layers). So ~290 ms (request 8) is ~2% of a microbatch.
-- DeepSeek-V4 flash, our region stack (fork PRs 105-108 plus 110): ~2.2-2.5 s (2 layers 103.6-114.5 ms; 43 layers; https://github.com/felipemello1/torchtitan/pull/137). On upstream main's default regions its 2 layers take 233.3 ms (https://github.com/felipemello1/torchtitan/pull/105), ~5.0 s per microbatch.
+- DeepSeek-V4 flash, our region stack (fork PRs 105-108, with and without 110): ~2.2-2.5 s (2 layers 103.6-114.5 ms; 43 layers; https://github.com/felipemello1/torchtitan/pull/137). On upstream main's default regions its 2 layers take 233.3 ms (https://github.com/felipemello1/torchtitan/pull/105), ~5.0 s per microbatch.
 - DeepSeek-V3 671B, fused MLA override plus our regions (EP8 rank shapes): ~3.3 s at 16k and ~0.83 s at 4k (2 MoE layers 109.1 / 27.2 ms; 61 layers, its 3 dense layers counted as MoE layers; https://github.com/felipemello1/torchtitan/pull/110).
 
 1. **[hard failure under fullgraph]** Never install guards in performance heuristics (mix-order reduction)
