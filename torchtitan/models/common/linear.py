@@ -403,6 +403,18 @@ def accumulate_into_weight_grad() -> Iterator[None]:
         _ACCUMULATE_INTO_WEIGHT_GRAD.reset(token)
 
 
+def weight_to_accumulate_into(weight: torch.Tensor) -> torch.Tensor | None:
+    """`weight`, if a backward may add into its .grad in place; None when:
+    (a) outside `accumulate_into_weight_grad`;
+    (b) traced: a traced backward can't write into .grad (Dynamo sets is_compiling, graph_trainer's
+        make_fx tracer only a proxy mode);
+    (c) the weight is not a leaf (SimpleFSDP's, num_linears > 1).
+    """
+    is_tracing = torch.compiler.is_compiling() or get_proxy_mode() is not None
+    accumulate = not is_tracing and _ACCUMULATE_INTO_WEIGHT_GRAD.get()
+    return weight if accumulate and weight.is_leaf else None
+
+
 @spmd.register_local_autograd_function
 class _FP32OutputLinearFunction(torch.autograd.Function):
     """``output = input @ weight.T`` in fp32, with bf16 GEMMs. See ``FP32OutputLinear``."""
@@ -438,12 +450,8 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
         )
         ctx.grad_output_pieces = grad_output_pieces
         # The wide backward may add into this parameter's .grad; see `accumulate_into_weight_grad`.
-        # Not when traced, since a traced backward can't write into .grad (Dynamo sets
-        # is_compiling, graph_trainer's make_fx tracer only a proxy mode), nor for a non-leaf weight
-        # (SimpleFSDP's, num_linears > 1). On ctx, not saved: saved-tensor hooks may unpack a copy.
-        is_tracing = torch.compiler.is_compiling() or get_proxy_mode() is not None
-        accumulate = not is_tracing and _ACCUMULATE_INTO_WEIGHT_GRAD.get()
-        ctx.weight_param = weight_OD if accumulate and weight_OD.is_leaf else None
+        # On ctx, not saved: saved-tensor hooks may unpack a copy.
+        ctx.weight_param = weight_to_accumulate_into(weight_OD)
         ctx.input_dtype = input_TD.dtype
         if ctx.use_bf16_gemm:
             # A no-op for bf16. TP's fp32 lm_head input is an upcast bf16, so rounding it is exact.
@@ -753,6 +761,7 @@ def _(a_MK: torch.Tensor, b_KN: torch.Tensor) -> torch.Tensor:
 
 __all__ = [
     "accumulate_into_weight_grad",
+    "weight_to_accumulate_into",
     "ColumnParallelLinear",
     "GroupedLinear",
     "FP32OutputLinear",
