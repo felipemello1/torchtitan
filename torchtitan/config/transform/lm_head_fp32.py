@@ -26,12 +26,12 @@ class LMHeadFP32OutputConverter(ModelConfigConverter):
 
     @dataclass(kw_only=True, slots=True)
     class Config(ModelConfigConverter.Config):
-        # TODO: True may make a difference once grad_input sums the vocab in chunks (split-K,
-        # see the TODO in FP32OutputLinear's backward).
-        exact_grad_output_split: bool = False
-        """``FP32OutputLinear.Config.exact_grad_output_split`` for the lm_head. False: summed over
-        the vocab, the GEMM's own error is larger than what a third piece fixes, and the third
-        piece costs ~50% more backward time."""
+        # TODO: 3 may make a difference once grad_input sums the vocab in chunks (split-K, see the
+        # TODO in FP32OutputLinear's backward).
+        grad_output_pieces: int = 2
+        """``FP32OutputLinear.Config.grad_output_pieces`` for the lm_head. 2: summed over the
+        vocab, the GEMM's own error is larger than what a third piece fixes, and the third piece
+        costs ~1.5x the backward time."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -45,7 +45,7 @@ class LMHeadFP32OutputConverter(ModelConfigConverter):
             kwargs = {
                 f.name: getattr(linear_config, f.name) for f in fields(linear_config)
             }
-            kwargs["exact_grad_output_split"] = self.config.exact_grad_output_split
+            kwargs["grad_output_pieces"] = self.config.grad_output_pieces
             new_config = FP32OutputLinear.Config(**kwargs)
             if isinstance(parent, list):
                 parent[attr] = new_config
