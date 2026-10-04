@@ -4,7 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import os
+import warnings
+from functools import partial
 
 import pytest
 import torch
@@ -15,10 +18,22 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.elastic.utils.distributed import get_free_port
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.pipelining._backward import (
+    stage_backward_input,
+    stage_backward_weight,
+)
 from torch.fx.experimental.proxy_tensor import make_fx
 
+from torchtitan.components.loss import ChunkedLossWrapper
+from torchtitan.distributed.cuda_graph import (
+    cuda_graph_teardown,
+    run_eager_on_cuda_graph_stream,
+    wrap_with_cuda_graph,
+)
 from torchtitan.models.common import linear as linear_module
 from torchtitan.models.common.linear import FP32OutputLinear
+from torchtitan.models.deepseek_v3.mtp import MTPLoss
+from torchtitan.observability.sdc_replayer import SDCReplayer
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -307,6 +322,253 @@ def test_weight_grad_stays_fp32_when_grad_dtype_is_fp32(
     assert _relative_error(weight.grad, exact) < 0.01 * floor
 
 
+def _num_addmm_calls(fn) -> int:
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    with torch.profiler.profile(activities=activities) as prof:
+        fn()
+    events = prof.key_averages()
+    return sum(event.count for event in events if event.key == "aten::addmm")
+
+
+def _chunks(num_chunks: int = 3):
+    """LM-head-shaped (num_tokens < out_features) inputs and grad_outputs, one per chunk."""
+    inputs = [torch.randn(64, 256, device="cuda").bfloat16() for _ in range(num_chunks)]
+    grad_outputs = [torch.randn(64, 1024, device="cuda") for _ in range(num_chunks)]
+    return inputs, grad_outputs
+
+
+def _run_chunks(lm_head, inputs, grad_outputs, *, accumulate: bool):
+    """One forward and backward per chunk, as ChunkedLossWrapper runs them."""
+    for input_TD, grad_output_TO in zip(inputs, grad_outputs):
+        with (
+            linear_module.accumulate_into_weight_grad()
+            if accumulate
+            else contextlib.nullcontext()
+        ):
+            output_TO = lm_head(input_TD)
+        output_TO.backward(grad_output_TO)
+
+
+@pytest.mark.parametrize("grad_dtype", [torch.float32, torch.bfloat16])
+def test_chunked_loss_adds_into_weight_grad_inside_the_gemm(grad_dtype):
+    # ChunkedLossWrapper runs one backward per chunk under accumulate_into_weight_grad: each chunk
+    # after the first adds into lm_head.weight.grad with addmm(out=), not in a separate kernel.
+    torch.manual_seed(0)
+    lm_head = _lm_head()
+    lm_head.weight.grad_dtype = grad_dtype
+    chunked_loss = ChunkedLossWrapper.Config(num_chunks=3).build()
+    chunked_loss.set_lm_head(lm_head)
+    hidden = torch.randn(192, 256, device="cuda").bfloat16()
+    labels = torch.randint(0, 1024, (192,), device="cuda")
+
+    def separate_adds():
+        for x, chunk_labels in zip(hidden.chunk(3), labels.chunk(3)):
+            F.cross_entropy(lm_head(x), chunk_labels, reduction="sum").backward()
+
+    def chunked_loss_step():
+        loss, _ = chunked_loss(hidden.clone().requires_grad_(), labels)
+        loss.backward()
+
+    # Called directly, outside the context, autograd adds each chunk's grad_weight.
+    assert _num_addmm_calls(separate_adds) == 0
+    expected = lm_head.weight.grad
+    lm_head.weight.grad = None
+    assert _num_addmm_calls(chunked_loss_step) == 2
+    torch.testing.assert_close(lm_head.weight.grad, expected)
+
+
+def test_multi_output_chunked_loss_adds_into_weight_grad(monkeypatch):
+    # MTP: two lm_head calls per chunk share one backward, and each adds into .grad. Correct, but
+    # summed in a different order than autograd's, so not bitwise the same.
+    torch.manual_seed(0)
+    lm_head = _lm_head()
+    lm_head.weight.grad_dtype = torch.float32
+    chunked_loss = ChunkedLossWrapper.Config(
+        num_chunks=3, loss_fn=MTPLoss.Config()
+    ).build()
+    chunked_loss.set_lm_head(lm_head)
+    hidden = tuple(torch.randn(192, 256, device="cuda").bfloat16() for _ in range(2))
+    labels = tuple(torch.randint(0, 1024, (192,), device="cuda") for _ in range(2))
+
+    def step():
+        pred = tuple(hidden_state.clone().requires_grad_() for hidden_state in hidden)
+        loss, _ = chunked_loss(pred, labels)
+        loss.backward()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            linear_module, "accumulate_into_weight_grad", contextlib.nullcontext
+        )
+        assert _num_addmm_calls(step) == 0
+    separate_adds = lm_head.weight.grad
+    lm_head.weight.grad = None
+    assert _num_addmm_calls(step) == 4
+    torch.testing.assert_close(lm_head.weight.grad, separate_adds)
+
+
+def test_input_only_backward_keeps_weight_grad():
+    # Zero-bubble PP's input pass is autograd.grad wrt the stage input: it runs this backward but
+    # drops grad_weight. A fused add would still change weight.grad, so it's off by default.
+    lm_head = _lm_head()
+    lm_head.weight.grad = torch.ones_like(lm_head.weight)
+    (input_TD,), (grad_output_TO,) = _chunks(1)
+    input_TD.requires_grad_()
+
+    torch.autograd.grad(lm_head(input_TD), input_TD, grad_output_TO)
+
+    assert torch.equal(lm_head.weight.grad, torch.ones_like(lm_head.weight))
+
+
+def test_zero_bubble_weight_pass_raises_in_the_context():
+    # Misuse is loud: zero-bubble PP's weight pass is autograd.grad wrt the weight, and the fused
+    # backward returns no grad_weight, so autograd reports the weight as unused.
+    lm_head = _lm_head()
+    lm_head.weight.grad = torch.zeros_like(lm_head.weight)
+    (input_TD,), (grad_output_TO,) = _chunks(1)
+    input_TD.requires_grad_()
+    with linear_module.accumulate_into_weight_grad():
+        loss = (lm_head(input_TD) * grad_output_TO).sum()
+
+    _, param_groups = stage_backward_input(
+        [loss], None, [input_TD], lm_head.parameters()
+    )
+    with pytest.raises(RuntimeError, match="not have been used"):
+        stage_backward_weight(lm_head.parameters(), param_groups)
+
+
+def test_stacked_weight_leaves_weight_grad_to_autograd():
+    # num_linears > 1 hands the Function a flattened view of the weight: a non-leaf, whose .grad
+    # autograd never fills. Reading it would warn on every chunk.
+    lm_head = FP32OutputLinear.Config(
+        in_features=256, out_features=512, num_linears=2
+    ).build()
+    lm_head = lm_head.to(device="cuda", dtype=torch.bfloat16)
+    lm_head.weight.grad = torch.zeros_like(lm_head.weight)
+    inputs, _ = _chunks()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*not a leaf Tensor.*")
+        for input_TD in inputs:
+            with linear_module.accumulate_into_weight_grad():
+                output = lm_head(input_TD)
+            output.sum().backward()
+
+
+@pytest.mark.parametrize("tracer", ["compile", "make_fx"])
+def test_traced_backward_leaves_weight_grad_to_autograd(tracer):
+    # A traced backward can't write into weight.grad, so it returns grad_weight and autograd adds
+    # it. Dynamo sets is_compiling; graph_trainer's make_fx tracer only has a proxy mode.
+    torch.manual_seed(0)
+    lm_head = _lm_head()
+    inputs, grad_outputs = _chunks()
+    if tracer == "compile":
+        _run_chunks(lm_head, inputs, grad_outputs, accumulate=False)
+        separate_adds = lm_head.weight.grad
+        # Trace while weight.grad exists, so a traced backward would see it.
+        lm_head.weight.grad = torch.zeros_like(lm_head.weight)
+        # Other tests fill Dynamo's recompile cache for this class; a full one silently runs eager.
+        torch._dynamo.reset()
+        compiled = torch.compile(lm_head, fullgraph=True)
+        _run_chunks(compiled, inputs[:1], grad_outputs[:1], accumulate=True)
+        num_addmm_calls = _num_addmm_calls(
+            lambda: _run_chunks(compiled, inputs[1:], grad_outputs[1:], accumulate=True)
+        )
+        assert num_addmm_calls == 0
+        torch.testing.assert_close(lm_head.weight.grad, separate_adds)
+    else:
+        lm_head.weight.grad = torch.zeros_like(lm_head.weight)
+
+        def grad_weight(input_TD, grad_output_TO):
+            with linear_module.accumulate_into_weight_grad():
+                output_TO = lm_head(input_TD)
+            return torch.autograd.grad(output_TO, lm_head.weight, grad_output_TO)[0]
+
+        with torch.autograd.set_multithreading_enabled(False):
+            graph = make_fx(grad_weight)(inputs[0], grad_outputs[0])
+        assert not any("addmm" in str(node.target) for node in graph.graph.nodes)
+        assert torch.equal(lm_head.weight.grad, torch.zeros_like(lm_head.weight))
+
+
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_weight_grad_accumulation_replays_in_a_cuda_graph(accumulate):
+    # torchtitan captures forward + backward in a CUDA graph and zeroes .grad in place between
+    # steps. Replays must keep adding into that buffer, even while something else holds it (as
+    # SDCReplayer does).
+    torch.manual_seed(0)
+    lm_head = _lm_head()
+    lm_head.weight.grad_dtype = torch.float32
+    inputs, grad_outputs = _chunks()
+    _run_chunks(lm_head, inputs, grad_outputs, accumulate=False)
+    expected = lm_head.weight.grad.clone()
+
+    # Warm up on a side stream, as capture requires.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        lm_head.weight.grad.zero_()
+        _run_chunks(lm_head, inputs, grad_outputs, accumulate=accumulate)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    held_grad = lm_head.weight.grad
+    held_grad.zero_()
+    with torch.cuda.graph(graph):
+        _run_chunks(lm_head, inputs, grad_outputs, accumulate=accumulate)
+
+    for _ in range(3):
+        lm_head.weight.grad.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert lm_head.weight.grad is held_grad
+        torch.testing.assert_close(held_grad, expected)
+
+
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_sdc_replayer_checks_captured_chunked_loss_steps(accumulate, monkeypatch):
+    # SDCReplayer keeps each parameter's entry .grad across a checked step and replays the step.
+    # num_steps=-1 checks every step, including the CUDA graph capture (step 3, after 2 eager
+    # warmup steps, as training_engine runs them).
+    if not accumulate:
+        monkeypatch.setattr(
+            linear_module, "accumulate_into_weight_grad", contextlib.nullcontext
+        )
+    torch.manual_seed(0)
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Linear(256, 256, bias=False).to("cuda", torch.bfloat16)
+    model.lm_head = _lm_head()
+    model.lm_head.weight.grad_dtype = torch.float32
+    chunked_loss = ChunkedLossWrapper.Config(num_chunks=4).build()
+    chunked_loss.set_lm_head(model.lm_head)
+    hidden = torch.randn(256, 256, device="cuda").bfloat16()
+    labels = torch.randint(0, 1024, (256,), device="cuda")
+
+    def step(*, hidden, labels):
+        loss, _ = chunked_loss(model.decoder(hidden), labels)
+        loss.backward()
+        return loss
+
+    graphed_step = wrap_with_cuda_graph(step)
+    replayer = SDCReplayer(
+        SDCReplayer.Config(num_steps=-1, num_replays=1),
+        modules=[model],
+        device=torch.device("cuda"),
+    )
+    try:
+        for step_index in range(1, 6):
+            model.zero_grad(set_to_none=False)
+            run = (
+                graphed_step
+                if step_index > 2
+                else partial(run_eager_on_cuda_graph_stream, step)
+            )
+            # Raises SDCReplayMismatch if a replay's loss or gradients differ.
+            replayer.run_fwd_bwd(
+                lambda: run(hidden=hidden, labels=labels),
+                step=step_index,
+                get_loss=lambda loss: loss,
+            )
+    finally:
+        cuda_graph_teardown()
+
+
 def test_backward_handles_zero_tokens():
     x = torch.empty(0, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(
@@ -377,6 +639,68 @@ def test_fsdp_keeps_fp32_weight_grad(compile):
     mp.spawn(
         _run_fsdp_keeps_fp32_weight_grad,
         args=(2, get_free_port(), compile),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _run_fsdp_chunked_loss_adds_into_weight_grad(rank, world_size, port):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    try:
+        mesh = init_device_mesh("cuda", (world_size,))
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+        )
+        # Same data on every rank, so FSDP's average is the local gradient.
+        torch.manual_seed(0)
+        lm_head = FP32OutputLinear.Config(
+            in_features=256, out_features=1024, grad_output_pieces=2
+        ).build()
+        lm_head = lm_head.cuda()
+        torch.nn.init.normal_(lm_head.weight, std=0.02)
+        fully_shard(lm_head, mesh=mesh, mp_policy=mp_policy)
+        chunked_loss = ChunkedLossWrapper.Config(num_chunks=4).build()
+        chunked_loss.set_lm_head(lm_head)
+        hidden = torch.randn(256, 256, device="cuda").bfloat16().requires_grad_()
+        labels = torch.randint(0, 1024, (256,), device="cuda")
+
+        def step():
+            loss, _ = chunked_loss(hidden, labels)
+            loss.backward()
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                linear_module, "accumulate_into_weight_grad", contextlib.nullcontext
+            )
+            assert _num_addmm_calls(step) == 0
+        separate_adds = lm_head.weight.grad.full_tensor()
+        lm_head.zero_grad(set_to_none=True)
+        # Chunks 0-2 skip FSDP's gradient sync, so chunks 1-3 find an fp32 .grad to add into.
+        assert _num_addmm_calls(step) == 3
+        torch.testing.assert_close(lm_head.weight.grad.full_tensor(), separate_adds)
+
+        weight = lm_head.weight.full_tensor().detach().bfloat16()
+        exact_grad = 0
+        for x, chunk_labels in zip(hidden.detach().chunk(4), labels.chunk(4)):
+            logits = torch.mm(x, weight.T, out_dtype=torch.float32).requires_grad_()
+            F.cross_entropy(logits, chunk_labels, reduction="sum").backward()
+            exact_grad = exact_grad + logits.grad.double().T @ x.double()
+        floor = _relative_error(exact_grad.bfloat16(), exact_grad)
+        grad = lm_head.weight.grad.full_tensor()
+        assert _relative_error(grad, exact_grad) < 0.01 * floor
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+def test_fsdp_chunked_loss_adds_into_weight_grad():
+    mp.spawn(
+        _run_fsdp_chunked_loss_adds_into_weight_grad,
+        args=(2, get_free_port()),
         nprocs=2,
         join=True,
     )
