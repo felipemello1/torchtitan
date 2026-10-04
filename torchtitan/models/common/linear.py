@@ -13,7 +13,10 @@
   from ``Configurable.Config``.
 """
 
+import contextlib
 import math
+from collections.abc import Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 import spmd_types as spmd
@@ -21,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd.function import once_differentiable
+from torch.fx.experimental.proxy_tensor import get_proxy_mode
 
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.distributed.parallelism_context import MeshAxisName
@@ -328,6 +332,8 @@ class FP32OutputLinear(Linear):
 
     Forward: bf16 input and weight, a bf16 GEMM that accumulates in fp32, fp32 output.
     Backward: approximates an fp32 backward with bf16 GEMMs, and returns grad_weight in fp32.
+    Under `accumulate_into_weight_grad` (ChunkedLossWrapper), an LM head's eager backward adds
+    into an existing weight.grad.
 
     Falls back to slower fp32 matmuls when:
     (a) the input is not on CUDA,
@@ -363,6 +369,34 @@ class FP32OutputLinear(Linear):
         return output if bias is None else output + bias.float()
 
 
+_ACCUMULATE_INTO_WEIGHT_GRAD = ContextVar("accumulate_into_weight_grad", default=False)
+
+
+@contextlib.contextmanager
+def accumulate_into_weight_grad() -> Iterator[None]:
+    """Let FP32OutputLinear calls made here add grad_weight into an existing weight.grad inside the
+    backward GEMM, instead of in autograd's separate add. Only the eager wide backward (an LM head)
+    does it; a router, the fp32 fallback and a traced call (torch.compile, make_fx) don't.
+
+    The backward then returns no grad_weight, so enter it only around calls whose backward is a
+    plain `.backward()`, as ChunkedLossWrapper's per-chunk one is, and outside compiled code (Dynamo
+    can't trace the ContextVar write). Otherwise, once weight.grad exists:
+    - `backward(inputs=...)` and zero-bubble PP's input pass still add into weight.grad;
+    - `torch.autograd.grad` wrt the weight raises (it returns None with `allow_unused=True`).
+
+    Example:
+
+        with accumulate_into_weight_grad():
+            logits = lm_head(hidden_chunk)
+        F.cross_entropy(logits, labels).backward()  # adds into lm_head.weight.grad, if it exists
+    """
+    token = _ACCUMULATE_INTO_WEIGHT_GRAD.set(True)
+    try:
+        yield
+    finally:
+        _ACCUMULATE_INTO_WEIGHT_GRAD.reset(token)
+
+
 @spmd.register_local_autograd_function
 class _FP32OutputLinearFunction(torch.autograd.Function):
     """``output = input @ weight.T`` in fp32, with bf16 GEMMs. See ``FP32OutputLinear``."""
@@ -396,6 +430,13 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
             and not is_in_batch_invariant_mode()
         )
         ctx.grad_output_pieces = grad_output_pieces
+        # The wide backward may add into this parameter's .grad; see `accumulate_into_weight_grad`.
+        # Not when traced, since a traced backward can't write into .grad (Dynamo sets
+        # is_compiling, graph_trainer's make_fx tracer only a proxy mode), nor for a non-leaf weight
+        # (SimpleFSDP's, num_linears > 1). On ctx, not saved: saved-tensor hooks may unpack a copy.
+        is_tracing = torch.compiler.is_compiling() or get_proxy_mode() is not None
+        accumulate = not is_tracing and _ACCUMULATE_INTO_WEIGHT_GRAD.get()
+        ctx.weight_param = weight_OD if accumulate and weight_OD.is_leaf else None
         ctx.save_for_backward(input_TD, weight_OD)
         if ctx.use_bf16_gemm:
             return torch.mm(input_TD, weight_OD.T, out_dtype=torch.float32)
@@ -535,17 +576,27 @@ class _FP32OutputLinearFunction(torch.autograd.Function):
                 grad_input_PTD = grad_input_PTD.unflatten(0, (num_pieces, num_tokens))
                 grad_input_TD = grad_input_PTD.sum(dim=0).to(input_TD.dtype)
             if needs_grad_weight:
-                # TODO: with ChunkedLossWrapper, autograd adds each chunk's grad_weight into
-                # weight.grad in a separate kernel. addmm(out=weight.grad), as MXFP8Linear does,
-                # saves 2.9 ms and a 2.3 GiB temporary per Qwen3-8B chunk (H100). Eager only, like
-                # https://github.com/pytorch/torchtitan/pull/4386 for plain Linear. graph_trainer's
-                # compiled pass (https://github.com/pytorch/torchtitan/pull/4768) is bf16-only.
-                grad_weight_OD = torch.mm(
-                    stacked_PTO.T,
-                    # Copying x (0.02 ms) makes this 1.4x faster than one GEMM per piece + add.
-                    torch.cat([input_TD] * num_pieces),
-                    out_dtype=torch.float32,
+                # Copying x (0.02 ms) makes this 1.4x faster than one GEMM per piece + add.
+                input_PTD = torch.cat([input_TD] * num_pieces)
+                running_grad_OD = (
+                    None if ctx.weight_param is None else ctx.weight_param.grad
                 )
+                if running_grad_OD is None:
+                    grad_weight_OD = torch.mm(
+                        stacked_PTO.T, input_PTD, out_dtype=torch.float32
+                    )
+                else:
+                    # A later chunk or microbatch: add into weight.grad inside the GEMM instead of
+                    # in a separate autograd kernel, and return no grad_weight. Qwen3-8B chunk, fp32
+                    # .grad, H100: backward 19.5 -> 16.6 ms, bitwise the same .grad with one lm_head
+                    # call per backward. .grad keeps its buffer, which CUDA graph replays rely on.
+                    torch.addmm(
+                        running_grad_OD,
+                        stacked_PTO.T,
+                        input_PTD,
+                        out_dtype=running_grad_OD.dtype,
+                        out=running_grad_OD,
+                    )
         else:
             # ==== Narrow (e.g. a router): stack along out_features, copy the weight ====
             pieces_TO = _split_into_bf16_pieces(
@@ -647,6 +698,7 @@ def _round_to_bf16(tensor: torch.Tensor) -> torch.Tensor:
 
 
 __all__ = [
+    "accumulate_into_weight_grad",
     "ColumnParallelLinear",
     "GroupedLinear",
     "FP32OutputLinear",
