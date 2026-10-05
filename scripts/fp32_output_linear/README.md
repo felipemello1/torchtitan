@@ -34,7 +34,7 @@ Baselines that no longer exist in torchtitan are local copies, labeled in each s
 
 ## Where each number comes from
 
-"line" = a string to grep for in `<out_dir>/<script>.txt`.
+"line" = the label or row to look for in `<out_dir>/<script>.txt`.
 
 ### `torchtitan/models/common/linear.py`
 
