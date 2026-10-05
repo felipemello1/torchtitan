@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""GEMM throughput by precision: why bf16 pieces beat fp32 matmuls (the backward docstring's ~15x).
+"""GEMM throughput by precision: why bf16 pieces beat fp32 matmuls (the backward docstring's ~25x).
 
 Per shape: TFLOPS of a bf16 GEMM (bf16 or fp32 output, fp32 accumulation), an fp32 GEMM (IEEE, TF32,
 and BF16x9 on sm100+), and how many times faster bf16 is than fp32 IEEE. Operands are ready in their

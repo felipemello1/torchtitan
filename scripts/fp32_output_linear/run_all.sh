@@ -64,8 +64,6 @@ run docstring_table one_gpu "$PY" "$HERE/docstring_table.py" --cache-dir "$CACHE
 run rounding one_gpu "$PY" "$HERE/rounding.py" --cache-dir "$CACHE"
 run split_k one_gpu "$PY" "$HERE/split_k.py" --cache-dir "$CACHE"
 run split_compile one_gpu "$PY" "$HERE/split_compile.py"
-run split_compile_TORCH_COMPILE_DISABLE one_gpu env TORCH_COMPILE_DISABLE=1 \
-  "$PY" "$HERE/split_compile.py" --sections chunk
 run grad_weight_layouts one_gpu "$PY" "$HERE/grad_weight_layouts.py"
 run backward_memory one_gpu "$PY" "$HERE/backward_memory.py"
 run gemm_throughput one_gpu "$PY" "$HERE/gemm_throughput.py"

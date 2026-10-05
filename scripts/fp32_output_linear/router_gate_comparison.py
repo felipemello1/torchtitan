@@ -14,7 +14,7 @@ Router 2048 -> 256 experts, 40 MoE layers, random data, 4k / 16k / 64k tokens. P
 of fwd + bwd (profiler kernel sum) per layer and x40; grad_input and grad_weight error vs fp64; and
 the % of gradient values bitwise equal to RouterGateLinear's (grad_weight compared after rounding to
 bf16). FP32OutputLinear returns grad_weight in fp32 (weight.grad_dtype = fp32 here); routers use 3
-pieces (higher_precision_bwd=True).
+pieces (backward_mode="bf16x3").
 
 Example:
     python scripts/fp32_output_linear/router_gate_comparison.py
@@ -24,7 +24,7 @@ import torch
 from common import gpu_kernels, header, relative_error
 from torch.autograd.function import once_differentiable
 
-from torchtitan.models.common import linear
+from torchtitan.models.common import fp32_output_linear
 
 NUM_LAYERS = 40
 
@@ -57,11 +57,11 @@ def main():
     print(f"fp32 matmuls: {torch.backends.cuda.matmul.fp32_precision}")
     functions = {
         "RouterGateLinear (before)": lambda x, w: RouterGateLinearFunction.apply(x, w),
-        "FP32OutputLinear, 2 pieces": lambda x, w: linear._FP32OutputLinearFunction.apply(
-            x, w, False
+        "FP32OutputLinear, 2 pieces": lambda x, w: fp32_output_linear._FP32OutputLinearFunction.apply(
+            x, w, 2
         ),
-        "FP32OutputLinear, 3 pieces": lambda x, w: linear._FP32OutputLinearFunction.apply(
-            x, w, True
+        "FP32OutputLinear, 3 pieces": lambda x, w: fp32_output_linear._FP32OutputLinearFunction.apply(
+            x, w, 3
         ),
     }
     for num_tokens in (4096, 16384, 65536):

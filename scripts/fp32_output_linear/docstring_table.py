@@ -15,8 +15,8 @@ Errors are relative to fp64 on the same fp32 grad_output (data from prepare_data
 
 Times are fwd + bwd minus fwd (medians of interleaved rounds), random data, as multiples of a bf16
 Linear's, median of --runs runs:
-    eager:       the Function as it ships (its split is compiled, behind a custom op).
-    eager split: the same, with ``_split_into_bf16_pieces_eager`` (what TORCH_COMPILE_DISABLE=1 runs).
+    eager:       the Function as it ships (its split is compiled: the "fp32_output_split" region).
+    eager split: the same, with the split eager (what the region off runs).
     compiled:    the Function inside torch.compile.
 
 Example:
@@ -38,6 +38,7 @@ import torch.nn.functional as F  # noqa: E402
 from common import (  # noqa: E402
     correctly_rounded_pct,
     DEFAULT_CACHE_DIR,
+    eager_split,
     head_grads,
     header,
     interleaved_median_ms,
@@ -46,7 +47,7 @@ from common import (  # noqa: E402
     router_grads,
 )
 
-from torchtitan.models.common import linear  # noqa: E402
+from torchtitan.models.common import fp32_output_linear  # noqa: E402
 
 # (label, tokens, in_features, out_features)
 SHAPES = [
@@ -117,24 +118,23 @@ def gradients(variant: str, x: torch.Tensor, weight: torch.Tensor, grad_output):
         return dx_fp32, dx_fp32.bfloat16(), grad_output.T @ x.float()
 
     # The shipped Function, then its grad_input GEMMs again with an fp32 output.
-    higher_precision_bwd = variant == "3 pieces"
+    num_pieces = 3 if variant == "3 pieces" else 2
     x_leaf = x.clone().requires_grad_()
     weight_leaf = weight.clone().requires_grad_()
     weight_leaf.grad_dtype = torch.float32
-    output = linear._FP32OutputLinearFunction.apply(
-        x_leaf, weight_leaf, higher_precision_bwd
+    output = fp32_output_linear._FP32OutputLinearFunction.apply(
+        x_leaf, weight_leaf, num_pieces
     )
     output.backward(grad_output)
-    num_pieces = 3 if higher_precision_bwd else 2
     if weight.shape[0] > x.shape[0]:  # _wide_backward
-        stacked_PTO = linear._split_into_bf16_pieces(
-            grad_output, higher_precision_bwd, dim=0
+        stacked_PTO = fp32_output_linear._split_into_bf16_pieces(
+            grad_output, num_pieces, dim=0
         )
         dx_PTD = torch.mm(stacked_PTO, weight, out_dtype=torch.float32)
         dx_fp32 = dx_PTD.unflatten(0, (num_pieces, x.shape[0])).sum(dim=0)
     else:  # _narrow_backward
-        stacked_TPO = linear._split_into_bf16_pieces(
-            grad_output, higher_precision_bwd, dim=1
+        stacked_TPO = fp32_output_linear._split_into_bf16_pieces(
+            grad_output, num_pieces, dim=1
         )
         weights = torch.cat([weight] * num_pieces)
         dx_fp32 = torch.mm(stacked_TPO, weights, out_dtype=torch.float32)
@@ -187,9 +187,9 @@ def one_run() -> dict:
         }
         for mode in MODES:
             split = (
-                linear._split_into_bf16_pieces_eager
+                eager_split
                 if mode == "eager split"
-                else linear._split_into_bf16_pieces
+                else fp32_output_linear._split_into_bf16_pieces
             )
             with patched_split(split):
                 mode_times = backward_times(variants, compiled=mode == "compiled")
@@ -211,11 +211,11 @@ def one_run() -> dict:
 
 
 def two_pieces(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return linear._FP32OutputLinearFunction.apply(x, weight, False)
+    return fp32_output_linear._FP32OutputLinearFunction.apply(x, weight, 2)
 
 
 def three_pieces(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return linear._FP32OutputLinearFunction.apply(x, weight, True)
+    return fp32_output_linear._FP32OutputLinearFunction.apply(x, weight, 3)
 
 
 def backward_times(variants: dict, compiled: bool) -> dict:

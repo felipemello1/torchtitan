@@ -32,7 +32,7 @@ from common import (
 )
 from torch.autograd.function import once_differentiable
 
-from torchtitan.models.common import linear
+from torchtitan.models.common import fp32_output_linear
 
 CHUNK_WIDTHS = [
     None,
@@ -71,11 +71,10 @@ def mm_fp32_split_k(
     return out_MN
 
 
-def grad_input_fp32(grad_output_TO, weight_OD, higher_precision_bwd, chunk_width):
+def grad_input_fp32(grad_output_TO, weight_OD, num_pieces, chunk_width):
     """``_wide_backward``'s grad_input before its bf16 rounding, with split-K."""
-    num_pieces = 3 if higher_precision_bwd else 2
-    stacked_PTO = linear._split_into_bf16_pieces(
-        grad_output_TO, higher_precision_bwd, dim=0
+    stacked_PTO = fp32_output_linear._split_into_bf16_pieces(
+        grad_output_TO, num_pieces, dim=0
     )
     grad_input_PTD = mm_fp32_split_k(stacked_PTO, weight_OD, chunk_width)
     return grad_input_PTD.unflatten(0, (num_pieces, -1)).sum(dim=0)
@@ -86,12 +85,12 @@ def print_errors(cache_dir: str):
     exact_dx = grad_output.double() @ weight.double()
     print(f"\nQwen3-8B head (real): x {tuple(x.shape)}, weight {tuple(weight.shape)}")
     print(f"  {'':22s} {'grad_input':>11s} {'rounded ok':>11s}")
-    for hp in (False, True):
+    for num_pieces in (2, 3):
         for chunk_width in CHUNK_WIDTHS:
-            dx = grad_input_fp32(grad_output, weight, hp, chunk_width)
+            dx = grad_input_fp32(grad_output, weight, num_pieces, chunk_width)
             label = f"L={chunk_width}" if chunk_width else "one GEMM (ships)"
             print(
-                f"  {2 + hp} pieces {label:18s} {relative_error(dx, exact_dx):9.2e} "
+                f"  {num_pieces} pieces {label:18s} {relative_error(dx, exact_dx):9.2e} "
                 f"{correctly_rounded_pct(dx.bfloat16(), exact_dx):10.2f}%",
                 flush=True,
             )
@@ -103,9 +102,9 @@ class SplitKFunction(torch.autograd.Function):
     """``_FP32OutputLinearFunction`` for a wide layer, with a split-K grad_input."""
 
     @staticmethod
-    def forward(ctx, input_TD, weight_OD, higher_precision_bwd, chunk_width):
+    def forward(ctx, input_TD, weight_OD, num_pieces, chunk_width):
         ctx.save_for_backward(input_TD, weight_OD)
-        ctx.higher_precision_bwd = higher_precision_bwd
+        ctx.num_pieces = num_pieces
         ctx.chunk_width = chunk_width
         return torch.mm(input_TD, weight_OD.T, out_dtype=torch.float32)
 
@@ -113,10 +112,11 @@ class SplitKFunction(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, grad_output_TO):
         input_TD, weight_OD = ctx.saved_tensors
-        hp = ctx.higher_precision_bwd
-        num_pieces = 3 if hp else 2
+        num_pieces = ctx.num_pieces
         # As _wide_backward, with mm_fp32_split_k for grad_input.
-        stacked_PTO = linear._split_into_bf16_pieces(grad_output_TO, hp, dim=0)
+        stacked_PTO = fp32_output_linear._split_into_bf16_pieces(
+            grad_output_TO, num_pieces, dim=0
+        )
         grad_input_PTD = mm_fp32_split_k(stacked_PTO, weight_OD, ctx.chunk_width)
         grad_input_PTD = grad_input_PTD.unflatten(0, (num_pieces, -1))
         grad_input_TD = grad_input_PTD.sum(dim=0).to(input_TD.dtype)
@@ -137,23 +137,27 @@ def print_times(rounds: int):
     weight.requires_grad_()
     weight.grad_dtype = torch.float32
     grad_output = torch.randn(2048, 151936, device="cuda") * 1e-3
-    for hp in (False, True):
+    for num_pieces in (2, 3):
         variants = {
             "shipped": backward_fn(
-                linear._FP32OutputLinearFunction, x, weight, grad_output, hp
+                fp32_output_linear._FP32OutputLinearFunction,
+                x,
+                weight,
+                grad_output,
+                num_pieces,
             )
         }
         for chunk_width in CHUNK_WIDTHS:
             label = f"L={chunk_width}" if chunk_width else "local, one GEMM"
             variants[label] = backward_fn(
-                SplitKFunction, x, weight, grad_output, hp, chunk_width
+                SplitKFunction, x, weight, grad_output, num_pieces, chunk_width
             )
         # The local copy of the shipped backward must match it bitwise.
         same = torch.equal(variants["shipped"]()[0], variants["local, one GEMM"]()[0])
         times = interleaved_median_ms(variants, rounds=rounds, calls=10)
         base = times["shipped"]
         print(
-            f"  {2 + hp} pieces (local one-GEMM grad_input == shipped, bitwise: {same})"
+            f"  {num_pieces} pieces (local one-GEMM grad_input == shipped, bitwise: {same})"
         )
         for label, ms in times.items():
             print(

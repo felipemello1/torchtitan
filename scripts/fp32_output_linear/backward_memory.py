@@ -18,9 +18,15 @@ Example:
 """
 
 import torch
-from common import header, interleaved_median_ms, patched_split, peak_extra_gib
+from common import (
+    eager_split,
+    header,
+    interleaved_median_ms,
+    patched_split,
+    peak_extra_gib,
+)
 
-from torchtitan.models.common import linear
+from torchtitan.models.common import fp32_output_linear
 
 # (label, tokens, in_features, out_features)
 SHAPES = [
@@ -114,12 +120,12 @@ def print_peaks():
         for num_pieces in (2, 3):
             cells = []
             for split_name, split in (
-                ("compiled split", linear._split_into_bf16_pieces),
-                ("eager split", linear._split_into_bf16_pieces_eager),
+                ("compiled split", fp32_output_linear._split_into_bf16_pieces),
+                ("eager split", eager_split),
             ):
                 for grad_dtype in (torch.float32, torch.bfloat16):
                     peak = peak_of_backward(
-                        x, weight, grad_output, num_pieces == 3, split, grad_dtype
+                        x, weight, grad_output, num_pieces, split, grad_dtype
                     )
                     dtype_name = "fp32" if grad_dtype == torch.float32 else "bf16"
                     cells.append(f"{split_name}, {dtype_name} .grad {peak:5.2f}")
@@ -137,15 +143,15 @@ def random_inputs(num_tokens, in_features, out_features):
     return x, weight, grad_output
 
 
-def peak_of_backward(x, weight, grad_output, higher_precision_bwd, split, grad_dtype):
+def peak_of_backward(x, weight, grad_output, num_pieces, split, grad_dtype):
     """Peak GiB of one backward (no .grad yet), past the forward. grad_output is freed by its owner."""
     x = x.clone().requires_grad_()
     weight = weight.clone().requires_grad_()
     weight.grad_dtype = grad_dtype
     with patched_split(split):
         for _ in range(2):  # the first call compiles
-            output = linear._FP32OutputLinearFunction.apply(
-                x, weight, higher_precision_bwd
+            output = fp32_output_linear._FP32OutputLinearFunction.apply(
+                x, weight, num_pieces
             )
             x.grad = weight.grad = None
             peak = peak_extra_gib(lambda output=output: output.backward(grad_output))
@@ -165,7 +171,7 @@ def print_grad_dtype_times():
                 weight_leaf = weight.clone().requires_grad_()
                 weight_leaf.grad_dtype = grad_dtype
                 fns[grad_dtype] = backward_fn(
-                    x_leaf, weight_leaf, grad_output, num_pieces == 3
+                    x_leaf, weight_leaf, grad_output, num_pieces
                 )
             times = interleaved_median_ms(
                 {"fp32 .grad": fns[torch.float32], "bf16 .grad": fns[torch.bfloat16]},
@@ -182,11 +188,13 @@ def print_grad_dtype_times():
         torch.cuda.empty_cache()
 
 
-def backward_fn(x, weight, grad_output, higher_precision_bwd):
+def backward_fn(x, weight, grad_output, num_pieces):
     """fwd + bwd into a fresh .grad. The forward is the same for both .grad dtypes."""
 
     def step():
-        output = linear._FP32OutputLinearFunction.apply(x, weight, higher_precision_bwd)
+        output = fp32_output_linear._FP32OutputLinearFunction.apply(
+            x, weight, num_pieces
+        )
         output.backward(grad_output)
         x.grad = weight.grad = None
 

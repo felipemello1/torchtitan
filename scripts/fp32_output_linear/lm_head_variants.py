@@ -35,7 +35,7 @@ from common import DEFAULT_CACHE_DIR, header, load_cache, relative_error, sample
 from router_gate_comparison import RouterGateLinearFunction
 from torch.autograd.function import once_differentiable
 
-from torchtitan.models.common import linear
+from torchtitan.models.common import fp32_output_linear
 
 CACHES = {"qwen3_5_27b": "qwen3_5_27b_head.pt", "qwen3_8b": "qwen3_8b_head.pt"}
 
@@ -72,8 +72,8 @@ def main():
     print(f"fp32 matmuls in the 'fp32 bwd (router)' rows: {router_precision}")
 
     upcast = lambda h, w: F.linear(h.float(), w.float())  # noqa: E731
-    shipped = lambda h, w: linear._FP32OutputLinearFunction.apply(
-        h, w, False
+    shipped = lambda h, w: fp32_output_linear._FP32OutputLinearFunction.apply(
+        h, w, 2
     )  # noqa: E731
     # name -> (fp32 matmul precision, function of (hidden, weight) -> logits)
     variants = {

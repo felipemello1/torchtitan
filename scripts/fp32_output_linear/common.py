@@ -22,7 +22,13 @@ from collections import defaultdict
 import torch
 import torch.nn.functional as F
 
-from torchtitan.models.common import linear
+from torchtitan.distributed.local_compile import apply_local_compile
+from torchtitan.models.common import fp32_output_linear
+
+# Compile the split, as the models with FP32OutputLinear do (their local_compile_regions list it).
+apply_local_compile(["fp32_output_split"])
+# The split without its local_compile wrapper: always eager.
+eager_split = fp32_output_linear._split_into_bf16_pieces_impl.__wrapped__
 
 DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/fp32_output_linear")
 
@@ -37,7 +43,14 @@ CACHE_FILES = {
 def header(title: str) -> str:
     """First line of every output: what ran, on which GPU, torch and torchtitan commit."""
     commit = subprocess.run(
-        ["git", "-C", os.path.dirname(linear.__file__), "rev-parse", "--short", "HEAD"],
+        [
+            "git",
+            "-C",
+            os.path.dirname(fp32_output_linear.__file__),
+            "rev-parse",
+            "--short",
+            "HEAD",
+        ],
         capture_output=True,
         text=True,
     ).stdout.strip()
@@ -200,15 +213,15 @@ def peak_extra_gib(fn) -> float:
 
 @contextlib.contextmanager
 def patched_split(split):
-    """Make FP32OutputLinear's backward call ``split`` instead of the compiled custom op.
+    """Make FP32OutputLinear's backward call ``split`` instead of the custom op (compiled split).
 
     Example:
-        with patched_split(linear._split_into_bf16_pieces_eager):  # 6-10 eager kernels
+        with patched_split(eager_split):  # 5-8 eager kernels
             out.backward(grad_output)
     """
-    shipped = linear._split_into_bf16_pieces
-    linear._split_into_bf16_pieces = split
+    shipped = fp32_output_linear._split_into_bf16_pieces
+    fp32_output_linear._split_into_bf16_pieces = split
     try:
         yield
     finally:
-        linear._split_into_bf16_pieces = shipped
+        fp32_output_linear._split_into_bf16_pieces = shipped

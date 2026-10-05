@@ -23,13 +23,17 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 
-from torchtitan.models.common.linear import FP32OutputLinear
+from torchtitan.distributed.local_compile import apply_local_compile
+from torchtitan.models.common.fp32_output_linear import FP32OutputLinear
 
-# name -> (tokens, out_features, higher_precision_bwd)
+# Compile the split, as the models with FP32OutputLinear do (their local_compile_regions list it).
+apply_local_compile(["fp32_output_split"])
+
+# name -> (tokens, out_features, backward_mode)
 LAYERS = {
-    "LM head (wide), 2 pieces": (64, 4096, False),
-    "LM head (wide), 3 pieces": (64, 4096, True),
-    "router (narrow), 3 pieces": (512, 16, True),
+    "LM head (wide), 2 pieces": (64, 4096, "bf16x2"),
+    "LM head (wide), 3 pieces": (64, 4096, "bf16x3"),
+    "router (narrow), 3 pieces": (512, 16, "bf16x3"),
 }
 
 
@@ -47,10 +51,10 @@ def main():
             f"{torch.cuda.get_device_name()}, torch {torch.__version__}"
         )
     for mode in ("eager", "compiled"):
-        for name, (num_tokens, out_features, hp) in LAYERS.items():
+        for name, (num_tokens, out_features, backward_mode) in LAYERS.items():
             torch.manual_seed(0)
             layer = FP32OutputLinear.Config(
-                in_features=256, out_features=out_features, higher_precision_bwd=hp
+                in_features=256, out_features=out_features, backward_mode=backward_mode
             ).build()
             layer = layer.cuda()
             torch.nn.init.normal_(layer.weight, std=0.02)

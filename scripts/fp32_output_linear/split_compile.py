@@ -6,34 +6,39 @@
 
 """The compiled split of grad_output vs the eager one: kernels, time, dynamic shapes, and one chunk.
 
-1. Kernels and GPU time (profiler) of the split alone: the shipped custom op (compiled) vs
-   ``_split_into_bf16_pieces_eager``, for an LM head chunk and a router, 2 and 3 pieces.
-2. Split time with static or symbolic dims, compiled fresh each time:
-       static T, static O      the first call (what ships, before the token count changes)
-       symbolic T, static O    what ships once the token count changes (mark_static on O)
+1. Kernels and GPU time (profiler) of the split alone: the shipped custom op (compiled: the
+   "fp32_output_split" region) vs the eager split, for an LM head chunk and a router, 2 and 3 pieces.
+2. Split time with static or symbolic dims, each compiled fresh with the region's options
+   (fullgraph=True, emulate_precision_casts):
+       static T, static O      torch.compile's default, on a first call
+       symbolic T, static O    mark_dynamic on tokens
        static T, symbolic O    mark_dynamic on out_features
-       symbolic T and O        torch.compile(dynamic=True)
+       symbolic T and O        torch.compile(dynamic=True): what ships
 3. One Qwen3-8B LM head + loss chunk (FP32OutputLinear forward, CE, backward into an fp32
    weight.grad, 2 pieces), compiled vs eager split, with the CE eager or compiled. Interleaved
-   rounds, median. TORCH_COMPILE_DISABLE=1 runs the shipped code with the eager split, like the
-   "eager split" rows here.
+   rounds, median.
 
 Example:
     python scripts/fp32_output_linear/split_compile.py
-    TORCH_COMPILE_DISABLE=1 python scripts/fp32_output_linear/split_compile.py --sections chunk
 """
 
 import argparse
-import os
 import statistics
 from collections import defaultdict
 
 import torch
-from common import gpu_kernels, header, interleaved_median_ms, mean_ms, patched_split
+from common import (
+    eager_split,
+    gpu_kernels,
+    header,
+    interleaved_median_ms,
+    mean_ms,
+    patched_split,
+)
 
 from torchtitan.components.loss import cross_entropy_loss
-from torchtitan.models.common import linear
-from torchtitan.models.common.linear import FP32OutputLinear
+from torchtitan.models.common import fp32_output_linear
+from torchtitan.models.common.fp32_output_linear import FP32OutputLinear
 
 VOCAB, HIDDEN = 151936, 4096
 # (label, tokens, out_features, dim the pieces stack along)
@@ -55,8 +60,6 @@ def main():
     args = parser.parse_args()
 
     print(header("Compiled vs eager split of grad_output"))
-    if os.environ.get("TORCH_COMPILE_DISABLE") == "1":
-        print("TORCH_COMPILE_DISABLE=1: every split and CE below runs eagerly")
     if "kernels" in args.sections:
         print_kernels()
     if "dynamic" in args.sections:
@@ -70,23 +73,21 @@ def print_kernels():
     for label, num_tokens, out_features, dim in SPLIT_SHAPES:
         torch.manual_seed(0)
         grad_output = torch.randn(num_tokens, out_features, device="cuda") * 1e-3
-        for hp in (False, True):
+        for num_pieces in (2, 3):
             torch._dynamo.reset()
             rows = {}
             for name, split in (
-                ("eager", linear._split_into_bf16_pieces_eager),
-                ("compiled", linear._split_into_bf16_pieces),
+                ("eager", eager_split),
+                ("compiled", fp32_output_linear._split_into_bf16_pieces),
             ):
                 rows[name] = gpu_kernels(
-                    lambda split=split: split(grad_output, hp, dim=dim)
+                    lambda split=split: split(grad_output, num_pieces, dim=dim)
                 )
             same = torch.equal(
-                linear._split_into_bf16_pieces_eager(grad_output, hp, dim=dim).view(
-                    torch.int16
-                ),
-                linear._split_into_bf16_pieces(grad_output, hp, dim=dim).view(
-                    torch.int16
-                ),
+                eager_split(grad_output, num_pieces, dim=dim).view(torch.int16),
+                fp32_output_linear._split_into_bf16_pieces(
+                    grad_output, num_pieces, dim=dim
+                ).view(torch.int16),
             )
             (eager_n, eager_ms, eager_names), (
                 compiled_n,
@@ -94,7 +95,7 @@ def print_kernels():
                 _,
             ) = rows.values()
             print(
-                f"  {label:24s} {2 + hp} pieces: eager {eager_n:2d} kernels {eager_ms:6.3f} ms -> "
+                f"  {label:24s} {num_pieces} pieces: eager {eager_n:2d} kernels {eager_ms:6.3f} ms -> "
                 f"compiled {compiled_n} kernel(s) {compiled_ms:6.3f} ms "
                 f"({compiled_ms / eager_ms - 1:+.0%}); bitwise equal: {same}"
             )
@@ -110,21 +111,23 @@ def print_dynamic(num_passes: int = 3):
         f"alone, median of {num_passes} passes"
     )
     for label, num_tokens, out_features, dim in SPLIT_SHAPES:
-        for hp in (False, True):
+        for num_pieces in (2, 3):
             torch.manual_seed(0)
             grad_output = torch.randn(num_tokens, out_features, device="cuda") * 1e-3
-            expected = linear._split_into_bf16_pieces_eager(grad_output, hp, dim=dim)
+            expected = eager_split(grad_output, num_pieces, dim=dim)
             times = defaultdict(list)
             for _ in range(num_passes):
                 for setting in DYNAMIC_SETTINGS:
-                    split = compiled_split(setting, grad_output, hp, dim, expected)
+                    split = compiled_split(
+                        setting, grad_output, num_pieces, dim, expected
+                    )
                     times[setting].append(mean_ms(split))
             medians = {k: statistics.median(v) for k, v in times.items()}
             base = medians["static T, static O"]
             cells = "  ".join(
                 f"{k} {v:6.3f} ({v / base - 1:+4.0%})" for k, v in medians.items()
             )
-            print(f"  {label:24s} {2 + hp} pieces: {cells}", flush=True)
+            print(f"  {label:24s} {num_pieces} pieces: {cells}", flush=True)
             del grad_output, expected
             torch.cuda.empty_cache()
 
@@ -137,12 +140,17 @@ DYNAMIC_SETTINGS = [
 ]
 
 
-def compiled_split(setting, grad_output, hp, dim, expected):
+def compiled_split(setting, grad_output, num_pieces, dim, expected):
     """A split of ``grad_output``, compiled from a clean Dynamo state with the dims ``setting``
     names symbolic. mark_dynamic raises if compiling specializes such a dim."""
     torch._dynamo.reset()
     dynamic = True if setting == "symbolic T and O" else None
-    compiled = torch.compile(linear._split_into_bf16_pieces_eager, dynamic=dynamic)
+    compiled = torch.compile(
+        eager_split,
+        fullgraph=True,
+        dynamic=dynamic,
+        options={"emulate_precision_casts": True},
+    )
     tensor = (
         grad_output.clone()
     )  # marks live on the tensor object: one object per setting
@@ -150,12 +158,10 @@ def compiled_split(setting, grad_output, hp, dim, expected):
         torch._dynamo.mark_dynamic(tensor, 0)
     elif setting == "static T, symbolic O":
         torch._dynamo.mark_dynamic(tensor, 1)
-    if setting != "static T, symbolic O" and setting != "symbolic T and O":
-        torch._dynamo.mark_static(tensor, 1)
     assert torch.equal(
-        compiled(tensor, hp, dim).view(torch.int16), expected.view(torch.int16)
+        compiled(tensor, num_pieces, dim).view(torch.int16), expected.view(torch.int16)
     )
-    return lambda: compiled(tensor, hp, dim)
+    return lambda: compiled(tensor, num_pieces, dim)
 
 
 def print_chunk(rounds: int):
@@ -185,8 +191,8 @@ def print_chunk(rounds: int):
             ("CE compiled", compiled_ce),
         ):
             for split_name, split in (
-                ("compiled split", linear._split_into_bf16_pieces),
-                ("eager split", linear._split_into_bf16_pieces_eager),
+                ("compiled split", fp32_output_linear._split_into_bf16_pieces),
+                ("eager split", eager_split),
             ):
                 variants[f"{ce_name}, {split_name}"] = lambda ce=ce, split=split: chunk(
                     ce, split
