@@ -287,7 +287,7 @@ def backward_times(splits, x, weight, grad_output, higher_precision_bwd) -> dict
         name: lambda split=split: forward_backward(split)
         for name, split in splits.items()
     }
-    times = interleaved_median_ms({"fwd": forward, **fns}, rounds=20)
+    times = interleaved_median_ms({"fwd": forward, **fns}, rounds=10, calls=10)
     return {name: times[name] - times["fwd"] for name in splits}
 
 

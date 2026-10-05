@@ -14,6 +14,7 @@ Example:
 import contextlib
 import datetime
 import os
+import random
 import statistics
 import subprocess
 from collections import defaultdict
@@ -133,25 +134,33 @@ def mean_ms(fn, warmup: int = 5, iters: int = 30) -> float:
     return start.elapsed_time(end) / iters
 
 
-def interleaved_median_ms(fns: dict, rounds: int = 30, warmup: int = 3) -> dict:
-    """Median ms per call of each fn. Each round runs every fn once, so clock drift hits all alike.
+def interleaved_median_ms(
+    fns: dict, rounds: int = 30, warmup: int = 3, calls: int = 1
+) -> dict:
+    """Median ms per call of each fn. Each round times ``calls`` back-to-back calls of every fn, in
+    a shuffled order, so clock drift and the previous fn's load hit all fns alike.
 
     Example:
-        interleaved_median_ms({"a": f, "b": g}) -> {"a": 7.1, "b": 10.6}
+        interleaved_median_ms({"a": f, "b": g}, rounds=10, calls=10) -> {"a": 7.1, "b": 10.6}
     """
     for fn in fns.values():
         for _ in range(warmup):
             fn()
+    order = list(fns)
+    shuffle = random.Random(0).shuffle
     times = defaultdict(list)
     for _ in range(rounds):
-        for name, fn in fns.items():
+        shuffle(order)
+        for name in order:
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
             start.record()
-            fn()
+            for _ in range(calls):
+                fns[name]()
             end.record()
             torch.cuda.synchronize()
-            times[name].append(start.elapsed_time(end))
+            times[name].append(start.elapsed_time(end) / calls)
     return {name: statistics.median(times[name]) for name in fns}
 
 

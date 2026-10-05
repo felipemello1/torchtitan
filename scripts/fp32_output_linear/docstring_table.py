@@ -218,8 +218,9 @@ def three_pieces(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return linear._FP32OutputLinearFunction.apply(x, weight, True)
 
 
-def backward_times(variants: dict, compiled: bool, rounds: int = 20) -> dict:
-    """{variant: backward ms}, as the median fwd + bwd minus the median fwd over interleaved rounds.
+def backward_times(variants: dict, compiled: bool) -> dict:
+    """{variant: backward ms}: median fwd + bwd minus median fwd, over 10 interleaved rounds of 10
+    back-to-back calls each.
 
     Leaves keep the default grad_dtype: a bf16 weight gets a bf16 .grad.
     """
@@ -241,7 +242,7 @@ def backward_times(variants: dict, compiled: bool, rounds: int = 20) -> dict:
 
         fns[(name, "fwd")] = forward
         fns[(name, "fwd + bwd")] = forward_backward
-    times = interleaved_median_ms(fns, rounds=rounds)
+    times = interleaved_median_ms(fns, rounds=10, calls=10)
     return {
         name: times[(name, "fwd + bwd")] - times[(name, "fwd")] for name in variants
     }

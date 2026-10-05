@@ -45,7 +45,7 @@ CHUNK_WIDTHS = [
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR)
-    parser.add_argument("--rounds", type=int, default=20)
+    parser.add_argument("--rounds", type=int, default=10)
     args = parser.parse_args()
 
     print(header("Split-K for the LM head's grad_input"))
@@ -129,7 +129,7 @@ class SplitKFunction(torch.autograd.Function):
 def print_times(rounds: int):
     print(
         f"\nQwen3-8B head chunk (2048 tokens, random data), eager backward ms, median of "
-        f"{rounds} interleaved rounds; weight.grad_dtype = fp32"
+        f"{rounds} interleaved rounds of 10 calls; weight.grad_dtype = fp32"
     )
     torch.manual_seed(0)
     x = torch.randn(2048, 4096, device="cuda").bfloat16().requires_grad_()
@@ -150,7 +150,7 @@ def print_times(rounds: int):
             )
         # The local copy of the shipped backward must match it bitwise.
         same = torch.equal(variants["shipped"]()[0], variants["local, one GEMM"]()[0])
-        times = interleaved_median_ms(variants, rounds=rounds)
+        times = interleaved_median_ms(variants, rounds=rounds, calls=10)
         base = times["shipped"]
         print(
             f"  {2 + hp} pieces (local one-GEMM grad_input == shipped, bitwise: {same})"

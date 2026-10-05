@@ -154,7 +154,7 @@ def peak_of_backward(x, weight, grad_output, higher_precision_bwd, split, grad_d
 
 def print_grad_dtype_times():
     print(
-        "\nfwd + bwd ms with an fp32 vs a bf16 weight.grad (median of interleaved rounds)"
+        "\nfwd + bwd ms with an fp32 vs a bf16 weight.grad (median of 10 interleaved rounds of 10 calls)"
     )
     for label, num_tokens, in_features, out_features in SHAPES:
         x, weight, grad_output = random_inputs(num_tokens, in_features, out_features)
@@ -168,7 +168,9 @@ def print_grad_dtype_times():
                     x_leaf, weight_leaf, grad_output, num_pieces == 3
                 )
             times = interleaved_median_ms(
-                {"fp32 .grad": fns[torch.float32], "bf16 .grad": fns[torch.bfloat16]}
+                {"fp32 .grad": fns[torch.float32], "bf16 .grad": fns[torch.bfloat16]},
+                rounds=10,
+                calls=10,
             )
             delta = times["bf16 .grad"] - times["fp32 .grad"]
             print(
