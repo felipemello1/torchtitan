@@ -125,6 +125,7 @@ def deepseek_v3_debugmodel_hybridep(
         "debugmodel",
         seq_len=seq_len,
     )
+    config.model.local_compile_regions.append("router")
     config.parallelism.expert_parallel_degree = 2
     return apply_transforms(
         config,
@@ -182,6 +183,7 @@ def deepseek_v3_16b_hybridep(seq_len: int | None = None) -> Trainer.Config:
         seq_len=seq_len,
         attn_backend="flex",
     )
+    config.model.local_compile_regions.append("router")
     config.training.disable_cuda_graphs = False
     return apply_transforms(
         config,
