@@ -861,6 +861,15 @@ class DeepEPTokenDispatcher(BaseEPTokenDispatcher):
         return hidden_states_RD, num_global_tokens_per_local_expert_e, metadata
 
     # pyrefly: ignore [bad-override]
+    def take_routed_scores(self, metadata: EPDispatchMetadata) -> torch.Tensor | None:
+        """Hand the ``(R,)`` routing scores to the experts, so ``combine`` only sums."""
+        state = metadata.state
+        # state is typed object; DeepEP's dispatch always stores a DispatchState.
+        # pyrefly: ignore [missing-attribute]
+        scores_R, state.recv_scores = state.recv_scores, None
+        return scores_R
+
+    # pyrefly: ignore [bad-override]
     def combine(
         self,
         routed_output_RD: torch.Tensor,
