@@ -140,10 +140,26 @@ class SwiGLU(BinaryActivationFn):
         self,
         gate: torch.Tensor,
         up: torch.Tensor,
+        *,
+        scores: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        """Return ``silu(gate) * up``, with row ``r`` scaled by ``scores[r]`` if given.
+
+        Args:
+            gate: ``(R, F)`` gate projection.
+            up: ``(R, F)`` up projection.
+            scores: Optional ``(R,)`` routing score per routed row.
+            **kwargs: Ignored.
+
+        Returns:
+            ``(R, F)`` activation in ``gate``'s dtype.
+        """
         del kwargs
-        return F.silu(gate) * up
+        out = F.silu(gate) * up
+        if scores is None:
+            return out
+        return (out * scores.unsqueeze(-1)).to(out.dtype)
 
 
 # TODO: move to models/kimi_k3, its only user.
