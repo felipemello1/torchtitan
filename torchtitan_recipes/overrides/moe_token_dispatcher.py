@@ -12,7 +12,7 @@ backward-able trainer does not. Each EP comm backend has its own override here; 
 generator activates the one matching its backend (passing its kwarg), while the trainer
 keeps the shared spec's default. Activate per-actor via the ``module.function`` target::
 
-    # generator.override -- DeepEP CUDA-graph-compatible EXPAND dispatch:
+    # generator.override -- DeepEP dispatch without a host sync (CUDA-graph-capturable):
     OverrideConfig(imports=[(
         "torchtitan_recipes.overrides.moe_token_dispatcher.deepep_override",
         {"cuda_graph_compatible": True},
@@ -23,11 +23,11 @@ keeps the shared spec's default. Activate per-actor via the ``module.function`` 
         {"capacity_factor": 0.0325},
     )])
 
-``deepep_override`` (``DeepEPTokenDispatcher.Config``): ``cuda_graph_compatible=True`` flips DeepEP
-to the static, host-sync-free EXPAND layout a CUDA graph can capture (the compact,
-host-synced, backward-able path is the default). ``deepep.dispatch_tokens`` also gates the
-expand path to ``not torch.is_grad_enabled()``, so it only takes effect for the no-grad
-inference forward. The runtime configuration derives the required per-rank buffer capacity
+``deepep_override`` (``DeepEPTokenDispatcher.Config``): ``cuda_graph_compatible=True`` drops
+DeepEP's host sync so a CUDA graph can capture the dispatch (the host-synced dispatch is
+the default). ``deepep.dispatch_tokens`` also gates it to
+``not torch.is_grad_enabled()``, so it only takes effect for the no-grad inference
+forward. The runtime configuration derives the required per-rank buffer capacity
 from the scheduler and CUDA graph limits before applying this override.
 
 ``hybridep_override`` (``HybridEPTokenDispatcher.Config``): ``capacity_factor`` sets
@@ -50,15 +50,15 @@ from torchtitan.models.common.token_dispatcher import (
 
 @override(
     target=DeepEPTokenDispatcher.Config,
-    description="DeepEP CUDA-graph-compatible expand dispatch for inference.",
+    description="DeepEP dispatch without a host sync, for CUDA graph inference.",
 )
 def deepep_override(
     cfg: DeepEPTokenDispatcher.Config,
     *,
     cuda_graph_compatible: bool,
 ) -> DeepEPTokenDispatcher.Config:
-    # cuda_graph_compatible=True flips the DeepEP dispatchers to the static, CUDA-graph-compatible EXPAND
-    # layout (False keeps the compact host-synced default).
+    # cuda_graph_compatible=True drops the DeepEP dispatch's host sync so a CUDA graph can
+    # capture it (False keeps the host-synced default).
     return dataclasses.replace(cfg, cuda_graph_compatible=cuda_graph_compatible)
 
 
