@@ -8,7 +8,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols, ShapeEnv
 
-from torchtitan.distributed.deepep import hybridep  # noqa: F401  (registers the ops)
+from torchtitan.distributed.deepep import hybridep
 
 NUM_TOKENS, HIDDEN_DIM, TOP_K, NUM_EXPERTS, EP_SIZE = 16, 4, 2, 8, 2
 NUM_LOCAL_EXPERTS = NUM_EXPERTS // EP_SIZE
@@ -54,6 +54,21 @@ def test_blocking_dispatch_fake_traces_forward_and_backward():
         out.sum().backward()
     assert x.grad.shape == x.shape
     assert topk_weights.grad.shape == topk_weights.shape
+
+
+def test_combine_backward_fake_matches_a_rank_with_no_tokens():
+    with FakeTensorMode(shape_env=ShapeEnv()):
+        grad_hidden = torch.empty(0, HIDDEN_DIM, dtype=torch.bfloat16)
+        grad_scores = torch.empty(0)
+        grad_x, grad_probs = torch.ops.hybridep.combine_bwd(
+            grad_hidden,
+            grad_scores,
+            hybridep.DispatchHandle(),
+            num_tokens=NUM_TOKENS,
+            num_experts=NUM_EXPERTS,
+        )
+    assert grad_x.shape == (NUM_TOKENS, HIDDEN_DIM)
+    assert grad_probs.shape == (NUM_TOKENS, NUM_EXPERTS)
 
 
 def test_non_blocking_dispatch_fake_rows_are_the_capacity():
