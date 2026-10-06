@@ -890,7 +890,7 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
                 with a given capacity factor.
 
                 Setting this to a float in (0, 1] enables CPU-free non-blocking
-                dispatch and controls num_permuted_tokens — the fused-permute
+                dispatch and controls num_permuted_tokens — the permute
                 output capacity, estimated as:
                 num_max_tokens_per_rank * ep_size *
                 min(num_local_experts, top_k) * capacity_factor, aligned for
@@ -904,16 +904,25 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
                 - 1.0 = non-blocking, worst-case sizing: every token can reach
                   every local expert, no drops, highest memory.
                 - < 1.0 = non-blocking, reduced memory; controls the
-                  fused-permute output tensor size (num_permuted_tokens).
+                  permute output tensor size (num_permuted_tokens).
                   Safe in practice when forced load balancing (e.g. aux-loss /
                   round-robin) keeps distribution roughly uniform.
 
                 This factor does not affect the all-to-all communication
                 buffer, which is initialized separately from
                 ``num_max_tokens_per_rank``.
+            fuse_permute: Permute the received rows inside the dispatch kernel, and
+                unpermute them inside the combine kernel, instead of in a separate
+                kernel after the dispatch transfer and before the combine transfer.
+                Outputs and gradients are bitwise equal either way. A DSv3 671B MoE
+                layer's fwd+bwd: 3-5% faster on 8x H100 (EP=8), 3% slower on 4x
+                GB300 (EP=4). When non-blocking dispatch can drop tokens
+                (non_blocking_capacity_factor < 1.0, or pad_multiple set), only the
+                permute fuses: the fused unpermute hangs on dropped tokens.
         """
 
         non_blocking_capacity_factor: float | None = None
+        fuse_permute: bool = False
         pad_multiple: int | None = None
         hidden_dim: int | None = None
         num_max_tokens_per_rank: int | None = None
@@ -921,6 +930,7 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
     def __init__(self, config: Config):
         super().__init__(config)
         self.non_blocking_capacity_factor = config.non_blocking_capacity_factor
+        self.fuse_permute = config.fuse_permute
         self.pad_multiple = config.pad_multiple
         self.hidden_dim = config.hidden_dim
         self.num_max_tokens_per_rank = config.num_max_tokens_per_rank
@@ -977,6 +987,7 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
             ep_group,
             non_blocking_expert_capacity_factor=self.non_blocking_capacity_factor,
             pad_multiple=self.pad_multiple,
+            fuse_permute=self.fuse_permute,
         )
 
         metadata = EPDispatchMetadata(state=state)

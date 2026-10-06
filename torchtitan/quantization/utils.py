@@ -69,6 +69,7 @@ def swap_token_dispatcher(routed_experts_config, pad_multiple: int) -> None:
             num_experts=dispatcher.num_experts,
             top_k=dispatcher.top_k,
             non_blocking_capacity_factor=dispatcher.non_blocking_capacity_factor,
+            fuse_permute=dispatcher.fuse_permute,
             pad_multiple=pad_multiple,
             hidden_dim=dispatcher.hidden_dim,
             num_max_tokens_per_rank=dispatcher.num_max_tokens_per_rank,
