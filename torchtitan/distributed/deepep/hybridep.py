@@ -187,7 +187,9 @@ def _dispatch_impl(
     if scores is None:
         scores = torch.empty(0, device=x.device, dtype=torch.float32)
     if tokens_per_expert.device != x.device:
-        tokens_per_expert = tokens_per_expert.to(x.device)
+        # Blocking dispatch already synced and returns pinned host memory from
+        # torch's caching host allocator, so the copy needs no second stream sync.
+        tokens_per_expert = tokens_per_expert.to(x.device, non_blocking=True)
 
     return hidden, scores, tokens_per_expert, DispatchHandle(value=handle)
 
