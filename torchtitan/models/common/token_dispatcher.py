@@ -998,6 +998,7 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
         scales the ``(R, D)`` expert output in an extra eager pass.
         """
         state = metadata.state
+        # state is typed object; HybridEP's dispatch always stores a DispatchState.
         # pyrefly: ignore [missing-attribute]
         scores_R, state.permuted_scores = state.permuted_scores, None
         return scores_R
