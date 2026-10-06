@@ -135,6 +135,24 @@ class RoutedExperts(Module):
             remat.recompute_needs_tensor(gate_up_R2F)
             gate_RF, up_RF = gate_up_R2F.unbind(dim=-2)
             hidden_RF = self.activation_fn(gate_RF, up_RF, offsets=offsets_E)
+            # DeepEP and HybridEP send each row's score with the row; the other
+            # dispatchers return None and apply the scores in combine.
+            received_scores_R = self.token_dispatcher.received_scores(metadata)
+            if received_scores_R is not None:
+                # w2 is linear, so scaling its input scales its output: the multiply runs on
+                # F columns instead of D, and the score's gradient reads hidden_RF, not w2's output.
+                assert (
+                    getattr(self.w2, "bias", None) is None
+                    and self.output_postprocess is None
+                ), (
+                    f"With {type(self.token_dispatcher).__name__}, the routing scores scale "
+                    "w2's input, which needs a w2 without bias and no output_postprocess."
+                )
+                # TODO: fold this multiply into the SwiGLU region, where it is free: another
+                # -1.8% at 4k and -2.4% at 16k tokens/rank for 2 DSv3 MoE layers (H100, EP=8).
+                # It needs the score as an activation argument (pytorch/torchtitan#5086 changes it).
+                scores_R1 = received_scores_R.to(hidden_RF.dtype).unsqueeze(1)
+                hidden_RF = hidden_RF * scores_R1
             routed_output_RD = self.w2(hidden_RF, offsets_E)
             remat.recompute_needs_tensor(routed_output_RD)
             routed_output_RD = routed_output_RD.type_as(routed_input_RD)

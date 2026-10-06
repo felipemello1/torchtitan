@@ -23,8 +23,8 @@ whether dispatch syncs with the host:
   CUDA-graph-capturable. ``recv_x`` reserves ``num_tokens_per_rank * ep_size * top_k``
   rows; the rows past ``sum(num_recv_per_expert)`` are unused.
 
-Routing scores are applied to expert outputs in plain PyTorch (in ``combine_tokens``,
-before the pure-reduction combine op), so autograd handles the score gradient and the
+Routing scores arrive with the rows (``recv_scores``), and ``RoutedExperts`` multiplies
+them into w2's input in plain PyTorch, so autograd handles the score gradient and the
 custom ops stay pure communication.
 """
 
@@ -366,7 +366,7 @@ def get_buffer(
 
 @dataclass
 class DispatchState:
-    """State from dispatch needed for combine."""
+    """State from dispatch: the handle for combine and each received row's routing score."""
 
     handle_id: torch.Tensor  # CPU tensor used to retrieve the cached EPHandle
     recv_scores: torch.Tensor  # one routing score per received row
@@ -386,8 +386,8 @@ def dispatch_tokens(
 ) -> tuple[torch.Tensor, torch.Tensor, DispatchState]:
     """Dispatch tokens to experts via DeepEP v2 ``ElasticBuffer``.
 
-    Returns the received rows grouped by local expert, ready for the grouped GEMM. Routing
-    scores are applied to the expert outputs in ``combine_tokens``.
+    Returns the received rows grouped by local expert, ready for the grouped GEMM. Their
+    routing scores are in ``state.recv_scores``.
 
     Args:
         hidden_states: Input tokens [num_tokens, hidden_dim]
@@ -445,8 +445,8 @@ def dispatch_tokens(
         num_tokens_per_rank=num_tokens_per_rank,
         cuda_graph_compatible=cuda_graph_compatible,
     )
-    # The saved region is skipped during replay, while the caller (grouped GEMM, score
-    # multiply in combine_tokens) still runs and needs its original outputs.
+    # The saved region is skipped during replay, while the caller (grouped GEMM,
+    # RoutedExperts' score multiply) still runs and needs its original outputs.
     remat.recompute_needs_tensor(recv_x, recv_scores, num_recv_per_expert, handle_id)
 
     state = DispatchState(handle_id=handle_id, recv_scores=recv_scores)
@@ -462,12 +462,10 @@ def combine_tokens(
 ) -> torch.Tensor:
     """Combine expert outputs back to tokens via DeepEP v2.
 
-    Routing scores are applied here (in plain PyTorch) before the pure-reduction combine
-    op, so autograd handles the score gradient. Combine is async; the caller MUST call
-    ``sync_combine()`` before using the result.
+    Combine is async; the caller MUST call ``sync_combine()`` before using the result.
 
     Args:
-        hidden_states: Raw (unweighted) expert outputs [num_recv, hidden].
+        hidden_states: Expert outputs, already scaled by their routing scores [num_recv, hidden].
         state: Dispatch state from ``dispatch_tokens``.
         remat_region_name: Name for the combine communication region.
         recompute: Whether to replay the combine communication during backward.
@@ -478,9 +476,6 @@ def combine_tokens(
     # Outer grad state decides whether the combine op frees the handle itself (no
     # backward) or leaves it for combine-backward. Evaluated here, before the op.
     will_backward = torch.is_grad_enabled()
-
-    recv_scores = state.recv_scores.to(hidden_states.dtype)
-    hidden_states = hidden_states * recv_scores.unsqueeze(1)
 
     combined = remat.region(
         torch.ops.deepep.combine,

@@ -87,9 +87,30 @@ class _IdentityDispatcher(nn.Module):
         del topk_scores_TK, topk_expert_ids_TK
         return x_TD, num_local_tokens_per_expert_E, None
 
+    def received_scores(self, metadata):
+        del metadata
+        return None
+
     def combine(self, routed_output_RD, metadata, x_TD):
         del metadata, x_TD
         return routed_output_RD
+
+
+class _RowScoresDispatcher(_IdentityDispatcher):
+    """Sends each row's routing score with the row, as DeepEP and HybridEP do."""
+
+    def dispatch(
+        self,
+        x_TD,
+        topk_scores_TK,
+        topk_expert_ids_TK,
+        num_local_tokens_per_expert_E,
+    ):
+        del topk_expert_ids_TK
+        return x_TD, num_local_tokens_per_expert_E, topk_scores_TK.view(-1)
+
+    def received_scores(self, metadata):
+        return metadata
 
 
 class _AddOneW13(nn.Module):
@@ -159,6 +180,32 @@ class TestMoE(unittest.TestCase):
         expected_RF = activation_fn.build()(gate_RF, up_RF)
         actual_RF = experts.activation_fn(gate_RF, up_RF)
         torch.testing.assert_close(actual_RF, expected_RF)
+
+    def test_routed_experts_scale_w2_input_by_received_scores(self):
+        routed_experts = make_routed_experts_config(
+            dim=4,
+            hidden_dim=4,
+            num_experts=2,
+            top_k=1,
+            param_init={},
+        ).build()
+        routed_experts.w13 = _AddOneW13()
+        routed_experts.activation_fn = _SelectGate()
+        routed_experts.w2 = _IdentityW2()
+        routed_experts.token_dispatcher = _RowScoresDispatcher()
+        x_TD = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        scores_TK = torch.tensor([[2.0], [3.0]])
+        args = (
+            x_TD,
+            scores_TK,
+            torch.zeros(2, 1, dtype=torch.int64),
+            torch.tensor([2, 0]),
+        )
+        torch.testing.assert_close(routed_experts(*args), (x_TD + 1) * scores_TK)
+
+        routed_experts.output_postprocess = nn.Identity()
+        with self.assertRaisesRegex(AssertionError, "w2 without bias"):
+            routed_experts(*args)
 
     def test_routed_experts_own_postprocess_before_combine(self):
         config = replace(

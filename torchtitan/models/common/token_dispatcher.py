@@ -56,6 +56,12 @@ class LocalTokenDispatcher(Module):
     def init_buffer(self) -> None:
         """Initialize backend communication buffers, if any."""
 
+    def received_scores(self, metadata: object) -> torch.Tensor | None:
+        """Each routed row's routing score ``(R,)`` if it arrives with the row, so
+        ``RoutedExperts`` applies it before w2; None if ``combine`` applies the scores."""
+        del metadata
+        return None
+
     def _local_reorder(
         self,
         x_TD: torch.Tensor,
@@ -853,6 +859,11 @@ class DeepEPTokenDispatcher(BaseEPTokenDispatcher):
         return hidden_states_RD, num_global_tokens_per_local_expert_e, metadata
 
     # pyrefly: ignore [bad-override]
+    def received_scores(self, metadata: EPDispatchMetadata) -> torch.Tensor:
+        """DeepEP sends each routed row's score with the row."""
+        return metadata.state.recv_scores  # pyrefly: ignore [missing-attribute]
+
+    # pyrefly: ignore [bad-override]
     def combine(
         self,
         routed_output_RD: torch.Tensor,
@@ -980,6 +991,11 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
 
         metadata = EPDispatchMetadata(state=state)
         return hidden_states_RD, num_global_tokens_per_local_expert_e, metadata
+
+    # pyrefly: ignore [bad-override]
+    def received_scores(self, metadata: EPDispatchMetadata) -> torch.Tensor | None:
+        """HybridEP permutes each routed row's score with the row."""
+        return metadata.state.permuted_scores  # pyrefly: ignore [missing-attribute]
 
     # pyrefly: ignore [bad-override]
     def combine(
