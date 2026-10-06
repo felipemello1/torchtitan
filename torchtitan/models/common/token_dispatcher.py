@@ -997,10 +997,8 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
         HybridEP's combine kernel only sums rows, so without this ``combine_tokens``
         scales the ``(R, D)`` expert output in an extra eager pass.
         """
-        from torchtitan.distributed.deepep.hybridep import DispatchState
-
         state = metadata.state
-        assert isinstance(state, DispatchState)
+        # pyrefly: ignore [missing-attribute]
         scores_R, state.permuted_scores = state.permuted_scores, None
         return scores_R
 

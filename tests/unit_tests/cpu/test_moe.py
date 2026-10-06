@@ -18,7 +18,13 @@ from spmd_types import SpmdType
 from torchtitan.distributed.deepep.hybridep import DispatchHandle, DispatchState
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import _per_axis_types
-from torchtitan.models.common.activation import Sigmoid, SiTUGLU, Softmax, SqrtSoftplus
+from torchtitan.models.common.activation import (
+    Sigmoid,
+    SiTUGLU,
+    Softmax,
+    SqrtSoftplus,
+    SwiGLU,
+)
 from torchtitan.models.common.config_utils import (
     make_moe_config,
     make_routed_experts_config,
@@ -121,9 +127,11 @@ class _SumOnlyDispatcher(_IdentityDispatcher):
     def __init__(self, scores_R):
         super().__init__()
         self.scores_R = scores_R
+        self.taken = False
 
     def take_routed_scores(self, metadata):
         del metadata
+        self.taken = True
         return self.scores_R
 
 
@@ -204,7 +212,47 @@ class TestMoE(unittest.TestCase):
         expected_TD = (hidden_TD * scores_R.unsqueeze(-1)).bfloat16().float()
         torch.testing.assert_close(output_TD, expected_TD)
 
-    def test_hybridep_take_routed_scores_leaves_combine_a_plain_sum(self):
+    def test_routed_experts_leave_scores_to_combine_unless_exact(self):
+        class _SwiGLUSubclass(SwiGLU):
+            pass
+
+        postprocess = RMSNorm.Config(normalized_shape=4).build()
+        with torch.no_grad():
+            postprocess.weight.fill_(1.0)
+        biased_w2 = _IdentityW2()
+        biased_w2.bias = nn.Parameter(torch.zeros(4))
+        # Each case breaks w2(h * s) == s * w2(h), or could drop the scores.
+        cases = {
+            "output_postprocess": ("output_postprocess", postprocess),
+            "w2_bias": ("w2", biased_w2),
+            "swiglu_subclass": ("activation_fn", _SwiGLUSubclass(SwiGLU.Config())),
+        }
+        x_TD = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        for name, (attribute, module) in cases.items():
+            with self.subTest(name):
+                routed_experts = make_routed_experts_config(
+                    dim=4,
+                    hidden_dim=4,
+                    num_experts=2,
+                    top_k=1,
+                    param_init={},
+                ).build()
+                routed_experts.w13 = _AddOneW13()
+                routed_experts.w2 = _IdentityW2()
+                dispatcher = _SumOnlyDispatcher(torch.tensor([0.5, 2.0]))
+                routed_experts.token_dispatcher = dispatcher
+                setattr(routed_experts, attribute, module)
+
+                routed_experts(
+                    x_TD,
+                    torch.ones(2, 1),
+                    torch.zeros(2, 1, dtype=torch.int64),
+                    torch.tensor([2, 0]),
+                )
+
+                self.assertFalse(dispatcher.taken)
+
+    def test_hybridep_take_routed_scores_returns_and_clears_state_scores(self):
         dispatcher = HybridEPTokenDispatcher.Config(num_experts=4, top_k=2).build()
         scores_R = torch.rand(6)
         state = DispatchState(handle=DispatchHandle(), permuted_scores=scores_R)
