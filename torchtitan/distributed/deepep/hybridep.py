@@ -216,7 +216,9 @@ def _dispatch_fake(
             pad_multiple=pad_multiple,
         )
     else:
-        out_tokens = x.shape[0]
+        # Blocking dispatch sizes its output on the host from the routing, so the
+        # row count is data dependent.
+        out_tokens = torch.library.get_ctx().new_dynamic_size()
     hidden = x.new_empty(out_tokens, x.shape[1])
     scores = x.new_empty(out_tokens, dtype=torch.float32)
     tpe = x.new_empty(num_local_experts, dtype=torch.int64)
