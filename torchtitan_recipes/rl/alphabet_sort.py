@@ -738,14 +738,14 @@ def rl_grpo_qwen3_moe_debug_deepep() -> Controller.Config:
     Same EP/TP/DP layout as ``rl_grpo_qwen3_moe_debug_varlen`` (trainer FSDP=2/TP=2/EP=4,
     generator DP=2/TP=2/EP=4), but the MoE uses the DeepEP v2 comm backend. Unlike the
     standard all-to-all -- whose unpinned D2H split-size copy blocks CUDA graph capture, so
-    that config disables it -- DeepEP v2's inference dispatch is a static, host-sync-free
-    EXPAND layout, so this generator enables CUDA graph capture.
+    that config disables it -- DeepEP v2's inference dispatch can skip its host sync, so
+    this generator enables CUDA graph capture.
 
-    Per-role config from one shared model config: the trainer uses it as-is (compact,
-    host-synced, backward-able DeepEP path), while the generator applies per-actor
+    Per-role config from one shared model config: the trainer uses it as-is (host-synced,
+    backward-able DeepEP path), while the generator applies per-actor
     overrides (``generator.override``) to its own copy (``fused_swiglu`` +
-    ``deepep_override`` with ``cuda_graph_compatible=True``) to switch its dispatchers to the
-    CUDA-graph-compatible EXPAND layout. The overrides touch only the generator's spec, so the
+    ``deepep_override`` with ``cuda_graph_compatible=True``) to drop the dispatch's host
+    sync for CUDA graph capture. The overrides touch only the generator's spec, so the
     trainer and weight sync are unaffected.
     """
     config = rl_grpo_qwen3_moe_debug_varlen()
@@ -767,7 +767,7 @@ def rl_grpo_qwen3_moe_debug_deepep() -> Controller.Config:
             ),
         ),
     )
-    # Generator-only overrides -> CUDA-graph-compatible DeepEP EXPAND dispatch; trainer keeps compact.
+    # Generator-only overrides -> DeepEP dispatch without a host sync; trainer keeps host sync.
     config.generator.override = OverrideConfig(
         imports=[
             "torchtitan_recipes.overrides.fused_swiglu.fused_swiglu",

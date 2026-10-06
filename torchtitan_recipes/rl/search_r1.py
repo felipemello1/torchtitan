@@ -211,9 +211,9 @@ def rl_grpo_qwen3_30b_a3b_deepep_search_r1_perf() -> Controller.Config:
     DeepEP v2 runs multi-node on H100 (NVLink intra-node + IB/RoCE inter-node), so unlike
     a HybridEP generator (whose all-to-all is intra-node only) this generator may span
     nodes. Qwen3-30B-A3B has 4 KV heads, so the generator TP must be <=4. The trainer
-    keeps the compact (host-synced, backward-able) DeepEP path; the generator applies the
-    ``deepep_override`` to switch its dispatchers to the CUDA-graph-compatible EXPAND
-    layout. Applies the same ``fused_swiglu`` performance override as
+    keeps the host-synced, backward-able DeepEP path; the generator applies the
+    ``deepep_override`` to drop the dispatch's host sync for CUDA graph capture. Applies
+    the same ``fused_swiglu`` performance override as
     ``rl_grpo_qwen3_30b_a3b_varlen_perf``.
     """
     seq_len = 4096
@@ -285,7 +285,7 @@ def rl_grpo_qwen3_30b_a3b_deepep_search_r1_perf() -> Controller.Config:
             cuda_graph=VLLMCudaGraphConfig(mode="FULL"),
             checkpointer=None,
             sampling=SamplingConfig(temperature=1.0, top_p=1.0, max_tokens=512),
-            # Generator-only: DeepEP CUDA graph EXPAND dispatch on top of the perf overrides.
+            # Generator-only: DeepEP dispatch without a host sync, on top of the perf overrides.
             override=OverrideConfig(
                 imports=[
                     *perf_imports,
