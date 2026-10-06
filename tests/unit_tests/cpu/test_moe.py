@@ -61,6 +61,8 @@ class _PassthroughRoutedExperts(nn.Module):
         topk_scores_TK,
         topk_expert_ids_TK,
         num_local_tokens_per_expert_E,
+        *,
+        padding_mask_T=None,
     ):
         self.num_tokens_per_expert_E = num_local_tokens_per_expert_E
         return x_TD
