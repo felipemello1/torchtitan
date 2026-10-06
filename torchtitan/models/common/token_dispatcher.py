@@ -127,6 +127,14 @@ class LocalTokenDispatcher(Module):
         )
         return routed_input_RD, num_local_tokens_per_expert_E, metadata
 
+    def take_routed_scores(self, metadata: object) -> torch.Tensor | None:
+        """Return per-row routing scores for the experts to apply, or None.
+
+        None means ``combine`` applies the scores, as this dispatcher does.
+        """
+        del metadata
+        return None
+
     def combine(
         self,
         routed_output_RD: torch.Tensor,
@@ -981,6 +989,20 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
 
         metadata = EPDispatchMetadata(state=state)
         return hidden_states_RD, num_global_tokens_per_local_expert_e, metadata
+
+    # pyrefly: ignore [bad-override]
+    def take_routed_scores(self, metadata: EPDispatchMetadata) -> torch.Tensor | None:
+        """Hand the ``(R,)`` routing scores to the experts, so ``combine`` only sums.
+
+        HybridEP's combine kernel only sums rows, so without this ``combine_tokens``
+        scales the ``(R, D)`` expert output in an extra eager pass.
+        """
+        from torchtitan.distributed.deepep.hybridep import DispatchState
+
+        state = metadata.state
+        assert isinstance(state, DispatchState)
+        scores_R, state.permuted_scores = state.permuted_scores, None
+        return scores_R
 
     # pyrefly: ignore [bad-override]
     def combine(

@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from spmd_types import SpmdType
 
+from torchtitan.distributed.deepep.hybridep import DispatchHandle, DispatchState
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import _per_axis_types
 from torchtitan.models.common.activation import Sigmoid, SiTUGLU, Softmax, SqrtSoftplus
@@ -47,6 +48,10 @@ from torchtitan.models.common.moe_sharding import (
     set_moe_sharding_config,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.common.token_dispatcher import (
+    EPDispatchMetadata,
+    HybridEPTokenDispatcher,
+)
 
 
 class _PassthroughRoutedExperts(nn.Module):
@@ -110,6 +115,18 @@ class _IdentityW2(nn.Module):
         return hidden_RD
 
 
+class _SumOnlyDispatcher(_IdentityDispatcher):
+    """Identity dispatch whose combine only sums, so the experts apply the scores."""
+
+    def __init__(self, scores_R):
+        super().__init__()
+        self.scores_R = scores_R
+
+    def take_routed_scores(self, metadata):
+        del metadata
+        return self.scores_R
+
+
 class TestMoE(unittest.TestCase):
     def test_make_router_config_requires_score_func(self):
         with self.assertRaisesRegex(TypeError, "score_func"):
@@ -159,6 +176,43 @@ class TestMoE(unittest.TestCase):
         expected_RF = activation_fn.build()(gate_RF, up_RF)
         actual_RF = experts.activation_fn(gate_RF, up_RF)
         torch.testing.assert_close(actual_RF, expected_RF)
+
+    def test_routed_experts_apply_taken_scores_in_swiglu(self):
+        config = make_routed_experts_config(
+            dim=4,
+            hidden_dim=4,
+            num_experts=2,
+            top_k=1,
+            param_init={},
+        )
+        routed_experts = config.build()
+        routed_experts.w13 = _AddOneW13()
+        routed_experts.w2 = _IdentityW2()
+        scores_R = torch.tensor([0.5, 2.0])
+        routed_experts.token_dispatcher = _SumOnlyDispatcher(scores_R)
+        x_TD = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+        output_TD = routed_experts(
+            x_TD,
+            torch.ones(2, 1),
+            torch.zeros(2, 1, dtype=torch.int64),
+            torch.tensor([2, 0]),
+        )
+        # Routed experts run in bf16.
+        x_bf16_TD = x_TD.bfloat16()
+        hidden_TD = F.silu(x_bf16_TD + 1) * x_bf16_TD
+        expected_TD = (hidden_TD * scores_R.unsqueeze(-1)).bfloat16().float()
+        torch.testing.assert_close(output_TD, expected_TD)
+
+    def test_hybridep_take_routed_scores_leaves_combine_a_plain_sum(self):
+        dispatcher = HybridEPTokenDispatcher.Config(num_experts=4, top_k=2).build()
+        scores_R = torch.rand(6)
+        state = DispatchState(handle=DispatchHandle(), permuted_scores=scores_R)
+
+        taken_R = dispatcher.take_routed_scores(EPDispatchMetadata(state=state))
+
+        self.assertIs(taken_R, scores_R)
+        self.assertIsNone(state.permuted_scores)
 
     def test_routed_experts_own_postprocess_before_combine(self):
         config = replace(

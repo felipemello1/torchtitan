@@ -137,7 +137,18 @@ class RoutedExperts(Module):
             )(routed_input_RD.bfloat16(), offsets_E)
             remat.recompute_needs_tensor(gate_up_R2F)
             gate_RF, up_RF = gate_up_R2F.unbind(dim=-2)
-            hidden_RF = self.activation_fn(gate_RF, up_RF, offsets=offsets_E)
+            # w2 is linear, so scaling its input by the routing score equals scaling
+            # its output; inside SwiGLU's region the multiply costs no extra pass.
+            # A postprocess on the w2 output would break that equality.
+            scores_R = None
+            if self.output_postprocess is None and isinstance(
+                self.activation_fn, SwiGLU
+            ):
+                scores_R = self.token_dispatcher.take_routed_scores(metadata)
+            if scores_R is None:
+                hidden_RF = self.activation_fn(gate_RF, up_RF, offsets=offsets_E)
+            else:
+                hidden_RF = self.activation_fn(gate_RF, up_RF, scores=scores_R)
             routed_output_RD = remat.region(
                 self.w2,
                 self.remat_region_name("w2"),
