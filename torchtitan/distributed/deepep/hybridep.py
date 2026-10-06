@@ -303,17 +303,14 @@ def _combine_bwd_impl(
     if _buffer is None:
         raise RuntimeError("HybridEP buffer not initialized.")
 
+    # Pass probs even when this rank received no tokens (empty grad_scores). Its own
+    # tokens' probs gradients come from the ranks that received them, and combine
+    # sends them back only if every rank runs it with probs.
     grad_x, grad_probs_dense = _buffer.combine_with_unpermute(
         hidden=grad_hidden,
-        probs=grad_scores if grad_scores.numel() > 0 else None,
+        probs=grad_scores,
         handle=handle.value,
     )
-    if grad_probs_dense is None:
-        # No probs went into combine (this rank received no tokens), so it returned no
-        # probs gradient; return the fake's shape so traced and eager outputs agree.
-        grad_probs_dense = grad_hidden.new_zeros(
-            num_tokens, num_experts, dtype=torch.float32
-        )
     return grad_x, grad_probs_dense
 
 
