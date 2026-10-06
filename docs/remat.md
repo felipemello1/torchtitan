@@ -187,7 +187,8 @@ communication regions:
 - Routed-expert `w13` and `w2` grouped projections (`w13.grouped_mm`,
   `w2.grouped_mm`).
 - Token-dispatcher `ep_communication`, which controls the token-count exchange,
-  dispatch, and combine collectives together.
+  dispatch, and combine collectives together. DeepEP ignores it and always
+  retains its dispatch and combine.
 - Shared-expert linear regions. The shared `w2.tp_reduce` region is the
   `Partial -> Shard(0)` reduce-scatter when sequence parallelism is enabled;
   save it together with `w2.linear`.
