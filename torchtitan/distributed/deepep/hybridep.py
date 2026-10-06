@@ -216,7 +216,9 @@ def _dispatch_fake(
             pad_multiple=pad_multiple,
         )
     else:
-        out_tokens = x.shape[0]
+        # Blocking dispatch sizes its output on the host from the routing, so the
+        # row count is data dependent.
+        out_tokens = torch.library.get_ctx().new_dynamic_size()
     hidden = x.new_empty(out_tokens, x.shape[1])
     scores = x.new_empty(out_tokens, dtype=torch.float32)
     tpe = x.new_empty(num_local_experts, dtype=torch.int64)
@@ -307,8 +309,10 @@ def _combine_bwd_impl(
         handle=handle.value,
     )
     if grad_probs_dense is None:
-        grad_probs_dense = torch.empty(
-            0, device=grad_hidden.device, dtype=torch.float32
+        # No probs went into combine (this rank received no tokens), so it returned no
+        # probs gradient; return the fake's shape so traced and eager outputs agree.
+        grad_probs_dense = grad_hidden.new_zeros(
+            num_tokens, num_experts, dtype=torch.float32
         )
     return grad_x, grad_probs_dense
 
@@ -324,12 +328,9 @@ def _combine_bwd_fake(
     """Fake combine_bwd for torch.compile tracing."""
     hidden_dim = grad_hidden.shape[1]
     grad_x = grad_hidden.new_empty(num_tokens, hidden_dim)
-    if grad_scores.numel() > 0:
-        grad_probs_dense = grad_hidden.new_empty(
-            num_tokens, num_experts, dtype=torch.float32
-        )
-    else:
-        grad_probs_dense = grad_hidden.new_empty(0, dtype=torch.float32)
+    grad_probs_dense = grad_hidden.new_empty(
+        num_tokens, num_experts, dtype=torch.float32
+    )
     return grad_x, grad_probs_dense
 
 
