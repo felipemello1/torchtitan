@@ -71,6 +71,39 @@ def test_combine_backward_fake_matches_a_rank_with_no_tokens():
     assert grad_probs.shape == (NUM_TOKENS, NUM_EXPERTS)
 
 
+class _RecordingBuffer:
+    """Stands in for the HybridEP buffer and records the probs combine receives."""
+
+    def __init__(self):
+        self.probs = None
+
+    def combine_with_unpermute(self, *, hidden, probs, handle):
+        del handle
+        self.probs = probs
+        grad_x = hidden.new_zeros(NUM_TOKENS, HIDDEN_DIM)
+        return grad_x, torch.zeros(NUM_TOKENS, NUM_EXPERTS)
+
+
+def test_combine_backward_passes_probs_on_a_rank_with_no_tokens(monkeypatch):
+    buffer = _RecordingBuffer()
+    monkeypatch.setattr(hybridep, "_buffer", buffer)
+    grad_scores = torch.empty(0)
+
+    # The op only has a CUDA kernel, so call its eager implementation directly
+    # (CustomOpDef._init_fn is private torch API).
+    hybridep._combine_bwd_impl._init_fn(
+        torch.empty(0, HIDDEN_DIM, dtype=torch.bfloat16),
+        grad_scores,
+        hybridep.DispatchHandle(),
+        NUM_TOKENS,
+        NUM_EXPERTS,
+    )
+
+    # Every rank must run combine with probs, or the gradients that other ranks
+    # computed for this rank's routing scores never come back.
+    assert buffer.probs is not None
+
+
 def test_non_blocking_dispatch_fake_rows_are_the_capacity():
     capacity_factor = 0.5
     with FakeTensorMode(shape_env=ShapeEnv()):
