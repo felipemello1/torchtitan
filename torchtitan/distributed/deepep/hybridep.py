@@ -309,7 +309,8 @@ def _combine_bwd_impl(
         handle=handle.value,
     )
     if grad_probs_dense is None:
-        # A rank that received no tokens has no scores, so their gradient is zero.
+        # No probs went into combine (this rank received no tokens), so it returned no
+        # probs gradient; return the fake's shape so traced and eager outputs agree.
         grad_probs_dense = grad_hidden.new_zeros(
             num_tokens, num_experts, dtype=torch.float32
         )
