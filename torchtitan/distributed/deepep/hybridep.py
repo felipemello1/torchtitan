@@ -70,7 +70,8 @@ class DispatchState:
 
     Attributes:
         handle: Opaque dispatch handle wrapping the deep_ep handle.
-        permuted_scores: Routing scores applied to expert outputs in combine.
+        permuted_scores: fp32 routing score per permuted row. combine_tokens applies
+            it unless the experts took it (HybridEPTokenDispatcher.take_routed_scores).
         num_tokens: Original input token count (for combine fake shape inference).
     """
 
@@ -467,8 +468,8 @@ def dispatch_tokens(
 ) -> tuple[torch.Tensor, torch.Tensor, DispatchState]:
     """Dispatch tokens to experts via HybridEP all-to-all.
 
-    Routing scores are applied to the expert outputs in ``combine_tokens``,
-    after expert computation.
+    The routing scores come back in ``state``; the experts or ``combine_tokens``
+    apply them.
 
     Args:
         hidden_states: [num_tokens, hidden_dim]
@@ -513,10 +514,6 @@ def dispatch_tokens(
         pad_multiple,
     )
 
-    # Routing scores are applied to expert outputs in combine_tokens.
-    if permuted_scores is not None and permuted_scores.dtype != hidden.dtype:
-        permuted_scores = permuted_scores.to(hidden.dtype)
-
     state = DispatchState(
         handle=dispatch_handle,
         permuted_scores=permuted_scores,
@@ -535,7 +532,8 @@ def combine_tokens(
     Applies deferred scores (if any), then unpermutes via the opaque dispatch handle.
     """
     if state.permuted_scores is not None:
-        hidden_states = hidden_states * state.permuted_scores.reshape(-1, 1)
+        scores_R1 = state.permuted_scores.to(hidden_states.dtype).reshape(-1, 1)
+        hidden_states = hidden_states * scores_R1
 
     return torch.ops.hybridep.combine(
         hidden_states, state.handle, state.num_tokens, pad_multiple
