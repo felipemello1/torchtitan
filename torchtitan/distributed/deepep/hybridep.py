@@ -41,8 +41,11 @@ class DispatchHandle(CustomClassBase):
     the need for a global handle cache.
     """
 
-    def __init__(self, value=None):
+    def __init__(self, value=None, fuse_permute=False, fuse_unpermute=False):
         self.value = value
+        # Which later calls with this handle fuse; set in _dispatch_impl.
+        self.fuse_permute = fuse_permute  # dispatch_bwd
+        self.fuse_unpermute = fuse_unpermute  # combine and combine_bwd
 
     def __eq__(self, other):
         if not isinstance(other, DispatchHandle):
@@ -125,10 +128,11 @@ def _dispatch_impl(
     non_blocking: bool = False,
     moe_expert_capacity_factor: float | None = None,
     pad_multiple: int | None = None,
+    fuse_permute: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, DispatchHandle]:
     """
     DeepEP's dispatch_with_permute needs to know the output buffer size
-    (num_permuted_tokens) for the fused permute kernel.
+    (num_permuted_tokens) for the permute output.
 
     * **non_blocking=True** — no D2H sync is allowed, so num_permuted_tokens
       must be supplied upfront via moe_expert_capacity_factor.
@@ -151,10 +155,19 @@ def _dispatch_impl(
     )
 
     num_permuted_tokens = None
+    # HybridEP's fused unpermute hangs on a token whose local experts were all dropped,
+    # so combine fuses only when no token can drop: blocking, or capacity >= 1 without
+    # pad_multiple (padding can still drop tokens at capacity 1).
+    # TODO: also fuse at capacity < 1 once HybridEP's fused combine handles such tokens
+    # (CUDA-graph step at capacity 0.15: -3.6% instead of -2.1% vs main, H100).
+    fuse_unpermute = fuse_permute
     if non_blocking:
         assert (
             moe_expert_capacity_factor is not None
         ), "moe_expert_capacity_factor is required for non_blocking dispatch"
+        fuse_unpermute = (
+            fuse_permute and moe_expert_capacity_factor >= 1.0 and pad_multiple is None
+        )
         num_permuted_tokens = _num_permuted_tokens_for_non_blocking(
             x.shape[0],
             ep_size,
@@ -173,12 +186,13 @@ def _dispatch_impl(
         pad_multiple=pad_multiple,
         num_permuted_tokens=num_permuted_tokens,
         non_blocking=non_blocking,
+        fuse_permute_dispatch=fuse_permute,
     )
 
     # NOTE: In non_blocking mode, overflow_flag lives on GPU so checking it
     # (.item()) would force cudaStreamSynchronize, defeating the purpose.
-    # Overflow is governed by num_permuted_tokens (the output buffer capacity
-    # for the fused permute kernel) — tokens whose permuted offset exceeds
+    # Overflow is governed by num_permuted_tokens (the permute output's
+    # capacity) — tokens whose permuted offset exceeds
     # that limit are silently dropped.  Correct sizing of num_permuted_tokens
     # via _num_permuted_tokens_for_non_blocking is therefore critical:
     # capacity_factor=1.0 → worst-case sizing, no drops, most memory;
@@ -189,7 +203,14 @@ def _dispatch_impl(
     if tokens_per_expert.device != x.device:
         tokens_per_expert = tokens_per_expert.to(x.device)
 
-    return hidden, scores, tokens_per_expert, DispatchHandle(value=handle)
+    return (
+        hidden,
+        scores,
+        tokens_per_expert,
+        DispatchHandle(
+            value=handle, fuse_permute=fuse_permute, fuse_unpermute=fuse_unpermute
+        ),
+    )
 
 
 @_dispatch_impl.register_fake
@@ -203,6 +224,7 @@ def _dispatch_fake(
     non_blocking: bool = False,
     moe_expert_capacity_factor: float | None = None,
     pad_multiple: int | None = None,
+    fuse_permute: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, DispatchHandle]:
     """Fake dispatch for torch.compile tracing."""
     num_local_experts = num_experts // ep_size
@@ -235,7 +257,9 @@ def _combine_impl(
     if _buffer is None:
         raise RuntimeError("HybridEP buffer not initialized.")
 
-    combined, _ = _buffer.combine_with_unpermute(hidden=x, handle=handle.value)
+    combined, _ = _buffer.combine_with_unpermute(
+        hidden=x, handle=handle.value, fuse_unpermute_combine=handle.fuse_unpermute
+    )
     return combined
 
 
@@ -273,6 +297,7 @@ def _dispatch_bwd_impl(
         handle=handle.value,
         num_permuted_tokens=num_permuted_tokens,
         pad_multiple=pad_multiple,
+        fuse_permute_dispatch=handle.fuse_permute,
     )
     return grad_x
 
@@ -305,6 +330,7 @@ def _combine_bwd_impl(
         hidden=grad_hidden,
         probs=grad_scores if grad_scores.numel() > 0 else None,
         handle=handle.value,
+        fuse_unpermute_combine=handle.fuse_unpermute,
     )
     if grad_probs_dense is None:
         grad_probs_dense = torch.empty(
@@ -336,7 +362,7 @@ def _combine_bwd_fake(
 def _dispatch_backward(ctx, grad_hidden, grad_scores, grad_tpe, grad_handle):
     """Backward: gather gradients via combine_bwd op."""
     if grad_hidden is None:
-        return None, None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None
 
     (topk_idx,) = ctx.saved_tensors
     num_tokens = topk_idx.shape[0]
@@ -352,13 +378,14 @@ def _dispatch_backward(ctx, grad_hidden, grad_scores, grad_tpe, grad_handle):
         else None
     )
     # Gradients for: x, topk_idx, topk_weights, num_experts, ep_size, group,
-    #                non_blocking, moe_expert_capacity_factor, pad_multiple
-    return grad_x, None, grad_weights, None, None, None, None, None, None
+    #                non_blocking, moe_expert_capacity_factor, pad_multiple,
+    #                fuse_permute
+    return grad_x, None, grad_weights, None, None, None, None, None, None, None
 
 
 def _dispatch_setup_context(ctx, inputs, output):
     """Save context for dispatch backward."""
-    x, topk_idx, _, num_experts, _, _, _, _, _ = inputs
+    x, topk_idx, _, num_experts, _, _, _, _, _, _ = inputs
     _, _, _, dispatch_handle = output
     ctx.dispatch_handle = dispatch_handle
     ctx.input_dtype = x.dtype
@@ -464,6 +491,7 @@ def dispatch_tokens(
     *,
     non_blocking_expert_capacity_factor: float | None = None,
     pad_multiple: int | None = None,
+    fuse_permute: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, DispatchState]:
     """Dispatch tokens to experts via HybridEP all-to-all.
 
@@ -484,6 +512,7 @@ def dispatch_tokens(
             pad_multiple.
         pad_multiple: Pad per-expert token groups to this multiple (e.g. 32 for
             MXFP8). None means no padding.
+        fuse_permute: See ``HybridEPTokenDispatcher.Config.fuse_permute``.
 
     Returns:
         (permuted_hidden, tokens_per_expert, state)
@@ -511,6 +540,7 @@ def dispatch_tokens(
         non_blocking,
         non_blocking_expert_capacity_factor,
         pad_multiple,
+        fuse_permute,
     )
 
     # Routing scores are applied to expert outputs in combine_tokens.
