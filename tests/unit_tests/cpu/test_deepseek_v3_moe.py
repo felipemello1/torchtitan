@@ -186,6 +186,8 @@ class TestDeepSeekV3Router(unittest.TestCase):
         self.assertIs(type(shared_experts.w2), SharedExpertRowParallelLinear.Config)
 
     def test_hybridep_recipes_compile_the_router_region(self):
+        # Imported here: the recipes module pulls in trainer, dataloader and optimizer
+        # configs that the rest of this file does not need.
         from torchtitan_recipes.tests.models.deepseek_v3 import (
             deepseek_v3_16b_hybridep,
             deepseek_v3_debugmodel_hybridep,
