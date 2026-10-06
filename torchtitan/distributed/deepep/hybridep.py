@@ -26,7 +26,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch._library.opaque_object import CustomClassBase, register_opaque_type
-from torch.fx.experimental.symbolic_shapes import guard_or_true
 
 logger = logging.getLogger(__name__)
 
@@ -310,8 +309,9 @@ def _combine_bwd_impl(
         handle=handle.value,
     )
     if grad_probs_dense is None:
-        grad_probs_dense = torch.empty(
-            0, device=grad_hidden.device, dtype=torch.float32
+        # A rank that received no tokens has no scores, so their gradient is zero.
+        grad_probs_dense = grad_hidden.new_zeros(
+            num_tokens, num_experts, dtype=torch.float32
         )
     return grad_x, grad_probs_dense
 
@@ -327,14 +327,9 @@ def _combine_bwd_fake(
     """Fake combine_bwd for torch.compile tracing."""
     hidden_dim = grad_hidden.shape[1]
     grad_x = grad_hidden.new_empty(num_tokens, hidden_dim)
-    # Blocking dispatch gives grad_scores a data-dependent row count; scores are
-    # empty only when dispatch returned none, so assume they are present.
-    if guard_or_true(grad_scores.numel() > 0):
-        grad_probs_dense = grad_hidden.new_empty(
-            num_tokens, num_experts, dtype=torch.float32
-        )
-    else:
-        grad_probs_dense = grad_hidden.new_empty(0, dtype=torch.float32)
+    grad_probs_dense = grad_hidden.new_empty(
+        num_tokens, num_experts, dtype=torch.float32
+    )
     return grad_x, grad_probs_dense
 
 
