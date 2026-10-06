@@ -27,6 +27,7 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 import torch_remat as remat
+from torch.fx.experimental.symbolic_shapes import guard_or_true
 
 logger = logging.getLogger(__name__)
 
@@ -315,7 +316,9 @@ def _combine_bwd_fake(
     """Fake combine_bwd for torch.compile tracing."""
     hidden_dim = grad_hidden.shape[1]
     grad_x = grad_hidden.new_empty(num_tokens, hidden_dim)
-    if grad_scores.numel() > 0:
+    # Blocking dispatch gives grad_scores a data-dependent row count; scores are
+    # empty only when dispatch returned none, so assume they are present.
+    if guard_or_true(grad_scores.numel() > 0):
         grad_probs_dense = grad_hidden.new_empty(
             num_tokens, num_experts, dtype=torch.float32
         )
