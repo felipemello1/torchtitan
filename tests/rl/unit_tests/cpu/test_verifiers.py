@@ -577,6 +577,70 @@ def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
     assert "characters omitted" in log["tests"]["stdout"]
 
 
+def test_sandoq_tmux_outlives_grading(tmp_path, monkeypatch) -> None:
+    """launch leaves tmux running, so test.sh sees the agent's shell jobs as under `harbor run`;
+    cleanup writes the log with the pane, then kills tmux."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.runtimes import ProgramResult
+
+    monkeypatch.setattr(sandoq, "Terminus2", _terminus2_without_model(sandoq))
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    runtime = _RecordingRuntime(
+        {
+            "tail": ProgramResult(
+                exit_code=0, stdout="$ python3 server.py &\n", stderr=""
+            )
+        }
+    )
+
+    asyncio.run(_launch(harness, trace, runtime))
+    assert not any("kill-server" in " ".join(argv) for argv, _ in runtime.calls)
+
+    asyncio.run(harness.cleanup(trace, runtime))
+    commands = [" ".join(argv) for argv, _ in runtime.calls]
+    pane_read = next(i for i, c in enumerate(commands) if c.startswith("tail"))
+    kill = next(i for i, c in enumerate(commands) if "kill-server" in c)
+    assert pane_read < kill
+    assert _read_rollout_log(tmp_path, trace)["pane"] == "$ python3 server.py &\n"
+
+
+class _RecordingRuntime:
+    """Runtime that records each `run` and answers by the command's first word."""
+
+    def __init__(self, results: dict | None = None) -> None:
+        self.calls: list[tuple[list[str], dict[str, str]]] = []
+        self._results = results or {}
+
+    async def run(self, argv: list[str], env: dict[str, str]):
+        from verifiers.v1.runtimes import ProgramResult
+
+        self.calls.append((argv, env))
+        return self._results.get(
+            argv[0], ProgramResult(exit_code=0, stdout="", stderr="")
+        )
+
+
+def _terminus2_without_model(sandoq):
+    """Terminus-2 that runs no model and no tmux; its session records the keys it is sent."""
+
+    class Session:
+        def __init__(self) -> None:
+            self.keys: list = []
+
+        async def send_keys(self, keys, **kwargs) -> None:
+            self.keys.append(keys)
+
+    class Terminus2WithoutModel(sandoq.Terminus2):
+        async def setup(self, environment) -> None:
+            self._session = Session()
+
+        async def run(self, instruction, environment, context) -> None:
+            pass
+
+    return Terminus2WithoutModel
+
+
 def _sandoq_harness_and_trace(sandoq, log_dir):
     from verifiers.v1.configs.agent import AgentConfig
     from verifiers.v1.trace import AgentInfo, Trace, TraceTask
