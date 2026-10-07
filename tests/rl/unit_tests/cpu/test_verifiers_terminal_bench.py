@@ -118,14 +118,21 @@ def _run_terminus_program(
     async def llm_call(*args: object, message_history: list[dict]) -> list[dict]:
         return message_history
 
+    class RecordingSession:
+        async def send_keys(
+            self, keys: list[str], min_timeout_sec: float = 0.0
+        ) -> None:
+            recorded.calls.append(("send_keys", keys, min_timeout_sec))
+
     class RecordingTerminus2:
         def __init__(self, **kwargs: object) -> None:
             recorded.kwargs.update(kwargs)
             recorded.terminus = self
             self._llm = SimpleNamespace(call=llm_call)
+            self._session = RecordingSession()
 
         async def setup(self, environment: object) -> None:
-            pass
+            recorded.calls.append(("setup",))
 
         async def run(self, instruction: str, *args: object) -> None:
             recorded.calls.append(("run", instruction))
@@ -164,6 +171,16 @@ def test_prompts_reach_terminus2_outside_its_argv(tmp_path, monkeypatch) -> None
         recorded.terminus._llm.call(message_history=[{"role": "user", "content": "hi"}])
     )
     assert history[0] == {"role": "system", "content": "Answer in JSON."}
+
+
+def test_agent_shell_runs_inside_the_login_shell(tmp_path, monkeypatch) -> None:
+    """As under Harbor's terminal recording, an ``exit`` ends only the inner shell."""
+    assert _run_terminus_program(tmp_path, monkeypatch).calls == [
+        ("setup",),
+        ("send_keys", ["bash", "Enter"], 1.0),
+        ("send_keys", ["clear", "Enter"], 0.0),
+        ("run", "Fix the parser in /app."),
+    ]
 
 
 def test_tmux_server_outlives_launch_until_cleanup() -> None:

@@ -13,7 +13,8 @@ This copy runs ``terminus_harness.py`` and adds the ``interleaved_thinking`` and
 ``enable_summarize`` options of
 https://github.com/PrimeIntellect-ai/verifiers/pull/2458, with the same names
 and defaults. To grade as ``harbor run`` does, it also stops tmux only after
-grading and passes the prompts in a file, not argv.
+grading, passes the prompts in a file instead of argv, and runs the agent's shell
+inside the login shell (``terminus_harness.py``).
 
 TODO: once a Verifiers release includes
 https://github.com/PrimeIntellect-ai/verifiers/pull/2458 and the Harbor-parity
