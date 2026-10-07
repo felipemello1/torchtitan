@@ -440,8 +440,8 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
 
 
 def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench() -> Controller.Config:
-    """Qwen3.5-35B-A3B-Base: train on all of TMax-15K, validate on the 78 Terminal-Bench
-    2.1 tasks that fit a small Sandoq VM.
+    """Qwen3.5-35B-A3B-Base: train on all of TMax-15K; no online validation (the 78
+    Terminal-Bench 2.1 tasks that fit a small Sandoq VM are evaluated offline).
 
     16 GB300 GPUs on 4 hosts. Trainer on two: FSDP 4 x TP 2 x EP 4 with Dist-MoE experts.
     Generators: eight TP1 engines, each with every expert, FULL CUDA graphs. 150 turns of
@@ -472,7 +472,8 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench() -> Controller.Config:
         # At most 24 rollouts per env-server worker: each waiting rollout holds one of the
         # worker's 32 executor threads, and Sandoq needs a free thread to ready a VM.
         num_env_workers=math.ceil(sandbox_pool / 24),
-        num_validation_samples=78,
+        # No online eval (Felipe, 2026-10-07): the checkpoints are evaluated offline.
+        num_validation_samples=0,
         num_generators=8,
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=4,
