@@ -624,6 +624,19 @@ def test_sandoq_exec_keeps_keystrokes_out_of_argv() -> None:
     assert output == 'it\'s "quoted" $HOME\n'
 
 
+def test_sandoq_exec_rejects_a_null_byte_like_harbor() -> None:
+    """A command with a NUL byte raises ValueError, as Harbor's subprocess exec does, so the
+    rollout fails as HarnessError instead of a retried SandboxError."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+
+    runtime = _RecordingRuntime()
+    environment = sandoq.RuntimeEnvironment(runtime, {})
+    with pytest.raises(ValueError, match="embedded null byte"):
+        asyncio.run(environment.exec("printf 'a\0b'"))
+    assert runtime.calls == []
+
+
 def test_sandoq_session_nests_a_shell(tmp_path, monkeypatch) -> None:
     """After tmux setup the agent's shell is a child shell, as under Harbor's recording, so its
     first `exit` returns to the outer shell instead of ending the session."""
