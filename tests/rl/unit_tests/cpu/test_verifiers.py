@@ -518,10 +518,7 @@ def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
     sent_api_keys = []
     test_stdout = "apt-get update\n" + "x" * 100_000 + "\n1 failed"
 
-    class Terminus2WithoutModel(sandoq.Terminus2):
-        async def setup(self, environment) -> None:
-            pass
-
+    class Terminus2WithoutModel(_terminus2_without_model(sandoq)):
         async def run(self, instruction, environment, context) -> None:
             sent_api_keys.append(self._llm._build_base_kwargs()["api_key"])
             self._context = context
@@ -619,6 +616,26 @@ def test_sandoq_exec_keeps_keystrokes_out_of_argv() -> None:
     assert output == 'it\'s "quoted" $HOME\n'
 
 
+def test_sandoq_session_nests_a_shell(tmp_path, monkeypatch) -> None:
+    """After tmux setup the agent's shell is a child shell, as under Harbor's recording, so its
+    first `exit` returns to the outer shell instead of ending the session."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+
+    sessions = []
+
+    class Terminus2KeepingSession(_terminus2_without_model(sandoq)):
+        async def run(self, instruction, environment, context) -> None:
+            sessions.append(self._session)
+
+    monkeypatch.setattr(sandoq, "Terminus2", Terminus2KeepingSession)
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    result = asyncio.run(_launch(harness, trace, _RecordingRuntime()))
+
+    assert result.exit_code == 0
+    assert sessions[0].keys == [["bash", "Enter"], ["clear", "Enter"]]
+
+
 class _RecordingRuntime:
     """Runtime that records each `run` and succeeds."""
 
@@ -633,11 +650,18 @@ class _RecordingRuntime:
 
 
 def _terminus2_without_model(sandoq):
-    """Terminus-2 that runs no model and no tmux."""
+    """Terminus-2 that runs no model and no tmux; its session records the keys it is sent."""
+
+    class Session:
+        def __init__(self) -> None:
+            self.keys: list = []
+
+        async def send_keys(self, keys, **kwargs) -> None:
+            self.keys.append(keys)
 
     class Terminus2WithoutModel(sandoq.Terminus2):
         async def setup(self, environment) -> None:
-            pass
+            self._session = Session()
 
         async def run(self, instruction, environment, context) -> None:
             pass
