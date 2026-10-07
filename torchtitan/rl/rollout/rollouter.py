@@ -19,6 +19,7 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import MessageEnv, TokenEnv
+from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
 from torchtitan.rl.rollout.types import (
     GenerateFn,
     Rollout,
@@ -235,12 +236,17 @@ class RolloutWorker(Configurable):
         """Post-scoring advantage estimator. Default = Dr.GRPO (mean-baseline only);
         set `AdvantageEstimator.Config(should_std_normalize=True)` for standard GRPO."""
 
+        thinking_budget: ThinkingBudget.Config | None = None
+        """Caps thinking per turn by forcing its end; None leaves replies to `max_tokens`."""
+
     def __init__(self, config: Config) -> None:
         self.rubric: Rubric = config.rubric.build()
         self._message_env_config = config.message_env
         self._token_env_config = config.token_env
+        self._thinking_budget_config = config.thinking_budget
         self.advantage_estimator: AdvantageEstimator = config.advantage.build()
         self._renderer: Renderer
+        self._thinking_budget: ThinkingBudget | None = None
 
     async def setup_async(
         self,
@@ -252,6 +258,10 @@ class RolloutWorker(Configurable):
         """Build runtime dependencies after the worker actor is spawned."""
         tokenizer = tokenizer_config.build(tokenizer_path=hf_assets_path)
         self._renderer = renderer_config.build(tokenizer=tokenizer)
+        if self._thinking_budget_config is not None:
+            self._thinking_budget = self._thinking_budget_config.build(
+                tokenizer=tokenizer
+            )
 
     def make_env_group(
         self,
@@ -394,6 +404,8 @@ class RolloutWorker(Configurable):
         Returns:
             One unscored `Rollout`; `run_group` fills its reward later.
         """
+        if self._thinking_budget is not None:
+            generate_fn = self._thinking_budget.wrap(generate_fn)
         turns: list[RolloutTurn] = []
         status = RolloutStatus.ERROR
         try:
@@ -426,6 +438,7 @@ class RolloutWorker(Configurable):
                         prompt_messages=env_step.next_prompt_messages or [],
                         completion_token_ids=completion.token_ids,
                         completion_logprobs=completion.token_logprobs,
+                        completion_loss_mask=completion.loss_mask,
                         completion_message=next_env_step.completion_message,
                         env_messages=next_env_step.env_messages,
                         env_rewards=next_env_step.env_rewards,
