@@ -676,6 +676,32 @@ def test_sandoq_exec_failure_raises_sandbox_error(tmp_path, monkeypatch) -> None
     )
 
 
+def test_sandoq_model_call_stops_with_the_rollout(tmp_path, monkeypatch) -> None:
+    """Once Verifiers has stopped the rollout, the model call raises at once instead of letting
+    Terminus-2 retry a request Verifiers will refuse."""
+    pytest.importorskip("harbor")
+    from harbor.llms.base import ContextLengthExceededError
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+
+    raised = []
+
+    class Terminus2AtTheCap(_terminus2_without_model(sandoq)):
+        async def run(self, instruction, environment, context) -> None:
+            trace.stop_condition = "context_length"
+            try:
+                await self._llm.call(prompt="next turn", message_history=[])
+            except ContextLengthExceededError as error:
+                raised.append(str(error))
+                raise
+
+    monkeypatch.setattr(sandoq, "Terminus2", Terminus2AtTheCap)
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    result = asyncio.run(_launch(harness, trace, _RecordingRuntime()))
+
+    assert raised == ["Verifiers stopped the rollout: context_length"]
+    assert result.exit_code == 1
+
+
 class _RecordingRuntime:
     """Runtime that records each `run` and answers by the command's first word."""
 
