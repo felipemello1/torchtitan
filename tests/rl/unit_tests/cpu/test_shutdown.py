@@ -9,8 +9,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
+from torchtitan.models.common.moe import MoE
+from torchtitan.models.qwen3 import build_model_config
 from torchtitan.rl import train
-from torchtitan.rl.controller import AsyncLoopConfig
+from torchtitan.rl.controller import AsyncLoopConfig, RLModelDefaults
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
 from torchtitan.rl.observability.rollout_recorder import RolloutSampleRecorder
@@ -149,8 +152,8 @@ def _make_stub_rl_trainer():
             sampling=SamplingConfig(), debug=SimpleNamespace(seed=None)
         )
         rollouter = SimpleNamespace(build=lambda: _StubRollouter())
-        model = None
-        model_defaults = SimpleNamespace(apply_=lambda model: model)
+        model = build_model_config("debugmodel_moe", attn_backend="varlen")
+        model_defaults = RLModelDefaults()
 
         def to_dict(self):
             return {}
@@ -180,6 +183,13 @@ def stub_mesh_provisioning(monkeypatch):
         )
 
     monkeypatch.setattr(train, "spawn_proc_mesh", _spawn_proc_mesh)
+
+
+def test_controller_applies_model_defaults() -> None:
+    model = _make_stub_rl_trainer().config.model
+    assert isinstance(model.lm_head, HiMidLoLinear.Config)
+    moe_configs = [moe for _, moe, _, _ in model.traverse(MoE.Config)]
+    assert moe_configs and all(moe.freeze_expert_bias for moe in moe_configs)
 
 
 def test_main_shuts_down_after_success(monkeypatch, stub_mesh_provisioning):

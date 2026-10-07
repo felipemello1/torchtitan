@@ -186,7 +186,7 @@ class RLModelDefaults:
     choices between the trainer and generator each step, so their logprob gap keeps growing.
     No-op on dense models."""
 
-    # TODO: decide an RL aux-loss default once Qwen3 MoE trains with one
+    # TODO: decide an RL aux-loss default once Qwen3 or GPT-OSS MoE trains with one
     #   (https://github.com/pytorch/torchtitan/pull/4772).
 
     def apply_(self, model: Decoder.Config) -> Decoder.Config:
@@ -454,8 +454,8 @@ class Controller(Configurable):
                     )
 
     def __init__(self, config: Config):
-        # Not in `Config.__post_init__`: recipes may replace `model` after building the config,
-        # and the lm_head swap is one-way, so it must run on the final model.
+        # Here, not in `Config.__post_init__`, which also runs when a recipe constructs the
+        # config: the lm_head swap cannot be undone, so a later `model_defaults` opt-out would be lost.
         config.model = config.model_defaults.apply_(config.model)
         self.config = config
         config.maybe_log()
