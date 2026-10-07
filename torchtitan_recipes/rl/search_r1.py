@@ -33,7 +33,6 @@ from torchtitan.config import OverrideConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import (
     apply_transforms,
-    LMHeadFP32OutputConverter,
     ModelConfigTransformContext,
     TokenDispatcherTransform,
 )
@@ -44,7 +43,12 @@ from torchtitan.models.muse_glimmer import (
     build_model_config as build_muse_glimmer_model_config,
 )
 from torchtitan.models.qwen3 import build_model_config
-from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
+from torchtitan.rl.controller import (
+    AsyncLoopConfig,
+    Controller,
+    RLModelDefaults,
+    ValidationConfig,
+)
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.examples.search_r1.data import SearchR1Dataset
 from torchtitan.rl.examples.search_r1.env import SearchR1Env
@@ -99,7 +103,6 @@ def rl_grpo_qwen3_1_7b_search_r1() -> Controller.Config:
         "1.7B",
         seq_len=seq_len,
         attn_backend="varlen",
-        converters=[LMHeadFP32OutputConverter.Config()],
     )
     return Controller.Config(
         model=model_config,
@@ -179,7 +182,6 @@ def rl_grpo_qwen3_8b_search_r1() -> Controller.Config:
         "8B",
         seq_len=config.trainer.training.max_context_length,
         attn_backend="varlen",
-        converters=[LMHeadFP32OutputConverter.Config()],
     )
     config.hf_assets_path = "torchtitan/rl/example_checkpoint/Qwen3-8B"
     loss_config = config.trainer.loss
@@ -228,7 +230,6 @@ def rl_grpo_qwen3_30b_a3b_deepep_search_r1_perf() -> Controller.Config:
         "30B-A3B",
         seq_len=seq_len,
         attn_backend="varlen",
-        converters=[LMHeadFP32OutputConverter.Config()],
     )
 
     # Same opt-in throughput overrides as rl_grpo_qwen3_30b_a3b_varlen_perf, applied
@@ -340,12 +341,13 @@ def rl_grpo_muse_glimmer_30b_search_r1() -> Controller.Config:
     on load, and the renderer handles Muse Glimmer's harmony chat
     format and ATEM tool calls.
     """
-    # TODO: this head computes bf16 logits. LMHeadFP32OutputConverter can't convert a
-    # SoftCappedLinear (it raises on the extra fields), so this config doesn't apply it; it needs
-    # a HiMidLoLinear-based variant with the soft cap.
     model_config = build_muse_glimmer_model_config("30B", attn_backend="varlen")
     return Controller.Config(
         model=model_config,
+        # TODO: this head computes bf16 logits. LMHeadFP32OutputConverter can't convert a
+        # SoftCappedLinear (it raises on the extra fields); it needs a HiMidLoLinear-based
+        # variant with the soft cap.
+        model_defaults=RLModelDefaults(fp32_lm_head=False),
         hf_assets_path="torchtitan/rl/example_checkpoint/Muse-Glimmer-30B",
         async_loop=AsyncLoopConfig(
             num_training_steps=500,

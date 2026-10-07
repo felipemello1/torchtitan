@@ -107,7 +107,9 @@ from monarch.spmd import setup_torch_elastic_env_async
 from torchtitan.components.renderer import RendererConfig
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
+from torchtitan.config.transform import LMHeadFP32OutputConverter
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.moe import MoE
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.components.batcher import Batcher
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
@@ -145,6 +147,40 @@ class ValidationConfig:
 
     num_samples: int = 20
     """Held-out prompts scored greedily (temp=0, n=1) per validation pass. 0 skips validation."""
+
+
+@dataclass(kw_only=True, slots=True)
+class RLModelDefaults:
+    """Model changes every RL run needs, applied to the shared model config before the trainer
+    and generators copy it."""
+
+    fp32_lm_head: bool = True
+    """Swap the lm_head to `HiMidLoLinear`, so the trainer and generator compute fp32 logits with
+    the same op. Turn off for a head `LMHeadFP32OutputConverter` cannot convert."""
+
+    freeze_expert_bias: bool = True
+    """Keep every MoE layer's expert bias at its loaded value. A moving bias flips more expert
+    choices between the trainer and generator each step, so their logprob gap keeps growing.
+    No-op on dense models."""
+
+    # TODO: decide an RL aux-loss default once Qwen3 MoE trains with one
+    #   (https://github.com/pytorch/torchtitan/pull/4772).
+
+    def apply_(self, model: Decoder.Config) -> Decoder.Config:
+        """Rewrite `model` in place with these defaults and return its root. Idempotent.
+
+        Example:
+            config = rl_grpo_qwen3_30b_a3b_varlen()
+            config.model = config.model_defaults.apply_(config.model)
+            # lm_head: Linear.Config -> HiMidLoLinear.Config
+            # layers[i].moe.freeze_expert_bias: False -> True, for all 48 layers
+        """
+        if self.fp32_lm_head:
+            model = LMHeadFP32OutputConverter.Config().build().convert(model)
+        if self.freeze_expert_bias:
+            for _fqn, moe_config, _parent, _attr in model.traverse(MoE.Config):
+                moe_config.freeze_expert_bias = True
+        return model
 
 
 @dataclass(kw_only=True, slots=True)
@@ -253,7 +289,11 @@ class Controller(Configurable):
         """Top-level config for RL training."""
 
         model: Decoder.Config | None = None
-        """Model config shared by the trainer and generator."""
+        """Model config shared by the trainer and generator. `model_defaults` rewrites it before
+        either copies it."""
+
+        model_defaults: RLModelDefaults = field(default_factory=RLModelDefaults)
+        """RL changes to `model`: fp32 logits and a frozen MoE expert bias."""
 
         hf_assets_path: str = "./tests/assets/tokenizer"
         """Path to HF assets folder (model weights, tokenizer, config files)."""
@@ -391,6 +431,9 @@ class Controller(Configurable):
                     )
 
     def __init__(self, config: Config):
+        # Not in `Config.__post_init__`: recipes may replace `model` after building the config,
+        # and the lm_head swap is one-way, so it must run on the final model.
+        config.model = config.model_defaults.apply_(config.model)
         self.config = config
         config.maybe_log()
         self.trainer: Trainer | None = None

@@ -149,6 +149,8 @@ def _make_stub_rl_trainer():
             sampling=SamplingConfig(), debug=SimpleNamespace(seed=None)
         )
         rollouter = SimpleNamespace(build=lambda: _StubRollouter())
+        model = None
+        model_defaults = SimpleNamespace(apply_=lambda model: model)
 
         def to_dict(self):
             return {}
