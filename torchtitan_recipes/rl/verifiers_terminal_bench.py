@@ -143,10 +143,13 @@ def _terminal_bench_rollouter_config(
     )
 
 
-def _on_sandoq(rollouter: VerifiersRollouter.Config) -> VerifiersRollouter.Config:
+def _on_sandoq(
+    rollouter: VerifiersRollouter.Config, *, interleaved_thinking: bool
+) -> VerifiersRollouter.Config:
     """Run the rollouter's Terminus-2 in the env server, with a Sandoq VM per rollout.
 
-    Only the agent's shell commands go to the VM; each turn's reasoning goes back to the policy.
+    Only the agent's shell commands go to the VM; with ``interleaved_thinking``, each turn's
+    reasoning goes back to the policy.
     Needs ``torchtitan_recipes/rl/verifiers_plugins`` on PYTHONPATH and the oci-runner provider
     env (DOME's ``SANDOQ_ENV``).
     """
@@ -170,7 +173,7 @@ def _on_sandoq(rollouter: VerifiersRollouter.Config) -> VerifiersRollouter.Confi
     agent = environment.agent.model_copy(
         update={
             "harness": StockTerminusOutsideConfig(
-                id=PLUGIN_ID, interleaved_thinking=True
+                id=PLUGIN_ID, interleaved_thinking=interleaved_thinking
             ),
             "runtime": sandbox_runtime(),
         }
@@ -519,6 +522,37 @@ def rl_grpo_qwen3_5_4b_base_terminal_bench_dev() -> Controller.Config:
     )
 
 
+def rl_grpo_qwen3_5_9b_base_terminal_bench_fast() -> Controller.Config:
+    """Qwen3.5-9B-Base with thinking off: fast Terminal-Bench steps on Sandoq to shake out bugs.
+
+    8 GB300 GPUs on 2 hosts: trainer FSDP 4 on one, four TP1 generators on the other. 8 prompts x
+    8 samples per step, 150 turns, a pool of 256 sandboxes, no validation; every rollout is
+    recorded.
+    """
+    num_samples_per_prompt = 8
+    config = _qwen3_5_base_terminal_bench_config(
+        flavor="9B",
+        num_prompts_per_train_step=8,
+        num_samples_per_prompt=num_samples_per_prompt,
+        microbatch_rows=1,
+        max_turns=150,
+        sandbox_pool=256,
+        num_env_workers=math.ceil(256 / 24),
+        num_validation_samples=0,
+        num_generators=4,
+        parallelism=ParallelismConfig(data_parallel_shard_degree=4),
+        dump_folder="outputs/rl/qwen3_5_9b_base_terminal_bench_fast",
+        enable_thinking=False,
+    )
+    # k = the group size keeps every scored rollout; keep_errors adds the errored ones.
+    config.rollout_recorder = RolloutSampleRecorder.Config(
+        filter=KeepExtremeRewardsFilter.Config(
+            k=num_samples_per_prompt, keep_errors=True
+        )
+    )
+    return config
+
+
 def _qwen3_5_base_terminal_bench_config(
     *,
     flavor: str,
@@ -532,10 +566,13 @@ def _qwen3_5_base_terminal_bench_config(
     num_generators: int,
     parallelism: ParallelismConfig,
     dump_folder: str,
+    enable_thinking: bool = True,
 ) -> Controller.Config:
     """Build a Qwen3.5-Base Terminal-Bench run on Sandoq that saves resumable checkpoints.
 
     Args:
+        enable_thinking: Qwen3.5 thinking; Terminus-2 then also sends each turn's reasoning
+            back. Off, the renderer prefills an empty think block.
         microbatch_rows: Tokens per trainer microbatch, in rows of 131,072 tokens.
         sandbox_pool: Sandoq sessions the run may hold; the env server runs this many
             rollouts at once.
@@ -573,11 +610,12 @@ def _qwen3_5_base_terminal_bench_config(
                 # in the env server, not in Sandoq.
                 max_concurrent_rollouts=sandbox_pool,
                 num_env_workers=num_env_workers,
-            )
+            ),
+            interleaved_thinking=enable_thinking,
         ),
         renderer=from_renderers(
             Qwen35RendererConfig(
-                enable_thinking=True,
+                enable_thinking=enable_thinking,
                 thinking_retention="all",
             )
         ),
