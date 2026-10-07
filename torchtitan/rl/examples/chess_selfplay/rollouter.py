@@ -54,15 +54,16 @@ class ChessSelfPlayWorker(RolloutWorker):
 
     Example (group_size=2, self-play):
 
-        game 0: White mates on ply 31, Black lasted 15 of its 30 moves -> rewards White 1.0, Black -0.125
-        game 1: the 60-ply cap at even material                       -> rewards White 0.5, Black 0.5
-        advantages: White [+0.25, -0.25], Black [-0.3125, +0.3125]   (each color's mean is subtracted)
+        game 0: White mates on ply 31 of 60          -> rewards White 1.0, Black -0.25 * (1 - 31 / 60) = -0.12
+        game 1: the 60-ply cap at even material      -> rewards White 0.5, Black 0.5
+        advantages: White [+0.25, -0.25], Black [-0.31, +0.31]   (each color's mean is subtracted)
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(RolloutWorker.Config):
-        max_plies: int = 40
-        """Plies (half-moves) after which an unfinished game is scored by material."""
+        max_plies: int
+        """Plies (half-moves, both players) after which a game ends as a draw, adjusted by material.
+        Rewards scale with the share of it played (see `ChessGame.rewards`), so any value works."""
 
         stockfish_path: str | None = None
         """Stockfish binary for bot games and for scoring the policy's moves (centipawn loss).

@@ -33,7 +33,7 @@ _PIECE_VALUES = {
 }
 _BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
 # Training rewards (see `ChessGame.rewards`). A forfeit or a checkmate against you costs its full
-# reward before your first move, shrinking to 0 by the `max_plies` cap; a draw grows to 0.5 by then.
+# reward on the first ply, shrinking to 0 at `max_plies`; a draw grows to 0.5 by then.
 _FORFEIT_REWARD = -0.5
 _CHECKMATED_REWARD = -0.25
 # Share of the material score in an unfinished game's reward: 0.5 keeps it within [0.25, 0.75].
@@ -99,7 +99,7 @@ class ChessGame:
 
     A game ends on:
     (a) checkmate, stalemate, or insufficient material (a repetition plays on, see `_end_if_over`);
-    (b) `max_plies` plies played, scored by material (see `material_score`);
+    (b) `max_plies` plies played: a draw, adjusted by material (see `material_score`);
     (c) an illegal or missing move, or `forfeit`: that color loses.
 
     `scores` is the chess result, used for the Elo metrics; `rewards` is what training uses.
@@ -111,7 +111,7 @@ class ChessGame:
         await game.play(chess.WHITE, "e4")
         await game.wait_for_turn(chess.BLACK)  # returns at once: Black to move
         await game.play(chess.BLACK, "Ke9")    # illegal -> game.scores == {WHITE: 1.0, BLACK: 0.0}
-                                               #            game.rewards == {WHITE: 0.5, BLACK: -0.5}
+                                               #            game.rewards == {WHITE: 0.5, BLACK: -0.4875}
     """
 
     def __init__(
@@ -134,7 +134,6 @@ class ChessGame:
         self._rng = random.Random(seed)
         self._last_move_san: str | None = None
         self._forfeiter: chess.Color | None = None
-        self._num_moves = {chess.WHITE: 0, chess.BLACK: 0}
         self._turn_changed = asyncio.Condition()
         self._end_if_over()
 
@@ -144,33 +143,31 @@ class ChessGame:
 
     @property
     def rewards(self) -> dict[chess.Color, float]:
-        """Each color's training reward once the game is over:
-        (a) checkmate: 1 for the winner however long it took; the loser's -0.25 shrinks with the moves it lasted;
-        (b) stalemate or insufficient material: 0.5 times the share of its moves each color played;
-        (c) `max_plies` plies: halfway between a draw and the material score, so within [0.25, 0.75];
-        (d) a forfeit: -0.5, shrinking with the moves the forfeiter lasted, so always below being
-            checkmated later; the other color is scored as in (c), not as a win.
+        """Each color's training reward once the game is over, with `played` the share of `max_plies`
+        played, so it works for any `max_plies`:
+        (a) checkmate: 1 for the winner however long it took, -0.25 * (1 - played) for the loser;
+        (b) stalemate or insufficient material: 0.5 * played each;
+        (c) `max_plies` plies: a draw, 0.5, moved halfway toward the material score, so within [0.25, 0.75];
+        (d) a forfeit: -0.5 * (1 - played), always below being checkmated later; the other color is
+            scored as in (c), not as a win.
 
-        Example (max_plies=60, so 30 moves per color):
+        Example (max_plies=60):
 
-            max_plies, White up a knight               -> {WHITE: 0.59, BLACK: 0.41}
-            Black checkmated on White's 10th move      -> {WHITE: 1.0, BLACK: -0.25 * (1 - 9 / 30) = -0.175}
-            Black forfeits after 10 moves, up a queen  -> {WHITE: 0.30, BLACK: -0.5 * (1 - 10 / 30) = -0.33}
-            Black forfeits before its first move       -> {WHITE: 0.5, BLACK: -0.5}
+            max_plies, White up a knight              -> {WHITE: 0.59, BLACK: 0.41}
+            White checkmates on ply 19                -> {WHITE: 1.0, BLACK: -0.25 * (1 - 19 / 60) = -0.17}
+            Black forfeits at ply 20, up a queen      -> {WHITE: 0.30, BLACK: -0.5 * (1 - 20 / 60) = -0.33}
+            Black forfeits at ply 1, even material    -> {WHITE: 0.5, BLACK: -0.5 * (1 - 1 / 60) = -0.49}
         """
+        played = self.num_plies / self._max_plies
         if self.end_reason == "checkmate":
             loser = self.board.turn
-            return {not loser: 1.0, loser: _CHECKMATED_REWARD * self._moves_left(loser)}
+            return {not loser: 1.0, loser: _CHECKMATED_REWARD * (1.0 - played)}
         if self.end_reason != "max_plies" and self._forfeiter is None:
-            return {
-                color: 0.5 * (1.0 - self._moves_left(color)) for color in chess.COLORS
-            }
+            return {chess.WHITE: 0.5 * played, chess.BLACK: 0.5 * played}
         white_reward = 0.5 + _MATERIAL_WEIGHT * (material_score(self.board) - 0.5)
         rewards = {chess.WHITE: white_reward, chess.BLACK: 1.0 - white_reward}
         if self._forfeiter is not None:
-            rewards[self._forfeiter] = _FORFEIT_REWARD * self._moves_left(
-                self._forfeiter
-            )
+            rewards[self._forfeiter] = _FORFEIT_REWARD * (1.0 - played)
         return rewards
 
     @property
@@ -240,7 +237,6 @@ class ChessGame:
 
     def _push(self, move: chess.Move) -> None:
         self._last_move_san = self.board.san(move)
-        self._num_moves[self.board.turn] += 1
         self.board.push(move)
         self._end_if_over()
 
@@ -259,10 +255,6 @@ class ChessGame:
             white_score = material_score(self.board)
             self.scores = {chess.WHITE: white_score, chess.BLACK: 1.0 - white_score}
             self.end_reason = "max_plies"
-
-    def _moves_left(self, color: chess.Color) -> float:
-        """The share of its `max_plies / 2` moves that `color` did not play: 1 before its first move."""
-        return 1.0 - 2 * self._num_moves[color] / self._max_plies
 
     def _forfeit(self, color: chess.Color, *, reason: str) -> None:
         self._forfeiter = color
