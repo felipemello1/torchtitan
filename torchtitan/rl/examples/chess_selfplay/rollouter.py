@@ -27,19 +27,16 @@ from torchtitan.rl.rollout.types import GenerateFn, Rollout, RolloutGroup, Rollo
 if TYPE_CHECKING:
     from torchtitan.rl.generator import SamplingConfig
 
-_END_REASONS = (
-    "checkmate",
-    "stalemate",
-    "insufficient_material",
-    "max_plies",
-    "illegal_move",
-    # a player that stopped without a move forfeits, with its rollout status as the reason
-    *(
-        status.value
-        for status in RolloutStatus
-        if status.is_truncated() or status.is_error()
-    ),
-)
+# `ChessGame.end_reason`s grouped for the end-of-game metrics; any other reason (an error status,
+# `truncated_max_turns`) logs as "error".
+_END_GROUPS = {
+    "checkmate": ("checkmate",),
+    "draw": ("stalemate", "insufficient_material"),
+    "ply_limit": ("max_plies",),
+    "illegal_move": ("illegal_move",),
+    "reply_too_long": (RolloutStatus.TRUNCATED_LENGTH.value,),
+    "context_full": (RolloutStatus.TRUNCATED_PROMPT_TOO_LONG.value,),
+}
 # End reasons caused by exactly one bad reply: one per game that ended this way.
 _REPLY_FORFEITS = ("illegal_move", "truncated_length", "error_parse")
 
@@ -286,38 +283,66 @@ def _game_metrics(
     sample: ChessSample,
     losses_per_game: list[list[int]],
 ) -> list[m.Metric]:
-    """Per-game end-reason rates and length, the share of policy replies that forfeit, the policy's
-    centipawn loss per move, and, against a bot, its mean score and the step's Elo fit."""
-    scope = "chess" if sample.split == "train" else "val_chess"
-    prefix = f"{scope}_{sample.opponent}"
+    """Metrics in two sections, split by self-play and bot games where both apply.
+
+    Example (training; validation prefixes each section with "val_"):
+
+        chess_strength/elo                          Elo fitted to the step's bot games
+        chess_strength/score_vs_<bot>               the policy's mean chess result against <bot>
+        chess_strength/acpl_{self_play,vs_bot}      Stockfish centipawn loss of the policy's moves
+        chess_games/reward_{self_play,vs_bot}       mean training reward
+        chess_games/plies_{self_play,vs_bot}        game length
+        chess_games/forfeits_per_reply_{self_play,vs_bot}
+        chess_games/end_{self_play,vs_bot}/<end>    share of games ending in checkmate, draw,
+                                                    ply_limit, illegal_move, reply_too_long, context_full, error
+    """
+    val = "" if sample.split == "train" else "val_"
+    strength, games_section = f"{val}chess_strength", f"{val}chess_games"
+    kind = "self_play" if sample.opponent == "self" else "vs_bot"
+    end_groups = [
+        next(
+            (
+                group
+                for group, reasons in _END_GROUPS.items()
+                if game.end_reason in reasons
+            ),
+            "error",
+        )
+        for game in games
+    ]
     metrics = [
         m.Metric(
-            f"{prefix}/end_reason/{reason}",
-            m.Mean.from_list([float(game.end_reason == reason) for game in games]),
+            f"{games_section}/end_{kind}/{group}",
+            m.Mean.from_list([float(end == group) for end in end_groups]),
         )
-        for reason in _END_REASONS
+        for group in [*_END_GROUPS, "error"]
     ]
     num_forfeiting_replies = sum(game.end_reason in _REPLY_FORFEITS for game in games)
     num_replies = sum(len(rollout.turns) for rollout in rollouts)
     metrics += [
         m.Metric(
-            f"{prefix}/num_plies", m.Mean.from_list([game.num_plies for game in games])
+            f"{games_section}/reward_{kind}",
+            m.Mean.from_list([rollout.reward for rollout in rollouts]),
         ),
         m.Metric(
-            f"{prefix}/forfeit_rate_per_reply",
+            f"{games_section}/plies_{kind}",
+            m.Mean.from_list([game.num_plies for game in games]),
+        ),
+        m.Metric(
+            f"{games_section}/forfeits_per_reply_{kind}",
             m.Mean(float(num_forfeiting_replies), count=float(num_replies)),
         ),
     ]
     losses = [loss for game_losses in losses_per_game for loss in game_losses]
     if losses:
-        metrics.append(m.Metric(f"{prefix}/acpl", m.Mean.from_list(losses)))
+        metrics.append(m.Metric(f"{strength}/acpl_{kind}", m.Mean.from_list(losses)))
     if sample.opponent != "self":
         scores = [game.scores[sample.policy_color] for game in games]
         bot_elo = BOTS[sample.opponent].elo
         metrics += [
-            m.Metric(f"{prefix}/policy_score", m.Mean.from_list(scores)),
             m.Metric(
-                f"{scope}_bot/elo", EloFit([(bot_elo, score) for score in scores])
+                f"{strength}/score_vs_{sample.opponent}", m.Mean.from_list(scores)
             ),
+            m.Metric(f"{strength}/elo", EloFit([(bot_elo, score) for score in scores])),
         ]
     return metrics

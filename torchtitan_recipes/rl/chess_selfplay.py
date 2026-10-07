@@ -22,7 +22,7 @@ from torchtitan.components.renderer import from_renderers
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import LMHeadCastConverter
-from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
@@ -48,9 +48,9 @@ from torchtitan.rl.trainer import Trainer
 
 
 def rl_chess_qwen3_5_4b() -> Controller.Config:
-    """60-ply games on one node: one TP=2 trainer and six TP=1 generators.
+    """60-ply games on one node: an FSDP=4 trainer and four TP=1 generators.
 
-    Each step trains on 8 start positions x 8 games. Half the groups are self-play (up to 2 rollouts per
+    Each step trains on 16 start positions x 8 games. Half the groups are self-play (up to 2 rollouts per
     game, one per color); the other half play a Stockfish bot drawn from the ladder in `bots.BOTS`
     (1 rollout per game). Validation plays 64 greedy-decoded games against the same ladder before
     and after training.
@@ -74,11 +74,13 @@ def rl_chess_qwen3_5_4b() -> Controller.Config:
         dump_folder="outputs/rl/qwen3_5_4b_chess",
         async_loop=AsyncLoopConfig(
             num_training_steps=150,
-            num_prompts_per_train_step=8,
+            num_prompts_per_train_step=16,
             # Games per start position. Only one player of a game generates at a time, so this
             # is also the group's generation concurrency, which sizes the generators' max_num_seqs.
             num_samples_per_prompt=8,
-            target_offpolicy_steps=4,
+            # 7 x 16 groups in flight keeps ~80 requests on each generator; a 60-ply game spans
+            # several policy versions, so the observed policy age runs above this target.
+            target_offpolicy_steps=6,
             validation=ValidationConfig(num_samples=num_validation_games),
         ),
         rollouter=Rollouter.Config(
@@ -109,20 +111,20 @@ def rl_chess_qwen3_5_4b() -> Controller.Config:
         # Thinking off: with thinking on, Qwen3.5-4B thinks past 4,096 tokens on every chess move.
         # Its reasoning goes in the reply instead, and each turn bridges onto the previous tokens.
         renderer=from_renderers(Qwen35RendererConfig(enable_thinking=False)),
-        num_generators=6,
+        num_generators=4,
         metrics=MetricsProcessor.Config(
             enable_wandb=True,
             console_log_keys_train=MetricsProcessor.Config().console_log_keys_train
             + [
-                "chess_self/forfeit_rate_per_reply",
-                "chess_self/num_plies",
-                "chess_self/acpl",
-                "chess_bot/elo",
+                "chess_strength/elo",
+                "chess_strength/acpl_self_play",
+                "chess_games/plies_self_play",
+                "chess_games/forfeits_per_reply_self_play",
             ],
             console_log_keys_validation=[
                 "validation_reward/_mean",
-                "val_chess_bot/elo",
-                "val_chess_sf_.*/policy_score",
+                "val_chess_strength/elo",
+                "val_chess_strength/score_vs_.*",
                 "timing/validate",
             ],
         ),
@@ -148,13 +150,14 @@ def rl_chess_qwen3_5_4b() -> Controller.Config:
                 num_tokens_per_microbatch_per_dp_rank=max_total_tokens,
                 max_context_length=max_total_tokens,
             ),
+            # FSDP only: a 4B model does not need tensor parallelism.
             parallelism=ParallelismConfig(
                 data_parallel_replicate_degree=1,
-                data_parallel_shard_degree=1,
-                tensor_parallel_degree=2,
+                data_parallel_shard_degree=4,
+                tensor_parallel_degree=1,
             ),
-            # Full activation checkpointing: games run up to 29k tokens per sample.
-            activation_checkpoint=FullAC.Config(),
+            # With full activation checkpointing the trainer reserved 33 of 95 GB (FSDP=2 x TP=2).
+            activation_checkpoint=SelectiveAC.Config(),
             checkpointer=CheckpointManager.Config(
                 initial_load_in_hf=True,
                 interval=50,
