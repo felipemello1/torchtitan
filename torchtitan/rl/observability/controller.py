@@ -15,7 +15,7 @@ import time
 from collections import defaultdict
 
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.rollout.types import Rollout
+from torchtitan.rl.rollout.types import Rollout, RolloutStatus
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +278,16 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
         m.Metric(f"{prefix}/truncation_rate", m.Mean.from_list(truncated)),
         m.Metric(f"{prefix}_reward", m.SummaryStats.from_list(rewards)),
     ]
+    # Share of rollouts per terminal status (truncation and errors by cause). Every status
+    # is logged, at 0 when absent, so each series has a point at every step.
+    out.extend(
+        m.Metric(
+            f"{prefix}/status/{status}",
+            m.Mean.from_list([rollout.status is status for rollout in rollouts]),
+        )
+        for status in RolloutStatus
+        if status.is_terminal()
+    )
 
     # Per-component reward breakdown
     values_by_name: dict[str, list[float]] = defaultdict(list)

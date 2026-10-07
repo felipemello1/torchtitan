@@ -27,9 +27,11 @@ from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
+    compute_rollout_metrics,
     MetricsTimer,
 )
 from torchtitan.rl.rollout import RolloutGroup
+from torchtitan.rl.rollout.types import Rollout, RolloutStatus
 from torchtitan.rl.types import RolloutTurnID, TrainingSample, TrainingSampleGroup
 
 
@@ -537,6 +539,38 @@ def test_batcher_requires_whole_rows_per_microbatch() -> None:
             pad_id=0,
             temperature=1.0,
         )
+
+
+def test_compute_rollout_metrics_logs_share_per_status() -> None:
+    statuses = [
+        RolloutStatus.COMPLETED,
+        RolloutStatus.TRUNCATED_LENGTH,
+        RolloutStatus.TRUNCATED_LENGTH,
+        RolloutStatus.ERROR_TIMEOUT,
+    ]
+    rollouts = [
+        Rollout(group_id=0, rollout_id=i, status=status)
+        for i, status in enumerate(statuses)
+    ]
+
+    metrics = compute_rollout_metrics("rollout", rollouts)
+    share = {
+        metric.key: metric.value.value / metric.value.count
+        for metric in metrics
+        if metric.key.startswith("rollout/status/")
+    }
+
+    # Every terminal status is logged, absent ones at 0; ONGOING is not terminal.
+    assert share == {
+        "rollout/status/completed": 0.25,
+        "rollout/status/truncated_length": 0.5,
+        "rollout/status/truncated_prompt_too_long": 0.0,
+        "rollout/status/truncated_max_turns": 0.0,
+        "rollout/status/error_parse": 0.0,
+        "rollout/status/error_timeout": 0.25,
+        "rollout/status/error_abort": 0.0,
+        "rollout/status/error": 0.0,
+    }
 
 
 def test_compute_perf_ratio_metrics_reads_flushed_means() -> None:
