@@ -45,7 +45,12 @@ from torchtitan.models.muse_glimmer import (
 )
 from torchtitan.models.qwen3 import build_model_config
 from torchtitan.rl.components.data import IterableRLDataLoader
-from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
+from torchtitan.rl.controller import (
+    AsyncLoopConfig,
+    Controller,
+    RLModelDefaults,
+    ValidationConfig,
+)
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.examples.search_r1.data import SearchR1Dataset
 from torchtitan.rl.examples.search_r1.env import SearchR1Env
@@ -343,12 +348,13 @@ def rl_grpo_muse_glimmer_30b_search_r1() -> Controller.Config:
     on load, and the renderer handles Muse Glimmer's harmony chat
     format and ATEM tool calls.
     """
-    # TODO: this head computes bf16 logits. LMHeadFP32OutputConverter can't convert a
-    # SoftCappedLinear (it raises on the extra fields), so this config doesn't apply it; it needs
-    # a HiMidLoLinear-based variant with the soft cap.
     model_config = build_muse_glimmer_model_config("30B", attn_backend="varlen")
     return Controller.Config(
         model=model_config,
+        # TODO: this head computes bf16 logits. LMHeadFP32OutputConverter can't convert a
+        # SoftCappedLinear (it raises on the extra fields); it needs a HiMidLoLinear-based
+        # variant with the soft cap.
+        model_defaults=RLModelDefaults(fp32_lm_head=False),
         hf_assets_path="torchtitan/rl/example_checkpoint/Muse-Glimmer-30B",
         async_loop=AsyncLoopConfig(
             num_training_steps=500,

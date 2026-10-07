@@ -808,6 +808,7 @@ def test_vllm_uneven_decode_tp_padding():
     )
 
     config = rl_grpo_qwen3_moe_debug_varlen()
+    config.model = config.model_defaults.apply_(config.model)
     config.generator.parallelism.data_parallel_degree = 1
     config.generator.parallelism.tensor_parallel_degree = 4
     config.generator.gpu_memory_limit = 0.5
