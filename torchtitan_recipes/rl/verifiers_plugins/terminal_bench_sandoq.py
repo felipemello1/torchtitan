@@ -507,6 +507,7 @@ def oci_runner_task_context(**task_fields: object) -> Iterator[None]:
 
     install()
     install_shell_refresh()
+    install_text_only_parse()
     token = registry.bind_task_context(task_fields)
     try:
         yield
@@ -558,6 +559,43 @@ def install_shell_refresh() -> None:
 
     client_cls._nested_exec_argv = _nested_exec_argv
     client_cls._shell_refresh_installed = True
+
+
+def install_text_only_parse() -> None:
+    """Keep Qwen3.5 tool-call markup in the content when a request declares no tools. Idempotent.
+
+    Terminus-2 declares no tools and reads its JSON from the content. The Qwen3.5 parser moves
+    everything from a ``<tool_call>`` token on into a tool call, and Verifiers drops a tool call
+    without a ``<function=...>`` name, so a reply wrapped in ``<tool_call>`` reached Terminus-2
+    as "".
+
+    TODO: upstream to renderers: no tool-call extraction when no tools are declared. renderers'
+    main (after v0.1.11) breaks this patch: its client passes `prompt_ids=` to `parse_response`.
+    Redo it on that upgrade.
+    """
+    from renderers.parsing import parse_qwen35
+    from renderers.qwen35 import Qwen35Renderer
+
+    if getattr(Qwen35Renderer, "_text_only_parse_installed", False):
+        return
+    stock_parse_response = Qwen35Renderer.parse_response
+
+    def parse_response_without_tools(self, token_ids, *, tools=None):
+        if tools:
+            return stock_parse_response(self, token_ids, tools=tools)
+        # -1 matches no token: everything after the think block is content.
+        return parse_qwen35(
+            self._tokenizer,
+            token_ids,
+            stop_ids={self._im_end, self._endoftext},
+            think_id=self._think,
+            think_end_id=self._think_end,
+            tool_call_id=-1,
+            tool_call_end_id=-1,
+        )
+
+    Qwen35Renderer.parse_response = parse_response_without_tools
+    Qwen35Renderer._text_only_parse_installed = True
 
 
 def image_workdir(task_dir: Path) -> str | None:

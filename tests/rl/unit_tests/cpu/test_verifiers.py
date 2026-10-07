@@ -1105,3 +1105,58 @@ async def _launch(harness, trace, runtime):
 
 def _read_rollout_log(log_dir, trace) -> dict:
     return json.loads(gzip.decompress((log_dir / f"{trace.id}.json.gz").read_bytes()))
+
+
+def test_text_only_parse_keeps_tool_call_markup(monkeypatch) -> None:
+    """With no tools declared, a reply wrapped in <tool_call> stays in the content, where
+    Terminus-2 reads its JSON; declared tools use the stock parser."""
+    pytest.importorskip("renderers")
+    from renderers.qwen35 import Qwen35Renderer
+    from torchtitan_recipes.rl.verifiers_plugins.terminal_bench_sandoq import (
+        install_text_only_parse,
+    )
+
+    renderer = _fake_qwen35_renderer(monkeypatch)
+    stock_parse_response = Qwen35Renderer.parse_response
+    wrapped = [4, 7, 6, 7, 5, 0]  # <tool_call>\n{json}\n</tool_call><|im_end|>
+    tools = [{"name": "bash", "parameters": {}}]
+    assert stock_parse_response(renderer, wrapped, tools=None).content == ""
+
+    install_text_only_parse()
+
+    assert (
+        renderer.parse_response(wrapped, tools=None).content
+        == '<tool_call>\n{"analysis": "x"}\n</tool_call>'
+    )
+    assert renderer.parse_response(wrapped, tools=tools) == stock_parse_response(
+        renderer, wrapped, tools=tools
+    )
+
+
+def _fake_qwen35_renderer(monkeypatch):
+    """Thinking-off Qwen3.5 renderer over a toy vocabulary; restores the class
+    install_text_only_parse patches.
+
+    Token ids: 0 <|im_end|>, 1 <|endoftext|>, 2 <think>, 3 </think>, 4 <tool_call>,
+    5 </tool_call>, 6 '{"analysis": "x"}', 7 "\n", 8 "I will look."
+    """
+    from renderers.qwen35 import Qwen35Renderer
+
+    vocab = ["<|im_end|>", "<|endoftext|>", "<think>", "</think>", "<tool_call>"]
+    vocab += ["</tool_call>", '{"analysis": "x"}', "\n", "I will look."]
+
+    class Tokenizer:
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join(vocab[i] for i in ids)
+
+    monkeypatch.setattr(Qwen35Renderer, "parse_response", Qwen35Renderer.parse_response)
+    monkeypatch.setattr(
+        Qwen35Renderer, "_text_only_parse_installed", False, raising=False
+    )
+    renderer = object.__new__(Qwen35Renderer)
+    renderer._tokenizer = Tokenizer()
+    renderer._im_end, renderer._endoftext = 0, 1
+    renderer._think, renderer._think_end = 2, 3
+    renderer._tool_call, renderer._tool_call_end = 4, 5
+    renderer.config = SimpleNamespace(enable_thinking=False)
+    return renderer
