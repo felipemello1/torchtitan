@@ -53,7 +53,10 @@ def _rollouter_config(train_dataset: str, validation_dataset: str):
 
 
 class _RecordingRuntime:
-    """Records the program the harness prepares and the argv it runs."""
+    """Records the program the harness prepares, how it runs it, and other commands."""
+
+    def __init__(self) -> None:
+        self.commands: list[tuple[list[str], dict[str, str]]] = []
 
     async def prepare_uv_script(self, source: str, env: dict[str, str]) -> list[str]:
         self.source = source
@@ -61,10 +64,11 @@ class _RecordingRuntime:
 
     async def run_program(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
         self.argv = argv
+        self.program_env = env
         return ProgramResult(exit_code=0, stdout="", stderr="")
 
     async def run(self, argv: list[str], env: dict[str, str]) -> None:
-        pass
+        self.commands.append((argv, env))
 
 
 def _terminus_kwargs(tmp_path, monkeypatch, **options: bool) -> dict[str, object]:
@@ -123,6 +127,32 @@ def test_harness_options_reach_terminus2(tmp_path, monkeypatch) -> None:
     )
     assert flipped["interleaved_thinking"] is False
     assert flipped["enable_summarize"] is True
+
+
+def test_tmux_server_outlives_launch_until_cleanup() -> None:
+    """Verifiers scores between ``launch`` and ``cleanup``; the agent's tmux session
+    and the jobs started from it must still be alive then."""
+    harness = TerminalBenchTerminusHarness(TerminalBenchTerminusHarnessConfig())
+    runtime = _RecordingRuntime()
+    trace = SimpleNamespace(id="trace")
+    asyncio.run(
+        harness.launch(
+            SimpleNamespace(model="torchtitan"),
+            trace,
+            runtime,
+            "http://127.0.0.1:1/v1",
+            "secret",
+            {},
+            SimpleNamespace(prompt="Fix the parser in /app.", system_prompt=None),
+        )
+    )
+    assert runtime.commands == []
+
+    asyncio.run(harness.cleanup(trace, runtime))
+    [(argv, env)] = runtime.commands
+    assert "tmux kill-server" in argv[-1]
+    assert env == {"TMUX_TMPDIR": "/tmp/vf-terminus-2-trace"}
+    assert runtime.program_env["TMUX_TMPDIR"] == env["TMUX_TMPDIR"]
 
 
 def test_agent_runs_inside_docker_and_verifier_uses_same_taskset() -> None:
