@@ -612,6 +612,7 @@ class BitwiseParityTestBase(unittest.TestCase):
             )
 
         config = cls.config_fn()
+        config.model = config.model_defaults.apply_(config.model)
         hf_path = os.environ.get(cls.hf_assets_env_var)
         if hf_path:
             config.hf_assets_path = hf_path
