@@ -144,7 +144,10 @@ class ValidationConfig:
     # TODO: enable periodic validation with proper overlapping
 
     num_samples: int = 20
-    """Held-out prompts scored greedily (temp=0, n=1) per validation pass. 0 skips validation."""
+    """Held-out prompts per validation pass, one rollout each. 0 skips validation."""
+
+    greedy: bool = True
+    """Sample at temperature 0; False samples like training (the generator's sampling config)."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -668,7 +671,7 @@ class Controller(Configurable):
     async def _collect_validation_rollouts(
         self, *, num_groups: int, sampling: SamplingConfig, step: int
     ) -> tuple[list[RolloutGroup], list[m.Metric]]:
-        """Sample held-out prompts, run each greedily (n=1) concurrently, and emit validation metrics."""
+        """Sample held-out prompts, run each once (n=1) concurrently, and emit validation metrics."""
         # TODO: group_size=1 (best-of-1) only. Support best-of-N.
         generate = self._make_generate_fn(metrics_prefix="validation_generator")
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
@@ -682,7 +685,12 @@ class Controller(Configurable):
                     # request_ids can't collide in the shared engine (e.g. post-validation).
                     group_id=-(i + 1),
                     group_size=1,
-                    sampling=sampling,
+                    # One seed per group, so a seeded run's repeat passes over a prompt differ.
+                    sampling=(
+                        sampling
+                        if sampling.seed is None
+                        else replace(sampling, seed=sampling.seed + i)
+                    ),
                 )
                 for i, sample in enumerate(samples)
             ),
@@ -721,7 +729,7 @@ class Controller(Configurable):
     # but what if i want to run the entire dataset?
     @sl.log_trace_span("validate")
     async def validate(self, *, step: int) -> list[m.Metric]:
-        """Run greedy validation on held-out prompts.
+        """Run one rollout per held-out prompt.
 
         Args:
             step: Training step this validation pass belongs to (0 for the
@@ -733,13 +741,17 @@ class Controller(Configurable):
         """
         # TODO: investigate using pass@k for validation.
         t_validate_start = time.perf_counter()
-        num_samples = self.config.async_loop.validation.num_samples
-        if num_samples == 0:  # skip validation (e.g. loss guard CI)
+        validation = self.config.async_loop.validation
+        if validation.num_samples == 0:  # skip validation (e.g. loss guard CI)
             return []
-        greedy = replace(self._sampling, temperature=0.0, top_p=1.0)
+        sampling = (
+            replace(self._sampling, temperature=0.0, top_p=1.0)
+            if validation.greedy
+            else self._sampling
+        )
 
         rollout_groups, validation_metrics = await self._collect_validation_rollouts(
-            num_groups=num_samples, sampling=greedy, step=step
+            num_groups=validation.num_samples, sampling=sampling, step=step
         )
 
         self.rollout_recorder.record(is_validation=True, rollout_groups=rollout_groups)
