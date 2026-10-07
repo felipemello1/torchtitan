@@ -63,6 +63,10 @@ class Completion:
     finish_reason: str | None = None
     """vLLM `CompletionOutput.finish_reason` ("stop" | "length" | "abort")"""
 
+    loss_mask: list[bool] | None = None  # [num_completion_tokens] or None
+    """False on tokens the rollout appended (e.g. a forced end of thinking), which the loss skips.
+    None: train every token."""
+
     metrics: list[m.Metric] = field(default_factory=list)
     """Per-generation metrics measured by the generator (latencies); the
     controller attaches them to the rollout turn."""
@@ -97,7 +101,7 @@ class TrainingSample:
     loss_mask: list[bool]
     """[L] True on assistant tokens to train."""
     logprobs: list[float]
-    """[L] generator logprobs; 0.0 where loss_mask is False."""
+    """[L] generator logprobs; 0.0 on prompt and env tokens, NaN on tokens the rollout appended."""
     advantage: list[float]
     """[L] advantage on assistant tokens, 0.0 elsewhere."""
 
