@@ -67,12 +67,12 @@ sf_elo1500 1500
 
 Half the training groups play a bot drawn uniformly from the recipe's ladder; the other half are self-play. Validation plays 64 fixed greedy-decoded games against the same ladder. Each bot runs its own Stockfish process, off the event loop; set `ChessSelfPlayWorker.Config.stockfish_path`.
 
-Logged every step (validation logs the same keys under `val_chess_*`):
+Logged every step in two sections (validation prefixes each with `val_`):
 
-- `chess_bot/elo/fit`: one Elo fitted to the step's bot games, the rating whose expected score matches the actual one;
-- `chess_<bot>/policy_score`: the policy's mean score against each bot;
-- `chess_self/acpl` and `chess_<bot>/acpl`: Stockfish's centipawn loss of the policy's moves at depth 8, a strength measure that does not depend on the opponent;
-- `chess_self/forfeit_rate_per_reply`, `chess_self/num_plies`, `chess_self/end_reason/*`.
+- `chess_strength/elo`: one Elo fitted to the step's bot games, the rating whose expected score matches the actual one;
+- `chess_strength/score_vs_<bot>`: the policy's mean chess result against each bot;
+- `chess_strength/acpl_{self_play,vs_bot}`: Stockfish's centipawn loss of the policy's moves at depth 8, a strength measure that does not depend on the opponent;
+- `chess_games/{reward,plies,forfeits_per_reply}_{self_play,vs_bot}` and `chess_games/end_{self_play,vs_bot}/<end>`, with `<end>` one of checkmate, draw, ply_limit, illegal_move, reply_too_long, context_full, error.
 
 The self-play reward is not a progress metric: both players are the same policy, so it reflects how its games end, not how strong it is.
 

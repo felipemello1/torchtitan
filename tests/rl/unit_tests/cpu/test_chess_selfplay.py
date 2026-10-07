@@ -476,10 +476,12 @@ def test_worker_trains_both_colors_with_per_color_advantages() -> None:
         assert [len(by_id[i].turns) for i in range(4)] == [2, 2, 1, 1]
 
         reduced = _reduced_metrics(group.rollouts)
-        assert reduced["chess_self/end_reason/checkmate/mean"] == 0.5
-        assert reduced["chess_self/end_reason/illegal_move/mean"] == 0.5
+        assert reduced["chess_games/end_self_play/checkmate/mean"] == 0.5
+        assert reduced["chess_games/end_self_play/illegal_move/mean"] == 0.5
         # 6 policy replies, 1 of them illegal
-        assert reduced["chess_self/forfeit_rate_per_reply/mean"] == pytest.approx(1 / 6)
+        assert reduced[
+            "chess_games/forfeits_per_reply_self_play/mean"
+        ] == pytest.approx(1 / 6)
 
     asyncio.run(run())
 
@@ -509,7 +511,7 @@ def test_worker_forfeits_a_player_that_stops_mid_game() -> None:
         assert black.turns[-1].env_rewards == {"score": 0.5}
         assert (
             _reduced_metrics(group.rollouts)[
-                "chess_self/end_reason/truncated_length/mean"
+                "chess_games/end_self_play/reply_too_long/mean"
             ]
             == 1.0
         )
@@ -541,12 +543,12 @@ def test_worker_plays_only_the_policy_against_a_bot(
         reduced = _reduced_metrics(group.rollouts, prefix="validation")
         assert reduced["validation_reward/_mean"] == pytest.approx(-0.4875)
         # the Elo metrics use the chess result: a forfeit is a loss
-        assert reduced["val_chess_test_bot/policy_score/mean"] == 0.0
-        assert reduced["val_chess_test_bot/forfeit_rate_per_reply/mean"] == 1.0
+        assert reduced["val_chess_strength/score_vs_test_bot/mean"] == 0.0
+        assert reduced["val_chess_games/forfeits_per_reply_vs_bot/mean"] == 1.0
         assert (
-            reduced["val_chess_test_bot/num_plies/mean"] == 1.0
+            reduced["val_chess_games/plies_vs_bot/mean"] == 1.0
         )  # the bot's opening move
-        assert reduced["val_chess_bot/elo/fit"] == pytest.approx(
+        assert reduced["val_chess_strength/elo/fit"] == pytest.approx(
             0.0, abs=1e-6
         )  # one loss
 
