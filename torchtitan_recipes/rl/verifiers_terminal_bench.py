@@ -550,14 +550,12 @@ def rl_grpo_qwen3_5_9b_base_terminal_bench_fast() -> Controller.Config:
     """Qwen3.5-9B-Base with thinking off: fast Terminal-Bench steps on Sandoq to shake out bugs.
 
     8 GB300 GPUs on 2 hosts: trainer FSDP 4 on one, four TP1 generators on the other. 8 prompts x
-    8 samples per step, 150 turns, a pool of 256 sandboxes, no validation; every rollout is
-    recorded.
+    8 samples per step, 150 turns, a pool of 256 sandboxes, no validation.
     """
-    num_samples_per_prompt = 8
-    config = _qwen3_5_base_terminal_bench_config(
+    return _qwen3_5_base_terminal_bench_config(
         flavor="9B",
         num_prompts_per_train_step=8,
-        num_samples_per_prompt=num_samples_per_prompt,
+        num_samples_per_prompt=8,
         microbatch_rows=1,
         max_turns=150,
         sandbox_pool=256,
@@ -568,13 +566,6 @@ def rl_grpo_qwen3_5_9b_base_terminal_bench_fast() -> Controller.Config:
         dump_folder="outputs/rl/qwen3_5_9b_base_terminal_bench_fast",
         enable_thinking=False,
     )
-    # k = the group size keeps every scored rollout; keep_errors adds the errored ones.
-    config.rollout_recorder = RolloutSampleRecorder.Config(
-        filter=KeepExtremeRewardsFilter.Config(
-            k=num_samples_per_prompt, keep_errors=True
-        )
-    )
-    return config
 
 
 def _qwen3_5_base_terminal_bench_config(
@@ -611,8 +602,11 @@ def _qwen3_5_base_terminal_bench_config(
         model=model_config,
         hf_assets_path=f"torchtitan/rl/example_checkpoint/Qwen3.5-{flavor}-Base",
         dump_folder=dump_folder,
+        # k = the group size keeps every scored rollout; keep_errors adds the errored ones.
         rollout_recorder=RolloutSampleRecorder.Config(
-            filter=KeepExtremeRewardsFilter.Config(keep_errors=True)
+            filter=KeepExtremeRewardsFilter.Config(
+                k=num_samples_per_prompt, keep_errors=True
+            )
         ),
         async_loop=AsyncLoopConfig(
             num_training_steps=150,

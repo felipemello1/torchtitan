@@ -780,7 +780,6 @@ def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
     from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
     from verifiers.v1.runtimes import ProgramResult
     from verifiers.v1.tasksets.harbor import HarborTask
-    from verifiers.v1.tasksets.harbor.taskset import HarborData
 
     sent_api_keys = []
     test_stdout = "apt-get update\n" + "x" * 100_000 + "\n1 failed"
@@ -813,7 +812,7 @@ def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
     monkeypatch.setattr(sandoq, "Terminus2", Terminus2WithoutModel)
     harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
     runtime = VMRuntime()
-    data = HarborData(prompt="Write a.py")
+    data = trace.task.data
 
     async def rollout() -> tuple[ProgramResult, float, float]:
         result = await _launch(harness, trace, runtime)
@@ -830,6 +829,7 @@ def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
     assert sandoq.SandoqTerminalTaskset.task_type() is sandoq.SandoqHarborTask
     assert reward == stock_reward == 0.0
     assert result.exit_code == 0
+    assert log["task_name"] == "allenai-tmax/task_000000_c19dda5b"
     assert log["harness_stderr"] == ""
     assert log["trajectory"]["steps"][0]["message"] == "Write a.py"
     assert log["trajectory"]["agent"]["extra"]["llm_kwargs"] == {
@@ -1002,13 +1002,15 @@ def _terminus2_without_model(sandoq):
 
 def _sandoq_harness_and_trace(sandoq, log_dir):
     from verifiers.v1.configs.agent import AgentConfig
+    from verifiers.v1.tasksets.harbor.taskset import HarborData
     from verifiers.v1.trace import AgentInfo, Trace, TraceTask
 
     config = sandoq.StockTerminusOutsideConfig(
         id=sandoq.PLUGIN_ID, rollout_log_dir=str(log_dir)
     )
+    data = HarborData(name="allenai-tmax/task_000000_c19dda5b", prompt="Write a.py")
     trace = Trace(
-        task=TraceTask(type="Task", data={}), agent=AgentInfo(config=AgentConfig())
+        task=TraceTask(type="Task", data=data), agent=AgentInfo(config=AgentConfig())
     )
     return sandoq.StockTerminusOutsideHarness(config), trace
 
