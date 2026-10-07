@@ -228,6 +228,23 @@ def test_batcher_raises_at_consecutive_untrainable_group_limit() -> None:
         batcher.add_training_samples(training_sample_group=_untrainable_group(19))
 
 
+def test_batcher_raises_at_configured_untrainable_batch_limit() -> None:
+    batcher = Batcher.Config(max_consecutive_untrainable_batches=3).build(
+        num_tokens_per_microbatch_per_dp_rank=16384,
+        max_context_length=2048,
+        num_prompts_per_train_step=2,
+        dp_degree=1,
+        pad_id=0,
+        temperature=1.0,
+    )
+
+    for group_id in range(5):
+        batcher.add_training_samples(training_sample_group=_untrainable_group(group_id))
+
+    with pytest.raises(RuntimeError, match="3 consecutive untrainable batches"):
+        batcher.add_training_samples(training_sample_group=_untrainable_group(5))
+
+
 def test_dp_assignment_avoids_all_padding_ranks_when_possible() -> None:
     # Five two-token samples need four rank inputs across two microbatches.
     # Redistributing one sample keeps every rank input trainable.

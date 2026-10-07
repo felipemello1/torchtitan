@@ -28,6 +28,8 @@ from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 from torchtitan.models.qwen3 import build_model_config
 from torchtitan.models.qwen3_5 import build_model_config as build_qwen3_5_model_config
+from torchtitan.rl.components.batcher import Batcher
+from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.examples.dapo_math.data import AIME2025Dataset, DapoMathDataset
@@ -299,6 +301,17 @@ def _qwen3_5_base_dapo_math_config(
                 num_samples=num_validation_samples,
                 interval_steps=validation_interval_steps,
                 greedy=True,
+            ),
+            # Launch knobs for a resumed job: keep zero-std groups (advantage 0, no wait
+            # for a replacement), or tolerate longer runs of them before failing.
+            training_sample_builder=TrainingSampleBuilder.Config(
+                drop_zero_std_reward_groups=os.environ.get("DOME_V2_DROP_ZERO_STD", "1")
+                == "1"
+            ),
+            batcher=Batcher.Config(
+                max_consecutive_untrainable_batches=int(
+                    os.environ.get("DOME_V2_MAX_UNTRAINABLE_BATCHES", 10)
+                )
             ),
         ),
         rollouter=_dapo_math_rollouter_config(

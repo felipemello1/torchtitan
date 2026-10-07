@@ -28,8 +28,6 @@ from torchtitan.rl.types import (
 
 logger = logging.getLogger(__name__)
 
-_MAX_CONSECUTIVE_UNTRAINABLE_BATCHES = 10
-
 # Per-field pad values + tensor dtypes for a packed row.
 _PAD_VALUES: dict[str, int | float | bool] = {
     "input_ids": 0,  # overwritten with pad_id in __init__-bound builds
@@ -132,6 +130,9 @@ class Batcher(Configurable):
         When unset, the trainer uses the microbatch token capacity as the
         CUDA-graph-safe metadata bound without imposing a tighter packing cap.
         """
+        max_consecutive_untrainable_batches: int = 10
+        """Fail after this many batches' worth of consecutive groups with no trainable
+        sample, e.g. every group zero-std while those are dropped."""
 
         def __post_init__(self) -> None:
             if self.num_mtp_layers < 0:
@@ -170,13 +171,17 @@ class Batcher(Configurable):
         self._dp_degree = dp_degree
         self._groups_for_next_batch: list[TrainingSampleGroup] = []
         self._num_consecutive_zero_output_groups = 0
+        self._max_consecutive_untrainable_batches = (
+            config.max_consecutive_untrainable_batches
+        )
 
     def _record_untrainable_groups(self, *, group_is_trainable: bool) -> None:
         """Fail when consecutive groups cannot contribute one training sample.
 
         Each ``num_prompts_per_train_step`` consecutive untrainable groups
         represents one complete untrainable batch. For a target of 8 groups,
-        warn after each block of 8 and fail after 10 such batches (80 groups).
+        warn after each block of 8 and fail after
+        ``max_consecutive_untrainable_batches`` (default 10) such batches (80 groups).
         Any trainable group resets the count.
         """
         # A useful group proves the pipeline is making progress, even before
@@ -197,10 +202,10 @@ class Batcher(Configurable):
             "Consecutive untrainable batches: %d/%d (%d rollout groups "
             "produced no trainable samples).",
             num_untrainable_batches,
-            _MAX_CONSECUTIVE_UNTRAINABLE_BATCHES,
+            self._max_consecutive_untrainable_batches,
             self._num_consecutive_zero_output_groups,
         )
-        if num_untrainable_batches < _MAX_CONSECUTIVE_UNTRAINABLE_BATCHES:
+        if num_untrainable_batches < self._max_consecutive_untrainable_batches:
             return
 
         raise RuntimeError(
