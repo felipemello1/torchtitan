@@ -13,18 +13,24 @@ the vLLM engine and sampling parameters.
 
 Run: torchrun --nproc_per_node=4 \
       torchtitan/rl/generate.py --config rl_grpo_qwen3_30b_a3b_varlen
+
+Decode speed under load, e.g. 160 concurrent requests on one GPU:
+     torchrun --nproc_per_node=1 -m torchtitan.rl.generate \
+      --module torchtitan_recipes.rl.dapo_math --config rl_dapo_qwen3_5_35b_a3b_base_math \
+      --max-num-seqs 160 --num-requests 160 --max-tokens 2048
 """
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
+import time
 
 # Must set spawn method before any CUDA operations or vLLM imports
 # CUDA cannot be re-initialized in forked subprocesses
 # See also https://docs.vllm.ai/en/v0.8.3/design/multiprocessing.html#python-multiprocessing
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-from torchtitan_recipes.rl import alphabet_sort as recipes
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig
 from vllm.logger import init_logger
@@ -50,6 +56,11 @@ def _parse_args() -> argparse.Namespace:
         description="Run a TorchTitan RL/vLLM generator config standalone."
     )
     parser.add_argument(
+        "--module",
+        default="torchtitan_recipes.rl.alphabet_sort",
+        help="Module that defines the recipe function.",
+    )
+    parser.add_argument(
         "--config",
         default="rl_grpo_qwen3_0_6b_varlen",
         help="RL recipe function to instantiate.",
@@ -71,13 +82,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument(
+        "--num-requests",
+        type=int,
+        default=1,
+        help="Copies of the prompt sent at once; prints the mean time per output token.",
+    )
     return parser.parse_args()
 
 
 def generate() -> None:
     args = _parse_args()
 
-    config_factory = getattr(recipes, args.config, None)
+    config_factory = getattr(importlib.import_module(args.module), args.config, None)
     if not callable(config_factory):
         raise ValueError(f"Unknown RL config {args.config!r}")
     config = config_factory()
@@ -86,7 +103,8 @@ def generate() -> None:
     if model_config is None:
         raise ValueError("RL config must define a model.")
     model_config = config.model_defaults.apply_(model_config)
-    model_path = config.hf_assets_path
+    # The initial checkpoint load needs an absolute path.
+    model_path = os.path.abspath(config.hf_assets_path)
     max_num_seqs = args.max_num_seqs
     is_rank0 = os.environ.get("RANK", "0") == "0"
 
@@ -201,9 +219,8 @@ def generate() -> None:
     prompt = args.prompt
     logger.debug(f"Prompt: {prompt}")
 
-    # Add request to engine
-    logger.debug("Adding request to engine...")
-    request_id = "0"
+    # Add requests to engine
+    logger.debug("Adding requests to engine...")
     if args.raw_prompt:
         engine_input = prompt
     else:
@@ -218,10 +235,13 @@ def generate() -> None:
         if is_rank0:
             print(f"Prompt token count: {len(prompt_token_ids)}", flush=True)
             print(f"Stop token ids: {stop_token_ids}", flush=True)
-    engine.add_request(request_id, engine_input, sampling_params)
+    for request_index in range(args.num_requests):
+        engine.add_request(str(request_index), engine_input, sampling_params)
 
     # Generate text by stepping through engine
     logger.debug("Generating text...")
+    start_s = time.perf_counter()
+    seconds_per_token: list[float] = []
     while engine.has_unfinished_requests():
         request_outputs = engine.step()
 
@@ -230,14 +250,25 @@ def generate() -> None:
             if request_output.finished:
                 generated_text = request_output.outputs[0].text
                 output_token_ids = request_output.outputs[0].token_ids
+                seconds_per_token.append(
+                    (time.perf_counter() - start_s) / max(len(output_token_ids), 1)
+                )
 
                 # Print results
                 logger.debug("Generation complete")
-                if is_rank0:
+                if is_rank0 and request_output.request_id == "0":
                     print(f"\nConfig: {args.config}", flush=True)
                     print(f"Prompt: {prompt}", flush=True)
                     print(f"Generated token count: {len(output_token_ids)}", flush=True)
                     print(f"Generated text: {generated_text!r}\n", flush=True)
+    if is_rank0:
+        # Includes prefill and queueing; requests start together, so this is the decode
+        # time per token at `--num-requests` concurrent sequences.
+        mean_ms = 1000 * sum(seconds_per_token) / len(seconds_per_token)
+        print(
+            f"{args.num_requests} requests: {mean_ms:.1f} ms per output token (mean)",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
