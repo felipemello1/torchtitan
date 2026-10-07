@@ -739,6 +739,7 @@ def test_sandoq_rollout_log_explains_a_tmux_failure(tmp_path, caplog) -> None:
     """A rollout whose tmux never starts leaves a log with Terminus-2's traceback and log lines."""
     pytest.importorskip("harbor")
     from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.errors import HarnessError
     from verifiers.v1.runtimes import ProgramResult
 
     class NoTmuxRuntime:
@@ -748,18 +749,17 @@ def test_sandoq_rollout_log_explains_a_tmux_failure(tmp_path, caplog) -> None:
     harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
     runtime = NoTmuxRuntime()
 
-    async def rollout() -> ProgramResult:
-        result = await _launch(harness, trace, runtime)
+    async def rollout() -> None:
+        with pytest.raises(HarnessError):
+            await _launch(harness, trace, runtime)
         sandoq.harbor_logger.warning("logged outside any launch")
         await harness.cleanup(trace, runtime)
         # Verifiers' abort() after a cancelled close() calls cleanup again.
         await harness.cleanup(trace, runtime)
-        return result
 
-    result = asyncio.run(rollout())
+    asyncio.run(rollout())
     log = _read_rollout_log(tmp_path, trace)
 
-    assert result.exit_code == 1
     assert log["verifiers_trace_id"] == trace.id
     assert "Failed to start tmux session" in log["harness_stderr"]
     assert "ERROR harbor.utils.logger: Failed to install tmux" in log["terminus_log"]
@@ -901,6 +901,49 @@ def test_sandoq_session_nests_a_shell(tmp_path, monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert sessions[0].keys == [["bash", "Enter"], ["clear", "Enter"]]
+
+
+def test_sandoq_exec_failure_raises_sandbox_error(tmp_path, monkeypatch) -> None:
+    """A lost exec channel leaves launch as a SandboxError, which the agent's retries can rerun
+    on a fresh VM; the rollout log still keeps the traceback."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.errors import SandboxError
+
+    class Terminus2LosingTheVM(_terminus2_without_model(sandoq)):
+        async def run(self, instruction, environment, context) -> None:
+            raise SandboxError("prime exec failed: uncertain transport failure")
+
+    monkeypatch.setattr(sandoq, "Terminus2", Terminus2LosingTheVM)
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    runtime = _RecordingRuntime()
+    with pytest.raises(SandboxError):
+        asyncio.run(_launch(harness, trace, runtime))
+    asyncio.run(harness.cleanup(trace, runtime))
+    assert (
+        "uncertain transport failure"
+        in _read_rollout_log(tmp_path, trace)["harness_stderr"]
+    )
+
+
+def test_sandoq_dead_container_is_not_retried(tmp_path, monkeypatch) -> None:
+    """A container the agent killed fails as HarnessError, which the SandboxError retry skips."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.errors import HarnessError
+
+    class Terminus2KillingItsContainer(_terminus2_without_model(sandoq)):
+        async def run(self, instruction, environment, context) -> None:
+            # What Terminus-2 raises on its next keystroke after `pkill -9 -f sleep`.
+            raise RuntimeError(
+                "failed to send non-blocking keys: return_code=255, stderr='Error: can only "
+                "create exec sessions on running containers'"
+            )
+
+    monkeypatch.setattr(sandoq, "Terminus2", Terminus2KillingItsContainer)
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    with pytest.raises(HarnessError, match="running containers"):
+        asyncio.run(_launch(harness, trace, _RecordingRuntime()))
 
 
 class _RecordingRuntime:
