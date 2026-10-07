@@ -36,7 +36,7 @@ from torchtitan.models.common.attention import (
     VarlenInnerAttention,
     VarlenMetadata,
 )
-from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.decoder import Decoder, routed_expert_ids_kwargs
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 from torchtitan.models.common.multimodal import (
     add_zero_vision_dependency,
@@ -264,6 +264,7 @@ class KimiK3TransformerBlock(Module):
         positions: torch.Tensor | None = None,
         *,
         padding_mask: torch.Tensor | None = None,
+        routed_expert_ids_TK: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.first_layer_in_block:
             block_residual_TND = torch.cat(
@@ -302,7 +303,11 @@ class KimiK3TransformerBlock(Module):
         )
         h_TD = self.ffn_norm(h_TD)
         if self.moe is not None:
-            h_TD = self.moe(h_TD, padding_mask_T=padding_mask)
+            h_TD = self.moe(
+                h_TD,
+                padding_mask_T=padding_mask,
+                routed_expert_ids_TK=routed_expert_ids_TK,
+            )
         else:
             assert self.feed_forward is not None
             h_TD = self.feed_forward(h_TD)
@@ -575,6 +580,7 @@ class KimiK3Model(MultimodalModel):
         positions: torch.Tensor | None = None,
         attention_masks: HybridAttentionMetadata | None = None,
         padding_mask: torch.Tensor | None = None,
+        routed_expert_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if pixel_values_videos is not None or grid_thw_videos is not None:
             raise NotImplementedError("Kimi K3 v1 supports images but not videos.")
@@ -595,13 +601,14 @@ class KimiK3Model(MultimodalModel):
 
         if block_residual_TND is None:
             block_residual_TND = h_TD.unsqueeze(1)[:, :0]
-        for layer in self.layers.values():
+        for layer_name, layer in self.layers.items():
             h_TD, block_residual_TND = layer(
                 h_TD,
                 block_residual_TND,
                 attention_masks,
                 positions,
                 padding_mask=padding_mask,
+                **routed_expert_ids_kwargs(routed_expert_ids, layer_name),
             )
 
         if self.output_res_proj is None:

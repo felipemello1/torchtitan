@@ -31,6 +31,7 @@ from torchtitan.models.common.attention import (
     FlexInnerAttention,
     VarlenInnerAttention,
 )
+from torchtitan.models.common.decoder import routed_expert_ids_kwargs
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 from torchtitan.models.common.multimodal import (
     add_zero_vision_dependency,
@@ -275,6 +276,7 @@ class KimiK25Model(MultimodalModel, MTPDecoder):
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        routed_expert_ids: torch.Tensor | None = None,
     ):
         """Forward pass for Kimi K2.5.
 
@@ -314,8 +316,14 @@ class KimiK25Model(MultimodalModel, MTPDecoder):
             # resumes as global batch sharding after the multimodal region.
             spmd.assert_type(x, {"dp": spmd.S(0), "tp": spmd.R})
 
-        for layer in self.layers.values():
-            x = layer(x, attention_masks, positions, padding_mask=padding_mask)
+        for layer_name, layer in self.layers.items():
+            x = layer(
+                x,
+                attention_masks,
+                positions,
+                padding_mask=padding_mask,
+                **routed_expert_ids_kwargs(routed_expert_ids, layer_name),
+            )
 
         x = self.norm(x) if self.norm is not None else x
         if self._skip_lm_head:

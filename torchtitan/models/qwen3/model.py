@@ -59,11 +59,16 @@ class Qwen3TransformerBlock(TransformerBlock):
         positions: torch.Tensor | None = None,
         *,
         padding_mask: torch.Tensor | None = None,
+        routed_expert_ids_TK: torch.Tensor | None = None,
     ):
         x = x + self.attention(self.attention_norm(x), attention_masks, positions)
 
         if self.moe_enabled:
-            x = x + self.moe(self.ffn_norm(x), padding_mask_T=padding_mask)
+            x = x + self.moe(
+                self.ffn_norm(x),
+                padding_mask_T=padding_mask,
+                routed_expert_ids_TK=routed_expert_ids_TK,
+            )
         else:
             x = x + self.feed_forward(self.ffn_norm(x))
         return x

@@ -18,7 +18,11 @@ from torchtitan.models.common.attention import (
     create_varlen_metadata_for_document,
     VarlenMetadata,
 )
-from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.decoder import (
+    Decoder,
+    routed_expert_ids_kwargs,
+    TransformerBlock,
+)
 from torchtitan.models.deepseek_v3.mtp import (
     apply_fsdp_to_mtp_decoder,
     roll_mtp_sequence,
@@ -76,6 +80,7 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         positions: torch.Tensor | None = None,
         *,
         padding_mask: torch.Tensor | None = None,
+        routed_expert_ids_TK: torch.Tensor | None = None,
     ):
         """Run one DeepSeek V4 decoder block.
 
@@ -102,10 +107,15 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
                 x = self.moe(
                     ffn_input,
                     padding_mask_T=padding_mask,
+                    routed_expert_ids_TK=routed_expert_ids_TK,
                     input_ids_T=input_ids_T,
                 )
             else:
-                x = self.moe(ffn_input, padding_mask_T=padding_mask)
+                x = self.moe(
+                    ffn_input,
+                    padding_mask_T=padding_mask,
+                    routed_expert_ids_TK=routed_expert_ids_TK,
+                )
         else:
             x = self.feed_forward(self.ffn_norm(x))
         x = self.hc_post(x, residual, post, comb)
@@ -325,6 +335,7 @@ class DeepSeekV4Model(Decoder):
         positions: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
         padding_mask: torch.Tensor | None = None,
+        routed_expert_ids: torch.Tensor | None = None,
     ):
         """Run the DeepSeek V4 decoder."""
         if len(self.mtp_layers) > 0 and self.tok_embeddings is None:
@@ -347,6 +358,7 @@ class DeepSeekV4Model(Decoder):
                 attention_masks,
                 positions,
                 padding_mask=padding_mask,
+                **routed_expert_ids_kwargs(routed_expert_ids, str(i)),
             )
 
         prev_hc_hidden = h
