@@ -232,17 +232,56 @@ def rl_dapo_qwen3_5_35b_a3b_base_math() -> Controller.Config:
     `DOME_V2_MAX_RESPONSE_TOKENS` (default 32,768) set the batch and budget at launch, so a
     resumed job can change them without a new commit.
     """
+    return _qwen3_5_35b_a3b_base_dapo_math_config(
+        max_response_tokens=int(os.environ.get("DOME_V2_MAX_RESPONSE_TOKENS", 32768)),
+        num_prompts_per_train_step=int(os.environ.get("DOME_V2_PROMPTS", 16)),
+        microbatch_rows=int(os.environ.get("DOME_V2_MICROBATCH_ROWS", 5)),
+        dump_folder="outputs/rl/qwen3_5_35b_a3b_base_dapo_math",
+    )
+
+
+def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math() -> Controller.Config:
+    """Qwen3.5-35B-A3B-Base on harder problems: the 10,805 INTELLECT-3 RL math problems that
+    Qwen3-4B-Thinking-2507 solves in 1-7 of 8 tries, instead of DAPO-Math-17k.
+
+    The `rl_dapo_qwen3_5_35b_a3b_base_math` layout with 32 prompts x 16 samples, 48K
+    responses and 4-row microbatches. Truncated rollouts score `DOME_V2_TRUNCATION_REWARD`
+    (default 0). No online validation: the checkpoints are evaluated offline.
+    """
+    config = _qwen3_5_35b_a3b_base_dapo_math_config(
+        max_response_tokens=int(os.environ.get("DOME_V2_MAX_RESPONSE_TOKENS", 49152)),
+        num_prompts_per_train_step=int(os.environ.get("DOME_V2_PROMPTS", 32)),
+        microbatch_rows=int(os.environ.get("DOME_V2_MICROBATCH_ROWS", 4)),
+        dump_folder="outputs/rl/qwen3_5_35b_a3b_base_intellect3_math",
+    )
+    config.rollouter.train_dataset = Intellect3MathDataset.Config()
+    # A truncated rollout has no final answer; grading the last \boxed{} of its unfinished
+    # reasoning would reward a guess.
+    config.rollouter.worker.rubric.truncation_reward = float(
+        os.environ.get("DOME_V2_TRUNCATION_REWARD", 0.0)
+    )
+    config.async_loop.validation = ValidationConfig(num_samples=0)
+    return config
+
+
+def _qwen3_5_35b_a3b_base_dapo_math_config(
+    *,
+    max_response_tokens: int,
+    num_prompts_per_train_step: int,
+    microbatch_rows: int,
+    dump_folder: str,
+) -> Controller.Config:
+    """Build the 16-GPU Qwen3.5-35B-A3B-Base DAPO run with a Dist-MoE trainer."""
     expert_parallel_degree = 4
-    max_response_tokens = int(os.environ.get("DOME_V2_MAX_RESPONSE_TOKENS", 32768))
     config = _qwen3_5_base_dapo_math_config(
         flavor="35B-A3B",
         enable_thinking=True,
         max_response_tokens=max_response_tokens,
         # 2,048 tokens for the prompt.
         max_total_tokens=max_response_tokens + 2048,
-        num_prompts_per_train_step=int(os.environ.get("DOME_V2_PROMPTS", 16)),
+        num_prompts_per_train_step=num_prompts_per_train_step,
         num_samples_per_prompt=16,
-        microbatch_rows=int(os.environ.get("DOME_V2_MICROBATCH_ROWS", 5)),
+        microbatch_rows=microbatch_rows,
         validation_interval_steps=25,
         num_generators=8,
         parallelism=ParallelismConfig(
@@ -251,7 +290,7 @@ def rl_dapo_qwen3_5_35b_a3b_base_math() -> Controller.Config:
             expert_parallel_degree=expert_parallel_degree,
         ),
         num_loss_chunks=16,
-        dump_folder="outputs/rl/qwen3_5_35b_a3b_base_dapo_math",
+        dump_folder=dump_folder,
     )
     trainer = config.trainer
     # Recompute every op in the block except the Dist-MoE call, which is never recomputed.
@@ -265,15 +304,6 @@ def rl_dapo_qwen3_5_35b_a3b_base_math() -> Controller.Config:
     trainer.dist_moe = DistMoeRuntime.Config(
         scratch_capacity_factor=float(expert_parallel_degree)
     )
-    return config
-
-
-def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math() -> Controller.Config:
-    """`rl_dapo_qwen3_5_35b_a3b_base_math` on harder problems: the 10,805 INTELLECT-3 RL math
-    problems that Qwen3-4B-Thinking-2507 solves in 1-7 of 8 tries, instead of DAPO-Math-17k."""
-    config = rl_dapo_qwen3_5_35b_a3b_base_math()
-    config.rollouter.train_dataset = Intellect3MathDataset.Config()
-    config.dump_folder = "outputs/rl/qwen3_5_35b_a3b_base_intellect3_math"
     return config
 
 
