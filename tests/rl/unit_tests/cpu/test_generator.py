@@ -321,7 +321,7 @@ def _admit_through_engine_loop(monkeypatch, generator, requests):
     generator._decide_next_action = decide_next_action
     generator._request_dispatcher = SimpleNamespace(
         setup=lambda: None,
-        rank0_stamp_min_policy_version=lambda *args: None,
+        process_rejected_requests=lambda rejected_requests: None,
         shutdown=AsyncMock(),
         fail_outstanding_generations=lambda exc: None,
         _dp_rank=0,
