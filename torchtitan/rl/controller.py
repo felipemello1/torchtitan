@@ -147,6 +147,9 @@ class ValidationConfig:
     steps: int = 20
     """Maximum prompts per pass. -1 consumes one finite source pass; 0 disables."""
 
+    greedy: bool = True
+    """Sample at temperature 0; False samples like training (the generator's sampling config)."""
+
     def __post_init__(self) -> None:
         if self.steps < -1:
             raise ValueError("validation steps must be -1 or non-negative")
@@ -692,7 +695,7 @@ class Controller(Configurable):
     async def _collect_validation_rollouts(
         self, *, samples: list[object], sampling: SamplingConfig, step: int
     ) -> tuple[list[RolloutGroup], list[m.Metric]]:
-        """Sample held-out prompts, run each greedily (n=1) concurrently, and emit validation metrics."""
+        """Sample held-out prompts, run each once (n=1) concurrently, and emit validation metrics."""
         # TODO: group_size=1 (best-of-1) only. Support best-of-N.
         generate = self._make_generate_fn(metrics_prefix="validation_generator")
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
@@ -705,7 +708,12 @@ class Controller(Configurable):
                     # request_ids can't collide in the shared engine (e.g. post-validation).
                     group_id=-(i + 1),
                     group_size=1,
-                    sampling=sampling,
+                    # One seed per group, so a seeded run's repeat passes over a prompt differ.
+                    sampling=(
+                        sampling
+                        if sampling.seed is None
+                        else replace(sampling, seed=sampling.seed + i)
+                    ),
                 )
                 for i, sample in enumerate(samples)
             ),
@@ -742,7 +750,7 @@ class Controller(Configurable):
 
     @sl.log_trace_span("validate")
     async def validate(self, *, step: int) -> list[m.Metric]:
-        """Run greedy validation on held-out prompts.
+        """Run one rollout per held-out prompt.
 
         Args:
             step: Training step this validation pass belongs to (0 for the
@@ -758,10 +766,14 @@ class Controller(Configurable):
         if steps == 0:  # skip validation (e.g. loss guard CI)
             return []
         samples = self._rollouter.get_validation_samples(steps)
-        greedy = replace(self._sampling, temperature=0.0, top_p=1.0)
+        sampling = (
+            replace(self._sampling, temperature=0.0, top_p=1.0)
+            if self.config.async_loop.validation.greedy
+            else self._sampling
+        )
 
         rollout_groups, validation_metrics = await self._collect_validation_rollouts(
-            samples=samples, sampling=greedy, step=step
+            samples=samples, sampling=sampling, step=step
         )
 
         self.rollout_recorder.record(is_validation=True, rollout_groups=rollout_groups)
