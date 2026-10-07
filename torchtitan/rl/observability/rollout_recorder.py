@@ -162,6 +162,7 @@ class RolloutSampleRecorder(Configurable):
         if self._log_tensors:
             encoded["prompt_token_ids"] = turn.prompt_token_ids
             encoded["completion_token_ids"] = turn.completion_token_ids
+            encoded["completion_loss_mask"] = turn.completion_loss_mask
         if self._log_logprobs:
             encoded["completion_logprobs"] = turn.completion_logprobs
         return encoded
