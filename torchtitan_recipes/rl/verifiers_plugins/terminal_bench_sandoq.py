@@ -59,6 +59,14 @@ _SANDBOX_TMUX_DIR = "/tmp/vf-terminus-2"
 _WORKDIR_DIRECTIVE = re.compile(r"\s*WORKDIR\s+(\S+)", re.IGNORECASE)
 # Sandoq reaps a persistent shell unused for 1,800 s; refresh it with margin to spare.
 _SHELL_REFRESH_IDLE_S = 1500.0
+# Terminus-2 installs tmux with apt-get (120 s timeout) when the image has none, and the mirrors
+# time out under load. Sandoq already streamed a static tmux into the container for the provider's
+# shell; put a verified copy on PATH. If any step fails, Terminus-2 falls back to apt-get as before.
+_USE_SANDOQ_TMUX = (
+    "command -v tmux >/dev/null || { src=$(ls /tmp/.sandoq-shell/*/tmux 2>/dev/null | head -n 1); "
+    '[ -n "$src" ] && cp "$src" /usr/local/bin/.tmux.tmp && /usr/local/bin/.tmux.tmp -V >/dev/null '
+    "&& mv /usr/local/bin/.tmux.tmp /usr/local/bin/tmux; }"
+)
 
 
 def sandbox_runtime() -> vf.PrimeConfig:
@@ -179,7 +187,9 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
     ) -> ProgramResult:
         """Failures become a nonzero ``ProgramResult``, like the program crashing in the sandbox."""
         environment = RuntimeEnvironment(runtime, {"TMUX_TMPDIR": _SANDBOX_TMUX_DIR})
-        await environment.exec(f"mkdir -p -m 700 {_SANDBOX_TMUX_DIR}")
+        await environment.exec(
+            f"mkdir -p -m 700 {_SANDBOX_TMUX_DIR}; {_USE_SANDOQ_TMUX}"
+        )
         # Terminus reads the sandbox-side log directory from this class attribute;
         # every rollout uses the same sandbox path.
         EnvironmentPaths.agent_dir = PurePosixPath(_SANDBOX_TMUX_DIR)
