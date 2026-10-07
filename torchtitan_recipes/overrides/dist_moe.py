@@ -14,14 +14,14 @@ actor that lists it::
     trainer.override = OverrideConfig(
         imports=["torchtitan_recipes.overrides.dist_moe.dist_moe_routed_experts"]
     )
-    trainer.dist_moe = DistMoeRuntime.Config(device_scratch_capacity_factor=4.0)
+    trainer.dist_moe = DistMoeRuntime.Config(scratch_capacity_factor=4.0)
 
 The generator keeps the stock ``RoutedExperts``. Checkpoint and weight-sync keys
 do not change.
 """
 
 from torchtitan.config import override
-from torchtitan.config.transform import DistMoeTransform
+from torchtitan.config.transform.dist_moe import DistMoeTransform
 from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.protocols.module import Module
 
@@ -34,4 +34,6 @@ __all__ = ["dist_moe_routed_experts"]
     description="BF16 Dist-MoE routed experts (SM100+); needs trainer.dist_moe.",
 )
 def dist_moe_routed_experts(cfg: RoutedExperts.Config) -> Module.Config:
-    return DistMoeTransform().transform(cfg)
+    # The functional WGRAD path (gradients returned through autograd), as v1 and
+    # Jiani ran it; in-place accumulation is untested with the image's dist_moe.
+    return DistMoeTransform(inplace_wgrad_accum=False).transform(cfg)
