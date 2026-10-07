@@ -249,7 +249,7 @@ class VerifiersRollouter(Rollouter):
             raise RuntimeError("Verifiers rollouter is not initialized")
         if self._thinking_budget is not None:
             generate_fn = self._thinking_budget.wrap(generate_fn)
-        self._generation_server.set_generate_fn(generate_fn)
+        self._generation_server.generate_fns[group_id] = generate_fn
         rollouts = await asyncio.gather(
             *(
                 self._run_single_rollout(
@@ -265,6 +265,8 @@ class VerifiersRollouter(Rollouter):
                 for rollout_id in range(group_size)
             )
         )
+        # The group sends no more generation requests.
+        del self._generation_server.generate_fns[group_id]
 
         outputs = await self._rubric.score_group(rollouts, sample)
         for rollout, output in zip(rollouts, outputs, strict=True):

@@ -89,7 +89,7 @@ def test_prompt_at_the_context_cap_never_reaches_the_generator() -> None:
     async def run_test() -> None:
         config = _rollouter_config(TRAIN_DATASET, EVAL_DATASET).generation_server
         server = config.build()
-        server.set_generate_fn(generate_fn)
+        server.generate_fns[0] = generate_fn
         await server.start()
         try:
             client = AsyncOpenAI(
@@ -247,7 +247,7 @@ def test_group_rewards_get_the_length_reward(monkeypatch) -> None:
     rollouter = config.build()
     rollouter._generation_server = SimpleNamespace(
         model_id="torchtitan",
-        set_generate_fn=lambda generate_fn: None,
+        generate_fns={},
         pop_generation_metadata=lambda trace_id: VerifiersGenerationMetadata(
             min_policy_version=0, max_policy_version=0, metrics=[]
         ),
