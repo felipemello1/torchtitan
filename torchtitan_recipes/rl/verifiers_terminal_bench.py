@@ -144,7 +144,10 @@ def _terminal_bench_rollouter_config(
 
 
 def _on_sandoq(
-    rollouter: VerifiersRollouter.Config, *, interleaved_thinking: bool
+    rollouter: VerifiersRollouter.Config,
+    *,
+    interleaved_thinking: bool,
+    rollout_log_dir: str,
 ) -> VerifiersRollouter.Config:
     """Run the rollouter's Terminus-2 in the env server, with a Sandoq VM per rollout.
 
@@ -173,7 +176,9 @@ def _on_sandoq(
     agent = environment.agent.model_copy(
         update={
             "harness": StockTerminusOutsideConfig(
-                id=PLUGIN_ID, interleaved_thinking=interleaved_thinking
+                id=PLUGIN_ID,
+                interleaved_thinking=interleaved_thinking,
+                rollout_log_dir=rollout_log_dir,
             ),
             "runtime": sandbox_runtime(),
         }
@@ -612,6 +617,12 @@ def _qwen3_5_base_terminal_bench_config(
                 num_env_workers=num_env_workers,
             ),
             interleaved_thinking=enable_thinking,
+            # DOME sets dump_folder with --output-dir $DOME_TTRL_LOCAL_OUT_DIR after this
+            # returns, and the env server, which writes these logs, never sees dump_folder.
+            # Off DOME, --output-dir moves rollout_samples.jsonl but not these logs.
+            rollout_log_dir=os.path.join(
+                os.environ.get("DOME_TTRL_LOCAL_OUT_DIR", dump_folder), "rollout_logs"
+            ),
         ),
         renderer=from_renderers(
             Qwen35RendererConfig(

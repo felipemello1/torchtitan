@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gzip
+import json
 import logging
 import os
 import re
@@ -34,15 +36,22 @@ import tempfile
 import time
 import traceback
 from collections.abc import Iterator
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 
 import verifiers.v1 as vf
 from harbor.agents.terminus_2 import Terminus2
 from harbor.environments.base import ExecResult
 from harbor.models.agent.context import AgentContext
 from harbor.models.trial.paths import EnvironmentPaths
+from harbor.utils.logger import logger as harbor_logger
 
-from torchtitan.rl.examples.verifiers.terminal_bench.taskset import TerminalTaskset
+from torchtitan.rl.examples.verifiers.terminal_bench.taskset import (
+    TerminalTaskset,
+    TerminalTasksetConfig,
+)
 from verifiers.v1.clients import ModelContext
 from verifiers.v1.configs.harness import HarnessConfig
 from verifiers.v1.harness import Harness
@@ -67,6 +76,14 @@ _USE_SANDOQ_TMUX = (
     '[ -n "$src" ] && cp "$src" /usr/local/bin/.tmux.tmp && /usr/local/bin/.tmux.tmp -V >/dev/null '
     "&& mv /usr/local/bin/.tmux.tmp /usr/local/bin/tmux; }"
 )
+# A rollout log keeps at most this many characters of each text field, its head and tail.
+# Terminus-2 already caps each terminal output in its trajectory at 10,000 bytes.
+_MAX_LOG_CHARS = 65536
+# The log lines of the rollout whose launch is running in this asyncio task.
+_launch_log_lines: ContextVar[list[str] | None] = ContextVar(
+    "launch_log_lines", default=None
+)
+_LOG_FORMATTER = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
 def sandbox_runtime() -> vf.PrimeConfig:
@@ -89,6 +106,10 @@ class StockTerminusOutsideConfig(HarnessConfig):
     """Send each turn's reasoning back in the chat history. Set it with a thinking renderer:
     Verifiers keys assistant messages on their reasoning, so a history without it forks a new
     branch, a separate training sample holding the full context, at every turn."""
+
+    rollout_log_dir: str | None = None
+    """Write each rollout's log to `<rollout_log_dir>/<trace id>.json.gz`; None writes none.
+    See `StockTerminusOutsideHarness.cleanup`."""
 
 
 class RuntimeEnvironment:
@@ -135,6 +156,11 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
 
     APPENDS_SYSTEM_PROMPT = True
     NEEDS_CONTAINER = False
+
+    def __init__(self, config: StockTerminusOutsideConfig) -> None:
+        super().__init__(config)
+        # Kept by each rollout's launch for its cleanup, by trace id.
+        self._launch_logs: dict[str, LaunchLog] = {}
 
     async def launch(
         self,
@@ -195,7 +221,9 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
         # Terminus reads the sandbox-side log directory from this class attribute;
         # every rollout uses the same sandbox path.
         EnvironmentPaths.agent_dir = PurePosixPath(_SANDBOX_TMUX_DIR)
+        launch_log = self._launch_logs[trace.id] = LaunchLog()
         with tempfile.TemporaryDirectory(prefix="vf-terminus-2-") as logs_dir:
+            log_lines_token = _launch_log_lines.set(launch_log.terminus_log_lines)
             try:
                 agent = Terminus2(
                     logs_dir=Path(logs_dir),
@@ -207,6 +235,16 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
                     # A rollout ends at the context cap instead of Terminus-2 rewriting its history.
                     enable_summarize=False,
                 )
+                # trajectory.json records these kwargs; LiteLLM keeps its own copy of the key.
+                del agent._llm_kwargs["api_key"]
+                # A filter sees only its own logger's records, not a child's, so add it to each
+                # logger Terminus-2 uses: its tmux session's, its own and LiteLLM's. Idempotent.
+                for terminus_logger in (
+                    harbor_logger,
+                    agent.logger,
+                    agent._llm._logger,
+                ):
+                    terminus_logger.addFilter(_keep_launch_record)
                 call = agent._llm.call
                 system = (
                     [{"role": "system", "content": system_prompt}]
@@ -228,10 +266,96 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
                 await agent.setup(environment)
                 await agent.run(prompt, environment, AgentContext())
             except Exception:  # noqa: BLE001 - reported like a crashed program
+                launch_log.harness_stderr = traceback.format_exc()
                 return ProgramResult(
-                    exit_code=1, stdout="", stderr=traceback.format_exc()
+                    exit_code=1, stdout="", stderr=launch_log.harness_stderr
                 )
+            finally:
+                _launch_log_lines.reset(log_lines_token)
+                # Missing when Terminus-2 failed before running, e.g. in tmux setup.
+                trajectory_path = Path(logs_dir) / "trajectory.json"
+                if trajectory_path.exists():
+                    launch_log.trajectory = json.loads(trajectory_path.read_text())
         return ProgramResult(exit_code=0, stdout="", stderr="")
+
+    async def cleanup(self, trace: Trace, runtime: Runtime) -> None:
+        """Write this rollout's log, if `rollout_log_dir` is set.
+
+        Verifiers calls this after scoring, also when leasing the VM or starting tmux failed, so
+        those rollouts leave a log too. The log is gzipped JSON:
+
+            {
+                "verifiers_trace_id": "9f2c...",  # logs.verifiers_trace_id in rollout_samples.jsonl
+                "task": ..., "reward": 0.0, "stop_condition": "error",
+                "errors": [...],                   # trace.errors, as in Rollout.logs
+                "timing": {"setup": {"start": ..., "end": ...}, "agent": {...}, ...},
+                "tests": {"exit_code": 1, "stdout": "...", "stderr": ""},  # tests/test.sh
+                "harness_stderr": "Traceback ...",  # what Terminus-2 raised; "" if nothing
+                "terminus_log": "... WARNING harbor.utils.logger: Tool installation exceeded ...",
+                "trajectory": {...},               # Terminus-2's trajectory.json
+            }
+        """
+        launch_log = self._launch_logs.pop(trace.id, LaunchLog())
+        if self.config.rollout_log_dir is None:
+            return
+        path = Path(self.config.rollout_log_dir) / f"{trace.id}.json.gz"
+        # Verifiers' abort() calls cleanup again after a cancelled close(); keep the full log.
+        if path.exists():
+            return
+        record = {
+            "verifiers_trace_id": trace.id,
+            "task": trace.task.key,
+            "reward": trace.reward,
+            "stop_condition": trace.stop_condition,
+            "errors": [error.model_dump(mode="json") for error in trace.errors],
+            "timing": trace.timing.model_dump(mode="json"),
+            "tests": trace.info.get("tests"),
+            "harness_stderr": truncate_middle(launch_log.harness_stderr),
+            "terminus_log": truncate_middle("\n".join(launch_log.terminus_log_lines)),
+            "trajectory": launch_log.trajectory,
+        }
+        # On the event loop, like Terminus-2's trajectory dump after every turn: ~3 ms per log,
+        # 48 ms for T3's largest. Level 6 is as small as the default 9 and ~3x faster.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(gzip.compress(json.dumps(record).encode(), compresslevel=6))
+
+
+@dataclass
+class LaunchLog:
+    """What a rollout's `launch` keeps for its `cleanup` to write."""
+
+    terminus_log_lines: list[str] = field(default_factory=list)
+    """Records Terminus-2, its tmux session and LiteLLM logged during the launch."""
+    harness_stderr: str = ""
+    """The traceback of what Terminus-2 raised. Verifiers' error keeps its last 2,000 characters."""
+    trajectory: dict | None = None
+    """Terminus-2's trajectory.json."""
+
+
+def _keep_launch_record(record: logging.LogRecord) -> bool:
+    """Logging filter that copies a record into the running launch's log lines; drops nothing.
+
+    A filter, not a handler, so the job log is unchanged: when no logger up the chain has a
+    handler, Python prints warnings to stderr (`logging.lastResort`), and a handler stops that.
+    """
+    lines = _launch_log_lines.get()
+    if lines is not None:
+        lines.append(_LOG_FORMATTER.format(record))
+    return True
+
+
+def truncate_middle(text: str, max_chars: int = _MAX_LOG_CHARS) -> str:
+    """Keep the head and tail of `text`, `max_chars` in all, as Terminus-2 does for terminal output.
+
+    Example:
+        truncate_middle("aaaaXXXXXXbbbb", max_chars=8)
+        # -> "aaaa\\n[... 6 characters omitted ...]\\nbbbb"
+    """
+    if len(text) <= max_chars:
+        return text
+    half = max_chars // 2
+    omitted = len(text) - 2 * half
+    return f"{text[:half]}\n[... {omitted} characters omitted ...]\n{text[-half:]}"
 
 
 def restore_sampled_reasoning(message_history: list[dict], trace: Trace) -> list[dict]:
@@ -263,15 +387,38 @@ def restore_sampled_reasoning(message_history: list[dict], trace: Trace) -> list
     ]
 
 
-class SandoqTerminalTaskset(TerminalTaskset):
+class SandoqHarborTask(HarborTask):
+    """Harbor's task, which also keeps test.sh's exit code and output in `trace.info["tests"]`."""
+
+    async def _graded(self, runtime: Runtime, trace: Trace) -> float | dict[str, float]:
+        # The stock `_graded` runs test.sh with its one `run`, drops the output, and reads the
+        # reward with `read`.
+        async def run_and_keep(argv: list[str], env: dict[str, str]) -> ProgramResult:
+            result = await runtime.run(argv, env)
+            trace.info["tests"] = {
+                "exit_code": result.exit_code,
+                "stdout": truncate_middle(result.stdout),
+                "stderr": truncate_middle(result.stderr),
+            }
+            return result
+
+        grading_runtime = SimpleNamespace(run=run_and_keep, read=runtime.read)
+        return await super()._graded(grading_runtime, trace)
+
+
+# Verifiers' env server builds each rollout's task as this generic's task type; `load` only
+# feeds the dataset.
+class SandoqTerminalTaskset(
+    TerminalTaskset, vf.Taskset[SandoqHarborTask, TerminalTasksetConfig]
+):
     """The PR's taskset, with each task's image WORKDIR filled in."""
 
-    def load(self) -> Iterator[HarborTask]:
+    def load(self) -> Iterator[SandoqHarborTask]:
         # Without a task.toml workdir, use the image's last WORKDIR: the runtime
         # default (/app) is missing in some images, and a Sandoq VM fails then.
         for task in super().load():
             workdir = task.data.workdir or image_workdir(Path(task.data.task_dir))
-            yield HarborTask(
+            yield SandoqHarborTask(
                 task.data.model_copy(update={"workdir": workdir}), self.config.task
             )
 
