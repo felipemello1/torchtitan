@@ -32,6 +32,12 @@ _PIECE_VALUES = {
     chess.QUEEN: 9,
 }
 _BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
+# Training rewards (see `ChessGame.rewards`). A forfeit or a checkmate against you costs its full
+# reward before your first move, shrinking to 0 by the `max_plies` cap; a draw grows to 0.5 by then.
+_FORFEIT_REWARD = -0.5
+_CHECKMATED_REWARD = -0.25
+# Share of the material score in an unfinished game's reward: 0.5 keeps it within [0.25, 0.75].
+_MATERIAL_WEIGHT = 0.5
 
 
 class ChessPlayerEnv(MessageEnv):
@@ -39,13 +45,13 @@ class ChessPlayerEnv(MessageEnv):
     moves, and each assistant reply ends with a move in `\\boxed{}`.
 
     `step` plays the move, then waits for the other player's reply. The rollout ends when the game
-    does, and the last step's `env_rewards["score"]` is this player's score (win 1, draw 0.5, loss 0).
+    does, and the last step's `env_rewards["score"]` is this player's reward (see `ChessGame.rewards`).
 
     Example (self-play; White's view):
 
         init:                    "You are playing chess as White ... Legal moves: c3 Nf3 ... e4 ..."
         step("... \\boxed{e4}")   -> waits for Black's move -> "Black played c5. <board> Legal moves: ..."
-        step("... \\boxed{Ke9}")  -> illegal: White forfeits -> done, env_rewards={"score": 0.0}
+        step("... \\boxed{Ke9}")  -> illegal: White forfeits -> done, env_rewards={"score": -0.475}  (max_plies=40)
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -77,7 +83,7 @@ class ChessPlayerEnv(MessageEnv):
         await self._game.wait_for_turn(self._color)
         if self._game.is_over:
             return MessageEnvStepOutput(
-                done=True, env_rewards={"score": self._game.scores[self._color]}
+                done=True, env_rewards={"score": self._game.rewards[self._color]}
             )
         return MessageEnvStepOutput(
             env_messages=[{"role": "user", "content": self._game.turn_message()}]
@@ -92,9 +98,11 @@ class ChessGame:
     `start` once before play, so the bot makes the first move when it is to move.
 
     A game ends on:
-    (a) checkmate, stalemate, insufficient material, or threefold repetition;
+    (a) checkmate, stalemate, or insufficient material (a repetition plays on, see `_end_if_over`);
     (b) `max_plies` plies played, scored by material (see `material_score`);
     (c) an illegal or missing move, or `forfeit`: that color loses.
+
+    `scores` is the chess result, used for the Elo metrics; `rewards` is what training uses.
 
     Example (self-play):
 
@@ -103,6 +111,7 @@ class ChessGame:
         await game.play(chess.WHITE, "e4")
         await game.wait_for_turn(chess.BLACK)  # returns at once: Black to move
         await game.play(chess.BLACK, "Ke9")    # illegal -> game.scores == {WHITE: 1.0, BLACK: 0.0}
+                                               #            game.rewards == {WHITE: 0.5, BLACK: -0.5}
     """
 
     def __init__(
@@ -124,12 +133,45 @@ class ChessGame:
         # Shuffles each turn's legal-move list.
         self._rng = random.Random(seed)
         self._last_move_san: str | None = None
+        self._forfeiter: chess.Color | None = None
+        self._num_moves = {chess.WHITE: 0, chess.BLACK: 0}
         self._turn_changed = asyncio.Condition()
         self._end_if_over()
 
     @property
     def is_over(self) -> bool:
         return self.scores is not None
+
+    @property
+    def rewards(self) -> dict[chess.Color, float]:
+        """Each color's training reward once the game is over:
+        (a) checkmate: 1 for the winner however long it took; the loser's -0.25 shrinks with the moves it lasted;
+        (b) stalemate or insufficient material: 0.5 times the share of its moves each color played;
+        (c) `max_plies` plies: halfway between a draw and the material score, so within [0.25, 0.75];
+        (d) a forfeit: -0.5, shrinking with the moves the forfeiter lasted, so always below being
+            checkmated later; the other color is scored as in (c), not as a win.
+
+        Example (max_plies=60, so 30 moves per color):
+
+            max_plies, White up a knight               -> {WHITE: 0.59, BLACK: 0.41}
+            Black checkmated on White's 10th move      -> {WHITE: 1.0, BLACK: -0.25 * (1 - 9 / 30) = -0.175}
+            Black forfeits after 10 moves, up a queen  -> {WHITE: 0.30, BLACK: -0.5 * (1 - 10 / 30) = -0.33}
+            Black forfeits before its first move       -> {WHITE: 0.5, BLACK: -0.5}
+        """
+        if self.end_reason == "checkmate":
+            loser = self.board.turn
+            return {not loser: 1.0, loser: _CHECKMATED_REWARD * self._moves_left(loser)}
+        if self.end_reason != "max_plies" and self._forfeiter is None:
+            return {
+                color: 0.5 * (1.0 - self._moves_left(color)) for color in chess.COLORS
+            }
+        white_reward = 0.5 + _MATERIAL_WEIGHT * (material_score(self.board) - 0.5)
+        rewards = {chess.WHITE: white_reward, chess.BLACK: 1.0 - white_reward}
+        if self._forfeiter is not None:
+            rewards[self._forfeiter] = _FORFEIT_REWARD * self._moves_left(
+                self._forfeiter
+            )
+        return rewards
 
     @property
     def num_plies(self) -> int:
@@ -158,7 +200,7 @@ class ChessGame:
                 return
             move = None if move_text is None else _parse_move(self.board, move_text)
             if move is None:
-                self._end(winner=not color, reason="illegal_move")
+                self._forfeit(color, reason="illegal_move")
             else:
                 self._push(move)
                 if not self.is_over and self._bot is not None:
@@ -169,7 +211,7 @@ class ChessGame:
         """End the game as a loss for `color`, unless it is already over."""
         async with self._turn_changed:
             if not self.is_over:
-                self._end(winner=not color, reason=reason)
+                self._forfeit(color, reason=reason)
             self._turn_changed.notify_all()
 
     def turn_message(self) -> str:
@@ -198,21 +240,33 @@ class ChessGame:
 
     def _push(self, move: chess.Move) -> None:
         self._last_move_san = self.board.san(move)
+        self._num_moves[self.board.turn] += 1
         self.board.push(move)
         self._end_if_over()
 
     def _end_if_over(self) -> None:
         outcome = self.board.outcome()
-        # `outcome(claim_draw=True)` also ends the game when the side to move could repeat a
-        # position a third time; end it only once the repetition has happened.
-        if outcome is None and self.board.is_repetition(3):
-            outcome = chess.Outcome(chess.Termination.THREEFOLD_REPETITION, winner=None)
+        # A repetition plays on to `max_plies`: a repetition draw would lock in a reward while playing
+        # on risks a forfeit, so self-play could learn to repeat moves instead of playing.
+        if (
+            outcome is not None
+            and outcome.termination == chess.Termination.FIVEFOLD_REPETITION
+        ):
+            outcome = None
         if outcome is not None:
             self._end(winner=outcome.winner, reason=outcome.termination.name.lower())
         elif self.num_plies >= self._max_plies:
             white_score = material_score(self.board)
             self.scores = {chess.WHITE: white_score, chess.BLACK: 1.0 - white_score}
             self.end_reason = "max_plies"
+
+    def _moves_left(self, color: chess.Color) -> float:
+        """The share of its `max_plies / 2` moves that `color` did not play: 1 before its first move."""
+        return 1.0 - 2 * self._num_moves[color] / self._max_plies
+
+    def _forfeit(self, color: chess.Color, *, reason: str) -> None:
+        self._forfeiter = color
+        self._end(winner=not color, reason=reason)
 
     def _end(self, *, winner: chess.Color | None, reason: str) -> None:
         if winner is None:

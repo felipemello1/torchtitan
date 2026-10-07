@@ -103,14 +103,15 @@ def test_a_move_after_the_game_ended_changes_nothing() -> None:
     asyncio.run(run())
 
 
-def test_threefold_ends_the_game_on_the_third_occurrence() -> None:
+def test_repetition_plays_on_to_the_ply_cap() -> None:
     async def run() -> None:
-        game = _new_game()
-        await _play_moves(game, ["Nf3", "Nf6", "Ng1", "Ng8", "Nf3", "Nf6", "Ng1"])
-        assert not game.is_over  # Black could repeat with Ng8, but has not
-        await game.play(chess.BLACK, "Ng8")
-        assert game.end_reason == "threefold_repetition"
-        assert game.scores == {chess.WHITE: 0.5, chess.BLACK: 0.5}
+        game = _new_game(max_plies=20)
+        # the start position occurs a fifth time on ply 16
+        await _play_moves(game, ["Nf3", "Nf6", "Ng1", "Ng8"] * 4)
+        assert game.board.is_fivefold_repetition() and not game.is_over
+        await _play_moves(game, ["Nf3", "Nf6", "Ng1", "Ng8"])
+        assert game.end_reason == "max_plies"
+        assert game.rewards == {chess.WHITE: 0.5, chess.BLACK: 0.5}
 
     asyncio.run(run())
 
@@ -124,6 +125,55 @@ def test_max_plies_scores_by_material() -> None:
         assert game.scores[chess.WHITE] == pytest.approx(material_score(game.board))
         assert game.scores[chess.WHITE] + game.scores[chess.BLACK] == pytest.approx(1.0)
         assert game.scores[chess.WHITE] > 0.5
+
+    asyncio.run(run())
+
+
+def test_rewards_make_a_forfeit_cost_more_than_a_loss_and_no_free_win() -> None:
+    async def run() -> None:
+        # White is checkmated after 2 of its 20 moves
+        mate = _new_game()
+        await _play_moves(mate, ["f3", "e5", "g4", "Qh4#"])
+        assert mate.rewards == {
+            chess.WHITE: pytest.approx(-0.25 * (1 - 2 / 20)),
+            chess.BLACK: 1.0,
+        }
+
+        # 1. e4 d5 2. exd5 Nf6: White is a pawn up
+        capped = _new_game(max_plies=4)
+        await _play_moves(capped, ["e4", "d5", "exd5", "Nf6"])
+        white_reward = 0.5 + 0.5 * (material_score(capped.board) - 0.5)
+        assert 0.5 < white_reward < 0.75
+        assert capped.rewards == {
+            chess.WHITE: pytest.approx(white_reward),
+            chess.BLACK: pytest.approx(1.0 - white_reward),
+        }
+
+        # same position, but White forfeits after 2 moves: Black, a pawn down, gets the capped
+        # reward, not a win
+        forfeited = _new_game()
+        await _play_moves(forfeited, ["e4", "d5", "exd5", "Nf6", "Ke9"])
+        assert forfeited.scores == {chess.WHITE: 0.0, chess.BLACK: 1.0}
+        assert forfeited.rewards == {
+            chess.WHITE: pytest.approx(-0.5 * (1 - 2 / 20)),
+            chess.BLACK: pytest.approx(1.0 - white_reward),
+        }
+
+        # forfeiting before the first move costs the full -0.5
+        early = _new_game()
+        await early.play(chess.WHITE, "Ke9")
+        assert early.rewards == {chess.WHITE: -0.5, chess.BLACK: 0.5}
+
+        # White stalemates Black on its first move: a draw is worth 0.5 times the moves played
+        draw = _new_game(
+            sample=ChessSample(fen="7k/4Q3/8/8/8/8/8/K7 w - - 0 1", opponent="self")
+        )
+        await draw.play(chess.WHITE, "Qf7")
+        assert draw.end_reason == "stalemate"
+        assert draw.rewards == {
+            chess.WHITE: pytest.approx(0.5 * 1 / 20),
+            chess.BLACK: 0.0,
+        }
 
     asyncio.run(run())
 
@@ -264,7 +314,8 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
 
         step_output = await white.step({"role": "assistant", "content": "\\boxed{Ke9}"})
         assert step_output.done
-        assert step_output.env_rewards == {"score": 0.0}
+        # White forfeits after 1 of its 20 moves
+        assert step_output.env_rewards == {"score": pytest.approx(-0.5 * (1 - 1 / 20))}
 
     asyncio.run(run())
 
@@ -363,8 +414,6 @@ async def _run_group(
     worker = ChessSelfPlayWorker.Config(
         rubric=Rubric.Config(
             reward_fns=[RewardChessScore.Config()],
-            truncation_reward=0.0,
-            error_reward=0.0,
         ),
         message_env=ChessPlayerEnv.Config(),
         token_env=TokenEnv.Config(step_timeout_s=None),
@@ -415,9 +464,15 @@ def test_worker_trains_both_colors_with_per_color_advantages() -> None:
         by_id = {rollout.rollout_id: rollout for rollout in group.rollouts}
         assert sorted(by_id) == [0, 1, 2, 3]
         assert all(r.status == RolloutStatus.COMPLETED for r in group.rollouts)
-        assert [by_id[i].reward for i in range(4)] == [0.0, 1.0, 1.0, 0.0]
-        # each color is centered on its own mean (0.5 for both here)
-        assert [by_id[i].advantage for i in range(4)] == [-0.5, 0.5, 0.5, -0.5]
+        # White is mated after 2 of its 20 moves; Black's forfeit before its first move costs -0.5
+        # and gives White a draw's 0.5 at even material, not a win
+        assert [by_id[i].reward for i in range(4)] == pytest.approx(
+            [-0.225, 1.0, 0.5, -0.5]
+        )
+        # each color is centered on its own mean (White 0.1375, Black 0.25)
+        assert [by_id[i].advantage for i in range(4)] == pytest.approx(
+            [-0.3625, 0.75, 0.3625, -0.75]
+        )
         assert [len(by_id[i].turns) for i in range(4)] == [2, 2, 1, 1]
 
         reduced = _reduced_metrics(group.rollouts)
@@ -433,7 +488,7 @@ def test_worker_drops_a_player_that_never_moved() -> None:
     async def run() -> None:
         group = await _run_group({0: ["Ke9"], 1: []}, group_size=1)
         assert [rollout.rollout_id for rollout in group.rollouts] == [0]
-        assert group.rollouts[0].reward == 0.0
+        assert group.rollouts[0].reward == -0.5
 
     asyncio.run(run())
 
@@ -448,8 +503,10 @@ def test_worker_forfeits_a_player_that_stops_mid_game() -> None:
         white, black = group.rollouts
         assert white.status == RolloutStatus.TRUNCATED_LENGTH
         assert black.status == RolloutStatus.COMPLETED
-        assert (white.reward, black.reward) == (0.0, 1.0)
-        assert black.turns[-1].env_rewards == {"score": 1.0}
+        # White forfeits after 1 of its 20 moves; Black gets the even-material 0.5
+        assert (white.reward, black.reward) == pytest.approx((-0.475, 0.5))
+        assert white.turns[-1].env_rewards == {"score": pytest.approx(-0.475)}
+        assert black.turns[-1].env_rewards == {"score": 0.5}
         assert (
             _reduced_metrics(group.rollouts)[
                 "chess_self/end_reason/truncated_length/mean"
@@ -476,12 +533,13 @@ def test_worker_plays_only_the_policy_against_a_bot(
         group = await _run_group({0: ["Ke9"]}, group_size=1, sample=sample)
         assert [rollout.rollout_id for rollout in group.rollouts] == [0]
         rollout = group.rollouts[0]
-        assert rollout.reward == 0.0
+        assert rollout.reward == -0.5
         # Black's first prompt shows the bot's opening move
         assert "White played" in rollout.turns[0].prompt_messages[-1]["content"]
 
         reduced = _reduced_metrics(group.rollouts, prefix="validation")
-        assert reduced["validation_reward/_mean"] == 0.0
+        assert reduced["validation_reward/_mean"] == -0.5
+        # the Elo metrics use the chess result: a forfeit is a loss
         assert reduced["val_chess_test_bot/policy_score/mean"] == 0.0
         assert reduced["val_chess_test_bot/forfeit_rate_per_reply/mean"] == 1.0
         assert (

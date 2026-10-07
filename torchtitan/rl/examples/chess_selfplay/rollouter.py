@@ -31,7 +31,6 @@ _END_REASONS = (
     "checkmate",
     "stalemate",
     "insufficient_material",
-    "threefold_repetition",
     "max_plies",
     "illegal_move",
     # a player that stopped without a move forfeits, with its rollout status as the reason
@@ -55,9 +54,9 @@ class ChessSelfPlayWorker(RolloutWorker):
 
     Example (group_size=2, self-play):
 
-        game 0: White mates on ply 31        -> scores White 1.0, Black 0.0
-        game 1: draw by threefold repetition -> scores White 0.5, Black 0.5
-        advantages: White [+0.25, -0.25], Black [-0.25, +0.25]   (each color's mean is subtracted)
+        game 0: White mates on ply 31, Black lasted 15 of its 30 moves -> rewards White 1.0, Black -0.125
+        game 1: the 60-ply cap at even material                       -> rewards White 0.5, Black 0.5
+        advantages: White [+0.25, -0.25], Black [-0.3125, +0.3125]   (each color's mean is subtracted)
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -230,11 +229,18 @@ class ChessSelfPlayWorker(RolloutWorker):
             # A player can stop without moving: its reply hit `max_tokens`, its history outgrew
             # `max_rollout_tokens`, or it errored. It forfeits with that status, so the other
             # player stops waiting; a no-op if the game already ended.
-            # TODO: a game lost to an infra error (status "error") counts as a loss and a win;
-            # dropping both players' rollouts would keep infra failures out of the reward.
+            # TODO: a game lost to an infra error (status "error") counts as a forfeit; dropping
+            # both players' rollouts would keep infra failures out of the reward.
             await game.forfeit(
                 color, reason="error" if rollout is None else rollout.status.value
             )
+            if (
+                rollout is not None
+                and rollout.turns
+                and not rollout.turns[-1].env_rewards
+            ):
+                # the env never stepped the reply that stopped this player: score the forfeit here
+                rollout.turns[-1].env_rewards = {"score": game.rewards[color]}
             await env.close()
 
 
