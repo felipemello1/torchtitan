@@ -818,6 +818,19 @@ class Controller(Configurable):
         """
         async_loop = self.config.async_loop
         num_training_steps = async_loop.num_training_steps
+        training = self.config.trainer.training
+        # One line to check a relaunch picked up its launch-time batch settings.
+        logger.info(
+            f"Run shape: start_step={self.start_step}, "
+            f"{async_loop.num_prompts_per_train_step} prompts x "
+            f"{async_loop.num_samples_per_prompt} samples, "
+            f"max_active_rollout_groups={async_loop.max_active_rollout_groups}, "
+            f"num_tokens_per_microbatch_per_dp_rank="
+            f"{training.num_tokens_per_microbatch_per_dp_rank}, "
+            f"max_context_length={training.max_context_length}, "
+            f"drop_zero_std_reward_groups="
+            f"{async_loop.training_sample_builder.drop_zero_std_reward_groups}"
+        )
         if self.start_step == 0:
             logger.info(
                 f"Running pre-training validation; then {num_training_steps} steps of async RL training"
