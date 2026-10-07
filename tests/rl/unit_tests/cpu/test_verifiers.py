@@ -121,6 +121,34 @@ def test_verifiers_multiturn_trace_matches_titanrl_rollout_structure() -> None:
     assert [turn.completion_logprobs for turn in turns] == [[-0.1], [-0.2]]
 
 
+def test_verifiers_rollout_logs_keep_the_trace_errors() -> None:
+    from verifiers.v1.trace import Error
+
+    trace = SimpleNamespace(
+        id="trace-1",
+        stop_condition="error",
+        errors=[
+            Error(type="HarnessError", message="agent timeout", traceback="Traceback")
+        ],
+    )
+    logs = VerifiersRollouter.rollout_logs(
+        verifiers_episode=SimpleNamespace(errors=[]), trace=trace
+    )
+
+    assert logs == {
+        "verifiers_trace_id": "trace-1",
+        "stop_condition": "error",
+        "errors": [
+            {
+                "type": "HarnessError",
+                "message": "agent timeout",
+                "status_code": None,
+                "traceback": "Traceback",
+            },
+        ],
+    }
+
+
 def test_generation_server_forwards_token_request() -> None:
     async def run_test() -> None:
         received = []

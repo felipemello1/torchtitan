@@ -77,6 +77,15 @@ def test_filter_dedupes_small_groups() -> None:
     assert len(KeepExtremeRewardsFilter.Config(k=5).build()([group])) == 2  # no dups
 
 
+def test_filter_keep_errors_adds_every_errored_rollout_once() -> None:
+    # 0.2 and the unscored None errored; so did one -1, which is already kept as a lowest.
+    group = _group(0, rewards=[0.9, 0.9, 0.2, None, -0.3, -1.0, -1.0])
+    for rollout_index in (2, 3, 5):
+        group.rollouts[rollout_index].status = RolloutStatus.ERROR
+    picked = KeepExtremeRewardsFilter.Config(k=2, keep_errors=True).build()([group])
+    assert [rollout.reward for rollout in picked] == [-1.0, -1.0, 0.9, 0.9, 0.2, None]
+
+
 def test_default_filter_logs_only_highest_and_lowest_per_group(tmp_path) -> None:
     recorder = _recorder(tmp_path)  # default filter: KeepExtremeRewardsFilter, k=1
     recorder.record(
@@ -124,6 +133,15 @@ def test_record_dumps_the_rollout_minus_token_arrays(tmp_path) -> None:
     assert "prompt_token_ids" not in turn
     assert "completion_token_ids" not in turn
     assert "completion_logprobs" not in turn
+
+
+def test_record_writes_rollout_logs(tmp_path) -> None:
+    logs = {"errors": [{"type": "TimeoutError", "message": "sandbox timed out"}]}
+    group = _group(0, rewards=[0.1, 0.9])
+    group.rollouts[0].logs = logs
+    _recorder(tmp_path).record(is_validation=False, rollout_groups=[group])
+    records = _read_lines(tmp_path / "rollout_samples.jsonl")
+    assert [record["logs"] for record in records] == [logs, {}]  # {} when unset
 
 
 def test_log_tensors_and_logprobs_opt_in(tmp_path) -> None:
