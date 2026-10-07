@@ -66,6 +66,7 @@ from torchtitan.rl.observability.rollout_recorder import (
 from torchtitan.rl.rubric import Rubric
 from torchtitan.rl.trainer import Trainer
 from verifiers.v1.configs.agent import TimeoutConfig as AgentTimeoutConfig
+from verifiers.v1.configs.retries import RetryConfig
 from verifiers.v1.harnesses.terminus_2 import Terminus2HarnessConfig
 from verifiers.v1.tasksets.harbor import HarborEnvConfig
 
@@ -181,6 +182,8 @@ def _on_sandoq(
                 rollout_log_dir=rollout_log_dir,
             ),
             "runtime": sandbox_runtime(),
+            # A lost exec channel (Sandoq transport, VM gone) gets one more try on a fresh VM.
+            "retries": RetryConfig(max_retries=1, include=["SandboxError"]),
         }
     )
     return dataclasses.replace(

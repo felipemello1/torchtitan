@@ -54,6 +54,7 @@ from torchtitan.rl.examples.verifiers.terminal_bench.taskset import (
 )
 from verifiers.v1.clients import ModelContext
 from verifiers.v1.configs.harness import HarnessConfig
+from verifiers.v1.errors import SandboxError
 from verifiers.v1.harness import Harness
 from verifiers.v1.runtimes import ProgramResult, Runtime
 from verifiers.v1.task import TaskData
@@ -264,6 +265,10 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
                 )
                 await agent._session.send_keys(keys=["clear", "Enter"])
                 await agent.run(prompt, environment, AgentContext())
+            except SandboxError:
+                # Raised as is: Verifiers can rerun the rollout on a fresh VM (agent retries).
+                launch_log.harness_stderr = traceback.format_exc()
+                raise
             except Exception:  # noqa: BLE001 - reported like a crashed program
                 launch_log.harness_stderr = traceback.format_exc()
                 return ProgramResult(

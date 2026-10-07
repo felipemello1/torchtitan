@@ -647,6 +647,35 @@ def test_sandoq_session_nests_a_shell(tmp_path, monkeypatch) -> None:
     assert sessions[0].keys == [["bash", "Enter"], ["clear", "Enter"]]
 
 
+def test_sandoq_exec_failure_raises_sandbox_error(tmp_path, monkeypatch) -> None:
+    """A lost exec channel leaves launch as a SandboxError, which the agent's retries can rerun
+    on a fresh VM; the rollout log still keeps the traceback."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.errors import SandboxError
+
+    class LostRuntime(_RecordingRuntime):
+        async def run(self, argv, env):
+            if env.get("TERMINUS_EXEC") == "ls":
+                raise SandboxError("prime exec failed: uncertain transport failure")
+            return await super().run(argv, env)
+
+    class Terminus2Typing(_terminus2_without_model(sandoq)):
+        async def run(self, instruction, environment, context) -> None:
+            await environment.exec("ls")
+
+    monkeypatch.setattr(sandoq, "Terminus2", Terminus2Typing)
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    runtime = LostRuntime()
+    with pytest.raises(SandboxError):
+        asyncio.run(_launch(harness, trace, runtime))
+    asyncio.run(harness.cleanup(trace, runtime))
+    assert (
+        "uncertain transport failure"
+        in _read_rollout_log(tmp_path, trace)["harness_stderr"]
+    )
+
+
 class _RecordingRuntime:
     """Runtime that records each `run` and answers by the command's first word."""
 
