@@ -20,8 +20,9 @@ __all__ = ["LMHeadFP32OutputConverter"]
 class LMHeadFP32OutputConverter(ModelConfigConverter):
     """Swap the decoder lm_head's ``Linear.Config`` to ``HiMidLoLinear.Config``.
 
-    Only the lm_head changes. The same model config backs the trainer and the vLLM
-    generator, so both compute fp32 logits with the same op.
+    Only the lm_head changes; `local_compile_regions` stays the model config's choice. The same
+    model config backs the trainer and the vLLM generator, so both compute fp32 logits with the
+    same op.
     """
 
     _TARGET = "lm_head"
