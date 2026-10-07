@@ -46,6 +46,7 @@ from torchtitan.rl.generator import (
     SamplingConfig,
     VLLMGenerator,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.logprobs import FlatLogprobs, Logprob
 
 _TIMEOUT_S = 5
@@ -555,6 +556,20 @@ class _HeldEngine(_FakeEngine):
         return []
 
 
+class _RejectingEngine(_FakeEngine):
+    """`add_request` raises vLLM's prompt-length error for request "too_long"."""
+
+    error_type: type[Exception] = VLLMValidationError
+
+    def add_request(self, *, request_id, prompt, params):
+        if request_id == "too_long":
+            raise self.error_type(
+                "The decoder prompt (length 2) plus the number of requested output tokens "
+                "(at least 1) is longer than the maximum model length of 2."
+            )
+        super().add_request(request_id=request_id, prompt=prompt, params=params)
+
+
 class _StepGate:
     """A `step_hook` that holds every step until `release()`; `entered` is set once one starts."""
 
@@ -956,6 +971,138 @@ def test_generate_cancelled_after_admission_leaves_the_loop_running(
     asyncio.run(run())
 
 
+# Older vLLM raises a plain ValueError for this prompt length.
+@pytest.mark.parametrize("error_type", [VLLMValidationError, ValueError])
+def test_request_rejected_at_admission_fails_only_its_reply(
+    engine_thread, error_type
+) -> None:
+    gate = _StepGate()
+    engine = _RejectingEngine(gate)
+    engine.error_type = error_type
+
+    async def run() -> None:
+        generator = engine_thread(engine)
+        await generator.start_engine_loop()
+        first = _generate(generator, "r0")
+        assert await asyncio.to_thread(gate.entered.wait, _TIMEOUT_S)
+        # Put while `step` holds the engine thread, so the three are admitted in one decision.
+        batch = [
+            _generate(generator, request_id) for request_id in ("r1", "too_long", "r2")
+        ]
+        await asyncio.sleep(0)
+        gate.release()
+
+        results = await asyncio.wait_for(
+            asyncio.gather(first, *batch, return_exceptions=True), _TIMEOUT_S
+        )
+        r0, r1, rejection, r2 = results
+        assert isinstance(rejection, ValueError)
+        assert "is longer than the maximum model length" in str(rejection)
+        assert [r0.request_id, r1.request_id, r2.request_id] == ["r0", "r1", "r2"]
+
+        # The loop keeps serving.
+        completion = await asyncio.wait_for(_generate(generator, "r3"), _TIMEOUT_S)
+        assert completion.request_id == "r3"
+        assert not generator._engine_loop_future.done()
+        assert generator._request_dispatcher._rank0_outstanding_generations == {}
+
+        await asyncio.wait_for(generator.close(), _TIMEOUT_S)
+
+    asyncio.run(run())
+
+
+def test_render_rejection_fails_only_its_reply(engine_thread) -> None:
+    gate = _StepGate()
+    engine = _FakeEngine(gate)
+
+    def render_cmpl(prompts):
+        # vLLM's renderer rejects a prompt longer than max_model_len, here 2.
+        if any(len(prompt["prompt_token_ids"]) > 2 for prompt in prompts):
+            raise VLLMValidationError(
+                "This model's maximum context length is 2 tokens."
+            )
+        return prompts
+
+    engine.renderer.render_cmpl = render_cmpl
+
+    async def run() -> None:
+        generator = engine_thread(engine)
+        await generator.start_engine_loop()
+        first = _generate(generator, "r0")
+        assert await asyncio.to_thread(gate.entered.wait, _TIMEOUT_S)
+        # Put while `step` holds the engine thread, so both are admitted in one decision.
+        too_long = asyncio.create_task(
+            generator.generate(
+                [1, 2, 3], request_id="too_long", group_id=0, routing_session_id="s"
+            )
+        )
+        second = _generate(generator, "r1")
+        await asyncio.sleep(0)
+        gate.release()
+
+        r0, rejection, r1 = await asyncio.wait_for(
+            asyncio.gather(first, too_long, second, return_exceptions=True), _TIMEOUT_S
+        )
+        assert isinstance(rejection, ValueError)
+        assert "maximum context length" in str(rejection)
+        assert [r0.request_id, r1.request_id] == ["r0", "r1"]
+        assert not generator._engine_loop_future.done()
+
+        await asyncio.wait_for(generator.close(), _TIMEOUT_S)
+
+    asyncio.run(run())
+
+
+def test_sampling_params_rejection_fails_only_its_reply(engine_thread) -> None:
+    async def run() -> None:
+        generator = engine_thread(_FakeEngine())
+        await generator.start_engine_loop()
+        rejected = generator.generate(
+            [1, 2],
+            request_id="max_tokens_0",
+            group_id=0,
+            routing_session_id="s",
+            sampling_config=SamplingConfig(max_tokens=0, stop_token_ids=[]),
+        )
+        with pytest.raises(ValueError, match="max_tokens must be at least 1"):
+            await asyncio.wait_for(rejected, _TIMEOUT_S)
+
+        completion = await asyncio.wait_for(_generate(generator, "r0"), _TIMEOUT_S)
+        assert completion.request_id == "r0"
+
+        await asyncio.wait_for(generator.close(), _TIMEOUT_S)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("CUDA error: an illegal memory access was encountered"),
+        # Our own bug, e.g. passing the wrong params type; not a rejection.
+        TypeError("params must be either SamplingParams or PoolingParams"),
+    ],
+)
+def test_admission_error_that_is_not_a_rejection_crashes_the_loop(
+    engine_thread, error
+) -> None:
+    class BrokenEngine(_FakeEngine):
+        def add_request(self, *, request_id, prompt, params):
+            raise error
+
+    async def run() -> None:
+        generator = engine_thread(BrokenEngine())
+        await generator.start_engine_loop()
+        with pytest.raises(type(error)):
+            await asyncio.wait_for(_generate(generator, "r0"), _TIMEOUT_S)
+        with pytest.raises(RuntimeError, match="generator is closed"):
+            await asyncio.wait_for(_generate(generator, "r1"), _TIMEOUT_S)
+
+        await asyncio.wait_for(generator.close(), _TIMEOUT_S)
+
+    asyncio.run(run())
+
+
 def test_close_fails_outstanding_requests_and_later_calls(engine_thread) -> None:
     gate = _StepGate()
 
@@ -1063,7 +1210,7 @@ def test_follower_applies_broadcast_decisions_on_the_engine_thread(
     asyncio.run(run())
 
 
-def test_drain_task_resolves_peer_completions_on_the_engine_thread(
+def test_drain_task_resolves_peer_completions_and_rejections_on_the_engine_thread(
     engine_thread, monkeypatch
 ) -> None:
     peer_results: asyncio.Queue = asyncio.Queue()
@@ -1091,28 +1238,46 @@ def test_drain_task_resolves_peer_completions_on_the_engine_thread(
         # Load DP rank 0, so the request goes to the peer, DP rank 1.
         dispatcher._rank0_dp_router.reserve("busy", routing_session_id="busy")
         generator._request_dispatcher = dispatcher
+        # DP rank 1's tp_rank 0, whose port delivers to rank 0's drain task.
+        peer_dispatcher = RequestDispatcher(
+            rank=1,
+            dp_rank=1,
+            tp_rank=0,
+            dp_degree=2,
+            broadcast_group=None,
+            open_result_channel=None,
+            intra_generator_router=IntraGeneratorRouter.Config(
+                strategy=LeastLoadedRoutingStrategy.Config()
+            ),
+        )
+        peer_dispatcher._result_port = SimpleNamespace(
+            send=lambda message: generator._engine_event_loop.call_soon_threadsafe(
+                peer_results.put_nowait, message
+            )
+        )
         peer_requests: list[str] = []
 
         def broadcast_object_list(container, **kwargs):
             # Stand-in for DP rank 1, which meets rank 0 at every decision broadcast: it sends
             # back the completions of the requests it admitted at the previous one, then admits
-            # its share of this one.
+            # its share of this one, rejecting "too_long".
             if peer_requests:
-                completions = dispatcher._build_completions(
+                peer_dispatcher.process_finished_requests(
                     [_finished_output(request_id) for request_id in peer_requests], 0
                 )
                 peer_requests.clear()
-                generator._engine_event_loop.call_soon_threadsafe(
-                    peer_results.put_nowait, completions
-                )
             decision = container[0]
             if (
                 isinstance(decision, LoopDecision)
                 and decision.action is LoopAction.STEP
             ):
-                peer_requests.extend(
-                    r.request_id for r in decision.requests_per_dp_rank[1]
-                )
+                for request in decision.requests_per_dp_rank[1]:
+                    if request.request_id == "too_long":
+                        peer_dispatcher.process_rejected_requests(
+                            [(request.request_id, "too long")]
+                        )
+                    else:
+                        peer_requests.append(request.request_id)
 
         monkeypatch.setattr(
             generator_module.dist, "broadcast_object_list", broadcast_object_list
@@ -1121,8 +1286,50 @@ def test_drain_task_resolves_peer_completions_on_the_engine_thread(
 
         completion = await asyncio.wait_for(_generate(generator, "r0"), _TIMEOUT_S)
         assert completion.request_id == "r0"
+
+        with pytest.raises(ValueError, match="vLLM rejected request too_long"):
+            await asyncio.wait_for(_generate(generator, "too_long"), _TIMEOUT_S)
+        # The rejection freed its DP rank 1 reservation, and the loop keeps serving.
+        assert dispatcher._rank0_dp_router._reservations == {"busy": 0}
+        completion = await asyncio.wait_for(_generate(generator, "r1"), _TIMEOUT_S)
+        assert completion.request_id == "r1"
+
         assert engine.threads == set()  # rank 0's own DP replica served nothing
         assert set(recv_threads) == {generator._engine_thread}
+
+        await asyncio.wait_for(generator.close(), _TIMEOUT_S)
+
+    asyncio.run(run())
+
+
+def test_own_replica_rejection_frees_its_dp_reservation(engine_thread) -> None:
+    class IdleReceiver:
+        async def recv(self):
+            await asyncio.Event().wait()  # no peer DP rank sends anything
+
+    async def run() -> None:
+        generator = engine_thread(_RejectingEngine())
+        dispatcher = RequestDispatcher(
+            rank=0,
+            dp_rank=0,
+            tp_rank=0,
+            dp_degree=2,
+            broadcast_group=None,
+            open_result_channel=lambda: ("port", IdleReceiver()),
+            intra_generator_router=IntraGeneratorRouter.Config(
+                strategy=LeastLoadedRoutingStrategy.Config()
+            ),
+        )
+        # Equal loads, and DP rank 0 was chosen least recently, so "too_long" goes to rank 0's
+        # own replica.
+        dispatcher._rank0_dp_router.reserve("busy0", routing_session_id="busy0")
+        dispatcher._rank0_dp_router.reserve("busy1", routing_session_id="busy1")
+        generator._request_dispatcher = dispatcher
+        await generator.start_engine_loop()
+
+        with pytest.raises(ValueError, match="vLLM rejected request too_long"):
+            await asyncio.wait_for(_generate(generator, "too_long"), _TIMEOUT_S)
+        assert dispatcher._rank0_dp_router._reservations == {"busy0": 0, "busy1": 1}
 
         await asyncio.wait_for(generator.close(), _TIMEOUT_S)
 
