@@ -223,16 +223,19 @@ def rl_dapo_qwen3_5_35b_a3b_base_math() -> Controller.Config:
 
     16 GB300 GPUs on 4 hosts. Trainer on two: FSDP 4 x TP 2 x EP 4 with Dist-MoE experts.
     Generators: eight TP1 engines, each with every expert, FULL CUDA graphs. 16 prompts x
-    16 samples per step, AIME 2025 greedy every 25 steps. `DOME_V2_PROMPTS` and
-    `DOME_V2_MICROBATCH_ROWS` (rows of 34,816 tokens, default 5) set the batch at launch,
-    so a resumed job can change it without a new commit.
+    16 samples per step, AIME 2025 greedy every 25 steps. `DOME_V2_PROMPTS`,
+    `DOME_V2_MICROBATCH_ROWS` (rows of max_total_tokens, default 5) and
+    `DOME_V2_MAX_RESPONSE_TOKENS` (default 32,768) set the batch and budget at launch, so a
+    resumed job can change them without a new commit.
     """
     expert_parallel_degree = 4
+    max_response_tokens = int(os.environ.get("DOME_V2_MAX_RESPONSE_TOKENS", 32768))
     config = _qwen3_5_base_dapo_math_config(
         flavor="35B-A3B",
         enable_thinking=True,
-        max_response_tokens=32768,
-        max_total_tokens=34816,
+        max_response_tokens=max_response_tokens,
+        # 2,048 tokens for the prompt.
+        max_total_tokens=max_response_tokens + 2048,
         num_prompts_per_train_step=int(os.environ.get("DOME_V2_PROMPTS", 16)),
         num_samples_per_prompt=16,
         microbatch_rows=int(os.environ.get("DOME_V2_MICROBATCH_ROWS", 5)),
