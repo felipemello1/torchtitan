@@ -586,8 +586,7 @@ def _qwen3_5_base_terminal_bench_config(
         model=model_config,
         hf_assets_path=f"torchtitan/rl/example_checkpoint/Qwen3.5-{flavor}-Base",
         dump_folder=dump_folder,
-        # Every rollout, failures and truncations included: k = the group size keeps every
-        # scored rollout, and keep_errors adds the errored ones.
+        # k = the group size keeps every scored rollout; keep_errors adds the errored ones.
         rollout_recorder=RolloutSampleRecorder.Config(
             filter=KeepExtremeRewardsFilter.Config(
                 k=num_samples_per_prompt, keep_errors=True

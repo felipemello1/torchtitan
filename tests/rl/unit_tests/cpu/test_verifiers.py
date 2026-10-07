@@ -12,6 +12,7 @@ import asyncio
 import gzip
 import json
 import logging
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -471,6 +472,7 @@ def test_sandoq_rollout_log_explains_a_tmux_failure(tmp_path, caplog) -> None:
     """A rollout whose tmux never starts leaves a log with Terminus-2's traceback and log lines."""
     pytest.importorskip("harbor")
     from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.errors import HarnessError
     from verifiers.v1.runtimes import ProgramResult
 
     class NoTmuxRuntime:
@@ -480,18 +482,17 @@ def test_sandoq_rollout_log_explains_a_tmux_failure(tmp_path, caplog) -> None:
     harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
     runtime = NoTmuxRuntime()
 
-    async def rollout() -> ProgramResult:
-        result = await _launch(harness, trace, runtime)
+    async def rollout() -> None:
+        with pytest.raises(HarnessError):
+            await _launch(harness, trace, runtime)
         sandoq.harbor_logger.warning("logged outside any launch")
         await harness.cleanup(trace, runtime)
         # Verifiers' abort() after a cancelled close() calls cleanup again.
         await harness.cleanup(trace, runtime)
-        return result
 
-    result = asyncio.run(rollout())
+    asyncio.run(rollout())
     log = _read_rollout_log(tmp_path, trace)
 
-    assert result.exit_code == 1
     assert log["verifiers_trace_id"] == trace.id
     assert "Failed to start tmux session" in log["harness_stderr"]
     assert "ERROR harbor.utils.logger: Failed to install tmux" in log["terminus_log"]
@@ -500,6 +501,7 @@ def test_sandoq_rollout_log_explains_a_tmux_failure(tmp_path, caplog) -> None:
     assert "Failed to install tmux" in caplog.text
     assert log["trajectory"] is None
     assert log["tests"] is None
+    assert log["pane"] is None
 
 
 def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
@@ -512,7 +514,6 @@ def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
     from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
     from verifiers.v1.runtimes import ProgramResult
     from verifiers.v1.tasksets.harbor import HarborTask
-    from verifiers.v1.tasksets.harbor.taskset import HarborData
 
     sent_api_keys = []
     test_stdout = "apt-get update\n" + "x" * 100_000 + "\n1 failed"
@@ -545,7 +546,7 @@ def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
     monkeypatch.setattr(sandoq, "Terminus2", Terminus2WithoutModel)
     harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
     runtime = VMRuntime()
-    data = HarborData(prompt="Write a.py")
+    data = trace.task.data
 
     async def rollout() -> tuple[ProgramResult, float, float]:
         result = await _launch(harness, trace, runtime)
@@ -562,6 +563,7 @@ def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
     assert sandoq.SandoqTerminalTaskset.task_type() is sandoq.SandoqHarborTask
     assert reward == stock_reward == 0.0
     assert result.exit_code == 0
+    assert log["task_name"] == "allenai-tmax/task_000000_c19dda5b"
     assert log["harness_stderr"] == ""
     assert log["trajectory"]["steps"][0]["message"] == "Write a.py"
     assert log["trajectory"]["agent"]["extra"]["llm_kwargs"] == {
@@ -576,40 +578,34 @@ def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
 
 def test_sandoq_tmux_outlives_grading(tmp_path, monkeypatch) -> None:
     """launch leaves tmux running, so test.sh sees the agent's shell jobs as under `harbor run`;
-    cleanup writes the log with the pane, then kills tmux."""
+    cleanup writes the log with the pane, then kills tmux once."""
     pytest.importorskip("harbor")
     from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
     from verifiers.v1.runtimes import ProgramResult
 
     monkeypatch.setattr(sandoq, "Terminus2", _terminus2_without_model(sandoq))
     harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
-    runtime = _RecordingRuntime(
-        {
-            "tail": ProgramResult(
-                exit_code=0, stdout="$ python3 server.py &\n", stderr=""
-            )
-        }
-    )
+    pane = ProgramResult(exit_code=0, stdout="$ python3 server.py &\n", stderr="")
+    runtime = _RecordingRuntime({"tail": pane})
 
     asyncio.run(_launch(harness, trace, runtime))
     assert not any("kill-server" in " ".join(argv) for argv, _ in runtime.calls)
-
+    asyncio.run(harness.cleanup(trace, runtime))
+    # Verifiers' abort() after a cancelled close() calls cleanup again.
     asyncio.run(harness.cleanup(trace, runtime))
     commands = [" ".join(argv) for argv, _ in runtime.calls]
-    pane_read = next(i for i, c in enumerate(commands) if c.startswith("tail"))
-    kill = next(i for i, c in enumerate(commands) if "kill-server" in c)
-    assert pane_read < kill
-    log = _read_rollout_log(tmp_path, trace)
-    assert log["pane"] == "$ python3 server.py &\n"
-    assert log["task_name"] == "allenai-tmax/task_000000_c19dda5b"
+    kills = [i for i, command in enumerate(commands) if "kill-server" in command]
+    pane_read = next(
+        i for i, command in enumerate(commands) if command.startswith("tail")
+    )
+    assert len(kills) == 1 and pane_read < kills[0]
+    assert _read_rollout_log(tmp_path, trace)["pane"] == "$ python3 server.py &\n"
 
 
 def test_sandoq_exec_keeps_keystrokes_out_of_argv() -> None:
     """Each exec ships its command in an env var, so an agent's `pkill -f` pattern can't match
     the exec that typed it; the command still runs as written."""
     pytest.importorskip("harbor")
-    import subprocess
-
     from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
 
     command = "tmux send-keys -t terminus-2 -- 'pkill -f server.py' Enter"
@@ -635,9 +631,8 @@ def test_sandoq_session_nests_a_shell(tmp_path, monkeypatch) -> None:
     from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
 
     sessions = []
-    terminus2 = _terminus2_without_model(sandoq)
 
-    class Terminus2KeepingSession(terminus2):
+    class Terminus2KeepingSession(_terminus2_without_model(sandoq)):
         async def run(self, instruction, environment, context) -> None:
             sessions.append(self._session)
 
@@ -656,19 +651,13 @@ def test_sandoq_exec_failure_raises_sandbox_error(tmp_path, monkeypatch) -> None
     from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
     from verifiers.v1.errors import SandboxError
 
-    class LostRuntime(_RecordingRuntime):
-        async def run(self, argv, env):
-            if env.get("TERMINUS_EXEC") == "ls":
-                raise SandboxError("prime exec failed: uncertain transport failure")
-            return await super().run(argv, env)
-
-    class Terminus2Typing(_terminus2_without_model(sandoq)):
+    class Terminus2LosingTheVM(_terminus2_without_model(sandoq)):
         async def run(self, instruction, environment, context) -> None:
-            await environment.exec("ls")
+            raise SandboxError("prime exec failed: uncertain transport failure")
 
-    monkeypatch.setattr(sandoq, "Terminus2", Terminus2Typing)
+    monkeypatch.setattr(sandoq, "Terminus2", Terminus2LosingTheVM)
     harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
-    runtime = LostRuntime()
+    runtime = _RecordingRuntime()
     with pytest.raises(SandboxError):
         asyncio.run(_launch(harness, trace, runtime))
     asyncio.run(harness.cleanup(trace, runtime))
@@ -678,30 +667,45 @@ def test_sandoq_exec_failure_raises_sandbox_error(tmp_path, monkeypatch) -> None
     )
 
 
+def test_sandoq_dead_container_is_not_retried(tmp_path, monkeypatch) -> None:
+    """A container the agent killed fails as HarnessError, which the SandboxError retry skips."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.errors import HarnessError
+
+    class Terminus2KillingItsContainer(_terminus2_without_model(sandoq)):
+        async def run(self, instruction, environment, context) -> None:
+            # What Terminus-2 raises on its next keystroke after `pkill -9 -f sleep`.
+            raise RuntimeError(
+                "failed to send non-blocking keys: return_code=255, stderr='Error: can only "
+                "create exec sessions on running containers'"
+            )
+
+    monkeypatch.setattr(sandoq, "Terminus2", Terminus2KillingItsContainer)
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    with pytest.raises(HarnessError, match="running containers"):
+        asyncio.run(_launch(harness, trace, _RecordingRuntime()))
+
+
 def test_sandoq_model_call_stops_with_the_rollout(tmp_path, monkeypatch) -> None:
     """Once Verifiers has stopped the rollout, the model call raises at once instead of letting
     Terminus-2 retry a request Verifiers will refuse."""
     pytest.importorskip("harbor")
-    from harbor.llms.base import ContextLengthExceededError
     from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
-
-    raised = []
+    from verifiers.v1.errors import HarnessError
 
     class Terminus2AtTheCap(_terminus2_without_model(sandoq)):
         async def run(self, instruction, environment, context) -> None:
             trace.stop_condition = "context_length"
-            try:
-                await self._llm.call(prompt="next turn", message_history=[])
-            except ContextLengthExceededError as error:
-                raised.append(str(error))
-                raise
+            await self._llm.call(prompt="next turn", message_history=[])
 
     monkeypatch.setattr(sandoq, "Terminus2", Terminus2AtTheCap)
     harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
-    result = asyncio.run(_launch(harness, trace, _RecordingRuntime()))
-
-    assert raised == ["Verifiers stopped the rollout: context_length"]
-    assert result.exit_code == 1
+    with pytest.raises(
+        HarnessError,
+        match="ContextLengthExceededError: Verifiers stopped the rollout: context_length",
+    ):
+        asyncio.run(_launch(harness, trace, _RecordingRuntime()))
 
 
 class _RecordingRuntime:
