@@ -44,11 +44,13 @@ The legal moves are shuffled with a per-game seed, and the prompt never shows an
 
 A game ends on:
 
-- checkmate, stalemate, insufficient material, or threefold repetition;
+- checkmate, stalemate, or insufficient material. A repetition plays on: a repetition draw would lock in a reward while playing on risks a forfeit, so self-play could learn to repeat moves;
 - an illegal, missing, or unparsable move, a reply cut at `max_tokens`, or a history longer than `max_rollout_tokens`: that player forfeits;
 - 60 plies: the game is scored by material, after the side to move plays out its captures. White's score is `1 / (1 + exp(-pawns / 4))`.
 
-Each player scores 1 for a win, 0.5 for a draw, and 0 for a loss. Advantages are centered per color within a group: White's rollouts against White's mean, Black's against Black's. With one baseline over both colors, the mean of complementary scores is 0.5, so the color that moves first would collect a free positive advantage.
+The training reward (`ChessGame.rewards`) is 1 for a win, at any length. A game cut at 60 plies, or forfeited by the opponent, scores 0.25 to 0.75 by material, so an opponent's forfeit is not a free win. A draw scores 0.5 times the share of its 30 moves the player played. Being checkmated scores -0.25 and a forfeit -0.5, both shrinking to 0 with the moves the player lasted. So a win beats every other ending, and forfeiting is worse than any way of playing on. The Elo metrics use the chess result instead (`ChessGame.scores`: 1 / 0.5 / 0, material at the cap).
+
+Advantages are centered per color within a group: White's rollouts against White's mean, Black's against Black's. With one baseline over both colors, the mean of complementary scores is 0.5, so the color that moves first would collect a free positive advantage.
 
 ## Bots, validation, and metrics
 
@@ -72,7 +74,7 @@ Logged every step (validation logs the same keys under `val_chess_*`):
 - `chess_self/acpl` and `chess_<bot>/acpl`: Stockfish's centipawn loss of the policy's moves at depth 8, a strength measure that does not depend on the opponent;
 - `chess_self/forfeit_rate_per_reply`, `chess_self/num_plies`, `chess_self/end_reason/*`.
 
-The self-play reward is not a progress metric, because the two players' scores always sum to 1.
+The self-play reward is not a progress metric: both players are the same policy, so it reflects how its games end, not how strong it is.
 
 ## Setup
 

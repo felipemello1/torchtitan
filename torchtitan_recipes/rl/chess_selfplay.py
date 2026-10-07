@@ -91,9 +91,8 @@ def rl_chess_qwen3_5_4b() -> Controller.Config:
             worker=ChessSelfPlayWorker.Config(
                 rubric=Rubric.Config(
                     reward_fns=[RewardChessScore.Config()],
-                    # A player that stops mid-game forfeits; score it as the loss the game records.
-                    truncation_reward=0.0,
-                    error_reward=0.0,
+                    # No truncation_reward / error_reward: a player that stops mid-game forfeits, and
+                    # the worker scores the forfeit by the moves it lasted (see `ChessGame.rewards`).
                 ),
                 message_env=ChessPlayerEnv.Config(),
                 token_env=TokenEnv.Config(
