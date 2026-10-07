@@ -768,6 +768,7 @@ def test_sandoq_rollout_log_explains_a_tmux_failure(tmp_path, caplog) -> None:
     assert "Failed to install tmux" in caplog.text
     assert log["trajectory"] is None
     assert log["tests"] is None
+    assert log["pane"] is None
 
 
 def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
@@ -844,21 +845,28 @@ def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
 
 def test_sandoq_tmux_outlives_grading(tmp_path, monkeypatch) -> None:
     """launch leaves tmux running, so test.sh sees the agent's shell jobs as under `harbor run`;
-    cleanup kills it once."""
+    cleanup writes the log with the pane, then kills tmux once."""
     pytest.importorskip("harbor")
     from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.runtimes import ProgramResult
 
     monkeypatch.setattr(sandoq, "Terminus2", _terminus2_without_model(sandoq))
     harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
-    runtime = _RecordingRuntime()
+    pane = ProgramResult(exit_code=0, stdout="$ python3 server.py &\n", stderr="")
+    runtime = _RecordingRuntime({"tail": pane})
 
     asyncio.run(_launch(harness, trace, runtime))
     assert not any("kill-server" in " ".join(argv) for argv, _ in runtime.calls)
     asyncio.run(harness.cleanup(trace, runtime))
     # Verifiers' abort() after a cancelled close() calls cleanup again.
     asyncio.run(harness.cleanup(trace, runtime))
-    kills = [argv for argv, _ in runtime.calls if "kill-server" in " ".join(argv)]
-    assert len(kills) == 1
+    commands = [" ".join(argv) for argv, _ in runtime.calls]
+    kills = [i for i, command in enumerate(commands) if "kill-server" in command]
+    pane_read = next(
+        i for i, command in enumerate(commands) if command.startswith("tail")
+    )
+    assert len(kills) == 1 and pane_read < kills[0]
+    assert _read_rollout_log(tmp_path, trace)["pane"] == "$ python3 server.py &\n"
 
 
 def test_sandoq_exec_keeps_keystrokes_out_of_argv() -> None:
@@ -968,16 +976,19 @@ def test_sandoq_model_call_stops_with_the_rollout(tmp_path, monkeypatch) -> None
 
 
 class _RecordingRuntime:
-    """Runtime that records each `run` and succeeds."""
+    """Runtime that records each `run` and answers by the command's first word."""
 
-    def __init__(self) -> None:
+    def __init__(self, results: dict | None = None) -> None:
         self.calls: list[tuple[list[str], dict[str, str]]] = []
+        self._results = results or {}
 
     async def run(self, argv: list[str], env: dict[str, str]):
         from verifiers.v1.runtimes import ProgramResult
 
         self.calls.append((argv, env))
-        return ProgramResult(exit_code=0, stdout="", stderr="")
+        return self._results.get(
+            argv[0], ProgramResult(exit_code=0, stdout="", stderr="")
+        )
 
 
 def _terminus2_without_model(sandoq):

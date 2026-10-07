@@ -67,6 +67,8 @@ logger = logging.getLogger(__name__)
 PLUGIN_ID = __name__
 # Each Sandoq rollout owns its VM, so one fixed directory cannot collide.
 _SANDBOX_TMUX_DIR = "/tmp/vf-terminus-2"
+# Terminus-2 pipes its tmux pane here (`EnvironmentPaths.agent_dir / "terminus_2.pane"`).
+_PANE_LOG = f"{_SANDBOX_TMUX_DIR}/terminus_2.pane"
 _WORKDIR_DIRECTIVE = re.compile(r"\s*WORKDIR\s+(\S+)", re.IGNORECASE)
 # Sandoq reaps a persistent shell unused for 1,800 s; refresh it with margin to spare.
 _SHELL_REFRESH_IDLE_S = 1500.0
@@ -290,7 +292,7 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
         return ProgramResult(exit_code=0, stdout="", stderr="")
 
     async def cleanup(self, trace: Trace, runtime: Runtime) -> None:
-        """Stop this rollout's tmux server, then write its log if `rollout_log_dir` is set.
+        """Write this rollout's log if `rollout_log_dir` is set, then stop its tmux server.
 
         Verifiers calls this after scoring, so test.sh still sees the agent's shell jobs
         (`python3 server.py &`), as under `harbor run`. It also calls it when leasing the VM or
@@ -306,30 +308,44 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
                 "harness_stderr": "Traceback ...",  # what Terminus-2 raised; "" if nothing
                 "terminus_log": "... WARNING harbor.utils.logger: Tool installation exceeded ...",
                 "trajectory": {...},               # Terminus-2's trajectory.json
+                "pane": "root@vm:/app# ls ...",    # the tmux pane log's last 64 KB; None if unreadable
             }
         """
-        # No launch log: launch never got to tmux, or an earlier cleanup already stopped it.
-        if trace.id in self._launch_logs:
-            try:
-                await runtime.run(
-                    [
-                        "sh",
-                        "-c",
-                        'timeout 10 tmux kill-server >/dev/null 2>&1 || true; rm -rf "$TMUX_TMPDIR"',
-                    ],
-                    {"TMUX_TMPDIR": _SANDBOX_TMUX_DIR},
-                )
-            except Exception:
-                logger.warning(
-                    "failed to clean up Terminus 2 tmux server", exc_info=True
-                )
-        launch_log = self._launch_logs.pop(trace.id, LaunchLog())
-        if self.config.rollout_log_dir is None:
+        launch_log = self._launch_logs.get(trace.id)
+        if self.config.rollout_log_dir is not None:
+            # Before kill-server, whose rm -rf deletes the pane log.
+            await self._write_rollout_log(trace, runtime, launch_log or LaunchLog())
+        # Popped only now, so abort() repeats a cleanup cancelled while reading the pane. None:
+        # launch never got to tmux, or an earlier cleanup already stopped it.
+        if self._launch_logs.pop(trace.id, None) is None:
             return
+        try:
+            await runtime.run(
+                [
+                    "sh",
+                    "-c",
+                    'timeout 10 tmux kill-server >/dev/null 2>&1 || true; rm -rf "$TMUX_TMPDIR"',
+                ],
+                {"TMUX_TMPDIR": _SANDBOX_TMUX_DIR},
+            )
+        except Exception:
+            logger.warning("failed to clean up Terminus 2 tmux server", exc_info=True)
+
+    async def _write_rollout_log(
+        self, trace: Trace, runtime: Runtime, launch_log: LaunchLog
+    ) -> None:
         path = Path(self.config.rollout_log_dir) / f"{trace.id}.json.gz"
         # Verifiers' abort() calls cleanup again after a cancelled close(); keep the full log.
         if path.exists():
             return
+        try:
+            # The pane log holds every byte the terminal printed; keep its last 64 KB.
+            result = await runtime.run(
+                ["tail", "-c", str(_MAX_LOG_CHARS), _PANE_LOG], {}
+            )
+            pane = result.stdout if result.exit_code == 0 else None
+        except Exception:  # noqa: BLE001 - e.g. the VM is gone
+            pane = None
         record = {
             "verifiers_trace_id": trace.id,
             "task": trace.task.key,
@@ -342,6 +358,7 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
             "harness_stderr": truncate_middle(launch_log.harness_stderr),
             "terminus_log": truncate_middle("\n".join(launch_log.terminus_log_lines)),
             "trajectory": launch_log.trajectory,
+            "pane": pane,
         }
         # On the event loop, like Terminus-2's trajectory dump after every turn: ~3 ms per log,
         # 48 ms for T3's largest. Level 6 is as small as the default 9 and ~3x faster.
