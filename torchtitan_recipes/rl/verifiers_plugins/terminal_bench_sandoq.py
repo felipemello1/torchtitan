@@ -54,6 +54,7 @@ from torchtitan.rl.examples.verifiers.terminal_bench.taskset import (
 )
 from verifiers.v1.clients import ModelContext
 from verifiers.v1.configs.harness import HarnessConfig
+from verifiers.v1.errors import HarnessError, SandboxError
 from verifiers.v1.harness import Harness
 from verifiers.v1.runtimes import ProgramResult, Runtime
 from verifiers.v1.task import TaskData
@@ -203,7 +204,8 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
         system_prompt: str | None,
         prompt: str,
     ) -> ProgramResult:
-        """Failures become a nonzero ``ProgramResult``, like the program crashing in the sandbox."""
+        """Raises ``SandboxError`` for a lost exec channel, which the agent's retries rerun on a
+        fresh VM, and ``HarnessError`` for anything else Terminus-2 raised."""
         environment = RuntimeEnvironment(runtime, {"TMUX_TMPDIR": _SANDBOX_TMUX_DIR})
         await environment.exec(
             f"mkdir -p -m 700 {_SANDBOX_TMUX_DIR}; {_USE_SANDOQ_TMUX}"
@@ -261,11 +263,17 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
                 )
                 await agent._session.send_keys(keys=["clear", "Enter"])
                 await agent.run(prompt, environment, AgentContext())
-            except Exception:  # noqa: BLE001 - reported like a crashed program
+            except SandboxError:
                 launch_log.harness_stderr = traceback.format_exc()
-                return ProgramResult(
-                    exit_code=1, stdout="", stderr=launch_log.harness_stderr
-                )
+                raise
+            except Exception as error:  # noqa: BLE001 - reported like a crashed program
+                launch_log.harness_stderr = traceback.format_exc()
+                # Not exit 1: Verifiers would probe `runtime.alive()` and call a container the agent
+                # stopped (`pkill -9 -f sleep`) a SandboxError, which the retries would rerun.
+                raise HarnessError(
+                    f"harness {self.config.id!r} exited 1: "
+                    f"{launch_log.harness_stderr.strip()[-2000:]}"
+                ) from error
             finally:
                 _launch_log_lines.reset(log_lines_token)
                 # Missing when Terminus-2 failed before running, e.g. in tmux setup.
