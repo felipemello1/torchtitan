@@ -137,8 +137,13 @@ class RuntimeEnvironment:
         _ = user
         if cwd is not None:
             command = f"cd {shlex.quote(cwd)} && {command}"
+        # Sandoq keeps `setsid bash -lc '<argv>'` alive for the whole exec, so an agent's
+        # `pkill -f x` would kill the exec whose keystrokes contain x. An env var is in no argv.
         result = await asyncio.wait_for(
-            self._runtime.run(["sh", "-c", command], {**self._env, **(env or {})}),
+            self._runtime.run(
+                ["sh", "-c", 'eval "$TERMINUS_EXEC"'],
+                {**self._env, **(env or {}), "TERMINUS_EXEC": command},
+            ),
             timeout_sec,
         )
         return ExecResult(
