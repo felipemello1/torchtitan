@@ -154,6 +154,7 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
         try:
             return await self._run_terminus(
                 runtime,
+                trace,
                 endpoint=endpoint,
                 secret=secret,
                 model=ctx.model,
@@ -178,6 +179,7 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
     async def _run_terminus(
         self,
         runtime: Runtime,
+        trace: Trace,
         *,
         endpoint: str,
         secret: str,
@@ -205,20 +207,24 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
                     # A rollout ends at the context cap instead of Terminus-2 rewriting its history.
                     enable_summarize=False,
                 )
-                if system_prompt:
-                    call = agent._llm.call
+                call = agent._llm.call
+                system = (
+                    [{"role": "system", "content": system_prompt}]
+                    if system_prompt
+                    else []
+                )
 
-                    async def call_with_system_prompt(*args, message_history, **kwargs):
-                        return await call(
-                            *args,
-                            message_history=[
-                                {"role": "system", "content": system_prompt},
-                                *message_history,
-                            ],
-                            **kwargs,
-                        )
+                async def call_with_sampled_history(*args, message_history, **kwargs):
+                    return await call(
+                        *args,
+                        message_history=[
+                            *system,
+                            *restore_sampled_reasoning(message_history, trace),
+                        ],
+                        **kwargs,
+                    )
 
-                    agent._llm.call = call_with_system_prompt
+                agent._llm.call = call_with_sampled_history
                 await agent.setup(environment)
                 await agent.run(prompt, environment, AgentContext())
             except Exception:  # noqa: BLE001 - reported like a crashed program
@@ -226,6 +232,35 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
                     exit_code=1, stdout="", stderr=traceback.format_exc()
                 )
         return ProgramResult(exit_code=0, stdout="", stderr="")
+
+
+def restore_sampled_reasoning(message_history: list[dict], trace: Trace) -> list[dict]:
+    """Put the sampled reasoning back on assistant messages Terminus-2 re-sends without it.
+
+    Terminus-2 re-sends a turn that hit max_tokens as its truncated text only. Verifiers keys
+    assistant messages on their reasoning, so that copy no longer matches the sampled turn: the
+    next prompt is re-rendered with every earlier turn's thinking stripped, and the rollout forks
+    into a second training sample.
+
+    Example:
+        # sampled turn: content='{"analysis": "Wri', reasoning_content="I will write it."
+        restore_sampled_reasoning([{"role": "assistant", "content": '{"analysis": "Wri'}], trace)
+        # -> [{"role": "assistant", "content": '{"analysis": "Wri',
+        #      "reasoning_content": "I will write it."}]
+    """
+    reasoning = {
+        node.message.content or "": node.message.reasoning_content
+        for node in trace.nodes
+        if node.sampled and node.message.reasoning_content
+    }
+    return [
+        {**message, "reasoning_content": reasoning[message["content"] or ""]}
+        if message["role"] == "assistant"
+        and "reasoning_content" not in message
+        and (message["content"] or "") in reasoning
+        else message
+        for message in message_history
+    ]
 
 
 class SandoqTerminalTaskset(TerminalTaskset):
