@@ -141,6 +141,10 @@ class RuntimeEnvironment:
         _ = user
         if cwd is not None:
             command = f"cd {shlex.quote(cwd)} && {command}"
+        if "\0" in command:
+            # Harbor's subprocess exec raises this too. Sandoq would answer HTTP 500, a
+            # SandboxError the agent's retries rerun.
+            raise ValueError("embedded null byte")
         # Sandoq keeps `setsid bash -lc '<argv>'` alive for the whole exec, so an agent's
         # `pkill -f x` would kill the exec whose keystrokes contain x. An env var is in no argv.
         result = await asyncio.wait_for(
