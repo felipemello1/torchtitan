@@ -8,6 +8,7 @@
 
 from dataclasses import replace
 
+from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import GrainDataLoader, SingleDatasetConfig
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optim import (
@@ -17,16 +18,22 @@ from torchtitan.components.optim import (
     OptimizersContainer,
 )
 from torchtitan.components.tokenizer import MultiModalTokenizer
-from torchtitan.config import TrainingConfig
+from torchtitan.config import OverrideConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.config.transform import apply_transforms, LoRATransform
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.config.transform import (
+    apply_transforms,
+    LMHeadFP32OutputConverter,
+    LoRATransform,
+)
+from torchtitan.distributed.activation_checkpoint import RegionAC, SelectiveAC
 from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
 from torchtitan.hf_datasets.multimodal.mm_datasets import MM_DATASETS, VisionProcessor
 from torchtitan.models.common.config_utils import (
     decoder_vocab_size,
     DEFAULT_DEBUG_MODEL_SEQ_LEN,
 )
+from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
+from torchtitan.models.common.moe import MoE
 
 from torchtitan.models.qwen3_5 import build_model_config, QWEN3_5_SPECIAL_TOKENS
 from torchtitan.observability.metrics import MetricsProcessor
@@ -154,6 +161,40 @@ def qwen35_debugmodel_moe(
         checkpointer=None,
         activation_checkpoint=SelectiveAC.Config(),
     )
+
+
+def qwen35_debugmodel_moe_dist_moe(
+    seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> Trainer.Config:
+    """`qwen35_debugmodel_moe` with the RL trainer's Dist-MoE setup, on 4 SM100 GPUs.
+
+    FSDP 2 x TP 2 x EP 4, Dist-MoE experts, `RegionAC(save_regions=[])`, and the fp32
+    lm_head and frozen expert bias that RL applies. 3 steps with an async save at step 2:
+    rerun with `--resume-step 2` and compare the step-3 loss.
+    """
+    config = qwen35_debugmodel_moe(seq_len=seq_len)
+    config.model = build_model_config(
+        "debugmodel_moe",
+        seq_len=seq_len,
+        attn_backend="varlen",
+        converters=[LMHeadFP32OutputConverter.Config()],
+    )
+    for _fqn, moe_config, _parent, _attr in config.model.traverse(MoE.Config):
+        moe_config.freeze_expert_bias = True
+    config.parallelism.pipeline_parallel_degree = 1
+    config.training.steps = 3
+    config.activation_checkpoint = RegionAC.Config(save_regions=[])
+    config.override = OverrideConfig(
+        imports=["torchtitan_recipes.overrides.dist_moe.dist_moe_routed_experts"]
+    )
+    config.dist_moe = DistMoeRuntime.Config(scratch_capacity_factor=4.0)
+    # The last step always saves synchronously; step 2 tests the async path.
+    config.checkpointer = CheckpointManager.Config(
+        interval=2,
+        async_mode="async",
+        last_save_model_only=False,
+    )
+    return config
 
 
 def qwen35_debugmodel_moe_lora(

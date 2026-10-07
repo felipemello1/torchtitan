@@ -4,11 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Verified single-node Qwen3-4B-Base DAPO-Math recipes."""
+"""DAPO-Math recipes: verified single-node Qwen3-4B-Base, and multi-host Qwen3.5-Base."""
 
 from __future__ import annotations
 
-from renderers import Qwen3RendererConfig
+import os
+
+from renderers import Qwen35RendererConfig, Qwen3RendererConfig
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper
@@ -19,10 +21,13 @@ from torchtitan.components.optim import (
     OptimizersContainer,
 )
 from torchtitan.components.renderer import from_renderers
-from torchtitan.config import TrainingConfig
+from torchtitan.config import OverrideConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.activation_checkpoint import RegionAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 from torchtitan.models.qwen3 import build_model_config
+from torchtitan.models.qwen3_5 import build_model_config as build_qwen3_5_model_config
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.examples.dapo_math.data import AIME2025Dataset, DapoMathDataset
@@ -183,4 +188,205 @@ def rl_dapo_qwen3_4b_math_32k() -> Controller.Config:
         max_response_tokens=32768,
         max_total_tokens=34816,
         dump_folder="outputs/rl/qwen3_4b_dapo_math_32k",
+    )
+
+
+def rl_dapo_qwen3_5_4b_base_math() -> Controller.Config:
+    """Qwen3.5-4B-Base, thinking off, 8K responses: a short run that checks checkpoint,
+    resume and eval on the 2-host trainer layout.
+
+    12 GPUs on 3 hosts: trainer FSDP 8 on two, four TP1 generators on the third. 4 prompts
+    x 4 samples per step, AIME 2025 greedy every 3 steps. `DOME_V2_PROMPTS` and
+    `DOME_V2_MICROBATCH_ROWS` (rows of 10,240 tokens, default 1) set the batch at launch,
+    so a resumed job can change it without a new commit.
+    """
+    return _qwen3_5_base_dapo_math_config(
+        flavor="4B",
+        enable_thinking=False,
+        max_response_tokens=8192,
+        max_total_tokens=10240,
+        num_prompts_per_train_step=int(os.environ.get("DOME_V2_PROMPTS", 4)),
+        num_samples_per_prompt=4,
+        microbatch_rows=int(os.environ.get("DOME_V2_MICROBATCH_ROWS", 1)),
+        validation_interval_steps=3,
+        num_generators=4,
+        parallelism=ParallelismConfig(data_parallel_shard_degree=8),
+        num_loss_chunks=8,
+        dump_folder="outputs/rl/qwen3_5_4b_base_dapo_math",
+    )
+
+
+def rl_dapo_qwen3_5_35b_a3b_base_math() -> Controller.Config:
+    """Qwen3.5-35B-A3B-Base, thinking on, 32K responses, 150 steps.
+
+    16 GB300 GPUs on 4 hosts. Trainer on two: FSDP 4 x TP 2 x EP 4 with Dist-MoE experts.
+    Generators: eight TP1 engines, each with every expert, FULL CUDA graphs. 16 prompts x
+    16 samples per step, AIME 2025 greedy every 25 steps. `DOME_V2_PROMPTS` and
+    `DOME_V2_MICROBATCH_ROWS` (rows of 34,816 tokens, default 5) set the batch at launch,
+    so a resumed job can change it without a new commit.
+    """
+    expert_parallel_degree = 4
+    config = _qwen3_5_base_dapo_math_config(
+        flavor="35B-A3B",
+        enable_thinking=True,
+        max_response_tokens=32768,
+        max_total_tokens=34816,
+        num_prompts_per_train_step=int(os.environ.get("DOME_V2_PROMPTS", 16)),
+        num_samples_per_prompt=16,
+        microbatch_rows=int(os.environ.get("DOME_V2_MICROBATCH_ROWS", 5)),
+        validation_interval_steps=25,
+        num_generators=8,
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=4,
+            tensor_parallel_degree=2,
+            expert_parallel_degree=expert_parallel_degree,
+        ),
+        num_loss_chunks=16,
+        dump_folder="outputs/rl/qwen3_5_35b_a3b_base_dapo_math",
+    )
+    trainer = config.trainer
+    # Recompute every op in the block except the Dist-MoE call, which is never recomputed.
+    trainer.activation_checkpoint = RegionAC.Config(save_regions=[])
+    # Dist-MoE experts on the trainer's model copy only; generators keep stock experts.
+    trainer.override = OverrideConfig(
+        imports=["torchtitan_recipes.overrides.dist_moe.dist_moe_routed_experts"]
+    )
+    # Worst case, every EP rank routes all its tokens to one rank; a smaller scratch
+    # buffer is an illegal memory access.
+    trainer.dist_moe = DistMoeRuntime.Config(
+        scratch_capacity_factor=float(expert_parallel_degree)
+    )
+    return config
+
+
+def _qwen3_5_base_dapo_math_config(
+    *,
+    flavor: str,
+    enable_thinking: bool,
+    max_response_tokens: int,
+    max_total_tokens: int,
+    num_prompts_per_train_step: int,
+    num_samples_per_prompt: int,
+    microbatch_rows: int,
+    validation_interval_steps: int,
+    num_generators: int,
+    parallelism: ParallelismConfig,
+    num_loss_chunks: int,
+    dump_folder: str,
+) -> Controller.Config:
+    """Build a Qwen3.5-Base DAPO-Math run that saves resumable checkpoints.
+
+    Args:
+        microbatch_rows: Tokens per trainer microbatch, in rows of `max_total_tokens`.
+    """
+    num_validation_samples = 30
+    model_config = build_qwen3_5_model_config(
+        flavor,
+        seq_len=max_total_tokens,
+        attn_backend="varlen",
+    )
+    return Controller.Config(
+        model=model_config,
+        hf_assets_path=f"torchtitan/rl/example_checkpoint/Qwen3.5-{flavor}-Base",
+        dump_folder=dump_folder,
+        async_loop=AsyncLoopConfig(
+            num_training_steps=150,
+            num_prompts_per_train_step=num_prompts_per_train_step,
+            num_samples_per_prompt=num_samples_per_prompt,
+            target_offpolicy_steps=4,
+            windowed_fifo_batches=None,
+            validation=ValidationConfig(
+                num_samples=num_validation_samples,
+                interval_steps=validation_interval_steps,
+                greedy=True,
+            ),
+        ),
+        rollouter=_dapo_math_rollouter_config(
+            validation_dataset=AIME2025Dataset.Config(
+                num_samples=num_validation_samples
+            ),
+            token_env=TokenEnv.Config(
+                max_rollout_tokens=max_total_tokens,
+                max_num_turns=1,
+            ),
+        ),
+        renderer=from_renderers(
+            Qwen35RendererConfig(
+                enable_thinking=enable_thinking, thinking_retention="all"
+            )
+        ),
+        num_generators=num_generators,
+        metrics=MetricsProcessor.Config(
+            enable_wandb=True,
+            console_log_keys_validation=[
+                "validation_reward/_mean",
+                "validation_reward/_max",
+                "validation/response_length/mean",
+                "timing/validate",
+            ],
+        ),
+        trainer=Trainer.Config(
+            optim=Optim.Config(
+                optimizer=OptimizersContainer.Config(
+                    optimizers=[
+                        AdamW.Config(
+                            pattern=r".*",
+                            lr=1e-6,
+                            betas=(0.9, 0.98),
+                            weight_decay=0.1,
+                        )
+                    ]
+                ),
+                # A minimum factor of 1 keeps the learning rate constant.
+                lr_scheduler=LRSchedulersContainer.Config(
+                    warmup_steps=0,
+                    min_lr_factor=1.0,
+                ),
+            ),
+            training=TrainingConfig(
+                disable_cuda_graphs=True,
+                num_tokens_per_microbatch_per_dp_rank=microbatch_rows
+                * max_total_tokens,
+                max_context_length=max_total_tokens,
+                # fp32 master weights; FSDP unshards bf16 params for compute.
+                dtype="float32",
+                mixed_precision_param="bfloat16",
+            ),
+            parallelism=parallelism,
+            # Every save is a full resumable DCP; DOME sets the interval and uploads
+            # the steps, so torchtitan purges nothing.
+            checkpointer=CheckpointManager.Config(
+                initial_load_in_hf=True,
+                interval=25,
+                enable_first_step_checkpoint=True,
+                async_mode="async",
+                keep_latest_k=0,
+                last_save_in_hf=False,
+                last_save_model_only=False,
+            ),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=num_loss_chunks,
+                loss_fn=DAPOLoss.Config(
+                    ratio_clip_low=0.2,
+                    ratio_clip_high=0.28,
+                    global_vocab_size=decoder_vocab_size(model_config),
+                ),
+            ),
+        ),
+        generator=VLLMGenerator.Config(
+            model_dtype="bfloat16",
+            parallelism=InferenceParallelismConfig(
+                data_parallel_degree=1,
+                tensor_parallel_degree=1,
+            ),
+            cuda_graph=VLLMCudaGraphConfig(mode="FULL"),
+            gpu_memory_limit=0.9,
+            max_num_batched_tokens=8192,
+            checkpointer=None,
+            sampling=SamplingConfig(
+                temperature=1.0,
+                top_p=1.0,
+                max_tokens=max_response_tokens,
+            ),
+        ),
     )
