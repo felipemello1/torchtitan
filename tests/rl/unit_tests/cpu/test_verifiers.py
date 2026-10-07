@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 import logging
 from types import SimpleNamespace
 
@@ -463,3 +465,144 @@ def test_terminus_max_tokens_turn_stays_on_its_branch() -> None:
 
     assert not bridges(history)
     assert bridges(restore_sampled_reasoning(history, trace))
+
+
+def test_sandoq_rollout_log_explains_a_tmux_failure(tmp_path, caplog) -> None:
+    """A rollout whose tmux never starts leaves a log with Terminus-2's traceback and log lines."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.runtimes import ProgramResult
+
+    class NoTmuxRuntime:
+        async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+            return ProgramResult(exit_code=127, stdout="", stderr="tmux: not found")
+
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    runtime = NoTmuxRuntime()
+
+    async def rollout() -> ProgramResult:
+        result = await _launch(harness, trace, runtime)
+        sandoq.harbor_logger.warning("logged outside any launch")
+        await harness.cleanup(trace, runtime)
+        # Verifiers' abort() after a cancelled close() calls cleanup again.
+        await harness.cleanup(trace, runtime)
+        return result
+
+    result = asyncio.run(rollout())
+    log = _read_rollout_log(tmp_path, trace)
+
+    assert result.exit_code == 1
+    assert log["verifiers_trace_id"] == trace.id
+    assert "Failed to start tmux session" in log["harness_stderr"]
+    assert "ERROR harbor.utils.logger: Failed to install tmux" in log["terminus_log"]
+    assert "outside any launch" not in log["terminus_log"]
+    # The filter copies Harbor's records; they still reach the job log.
+    assert "Failed to install tmux" in caplog.text
+    assert log["trajectory"] is None
+    assert log["tests"] is None
+
+
+def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
+    tmp_path, monkeypatch
+) -> None:
+    """A finished rollout's log holds Terminus-2's trajectory, without the API key, and test.sh's
+    capped output; the reward is the one the stock HarborTask reads."""
+    pytest.importorskip("harbor")
+    from harbor.models.trajectories import Step
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.runtimes import ProgramResult
+    from verifiers.v1.tasksets.harbor import HarborTask
+    from verifiers.v1.tasksets.harbor.taskset import HarborData
+
+    sent_api_keys = []
+    test_stdout = "apt-get update\n" + "x" * 100_000 + "\n1 failed"
+
+    class Terminus2WithoutModel(sandoq.Terminus2):
+        async def setup(self, environment) -> None:
+            pass
+
+        async def run(self, instruction, environment, context) -> None:
+            sent_api_keys.append(self._llm._build_base_kwargs()["api_key"])
+            self._context = context
+            self._trajectory_steps = [
+                Step(
+                    step_id=1,
+                    timestamp="2026-10-07T12:00:00Z",
+                    source="user",
+                    message=instruction,
+                )
+            ]
+            self._dump_trajectory()
+
+    class VMRuntime:
+        async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+            if argv == ["bash", "/tests/test.sh"]:
+                return ProgramResult(exit_code=1, stdout=test_stdout, stderr="")
+            return ProgramResult(exit_code=0, stdout="", stderr="")
+
+        async def read(self, path: str, max_bytes: int) -> bytes:
+            if path.endswith("reward.json"):
+                raise OSError(path)
+            return b"0"
+
+    monkeypatch.setattr(sandoq, "Terminus2", Terminus2WithoutModel)
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    runtime = VMRuntime()
+    data = HarborData(prompt="Write a.py")
+
+    async def rollout() -> tuple[ProgramResult, float, float]:
+        result = await _launch(harness, trace, runtime)
+        reward = await sandoq.SandoqHarborTask(data)._graded(runtime, trace)
+        stock_reward = await HarborTask(data)._graded(runtime, trace)
+        trace.record_reward("solved", reward)
+        await harness.cleanup(trace, runtime)
+        return result, reward, stock_reward
+
+    result, reward, stock_reward = asyncio.run(rollout())
+    log = _read_rollout_log(tmp_path, trace)
+
+    # The env server builds tasks as the taskset's task type.
+    assert sandoq.SandoqTerminalTaskset.task_type() is sandoq.SandoqHarborTask
+    assert reward == stock_reward == 0.0
+    assert result.exit_code == 0
+    assert log["harness_stderr"] == ""
+    assert log["trajectory"]["steps"][0]["message"] == "Write a.py"
+    assert log["trajectory"]["agent"]["extra"]["llm_kwargs"] == {
+        "custom_llm_provider": "openai"
+    }
+    assert sent_api_keys == ["secret"]
+    assert log["tests"]["exit_code"] == 1
+    assert log["tests"]["stdout"].startswith("apt-get update\n")
+    assert log["tests"]["stdout"].endswith("\n1 failed")
+    assert "characters omitted" in log["tests"]["stdout"]
+
+
+def _sandoq_harness_and_trace(sandoq, log_dir):
+    from verifiers.v1.configs.agent import AgentConfig
+    from verifiers.v1.trace import AgentInfo, Trace, TraceTask
+
+    config = sandoq.StockTerminusOutsideConfig(
+        id=sandoq.PLUGIN_ID, rollout_log_dir=str(log_dir)
+    )
+    trace = Trace(
+        task=TraceTask(type="Task", data={}), agent=AgentInfo(config=AgentConfig())
+    )
+    return sandoq.StockTerminusOutsideHarness(config), trace
+
+
+async def _launch(harness, trace, runtime):
+    from verifiers.v1.task import TaskData
+
+    return await harness.launch(
+        SimpleNamespace(model="policy"),
+        trace,
+        runtime,
+        endpoint="http://127.0.0.1:1",
+        secret="secret",
+        mcp_urls={},
+        data=TaskData(prompt="Write a.py"),
+    )
+
+
+def _read_rollout_log(log_dir, trace) -> dict:
+    return json.loads(gzip.decompress((log_dir / f"{trace.id}.json.gz").read_bytes()))
