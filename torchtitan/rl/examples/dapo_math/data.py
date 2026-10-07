@@ -109,6 +109,40 @@ class DapoMathDataset(_CyclingDataset):
         super().__init__(samples, seed=config.seed, shuffle=config.shuffle)
 
 
+class Intellect3MathDataset(_CyclingDataset):
+    """INTELLECT-3 RL math problems that Qwen3-4B-Thinking-2507 solves in some, not all, of 8 tries.
+
+    Harder than DAPO-Math-17k for a strong base model: the dataset already drops problems
+    solved 8/8, and the default bounds drop the 0/8 ones too (21,161 -> 10,805 rows).
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        repo_id: str = "PrimeIntellect/INTELLECT-3-RL"
+        subset: str = "math"
+        split: str = "train"
+        min_pass_rate: float = 0.125
+        """Keep rows whose `avg@8_qwen3_4b_thinking_2507` is at least this."""
+        max_pass_rate: float = 0.875
+        """Keep rows whose `avg@8_qwen3_4b_thinking_2507` is at most this."""
+        seed: int = 42
+        shuffle: bool = True
+
+    def __init__(self, config: Config) -> None:
+        dataset = load_dataset(config.repo_id, config.subset, split=config.split)
+        samples = [
+            DapoMathSample(
+                prompt=_MATH_PROMPT_TEMPLATE.format(problem=row["question"]),
+                ground_truth=str(row["answer"]),
+            )
+            for row in dataset
+            if config.min_pass_rate
+            <= row["avg@8_qwen3_4b_thinking_2507"]
+            <= config.max_pass_rate
+        ]
+        super().__init__(samples, seed=config.seed, shuffle=config.shuffle)
+
+
 class AIME2025Dataset(_CyclingDataset):
     """Provides AIME 2025 I+II problems using the DAPO answer format."""
 

@@ -32,7 +32,11 @@ from torchtitan.rl.components.batcher import Batcher
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
-from torchtitan.rl.examples.dapo_math.data import AIME2025Dataset, DapoMathDataset
+from torchtitan.rl.examples.dapo_math.data import (
+    AIME2025Dataset,
+    DapoMathDataset,
+    Intellect3MathDataset,
+)
 from torchtitan.rl.examples.dapo_math.env import DapoMathEnv
 from torchtitan.rl.examples.dapo_math.rubric import RewardMathVerify
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
@@ -261,6 +265,15 @@ def rl_dapo_qwen3_5_35b_a3b_base_math() -> Controller.Config:
     trainer.dist_moe = DistMoeRuntime.Config(
         scratch_capacity_factor=float(expert_parallel_degree)
     )
+    return config
+
+
+def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math() -> Controller.Config:
+    """`rl_dapo_qwen3_5_35b_a3b_base_math` on harder problems: the 10,805 INTELLECT-3 RL math
+    problems that Qwen3-4B-Thinking-2507 solves in 1-7 of 8 tries, instead of DAPO-Math-17k."""
+    config = rl_dapo_qwen3_5_35b_a3b_base_math()
+    config.rollouter.train_dataset = Intellect3MathDataset.Config()
+    config.dump_folder = "outputs/rl/qwen3_5_35b_a3b_base_intellect3_math"
     return config
 
 
