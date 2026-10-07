@@ -192,6 +192,8 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
                     llm_kwargs={"custom_llm_provider": "openai", "api_key": secret},
                     record_terminal_session=False,
                     interleaved_thinking=self.config.interleaved_thinking,
+                    # A rollout ends at the context cap instead of Terminus-2 rewriting its history.
+                    enable_summarize=False,
                 )
                 if system_prompt:
                     call = agent._llm.call
