@@ -771,3 +771,51 @@ async def _launch(harness, trace, runtime):
 
 def _read_rollout_log(log_dir, trace) -> dict:
     return json.loads(gzip.decompress((log_dir / f"{trace.id}.json.gz").read_bytes()))
+
+
+def test_text_only_parse_keeps_tool_call_markup(monkeypatch) -> None:
+    """With no tools declared, a reply wrapped in <tool_call> stays in the content, where
+    Terminus-2 reads its JSON; whitespace stays empty; declared tools use the stock parser."""
+    pytest.importorskip("renderers")
+    from renderers.qwen35 import Qwen35Renderer
+    from torchtitan_recipes.rl.verifiers_plugins.terminal_bench_sandoq import (
+        install_text_only_parse,
+    )
+
+    vocab = ["<|im_end|>", "<|endoftext|>", "<think>", "</think>"]
+    vocab += ["<tool_call>", "</tool_call>", '{"analysis": "x"}', "\n"]
+
+    class Tokenizer:
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join(vocab[i] for i in ids)
+
+    renderer = object.__new__(Qwen35Renderer)
+    renderer._tokenizer = Tokenizer()
+    renderer._im_end, renderer._endoftext, renderer._think, renderer._think_end = (
+        0,
+        1,
+        2,
+        3,
+    )
+    renderer._tool_call, renderer._tool_call_end = 4, 5
+    stock_parse = Qwen35Renderer.parse_response
+    # Restore the class after the test; install_text_only_parse patches it in place.
+    monkeypatch.setattr(Qwen35Renderer, "parse_response", stock_parse)
+    monkeypatch.setattr(
+        Qwen35Renderer, "_text_only_parse_installed", False, raising=False
+    )
+    wrapped = [4, 7, 6, 7, 5, 0]  # <tool_call>\n{json}\n</tool_call><|im_end|>
+    whitespace = [7, 7, 0]
+    tools = [{"name": "bash", "parameters": {}}]
+    assert stock_parse(renderer, wrapped, tools=None).content == ""
+
+    install_text_only_parse()
+
+    assert (
+        renderer.parse_response(wrapped, tools=None).content
+        == '<tool_call>\n{"analysis": "x"}\n</tool_call>'
+    )
+    assert renderer.parse_response(whitespace, tools=None).content == ""
+    assert renderer.parse_response(wrapped, tools=tools) == stock_parse(
+        renderer, wrapped, tools=tools
+    )
