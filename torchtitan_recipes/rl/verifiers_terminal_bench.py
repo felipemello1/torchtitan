@@ -527,7 +527,7 @@ def rl_grpo_qwen3_5_9b_base_terminal_bench_fast() -> Controller.Config:
 
     8 GB300 GPUs on 2 hosts: trainer FSDP 4 on one, four TP1 generators on the other. 8 prompts x
     8 samples per step, 150 turns, a pool of 256 sandboxes, no validation; every rollout is
-    recorded.
+    recorded, with its token ids.
     """
     num_samples_per_prompt = 8
     config = _qwen3_5_base_terminal_bench_config(
@@ -544,11 +544,13 @@ def rl_grpo_qwen3_5_9b_base_terminal_bench_fast() -> Controller.Config:
         dump_folder="outputs/rl/qwen3_5_9b_base_terminal_bench_fast",
         enable_thinking=False,
     )
-    # k = the group size keeps every scored rollout; keep_errors adds the errored ones.
+    # k = the group size keeps every scored rollout; keep_errors adds the errored ones. Token ids
+    # too, so a completion that parses to nothing can be decoded.
     config.rollout_recorder = RolloutSampleRecorder.Config(
         filter=KeepExtremeRewardsFilter.Config(
             k=num_samples_per_prompt, keep_errors=True
-        )
+        ),
+        log_tensors=True,
     )
     return config
 
