@@ -26,6 +26,7 @@ from torchstore import RankRole
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, CompilationConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode, PassConfig
+from vllm.exceptions import VLLMValidationError
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -572,7 +573,7 @@ class RequestDispatcher:
         if self._rank == 0:
             self._rank0_resolve_generations(completions)
         elif completions:
-            self._result_port.send(completions)
+            self._result_port.send((completions, []))
 
     def _build_completions(
         self, request_outputs: list[RequestOutput], policy_version: int
@@ -657,13 +658,36 @@ class RequestDispatcher:
             if self._rank0_dp_router is not None:
                 self._rank0_dp_router.release(request_id)
 
+    def process_rejected_requests(
+        self, rejected_requests: list[tuple[str, str]]
+    ) -> None:
+        """Send the ``(request_id, error)`` of requests vLLM rejected at admission to global rank 0,
+        which fails their replies. Routed like ``process_finished_requests``."""
+        if self._tp_rank != 0:
+            return
+        if self._rank == 0:
+            self._rank0_fail_generations(rejected_requests)
+        elif rejected_requests:
+            self._result_port.send(([], rejected_requests))
+
+    def _rank0_fail_generations(self, rejected_requests: list[tuple[str, str]]) -> None:
+        """RANK 0: fail the reply of each ``(request_id, error)`` that vLLM rejected at admission."""
+        for request_id, error in rejected_requests:
+            generation = self._rank0_outstanding_generations.pop(request_id)
+            generation.reply.set_exception(
+                ValueError(f"vLLM rejected request {request_id}: {error}")
+            )
+            if self._rank0_dp_router is not None:
+                self._rank0_dp_router.release(request_id)
+
     async def _rank0_drain_results(self) -> None:
-        """RANK 0 background task which receives and resolves completions pushed
-        by peer TP rank 0s.
+        """RANK 0 background task which receives and resolves completions and
+        rejected requests pushed by peer TP rank 0s.
         """
         while True:
-            completions = await self._rank0_result_receiver.recv()
+            completions, rejected_requests = await self._rank0_result_receiver.recv()
             self._rank0_resolve_generations(completions)
+            self._rank0_fail_generations(rejected_requests)
 
     def fail_outstanding_generations(self, exc: BaseException) -> None:
         """RANK 0: fail the reply of every outstanding generation after an exception or
@@ -1199,6 +1223,10 @@ class VLLMGenerator(Configurable):
                 `Completion` (default ``"generator"``). Callers that need to keep streams
                 separate, e.g. ``"validation/generator"``, can override it.
 
+        Raises:
+            ValueError: vLLM rejected the request, e.g. its prompt leaves no room for an
+                output token. Only this call fails; the generator keeps serving.
+
         Example:
 
             completion = await generator.slice(hosts=0, gpus=0).generate.call_one(
@@ -1309,14 +1337,6 @@ class VLLMGenerator(Configurable):
                     continue  # back to the start for the next decision
 
                 if decision.action is LoopAction.STEP:
-                    # Rank 0 holds every outstanding generation, so it stamps the admitted (min) version for the
-                    # whole decision.
-                    # TODO: move under the engine_step call (register at generation_start, not admission).
-                    # The way to do it is probably to change to RequestOutputKind.CUMULATIVE and mark per token.
-                    if self._rank == 0:
-                        self._request_dispatcher.rank0_stamp_min_policy_version(
-                            decision.requests_per_dp_rank
-                        )
                     # Admit only this rank's DP replica slice. TP ranks in the same
                     # replica compute the same _dp_rank, so they add the identical
                     # set in the same FCFS order.
@@ -1326,23 +1346,37 @@ class VLLMGenerator(Configurable):
                     if local_requests:
                         # render_cmpl is vLLM's input pipeline (tokenize is a no-op for tokenized prompts);
                         # the high-level entry stays resilient to vLLM internals vs vllm.inputs.tokens_input.
-                        prompts = []
+                        # Admit one at a time, so a request vLLM rejects fails only its own reply. Every rank of
+                        # the replica sees the same request and engine config, so all of them reject the same ones.
+                        rejected_requests: list[tuple[str, str]] = []
                         for request in local_requests:
                             prompt = {"prompt_token_ids": request.prompt_token_ids}
                             if not self.config.reset_kv_cache_on_weight_sync:
                                 # Salt by the pinned version so a request only reuses KV
                                 # computed under that version.
                                 prompt["cache_salt"] = str(request.min_policy_version)
-                            prompts.append(prompt)
-                        engine_inputs = self._engine.renderer.render_cmpl(prompts)
-                        for request, engine_input in zip(
-                            local_requests, engine_inputs, strict=True
-                        ):
-                            self._engine.add_request(
-                                request_id=request.request_id,
-                                prompt=engine_input,
-                                params=self._build_sampling_params(request.sampling),
-                            )
+                            try:
+                                (engine_input,) = self._engine.renderer.render_cmpl(
+                                    [prompt]
+                                )
+                                self._engine.add_request(
+                                    request_id=request.request_id,
+                                    prompt=engine_input,
+                                    params=self._build_sampling_params(
+                                        request.sampling
+                                    ),
+                                )
+                            # Older vLLM raises a plain ValueError, e.g. for a prompt of max_model_len tokens.
+                            except (VLLMValidationError, ValueError) as exc:
+                                logger.warning(
+                                    "vLLM rejected request %s: %s",
+                                    request.request_id,
+                                    exc,
+                                )
+                                rejected_requests.append((request.request_id, str(exc)))
+                        self._request_dispatcher.process_rejected_requests(
+                            rejected_requests
+                        )
 
                 # Barrier (NCCL): engine.step() runs SPMD in lockstep.
                 # The step burst `max_engine_steps_between_decisions` gives the generator time to buffer
@@ -1452,6 +1486,11 @@ class VLLMGenerator(Configurable):
         requests_per_dp_rank = self._request_dispatcher.rank0_route(
             pending_engine_requests
         )
+        # Stamp before the broadcast: a peer DP rank can reject a request as soon as it sees the
+        # decision, and the drain task then pops that request's generation.
+        # TODO: stamp the version a request starts generating under, not its admission version,
+        # e.g. per token with RequestOutputKind.CUMULATIVE.
+        self._request_dispatcher.rank0_stamp_min_policy_version(requests_per_dp_rank)
         pending_engine_requests.clear()
         return LoopDecision(
             action=LoopAction.STEP,
