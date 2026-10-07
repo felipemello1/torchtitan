@@ -257,6 +257,12 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
 
                 agent._llm.call = call_with_sampled_history
                 await agent.setup(environment)
+                # Harbor's default session recording runs the agent's shell under asciinema, so
+                # an `exit` ends the recording, not the session. Nest a shell to match it.
+                await agent._session.send_keys(
+                    keys=["bash", "Enter"], min_timeout_sec=1.0
+                )
+                await agent._session.send_keys(keys=["clear", "Enter"])
                 await agent.run(prompt, environment, AgentContext())
             except Exception:  # noqa: BLE001 - reported like a crashed program
                 launch_log.harness_stderr = traceback.format_exc()
