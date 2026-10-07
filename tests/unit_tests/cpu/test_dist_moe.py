@@ -521,7 +521,7 @@ def test_runtime_passes_per_slot_capacity_to_annex() -> None:
         max_moe_layers_per_activation_slot=3,
     )
 
-    assert context_config.num_local_input_tokens == 128
+    assert context_config.max_local_input_tokens == 128
     assert context_config.max_moe_layers_per_activation_slot == 3
     assert context_config.device_scratch_capacity_factor == 2.0
     assert context_config.activation_slot_bytes == 2048
@@ -531,7 +531,7 @@ def test_runtime_passes_per_slot_capacity_to_annex() -> None:
     assert context_config.vmm.total_scratch_capacity_factor == 4.0
     assert context_config.vmm.prefetch
     assert context_config.bf16_grouped_gemm_preset == "1cta1mma_bm64_bn128"
-    assert context_config.wgrad_dtype is None
+    assert context_config.wgrad_dtype == torch.float32
 
     runtime.config = DistMoeRuntime.Config(
         scratch_capacity_factor=2.0,
@@ -547,7 +547,7 @@ def test_runtime_passes_per_slot_capacity_to_annex() -> None:
     assert factor_config.activation_slot_bytes is None
     assert factor_config.activation_slot_capacity_factor == 1.5
     assert factor_config.num_activation_slots == 2
-    assert factor_config.wgrad_dtype is None
+    assert factor_config.wgrad_dtype == torch.float32
 
 
 def test_mxfp8_transform_is_independent_and_uses_prepared_weights() -> None:

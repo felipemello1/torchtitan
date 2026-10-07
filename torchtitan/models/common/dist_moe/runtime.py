@@ -402,7 +402,7 @@ class DistMoeRuntime(Configurable):
             )
         )
         return dist_moe.Config(
-            num_local_input_tokens=num_local_input_tokens,
+            max_local_input_tokens=num_local_input_tokens,
             hidden_dim=module.hidden_dim,
             intermediate_dim=module.intermediate_dim,
             top_k=module.top_k,
@@ -417,7 +417,7 @@ class DistMoeRuntime(Configurable):
             vmm=vmm,
             bf16_grouped_gemm_preset=module.bf16_grouped_gemm_preset,
             block_scaled=module.block_scaled_config,
-            wgrad_dtype=wgrad_dtype,
+            wgrad_dtype=wgrad_dtype or torch.float32,
         )
 
     def _plan_pp_activation_slots(
