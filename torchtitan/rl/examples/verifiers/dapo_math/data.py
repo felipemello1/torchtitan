@@ -20,8 +20,11 @@ from torchtitan.rl.examples.dapo_math import (
     AIME2025Dataset,
     DapoMathDataset,
     DapoMathSample,
-    score_math_response,
+    MathVerifyPool,
 )
+
+# Threads and worker processes start on the first score, not at import.
+_MATH_VERIFY_POOL = MathVerifyPool(num_workers=4, timeout_seconds=5.0)
 
 
 class VerifiersMathData(vf.TaskData):
@@ -33,7 +36,9 @@ class VerifiersMathTask(vf.Task[VerifiersMathData]):
 
     @vf.reward(weight=1.0)
     async def math_verify(self, trace: vf.Trace) -> float:
-        return score_math_response(trace.last_reply or "", self.data.ground_truth)
+        return await _MATH_VERIFY_POOL.score(
+            trace.last_reply or "", self.data.ground_truth
+        )
 
 
 class VerifiersMathTasksetConfig(vf.TasksetConfig):

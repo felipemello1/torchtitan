@@ -11,10 +11,8 @@ from torchtitan.rl.examples.dapo_math.data import (
     Intellect3MathDataset,
 )
 from torchtitan.rl.examples.dapo_math.env import DapoMathEnv
-from torchtitan.rl.examples.dapo_math.rubric import (
-    RewardMathVerify,
-    score_math_response,
-)
+from torchtitan.rl.examples.dapo_math.grader import MathVerifyPool, score_math_response
+from torchtitan.rl.examples.dapo_math.rubric import RewardMathVerify
 
 __all__ = [
     "AIME2025Dataset",
@@ -22,6 +20,7 @@ __all__ = [
     "DapoMathEnv",
     "DapoMathSample",
     "Intellect3MathDataset",
+    "MathVerifyPool",
     "RewardMathVerify",
     "score_math_response",
 ]
