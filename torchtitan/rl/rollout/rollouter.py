@@ -40,6 +40,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# How long `Rollouter.close` waits for in-flight `run_group` calls before stopping their workers anyway.
+_RUN_GROUP_DRAIN_TIMEOUT_S = 30.0
+
 
 class Rollouter(Configurable):
     """Turns a problem (train/val datasets, the `MessageEnv` to build per sample, and a
@@ -124,6 +127,8 @@ class Rollouter(Configurable):
 
         self._worker_actors: RolloutWorkerActor | None = None
         self._worker_mesh: ProcMesh | None = None
+        # `run_group` calls still running on a worker, including those whose caller was cancelled.
+        self._inflight_run_group_calls: set[asyncio.Future[RolloutGroup]] = set()
 
     # TODO: revisit this abstraction: should it return a sample or a dataset or an iterator?
     def get_training_sample(self) -> object:
@@ -164,10 +169,26 @@ class Rollouter(Configurable):
         )
 
     async def close(self) -> None:
-        """Stop the owned rollout worker proc mesh."""
+        """Wait up to 30 s for in-flight `run_group` calls, then stop the worker proc mesh.
+
+        A worker stopped mid-group cannot receive the generator router's replies to its pending
+        `generate_fn` calls, and Monarch fails the router on the first reply it cannot deliver.
+        Close the generators first, so those calls fail fast and the groups finish.
+        """
         worker_mesh = self._worker_mesh
         self._worker_actors = None
         self._worker_mesh = None
+        calls = tuple(self._inflight_run_group_calls)
+        if calls:
+            _, pending = await asyncio.wait(calls, timeout=_RUN_GROUP_DRAIN_TIMEOUT_S)
+            if pending:
+                logger.warning(
+                    "Stopping rollout workers with %d run_group calls still running",
+                    len(pending),
+                )
+                for call in pending:
+                    call.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
         if worker_mesh is not None:
             await worker_mesh.stop()
 
@@ -206,13 +227,26 @@ class Rollouter(Configurable):
 
         # Use Monarch `choose` API to randomly select an actor in the mesh, and
         # send the message to its `run_group` endpoint.
-        return await self._worker_actors.run_group.choose(
-            generate_fn=generate_fn,
-            sample=sample,
-            group_id=group_id,
-            group_size=group_size,
-            sampling=sampling,
+        call = asyncio.ensure_future(
+            self._worker_actors.run_group.choose(
+                generate_fn=generate_fn,
+                sample=sample,
+                group_id=group_id,
+                group_size=group_size,
+                sampling=sampling,
+            )
         )
+        self._inflight_run_group_calls.add(call)
+        call.add_done_callback(self._on_run_group_call_done)
+        # The controller cancels its rollout loops when training ends. The shield keeps that
+        # from cancelling `call`, so `close` still waits for the worker to finish the group.
+        return await asyncio.shield(call)
+
+    def _on_run_group_call_done(self, call: asyncio.Future[RolloutGroup]) -> None:
+        self._inflight_run_group_calls.discard(call)
+        # A cancelled caller never reads the error; read it so asyncio does not log it.
+        if not call.cancelled():
+            call.exception()
 
 
 class RolloutWorker(Configurable):
@@ -440,6 +474,9 @@ class RolloutWorker(Configurable):
 
             status = env_step.status
         except Exception:
+            # TODO: `Controller.close` closes the generators first, so every rollout still generating
+            # lands here with a ~40-line remote traceback (15-30 per 8x H100 DAPO-Math run). Raise a
+            # typed error on generator close and log it at info, without the traceback.
             logger.exception(
                 "rollout %s/rollout=%d failed after %d turn(s); marking ERROR",
                 group_id,
