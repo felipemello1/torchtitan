@@ -270,6 +270,9 @@ class InterGeneratorRouter(Actor, Configurable):
     ) -> Any:
         """Call ``method`` on a generator's rank 0, reserving ``cost`` while it runs."""
         self._reserve(h, cost)
+        # TODO: a generator whose engine loop crashed fails every call at once, so it looks idle and
+        # gets most new sessions (61 of 64 rollouts with 1 of 4 dead, in a CPU sim). Detect it with a
+        # typed "closed" error from VLLMGenerator, then skip the dead generator, or fail the job.
         try:
             return await getattr(h.rank0_actor, method).call_one(*args, **kwargs)
         finally:
