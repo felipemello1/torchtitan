@@ -146,10 +146,10 @@ class ValidationConfig:
 
     Example, `interval_steps=25`, `overlap_training=True`, 100 steps:
         step 0:   a pass starts on policy 0; training starts at once.
-        step 7:   the pass ends and is logged at step 7. Its slowest rollouts sampled policies
-                  0 to 6: `validation/min_policy_version` 0, `validation/max_policy_version` 6.
-        step 25:  the next pass starts on policy 25. If a pass were still running, it would
-                  start when that one ends.
+        step 7:   the pass ends and is logged at step 7. Its slowest rollouts sampled policies 0
+                  to 6: `validation/min_policy_version/min` 0, `validation/max_policy_version/max` 6.
+        step 25:  the next pass starts on policy 25 or later. If a pass were still running, it
+                  would start at the end of the step in which that one ends.
         step 100: a pass still running is logged at step 100; then the final pass runs alone.
     """
 
@@ -165,7 +165,9 @@ class ValidationConfig:
     overlap_training: bool = False
     """False: training waits for each pass, so every rollout in it samples one policy.
     True: the pre-training and periodic passes run beside training, on the same generators. A
-    long rollout's later turns can then sample newer policies; see `validation/max_policy_version`."""
+    long rollout's later turns can then sample newer policies; see `validation/max_policy_version/max`.
+    That includes the step-0 pass, so keep False, or evaluate a saved checkpoint offline, for a
+    clean pre-training score."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -480,18 +482,18 @@ class Controller(Configurable):
         self.rollout_recorder = config.rollout_recorder.build(
             dump_dir=config.dump_folder
         )
-        # With `validation.overlap_training`: the pass running beside training, and whether a
-        # validation step came while it ran (the next pass then starts when it ends).
+        # With `validation.overlap_training`: the pass running beside training.
         self._validation_task: asyncio.Task[list[m.Metric]] | None = None
-        self._validation_requested = False
 
     async def close(self):
         """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
         logger.info("Closing: tearing down actors and process meshes.")
 
-        # Still set only if training crashed; a healthy run() awaits it.
+        # Still set only if training crashed; a healthy run() awaits it. Wait for the cancel to
+        # finish before the rollouter it uses is closed below.
         if self._validation_task is not None:
             self._validation_task.cancel()
+            await asyncio.gather(self._validation_task, return_exceptions=True)
 
         if self.trainer is not None:
             try:
@@ -755,7 +757,7 @@ class Controller(Configurable):
         with sl.log_trace_span("generator_pull_model_state_dict"):
             await self.generator_router.pull_model_state_dict.call_one(self.start_step)
 
-    # TODO: fold validation into a Validator(Configurable) the controller attaches, instead of 4 methods.
+    # TODO: fold validation into a Validator(Configurable) the controller attaches, instead of these methods.
     @sl.log_trace_span("_collect_validation_rollouts")
     async def _collect_validation_rollouts(
         self, *, num_groups: int, sampling: SamplingConfig, step: int
@@ -806,7 +808,7 @@ class Controller(Configurable):
         # Policies the pass sampled. One, unless the pass overlaps training: then a weight sync
         # during a rollout makes its later tokens sample a newer policy.
         turns = [turn for rollout in rollouts for turn in rollout.turns]
-        mixed_policy = [
+        is_mixed_policy = [
             rollout.turns[-1].max_policy_version > rollout.turns[0].min_policy_version
             for rollout in rollouts
             if rollout.turns
@@ -821,7 +823,7 @@ class Controller(Configurable):
                 m.Max.from_list([turn.max_policy_version for turn in turns]),
             ),
             m.Metric(
-                "validation/mixed_policy_rollouts", m.Mean.from_list(mixed_policy)
+                "validation/mixed_policy_rollouts", m.Mean.from_list(is_mixed_policy)
             ),
         ]
         return rollout_groups, metrics
@@ -885,7 +887,7 @@ class Controller(Configurable):
                 # Generators already hold policy 0 (setup_async), so training can start right away.
                 self._start_validation(step=0)
                 pre_validation_task = self._validation_task
-                pre_validation = {}
+                pre_validation = {}  # read from the task after training
             else:
                 pre_validation = await self._validate_and_log(step=0)
         else:
@@ -1017,10 +1019,13 @@ class Controller(Configurable):
                 *background_tasks, trainer_task, return_exceptions=True
             )
 
-        # A pass that overlapped training and is still running now has the generators to itself.
-        # Awaited, not cancelled: a cancelled pass's rollouts can outlive it in the rollout workers,
-        # and the final pass reuses their group ids.
+        # A pass that overlapped training may still be running; no new training rollouts start now.
+        # Awaited, not cancelled: the generators would keep serving its requests, and the final
+        # pass can reuse their request ids.
         if self._validation_task is not None:
+            logger.info(
+                f"Training done; waiting for {self._validation_task.get_name()} before the final pass"
+            )
             await self._validation_task
             self._log_finished_validation(step=num_training_steps)
         if pre_validation_task is not None:
@@ -1041,10 +1046,13 @@ class Controller(Configurable):
     def _start_validation(self, *, step: int) -> None:
         """Start a validation pass beside training; `_log_finished_validation` logs it once it ends.
 
-        The caller makes sure the generators hold policy `step` and no pass is running.
+        The caller makes sure the generators hold at least policy `step` and no pass is running.
         """
+        # TODO: validation rollouts queue behind training rollouts for generator slots and
+        # env-server sandboxes, so a periodic pass can take longer than alone. prime-rl dispatches
+        # eval before new training rollouts (PREFER_EVAL); here that needs a request priority in
+        # the env server and the generator router.
         logger.info(f"Starting validation at step {step}, beside training")
-        self._validation_requested = False
         self._validation_task = asyncio.create_task(
             self.validate(step=step), name=f"validation_step_{step}"
         )
@@ -1053,7 +1061,7 @@ class Controller(Configurable):
         """If the pass started by `_start_validation` has ended, log it at `step`; re-raise its error.
 
         Example: a pass started at step 25 that ends during step 31 is logged at step 31, with
-        `validation/min_policy_version` 25. Metric backends need steps that never go back.
+        `validation/min_policy_version/min` 25. Metric backends need steps that never go back.
         """
         task = self._validation_task
         if task is None or not task.done():
@@ -1068,6 +1076,12 @@ class Controller(Configurable):
         reward_keys = sorted(key for key in set(pre) | set(post) if "reward" in key)
         logger.info("=" * 60)
         logger.info("Validation reward (pre / post):")
+        # With `overlap_training`, "pre" is the step-0 pass, which ran beside training.
+        newest_pre_policy = pre.get("validation/max_policy_version/max", 0)
+        if newest_pre_policy > 0:
+            logger.info(
+                f"  pre sampled policies 0 to {newest_pre_policy:.0f}: not a clean pre-training score"
+            )
         for key in reward_keys:
             logger.info(
                 f"  {key}:  {pre.get(key, float('nan')):+.3f}  /  {post.get(key, float('nan')):+.3f}"
@@ -1224,6 +1238,9 @@ class Controller(Configurable):
             waits for:    a TrainerStepBatch in the queue
             unblocked by: _batcher_loop training_batch_queue.put()
         """
+        # With `validation.overlap_training`: a validation step asked for a pass, which waits
+        # while another pass runs.
+        validation_requested = False
         for step in range(self.start_step + 1, num_training_steps + 1):
             sl.set_step(step)  # propagate the step counter to the actors
             with sl.log_trace_span("sync_log_step"):
@@ -1360,16 +1377,23 @@ class Controller(Configurable):
             if validation.overlap_training:
                 self._log_finished_validation(step=step)
                 if is_validation_step:
-                    self._validation_requested = True
+                    validation_requested = True
+                    if self._validation_task is not None:
+                        logger.info(
+                            f"Validation step {step}: {self._validation_task.get_name()} is still "
+                            "running; the next pass starts when it ends"
+                        )
                 # No pass starts at the last step: the final pass after training covers it.
                 if (
-                    self._validation_requested
+                    validation_requested
                     and self._validation_task is None
                     and step < num_training_steps
                 ):
-                    # Wait for this step's weight pull (not the pass), so the pass starts on policy `step`.
+                    # Wait for this step's weight pull (not the pass), so the pass starts on at
+                    # least policy `step`.
                     await self._weight_sync.wait_inflight_push_pull()
                     self._start_validation(step=step)
+                    validation_requested = False
             elif is_validation_step:
                 # Pause the trainer until validation ends. It is the only weight syncer, so
                 # every validation rollout samples this step's policy; training rollouts
