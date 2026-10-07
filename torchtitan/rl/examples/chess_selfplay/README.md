@@ -46,9 +46,9 @@ A game ends on:
 
 - checkmate, stalemate, or insufficient material. A repetition plays on: a repetition draw would lock in a reward while playing on risks a forfeit, so self-play could learn to repeat moves;
 - an illegal, missing, or unparsable move, a reply cut at `max_tokens`, or a history longer than `max_rollout_tokens`: that player forfeits;
-- 60 plies: the game is scored by material, after the side to move plays out its captures. White's score is `1 / (1 + exp(-pawns / 4))`.
+- `max_plies` plies (required; the recipe uses 60): a draw, adjusted by material after the side to move plays out its captures. White's material score is `1 / (1 + exp(-pawns / 4))`.
 
-The training reward (`ChessGame.rewards`) is 1 for a win, at any length. A game cut at 60 plies, or forfeited by the opponent, scores 0.25 to 0.75 by material, so an opponent's forfeit is not a free win. A draw scores 0.5 times the share of its 30 moves the player played. Being checkmated scores -0.25 and a forfeit -0.5, both shrinking to 0 with the moves the player lasted. So a win beats every other ending, and forfeiting is worse than any way of playing on. The Elo metrics use the chess result instead (`ChessGame.scores`: 1 / 0.5 / 0, material at the cap).
+The training reward (`ChessGame.rewards`) is 1 for a win, at any length. A game that reaches `max_plies`, or is forfeited by the opponent, is a draw moved toward the material score: 0.25 to 0.75, so more material scores more and an opponent's forfeit is not a free win. With `played` the share of `max_plies` played, a stalemate or insufficient material scores 0.5 * `played`, being checkmated -0.25 * (1 - `played`), and a forfeit -0.5 * (1 - `played`). So a win beats every other ending, and forfeiting is worse than any way of playing on. The Elo metrics use the chess result instead (`ChessGame.scores`: 1 / 0.5 / 0, material at the cap).
 
 Advantages are centered per color within a group: White's rollouts against White's mean, Black's against Black's. With one baseline over both colors, the mean of complementary scores is 0.5, so the color that moves first would collect a free positive advantage.
 
