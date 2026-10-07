@@ -20,16 +20,17 @@ class RewardMathVerify(RewardFn):
     @dataclass(kw_only=True, slots=True)
     class Config(RewardFn.Config):
         timeout_seconds: float = 5.0
-        """Wall-clock limit to score one answer; a slower answer scores 0. Normal answers
-        take 2-20 ms. 5 s matches Math-Verify's own default."""
+        """Limit to score one answer, counted from when a grader process receives it
+        (queue wait and process start excluded); a slower answer scores 0. Most answers
+        take 2-20 ms; the slowest symbolic answers we measured took ~4 s."""
 
-        num_workers: int = 4
-        """Worker processes (~70 MB each) scoring answers in parallel, per rollout worker."""
+        num_processes: int = 4
+        """Grader processes per rollout worker (~70 MB each); each scores one answer at a time."""
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self._pool = MathVerifyPool(
-            num_workers=config.num_workers, timeout_seconds=config.timeout_seconds
+            num_processes=config.num_processes, timeout_seconds=config.timeout_seconds
         )
 
     async def __call__(self, rollout: Rollout, env_input: DapoMathSample) -> float:
@@ -40,4 +41,6 @@ class RewardMathVerify(RewardFn):
         response = (
             (completion_message.get("content") or "") if completion_message else ""
         )
-        return await self._pool.score(response, env_input.ground_truth)
+        return await self._pool.score(
+            response=response, ground_truth=env_input.ground_truth
+        )

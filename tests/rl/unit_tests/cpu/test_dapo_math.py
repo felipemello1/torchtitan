@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
 from datasets import Dataset
 
 from torchtitan.rl.examples.dapo_math import (
@@ -19,6 +20,7 @@ from torchtitan.rl.examples.dapo_math import (
     DapoMathEnv,
     DapoMathSample,
     data as math_data,
+    grader,
     Intellect3MathDataset,
     MathVerifyPool,
     RewardMathVerify,
@@ -173,7 +175,7 @@ def test_math_verifier_rejects_unboxed_large_intermediate_expression() -> None:
 
 
 def test_math_verify_pool_matches_in_process_scores() -> None:
-    pool = MathVerifyPool(num_workers=2, timeout_seconds=5.0)
+    pool = MathVerifyPool(num_processes=2, timeout_seconds=5.0)
     cases = [
         (r"work\nAnswer: \boxed{34}", "34"),
         (r"work\n\boxed{\frac{68}{2}}", "34"),
@@ -190,7 +192,7 @@ def test_math_verify_pool_matches_in_process_scores() -> None:
 
 def test_reward_scores_a_hung_answer_zero_while_other_answers_finish() -> None:
     # sympy computes 2000**(2000**2000) in one C call that does not finish.
-    reward = RewardMathVerify.Config(timeout_seconds=2.0, num_workers=2).build()
+    reward = RewardMathVerify.Config(timeout_seconds=2.0, num_processes=2).build()
     sample = DapoMathSample(prompt="problem", ground_truth="34")
     finish_seconds = {}
 
@@ -208,11 +210,28 @@ def test_reward_scores_a_hung_answer_zero_while_other_answers_finish() -> None:
 
     start = time.monotonic()
     assert asyncio.run(score_all()) == [0.0, 1.0, 1.0, 1.0, 1.0]
-    # The 2 s timeout, plus up to 5 s to start the worker.
+    # The 2 s timeout, plus up to 5 s to start the grader process.
     assert finish_seconds["hung"] < 2.0 + 5.0
     assert max(finish_seconds[f"normal_{i}"] for i in range(4)) < finish_seconds["hung"]
-    # The killed worker was replaced.
-    assert asyncio.run(reward(_rollout(r"\boxed{34}"), sample)) == 1.0
+
+
+def test_math_verify_pool_replaces_a_killed_process() -> None:
+    # One process, so the second score runs on its replacement.
+    pool = MathVerifyPool(num_processes=1, timeout_seconds=1.0)
+    assert asyncio.run(pool.score(r"\boxed{2000^{2000^{2000}}}", "34")) == 0.0
+    assert asyncio.run(pool.score(r"\boxed{34}", "34")) == 1.0
+
+
+def test_math_verify_pool_raises_when_a_process_fails_to_start(
+    monkeypatch, tmp_path
+) -> None:
+    # A process that prints something other than "ready" and keeps running.
+    script = tmp_path / "noisy.py"
+    script.write_text("import sys\nprint('noise', flush=True)\nsys.stdin.read()\n")
+    monkeypatch.setattr(grader, "__file__", str(script))
+    pool = MathVerifyPool(num_processes=1, timeout_seconds=1.0)
+    with pytest.raises(RuntimeError, match="noise"):
+        asyncio.run(pool.score(r"\boxed{34}", "34"))
 
 
 def test_reward_handles_equivalent_latex_and_units() -> None:

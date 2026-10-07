@@ -4,9 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Math-Verify scoring, run in worker processes with a hard timeout.
+"""Math-Verify scoring, run in grader processes with a hard timeout.
 
-`MathVerifyPool` runs this file as a script in each worker process, so it must not
+`MathVerifyPool` runs this file as a script in each grader process, so it must not
 import torchtitan: importing `torchtitan.rl` loads vLLM (~9 s and ~1 GB per process).
 """
 
@@ -16,6 +16,7 @@ import asyncio
 import ctypes
 import json
 import logging
+import os
 import signal
 import subprocess
 import sys
@@ -33,64 +34,63 @@ _PR_SET_PDEATHSIG = 1
 
 
 class MathVerifyPool:
-    """Score answers in worker processes, so an answer that hangs Math-Verify cannot
+    """Score answers in grader processes, so an answer that hangs Math-Verify cannot
     stall the caller.
 
-    Each worker process scores one answer at a time. If a worker gives no score
-    within `timeout_seconds`, the answer scores 0 and the worker is killed and
-    replaced. Pool threads, not the caller's event loop, wait on the workers, so
-    other scores keep flowing while one worker is stuck.
+    Each grader process (a "worker" below) scores one answer at a time. A worker that
+    gives no score within `timeout_seconds` is killed, the answer scores 0, and the next
+    score starts a new worker. Pool threads, not the caller's event loop, wait on them.
 
-    Why processes: `\\boxed{2000^{2000^{2000}}}` makes sympy compute 2000**(2000**2000),
-    one C call that does not finish and holds the GIL throughout. In-process, that means:
+    Why processes: for `\\boxed{2000^{2000^{2000}}}`, sympy computes 2000**(2000**2000)
+    in one C call that never finishes and holds the GIL. In-process:
     1. Every other thread stops, including the event loop.
-    2. A thread timeout (`PyThreadState_SetAsyncExc`) never fires: it is checked
-       only between bytecodes.
-    3. Math-Verify's SIGALRM timeout needs the main thread, and rollout workers score
-       on a monarch actor thread.
-    Killing the process is the only way out.
+    2. A thread timeout (`PyThreadState_SetAsyncExc`) fires only between bytecodes.
+    3. Math-Verify's SIGALRM timeout needs the main thread; rollout workers score on a
+       monarch actor thread.
 
     Example:
-        pool = MathVerifyPool(num_workers=4, timeout_seconds=5.0)
+        pool = MathVerifyPool(num_processes=4, timeout_seconds=5.0)
         await pool.score(r"Answer: \\boxed{34}", "34")  # 1.0
         await pool.score(r"Answer: \\boxed{2000^{2000^{2000}}}", "34")  # 0.0 after 5 s
     """
 
-    def __init__(self, *, num_workers: int, timeout_seconds: float) -> None:
+    def __init__(self, *, num_processes: int, timeout_seconds: float) -> None:
         self._timeout_seconds = timeout_seconds
-        # Each thread drives at most one worker process, started on its first score.
-        self._threads = ThreadPoolExecutor(
-            max_workers=num_workers, thread_name_prefix="math_verify"
+        # Each thread drives at most one worker, started on its first score.
+        self._executor = ThreadPoolExecutor(
+            max_workers=num_processes, thread_name_prefix="math_verify"
         )
         self._thread_local = threading.local()
 
     async def score(self, response: str, ground_truth: str) -> float:
         """Return `score_math_response(response, ground_truth)`, or 0.0 on timeout."""
         return await asyncio.get_running_loop().run_in_executor(
-            self._threads, self._score_in_worker, response, ground_truth
+            self._executor, self._score_in_worker, response, ground_truth
         )
 
     def _score_in_worker(self, response: str, ground_truth: str) -> float:
         worker = getattr(self._thread_local, "worker", None)
+        # Start a worker on this thread's first score, or after its last one exited.
         if worker is None or worker.poll() is not None:
             worker = self._thread_local.worker = _start_worker()
 
         worker.stdin.write(json.dumps([response, ground_truth]) + "\n")
         worker.stdin.flush()
-        # Unlike select(), `connection.wait` uses poll(), which handles fds above 1024.
-        ready = connection.wait([worker.stdout], timeout=self._timeout_seconds)
-        # An empty line means the worker died mid-score; treat it like a timeout.
-        score_line = worker.stdout.readline() if ready else ""
-        if score_line:
-            return float(score_line)
+        # `connection.wait` uses poll(); select() rejects fds >= 1024.
+        if connection.wait([worker.stdout], timeout=self._timeout_seconds):
+            # An empty line means the worker died mid-score; treat it like a timeout.
+            score_line = worker.stdout.readline()
+            if score_line:
+                return float(score_line)
 
         worker.kill()
         worker.wait()
-        self._thread_local.worker = None
+        # TODO: count these per step as a metric; today they only show in this warning.
         logger.warning(
-            "Math-Verify gave no score within %s seconds; killed its worker and "
-            "assigned zero reward",
+            "Math-Verify worker gave no score within %s seconds, or died; killed it and "
+            "assigned zero reward. Response tail: %r",
             self._timeout_seconds,
+            response[-200:],
         )
         return 0.0
 
@@ -141,15 +141,20 @@ def _last_boxed_expression(text: str) -> str | None:
 def _start_worker() -> subprocess.Popen[str]:
     """Start a process running `_serve`; return once it is ready to score."""
     worker = subprocess.Popen(
-        [sys.executable, __file__],
+        # -I: ignore PYTHONPATH and user site-packages, so no parent sitecustomize loads.
+        [sys.executable, "-I", __file__],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
     )
     # Wait out the interpreter start, so it does not count against the first timeout.
-    if worker.stdout.readline() != "ready\n":
+    first_line = worker.stdout.readline()
+    if first_line != "ready\n":
+        # Kill first: a worker that printed something else is alive, and wait() would hang.
+        worker.kill()
         raise RuntimeError(
-            f"Math-Verify worker exited during startup with code {worker.wait()}"
+            f"Math-Verify worker failed to start (exit code {worker.wait()}); "
+            f"first stdout line: {first_line!r}"
         )
     return worker
 
@@ -158,9 +163,10 @@ def _serve() -> None:
     """Worker loop: read `[response, ground_truth]` JSON lines, write one score per line."""
     # SIGKILL this worker if its parent dies: a stuck score never sees stdin close.
     ctypes.CDLL(None).prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
-    # Library prints go to stderr, so stdout carries only scores. (ANTLR prints a
-    # warning on every parse when its runtime and generated parser versions differ.)
-    scores_out, sys.stdout = sys.stdout, sys.stderr
+    # Scores get a private copy of fd 1, and fd 1 now goes to stderr, so no library
+    # write, Python or C, lands between scores (e.g. ANTLR's version warning).
+    scores_out = os.fdopen(os.dup(1), "w")
+    os.dup2(2, 1)
     print("ready", file=scores_out, flush=True)
     for line in sys.stdin:
         response, ground_truth = json.loads(line)
