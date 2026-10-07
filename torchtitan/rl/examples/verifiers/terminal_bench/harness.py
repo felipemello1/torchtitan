@@ -13,7 +13,7 @@ This copy runs ``terminus_harness.py`` and adds the ``interleaved_thinking`` and
 ``enable_summarize`` options of
 https://github.com/PrimeIntellect-ai/verifiers/pull/2458, with the same names
 and defaults. To grade as ``harbor run`` does, it also stops tmux only after
-grading.
+grading and passes the prompts in a file, not argv.
 
 TODO: once a Verifiers release includes
 https://github.com/PrimeIntellect-ai/verifiers/pull/2458 and the Harbor-parity
@@ -21,6 +21,7 @@ changes listed here, delete this file and ``terminus_harness.py`` and use
 Verifiers' ``Terminus2HarnessConfig`` in the recipe.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -86,6 +87,14 @@ class TerminalBenchTerminusHarness(Harness[TerminalBenchTerminusHarnessConfig]):
         if prompt is None:
             raise ValueError("Terminus 2 requires a task prompt")
         tmux_dir = f"/tmp/vf-terminus-2-{trace.id}"
+        # A file, not argv or env: the agent's `pkill -f` matches argv, and Prime's job
+        # wrapper copies the env into its argv. Outside tmux_dir, so the program still
+        # creates that dir with mode 0700.
+        prompts_path = f"{tmux_dir}.prompts.json"
+        await runtime.write(
+            prompts_path,
+            json.dumps({"system_prompt": system_prompt or "", "task": prompt}).encode(),
+        )
         env = {
             **self.config.resolved_env,
             "TMUX_TMPDIR": tmux_dir,
@@ -94,8 +103,7 @@ class TerminalBenchTerminusHarness(Harness[TerminalBenchTerminusHarnessConfig]):
             f"--base-url={endpoint}",
             f"--api-key={secret}",
             f"--model={ctx.model}",
-            f"--system-prompt={system_prompt or ''}",
-            f"--task={prompt}",
+            f"--prompts={prompts_path}",
         ]
         if self.config.enable_summarize:
             args.append("--enable-summarize")
@@ -116,7 +124,8 @@ class TerminalBenchTerminusHarness(Harness[TerminalBenchTerminusHarnessConfig]):
             [
                 "sh",
                 "-c",
-                'tmux kill-server >/dev/null 2>&1 || true; rm -rf "$TMUX_TMPDIR"',
+                "tmux kill-server >/dev/null 2>&1 || true; "
+                'rm -rf "$TMUX_TMPDIR" "$TMUX_TMPDIR.prompts.json"',
             ],
             {"TMUX_TMPDIR": f"/tmp/vf-terminus-2-{trace.id}"},
         )

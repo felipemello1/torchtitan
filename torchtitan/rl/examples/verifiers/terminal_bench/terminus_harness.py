@@ -14,17 +14,18 @@
 Copied from Verifiers 0.3.1's Terminus-2 program (MIT License):
 https://github.com/PrimeIntellect-ai/verifiers/blob/v0.3.1/verifiers/v1/harnesses/terminus_2/program.py
 It adds the ``--enable-summarize`` and ``--no-interleaved-thinking`` flags of
-https://github.com/PrimeIntellect-ai/verifiers/pull/2458.
+https://github.com/PrimeIntellect-ai/verifiers/pull/2458, and reads the prompts
+from the ``--prompts`` file the harness writes.
 
 ``TerminalBenchTerminusHarness`` in ``harness.py`` fills in the Harbor version
 above and runs this file as a uv script, so it is never imported by TorchTitan.
 
-TODO: delete this file together with ``harness.py`` once a Verifiers release
-includes https://github.com/PrimeIntellect-ai/verifiers/pull/2458.
+TODO: delete this file together with ``harness.py``, as its TODO says.
 """
 
 import argparse
 import asyncio
+import json
 import os
 import subprocess
 from pathlib import Path, PurePosixPath
@@ -71,8 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--api-key", required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--system-prompt", default="")
-    parser.add_argument("--task", required=True)
+    parser.add_argument("--prompts", required=True)
     parser.add_argument("--enable-summarize", action="store_true")
     parser.add_argument("--no-interleaved-thinking", action="store_true")
     return parser.parse_args()
@@ -80,7 +80,8 @@ def parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     args = parse_args()
-    model, system_prompt, task = args.model, args.system_prompt, args.task
+    prompts = json.loads(Path(args.prompts).read_text())
+    model, system_prompt, task = args.model, prompts["system_prompt"], prompts["task"]
     logs_dir = Path(os.environ["TMUX_TMPDIR"])
     logs_dir.mkdir(mode=0o700, exist_ok=True)
     EnvironmentPaths.agent_dir = PurePosixPath(logs_dir)
