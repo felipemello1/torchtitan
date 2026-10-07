@@ -16,6 +16,7 @@ import chess
 from torchtitan.rl.examples.chess_selfplay.bots import (
     BOTS,
     centipawn_losses,
+    executable_stockfish,
     StockfishBot,
 )
 from torchtitan.rl.examples.chess_selfplay.data import ChessSample
@@ -69,7 +70,7 @@ class ChessSelfPlayWorker(RolloutWorker):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self._max_plies = config.max_plies
-        self._stockfish_path = config.stockfish_path
+        self._stockfish_path = executable_stockfish(config.stockfish_path)
 
     async def run_group(
         self,

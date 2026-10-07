@@ -29,7 +29,10 @@ from torchtitan.rl.examples.chess_selfplay import (
     RewardChessScore,
     StockfishBot,
 )
-from torchtitan.rl.examples.chess_selfplay.bots import centipawn_losses
+from torchtitan.rl.examples.chess_selfplay.bots import (
+    centipawn_losses,
+    executable_stockfish,
+)
 from torchtitan.rl.examples.chess_selfplay.rollouter import EloFit
 from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.observability.controller import compute_rollout_metrics
@@ -278,6 +281,19 @@ def test_centipawn_losses_rank_moves() -> None:
         engine_path=_STOCKFISH,
     )
     assert len(white_only) == 2
+
+
+def test_executable_stockfish_copies_a_binary_without_the_execute_bit(tmp_path) -> None:
+    staged = tmp_path / "stockfish"
+    staged.write_bytes(b"binary")
+    staged.chmod(0o444)
+    copy = executable_stockfish(str(staged))
+    assert copy != str(staged)
+    assert os.access(copy, os.X_OK) and open(copy, "rb").read() == b"binary"
+    staged.chmod(0o755)
+    assert executable_stockfish(str(staged)) == str(staged)
+    assert executable_stockfish("stockfish") == "stockfish"
+    assert executable_stockfish(None) is None
 
 
 def test_elo_fit() -> None:

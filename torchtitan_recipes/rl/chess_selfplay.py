@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import os
+
 from renderers import Qwen35RendererConfig
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -19,11 +21,11 @@ from torchtitan.components.optim import (
     OptimizersContainer,
 )
 from torchtitan.components.renderer import from_renderers
-from torchtitan.config import TrainingConfig
+from torchtitan.config import OverrideConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.config.transform import LMHeadCastConverter
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_checkpoint import RegionAC, SelectiveAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
@@ -68,8 +70,6 @@ def rl_chess_qwen3_5_4b(
         "4B",
         seq_len=max_total_tokens,
         attn_backend="varlen",
-        # Compute vocabulary logits in fp32; the rest of the forward uses bf16.
-        converters=[LMHeadCastConverter.Config()],
     )
     return Controller.Config(
         model=model_config,
@@ -191,3 +191,63 @@ def rl_chess_qwen3_5_4b(
             ),
         ),
     )
+
+
+def rl_chess_qwen3_5_35b_a3b() -> Controller.Config:
+    """Qwen3.5-35B-A3B (instruct, thinking off), 120-ply games, 150 steps on two GB300 hosts.
+
+    Host 0 trains: FSDP 2 x TP 2 x EP 4 with Dist-MoE experts, the layout of the 35B Terminal-Bench
+    runs. Host 1 runs four one-GPU generators, each with every expert, FULL CUDA graphs. 120 plies
+    need a ~48k-token history.
+    """
+    max_rollout_tokens = 49152
+    config = rl_chess_qwen3_5_4b(max_plies=120, max_rollout_tokens=max_rollout_tokens)
+    max_total_tokens = max_rollout_tokens + config.generator.sampling.max_tokens
+    config.model = build_model_config(
+        "35B-A3B", seq_len=max_total_tokens, attn_backend="varlen"
+    )
+    config.hf_assets_path = "torchtitan/rl/example_checkpoint/Qwen3.5-35B-A3B"
+    config.dump_folder = "outputs/rl/qwen3_5_35b_a3b_chess"
+    # The bot games and move scoring track progress, so validation is off.
+    config.async_loop.validation.num_samples = 0
+    # The launcher sets the path of a Stockfish build for the host's architecture.
+    config.rollouter.worker.stockfish_path = os.environ.get(
+        "CHESS_STOCKFISH_PATH", "stockfish"
+    )
+
+    trainer = config.trainer
+    expert_parallel_degree = 4
+    trainer.parallelism = ParallelismConfig(
+        data_parallel_shard_degree=2,
+        tensor_parallel_degree=2,
+        expert_parallel_degree=expert_parallel_degree,
+    )
+    # fp32 master weights; FSDP unshards bf16 params for compute.
+    trainer.training.dtype = "float32"
+    trainer.training.mixed_precision_param = "bfloat16"
+    # Recompute every op in the block except the Dist-MoE call, which is never recomputed.
+    trainer.activation_checkpoint = RegionAC.Config(save_regions=[])
+    # Dist-MoE experts on the trainer's model copy only; generators keep stock experts.
+    trainer.override = OverrideConfig(
+        imports=["torchtitan_recipes.overrides.dist_moe.dist_moe_routed_experts"]
+    )
+    # Worst case, every EP rank routes all its tokens to one rank; a smaller scratch buffer is an
+    # illegal memory access.
+    trainer.dist_moe = DistMoeRuntime.Config(
+        scratch_capacity_factor=float(expert_parallel_degree)
+    )
+    trainer.loss.loss_fn.global_vocab_size = decoder_vocab_size(config.model)
+    # DOME uploads every saved step and prunes, so torchtitan keeps them all.
+    trainer.checkpointer = CheckpointManager.Config(
+        initial_load_in_hf=True,
+        interval=25,
+        enable_first_step_checkpoint=True,
+        async_mode="async",
+        keep_latest_k=0,
+        last_save_in_hf=False,
+        last_save_model_only=False,
+    )
+
+    config.generator.gpu_memory_limit = 0.9
+    config.generator.max_num_batched_tokens = 8192
+    return config
