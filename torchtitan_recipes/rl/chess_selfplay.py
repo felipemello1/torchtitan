@@ -78,9 +78,8 @@ def rl_chess_qwen3_5_4b() -> Controller.Config:
             # Games per start position. Only one player of a game generates at a time, so this
             # is also the group's generation concurrency, which sizes the generators' max_num_seqs.
             num_samples_per_prompt=8,
-            # 7 x 16 groups in flight keeps ~80 requests on each generator; a 60-ply game spans
-            # several policy versions, so the observed policy age runs above this target.
-            target_offpolicy_steps=6,
+            # A 60-ply game spans several policy versions, so the observed policy age runs above this target.
+            target_offpolicy_steps=4,
             validation=ValidationConfig(num_samples=num_validation_games),
         ),
         rollouter=Rollouter.Config(
