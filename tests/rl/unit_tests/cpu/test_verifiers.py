@@ -679,6 +679,27 @@ def test_sandoq_dead_container_is_not_retried(tmp_path, monkeypatch) -> None:
         asyncio.run(_launch(harness, trace, _RecordingRuntime()))
 
 
+def test_sandoq_model_call_stops_with_the_rollout(tmp_path, monkeypatch) -> None:
+    """Once Verifiers has stopped the rollout, the model call raises at once instead of letting
+    Terminus-2 retry a request Verifiers will refuse."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.errors import HarnessError
+
+    class Terminus2AtTheCap(_terminus2_without_model(sandoq)):
+        async def run(self, instruction, environment, context) -> None:
+            trace.stop_condition = "context_length"
+            await self._llm.call(prompt="next turn", message_history=[])
+
+    monkeypatch.setattr(sandoq, "Terminus2", Terminus2AtTheCap)
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    with pytest.raises(
+        HarnessError,
+        match="ContextLengthExceededError: Verifiers stopped the rollout: context_length",
+    ):
+        asyncio.run(_launch(harness, trace, _RecordingRuntime()))
+
+
 class _RecordingRuntime:
     """Runtime that records each `run` and succeeds."""
 

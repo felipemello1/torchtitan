@@ -44,6 +44,7 @@ from types import SimpleNamespace
 import verifiers.v1 as vf
 from harbor.agents.terminus_2 import Terminus2
 from harbor.environments.base import ExecResult
+from harbor.llms.base import ContextLengthExceededError
 from harbor.models.agent.context import AgentContext
 from harbor.models.trial.paths import EnvironmentPaths
 from harbor.utils.logger import logger as harbor_logger
@@ -245,6 +246,12 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
                 )
 
                 async def call_with_sampled_history(*args, message_history, **kwargs):
+                    if trace.stop_condition:
+                        # Verifiers stopped the rollout (context or turn cap) and answers 400
+                        # from now on; Terminus-2 retries any error but this one.
+                        raise ContextLengthExceededError(
+                            f"Verifiers stopped the rollout: {trace.stop_condition}"
+                        )
                     return await call(
                         *args,
                         message_history=[
