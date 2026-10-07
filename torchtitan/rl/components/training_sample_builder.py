@@ -279,7 +279,9 @@ class TrainingSampleBuilder(Configurable):
                 training_sample.max_policy_version, rollout_turn.max_policy_version
             )
             training_sample.token_ids += rollout_turn.completion_token_ids
-            training_sample.loss_mask += [True] * num_completion
+            training_sample.loss_mask += (
+                rollout_turn.completion_loss_mask or [True] * num_completion
+            )
             training_sample.logprobs += rollout_turn.completion_logprobs
             training_sample.advantage += [rollout_advantage] * num_completion
 
