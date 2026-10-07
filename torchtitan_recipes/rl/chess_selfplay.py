@@ -47,8 +47,13 @@ from torchtitan.rl.trainer import Trainer
 # verified.
 
 
-def rl_chess_qwen3_5_4b() -> Controller.Config:
-    """60-ply games on one node: an FSDP=4 trainer and four TP=1 generators.
+def rl_chess_qwen3_5_4b(
+    max_plies: int = 60, max_rollout_tokens: int = 28672
+) -> Controller.Config:
+    """`max_plies`-ply games on one node: an FSDP=4 trainer and four TP=1 generators.
+
+    A player's history grows ~400 tokens per turn (a ~250-token board plus its reply), so
+    `max_rollout_tokens` must cover `max_plies / 2` turns: 28k for 60 plies, 48k for 120.
 
     Each step trains on 16 start positions x 8 games. Half the groups are self-play (up to 2 rollouts per
     game, one per color); the other half play a Stockfish bot drawn from the ladder in `bots.BOTS`
@@ -57,8 +62,6 @@ def rl_chess_qwen3_5_4b() -> Controller.Config:
     """
     ladder = ("sf_eps90", "sf_eps75", "sf_eps50", "sf_eps25", "sf_elo1320")
     max_response_tokens = 1024
-    # 30 turns per player x (~270 board tokens + up to ~600 reply tokens) fits in 28k
-    max_rollout_tokens = 28672
     max_total_tokens = max_rollout_tokens + max_response_tokens
     num_validation_games = 64
     model_config = build_model_config(
@@ -103,7 +106,7 @@ def rl_chess_qwen3_5_4b() -> Controller.Config:
                     step_timeout_s=None,
                 ),
                 advantage=AdvantageEstimator.Config(should_std_normalize=False),
-                max_plies=60,
+                max_plies=max_plies,
                 stockfish_path="stockfish",
             ),
         ),
