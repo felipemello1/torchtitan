@@ -599,7 +599,9 @@ def test_sandoq_tmux_outlives_grading(tmp_path, monkeypatch) -> None:
     pane_read = next(i for i, c in enumerate(commands) if c.startswith("tail"))
     kill = next(i for i, c in enumerate(commands) if "kill-server" in c)
     assert pane_read < kill
-    assert _read_rollout_log(tmp_path, trace)["pane"] == "$ python3 server.py &\n"
+    log = _read_rollout_log(tmp_path, trace)
+    assert log["pane"] == "$ python3 server.py &\n"
+    assert log["task_name"] == "allenai-tmax/task_000000_c19dda5b"
 
 
 def test_sandoq_exec_keeps_keystrokes_out_of_argv() -> None:
@@ -740,13 +742,15 @@ def _terminus2_without_model(sandoq):
 
 def _sandoq_harness_and_trace(sandoq, log_dir):
     from verifiers.v1.configs.agent import AgentConfig
+    from verifiers.v1.tasksets.harbor.taskset import HarborData
     from verifiers.v1.trace import AgentInfo, Trace, TraceTask
 
     config = sandoq.StockTerminusOutsideConfig(
         id=sandoq.PLUGIN_ID, rollout_log_dir=str(log_dir)
     )
+    data = HarborData(name="allenai-tmax/task_000000_c19dda5b", prompt="Write a.py")
     trace = Trace(
-        task=TraceTask(type="Task", data={}), agent=AgentInfo(config=AgentConfig())
+        task=TraceTask(type="Task", data=data), agent=AgentInfo(config=AgentConfig())
     )
     return sandoq.StockTerminusOutsideHarness(config), trace
 

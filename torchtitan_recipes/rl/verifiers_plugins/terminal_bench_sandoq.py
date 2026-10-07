@@ -299,7 +299,8 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
 
             {
                 "verifiers_trace_id": "9f2c...",  # logs.verifiers_trace_id in rollout_samples.jsonl
-                "task": ..., "reward": 0.0, "stop_condition": "error",
+                "task": ..., "task_name": "allenai-tmax/task_000000_c19dda5b",
+                "reward": 0.0, "stop_condition": "error",
                 "errors": [...],                   # trace.errors, as in Rollout.logs
                 "timing": {"setup": {"start": ..., "end": ...}, "agent": {...}, ...},
                 "tests": {"exit_code": 1, "stdout": "...", "stderr": ""},  # tests/test.sh
@@ -339,6 +340,7 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
         record = {
             "verifiers_trace_id": trace.id,
             "task": trace.task.key,
+            "task_name": trace.task.data.name,  # e.g. "allenai-tmax/task_000000_c19dda5b"
             "reward": trace.reward,
             "stop_condition": trace.stop_condition,
             "errors": [error.model_dump(mode="json") for error in trace.errors],
