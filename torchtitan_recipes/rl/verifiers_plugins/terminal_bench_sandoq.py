@@ -177,30 +177,15 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
         system_prompt, prompt = self.resolve_text_prompt(data)
         if prompt is None:
             raise ValueError("Terminus 2 requires a task prompt")
-        try:
-            return await self._run_terminus(
-                runtime,
-                trace,
-                endpoint=endpoint,
-                secret=secret,
-                model=ctx.model,
-                system_prompt=system_prompt,
-                prompt=prompt,
-            )
-        finally:
-            try:
-                await runtime.run(
-                    [
-                        "sh",
-                        "-c",
-                        'tmux kill-server >/dev/null 2>&1 || true; rm -rf "$TMUX_TMPDIR"',
-                    ],
-                    {"TMUX_TMPDIR": _SANDBOX_TMUX_DIR},
-                )
-            except Exception:
-                logger.warning(
-                    "failed to clean up Terminus 2 tmux server", exc_info=True
-                )
+        return await self._run_terminus(
+            runtime,
+            trace,
+            endpoint=endpoint,
+            secret=secret,
+            model=ctx.model,
+            system_prompt=system_prompt,
+            prompt=prompt,
+        )
 
     async def _run_terminus(
         self,
@@ -279,10 +264,11 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
         return ProgramResult(exit_code=0, stdout="", stderr="")
 
     async def cleanup(self, trace: Trace, runtime: Runtime) -> None:
-        """Write this rollout's log, if `rollout_log_dir` is set.
+        """Stop this rollout's tmux server, then write its log if `rollout_log_dir` is set.
 
-        Verifiers calls this after scoring, also when leasing the VM or starting tmux failed, so
-        those rollouts leave a log too. The log is gzipped JSON:
+        Verifiers calls this after scoring, so test.sh still sees the agent's shell jobs
+        (`python3 server.py &`), as under `harbor run`. It also calls it when leasing the VM or
+        starting tmux failed, so those rollouts leave a log too. The log is gzipped JSON:
 
             {
                 "verifiers_trace_id": "9f2c...",  # logs.verifiers_trace_id in rollout_samples.jsonl
@@ -295,6 +281,21 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
                 "trajectory": {...},               # Terminus-2's trajectory.json
             }
         """
+        # No launch log: launch never got to tmux, or an earlier cleanup already stopped it.
+        if trace.id in self._launch_logs:
+            try:
+                await runtime.run(
+                    [
+                        "sh",
+                        "-c",
+                        'timeout 10 tmux kill-server >/dev/null 2>&1 || true; rm -rf "$TMUX_TMPDIR"',
+                    ],
+                    {"TMUX_TMPDIR": _SANDBOX_TMUX_DIR},
+                )
+            except Exception:
+                logger.warning(
+                    "failed to clean up Terminus 2 tmux server", exc_info=True
+                )
         launch_log = self._launch_logs.pop(trace.id, LaunchLog())
         if self.config.rollout_log_dir is None:
             return

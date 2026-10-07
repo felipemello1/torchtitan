@@ -577,6 +577,51 @@ def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
     assert "characters omitted" in log["tests"]["stdout"]
 
 
+def test_sandoq_tmux_outlives_grading(tmp_path, monkeypatch) -> None:
+    """launch leaves tmux running, so test.sh sees the agent's shell jobs as under `harbor run`;
+    cleanup kills it once."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+
+    monkeypatch.setattr(sandoq, "Terminus2", _terminus2_without_model(sandoq))
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    runtime = _RecordingRuntime()
+
+    asyncio.run(_launch(harness, trace, runtime))
+    assert not any("kill-server" in " ".join(argv) for argv, _ in runtime.calls)
+    asyncio.run(harness.cleanup(trace, runtime))
+    # Verifiers' abort() after a cancelled close() calls cleanup again.
+    asyncio.run(harness.cleanup(trace, runtime))
+    kills = [argv for argv, _ in runtime.calls if "kill-server" in " ".join(argv)]
+    assert len(kills) == 1
+
+
+class _RecordingRuntime:
+    """Runtime that records each `run` and succeeds."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], dict[str, str]]] = []
+
+    async def run(self, argv: list[str], env: dict[str, str]):
+        from verifiers.v1.runtimes import ProgramResult
+
+        self.calls.append((argv, env))
+        return ProgramResult(exit_code=0, stdout="", stderr="")
+
+
+def _terminus2_without_model(sandoq):
+    """Terminus-2 that runs no model and no tmux."""
+
+    class Terminus2WithoutModel(sandoq.Terminus2):
+        async def setup(self, environment) -> None:
+            pass
+
+        async def run(self, instruction, environment, context) -> None:
+            pass
+
+    return Terminus2WithoutModel
+
+
 def _sandoq_harness_and_trace(sandoq, log_dir):
     from verifiers.v1.configs.agent import AgentConfig
     from verifiers.v1.trace import AgentInfo, Trace, TraceTask
