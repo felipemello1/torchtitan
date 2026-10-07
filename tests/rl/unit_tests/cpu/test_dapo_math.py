@@ -21,6 +21,7 @@ from torchtitan.rl.examples.dapo_math import (
     DapoMathSample,
     data as math_data,
     grader,
+    Intellect3MathDataset,
     MathVerifyPool,
     RewardMathVerify,
     score_math_response,
@@ -88,6 +89,39 @@ def test_aime_dataset_restarts_after_configured_num_samples(monkeypatch) -> None
     dataset = AIME2025Dataset.Config(num_samples=1).build()
     first = next(dataset)
     assert next(dataset) == first
+
+
+def test_intellect3_dataset_keeps_partially_solved_problems(monkeypatch) -> None:
+    pass_rates = [0.0, 0.125, 0.875, 1.0]
+
+    def load_dataset(repo_id, subset, *, split):
+        assert (repo_id, subset, split) == (
+            "PrimeIntellect/INTELLECT-3-RL",
+            "math",
+            "train",
+        )
+        return Dataset.from_list(
+            [
+                {
+                    "question": f"q{i}",
+                    "answer": rf"{i}\sqrt{{2}}",
+                    "avg@8_qwen3_4b_thinking_2507": rate,
+                }
+                for i, rate in enumerate(pass_rates)
+            ]
+        )
+
+    monkeypatch.setattr(math_data, "load_dataset", load_dataset)
+    dataset = Intellect3MathDataset.Config(shuffle=False).build()
+    samples = [next(dataset) for _ in range(3)]
+    # Inclusive bounds keep 1/8 and 7/8 and drop 0/8 and 8/8, so the third sample wraps to q1.
+    assert [sample.ground_truth for sample in samples] == [
+        r"1\sqrt{2}",
+        r"2\sqrt{2}",
+        r"1\sqrt{2}",
+    ]
+    assert "q1" in samples[0].prompt
+    assert r"Answer: \boxed{" in samples[0].prompt
 
 
 def test_env_is_single_turn() -> None:
