@@ -58,6 +58,11 @@ class _TokenEnv:
         self.closed = True
 
 
+class _FailingTokenEnv(_TokenEnv):
+    async def init(self) -> TokenEnvOutput:
+        raise ConnectionError("sandbox unreachable")
+
+
 class _TokenEnvConfig:
     def __init__(self) -> None:
         self.envs: list[_TokenEnv] = []
@@ -148,6 +153,7 @@ def test_worker_executes_group_without_actor_mesh() -> None:
         assert worker.score_group_called
         assert [rollout.reward for rollout in group.rollouts] == [1.0, 2.0]
         assert [rollout.advantage for rollout in group.rollouts] == [10.0, 20.0]
+        assert [rollout.logs for rollout in group.rollouts] == [{}, {}]
         assert all(env.closed for env in token_env_config.envs)
         assert [type(r).__name__ for r in token_env_config.renderers] == [
             "Qwen3Renderer",
@@ -161,5 +167,38 @@ def test_worker_executes_group_without_actor_mesh() -> None:
             11,
             12,
         ]
+
+    asyncio.run(run())
+
+
+def test_worker_keeps_the_failure_reason_in_rollout_logs() -> None:
+    async def run() -> None:
+        worker = RolloutWorker(
+            SimpleNamespace(
+                rubric=_Config(_Rubric()),
+                message_env=_MessageEnvConfig(),
+                token_env=_Config(_FailingTokenEnv()),
+                advantage=_Config(_AdvantageEstimator()),
+            )
+        )
+        await worker.setup_async(
+            tokenizer_config=HuggingFaceTokenizer.Config(),
+            renderer_config=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
+            hf_assets_path="tests/assets/tokenizer",
+        )
+        group = await worker.run_group(
+            generate_fn=_GenerateFn(),
+            sample="sample",
+            group_id=7,
+            group_size=1,
+            sampling=SamplingConfig(),
+        )
+
+        (rollout,) = group.rollouts
+        assert rollout.status == RolloutStatus.ERROR
+        (error,) = rollout.logs["errors"]
+        assert error["type"] == "ConnectionError"
+        assert error["message"] == "sandbox unreachable"
+        assert error["traceback"].endswith("ConnectionError: sandbox unreachable\n")
 
     asyncio.run(run())

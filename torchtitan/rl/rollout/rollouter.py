@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import traceback
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from monarch.actor import ProcMesh, this_host
 
@@ -396,6 +397,7 @@ class RolloutWorker(Configurable):
         """
         turns: list[RolloutTurn] = []
         status = RolloutStatus.ERROR
+        logs: dict[str, Any] = {}
         try:
             env_step = await env.init()
             while not env_step.status.is_terminal():
@@ -439,7 +441,7 @@ class RolloutWorker(Configurable):
                 env_step = next_env_step
 
             status = env_step.status
-        except Exception:
+        except Exception as error:
             logger.exception(
                 "rollout %s/rollout=%d failed after %d turn(s); marking ERROR",
                 group_id,
@@ -447,10 +449,18 @@ class RolloutWorker(Configurable):
                 len(turns),
             )
             status = RolloutStatus.ERROR
+            logs["errors"] = [
+                {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                    "traceback": traceback.format_exc(),
+                }
+            ]
 
         return Rollout(
             group_id=group_id,
             rollout_id=rollout_id,
             status=status,
             turns=turns,
+            logs=logs,
         )

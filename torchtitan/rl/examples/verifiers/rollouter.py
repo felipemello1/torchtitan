@@ -322,6 +322,7 @@ class VerifiersRollouter(Rollouter):
             rollout_id=rollout_id,
             status=status,
             turns=turns,
+            logs=self.rollout_logs(verifiers_episode=verifiers_episode, trace=trace),
         )
 
     @staticmethod
@@ -333,6 +334,19 @@ class VerifiersRollouter(Rollouter):
         if trace.stop_condition == "max_turns":
             return RolloutStatus.TRUNCATED_MAX_TURNS
         return RolloutStatus.TRUNCATED_LENGTH
+
+    @staticmethod
+    def rollout_logs(*, verifiers_episode: Any, trace: Any) -> dict[str, Any]:
+        """Return the trace id, stop condition and errors (with tracebacks) for `Rollout.logs`.
+        The id matches Verifiers' own "rollout done" line, which prints only the error class."""
+        return {
+            "verifiers_trace_id": trace.id,
+            "stop_condition": trace.stop_condition,
+            "errors": [
+                error.model_dump(mode="json")
+                for error in (*verifiers_episode.errors, *trace.errors)
+            ],
+        }
 
     @staticmethod
     def trace_to_rollout_turns(

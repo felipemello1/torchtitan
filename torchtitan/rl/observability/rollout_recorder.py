@@ -31,19 +31,27 @@ def _json_default(value: Any) -> Any:
 
 
 class KeepExtremeRewardsFilter(Configurable):
-    """Keep the k highest- and k lowest-reward rollouts of each group (unscored skipped).
+    """Keep the k highest- and k lowest-reward rollouts of each group (unscored skipped),
+    plus every errored rollout with `keep_errors`.
 
     Example:
 
         # a group whose rollouts have rewards [0.9, 0.9, 0.2, None, -0.3, -1, -1]
         KeepExtremeRewardsFilter.Config(k=2).build()([group])
         # -> rollouts with rewards [-1, -1, 0.9, 0.9]   (None skipped)
+
+        # same group, where the 0.2 and the None rollouts errored
+        KeepExtremeRewardsFilter.Config(k=2, keep_errors=True).build()([group])
+        # -> rollouts with rewards [-1, -1, 0.9, 0.9, 0.2, None]
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         k: int = 1
         """Rollouts to keep from each end (highest and lowest) of every group; 0 keeps none."""
+        keep_errors: bool = False
+        """Also keep every errored rollout, scored or not, e.g. to read `Rollout.logs`.
+        If every rollout errors (e.g. a dead sandbox), this records them all."""
 
         def __post_init__(self) -> None:
             if self.k < 0:
@@ -51,6 +59,7 @@ class KeepExtremeRewardsFilter(Configurable):
 
     def __init__(self, config: Config) -> None:
         self._k = config.k
+        self._keep_errors = config.keep_errors
 
     @sl.log_trace_span("keep_extreme_rewards")
     def __call__(self, groups: list[RolloutGroup]) -> list[Rollout]:
@@ -64,7 +73,16 @@ class KeepExtremeRewardsFilter(Configurable):
             # small group (<= 2k): keep all, avoiding a highest/lowest overlap; else both ends.
             # Slice the top end by index: ranked[-k:] is the whole list when k == 0.
             top = ranked[len(ranked) - k :]
-            picked.extend(ranked if len(ranked) <= 2 * k else ranked[:k] + top)
+            extremes = ranked if len(ranked) <= 2 * k else ranked[:k] + top
+            picked.extend(extremes)
+            if self._keep_errors:
+                extreme_ids = {rollout.rollout_id for rollout in extremes}
+                picked.extend(
+                    rollout
+                    for rollout in group.rollouts
+                    if rollout.status.is_error()
+                    and rollout.rollout_id not in extreme_ids
+                )
         return picked
 
 
@@ -130,6 +148,7 @@ class RolloutSampleRecorder(Configurable):
             "reward": rollout.reward,
             "reward_breakdown": rollout.reward_breakdown,
             "advantage": rollout.advantage,
+            "logs": rollout.logs,
             "turns": [self._encode_turn(turn) for turn in rollout.turns],
         }
 
