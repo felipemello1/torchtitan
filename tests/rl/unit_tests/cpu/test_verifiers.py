@@ -605,6 +605,30 @@ def test_sandoq_tmux_outlives_grading(tmp_path, monkeypatch) -> None:
     assert _read_rollout_log(tmp_path, trace)["pane"] == "$ python3 server.py &\n"
 
 
+def test_sandoq_exec_keeps_keystrokes_out_of_argv() -> None:
+    """Each exec ships its command in an env var, so an agent's `pkill -f` pattern can't match
+    the exec that typed it; the command still runs as written."""
+    pytest.importorskip("harbor")
+    import subprocess
+
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+
+    command = "tmux send-keys -t terminus-2 -- 'pkill -f server.py' Enter"
+    runtime = _RecordingRuntime()
+    environment = sandoq.RuntimeEnvironment(runtime, {"TMUX_TMPDIR": "/tmp/t"})
+    asyncio.run(environment.exec(command, cwd="/app"))
+
+    [(argv, env)] = runtime.calls
+    assert "server.py" not in " ".join(argv)
+    assert env == {"TMUX_TMPDIR": "/tmp/t", "TERMINUS_EXEC": f"cd /app && {command}"}
+    # The wrapper runs a quoted, multi-line command unchanged.
+    script = "cat <<'EOF'\nit's \"quoted\" $HOME\nEOF"
+    output = subprocess.run(
+        argv, env={"TERMINUS_EXEC": script}, capture_output=True, text=True
+    ).stdout
+    assert output == 'it\'s "quoted" $HOME\n'
+
+
 class _RecordingRuntime:
     """Runtime that records each `run` and answers by the command's first word."""
 
