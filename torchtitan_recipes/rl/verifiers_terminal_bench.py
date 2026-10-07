@@ -85,7 +85,7 @@ def _terminal_bench_rollouter_config(
     """Select Harbor datasets by id.
 
     ``max_context_length`` is the generator's sequence length; the generation
-    server caps each rollout at it. ``max_turns`` is the agent turn limit, which
+    server caps each prompt one token below it. ``max_turns`` is the agent turn limit, which
     Verifiers enforces. ``max_concurrent_rollouts`` sizes the env server; set it
     to the number of rollouts the controller keeps in flight, or the excess
     queues in the env server and the generators idle. The env server splits it
@@ -137,8 +137,10 @@ def _terminal_bench_rollouter_config(
             reward_fns=[RewardFromVerifiers.Config(weight=1.0)],
             error_reward=0.0,
         ),
+        # vLLM needs room for one output token. A prompt of max_context_length tokens
+        # would pass Verifiers' check (prompt > cap), then crash the engine loop.
         generation_server=GenerationServer.Config(
-            max_rollout_tokens=max_context_length
+            max_rollout_tokens=max_context_length - 1
         ),
         connection_timeout_sec=1800.0,
     )

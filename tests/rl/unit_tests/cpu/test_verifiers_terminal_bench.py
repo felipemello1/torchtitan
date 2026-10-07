@@ -7,9 +7,11 @@
 """CPU checks for the Terminal-Bench Verifiers recipe."""
 
 import ast
+import asyncio
 import json
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -50,6 +52,50 @@ def _rollouter_config(train_dataset: str, validation_dataset: str):
     )
 
 
+def test_prompt_at_the_context_cap_never_reaches_the_generator() -> None:
+    """A prompt of `max_context_length` tokens fails Verifiers' pre-flight check, which stops the
+    rollout as `context_length`; vLLM would reject it in the engine loop (no room to sample)."""
+    from openai import AsyncOpenAI, InternalServerError
+    from renderers import OverlongPromptError
+    from renderers.client import generate
+
+    prompt_lengths = []
+
+    async def generate_fn(prompt_token_ids, **kwargs):
+        prompt_lengths.append(len(prompt_token_ids))
+        raise RuntimeError("generator reached")
+
+    async def send(client, server, num_tokens: int) -> None:
+        await generate(
+            client=client,
+            renderer=SimpleNamespace(get_stop_token_ids=lambda: [0]),
+            messages=[],
+            model=server.model_id,
+            prompt_ids=[1] * num_tokens,
+            sampling_params={"torchtitan_group_id": 0},
+            extra_headers={"X-Session-ID": "group=0/rollout=0"},
+        )
+
+    async def run_test() -> None:
+        config = _rollouter_config(TRAIN_DATASET, EVAL_DATASET).generation_server
+        server = config.build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+        try:
+            client = AsyncOpenAI(
+                base_url=server.base_url, api_key="unused", max_retries=0
+            )
+            with pytest.raises(OverlongPromptError):
+                await send(client, server, MAX_CONTEXT_LENGTH)
+            with pytest.raises(InternalServerError, match="generator reached"):
+                await send(client, server, MAX_CONTEXT_LENGTH - 1)
+        finally:
+            await server.close()
+
+    asyncio.run(run_test())
+    assert prompt_lengths == [MAX_CONTEXT_LENGTH - 1]
+
+
 def test_terminus_program_sends_reasoning_back() -> None:
     harness = _rollouter_config(
         TRAIN_DATASET, EVAL_DATASET
@@ -68,7 +114,7 @@ def test_agent_runs_inside_docker_and_verifier_uses_same_taskset() -> None:
     assert isinstance(environment.agent.runtime, vf.DockerConfig)
     assert isinstance(environment.agent.harness, Terminus2HarnessConfig)
     assert environment.agent.harness.version == "0.22.0"
-    assert config.generation_server.max_rollout_tokens == MAX_CONTEXT_LENGTH
+    assert config.generation_server.max_rollout_tokens == MAX_CONTEXT_LENGTH - 1
     assert environment.agent.max_turns == MAX_TURNS
     assert environment.agent.timeout.rollout == 7200
     assert environment.taskset == config.train_dataset.verifiers_taskset
@@ -247,7 +293,7 @@ def test_recipes_share_the_loop_and_keep_fp32_master_weights(name: str) -> None:
     assert config.rollouter.verifiers_env_server.environment.agent.max_turns == 120
     assert (
         config.rollouter.generation_server.max_rollout_tokens
-        == config.trainer.training.max_context_length
+        == config.trainer.training.max_context_length - 1
     )
     loop = config.async_loop
     serve = config.rollouter.verifiers_env_server.serve
