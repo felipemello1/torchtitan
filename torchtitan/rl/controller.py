@@ -857,12 +857,18 @@ class Controller(Configurable):
             name="trainer",
         )
 
+        # event_loop_lag
+        event_loop_lag_task = asyncio.create_task(
+            sl.log_event_loop_lag(), name="event_loop_lag"
+        )
+
         # run everything until trainer finishes its number of steps
         # or some other loop breaks
         background_tasks = [
             data_input_task,
             *rollout_tasks,
             batcher_task,
+            event_loop_lag_task,
         ]
         try:
             done, _ = await asyncio.wait(
