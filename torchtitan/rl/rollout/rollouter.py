@@ -139,8 +139,7 @@ class Rollouter(Configurable):
     def acknowledge_training_sample_ids(
         self, sample_ids: Iterable[int], *, solved_ids: Iterable[int] = ()
     ) -> None:
-        """Mark training samples as safe to omit from the next checkpoint; the dataset hears
-        which of them were solved."""
+        """Mark training samples as safe to omit from the next checkpoint, and pass the solved ones to the dataset."""
         self._training_dataloader.acknowledge(sample_ids, solved_indices=solved_ids)
 
     def get_validation_samples(self, steps: int) -> list[object]:

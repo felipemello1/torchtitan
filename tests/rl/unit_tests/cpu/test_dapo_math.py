@@ -88,8 +88,8 @@ def test_dapo_dataset_skips_solved_problems_after_resume(monkeypatch) -> None:
     monkeypatch.setattr(math_data, "load_dataset", lambda *args, **kwargs: _dapo_rows())
     config = DapoMathDataset.Config(shuffle=False, skip_solved_prompts=True)
     dataset = config.build()
-    problem_1, _, _ = [next(dataset) for _ in range(3)]
-    dataset.mark_solved(problem_1)
+    first_problem, _, _ = [next(dataset) for _ in range(3)]
+    dataset.mark_solved(first_problem)
 
     resumed = config.build()
     resumed.load_state_dict(dataset.state_dict())
@@ -109,7 +109,15 @@ def test_cycling_dataset_draws_solved_rows_again_with_the_flag_off() -> None:
     dataset.mark_solved(next(dataset))
     resumed = _cycling_dataset(2, skip_solved_prompts=False)
     resumed.load_state_dict(dataset.state_dict())
+    resumed.mark_solved(DapoMathSample(prompt="q1", ground_truth="1"))
     assert [next(resumed).ground_truth for _ in range(3)] == ["1", "0", "1"]
+
+
+def test_cycling_dataset_ignores_a_sample_that_is_no_longer_a_row() -> None:
+    # A pending sample saved before its row's gold changed is replayed after the resume.
+    dataset = _cycling_dataset(2, skip_solved_prompts=True)
+    dataset.mark_solved(DapoMathSample(prompt="q0", ground_truth="changed"))
+    assert [next(dataset).ground_truth for _ in range(2)] == ["0", "1"]
 
 
 def test_cycling_dataset_raises_once_every_row_is_solved() -> None:
