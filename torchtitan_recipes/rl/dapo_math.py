@@ -45,7 +45,8 @@ from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import TokenEnv
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
-from torchtitan.rl.rubric import Rubric
+from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
+from torchtitan.rl.rubric import CorrectLengthPenalty, Rubric
 from torchtitan.rl.trainer import Trainer
 
 # TODO: Enable CUDA graphs for RL trainers after eager/graph numerics parity is
@@ -244,26 +245,41 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math() -> Controller.Config:
     """Qwen3.5-35B-A3B-Base on harder problems: the 10,805 INTELLECT-3 RL math problems that
     Qwen3-4B-Thinking-2507 solves in 1-7 of 8 tries, instead of DAPO-Math-17k.
 
-    The `rl_dapo_qwen3_5_35b_a3b_base_math` layout with 32 prompts x 16 samples, 48K
-    responses and 4-row microbatches. Truncated rollouts score `DOME_V2_TRUNCATION_REWARD`
-    (default 0). No online validation: the checkpoints are evaluated offline.
+    The `rl_dapo_qwen3_5_35b_a3b_base_math` layout with 32 prompts x 16 samples, 131K
+    responses with a forced answer at the cap and a length penalty (`_apply_length_control`),
+    and 1-row microbatches. Truncated rollouts score `DOME_V2_TRUNCATION_REWARD` (default 0).
+    No online validation: the checkpoints are evaluated offline.
     """
-    return _intellect3_math_config(default_prompts=32, default_microbatch_rows=4)
+    return _intellect3_math_config(default_prompts=32, default_microbatch_rows=1)
 
 
 def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_12_generators() -> Controller.Config:
     """`rl_dapo_qwen3_5_35b_a3b_base_intellect3_math` with one trainer host and three
     generator hosts: more sequences in flight, which is what bounds the step.
 
-    Trainer on 4 GPUs: FSDP 2 x TP 2 x EP 4, 2-row microbatches (fp32 state and Adam take
+    Trainer on 4 GPUs: FSDP 2 x TP 2 x EP 4, 1-row microbatches (fp32 state and Adam take
     ~125 GiB per GPU). Twelve TP1 engines; 64 prompts x 16 samples per step;
     target_offpolicy_steps 5.
     """
     return _intellect3_math_config(
         default_prompts=64,
-        default_microbatch_rows=2,
+        default_microbatch_rows=1,
         data_parallel_shard_degree=2,
         num_generators=12,
+        target_offpolicy_steps=5,
+    )
+
+
+def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_8_generators() -> Controller.Config:
+    """`rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_12_generators` with two generator hosts
+    instead of three: 1 trainer host (4 GPUs) + 8 TP1 engines. Set the batch with
+    `DOME_V2_PROMPTS` at launch.
+    """
+    return _intellect3_math_config(
+        default_prompts=64,
+        default_microbatch_rows=1,
+        data_parallel_shard_degree=2,
+        num_generators=8,
         target_offpolicy_steps=5,
     )
 
@@ -272,8 +288,9 @@ def _intellect3_math_config(
     *, default_prompts: int, default_microbatch_rows: int, **layout
 ) -> Controller.Config:
     """Build the INTELLECT-3 run; `layout` goes to `_qwen3_5_35b_a3b_base_dapo_math_config`."""
+    max_response_tokens = int(os.environ.get("DOME_V2_MAX_RESPONSE_TOKENS", 131072))
     config = _qwen3_5_35b_a3b_base_dapo_math_config(
-        max_response_tokens=int(os.environ.get("DOME_V2_MAX_RESPONSE_TOKENS", 49152)),
+        max_response_tokens=max_response_tokens,
         num_prompts_per_train_step=int(
             os.environ.get("DOME_V2_PROMPTS", default_prompts)
         ),
@@ -289,8 +306,31 @@ def _intellect3_math_config(
     config.rollouter.worker.rubric.truncation_reward = float(
         os.environ.get("DOME_V2_TRUNCATION_REWARD", 0.0)
     )
+    _apply_length_control(config, max_response_tokens=max_response_tokens)
     config.async_loop.validation = ValidationConfig(num_samples=0)
     return config
+
+
+def _apply_length_control(
+    config: Controller.Config, *, max_response_tokens: int
+) -> None:
+    """Force an answer at the response cap and charge long correct answers.
+
+    Thinking still open 2,048 tokens before the cap gets a forced close plus
+    `Answer: \\boxed{`, and a correct forced answer is worth half. `DOME_V2_FORCED_ANSWER=0`
+    turns that off; `DOME_V2_LENGTH_PENALTY=none` turns off the `CorrectLengthPenalty`.
+    """
+    worker = config.rollouter.worker
+    if os.environ.get("DOME_V2_FORCED_ANSWER", "1") == "1":
+        worker.thinking_budget = ThinkingBudget.Config(
+            max_thinking_tokens=max_response_tokens - 2048,
+            answer_prefix="Answer: \\boxed{",
+        )
+        worker.rubric.forced_answer_scale = 0.5
+    if os.environ.get("DOME_V2_LENGTH_PENALTY", "correct") == "correct":
+        worker.rubric.length_penalty = CorrectLengthPenalty.Config(
+            max_tokens=max_response_tokens
+        )
 
 
 def _qwen3_5_35b_a3b_base_dapo_math_config(
