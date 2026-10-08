@@ -700,6 +700,33 @@ def test_sandoq_tests_get_requests_from_a_bundle(tmp_path, monkeypatch) -> None:
     assert trace.info["tests"]["stdout"].startswith(str(deps)), trace.info["tests"]
 
 
+def test_sandoq_task_scores_within_harbor_verifier_timeout(monkeypatch) -> None:
+    """A task's scoring timeout is its declared verifier timeout, else Harbor's 600 s, plus 60 s
+    to stage the tests and read the reward."""
+    pytest.importorskip("harbor")
+    from torchtitan.rl.examples.verifiers.terminal_bench.taskset import TerminalTaskset
+    from torchtitan_recipes.rl.verifiers_plugins.terminal_bench_sandoq import (
+        SandoqTerminalTaskset,
+    )
+    from verifiers.v1.task import TaskTimeout
+    from verifiers.v1.tasksets.harbor import HarborTask
+    from verifiers.v1.tasksets.harbor.taskset import HarborData
+
+    declared = HarborData(
+        prompt="x", workdir="/app", timeout=TaskTimeout(scoring=1800.0)
+    )
+    undeclared = HarborData(prompt="x", workdir="/home/user")
+    monkeypatch.setattr(
+        TerminalTaskset,
+        "load",
+        lambda self: iter([HarborTask(declared), HarborTask(undeclared)]),
+    )
+    taskset = object.__new__(SandoqTerminalTaskset)
+    taskset.config = SimpleNamespace(task=None)
+
+    assert [task.data.timeout.scoring for task in taskset.load()] == [1860.0, 660.0]
+
+
 def test_sandoq_tmux_outlives_grading(tmp_path, monkeypatch) -> None:
     """launch leaves tmux running, so test.sh sees the agent's shell jobs as under `harbor run`;
     cleanup writes the log with the pane, then kills tmux once."""

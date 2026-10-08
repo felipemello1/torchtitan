@@ -88,6 +88,8 @@ _USE_SANDOQ_TMUX = (
 # A rollout log keeps at most this many characters of each text field, its head and tail.
 # Terminus-2 already caps each terminal output in its trajectory at 10,000 bytes.
 _MAX_LOG_CHARS = 65536
+# Harbor's verifier timeout when task.toml declares none (harbor VerifierConfig.timeout_sec).
+_HARBOR_VERIFIER_TIMEOUT_S = 600.0
 # Where grading puts the `requests` packages a task's image lacks; on PYTHONPATH for its test.sh.
 _TEST_PYTHON_DEPS = "/tmp/vf-test-python-deps"
 _REQUESTS_PACKAGES = ("requests", "urllib3", "idna", "certifi", "charset_normalizer")
@@ -549,15 +551,21 @@ def requests_bundle() -> bytes:
 class SandoqTerminalTaskset(
     TerminalTaskset, vf.Taskset[SandoqHarborTask, TerminalTasksetConfig]
 ):
-    """The PR's taskset, with each task's image WORKDIR filled in."""
+    """The PR's taskset, with each task's image WORKDIR filled in and Harbor's verifier timeout
+    as its scoring timeout."""
 
     def load(self) -> Iterator[SandoqHarborTask]:
-        # Without a task.toml workdir, use the image's last WORKDIR: the runtime
-        # default (/app) is missing in some images, and a Sandoq VM fails then.
         for task in super().load():
+            # Without a task.toml workdir, use the image's last WORKDIR: the runtime
+            # default (/app) is missing in some images, and a Sandoq VM fails then.
             workdir = task.data.workdir or image_workdir(Path(task.data.task_dir))
+            # Harbor stops test.sh at the task's verifier timeout, 600 s when undeclared; the
+            # extra 60 s stage the tests and read the reward.
+            scoring = (task.data.timeout.scoring or _HARBOR_VERIFIER_TIMEOUT_S) + 60
+            timeout = task.data.timeout.model_copy(update={"scoring": scoring})
             yield SandoqHarborTask(
-                task.data.model_copy(update={"workdir": workdir}), self.config.task
+                task.data.model_copy(update={"workdir": workdir, "timeout": timeout}),
+                self.config.task,
             )
 
 
