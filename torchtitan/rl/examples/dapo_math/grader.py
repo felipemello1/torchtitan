@@ -32,8 +32,10 @@ logger = logging.getLogger(__name__)
 _BOXED_START = r"\boxed{"
 # The thin space in `10\,002`; Math-Verify reads it as 10 + 002 = 12.
 _THIN_SPACE_IN_NUMBER = re.compile(r"(?<=\d)\\,(?=\d{3}(?!\d))")
-# A word answer like `indonesian`. One- and two-letter answers stay math: `ab`, or a segment `CD`.
+# A word answer like `indonesian`. 1-2 letters stay math: `ab`, or a segment `CD`.
 _WORD = re.compile(r"\s*[A-Za-z]{3,}\s*")
+# Spaces between letters, as in `D A E C B`, which would otherwise skip the word check.
+_SPACING = re.compile(r"\s+|\\[,;:! ]")
 # From <sys/prctl.h>: signal this process when the thread that started it exits.
 _PR_SET_PDEATHSIG = 1
 
@@ -103,6 +105,7 @@ class MathVerifyPool:
 def score_math_response(response: str, ground_truth: str) -> float:
     """Score the final `\\boxed{}` expression with Math-Verify, in this process.
 
+    If answer and gold are each a 3+ letter word, they compare as lowercase strings.
     No timeout: on an event loop, use `MathVerifyPool.score` instead.
 
     Args:
@@ -111,28 +114,26 @@ def score_math_response(response: str, ground_truth: str) -> float:
 
     Example:
         score_math_response(r"work\nAnswer: \boxed{34}", "34")  # 1.0
-        score_math_response(r"\boxed{eat}", "tea")  # 0.0
+        score_math_response(r"\\boxed{eat}", "tea")  # 0.0
     """
     prediction = _last_boxed_expression(response)
     if prediction is None:
         return 0.0
 
+    prediction = _THIN_SPACE_IN_NUMBER.sub("", prediction)
+    ground_truth = _THIN_SPACE_IN_NUMBER.sub("", ground_truth)
+
     # Compare words as strings: Math-Verify reads `tea` as t*e*a, so `eat` matches,
     # and reads the `I` in `Indonesian` as the imaginary unit.
-    answer = prediction[len(_BOXED_START) : -1]
+    answer = _SPACING.sub("", prediction[len(_BOXED_START) : -1])
     if _WORD.fullmatch(answer) and _WORD.fullmatch(ground_truth):
-        return float(answer.strip().lower() == ground_truth.strip().lower())
+        return float(answer.lower() == ground_truth.strip().lower())
 
     try:
         # Box the gold like the prediction: a bare `2\sqrt{3}` parses as 2, and a
         # bare `(1,2)` or `\pi/4` parses to nothing.
-        gold = parse(
-            _BOXED_START + _THIN_SPACE_IN_NUMBER.sub("", ground_truth) + "}",
-            parsing_timeout=None,
-        )
-        prediction = parse(
-            _THIN_SPACE_IN_NUMBER.sub("", prediction), parsing_timeout=None
-        )
+        gold = parse(_BOXED_START + ground_truth + "}", parsing_timeout=None)
+        prediction = parse(prediction, parsing_timeout=None)
         return float(bool(gold) and verify(gold, prediction, timeout_seconds=None))
     except Exception:
         # Model output is untrusted; malformed LaTeX produces a zero reward
