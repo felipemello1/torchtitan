@@ -22,15 +22,17 @@ Each turn you see the board and your legal moves. Think about the position, then
 
 White played e4.
 
-Board (uppercase is White, lowercase is Black; rank 8 at the top):
-r n b q k b n r
-p p p p p p p p
-. . . . . . . .
-. . . . . . . .
-. . . . P . . .
-. . . . . . . .
-P P P P . P P P
-R N B Q K B N R
+Board (uppercase is White, lowercase is Black):
+    a b c d e f g h
+8 | r n b q k b n r | 8
+7 | p p p p p p p p | 7
+6 | . . . . . . . . | 6
+5 | . . . . . . . . | 5
+4 | . . . . P . . . | 4
+3 | . . . . . . . . | 3
+2 | P P P P . P P P | 2
+1 | R N B Q K B N R | 1
+    a b c d e f g h
 
 Legal moves: b6 b5 d5 f5 Nh6 c5 a6 Nc6 Na6 c6 g6 e6 h6 a5 f6 e5 d6 Nf6 g5 h5
 

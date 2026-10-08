@@ -224,8 +224,10 @@ class ChessGame:
                 f"{_COLOR_NAMES[not board.turn]} played {self._last_move_san}.\n"
             )
         lines += [
-            "Board (uppercase is White, lowercase is Black; rank 8 at the top):",
-            str(board),
+            "Board (uppercase is White, lowercase is Black):",
+            # File letters and rank numbers: without them Qwen3.5-35B spent most of its thinking
+            # counting cells to name squares.
+            _board_diagram(board),
             # No FEN: with it, Qwen3.5 re-parsed the FEN rank by rank until its reply ran out of
             # tokens (69-78% of cut replies vs 8-15% of finished ones); the board shows the position.
             "",
@@ -267,6 +269,25 @@ class ChessGame:
         else:
             self.scores = {winner: 1.0, not winner: 0.0}
         self.end_reason = reason
+
+
+def _board_diagram(board: chess.Board) -> str:
+    """The board with file letters and rank numbers, rank 8 at the top.
+
+    Example:
+
+            a b c d e f g h
+        8 | r n b q k b n r | 8
+        ...
+        1 | R N B Q K B N R | 1
+            a b c d e f g h
+    """
+    files = "    a b c d e f g h"
+    rows = [
+        f"{rank} | {row} | {rank}"
+        for rank, row in zip(range(8, 0, -1), str(board).splitlines())
+    ]
+    return "\n".join([files, *rows, files])
 
 
 def material_score(board: chess.Board) -> float:

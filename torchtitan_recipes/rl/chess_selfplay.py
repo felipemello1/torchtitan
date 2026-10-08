@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 
 from renderers import Qwen35RendererConfig
@@ -58,7 +57,7 @@ def rl_chess_qwen3_5_4b(
 ) -> Controller.Config:
     """`max_plies`-ply games on one node: an FSDP=4 trainer and four TP=1 generators.
 
-    A player's history grows ~400 tokens per turn (a ~250-token board plus its reply), so
+    A player's history grows ~400 tokens per turn (a ~300-token board plus its reply), so
     `max_rollout_tokens` must cover `max_plies / 2` turns: 28k for 60 plies, 48k for 120.
 
     Each step trains on 16 start positions x 8 games. Half the groups are self-play (up to 2 rollouts per
@@ -197,7 +196,9 @@ def rl_chess_qwen3_5_4b(
 
 
 def rl_chess_qwen3_5_35b_a3b(
-    max_plies: int = 120, max_thinking_tokens: int = 1024
+    max_plies: int = 120,
+    max_thinking_tokens: int = 1024,
+    max_context_tokens: int = 131072,
 ) -> Controller.Config:
     """Qwen3.5-35B-A3B (instruct) with thinking on, 150 steps on three GB300 hosts, 96 positions x 8
     games per step.
@@ -205,8 +206,9 @@ def rl_chess_qwen3_5_35b_a3b(
     A turn thinks up to `max_thinking_tokens`; then `ThinkingBudget` closes the thinking and starts
     the answer with "\\boxed{", and the reward loses up to 0.1 for force-closed turns. A player keeps
     its own past thinking in its history (never the opponent's), so the history grows up to
-    ~`max_thinking_tokens` per turn: 120 plies x 1k thinking need ~107k tokens. 120 plies covers p90
-    of human games below 2000 Elo (research/game_length_by_elo.md in discussion 118).
+    ~`max_thinking_tokens` per turn: 120 plies x 1k thinking need up to ~113k of
+    `max_context_tokens`. 120 plies covers p90 of human games below 2000 Elo
+    (research/game_length_by_elo.md in discussion 118).
 
     Host 0 trains: FSDP 2 x TP 2 x EP 4 with Dist-MoE experts, the layout of the 35B Terminal-Bench
     runs. Hosts 1-2 run eight one-GPU generators, each with every expert, FULL CUDA graphs: with
@@ -214,19 +216,14 @@ def rl_chess_qwen3_5_35b_a3b(
     """
     # room for the answer after the thinking ends, forced or not
     max_response_tokens = max_thinking_tokens + 512
-    # A ~250-token board per turn plus the reply. The history plus one reply rounds up to a multiple
-    # of 1,024 so ChunkedLossWrapper can split each TP rank's sequence into equal chunks.
-    history_tokens = (max_plies // 2) * (250 + max_response_tokens)
-    max_rollout_tokens = (
-        math.ceil((history_tokens + max_response_tokens) / 1024) * 1024
-        - max_response_tokens
-    )
+    # `max_context_tokens` must be a multiple of 1,024 so ChunkedLossWrapper splits each TP rank's
+    # sequence into equal chunks.
+    max_rollout_tokens = max_context_tokens - max_response_tokens
     config = rl_chess_qwen3_5_4b(
         max_plies=max_plies,
         max_rollout_tokens=max_rollout_tokens,
         max_response_tokens=max_response_tokens,
     )
-    max_total_tokens = max_rollout_tokens + max_response_tokens
     config.renderer = from_renderers(
         Qwen35RendererConfig(enable_thinking=True, thinking_retention="all")
     )
@@ -236,7 +233,7 @@ def rl_chess_qwen3_5_35b_a3b(
     )
     worker.rubric.reward_fns = [RewardChessScore.Config(forced_close_penalty=0.1)]
     config.model = build_model_config(
-        "35B-A3B", seq_len=max_total_tokens, attn_backend="varlen"
+        "35B-A3B", seq_len=max_context_tokens, attn_backend="varlen"
     )
     config.hf_assets_path = "torchtitan/rl/example_checkpoint/Qwen3.5-35B-A3B"
     config.dump_folder = "outputs/rl/qwen3_5_35b_a3b_chess"
