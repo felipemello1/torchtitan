@@ -13,6 +13,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
 from datasets import Dataset
 
 from torchtitan.rl.examples.dapo_math import (
@@ -144,23 +145,40 @@ def _intellect3_dataset(
     return Intellect3MathDataset.Config(shuffle=False).build()
 
 
-def test_intellect3_dataset_drops_multiple_choice_and_one_letter_golds(
+def test_intellect3_dataset_drops_rows_that_mis_score_answers(
     monkeypatch,
 ) -> None:
-    # Shortened INTELLECT-3-RL rows: a boxed `C` scores 0 against gold `135`, and ` n `
-    # only names the variable. The last three merely look like option lists.
+    # Shortened INTELLECT-3-RL rows: a boxed `C` scores 0 against gold `135`, ` n ` only
+    # names the variable, and `0, -6` scores 0 against `-6`. The last five are kept: they only
+    # look like option lists, or their gold holds both values, or they ask for one value.
     rows = [
         (r"What is $\tfrac1A+\tfrac1B$? A) 133 B) 134 C) 135 D) 136 E) 137", "135"),
         ("Find the volume.\n- **A)** $1024$\n- **B)** $1200$\n- **C)** $1280$", "1280"),
         (r"How many? $\textbf{a)}\ 0 \qquad\textbf{b)}\ 1 \qquad\textbf{c)}\ 2$", "2"),
         (r"For which positive integers $n$ is $x^n+(x+1)^n$ an integer?", " n "),
+        (r"Given $f(x)=6-3x$, find $f(-2)$ and $f(4)$.", "-6"),
         ("Menchikov A.B.  Find all pairs of natural numbers a and k.", "1,k"),
         (r"In triangle ABC, $\angle A: \angle B: \angle C=2: 3: 4$. Find AC.", "26"),
         (r"In triangle ABC, find $\cos(3A)+\cos(3B)+\cos(3C)$.", "1"),
+        (r"Find the values of $m$ and $n$.", "m=6, n=9"),
+        (r"Find the product of the maximum and minimum values of $x+y$.", "4"),
     ]
     dataset = _intellect3_dataset(monkeypatch, rows)
-    # Only the last three survive, so the fourth sample wraps to the first.
-    assert [next(dataset).ground_truth for _ in range(4)] == ["1,k", "26", "1", "1,k"]
+    # Only the last five survive, so the sixth sample wraps to the first.
+    golds = [next(dataset).ground_truth for _ in range(6)]
+    assert golds == ["1,k", "26", "1", "m=6, n=9", "4", "1,k"]
+
+
+def test_cycling_dataset_rejects_a_state_saved_with_another_row_count(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(math_data, "load_dataset", lambda *args, **kwargs: _dapo_rows())
+    state = DapoMathDataset.Config().build().state_dict()
+    monkeypatch.setattr(
+        math_data, "load_dataset", lambda *args, **kwargs: _dapo_rows()[:2]
+    )
+    with pytest.raises(ValueError, match="covers 3 rows, but the dataset has 2"):
+        DapoMathDataset.Config().build().load_state_dict(state)
 
 
 def test_intellect3_dataset_unescapes_golds(monkeypatch) -> None:
