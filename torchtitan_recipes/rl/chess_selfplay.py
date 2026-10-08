@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 
 from renderers import Qwen35RendererConfig
@@ -211,8 +212,13 @@ def rl_chess_qwen3_5_35b_a3b(
     """
     # room for the answer after the thinking ends, forced or not
     max_response_tokens = max_thinking_tokens + 512
-    # a ~250-token board per turn plus the reply
-    max_rollout_tokens = (max_plies // 2) * (250 + max_response_tokens)
+    # A ~250-token board per turn plus the reply. The history plus one reply rounds up to a multiple
+    # of 1,024 so ChunkedLossWrapper can split each TP rank's sequence into equal chunks.
+    history_tokens = (max_plies // 2) * (250 + max_response_tokens)
+    max_rollout_tokens = (
+        math.ceil((history_tokens + max_response_tokens) / 1024) * 1024
+        - max_response_tokens
+    )
     config = rl_chess_qwen3_5_4b(
         max_plies=max_plies,
         max_rollout_tokens=max_rollout_tokens,
