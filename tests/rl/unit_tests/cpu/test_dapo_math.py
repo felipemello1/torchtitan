@@ -123,6 +123,33 @@ def test_intellect3_dataset_keeps_partially_solved_problems(monkeypatch) -> None
     assert "q1" in samples[0].prompt and r"Answer: \boxed{" in samples[0].prompt
 
 
+def test_intellect3_dataset_unescapes_golds(monkeypatch) -> None:
+    # Real golds, stored JSON-escaped: Math-Verify reads `0 \\text{ or } 5` as 5.
+    rows = [
+        ("q0", r"0 \\text{ or } 5"),
+        ("q1", r"\\{1/2, 2\\}"),
+        ("q2", r"\\frac{1}{2}"),
+        ("q3", r"\sqrt{2}"),
+    ]
+
+    def load_dataset(repo_id, subset, *, split):
+        del repo_id, subset, split
+        return Dataset.from_list(
+            [
+                {"question": q, "answer": a, "avg@8_qwen3_4b_thinking_2507": 0.5}
+                for q, a in rows
+            ]
+        )
+
+    monkeypatch.setattr(math_data, "load_dataset", load_dataset)
+    dataset = Intellect3MathDataset.Config(shuffle=False).build()
+    golds = [next(dataset).ground_truth for _ in range(4)]
+    assert golds == [r"0 \text{ or } 5", r"\{1/2, 2\}", r"\frac{1}{2}", r"\sqrt{2}"]
+    assert score_math_response(r"\boxed{0 \text{ or } 5}", golds[0]) == 1.0
+    assert score_math_response(r"\boxed{5}", golds[0]) == 0.0
+    assert score_math_response(r"\boxed{\{\frac12, 2\}}", golds[1]) == 1.0
+
+
 def test_env_is_single_turn() -> None:
     env = DapoMathEnv.Config().build(
         env_input=DapoMathSample(prompt="solve me", ground_truth="3"),

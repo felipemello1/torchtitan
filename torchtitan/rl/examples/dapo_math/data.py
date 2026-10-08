@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import random
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -21,6 +22,10 @@ _MATH_PROMPT_TEMPLATE = (
     "{problem}\n\n"
     'Remember to put your answer on its own line as "Answer: \\boxed{{...}}".'
 )
+
+# A JSON-escaped `\\text` or `\\{` in a gold: Math-Verify reads `\\` as a line break, so
+# `0 \\text{ or } 5` parses as 5.
+_ESCAPED_COMMAND = re.compile(r"(?<!\\)\\\\(?=[A-Za-z{}])")
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -133,7 +138,7 @@ class Intellect3MathDataset(_CyclingDataset):
         samples = [
             DapoMathSample(
                 prompt=_MATH_PROMPT_TEMPLATE.format(problem=row["question"]),
-                ground_truth=str(row["answer"]),
+                ground_truth=_ESCAPED_COMMAND.sub(r"\\", str(row["answer"])),
             )
             for row in dataset
             if config.min_pass_rate
