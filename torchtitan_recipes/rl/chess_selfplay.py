@@ -199,7 +199,7 @@ def rl_chess_qwen3_5_4b(
 def rl_chess_qwen3_5_35b_a3b(
     max_plies: int = 120, max_thinking_tokens: int = 1024
 ) -> Controller.Config:
-    """Qwen3.5-35B-A3B (instruct) with thinking on, 150 steps on three GB300 hosts, 32 positions x 8
+    """Qwen3.5-35B-A3B (instruct) with thinking on, 150 steps on three GB300 hosts, 96 positions x 8
     games per step.
 
     A turn thinks up to `max_thinking_tokens`; then `ThinkingBudget` closes the thinking and starts
@@ -281,7 +281,7 @@ def rl_chess_qwen3_5_35b_a3b(
     )
 
     config.num_generators = 8
-    config.async_loop.num_prompts_per_train_step = 32
+    config.async_loop.num_prompts_per_train_step = 96
     config.generator.gpu_memory_limit = 0.9
     config.generator.max_num_batched_tokens = 8192
     return config
