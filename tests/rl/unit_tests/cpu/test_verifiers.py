@@ -700,6 +700,61 @@ def test_sandoq_tests_get_requests_from_a_bundle(tmp_path, monkeypatch) -> None:
     assert trace.info["tests"]["stdout"].startswith(str(deps)), trace.info["tests"]
 
 
+def test_sandoq_task_scores_within_harbor_verifier_timeout(
+    tmp_path, monkeypatch
+) -> None:
+    """Through the recipe's Sandoq config, scoring stops at the task's [verifier] timeout_sec,
+    else Harbor's 600 s; the run-level rollout timeout is unchanged."""
+    pytest.importorskip("harbor")
+    import verifiers.v1.tasksets.harbor.taskset as harbor_taskset
+    from torchtitan.rl.examples.verifiers.terminal_bench.prepare_tmax import task_toml
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq
+    from torchtitan_recipes.rl.verifiers_terminal_bench import (
+        _on_sandoq,
+        _terminal_bench_rollouter_config,
+    )
+    from verifiers.v1.utils.loaders import load_taskset
+
+    monkeypatch.setenv("VF_SANDBOX_PROVIDER", "oci-runner")
+    monkeypatch.setenv("OCI_RUNNER_TASK_NETWORK", "host")
+    monkeypatch.syspath_prepend(str(Path(terminal_bench_sandoq.__file__).parent))
+    monkeypatch.setattr(harbor_taskset, "CACHE", tmp_path)
+    declared = "[verifier]\ntimeout_sec = 1800.0\n"
+    for name, verifier in [("undeclared", ""), ("declared", declared)]:
+        task_dir = tmp_path / "train_1" / name
+        (task_dir / "tests").mkdir(parents=True)
+        (task_dir / "tests" / "test.sh").write_text("true\n")
+        (task_dir / "instruction.md").write_text("x")
+        (task_dir / "task.toml").write_text(
+            task_toml(name, "ubuntu:22.04", 1, 2048, "/app") + verifier
+        )
+
+    rollouter = _on_sandoq(
+        _terminal_bench_rollouter_config(
+            "train@1",
+            "validation@1",
+            max_context_length=1024,
+            max_turns=1,
+            max_concurrent_rollouts=1,
+            num_env_workers=1,
+        ),
+        interleaved_thinking=False,
+        rollout_log_dir=str(tmp_path / "logs"),
+    )
+    agent = rollouter.verifiers_env_server.environment.agent
+    scoring = {
+        task.data.name: agent.timeout.scoring or task.data.timeout.scoring
+        for task in load_taskset(rollouter.train_dataset.verifiers_taskset)
+    }
+
+    assert scoring == {
+        "allenai-tmax/declared": 1800.0,
+        "allenai-tmax/undeclared": 600.0,
+    }
+    assert rollouter.validation_dataset.verifiers_taskset.ignore_timeouts is False
+    assert agent.timeout.rollout == 7200
+
+
 def test_sandoq_tmux_outlives_grading(tmp_path, monkeypatch) -> None:
     """launch leaves tmux running, so test.sh sees the agent's shell jobs as under `harbor run`;
     cleanup writes the log with the pane, then kills tmux once."""
