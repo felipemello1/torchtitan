@@ -131,6 +131,38 @@ def test_math_verifier_parses_non_integer_gold_answers() -> None:
     assert score_math_response(r"\boxed{\frac{\pi}{4}}", r"\pi/4") == 1.0
 
 
+def test_math_verifier_reads_thin_space_digit_groups_as_one_number() -> None:
+    # Math-Verify alone reads `10\,002` as 10 + 002 = 12.
+    assert score_math_response(r"\boxed{10\,002}", "10002") == 1.0
+    assert score_math_response(r"\boxed{1\,091\,328}", "1091328") == 1.0
+    assert score_math_response(r"\boxed{50\,413.5}", "50413.5") == 1.0
+    assert score_math_response(r"\boxed{10002}", r"10\,002") == 1.0
+    assert score_math_response(r"\boxed{10\,002}", "12") == 0.0
+
+
+def test_math_verifier_compares_word_answers_as_strings() -> None:
+    assert score_math_response(r"\boxed{Indonesian}", "indonesian") == 1.0
+    assert score_math_response(r"\boxed{eat}", "tea") == 0.0
+    assert score_math_response(r"\boxed{DAECB}", "EDACB") == 0.0
+    # One- and two-letter answers stay math: `ba` is `ab`.
+    assert score_math_response(r"\boxed{ba}", "ab") == 1.0
+
+
+def test_math_verifier_accepts_correct_answers_in_other_formats() -> None:
+    # Close to the two cases above: other digit separators, `\,` padding, other word forms.
+    cases = [
+        (r"\boxed{44{,}643}", "44643"),
+        (r"\boxed{1,000,000}", "1000000"),
+        (r"\boxed{(N+1)^2\,(4N+1)}", "4N^3+9N^2+6N+1"),
+        (r"\boxed{\,n-1\,}", "n-1"),
+        (r"\boxed{black}", "Black"),
+        (r"\boxed{\text{Sunday}}", "Sunday"),
+        (r"\boxed{n}", "n"),
+    ]
+    for response, ground_truth in cases:
+        assert score_math_response(response, ground_truth) == 1.0
+
+
 def test_math_verifier_uses_the_last_boxed_answer() -> None:
     response = r"Work: \boxed{2003^{2002^{2001}}}" "\n" r"Answer: \boxed{34}"
     assert score_math_response(response, "34") == 1.0
