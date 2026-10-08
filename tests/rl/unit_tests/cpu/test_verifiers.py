@@ -10,12 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import gzip
-import io
 import json
 import logging
 import subprocess
 import sys
-import tarfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -629,10 +628,11 @@ def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
     assert "characters omitted" in log["tests"]["stdout"]
 
 
-def test_sandoq_tests_get_requests_from_a_bundle(tmp_path) -> None:
+def test_sandoq_tests_get_requests_from_a_bundle(tmp_path, monkeypatch) -> None:
     """A test.sh that imports `requests` and installs nothing gets the packages the image lacks
     from a pure-Python bundle on its PYTHONPATH; one that pip-installs is left alone."""
     pytest.importorskip("harbor")
+    import idna
     from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
     from verifiers.v1.runtimes import ProgramResult
     from verifiers.v1.tasksets.harbor.taskset import HarborData
@@ -650,17 +650,40 @@ def test_sandoq_tests_get_requests_from_a_bundle(tmp_path) -> None:
     assert sandoq.tests_need_requests(tmax)
     assert not sandoq.tests_need_requests(installs)
 
-    class VMRuntime:
-        def __init__(self) -> None:
-            self.writes: list[str] = []
-            self.runs: list[tuple[list[str], dict[str, str]]] = []
+    # The image: a python3 without site-packages, whose own PYTHONPATH has idna. Staging must
+    # extract the other 4 packages, and test.sh must keep that PYTHONPATH.
+    deps = tmp_path / "deps"
+    monkeypatch.setattr(sandoq, "_TEST_PYTHON_DEPS", str(deps))
+    (tmp_path / "image_site").mkdir()
+    (tmp_path / "image_site" / "idna").symlink_to(Path(idna.__file__).parent)
+    image_python = tmp_path / "bin" / "python3"
+    image_python.parent.mkdir()
+    image_python.write_text(f'#!/bin/sh\nexec {sys.executable} -S "$@"\n')
+    image_python.chmod(0o755)
+    image_env = {
+        "PATH": f"{image_python.parent}:/usr/bin:/bin",
+        "PYTHONPATH": str(tmp_path / "image_site"),
+    }
+    # Stands in for the pytest file test.sh writes, which starts with `import requests`.
+    pytest_file = ["python3", "-c", "import requests; print(requests.__file__)"]
 
+    class VMRuntime:
         async def write(self, path: str, data: bytes) -> None:
-            self.writes.append(path)
+            if path.startswith(str(deps)):
+                Path(path).write_bytes(data)
 
         async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
-            self.runs.append((argv, env))
-            return ProgramResult(exit_code=0, stdout="", stderr="")
+            if argv[-2:] == ["bash", "/tests/test.sh"]:
+                argv = [*argv[:-2], *pytest_file]
+            elif str(deps) not in argv[-1]:
+                # Harbor's own staging of /tests.
+                return ProgramResult(exit_code=0, stdout="", stderr="")
+            done = subprocess.run(
+                argv, env={**image_env, **env}, capture_output=True, text=True
+            )
+            return ProgramResult(
+                exit_code=done.returncode, stdout=done.stdout, stderr=done.stderr
+            )
 
         async def read(self, path: str, max_bytes: int) -> bytes:
             if path.endswith("reward.json"):
@@ -671,23 +694,10 @@ def test_sandoq_tests_get_requests_from_a_bundle(tmp_path) -> None:
     harbor_task = sandoq.SandoqHarborTask(HarborData(prompt="x", task_dir=tmax))
     trace = _sandoq_harness_and_trace(sandoq, tmp_path)[1]
     assert asyncio.run(harbor_task.solved(runtime, trace)) == 1.0
-    assert f"{sandoq._TEST_PYTHON_DEPS}.tgz" in runtime.writes
-    test_sh_env = next(
-        env for argv, env in runtime.runs if argv == ["bash", "/tests/test.sh"]
-    )
-    assert test_sh_env["PYTHONPATH"] == sandoq._TEST_PYTHON_DEPS
-
-    # The bundle imports on a python without site-packages: no compiled extension is needed.
-    with tarfile.open(fileobj=io.BytesIO(sandoq.requests_bundle())) as bundle:
-        assert not [name for name in bundle.getnames() if name.endswith(".so")]
-        bundle.extractall(tmp_path / "deps", filter="data")
-    imported = subprocess.run(
-        [sys.executable, "-S", "-c", "import requests; print(requests.__file__)"],
-        env={"PYTHONPATH": str(tmp_path / "deps")},
-        capture_output=True,
-        text=True,
-    )
-    assert imported.stdout.startswith(str(tmp_path / "deps")), imported.stderr
+    extracted = sorted(path.name for path in deps.iterdir())
+    assert extracted == ["certifi", "charset_normalizer", "requests", "urllib3"]
+    assert not list(deps.rglob("*.so"))
+    assert trace.info["tests"]["stdout"].startswith(str(deps)), trace.info["tests"]
 
 
 def test_sandoq_tmux_outlives_grading(tmp_path, monkeypatch) -> None:

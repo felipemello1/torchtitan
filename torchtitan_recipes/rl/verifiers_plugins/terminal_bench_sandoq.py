@@ -91,7 +91,7 @@ _MAX_LOG_CHARS = 65536
 # Where grading puts the `requests` packages a task's image lacks; on PYTHONPATH for its test.sh.
 _TEST_PYTHON_DEPS = "/tmp/vf-test-python-deps"
 _REQUESTS_PACKAGES = ("requests", "urllib3", "idna", "certifi", "charset_normalizer")
-_IMPORTS_REQUESTS = re.compile(r"^\s*(import requests|from requests\b)", re.MULTILINE)
+_IMPORTS_REQUESTS = re.compile(r"^\s*(import|from) requests\b", re.MULTILINE)
 _INSTALLS_PACKAGES = re.compile(r"^\s*(pip3?|uvx?|python3? -m pip)\s", re.MULTILINE)
 # The log lines of the rollout whose launch is running in this asyncio task.
 _launch_log_lines: ContextVar[list[str] | None] = ContextVar(
@@ -463,11 +463,15 @@ class SandoqHarborTask(HarborTask):
         if not tests_need_requests(self.data.task_dir):
             return
         # Only the packages the image lacks: an installed urllib3 1.x keeps serving its users.
+        # The final import turns a bundle this python3 can't run into a TaskError, not a silent 0.
         await runtime.write(f"{_TEST_PYTHON_DEPS}.tgz", requests_bundle())
         extract = (
-            f"mkdir -p {_TEST_PYTHON_DEPS} && for p in {' '.join(_REQUESTS_PACKAGES)}; do "
+            f"rm -rf {_TEST_PYTHON_DEPS} && mkdir -p {_TEST_PYTHON_DEPS} && "
+            f"for p in {' '.join(_REQUESTS_PACKAGES)}; do "
             f'python3 -c "import $p" 2>/dev/null || '
-            f'tar -xzf {_TEST_PYTHON_DEPS}.tgz -C {_TEST_PYTHON_DEPS} "$p" || exit 1; done'
+            f'tar --no-same-owner -xzf {_TEST_PYTHON_DEPS}.tgz -C {_TEST_PYTHON_DEPS} "$p" || exit 1; '
+            f"done; "
+            f'PYTHONPATH={_TEST_PYTHON_DEPS}${{PYTHONPATH:+:$PYTHONPATH}} python3 -c "import requests"'
         )
         result = await runtime.run(["sh", "-c", extract], {})
         if result.exit_code:
@@ -483,12 +487,9 @@ class SandoqHarborTask(HarborTask):
         # reward with `read`.
         async def run_and_keep(argv: list[str], env: dict[str, str]) -> ProgramResult:
             if needs_requests:
-                env = {
-                    **env,
-                    "PYTHONPATH": ":".join(
-                        filter(None, [_TEST_PYTHON_DEPS, env.get("PYTHONPATH")])
-                    ),
-                }
+                # Prepend in the box: the image's own PYTHONPATH is not in `env`.
+                prepend = f"export PYTHONPATH={_TEST_PYTHON_DEPS}${{PYTHONPATH:+:$PYTHONPATH}}"
+                argv = ["sh", "-c", f'{prepend}; exec "$@"', "sh", *argv]
             result = await runtime.run(argv, env)
             trace.info["tests"] = {
                 "exit_code": result.exit_code,
@@ -503,22 +504,17 @@ class SandoqHarborTask(HarborTask):
 
 @functools.cache
 def tests_need_requests(task_dir: str) -> bool:
-    """Whether the task's tests import `requests` and its test.sh installs nothing.
+    """Whether test.sh imports `requests` and installs nothing, so it relies on the image's own.
 
-    1,094 TMax tasks write such a pytest file and run it with the image's python3, which lacks
-    `requests` in most of their images, so they score 0 whatever the agent did; `harbor run` grades
-    them the same way. Terminal-Bench 2.1 tests that import it `pip install` it themselves.
+    Example:
+        TMax:   test.sh writes /tmp/test_final_state.py with `import requests`, runs pytest -> True
+        TB 2.1: test.sh runs `pip install pytest==8.4.1 requests==2.32.5`, then pytest     -> False
     """
     test_sh = Path(task_dir) / "tests" / "test.sh"
     if not test_sh.is_file():
         return False
-    if _INSTALLS_PACKAGES.search(test_sh.read_text(errors="replace")):
-        return False
-    return any(
-        _IMPORTS_REQUESTS.search(path.read_text(errors="replace"))
-        for path in test_sh.parent.rglob("*")
-        if path.suffix in (".py", ".sh")
-    )
+    text = test_sh.read_text(errors="replace")
+    return bool(_IMPORTS_REQUESTS.search(text)) and not _INSTALLS_PACKAGES.search(text)
 
 
 @functools.cache
@@ -526,8 +522,9 @@ def requests_bundle() -> bytes:
     """A tar.gz of `requests` and its dependencies from the env server's own install, pure Python.
 
     Compiled extensions are left out (charset_normalizer falls back to its .py modules), so the
-    bundle runs on the task image's python3 (3.10 in TMax) whatever the env server's Python and
-    arch. No network: each rollout would otherwise hit a package mirror at grading time.
+    bundle runs on any python3 its packages support: >= 3.10 for requests 2.34 and urllib3 2.8,
+    and TMax images run 3.10.12. No network: each rollout would otherwise hit a package mirror at
+    grading time.
 
     Example:
         tarfile.open(fileobj=io.BytesIO(requests_bundle())).getnames()[:2]
