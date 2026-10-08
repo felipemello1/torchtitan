@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.types import split_prompt
 from torchtitan.rl.types import RolloutTurnID
@@ -341,11 +342,10 @@ def test_routed_expert_ids_keep_each_turns_rows_and_take_the_boundary_from_the_n
         ),
     ]
     # vLLM returns one row per forward input: the prompt plus every completion token but the last.
+    # prompt_delta_token_ids holds the full prompt until `_scored_rollout` splits it.
     for turn_id, rollout_turn in enumerate(turns):
         num_inputs = (
-            len(
-                rollout_turn.prompt_delta_token_ids
-            )  # the full prompt until `_scored_rollout`
+            len(rollout_turn.prompt_delta_token_ids)
             + len(rollout_turn.completion_token_ids)
             - 1
         )
@@ -476,3 +476,25 @@ def test_topk_rows_align_with_token_ids_across_turns() -> None:
             [[0, 0], [0, 0], [-0.1, -2.0], [-0.2, -3.0], [0, 0], [-0.3, -1.5]]
         ),
     )
+
+
+def test_zero_std_groups_split_into_all_success_and_all_failure() -> None:
+    # Three groups: all-1 is all_success, all-0 is all_failure, mixed is neither.
+    builder = TrainingSampleBuilder.Config().build()
+    metrics: list[m.Metric] = []
+    for group_id, rewards in enumerate([[1.0, 1.0], [0.0, 0.0], [1.0, 0.0]]):
+        rollouts = [
+            _scored_rollout(
+                [_turn(prompt_token_ids=[1], completion_token_ids=[2], version=0)],
+                reward=reward,
+                advantage=0.0,
+            )
+            for reward in rewards
+        ]
+        group = RolloutGroup(group_id=group_id, rollouts=rollouts)
+        metrics += builder.build_from_group(rollout_group=group).metrics
+    aggregated = m.MetricsProcessor._aggregate_metrics(metrics)
+    prefix = "rollout_reward/group_zero_std_frac"
+    assert aggregated[f"{prefix}/mean"] == pytest.approx(2 / 3)
+    assert aggregated[f"{prefix}/all_success/mean"] == pytest.approx(1 / 3)
+    assert aggregated[f"{prefix}/all_failure/mean"] == pytest.approx(1 / 3)
