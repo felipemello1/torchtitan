@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.types import split_prompt
 from torchtitan.rl.types import RolloutTurnID
@@ -317,3 +318,25 @@ def test_group_filters_preserve_group_id_for_acknowledgement() -> None:
     filtered_groups = [failed, untrainable, zero_std, no_valid_tokens]
     assert [group.group_id for group in filtered_groups] == [7, 8, 9, 10]
     assert all(not group.training_samples for group in filtered_groups)
+
+
+def test_zero_std_groups_split_into_all_success_and_all_failure() -> None:
+    # Three groups: all-1 is all_success, all-0 is all_failure, mixed is neither.
+    builder = TrainingSampleBuilder.Config().build()
+    metrics: list[m.Metric] = []
+    for group_id, rewards in enumerate([[1.0, 1.0], [0.0, 0.0], [1.0, 0.0]]):
+        rollouts = [
+            _scored_rollout(
+                [_turn(prompt_token_ids=[1], completion_token_ids=[2], version=0)],
+                reward=reward,
+                advantage=0.0,
+            )
+            for reward in rewards
+        ]
+        group = RolloutGroup(group_id=group_id, rollouts=rollouts)
+        metrics += builder.build_from_group(rollout_group=group).metrics
+    aggregated = m.MetricsProcessor._aggregate_metrics(metrics)
+    prefix = "rollout_reward/group_zero_std_frac"
+    assert aggregated[f"{prefix}/mean"] == pytest.approx(2 / 3)
+    assert aggregated[f"{prefix}/all_success/mean"] == pytest.approx(1 / 3)
+    assert aggregated[f"{prefix}/all_failure/mean"] == pytest.approx(1 / 3)
