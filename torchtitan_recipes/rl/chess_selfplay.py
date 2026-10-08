@@ -196,14 +196,15 @@ def rl_chess_qwen3_5_4b(
 
 
 def rl_chess_qwen3_5_35b_a3b(
-    max_plies: int = 60, max_thinking_tokens: int = 2048
+    max_plies: int = 120, max_thinking_tokens: int = 1024
 ) -> Controller.Config:
     """Qwen3.5-35B-A3B (instruct) with thinking on, 150 steps on two GB300 hosts.
 
     A turn thinks up to `max_thinking_tokens`; then `ThinkingBudget` closes the thinking and starts
     the answer with "\\boxed{", and the reward loses up to 0.1 for force-closed turns. A player keeps
     its own past thinking in its history (never the opponent's), so the history grows up to
-    ~`max_thinking_tokens` per turn: 60 plies x 2k thinking need ~84k tokens.
+    ~`max_thinking_tokens` per turn: 120 plies x 1k thinking need ~107k tokens. 120 plies covers p90
+    of human games below 2000 Elo (research/game_length_by_elo.md in discussion 118).
 
     Host 0 trains: FSDP 2 x TP 2 x EP 4 with Dist-MoE experts, the layout of the 35B Terminal-Bench
     runs. Host 1 runs four one-GPU generators, each with every expert, FULL CUDA graphs.
