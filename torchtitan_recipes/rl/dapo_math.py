@@ -316,14 +316,14 @@ def _apply_length_control(
 ) -> None:
     """Force an answer at the response cap and charge long correct answers.
 
-    Thinking still open 2,048 tokens before the cap gets a forced close plus
+    Thinking still open 4,096 tokens before the cap gets a forced close plus
     `Answer: \\boxed{`, and a correct forced answer is worth half. `DOME_V2_FORCED_ANSWER=0`
     turns that off; `DOME_V2_LENGTH_PENALTY=none` turns off the `CorrectLengthPenalty`.
     """
     worker = config.rollouter.worker
     if os.environ.get("DOME_V2_FORCED_ANSWER", "1") == "1":
         worker.thinking_budget = ThinkingBudget.Config(
-            max_thinking_tokens=max_response_tokens - 2048,
+            max_thinking_tokens=max_response_tokens - 4096,
             answer_prefix="Answer: \\boxed{",
         )
         worker.rubric.forced_answer_scale = 0.5
