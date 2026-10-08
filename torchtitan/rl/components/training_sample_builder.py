@@ -114,6 +114,20 @@ class TrainingSampleBuilder(Configurable):
                 m.Mean(1.0 if is_zero_std else 0.0),
             )
         )
+        # Logged for the same groups as group_zero_std_frac, so the two splits sum to it.
+        # Success = reward > 0, which assumes a failed rollout scores 0 or less.
+        all_success = is_zero_std and rewards[0] > 0.0
+        all_failure = is_zero_std and not all_success
+        metrics += [
+            m.Metric(
+                "rollout_reward/group_zero_std_frac/all_success",
+                m.Mean(1.0 if all_success else 0.0),
+            ),
+            m.Metric(
+                "rollout_reward/group_zero_std_frac/all_failure",
+                m.Mean(1.0 if all_failure else 0.0),
+            ),
+        ]
         # A turn with its own advantage (e.g. a forfeit's penalty) still trains in a tied group.
         has_turn_advantages = any(
             turn.advantage is not None
