@@ -147,11 +147,13 @@ class Intellect3MathDataset(_CyclingDataset):
 
     Example:
         config = rl_dapo_qwen3_4b_math_32k()
-        config.rollouter.train_dataset = Intellect3MathDataset.Config()
+        config.rollouter.training_dataloader = IterableRLDataLoader.Config(
+            dataset=Intellect3MathDataset.Config()
+        )
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(Configurable.Config):
+    class Config(RLDataset.Config):
         repo_id: str = "PrimeIntellect/INTELLECT-3-RL"
         split: str = "train"
         min_pass_rate: float = 0.125
