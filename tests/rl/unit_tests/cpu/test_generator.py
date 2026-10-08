@@ -37,6 +37,7 @@ from torchtitan.components.optim import AdamW
 from torchtitan.config import CommConfig, DebugConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.models.common.attention import VarlenInnerAttention
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.distributed.routing.strategies import LeastLoadedRoutingStrategy
@@ -109,7 +110,9 @@ def _sample(*, token_ids=(10, 11), finish_reason="stop"):
     )
 
 
-def _request_output(*, request_id="r0", outputs=None, num_generation_tokens=4):
+def _request_output(
+    *, request_id="r0", outputs=None, num_generation_tokens=4, num_preemptions=0
+):
     return SimpleNamespace(
         request_id=request_id,
         num_cached_tokens=0,
@@ -120,6 +123,7 @@ def _request_output(*, request_id="r0", outputs=None, num_generation_tokens=4):
             first_token_ts=1.017,
             last_token_ts=1.047,
             num_generation_tokens=num_generation_tokens,
+            num_preemptions=num_preemptions,
         ),
         outputs=list(outputs or [_sample()]),
     )
@@ -445,11 +449,12 @@ def test_sampling_config_rejects_top_p_below_one():
 
 def test_metric_timing_math_and_prefix_override():
     metrics = _prepare_generation_request_metrics(
-        _extract_request_metrics_inputs(_request_output()),
+        _extract_request_metrics_inputs(_request_output(num_preemptions=2)),
         prefix="validation_generator",
     )
     aggregate = m.MetricsProcessor._aggregate_metrics(metrics)
     assert all(key.startswith("validation_generator/") for key in aggregate)
+    assert aggregate["validation_generator/num_preemptions/mean"] == 2
     assert aggregate["validation_generator/queue_time_ms/mean"] == pytest.approx(5)
     assert aggregate["validation_generator/time_to_first_token_ms/mean"] == 12
     assert aggregate["validation_generator/prefill_time_ms/mean"] == pytest.approx(12)
@@ -526,6 +531,41 @@ def test_qwen36_27b_perf_config():
     assert optimizer.moment_dtype == "bfloat16"
     assert isinstance(config.trainer.activation_checkpoint, FullAC.Config)
     assert config.generator.cuda_graph.mode == "FULL"
+
+
+@pytest.mark.parametrize("watermark", [None, 0.03])
+def test_watermark_reaches_engine_args(monkeypatch, tmp_path, watermark):
+    """A set ``watermark`` reaches vLLM's ``EngineArgs``; ``None`` leaves vLLM's default."""
+
+    class _EngineArgsBuilt(Exception):
+        pass
+
+    engine_kwargs = {}
+
+    def capture_engine_args(**kwargs):
+        engine_kwargs.update(kwargs)
+        # Stop __init__ before it builds the vLLM engine.
+        raise _EngineArgsBuilt
+
+    monkeypatch.setattr(generator_module, "EngineArgs", capture_engine_args)
+    monkeypatch.setattr(generator_module, "register_to_vllm", Mock())
+    monkeypatch.setattr(generator_module, "init_logger", Mock())
+    monkeypatch.setattr(generator_module, "sl", Mock())
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    model_config = SimpleNamespace(
+        first_base_attention_backend=VarlenInnerAttention.Config(),
+        max_context_length=1024,
+    )
+    with pytest.raises(_EngineArgsBuilt):
+        VLLMGenerator(
+            VLLMGenerator.Config(watermark=watermark),
+            model_config=model_config,
+            model_path="unused",
+            max_num_seqs=8,
+            output_dir=str(tmp_path),
+            rank=0,
+        )
+    assert engine_kwargs.get("watermark") == watermark
 
 
 # --- CUDA graph config (VLLMCudaGraphConfig.get_vllm_compilation_config) ---
