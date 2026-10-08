@@ -10,6 +10,7 @@ the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID
 import asyncio
 import json
 import logging
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -19,6 +20,7 @@ from torchtitan.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
+from torchtitan.rl.controller import Controller
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
@@ -633,6 +635,49 @@ def test_untrainable_group_releases_before_training() -> None:
         )
 
     asyncio.run(run())
+
+
+def test_rollout_loop_keeps_worker_metrics() -> None:
+    async def run() -> RolloutGroup:
+        buffer = RolloutGroupWorkBuffer.Config().build(
+            max_active_rollout_groups=1, window_size=None
+        )
+        await buffer.wait_for_slot()
+        await buffer.add_work(RolloutGroupWork(group_id=0, sample=object()))
+
+        async def run_group_rollouts(**kwargs) -> RolloutGroup:
+            return RolloutGroup(
+                group_id=0,
+                rollouts=[],
+                metrics=[m.Metric("worker/x", m.Sum(1.0))],
+            )
+
+        async def release_groups(group_ids) -> None:
+            pass
+
+        # Stand-in for the controller: only the attributes _rollout_loop reads.
+        controller = SimpleNamespace(
+            _rollouter=SimpleNamespace(run_group_rollouts=run_group_rollouts),
+            config=SimpleNamespace(
+                async_loop=SimpleNamespace(num_samples_per_prompt=1)
+            ),
+            _sampling=None,
+            rollout_recorder=SimpleNamespace(record=lambda **kwargs: None),
+            generator_router=SimpleNamespace(
+                release_groups=SimpleNamespace(call_one=release_groups)
+            ),
+        )
+        rollout_loop = asyncio.create_task(
+            Controller._rollout_loop(controller, group_buffer=buffer, generate_fn=None)
+        )
+        group = await buffer.take_finalized()
+        rollout_loop.cancel()
+        return group
+
+    keys = [metric.key for metric in asyncio.run(run()).metrics]
+    # The worker's metric survives, and the controller's rollout metrics are appended.
+    assert "worker/x" in keys
+    assert "rollout/truncation_rate" in keys
 
 
 def test_compute_policy_age_metrics_raises_beyond_cap() -> None:
