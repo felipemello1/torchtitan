@@ -243,10 +243,38 @@ class RolloutGroupWorkBuffer(Configurable):
             self._work_by_group_id.clear()
             self._condition.notify_all()
 
-    def metrics(self) -> list[m.Metric]:
-        """Trainer loop: point-in-time buffer gauges for this step; resets the per-flush peak."""
+    def metrics(
+        self, *, num_groups_in_batcher: int, num_groups_in_queue: int
+    ) -> list[m.Metric]:
+        """Trainer loop: point-in-time gauges of where each active slot is; resets the per-flush peak.
+
+        Every slot is in exactly one of these places, so they sum to `max_active_rollout_groups`:
+
+            num_groups_waiting      admitted, no rollout started
+            num_groups_inflight     rollouts running
+            num_groups_finalized    rollouts done, not yet taken by the batcher
+            num_groups_in_batcher   taken by the batcher, not yet in a queued batch
+            num_groups_in_queue     in a batch waiting in `training_batch_queue`
+            num_groups_in_trainer   taken by the trainer; freed after the weight pull that follows its optimizer step
+            available_active_slots  free
+
+        Args:
+            num_groups_in_batcher: Groups the batcher took that still hold a slot.
+            num_groups_in_queue: Groups in batches waiting in `training_batch_queue`.
+
+        Example:
+            # 80 slots, 16 groups per batch: 12 inflight, 4 finalized and 16 free, so
+            # `take_finalized` has returned the groups of the other 48 slots.
+            buffer.metrics(num_groups_in_batcher=16, num_groups_in_queue=16)
+            # -> num_groups_in_trainer = 48 - 16 - 16 = 16
+        """
         states = [work.state for work in self._work_by_group_id.values()]
         state_enum = _RolloutGroupWorkState
+        # The trainer holds the slots `take_finalized` handed out that the batcher and queue do not.
+        num_groups_taken = self._active_rollout_groups - len(self._work_by_group_id)
+        num_groups_in_trainer = (
+            num_groups_taken - num_groups_in_batcher - num_groups_in_queue
+        )
         out = [
             m.Metric(
                 "rollout_buffer/num_groups_waiting",
@@ -259,6 +287,18 @@ class RolloutGroupWorkBuffer(Configurable):
             m.Metric(
                 "rollout_buffer/num_groups_finalized",
                 m.NoReduce(float(states.count(state_enum.FINALIZED))),
+            ),
+            m.Metric(
+                "rollout_buffer/num_groups_in_batcher",
+                m.NoReduce(float(num_groups_in_batcher)),
+            ),
+            m.Metric(
+                "rollout_buffer/num_groups_in_queue",
+                m.NoReduce(float(num_groups_in_queue)),
+            ),
+            m.Metric(
+                "rollout_buffer/num_groups_in_trainer",
+                m.NoReduce(float(num_groups_in_trainer)),
             ),
             m.Metric(
                 "rollout_buffer/active_slots_in_use_peak",
