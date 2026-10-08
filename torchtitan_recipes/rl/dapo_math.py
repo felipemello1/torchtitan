@@ -248,11 +248,40 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math() -> Controller.Config:
     responses and 4-row microbatches. Truncated rollouts score `DOME_V2_TRUNCATION_REWARD`
     (default 0). No online validation: the checkpoints are evaluated offline.
     """
+    return _intellect3_math_config(default_prompts=32, default_microbatch_rows=4)
+
+
+def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_12_generators() -> Controller.Config:
+    """`rl_dapo_qwen3_5_35b_a3b_base_intellect3_math` with one trainer host and three
+    generator hosts: more sequences in flight, which is what bounds the step.
+
+    Trainer on 4 GPUs: FSDP 2 x TP 2 x EP 4, 2-row microbatches (fp32 state and Adam take
+    ~125 GiB per GPU). Twelve TP1 engines; 64 prompts x 16 samples per step;
+    target_offpolicy_steps 5.
+    """
+    return _intellect3_math_config(
+        default_prompts=64,
+        default_microbatch_rows=2,
+        data_parallel_shard_degree=2,
+        num_generators=12,
+        target_offpolicy_steps=5,
+    )
+
+
+def _intellect3_math_config(
+    *, default_prompts: int, default_microbatch_rows: int, **layout
+) -> Controller.Config:
+    """Build the INTELLECT-3 run; `layout` goes to `_qwen3_5_35b_a3b_base_dapo_math_config`."""
     config = _qwen3_5_35b_a3b_base_dapo_math_config(
         max_response_tokens=int(os.environ.get("DOME_V2_MAX_RESPONSE_TOKENS", 49152)),
-        num_prompts_per_train_step=int(os.environ.get("DOME_V2_PROMPTS", 32)),
-        microbatch_rows=int(os.environ.get("DOME_V2_MICROBATCH_ROWS", 4)),
+        num_prompts_per_train_step=int(
+            os.environ.get("DOME_V2_PROMPTS", default_prompts)
+        ),
+        microbatch_rows=int(
+            os.environ.get("DOME_V2_MICROBATCH_ROWS", default_microbatch_rows)
+        ),
         dump_folder="outputs/rl/qwen3_5_35b_a3b_base_intellect3_math",
+        **layout,
     )
     config.rollouter.train_dataset = Intellect3MathDataset.Config()
     # A truncated rollout has no final answer; grading the last \boxed{} of its unfinished
@@ -270,8 +299,17 @@ def _qwen3_5_35b_a3b_base_dapo_math_config(
     num_prompts_per_train_step: int,
     microbatch_rows: int,
     dump_folder: str,
+    data_parallel_shard_degree: int = 4,
+    num_generators: int = 8,
+    target_offpolicy_steps: int = 4,
 ) -> Controller.Config:
-    """Build the 16-GPU Qwen3.5-35B-A3B-Base DAPO run with a Dist-MoE trainer."""
+    """Build the 16-GPU Qwen3.5-35B-A3B-Base DAPO run with a Dist-MoE trainer.
+
+    Args:
+        data_parallel_shard_degree: Trainer FSDP degree; with TP 2 the trainer takes
+            2 x this many GPUs (4 -> 8 GPUs on 2 hosts, 2 -> 4 GPUs on 1 host).
+        num_generators: One-GPU vLLM engines.
+    """
     expert_parallel_degree = 4
     config = _qwen3_5_base_dapo_math_config(
         flavor="35B-A3B",
@@ -283,14 +321,15 @@ def _qwen3_5_35b_a3b_base_dapo_math_config(
         num_samples_per_prompt=16,
         microbatch_rows=microbatch_rows,
         validation_interval_steps=25,
-        num_generators=8,
+        num_generators=num_generators,
         parallelism=ParallelismConfig(
-            data_parallel_shard_degree=4,
+            data_parallel_shard_degree=data_parallel_shard_degree,
             tensor_parallel_degree=2,
             expert_parallel_degree=expert_parallel_degree,
         ),
         num_loss_chunks=16,
         dump_folder=dump_folder,
+        target_offpolicy_steps=target_offpolicy_steps,
     )
     trainer = config.trainer
     # Recompute every op in the block except the Dist-MoE call, which is never recomputed.
@@ -321,6 +360,7 @@ def _qwen3_5_base_dapo_math_config(
     parallelism: ParallelismConfig,
     num_loss_chunks: int,
     dump_folder: str,
+    target_offpolicy_steps: int = 4,
 ) -> Controller.Config:
     """Build a Qwen3.5-Base DAPO-Math run that saves resumable checkpoints.
 
@@ -341,7 +381,7 @@ def _qwen3_5_base_dapo_math_config(
             num_training_steps=150,
             num_prompts_per_train_step=num_prompts_per_train_step,
             num_samples_per_prompt=num_samples_per_prompt,
-            target_offpolicy_steps=4,
+            target_offpolicy_steps=target_offpolicy_steps,
             windowed_fifo_batches=None,
             validation=ValidationConfig(
                 num_samples=num_validation_samples,
