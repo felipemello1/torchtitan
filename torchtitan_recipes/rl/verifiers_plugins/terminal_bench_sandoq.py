@@ -27,12 +27,16 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import functools
 import gzip
+import importlib
+import io
 import json
 import logging
 import os
 import re
 import shlex
+import tarfile
 import tempfile
 import time
 import traceback
@@ -56,7 +60,7 @@ from torchtitan.rl.examples.verifiers.terminal_bench.taskset import (
 )
 from verifiers.v1.clients import ModelContext
 from verifiers.v1.configs.harness import HarnessConfig
-from verifiers.v1.errors import HarnessError, SandboxError
+from verifiers.v1.errors import HarnessError, SandboxError, TaskError
 from verifiers.v1.harness import Harness
 from verifiers.v1.runtimes import ProgramResult, Runtime
 from verifiers.v1.task import TaskData
@@ -84,6 +88,11 @@ _USE_SANDOQ_TMUX = (
 # A rollout log keeps at most this many characters of each text field, its head and tail.
 # Terminus-2 already caps each terminal output in its trajectory at 10,000 bytes.
 _MAX_LOG_CHARS = 65536
+# Where grading puts the `requests` packages a task's image lacks; on PYTHONPATH for its test.sh.
+_TEST_PYTHON_DEPS = "/tmp/vf-test-python-deps"
+_REQUESTS_PACKAGES = ("requests", "urllib3", "idna", "certifi", "charset_normalizer")
+_IMPORTS_REQUESTS = re.compile(r"^\s*(import|from) requests\b", re.MULTILINE)
+_INSTALLS_PACKAGES = re.compile(r"^\s*(pip3?|uvx?|python3? -m pip)\s", re.MULTILINE)
 # The log lines of the rollout whose launch is running in this asyncio task.
 _launch_log_lines: ContextVar[list[str] | None] = ContextVar(
     "launch_log_lines", default=None
@@ -446,12 +455,41 @@ def restore_sampled_reasoning(message_history: list[dict], trace: Trace) -> list
 
 
 class SandoqHarborTask(HarborTask):
-    """Harbor's task, which also keeps test.sh's exit code and output in `trace.info["tests"]`."""
+    """Harbor's task, which also keeps test.sh's exit code and output in `trace.info["tests"]`,
+    and gives a test.sh that imports `requests` the packages its image lacks."""
+
+    async def _stage_tests(self, runtime: Runtime, wipe: bool = False) -> None:
+        await super()._stage_tests(runtime, wipe)
+        if not tests_need_requests(self.data.task_dir):
+            return
+        # Only the packages the image lacks: an installed urllib3 1.x keeps serving its users.
+        # The final import turns a bundle this python3 can't run into a TaskError, not a silent 0.
+        await runtime.write(f"{_TEST_PYTHON_DEPS}.tgz", requests_bundle())
+        extract = (
+            f"rm -rf {_TEST_PYTHON_DEPS} && mkdir -p {_TEST_PYTHON_DEPS} && "
+            f"for p in {' '.join(_REQUESTS_PACKAGES)}; do "
+            f'python3 -c "import $p" 2>/dev/null || '
+            f'tar --no-same-owner -xzf {_TEST_PYTHON_DEPS}.tgz -C {_TEST_PYTHON_DEPS} "$p" || exit 1; '
+            f"done; "
+            f'PYTHONPATH={_TEST_PYTHON_DEPS}${{PYTHONPATH:+:$PYTHONPATH}} python3 -c "import requests"'
+        )
+        result = await runtime.run(["sh", "-c", extract], {})
+        if result.exit_code:
+            raise TaskError(
+                f"staging requests failed (exit {result.exit_code}): "
+                f"{(result.stderr or result.stdout).strip()[-500:]}"
+            )
 
     async def _graded(self, runtime: Runtime, trace: Trace) -> float | dict[str, float]:
+        needs_requests = tests_need_requests(self.data.task_dir)
+
         # The stock `_graded` runs test.sh with its one `run`, drops the output, and reads the
         # reward with `read`.
         async def run_and_keep(argv: list[str], env: dict[str, str]) -> ProgramResult:
+            if needs_requests:
+                # Prepend in the box: the image's own PYTHONPATH is not in `env`.
+                prepend = f"export PYTHONPATH={_TEST_PYTHON_DEPS}${{PYTHONPATH:+:$PYTHONPATH}}"
+                argv = ["sh", "-c", f'{prepend}; exec "$@"', "sh", *argv]
             result = await runtime.run(argv, env)
             trace.info["tests"] = {
                 "exit_code": result.exit_code,
@@ -462,6 +500,48 @@ class SandoqHarborTask(HarborTask):
 
         grading_runtime = SimpleNamespace(run=run_and_keep, read=runtime.read)
         return await super()._graded(grading_runtime, trace)
+
+
+@functools.cache
+def tests_need_requests(task_dir: str) -> bool:
+    """Whether test.sh imports `requests` and installs nothing, so it relies on the image's own.
+
+    Example:
+        TMax:   test.sh writes /tmp/test_final_state.py with `import requests`, runs pytest -> True
+        TB 2.1: test.sh runs `pip install pytest==8.4.1 requests==2.32.5`, then pytest     -> False
+    """
+    test_sh = Path(task_dir) / "tests" / "test.sh"
+    if not test_sh.is_file():
+        return False
+    text = test_sh.read_text(errors="replace")
+    return bool(_IMPORTS_REQUESTS.search(text)) and not _INSTALLS_PACKAGES.search(text)
+
+
+@functools.cache
+def requests_bundle() -> bytes:
+    """A tar.gz of `requests` and its dependencies from the env server's own install, pure Python.
+
+    Compiled extensions are left out (charset_normalizer falls back to its .py modules), so the
+    bundle runs on any python3 its packages support: >= 3.10 for requests 2.34 and urllib3 2.8,
+    and TMax images run 3.10.12. No network: each rollout would otherwise hit a package mirror at
+    grading time.
+
+    Example:
+        tarfile.open(fileobj=io.BytesIO(requests_bundle())).getnames()[:2]
+        # -> ["requests", "requests/__init__.py"]
+    """
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        for name in _REQUESTS_PACKAGES:
+            package = Path(importlib.import_module(name).__file__).parent
+            tar.add(
+                package,
+                arcname=name,
+                filter=lambda info: None
+                if info.name.endswith(".so") or "__pycache__" in info.name
+                else info,
+            )
+    return buffer.getvalue()
 
 
 # Verifiers' env server builds each rollout's task as this generic's task type; `load` only
