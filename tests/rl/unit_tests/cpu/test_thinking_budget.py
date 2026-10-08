@@ -127,6 +127,15 @@ def test_reply_cut_while_answering_continues_without_forcing() -> None:
     assert _forced_close_rate(completion) == 0.0
 
 
+def test_reply_cut_by_the_context_is_not_continued() -> None:
+    # Fewer than max_thinking_tokens with "length": the context is full, a second call would be rejected.
+    generate = _ScriptedGenerate(_completion([10, 11], finish_reason="length"))
+    completion = _run(_budget(max_thinking_tokens=4), generate, prompt=[5, THINK])
+    assert len(generate.calls) == 1
+    assert completion.token_ids == [10, 11]
+    assert completion.loss_mask is None
+
+
 @pytest.mark.parametrize(
     "prompt",
     [

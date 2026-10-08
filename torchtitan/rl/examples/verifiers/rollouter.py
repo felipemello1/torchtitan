@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass, field, replace
 from typing import Any, TYPE_CHECKING
 
@@ -33,6 +34,7 @@ from torchtitan.rl.examples.verifiers.generation_server import (
 )
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
+from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
 from torchtitan.rl.rollout.types import (
     GenerateFn,
     Rollout,
@@ -110,6 +112,9 @@ class VerifiersRollouter(Rollouter):
         generation_server: GenerationServer.Config
         """Local HTTP bridge from Verifiers to TitanRL generation."""
 
+        thinking_budget: ThinkingBudget.Config | None = None
+        """Caps thinking per turn by forcing its end; None leaves replies to `max_tokens`."""
+
         renderer_multiplex: int = 256
         """Maximum concurrent rollouts sharing one Verifiers renderer instance.
 
@@ -155,6 +160,7 @@ class VerifiersRollouter(Rollouter):
         self._generation_server: GenerationServer | None = None
         self._verifiers_env_client: VerifiersEnvClient | None = None
         self._verifiers_train_client_config: VerifiersTrainClientConfig | None = None
+        self._thinking_budget: ThinkingBudget | None = None
 
     async def setup_async(
         self,
@@ -164,9 +170,12 @@ class VerifiersRollouter(Rollouter):
         hf_assets_path: str,
     ) -> None:
         """Start the EnvServer and connect it to TorchTitan generation."""
-        del tokenizer_config
         if self._verifiers_env_client is not None:
             return
+        if self._verifiers_config.thinking_budget is not None:
+            self._thinking_budget = self._verifiers_config.thinking_budget.build(
+                tokenizer=tokenizer_config.build(tokenizer_path=hf_assets_path)
+            )
         if not isinstance(renderer_config, RenderersConfigAdapter):
             raise ValueError(
                 "Verifiers requires a renderer configured with from_renderers(...) "
@@ -235,6 +244,8 @@ class VerifiersRollouter(Rollouter):
         """Run sibling rollouts through Verifiers, then compute advantages."""
         if self._generation_server is None:
             raise RuntimeError("Verifiers rollouter is not initialized")
+        if self._thinking_budget is not None:
+            generate_fn = self._thinking_budget.wrap(generate_fn)
         self._generation_server.set_generate_fn(generate_fn)
         rollouts = await asyncio.gather(
             *(
@@ -353,7 +364,8 @@ class VerifiersRollouter(Rollouter):
         Verifiers does not return TorchTitan policy metadata, so every emitted
         turn receives the conservative min/max policy-version span accumulated
         by the generation server for the whole rollout. Generator metrics are
-        attached once to avoid double counting.
+        attached once to avoid double counting. A completion with appended tokens
+        gets back its loss mask, and NaN logprobs on those tokens.
         """
         if generation_metadata is None:
             if any(any(node.mask) for node in trace.nodes):
@@ -381,6 +393,18 @@ class VerifiersRollouter(Rollouter):
                 for start, end in _trainable_token_spans(mask):
                     absolute_start = branch_offset + start
                     absolute_end = branch_offset + end
+                    completion_token_ids = list(token_ids[absolute_start:absolute_end])
+                    completion_logprobs = list(logprobs[absolute_start:absolute_end])
+                    loss_mask = generation_metadata.loss_masks.get(
+                        tuple(completion_token_ids)
+                    )
+                    if loss_mask is not None:
+                        completion_logprobs = [
+                            logprob if keep else math.nan
+                            for logprob, keep in zip(
+                                completion_logprobs, loss_mask, strict=True
+                            )
+                        ]
                     turns.append(
                         RolloutTurn(
                             rollout_id=RolloutTurnID(
@@ -389,12 +413,9 @@ class VerifiersRollouter(Rollouter):
                                 turn_id=len(turns),
                             ),
                             prompt_token_ids=list(token_ids[:absolute_start]),
-                            completion_token_ids=list(
-                                token_ids[absolute_start:absolute_end]
-                            ),
-                            completion_logprobs=list(
-                                logprobs[absolute_start:absolute_end]
-                            ),
+                            completion_token_ids=completion_token_ids,
+                            completion_logprobs=completion_logprobs,
+                            completion_loss_mask=loss_mask,
                             min_policy_version=generation_metadata.min_policy_version,
                             max_policy_version=generation_metadata.max_policy_version,
                             completion_message=message_to_wire(node.message),

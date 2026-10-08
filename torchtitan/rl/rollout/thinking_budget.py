@@ -40,7 +40,7 @@ class ThinkingBudget(Configurable):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        """Not applied on the Verifiers path, which does not run `RolloutWorker`."""
+        """Set on `RolloutWorker.Config`, or on `VerifiersRollouter.Config` for Verifiers environments."""
 
         max_thinking_tokens: int
         """Tokens a turn may think before its end of thinking is forced; must leave room for the
@@ -101,7 +101,13 @@ class ThinkingBudget(Configurable):
                     sampling_config, max_tokens=self._max_thinking_tokens
                 ),
             )
-            if first is None or first.finish_reason != "length":
+            # "length" with fewer tokens than asked: the context is full, so a second call would
+            # be rejected; end the turn cut, as without a budget.
+            if (
+                first is None
+                or first.finish_reason != "length"
+                or len(first.token_ids) < self._max_thinking_tokens
+            ):
                 if first is not None:
                     first.metrics.append(
                         m.Metric("thinking_budget/forced_close_rate", m.Mean(0.0))
