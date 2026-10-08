@@ -13,12 +13,12 @@ Black:          (waits for White's first move) -> "White played e4." + board -> 
 
 `ChessSelfPlayWorker` overrides `RolloutWorker.run_group`. It builds `group_size` games from one start position and drives both players of every game with the stock rollout loop.
 
-Black's first prompt, in full:
+Black's first prompt after 1. e4, in full (games start a random number of plies into a book opening):
 
 ```text
 You are playing chess as Black. Play to win.
 
-Each turn you see your pieces, keyed by piece letter and square (Ke1 is a king on e1; P is a pawn), with their legal moves, and your opponent's pieces. Think about the position, then end your reply with one of your legal moves, written exactly as listed, inside \boxed{}. An illegal or missing move loses the game.
+Each turn you see your pieces and your opponent's pieces, keyed by piece letter and square (Ke1 is a king on e1; P is a pawn), each with its legal moves. The current positions and legal moves are already given: avoid restating them. Analyze which move is best, then end your reply with that move, written exactly as listed, inside \boxed{}. An illegal or missing move loses the game.
 
 White played e4.
 
@@ -42,12 +42,30 @@ Your pieces (Black) and their legal moves:
   "Ph7": ["h5", "h6"]
 }
 
-White pieces: ["Ke1", "Qd1", "Ra1", "Rh1", "Bc1", "Bf1", "Nb1", "Ng1", "Pa2", "Pb2", "Pc2", "Pd2", "Pf2", "Pg2", "Ph2", "Pe4"]
+Opponent pieces (White) and the moves they could make on their turn:
+{
+  "Ke1": ["Ke2"],
+  "Qd1": ["Qe2", "Qf3", "Qg4", "Qh5"],
+  "Ra1": [],
+  "Rh1": [],
+  "Bc1": [],
+  "Bf1": ["Ba6", "Bb5", "Bc4", "Bd3", "Be2"],
+  "Nb1": ["Na3", "Nc3"],
+  "Ng1": ["Ne2", "Nf3", "Nh3"],
+  "Pa2": ["a3", "a4"],
+  "Pb2": ["b3", "b4"],
+  "Pc2": ["c3", "c4"],
+  "Pd2": ["d3", "d4"],
+  "Pf2": ["f3", "f4"],
+  "Pg2": ["g3", "g4"],
+  "Ph2": ["h3", "h4"],
+  "Pe4": ["e5"]
+}
 
-Your move as Black. Think briefly, then write one legal move inside \boxed{}.
+Your move as Black. Write your best legal move inside \boxed{}.
 ```
 
-Each piece's legal moves are shuffled with a per-game seed, and the prompt never shows an example move, so copying the prompt never plays a legal move. Each turn appends the opponent's move and the new pieces to the player's chat. The model's reasoning stays in its history, so a player's whole game packs into one training sample.
+The player's own legal moves are shuffled per piece with a per-game seed (the opponent's are sorted), and the prompt never shows an example move, so copying the prompt never plays a legal move. Each turn appends the opponent's move and the new pieces to the player's chat. The model's reasoning stays in its history, so a player's whole game packs into one training sample.
 
 ## Rewards and advantages
 

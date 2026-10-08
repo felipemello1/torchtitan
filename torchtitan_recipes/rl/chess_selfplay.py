@@ -57,7 +57,7 @@ def rl_chess_qwen3_5_4b(
 ) -> Controller.Config:
     """`max_plies`-ply games on one node: an FSDP=4 trainer and four TP=1 generators.
 
-    A player's history grows ~400 tokens per turn (a ~300-token board plus its reply), so
+    A player's history grows ~600 tokens per turn (a ~500-token turn message plus its reply), so
     `max_rollout_tokens` must cover `max_plies / 2` turns: 28k for 60 plies, 48k for 120.
 
     Each step trains on 16 start positions x 8 games. Half the groups are self-play (up to 2 rollouts per
@@ -206,8 +206,8 @@ def rl_chess_qwen3_5_35b_a3b(
     A turn thinks up to `max_thinking_tokens`; then `ThinkingBudget` closes the thinking and starts
     the answer with "\\boxed{", and the reward loses up to 0.1 for force-closed turns. A player keeps
     its own past thinking in its history (never the opponent's), so the history grows up to
-    ~`max_thinking_tokens` per turn: 120 plies x 1k thinking need up to ~113k of
-    `max_context_tokens`. 120 plies covers p90 of human games below 2000 Elo
+    ~`max_thinking_tokens` per turn: 120 plies x 1k thinking need ~100k of `max_context_tokens`
+    (a ~600-token turn message plus a ~1,050-token reply per turn). 120 plies covers p90 of human games below 2000 Elo
     (research/game_length_by_elo.md in discussion 118).
 
     Host 0 trains: FSDP 2 x TP 2 x EP 4 with Dist-MoE experts, the layout of the 35B Terminal-Bench
@@ -294,6 +294,7 @@ def rl_chess_qwen3_5_35b_a3b(
 
     config.num_generators = 8
     config.async_loop.num_prompts_per_train_step = 192
+    config.async_loop.target_offpolicy_steps = 5
     config.generator.gpu_memory_limit = 0.9
     config.generator.max_num_batched_tokens = 8192
     return config

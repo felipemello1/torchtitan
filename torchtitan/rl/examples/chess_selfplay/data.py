@@ -14,6 +14,7 @@ from typing import Literal
 import chess
 
 from torchtitan.config import Configurable
+from torchtitan.rl.examples.chess_selfplay.openings import OPENINGS
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -41,8 +42,8 @@ class ChessSample:
 
 
 class ChessSelfPlayDataset(Configurable):
-    """Provides training groups: start positions (the standard position after 0 to `max_opening_plies`
-    random legal moves) for self-play, with a `bot_fraction` of groups played against a bot instead.
+    """Provides training groups: start positions (0 to 16 plies into a random line of
+    `openings.OPENINGS`) for self-play, with a `bot_fraction` of groups played against a bot instead.
 
     A bot group draws its bot uniformly from `bots` and its policy color at random. Bot groups are
     spread evenly: with `bot_fraction=0.5`, every other group.
@@ -57,9 +58,6 @@ class ChessSelfPlayDataset(Configurable):
     class Config(Configurable.Config):
         seed: int = 42
 
-        max_opening_plies: int = 2
-        """Random legal plies played before the game starts, drawn uniformly from [0, max_opening_plies]."""
-
         bots: tuple[str, ...] = ()
         """Bot names from `bots.BOTS` for bot groups; empty means self-play only."""
 
@@ -67,7 +65,6 @@ class ChessSelfPlayDataset(Configurable):
         """Fraction of groups played against a bot when `bots` is set."""
 
     def __init__(self, config: Config) -> None:
-        self._max_opening_plies = config.max_opening_plies
         self._bots = config.bots
         self._bot_fraction = config.bot_fraction if config.bots else 0.0
         self._rng = random.Random(config.seed)
@@ -78,7 +75,7 @@ class ChessSelfPlayDataset(Configurable):
         return self
 
     def __next__(self) -> ChessSample:
-        board = _random_opening(self._rng, max_plies=self._max_opening_plies)
+        board = _random_opening(self._rng)
         self._bot_credit += self._bot_fraction
         if self._bot_credit >= 1.0:
             self._bot_credit -= 1.0
@@ -127,14 +124,11 @@ class ChessVsBotDataset(Configurable):
         )
         """Bot names from `bots.BOTS`."""
 
-        max_opening_plies: int = 2
-        """Random legal plies played before the game starts, drawn uniformly from [0, max_opening_plies]."""
-
     def __init__(self, config: Config) -> None:
         rng = random.Random(config.seed)
         self._samples = [
             ChessSample(
-                fen=_random_opening(rng, max_plies=config.max_opening_plies).fen(),
+                fen=_random_opening(rng).fen(),
                 opponent=config.opponents[(game_idx // 2) % len(config.opponents)],
                 policy_color=game_idx % 2 == 0,
                 seed=rng.getrandbits(32),
@@ -159,9 +153,17 @@ class ChessVsBotDataset(Configurable):
         self._position = state_dict["position"]
 
 
-def _random_opening(rng: random.Random, *, max_plies: int) -> chess.Board:
-    """Return the standard position after 0 to `max_plies` random legal plies."""
+def _random_opening(rng: random.Random) -> chess.Board:
+    """Return the position a random number of plies (0 to the whole line) into a random book line.
+
+    Example:
+
+        _random_opening(rng)
+        # e.g. 3 plies into "B22 Sicilian Defense: Heidenfeld Variation": 1. e4 c5 2. c3, Black to move
+    """
+    _, line = rng.choice(OPENINGS)
+    moves = line.split()
     board = chess.Board()
-    for _ in range(rng.randint(0, max_plies)):
-        board.push(rng.choice(list(board.legal_moves)))
+    for san in moves[: rng.randint(0, len(moves))]:
+        board.push_san(san)
     return board

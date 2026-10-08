@@ -34,6 +34,7 @@ from torchtitan.rl.examples.chess_selfplay.bots import (
     centipawn_losses,
     executable_stockfish,
 )
+from torchtitan.rl.examples.chess_selfplay.openings import OPENINGS
 from torchtitan.rl.examples.chess_selfplay.rollouter import EloFit
 from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.observability.controller import compute_rollout_metrics
@@ -344,10 +345,8 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
         init = await white.init()
         prompt = init.init_prompt_messages[0]["content"]
         assert "You are playing chess as White" in prompt
-        assert '"Pe2": [' in prompt and "Black pieces: " in prompt
-        assert prompt.endswith(
-            "Think briefly, then write one legal move inside \\boxed{}."
-        )
+        assert '"Pe2": [' in prompt and "Opponent pieces (Black)" in prompt
+        assert prompt.endswith("Write your best legal move inside \\boxed{}.")
         # no move written as an example, so copying the prompt never plays a move
         assert "\\boxed{e4}" not in prompt and "\\boxed{Nf3}" not in prompt
 
@@ -392,12 +391,39 @@ def test_turn_message_shows_pinned_pieces_without_moves() -> None:
     text = ChessGame(sample=sample, max_plies=40, seed=0).turn_message()
     by_piece = json.loads(text[text.index("{") : text.index("}") + 1])
     assert by_piece["Nc6"] == [] and "Pd7" not in by_piece
-    assert '"Bb5"' in text.split("White pieces: ")[1]
+    block = text.split("Opponent pieces (White)")[1]
+    opponent = json.loads(block[block.index("{") : block.index("}") + 1])
+    assert (
+        "Bxc6+" in opponent["Bb5"]
+    )  # Black is not in check, so White's threats keep their marks
+
+
+def test_opponent_moves_drop_king_captures_and_false_checks() -> None:
+    # Black to move, in check from White's bishop on b5
+    sample = ChessSample(
+        fen="rnbqkbnr/ppp2ppp/8/1B1pp3/4P3/8/PPPP1PPP/RNBQK1NR b KQkq - 1 3",
+        opponent="self",
+    )
+    text = ChessGame(sample=sample, max_plies=40, seed=0).turn_message()
+    block = text.split("Opponent pieces (White)")[1]
+    opponent = json.loads(block[block.index("{") : block.index("}") + 1])
+    assert "Bxe8" not in opponent["Bb5"] and "Bxe8+" not in opponent["Bb5"]
+    assert not any(move.endswith("+") for moves in opponent.values() for move in moves)
+
+
+def test_start_positions_come_from_the_opening_book() -> None:
+    for _, line in OPENINGS:
+        board = chess.Board()
+        for san in line.split():
+            board.push_san(san)  # every book move is legal
+    dataset = ChessSelfPlayDataset.Config().build()
+    starts = {next(dataset).fen for _ in range(50)}
+    assert len(starts) > 25  # many book positions, not only the standard one
 
 
 def test_datasets_are_deterministic_and_resumable() -> None:
-    first = ChessSelfPlayDataset.Config(seed=1, max_opening_plies=3).build()
-    second = ChessSelfPlayDataset.Config(seed=1, max_opening_plies=3).build()
+    first = ChessSelfPlayDataset.Config(seed=1).build()
+    second = ChessSelfPlayDataset.Config(seed=1).build()
     assert [next(first) for _ in range(5)] == [next(second) for _ in range(5)]
     state = first.state_dict()
     expected = [next(first) for _ in range(3)]

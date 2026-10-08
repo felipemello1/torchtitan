@@ -75,10 +75,11 @@ class ChessPlayerEnv(MessageEnv):
         """Show the rules, the board, and the legal moves for this player's first move."""
         rules = (
             f"You are playing chess as {_COLOR_NAMES[self._color]}. Play to win.\n\n"
-            "Each turn you see your pieces, keyed by piece letter and square (Ke1 is a king on e1; "
-            "P is a pawn), with their legal moves, and your opponent's pieces. Think about the "
-            "position, then end your reply with one of your legal moves, written exactly as listed, "
-            "inside \\boxed{}. An illegal or missing move loses the game."
+            "Each turn you see your pieces and your opponent's pieces, keyed by piece letter and "
+            "square (Ke1 is a king on e1; P is a pawn), each with its legal moves. The current "
+            "positions and legal moves are already given: avoid restating them. Analyze which move "
+            "is best, then end your reply with that move, written exactly as listed, inside "
+            "\\boxed{}. An illegal or missing move loses the game."
         )
         return MessageEnvInitOutput(
             init_prompt_messages=[
@@ -222,32 +223,28 @@ class ChessGame:
             self._turn_changed.notify_all()
 
     def turn_message(self) -> str:
-        """The user message for the color to move: the opponent's last move, its own pieces with their
-        legal moves, the opponent's pieces, and the request for a move, last so the model reads it last."""
+        """The user message for the color to move: the opponent's last move, each side's pieces with
+        their moves, and the request for a move, last so the model reads it last."""
         board = self.board
         me, opponent = _COLOR_NAMES[board.turn], _COLOR_NAMES[not board.turn]
         lines = []
         if self._last_move_san is not None:
             lines.append(f"{opponent} played {self._last_move_san}.\n")
         # Pieces keyed by square instead of a board: on a drawn board Qwen3.5-35B spent most of its
-        # thinking counting cells to name squares (no FEN either: it re-parsed it rank by rank). In a
-        # local probe the opponent's moves lowered the legal-move rate (86% vs 95%), so only their pieces.
-        opponent_pieces = [
-            chess.piece_symbol(piece_type).upper() + chess.square_name(square)
-            for piece_type in _PIECE_ORDER
-            for square in board.pieces(piece_type, not board.turn)
-        ]
+        # thinking counting cells to name squares (no FEN either: it re-parsed it rank by rank). The
+        # opponent's moves cost legal moves in a local probe (86% vs 93%); kept to show its threats.
         lines += [
             f"Your pieces ({me}) and their legal moves:",
-            _legal_moves_by_piece(board, self._rng),
+            _moves_by_piece(board, board.turn, self._rng),
             "",
-            f"{opponent} pieces: {json.dumps(opponent_pieces)}",
+            f"Opponent pieces ({opponent}) and the moves they could make on their turn:",
+            _moves_by_piece(board, not board.turn, self._rng),
         ]
         if board.is_check():
             lines += ["", f"{me} is in check."]
         lines += [
             "",
-            f"Your move as {me}. Think briefly, then write one legal move inside \\boxed{{}}.",
+            f"Your move as {me}. Write your best legal move inside \\boxed{{}}.",
         ]
         return "\n".join(lines)
 
@@ -284,10 +281,14 @@ class ChessGame:
         self.end_reason = reason
 
 
-def _legal_moves_by_piece(board: chess.Board, rng: random.Random) -> str:
-    """Each piece of the side to move, keyed by letter and square, with its legal moves in an order
-    shuffled by `rng`: a pinned or blocked piece shows `[]`. In python-chess's order the first listed
-    move is always legal, and always playing it beats a random mover.
+def _moves_by_piece(board: chess.Board, color: chess.Color, rng: random.Random) -> str:
+    """Each piece of `color`, keyed by letter and square, with the moves it could make on its turn: a
+    pinned or blocked piece shows `[]`, a captured one is absent.
+
+    The side to move's moves are shuffled with `rng`: in python-chess's order the first listed move
+    is always legal, and always playing it beats a random mover. The other side's moves are sorted,
+    without king captures, and without check marks when the side to move is in check (every move
+    would read as check).
 
     Example:
 
@@ -298,19 +299,29 @@ def _legal_moves_by_piece(board: chess.Board, rng: random.Random) -> str:
           ...
         }
     """
+    to_move = color == board.turn
+    strip_checks = not to_move and board.is_check()
+    if not to_move:
+        board = board.copy()
+        board.push(chess.Move.null())
     moves: dict[str, list[str]] = {
         chess.piece_symbol(piece_type).upper() + chess.square_name(square): []
         for piece_type in _PIECE_ORDER
-        for square in board.pieces(piece_type, board.turn)
+        for square in board.pieces(piece_type, color)
     }
     for move in board.legal_moves:
+        if board.piece_type_at(move.to_square) == chess.KING:
+            continue
         piece = board.piece_at(move.from_square)
-        moves[piece.symbol().upper() + chess.square_name(move.from_square)].append(
-            board.san(move)
-        )
+        san = board.san(move)
+        key = piece.symbol().upper() + chess.square_name(move.from_square)
+        moves[key].append(san.rstrip("+#") if strip_checks else san)
     rows = []
     for key, listed in moves.items():
-        rng.shuffle(listed)
+        if to_move:
+            rng.shuffle(listed)
+        else:
+            listed.sort()
         rows.append(f'  "{key}": {json.dumps(listed)}')
     return "{\n" + ",\n".join(rows) + "\n}"
 
