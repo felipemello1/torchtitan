@@ -25,6 +25,7 @@ directory goes on PYTHONPATH:
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import gzip
 import json
@@ -44,6 +45,7 @@ from types import SimpleNamespace
 import verifiers.v1 as vf
 from harbor.agents.terminus_2 import Terminus2
 from harbor.environments.base import ExecResult
+from harbor.llms.base import ContextLengthExceededError
 from harbor.models.agent.context import AgentContext
 from harbor.models.trial.paths import EnvironmentPaths
 from harbor.utils.logger import logger as harbor_logger
@@ -54,6 +56,7 @@ from torchtitan.rl.examples.verifiers.terminal_bench.taskset import (
 )
 from verifiers.v1.clients import ModelContext
 from verifiers.v1.configs.harness import HarnessConfig
+from verifiers.v1.errors import HarnessError, SandboxError
 from verifiers.v1.harness import Harness
 from verifiers.v1.runtimes import ProgramResult, Runtime
 from verifiers.v1.task import TaskData
@@ -65,6 +68,8 @@ logger = logging.getLogger(__name__)
 PLUGIN_ID = __name__
 # Each Sandoq rollout owns its VM, so one fixed directory cannot collide.
 _SANDBOX_TMUX_DIR = "/tmp/vf-terminus-2"
+# Terminus-2 pipes its tmux pane here (`EnvironmentPaths.agent_dir / "terminus_2.pane"`).
+_PANE_LOG = f"{_SANDBOX_TMUX_DIR}/terminus_2.pane"
 _WORKDIR_DIRECTIVE = re.compile(r"\s*WORKDIR\s+(\S+)", re.IGNORECASE)
 # Sandoq reaps a persistent shell unused for 1,800 s; refresh it with margin to spare.
 _SHELL_REFRESH_IDLE_S = 1500.0
@@ -137,8 +142,17 @@ class RuntimeEnvironment:
         _ = user
         if cwd is not None:
             command = f"cd {shlex.quote(cwd)} && {command}"
+        if "\0" in command:
+            # Harbor's subprocess exec raises this too. Sandoq would answer HTTP 500, a
+            # SandboxError the agent's retries rerun.
+            raise ValueError("embedded null byte")
+        # Sandoq keeps `setsid bash -lc '<argv>'` alive for the whole exec, so an agent's
+        # `pkill -f x` would kill the exec whose keystrokes contain x. An env var is in no argv.
         result = await asyncio.wait_for(
-            self._runtime.run(["sh", "-c", command], {**self._env, **(env or {})}),
+            self._runtime.run(
+                ["sh", "-c", 'eval "$TERMINUS_EXEC"'],
+                {**self._env, **(env or {}), "TERMINUS_EXEC": command},
+            ),
             timeout_sec,
         )
         return ExecResult(
@@ -177,30 +191,15 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
         system_prompt, prompt = self.resolve_text_prompt(data)
         if prompt is None:
             raise ValueError("Terminus 2 requires a task prompt")
-        try:
-            return await self._run_terminus(
-                runtime,
-                trace,
-                endpoint=endpoint,
-                secret=secret,
-                model=ctx.model,
-                system_prompt=system_prompt,
-                prompt=prompt,
-            )
-        finally:
-            try:
-                await runtime.run(
-                    [
-                        "sh",
-                        "-c",
-                        'tmux kill-server >/dev/null 2>&1 || true; rm -rf "$TMUX_TMPDIR"',
-                    ],
-                    {"TMUX_TMPDIR": _SANDBOX_TMUX_DIR},
-                )
-            except Exception:
-                logger.warning(
-                    "failed to clean up Terminus 2 tmux server", exc_info=True
-                )
+        return await self._run_terminus(
+            runtime,
+            trace,
+            endpoint=endpoint,
+            secret=secret,
+            model=ctx.model,
+            system_prompt=system_prompt,
+            prompt=prompt,
+        )
 
     async def _run_terminus(
         self,
@@ -213,7 +212,8 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
         system_prompt: str | None,
         prompt: str,
     ) -> ProgramResult:
-        """Failures become a nonzero ``ProgramResult``, like the program crashing in the sandbox."""
+        """Raises ``SandboxError`` for a lost exec channel, which the agent's retries rerun on a
+        fresh VM, and ``HarnessError`` for anything else Terminus-2 raised."""
         environment = RuntimeEnvironment(runtime, {"TMUX_TMPDIR": _SANDBOX_TMUX_DIR})
         await environment.exec(
             f"mkdir -p -m 700 {_SANDBOX_TMUX_DIR}; {_USE_SANDOQ_TMUX}"
@@ -253,6 +253,12 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
                 )
 
                 async def call_with_sampled_history(*args, message_history, **kwargs):
+                    if trace.stop_condition:
+                        # Verifiers stopped the rollout (context or turn cap) and answers 400
+                        # from now on; Terminus-2 retries any error but this one.
+                        raise ContextLengthExceededError(
+                            f"Verifiers stopped the rollout: {trace.stop_condition}"
+                        )
                     return await call(
                         *args,
                         message_history=[
@@ -264,12 +270,24 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
 
                 agent._llm.call = call_with_sampled_history
                 await agent.setup(environment)
-                await agent.run(prompt, environment, AgentContext())
-            except Exception:  # noqa: BLE001 - reported like a crashed program
-                launch_log.harness_stderr = traceback.format_exc()
-                return ProgramResult(
-                    exit_code=1, stdout="", stderr=launch_log.harness_stderr
+                # Harbor's default session recording runs the agent's shell under asciinema, so
+                # an `exit` ends the recording, not the session. Nest a shell to match it.
+                await agent._session.send_keys(
+                    keys=["bash", "Enter"], min_timeout_sec=1.0
                 )
+                await agent._session.send_keys(keys=["clear", "Enter"])
+                await agent.run(prompt, environment, AgentContext())
+            except SandboxError:
+                launch_log.harness_stderr = traceback.format_exc()
+                raise
+            except Exception as error:  # noqa: BLE001 - reported like a crashed program
+                launch_log.harness_stderr = traceback.format_exc()
+                # Not exit 1: Verifiers would probe `runtime.alive()` and call a container the agent
+                # stopped (`pkill -9 -f sleep`) a SandboxError, which the retries would rerun.
+                raise HarnessError(
+                    f"harness {self.config.id!r} exited 1: "
+                    f"{launch_log.harness_stderr.strip()[-2000:]}"
+                ) from error
             finally:
                 _launch_log_lines.reset(log_lines_token)
                 # Missing when Terminus-2 failed before running, e.g. in tmux setup.
@@ -279,32 +297,64 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
         return ProgramResult(exit_code=0, stdout="", stderr="")
 
     async def cleanup(self, trace: Trace, runtime: Runtime) -> None:
-        """Write this rollout's log, if `rollout_log_dir` is set.
+        """Write this rollout's log if `rollout_log_dir` is set, then stop its tmux server.
 
-        Verifiers calls this after scoring, also when leasing the VM or starting tmux failed, so
-        those rollouts leave a log too. The log is gzipped JSON:
+        Verifiers calls this after scoring, so test.sh still sees the agent's shell jobs
+        (`python3 server.py &`), as under `harbor run`. It also calls it when leasing the VM or
+        starting tmux failed, so those rollouts leave a log too. The log is gzipped JSON:
 
             {
                 "verifiers_trace_id": "9f2c...",  # logs.verifiers_trace_id in rollout_samples.jsonl
-                "task": ..., "reward": 0.0, "stop_condition": "error",
+                "task": ..., "task_name": "allenai-tmax/task_000000_c19dda5b",
+                "reward": 0.0, "stop_condition": "error",
                 "errors": [...],                   # trace.errors, as in Rollout.logs
                 "timing": {"setup": {"start": ..., "end": ...}, "agent": {...}, ...},
                 "tests": {"exit_code": 1, "stdout": "...", "stderr": ""},  # tests/test.sh
                 "harness_stderr": "Traceback ...",  # what Terminus-2 raised; "" if nothing
                 "terminus_log": "... WARNING harbor.utils.logger: Tool installation exceeded ...",
                 "trajectory": {...},               # Terminus-2's trajectory.json
+                "pane": "root@vm:/app# ls ...",    # the tmux pane log's last 64 KB; None if unreadable
             }
         """
-        launch_log = self._launch_logs.pop(trace.id, LaunchLog())
-        if self.config.rollout_log_dir is None:
+        launch_log = self._launch_logs.get(trace.id)
+        if self.config.rollout_log_dir is not None:
+            # Before kill-server, whose rm -rf deletes the pane log.
+            await self._write_rollout_log(trace, runtime, launch_log or LaunchLog())
+        # Popped only now, so abort() repeats a cleanup cancelled while reading the pane. None:
+        # launch never got to tmux, or an earlier cleanup already stopped it.
+        if self._launch_logs.pop(trace.id, None) is None:
             return
+        try:
+            await runtime.run(
+                [
+                    "sh",
+                    "-c",
+                    'timeout 10 tmux kill-server >/dev/null 2>&1 || true; rm -rf "$TMUX_TMPDIR"',
+                ],
+                {"TMUX_TMPDIR": _SANDBOX_TMUX_DIR},
+            )
+        except Exception:
+            logger.warning("failed to clean up Terminus 2 tmux server", exc_info=True)
+
+    async def _write_rollout_log(
+        self, trace: Trace, runtime: Runtime, launch_log: LaunchLog
+    ) -> None:
         path = Path(self.config.rollout_log_dir) / f"{trace.id}.json.gz"
         # Verifiers' abort() calls cleanup again after a cancelled close(); keep the full log.
         if path.exists():
             return
+        try:
+            # The pane log holds every byte the terminal printed; keep its last 64 KB.
+            result = await runtime.run(
+                ["tail", "-c", str(_MAX_LOG_CHARS), _PANE_LOG], {}
+            )
+            pane = result.stdout if result.exit_code == 0 else None
+        except Exception:  # noqa: BLE001 - e.g. the VM is gone
+            pane = None
         record = {
             "verifiers_trace_id": trace.id,
             "task": trace.task.key,
+            "task_name": trace.task.data.name,
             "reward": trace.reward,
             "stop_condition": trace.stop_condition,
             "errors": [error.model_dump(mode="json") for error in trace.errors],
@@ -313,6 +363,7 @@ class StockTerminusOutsideHarness(Harness[StockTerminusOutsideConfig]):
             "harness_stderr": truncate_middle(launch_log.harness_stderr),
             "terminus_log": truncate_middle("\n".join(launch_log.terminus_log_lines)),
             "trajectory": launch_log.trajectory,
+            "pane": pane,
         }
         # On the event loop, like Terminus-2's trajectory dump after every turn: ~3 ms per log,
         # 48 ms for T3's largest. Level 6 is as small as the default 9 and ~3x faster.
@@ -361,30 +412,37 @@ def truncate_middle(text: str, max_chars: int = _MAX_LOG_CHARS) -> str:
 def restore_sampled_reasoning(message_history: list[dict], trace: Trace) -> list[dict]:
     """Put the sampled reasoning back on assistant messages Terminus-2 re-sends without it.
 
-    Terminus-2 re-sends a turn that hit max_tokens as its truncated text only. Verifiers keys
-    assistant messages on their reasoning, so that copy no longer matches the sampled turn: the
-    next prompt is re-rendered with every earlier turn's thinking stripped, and the rollout forks
-    into a second training sample.
+    Terminus-2 re-sends a max_tokens turn, or any turn with interleaved thinking off, without its
+    reasoning. Verifiers keys assistant messages on their reasoning, so that copy no longer matches
+    the sampled turn and the rollout forks into a second training sample. The n-th re-sent copy of
+    a content gets the reasoning of the n-th sampled turn with that content.
 
     Example:
-        # sampled turn: content='{"analysis": "Wri', reasoning_content="I will write it."
-        restore_sampled_reasoning([{"role": "assistant", "content": '{"analysis": "Wri'}], trace)
-        # -> [{"role": "assistant", "content": '{"analysis": "Wri',
-        #      "reasoning_content": "I will write it."}]
+        # sampled turns: (content="", reasoning_content="A"), then (content="", reasoning_content="B")
+        restore_sampled_reasoning([task, {"role": "assistant", "content": ""}, reply,
+                                   {"role": "assistant", "content": ""}], trace)
+        # -> the first assistant copy gets reasoning_content="A", the second "B"
     """
-    reasoning = {
-        node.message.content or "": node.message.reasoning_content
-        for node in trace.nodes
-        if node.sampled and node.message.reasoning_content
-    }
-    return [
-        {**message, "reasoning_content": reasoning[message["content"] or ""]}
-        if message["role"] == "assistant"
-        and "reasoning_content" not in message
-        and (message["content"] or "") in reasoning
-        else message
-        for message in message_history
-    ]
+    reasoning: dict[str, list[str | None]] = collections.defaultdict(list)
+    for node in trace.nodes:
+        if node.sampled:
+            reasoning[node.message.content or ""].append(node.message.reasoning_content)
+    num_seen: collections.Counter[str] = collections.Counter()
+    restored = []
+    for message in message_history:
+        if message["role"] == "assistant":
+            content = message["content"] or ""
+            index = num_seen[content]
+            num_seen[content] += 1
+            sampled = reasoning.get(content, [])
+            if (
+                "reasoning_content" not in message
+                and index < len(sampled)
+                and sampled[index]
+            ):
+                message = {**message, "reasoning_content": sampled[index]}
+        restored.append(message)
+    return restored
 
 
 class SandoqHarborTask(HarborTask):
