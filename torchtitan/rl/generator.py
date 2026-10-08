@@ -77,6 +77,7 @@ class _RequestMetricsInputs:
     last_token_ts: float = 0.0
     first_token_latency: float = 0.0
     num_generation_tokens: int = 0
+    num_preemptions: int = 0
 
 
 def _extract_request_metrics_inputs(
@@ -97,6 +98,7 @@ def _extract_request_metrics_inputs(
         last_token_ts=stats.last_token_ts,
         first_token_latency=stats.first_token_latency,
         num_generation_tokens=stats.num_generation_tokens,
+        num_preemptions=stats.num_preemptions,
     )
 
 
@@ -132,6 +134,10 @@ def _prepare_generation_request_metrics(
         metric_values[f"{prefix}/queue_time_ms"] = (
             inputs.scheduled_ts - inputs.queued_ts
         ) * 1000
+        # Times vLLM evicted this request to free KV blocks and later re-prefilled it.
+        # TODO: also report the re-prefilled tokens, i.e. the cost. vLLM's prompt-token
+        # stats count only first prefills, so this needs a hook on the scheduler output.
+        metric_values[f"{prefix}/num_preemptions"] = inputs.num_preemptions
 
         if inputs.num_generation_tokens > 0:
             metric_values[f"{prefix}/time_to_first_token_ms"] = (
@@ -755,6 +761,11 @@ class VLLMGenerator(Configurable):
         (prefill + decode, summed over the batch). ``None`` (default) leaves
         vLLM's own engine default in place."""
 
+        watermark: float | None = None
+        """Fraction of KV-cache blocks vLLM keeps free for running requests when it admits new ones.
+        Raise it (e.g. 0.03) if the KV cache fills before ``max_num_seqs`` and vLLM evicts requests to
+        prefill them again later (``generator/num_preemptions`` > 0). ``None`` keeps vLLM's default."""
+
         cuda_graph: VLLMCudaGraphConfig = field(default_factory=VLLMCudaGraphConfig)
         """CUDA graph capture settings for the vLLM engine."""
 
@@ -946,6 +957,8 @@ class VLLMGenerator(Configurable):
         engine_kwargs["max_num_seqs"] = self._max_num_seqs
         if config.max_num_batched_tokens is not None:
             engine_kwargs["max_num_batched_tokens"] = config.max_num_batched_tokens
+        if config.watermark is not None:
+            engine_kwargs["watermark"] = config.watermark
         # Continuous batching requires FCFS scheduling: admission order must equal the
         # broadcast order on every rank
         engine_kwargs["scheduling_policy"] = "fcfs"
