@@ -46,7 +46,7 @@ from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import TokenEnv
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
-from torchtitan.rl.rubric import CorrectLengthPenalty, KimiLengthReward, Rubric
+from torchtitan.rl.rubric import CorrectLengthPenalty, Rubric
 from torchtitan.rl.trainer import Trainer
 
 # TODO: Enable CUDA graphs for RL trainers after eager/graph numerics parity is
@@ -358,7 +358,7 @@ def _apply_length_control(
             max_tokens=max_response_tokens
         )
     elif length_penalty == "kimi":
-        worker.rubric.length_reward = KimiLengthReward.Config(weight=0.1)
+        worker.rubric.length_reward_weight = 0.1
     elif length_penalty != "none":
         raise ValueError(
             f"DOME_V2_LENGTH_PENALTY={length_penalty!r}: correct, kimi or none"

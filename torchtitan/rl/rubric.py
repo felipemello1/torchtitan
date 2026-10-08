@@ -123,47 +123,6 @@ class CorrectLengthPenalty(Configurable):
         return penalties
 
 
-class KimiLengthReward(Configurable):
-    """Kimi k1.5's length reward (arXiv 2501.12599, section 2.3.3), added to each rollout's
-    reward per group.
-
-    Over the group, `lam = 0.5 - (len - min_len) / (max_len - min_len)`. A correct rollout gets
-    `weight * lam`; a wrong one gets `weight * min(0, lam)`, so only its length above the
-    group's midpoint costs it. All lengths equal: 0 for every rollout.
-
-    Example:
-        weight=0.1; lengths 1,000 / 2,000 / 3,000 / 3,000 tokens, the first two correct
-        correct, 1,000 -> 1 + 0.1 * 0.5  = 1.05
-        correct, 2,000 -> 1 + 0.1 * 0.0  = 1.0
-        wrong,   3,000 -> 0 + 0.1 * -0.5 = -0.05
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Configurable.Config):
-        weight: float = 0.1
-        """Scale of the length reward; Kimi k1.5 does not publish its value."""
-
-    def __init__(self, config: Config) -> None:
-        self._weight = config.weight
-
-    def __call__(self, rollouts: list[Rollout], rewards: list[float]) -> list[float]:
-        """Return one length reward per rollout, in group order; a reward > 0 counts as correct."""
-        lengths = [
-            sum(
-                len(rollout_turn.completion_token_ids) for rollout_turn in rollout.turns
-            )
-            for rollout in rollouts
-        ]
-        min_len, max_len = min(lengths), max(lengths)
-        if min_len == max_len:
-            return [0.0] * len(rollouts)
-        length_rewards = []
-        for length, reward in zip(lengths, rewards, strict=True):
-            lam = 0.5 - (length - min_len) / (max_len - min_len)
-            length_rewards.append(self._weight * (lam if reward > 0 else min(0.0, lam)))
-        return length_rewards
-
-
 class Rubric(Configurable):
     """Scores rollouts with a set of weighted reward functions.
 
@@ -196,23 +155,22 @@ class Rubric(Configurable):
 
         forced_answer_scale: float = 1.0
         """Multiplies a positive reward when a `ThinkingBudget` force-closed the last turn's
-        thinking. With a `length_penalty`, natural correct > forced correct > wrong needs
-        max_penalty < forced_answer_scale < 1 - max_penalty."""
+        thinking. With 0/1 rewards and a length reward of weight w, natural correct > forced
+        correct > wrong needs w / 2 < forced_answer_scale < 1 - w."""
 
         length_penalty: CorrectLengthPenalty.Config | None = None
         """Subtracted from each rollout's reward once its group is graded; None: no penalty."""
 
-        length_reward: KimiLengthReward.Config | None = None
-        """Added to each rollout's reward once its group is graded; None: no length reward."""
+        length_reward_weight: float = 0.0
+        """Weight of Kimi k1.5's length reward (`kimi_length_rewards`), added once the group is
+        graded; 0: off. Groups whose lengths differ are never zero-std, so all-correct and
+        all-wrong groups pass `drop_zero_std_reward_groups` and train on length alone."""
 
     def __init__(self, config: Config) -> None:
         self._config = config
         self._reward_fns = [rwd_cfg.build() for rwd_cfg in config.reward_fns]
         self._length_penalty = (
             None if config.length_penalty is None else config.length_penalty.build()
-        )
-        self._length_reward = (
-            None if config.length_reward is None else config.length_reward.build()
         )
 
         # Sanity checks
@@ -276,7 +234,7 @@ class Rubric(Configurable):
         rollouts: list[Rollout],
         env_input: object,
     ) -> list[RubricOutput]:
-        """Score every rollout in one prompt group, then apply `length_penalty` and `length_reward`.
+        """Score every rollout in one prompt group, then apply `length_penalty` and the length reward.
 
         Override for cross-rollout rewards (pairwise comparison, diversity,
         rank normalization).
@@ -305,9 +263,11 @@ class Rubric(Configurable):
                 )
                 for output, penalty in zip(outputs, penalties, strict=True)
             ]
-        if self._length_reward is not None:
-            length_rewards = self._length_reward(
-                rollouts, [output.reward for output in outputs]
+        if self._config.length_reward_weight != 0:
+            length_rewards = kimi_length_rewards(
+                rollouts=rollouts,
+                rewards=[output.reward for output in outputs],
+                weight=self._config.length_reward_weight,
             )
             outputs = [
                 RubricOutput(
@@ -320,3 +280,38 @@ class Rubric(Configurable):
                 for output, length_reward in zip(outputs, length_rewards, strict=True)
             ]
         return outputs
+
+
+def kimi_length_rewards(
+    *, rollouts: list[Rollout], rewards: list[float], weight: float
+) -> list[float]:
+    """Kimi k1.5's length reward (arXiv 2501.12599, section 2.3.3), one per rollout in group order.
+
+    Over the group, `lam = 0.5 - (len - min_len) / (max_len - min_len)`, with `len` the
+    completion tokens of all turns. A correct rollout (reward > 0) gets `weight * lam`; a wrong
+    one gets `weight * min(0, lam)`, so only its length above the group's midpoint costs it. All
+    lengths equal: 0 for every rollout.
+
+    Assumes the mean baseline (`should_std_normalize=False`), as k1.5 does: with std
+    normalization, a group that differs only in length trains at full advantage scale for any
+    `weight`.
+
+    Example:
+        weight=0.1; lengths 1,000 / 2,000 / 1,000 / 3,000 tokens, the first two correct
+        correct, 1,000 -> 0.1 * 0.5          = +0.05
+        correct, 2,000 -> 0.1 * 0.0          =  0.0
+        wrong,   1,000 -> 0.1 * min(0, 0.5)  =  0.0
+        wrong,   3,000 -> 0.1 * min(0, -0.5) = -0.05
+    """
+    lengths = [
+        sum(len(rollout_turn.completion_token_ids) for rollout_turn in rollout.turns)
+        for rollout in rollouts
+    ]
+    min_len, max_len = min(lengths), max(lengths)
+    if min_len == max_len:
+        return [0.0] * len(rollouts)
+    length_rewards = []
+    for length, reward in zip(lengths, rewards, strict=True):
+        lam = 0.5 - (length - min_len) / (max_len - min_len)
+        length_rewards.append(weight * (lam if reward > 0 else min(0.0, lam)))
+    return length_rewards
