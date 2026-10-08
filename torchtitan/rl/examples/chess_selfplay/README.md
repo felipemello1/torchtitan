@@ -18,28 +18,36 @@ Black's first prompt, in full:
 ```text
 You are playing chess as Black. Play to win.
 
-Each turn you see the board and your legal moves. Think about the position, then end your reply with one of your legal moves, written exactly as listed, inside \boxed{}. An illegal or missing move loses the game.
+Each turn you see your pieces, keyed by piece letter and square (Ke1 is a king on e1; P is a pawn), with their legal moves, and your opponent's pieces. Think about the position, then end your reply with one of your legal moves, written exactly as listed, inside \boxed{}. An illegal or missing move loses the game.
 
 White played e4.
 
-Board (uppercase is White, lowercase is Black):
-    a b c d e f g h
-8 | r n b q k b n r | 8
-7 | p p p p p p p p | 7
-6 | . . . . . . . . | 6
-5 | . . . . . . . . | 5
-4 | . . . . P . . . | 4
-3 | . . . . . . . . | 3
-2 | P P P P . P P P | 2
-1 | R N B Q K B N R | 1
-    a b c d e f g h
+Your pieces (Black) and their legal moves:
+{
+  "Ke8": [],
+  "Qd8": [],
+  "Ra8": [],
+  "Rh8": [],
+  "Bc8": [],
+  "Bf8": [],
+  "Nb8": ["Nc6", "Na6"],
+  "Ng8": ["Nh6", "Nf6"],
+  "Pa7": ["a5", "a6"],
+  "Pb7": ["b6", "b5"],
+  "Pc7": ["c6", "c5"],
+  "Pd7": ["d6", "d5"],
+  "Pe7": ["e6", "e5"],
+  "Pf7": ["f6", "f5"],
+  "Pg7": ["g6", "g5"],
+  "Ph7": ["h5", "h6"]
+}
 
-Legal moves: b6 b5 d5 f5 Nh6 c5 a6 Nc6 Na6 c6 g6 e6 h6 a5 f6 e5 d6 Nf6 g5 h5
+White pieces: ["Ke1", "Qd1", "Ra1", "Rh1", "Bc1", "Bf1", "Nb1", "Ng1", "Pa2", "Pb2", "Pc2", "Pd2", "Pf2", "Pg2", "Ph2", "Pe4"]
 
 Your move as Black. Think briefly, then write one legal move inside \boxed{}.
 ```
 
-The legal moves are shuffled with a per-game seed, and the prompt never shows an example move, so copying the prompt never plays a legal move. Each turn appends the opponent's move and the new board to the player's chat. The model's reasoning stays in its history, so a player's whole game packs into one training sample.
+Each piece's legal moves are shuffled with a per-game seed, and the prompt never shows an example move, so copying the prompt never plays a legal move. Each turn appends the opponent's move and the new pieces to the player's chat. The model's reasoning stays in its history, so a player's whole game packs into one training sample.
 
 ## Rewards and advantages
 

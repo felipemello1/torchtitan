@@ -7,6 +7,7 @@
 """Unit tests for the chess self-play example."""
 
 import asyncio
+import json
 import os
 import shutil
 
@@ -343,7 +344,7 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
         init = await white.init()
         prompt = init.init_prompt_messages[0]["content"]
         assert "You are playing chess as White" in prompt
-        assert "Legal moves: " in prompt
+        assert '"Pe2": [' in prompt and "Black pieces: " in prompt
         assert prompt.endswith(
             "Think briefly, then write one legal move inside \\boxed{}."
         )
@@ -371,19 +372,27 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
 def test_legal_moves_are_shuffled_per_game() -> None:
     def listed_moves(seed: int) -> list[str]:
         game = ChessGame(sample=_SELF_PLAY, max_plies=40, seed=seed)
-        line = next(
-            line
-            for line in game.turn_message().splitlines()
-            if line.startswith("Legal moves: ")
-        )
-        return line.removeprefix("Legal moves: ").split()
+        text = game.turn_message()
+        by_piece = json.loads(text[text.index("{") : text.index("}") + 1])
+        return [move for moves in by_piece.values() for move in moves]
 
     board = chess.Board()
     in_generation_order = [board.san(move) for move in board.legal_moves]
     assert sorted(listed_moves(0)) == sorted(in_generation_order)
     assert listed_moves(0) == listed_moves(0)
     assert listed_moves(0) != listed_moves(1)
-    assert listed_moves(0) != in_generation_order
+
+
+def test_turn_message_shows_pinned_pieces_without_moves() -> None:
+    # White's bishop on b5 pins Black's knight on c6 to the king
+    sample = ChessSample(
+        fen="r1bqkbnr/pp2pppp/2n5/1B6/4P3/8/PPPP1PPP/RNBQK1NR b KQkq - 0 1",
+        opponent="self",
+    )
+    text = ChessGame(sample=sample, max_plies=40, seed=0).turn_message()
+    by_piece = json.loads(text[text.index("{") : text.index("}") + 1])
+    assert by_piece["Nc6"] == [] and "Pd7" not in by_piece
+    assert '"Bb5"' in text.split("White pieces: ")[1]
 
 
 def test_datasets_are_deterministic_and_resumable() -> None:

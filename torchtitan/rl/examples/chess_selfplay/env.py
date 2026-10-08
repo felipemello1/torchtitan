@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import random
 import re
@@ -24,6 +25,14 @@ from torchtitan.rl.rollout.environment import (
 )
 
 _COLOR_NAMES = {chess.WHITE: "White", chess.BLACK: "Black"}
+_PIECE_ORDER = (
+    chess.KING,
+    chess.QUEEN,
+    chess.ROOK,
+    chess.BISHOP,
+    chess.KNIGHT,
+    chess.PAWN,
+)
 _PIECE_VALUES = {
     chess.PAWN: 1,
     chess.KNIGHT: 3,
@@ -66,9 +75,10 @@ class ChessPlayerEnv(MessageEnv):
         """Show the rules, the board, and the legal moves for this player's first move."""
         rules = (
             f"You are playing chess as {_COLOR_NAMES[self._color]}. Play to win.\n\n"
-            "Each turn you see the board and your legal moves. Think about the position, then end "
-            "your reply with one of your legal moves, written exactly as listed, inside \\boxed{}. "
-            "An illegal or missing move loses the game."
+            "Each turn you see your pieces, keyed by piece letter and square (Ke1 is a king on e1; "
+            "P is a pawn), with their legal moves, and your opponent's pieces. Think about the "
+            "position, then end your reply with one of your legal moves, written exactly as listed, "
+            "inside \\boxed{}. An illegal or missing move loses the game."
         )
         return MessageEnvInitOutput(
             init_prompt_messages=[
@@ -130,7 +140,7 @@ class ChessGame:
         self._max_plies = max_plies
         self._bot = bot
         self._bot_color = None if bot is None else not sample.policy_color
-        # Shuffles each turn's legal-move list.
+        # Shuffles each piece's legal moves.
         self._rng = random.Random(seed)
         self._last_move_san: str | None = None
         self._forfeiter: chess.Color | None = None
@@ -212,29 +222,32 @@ class ChessGame:
             self._turn_changed.notify_all()
 
     def turn_message(self) -> str:
-        """The user message for the color to move: the opponent's last move, the board, the legal
-        moves in random order, and the request for a move, last so the model reads it last."""
+        """The user message for the color to move: the opponent's last move, its own pieces with their
+        legal moves, the opponent's pieces, and the request for a move, last so the model reads it last."""
         board = self.board
-        legal_moves = [board.san(move) for move in board.legal_moves]
-        # In python-chess's order the first listed move is always legal, and always playing it beats a random mover.
-        self._rng.shuffle(legal_moves)
+        me, opponent = _COLOR_NAMES[board.turn], _COLOR_NAMES[not board.turn]
         lines = []
         if self._last_move_san is not None:
-            lines.append(
-                f"{_COLOR_NAMES[not board.turn]} played {self._last_move_san}.\n"
-            )
+            lines.append(f"{opponent} played {self._last_move_san}.\n")
+        # Pieces keyed by square instead of a board: on a drawn board Qwen3.5-35B spent most of its
+        # thinking counting cells to name squares (no FEN either: it re-parsed it rank by rank). In a
+        # local probe the opponent's moves lowered the legal-move rate (86% vs 95%), so only their pieces.
+        opponent_pieces = [
+            chess.piece_symbol(piece_type).upper() + chess.square_name(square)
+            for piece_type in _PIECE_ORDER
+            for square in board.pieces(piece_type, not board.turn)
+        ]
         lines += [
-            "Board (uppercase is White, lowercase is Black):",
-            # File letters and rank numbers: without them Qwen3.5-35B spent most of its thinking
-            # counting cells to name squares.
-            _board_diagram(board),
-            # No FEN: with it, Qwen3.5 re-parsed the FEN rank by rank until its reply ran out of
-            # tokens (69-78% of cut replies vs 8-15% of finished ones); the board shows the position.
+            f"Your pieces ({me}) and their legal moves:",
+            _legal_moves_by_piece(board, self._rng),
             "",
-            "Legal moves: " + " ".join(legal_moves),
+            f"{opponent} pieces: {json.dumps(opponent_pieces)}",
+        ]
+        if board.is_check():
+            lines += ["", f"{me} is in check."]
+        lines += [
             "",
-            f"Your move as {_COLOR_NAMES[board.turn]}. Think briefly, then write one legal move "
-            "inside \\boxed{}.",
+            f"Your move as {me}. Think briefly, then write one legal move inside \\boxed{{}}.",
         ]
         return "\n".join(lines)
 
@@ -271,23 +284,35 @@ class ChessGame:
         self.end_reason = reason
 
 
-def _board_diagram(board: chess.Board) -> str:
-    """The board with file letters and rank numbers, rank 8 at the top.
+def _legal_moves_by_piece(board: chess.Board, rng: random.Random) -> str:
+    """Each piece of the side to move, keyed by letter and square, with its legal moves in an order
+    shuffled by `rng`: a pinned or blocked piece shows `[]`. In python-chess's order the first listed
+    move is always legal, and always playing it beats a random mover.
 
     Example:
 
-            a b c d e f g h
-        8 | r n b q k b n r | 8
-        ...
-        1 | R N B Q K B N R | 1
-            a b c d e f g h
+        {
+          "Ke1": ["Ke2"],
+          "Qd1": ["Qh5", "Qe2", "Qg4", "Qf3"],
+          "Pd2": ["d4", "d3"],
+          ...
+        }
     """
-    files = "    a b c d e f g h"
-    rows = [
-        f"{rank} | {row} | {rank}"
-        for rank, row in zip(range(8, 0, -1), str(board).splitlines())
-    ]
-    return "\n".join([files, *rows, files])
+    moves: dict[str, list[str]] = {
+        chess.piece_symbol(piece_type).upper() + chess.square_name(square): []
+        for piece_type in _PIECE_ORDER
+        for square in board.pieces(piece_type, board.turn)
+    }
+    for move in board.legal_moves:
+        piece = board.piece_at(move.from_square)
+        moves[piece.symbol().upper() + chess.square_name(move.from_square)].append(
+            board.san(move)
+        )
+    rows = []
+    for key, listed in moves.items():
+        rng.shuffle(listed)
+        rows.append(f'  "{key}": {json.dumps(listed)}')
+    return "{\n" + ",\n".join(rows) + "\n}"
 
 
 def material_score(board: chess.Board) -> float:
