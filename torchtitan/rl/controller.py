@@ -458,11 +458,17 @@ class Controller(Configurable):
         except Exception:
             logger.exception("metrics_processor close failed")
 
-        for i, mesh in enumerate(self._proc_meshes):
-            try:
-                await mesh.stop()
-            except Exception:
-                logger.exception("mesh.stop[%d] failed", i)
+        # Every actor is closed by now, so the meshes can stop in any order.
+        stop_results = await asyncio.gather(
+            *(mesh.stop() for mesh in self._proc_meshes), return_exceptions=True
+        )
+        for i, result in enumerate(stop_results):
+            if isinstance(result, BaseException):
+                logger.error(
+                    "mesh.stop[%d] failed",
+                    i,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
         self._proc_meshes = []
 
     def _get_rank_0_value(self, result):

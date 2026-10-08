@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -302,12 +303,15 @@ class _StubActor:
 
 
 class _StubMesh:
-    def __init__(self, name, events):
+    def __init__(self, name, events, raises=False):
         self._name = name
         self._events = events
+        self._raises = raises
 
     async def stop(self):
         self._events.append(self._name)
+        if self._raises:
+            raise RuntimeError(f"{self._name} failed")
 
 
 def _set_generator_router(rl_trainer, generators):
@@ -338,13 +342,8 @@ def test_shutdown_calls_actor_close_before_mesh_stop():
     asyncio.run(rl_trainer.close())
 
     # Generators close before the rollouter, so their failed replies reach live workers.
-    assert events == [
-        "trainer.close",
-        "generator.close",
-        "rollouter.close",
-        "mesh.stop[0]",
-        "mesh.stop[1]",
-    ]
+    assert events[:3] == ["trainer.close", "generator.close", "rollouter.close"]
+    assert sorted(events[3:]) == ["mesh.stop[0]", "mesh.stop[1]"]
     assert rl_trainer._proc_meshes == []
 
 
@@ -369,6 +368,44 @@ def test_shutdown_closes_all_generators():
         "generator[1].close",
         "mesh.stop[0]",
     ]
+
+
+def test_shutdown_stops_process_meshes_concurrently():
+    barrier = asyncio.Barrier(2)
+
+    class _BlockingMesh:
+        async def stop(self):
+            # A serial stop would wait here forever for the second mesh.
+            await barrier.wait()
+
+    rl_trainer = _make_stub_rl_trainer()
+    rl_trainer._proc_meshes = [_BlockingMesh(), _BlockingMesh()]
+
+    asyncio.run(asyncio.wait_for(rl_trainer.close(), timeout=1))
+
+
+def test_shutdown_continues_after_mesh_stop_failure(caplog):
+    events: list[str] = []
+    rl_trainer = _make_stub_rl_trainer()
+
+    class _SlowMesh:
+        async def stop(self):
+            await asyncio.sleep(0)  # Still running when the other stop fails.
+            events.append("mesh.stop[1]")
+
+    rl_trainer._proc_meshes = [
+        _StubMesh("mesh.stop[0]", events, raises=True),
+        _SlowMesh(),
+    ]
+
+    with caplog.at_level(logging.ERROR, logger="torchtitan.rl.controller"):
+        asyncio.run(rl_trainer.close())
+
+    # mesh.stop[0] raised, but mesh 1 still stopped, the failure was logged, and close did not raise.
+    assert events == ["mesh.stop[0]", "mesh.stop[1]"]
+    assert rl_trainer._proc_meshes == []
+    assert "mesh.stop[0] failed" in caplog.text
+    assert "RuntimeError: mesh.stop[0] failed" in caplog.text
 
 
 def test_shutdown_continues_after_actor_close_failure():
