@@ -864,7 +864,7 @@ class Controller(Configurable):
             window_size=window_size,
         )
 
-        # Overlaps each step's weight handoff (push -> pull -> buffer-slot release) with the next step
+        # Overlaps each step's weight handoff (push -> pull -> buffer-slot release) with the next step's fwd/bwd
         self._weight_sync = WeightSyncManager(
             trainer=self.trainer,
             generator_router=self.generator_router,
@@ -1124,7 +1124,7 @@ class Controller(Configurable):
         NOTE: Weight sync is overlapped with the training step.
         Trainer push:
             - Called after optimizer.step()
-            - Awaited before the next forward/backward (see WeightSyncManager)
+            - Awaited before next optimizer.step (weights changes then)
         Generator pull:
             - Called after push completes.
             - Awaited before next push (weights changes then)
@@ -1172,17 +1172,6 @@ class Controller(Configurable):
                     max_offpolicy_steps=self.config.async_loop.max_offpolicy_steps,
                 )
 
-                # Forward/backward blocks the trainer's loop and would stall a pending push; see WeightSyncManager.
-                # TODO(perf): run forward_backward_steps off the trainer's event loop (asyncio.to_thread) so the
-                #   push overlaps it again, taking its 0.2-0.4 s off the critical path. Not done: the push's GPU
-                #   copy would queue behind forward/backward kernels on the shared default stream, its bf16 copy
-                #   would live through forward/backward again, and CUDA/NCCL per-thread state needs a review.
-                with (
-                    sl.log_trace_span("wait_for_push"),
-                    step_timer.record("timing/step/wait_for_push"),
-                ):
-                    push_metrics = await self._weight_sync.wait_prev_push()
-
                 # TODO(async): can't stream microbatches (interleave pack->train) -- the loss is normalized by
                 #   global counts over ALL microbatches, needed before any fwd/bwd. To
                 #   support streaming, accumulate raw loss/token counts across microbatches and scale before optimizer.
@@ -1201,6 +1190,13 @@ class Controller(Configurable):
                     if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
                         logger.error("Loss is NaN/Inf; training diverged")
                         break
+
+                # Await trainer weight push before the optimizer mutates the weights.
+                with (
+                    sl.log_trace_span("wait_for_push"),
+                    step_timer.record("timing/step/wait_for_push"),
+                ):
+                    push_metrics = await self._weight_sync.wait_prev_push()
 
                 with (
                     sl.log_trace_span("optimizer_step"),
@@ -1228,7 +1224,7 @@ class Controller(Configurable):
                 ):
                     pull_metrics = await self._weight_sync.wait_prev_pull()
 
-                # Overlap this step's push with the next batch wait, and its pull + slot release with the next fwd/bwd.
+                # Overlap this step's push -> pull -> buffer-slot release with the next step's fwd/bwd.
                 self._weight_sync.start_async_push_pull(
                     version=optimizer_result.policy_version
                 )

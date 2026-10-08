@@ -125,8 +125,8 @@ def compute_perf_ratio_metrics(
         phase: seconds.get(f"timing/step/{phase}")
         for phase in (
             "wait_for_training_batch",
-            "wait_for_push",
             "forward_backward",
+            "wait_for_push",
             "optimizer",
             "wait_for_pull",
         )
