@@ -124,6 +124,59 @@ def test_intellect3_dataset_keeps_partially_solved_problems(monkeypatch) -> None
     assert r"Answer: \boxed{" in samples[0].prompt
 
 
+def _intellect3_dataset(
+    monkeypatch, rows: list[tuple[str, str]]
+) -> Intellect3MathDataset:
+    def load_dataset(repo_id, subset, *, split):
+        del repo_id, subset, split
+        return Dataset.from_list(
+            [
+                {
+                    "question": question,
+                    "answer": answer,
+                    "avg@8_qwen3_4b_thinking_2507": 0.5,
+                }
+                for question, answer in rows
+            ]
+        )
+
+    monkeypatch.setattr(math_data, "load_dataset", load_dataset)
+    return Intellect3MathDataset.Config(shuffle=False).build()
+
+
+def test_intellect3_dataset_drops_multiple_choice_and_one_letter_golds(
+    monkeypatch,
+) -> None:
+    # Shortened INTELLECT-3-RL rows: a boxed `C` scores 0 against gold `135`, and ` n `
+    # only names the variable. The last three merely look like option lists.
+    rows = [
+        (r"What is $\tfrac1A+\tfrac1B$? A) 133 B) 134 C) 135 D) 136 E) 137", "135"),
+        ("Find the volume.\n- **A)** $1024$\n- **B)** $1200$\n- **C)** $1280$", "1280"),
+        (r"For which positive integers $n$ is $x^n+(x+1)^n$ an integer?", " n "),
+        ("Menchikov A.B.  Find all pairs of natural numbers a and k.", "1,k"),
+        (r"In triangle ABC, $\angle A: \angle B: \angle C=2: 3: 4$. Find AC.", "26"),
+        (r"In triangle ABC, find $\cos(3A)+\cos(3B)+\cos(3C)$.", "1"),
+    ]
+    dataset = _intellect3_dataset(monkeypatch, rows)
+    assert [next(dataset).ground_truth for _ in range(4)] == ["1,k", "26", "1", "1,k"]
+
+
+def test_intellect3_dataset_unescapes_golds(monkeypatch) -> None:
+    # Real golds, stored JSON-escaped: Math-Verify reads `0 \\text{ or } 5` as 5.
+    rows = [
+        ("q0", r"0 \\text{ or } 5"),
+        ("q1", r"\\{1/2, 2\\}"),
+        ("q2", r"\\frac{1}{2}"),
+        ("q3", r"\sqrt{2}"),
+    ]
+    dataset = _intellect3_dataset(monkeypatch, rows)
+    golds = [next(dataset).ground_truth for _ in range(4)]
+    assert golds == [r"0 \text{ or } 5", r"\{1/2, 2\}", r"\frac{1}{2}", r"\sqrt{2}"]
+    assert score_math_response(r"\boxed{0 \text{ or } 5}", golds[0]) == 1.0
+    assert score_math_response(r"\boxed{5}", golds[0]) == 0.0
+    assert score_math_response(r"\boxed{\{\frac12, 2\}}", golds[1]) == 1.0
+
+
 def test_env_is_single_turn() -> None:
     env = DapoMathEnv.Config().build(
         env_input=DapoMathSample(prompt="solve me", ground_truth="3"),
