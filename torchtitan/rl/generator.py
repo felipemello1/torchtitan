@@ -134,9 +134,10 @@ def _prepare_generation_request_metrics(
         metric_values[f"{prefix}/queue_time_ms"] = (
             inputs.scheduled_ts - inputs.queued_ts
         ) * 1000
-        # Times vLLM evicted this request to free KV blocks and later re-prefilled it.
-        # TODO: also report the re-prefilled tokens, i.e. the cost. vLLM's prompt-token
-        # stats count only first prefills, so this needs a hook on the scheduler output.
+        # Times vLLM preempted this request and later re-prefilled it: because the KV cache was full,
+        # or at a weight sync with reset_kv_cache_on_weight_sync, which preempts every running request.
+        # TODO: also log re-prefilled tokens (the cost). vLLM counts them per engine step, so they belong
+        # in VllmOtelStatLogger: SchedulerStats.prefix_cache_stats.preempted_queries - preempted_hits.
         metric_values[f"{prefix}/num_preemptions"] = inputs.num_preemptions
 
         if inputs.num_generation_tokens > 0:
@@ -785,9 +786,11 @@ class VLLMGenerator(Configurable):
         vLLM's own engine default in place."""
 
         watermark: float | None = None
-        """Fraction of KV-cache blocks vLLM keeps free for running requests when it admits new ones.
-        Raise it (e.g. 0.03) if the KV cache fills before ``max_num_seqs`` and vLLM evicts requests to
-        prefill them again later (``generator/num_preemptions`` > 0). ``None`` keeps vLLM's default."""
+        """Fraction of KV-cache blocks vLLM keeps free when it admits waiting or preempted requests.
+        Raise it (e.g. 0.03) if the KV cache fills before ``max_num_seqs`` and ``generator/num_preemptions``
+        stays high; it costs up to that fraction of concurrency. With ``reset_kv_cache_on_weight_sync``,
+        each weight sync adds one preemption per running request, so a count above 0 is not enough.
+        ``None`` follows vLLM's default (0.0, no reserve) instead of pinning it."""
 
         cuda_graph: VLLMCudaGraphConfig = field(default_factory=VLLMCudaGraphConfig)
         """CUDA graph capture settings for the vLLM engine."""
