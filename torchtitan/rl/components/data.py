@@ -26,6 +26,10 @@ class RLDataset(Configurable, ABC):
     class Config(Configurable.Config):
         pass
 
+    def mark_solved(self, sample: object) -> None:
+        """Called when every rollout of a consumed group of `sample` was solved. By default nothing
+        changes; a dataset may skip `sample` in later epochs."""
+
 
 class RLDataLoader(Stateful, ABC, Configurable):
     """Checkpointable iterator of globally identified RL inputs.
@@ -48,8 +52,10 @@ class RLDataLoader(Stateful, ABC, Configurable):
         ...
 
     @abstractmethod
-    def acknowledge(self, indices: Iterable[int]) -> None:
-        ...
+    def acknowledge(
+        self, indices: Iterable[int], *, solved_indices: Iterable[int] = ()
+    ) -> None:
+        """Forget the consumed `indices`; `solved_indices`, a subset, also reach the dataset's `mark_solved`."""
 
 
 class IterableRLDataLoader(RLDataLoader):
@@ -90,10 +96,15 @@ class IterableRLDataLoader(RLDataLoader):
         self._pending[index] = sample
         return index, sample
 
-    def acknowledge(self, indices: Iterable[int]) -> None:
+    def acknowledge(
+        self, indices: Iterable[int], *, solved_indices: Iterable[int] = ()
+    ) -> None:
+        solved = set(solved_indices)
         for index in indices:
             if index not in self._pending:
                 raise RuntimeError(f"cannot acknowledge an unyielded index {index}")
+            if index in solved:
+                self._dataset.mark_solved(self._pending[index])
             del self._pending[index]
 
     def state_dict(self) -> dict[str, Any]:
@@ -183,7 +194,12 @@ class MapStyleRLDataLoader(RLDataLoader):
         self._pending.add(index)
         return index, self._dataset[index]
 
-    def acknowledge(self, indices: Iterable[int]) -> None:
+    def acknowledge(
+        self, indices: Iterable[int], *, solved_indices: Iterable[int] = ()
+    ) -> None:
+        # TODO: skip solved rows here too, by advancing `_next_index` past them. Needs the
+        # shuffled index -> row map; no map-style RL dataset uses it yet.
+        del solved_indices
         for index in indices:
             if index not in self._pending:
                 raise RuntimeError(f"cannot acknowledge an unyielded index {index}")

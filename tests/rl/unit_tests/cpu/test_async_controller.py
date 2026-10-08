@@ -169,6 +169,20 @@ def test_batcher_carries_metric_only_groups_until_trainable_batch() -> None:
     assert batch.group_ids == [0, 1]
 
 
+def test_batcher_reports_solved_groups_including_metric_only_ones() -> None:
+    batcher = _build_batcher(num_prompts_per_train_step=1)
+    solved_zero_std = TrainingSampleGroup(
+        group_id=0, training_samples=[], metrics=[], solved=True
+    )
+    batcher.add_training_samples(training_sample_group=solved_zero_std)
+    batch, _ = batcher.add_training_samples(
+        training_sample_group=_trainable_group(1, num_samples=2)
+    )
+    assert batch is not None
+    assert batch.group_ids == [0, 1]
+    assert batch.solved_group_ids == [0]
+
+
 def test_batcher_prepares_per_depth_mtp_token_counts() -> None:
     batcher = _build_batcher(num_prompts_per_train_step=1, num_mtp_layers=2)
     batch, _ = batcher.add_training_samples(
