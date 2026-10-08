@@ -257,7 +257,10 @@ def build_inference_engine(config: Controller.Config) -> LLMEngine:
         num_group_workers * async_loop.num_samples_per_prompt,
         async_loop.validation.steps,
     )
-    max_num_seqs = min((rollout_concurrency + gen_dp - 1) // gen_dp, 512)
+    max_num_seqs = min(
+        (rollout_concurrency + gen_dp - 1) // gen_dp,
+        async_loop.max_num_seqs_per_generator,
+    )
     engine_kwargs["max_num_seqs"] = max_num_seqs
     expert_sequence_parallel_size = gen_config.parallelism.expert_sequence_parallel_size
     vllm_compilation_config = gen_config.cuda_graph.get_vllm_compilation_config(
