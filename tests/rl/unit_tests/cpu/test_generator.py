@@ -36,6 +36,7 @@ from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.distributed.routing.strategies import LeastLoadedRoutingStrategy
+from torchtitan.rl.distributed.routing.types import KVCacheBudget
 from torchtitan.rl.generator import (
     _extract_request_metrics_inputs,
     _prepare_generation_request_metrics,
@@ -57,6 +58,12 @@ from torchtitan.rl.observability import metrics as m
 from vllm import SamplingParams
 from vllm.logprobs import FlatLogprobs, Logprob
 from vllm.sampling_params import RequestOutputKind
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+)
 
 
 class _FakeRenderer:
@@ -226,6 +233,49 @@ def test_process_finished_requests_releases_dp_router_load():
 
 
 # --- SamplingParams contract (must match the batched path exactly) ---
+
+
+def test_kv_cache_budget_matches_vllm_capacity():
+    # Qwen3.5-35B-A3B on one GB300: 1 attention group and 3 Gated-DeltaNet groups in align mode.
+    attention = FullAttentionSpec(
+        block_size=1152, num_kv_heads=2, head_size=256, dtype=torch.bfloat16
+    )
+    gdn = MambaSpec(
+        block_size=1152,
+        shapes=((2, 4, 8192), (32, 128, 128)),
+        dtypes=(torch.bfloat16, torch.float32),
+        mamba_type="gdn_attention",
+    )
+    groups = [KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=attention)] + [
+        KVCacheGroupSpec(layer_names=[f"gdn{i}"], kv_cache_spec=gdn) for i in range(3)
+    ]
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8169, kv_cache_tensors=[], kv_cache_groups=groups
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=1152, mamba_cache_mode="align")
+    )
+    scheduler = SimpleNamespace(kv_cache_config=kv_cache_config)
+    generator = SimpleNamespace(
+        _engine=SimpleNamespace(
+            vllm_config=vllm_config,
+            engine_core=SimpleNamespace(
+                engine_core=SimpleNamespace(scheduler=scheduler)
+            ),
+        ),
+        _dp_degree=1,
+    )
+
+    budget = VLLMGenerator.kv_cache_budget(generator)
+
+    assert budget == KVCacheBudget(
+        num_blocks=8169,
+        block_size=1152,
+        num_growing_groups=1,
+        fixed_blocks_per_session=6,
+    )
+    # vLLM logs "GPU KV cache size: 8,922,726 tokens" for 131,072-token requests.
+    assert int(8169 / budget.session_blocks(131072) * 131072) == 8922726
 
 
 def test_build_sampling_params_matches_contract():
