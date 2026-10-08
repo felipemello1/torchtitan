@@ -248,9 +248,10 @@ def test_group_is_solved_when_every_reward_is_above_the_threshold() -> None:
         return builder.build_from_group(rollout_group=rollout_group).solved
 
     assert solved([1.0, 1.0])  # zero std, dropped from training
-    assert solved([1.05, 0.95])  # right answers with a length reward, still trained
+    assert solved([1.05, 0.95])  # right answers shaped by a bonus, still trained
     assert not solved([1.0, 0.0])
-    assert not solved([0.5, 0.5])  # right, but scored down
+    assert not solved([0.9, 1.0])  # strictly above the threshold
+    assert not solved([0.5, 0.5])  # partial credit
     failed = builder.build_from_group(
         rollout_group=RolloutGroup(group_id=0, rollouts=[])
     )
