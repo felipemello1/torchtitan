@@ -301,4 +301,8 @@ def rl_chess_qwen3_5_35b_a3b(
     # evicted before its next turn. Start new games only while the live ones fit; 0.9 leaves room
     # for sessions that join placed groups and for estimate error.
     config.generator_router.kv_admission_limit = 0.9
+    # Self-play groups open 2 sessions per game; bot groups (8) over-reserve until they finish.
+    config.generator_router.kv_admission_sessions_per_group = (
+        2 * config.async_loop.num_samples_per_prompt
+    )
     return config
