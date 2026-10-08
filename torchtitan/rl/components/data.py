@@ -27,8 +27,9 @@ class RLDataset(Configurable, ABC):
         pass
 
     def mark_solved(self, sample: object) -> None:
-        """Called when every rollout of a consumed group of `sample` was solved. By default nothing
-        changes; a dataset may skip `sample` in later epochs."""
+        """Called at the acknowledgement when a consumed group of `sample` came back solved. No-op
+        here; a dataset may skip `sample` later. Runs on the event loop while `__next__` may run
+        in a thread."""
 
 
 class RLDataLoader(Stateful, ABC, Configurable):
@@ -75,8 +76,12 @@ class IterableRLDataLoader(RLDataLoader):
 
     def __init__(self, config: Config) -> None:
         dataset = config.dataset.build()
-        if not isinstance(dataset, Iterable) or not isinstance(dataset, Stateful):
-            raise ValueError("RL dataset must be a stateful iterable")
+        if not (
+            isinstance(dataset, RLDataset)
+            and isinstance(dataset, Iterable)
+            and isinstance(dataset, Stateful)
+        ):
+            raise ValueError("RL dataset must be a stateful, iterable RLDataset")
         self._dataset: Stateful = dataset
         self._iterator: Iterator[object] = iter(dataset)
         self._next_index = 0

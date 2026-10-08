@@ -74,7 +74,7 @@ class _CyclingDataset(RLDataset):
             self._rng.shuffle(self._order)
         self._position = 0
         self._skip_solved_prompts = skip_solved_prompts
-        # Rows stay in `_order`, so a saved order still matches; `__next__` skips solved ones.
+        # Empty unless `skip_solved_prompts`. Rows stay in `_order`, so a saved order still matches.
         self._solved_rows: set[int] = set()
         # Maps a sample back to its row for `mark_solved`; no math dataset has duplicate samples.
         self._row_index_by_sample = {
@@ -88,8 +88,7 @@ class _CyclingDataset(RLDataset):
         while True:
             if self._position == len(self._order):
                 # Checked at each epoch: `mark_solved` can solve the last row during a scan.
-                num_unsolved = len(self._samples) - len(self._solved_rows)
-                if self._skip_solved_prompts and num_unsolved == 0:
+                if len(self._solved_rows) == len(self._samples):
                     raise RuntimeError(
                         f"every row is solved ({len(self._samples)} rows); "
                         "set skip_solved_prompts=False to draw them again"
@@ -101,13 +100,17 @@ class _CyclingDataset(RLDataset):
                 self._position = 0
             row_index = self._order[self._position]
             self._position += 1
-            if not self._skip_solved_prompts or row_index not in self._solved_rows:
+            if row_index not in self._solved_rows:
                 return self._samples[row_index]
 
     def mark_solved(self, sample: DapoMathSample) -> None:
-        """With `skip_solved_prompts`, skip `sample`'s row in later epochs."""
-        if self._skip_solved_prompts:
-            self._solved_rows.add(self._row_index_by_sample[sample])
+        """With `skip_solved_prompts`, skip `sample`'s row in later epochs.
+
+        A replayed sample whose row text changed since the save is no longer a row; it is ignored.
+        """
+        row_index = self._row_index_by_sample.get(sample)
+        if self._skip_solved_prompts and row_index is not None:
+            self._solved_rows.add(row_index)
 
     def state_dict(self) -> dict:
         """Snapshot row order, position and solved rows so resume continues the same stream."""
@@ -130,8 +133,10 @@ class _CyclingDataset(RLDataset):
         self._rng.setstate(state_dict["rng_state"])
         self._order = list(state_dict["order"])
         self._position = state_dict["position"]
-        # A state saved before `solved_rows` existed loads with no row solved.
-        self._solved_rows = set(state_dict.get("solved_rows", ()))
+        # Off: solved rows are drawn again, and the next save drops them.
+        if self._skip_solved_prompts:
+            # `.get` lets the skip be turned on at the resume of a run saved before it existed.
+            self._solved_rows = set(state_dict.get("solved_rows", ()))
 
 
 class DapoMathDataset(_CyclingDataset):

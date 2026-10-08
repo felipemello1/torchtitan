@@ -51,8 +51,9 @@ class TrainingSampleBuilder(Configurable):
         """Drop zero-reward-variance groups;"""
 
         solved_reward_above: float = 0.9
-        """A group is solved when every reward is above this. 0.9, not 0: a right answer scored
-        down (e.g. a forced one, ~0.5) does not count. A dataset may skip a solved prompt later."""
+        """A group is solved when every reward is above this; see `RLDataset.mark_solved`. Assumes a
+        correct answer scores near 1 and anything else below this: a reward shaping that moves correct
+        answers below it turns the skip off."""
 
     def __init__(self, config: Config) -> None:
         self.config = config

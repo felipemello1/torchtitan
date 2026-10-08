@@ -10,6 +10,8 @@ the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID
 import asyncio
 import json
 import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -19,6 +21,7 @@ from torchtitan.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
+from torchtitan.rl.controller import Controller
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
@@ -26,7 +29,13 @@ from torchtitan.rl.observability.controller import (
     MetricsTimer,
 )
 from torchtitan.rl.rollout import RolloutGroup
-from torchtitan.rl.types import RolloutTurnID, TrainingSample, TrainingSampleGroup
+from torchtitan.rl.types import (
+    OptimizerStepOutput,
+    RolloutTurnID,
+    TrainerStepBatch,
+    TrainingSample,
+    TrainingSampleGroup,
+)
 
 
 def test_controller_config_maybe_log(tmp_path, caplog) -> None:
@@ -181,6 +190,66 @@ def test_batcher_reports_solved_groups_including_metric_only_ones() -> None:
     assert batch is not None
     assert batch.group_ids == [0, 1]
     assert batch.solved_group_ids == [0]
+
+
+def test_trainer_loop_acknowledges_solved_groups_before_saving_the_state() -> None:
+    def rank_0(value):
+        return SimpleNamespace(get=lambda rank: value)
+
+    calls = []
+    rollouter = SimpleNamespace(
+        sync_log_step=AsyncMock(),
+        acknowledge_training_sample_ids=lambda sample_ids, *, solved_ids: calls.append(
+            ("acknowledge", list(sample_ids), list(solved_ids))
+        ),
+        state_dict=lambda: calls.append(("state_dict",)) or {},
+    )
+    optim_step_output = OptimizerStepOutput(policy_version=1, metrics={})
+    controller = Controller.__new__(Controller)
+    controller.start_step = 0
+    controller._trainer_policy_version = 0
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(target_offpolicy_steps=1, max_offpolicy_steps=None)
+    )
+    controller._rollouter = rollouter
+    controller.trainer = SimpleNamespace(
+        sync_log_step=SimpleNamespace(call=AsyncMock()),
+        forward_backward=SimpleNamespace(
+            call=AsyncMock(return_value=rank_0({"loss/mean": 0.0}))
+        ),
+        optim_step=SimpleNamespace(
+            call=AsyncMock(return_value=rank_0(optim_step_output))
+        ),
+    )
+    controller.generator_router = SimpleNamespace(
+        sync_log_step=SimpleNamespace(call_one=AsyncMock())
+    )
+    controller._weight_sync = SimpleNamespace(
+        wait_prev_push=AsyncMock(return_value=[]),
+        wait_prev_pull=AsyncMock(return_value=[]),
+        start_async_push_pull=MagicMock(),
+        wait_inflight_push_pull=AsyncMock(),
+    )
+    controller.metrics_processor = MagicMock()
+    controller._group_buffer = SimpleNamespace(metrics=lambda: [])
+    batch = TrainerStepBatch(
+        microbatches=[],
+        global_loss_token_counts=torch.ones(1),
+        global_routing_token_counts=torch.ones(1),
+        metrics=[],
+        group_ids=[0, 1],
+        solved_group_ids=[1],
+        min_policy_versions=[0],
+    )
+
+    async def train_one_step() -> None:
+        queue = asyncio.Queue()
+        queue.put_nowait(batch)
+        await controller._trainer_loop(queue, num_training_steps=1)
+
+    asyncio.run(train_one_step())
+    # The saved state already reflects the acknowledgement, solved subset included.
+    assert calls == [("acknowledge", [0, 1], [1]), ("state_dict",)]
 
 
 def test_batcher_prepares_per_depth_mtp_token_counts() -> None:

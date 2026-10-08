@@ -163,7 +163,7 @@ class TrainerStepBatch:
     group_ids: list[int]
     """Every consumed rollout group, including metric-only groups."""
     solved_group_ids: list[int]
-    """The `group_ids` whose group was solved; acknowledged as solved to the dataloader."""
+    """The subset of `group_ids` whose group came back solved."""
     # one per packed training_sample; trainer computes policy_age at consume time
     min_policy_versions: list[int]
 

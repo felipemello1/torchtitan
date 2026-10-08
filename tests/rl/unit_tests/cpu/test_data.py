@@ -24,9 +24,13 @@ class _StatefulDataset(RLDataset):
     def __init__(self, config: Config) -> None:
         del config
         self.position = 0
+        self.solved: list[int] = []
 
     def __iter__(self):
         return self
+
+    def mark_solved(self, sample: int) -> None:
+        self.solved.append(sample)
 
     def __next__(self):
         value = self.position
@@ -173,3 +177,17 @@ def test_iterable_loader_replay_must_be_yielded_before_acknowledgement() -> None
     with pytest.raises(RuntimeError):
         restored.acknowledge([0])
     assert next(restored) == (0, 0)
+
+
+def test_iterable_loader_passes_solved_samples_to_the_dataset() -> None:
+    loader = IterableRLDataLoader.Config(dataset=_StatefulDataset.Config()).build()
+    assert [next(loader) for _ in range(3)] == [(0, 0), (1, 1), (2, 2)]
+    loader.acknowledge([0, 1], solved_indices=[1])
+    assert loader._dataset.solved == [1]
+
+    # Sample 2 is replayed after the resume and still reaches `mark_solved`.
+    restored = IterableRLDataLoader.Config(dataset=_StatefulDataset.Config()).build()
+    restored.load_state_dict(loader.state_dict())
+    assert next(restored) == (2, 2)
+    restored.acknowledge([2], solved_indices=[2])
+    assert restored._dataset.solved == [2]
