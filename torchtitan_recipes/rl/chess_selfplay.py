@@ -199,7 +199,8 @@ def rl_chess_qwen3_5_4b(
 def rl_chess_qwen3_5_35b_a3b(
     max_plies: int = 120, max_thinking_tokens: int = 1024
 ) -> Controller.Config:
-    """Qwen3.5-35B-A3B (instruct) with thinking on, 150 steps on two GB300 hosts.
+    """Qwen3.5-35B-A3B (instruct) with thinking on, 150 steps on three GB300 hosts, 32 positions x 8
+    games per step.
 
     A turn thinks up to `max_thinking_tokens`; then `ThinkingBudget` closes the thinking and starts
     the answer with "\\boxed{", and the reward loses up to 0.1 for force-closed turns. A player keeps
@@ -208,7 +209,8 @@ def rl_chess_qwen3_5_35b_a3b(
     of human games below 2000 Elo (research/game_length_by_elo.md in discussion 118).
 
     Host 0 trains: FSDP 2 x TP 2 x EP 4 with Dist-MoE experts, the layout of the 35B Terminal-Bench
-    runs. Host 1 runs four one-GPU generators, each with every expert, FULL CUDA graphs.
+    runs. Hosts 1-2 run eight one-GPU generators, each with every expert, FULL CUDA graphs: with
+    thinking on, generation is the bottleneck.
     """
     # room for the answer after the thinking ends, forced or not
     max_response_tokens = max_thinking_tokens + 512
@@ -278,6 +280,8 @@ def rl_chess_qwen3_5_35b_a3b(
         last_save_model_only=False,
     )
 
+    config.num_generators = 8
+    config.async_loop.num_prompts_per_train_step = 32
     config.generator.gpu_memory_limit = 0.9
     config.generator.max_num_batched_tokens = 8192
     return config
