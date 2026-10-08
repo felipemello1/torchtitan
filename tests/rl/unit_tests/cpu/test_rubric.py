@@ -14,7 +14,12 @@ import pytest
 from torchtitan.rl.observability.controller import compute_rollout_metrics
 from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
-from torchtitan.rl.rubric import CorrectLengthPenalty, RewardFn, Rubric
+from torchtitan.rl.rubric import (
+    CorrectLengthPenalty,
+    KimiLengthReward,
+    RewardFn,
+    Rubric,
+)
 from torchtitan.rl.types import RolloutTurnID
 
 RIGHT, WRONG = 7, 8
@@ -110,6 +115,29 @@ def test_correct_length_penalty() -> None:
     # A correct reward below `max_penalty` pays at most itself, never dropping below a wrong one.
     tiny = replace(rubric, forced_answer_scale=0.05)
     assert _score(tiny, rollouts)[11] == 0.0
+
+
+def test_kimi_length_reward() -> None:
+    rubric = Rubric.Config(
+        reward_fns=[_RewardLastToken.Config()],
+        forced_answer_scale=0.5,
+        length_reward=KimiLengthReward.Config(weight=0.1),
+    )
+    # lam = 0.5 - (len - 1000) / 2000: +0.5, 0, -0.5 at 1,000 / 2,000 / 3,000 tokens.
+    rollouts = [
+        _rollout(1000, answer=RIGHT),
+        _rollout(2000, answer=RIGHT),
+        _rollout(3000, answer=RIGHT, forced=True),
+        _rollout(1000, answer=WRONG),  # a short wrong answer is not rewarded
+        _rollout(3000, answer=WRONG),
+    ]
+    rewards = _score(rubric, rollouts)
+    assert rewards == pytest.approx([1.05, 1.0, 0.45, 0.0, -0.05])
+    # All lengths equal: no length reward.
+    assert _score(rubric, [_rollout(10, answer=RIGHT), _rollout(10, answer=WRONG)]) == [
+        1.0,
+        0.0,
+    ]
 
 
 def test_rollout_metrics_split_forced_answers() -> None:

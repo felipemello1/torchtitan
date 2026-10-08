@@ -46,7 +46,7 @@ from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import TokenEnv
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
-from torchtitan.rl.rubric import CorrectLengthPenalty, Rubric
+from torchtitan.rl.rubric import CorrectLengthPenalty, KimiLengthReward, Rubric
 from torchtitan.rl.trainer import Trainer
 
 # TODO: Enable CUDA graphs for RL trainers after eager/graph numerics parity is
@@ -341,7 +341,9 @@ def _apply_length_control(
 
     Thinking still open 4,096 tokens before the cap gets a forced close plus
     `Answer: \\boxed{`, and a correct forced answer is worth half. `DOME_V2_FORCED_ANSWER=0`
-    turns that off; `DOME_V2_LENGTH_PENALTY=none` turns off the `CorrectLengthPenalty`.
+    turns that off. `DOME_V2_LENGTH_PENALTY`: "correct" (default) for the `CorrectLengthPenalty`,
+    "kimi" for Kimi k1.5's length reward (turn it on at a resume, after plain-RL steps, as
+    k1.5 does), "none" for neither.
     """
     worker = config.rollouter.worker
     if os.environ.get("DOME_V2_FORCED_ANSWER", "1") == "1":
@@ -350,9 +352,16 @@ def _apply_length_control(
             answer_prefix="Answer: \\boxed{",
         )
         worker.rubric.forced_answer_scale = 0.5
-    if os.environ.get("DOME_V2_LENGTH_PENALTY", "correct") == "correct":
+    length_penalty = os.environ.get("DOME_V2_LENGTH_PENALTY", "correct")
+    if length_penalty == "correct":
         worker.rubric.length_penalty = CorrectLengthPenalty.Config(
             max_tokens=max_response_tokens
+        )
+    elif length_penalty == "kimi":
+        worker.rubric.length_reward = KimiLengthReward.Config(weight=0.1)
+    elif length_penalty != "none":
+        raise ValueError(
+            f"DOME_V2_LENGTH_PENALTY={length_penalty!r}: correct, kimi or none"
         )
 
 
