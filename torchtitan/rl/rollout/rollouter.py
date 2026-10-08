@@ -136,9 +136,12 @@ class Rollouter(Configurable):
         """Return the next globally identified input from the training loader."""
         return next(self._training_dataloader)
 
-    def acknowledge_training_sample_ids(self, sample_ids: Iterable[int]) -> None:
-        """Mark training samples as safe to omit from the next checkpoint."""
-        self._training_dataloader.acknowledge(sample_ids)
+    def acknowledge_training_sample_ids(
+        self, sample_ids: Iterable[int], *, solved_ids: Iterable[int] = ()
+    ) -> None:
+        """Mark training samples as safe to omit from the next checkpoint; the dataset hears
+        which of them were solved."""
+        self._training_dataloader.acknowledge(sample_ids, solved_indices=solved_ids)
 
     def get_validation_samples(self, steps: int) -> list[object]:
         """Materialize one fresh validation pass, optionally bounded by steps."""

@@ -73,6 +73,53 @@ def test_dapo_dataset_is_deterministic_and_resumable(monkeypatch) -> None:
     assert all(r"Answer: \boxed{" in sample.prompt for sample in expected)
 
 
+def _cycling_dataset(
+    num_rows: int, *, skip_solved_prompts: bool
+) -> math_data._CyclingDataset:
+    samples = [
+        DapoMathSample(prompt=f"q{i}", ground_truth=str(i)) for i in range(num_rows)
+    ]
+    return math_data._CyclingDataset(
+        samples, seed=0, shuffle=False, skip_solved_prompts=skip_solved_prompts
+    )
+
+
+def test_dapo_dataset_skips_solved_problems_after_resume(monkeypatch) -> None:
+    monkeypatch.setattr(math_data, "load_dataset", lambda *args, **kwargs: _dapo_rows())
+    config = DapoMathDataset.Config(shuffle=False, skip_solved_prompts=True)
+    dataset = config.build()
+    problem_1, _, _ = [next(dataset) for _ in range(3)]
+    dataset.mark_solved(problem_1)
+
+    resumed = config.build()
+    resumed.load_state_dict(dataset.state_dict())
+    assert [next(resumed).ground_truth for _ in range(4)] == ["113", "7", "113", "7"]
+
+
+def test_cycling_dataset_loads_a_state_saved_before_solved_rows() -> None:
+    state = _cycling_dataset(3, skip_solved_prompts=True).state_dict()
+    del state["solved_rows"]
+    resumed = _cycling_dataset(3, skip_solved_prompts=True)
+    resumed.load_state_dict(state)
+    assert [next(resumed).ground_truth for _ in range(3)] == ["0", "1", "2"]
+
+
+def test_cycling_dataset_draws_solved_rows_again_with_the_flag_off() -> None:
+    dataset = _cycling_dataset(2, skip_solved_prompts=True)
+    dataset.mark_solved(next(dataset))
+    resumed = _cycling_dataset(2, skip_solved_prompts=False)
+    resumed.load_state_dict(dataset.state_dict())
+    assert [next(resumed).ground_truth for _ in range(3)] == ["1", "0", "1"]
+
+
+def test_cycling_dataset_raises_once_every_row_is_solved() -> None:
+    dataset = _cycling_dataset(2, skip_solved_prompts=True)
+    for _ in range(2):
+        dataset.mark_solved(next(dataset))
+    with pytest.raises(RuntimeError, match="every row is solved"):
+        next(dataset)
+
+
 def test_aime_dataset_combines_both_subsets(monkeypatch) -> None:
     def load_dataset(repo_id, subset, *, split):
         del repo_id, split
