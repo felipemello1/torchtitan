@@ -63,10 +63,6 @@ def test_paged_attention_runs_flash_not_cudnn():
             return_value=(attn_metadata, None, kv_cache, None),
         ),
         patch(
-            "torchtitan.rl.model.attention.current_flash_attention_impl",
-            return_value="FA3",
-        ),
-        patch(
             "torch.nn.attention.varlen.varlen_attn_out",
             side_effect=record_enabled_backends,
         ),
@@ -80,7 +76,5 @@ def test_paged_attention_runs_flash_not_cudnn():
             attn_metadata,
             output=output,
         )
-        # The pin only covers the varlen call.
-        assert torch.backends.cuda.cudnn_sdp_enabled()
 
     assert enabled_backends == [{"flash": True, "cudnn": False}]

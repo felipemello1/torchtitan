@@ -253,8 +253,8 @@ class VarlenInnerAttention(InnerAttention):
 
         varlen_attn_fn = varlen_attn if out_transform is None else varlen_attn_with_lse
 
-        # On SM90/SM100, torch's varlen_attn runs cuDNN instead of Flash whenever cuDNN
-        # supports the shape; keep the FA3/FA4 activated in __init__.
+        # On SM90/SM100/SM103, torch's varlen_attn runs cuDNN whenever cuDNN supports
+        # the batch; pin Flash so the FA3/FA4 activated in __init__ runs.
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             result = varlen_attn_fn(
                 q_THK.to(torch.bfloat16),

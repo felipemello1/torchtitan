@@ -251,8 +251,9 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         if self.out_transform is not None:
             extra_kwargs["return_aux"] = AuxRequest(lse=True)
 
-        # On SM90/SM100, torch's varlen_attn_out runs cuDNN instead of Flash whenever cuDNN
-        # supports the shape and page size; keep the FA3/FA4 activated in __init__.
+        # On SM90/SM100/SM103, torch's varlen_attn_out runs cuDNN whenever cuDNN
+        # supports the batch and page size; pin Flash so the FA3/FA4 activated in
+        # __init__ runs. vLLM's import disables cuDNN SDP today; don't rely on that.
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             result = torch.nn.attention.varlen.varlen_attn_out(
                 output[:num_actual_tokens],

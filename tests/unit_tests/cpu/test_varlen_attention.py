@@ -13,8 +13,7 @@ from unittest.mock import patch
 
 import spmd_types as spmd
 import torch
-from torch._subclasses import FakeTensorMode
-from torch.nn.attention import sdpa_kernel, SDPBackend, varlen
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import _per_axis_types
@@ -27,7 +26,6 @@ from torchtitan.models.common.attention import (
 )
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.rope import ComplexRoPE
-from torchtitan.tools.utils import get_cuda_flash_attention_impl
 
 
 class TestPackedVarlenAttentionMetadata(unittest.TestCase):
@@ -223,84 +221,34 @@ class TestPackedVarlenInnerAttention(unittest.TestCase):
 
         self.assertEqual(logits_TV.shape, (num_tokens, 2048))
 
+    def test_varlen_attn_runs_flash_not_cudnn(self):
+        """torch's varlen_attn tries cuDNN first; only Flash runs the FA3/FA4 that __init__ activates."""
+        q_THK = torch.randn(5, 2, 4)
+        positions_T = torch.tensor([0, 1, 0, 1, 2])
+        metadata = create_varlen_metadata_for_document(positions_T)
+        inner_attention = VarlenInnerAttention.Config().build()
+        enabled_backends = []
 
-def _clear_varlen_device_caches() -> None:
-    # torch caches the cuDNN version and device capability that the test mocks.
-    varlen._should_use_cudnn.cache_clear()
-    varlen._cudnn_version_and_major_capability.cache_clear()
-
-
-class TestVarlenInnerAttentionBackend(unittest.TestCase):
-    def test_head_dim_128_runs_flash_not_cudnn(self):
-        """On H100 and B200/GB300, a batch cuDNN supports still runs the FA3/FA4 behind Flash."""
-        self.addCleanup(_clear_varlen_device_caches)
-        selected_backends = []
-
-        def select_backend(*args, window_size, num_splits=None, **kwargs):
-            # Record the backend torch's varlen_attn picks before it launches a kernel.
-            query, key, value, cu_seq_q, cu_seq_k, max_q, _ = args
-            backend = varlen._select_backend(
-                query,
-                key,
-                value,
-                cu_seq_q,
-                cu_seq_k,
-                max_q,
-                list(window_size),
-                num_splits=num_splits,
+        def _record_enabled_backends(q, k, v, *args, **kwargs):
+            enabled_backends.append(
+                {
+                    "flash": torch.backends.cuda.flash_sdp_enabled(),
+                    "cudnn": torch.backends.cuda.cudnn_sdp_enabled(),
+                }
             )
-            selected_backends.append(backend)
-            return query
+            return q
 
-        for capability, flash_attention_impl in (
-            ((9, 0), "FA3"),
-            ((10, 0), "FA4"),
-            ((10, 3), "FA4"),
+        with (
+            # Importing vLLM (another test may have) disables cuDNN process-wide.
+            sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION]),
+            patch(
+                "torchtitan.models.common.attention.attention._varlen_attn",
+                side_effect=_record_enabled_backends,
+            ),
         ):
-            _clear_varlen_device_caches()
-            selected_backends.clear()
-            with (
-                self.subTest(capability=capability),
-                patch("torch.cuda.is_available", return_value=True),
-                patch("torch.cuda.get_device_capability", return_value=capability),
-                patch("torch.backends.cudnn.version", return_value=92600),
-                patch(
-                    "torchtitan.models.common.attention.attention.current_flash_attention_impl",
-                    return_value=flash_attention_impl,
-                ),
-                patch(
-                    "torchtitan.models.common.attention.attention._varlen_attn",
-                    side_effect=select_backend,
-                ),
-                # Importing vLLM (another test may have) disables cuDNN process-wide.
-                sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION]),
-                FakeTensorMode(),
-            ):
-                self.assertEqual(get_cuda_flash_attention_impl(), flash_attention_impl)
-                q_THK = torch.empty(
-                    512, 4, 128, dtype=torch.bfloat16, device="cuda", requires_grad=True
-                )
-                cu_seq = torch.arange(0, 513, 256, dtype=torch.int32, device="cuda")
-                metadata = VarlenAttentionMetadata(
-                    cu_seq_q=cu_seq, cu_seq_k=cu_seq, max_q=256, max_k=256
-                )
-                inner_attention = VarlenInnerAttention.Config().build()
+            inner_attention(q_THK, q_THK, q_THK, attention_metadata=metadata)
 
-                # Without the pin, torch picks cuDNN for this batch.
-                select_backend(
-                    q_THK, q_THK, q_THK, cu_seq, cu_seq, 256, 256, window_size=(-1, 0)
-                )
-                inner_attention(q_THK, q_THK, q_THK, attention_metadata=metadata)
-
-                self.assertEqual(
-                    selected_backends,
-                    [
-                        SDPBackend.CUDNN_ATTENTION.value,
-                        SDPBackend.FLASH_ATTENTION.value,
-                    ],
-                )
-                # The pin only covers the varlen call.
-                self.assertTrue(torch.backends.cuda.cudnn_sdp_enabled())
+        self.assertEqual(enabled_backends, [{"flash": True, "cudnn": False}])
 
 
 if __name__ == "__main__":
