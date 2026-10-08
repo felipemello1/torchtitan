@@ -26,6 +26,7 @@ from torchtitan.distributed.flex_shard import (
     DistMuon as FlexShardDistMuon,
 )
 
+from .offload import OptimizerStateOffloader
 from .utils import (
     get_flat_optim_state_dict,
     init_optim_state,
@@ -120,6 +121,8 @@ class Adam(torch.optim.Adam, BaseOptimizer):
         weight_decay: float = 0.0
         fused: bool | None = True
         moment_dtype: MomentDType = "parameter"
+        state_offload: OptimizerStateOffloader.Config | None = None
+        """Keep the moments in pinned CPU memory between steps (fused only); see `OptimizerStateOffloader`."""
 
         def __post_init__(self) -> None:
             _validate_moment_dtype(
@@ -157,6 +160,8 @@ class AdamW(torch.optim.AdamW, BaseOptimizer):
         foreach: bool | None = None
         fused: bool | None = True
         moment_dtype: MomentDType = "parameter"
+        state_offload: OptimizerStateOffloader.Config | None = None
+        """Keep the moments in pinned CPU memory between steps (fused only); see `OptimizerStateOffloader`."""
 
         def __post_init__(self) -> None:
             _validate_moment_dtype(
@@ -326,12 +331,34 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
                         return state_dict
 
                     optimizer.register_state_dict_post_hook(_save_host_lr)
-                self.optimizers.append(optimizer)
                 self._log_optimizer(
                     optimizer,
                     part_idx,
                     optimizer_config.pattern,
                 )
+                if (
+                    isinstance(optimizer_config, (Adam.Config, AdamW.Config))
+                    and optimizer_config.state_offload is not None
+                ):
+                    # One slab dtype per optimizer, while resident Adam matches each param.
+                    param_dtypes = {param.dtype for param in param_group["params"]}
+                    if (
+                        optimizer_config.moment_dtype == "parameter"
+                        and len(param_dtypes) > 1
+                    ):
+                        raise ValueError(
+                            "state_offload needs one parameter dtype per optimizer, but "
+                            f"{optimizer_config.pattern!r} matched {param_dtypes}"
+                        )
+                    optimizer = optimizer_config.state_offload.build(
+                        optimizer=optimizer,
+                        state_dtype=(
+                            torch.bfloat16
+                            if optimizer_config.moment_dtype == "bfloat16"
+                            else param_group["params"][0].dtype
+                        ),
+                    )
+                self.optimizers.append(optimizer)
                 all_params.extend(param_group["params"])
 
         self._validate_params(all_params)
