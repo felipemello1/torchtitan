@@ -277,8 +277,8 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
         for name, values in sorted(values_by_name.items())
     )
 
-    # Forced answers (a `ThinkingBudget` closed the thinking): how many, how often right, and how
-    # often cut again in the answer reserve. The share of forced turns is `thinking_budget/forced_close_rate`.
+    # Forced answers (a `ThinkingBudget` closed the thinking): how many, how often right (final
+    # reward > 0), and how often cut again while answering.
     scored = [rollout for rollout in rollouts if rollout.reward is not None]
     forced = [rollout for rollout in scored if rollout.has_forced_answer]
     natural = [rollout for rollout in scored if not rollout.has_forced_answer]
@@ -289,7 +289,7 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
             m.Mean.from_list([rollout.reward > 0 for rollout in forced]),
         ),
         m.Metric(
-            f"{prefix}/forced_answer/cut_in_reserve",
+            f"{prefix}/forced_answer/truncation_rate",
             m.Mean.from_list([rollout.status.is_truncated() for rollout in forced]),
         ),
         m.Metric(

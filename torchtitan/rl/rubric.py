@@ -70,12 +70,13 @@ class RubricOutput:
 
 class CorrectLengthPenalty(Configurable):
     """Penalizes correct rollouts longer than their group's median correct rollout, in groups
-    solved at least `min_pass_rate` of the time but not always.
+    solved at least half the time but not always.
 
-    Wrong rollouts never pay, so failing fast is never rewarded. Groups solved less often pay
-    nothing, so hard problems keep their long reasoning.
+    Wrong rollouts never pay, so failing fast is never rewarded. Groups solved less than half the
+    time pay nothing, so hard problems keep their long reasoning.
 
-    Example (max_tokens=131072, max_penalty=0.1; 12 of 16 correct, median correct 20,000 tokens):
+    Example:
+        max_tokens=131072, max_penalty=0.1; 12 of 16 correct, median correct 20,000 tokens
         correct, 15,000 tokens  -> 0.0
         correct, 75,536 tokens  -> 0.1 * (75536 - 20000) / (131072 - 20000) = 0.05
         wrong, any length       -> 0.0
@@ -85,25 +86,22 @@ class CorrectLengthPenalty(Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         max_tokens: int
-        """Completion tokens at which the penalty reaches `max_penalty`: the response cap."""
+        """Completion tokens of the whole rollout (all turns) at which the penalty reaches
+        `max_penalty`: the response cap for single-turn tasks."""
 
         max_penalty: float = 0.1
         """Largest penalty a rollout pays; never more than its reward."""
 
-        min_pass_rate: float = 0.5
-        """Groups solved less often than this pay nothing."""
-
     def __init__(self, config: Config) -> None:
         self._max_tokens = config.max_tokens
         self._max_penalty = config.max_penalty
-        self._min_pass_rate = config.min_pass_rate
 
     def __call__(self, rollouts: list[Rollout], rewards: list[float]) -> list[float]:
         """Return one penalty per rollout, in group order; a reward > 0 counts as correct."""
         is_correct = [reward > 0 for reward in rewards]
         pass_rate = sum(is_correct) / len(rewards)
-        # Never-solved and always-solved groups pay nothing: there length would be the only signal.
-        if not 0.0 < pass_rate < 1.0 or pass_rate < self._min_pass_rate:
+        # An always-solved group pays nothing: length would be its only training signal.
+        if not 0.5 <= pass_rate < 1.0:
             return [0.0] * len(rollouts)
         num_tokens = [
             sum(
@@ -115,12 +113,14 @@ class CorrectLengthPenalty(Configurable):
             n for n, correct in zip(num_tokens, is_correct, strict=True) if correct
         )
         ramp = max(self._max_tokens - median, 1)
-        return [
-            min(self._max_penalty * min(max((n - median) / ramp, 0.0), 1.0), reward)
-            if correct
-            else 0.0
-            for n, correct, reward in zip(num_tokens, is_correct, rewards, strict=True)
-        ]
+        penalties = []
+        for n, correct, reward in zip(num_tokens, is_correct, rewards, strict=True):
+            # 0 at the median, 1 at `max_tokens`.
+            fraction = min(max((n - median) / ramp, 0.0), 1.0)
+            penalties.append(
+                min(self._max_penalty * fraction, reward) if correct else 0.0
+            )
+        return penalties
 
 
 class Rubric(Configurable):
@@ -155,7 +155,8 @@ class Rubric(Configurable):
 
         forced_answer_scale: float = 1.0
         """Multiplies a positive reward when a `ThinkingBudget` force-closed the last turn's
-        thinking. Below 1, a forced answer is worth less than the same answer reached on its own."""
+        thinking. With a `length_penalty`, natural correct > forced correct > wrong needs
+        max_penalty < forced_answer_scale < 1 - max_penalty."""
 
         length_penalty: CorrectLengthPenalty.Config | None = None
         """Subtracted from each rollout's reward once its group is graded; None: no penalty."""
