@@ -221,6 +221,11 @@ class AsyncLoopConfig(Configurable.Config):
     `target_offpolicy_steps + n`. A value of 1 is FIFO by batch. See
     ``torchtitan/rl/docs/windowed_fifo.md``."""
 
+    max_num_seqs_per_generator: int = 512
+    """Cap on each generator's vLLM `max_num_seqs`, which is otherwise the in-flight sequences
+    split across generators. Lower it when the KV cache holds fewer sequences than that, so
+    vLLM queues requests instead of preempting and recomputing running ones."""
+
     group_buffer: RolloutGroupWorkBuffer.Config = field(
         default_factory=RolloutGroupWorkBuffer.Config
     )
@@ -613,7 +618,8 @@ class Controller(Configurable):
         # upper bound on concurrently scheduled sequences. vLLM may admit fewer if KV
         # is tight; this also sets CUDA-graph capture sizes.
         max_num_seqs = min(
-            math.ceil(rollout_concurrency / num_generator_dp_shards), 512
+            math.ceil(rollout_concurrency / num_generator_dp_shards),
+            async_loop.max_num_seqs_per_generator,
         )
 
         logger.info(
