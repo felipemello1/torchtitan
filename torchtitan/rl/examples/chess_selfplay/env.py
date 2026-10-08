@@ -226,8 +226,9 @@ class ChessGame:
         lines += [
             "Board (uppercase is White, lowercase is Black; rank 8 at the top):",
             str(board),
+            # No FEN: with it, Qwen3.5 re-parsed the FEN rank by rank until its reply ran out of
+            # tokens (69-78% of cut replies vs 8-15% of finished ones); the board shows the position.
             "",
-            f"FEN: {board.fen()}",
             "Legal moves: " + " ".join(legal_moves),
             "",
             f"Your move as {_COLOR_NAMES[board.turn]}. Think briefly, then write one legal move "

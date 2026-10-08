@@ -32,7 +32,6 @@ p p p p p p p p
 P P P P . P P P
 R N B Q K B N R
 
-FEN: rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1
 Legal moves: b6 b5 d5 f5 Nh6 c5 a6 Nc6 Na6 c6 g6 e6 h6 a5 f6 e5 d6 Nf6 g5 h5
 
 Your move as Black. Think briefly, then write one legal move inside \boxed{}.

@@ -42,6 +42,7 @@ from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import TokenEnv
 from torchtitan.rl.rollout.rollouter import Rollouter
+from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
 from torchtitan.rl.rubric import Rubric
 from torchtitan.rl.trainer import Trainer
 
@@ -50,7 +51,9 @@ from torchtitan.rl.trainer import Trainer
 
 
 def rl_chess_qwen3_5_4b(
-    max_plies: int = 60, max_rollout_tokens: int = 28672
+    max_plies: int = 60,
+    max_rollout_tokens: int = 28672,
+    max_response_tokens: int = 1024,
 ) -> Controller.Config:
     """`max_plies`-ply games on one node: an FSDP=4 trainer and four TP=1 generators.
 
@@ -63,7 +66,6 @@ def rl_chess_qwen3_5_4b(
     and after training.
     """
     ladder = ("sf_eps90", "sf_eps75", "sf_eps50", "sf_eps25", "sf_elo1320")
-    max_response_tokens = 1024
     max_total_tokens = max_rollout_tokens + max_response_tokens
     num_validation_games = 64
     model_config = build_model_config(
@@ -193,16 +195,37 @@ def rl_chess_qwen3_5_4b(
     )
 
 
-def rl_chess_qwen3_5_35b_a3b() -> Controller.Config:
-    """Qwen3.5-35B-A3B (instruct, thinking off), 120-ply games, 150 steps on two GB300 hosts.
+def rl_chess_qwen3_5_35b_a3b(
+    max_plies: int = 60, max_thinking_tokens: int = 2048
+) -> Controller.Config:
+    """Qwen3.5-35B-A3B (instruct) with thinking on, 150 steps on two GB300 hosts.
+
+    A turn thinks up to `max_thinking_tokens`; then `ThinkingBudget` closes the thinking and starts
+    the answer with "\\boxed{", and the reward loses up to 0.1 for force-closed turns. A player keeps
+    its own past thinking in its history (never the opponent's), so the history grows up to
+    ~`max_thinking_tokens` per turn: 60 plies x 2k thinking need ~84k tokens.
 
     Host 0 trains: FSDP 2 x TP 2 x EP 4 with Dist-MoE experts, the layout of the 35B Terminal-Bench
-    runs. Host 1 runs four one-GPU generators, each with every expert, FULL CUDA graphs. 120 plies
-    need a ~48k-token history.
+    runs. Host 1 runs four one-GPU generators, each with every expert, FULL CUDA graphs.
     """
-    max_rollout_tokens = 49152
-    config = rl_chess_qwen3_5_4b(max_plies=120, max_rollout_tokens=max_rollout_tokens)
-    max_total_tokens = max_rollout_tokens + config.generator.sampling.max_tokens
+    # room for the answer after the thinking ends, forced or not
+    max_response_tokens = max_thinking_tokens + 512
+    # a ~250-token board per turn plus the reply
+    max_rollout_tokens = (max_plies // 2) * (250 + max_response_tokens)
+    config = rl_chess_qwen3_5_4b(
+        max_plies=max_plies,
+        max_rollout_tokens=max_rollout_tokens,
+        max_response_tokens=max_response_tokens,
+    )
+    max_total_tokens = max_rollout_tokens + max_response_tokens
+    config.renderer = from_renderers(
+        Qwen35RendererConfig(enable_thinking=True, thinking_retention="all")
+    )
+    worker = config.rollouter.worker
+    worker.thinking_budget = ThinkingBudget.Config(
+        max_thinking_tokens=max_thinking_tokens, answer_prefix="\\boxed{"
+    )
+    worker.rubric.reward_fns = [RewardChessScore.Config(forced_close_penalty=0.1)]
     config.model = build_model_config(
         "35B-A3B", seq_len=max_total_tokens, attn_backend="varlen"
     )

@@ -22,11 +22,34 @@ class RewardChessScore(RewardFn):
     The env puts the reward on the last turn. For a player that stopped mid-game (its reply hit
     `max_tokens`, its history outgrew `max_rollout_tokens`), `ChessSelfPlayWorker` puts the game's
     forfeit reward there; leave the rubric's `truncation_reward` / `error_reward` unset so this fn scores it.
+
+    With `forced_close_penalty`, a turn whose thinking the `ThinkingBudget` had to close costs its share:
+    reward - penalty * (force-closed turns / turns).
+
+    Example:
+
+        RewardChessScore.Config(forced_close_penalty=0.1)
+        # a win with 10 of 30 turns force-closed -> 1.0 - 0.1 * 10 / 30 = 0.967
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(RewardFn.Config):
-        pass
+        forced_close_penalty: float = 0.0
+        """The most a rollout loses when every turn's thinking was force-closed; 0.1 keeps a win (0.9)
+        above every non-win (at most 0.75)."""
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self._forced_close_penalty = config.forced_close_penalty
 
     async def __call__(self, rollout: Rollout, env_input: ChessSample) -> float:
-        return rollout.turns[-1].env_rewards["score"]
+        # the budget masks the tokens it forced out of the loss; no other path does
+        num_forced = sum(
+            turn.completion_loss_mask is not None and not all(turn.completion_loss_mask)
+            for turn in rollout.turns
+        )
+        forced_share = num_forced / len(rollout.turns)
+        return (
+            rollout.turns[-1].env_rewards["score"]
+            - self._forced_close_penalty * forced_share
+        )

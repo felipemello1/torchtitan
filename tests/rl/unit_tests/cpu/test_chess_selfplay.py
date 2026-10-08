@@ -37,10 +37,10 @@ from torchtitan.rl.examples.chess_selfplay.rollouter import EloFit
 from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.observability.controller import compute_rollout_metrics
 from torchtitan.rl.observability.metrics import MetricsProcessor
-from torchtitan.rl.rollout import RolloutStatus
+from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.environment import TokenEnv
 from torchtitan.rl.rubric import Rubric
-from torchtitan.rl.types import Completion
+from torchtitan.rl.types import Completion, RolloutTurnID
 
 _SELF_PLAY = ChessSample(fen=chess.STARTING_FEN, opponent="self")
 _TOKENIZER_PATH = "tests/assets/tokenizer"
@@ -294,6 +294,38 @@ def test_executable_stockfish_copies_a_binary_without_the_execute_bit(tmp_path) 
     assert executable_stockfish(str(staged)) == str(staged)
     assert executable_stockfish("stockfish") == "stockfish"
     assert executable_stockfish(None) is None
+
+
+def test_reward_loses_the_share_of_force_closed_turns() -> None:
+    def turn(
+        turn_id: int, loss_mask: list[bool] | None, score: float | None = None
+    ) -> RolloutTurn:
+        return RolloutTurn(
+            rollout_id=RolloutTurnID(group_id=0, rollout_id=0, turn_id=turn_id),
+            prompt_token_ids=[1],
+            completion_token_ids=[2, 3],
+            completion_logprobs=[-0.1, -0.1],
+            completion_loss_mask=loss_mask,
+            env_rewards={} if score is None else {"score": score},
+            min_policy_version=0,
+            max_policy_version=0,
+        )
+
+    # 1 of 4 turns had its thinking force-closed (its forced tokens are masked out of the loss)
+    rollout = Rollout(
+        group_id=0,
+        rollout_id=0,
+        status=RolloutStatus.COMPLETED,
+        turns=[
+            turn(0, None),
+            turn(1, [True, False]),
+            turn(2, [True, True]),
+            turn(3, None, score=1.0),
+        ],
+    )
+    penalized = RewardChessScore.Config(forced_close_penalty=0.1).build()
+    assert asyncio.run(penalized(rollout, _SELF_PLAY)) == pytest.approx(1.0 - 0.1 / 4)
+    assert asyncio.run(RewardChessScore.Config().build()(rollout, _SELF_PLAY)) == 1.0
 
 
 def test_elo_fit() -> None:
