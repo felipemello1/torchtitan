@@ -152,12 +152,14 @@ def test_intellect3_dataset_drops_multiple_choice_and_one_letter_golds(
     rows = [
         (r"What is $\tfrac1A+\tfrac1B$? A) 133 B) 134 C) 135 D) 136 E) 137", "135"),
         ("Find the volume.\n- **A)** $1024$\n- **B)** $1200$\n- **C)** $1280$", "1280"),
+        (r"How many? $\textbf{a)}\ 0 \qquad\textbf{b)}\ 1 \qquad\textbf{c)}\ 2$", "2"),
         (r"For which positive integers $n$ is $x^n+(x+1)^n$ an integer?", " n "),
         ("Menchikov A.B.  Find all pairs of natural numbers a and k.", "1,k"),
         (r"In triangle ABC, $\angle A: \angle B: \angle C=2: 3: 4$. Find AC.", "26"),
         (r"In triangle ABC, find $\cos(3A)+\cos(3B)+\cos(3C)$.", "1"),
     ]
     dataset = _intellect3_dataset(monkeypatch, rows)
+    # Only the last three survive, so the fourth sample wraps to the first.
     assert [next(dataset).ground_truth for _ in range(4)] == ["1,k", "26", "1", "1,k"]
 
 
