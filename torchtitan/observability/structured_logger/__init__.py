@@ -27,6 +27,7 @@ from torchtitan.observability.structured_logger.step_state import (
 from torchtitan.observability.structured_logger.structured_logging import (
     get_structured_logger_subprocess_init_fn,
     init_structured_logger,
+    log_event_loop_lag,
     log_trace_instant,
     log_trace_scalar,
     log_trace_span,
@@ -41,6 +42,7 @@ __all__ = [
     "get_step",
     "get_step_tags",
     "get_relative_step",
+    "log_event_loop_lag",
     "log_trace_scalar",
     "log_trace_instant",
     "log_trace_span",

@@ -48,6 +48,7 @@ from torchtitan.observability.structured_logger.structured_logging import (
     event_extra,
     ExtraFields,
     init_structured_logger,
+    log_event_loop_lag,
     log_trace_instant,
     log_trace_scalar,
     log_trace_span,
@@ -911,6 +912,31 @@ class TestLogTraceScalar:
         with open(os.path.join(trace_dir, jsonl_files[0])) as f:
             lines = [json.loads(line) for line in f if line.strip()]
         assert len(lines) == 0
+
+
+# ---------------------------------------------------------------------------
+# log_event_loop_lag
+# ---------------------------------------------------------------------------
+
+
+class TestLogEventLoopLag:
+    def test_logs_once_when_sync_code_blocks_loop(
+        self, tmp_path, structured_logger_fixture
+    ):
+        init_structured_logger(rank=0, source="controller", output_dir=str(tmp_path))
+
+        async def run():
+            lag_task = asyncio.create_task(log_event_loop_lag())
+            await asyncio.sleep(0.2)
+            time.sleep(0.5)
+            await asyncio.sleep(0.2)
+            lag_task.cancel()
+
+        asyncio.run(run())
+
+        (line,) = _read_trace_lines(tmp_path)
+        assert line["event_name"] == "event_loop_lag_ms"
+        assert line["value"] >= 400
 
 
 # ---------------------------------------------------------------------------
