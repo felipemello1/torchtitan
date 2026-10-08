@@ -84,15 +84,21 @@ class WeightSyncManager:
 
     async def wait_prev_push(self) -> list[m.Metric]:
         await self._trainer_push_task
-        # Push start to done, including any time it waits behind other work on the trainer; the loop's
-        # wait for it is timing/step/wait_for_push.
-        return [m.Metric("timing/weight_sync/push_wall", m.NoReduce(self._last_push_s))]
+        return [
+            m.Metric(
+                "timing/weight_sync/trainer_push_model_state_dict",
+                m.NoReduce(self._last_push_s),
+            )
+        ]
 
     async def wait_prev_pull(self) -> list[m.Metric]:
         await self._generator_pull_task
-        # Pull start to done on all generators, including time each one queues behind its current engine
-        # steps (or the drain, with hot_swap=False); the loop's wait for it is timing/step/wait_for_pull.
-        return [m.Metric("timing/weight_sync/pull_wall", m.NoReduce(self._last_pull_s))]
+        return [
+            m.Metric(
+                "timing/weight_sync/generator_pull_model_state_dict",
+                m.NoReduce(self._last_pull_s),
+            )
+        ]
 
     async def wait_inflight_push_pull(self) -> None:
         """Finish the last in-flight push+pull so generators hold the final weights (e.g. before validation)."""

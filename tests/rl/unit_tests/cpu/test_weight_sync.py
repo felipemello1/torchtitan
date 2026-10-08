@@ -10,29 +10,25 @@ It overlaps the trainer->generator weight handoff with the next training step:
 `start_async_push_pull` fires push -> pull -> buffer-slot release in the background,
 and the loop joins each leg with `wait_prev_*`. These tests use fakes for the
 trainer actor, generator router, and group buffer (no GPU / Monarch / TorchStore).
-The last test runs `Controller._trainer_loop` on these fakes to check what the push timings measure.
 """
 
 import asyncio
 import contextlib
-import time
-from types import SimpleNamespace
 
-import torch
-
-from torchtitan.rl.controller import Controller
 from torchtitan.rl.distributed.weight_sync import WeightSyncManager
-from torchtitan.rl.types import OptimizerStepOutput, TrainerStepBatch
 
-TRAINER_PUSH_KEY = "timing/weight_sync/push_wall"
-GENERATOR_PULL_KEY = "timing/weight_sync/pull_wall"
+TRAINER_PUSH_KEY = "timing/weight_sync/trainer_push_model_state_dict"
+GENERATOR_PULL_KEY = "timing/weight_sync/generator_pull_model_state_dict"
 
 
 class _Endpoint:
-    """Stands in for a Monarch endpoint: `await endpoint.call(...)` or `endpoint.call_one(...)`."""
+    """Stands in for a Monarch endpoint, i.e. `trainer.push_model_state_dict.call()`."""
 
     def __init__(self, on_call):
-        self.call = self.call_one = on_call
+        self._on_call = on_call
+
+    async def call(self):
+        await self._on_call()
 
 
 class _FakeTrainer:
@@ -236,92 +232,3 @@ def test_push_exception_propagates_through_wait() -> None:
         assert raised
 
     asyncio.run(run())
-
-
-FORWARD_BACKWARD_S = 0.3
-PUSH_S = 0.05
-
-
-async def _rpc(*args, **kwargs):
-    await asyncio.sleep(0)  # an endpoint call always yields to the event loop
-
-
-class _FakeMetricsProcessor:
-    def __init__(self):
-        self.values_by_step: dict[int, dict[str, float]] = {}
-
-    def log(self, *, step, is_validation, metrics):
-        self.values_by_step[step] = {
-            metric.key: metric.value.value for metric in metrics
-        }
-
-
-async def _run_trainer_loop(*, num_training_steps):
-    """Run `Controller._trainer_loop` on fakes and return each step's logged values.
-
-    One asyncio loop stands in for the trainer actor's loop. Forward/backward blocks it with time.sleep,
-    as `Trainer.forward_backward_steps` blocks the actor's loop, so a push awaiting its RPC cannot resume.
-    """
-
-    async def push_model_state_dict():
-        await asyncio.sleep(PUSH_S)  # torchstore RPCs
-
-    async def forward_backward_steps(*args):
-        time.sleep(FORWARD_BACKWARD_S)
-        return {"loss/mean": 1.0}
-
-    async def optimizer_step(*, last_step):
-        return OptimizerStepOutput(
-            policy_version=controller._trainer_policy_version + 1, metrics={}
-        )
-
-    trainer = SimpleNamespace(
-        sync_log_step=_Endpoint(_rpc),
-        forward_backward_steps=_Endpoint(forward_backward_steps),
-        optimizer_step=_Endpoint(optimizer_step),
-        push_model_state_dict=_Endpoint(push_model_state_dict),
-    )
-    controller = SimpleNamespace(
-        start_step=0,
-        trainer=trainer,
-        generator_router=SimpleNamespace(sync_log_step=_Endpoint(_rpc)),
-        _rollouter=SimpleNamespace(sync_log_step=_rpc),
-        _trainer_policy_version=0,
-        config=SimpleNamespace(
-            async_loop=SimpleNamespace(
-                target_offpolicy_steps=1, max_offpolicy_steps=None
-            )
-        ),
-        _get_rank_0_value=lambda result: result,
-        _weight_sync=_manager(
-            trainer=trainer, router=_FakeRouter(_noop), buffer=_FakeBuffer()
-        ),
-        _group_buffer=SimpleNamespace(metrics=lambda: []),
-        metrics_processor=_FakeMetricsProcessor(),
-    )
-    training_batch_queue = asyncio.Queue()
-    for _ in range(num_training_steps):
-        training_batch_queue.put_nowait(
-            TrainerStepBatch(
-                microbatches=[],
-                global_loss_token_counts=torch.tensor([10]),
-                global_routing_token_counts=torch.tensor([10]),
-                metrics=[],
-                min_policy_versions=[0],
-            )
-        )
-    await Controller._trainer_loop(
-        controller, training_batch_queue, num_training_steps=num_training_steps
-    )
-    return controller.metrics_processor.values_by_step
-
-
-def test_trainer_loop_push_wall_counts_time_behind_forward_backward() -> None:
-    # Step 1's push starts after its optimizer step and can only finish after step 2's forward/backward.
-    values_by_step = asyncio.run(_run_trainer_loop(num_training_steps=2))
-    step_2 = values_by_step[2]
-    assert step_2["timing/step/forward_backward"] >= FORWARD_BACKWARD_S
-    # push_wall is the push's start to done, so it includes the time behind forward/backward ...
-    assert step_2[TRAINER_PUSH_KEY] >= FORWARD_BACKWARD_S
-    # ... while wait_for_push is only how long the loop waited for it.
-    assert step_2["timing/step/wait_for_push"] < FORWARD_BACKWARD_S / 2
