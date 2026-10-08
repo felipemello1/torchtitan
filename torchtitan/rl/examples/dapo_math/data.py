@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import random
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -21,6 +22,25 @@ _MATH_PROMPT_TEMPLATE = (
     "{problem}\n\n"
     'Remember to put your answer on its own line as "Answer: \\boxed{{...}}".'
 )
+
+# Options `A) 12 B) 14 C) 15` or `\textbf{a)}\ 12` in a question: the gold is the option's value,
+# so a boxed letter scores 0.
+_MULTIPLE_CHOICE = re.compile(r"(?:\bA|\{a)\).*(?:\bB|\{b)\).*(?:\bC|\{c)\)", re.S)
+# A one-letter gold like ` n `: mostly "for which n ...?" questions, where it names the variable.
+_ONE_LETTER = re.compile(r"\s*[A-Za-z]\s*")
+# A question asking for two values, as in `find $f(-2)$ and $f(4)$` or `find the maximum and
+# minimum values`: with a one-value gold like `-6`, the full answer `0, -6` scores 0.
+# One inline math span, `$x$` or `\(x\)`, of up to 30 characters.
+_INLINE_MATH = r"(?:\$[^$]{1,30}\$|\\\((?:(?!\\\))[^$]){1,30}\\\))"
+_TWO_VALUES_ASKED = re.compile(
+    r"\b(?:find|determine|calculate|compute|evaluate)\s+(?:the\s+(?:values?|lengths?)\s+of\s+)?"
+    rf"{_INLINE_MATH}(?:\s*,\s*{_INLINE_MATH})*\s*,?\s*and\s+{_INLINE_MATH}\s*[.?]"
+    r"|\b(?:find|determine)\s+(?:the\s+)?(?:maximum|minimum|largest|smallest|greatest|least)\s+"
+    r"(?:value\s+)?and\s+(?:the\s+)?(?:maximum|minimum|largest|smallest|greatest|least)\b",
+    re.IGNORECASE,
+)
+# A gold with two values: `m=6, n=9`, `1 \text{ and } -1`, `11 \pm 2\sqrt{3}`.
+_TWO_VALUE_GOLD = re.compile(r"[,;]|\band\b|\\pm")
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -77,6 +97,13 @@ class _CyclingDataset(Configurable):
 
     def load_state_dict(self, state_dict: dict) -> None:
         """Restore state returned by `state_dict`."""
+        # The saved order holds row indices: with another row count it picks wrong rows, never
+        # draws added rows, and raises IndexError on dropped ones.
+        if len(state_dict["order"]) != len(self._samples):
+            raise ValueError(
+                f"Saved dataset state covers {len(state_dict['order'])} rows, but the dataset "
+                f"has {len(self._samples)}: its rows changed since the save."
+            )
         self._rng.setstate(state_dict["rng_state"])
         self._order = list(state_dict["order"])
         self._position = state_dict["position"]
@@ -114,7 +141,9 @@ class Intellect3MathDataset(_CyclingDataset):
 
     Harder than `DapoMathDataset` for a strong base model, so more groups mix right and wrong
     answers; only those groups train. INTELLECT-3-RL has no 8/8 rows; the default
-    `min_pass_rate` drops the 0/8 ones, keeping 10,805 of 21,161 rows.
+    `min_pass_rate` drops the 0/8 ones, keeping 10,805 of 21,161 rows. It also drops 172 rows
+    whose golds mis-score answers (options `A) B) C)`, a one-letter gold, or two values asked
+    and one given), leaving 10,633.
 
     Example:
         config = rl_dapo_qwen3_4b_math_32k()
@@ -137,12 +166,20 @@ class Intellect3MathDataset(_CyclingDataset):
         samples = [
             DapoMathSample(
                 prompt=_MATH_PROMPT_TEMPLATE.format(problem=row["question"]),
-                ground_truth=str(row["answer"]),
+                # Some golds are JSON-escaped (`\\frac`), and Math-Verify reads `\\` before `\text` or `\{`
+                # as a line break, so `0 \\text{ or } 5` parses as 5. No gold holds a real line break.
+                ground_truth=str(row["answer"]).replace("\\\\", "\\"),
             )
             for row in dataset
             if config.min_pass_rate
             <= row["avg@8_qwen3_4b_thinking_2507"]
             <= config.max_pass_rate
+            and not _MULTIPLE_CHOICE.search(row["question"])
+            and not _ONE_LETTER.fullmatch(str(row["answer"]))
+            and not (
+                _TWO_VALUES_ASKED.search(row["question"])
+                and not _TWO_VALUE_GOLD.search(str(row["answer"]))
+            )
         ]
         super().__init__(samples, seed=config.seed, shuffle=config.shuffle)
 
