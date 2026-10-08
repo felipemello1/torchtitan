@@ -839,6 +839,8 @@ class Controller(Configurable):
         )
 
         # training_sample_batcher_loop
+        # Groups taken by the batcher, not yet in a queued batch.
+        self._num_groups_in_batcher = 0
         batcher_task = asyncio.create_task(
             self._batcher_loop(
                 group_buffer=self._group_buffer,
@@ -1016,6 +1018,7 @@ class Controller(Configurable):
             if rollout_group is None:  # closed and drained
                 logger.info("Buffer drained; batcher loop stopping")
                 break
+            self._num_groups_in_batcher += 1
             with sl.log_trace_span("training_sample_builder"):
                 training_sample_group = training_sample_builder.build_from_group(
                     rollout_group=rollout_group
@@ -1030,10 +1033,27 @@ class Controller(Configurable):
                 )
             if not group_is_trainable:
                 await group_buffer.release_active_groups(1, reason="untrainable_group")
+                # Nothing yields since the release, so no reader sees this slot both free and here.
+                self._num_groups_in_batcher -= 1
             if maybe_training_batch is not None:
                 await training_batch_queue.put(maybe_training_batch)
+                # While put blocks on a full queue, the batch's groups are still in the batcher.
+                self._num_groups_in_batcher -= (
+                    self.config.async_loop.num_prompts_per_train_step
+                )
         await training_batch_queue.put(None)
         # TODO(async-rl): if finite datasets are supported, drain a final partial batch here.
+
+    def _rollout_buffer_metrics(
+        self, *, training_batch_queue: "asyncio.Queue[TrainerStepBatch | None]"
+    ) -> list[m.Metric]:
+        """Trainer loop: where each rollout buffer slot is; see `RolloutGroupWorkBuffer.metrics`."""
+        # Each queued batch holds num_prompts_per_train_step slots.
+        return self._group_buffer.metrics(
+            num_groups_in_batcher=self._num_groups_in_batcher,
+            num_groups_in_queue=training_batch_queue.qsize()
+            * self.config.async_loop.num_prompts_per_train_step,
+        )
 
     async def _trainer_loop(
         self,
@@ -1163,7 +1183,9 @@ class Controller(Configurable):
                             m.Metric(key, m.NoReduce(value))
                             for key, value in optimizer_result.metrics.items()
                         ],
-                        *self._group_buffer.metrics(),
+                        *self._rollout_buffer_metrics(
+                            training_batch_queue=training_batch_queue
+                        ),
                         *time_metrics,
                         *policy_age_panel,
                         # Background push/pull work time; the trainer's wait for it is timing/step/blocking_*.

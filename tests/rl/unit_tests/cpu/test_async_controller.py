@@ -10,6 +10,7 @@ the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID
 import asyncio
 import json
 import logging
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -19,6 +20,7 @@ from torchtitan.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
+from torchtitan.rl.controller import Controller
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
@@ -766,5 +768,178 @@ def test_no_window_takes_oldest_ready_group_past_a_stuck_head() -> None:
         await asyncio.sleep(0)
         assert taker.done()
         assert taker.result().group_id == 6
+
+    asyncio.run(run())
+
+
+class _FakeTrainingSampleBuilder:
+    """Builds one trainable sample per group, or none for `untrainable_group_ids`."""
+
+    def __init__(self, *, untrainable_group_ids: tuple[int, ...]) -> None:
+        self._untrainable_group_ids = untrainable_group_ids
+
+    def build_from_group(self, *, rollout_group: RolloutGroup) -> TrainingSampleGroup:
+        if rollout_group.group_id in self._untrainable_group_ids:
+            return _untrainable_group(rollout_group.group_id)
+        return _trainable_group(rollout_group.group_id, num_samples=1)
+
+
+async def _pack_on_event_loop(func, /, *args, **kwargs):
+    """Stands in for `asyncio.to_thread`, so a fixed number of turns settles the batcher loop.
+    Other tasks still run for one turn while it packs, as they would during the thread."""
+    await asyncio.sleep(0)
+    return func(*args, **kwargs)
+
+
+async def _settle() -> None:
+    """Give the batcher loop enough event loop turns to take every finished group and block."""
+    for _ in range(50):
+        await asyncio.sleep(0)
+
+
+def _start_batcher_loop(
+    *,
+    buffer: RolloutGroupWorkBuffer,
+    num_prompts_per_train_step: int,
+    untrainable_group_ids: tuple[int, ...] = (),
+) -> tuple[Controller, asyncio.Queue, asyncio.Task]:
+    """Run the controller's `_batcher_loop` on `buffer` with a real `Batcher` and a size-1 queue."""
+    # The batcher loop and the gauges read only these attributes; skip the actor setup.
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(
+            num_prompts_per_train_step=num_prompts_per_train_step
+        )
+    )
+    controller._group_buffer = buffer
+    controller._num_groups_in_batcher = 0
+    training_batch_queue = asyncio.Queue(maxsize=1)
+    batcher_task = asyncio.create_task(
+        controller._batcher_loop(
+            group_buffer=buffer,
+            training_sample_builder=_FakeTrainingSampleBuilder(
+                untrainable_group_ids=untrainable_group_ids
+            ),
+            batcher=_build_batcher(
+                num_prompts_per_train_step=num_prompts_per_train_step
+            ),
+            training_batch_queue=training_batch_queue,
+        )
+    )
+    return controller, training_batch_queue, batcher_task
+
+
+def _slot_gauges(
+    controller: Controller, training_batch_queue: asyncio.Queue
+) -> dict[str, float]:
+    """The trainer loop's `rollout_buffer` gauges, without the per-flush peak."""
+    metrics = controller._rollout_buffer_metrics(
+        training_batch_queue=training_batch_queue
+    )
+    return {
+        metric.key: metric.value.value
+        for metric in metrics
+        if metric.key != "rollout_buffer/active_slots_in_use_peak"
+    }
+
+
+def _expected_gauges(
+    *,
+    waiting: int = 0,
+    inflight: int = 0,
+    finalized: int = 0,
+    in_batcher: int = 0,
+    in_queue: int = 0,
+    in_trainer: int = 0,
+    available: int = 0,
+) -> dict[str, float]:
+    return {
+        "rollout_buffer/num_groups_waiting": waiting,
+        "rollout_buffer/num_groups_inflight": inflight,
+        "rollout_buffer/num_groups_finalized": finalized,
+        "rollout_buffer/num_groups_in_batcher": in_batcher,
+        "rollout_buffer/num_groups_in_queue": in_queue,
+        "rollout_buffer/num_groups_in_trainer": in_trainer,
+        "rollout_buffer/available_active_slots": available,
+    }
+
+
+def test_buffer_gauges_account_for_every_slot(monkeypatch) -> None:
+    monkeypatch.setattr(asyncio, "to_thread", _pack_on_event_loop)
+
+    async def run() -> None:
+        # target_offpolicy_steps=2, num_prompts_per_train_step=2 -> 6 slots. g1 has no trainable samples.
+        buffer = _buffer(capacity=6, window_size=None)
+        controller, training_batch_queue, batcher_task = _start_batcher_loop(
+            buffer=buffer, num_prompts_per_train_step=2, untrainable_group_ids=(1,)
+        )
+
+        def read_gauges() -> dict[str, float]:
+            return _slot_gauges(controller, training_batch_queue)
+
+        async def expect(**counts: int) -> None:
+            await _settle()
+            assert read_gauges() == _expected_gauges(**counts)
+
+        # The trainer could log on any event loop turn, including while the batcher packs or
+        # waits on put. On every turn, in_trainer must be what this test's trainer holds.
+        num_groups_held_by_trainer = 0
+        wrong_readings: list[dict[str, float]] = []
+
+        async def check_every_turn() -> None:
+            while True:
+                gauges = read_gauges()
+                if (
+                    gauges["rollout_buffer/num_groups_in_trainer"]
+                    != num_groups_held_by_trainer
+                ):
+                    wrong_readings.append(gauges)
+                await asyncio.sleep(0)
+
+        checker_task = asyncio.create_task(check_every_turn())
+
+        for group_id in range(6):
+            await _admit(buffer, group_id)
+        for _ in range(5):
+            await buffer.claim_next()
+        await expect(waiting=1, inflight=5)
+
+        # The batcher takes g0 and waits for a second group.
+        await _finalize(buffer, 0)
+        await expect(waiting=1, inflight=4, in_batcher=1)
+
+        # g1 is untrainable: the batcher frees its slot at once.
+        await _finalize(buffer, 1)
+        await expect(waiting=1, inflight=3, in_batcher=1, available=1)
+
+        # g0 + g2 make a batch; the queue has room.
+        await _finalize(buffer, 2)
+        await expect(waiting=1, inflight=2, in_queue=2, available=1)
+
+        # g3 + g4 make a batch; put waits for room in the queue.
+        await _finalize(buffer, 3)
+        await _finalize(buffer, 4)
+        await expect(waiting=1, in_batcher=2, in_queue=2, available=1)
+
+        # The batcher is blocked on put, so g5 stays in the buffer.
+        await buffer.claim_next()
+        await _finalize(buffer, 5)
+        await expect(finalized=1, in_batcher=2, in_queue=2, available=1)
+
+        # The trainer takes g0 + g2; the batcher queues g3 + g4, then takes g5.
+        await training_batch_queue.get()
+        num_groups_held_by_trainer = 2
+        await expect(in_batcher=1, in_queue=2, in_trainer=2, available=1)
+
+        # The weight pull after the trainer's optimizer step frees its batch's slots.
+        await buffer.release_active_groups(2, reason="trained")
+        num_groups_held_by_trainer = 0
+        await expect(in_batcher=1, in_queue=2, available=3)
+
+        assert wrong_readings == []
+        await buffer.close()
+        for task in (checker_task, batcher_task):
+            task.cancel()
+        await asyncio.gather(checker_task, batcher_task, return_exceptions=True)
 
     asyncio.run(run())
