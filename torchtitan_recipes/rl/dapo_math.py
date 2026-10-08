@@ -275,7 +275,7 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_8_generators() -> Controller.Co
     instead of three: 1 trainer host (4 GPUs) + 8 TP1 engines.
 
     64 prompts x 16 samples per step (~7 min of forward/backward), target_offpolicy_steps 6
-    (a ~60K-token sample spans ~4 steps), up to 400 running sequences per engine, and only
+    (a ~60K-token sample spans ~4 steps), up to 320 running sequences per engine, and only
     problems Qwen3-4B-Thinking-2507 solves in at most 6 of 8 tries.
     """
     config = _intellect3_math_config(
@@ -285,7 +285,7 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_8_generators() -> Controller.Co
         num_generators=8,
         target_offpolicy_steps=6,
     )
-    config.async_loop.max_num_seqs_per_generator = 400
+    config.async_loop.max_num_seqs_per_generator = 320
     config.rollouter.train_dataset.max_pass_rate = 0.75
     return config
 
