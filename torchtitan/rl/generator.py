@@ -29,6 +29,7 @@ from vllm.config.compilation import CompilationMode, CUDAGraphMode, PassConfig
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.config import Configurable, DebugConfig, OverrideConfig
@@ -43,6 +44,7 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.intra_generator import IntraGeneratorRouter
+from torchtitan.rl.distributed.routing.types import KVCacheBudget
 from torchtitan.rl.model.batch_invariance import force_logprobs_fn_for_batch_invariance
 from torchtitan.rl.model.vllm_registry import (
     register_to_vllm,
@@ -1131,6 +1133,36 @@ class VLLMGenerator(Configurable):
     async def sync_log_step(self, step: int, relative_step: int | None = None) -> None:
         """Sync the structured-logger step counter from the controller."""
         sl.set_step(step, relative_step=relative_step)
+
+    def kv_cache_budget(self) -> KVCacheBudget:
+        """Return the KV cache size and per-session block cost, for the router's KV admission.
+
+        A session holds one block per ``block_size`` tokens in each full-attention group (and
+        Mamba group in "all" mode). In every other group it holds vLLM's per-request bound, e.g.
+        2 blocks per Mamba group in "align" mode. These are the counts behind vLLM's logged
+        "GPU KV cache size".
+        """
+        vllm_config = self._engine.vllm_config
+        kv_cache_config = self._engine.engine_core.engine_core.scheduler.kv_cache_config
+        growing_groups, fixed_blocks = 0, 0
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, FullAttentionSpec) or (
+                isinstance(spec, MambaSpec)
+                and vllm_config.cache_config.mamba_cache_mode == "all"
+            ):
+                growing_groups += 1
+            else:
+                fixed_blocks += math.ceil(
+                    spec.max_memory_usage_bytes(vllm_config) / spec.page_size_bytes
+                )
+        return KVCacheBudget(
+            # Each DP replica has its own engine; assumes they all have this one's size.
+            num_blocks=kv_cache_config.num_blocks * self._dp_degree,
+            block_size=vllm_config.cache_config.block_size,
+            num_growing_groups=growing_groups,
+            fixed_blocks_per_session=fixed_blocks,
+        )
 
     async def start_engine_loop(self) -> None:
         """Start the background engine loop on every rank (one-time, idempotent)."""

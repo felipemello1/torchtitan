@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -23,7 +24,13 @@ from torchtitan.rl.distributed.routing.strategies import (
     RoutingStrategy,
     StickySessionRoutingStrategy,
 )
-from torchtitan.rl.distributed.routing.types import RoutingCandidate, RoutingContext
+from torchtitan.rl.distributed.routing.types import (
+    KVCacheBudget,
+    RoutingCandidate,
+    RoutingContext,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class _GeneratorState(Enum):
@@ -56,6 +63,46 @@ class _GeneratorHandle(RoutingCandidate):
 
     serving: asyncio.Event = field(default_factory=asyncio.Event)
     """Set while this generator is ``SERVING``."""
+
+    kv_limit: int = 0
+    """KV cache blocks that the groups placed here may hold (KV admission only)."""
+
+    kv_blocks: int = 0
+    """Estimated KV cache blocks held by the groups placed here (KV admission only)."""
+
+
+@dataclass(kw_only=True, slots=True)
+class _PlacedGroup:
+    """A rollout group that KV admission placed on one generator.
+
+    Example (each session's first call costs 4 blocks; groups have had up to 3 sessions)::
+
+        group 7's first call -> placed on gen1, reserved_blocks=12, gen1.kv_blocks += 12
+        its 3 sessions grow to 6 blocks each -> blocks = max(12, 18) = 18
+        session r0 ends -> the reservation ends, blocks = 12
+        release_groups([7]) -> gen1.kv_blocks -= 12
+    """
+
+    handle: _GeneratorHandle
+
+    reserved_blocks: int
+    """Blocks held for sessions that have not arrived yet, until the group's first session ends."""
+
+    blocks_by_session: dict[str | None, int] = field(default_factory=dict)
+    """Blocks each live session holds for its context so far."""
+
+    @property
+    def blocks(self) -> int:
+        """Blocks charged to the generator: the reservation until live sessions outgrow it."""
+        return max(self.reserved_blocks, sum(self.blocks_by_session.values()))
+
+
+@dataclass(kw_only=True, slots=True)
+class _WaitingGroup:
+    """A new rollout group waiting for KV room."""
+
+    blocks: int
+    admitted: asyncio.Future[_PlacedGroup]
 
 
 class InterGeneratorRouter(Actor, Configurable):
@@ -108,6 +155,18 @@ class InterGeneratorRouter(Actor, Configurable):
         under different policy versions. A turn whose session is pinned to a
         draining generator waits for it instead of moving to another one."""
 
+        kv_admission_limit: float | None = None
+        """Fraction of each generator's KV cache blocks that live sessions may
+        hold, so that a session's history stays cached between its turns.
+        ``None`` (default) turns it off; when set, ``strategy`` is unused. Meant
+        for multi-turn rollouts: vLLM already admits running requests by size,
+        but counts a session's history between turns as free.
+
+        Each rollout group runs on the generator with the most room. A new group
+        waits (FIFO) until its first turns fit; turns of placed groups never
+        wait. Sessions count at their current context, so groups admitted
+        together, e.g. at startup, can grow past the limit."""
+
     def __init__(
         self,
         config: Config,
@@ -141,6 +200,14 @@ class InterGeneratorRouter(Actor, Configurable):
         # Routing sessions of each rollout group, so `release_groups` drops any a rollout did not release.
         self._group_sessions: dict[int, set[str]] = {}
 
+        # KV admission state, used when `kv_admission_limit` is set. The budget is read
+        # from the generators in `start_engine_loop`.
+        self._kv_budget: KVCacheBudget | None = None
+        self._placed_groups: dict[int, _PlacedGroup] = {}
+        # New groups in arrival order; admitted first-in, first-out.
+        self._waiting_groups: dict[int, _WaitingGroup] = {}
+        self._max_sessions_per_group = 1
+
     def _candidates(self) -> list[_GeneratorHandle]:
         """Return generator handles that are currently routable."""
 
@@ -163,6 +230,8 @@ class InterGeneratorRouter(Actor, Configurable):
         else:
             h.serving.clear()
         self._refresh_serving_status()
+        # A generator back from a drain may have room for waiting groups.
+        self._admit_waiting_groups()
 
     def _reserve(self, h: _GeneratorHandle, cost: int) -> None:
         """Reserve estimated generation work on a handle before dispatch."""
@@ -202,22 +271,183 @@ class InterGeneratorRouter(Actor, Configurable):
         candidates = self._candidates()
         assert candidates, "serving event was set with no serving generators"
         h = self._strategy.choose(routing_ctx, candidates)
-        self._reserve(h, routing_ctx.estimated_cost)
+        return await self._call(
+            h, method, *args, cost=routing_ctx.estimated_cost, **kwargs
+        )
+
+    async def _call(
+        self, h: _GeneratorHandle, method: str, *args, cost: int, **kwargs
+    ) -> Any:
+        """Call ``method`` on a generator's rank 0, reserving ``cost`` while it runs."""
+        self._reserve(h, cost)
         try:
             return await getattr(h.rank0_actor, method).call_one(*args, **kwargs)
         finally:
-            self._release(h, routing_ctx.estimated_cost)
+            self._release(h, cost)
+
+    def _roomiest_generator(self) -> _GeneratorHandle | None:
+        """Return the serving generator with the most KV room."""
+        return max(
+            self._candidates(), key=lambda h: h.kv_limit - h.kv_blocks, default=None
+        )
+
+    def _place_group(
+        self, group_id: int, h: _GeneratorHandle, reserved_blocks: int
+    ) -> _PlacedGroup:
+        placed = _PlacedGroup(handle=h, reserved_blocks=reserved_blocks)
+        self._placed_groups[group_id] = placed
+        h.kv_blocks += reserved_blocks
+        return placed
+
+    def _admit_waiting_groups(self) -> None:
+        """Place waiting groups, oldest first, while the oldest fits on a generator."""
+        while self._waiting_groups:
+            group_id, waiting = next(iter(self._waiting_groups.items()))
+            h = self._roomiest_generator()
+            # An empty generator takes any group, so a group larger than the limit still runs.
+            if h is None or (
+                h.kv_blocks > 0 and h.kv_blocks + waiting.blocks > h.kv_limit
+            ):
+                return
+            del self._waiting_groups[group_id]
+            waiting.admitted.set_result(self._place_group(group_id, h, waiting.blocks))
+
+    async def _admit_group(self, group_id: int, num_tokens: int) -> _PlacedGroup:
+        """Return the group's placement; a new group first waits for KV room.
+
+        Args:
+            group_id: Rollout group of the call.
+            num_tokens: The call's prompt length.
+        """
+        placed = self._placed_groups.get(group_id)
+        if placed is not None:
+            return placed
+        assert self._kv_budget is not None, "start_engine_loop reads the KV budget"
+        if group_id < 0:
+            # Validation groups (negative ids, see the controller) skip the queue: the
+            # trainer waits on them.
+            await self._serving.wait()
+            return self._place_group(group_id, self._roomiest_generator(), 0)
+        waiting = self._waiting_groups.get(group_id)
+        if waiting is None:
+            # Until its sessions arrive, reserve as many as the largest group seen so far.
+            # TODO: reserve what the sessions will grow to, e.g. the mean final blocks of
+            # released sessions; a group admitted at first-turn size can grow ~1.5-5x.
+            waiting = _WaitingGroup(
+                blocks=self._max_sessions_per_group
+                * self._kv_budget.session_blocks(num_tokens),
+                admitted=asyncio.get_running_loop().create_future(),
+            )
+            self._waiting_groups[group_id] = waiting
+            self._admit_waiting_groups()
+        with sl.log_trace_span("router_kv_admission_wait"):
+            # Shielded: one cancelled sibling must not cancel the group's admission.
+            return await asyncio.shield(waiting.admitted)
+
+    def _set_session_tokens(
+        self,
+        group_id: int,
+        placed: _PlacedGroup,
+        session_id: str | None,
+        num_tokens: int | None,
+    ) -> None:
+        """Set a session's context length on its group's generator; ``None`` ends the session."""
+        if self._placed_groups.get(group_id) is not placed:
+            return  # The group was released while this call ran.
+        assert self._kv_budget is not None
+        old_blocks = placed.blocks
+        if num_tokens is None:
+            # Once a session ends, its siblings have started: count only live sessions.
+            placed.reserved_blocks = 0
+            placed.blocks_by_session.pop(session_id, None)
+        else:
+            placed.blocks_by_session[session_id] = self._kv_budget.session_blocks(
+                num_tokens
+            )
+            self._max_sessions_per_group = max(
+                self._max_sessions_per_group, len(placed.blocks_by_session)
+            )
+        placed.handle.kv_blocks += placed.blocks - old_blocks
+        self._admit_waiting_groups()
+
+    async def _generate_with_kv_admission(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        request_id: str,
+        group_id: int,
+        routing_session_id: str | None,
+        sampling_config: Any | None,
+        metrics_prefix: str,
+    ) -> Any:
+        """Generate on the group's generator, admitting the group first if it is new.
+
+        A call charges its prompt while it runs (vLLM admits what it generates), then its
+        prompt plus completion.
+        """
+        num_prompt_tokens = len(prompt_token_ids)
+        placed = await self._admit_group(group_id, num_prompt_tokens)
+        self._set_session_tokens(
+            group_id, placed, routing_session_id, num_prompt_tokens
+        )
+        h = placed.handle
+        # Wait out a drain on the group's generator: it is short, and it keeps the group's KV.
+        while not h.serving.is_set():
+            await h.serving.wait()
+        completion = await self._call(
+            h,
+            "generate",
+            prompt_token_ids,
+            request_id=request_id,
+            group_id=group_id,
+            routing_session_id=routing_session_id,
+            sampling_config=sampling_config,
+            metrics_prefix=metrics_prefix,
+            cost=1,
+        )
+        self._set_session_tokens(
+            group_id,
+            placed,
+            routing_session_id,
+            num_prompt_tokens + len(completion.token_ids),
+        )
+        return completion
+
+    async def _read_kv_budgets(self) -> None:
+        """Read every generator's KV cache budget and set its admission limit."""
+        budgets = await asyncio.gather(
+            *[h.rank0_actor.kv_cache_budget.call_one() for h in self._generators]
+        )
+        for h, budget in zip(self._generators, budgets, strict=True):
+            h.kv_limit = int(self._config.kv_admission_limit * budget.num_blocks)
+        # The generators share one config, so one budget's per-session cost fits all.
+        self._kv_budget = budgets[0]
+        logger.info(
+            "KV admission: groups may hold %s KV cache blocks per generator; %s",
+            [h.kv_limit for h in self._generators],
+            self._kv_budget,
+        )
 
     def _release_session(self, group_id: int, session_id: str) -> None:
-        """Drop a session's affinity."""
+        """Drop a session's affinity and, with KV admission, its blocks."""
         self._group_sessions.get(group_id, set()).discard(session_id)
         self._strategy.release_session(session_id)
+        placed = self._placed_groups.get(group_id)
+        if placed is not None:
+            self._set_session_tokens(group_id, placed, session_id, None)
 
     def _release_groups(self, group_ids: list[int]) -> None:
-        """Drop the affinity of every session left in these groups."""
+        """Drop the affinity of every session left in these groups, and free their blocks."""
         for group_id in group_ids:
             for session_id in self._group_sessions.pop(group_id, ()):
                 self._strategy.release_session(session_id)
+            placed = self._placed_groups.pop(group_id, None)
+            if placed is not None:
+                placed.handle.kv_blocks -= placed.blocks
+            waiting = self._waiting_groups.pop(group_id, None)
+            if waiting is not None:
+                waiting.admitted.cancel()
+        self._admit_waiting_groups()
 
     async def _generate(
         self,
@@ -232,6 +462,15 @@ class InterGeneratorRouter(Actor, Configurable):
         """Body of the ``generate`` endpoint."""
         if routing_session_id is not None:
             self._group_sessions.setdefault(group_id, set()).add(routing_session_id)
+        if self._config.kv_admission_limit is not None:
+            return await self._generate_with_kv_admission(
+                prompt_token_ids,
+                request_id=request_id,
+                group_id=group_id,
+                routing_session_id=routing_session_id,
+                sampling_config=sampling_config,
+                metrics_prefix=metrics_prefix,
+            )
         return await self._route(
             "generate",
             prompt_token_ids,
@@ -339,11 +578,22 @@ class InterGeneratorRouter(Actor, Configurable):
     async def start_engine_loop(self) -> None:
         """Start the engine loop on every rank of every generator."""
         await self._fanout("start_engine_loop")
+        if self._config.kv_admission_limit is not None:
+            await self._read_kv_budgets()
 
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:
         """Set the step counter in this process and in every generator rank."""
         sl.set_step(step)
+        if self._config.kv_admission_limit is not None:
+            logger.info(
+                "KV admission at step %d: %d groups placed, %d waiting; "
+                "KV blocks / limit per generator: %s",
+                step,
+                len(self._placed_groups),
+                len(self._waiting_groups),
+                [round(h.kv_blocks / h.kv_limit, 2) for h in self._generators],
+            )
         await self._fanout("sync_log_step", step)
 
     @concurrent_endpoint

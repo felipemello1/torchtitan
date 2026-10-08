@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,7 +18,7 @@ from torchtitan.rl.distributed.routing.strategies import (
     RoundRobinRoutingStrategy,
     StickySessionRoutingStrategy,
 )
-from torchtitan.rl.distributed.routing.types import RoutingContext
+from torchtitan.rl.distributed.routing.types import KVCacheBudget, RoutingContext
 
 
 class _Endpoint:
@@ -69,12 +70,18 @@ class _Actor:
 
 
 def _router(
-    actors, *, strategy=None, hot_swap=False, enable_cpu_weight_prefetch=False
+    actors,
+    *,
+    strategy=None,
+    hot_swap=False,
+    enable_cpu_weight_prefetch=False,
+    kv_admission_limit=None,
 ) -> InterGeneratorRouter:
     return InterGeneratorRouter(
         InterGeneratorRouter.Config(
             strategy=strategy or LeastLoadedRoutingStrategy.Config(),
             hot_swap=hot_swap,
+            kv_admission_limit=kv_admission_limit,
         ),
         generators=actors,
         enable_cpu_weight_prefetch=enable_cpu_weight_prefetch,
@@ -343,9 +350,9 @@ def test_sticky_session_respects_max_sessions():
     asyncio.run(_run())
 
 
-async def _generate(router, *, group_id: int, session_id: str):
+async def _generate(router, *, group_id: int, session_id: str, prompt_tokens: int = 1):
     return await router._generate(
-        [0],
+        [0] * prompt_tokens,
         request_id=f"{session_id}/turn",
         group_id=group_id,
         routing_session_id=session_id,
@@ -545,5 +552,182 @@ def test_pull_model_state_dict_pulls_every_generator():
             [((7,), {})],
             [((7,), {})],
         ]
+
+    asyncio.run(_run())
+
+
+# KV admission. Each generator holds 10 blocks of 10 tokens, and a session holds one block per
+# 10 tokens plus one fixed block: a 20-token prompt holds 3 blocks, then 4 with a 10-token reply.
+_BUDGET = KVCacheBudget(
+    num_blocks=10, block_size=10, num_growing_groups=1, fixed_blocks_per_session=1
+)
+
+
+class _KVActor(_Actor):
+    """A generator fake whose completions have ``completion_tokens`` tokens."""
+
+    def __init__(self, name: str, *, completion_tokens: int = 10, **kwargs):
+        super().__init__(name, **kwargs)
+        self.generate.value = SimpleNamespace(
+            name=name, token_ids=[0] * completion_tokens
+        )
+        self.kv_cache_budget = _Endpoint(_BUDGET)
+
+
+async def _kv_router(actors) -> InterGeneratorRouter:
+    router = _router(actors, kv_admission_limit=1.0)
+    await router._read_kv_budgets()
+    return router
+
+
+async def _kv_generate(
+    router, *, group_id: int, session_id: str, prompt_tokens: int = 20
+):
+    completion = await _generate(
+        router, group_id=group_id, session_id=session_id, prompt_tokens=prompt_tokens
+    )
+    return completion.name
+
+
+def test_kv_admission_places_new_groups_on_the_roomiest_generator():
+    async def _run():
+        router = await _kv_router([_KVActor("gen0"), _KVActor("gen1")])
+
+        assert await _kv_generate(router, group_id=0, session_id="g0/r0") == "gen0"
+        assert await _kv_generate(router, group_id=1, session_id="g1/r0") == "gen1"
+        # Sessions of a placed group stay on its generator.
+        assert await _kv_generate(router, group_id=0, session_id="g0/r1") == "gen0"
+        assert [h.kv_blocks for h in router._generators] == [8, 4]
+
+    asyncio.run(_run())
+
+
+def test_kv_admission_new_group_waits_until_a_session_ends():
+    async def _run():
+        router = await _kv_router([_KVActor("gen0")])
+        await _kv_generate(router, group_id=0, session_id="g0/r0")
+        await _kv_generate(router, group_id=1, session_id="g1/r0")
+        assert router._generators[0].kv_blocks == 8
+
+        # 8 + 3 > 10 blocks: group 2 waits, and its sibling waits for the same admission.
+        waiting = asyncio.create_task(
+            _kv_generate(router, group_id=2, session_id="g2/r0")
+        )
+        sibling = asyncio.create_task(
+            _kv_generate(router, group_id=2, session_id="g2/r1")
+        )
+        await asyncio.sleep(0)
+        assert not waiting.done() and list(router._waiting_groups) == [2]
+
+        # Group 0's session ends, which frees its 4 blocks.
+        router._release_session(group_id=0, session_id="g0/r0")
+        assert await waiting == "gen0"
+        assert await sibling == "gen0"
+
+    asyncio.run(_run())
+
+
+def test_kv_admission_turns_of_placed_groups_never_wait():
+    async def _run():
+        router = await _kv_router([_KVActor("gen0")])
+        # Self-play: white's first turn places the group and fills the generator.
+        await _kv_generate(router, group_id=0, session_id="white", prompt_tokens=60)
+        assert router._generators[0].kv_blocks == 8
+        waiting = asyncio.create_task(
+            _kv_generate(router, group_id=1, session_id="g1/r0")
+        )
+        await asyncio.sleep(0)
+        assert not waiting.done()
+
+        # Black's first turn joins its placed group past the limit, so the game can go on.
+        assert await _kv_generate(router, group_id=0, session_id="black") == "gen0"
+        assert router._generators[0].kv_blocks == 8 + 4
+        assert not waiting.done()
+
+        router._release_groups([0])
+        assert await waiting == "gen0"
+
+    asyncio.run(_run())
+
+
+def test_kv_admission_counts_sessions_by_their_context_length():
+    async def _run():
+        router = await _kv_router([_KVActor("gen0", completion_tokens=5)])
+
+        # 20-token prompt: 3 blocks while it runs, then 25 tokens = 4 blocks.
+        await _kv_generate(router, group_id=0, session_id="g0/r0")
+        assert router._generators[0].kv_blocks == 4
+        # The next turn extends the history: 45 + 5 = 50 tokens = 6 blocks.
+        await _kv_generate(router, group_id=0, session_id="g0/r0", prompt_tokens=45)
+        assert router._generators[0].kv_blocks == 6
+
+        router._release_session(group_id=0, session_id="g0/r0")
+        assert router._generators[0].kv_blocks == 0
+
+    asyncio.run(_run())
+
+
+def test_kv_admission_reserves_the_largest_group_seen_so_far():
+    async def _run():
+        router = await _kv_router([_KVActor("gen0", completion_tokens=0)])
+        await _kv_generate(router, group_id=0, session_id="g0/r0")
+        await _kv_generate(router, group_id=0, session_id="g0/r1")
+        assert router._generators[0].kv_blocks == 6
+
+        # Group 1 reserves two sessions of 3 blocks: 6 + 6 > 10 waits, though one session fits.
+        waiting = asyncio.create_task(
+            _kv_generate(router, group_id=1, session_id="g1/r0")
+        )
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        router._release_groups([0])
+        assert await waiting == "gen0"
+
+    asyncio.run(_run())
+
+
+def test_kv_admission_empty_generator_takes_a_group_larger_than_its_limit():
+    async def _run():
+        router = await _kv_router([_KVActor("gen0")])
+        # A 200-token prompt holds 21 blocks, over the 10-block limit.
+        assert (
+            await _kv_generate(
+                router, group_id=0, session_id="g0/r0", prompt_tokens=200
+            )
+            == "gen0"
+        )
+
+    asyncio.run(_run())
+
+
+def test_kv_admission_validation_groups_skip_the_queue():
+    async def _run():
+        router = await _kv_router([_KVActor("gen0")])
+        await _kv_generate(router, group_id=0, session_id="g0/r0", prompt_tokens=60)
+        waiting = asyncio.create_task(
+            _kv_generate(router, group_id=1, session_id="g1/r0")
+        )
+        await asyncio.sleep(0)
+
+        # Validation group ids are negative; the trainer waits on them.
+        assert await _kv_generate(router, group_id=-1, session_id="v0") == "gen0"
+        assert not waiting.done()
+        router._release_groups([0, -1])
+        assert await waiting == "gen0"
+
+    asyncio.run(_run())
+
+
+def test_kv_admission_group_released_during_a_call_frees_all_its_blocks():
+    async def _run():
+        actor = _KVActor("gen0", wait_generate=True)
+        router = await _kv_router([actor])
+        call = asyncio.create_task(_kv_generate(router, group_id=0, session_id="g0/r0"))
+        await actor.generate.started.wait()
+
+        router._release_groups([0])
+        actor.generate.release.set()
+        await call
+        assert router._generators[0].kv_blocks == 0
 
     asyncio.run(_run())
