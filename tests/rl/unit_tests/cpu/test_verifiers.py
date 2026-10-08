@@ -735,6 +735,56 @@ def test_terminus_max_tokens_turn_stays_on_its_branch() -> None:
     assert bridges(restore_sampled_reasoning(history, trace))
 
 
+def test_terminus_turns_with_the_same_content_stay_on_one_branch() -> None:
+    """Two sampled turns with content "" but different reasoning (a stray </think> with thinking
+    off) each get their own reasoning back, so the next prompt bridges instead of forking."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins.terminal_bench_sandoq import (
+        restore_sampled_reasoning,
+    )
+    from verifiers.v1 import graph
+    from verifiers.v1.configs.agent import AgentConfig
+    from verifiers.v1.dialects.chat import parse_message
+    from verifiers.v1.trace import AgentInfo, Trace, TraceTask
+    from verifiers.v1.types import AssistantMessage, Response, TurnTokens
+
+    trace = Trace(
+        task=TraceTask(type="Task", data={}), agent=AgentInfo(config=AgentConfig())
+    )
+    task = {"role": "user", "content": "Write a.py"}
+    reply = {"role": "user", "content": "New Terminal Output: $"}
+    first = {"role": "assistant", "content": "", "reasoning_content": "junk A"}
+    second = {"role": "assistant", "content": "", "reasoning_content": "junk B"}
+
+    def commit(messages: list[dict], sampled: dict, prompt_ids: list[int]) -> None:
+        prompt = [parse_message(message) for message in messages]
+        graph.prepare_turn(trace, prompt).commit(
+            Response(
+                id=str(len(prompt_ids)),
+                created=0,
+                model="torchtitan",
+                message=AssistantMessage(
+                    content="", reasoning_content=sampled["reasoning_content"]
+                ),
+                finish_reason="stop",
+                tokens=TurnTokens(
+                    prompt_ids=prompt_ids, completion_ids=[9], completion_logprobs=[0.0]
+                ),
+            )
+        )
+
+    commit([task], first, [1, 2])
+    commit([task, first, reply], second, [1, 2, 9, 3])
+    # Terminus-2 with interleaved thinking off re-sends both turns without their reasoning.
+    resent = {"role": "assistant", "content": ""}
+    history = [task, resent, reply, resent, reply]
+
+    prompt = [
+        parse_message(message) for message in restore_sampled_reasoning(history, trace)
+    ]
+    assert graph.prepare_turn(trace, prompt).previous_token_ids() is not None
+
+
 def test_sandoq_rollout_log_explains_a_tmux_failure(tmp_path, caplog) -> None:
     """A rollout whose tmux never starts leaves a log with Terminus-2's traceback and log lines."""
     pytest.importorskip("harbor")
