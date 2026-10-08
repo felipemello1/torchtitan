@@ -27,7 +27,6 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
-import dataclasses
 import gzip
 import json
 import logging
@@ -39,7 +38,7 @@ import time
 import traceback
 from collections.abc import Iterator
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
@@ -563,12 +562,13 @@ def install_shell_refresh() -> None:
 
 
 def install_text_only_parse() -> None:
-    """Parse Qwen3.5 replies to requests without tools so the content is never lost. Idempotent.
+    """Patch Qwen3.5's parser so Terminus-2 gets its reply as content when a request declares no
+    tools. Idempotent.
 
     Terminus-2 declares no tools and reads its JSON from the content, which the stock parser left
     "" in two cases:
     - The parser moves everything from a ``<tool_call>`` token on into a tool call, and Verifiers
-      drops one without a ``<function=...>`` name. Here the markup stays in the content.
+      drops a tool call without a ``<function=...>`` name. Here the markup stays in the content.
     - With thinking off, the prompt already closed the think block, but the parser still splits at
       a stray ``</think>`` in the reply. When that leaves the content empty, the reasoning becomes
       the content.
@@ -578,18 +578,19 @@ def install_text_only_parse() -> None:
                                        # here:  content='{"analysis": "..."}', reasoning_content=None
 
     TODO: upstream to renderers: no tool-call extraction when no tools are declared. renderers'
-    main (after v0.1.11) parses everything after a closed think prefill as content; revisit then.
+    main (after v0.1.11) breaks this patch: its client passes `prompt_ids=`, and it no longer
+    splits at a stray `</think>` after a closed think prefill. Redo it on that upgrade.
     """
     from renderers.parsing import parse_qwen35
     from renderers.qwen35 import Qwen35Renderer
 
     if getattr(Qwen35Renderer, "_text_only_parse_installed", False):
         return
-    parse_response = Qwen35Renderer.parse_response
+    stock_parse_response = Qwen35Renderer.parse_response
 
     def parse_response_without_tools(self, token_ids, *, tools=None):
         if tools:
-            return parse_response(self, token_ids, tools=tools)
+            return stock_parse_response(self, token_ids, tools=tools)
         # -1 matches no token: everything after the think block is content.
         parsed = parse_qwen35(
             self._tokenizer,
@@ -602,7 +603,7 @@ def install_text_only_parse() -> None:
         )
         if self.config.enable_thinking or parsed.content:
             return parsed
-        return dataclasses.replace(
+        return replace(
             parsed, content=parsed.reasoning_content or "", reasoning_content=None
         )
 
