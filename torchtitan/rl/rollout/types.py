@@ -168,6 +168,12 @@ class Rollout:
     """Rollouter-specific debug record, e.g. why the rollout failed. Saved with the rollout
     by `RolloutSampleRecorder`; not used for training."""
 
+    @property
+    def has_forced_answer(self) -> bool:
+        """Whether a `ThinkingBudget` force-closed the thinking of the last turn."""
+        loss_mask = self.turns[-1].completion_loss_mask if self.turns else None
+        return loss_mask is not None and not all(loss_mask)
+
 
 @dataclass(kw_only=True, slots=True)
 class RolloutGroup:

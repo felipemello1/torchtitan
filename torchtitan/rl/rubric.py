@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import statistics
 from dataclasses import dataclass, field
 
 from torchtitan.config import Configurable
@@ -67,6 +68,61 @@ class RubricOutput:
     advantage, reweighting, metrics, or inspection."""
 
 
+class CorrectLengthPenalty(Configurable):
+    """Penalizes correct rollouts longer than their group's median correct rollout, in groups
+    solved at least `min_pass_rate` of the time but not always.
+
+    Wrong rollouts never pay, so failing fast is never rewarded. Groups solved less often pay
+    nothing, so hard problems keep their long reasoning.
+
+    Example (max_tokens=131072, max_penalty=0.1; 12 of 16 correct, median correct 20,000 tokens):
+        correct, 15,000 tokens  -> 0.0
+        correct, 75,536 tokens  -> 0.1 * (75536 - 20000) / (131072 - 20000) = 0.05
+        wrong, any length       -> 0.0
+        6 or 16 of 16 correct   -> 0.0 for every rollout
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        max_tokens: int
+        """Completion tokens at which the penalty reaches `max_penalty`: the response cap."""
+
+        max_penalty: float = 0.1
+        """Largest penalty a rollout pays; never more than its reward."""
+
+        min_pass_rate: float = 0.5
+        """Groups solved less often than this pay nothing."""
+
+    def __init__(self, config: Config) -> None:
+        self._max_tokens = config.max_tokens
+        self._max_penalty = config.max_penalty
+        self._min_pass_rate = config.min_pass_rate
+
+    def __call__(self, rollouts: list[Rollout], rewards: list[float]) -> list[float]:
+        """Return one penalty per rollout, in group order; a reward > 0 counts as correct."""
+        is_correct = [reward > 0 for reward in rewards]
+        pass_rate = sum(is_correct) / len(rewards)
+        # Never-solved and always-solved groups pay nothing: there length would be the only signal.
+        if not 0.0 < pass_rate < 1.0 or pass_rate < self._min_pass_rate:
+            return [0.0] * len(rollouts)
+        num_tokens = [
+            sum(
+                len(rollout_turn.completion_token_ids) for rollout_turn in rollout.turns
+            )
+            for rollout in rollouts
+        ]
+        median = statistics.median(
+            n for n, correct in zip(num_tokens, is_correct, strict=True) if correct
+        )
+        ramp = max(self._max_tokens - median, 1)
+        return [
+            min(self._max_penalty * min(max((n - median) / ramp, 0.0), 1.0), reward)
+            if correct
+            else 0.0
+            for n, correct, reward in zip(num_tokens, is_correct, rewards, strict=True)
+        ]
+
+
 class Rubric(Configurable):
     """Scores rollouts with a set of weighted reward functions.
 
@@ -97,9 +153,19 @@ class Rubric(Configurable):
         """Reward for a errored rollout. If set, the reward fns are SKIPPED and this fixed
         reward is used. If None, the reward fns run on the errored rollout."""
 
+        forced_answer_scale: float = 1.0
+        """Multiplies a positive reward when a `ThinkingBudget` force-closed the last turn's
+        thinking. Below 1, a forced answer is worth less than the same answer reached on its own."""
+
+        length_penalty: CorrectLengthPenalty.Config | None = None
+        """Subtracted from each rollout's reward once its group is graded; None: no penalty."""
+
     def __init__(self, config: Config) -> None:
         self._config = config
         self._reward_fns = [rwd_cfg.build() for rwd_cfg in config.reward_fns]
+        self._length_penalty = (
+            None if config.length_penalty is None else config.length_penalty.build()
+        )
 
         # Sanity checks
         if not self._reward_fns:
@@ -151,6 +217,8 @@ class Rubric(Configurable):
         for fn, r in zip(self._reward_fns, per_fn_rewards, strict=True):
             reward_breakdown[type(fn).__name__] = r
             total_reward += (fn.weight / self._weight_sum) * r
+        if total_reward > 0 and rollout.has_forced_answer:
+            total_reward *= cfg.forced_answer_scale
 
         return RubricOutput(reward=total_reward, reward_breakdown=reward_breakdown)
 
@@ -160,7 +228,7 @@ class Rubric(Configurable):
         rollouts: list[Rollout],
         env_input: object,
     ) -> list[RubricOutput]:
-        """Score every rollout in one prompt group.
+        """Score every rollout in one prompt group, then subtract `length_penalty`.
 
         Override for cross-rollout rewards (pairwise comparison, diversity,
         rank normalization).
@@ -172,6 +240,21 @@ class Rubric(Configurable):
         Returns:
             One `RubricOutput` per rollout, in input order.
         """
-        return await asyncio.gather(
+        outputs = await asyncio.gather(
             *(self._score_single_rollout(r, env_input) for r in rollouts)
         )
+        if self._length_penalty is None:
+            return outputs
+        penalties = self._length_penalty(
+            rollouts, [output.reward for output in outputs]
+        )
+        return [
+            RubricOutput(
+                reward=output.reward - penalty,
+                reward_breakdown={
+                    **output.reward_breakdown,
+                    "length_penalty": -penalty,
+                },
+            )
+            for output, penalty in zip(outputs, penalties, strict=True)
+        ]

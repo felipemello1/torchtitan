@@ -299,6 +299,27 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
         for name, values in sorted(values_by_name.items())
     )
 
+    # Forced answers (a `ThinkingBudget` closed the thinking): how many, how often right, and how
+    # often cut again in the answer reserve. The share of forced turns is `thinking_budget/forced_close_rate`.
+    scored = [rollout for rollout in rollouts if rollout.reward is not None]
+    forced = [rollout for rollout in scored if rollout.has_forced_answer]
+    natural = [rollout for rollout in scored if not rollout.has_forced_answer]
+    out += [
+        m.Metric(f"{prefix}/forced_answer/count", m.Sum(float(len(forced)))),
+        m.Metric(
+            f"{prefix}/forced_answer/correct",
+            m.Mean.from_list([rollout.reward > 0 for rollout in forced]),
+        ),
+        m.Metric(
+            f"{prefix}/forced_answer/cut_in_reserve",
+            m.Mean.from_list([rollout.status.is_truncated() for rollout in forced]),
+        ),
+        m.Metric(
+            f"{prefix}/natural_answer/correct",
+            m.Mean.from_list([rollout.reward > 0 for rollout in natural]),
+        ),
+    ]
+
     # Per-generation turn metrics (latencies, output tokens) measured by the generator.
     # They carry their own keys (e.g. "generator/..."), so they ride through unprefixed.
     out.extend(
