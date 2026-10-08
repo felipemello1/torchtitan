@@ -272,15 +272,15 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_12_generators() -> Controller.C
 
 def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_8_generators() -> Controller.Config:
     """`rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_12_generators` with two generator hosts
-    instead of three: 1 trainer host (4 GPUs) + 8 TP1 engines. Set the batch with
-    `DOME_V2_PROMPTS` at launch.
+    instead of three: 1 trainer host (4 GPUs) + 8 TP1 engines. 96 prompts x 16 samples per
+    step and target_offpolicy_steps 3: KV cache, not the off-policy depth, bounds the step.
     """
     return _intellect3_math_config(
-        default_prompts=64,
+        default_prompts=96,
         default_microbatch_rows=1,
         data_parallel_shard_degree=2,
         num_generators=8,
-        target_offpolicy_steps=5,
+        target_offpolicy_steps=3,
     )
 
 
