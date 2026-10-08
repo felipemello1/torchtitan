@@ -200,7 +200,7 @@ def rl_chess_qwen3_5_35b_a3b(
     max_thinking_tokens: int = 1024,
     max_context_tokens: int = 131072,
 ) -> Controller.Config:
-    """Qwen3.5-35B-A3B (instruct) with thinking on, 150 steps on three GB300 hosts, 96 positions x 8
+    """Qwen3.5-35B-A3B (instruct) with thinking on, 150 steps on three GB300 hosts, 192 positions x 8
     games per step.
 
     A turn thinks up to `max_thinking_tokens`; then `ThinkingBudget` closes the thinking and starts
@@ -227,7 +227,22 @@ def rl_chess_qwen3_5_35b_a3b(
     config.renderer = from_renderers(
         Qwen35RendererConfig(enable_thinking=True, thinking_retention="all")
     )
+    # Bot groups start against a random mover and move ~200 Elo up once the policy wins over 60%.
+    config.rollouter.train_dataset.bots = ("curriculum",)
     worker = config.rollouter.worker
+    worker.bot_curriculum = (
+        "sf_random",
+        "sf_eps75",
+        "sf_eps50",
+        "sf_eps25",
+        "sf_elo1320",
+        "sf_elo1500",
+        "sf_elo1700",
+        "sf_elo1900",
+        "sf_elo2100",
+        "sf_elo2300",
+        "sf_elo2500",
+    )
     worker.thinking_budget = ThinkingBudget.Config(
         max_thinking_tokens=max_thinking_tokens, answer_prefix="\\boxed{"
     )
@@ -278,7 +293,7 @@ def rl_chess_qwen3_5_35b_a3b(
     )
 
     config.num_generators = 8
-    config.async_loop.num_prompts_per_train_step = 96
+    config.async_loop.num_prompts_per_train_step = 192
     config.generator.gpu_memory_limit = 0.9
     config.generator.max_num_batched_tokens = 8192
     return config

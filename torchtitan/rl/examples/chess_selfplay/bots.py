@@ -34,12 +34,19 @@ class BotSpec:
 # Stockfish diluted with random moves fills the range below Stockfish's 1320 floor. Ratings: 96 games
 # per pair under full rules, anchored at UCI_Elo 1320 (research/elo_bots.md, 2026-10-07).
 BOTS: dict[str, BotSpec] = {
+    "sf_random": BotSpec(elo=360, random_move_prob=1.0),
     "sf_eps90": BotSpec(elo=441, random_move_prob=0.9, depth=5),
     "sf_eps75": BotSpec(elo=571, random_move_prob=0.75, depth=5),
     "sf_eps50": BotSpec(elo=747, random_move_prob=0.5, depth=5),
     "sf_eps25": BotSpec(elo=1048, random_move_prob=0.25, depth=5),
     "sf_elo1320": BotSpec(elo=1320, uci_elo=1320),
     "sf_elo1500": BotSpec(elo=1500, uci_elo=1500),
+    # Unmeasured on our scale: rated at their UCI_Elo, like the 1320 anchor.
+    "sf_elo1700": BotSpec(elo=1700, uci_elo=1700),
+    "sf_elo1900": BotSpec(elo=1900, uci_elo=1900),
+    "sf_elo2100": BotSpec(elo=2100, uci_elo=2100),
+    "sf_elo2300": BotSpec(elo=2300, uci_elo=2300),
+    "sf_elo2500": BotSpec(elo=2500, uci_elo=2500),
 }
 
 

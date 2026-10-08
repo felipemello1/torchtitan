@@ -30,7 +30,8 @@ class ChessSample:
 
     fen: str
     opponent: str
-    """"self", or the name of a bot in `bots.BOTS`."""
+    """"self", "curriculum" (the worker picks the bot, see `ChessSelfPlayWorker.Config.bot_curriculum`),
+    or the name of a bot in `bots.BOTS`."""
     policy_color: chess.Color = chess.WHITE
     """The policy's color against a bot; unused in self-play."""
     seed: int = 0

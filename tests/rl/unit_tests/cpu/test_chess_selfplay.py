@@ -466,16 +466,19 @@ class _ScriptedPolicy:
 
 
 async def _run_group(
-    moves_by_rollout, *, group_size, sample=_SELF_PLAY, truncate_at=None
+    moves_by_rollout, *, group_size, sample=_SELF_PLAY, truncate_at=None, worker=None
 ):
-    worker = ChessSelfPlayWorker.Config(
-        rubric=Rubric.Config(
-            reward_fns=[RewardChessScore.Config()],
-        ),
-        message_env=ChessPlayerEnv.Config(),
-        token_env=TokenEnv.Config(step_timeout_s=None),
-        max_plies=40,
-    ).build()
+    worker = (
+        worker
+        or ChessSelfPlayWorker.Config(
+            rubric=Rubric.Config(
+                reward_fns=[RewardChessScore.Config()],
+            ),
+            message_env=ChessPlayerEnv.Config(),
+            token_env=TokenEnv.Config(step_timeout_s=None),
+            max_plies=40,
+        ).build()
+    )
     tokenizer_config = HuggingFaceTokenizer.Config()
     await worker.setup_async(
         tokenizer_config=tokenizer_config,
@@ -574,6 +577,44 @@ def test_worker_forfeits_a_player_that_stops_mid_game() -> None:
         )
 
     asyncio.run(run())
+
+
+def test_worker_moves_up_the_bot_curriculum(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(BOTS, "bot_a", BotSpec(elo=100, random_move_prob=1.0))
+    monkeypatch.setitem(BOTS, "bot_b", BotSpec(elo=300, random_move_prob=1.0))
+
+    async def run(win_rate: float) -> list[float]:
+        worker = ChessSelfPlayWorker.Config(
+            rubric=Rubric.Config(reward_fns=[RewardChessScore.Config()]),
+            message_env=ChessPlayerEnv.Config(),
+            token_env=TokenEnv.Config(step_timeout_s=None),
+            max_plies=40,
+            bot_curriculum=("bot_a", "bot_b"),
+            curriculum_win_rate=win_rate,
+            curriculum_games=1,
+        ).build()
+        sample = ChessSample(
+            fen=chess.STARTING_FEN,
+            opponent="curriculum",
+            policy_color=chess.BLACK,
+            seed=3,
+        )
+        elos = []
+        for _ in range(3):
+            group = await _run_group(
+                {0: ["Ke9"]}, group_size=1, sample=sample, worker=worker
+            )
+            elos.append(
+                _reduced_metrics(group.rollouts)[
+                    "chess_strength/curriculum_bot_elo/mean"
+                ]
+            )
+        return elos
+
+    # each game is a forfeit, a loss: the worker stays on bot_a
+    assert asyncio.run(run(win_rate=0.6)) == [100, 100, 100]
+    # any win rate clears -1: it moves up after the first game, then stays on the last bot
+    assert asyncio.run(run(win_rate=-1.0)) == [100, 300, 300]
 
 
 def test_worker_plays_only_the_policy_against_a_bot(
