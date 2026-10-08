@@ -187,7 +187,7 @@ def _on_sandoq(
                 rollout_log_dir=rollout_log_dir,
             ),
             "runtime": sandbox_runtime(),
-            # Each task's own scoring timeout (Harbor's verifier timeout) applies instead.
+            # SandoqTerminalTaskset.load sets each task's scoring timeout instead.
             "timeout": environment.agent.timeout.model_copy(update={"scoring": None}),
             # A lost exec channel (Sandoq transport, VM gone) gets one more try on a fresh VM.
             "retries": RetryConfig(max_retries=1, include=["SandboxError"]),

@@ -18,7 +18,7 @@ torchtrain_datasets/tree/jianiw/tb_sweep), plus ``install_shell_refresh``. The m
 harness and the taskset plugin. Verifiers imports plugin ids as top-level modules, so this
 directory goes on PYTHONPATH:
 
-    TerminalTasksetConfig(id=PLUGIN_ID, dataset=...)
+    TerminalTasksetConfig(id=PLUGIN_ID, dataset=..., ignore_timeouts=False)
     StockTerminusOutsideConfig(id=PLUGIN_ID)
 """
 
@@ -551,18 +551,23 @@ def requests_bundle() -> bytes:
 class SandoqTerminalTaskset(
     TerminalTaskset, vf.Taskset[SandoqHarborTask, TerminalTasksetConfig]
 ):
-    """The PR's taskset, with each task's image WORKDIR filled in and Harbor's verifier timeout
-    as its scoring timeout."""
+    """The PR's taskset, with each task's image WORKDIR filled in and, when declared timeouts are
+    kept, Harbor's 600 s verifier timeout for a task that declares none."""
 
     def load(self) -> Iterator[SandoqHarborTask]:
         for task in super().load():
             # Without a task.toml workdir, use the image's last WORKDIR: the runtime
             # default (/app) is missing in some images, and a Sandoq VM fails then.
             workdir = task.data.workdir or image_workdir(Path(task.data.task_dir))
-            # Harbor stops test.sh at the task's verifier timeout, 600 s when undeclared; the
-            # extra 60 s stage the tests and read the reward.
-            scoring = (task.data.timeout.scoring or _HARBOR_VERIFIER_TIMEOUT_S) + 60
-            timeout = task.data.timeout.model_copy(update={"scoring": scoring})
+            timeout = task.data.timeout
+            if not self.config.ignore_timeouts and timeout.scoring is None:
+                # Harbor's verifier timeout when task.toml declares none, scaled like a declared one.
+                timeout = timeout.model_copy(
+                    update={
+                        "scoring": _HARBOR_VERIFIER_TIMEOUT_S
+                        * self.config.timeout_multiplier
+                    }
+                )
             yield SandoqHarborTask(
                 task.data.model_copy(update={"workdir": workdir, "timeout": timeout}),
                 self.config.task,
