@@ -258,8 +258,11 @@ class RolloutGroupWorkBuffer(Configurable):
             num_groups_in_trainer   taken by the trainer; freed after the weight pull that follows its optimizer step
             available_active_slots  free
 
+        At the trainer's log point, `num_groups_in_trainer` reads `num_prompts_per_train_step` today.
+        Any other value there means the other counts are wrong.
+
         Args:
-            num_groups_in_batcher: Groups the batcher took that still hold a slot.
+            num_groups_in_batcher: Groups taken by the batcher, not yet in a queued batch.
             num_groups_in_queue: Groups in batches waiting in `training_batch_queue`.
 
         Example:

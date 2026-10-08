@@ -804,13 +804,14 @@ def _start_batcher_loop(
     untrainable_group_ids: tuple[int, ...] = (),
 ) -> tuple[Controller, asyncio.Queue, asyncio.Task]:
     """Run the controller's `_batcher_loop` on `buffer` with a real `Batcher` and a size-1 queue."""
-    # _batcher_loop reads only num_prompts_per_train_step and its counter; skip the actor setup.
+    # The batcher loop and the gauges read only these attributes; skip the actor setup.
     controller = object.__new__(Controller)
     controller.config = SimpleNamespace(
         async_loop=SimpleNamespace(
             num_prompts_per_train_step=num_prompts_per_train_step
         )
     )
+    controller._group_buffer = buffer
     controller._num_groups_in_batcher = 0
     training_batch_queue = asyncio.Queue(maxsize=1)
     batcher_task = asyncio.create_task(
@@ -829,15 +830,11 @@ def _start_batcher_loop(
 
 
 def _slot_gauges(
-    buffer: RolloutGroupWorkBuffer,
-    controller: Controller,
-    training_batch_queue: asyncio.Queue,
+    controller: Controller, training_batch_queue: asyncio.Queue
 ) -> dict[str, float]:
     """The trainer loop's `rollout_buffer` gauges, without the per-flush peak."""
-    num_prompts_per_train_step = controller.config.async_loop.num_prompts_per_train_step
-    metrics = buffer.metrics(
-        num_groups_in_batcher=controller._num_groups_in_batcher,
-        num_groups_in_queue=training_batch_queue.qsize() * num_prompts_per_train_step,
+    metrics = controller._rollout_buffer_metrics(
+        training_batch_queue=training_batch_queue
     )
     return {
         metric.key: metric.value.value
@@ -871,14 +868,14 @@ def test_buffer_gauges_account_for_every_slot(monkeypatch) -> None:
     monkeypatch.setattr(asyncio, "to_thread", _pack_on_event_loop)
 
     async def run() -> None:
-        # S=2, P=2 -> 6 slots. g1 has no trainable samples.
+        # target_offpolicy_steps=2, num_prompts_per_train_step=2 -> 6 slots. g1 has no trainable samples.
         buffer = _buffer(capacity=6, window_size=None)
         controller, training_batch_queue, batcher_task = _start_batcher_loop(
             buffer=buffer, num_prompts_per_train_step=2, untrainable_group_ids=(1,)
         )
 
         def read_gauges() -> dict[str, float]:
-            return _slot_gauges(buffer, controller, training_batch_queue)
+            return _slot_gauges(controller, training_batch_queue)
 
         async def expect(**counts: int) -> None:
             await _settle()
@@ -944,39 +941,5 @@ def test_buffer_gauges_account_for_every_slot(monkeypatch) -> None:
         for task in (checker_task, batcher_task):
             task.cancel()
         await asyncio.gather(checker_task, batcher_task, return_exceptions=True)
-
-    asyncio.run(run())
-
-
-def test_group_taken_by_batcher_is_counted(monkeypatch) -> None:
-    monkeypatch.setattr(asyncio, "to_thread", _pack_on_event_loop)
-
-    async def run() -> None:
-        # 2 slots, 2 groups per batch: the batcher takes finished g0 and waits for g1.
-        buffer = _buffer(capacity=2, window_size=None)
-        controller, training_batch_queue, batcher_task = _start_batcher_loop(
-            buffer=buffer, num_prompts_per_train_step=2
-        )
-        for group_id in range(2):
-            await _admit(buffer, group_id)
-            await buffer.claim_next()
-        await _finalize(buffer, 0)
-        await _settle()
-
-        gauges = _slot_gauges(buffer, controller, training_batch_queue)
-        assert gauges == _expected_gauges(inflight=1, in_batcher=1)
-        # The gauges that existed before num_groups_in_batcher count 1 of the 2 slots.
-        old_keys = (
-            "rollout_buffer/num_groups_waiting",
-            "rollout_buffer/num_groups_inflight",
-            "rollout_buffer/num_groups_finalized",
-            "rollout_buffer/available_active_slots",
-        )
-        assert sum(gauges[key] for key in old_keys) == 1
-        assert sum(gauges.values()) == 2
-
-        await buffer.close()
-        batcher_task.cancel()
-        await asyncio.gather(batcher_task, return_exceptions=True)
 
     asyncio.run(run())
