@@ -23,13 +23,11 @@ _MATH_PROMPT_TEMPLATE = (
     'Remember to put your answer on its own line as "Answer: \\boxed{{...}}".'
 )
 
-# Options `A) 12 B) 14 C) 15` in a question: the gold is the option's value, so a boxed letter scores 0.
-_OPTIONS = re.compile(r"\bA\).*\bB\).*\bC\)", re.S)
+# Options `A) 12 B) 14 C) 15` or `\textbf{a)}\ 12` in a question: the gold is the option's value,
+# so a boxed letter scores 0.
+_MULTIPLE_CHOICE = re.compile(r"(?:\bA|\{a)\).*(?:\bB|\{b)\).*(?:\bC|\{c)\)", re.S)
 # A one-letter gold like ` n `: mostly "for which n ...?" questions, where it names the variable.
 _ONE_LETTER = re.compile(r"\s*[A-Za-z]\s*")
-# A JSON-escaped `\\text` or `\\{` in a gold: Math-Verify reads `\\` as a line break, so
-# `0 \\text{ or } 5` parses as 5.
-_ESCAPED_COMMAND = re.compile(r"(?<!\\)\\\\(?=[A-Za-z{}])")
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -123,8 +121,8 @@ class Intellect3MathDataset(_CyclingDataset):
 
     Harder than `DapoMathDataset` for a strong base model, so more groups mix right and wrong
     answers; only those groups train. INTELLECT-3-RL has no 8/8 rows; the default
-    `min_pass_rate` drops the 0/8 ones, keeping 10,805 of 21,161 rows. It also drops 134 rows
-    with options `A) B) C)` or a one-letter gold, which the grader scores wrong, leaving 10,671.
+    `min_pass_rate` drops the 0/8 ones, keeping 10,805 of 21,161 rows. It also drops 148 rows
+    with options `A) B) C)` or a one-letter gold, whose golds mis-score answers, leaving 10,657.
 
     Example:
         config = rl_dapo_qwen3_4b_math_32k()
@@ -147,13 +145,15 @@ class Intellect3MathDataset(_CyclingDataset):
         samples = [
             DapoMathSample(
                 prompt=_MATH_PROMPT_TEMPLATE.format(problem=row["question"]),
-                ground_truth=_ESCAPED_COMMAND.sub(r"\\", str(row["answer"])),
+                # Some golds are JSON-escaped (`\\frac`), and Math-Verify reads `\\` before `\text` or `\{`
+                # as a line break, so `0 \\text{ or } 5` parses as 5. No gold holds a real line break.
+                ground_truth=str(row["answer"]).replace("\\\\", "\\"),
             )
             for row in dataset
             if config.min_pass_rate
             <= row["avg@8_qwen3_4b_thinking_2507"]
             <= config.max_pass_rate
-            and not _OPTIONS.search(row["question"])
+            and not _MULTIPLE_CHOICE.search(row["question"])
             and not _ONE_LETTER.fullmatch(str(row["answer"]))
         ]
         super().__init__(samples, seed=config.seed, shuffle=config.shuffle)
