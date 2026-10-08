@@ -114,6 +114,8 @@ class TrainingSampleGroup:
     group_id: int
     training_samples: list[TrainingSample]
     metrics: list[m.Metric]
+    solved: bool = False
+    """Every rollout's reward is above `TrainingSampleBuilder.Config.solved_reward_above`."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -160,6 +162,8 @@ class TrainerStepBatch:
     metrics: list[m.Metric]
     group_ids: list[int]
     """Every consumed rollout group, including metric-only groups."""
+    solved_group_ids: list[int]
+    """The subset of `group_ids` whose group came back solved."""
     # one per packed training_sample; trainer computes policy_age at consume time
     min_policy_versions: list[int]
 

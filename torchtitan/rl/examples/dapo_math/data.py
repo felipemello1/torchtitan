@@ -62,6 +62,7 @@ class _CyclingDataset(RLDataset):
         *,
         seed: int,
         shuffle: bool,
+        skip_solved_prompts: bool = False,
     ) -> None:
         if not samples:
             raise ValueError("math dataset must contain at least one sample")
@@ -72,27 +73,52 @@ class _CyclingDataset(RLDataset):
         if shuffle:
             self._rng.shuffle(self._order)
         self._position = 0
+        self._skip_solved_prompts = skip_solved_prompts
+        # Empty unless `skip_solved_prompts`. Rows stay in `_order`, so a saved order still matches.
+        self._solved_rows: set[int] = set()
+        # Maps a sample back to its row for `mark_solved`; no math dataset has duplicate samples.
+        self._row_index_by_sample = {
+            sample: row_index for row_index, sample in enumerate(samples)
+        }
 
     def __iter__(self) -> Iterator[DapoMathSample]:
         return self
 
     def __next__(self) -> DapoMathSample:
-        if self._position == len(self._order):
-            # Rollout production consumes an endless stream; crossing the dataset
-            # boundary starts a new epoch. Training reshuffles; validation does not.
-            if self._shuffle:
-                self._rng.shuffle(self._order)
-            self._position = 0
-        sample_index = self._order[self._position]
-        self._position += 1
-        return self._samples[sample_index]
+        while True:
+            if self._position == len(self._order):
+                # Checked at each epoch: `mark_solved` can solve the last row during a scan.
+                if len(self._solved_rows) == len(self._samples):
+                    raise RuntimeError(
+                        f"every row is solved ({len(self._samples)} rows); "
+                        "set skip_solved_prompts=False to draw them again"
+                    )
+                # Rollout production consumes an endless stream; crossing the dataset
+                # boundary starts a new epoch. Training reshuffles; validation does not.
+                if self._shuffle:
+                    self._rng.shuffle(self._order)
+                self._position = 0
+            row_index = self._order[self._position]
+            self._position += 1
+            if row_index not in self._solved_rows:
+                return self._samples[row_index]
+
+    def mark_solved(self, sample: DapoMathSample) -> None:
+        """With `skip_solved_prompts`, skip `sample`'s row in later epochs.
+
+        A replayed sample whose row text changed since the save is no longer a row; it is ignored.
+        """
+        row_index = self._row_index_by_sample.get(sample)
+        if self._skip_solved_prompts and row_index is not None:
+            self._solved_rows.add(row_index)
 
     def state_dict(self) -> dict:
-        """Snapshot row order and position so resume continues the same stream."""
+        """Snapshot row order, position and solved rows so resume continues the same stream."""
         return {
             "rng_state": self._rng.getstate(),
             "order": list(self._order),
             "position": self._position,
+            "solved_rows": sorted(self._solved_rows),
         }
 
     def load_state_dict(self, state_dict: dict) -> None:
@@ -107,6 +133,10 @@ class _CyclingDataset(RLDataset):
         self._rng.setstate(state_dict["rng_state"])
         self._order = list(state_dict["order"])
         self._position = state_dict["position"]
+        # Off: solved rows are drawn again, and the next save drops them.
+        if self._skip_solved_prompts:
+            # `.get` lets the skip be turned on at the resume of a run saved before it existed.
+            self._solved_rows = set(state_dict.get("solved_rows", ()))
 
 
 class DapoMathDataset(_CyclingDataset):
@@ -118,6 +148,9 @@ class DapoMathDataset(_CyclingDataset):
         split: str = "train"
         seed: int = 42
         shuffle: bool = True
+        skip_solved_prompts: bool = False
+        """Skip a problem in later epochs once a consumed group of it is solved; see
+        `TrainingSampleBuilder.Config.solved_reward_above`."""
 
     def __init__(self, config: Config) -> None:
         dataset = load_dataset(config.repo_id, split=config.split)
@@ -133,7 +166,12 @@ class DapoMathDataset(_CyclingDataset):
                     ground_truth=str(row["ground_truth"]),
                 )
             )
-        super().__init__(samples, seed=config.seed, shuffle=config.shuffle)
+        super().__init__(
+            samples,
+            seed=config.seed,
+            shuffle=config.shuffle,
+            skip_solved_prompts=config.skip_solved_prompts,
+        )
 
 
 class Intellect3MathDataset(_CyclingDataset):
@@ -162,6 +200,9 @@ class Intellect3MathDataset(_CyclingDataset):
         """Keep problems solved in at most this fraction of the 8 tries; 0.875 is 7 of 8."""
         seed: int = 42
         shuffle: bool = True
+        skip_solved_prompts: bool = False
+        """Skip a problem in later epochs once a consumed group of it is solved; see
+        `TrainingSampleBuilder.Config.solved_reward_above`."""
 
     def __init__(self, config: Config) -> None:
         dataset = load_dataset(config.repo_id, "math", split=config.split)
@@ -183,7 +224,12 @@ class Intellect3MathDataset(_CyclingDataset):
                 and not _TWO_VALUE_GOLD.search(str(row["answer"]))
             )
         ]
-        super().__init__(samples, seed=config.seed, shuffle=config.shuffle)
+        super().__init__(
+            samples,
+            seed=config.seed,
+            shuffle=config.shuffle,
+            skip_solved_prompts=config.skip_solved_prompts,
+        )
 
 
 class AIME2025Dataset(_CyclingDataset):
