@@ -1133,6 +1133,29 @@ def test_text_only_parse_keeps_tool_call_markup(monkeypatch) -> None:
     )
 
 
+def test_text_only_parse_keeps_a_reply_before_a_stray_think_end(monkeypatch) -> None:
+    """With thinking off, a reply that ends in a stray </think> reaches Terminus-2 as content
+    instead of "", and an empty reply stays "" (not None); a thought before </think> and JSON
+    after it still split, and thinking on keeps the stock split."""
+    pytest.importorskip("renderers")
+    from torchtitan_recipes.rl.verifiers_plugins.terminal_bench_sandoq import (
+        install_text_only_parse,
+    )
+
+    renderer = _fake_qwen35_renderer(monkeypatch)
+    install_text_only_parse()
+
+    json_then_think_end = renderer.parse_response([6, 3, 0])
+    assert json_then_think_end.content == '{"analysis": "x"}'
+    assert json_then_think_end.reasoning_content is None
+    assert renderer.parse_response([7, 7, 0]).content == ""
+    thought_then_json = renderer.parse_response([8, 3, 6, 0])
+    assert thought_then_json.content == '{"analysis": "x"}'
+    assert thought_then_json.reasoning_content == "I will look."
+    renderer.config.enable_thinking = True
+    assert renderer.parse_response([6, 3, 0]).content == ""
+
+
 def _fake_qwen35_renderer(monkeypatch):
     """Thinking-off Qwen3.5 renderer over a toy vocabulary; restores the class
     install_text_only_parse patches.
