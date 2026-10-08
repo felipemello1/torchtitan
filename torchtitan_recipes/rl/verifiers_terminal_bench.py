@@ -552,23 +552,29 @@ def rl_grpo_qwen3_5_4b_base_terminal_bench_dev() -> Controller.Config:
 
 
 def rl_grpo_qwen3_5_9b_base_terminal_bench_fast() -> Controller.Config:
-    """Qwen3.5-9B-Base with thinking off: fast Terminal-Bench steps on Sandoq to shake out bugs.
+    """Qwen3.5-9B-Base with thinking off: fast Terminal-Bench steps on Sandoq.
 
-    8 GB300 GPUs on 2 hosts: trainer FSDP 4 on one, four TP1 generators on the other. 8 samples
-    per prompt, 150 turns, up to 6 steps off-policy, no validation.
+    12 GB300 GPUs on 3 hosts: trainer FSDP 4 on one, eight TP1 generators on the other two.
+    8 samples per prompt, 150 turns, up to 6 steps off-policy, no validation.
 
-    `DOME_SANDOQ_POOL` (default 256) is the number of sandboxes the run may hold. It sets the
-    rollouts in the env server and, by the pool >= 3 batches rule, the prompts per step:
-    pool 1,000 -> 40 x 8, 768 -> 32 x 8, 256 -> 10 x 8. `DOME_V2_PROMPTS` overrides the prompts.
+    `DOME_SANDOQ_POOL` (default 1,434) is the number of sandboxes the run may hold. It sets the
+    rollouts in the env server and the prompts per step, sized so the pool is 80% of the
+    rollouts in flight, (6 + 1) x prompts x 8: pool 1,434 -> 32 x 8, 717 -> 16 x 8.
+    `DOME_V2_PROMPTS` overrides the prompts.
     """
     # Read at load time, not import, so tests and other recipes import this module.
-    sandbox_pool = int(os.environ.get("DOME_SANDOQ_POOL", 256))
+    sandbox_pool = int(os.environ.get("DOME_SANDOQ_POOL", 1434))
     num_samples_per_prompt = 8
+    target_offpolicy_steps = 6
+    rollouts_in_flight_per_prompt = (
+        target_offpolicy_steps + 1
+    ) * num_samples_per_prompt
     return _qwen3_5_base_terminal_bench_config(
         flavor="9B",
         num_prompts_per_train_step=int(
             os.environ.get(
-                "DOME_V2_PROMPTS", min(40, sandbox_pool // (3 * num_samples_per_prompt))
+                "DOME_V2_PROMPTS",
+                round(sandbox_pool / (0.8 * rollouts_in_flight_per_prompt)),
             )
         ),
         num_samples_per_prompt=num_samples_per_prompt,
@@ -577,12 +583,12 @@ def rl_grpo_qwen3_5_9b_base_terminal_bench_fast() -> Controller.Config:
         sandbox_pool=sandbox_pool,
         num_env_workers=math.ceil(sandbox_pool / 24),
         num_validation_samples=0,
-        num_generators=4,
+        num_generators=8,
         parallelism=ParallelismConfig(data_parallel_shard_degree=4),
         dump_folder="outputs/rl/qwen3_5_9b_base_terminal_bench_fast",
         enable_thinking=False,
         # The trainer waits for most of a step; more groups in flight shorten the wait.
-        target_offpolicy_steps=6,
+        target_offpolicy_steps=target_offpolicy_steps,
     )
 
 
