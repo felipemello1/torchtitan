@@ -26,6 +26,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 from torch.testing._internal.distributed.checkpoint_utils import with_temp_dir
 from torchtitan.components.optim import (
     AdamW,
+    LRSchedulersContainer,
     OptimizersContainer,
     OptimizerStateOffloader,
 )
@@ -174,6 +175,11 @@ class TestOptimizerStateOffload(DTensorTestBase):
             for state in optimizer.state.values():
                 assert state["exp_avg"].dtype == expected_dtype
                 assert _local(state["exp_avg"]).dtype == expected_dtype
+        # LR metrics keep the wrapped optimizer's name.
+        lr_schedulers = LRSchedulersContainer.Config().build(
+            optimizers=offloaded, training_steps=3
+        )
+        assert set(lr_schedulers.get_metrics()) == {"lr/AdamW/0", "lr/AdamW/1"}
 
     @with_comms
     def test_staging_memory_is_bounded_by_two_chunks(self) -> None:
