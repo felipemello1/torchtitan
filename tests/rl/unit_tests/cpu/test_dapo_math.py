@@ -222,9 +222,13 @@ def test_math_verifier_scores_the_right_side_of_a_named_answer() -> None:
     assert score_math_response(r"\boxed{A_{\min}= \frac13}", r"\frac{1}{2}") == 0.0
     # Not a `name = value`: a list, an `=` inside braces, or `>=`.
     assert score_math_response(r"\boxed{x = 2 \text{ or } x = 3}", "3") == 0.0
+    assert score_math_response(r"\boxed{x = 2 or x = 3}", "3") == 0.0
     assert score_math_response(r"\boxed{a=4,\ b=-1}", "-1") == 0.0
     assert score_math_response(r"\boxed{\sum_{k=1}^{n} k}", "1") == 0.0
     assert score_math_response(r"\boxed{x >= 3}", "3") == 0.0
+    # A gold equation keeps its left side: Math-Verify drops it when the answer has none.
+    assert score_math_response(r"\boxed{y = 3}", "x = 3") == 0.0
+    assert score_math_response(r"\boxed{f(f(x)) = x}", "f(x) = x") == 0.0
 
 
 def test_math_verifier_reads_degrees_as_radians_against_pi() -> None:
@@ -232,7 +236,8 @@ def test_math_verifier_reads_degrees_as_radians_against_pi() -> None:
     assert score_math_response(r"\boxed{\frac{\pi}{3}}", r"60^{\circ}") == 1.0
     assert score_math_response(r"\boxed{90^\circ-30^\circ}", r"\frac{\pi}{3}") == 1.0
     assert score_math_response(r"\boxed{45^\circ}", r"\frac{\pi}{3}") == 0.0
-    # Without a `\pi` on the other side, degrees stay as written.
+    # Only the side without a `\pi` is rewritten; without a `\pi`, degrees stay as written.
+    assert score_math_response(r"\boxed{\frac{\pi}{3} = 60^\circ}", "60") == 1.0
     assert score_math_response(r"\boxed{60}", r"60^\circ") == 1.0
 
 

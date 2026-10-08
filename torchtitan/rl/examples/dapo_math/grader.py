@@ -38,8 +38,8 @@ _WORD = re.compile(r"\s*[A-Za-z]{3,}\s*")
 _SPACING = re.compile(r"\s+|\\[,;:! ]")
 # `60^\circ`, read as radians when only the other side has a `\pi`.
 _DEGREES = re.compile(r"(\d+(?:\.\d+)?)\s*\^\s*(?:\{\\circ\}|\\circ)")
-# A comma (not the thin space `\,`), a semicolon, or `\text{ or }`: a list, not `name = value`.
-_LIST = re.compile(r"(?<!\\)[,;]|\\text\{[^}]*\b(?:or|and)\b")
+# A `,` or `;` (not the spaces `\,` `\;`), or the word `or` or `and`: a list, not `name = value`.
+_LIST = re.compile(r"(?<!\\)[,;]|\b(?:or|and)\b")
 # From <sys/prctl.h>: signal this process when the thread that started it exits.
 _PR_SET_PDEATHSIG = 1
 
@@ -111,6 +111,7 @@ def score_math_response(response: str, ground_truth: str) -> float:
 
     If answer and gold are each a 3+ letter word, they compare as lowercase strings.
     A boxed `A_{\\min} = \\frac12` scores by its right side.
+    Degrees read as radians when only one side has a `\\pi`: `60^\\circ` matches `\\frac{\\pi}{3}`.
     No timeout: on an event loop, use `MathVerifyPool.score` instead.
 
     Args:
@@ -127,8 +128,9 @@ def score_math_response(response: str, ground_truth: str) -> float:
 
     prediction = _THIN_SPACE_IN_NUMBER.sub("", prediction)
     ground_truth = _THIN_SPACE_IN_NUMBER.sub("", ground_truth)
-    if ("\\pi" in prediction) != ("\\pi" in ground_truth):
+    if "\\pi" in ground_truth and "\\pi" not in prediction:
         prediction = _DEGREES.sub(r"(\1\\pi/180)", prediction)
+    elif "\\pi" in prediction and "\\pi" not in ground_truth:
         ground_truth = _DEGREES.sub(r"(\1\\pi/180)", ground_truth)
     boxed_text = prediction[len(_BOXED_START) : -1]
 
@@ -144,11 +146,13 @@ def score_math_response(response: str, ground_truth: str) -> float:
         gold = parse(_BOXED_START + ground_truth + "}", parsing_timeout=None)
         if verify(gold, parse(prediction, parsing_timeout=None), timeout_seconds=None):
             return 1.0
-        # Math-Verify reads `x = 5` as 5 but cannot parse a named left side like
-        # `A_{\min} = \frac12`. Score the right side of a top-level `=`, unless the box is a list.
+        # Math-Verify reads `x = 5` as 5 but cannot parse a named left side like `A_{\min} = \frac12`.
+        # Retry on the right side of the last `=`, unless that `=` is in `>=`, `<=`, `!=` or braces,
+        # the box is a list, or the gold is an equation (`y = 3` would then match gold `x = 3`).
         left_side, _, right_side = boxed_text.rpartition("=")
         if (
             not left_side
+            or "=" in ground_truth
             or left_side[-1] in "<>!"
             or right_side.count("{") != right_side.count("}")
             or _LIST.search(boxed_text)
