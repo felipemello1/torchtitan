@@ -36,6 +36,10 @@ _THIN_SPACE_IN_NUMBER = re.compile(r"(?<=\d)\\,(?=\d{3}(?!\d))")
 _WORD = re.compile(r"\s*[A-Za-z]{3,}\s*")
 # Spaces between letters, as in `D A E C B`, which would otherwise skip the word check.
 _SPACING = re.compile(r"\s+|\\[,;:! ]")
+# `60^\circ`, read as radians when only the other side has a `\pi`.
+_DEGREES = re.compile(r"(\d+(?:\.\d+)?)\s*\^\s*(?:\{\\circ\}|\\circ)")
+# A comma (not the thin space `\,`), a semicolon, or `\text{ or }`: a list, not `name = value`.
+_LIST = re.compile(r"(?<!\\)[,;]|\\text\{[^}]*\b(?:or|and)\b")
 # From <sys/prctl.h>: signal this process when the thread that started it exits.
 _PR_SET_PDEATHSIG = 1
 
@@ -106,6 +110,7 @@ def score_math_response(response: str, ground_truth: str) -> float:
     """Score the final `\\boxed{}` expression with Math-Verify, in this process.
 
     If answer and gold are each a 3+ letter word, they compare as lowercase strings.
+    A boxed `A_{\\min} = \\frac12` scores by its right side.
     No timeout: on an event loop, use `MathVerifyPool.score` instead.
 
     Args:
@@ -122,10 +127,14 @@ def score_math_response(response: str, ground_truth: str) -> float:
 
     prediction = _THIN_SPACE_IN_NUMBER.sub("", prediction)
     ground_truth = _THIN_SPACE_IN_NUMBER.sub("", ground_truth)
+    if ("\\pi" in prediction) != ("\\pi" in ground_truth):
+        prediction = _DEGREES.sub(r"(\1\\pi/180)", prediction)
+        ground_truth = _DEGREES.sub(r"(\1\\pi/180)", ground_truth)
+    boxed_text = prediction[len(_BOXED_START) : -1]
 
     # Compare words as strings: Math-Verify reads `tea` as t*e*a, so `eat` matches,
     # and reads the `I` in `Indonesian` as the imaginary unit.
-    answer = _SPACING.sub("", prediction[len(_BOXED_START) : -1])
+    answer = _SPACING.sub("", boxed_text)
     if _WORD.fullmatch(answer) and _WORD.fullmatch(ground_truth):
         return float(answer.lower() == ground_truth.strip().lower())
 
@@ -133,8 +142,20 @@ def score_math_response(response: str, ground_truth: str) -> float:
         # Box the gold like the prediction: a bare `2\sqrt{3}` parses as 2, and a
         # bare `(1,2)` or `\pi/4` parses to nothing.
         gold = parse(_BOXED_START + ground_truth + "}", parsing_timeout=None)
-        prediction = parse(prediction, parsing_timeout=None)
-        return float(bool(gold) and verify(gold, prediction, timeout_seconds=None))
+        if verify(gold, parse(prediction, parsing_timeout=None), timeout_seconds=None):
+            return 1.0
+        # Math-Verify reads `x = 5` as 5 but cannot parse a named left side like
+        # `A_{\min} = \frac12`. Score the right side of a top-level `=`, unless the box is a list.
+        left_side, _, right_side = boxed_text.rpartition("=")
+        if (
+            not left_side
+            or left_side[-1] in "<>!"
+            or right_side.count("{") != right_side.count("}")
+            or _LIST.search(boxed_text)
+        ):
+            return 0.0
+        right_side_parsed = parse(_BOXED_START + right_side + "}", parsing_timeout=None)
+        return float(verify(gold, right_side_parsed, timeout_seconds=None))
     except Exception:
         # Model output is untrusted; malformed LaTeX produces a zero reward
         # rather than failing the training loop.

@@ -154,6 +154,28 @@ def test_math_verifier_compares_word_answers_as_strings() -> None:
     assert score_math_response(r"\boxed{ba}", "ab") == 1.0
 
 
+def test_math_verifier_scores_the_right_side_of_a_named_answer() -> None:
+    # Math-Verify alone parses `A_{\min}= \frac12` to nothing and `k_{\max}(n)=...` to 2.
+    assert score_math_response(r"\boxed{A_{\min}= \frac12}", r"\frac{1}{2}") == 1.0
+    response = r"\boxed{\,k_{\max}(n)=2^{\,n-1}-n\,}"
+    assert score_math_response(response, "2^{n-1} - n") == 1.0
+    assert score_math_response(r"\boxed{A_{\min}= \frac13}", r"\frac{1}{2}") == 0.0
+    # Not a `name = value`: a list, an `=` inside braces, or `>=`.
+    assert score_math_response(r"\boxed{x = 2 \text{ or } x = 3}", "3") == 0.0
+    assert score_math_response(r"\boxed{a=4,\ b=-1}", "-1") == 0.0
+    assert score_math_response(r"\boxed{\sum_{k=1}^{n} k}", "1") == 0.0
+    assert score_math_response(r"\boxed{x >= 3}", "3") == 0.0
+
+
+def test_math_verifier_reads_degrees_as_radians_against_pi() -> None:
+    assert score_math_response(r"\boxed{60^\circ}", r"\frac{\pi}{3}") == 1.0
+    assert score_math_response(r"\boxed{\frac{\pi}{3}}", r"60^{\circ}") == 1.0
+    assert score_math_response(r"\boxed{90^\circ-30^\circ}", r"\frac{\pi}{3}") == 1.0
+    assert score_math_response(r"\boxed{45^\circ}", r"\frac{\pi}{3}") == 0.0
+    # Without a `\pi` on the other side, degrees stay as written.
+    assert score_math_response(r"\boxed{60}", r"60^\circ") == 1.0
+
+
 def test_math_verifier_uses_the_last_boxed_answer() -> None:
     response = r"Work: \boxed{2003^{2002^{2001}}}" "\n" r"Answer: \boxed{34}"
     assert score_math_response(response, "34") == 1.0
