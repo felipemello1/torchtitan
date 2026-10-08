@@ -76,12 +76,14 @@ def _router(
     hot_swap=False,
     enable_cpu_weight_prefetch=False,
     kv_admission_limit=None,
+    kv_admission_sessions_per_group=1,
 ) -> InterGeneratorRouter:
     return InterGeneratorRouter(
         InterGeneratorRouter.Config(
             strategy=strategy or LeastLoadedRoutingStrategy.Config(),
             hot_swap=hot_swap,
             kv_admission_limit=kv_admission_limit,
+            kv_admission_sessions_per_group=kv_admission_sessions_per_group,
         ),
         generators=actors,
         enable_cpu_weight_prefetch=enable_cpu_weight_prefetch,
@@ -574,8 +576,12 @@ class _KVActor(_Actor):
         self.kv_cache_budget = _Endpoint(_BUDGET)
 
 
-async def _kv_router(actors) -> InterGeneratorRouter:
-    router = _router(actors, kv_admission_limit=1.0)
+async def _kv_router(actors, sessions_per_group=1) -> InterGeneratorRouter:
+    router = _router(
+        actors,
+        kv_admission_limit=1.0,
+        kv_admission_sessions_per_group=sessions_per_group,
+    )
     await router._read_kv_budgets()
     return router
 
@@ -682,6 +688,18 @@ def test_kv_admission_reserves_the_largest_group_seen_so_far():
         assert not waiting.done()
         router._release_groups([0])
         assert await waiting == "gen0"
+
+    asyncio.run(_run())
+
+
+def test_kv_admission_reserves_the_expected_sessions_until_they_start():
+    async def _run():
+        router = await _kv_router([_KVActor("gen0")], sessions_per_group=2)
+        # One session at 4 blocks, plus 3 reserved for the sibling that has not started.
+        await _kv_generate(router, group_id=0, session_id="g0/r0")
+        assert router._generators[0].kv_blocks == 7
+        await _kv_generate(router, group_id=0, session_id="g0/r1")
+        assert router._generators[0].kv_blocks == 8
 
     asyncio.run(_run())
 

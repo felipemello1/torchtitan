@@ -75,33 +75,43 @@ class _GeneratorHandle(RoutingCandidate):
 class _PlacedGroup:
     """A rollout group that KV admission placed on one generator.
 
-    Example (each session's first call costs 4 blocks; groups have had up to 3 sessions)::
+    Example (3 sessions expected, each first call costs 4 blocks)::
 
-        group 7's first call -> placed on gen1, reserved_blocks=12, gen1.kv_blocks += 12
-        its 3 sessions grow to 6 blocks each -> blocks = max(12, 18) = 18
-        session r0 ends -> the reservation ends, blocks = 12
+        group 7's first call -> placed on gen1 with 3 x 4 = 12 blocks
+        all 3 sessions start and grow to 6 blocks each -> blocks = 18
+        session r0 ends -> blocks = 12
         release_groups([7]) -> gen1.kv_blocks -= 12
     """
 
     handle: _GeneratorHandle
 
-    reserved_blocks: int
-    """Blocks held for sessions that have not arrived yet, until the group's first session ends."""
+    expected_sessions: int
+    """Sessions the group is expected to open."""
+
+    first_call_blocks: int
+    """Blocks reserved for each expected session that has not started yet."""
 
     blocks_by_session: dict[str | None, int] = field(default_factory=dict)
     """Blocks each live session holds for its context so far."""
 
+    started_sessions: set[str | None] = field(default_factory=set)
+    """Sessions that have made a call, ended ones included."""
+
     @property
     def blocks(self) -> int:
-        """Blocks charged to the generator: the reservation until live sessions outgrow it."""
-        return max(self.reserved_blocks, sum(self.blocks_by_session.values()))
+        """Blocks charged to the generator: live sessions plus those not started yet."""
+        not_started = max(0, self.expected_sessions - len(self.started_sessions))
+        return (
+            sum(self.blocks_by_session.values()) + not_started * self.first_call_blocks
+        )
 
 
 @dataclass(kw_only=True, slots=True)
 class _WaitingGroup:
     """A new rollout group waiting for KV room."""
 
-    blocks: int
+    expected_sessions: int
+    first_call_blocks: int
     admitted: asyncio.Future[_PlacedGroup]
 
 
@@ -164,8 +174,15 @@ class InterGeneratorRouter(Actor, Configurable):
 
         Each rollout group runs on the generator with the most room. A new group
         waits (FIFO) until its first turns fit; turns of placed groups never
-        wait. Sessions count at their current context, so groups admitted
-        together, e.g. at startup, can grow past the limit."""
+        wait; nor do validation groups (negative ids). Sessions count at their
+        current context, so groups admitted together, e.g. at startup, can grow
+        past the limit."""
+
+        kv_admission_sessions_per_group: int = 1
+        """Sessions a new rollout group is expected to open, e.g. its group size,
+        times 2 for self-play. A group reserves its first call's blocks for each
+        one that has not started yet. The router raises it to the largest group
+        it has seen."""
 
     def __init__(
         self,
@@ -206,7 +223,7 @@ class InterGeneratorRouter(Actor, Configurable):
         self._placed_groups: dict[int, _PlacedGroup] = {}
         # New groups in arrival order; admitted first-in, first-out.
         self._waiting_groups: dict[int, _WaitingGroup] = {}
-        self._max_sessions_per_group = 1
+        self._max_sessions_per_group = config.kv_admission_sessions_per_group
 
     def _candidates(self) -> list[_GeneratorHandle]:
         """Return generator handles that are currently routable."""
@@ -292,11 +309,19 @@ class InterGeneratorRouter(Actor, Configurable):
         )
 
     def _place_group(
-        self, group_id: int, h: _GeneratorHandle, reserved_blocks: int
+        self,
+        group_id: int,
+        h: _GeneratorHandle,
+        expected_sessions: int,
+        first_call_blocks: int,
     ) -> _PlacedGroup:
-        placed = _PlacedGroup(handle=h, reserved_blocks=reserved_blocks)
+        placed = _PlacedGroup(
+            handle=h,
+            expected_sessions=expected_sessions,
+            first_call_blocks=first_call_blocks,
+        )
         self._placed_groups[group_id] = placed
-        h.kv_blocks += reserved_blocks
+        h.kv_blocks += placed.blocks
         return placed
 
     def _admit_waiting_groups(self) -> None:
@@ -305,12 +330,15 @@ class InterGeneratorRouter(Actor, Configurable):
             group_id, waiting = next(iter(self._waiting_groups.items()))
             h = self._roomiest_generator()
             # An empty generator takes any group, so a group larger than the limit still runs.
-            if h is None or (
-                h.kv_blocks > 0 and h.kv_blocks + waiting.blocks > h.kv_limit
-            ):
+            blocks = waiting.expected_sessions * waiting.first_call_blocks
+            if h is None or (h.kv_blocks > 0 and h.kv_blocks + blocks > h.kv_limit):
                 return
             del self._waiting_groups[group_id]
-            waiting.admitted.set_result(self._place_group(group_id, h, waiting.blocks))
+            waiting.admitted.set_result(
+                self._place_group(
+                    group_id, h, waiting.expected_sessions, waiting.first_call_blocks
+                )
+            )
 
     async def _admit_group(self, group_id: int, num_tokens: int) -> _PlacedGroup:
         """Return the group's placement; a new group first waits for KV room.
@@ -323,19 +351,25 @@ class InterGeneratorRouter(Actor, Configurable):
         if placed is not None:
             return placed
         assert self._kv_budget is not None, "start_engine_loop reads the KV budget"
+        first_call_blocks = self._kv_budget.session_blocks(num_tokens)
         if group_id < 0:
             # Validation groups (negative ids, see the controller) skip the queue: the
-            # trainer waits on them.
+            # controller blocks on validation.
             await self._serving.wait()
-            return self._place_group(group_id, self._roomiest_generator(), 0)
+            # A sibling may have placed the group while this call waited.
+            placed = self._placed_groups.get(group_id)
+            if placed is not None:
+                return placed
+            return self._place_group(
+                group_id, self._roomiest_generator(), 0, first_call_blocks
+            )
         waiting = self._waiting_groups.get(group_id)
         if waiting is None:
-            # Until its sessions arrive, reserve as many as the largest group seen so far.
             # TODO: reserve what the sessions will grow to, e.g. the mean final blocks of
-            # released sessions; a group admitted at first-turn size can grow ~1.5-5x.
+            # released sessions; a session admitted at first-turn size can grow ~2-7x.
             waiting = _WaitingGroup(
-                blocks=self._max_sessions_per_group
-                * self._kv_budget.session_blocks(num_tokens),
+                expected_sessions=self._max_sessions_per_group,
+                first_call_blocks=first_call_blocks,
                 admitted=asyncio.get_running_loop().create_future(),
             )
             self._waiting_groups[group_id] = waiting
@@ -357,15 +391,14 @@ class InterGeneratorRouter(Actor, Configurable):
         assert self._kv_budget is not None
         old_blocks = placed.blocks
         if num_tokens is None:
-            # Once a session ends, its siblings have started: count only live sessions.
-            placed.reserved_blocks = 0
             placed.blocks_by_session.pop(session_id, None)
         else:
+            placed.started_sessions.add(session_id)
             placed.blocks_by_session[session_id] = self._kv_budget.session_blocks(
                 num_tokens
             )
             self._max_sessions_per_group = max(
-                self._max_sessions_per_group, len(placed.blocks_by_session)
+                self._max_sessions_per_group, len(placed.started_sessions)
             )
         placed.handle.kv_blocks += placed.blocks - old_blocks
         self._admit_waiting_groups()
@@ -583,7 +616,7 @@ class InterGeneratorRouter(Actor, Configurable):
 
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:
-        """Set the step counter in this process and in every generator rank."""
+        """Set the step counter in this process and in every generator rank, and log KV admission."""
         sl.set_step(step)
         if self._config.kv_admission_limit is not None:
             logger.info(
