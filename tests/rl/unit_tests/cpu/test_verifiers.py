@@ -849,28 +849,8 @@ def test_text_only_parse_keeps_tool_call_markup(monkeypatch) -> None:
         install_text_only_parse,
     )
 
-    vocab = ["<|im_end|>", "<|endoftext|>", "<think>", "</think>"]
-    vocab += ["<tool_call>", "</tool_call>", '{"analysis": "x"}', "\n"]
-
-    class Tokenizer:
-        def decode(self, ids, skip_special_tokens=False):
-            return "".join(vocab[i] for i in ids)
-
-    renderer = object.__new__(Qwen35Renderer)
-    renderer._tokenizer = Tokenizer()
-    renderer._im_end, renderer._endoftext, renderer._think, renderer._think_end = (
-        0,
-        1,
-        2,
-        3,
-    )
-    renderer._tool_call, renderer._tool_call_end = 4, 5
+    renderer = _fake_qwen35_renderer(monkeypatch, enable_thinking=False)
     stock_parse = Qwen35Renderer.parse_response
-    # Restore the class after the test; install_text_only_parse patches it in place.
-    monkeypatch.setattr(Qwen35Renderer, "parse_response", stock_parse)
-    monkeypatch.setattr(
-        Qwen35Renderer, "_text_only_parse_installed", False, raising=False
-    )
     wrapped = [4, 7, 6, 7, 5, 0]  # <tool_call>\n{json}\n</tool_call><|im_end|>
     whitespace = [7, 7, 0]
     tools = [{"name": "bash", "parameters": {}}]
@@ -886,3 +866,57 @@ def test_text_only_parse_keeps_tool_call_markup(monkeypatch) -> None:
     assert renderer.parse_response(wrapped, tools=tools) == stock_parse(
         renderer, wrapped, tools=tools
     )
+
+
+def test_text_only_parse_keeps_a_reply_before_a_stray_think_end(monkeypatch) -> None:
+    """With thinking off, a reply that ends in a stray </think> reaches Terminus-2 as content
+    instead of ""; a thought before </think> and JSON after it still split, and thinking on
+    keeps the stock split."""
+    pytest.importorskip("renderers")
+    from torchtitan_recipes.rl.verifiers_plugins.terminal_bench_sandoq import (
+        install_text_only_parse,
+    )
+
+    renderer = _fake_qwen35_renderer(monkeypatch, enable_thinking=False)
+    install_text_only_parse()
+
+    json_then_think_end = renderer.parse_response([6, 3, 0])
+    assert json_then_think_end.content == '{"analysis": "x"}'
+    assert json_then_think_end.reasoning_content is None
+    thought_then_json = renderer.parse_response([8, 3, 6, 0])
+    assert thought_then_json.content == '{"analysis": "x"}'
+    assert thought_then_json.reasoning_content == "I will look."
+    renderer.config.enable_thinking = True
+    assert renderer.parse_response([6, 3, 0]).content == ""
+
+
+def _fake_qwen35_renderer(monkeypatch, *, enable_thinking: bool):
+    """Qwen3.5 renderer over a toy vocabulary; restores the class install_text_only_parse patches.
+
+    Token ids: 0 <|im_end|>, 1 <|endoftext|>, 2 <think>, 3 </think>, 4 <tool_call>,
+    5 </tool_call>, 6 '{"analysis": "x"}', 7 "\n", 8 "I will look."
+    """
+    from renderers.qwen35 import Qwen35Renderer
+
+    vocab = ["<|im_end|>", "<|endoftext|>", "<think>", "</think>", "<tool_call>"]
+    vocab += ["</tool_call>", '{"analysis": "x"}', "\n", "I will look."]
+
+    class Tokenizer:
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join(vocab[i] for i in ids)
+
+    monkeypatch.setattr(Qwen35Renderer, "parse_response", Qwen35Renderer.parse_response)
+    monkeypatch.setattr(
+        Qwen35Renderer, "_text_only_parse_installed", False, raising=False
+    )
+    renderer = object.__new__(Qwen35Renderer)
+    renderer._tokenizer = Tokenizer()
+    renderer._im_end, renderer._endoftext, renderer._think, renderer._think_end = (
+        0,
+        1,
+        2,
+        3,
+    )
+    renderer._tool_call, renderer._tool_call_end = 4, 5
+    renderer.config = SimpleNamespace(enable_thinking=enable_thinking)
+    return renderer

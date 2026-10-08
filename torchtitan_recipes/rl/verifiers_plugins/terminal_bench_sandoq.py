@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import dataclasses
 import gzip
 import json
 import logging
@@ -562,13 +563,22 @@ def install_shell_refresh() -> None:
 
 
 def install_text_only_parse() -> None:
-    """Keep Qwen3.5 tool-call markup in the content when a request declares no tools. Idempotent.
+    """Parse Qwen3.5 replies to requests without tools so the content is never lost. Idempotent.
 
-    Terminus-2 declares no tools and reads its JSON from the content. The Qwen3.5 parser moves
-    everything from a ``<tool_call>`` token on into a tool call, and Verifiers drops one without a
-    ``<function=...>`` name, so a reply wrapped in ``<tool_call>`` reached Terminus-2 as "".
+    Terminus-2 declares no tools and reads its JSON from the content, which the stock parser left
+    "" in two cases:
+    - The parser moves everything from a ``<tool_call>`` token on into a tool call, and Verifiers
+      drops one without a ``<function=...>`` name. Here the markup stays in the content.
+    - With thinking off, the prompt already closed the think block, but the parser still splits at
+      a stray ``</think>`` in the reply. When that leaves the content empty, the reasoning becomes
+      the content.
 
-    TODO: upstream to renderers: no tool-call extraction when no tools are declared.
+    Example (thinking off; reply tokens decoded):
+        '{"analysis": "..."}</think>'  # stock: content="", reasoning_content='{"analysis": "..."}'
+                                       # here:  content='{"analysis": "..."}', reasoning_content=None
+
+    TODO: upstream to renderers: no tool-call extraction when no tools are declared. renderers'
+    main (after v0.1.11) parses everything after a closed think prefill as content; revisit then.
     """
     from renderers.parsing import parse_qwen35
     from renderers.qwen35 import Qwen35Renderer
@@ -581,7 +591,7 @@ def install_text_only_parse() -> None:
         if tools:
             return parse_response(self, token_ids, tools=tools)
         # -1 matches no token: everything after the think block is content.
-        return parse_qwen35(
+        parsed = parse_qwen35(
             self._tokenizer,
             token_ids,
             stop_ids={self._im_end, self._endoftext},
@@ -589,6 +599,11 @@ def install_text_only_parse() -> None:
             think_end_id=self._think_end,
             tool_call_id=-1,
             tool_call_end_id=-1,
+        )
+        if self.config.enable_thinking or parsed.content:
+            return parsed
+        return dataclasses.replace(
+            parsed, content=parsed.reasoning_content or "", reasoning_content=None
         )
 
     Qwen35Renderer.parse_response = parse_response_without_tools
