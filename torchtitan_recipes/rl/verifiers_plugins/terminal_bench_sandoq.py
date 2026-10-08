@@ -25,6 +25,7 @@ directory goes on PYTHONPATH:
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import gzip
 import json
@@ -411,30 +412,37 @@ def truncate_middle(text: str, max_chars: int = _MAX_LOG_CHARS) -> str:
 def restore_sampled_reasoning(message_history: list[dict], trace: Trace) -> list[dict]:
     """Put the sampled reasoning back on assistant messages Terminus-2 re-sends without it.
 
-    Terminus-2 re-sends a turn that hit max_tokens as its truncated text only. Verifiers keys
-    assistant messages on their reasoning, so that copy no longer matches the sampled turn: the
-    next prompt is re-rendered with every earlier turn's thinking stripped, and the rollout forks
-    into a second training sample.
+    Terminus-2 re-sends a max_tokens turn, or any turn with interleaved thinking off, without its
+    reasoning. Verifiers keys assistant messages on their reasoning, so that copy no longer matches
+    the sampled turn and the rollout forks into a second training sample. The n-th re-sent copy of
+    a content gets the reasoning of the n-th sampled turn with that content.
 
     Example:
-        # sampled turn: content='{"analysis": "Wri', reasoning_content="I will write it."
-        restore_sampled_reasoning([{"role": "assistant", "content": '{"analysis": "Wri'}], trace)
-        # -> [{"role": "assistant", "content": '{"analysis": "Wri',
-        #      "reasoning_content": "I will write it."}]
+        # sampled turns: (content="", reasoning_content="A"), then (content="", reasoning_content="B")
+        restore_sampled_reasoning([task, {"role": "assistant", "content": ""}, reply,
+                                   {"role": "assistant", "content": ""}], trace)
+        # -> the first assistant copy gets reasoning_content="A", the second "B"
     """
-    reasoning = {
-        node.message.content or "": node.message.reasoning_content
-        for node in trace.nodes
-        if node.sampled and node.message.reasoning_content
-    }
-    return [
-        {**message, "reasoning_content": reasoning[message["content"] or ""]}
-        if message["role"] == "assistant"
-        and "reasoning_content" not in message
-        and (message["content"] or "") in reasoning
-        else message
-        for message in message_history
-    ]
+    reasoning: dict[str, list[str | None]] = collections.defaultdict(list)
+    for node in trace.nodes:
+        if node.sampled:
+            reasoning[node.message.content or ""].append(node.message.reasoning_content)
+    num_seen: collections.Counter[str] = collections.Counter()
+    restored = []
+    for message in message_history:
+        if message["role"] == "assistant":
+            content = message["content"] or ""
+            index = num_seen[content]
+            num_seen[content] += 1
+            sampled = reasoning.get(content, [])
+            if (
+                "reasoning_content" not in message
+                and index < len(sampled)
+                and sampled[index]
+            ):
+                message = {**message, "reasoning_content": sampled[index]}
+        restored.append(message)
+    return restored
 
 
 class SandoqHarborTask(HarborTask):
