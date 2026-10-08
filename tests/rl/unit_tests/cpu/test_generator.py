@@ -528,19 +528,10 @@ def test_qwen36_27b_perf_config():
 
 @pytest.mark.parametrize("watermark", [None, 0.03])
 def test_watermark_reaches_engine_args(monkeypatch, tmp_path, watermark):
-    """A set ``watermark`` reaches vLLM's ``EngineArgs``; ``None`` leaves vLLM's default."""
-
-    class _EngineArgsBuilt(Exception):
-        pass
-
-    engine_kwargs = {}
-
-    def capture_engine_args(**kwargs):
-        engine_kwargs.update(kwargs)
-        # Stop __init__ before it builds the vLLM engine.
-        raise _EngineArgsBuilt
-
-    monkeypatch.setattr(generator_module, "EngineArgs", capture_engine_args)
+    """Unset leaves ``watermark`` out of the engine kwargs (vLLM rejects None); set passes it."""
+    # Raising stops __init__ right after it builds the engine kwargs.
+    engine_args = Mock(side_effect=RuntimeError("stop before the engine build"))
+    monkeypatch.setattr(generator_module, "EngineArgs", engine_args)
     monkeypatch.setattr(generator_module, "register_to_vllm", Mock())
     monkeypatch.setattr(generator_module, "init_logger", Mock())
     monkeypatch.setattr(generator_module, "sl", Mock())
@@ -549,7 +540,7 @@ def test_watermark_reaches_engine_args(monkeypatch, tmp_path, watermark):
         first_base_attention_backend=VarlenInnerAttention.Config(),
         max_context_length=1024,
     )
-    with pytest.raises(_EngineArgsBuilt):
+    with pytest.raises(RuntimeError, match="stop before the engine build"):
         VLLMGenerator(
             VLLMGenerator.Config(watermark=watermark),
             model_config=model_config,
@@ -558,7 +549,11 @@ def test_watermark_reaches_engine_args(monkeypatch, tmp_path, watermark):
             output_dir=str(tmp_path),
             rank=0,
         )
-    assert engine_kwargs.get("watermark") == watermark
+    engine_kwargs = engine_args.call_args.kwargs
+    if watermark is None:
+        assert "watermark" not in engine_kwargs
+    else:
+        assert engine_kwargs["watermark"] == watermark
 
 
 # --- CUDA graph config (VLLMCudaGraphConfig.get_vllm_compilation_config) ---
