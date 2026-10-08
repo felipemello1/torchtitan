@@ -297,4 +297,8 @@ def rl_chess_qwen3_5_35b_a3b(
     config.async_loop.target_offpolicy_steps = 5
     config.generator.gpu_memory_limit = 0.9
     config.generator.max_num_batched_tokens = 8192
+    # 1,152 groups in flight outgrow the generators' KV cache, so a waiting player's history was
+    # evicted before its next turn. Start new games only while the live ones fit; 0.9 leaves room
+    # for sessions that join placed groups and for estimate error.
+    config.generator_router.kv_admission_limit = 0.9
     return config
