@@ -23,9 +23,11 @@ _MATH_PROMPT_TEMPLATE = (
     'Remember to put your answer on its own line as "Answer: \\boxed{{...}}".'
 )
 
-# A JSON-escaped `\\text` or `\\{` in a gold: Math-Verify reads `\\` as a line break, so
-# `0 \\text{ or } 5` parses as 5.
-_ESCAPED_COMMAND = re.compile(r"(?<!\\)\\\\(?=[A-Za-z{}])")
+# Options `A) 12 B) 14 C) 15` or `\\textbf{a)}\\ 12` in a question: the gold is the option's value,
+# so a boxed letter scores 0.
+_MULTIPLE_CHOICE = re.compile(r"(?:\bA|\{a)\).*(?:\bB|\{b)\).*(?:\bC|\{c)\)", re.S)
+# A one-letter gold like ` n `: mostly "for which n ...?" questions, where it names the variable.
+_ONE_LETTER = re.compile(r"\s*[A-Za-z]\s*")
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -118,7 +120,9 @@ class Intellect3MathDataset(_CyclingDataset):
     """INTELLECT-3 RL math problems that Qwen3-4B-Thinking-2507 solves in some, not all, of 8 tries.
 
     Harder than DAPO-Math-17k for a strong base model: the dataset already drops problems
-    solved 8/8, and the default bounds drop the 0/8 ones too (21,161 -> 10,805 rows).
+    solved 8/8, and the default bounds drop the 0/8 ones too (21,161 -> 10,805 rows). It also
+    drops 148 rows with options `A) B) C)` or a one-letter gold, whose golds mis-score answers,
+    leaving 10,657.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -138,12 +142,16 @@ class Intellect3MathDataset(_CyclingDataset):
         samples = [
             DapoMathSample(
                 prompt=_MATH_PROMPT_TEMPLATE.format(problem=row["question"]),
-                ground_truth=_ESCAPED_COMMAND.sub(r"\\", str(row["answer"])),
+                # Some golds are JSON-escaped (`\\frac`), and Math-Verify reads `\\` before `\text` or `\{`
+                # as a line break, so `0 \\text{ or } 5` parses as 5. No gold holds a real line break.
+                ground_truth=str(row["answer"]).replace("\\\\", "\\"),
             )
             for row in dataset
             if config.min_pass_rate
             <= row["avg@8_qwen3_4b_thinking_2507"]
             <= config.max_pass_rate
+            and not _MULTIPLE_CHOICE.search(row["question"])
+            and not _ONE_LETTER.fullmatch(str(row["answer"]))
         ]
         super().__init__(samples, seed=config.seed, shuffle=config.shuffle)
 
