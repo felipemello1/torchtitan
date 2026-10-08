@@ -284,6 +284,23 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_8_generators() -> Controller.Co
     )
 
 
+def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_4_generators() -> Controller.Config:
+    """`rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_8_generators` on two hosts: 1 trainer host
+    (4 GPUs) + 4 TP1 engines. 64 prompts x 16 samples per step, target_offpolicy_steps 2, and
+    at most 320 running sequences per engine, about what the KV cache holds at a 27K mean
+    response, so vLLM queues requests instead of preempting.
+    """
+    config = _intellect3_math_config(
+        default_prompts=64,
+        default_microbatch_rows=1,
+        data_parallel_shard_degree=2,
+        num_generators=4,
+        target_offpolicy_steps=2,
+    )
+    config.async_loop.max_num_seqs_per_generator = 320
+    return config
+
+
 def _intellect3_math_config(
     *, default_prompts: int, default_microbatch_rows: int, **layout
 ) -> Controller.Config:
