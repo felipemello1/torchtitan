@@ -10,7 +10,7 @@ It overlaps the trainer->generator weight handoff with the next training step:
 `start_async_push_pull` fires push -> pull -> buffer-slot release in the background,
 and the loop joins each leg with `wait_prev_*`. These tests use fakes for the
 trainer actor, generator router, and group buffer (no GPU / Monarch / TorchStore).
-The last test runs `Controller._trainer_loop` on these fakes to check what the push timings measure.
+The last test runs `Controller._trainer_loop` on these fakes to check when the loop awaits the push.
 """
 
 import asyncio
@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import torch
 
+from torchtitan.rl.components.data_stream_state import DataStreamState
 from torchtitan.rl.controller import Controller
 from torchtitan.rl.distributed.weight_sync import WeightSyncManager
 from torchtitan.rl.types import OptimizerStepOutput, TrainerStepBatch
@@ -257,17 +258,26 @@ class _FakeMetricsProcessor:
 
 
 async def _run_trainer_loop(*, num_training_steps):
-    """Run `Controller._trainer_loop` on fakes and return each step's logged values.
+    """Run `Controller._trainer_loop` on fakes; return each step's logged values and the event order.
 
     One asyncio loop stands in for the trainer actor's loop. Forward/backward blocks it with time.sleep,
     as `Trainer.forward_backward_steps` blocks the actor's loop, so a push awaiting its RPC cannot resume.
     """
 
+    events: list[str] = []
+
     async def push_model_state_dict():
+        events.append("push_start")
         await asyncio.sleep(PUSH_S)  # torchstore RPCs
+        events.append("push_end")
+
+    async def pull_model_state_dict():
+        await asyncio.sleep(0.01)  # the generators' pull
 
     async def forward_backward_steps(*args):
+        events.append("forward_backward_start")
         time.sleep(FORWARD_BACKWARD_S)
+        events.append("forward_backward_end")
         return {"loss/mean": 1.0}
 
     async def optimizer_step(*, last_step):
@@ -287,14 +297,19 @@ async def _run_trainer_loop(*, num_training_steps):
         generator_router=SimpleNamespace(sync_log_step=_Endpoint(_rpc)),
         _rollouter=SimpleNamespace(sync_log_step=_rpc),
         _trainer_policy_version=0,
+        _data_stream=DataStreamState(),
         config=SimpleNamespace(
             async_loop=SimpleNamespace(
-                target_offpolicy_steps=1, max_offpolicy_steps=None
+                target_offpolicy_steps=1,
+                max_offpolicy_steps=None,
+                validation=SimpleNamespace(interval_steps=0),
             )
         ),
         _get_rank_0_value=lambda result: result,
         _weight_sync=_manager(
-            trainer=trainer, router=_FakeRouter(_noop), buffer=_FakeBuffer()
+            trainer=trainer,
+            router=_FakeRouter(pull_model_state_dict),
+            buffer=_FakeBuffer(events),  # records "release"
         ),
         _group_buffer=SimpleNamespace(metrics=lambda: []),
         metrics_processor=_FakeMetricsProcessor(),
@@ -313,15 +328,21 @@ async def _run_trainer_loop(*, num_training_steps):
     await Controller._trainer_loop(
         controller, training_batch_queue, num_training_steps=num_training_steps
     )
-    return controller.metrics_processor.values_by_step
+    return controller.metrics_processor.values_by_step, events
 
 
-def test_trainer_loop_push_wall_counts_time_behind_forward_backward() -> None:
-    # Step 1's push starts after its optimizer step and can only finish after step 2's forward/backward.
-    values_by_step = asyncio.run(_run_trainer_loop(num_training_steps=2))
+def test_trainer_loop_finishes_push_before_forward_backward() -> None:
+    values_by_step, events = asyncio.run(_run_trainer_loop(num_training_steps=2))
+    # A push still waiting on its RPC when forward/backward starts would resume only after it ends.
+    # The pull and slot release are not awaited before forward/backward, so they still overlap it.
+    assert events == [
+        *["forward_backward_start", "forward_backward_end"],  # step 1, no push yet
+        *["push_start", "push_end"],  # step 1's push
+        *["forward_backward_start", "forward_backward_end"],  # step 2
+        "release",  # step 1's pull and slot release, after step 2's forward/backward started
+        *["push_start", "push_end", "release"],  # step 2's sync, awaited after the loop
+    ]
     step_2 = values_by_step[2]
-    assert step_2["timing/step/forward_backward"] >= FORWARD_BACKWARD_S
-    # push_wall is the push's start to done, so it includes the time behind forward/backward ...
-    assert step_2[TRAINER_PUSH_KEY] >= FORWARD_BACKWARD_S
-    # ... while wait_for_push is only how long the loop waited for it.
-    assert step_2["timing/step/wait_for_push"] < FORWARD_BACKWARD_S / 2
+    # The push takes its own time, and the loop waits for it before forward/backward.
+    assert step_2[TRAINER_PUSH_KEY] < FORWARD_BACKWARD_S / 2
+    assert PUSH_S / 2 < step_2["timing/step/wait_for_push"] < FORWARD_BACKWARD_S / 2
