@@ -535,22 +535,35 @@ def rl_grpo_qwen3_5_4b_base_terminal_bench_dev() -> Controller.Config:
 def rl_grpo_qwen3_5_9b_base_terminal_bench_fast() -> Controller.Config:
     """Qwen3.5-9B-Base with thinking off: fast Terminal-Bench steps on Sandoq to shake out bugs.
 
-    8 GB300 GPUs on 2 hosts: trainer FSDP 4 on one, four TP1 generators on the other. 8 prompts x
-    8 samples per step, 150 turns, a pool of 256 sandboxes, no validation.
+    8 GB300 GPUs on 2 hosts: trainer FSDP 4 on one, four TP1 generators on the other. 8 samples
+    per prompt, 150 turns, up to 6 steps off-policy, no validation.
+
+    `DOME_SANDOQ_POOL` (default 256) is the number of sandboxes the run may hold. It sets the
+    rollouts in the env server and, by the pool >= 3 batches rule, the prompts per step:
+    pool 1,000 -> 40 x 8, 768 -> 32 x 8, 256 -> 10 x 8. `DOME_V2_PROMPTS` overrides the prompts.
     """
+    # Read at load time, not import, so tests and other recipes import this module.
+    sandbox_pool = int(os.environ.get("DOME_SANDOQ_POOL", 256))
+    num_samples_per_prompt = 8
     return _qwen3_5_base_terminal_bench_config(
         flavor="9B",
-        num_prompts_per_train_step=8,
-        num_samples_per_prompt=8,
+        num_prompts_per_train_step=int(
+            os.environ.get(
+                "DOME_V2_PROMPTS", min(40, sandbox_pool // (3 * num_samples_per_prompt))
+            )
+        ),
+        num_samples_per_prompt=num_samples_per_prompt,
         microbatch_rows=1,
         max_turns=150,
-        sandbox_pool=256,
-        num_env_workers=math.ceil(256 / 24),
+        sandbox_pool=sandbox_pool,
+        num_env_workers=math.ceil(sandbox_pool / 24),
         num_validation_samples=0,
         num_generators=4,
         parallelism=ParallelismConfig(data_parallel_shard_degree=4),
         dump_folder="outputs/rl/qwen3_5_9b_base_terminal_bench_fast",
         enable_thinking=False,
+        # The trainer waits for most of a step; more groups in flight shorten the wait.
+        target_offpolicy_steps=6,
     )
 
 
@@ -568,6 +581,7 @@ def _qwen3_5_base_terminal_bench_config(
     parallelism: ParallelismConfig,
     dump_folder: str,
     enable_thinking: bool = True,
+    target_offpolicy_steps: int = 4,
 ) -> Controller.Config:
     """Build a Qwen3.5-Base Terminal-Bench run on Sandoq that saves resumable checkpoints.
 
@@ -577,6 +591,8 @@ def _qwen3_5_base_terminal_bench_config(
         microbatch_rows: Tokens per trainer microbatch, in rows of 131,072 tokens.
         sandbox_pool: Sandoq sessions the run may hold; the env server runs this many
             rollouts at once.
+        target_offpolicy_steps: How many steps a group's policy may trail the trainer; the
+            controller keeps (this + 1) x prompts groups in flight.
     """
     max_context_length = 131072
     model_config = build_model_config(
@@ -598,7 +614,7 @@ def _qwen3_5_base_terminal_bench_config(
             num_training_steps=150,
             num_prompts_per_train_step=num_prompts_per_train_step,
             num_samples_per_prompt=num_samples_per_prompt,
-            target_offpolicy_steps=4,
+            target_offpolicy_steps=target_offpolicy_steps,
             windowed_fifo_batches=None,
             validation=ValidationConfig(
                 num_samples=num_validation_samples, interval_steps=25, greedy=True
