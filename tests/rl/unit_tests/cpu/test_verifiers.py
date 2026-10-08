@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import io
 import json
 import logging
 import subprocess
+import sys
+import tarfile
 from types import SimpleNamespace
 
 import pytest
@@ -624,6 +627,67 @@ def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
     assert log["tests"]["stdout"].startswith("apt-get update\n")
     assert log["tests"]["stdout"].endswith("\n1 failed")
     assert "characters omitted" in log["tests"]["stdout"]
+
+
+def test_sandoq_tests_get_requests_from_a_bundle(tmp_path) -> None:
+    """A test.sh that imports `requests` and installs nothing gets the packages the image lacks
+    from a pure-Python bundle on its PYTHONPATH; one that pip-installs is left alone."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.runtimes import ProgramResult
+    from verifiers.v1.tasksets.harbor.taskset import HarborData
+
+    def task(name: str, test_sh: str) -> str:
+        (tmp_path / name / "tests").mkdir(parents=True)
+        (tmp_path / name / "tests" / "test.sh").write_text(test_sh)
+        return str(tmp_path / name)
+
+    heredoc = (
+        "cat << 'EOF' > /tmp/t.py\nimport requests\nEOF\npython3 -m pytest /tmp/t.py\n"
+    )
+    tmax = task("tmax", heredoc)
+    installs = task("tb21", "pip install requests==2.32.4\n" + heredoc)
+    assert sandoq.tests_need_requests(tmax)
+    assert not sandoq.tests_need_requests(installs)
+
+    class VMRuntime:
+        def __init__(self) -> None:
+            self.writes: list[str] = []
+            self.runs: list[tuple[list[str], dict[str, str]]] = []
+
+        async def write(self, path: str, data: bytes) -> None:
+            self.writes.append(path)
+
+        async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+            self.runs.append((argv, env))
+            return ProgramResult(exit_code=0, stdout="", stderr="")
+
+        async def read(self, path: str, max_bytes: int) -> bytes:
+            if path.endswith("reward.json"):
+                raise OSError(path)
+            return b"1"
+
+    runtime = VMRuntime()
+    harbor_task = sandoq.SandoqHarborTask(HarborData(prompt="x", task_dir=tmax))
+    trace = _sandoq_harness_and_trace(sandoq, tmp_path)[1]
+    assert asyncio.run(harbor_task.solved(runtime, trace)) == 1.0
+    assert f"{sandoq._TEST_PYTHON_DEPS}.tgz" in runtime.writes
+    test_sh_env = next(
+        env for argv, env in runtime.runs if argv == ["bash", "/tests/test.sh"]
+    )
+    assert test_sh_env["PYTHONPATH"] == sandoq._TEST_PYTHON_DEPS
+
+    # The bundle imports on a python without site-packages: no compiled extension is needed.
+    with tarfile.open(fileobj=io.BytesIO(sandoq.requests_bundle())) as bundle:
+        assert not [name for name in bundle.getnames() if name.endswith(".so")]
+        bundle.extractall(tmp_path / "deps", filter="data")
+    imported = subprocess.run(
+        [sys.executable, "-S", "-c", "import requests; print(requests.__file__)"],
+        env={"PYTHONPATH": str(tmp_path / "deps")},
+        capture_output=True,
+        text=True,
+    )
+    assert imported.stdout.startswith(str(tmp_path / "deps")), imported.stderr
 
 
 def test_sandoq_tmux_outlives_grading(tmp_path, monkeypatch) -> None:
