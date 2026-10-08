@@ -34,7 +34,7 @@ from torch_checkpointing.config import (
 )
 from torch_checkpointing.default_resharder import DefaultResharder
 from torch_checkpointing.distributed_metadata import (
-    METADATA_FILE_NAME as TORCH_CHECKPOINTING_METADATA_FILE_NAME,
+    METADATA_FILE_NAME as TORCH_CHECKPOINTING_METADATA_FILE_NAME,  # pyrefly: ignore[missing-module-attribute]
 )
 from torch_checkpointing.hf.consolidation import consolidate_hf_safetensors_checkpoint
 from torch_checkpointing.logging_utils import checkpoint_logging_context, EventLogger
