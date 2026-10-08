@@ -29,6 +29,8 @@ class DapoMathSample:
 
     prompt: str
     ground_truth: str
+    pass_rate: float | None = None
+    """Fraction of 8 tries Qwen3-4B-Thinking-2507 solved (INTELLECT-3-RL's avg@8); None elsewhere."""
 
 
 # TODO: Share this cycling iterator with other RL datasets instead of keeping
@@ -138,6 +140,7 @@ class Intellect3MathDataset(_CyclingDataset):
             DapoMathSample(
                 prompt=_MATH_PROMPT_TEMPLATE.format(problem=row["question"]),
                 ground_truth=str(row["answer"]),
+                pass_rate=row["avg@8_qwen3_4b_thinking_2507"],
             )
             for row in dataset
             if config.min_pass_rate

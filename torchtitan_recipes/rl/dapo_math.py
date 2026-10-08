@@ -29,12 +29,13 @@ from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.examples.dapo_math.data import AIME2025Dataset, DapoMathDataset
 from torchtitan.rl.examples.dapo_math.env import DapoMathEnv
 from torchtitan.rl.examples.dapo_math.rubric import RewardMathVerify
+from torchtitan.rl.examples.dapo_math.worker import DapoMathRolloutWorker
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
 from torchtitan.rl.losses import DAPOLoss
 from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import TokenEnv
-from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
+from torchtitan.rl.rollout.rollouter import Rollouter
 from torchtitan.rl.rubric import Rubric
 from torchtitan.rl.trainer import Trainer
 
@@ -50,7 +51,7 @@ def _dapo_math_rollouter_config(
     return Rollouter.Config(
         train_dataset=DapoMathDataset.Config(),
         validation_dataset=validation_dataset,
-        worker=RolloutWorker.Config(
+        worker=DapoMathRolloutWorker.Config(
             rubric=Rubric.Config(
                 reward_fns=[RewardMathVerify.Config(weight=1.0)],
                 error_reward=0.0,

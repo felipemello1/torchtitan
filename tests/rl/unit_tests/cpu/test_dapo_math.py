@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU tests for the DAPO-Math dataset, environment, and rubric."""
+"""CPU tests for the DAPO-Math dataset, environment, rubric, and worker."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from torchtitan.rl.examples.dapo_math import (
     AIME2025Dataset,
     DapoMathDataset,
     DapoMathEnv,
+    DapoMathRolloutWorker,
     DapoMathSample,
     data as math_data,
     Intellect3MathDataset,
@@ -26,7 +27,10 @@ from torchtitan.rl.examples.dapo_math import (
     rubric as math_rubric,
     score_math_response,
 )
-from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
+from torchtitan.rl.observability import metrics as m
+from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
+from torchtitan.rl.rollout.rollouter import RolloutWorker
+from torchtitan.rl.rubric import Rubric
 from torchtitan.rl.types import RolloutTurnID
 
 
@@ -211,3 +215,53 @@ def test_reward_handles_equivalent_latex_and_units() -> None:
     sample = DapoMathSample(prompt="problem", ground_truth=r"336^\circ")
     assert asyncio.run(reward(_rollout(r"work\nAnswer: \boxed{336}"), sample)) == 1.0
     assert asyncio.run(reward(_rollout(r"work\nAnswer: \boxed{335}"), sample)) == 0.0
+
+
+def _scored_group(rewards: list[float]) -> RolloutGroup:
+    rollouts = [
+        Rollout(
+            group_id=0,
+            rollout_id=rollout_id,
+            status=RolloutStatus.COMPLETED,
+            turns=[],
+            reward=reward,
+        )
+        for rollout_id, reward in enumerate(rewards)
+    ]
+    return RolloutGroup(group_id=0, rollouts=rollouts)
+
+
+def test_worker_logs_zero_std_groups_by_pass_rate(monkeypatch) -> None:
+    groups = iter(
+        [
+            # A correct answer another rubric term scaled to 0.5 still counts.
+            _scored_group([0.5, 0.5]),
+            _scored_group([1.0, 0.0]),
+            _scored_group([0.0, 0.0]),
+            _scored_group([1.0, 1.0]),
+            # Both correct, one forced to 0.5: rewards differ, so the group trains.
+            _scored_group([1.0, 0.5]),
+        ]
+    )
+
+    async def run_group(self, **kwargs) -> RolloutGroup:
+        return next(groups)
+
+    # The stock run_group needs a generator; stand in with already scored groups.
+    monkeypatch.setattr(RolloutWorker, "run_group", run_group)
+    worker = DapoMathRolloutWorker.Config(
+        rubric=Rubric.Config(reward_fns=[RewardMathVerify.Config()]),
+        message_env=DapoMathEnv.Config(),
+    ).build()
+    metrics: list[m.Metric] = []
+    # 0.75 is the top bin's lower edge; a sample without a pass rate logs nothing.
+    for pass_rate in [0.875, 0.75, 0.125, None, 0.875]:
+        sample = DapoMathSample(prompt="p", ground_truth="1", pass_rate=pass_rate)
+        metrics += asyncio.run(worker.run_group(sample=sample)).metrics
+    assert m.MetricsProcessor._aggregate_metrics(metrics) == {
+        # 1 of the 3 top-bin groups was all correct.
+        "math/zero_std/all_correct/avg8_ge0.75/mean": 1 / 3,
+        "math/zero_std/all_wrong/avg8_ge0.75/mean": 0.0,
+        "math/zero_std/all_correct/avg8_lt0.25/mean": 0.0,
+        "math/zero_std/all_wrong/avg8_lt0.25/mean": 1.0,
+    }
