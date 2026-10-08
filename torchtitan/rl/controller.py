@@ -971,7 +971,8 @@ class Controller(Configurable):
                         group_size=self.config.async_loop.num_samples_per_prompt,
                         sampling=self._sampling,
                     )
-                group.metrics = compute_rollout_metrics(
+                # += keeps the metrics a custom rollout worker attached to the group.
+                group.metrics += compute_rollout_metrics(
                     prefix="rollout", rollouts=group.rollouts
                 )
 
