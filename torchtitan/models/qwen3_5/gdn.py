@@ -33,6 +33,10 @@ from torchtitan.models.common.attention import (
     VarlenAttentionMetadata,
 )
 from torchtitan.models.common.linear import maybe_gather_tp_input
+from torchtitan.models.common.linear_attention import (
+    ChunkBackend,
+    resolve_chunk_backend,
+)
 from torchtitan.models.common.norm import GatedRMSNorm
 from torchtitan.protocols.module import Module
 
@@ -212,10 +216,12 @@ class GatedDeltaKernel(Module):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        pass
+        chunk_backend: ChunkBackend = "auto"
+        """Attention Gym chunk kernel; "auto" picks "cudnn" for fp16/bf16 on SM100/SM103, else "fused"."""
 
     def __init__(self, config: Config):
         super().__init__()
+        self.chunk_backend = config.chunk_backend
 
     def forward(
         self,
@@ -254,6 +260,9 @@ class GatedDeltaKernel(Module):
             cu_seqlens=cu_seqlens,
             scale=xq_BTHK.shape[-1] ** -0.5,
             impl="fused",
+            kernel_options={
+                "backend": resolve_chunk_backend(self.chunk_backend, xq_THK)
+            },
         )
         return output.squeeze(0)
 
