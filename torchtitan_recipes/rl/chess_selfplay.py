@@ -314,3 +314,33 @@ def rl_chess_qwen3_5_35b_a3b(
         2 * config.async_loop.num_samples_per_prompt
     )
     return config
+
+
+def rl_chess_qwen3_5_4b_gb300(
+    max_plies: int = 120,
+    max_thinking_tokens: int = 1024,
+    max_context_tokens: int = 131072,
+) -> Controller.Config:
+    """The 35B GB300 recipe with Qwen3.5-4B (instruct): same games, thinking budget, context, and
+    eight one-GPU generators on hosts 1-2; host 0 trains the dense 4B with FSDP 4.
+
+    The 4B's fp32 weights, grads and Adam state take ~16 GB per trainer GPU (the 35B's ~140 GB), so
+    the trainer spends the memory on selective activation checkpointing instead of full recompute.
+    """
+    config = rl_chess_qwen3_5_35b_a3b(
+        max_plies=max_plies,
+        max_thinking_tokens=max_thinking_tokens,
+        max_context_tokens=max_context_tokens,
+    )
+    config.model = build_model_config(
+        "4B", seq_len=max_context_tokens, attn_backend="varlen"
+    )
+    config.hf_assets_path = "torchtitan/rl/example_checkpoint/Qwen3.5-4B"
+    config.dump_folder = "outputs/rl/qwen3_5_4b_chess_gb300"
+    trainer = config.trainer
+    trainer.parallelism = ParallelismConfig(data_parallel_shard_degree=4)
+    trainer.activation_checkpoint = SelectiveAC.Config()
+    trainer.override = OverrideConfig()
+    trainer.dist_moe = None
+    trainer.loss.loss_fn.global_vocab_size = decoder_vocab_size(config.model)
+    return config
