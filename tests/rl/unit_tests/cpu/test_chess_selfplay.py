@@ -560,32 +560,67 @@ def test_worker_trains_both_colors_with_per_color_advantages() -> None:
             {
                 0: ["f3", "g4"],  # game 0: fool's mate, Black wins
                 1: ["e5", "Qh4#"],
-                2: ["e4"],  # game 1: Black forfeits on its first move
-                3: ["Ke9"],
+                2: ["e4", "d4"],  # game 1: Black forfeits on its second move
+                3: ["e5", "Ke9"],
             },
             group_size=2,
         )
         by_id = {rollout.rollout_id: rollout for rollout in group.rollouts}
         assert sorted(by_id) == [0, 1, 2, 3]
         assert all(r.status == RolloutStatus.COMPLETED for r in group.rollouts)
-        # White is mated on ply 4 of 40; Black's forfeit at ply 1 costs -1 * (1 - 1 / 80) and
+        # White is mated on ply 4 of 40; Black's forfeit at ply 3 costs -1 * (1 - 3 / 80) and
         # gives White a draw's 0.5 at even material, not a win
         assert [by_id[i].reward for i in range(4)] == pytest.approx(
-            [-0.225, 1.0, 0.5, -0.9875]
+            [-0.225, 1.0, 0.5, -0.9625]
         )
-        # each color is centered on its own mean (White 0.1375, Black 0.00625)
+        # each color is centered on its own mean (White 0.1375, Black 0.01875)
         assert [by_id[i].advantage for i in range(4)] == pytest.approx(
-            [-0.3625, 0.99375, 0.3625, -0.99375]
+            [-0.3625, 0.98125, 0.3625, -0.98125]
         )
-        assert [len(by_id[i].turns) for i in range(4)] == [2, 2, 1, 1]
+        assert [len(by_id[i].turns) for i in range(4)] == [2, 2, 2, 2]
+        # Black's turn before its forfeit is centered as if the game had stopped at the cap there:
+        # its 0.5 against (1.0 + 0.5) / 2; every other turn trains on its rollout's advantage
+        assert [[turn.advantage for turn in by_id[i].turns] for i in range(4)] == [
+            [None, None],
+            [None, None],
+            [None, None],
+            [pytest.approx(-0.25), None],
+        ]
 
         reduced = _reduced_metrics(group.rollouts)
         assert reduced["chess_games/end_self_play/checkmate/mean"] == 0.5
         assert reduced["chess_games/end_self_play/illegal_move/mean"] == 0.5
-        # 6 policy replies, 1 of them illegal
+        # 8 policy replies, 1 of them illegal
         assert reduced[
             "chess_games/forfeits_per_reply_self_play/mean"
-        ] == pytest.approx(1 / 6)
+        ] == pytest.approx(1 / 8)
+
+    asyncio.run(run())
+
+
+def test_worker_centers_earlier_turns_as_if_every_forfeit_was_capped() -> None:
+    async def run() -> None:
+        group = await _run_group(
+            {
+                0: ["e4", "d4"],  # game 0: Black forfeits at ply 3
+                1: ["e5", "Ke9"],
+                2: ["e4", "d3", "c3"],  # game 1: Black forfeits at ply 5
+                3: ["e5", "d6", "Ke9"],
+            },
+            group_size=2,
+        )
+        by_id = {rollout.rollout_id: rollout for rollout in group.rollouts}
+        black_0, black_1 = by_id[1], by_id[3]
+        assert (black_0.advantage, black_1.advantage) == pytest.approx(
+            (-0.0125, 0.0125)
+        )
+        # both would have stopped at 0.5 (even material), so every earlier turn is 0.5 - 0.5
+        assert [turn.advantage for turn in black_0.turns] == [pytest.approx(0.0), None]
+        assert [turn.advantage for turn in black_1.turns] == [
+            pytest.approx(0.0),
+            pytest.approx(0.0),
+            None,
+        ]
 
     asyncio.run(run())
 
@@ -613,6 +648,10 @@ def test_worker_forfeits_a_player_that_stops_mid_game() -> None:
         assert (white.reward, black.reward) == pytest.approx((-0.975, 0.5))
         assert white.turns[-1].env_rewards == {"score": pytest.approx(-0.975)}
         assert black.turns[-1].env_rewards == {"score": 0.5}
+        # a reply cut at max_tokens is a forfeit too: White's first turn is centered as if capped,
+        # its 0.5 against a mean of 0.5
+        assert [turn.advantage for turn in white.turns] == [pytest.approx(0.0), None]
+        assert [turn.advantage for turn in black.turns] == [None]
         assert (
             _reduced_metrics(group.rollouts)[
                 "chess_games/end_self_play/reply_too_long/mean"

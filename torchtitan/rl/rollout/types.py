@@ -133,6 +133,9 @@ class RolloutTurn:
     completion_loss_mask: list[bool] | None = None  # [num_completion_tokens] or None
     """`Completion.loss_mask`: False on tokens the rollout appended, which the loss skips. None: train every token."""
 
+    advantage: float | None = None
+    """Overrides `Rollout.advantage` on this turn's completion tokens; `None` uses the rollout's."""
+
     # Filtering
     min_policy_version: int | None = None
     """Oldest policy version this turn was sampled under; `None` if no generation happened."""

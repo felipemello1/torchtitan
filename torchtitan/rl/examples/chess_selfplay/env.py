@@ -141,13 +141,14 @@ class ChessGame:
         """Each color's score once the game is over (win 1, draw 0.5, loss 0); `None` while it runs."""
         self.end_reason: str | None = None
         """Why the game ended, e.g. "checkmate", "max_plies", "illegal_move"; `None` while it runs."""
+        self.forfeiter: chess.Color | None = None
+        """The color that lost by forfeit (an illegal move or `forfeit`); `None` otherwise."""
         self._max_plies = max_plies
         self._bot = bot
         self._bot_color = None if bot is None else not sample.policy_color
         # Shuffles each piece's legal moves.
         self._rng = random.Random(seed)
         self._last_move_san: str | None = None
-        self._forfeiter: chess.Color | None = None
         self._turn_changed = asyncio.Condition()
         self._end_if_over()
 
@@ -163,7 +164,8 @@ class ChessGame:
         (b) stalemate or insufficient material: 0.5 * played each;
         (c) `max_plies` plies: a draw, 0.5, moved halfway toward the material score, so within [0.25, 0.75];
         (d) a forfeit: -1 * (1 - played / 2), so within [-1, -0.5], below being checkmated at any ply;
-            the other color is scored as in (c), not as a win.
+            the other color is scored as in (c), not as a win. When one reply caused the forfeit,
+            `ChessSelfPlayWorker` credits the forfeiter's earlier turns as if it had scored (c).
 
         Example (max_plies=60):
 
@@ -176,13 +178,19 @@ class ChessGame:
         if self.end_reason == "checkmate":
             loser = self.board.turn
             return {not loser: 1.0, loser: _CHECKMATED_REWARD * (1.0 - played)}
-        if self.end_reason != "max_plies" and self._forfeiter is None:
+        if self.end_reason != "max_plies" and self.forfeiter is None:
             return {chess.WHITE: 0.5 * played, chess.BLACK: 0.5 * played}
-        white_reward = 0.5 + _MATERIAL_WEIGHT * (material_score(self.board) - 0.5)
-        rewards = {chess.WHITE: white_reward, chess.BLACK: 1.0 - white_reward}
-        if self._forfeiter is not None:
-            rewards[self._forfeiter] = _FORFEIT_REWARD * (1.0 - played / 2)
+        rewards = self.material_rewards
+        if self.forfeiter is not None:
+            rewards[self.forfeiter] = _FORFEIT_REWARD * (1.0 - played / 2)
         return rewards
+
+    @property
+    def material_rewards(self) -> dict[chess.Color, float]:
+        """Each color's reward if the game ended at `max_plies` now: a draw, 0.5, moved halfway toward
+        the material score."""
+        white_reward = 0.5 + _MATERIAL_WEIGHT * (material_score(self.board) - 0.5)
+        return {chess.WHITE: white_reward, chess.BLACK: 1.0 - white_reward}
 
     @property
     def num_plies(self) -> int:
@@ -273,7 +281,7 @@ class ChessGame:
             self.end_reason = "max_plies"
 
     def _forfeit(self, color: chess.Color, *, reason: str) -> None:
-        self._forfeiter = color
+        self.forfeiter = color
         self._end(winner=not color, reason=reason)
 
     def _end(self, *, winner: chess.Color | None, reason: str) -> None:

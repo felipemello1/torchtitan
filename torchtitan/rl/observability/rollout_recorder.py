@@ -191,6 +191,7 @@ class RolloutSampleRecorder(Configurable):
             "completion_message": turn.completion_message,
             "env_messages": turn.env_messages,
             "env_rewards": turn.env_rewards,
+            "advantage": turn.advantage,
         }
         if self._log_tensors:
             encoded["prompt_prefix_len"] = turn.prompt_prefix_len

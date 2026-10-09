@@ -79,6 +79,8 @@ The training reward (`ChessGame.rewards`) is 1 for a win, at any length. A game 
 
 Advantages are centered per color within a group: White's rollouts against White's mean, Black's against Black's. With one baseline over both colors, the mean of complementary scores is 0.5, so the color that moves first would collect a free positive advantage.
 
+A rollout's advantage lands on every turn, so a late forfeit would push dozens of legal moves down with it. A forfeit caused by one reply (an illegal or unparsable move, or a reply cut at `max_tokens`) therefore costs only that turn: the forfeiter's earlier turns get the advantage they would have had if every such forfeit in the group had ended its game at `max_plies` at that moment, so a forfeit does not lower the mean its own earlier turns are measured against (`RolloutTurn.advantage` overrides the rollout's on a turn).
+
 ## Bots, validation, and metrics
 
 `bots.BOTS` is a ladder of Stockfish opponents, rated on a full-rules scale anchored at Stockfish's `UCI_Elo` 1320:

@@ -146,6 +146,20 @@ def test_multiturn_with_growing_prefix_packs_into_one_training_sample() -> None:
     )
 
 
+def test_turn_advantage_overrides_the_rollout_advantage() -> None:
+    first = _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=2)
+    first.advantage = 0.3
+    second = _turn(
+        prompt_token_ids=[1, 2, 4, 8], completion_token_ids=[5, 6], version=2
+    )
+    rollout = _scored_rollout([first, second], reward=-1.0, advantage=-0.9)
+    [training_sample] = rollout_to_training_samples(rollout)
+    # turn 0 trains on its own advantage, turn 1 on the rollout's
+    assert training_sample.advantage.tolist() == pytest.approx(
+        [0.0, 0.0, 0.3, 0.0, -0.9, -0.9]
+    )
+
+
 def test_history_edit_branches_into_separate_training_samples() -> None:
     # Turn 1's prompt does NOT extend turn 0's prompt+completion (the env rewrote history),
     # so the trajectory splits into two training_samples.

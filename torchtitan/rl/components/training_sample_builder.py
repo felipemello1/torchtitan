@@ -303,7 +303,9 @@ class TrainingSampleBuilder(Configurable):
                 rollout_turn.completion_loss_mask or [True] * num_completion
             )
             training_sample.logprobs += rollout_turn.completion_logprobs
-            training_sample.advantage += [rollout_advantage] * num_completion
+            training_sample.advantage += [
+                rollout_advantage if rollout_turn.advantage is None else rollout_turn.advantage
+            ] * num_completion
 
         return [
             training_sample.to_training_sample() for training_sample in training_samples
