@@ -311,7 +311,7 @@ async def _run_trainer_loop(*, num_training_steps):
             router=_FakeRouter(pull_model_state_dict),
             buffer=_FakeBuffer(events),  # records "release"
         ),
-        _group_buffer=SimpleNamespace(metrics=lambda: []),
+        _group_buffer=SimpleNamespace(metrics=lambda: [], record_step_start=_rpc),
         metrics_processor=_FakeMetricsProcessor(),
     )
     training_batch_queue = asyncio.Queue()

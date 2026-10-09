@@ -30,6 +30,7 @@ from torchtitan.models.qwen3 import build_model_config
 from torchtitan.models.qwen3_5 import build_model_config as build_qwen3_5_model_config
 from torchtitan.rl.components.batcher import Batcher
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
+from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
 from torchtitan.rl.controller import (
     AsyncLoopConfig,
     Controller,
@@ -294,6 +295,27 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_8_generators() -> Controller.Co
     )
     config.rollouter.train_dataset.max_pass_rate = 0.75
     config.generator.watermark = 0.03
+    return config
+
+
+def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_8_generators_adaptive_buffer() -> (
+    Controller.Config
+):
+    """`rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_8_generators` with the adaptive rollout
+    buffer: the slot count follows how many groups were not ready at recent step starts, capped
+    so the mean policy age stays at or under 6.
+    """
+    config = rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_8_generators()
+    config.async_loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
+        # The live run's mean policy age, from its fixed (6 + 1) x 64 slots.
+        target_offpolicy_steps=6,
+        # No age drops, as with the fixed buffer.
+        max_offpolicy_steps=None,
+        # Start at the fixed buffer's (6 + 1) x 64 = 448 slots, so a resume does not restart at 3 x 64.
+        start_batches=7,
+        # Never binds (the demand stays near 448); a cap at the engines' ~160-256 running groups starves them.
+        generation_capacity=1024,
+    )
     return config
 
 
