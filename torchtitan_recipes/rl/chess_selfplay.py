@@ -228,9 +228,11 @@ def rl_chess_qwen3_5_35b_a3b(
     config.renderer = from_renderers(
         Qwen35RendererConfig(enable_thinking=True, thinking_retention="all")
     )
-    # Bot groups start against a random mover and move ~200 Elo up once the policy wins over 60%.
+    # Bot groups start against a random mover and move ~200 Elo up once the policy wins over 40%.
+    # Only checkmates count, not a material lead at the ply cap, where most won games still end.
     config.rollouter.train_dataset.bots = ("curriculum",)
     worker = config.rollouter.worker
+    worker.curriculum_win_rate = 0.4
     worker.bot_curriculum = (
         "sf_random",
         "sf_eps75",
