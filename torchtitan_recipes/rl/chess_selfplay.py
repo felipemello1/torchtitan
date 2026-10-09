@@ -301,6 +301,11 @@ def rl_chess_qwen3_5_35b_a3b(
     # evicted before its next turn. Start new games only while the live ones fit. 0.9: at 1.2 the
     # startup wave thrashed (prefix hit peaked at 60%, then fell, v4 2026-10-08).
     config.generator_router.kv_admission_limit = 0.9
+    # Hold each player's prefix (attention + GDN state) between its turns; release whole idle
+    # sessions LRU below 5% free. The watermark keeps 3% free for running requests to grow.
+    config.generator.hold_session_kv = True
+    config.generator.session_kv_free_floor = 0.05
+    config.generator.watermark = 0.03
     # Self-play groups open 2 sessions per game; bot groups (8) over-reserve until they finish.
     config.generator_router.kv_admission_sessions_per_group = (
         2 * config.async_loop.num_samples_per_prompt
