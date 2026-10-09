@@ -174,6 +174,12 @@ class VarlenInnerAttention(InnerAttention):
             and current_flash_attention_impl() != flash_attention_impl
         ):
             activate_flash_attention_impl(flash_attention_impl)
+        # cuDNN before 9.25 fails on different q/k and v head dims (DeepSeek-V3's
+        # 192/128) instead of falling back. Read once here: cudnn.version()
+        # inside forward breaks torch.compile(fullgraph=True).
+        self.cudnn_rejects_mixed_head_dims = (
+            torch.backends.cudnn.version() or 0
+        ) < 92500
 
     def forward(
         self,
@@ -220,9 +226,16 @@ class VarlenInnerAttention(InnerAttention):
 
         # varlen_attn prefers cuDNN when eligible, but cuDNN's varlen backward
         # is not deterministic even in deterministic mode; FA4's is.
+        use_fa4 = fa_impl == "FA4" and (
+            torch.are_deterministic_algorithms_enabled()
+            or (
+                q_THK.shape[-1] != v_THV.shape[-1]
+                and self.cudnn_rejects_mixed_head_dims
+            )
+        )
         backend_context = (
             sdpa_kernel(SDPBackend.FLASH_ATTENTION)
-            if fa_impl == "FA4" and torch.are_deterministic_algorithms_enabled()
+            if use_fa4
             else contextlib.nullcontext()
         )
         with backend_context:

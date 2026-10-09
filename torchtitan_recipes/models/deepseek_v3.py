@@ -24,7 +24,19 @@ from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.deepseek_v3 import build_model_config
+from torchtitan.tools.utils import has_cuda_capability
 from torchtitan.trainer import Trainer
+
+
+def _attn_backend() -> str:
+    """Return varlen on Blackwell and flex elsewhere.
+
+    At DeepSeek V3's attention head dims (q/k 192, v 128), varlen attention
+    fwd+bwd is 3.8x faster than flex on GB300 (128 heads, 4096-token documents).
+    Other GPUs keep flex: FA2 requires equal q/v head dims, and FA3 is untested
+    with these head dims.
+    """
+    return "varlen" if has_cuda_capability(10, 0) else "flex"
 
 
 def _require_dist_moe() -> ModuleType:
@@ -81,7 +93,7 @@ def deepseek_v3_671b(seq_len: int | None = None) -> Trainer.Config:
     model_config = build_model_config(
         "671B",
         seq_len=seq_len,
-        attn_backend="flex",
+        attn_backend=_attn_backend(),
     )
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
