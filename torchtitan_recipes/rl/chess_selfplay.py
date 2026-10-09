@@ -29,6 +29,7 @@ from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
+from torchtitan.rl.distributed.routing import admission
 from torchtitan.rl.examples.chess_selfplay import (
     ChessPlayerEnv,
     ChessSelfPlayDataset,
@@ -301,18 +302,19 @@ def rl_chess_qwen3_5_35b_a3b(
     config.generator.gpu_memory_limit = 0.9
     config.generator.max_num_batched_tokens = 8192
     # 1,152 groups in flight outgrow the generators' KV cache, so a waiting player's history was
-    # evicted before its next turn. Start new games only while the live ones fit. 0.9: at 1.2 the
-    # startup wave thrashed (prefix hit peaked at 60%, then fell, v4 2026-10-08).
-    config.generator_router.kv_admission_limit = 0.9
+    # evicted before its next turn. Start new games only while the live ones, each grown to its
+    # expected final size, still fit. The other modes, as a one-line switch:
+    #   admission.KVEstimateAdmission.Config(limit=0.9, sessions_per_group=16)  # current size only
+    #   admission.KVUsageAdmission.Config(initial_inflight=512)  # vLLM's measured KV usage
+    # 1.5: the admission sim's pick, 93-98% of the best rule at 1x-3x game length.
+    config.generator_router.admission = admission.KVGrowthEstimateAdmission.Config(
+        limit=1.5
+    )
     # Hold each player's prefix (attention + GDN state) between its turns; below 5% free blocks,
     # release the sessions idle longest. The watermark keeps 3% free for running requests to grow.
     config.generator.hold_session_kv = True
     config.generator.session_kv_free_floor = 0.05
     config.generator.watermark = 0.03
-    # Self-play groups open 2 sessions per game; bot groups (8) over-reserve until they finish.
-    config.generator_router.kv_admission_sessions_per_group = (
-        2 * config.async_loop.num_samples_per_prompt
-    )
     return config
 
 

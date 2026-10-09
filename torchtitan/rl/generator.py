@@ -30,6 +30,8 @@ from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.metrics.loggers import StatLoggerBase
+from vllm.v1.metrics.stats import IterationStats, MultiModalCacheStats, SchedulerStats
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.config import Configurable, DebugConfig, OverrideConfig
@@ -44,7 +46,7 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.intra_generator import IntraGeneratorRouter
-from torchtitan.rl.distributed.routing.types import KVCacheBudget
+from torchtitan.rl.distributed.routing.types import EngineLoad, KVCacheBudget
 from torchtitan.rl.model.batch_invariance import force_logprobs_fn_for_batch_invariance
 from torchtitan.rl.model.vllm_registry import (
     register_to_vllm,
@@ -164,6 +166,38 @@ def _prepare_generation_request_metrics(
         for key, value in metric_values.items()
         for metric in (m.Metric(key, m.Mean(value)), m.Metric(key, m.Max(value)))
     ]
+
+
+class _EngineStatsLogger(StatLoggerBase):
+    """Keeps the engine's request counts after its last step and its preemptions so far, as vLLM's
+    metrics do. vLLM calls ``record`` on the engine thread after each step."""
+
+    def __init__(self) -> None:
+        # Plain ints, so `engine_load` can read them from the actor thread.
+        self.num_running = 0
+        self.num_waiting = 0
+        self.num_waiting_for_capacity = 0
+        self.num_preemptions = 0
+
+    def record(
+        self,
+        scheduler_stats: SchedulerStats | None,
+        iteration_stats: IterationStats | None,
+        mm_cache_stats: MultiModalCacheStats | None = None,
+        engine_idx: int = 0,
+    ) -> None:
+        if scheduler_stats is not None:
+            self.num_running = scheduler_stats.num_running_reqs
+            self.num_waiting_for_capacity = scheduler_stats.num_waiting_reqs
+            self.num_waiting = (
+                scheduler_stats.num_waiting_reqs
+                + scheduler_stats.num_skipped_waiting_reqs
+            )
+        if iteration_stats is not None:
+            self.num_preemptions += iteration_stats.num_preempted_reqs
+
+    def log_engine_initialized(self) -> None:
+        pass
 
 
 # vLLM's default max_num_batched_tokens (vllm's per-step budget:
@@ -699,10 +733,11 @@ class VLLMGenerator(Configurable):
     dispatcher) live on a dedicated engine thread, which runs its own event loop. The endpoints run on the
     actor's event loop and reach the engine loop only through the thread-safe queue and the
     `concurrent.futures.Future`s it resolves, so the actor's loop stays free to take calls while the engine steps.
-    Two endpoints are exceptions. `release_groups` pops cache-salt pins directly: each pop, like the engine loop's
+    Three endpoints are exceptions. `release_groups` pops cache-salt pins directly: each pop, like the engine loop's
     `setdefault`, is a single dict operation, atomic under the GIL. `prefetch_model_state_dict` writes the staging
     buffers the engine loop reads on a pull: the router awaits it before `pull_model_state_dict`, and the
-    controller awaits that pull before the next weight sync, so the two never overlap.
+    controller awaits that pull before the next weight sync, so the two never overlap. `engine_load` reads the
+    scheduler's free-block count and the counts the engine thread wrote, each one attribute (a skewed snapshot).
 
     A weight sync rides the same loop: `pull_model_state_dict` puts a `ModelStateDictPullMessage` on the queue, which
     rank 0 turns into a `LoopDecision(LoopAction.PULL_MODEL_STATE_DICT)` applied between step bursts. The engine does
@@ -1006,7 +1041,9 @@ class VLLMGenerator(Configurable):
 
         with sl.log_trace_span("vllm_init"):
             logger.info("Initializing LLMEngine from EngineArgs...")
-            stat_loggers = None
+            # `engine_load` reads vLLM's request counts and preemptions from this logger.
+            self._engine_stats = _EngineStatsLogger()
+            stat_loggers = [lambda vllm_config, engine_index: self._engine_stats]
             if self._tp_rank == 0:
                 if config.vllm_stat_logger is None:
                     logger.info(
@@ -1032,7 +1069,7 @@ class VLLMGenerator(Configurable):
                             context=logger_context,
                         )
 
-                    stat_loggers = [build_stat_logger]
+                    stat_loggers.append(build_stat_logger)
 
             # Start the thread that runs vllm engine.
             self._engine_event_loop = asyncio.new_event_loop()
@@ -1197,7 +1234,7 @@ class VLLMGenerator(Configurable):
             )
 
     def kv_cache_budget(self) -> KVCacheBudget:
-        """Return the KV cache size and per-session block cost, for the router's KV admission.
+        """Return the KV cache size and per-session block cost, for the router's admission policy.
 
         A session holds one block per ``block_size`` tokens in each full-attention group (and
         Mamba group in "all" mode). In every other group it holds vLLM's per-request bound, e.g.
@@ -1224,6 +1261,24 @@ class VLLMGenerator(Configurable):
             block_size=vllm_config.cache_config.block_size,
             num_growing_groups=growing_groups,
             fixed_blocks_per_session=fixed_blocks,
+            max_model_len=vllm_config.model_config.max_model_len,
+        )
+
+    def engine_load(self) -> EngineLoad:
+        """Return vLLM's KV usage, queue, and preemption count, for the router's admission policy.
+
+        The request counts are the last step's, after scheduling, as vLLM's metrics report them. KV
+        usage is read now: releasing held sessions frees blocks without a step, so an idle
+        generator's last-step usage would stay high. With data parallelism this is rank 0's replica;
+        assumes the replicas are alike.
+        """
+        stats = self._engine_stats
+        return EngineLoad(
+            kv_usage=self._engine.engine_core.engine_core.scheduler.kv_cache_manager.usage,
+            num_running=stats.num_running,
+            num_waiting=stats.num_waiting,
+            num_waiting_for_capacity=stats.num_waiting_for_capacity,
+            num_preemptions=stats.num_preemptions,
         )
 
     async def start_engine_loop(self) -> None:

@@ -11,7 +11,7 @@ from __future__ import annotations
 from monarch.actor import Actor, Channel, concurrent_endpoint, context, current_rank
 
 from torchtitan.models.common.decoder import Decoder
-from torchtitan.rl.distributed.routing.types import KVCacheBudget
+from torchtitan.rl.distributed.routing.types import EngineLoad, KVCacheBudget
 from torchtitan.rl.generator import SamplingConfig, VLLMGenerator
 from torchtitan.rl.types import Completion
 
@@ -48,6 +48,10 @@ class _GeneratorActorEndpoints:
     @concurrent_endpoint
     async def kv_cache_budget(self) -> KVCacheBudget:
         return super().kv_cache_budget()
+
+    @concurrent_endpoint
+    async def engine_load(self) -> EngineLoad:
+        return super().engine_load()
 
     @concurrent_endpoint
     async def generate(
