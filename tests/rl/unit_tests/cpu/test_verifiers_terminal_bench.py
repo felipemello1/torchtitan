@@ -11,6 +11,7 @@ import asyncio
 import json
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -300,3 +301,41 @@ def test_recipes_share_the_loop_and_keep_fp32_master_weights(name: str) -> None:
     assert serve.pool.num_workers * serve.max_concurrent >= (
         loop.max_active_rollout_groups * loop.num_samples_per_prompt
     )
+
+
+def test_35b_sandoq_1x2_recipe_fits_three_hosts(monkeypatch) -> None:
+    """A 4-GPU Dist-MoE trainer on one host and eight TP1 engines on two; the pool sizes the
+    env server at 24 rollouts per worker."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq
+
+    monkeypatch.syspath_prepend(str(Path(terminal_bench_sandoq.__file__).parent))
+    monkeypatch.setenv("VF_SANDBOX_PROVIDER", "oci-runner")
+    monkeypatch.setenv("OCI_RUNNER_TASK_NETWORK", "host")
+    monkeypatch.setenv("DOME_SANDOQ_POOL", "920")
+    monkeypatch.delenv("DOME_V2_PROMPTS", raising=False)
+    monkeypatch.delenv("DOME_V2_THINKING_BUDGET", raising=False)
+    config = _terminal_bench_config("rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2")
+
+    trainer = config.trainer.parallelism
+    assert (
+        trainer.data_parallel_shard_degree,
+        trainer.tensor_parallel_degree,
+        trainer.expert_parallel_degree,
+    ) == (2, 2, 4)
+    assert config.trainer.override.imports == [
+        "torchtitan_recipes.overrides.dist_moe.dist_moe_routed_experts"
+    ]
+    assert config.trainer.training.num_tokens_per_microbatch_per_dp_rank == 131072
+    assert config.num_generators == 8
+    assert config.generator.parallelism.tensor_parallel_degree == 1
+    assert config.generator.cuda_graph.mode == "FULL"
+    assert config.generator.watermark == 0.03
+    loop = config.async_loop
+    assert (loop.num_prompts_per_train_step, loop.num_samples_per_prompt) == (12, 16)
+    assert loop.target_offpolicy_steps == 5
+    assert loop.validation.num_samples == 0
+    assert config.rollouter.thinking_budget.max_thinking_tokens == 12288
+    serve = config.rollouter.verifiers_env_server.serve
+    assert serve.pool.num_workers == 39
+    assert serve.pool.num_workers * serve.max_concurrent >= 920

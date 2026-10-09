@@ -63,6 +63,7 @@ from torchtitan.rl.observability.rollout_recorder import (
     KeepExtremeRewardsFilter,
     RolloutSampleRecorder,
 )
+from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
 from torchtitan.rl.rubric import Rubric
 from torchtitan.rl.trainer import Trainer
 from verifiers.v1.configs.agent import TimeoutConfig as AgentTimeoutConfig
@@ -512,6 +513,62 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench() -> Controller.Config:
     trainer.dist_moe = DistMoeRuntime.Config(
         scratch_capacity_factor=float(expert_parallel_degree)
     )
+    return config
+
+
+def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2() -> Controller.Config:
+    """`rl_grpo_qwen3_5_35b_a3b_base_terminal_bench` on 3 hosts: 1 trainer host + 2 generator hosts.
+
+    12 GB300 GPUs. Trainer on one host: FSDP 2 x TP 2 x EP 4 with Dist-MoE experts, 1-row
+    microbatches. Generators: eight TP1 engines, FULL CUDA graphs, vLLM watermark 0.03.
+    12 prompts x 16 samples per step, up to 5 steps off-policy, no validation. A turn still
+    thinking at 12,288 of its 16,384 tokens gets a forced end of thinking.
+
+    `DOME_SANDOQ_POOL` (required) is the number of sandboxes the run may hold; 920 is 80% of
+    the 1,152 rollouts in flight, (5 + 1) x 12 x 16. `DOME_V2_PROMPTS` overrides the prompts
+    and `DOME_V2_THINKING_BUDGET` the thinking tokens per turn (0 turns the budget off).
+    """
+    # Read at load time, not import, so tests and other recipes import this module.
+    sandbox_pool = int(os.environ["DOME_SANDOQ_POOL"])
+    expert_parallel_degree = 4
+    config = _qwen3_5_base_terminal_bench_config(
+        flavor="35B-A3B",
+        num_prompts_per_train_step=int(os.environ.get("DOME_V2_PROMPTS", 12)),
+        num_samples_per_prompt=16,
+        microbatch_rows=1,
+        max_turns=150,
+        sandbox_pool=sandbox_pool,
+        num_env_workers=math.ceil(sandbox_pool / 24),
+        num_validation_samples=0,
+        num_generators=8,
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=2,
+            tensor_parallel_degree=2,
+            expert_parallel_degree=expert_parallel_degree,
+        ),
+        dump_folder="outputs/rl/qwen3_5_35b_a3b_base_terminal_bench_1x2",
+        target_offpolicy_steps=5,
+    )
+    trainer = config.trainer
+    # Recompute every op in the block except the Dist-MoE call, which is never recomputed.
+    trainer.activation_checkpoint = RegionAC.Config(save_regions=[])
+    # Dist-MoE experts on the trainer's model copy only; generators keep stock experts.
+    trainer.override = OverrideConfig(
+        imports=["torchtitan_recipes.overrides.dist_moe.dist_moe_routed_experts"]
+    )
+    # Worst case, every EP rank routes all its tokens to one rank; a smaller scratch
+    # buffer is an illegal memory access.
+    trainer.dist_moe = DistMoeRuntime.Config(
+        scratch_capacity_factor=float(expert_parallel_degree)
+    )
+    # Admit a request only while 3% of KV blocks stay free, so running requests have room to
+    # grow before vLLM preempts one.
+    config.generator.watermark = 0.03
+    max_thinking_tokens = int(os.environ.get("DOME_V2_THINKING_BUDGET", 12288))
+    if max_thinking_tokens > 0:
+        config.rollouter.thinking_budget = ThinkingBudget.Config(
+            max_thinking_tokens=max_thinking_tokens
+        )
     return config
 
 
