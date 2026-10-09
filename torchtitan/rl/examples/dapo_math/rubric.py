@@ -6,12 +6,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from torchtitan.rl.examples.dapo_math.data import DapoMathSample
+from torchtitan.rl.examples.dapo_math.data import DapoMathSample, MathEvalSample
 from torchtitan.rl.examples.dapo_math.grader import MathVerifyPool
 from torchtitan.rl.rollout import Rollout
-from torchtitan.rl.rubric import RewardFn
+from torchtitan.rl.rubric import RewardFn, Rubric, RubricOutput
 
 
 class RewardMathVerify(RewardFn):
@@ -44,3 +44,38 @@ class RewardMathVerify(RewardFn):
         return await self._pool.score(
             response=response, ground_truth=env_input.ground_truth
         )
+
+
+class PerBenchmarkRubric(Rubric):
+    """`Rubric` that also records each rollout's reward under a `MathEvalSample`'s `benchmark` and `tier`.
+
+    Every `reward_breakdown` key becomes a metric, so a validation pass over
+    `MathEvalDataset` logs one mean per benchmark and one per tier.
+
+    Example:
+        # env_input.benchmark == "aime_2026", env_input.tier == "core", RewardMathVerify scores 1.0
+        # -> reward_breakdown == {"RewardMathVerify": 1.0, "aime_2026": 1.0, "core": 1.0}
+        # -> logged as validation_reward/component/aime_2026/mean and .../core/mean
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Rubric.Config):
+        pass
+
+    async def score_group(
+        self, rollouts: list[Rollout], env_input: DapoMathSample
+    ) -> list[RubricOutput]:
+        outputs = await super().score_group(rollouts, env_input)
+        if not isinstance(env_input, MathEvalSample):
+            return outputs
+        names = (env_input.benchmark, env_input.tier)
+        return [
+            replace(
+                output,
+                reward_breakdown={
+                    **output.reward_breakdown,
+                    **dict.fromkeys(names, output.reward),
+                },
+            )
+            for output in outputs
+        ]

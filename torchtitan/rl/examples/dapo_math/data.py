@@ -38,6 +38,20 @@ class DapoMathSample:
     ground_truth: str
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class MathEvalSample(DapoMathSample):
+    """A `DapoMathSample` tagged with its benchmark and tier, which `PerBenchmarkRubric` logs.
+
+    A subclass, not new `DapoMathSample` fields: data stream checkpoints pickle training samples,
+    and a slots dataclass loads an older pickle with the new fields unset.
+    """
+
+    benchmark: str
+    """Benchmark the problem comes from, e.g. `"aime_2026"`."""
+    tier: str
+    """Group of benchmarks, e.g. `"core"`."""
+
+
 # TODO: Share this cycling iterator with other RL datasets instead of keeping
 # per-environment implementations.
 class _CyclingDataset(Configurable):
@@ -183,3 +197,83 @@ class AIME2025Dataset(_CyclingDataset):
             for row in dataset
         ]
         super().__init__(samples, seed=config.seed, shuffle=config.shuffle)
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class MathEvalBenchmark:
+    """One Hugging Face math benchmark with `problem` and `answer` columns."""
+
+    repo_id: str
+    revision: str
+    """Pinned commit, so a dataset update cannot change the eval between runs."""
+    tier: str
+    """Benchmarks with the same tier are also averaged together, e.g. `"core"` or `"hard"`."""
+    split: str = "train"
+
+    @property
+    def name(self) -> str:
+        """Metric name, e.g. `"aime_2026"` for `MathArena/aime_2026`."""
+        return self.repo_id.rsplit("/", 1)[-1]
+
+
+class MathEvalDataset(_CyclingDataset):
+    """Provides problems from several math benchmarks, in order, using the DAPO answer format.
+
+    Example:
+        # avg@4: the dataset cycles, so 4 * 240 draws score each default problem 4 times.
+        validation_dataset=MathEvalDataset.Config()
+        validation=ValidationConfig(num_samples=4 * 240, greedy=False)
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        benchmarks: tuple[MathEvalBenchmark, ...] = (
+            # Problem 1 also appears in the training set (DAPO-Math-17k row 719).
+            MathEvalBenchmark(
+                repo_id="MathArena/aime_2026",
+                revision="d2de22f3c656b4f56cf8981212186377d1e23bc3",
+                tier="core",
+            ),
+            MathEvalBenchmark(
+                repo_id="MathArena/hmmt_feb_2026",
+                revision="02fba4f74d8e68e73e66a02d540fd979c05c274c",
+                tier="core",
+            ),
+            MathEvalBenchmark(
+                repo_id="MathArena/hmmt_nov_2025",
+                revision="118dbfb45c4c9467c672268ed55166642897aa46",
+                tier="core",
+            ),
+            MathEvalBenchmark(
+                repo_id="ByteDance-Seed/BeyondAIME",
+                revision="c705198ae1043810b1e1693bd879250b51a7a523",
+                tier="core",
+                split="test",
+            ),
+            MathEvalBenchmark(
+                repo_id="MathArena/apex-shortlist",
+                revision="f3efdf224ef665f129ddaae37699f6098c65781b",
+                tier="hard",
+            ),
+        )
+        """Benchmarks in eval order. Default: 193 "core" problems (30 + 33 + 30 + 100) and 47
+        "hard" ones. MathArena (avg@4) scores the post-trained Qwen3.5-35B-A3B 0.82-0.93 on
+        AIME 2026 and HMMT Feb 2026, but 0.45 on the Apex shortlist."""
+
+    def __init__(self, config: Config) -> None:
+        samples: list[MathEvalSample] = []
+        for benchmark in config.benchmarks:
+            dataset = load_dataset(
+                benchmark.repo_id, split=benchmark.split, revision=benchmark.revision
+            )
+            samples.extend(
+                MathEvalSample(
+                    prompt=_MATH_PROMPT_TEMPLATE.format(problem=row["problem"]),
+                    # AIME and BeyondAIME store int64 answers; the others, LaTeX strings.
+                    ground_truth=str(row["answer"]),
+                    benchmark=benchmark.name,
+                    tier=benchmark.tier,
+                )
+                for row in dataset
+            )
+        super().__init__(samples, seed=0, shuffle=False)
