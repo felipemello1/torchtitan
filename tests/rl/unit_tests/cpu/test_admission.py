@@ -281,6 +281,7 @@ def test_growth_reserve_is_charged_to_every_session():
         assert _admit(policy, group_id, num_prompt_tokens=100) == generator
         for session in ("s0", "s1"):
             _play(policy, group_id, session, 100, 400)
+    # A poll re-estimates the reserves.
     policy.observe({})
     # Both generators: 80 blocks + 2 sessions x 5 = 90; a third group would add 2 x 15.
     # Without the reserve, 80 + 2 x 10 = 100 would fit.
@@ -301,8 +302,57 @@ def test_live_session_reserves_its_expected_remaining_growth():
     _play(policy, 0, "old", 10, 130)
     assert policy._growth_per_session() == pytest.approx(10.0)
     policy.observe({})
-    # Each reserves max(mean(G - g | G > g), R - g): young max(9.76, 10), old max(16 - 12, -2).
-    assert policy._reserved_growth(0) == pytest.approx(10.0 + 4.0)
+    # Each reserves max(mean(G - g | G > g), R - g): young max(488 / 50 = 9.76, 10), old
+    # max(16 - 12, -2).
+    assert policy.reserve[0] == pytest.approx(10.0 + 4.0)
+
+
+def test_remaining_growth_averages_the_ended_sessions_that_grew_more():
+    remaining = admission_module._remaining_growth([4, 10, 16])
+    # A session that grew 4 counts only 10 and 16 as above it; past 16, none is.
+    assert [remaining(grown) for grown in (0, 4, 12, 16, 20)] == [10, 9, 4, 0, 0]
+
+
+def test_seats_not_started_reserve_r():
+    # 20 blocks per generator; a new group reserves 2 seats.
+    policy = _growth_policy(limit=0.02)
+    # Before any poll, as on a resume, each group books 2 seats x (1 + 5) blocks, so a third does
+    # not fit. Without the seats' reserve, 2 + 12 <= 20 would admit it.
+    assert [_admit(policy, group_id) for group_id in range(3)] == [0, 1, None]
+    assert policy.reserve == [10.0, 10.0]
+    # A poll re-estimates the reserves: generator 0 has a live session (grew 2, reserves R) and one
+    # seat left; generator 1 has two seats left.
+    _play(policy, 0, "s0", 10, 30)
+    policy.observe({})
+    assert policy.reserve == [10.0, 10.0]
+
+
+def test_live_sessions_reserve_r_until_50_sessions_end():
+    policy = _growth_policy()
+    assert _admit(policy, 0) == 0
+    # 49 sessions end having grown G = 10 (25 of them) or 2 (24) blocks; a live one grew g = 4.
+    for i in range(49):
+        _play(policy, 0, f"ended{i}", 10, 110 if i < 25 else 30, None)
+    _play(policy, 0, "live", 10, 50)
+    policy.observe({})
+    # Fewer than 50 ended: it reserves the initial R, 5, not mean(10 - 4) = 6.
+    assert policy.reserve[0] == 5.0
+    # The 50th ends: R = (25 x 10 + 25 x 2 + 4) / 50 = 6.08, so it reserves max(10 - 4, R - 4) = 6.
+    _play(policy, 0, "ended49", 10, 30, None)
+    policy.observe({})
+    assert policy.reserve[0] == pytest.approx(6.0)
+
+
+def test_sessions_live_at_release_count_as_ended():
+    policy = _growth_policy()
+    # Verifiers ends sessions only with their group: 25 groups of 2 sessions that grew 3 blocks.
+    for group_id in range(25):
+        _admit(policy, group_id)
+        for session in ("s0", "s1"):
+            _play(policy, group_id, session, 10, 40)
+        policy.release(group_id, num_completion_tokens=60)
+    # 50 sessions ended, so R is learned: 50 x 3 / 50.
+    assert policy._growth_per_session() == pytest.approx(3.0)
 
 
 def test_new_group_reserves_the_mean_sessions_of_finished_groups():
