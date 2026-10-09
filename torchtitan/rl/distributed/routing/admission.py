@@ -542,10 +542,10 @@ class KVGrowthEstimateAdmission(KVEstimateAdmission):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        limit: float = 1.0
-        """Fraction of each generator's KV cache blocks that sessions may hold, each counted at
-        its expected final size. 1.0: every live session can grow to its expected final size and
-        still fit."""
+        limit: float = 1.5
+        """How far the sessions' expected final sizes may overcommit each generator's KV cache.
+        1.0: every live session could reach its expected final size at once and still fit. Sessions
+        end at different times, so 1.5 holds across 1x-3x game lengths and bot mixes untuned."""
 
     def __init__(
         self,
