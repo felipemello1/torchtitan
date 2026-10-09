@@ -168,3 +168,71 @@ def test_worker_executes_group_without_actor_mesh() -> None:
         ]
 
     asyncio.run(run())
+
+
+class _TwoTurnTokenEnv(_TokenEnv):
+    def __init__(self) -> None:
+        super().__init__()
+        self.num_steps = 0
+
+    async def step(self, completion: Completion) -> TokenEnvOutput:
+        self.num_steps += 1
+        if self.num_steps == 2:
+            return await super().step(completion)
+        # Turn 1 continues turn 0: prompt [1, 2] + completion [4] + env reply [8]
+        return TokenEnvOutput(
+            next_prompt_token_ids=[1, 2, 4, 8],
+            next_prompt_messages=[{"role": "user", "content": "prompt"}],
+            status=RolloutStatus.ONGOING,
+            completion_message={"role": "assistant", "content": "answer"},
+        )
+
+
+class _RoutedGenerateFn:
+    async def __call__(self, prompt_token_ids, **kwargs) -> Completion:
+        # One row per forward input, tagged by position: the prompt + the completion but its last token
+        num_rows = len(prompt_token_ids)
+        return Completion(
+            min_policy_version=3,
+            max_policy_version=3,
+            request_id=kwargs["request_id"],
+            token_ids=[4] if len(prompt_token_ids) == 2 else [5],
+            token_logprobs=[-0.5],
+            routed_expert_ids=torch.arange(num_rows, dtype=torch.uint8).view(-1, 1, 1),
+            finish_reason="stop",
+        )
+
+
+def test_worker_stores_each_turns_routed_rows_from_its_prefix() -> None:
+    async def run() -> None:
+        token_env_config = _TokenEnvConfig()
+        token_env_config.build = lambda *, message_env, renderer: _TwoTurnTokenEnv()
+        worker = RolloutWorker(
+            SimpleNamespace(
+                rubric=_Config(_Rubric()),
+                message_env=_MessageEnvConfig(),
+                token_env=token_env_config,
+                advantage=_Config(_AdvantageEstimator()),
+            )
+        )
+        await worker.setup_async(
+            tokenizer_config=HuggingFaceTokenizer.Config(),
+            renderer_config=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
+            hf_assets_path="tests/assets/tokenizer",
+        )
+        group = await worker.run_group(
+            generate_fn=_RoutedGenerateFn(),
+            sample="sample",
+            group_id=7,
+            group_size=1,
+            sampling=SamplingConfig(),
+        )
+
+        first, second = group.rollouts[0].turns
+        assert (second.prompt_prefix_len, second.prompt_delta_token_ids) == (3, [8])
+        # Turn 0 keeps positions 0..1; turn 1 (prompt_prefix_len=3) keeps positions 2..3: token 4's
+        # row, which only turn 1's prefill ran, and the env reply's.
+        assert first.routed_expert_ids.flatten().tolist() == [0, 1]
+        assert second.routed_expert_ids.flatten().tolist() == [2, 3]
+
+    asyncio.run(run())

@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Unit tests for `TrainingSampleBuilder.rollout_to_training_samples`."""
+"""Unit tests for `TrainingSampleBuilder.rollout_to_training_samples` and `split_prompt`."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import torch
 
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
+from torchtitan.rl.rollout.types import split_prompt
 from torchtitan.rl.types import RolloutTurnID
 
 _GROUP_ID = "step=1/group=0"
@@ -33,7 +34,9 @@ def _turn(
 ) -> RolloutTurn:
     return RolloutTurn(
         rollout_id=RolloutTurnID(group_id=_GROUP_ID, rollout_id=0, turn_id=0),
-        prompt_token_ids=prompt_token_ids,
+        # The full prompt for now; `_scored_rollout` stores it as a delta like the Rollouter does
+        prompt_prefix_len=0,
+        prompt_delta_token_ids=prompt_token_ids,
         completion_token_ids=completion_token_ids,
         completion_logprobs=[-0.1] * len(completion_token_ids),
         min_policy_version=version,
@@ -45,6 +48,18 @@ def _turn(
 def _scored_rollout(
     turns: list[RolloutTurn], *, reward: float, advantage: float
 ) -> Rollout:
+    previous_token_ids: list[int] = []
+    for rollout_turn in turns:
+        prompt_token_ids = rollout_turn.prompt_delta_token_ids
+        prefix_len, delta = split_prompt(prompt_token_ids, previous_token_ids)
+        rollout_turn.prompt_prefix_len = prefix_len
+        rollout_turn.prompt_delta_token_ids = delta
+        if rollout_turn.routed_expert_ids is not None:
+            # Full rows -> the turn's rows from prompt_prefix_len - 1, as the Rollouter slices them
+            rollout_turn.routed_expert_ids = rollout_turn.routed_expert_ids[
+                max(prefix_len - 1, 0) :
+            ]
+        previous_token_ids = prompt_token_ids + rollout_turn.completion_token_ids
     return Rollout(
         group_id=_GROUP_ID,
         rollout_id=0,
@@ -160,6 +175,70 @@ def test_history_edit_branches_into_separate_training_samples() -> None:
     assert second.advantage == [0.0, 0.0, 0.1]
 
 
+def test_rewrite_that_keeps_a_prefix_branches_then_continues() -> None:
+    # Turn 1 keeps [1, 2] but rewrites turn 0's completion [4] as [7] (e.g. thinking stripped), so it
+    # stores only [7] and opens a new training_sample; turn 2 continues it with the env reply [9].
+    rollout = _scored_rollout(
+        [
+            _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=1),
+            _turn(prompt_token_ids=[1, 2, 7], completion_token_ids=[5], version=1),
+            _turn(
+                prompt_token_ids=[1, 2, 7, 5, 9], completion_token_ids=[6], version=2
+            ),
+        ],
+        reward=0.5,
+        advantage=0.1,
+    )
+    stored = [
+        (rollout_turn.prompt_prefix_len, rollout_turn.prompt_delta_token_ids)
+        for rollout_turn in rollout.turns
+    ]
+    assert stored == [(0, [1, 2]), (2, [7]), (4, [9])]
+    first, second = rollout_to_training_samples(rollout)
+    assert first.token_ids == [1, 2, 4]
+    assert second.token_ids == [1, 2, 7, 5, 9, 6]
+    assert second.loss_mask == [False, False, False, True, False, True]
+    assert second.rollout_id.turn_id == 1
+    assert (second.min_policy_version, second.max_policy_version) == (1, 2)
+
+
+def test_prefix_longer_than_the_previous_turn_raises() -> None:
+    # A hand-built turn that claims more shared tokens than the previous turn has would train on a
+    # truncated prompt, so the builder refuses it.
+    rollout = _scored_rollout(
+        [_turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=1)],
+        reward=0.0,
+        advantage=0.0,
+    )
+    rollout.turns.append(
+        RolloutTurn(
+            rollout_id=RolloutTurnID(group_id=_GROUP_ID, rollout_id=0, turn_id=1),
+            prompt_prefix_len=9,
+            prompt_delta_token_ids=[8],
+            completion_token_ids=[5],
+            completion_logprobs=[-0.1],
+            min_policy_version=1,
+            max_policy_version=1,
+        )
+    )
+    with pytest.raises(ValueError, match="split_prompt"):
+        rollout_to_training_samples(rollout)
+
+
+@pytest.mark.parametrize(
+    "prompt, previous, expected",
+    [
+        ([1, 2, 4, 5, 9], [1, 2, 4, 5], (4, [9])),  # continues
+        ([1, 2, 7], [1, 2, 4, 5], (2, [7])),  # history rewritten after [1, 2]
+        ([1, 2], [1, 2, 4, 5], (2, [])),  # strict prefix of the previous tokens
+        ([1, 2], [], (0, [1, 2])),  # first turn
+        ([], [1, 2], (0, [])),  # empty prompt
+    ],
+)
+def test_split_prompt(prompt, previous, expected) -> None:
+    assert split_prompt(prompt, previous_token_ids=previous) == expected
+
+
 def test_empty_completion_on_a_later_turn_raises() -> None:
     # An empty completion is only expected on the first turn (initial prompt too long). On any later
     # turn it is an anomaly, so building the training samples raises.
@@ -251,7 +330,9 @@ def test_routed_expert_ids_keep_each_turns_rows_and_take_the_boundary_from_the_n
     # vLLM returns one row per forward input: the prompt plus every completion token but the last.
     for turn_id, rollout_turn in enumerate(turns):
         num_inputs = (
-            len(rollout_turn.prompt_token_ids)
+            len(
+                rollout_turn.prompt_delta_token_ids
+            )  # the full prompt until `_scored_rollout`
             + len(rollout_turn.completion_token_ids)
             - 1
         )
@@ -290,6 +371,54 @@ def test_routed_expert_ids_restart_at_a_branch() -> None:
 
     assert first.routed_expert_ids.flatten().tolist() == [0, 1]
     assert second.routed_expert_ids.flatten().tolist() == [16, 17]
+
+
+def test_routed_expert_ids_at_a_rewritten_history_take_the_shared_prefix_rows() -> None:
+    # Turn 1 rewrites turn 0's history after [1, 2]: prompt_prefix_len=2 opens a new sample whose
+    # first row (position 0) is the previous sample's; turn 2 continues it.
+    turns = [
+        _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=1),
+        _turn(prompt_token_ids=[1, 2, 7], completion_token_ids=[5], version=1),
+        _turn(prompt_token_ids=[1, 2, 7, 5, 9], completion_token_ids=[6], version=1),
+    ]
+    for turn_id, rollout_turn in enumerate(turns):
+        num_inputs = (
+            len(rollout_turn.prompt_delta_token_ids)
+            + len(rollout_turn.completion_token_ids)
+            - 1
+        )
+        rollout_turn.routed_expert_ids = _routed_expert_ids(
+            turn=turn_id, num_positions=num_inputs
+        )
+    rollout = _scored_rollout(turns, reward=0.5, advantage=0.1)
+    assert [len(turn.routed_expert_ids) for turn in rollout.turns] == [2, 2, 2]
+
+    first, second = rollout_to_training_samples(rollout)
+
+    assert first.routed_expert_ids.flatten().tolist() == [0, 1]
+    # inputs:        1       2        7        5        9
+    assert second.routed_expert_ids.flatten().tolist() == [
+        16 * 0 + 0,
+        16 * 1 + 1,
+        16 * 1 + 2,
+        16 * 2 + 3,
+        16 * 2 + 4,
+    ]
+    assert len(second.routed_expert_ids) == len(second.token_ids) - 1
+
+
+def test_routed_expert_ids_with_the_wrong_row_count_raise() -> None:
+    turns = [
+        _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=1),
+        _turn(prompt_token_ids=[1, 2, 4, 8], completion_token_ids=[5], version=1),
+    ]
+    rollout = _scored_rollout(turns, reward=0.5, advantage=0.1)
+    # Full rows where the turn should store only its rows from prompt_prefix_len - 1
+    turns[0].routed_expert_ids = _routed_expert_ids(turn=0, num_positions=2)
+    turns[1].routed_expert_ids = _routed_expert_ids(turn=1, num_positions=4)
+
+    with pytest.raises(ValueError, match="routed expert rows"):
+        rollout_to_training_samples(rollout)
 
 
 def test_samples_without_routed_expert_ids_keep_none() -> None:

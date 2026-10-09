@@ -188,16 +188,19 @@ class TrainingSampleBuilder(Configurable):
         newest version any of its turns reached.
 
         With routed expert ids, each turn keeps its own rows, so trained tokens replay the routing they were
-        sampled with. A continuing turn also supplies the row of the previous completion's last token,
-        which only its prefill ran forward (`len(routed_expert_ids) == len(token_ids) - 1`).
+        sampled with. A turn's rows start at its `prompt_prefix_len - 1`: a continuing turn supplies the row
+        of the previous completion's last token, which only its prefill ran forward; a new branch takes the
+        rows of its shared prefix from the previous training_sample, whose tokens there are the same
+        (`len(routed_expert_ids) == len(token_ids) - 1`).
 
         Example (5 turns; the env compacts history before turn 3, so the prefix breaks -> 2 training_samples).
-        P = prompt; C = completion; E = env reply
-            turn0 (v5): prompt=[P1]              completion=[C1]
-            turn1 (v6): prompt=[P1,C1,E1]        completion=[C2]
-            turn2 (v6): prompt=[P1,C1,E1,C2,E2]  completion=[C3]
-            turn3 (v6): prompt=[P2]              completion=[C4]   # history compacted -> prefix breaks
-            turn4 (v7): prompt=[P2,C4,E4]        completion=[C5]
+        P = prompt; C = completion; E = env reply. A turn stores its prompt as
+        (prompt_prefix_len, prompt_delta_token_ids), the delta on the previous turn's prompt + completion:
+            turn0 (v5): prompt=[P1]              stored (0, [P1])                 completion=[C1]
+            turn1 (v6): prompt=[P1,C1,E1]        stored (len(P1+C1), [E1])        completion=[C2]
+            turn2 (v6): prompt=[P1,C1,E1,C2,E2]  stored (len(P1+C1+E1+C2), [E2])  completion=[C3]
+            turn3 (v6): prompt=[P2]              stored (0, [P2])                 completion=[C4]   # prefix breaks
+            turn4 (v7): prompt=[P2,C4,E4]        stored (len(P2+C4), [E4])        completion=[C5]
             # -> training_sample 0: token_ids=[P1,C1,E1,C2,E2,C3], loss_mask=[0,1,0,1,0,1]
             #              rollout_id.turn_id=0, min_policy_version=5, max_policy_version=6
             #    training_sample 1: token_ids=[P2,C4,E4,C5],        loss_mask=[0,1,0,1]
@@ -210,9 +213,6 @@ class TrainingSampleBuilder(Configurable):
                 "must fill it (via its advantage estimator) before training_samples are built."
             )
         training_samples: list[TrainingSample] = []
-
-        # Used to check if [P1, C1] is prefix of [P1,C1,E1] in the docstring example
-        prev_prompt_and_completion: list[int] = []
 
         # Skip if no completion (nothing to train on). This happens when the prompt is too
         # long in the first turn, before any generation. We keep these rollouts for debugging.
@@ -229,13 +229,26 @@ class TrainingSampleBuilder(Configurable):
                     f"non-final turn {turn_idx} has no completion"
                 )
 
-            prompt = rollout_turn.prompt_token_ids
+            # The previous turn's prompt + completion is the last training_sample's token_ids: a
+            # training_sample opens at the turn whose prompt breaks that prefix, and later turns join it.
+            prev_prompt_and_completion = (
+                training_samples[-1].token_ids if training_samples else []
+            )
+            if rollout_turn.prompt_prefix_len > len(prev_prompt_and_completion):
+                raise ValueError(
+                    f"rollout {rollout.group_id}/rollout={rollout.rollout_id}: turn {turn_idx} shares "
+                    f"{rollout_turn.prompt_prefix_len} prompt tokens with a previous turn of "
+                    f"{len(prev_prompt_and_completion)}; build it with `split_prompt`"
+                )
             # True when this prompt continues the previous one (prefix-preserving);
             # False when the env edited history -> open a new training_sample (branch).
-            extends_prev = (
-                prompt[: len(prev_prompt_and_completion)] == prev_prompt_and_completion
+            extends_prev = rollout_turn.prompt_prefix_len == len(
+                prev_prompt_and_completion
             )
             if not training_samples or not extends_prev:
+                prev_routed_expert_ids = (
+                    training_samples[-1].routed_expert_ids if training_samples else None
+                )
                 # Start a new training_sample; its RolloutTurnID marks the turn the segment begins at.
                 training_samples.append(
                     TrainingSample(
@@ -252,14 +265,22 @@ class TrainingSampleBuilder(Configurable):
                         advantage=[],
                     )
                 )
-                # New branch (first turn or a branch): no shared prefix.
-                prefix_len = 0
+                # New branch (first turn or a branch): it starts from this turn's full prompt.
+                prompt_delta = (
+                    prev_prompt_and_completion[: rollout_turn.prompt_prefix_len]
+                    + rollout_turn.prompt_delta_token_ids
+                )
+                if rollout_turn.prompt_prefix_len > 0 and prev_routed_expert_ids is not None:
+                    # The turn's routed rows start at prompt_prefix_len - 1; the shared prefix
+                    # routed the same before that.
+                    training_samples[-1].routed_expert_ids = prev_routed_expert_ids[
+                        : rollout_turn.prompt_prefix_len - 1
+                    ]
             else:
-                prefix_len = len(prev_prompt_and_completion)
+                prompt_delta = rollout_turn.prompt_delta_token_ids
 
             # Append this turn's new info to `training_sample`: prefix delta (untrained) + completion (trained).
             training_sample = training_samples[-1]
-            prompt_delta = prompt[prefix_len:]
             num_delta = len(prompt_delta)
             num_completion = len(rollout_turn.completion_token_ids)
             training_sample.token_ids += prompt_delta
@@ -275,22 +296,24 @@ class TrainingSampleBuilder(Configurable):
             training_sample.logprobs += rollout_turn.completion_logprobs
             training_sample.advantage += [rollout_advantage] * num_completion
             if rollout_turn.routed_expert_ids is not None:
-                # Row i is position i. A continuing turn adds rows from prefix_len - 1: the
-                # previous completion's last token only ran forward in this turn's prefill.
+                # Row i is position i; the turn's rows start at its prompt_prefix_len - 1.
                 training_sample.routed_expert_ids = (
                     rollout_turn.routed_expert_ids
-                    if prefix_len == 0
+                    if training_sample.routed_expert_ids is None
                     else torch.cat(
-                        [
-                            training_sample.routed_expert_ids,
-                            rollout_turn.routed_expert_ids[prefix_len - 1 :],
-                        ]
+                        [training_sample.routed_expert_ids, rollout_turn.routed_expert_ids]
                     )
                 )
-                assert (
+                if (
                     len(training_sample.routed_expert_ids)
-                    == len(training_sample.token_ids) - 1
-                )
+                    != len(training_sample.token_ids) - 1
+                ):
+                    raise ValueError(
+                        f"rollout {rollout.group_id}/rollout={rollout.rollout_id}: turn {turn_idx} "
+                        f"has {len(rollout_turn.routed_expert_ids)} routed expert rows; expected rows "
+                        "from prompt_prefix_len - 1 to the completion's second-to-last token "
+                        "(see RolloutTurn.routed_expert_ids)"
+                    )
             if rollout_turn.completion_topk_token_ids is not None:
                 training_sample.topk_token_ids = _append_rows(
                     training_sample.topk_token_ids,
@@ -302,8 +325,6 @@ class TrainingSampleBuilder(Configurable):
                     num_zero_rows=num_delta,
                     new_rows=rollout_turn.completion_topk_logprobs,
                 )
-
-            prev_prompt_and_completion = prompt + rollout_turn.completion_token_ids
 
         return training_samples
 

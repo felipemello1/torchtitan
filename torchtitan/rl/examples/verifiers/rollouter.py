@@ -41,6 +41,7 @@ from torchtitan.rl.rollout.types import (
     RolloutGroup,
     RolloutStatus,
     RolloutTurn,
+    split_prompt,
 )
 from torchtitan.rl.rubric import RewardFn, Rubric
 from torchtitan.rl.types import RolloutTurnID
@@ -386,6 +387,8 @@ class VerifiersRollouter(Rollouter):
         replied_nodes: set[int] = set()
         last_turn_by_node: dict[int, RolloutTurn] = {}
         turns: list[RolloutTurn] = []
+        # The last appended turn's prompt + completion, across branches
+        previous_token_ids: list[int] = []
 
         for branch in trace.branches:
             token_ids = branch.token_ids
@@ -426,6 +429,10 @@ class VerifiersRollouter(Rollouter):
                     # Trainer.Config.replay_routed_experts=True raises on this rollouter.
                     # Completion rows of this span: sampled tokens before `start` in the node.
                     row = sum(node.mask[:start])
+                    prompt_prefix_len, prompt_delta_token_ids = split_prompt(
+                        token_ids[:absolute_start], previous_token_ids
+                    )
+                    previous_token_ids = token_ids[:absolute_end]
                     turns.append(
                         RolloutTurn(
                             rollout_id=RolloutTurnID(
@@ -433,7 +440,8 @@ class VerifiersRollouter(Rollouter):
                                 rollout_id=rollout_id,
                                 turn_id=len(turns),
                             ),
-                            prompt_token_ids=list(token_ids[:absolute_start]),
+                            prompt_prefix_len=prompt_prefix_len,
+                            prompt_delta_token_ids=prompt_delta_token_ids,
                             completion_token_ids=list(
                                 token_ids[absolute_start:absolute_end]
                             ),
