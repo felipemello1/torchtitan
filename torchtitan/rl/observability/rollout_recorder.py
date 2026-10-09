@@ -86,12 +86,18 @@ class RolloutSampleRecorder(Configurable):
 
     The filter selects which rollouts to record each step (default: highest + lowest reward per group);
     raw token / logprob arrays are recorded only when `Config.log_tensors` / `log_logprobs` opt in.
+    A turn records only the prompt messages it adds, so a multi-turn rollout does not repeat its
+    history every turn: its first `prompt_message_prefix_len` messages are shared with the previous
+    turn's full conversation (that turn's rebuilt prompt + completion + env replies), and
+    `prompt_delta_messages` are the rest.
 
     Example:
 
         recorder = RolloutSampleRecorder.Config().build(dump_dir="outputs/rl")
         recorder.record(is_validation=False, rollout_groups=groups)
         # -> outputs/rl/rollout_samples.jsonl, one JSON line per recorded rollout
+        # turn 0: prefix 0, delta [system, user]; turn 1: prefix 4, delta [] (continues turn 0)
+        # rebuild turn i's prompt: (prompt[i-1] + [completion[i-1]] + env[i-1])[:prefix] + delta
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -145,17 +151,43 @@ class RolloutSampleRecorder(Configurable):
             "reward_breakdown": rollout.reward_breakdown,
             "advantage": rollout.advantage,
             "logs": rollout.logs,
-            "turns": [self._encode_turn(turn) for turn in rollout.turns],
+            "turns": self._encode_turns(rollout.turns),
         }
 
-    def _encode_turn(self, turn: RolloutTurn) -> dict:
+    def _encode_turns(self, turns: list[RolloutTurn]) -> list[dict]:
+        """Encode each turn with its prompt as the messages added to the previous turn's conversation."""
+        encoded, previous_messages = [], []
+        for turn in turns:
+            # Fast path, one list compare: the prompt continues the previous turn (the common case)
+            if turn.prompt_messages[: len(previous_messages)] == previous_messages:
+                prefix_len = len(previous_messages)
+            else:
+                prefix_len = 0
+                for message, previous in zip(turn.prompt_messages, previous_messages):
+                    if message != previous:
+                        break
+                    prefix_len += 1
+            encoded.append(
+                self._encode_turn(turn, prompt_message_prefix_len=prefix_len)
+            )
+            previous_messages = [
+                *turn.prompt_messages,
+                turn.completion_message,
+                *turn.env_messages,
+            ]
+        return encoded
+
+    def _encode_turn(
+        self, turn: RolloutTurn, prompt_message_prefix_len: int = 0
+    ) -> dict:
         """One JSON object per turn. The large token / logprob arrays are opt-in
         (`log_tensors` / `log_logprobs`)."""
         encoded = {
             "turn_id": turn.rollout_id.turn_id,
             "min_policy_version": turn.min_policy_version,
             "max_policy_version": turn.max_policy_version,
-            "prompt_messages": turn.prompt_messages,
+            "prompt_message_prefix_len": prompt_message_prefix_len,
+            "prompt_delta_messages": turn.prompt_messages[prompt_message_prefix_len:],
             "completion_message": turn.completion_message,
             "env_messages": turn.env_messages,
             "env_rewards": turn.env_rewards,

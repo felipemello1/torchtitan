@@ -230,12 +230,44 @@ def test_none_policy_version_and_completion_message(tmp_path) -> None:
     assert record["turns"][0]["completion_message"] is None
 
 
+def test_later_turns_record_only_the_prompt_messages_they_add(tmp_path) -> None:
+    first = _turn(completion_logprobs=[-0.5])
+    history = [*first.prompt_messages, first.completion_message, *first.env_messages]
+    second = dataclasses.replace(
+        first,
+        rollout_id=RolloutTurnID(group_id=0, rollout_id=0, turn_id=1),
+        prompt_messages=history,
+    )
+    # a rewritten history keeps the first prompt, drops the reply, adds a new message
+    rewritten = dataclasses.replace(
+        second,
+        prompt_messages=[*first.prompt_messages, {"role": "user", "content": "new"}],
+    )
+    turns = [first, second, rewritten]
+    encoded = _recorder(tmp_path)._encode_turns(turns)
+
+    assert [t["prompt_message_prefix_len"] for t in encoded] == [0, 3, 1]
+    assert encoded[0]["prompt_delta_messages"] == first.prompt_messages
+    assert encoded[1]["prompt_delta_messages"] == []
+    assert encoded[2]["prompt_delta_messages"] == [{"role": "user", "content": "new"}]
+    # every prompt rebuilds from the previous turn's conversation + the delta
+    previous = []
+    for turn, record in zip(turns, encoded, strict=True):
+        prompt = (
+            previous[: record["prompt_message_prefix_len"]]
+            + record["prompt_delta_messages"]
+        )
+        assert prompt == turn.prompt_messages
+        previous = [*prompt, record["completion_message"], *record["env_messages"]]
+
+
 def test_encode_turn_covers_all_rollout_turn_fields(tmp_path) -> None:
     recorder = _recorder(tmp_path, log_tensors=True, log_logprobs=True)
     encoded = recorder._encode_turn(_turn(completion_logprobs=[-0.5, -1.5]))
 
-    # rollout_id is flattened to turn_id; metrics is not JSON-serializable.
-    dropped_or_flattened = {"metrics", "rollout_id"}
+    # rollout_id is flattened to turn_id; metrics is not JSON-serializable; prompt_messages is
+    # recorded as prompt_message_prefix_len + prompt_delta_messages.
+    dropped_or_flattened = {"metrics", "rollout_id", "prompt_messages"}
     for field in dataclasses.fields(RolloutTurn):
         if field.name in dropped_or_flattened:
             continue
@@ -244,6 +276,7 @@ def test_encode_turn_covers_all_rollout_turn_fields(tmp_path) -> None:
         ), f"RolloutTurn.{field.name} is not encoded by _encode_turn"
 
     assert "turn_id" in encoded  # rollout_id -> turn_id
+    assert "prompt_delta_messages" in encoded  # prompt_messages -> its delta
 
 
 def test_filter_k_zero_keeps_nothing() -> None:
