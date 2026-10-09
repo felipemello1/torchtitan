@@ -276,7 +276,8 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_8_generators() -> Controller.Co
 
     64 prompts x 16 samples per step (~7 min of forward/backward), target_offpolicy_steps 6
     (a ~60K-token sample spans ~4 steps), and only problems Qwen3-4B-Thinking-2507 solves in at
-    most 6 of 8 tries.
+    most 6 of 8 tries. vLLM watermark 0.03, so engines that fill their KV cache admit new requests
+    with headroom instead of evicting running ones.
     """
     config = _intellect3_math_config(
         default_prompts=64,
@@ -286,6 +287,7 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_8_generators() -> Controller.Co
         target_offpolicy_steps=6,
     )
     config.rollouter.train_dataset.max_pass_rate = 0.75
+    config.generator.watermark = 0.03
     return config
 
 
