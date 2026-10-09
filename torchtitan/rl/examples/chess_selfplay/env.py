@@ -79,7 +79,9 @@ class ChessPlayerEnv(MessageEnv):
             "square (Ke1 is a king on e1; P is a pawn), each with its legal moves. The current "
             "positions and legal moves are already given: avoid restating them. Analyze which move "
             "is best, then end your reply with that move, written exactly as listed, inside "
-            "\\boxed{}. An illegal or missing move loses the game."
+            '\\boxed{}. For example, "Pe2": ["e4"] means \\boxed{e4}, not \\boxed{Pe4}; '
+            '"Nb1": ["Nbd2"] means \\boxed{Nbd2}, not \\boxed{Nd2}. An illegal or missing move '
+            "loses the game."
         )
         return MessageEnvInitOutput(
             init_prompt_messages=[
