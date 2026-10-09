@@ -350,8 +350,8 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
         assert "You are playing chess as White" in prompt
         assert '"Pe2": [' in prompt and "Opponent pieces (Black)" in prompt
         assert prompt.endswith("Write your best legal move inside \\boxed{}.")
-        # no move written as an example, so copying the prompt never plays a move
-        assert "\\boxed{e4}" not in prompt and "\\boxed{Nf3}" not in prompt
+        # one right and one wrong way to write a move
+        assert "means \\boxed{Nbd2}, not \\boxed{Nd2}" in prompt
 
         white_step = asyncio.create_task(
             white.step({"role": "assistant", "content": "I open. \\boxed{e4}"})
