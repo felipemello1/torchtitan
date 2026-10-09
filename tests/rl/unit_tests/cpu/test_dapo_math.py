@@ -277,6 +277,19 @@ def test_math_verifier_reads_leqq_as_le() -> None:
     assert score_math_response(r"\boxed{p \ge 0}", r"p\leqq0") == 0.0
 
 
+def test_math_verifier_drops_delimiter_sizes() -> None:
+    # Math-Verify alone parses `\bigl(` and `\Big|` to nothing, and `\biggl[0, 1\biggr)` as 1.
+    response = r"\boxed{4\pi\bigl(2-\sqrt3\bigr)}"
+    assert score_math_response(response, r"4 \pi (2 - \sqrt{3})") == 1.0
+    assert score_math_response(response, r"4 \pi (2 + \sqrt{3})") == 0.0
+    assert score_math_response(r"\boxed{\Big|x\Big|}", "|x|") == 1.0
+    assert score_math_response(r"\boxed{|x|}", r"\Big|x\Big|") == 1.0
+    assert score_math_response(r"\boxed{\biggl[0, 1\biggr)}", "[0, 1)") == 1.0
+    assert score_math_response(r"\boxed{\biggl[0, 1\biggr)}", "1") == 0.0
+    # A JSON-escaped `\\bigl(` stays: dropping `\bigl` would leave `\(`, which starts inline math.
+    assert score_math_response(r"\boxed{2\\bigl(3\\bigr)}", "3") == 0.0
+
+
 def test_math_verifier_drops_a_percent_sign_on_one_side() -> None:
     # Math-Verify alone matches `12\%` with `12`, but not these.
     assert score_math_response(r"\boxed{-12\%}", "-12") == 1.0

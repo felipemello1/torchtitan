@@ -46,6 +46,8 @@ _KEEP_UNITS = [
 _THIN_SPACE_IN_NUMBER = re.compile(r"(?<=\d)\\,(?=\d{3}(?!\d))")
 # `\leqq` and `\geqq`; Math-Verify reads `p\leqq0` as `p \le q \cdot 0`.
 _LEQQ = re.compile(r"\\([lg]e)qq")
+# A delimiter size like the `\bigl` in `\bigl(2-\sqrt3\bigr)` (not `\bigcup`), which Math-Verify cannot parse.
+_DELIMITER_SIZE = re.compile(r"(?<!\\)\\[Bb]igg?[lrm]?(?![A-Za-z])")
 # Where a trailing qualifier starts, once LaTeX spaces are plain spaces: `\text{ for all } n`,
 # `\forall n`, `, k \in \mathbb{Z}`, `(a,b \in \mathbb{R})`.
 _QUALIFIER = re.compile(
@@ -137,6 +139,7 @@ def score_math_response(response: str, ground_truth: str) -> float:
     Degrees read as radians when only one side has a `\\pi`: `60^\\circ` matches `\\frac{\\pi}{3}`.
     These answer and gold pairs also match, though Math-Verify alone misses them:
     - `p \\le 0` and `p \\leqq 0`;
+    - `4\\pi\\bigl(2-\\sqrt3\\bigr)` and `4\\pi(2-\\sqrt3)`: a delimiter size;
     - `-12\\%` and `-12`: a `\\%` on one side;
     - `x = 2k\\pi,\\ k \\in \\mathbb{Z}` and `2k\\pi`: a trailing qualifier;
     - `-1 < x < 2` and `(-1, 2)`: a solved inequality and its interval;
@@ -161,6 +164,8 @@ def score_math_response(response: str, ground_truth: str) -> float:
     ground_truth = _THIN_SPACE_IN_NUMBER.sub("", ground_truth)
     prediction = _LEQQ.sub(r"\\\1 ", prediction)
     ground_truth = _LEQQ.sub(r"\\\1 ", ground_truth)
+    prediction = _DELIMITER_SIZE.sub("", prediction)
+    ground_truth = _DELIMITER_SIZE.sub("", ground_truth)
     if "\\pi" in ground_truth and "\\pi" not in prediction:
         prediction = _DEGREES.sub(r"(\1\\pi/180)", prediction)
     elif "\\pi" in prediction and "\\pi" not in ground_truth:
