@@ -119,7 +119,11 @@ def centipawn_losses(
         for move in moves:
             mover = board.turn
             board.push(move)
-            after = engine.analyse(board, limit)["score"]
+            # Score the bare position: given the game's history and 50-move clock, Stockfish calls a
+            # repeatable position a draw, but the env plays on through repetitions and long shuffles.
+            position = chess.Board(board.fen())
+            position.halfmove_clock = 0
+            after = engine.analyse(position, limit)["score"]
             if scored_color is None or mover == scored_color:
                 # a mate counts as 2000 centipawns, so one missed mate does not dominate the mean
                 best_cp = best.pov(mover).score(mate_score=2000)
