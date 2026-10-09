@@ -646,7 +646,17 @@ class InterGeneratorRouter(Actor, Configurable):
     @concurrent_endpoint
     async def release_session(self, group_id: int, routing_session_id: str) -> None:
         """Forget a routing session after its rollout's last generation call."""
+        placed = self._placed_groups.get(group_id)
         self._release_session(group_id, routing_session_id)
+        # Generators holding the session's KV (`hold_session_kv`) let go of it; KV admission knows
+        # the session's generator, otherwise every generator is told.
+        targets = [placed.handle] if placed is not None else self._generators
+        await asyncio.gather(
+            *[
+                h.rank0_actor.release_sessions.call_one([routing_session_id])
+                for h in targets
+            ]
+        )
 
     @concurrent_endpoint
     async def release_groups(self, group_ids: list[int]) -> None:
