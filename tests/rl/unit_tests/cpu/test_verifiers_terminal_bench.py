@@ -326,7 +326,7 @@ def test_group_rewards_get_the_length_reward(monkeypatch) -> None:
     length reward over completion tokens (terminal output does not count)."""
     from verifiers.v1.types import AssistantMessage, UserMessage
 
-    def trace(completion_lens, *, reward, stop_condition=None):
+    def trace(completion_lens, *, reward, stop_condition=None, ok=True):
         # The task prompt, then per turn: the sampled reply and 3,000 tokens of terminal output.
         nodes = [SimpleNamespace(token_ids=[0] * 10, mask=[False] * 10, sampled=False)]
         for completion_len in completion_lens:
@@ -355,7 +355,7 @@ def test_group_rewards_get_the_length_reward(monkeypatch) -> None:
                     nodes=nodes, token_ids=token_ids, logprobs=[-0.1] * len(token_ids)
                 )
             ],
-            ok=True,
+            ok=ok,
             is_truncated=stop_condition is not None,
             stop_condition=stop_condition,
             reward=reward,
@@ -412,6 +412,9 @@ def test_group_rewards_get_the_length_reward(monkeypatch) -> None:
             # Stopped at the context cap, then graded: its tests passed.
             trace([500, 500], reward=1.0, stop_condition="context_length"),
             trace([100, 100], reward=0.0),
+            # Errored after 4,000 tokens (e.g. an agent timeout): not graded, no length
+            # reward, and the group's range stays 200 to 1,000.
+            trace([2000, 2000], reward=0.0, ok=False),
         ]
     )
     rollouts = group.rollouts
@@ -419,8 +422,9 @@ def test_group_rewards_get_the_length_reward(monkeypatch) -> None:
     assert rollouts[2].reward_breakdown == pytest.approx(
         {"RewardFromVerifiers": 1.0, "length_reward": -0.05}
     )
+    assert rollouts[4].reward_breakdown == {"errored": 0.0, "length_reward": 0.0}
     assert [rollout.reward for rollout in rollouts] == pytest.approx(
-        [1.05, 1.0, 0.95, 0.0]
+        [1.05, 1.0, 0.95, 0.0, 0.0]
     )
 
     # An all-fail group gets the length term too, so its rewards are no longer all equal.

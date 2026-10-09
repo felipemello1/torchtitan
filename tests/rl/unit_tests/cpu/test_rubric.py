@@ -29,7 +29,13 @@ class _RewardLastToken(RewardFn):
         return float(rollout.turns[-1].completion_token_ids[-1] == RIGHT)
 
 
-def _rollout(num_tokens: int, *, answer: int, prompt_len: int = 1) -> Rollout:
+def _rollout(
+    num_tokens: int,
+    *,
+    answer: int,
+    prompt_len: int = 1,
+    status: RolloutStatus = RolloutStatus.COMPLETED,
+) -> Rollout:
     """A one-turn rollout of `num_tokens` completion tokens ending in `answer`."""
     turn = RolloutTurn(
         rollout_id=RolloutTurnID(group_id=0, rollout_id=0, turn_id=0),
@@ -37,9 +43,7 @@ def _rollout(num_tokens: int, *, answer: int, prompt_len: int = 1) -> Rollout:
         completion_token_ids=[1] * (num_tokens - 1) + [answer],
         completion_logprobs=[-0.5] * num_tokens,
     )
-    return Rollout(
-        group_id=0, rollout_id=0, status=RolloutStatus.COMPLETED, turns=[turn]
-    )
+    return Rollout(group_id=0, rollout_id=0, status=status, turns=[turn])
 
 
 def _score(rubric_config: Rubric.Config, rollouts: list[Rollout]) -> list[float]:
@@ -72,3 +76,17 @@ def test_kimi_length_reward() -> None:
     no_length_reward = Rubric.Config(reward_fns=[_RewardLastToken.Config()]).build()
     outputs = asyncio.run(no_length_reward.score_group(rollouts, None))
     assert all("length_reward" not in output.reward_breakdown for output in outputs)
+
+
+def test_kimi_length_reward_leaves_out_errored_rollouts() -> None:
+    rubric = Rubric.Config(
+        reward_fns=[_RewardLastToken.Config()],
+        error_reward=0.0,
+        length_reward_weight=0.1,
+    )
+    # A 5,000-token errored rollout gets 0 and does not stretch the group's range.
+    errored = _rollout(5000, answer=RIGHT, status=RolloutStatus.ERROR)
+    rollouts = [_rollout(1000, answer=RIGHT), _rollout(3000, answer=RIGHT), errored]
+    assert _score(rubric, rollouts) == pytest.approx([1.05, 0.95, 0.0])
+    # No graded rollout: no length reward.
+    assert _score(rubric, [errored, errored]) == [0.0, 0.0]

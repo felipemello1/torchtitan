@@ -207,7 +207,8 @@ def kimi_length_rewards(
     Over the group, `lam = 0.5 - (len - min_len) / (max_len - min_len)`, with `len` the
     completion tokens of all turns. A correct rollout (reward > 0) gets `weight * lam`; a wrong
     one gets `weight * min(0, lam)`, so only its length above the group's midpoint costs it. All
-    lengths equal: 0 for every rollout.
+    lengths equal: 0 for every rollout. An errored rollout gets 0 and is left out of `min_len`
+    and `max_len`: the error, not the model, decided where it stopped.
 
     Assumes the mean baseline (`should_std_normalize=False`), as k1.5 does: with std
     normalization, a group that differs only in length trains at full advantage scale for any
@@ -224,11 +225,20 @@ def kimi_length_rewards(
         sum(len(rollout_turn.completion_token_ids) for rollout_turn in rollout.turns)
         for rollout in rollouts
     ]
-    min_len, max_len = min(lengths), max(lengths)
-    if min_len == max_len:
+    scored_lengths = [
+        length
+        for length, rollout in zip(lengths, rollouts, strict=True)
+        if not rollout.status.is_error()
+    ]
+    # No scored rollout, or all of one length.
+    if len(set(scored_lengths)) < 2:
         return [0.0] * len(rollouts)
+    min_len, max_len = min(scored_lengths), max(scored_lengths)
     length_rewards = []
-    for length, reward in zip(lengths, rewards, strict=True):
+    for rollout, length, reward in zip(rollouts, lengths, rewards, strict=True):
+        if rollout.status.is_error():
+            length_rewards.append(0.0)
+            continue
         lam = 0.5 - (length - min_len) / (max_len - min_len)
         length_rewards.append(weight * (lam if reward > 0 else min(0.0, lam)))
     return length_rewards
