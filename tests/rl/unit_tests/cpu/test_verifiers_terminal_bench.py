@@ -22,7 +22,7 @@ import verifiers.v1 as vf
 
 from torchtitan.config import ConfigLoader
 from torchtitan.distributed.activation_checkpoint import FullAC
-from torchtitan.rl.controller import Controller
+from torchtitan.rl.controller import Controller, ValidationConfig, ValidationLoopMode
 from torchtitan.rl.examples.verifiers.data import (
     VerifiersTaskDataset,
     VerifiersTaskSample,
@@ -455,7 +455,12 @@ def test_35b_sandoq_1x2_recipe_fits_three_hosts(monkeypatch) -> None:
     loop = config.async_loop
     assert (loop.num_prompts_per_train_step, loop.num_samples_per_prompt) == (12, 16)
     assert loop.target_offpolicy_steps == 5
-    assert loop.validation.num_samples == 0
+    assert loop.validation == ValidationConfig(
+        num_samples=78,
+        interval_steps=10,
+        greedy=True,
+        loop_mode=ValidationLoopMode.OVERLAP_TRAINING,
+    )
     assert config.rollouter.thinking_budget.max_thinking_tokens == 12288
     # Kimi's length reward assumes the mean baseline.
     assert config.rollouter.rubric.length_reward_weight == 0.1

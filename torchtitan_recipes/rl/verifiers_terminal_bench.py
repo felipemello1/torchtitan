@@ -35,7 +35,12 @@ from torchtitan.distributed.activation_checkpoint import FullAC, RegionAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 from torchtitan.models.qwen3_5 import build_model_config
-from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
+from torchtitan.rl.controller import (
+    AsyncLoopConfig,
+    Controller,
+    ValidationConfig,
+    ValidationLoopMode,
+)
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.distributed.routing.strategies import (
@@ -521,12 +526,14 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2() -> Controller.Config:
 
     12 GB300 GPUs. Trainer on one host: FSDP 2 x TP 2 x EP 4 with Dist-MoE experts, 1-row
     microbatches. Generators: eight TP1 engines, FULL CUDA graphs, vLLM watermark 0.03.
-    12 prompts x 16 samples per step, up to 5 steps off-policy, no validation. A turn still
-    thinking at 12,288 of its 16,384 tokens gets a forced end of thinking. Kimi k1.5's length
-    reward, weight 0.1, favors the shorter rollouts in each group (`kimi_length_rewards`).
+    12 prompts x 16 samples per step, up to 5 steps off-policy. Every 10 steps, a greedy pass
+    over the 78 Terminal-Bench 2.1 tasks runs beside training on the same generators
+    (`ValidationLoopMode.OVERLAP_TRAINING`). A turn still thinking at 12,288 of its 16,384
+    tokens gets a forced end of thinking. Kimi k1.5's length reward, weight 0.1, favors the
+    shorter rollouts in each group (`kimi_length_rewards`).
 
     `DOME_SANDOQ_POOL` (required) is the number of sandboxes the run may hold; 920 is 80% of
-    the 1,152 rollouts in flight, (5 + 1) x 12 x 16. `DOME_V2_PROMPTS` overrides the prompts,
+    the 1,152 training rollouts in flight, (5 + 1) x 12 x 16. `DOME_V2_PROMPTS` overrides the prompts,
     `DOME_V2_THINKING_BUDGET` the thinking tokens per turn (0 turns the budget off) and
     `DOME_V2_LENGTH_REWARD_WEIGHT` the length reward's weight (0 turns it off).
     """
@@ -541,7 +548,7 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2() -> Controller.Config:
         max_turns=150,
         sandbox_pool=sandbox_pool,
         num_env_workers=math.ceil(sandbox_pool / 24),
-        num_validation_samples=0,
+        num_validation_samples=78,
         num_generators=8,
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=2,
@@ -574,6 +581,8 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2() -> Controller.Config:
     config.rollouter.rubric.length_reward_weight = float(
         os.environ.get("DOME_V2_LENGTH_REWARD_WEIGHT", 0.1)
     )
+    config.async_loop.validation.interval_steps = 10
+    config.async_loop.validation.loop_mode = ValidationLoopMode.OVERLAP_TRAINING
     return config
 
 
@@ -735,6 +744,10 @@ def _qwen3_5_base_terminal_bench_config(
             console_log_keys_validation=[
                 "validation_reward/_mean",
                 "validation_reward/_max",
+                "validation/launch_step",
+                "validation/min_policy_version/min",
+                "validation/max_policy_version/max",
+                "validation/mixed_policy_rollouts/mean",
                 "timing/validate",
             ],
         ),
