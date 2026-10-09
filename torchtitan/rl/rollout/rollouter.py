@@ -25,6 +25,7 @@ from torchtitan.rl.rollout.types import (
     RolloutGroup,
     RolloutStatus,
     RolloutTurn,
+    split_prompt,
 )
 from torchtitan.rl.rubric import Rubric, RubricOutput
 from torchtitan.rl.types import RolloutTurnID
@@ -395,6 +396,8 @@ class RolloutWorker(Configurable):
             One unscored `Rollout`; `run_group` fills its reward later.
         """
         turns: list[RolloutTurn] = []
+        # The previous turn's prompt + completion; each turn stores only what its prompt adds to it
+        previous_token_ids: list[int] = []
         status = RolloutStatus.ERROR
         try:
             env_step = await env.init()
@@ -418,11 +421,16 @@ class RolloutWorker(Configurable):
                 # env call
                 next_env_step = await env.step(completion)
 
-                # full snapshot of this turn from a token and message perspective
+                # this turn from a token and message perspective
+                prompt_token_ids = env_step.next_prompt_token_ids or []
+                prompt_prefix_len, prompt_delta_token_ids = split_prompt(
+                    prompt_token_ids, previous_token_ids
+                )
                 turns.append(
                     RolloutTurn(
                         rollout_id=turn_rollout_id,
-                        prompt_token_ids=env_step.next_prompt_token_ids or [],
+                        prompt_prefix_len=prompt_prefix_len,
+                        prompt_delta_token_ids=prompt_delta_token_ids,
                         prompt_messages=env_step.next_prompt_messages or [],
                         completion_token_ids=completion.token_ids,
                         completion_logprobs=completion.token_logprobs,
@@ -435,6 +443,7 @@ class RolloutWorker(Configurable):
                     )
                 )
 
+                previous_token_ids = prompt_token_ids + completion.token_ids
                 # holds the input for next generation call
                 env_step = next_env_step
 
