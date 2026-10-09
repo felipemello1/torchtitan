@@ -364,4 +364,6 @@ class TrainingSampleBuilder(Configurable):
                 ):
                     chunks += [new_rows.new_zeros(num_delta, new_rows.shape[1]), new_rows]
 
-        return [training_sample.to_training_sample() for training_sample in training_samples]
+        return [
+            training_sample.to_training_sample() for training_sample in training_samples
+        ]
