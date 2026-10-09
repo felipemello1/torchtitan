@@ -41,9 +41,10 @@ _PIECE_VALUES = {
     chess.QUEEN: 9,
 }
 _BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
-# Training rewards (see `ChessGame.rewards`). A forfeit or a checkmate against you costs its full
-# reward on the first ply, shrinking to 0 at `max_plies`; a draw grows to 0.5 by then.
-_FORFEIT_REWARD = -0.5
+# Training rewards (see `ChessGame.rewards`). A checkmate against you costs its full reward on the
+# first ply, shrinking to 0 at `max_plies`; a draw grows to 0.5 by then. A forfeit costs its full
+# reward on the first ply and half at `max_plies`, so it is below any loss.
+_FORFEIT_REWARD = -1.0
 _CHECKMATED_REWARD = -0.25
 # Share of the material score in an unfinished game's reward: 0.5 keeps it within [0.25, 0.75].
 _MATERIAL_WEIGHT = 0.5
@@ -60,7 +61,7 @@ class ChessPlayerEnv(MessageEnv):
 
         init:                    "You are playing chess as White ... Legal moves: c3 Nf3 ... e4 ..."
         step("... \\boxed{e4}")   -> waits for Black's move -> "Black played c5. <board> Legal moves: ..."
-        step("... \\boxed{Ke9}")  -> illegal: White forfeits -> done, env_rewards={"score": -0.475}  (max_plies=40)
+        step("... \\boxed{Ke9}")  -> illegal: White forfeits -> done, env_rewards={"score": -0.975}  (max_plies=40)
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -124,7 +125,7 @@ class ChessGame:
         await game.play(chess.WHITE, "e4")
         await game.wait_for_turn(chess.BLACK)  # returns at once: Black to move
         await game.play(chess.BLACK, "Ke9")    # illegal -> game.scores == {WHITE: 1.0, BLACK: 0.0}
-                                               #            game.rewards == {WHITE: 0.5, BLACK: -0.4875}
+                                               #            game.rewards == {WHITE: 0.5, BLACK: -0.9875}
     """
 
     def __init__(
@@ -161,15 +162,15 @@ class ChessGame:
         (a) checkmate: 1 for the winner however long it took, -0.25 * (1 - played) for the loser;
         (b) stalemate or insufficient material: 0.5 * played each;
         (c) `max_plies` plies: a draw, 0.5, moved halfway toward the material score, so within [0.25, 0.75];
-        (d) a forfeit: -0.5 * (1 - played), always below being checkmated later; the other color is
-            scored as in (c), not as a win.
+        (d) a forfeit: -1 * (1 - played / 2), so within [-1, -0.5], below being checkmated at any ply;
+            the other color is scored as in (c), not as a win.
 
         Example (max_plies=60):
 
             max_plies, White up a knight              -> {WHITE: 0.59, BLACK: 0.41}
             White checkmates on ply 19                -> {WHITE: 1.0, BLACK: -0.25 * (1 - 19 / 60) = -0.17}
-            Black forfeits at ply 20, up a queen      -> {WHITE: 0.30, BLACK: -0.5 * (1 - 20 / 60) = -0.33}
-            Black forfeits at ply 1, even material    -> {WHITE: 0.5, BLACK: -0.5 * (1 - 1 / 60) = -0.49}
+            Black forfeits at ply 20, up a queen      -> {WHITE: 0.30, BLACK: -1 * (1 - 20 / 120) = -0.83}
+            Black forfeits at ply 1, even material    -> {WHITE: 0.5, BLACK: -1 * (1 - 1 / 120) = -0.99}
         """
         played = self.num_plies / self._max_plies
         if self.end_reason == "checkmate":
@@ -180,7 +181,7 @@ class ChessGame:
         white_reward = 0.5 + _MATERIAL_WEIGHT * (material_score(self.board) - 0.5)
         rewards = {chess.WHITE: white_reward, chess.BLACK: 1.0 - white_reward}
         if self._forfeiter is not None:
-            rewards[self._forfeiter] = _FORFEIT_REWARD * (1.0 - played)
+            rewards[self._forfeiter] = _FORFEIT_REWARD * (1.0 - played / 2)
         return rewards
 
     @property
