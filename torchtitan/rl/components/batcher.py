@@ -664,11 +664,12 @@ class Batcher(Configurable):
         """
         pad_values = {**_PAD_VALUES, "input_ids": self.pad_id, "labels": self.pad_id}
         keys = list(pad_values)
-        packed_fields: dict[str, list] = {key: [] for key in keys}
-        positions: list[int] = []
-        padding_mask: list[bool] = []
+        packed_fields: dict[str, list[torch.Tensor]] = {key: [] for key in keys}
+        positions: list[torch.Tensor] = []
+        padding_mask: list[torch.Tensor] = []
         routed_expert_ids: list[torch.Tensor] = []
         num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
+        num_packed_tokens = 0
         topk_token_ids = topk_logprobs = None
         if self._num_topk_logprobs > 0:
             # Zero rows wherever no sample writes (padding, empty bins); the loss masks them out.
@@ -676,6 +677,9 @@ class Batcher(Configurable):
                 num_tokens_per_rank, self._num_topk_logprobs, dtype=torch.int32
             )
             topk_logprobs = torch.zeros(num_tokens_per_rank, self._num_topk_logprobs)
+
+        def pad(key: str, num_tokens: int) -> torch.Tensor:
+            return torch.full((num_tokens,), pad_values[key], dtype=_DTYPES[key])
 
         # Shift labels/logits and pad to per_sample_pad_multiple.
         for training_sample in training_samples:
@@ -686,22 +690,17 @@ class Batcher(Configurable):
                 "loss_mask": training_sample.loss_mask[1:],
                 "advantages": training_sample.advantage[1:],
             }
-            sample_len = len(sample["input_ids"])
-            unpadded_len = sample_len
+            unpadded_len = len(sample["input_ids"])
+            sample_len = unpadded_len
 
             # pad to multiple
             if self._per_sample_pad_multiple:
                 align = self._per_sample_pad_multiple
-                padded_len = ((sample_len + align - 1) // align) * align
-                for key in keys:
-                    sample[key] = sample[key] + [pad_values[key]] * (
-                        padded_len - sample_len
-                    )
-                sample_len = padded_len
+                sample_len = ((unpadded_len + align - 1) // align) * align
 
             # extend row
             if topk_token_ids is not None:
-                start = len(positions)
+                start = num_packed_tokens
                 topk_token_ids[
                     start : start + unpadded_len
                 ] = training_sample.topk_token_ids[1:]
@@ -709,34 +708,33 @@ class Batcher(Configurable):
                     start : start + unpadded_len
                 ] = training_sample.topk_logprobs[1:]
             for key in keys:
-                packed_fields[key].extend(sample[key])
-            positions.extend(range(sample_len))
-            padding_mask.extend([False] * unpadded_len)
-            padding_mask.extend([True] * (sample_len - unpadded_len))
+                packed_fields[key] += [sample[key], pad(key, sample_len - unpadded_len)]
+            positions.append(torch.arange(sample_len))
+            padding_mask.append(torch.arange(sample_len) >= unpadded_len)
             if training_sample.routed_expert_ids is not None:
                 # One row per input token; a short tensor would zero-pad real tokens to expert 0.
                 assert len(training_sample.routed_expert_ids) == unpadded_len
                 routed_expert_ids.append(
                     _pad_rows(training_sample.routed_expert_ids, num_rows=sample_len)
                 )
+            num_packed_tokens += sample_len
 
-        pad_len = num_tokens_per_rank - len(positions)
+        pad_len = num_tokens_per_rank - num_packed_tokens
         assert pad_len >= 0
         if pad_len > 0:
             for key in keys:
-                packed_fields[key].extend([pad_values[key]] * pad_len)
-            positions.extend(index % self.seq_len for index in range(pad_len))
-            padding_mask.extend([True] * pad_len)
+                packed_fields[key].append(pad(key, pad_len))
+            positions.append(torch.arange(pad_len) % self.seq_len)
+            padding_mask.append(torch.ones(pad_len, dtype=torch.bool))
         # All samples or none carry routed expert ids; a gap would shift later rows.
         assert len(routed_expert_ids) in (0, len(training_samples))
 
-        generator_logprobs = torch.tensor(
-            packed_fields["generator_logprobs"], dtype=_DTYPES["generator_logprobs"]
-        )
-        loss_mask = torch.tensor(packed_fields["loss_mask"], dtype=_DTYPES["loss_mask"])
+        packed = {key: torch.cat(packed_fields[key]) for key in keys}
+        generator_logprobs = packed["generator_logprobs"]
+        loss_mask = packed["loss_mask"]
         target_mask = loss_mask & torch.isfinite(generator_logprobs)
-        positions_tensor = torch.tensor(positions, dtype=torch.long)
-        padding_mask_tensor = torch.tensor(padding_mask, dtype=torch.bool)
+        positions_tensor = torch.cat(positions)
+        padding_mask_tensor = torch.cat(padding_mask)
         loss_token_counts, routing_token_counts = get_mtp_token_counts(
             target_mask=target_mask,
             positions=positions_tensor,
@@ -744,17 +742,15 @@ class Batcher(Configurable):
             num_mtp_layers=self._num_mtp_layers,
         )
         return TrainingMicrobatch(
-            input=torch.tensor(packed_fields["input_ids"], dtype=_DTYPES["input_ids"]),
-            labels=torch.tensor(packed_fields["labels"], dtype=_DTYPES["labels"]),
+            input=packed["input_ids"],
+            labels=packed["labels"],
             positions=positions_tensor,
             generator_logprobs=generator_logprobs,
             # TODO: support per-turn temperature: record it on each RolloutTurn and carry it
             # per token like generator_logprobs, instead of the run's sampling temperature.
             temperature=torch.full_like(generator_logprobs, self._temperature),
             loss_mask=loss_mask,
-            advantages=torch.tensor(
-                packed_fields["advantages"], dtype=_DTYPES["advantages"]
-            ),
+            advantages=packed["advantages"],
             padding_mask=padding_mask_tensor,
             loss_token_counts=loss_token_counts,
             routing_token_counts=routing_token_counts,

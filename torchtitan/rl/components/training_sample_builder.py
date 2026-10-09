@@ -9,9 +9,8 @@
 RolloutGroup -> group filters -> rollout_to_training_samples -> sample filters -> TrainingSampleGroup
 """
 
-import math
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -27,14 +26,58 @@ from torchtitan.rl.types import (
 
 def _has_valid_loss_token(training_sample: TrainingSample) -> bool:
     """Return whether the shifted sample has a token usable by the RL loss."""
-    return any(
-        include_in_loss and math.isfinite(generator_logprob)
-        for include_in_loss, generator_logprob in zip(
-            training_sample.loss_mask[1:],
-            training_sample.logprobs[1:],
-            strict=True,
+    loss_mask, logprobs = training_sample.loss_mask[1:], training_sample.logprobs[1:]
+    return bool((loss_mask & logprobs.isfinite()).any())
+
+
+@dataclass(kw_only=True, slots=True)
+class _OpenSample:
+    """A training_sample while turns are appended to it: per-token Python lists and per-turn row
+    chunks (cheap appends), converted to tensors once by `to_training_sample`."""
+
+    rollout_id: RolloutTurnID
+    min_policy_version: int
+    max_policy_version: int
+    token_ids: list[int] = field(default_factory=list)
+    loss_mask: list[bool] = field(default_factory=list)
+    logprobs: list[float] = field(default_factory=list)
+    advantage: list[float] = field(default_factory=list)
+    routed_expert_ids: list[torch.Tensor] = field(default_factory=list)
+    """Row chunks of `TrainingSample.routed_expert_ids`; empty without routed expert ids."""
+    num_routed_rows: int = 0
+    topk_token_ids: list[torch.Tensor] = field(default_factory=list)
+    """Row chunks of `TrainingSample.topk_token_ids`; empty without top-k."""
+    topk_logprobs: list[torch.Tensor] = field(default_factory=list)
+
+    def append_routed_rows(self, rows: list[torch.Tensor]) -> None:
+        self.routed_expert_ids += rows
+        self.num_routed_rows += sum(len(chunk) for chunk in rows)
+
+    def leading_routed_rows(self, num_rows: int) -> list[torch.Tensor]:
+        """The first `num_rows` routed rows, as views of the chunks."""
+        rows = []
+        for chunk in self.routed_expert_ids:
+            if num_rows <= 0:
+                break
+            rows.append(chunk[:num_rows])
+            num_rows -= len(chunk)
+        return rows
+
+    def to_training_sample(self) -> TrainingSample:
+        return TrainingSample(
+            rollout_id=self.rollout_id,
+            min_policy_version=self.min_policy_version,
+            max_policy_version=self.max_policy_version,
+            token_ids=torch.tensor(self.token_ids, dtype=torch.long),
+            loss_mask=torch.tensor(self.loss_mask, dtype=torch.bool),
+            logprobs=torch.tensor(self.logprobs, dtype=torch.float32),
+            advantage=torch.tensor(self.advantage, dtype=torch.float32),
+            routed_expert_ids=(
+                torch.cat(self.routed_expert_ids) if self.routed_expert_ids else None
+            ),
+            topk_token_ids=torch.cat(self.topk_token_ids) if self.topk_token_ids else None,
+            topk_logprobs=torch.cat(self.topk_logprobs) if self.topk_logprobs else None,
         )
-    )
 
 
 class TrainingSampleBuilder(Configurable):
@@ -212,7 +255,7 @@ class TrainingSampleBuilder(Configurable):
                 f"rollout {rollout.group_id}/rollout={rollout.rollout_id} has no advantage; the Rollouter "
                 "must fill it (via its advantage estimator) before training_samples are built."
             )
-        training_samples: list[TrainingSample] = []
+        training_samples: list[_OpenSample] = []
 
         # Skip if no completion (nothing to train on). This happens when the prompt is too
         # long in the first turn, before any generation. We keep these rollouts for debugging.
@@ -255,12 +298,10 @@ class TrainingSampleBuilder(Configurable):
             # False when the env edited history -> open a new training_sample (branch).
             extends_prev = prompt_prefix_len == len(prev_prompt_and_completion)
             if not training_samples or not extends_prev:
-                prev_routed_expert_ids = (
-                    training_samples[-1].routed_expert_ids if training_samples else None
-                )
+                prev_sample = training_samples[-1] if training_samples else None
                 # Start a new training_sample; its RolloutTurnID marks the turn the segment begins at.
                 training_samples.append(
-                    TrainingSample(
+                    _OpenSample(
                         min_policy_version=rollout_turn.min_policy_version,
                         max_policy_version=rollout_turn.max_policy_version,
                         rollout_id=RolloutTurnID(
@@ -268,22 +309,18 @@ class TrainingSampleBuilder(Configurable):
                             rollout_id=rollout.rollout_id,
                             turn_id=turn_idx,
                         ),
-                        token_ids=[],
-                        loss_mask=[],
-                        logprobs=[],
-                        advantage=[],
                     )
                 )
                 # New branch (first turn or a branch): it starts from this turn's full prompt.
                 prompt_delta = (
                     prev_prompt_and_completion[:prompt_prefix_len] + prompt_delta_token_ids
                 )
-                if rollout_turn.prompt_prefix_len > 0 and prev_routed_expert_ids is not None:
+                if prompt_prefix_len > 0 and prev_sample is not None:
                     # The turn's routed rows start at prompt_prefix_len - 1; the shared prefix
                     # routed the same before that.
-                    training_samples[-1].routed_expert_ids = prev_routed_expert_ids[
-                        : rollout_turn.prompt_prefix_len - 1
-                    ]
+                    training_samples[-1].append_routed_rows(
+                        prev_sample.leading_routed_rows(prompt_prefix_len - 1)
+                    )
             else:
                 prompt_delta = prompt_delta_token_ids
 
@@ -305,17 +342,8 @@ class TrainingSampleBuilder(Configurable):
             training_sample.advantage += [rollout_advantage] * num_completion
             if rollout_turn.routed_expert_ids is not None:
                 # Row i is position i; the turn's rows start at its prompt_prefix_len - 1.
-                training_sample.routed_expert_ids = (
-                    rollout_turn.routed_expert_ids
-                    if training_sample.routed_expert_ids is None
-                    else torch.cat(
-                        [training_sample.routed_expert_ids, rollout_turn.routed_expert_ids]
-                    )
-                )
-                if (
-                    len(training_sample.routed_expert_ids)
-                    != len(training_sample.token_ids) - 1
-                ):
+                training_sample.append_routed_rows([rollout_turn.routed_expert_ids])
+                if training_sample.num_routed_rows != len(training_sample.token_ids) - 1:
                     raise ValueError(
                         f"rollout {rollout.group_id}/rollout={rollout.rollout_id}: turn {turn_idx} "
                         f"has {len(rollout_turn.routed_expert_ids)} routed expert rows; expected rows "
@@ -323,30 +351,17 @@ class TrainingSampleBuilder(Configurable):
                         "(see RolloutTurn.routed_expert_ids)"
                     )
             if rollout_turn.completion_topk_token_ids is not None:
-                training_sample.topk_token_ids = _append_rows(
-                    training_sample.topk_token_ids,
-                    num_zero_rows=num_delta,
-                    new_rows=rollout_turn.completion_topk_token_ids,
-                )
-                training_sample.topk_logprobs = _append_rows(
-                    training_sample.topk_logprobs,
-                    num_zero_rows=num_delta,
-                    new_rows=rollout_turn.completion_topk_logprobs,
-                )
+                # Zero rows on the untrained prompt delta, then the completion's rows
+                for chunks, new_rows in (
+                    (
+                        training_sample.topk_token_ids,
+                        rollout_turn.completion_topk_token_ids,
+                    ),
+                    (
+                        training_sample.topk_logprobs,
+                        rollout_turn.completion_topk_logprobs,
+                    ),
+                ):
+                    chunks += [new_rows.new_zeros(num_delta, new_rows.shape[1]), new_rows]
 
-        return training_samples
-
-
-def _append_rows(
-    rows: torch.Tensor | None, *, num_zero_rows: int, new_rows: torch.Tensor
-) -> torch.Tensor:
-    """Append `num_zero_rows` zero rows (the untrained prompt delta), then `new_rows`.
-
-    Example:
-
-        _append_rows(None, num_zero_rows=2, new_rows=[[7, 3]])  # -> [[0, 0], [0, 0], [7, 3]]
-    """
-    zero_rows = new_rows.new_zeros(num_zero_rows, new_rows.shape[1])
-    return torch.cat(
-        [zero_rows, new_rows] if rows is None else [rows, zero_rows, new_rows]
-    )
+        return [training_sample.to_training_sample() for training_sample in training_samples]
