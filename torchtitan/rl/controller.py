@@ -627,6 +627,7 @@ class Controller(Configurable):
                 InterGeneratorRouter,
                 config.generator_router,
                 generators=generators,
+                group_size=config.async_loop.num_samples_per_prompt,
             )
 
             await self._rollouter.setup_async(
