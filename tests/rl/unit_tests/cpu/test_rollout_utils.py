@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
-from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
+from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.types import split_prompt
 from torchtitan.rl.types import RolloutTurnID
 
@@ -158,6 +158,29 @@ def test_turn_advantage_overrides_the_rollout_advantage() -> None:
     assert training_sample.advantage.tolist() == pytest.approx(
         [0.0, 0.0, 0.3, 0.0, -0.9, -0.9]
     )
+
+
+def test_tied_group_with_a_turn_advantage_still_trains() -> None:
+    # two forfeits on move 1: rewards tie, but each forfeiting turn carries its own penalty
+    rollouts = []
+    for rollout_id in range(2):
+        turn = _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=2)
+        turn.advantage = -1.5
+        rollout = _scored_rollout([turn], reward=-1.0, advantage=0.0)
+        rollout.rollout_id = rollout_id
+        rollouts.append(rollout)
+    builder = TrainingSampleBuilder.Config().build()
+    group = builder.build_from_group(
+        rollout_group=RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+    )
+    assert len(group.training_samples) == 2
+
+    for rollout in rollouts:
+        rollout.turns[0].advantage = None
+    group = builder.build_from_group(
+        rollout_group=RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+    )
+    assert group.training_samples == []
 
 
 def test_history_edit_branches_into_separate_training_samples() -> None:

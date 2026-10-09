@@ -114,7 +114,17 @@ class TrainingSampleBuilder(Configurable):
                 m.Mean(1.0 if is_zero_std else 0.0),
             )
         )
-        if self.config.drop_zero_std_reward_groups and is_zero_std:
+        # A turn with its own advantage (e.g. a forfeit's penalty) still trains in a tied group.
+        has_turn_advantages = any(
+            turn.advantage is not None
+            for rollout in rollout_group.rollouts
+            for turn in rollout.turns
+        )
+        if (
+            self.config.drop_zero_std_reward_groups
+            and is_zero_std
+            and not has_turn_advantages
+        ):
             metrics.append(
                 m.Metric(
                     "training_sample_builder/num_groups_dropped_zero_std", m.Sum(1.0)

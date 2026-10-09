@@ -41,6 +41,8 @@ _END_GROUPS = {
 }
 # End reasons caused by exactly one bad reply: one per game that ended this way.
 _REPLY_FORFEITS = ("illegal_move", "truncated_length", "error_parse")
+# End reasons caused by the infrastructure, not the policy: scored as if the game hit `max_plies`.
+_INFRA_ERRORS = ("error", "error_abort", "error_timeout")
 
 
 class ChessSelfPlayWorker(RolloutWorker):
@@ -202,7 +204,7 @@ class ChessSelfPlayWorker(RolloutWorker):
             forfeit_costs = [
                 game.material_rewards[color] - game.rewards[color]
                 if game.forfeiter == color
-                and game.end_reason in (*_REPLY_FORFEITS, "error")
+                and game.end_reason in (*_REPLY_FORFEITS, *_INFRA_ERRORS)
                 else 0.0
                 for _, game in color_players
             ]
@@ -301,8 +303,8 @@ class ChessSelfPlayWorker(RolloutWorker):
             # A player can stop without moving: its reply hit `max_tokens`, its history outgrew
             # `max_rollout_tokens`, or it errored. It forfeits with that status, so the other
             # player stops waiting; a no-op if the game already ended.
-            # TODO: a game lost to an infra error (status "error") counts as a forfeit; dropping
-            # both players' rollouts would keep infra failures out of the reward.
+            # TODO: an infra error still counts as a forfeit in the reward and the Elo metrics (the
+            # advantages already treat it as a game that hit `max_plies`).
             await game.forfeit(
                 color, reason="error" if rollout is None else rollout.status.value
             )
