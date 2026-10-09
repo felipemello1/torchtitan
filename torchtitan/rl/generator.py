@@ -53,7 +53,7 @@ from torchtitan.rl.model.vllm_registry import (
 )
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.vllm import StatLoggerContext, VllmOtelStatLogger
-from torchtitan.rl.session_kv_pins import SessionKVPins
+from torchtitan.rl.session_kv_holder import SessionKVHolder
 from torchtitan.rl.types import Completion
 from torchtitan.tools.utils import has_cuda_capability
 
@@ -727,9 +727,6 @@ class VLLMGenerator(Configurable):
             disabled.
     """
 
-    # Set in __init__ with hold_session_kv; a class default keeps partially built test fakes working.
-    _session_kv: SessionKVPins | None = None
-
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         """Generator actor configuration.
@@ -828,7 +825,7 @@ class VLLMGenerator(Configurable):
         hold_session_kv: bool = False
         """Hold each multi-turn session's reusable prefix (attention and Gated-DeltaNet state
         blocks) from the end of a turn's prefill until its next turn or its end, so no other
-        request evicts it (see `SessionKVPins`). Held blocks count in vLLM's KV usage."""
+        request evicts it (see `SessionKVHolder`). Held blocks count in vLLM's KV usage."""
 
         session_kv_free_floor: float = 0.05
         """With ``hold_session_kv``, release whole sessions, least recently held first, while
@@ -1126,14 +1123,14 @@ class VLLMGenerator(Configurable):
         self._engine_loop_queue = EngineLoopQueue(self._engine_event_loop)
 
         # Every rank holds the same blocks in its own scheduler; only the engine thread touches them.
-        self._session_kv: SessionKVPins | None = None
+        self._session_kv: SessionKVHolder | None = None
         if config.hold_session_kv:
             scheduler = self._engine.engine_core.engine_core.scheduler
             # A finer hash than the block (TP>1) or speculative decoding moves the replay point
-            # away from the prompt-end block that SessionKVPins holds.
+            # away from the prompt-end block that SessionKVHolder holds.
             assert not scheduler.kv_cache_manager.coordinator.enable_partial_hash_hits
             assert self._engine.vllm_config.speculative_config is None
-            self._session_kv = SessionKVPins(
+            self._session_kv = SessionKVHolder(
                 scheduler,
                 free_floor_blocks=int(
                     config.session_kv_free_floor
@@ -1193,10 +1190,10 @@ class VLLMGenerator(Configurable):
         sl.set_step(step, relative_step=relative_step)
         if self._session_kv is not None and self._rank == 0:
             logger.info(
-                "Session KV at step %d: %d sessions hold %d blocks",
+                "Session KV at step %d: %d sessions held, %d evicted so far",
                 step,
                 self._session_kv.num_sessions,
-                self._session_kv.num_blocks,
+                self._session_kv.num_evicted,
             )
 
     def kv_cache_budget(self) -> KVCacheBudget:
@@ -1442,7 +1439,7 @@ class VLLMGenerator(Configurable):
                         if not self._engine.has_unfinished_requests():
                             break
                         if self._session_kv is not None:
-                            self._session_kv.ensure_free()
+                            self._session_kv.evict_until_free()
                         with torch.no_grad():
                             request_outputs = self._engine.step()
                         if self._session_kv is not None:
@@ -1599,7 +1596,7 @@ class VLLMGenerator(Configurable):
         )
 
     async def release_groups(self, group_ids: list[int]) -> None:
-        """Drop the pinned cache salts of finished rollout groups.
+        """Drop the pinned cache salts and the held KV of finished rollout groups.
 
         Args:
             group_ids: Groups with no more generation calls.

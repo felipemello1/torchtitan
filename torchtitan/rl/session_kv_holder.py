@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Hold each multi-turn session's reusable KV between its turns (TBR-style session blocks)."""
+"""Hold each multi-turn session's reusable KV between its turns."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from collections import Counter, OrderedDict
 from typing import Any
 
 
-class SessionKVPins:
+class SessionKVHolder:
     """Keeps a session's reusable prefix out of vLLM's free pool until its next turn or its end.
 
     vLLM frees a finished turn's blocks to an LRU free queue, where any new request can evict them;
@@ -23,19 +23,19 @@ class SessionKVPins:
     count as used in vLLM's ``kv_cache_usage``.
 
     When free blocks fall below ``free_floor_blocks``, whole idle sessions (no request in vLLM) are
-    released, the one idle longest first (TBR's ``evict_until_free``). Every mutating method must run
+    released, the one idle longest first. Every mutating method must run
     on the engine thread of every rank, in the same order, so the schedulers of all TP ranks stay
     identical.
 
     Example::
 
-        pins = SessionKVPins(scheduler, free_floor_blocks=400)
+        holder = SessionKVHolder(scheduler, free_floor_blocks=400)
         internal_id = engine.add_request(request_id="group=3/rollout=0/turn=2", ...)
-        pins.track(internal_id, session_id="group=3/rollout=0", group_id=3)
-        pins.ensure_free()  # before each engine.step()
+        holder.track(internal_id, session_id="group=3/rollout=0", group_id=3)
+        holder.evict_until_free()  # before each engine.step()
         engine.step()
-        pins.after_step()  # holds the prefix of requests whose prefill just finished
-        pins.release(session_ids=["group=3/rollout=0"])  # the rollout ended
+        holder.after_step()  # holds the prefix of requests whose prefill just finished
+        holder.release(session_ids=["group=3/rollout=0"])  # the rollout ended
 
     Args:
         scheduler: The vLLM v1 scheduler of this rank's in-process engine.
@@ -46,7 +46,7 @@ class SessionKVPins:
         self._scheduler = scheduler
         self._coordinator = scheduler.kv_cache_manager.coordinator
         self._block_pool = scheduler.kv_cache_manager.block_pool
-        self._free_floor_blocks = free_floor_blocks
+        self.free_floor_blocks = free_floor_blocks
         # Requests in vLLM: internal request id -> (session, group, prefill seen).
         self._live: dict[str, tuple[str, int, bool]] = {}
         self._busy_sessions: Counter[str] = Counter()
@@ -56,7 +56,7 @@ class SessionKVPins:
         self._group_sessions: dict[int, set[str]] = {}
         # Plain ints, so other threads (e.g. a logging endpoint) can read them safely.
         self.num_sessions = 0
-        self.num_blocks = 0
+        self.num_evicted = 0
 
     def track(self, internal_request_id: str, session_id: str, group_id: int) -> None:
         """Hold this request's prefix once its prefill finishes."""
@@ -78,17 +78,18 @@ class SessionKVPins:
                 self._live[internal_id] = (session_id, group_id, True)
                 self._hold(request, session_id, group_id)
 
-    def ensure_free(self) -> None:
+    def evict_until_free(self) -> None:
         """Release idle sessions, idle longest first, until enough blocks are free.
 
         A session with a request in vLLM is skipped: its own request still references most of its
         blocks, so releasing it frees little and costs its next call a recompute.
         """
         for session_id in list(self._held):
-            if self._block_pool.get_num_free_blocks() >= self._free_floor_blocks:
+            if self._block_pool.get_num_free_blocks() >= self.free_floor_blocks:
                 return
             if session_id not in self._busy_sessions:
                 self._release(session_id)
+                self.num_evicted += 1
 
     def release(self, session_ids: list[str] = (), group_ids: list[int] = ()) -> None:
         """Release sessions that make no more calls, and every session of finished groups."""
@@ -112,7 +113,7 @@ class SessionKVPins:
         hit_blocks, _, _ = self._coordinator.find_longest_cache_hit(
             request.block_hashes, request.num_prompt_tokens - 1
         )
-        blocks = [b for group in hit_blocks for b in group if not b.is_null]
+        blocks = [b for kv_group in hit_blocks for b in kv_group if not b.is_null]
         # Take the new hold before dropping the old one, so shared prefix blocks stay held.
         self._block_pool.touch(blocks)
         self._release(session_id)
@@ -120,7 +121,6 @@ class SessionKVPins:
         self._session_groups[session_id] = group_id
         self._group_sessions.setdefault(group_id, set()).add(session_id)
         self.num_sessions += 1
-        self.num_blocks += len(blocks)
 
     def _release(self, session_id: str) -> None:
         blocks = self._held.pop(session_id, None)
@@ -129,5 +129,4 @@ class SessionKVPins:
             self._group_sessions.get(group_id, set()).discard(session_id)
         if blocks is not None:
             self.num_sessions -= 1
-            self.num_blocks -= len(blocks)
             self._block_pool.free_blocks(reversed(blocks))

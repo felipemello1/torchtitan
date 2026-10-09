@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""SessionKVPins on vLLM's real KV cache manager: 1 attention group + 3 Mamba "align" groups,
+"""SessionKVHolder on vLLM's real KV cache manager: 1 attention group + 3 Mamba "align" groups,
 16-token blocks standing in for Qwen3.5's 1,152."""
 
 from types import SimpleNamespace
@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from torchtitan.rl.session_kv_pins import SessionKVPins
+from torchtitan.rl.session_kv_holder import SessionKVHolder
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -104,19 +104,19 @@ def _churn(manager, tag: str) -> None:
         manager.free(request)
 
 
-def _pins(manager, requests, floor=0) -> SessionKVPins:
+def _holder(manager, requests, floor=0) -> SessionKVHolder:
     scheduler = SimpleNamespace(kv_cache_manager=manager, requests=requests)
-    return SessionKVPins(scheduler, free_floor_blocks=floor)
+    return SessionKVHolder(scheduler, free_floor_blocks=floor)
 
 
 def test_held_prefix_survives_churn_and_the_next_turn_hits_it(manager):
     requests = {}
-    pins = _pins(manager, requests)
+    holder = _holder(manager, requests)
     turn1 = _request("t1", list(range(50)))
     requests["t1"] = turn1
-    pins.track("t1", session_id="s", group_id=0)
+    holder.track("t1", session_id="s", group_id=0)
     _prefill(manager, turn1)
-    pins.after_step()
+    holder.after_step()
     # Decode moves the GDN checkpoint out of the request; other requests churn the free queue.
     for t in range(20):
         _schedule(manager, turn1, 1, sample=100 + t)
@@ -144,65 +144,97 @@ def test_without_holding_the_next_turn_recomputes(manager):
 
 def test_release_returns_every_held_block(manager):
     requests = {}
-    pins = _pins(manager, requests)
+    holder = _holder(manager, requests)
     free_before = manager.block_pool.get_num_free_blocks()
     turn1 = _request("t1", list(range(50)))
     requests["t1"] = turn1
-    pins.track("t1", session_id="s", group_id=3)
+    holder.track("t1", session_id="s", group_id=3)
     _prefill(manager, turn1)
-    pins.after_step()
+    holder.after_step()
     manager.free(turn1)
     assert manager.block_pool.get_num_free_blocks() < free_before
 
-    pins.release(group_ids=[3])
-    assert pins.num_sessions == 0 and pins.num_blocks == 0
+    holder.release(group_ids=[3])
+    assert holder.num_sessions == 0
     assert manager.block_pool.get_num_free_blocks() == free_before
 
 
-def _finished_turn(manager, pins, requests, session: str, tokens: list[int]) -> None:
+def _finished_turn(manager, holder, requests, session: str, tokens: list[int]) -> None:
     """One turn of `session`: admit, prefill (held), finish."""
     request = _request(session, tokens)
     requests[session] = request
-    pins.track(session, session_id=session, group_id=0)
+    holder.track(session, session_id=session, group_id=0)
     _prefill(manager, request)
-    pins.after_step()
+    holder.after_step()
     manager.free(request)
     del requests[session]
-    pins.after_step()
+    holder.after_step()
 
 
-def test_ensure_free_releases_the_session_idle_longest_first(manager):
+def test_evict_until_free_releases_the_session_idle_longest_first(manager):
     requests = {}
-    pins = _pins(manager, requests)
-    _finished_turn(manager, pins, requests, "old", list(range(50)))
-    _finished_turn(manager, pins, requests, "new", list(range(500, 550)))
+    holder = _holder(manager, requests)
+    _finished_turn(manager, holder, requests, "old", list(range(50)))
+    _finished_turn(manager, holder, requests, "new", list(range(500, 550)))
 
-    pins._free_floor_blocks = manager.block_pool.get_num_free_blocks() + 1
-    pins.ensure_free()
-    assert list(pins._held) == ["new"]
+    holder.free_floor_blocks = manager.block_pool.get_num_free_blocks() + 1
+    holder.evict_until_free()
+    # Only "old" was released: releasing "new" now frees the rest.
+    assert holder.num_sessions == 1 and holder.num_evicted == 1
+    holder.release(session_ids=["new"])
+    assert holder.num_sessions == 0
 
 
-def test_ensure_free_skips_a_session_with_a_request_in_vllm(manager):
+def test_evict_until_free_skips_a_session_with_a_request_in_vllm(manager):
     requests = {}
-    pins = _pins(manager, requests)
+    holder = _holder(manager, requests)
     busy = _request("busy", list(range(50)))
     requests["busy"] = busy
-    pins.track("busy", session_id="busy", group_id=0)
+    holder.track("busy", session_id="busy", group_id=0)
     _prefill(manager, busy)
-    pins.after_step()
+    holder.after_step()
 
-    pins._free_floor_blocks = manager.block_pool.get_num_free_blocks() + 1
-    pins.ensure_free()
-    assert pins.num_sessions == 1
+    holder.free_floor_blocks = manager.block_pool.get_num_free_blocks() + 1
+    holder.evict_until_free()
+    assert holder.num_sessions == 1 and holder.num_evicted == 0
 
 
 def test_release_before_prefill_takes_no_hold(manager):
     requests = {}
-    pins = _pins(manager, requests)
+    holder = _holder(manager, requests)
     request = _request("t1", list(range(50)))
     requests["t1"] = request
-    pins.track("t1", session_id="s", group_id=7)
-    pins.release(session_ids=["s"], group_ids=[7])
+    holder.track("t1", session_id="s", group_id=7)
+    holder.release(session_ids=["s"], group_ids=[7])
     _prefill(manager, request)
-    pins.after_step()
-    assert pins.num_sessions == 0
+    holder.after_step()
+    assert holder.num_sessions == 0
+
+
+def test_next_turn_moves_the_hold_and_release_frees_everything(manager):
+    requests = {}
+    holder = _holder(manager, requests)
+    free_before = manager.block_pool.get_num_free_blocks()
+    turn1 = _request("t1", list(range(50)))
+    requests["t1"] = turn1
+    holder.track("t1", session_id="s", group_id=0)
+    _prefill(manager, turn1)
+    holder.after_step()
+    for t in range(20):
+        _schedule(manager, turn1, 1, sample=100 + t)
+    manager.free(turn1)
+    del requests["t1"]
+    holder.after_step()
+
+    turn2 = _request("t2", list(turn1.all_token_ids) + [5, 6, 7])
+    requests["t2"] = turn2
+    holder.track("t2", session_id="s", group_id=0)
+    _prefill(manager, turn2)
+    holder.after_step()
+    manager.free(turn2)
+    del requests["t2"]
+    holder.after_step()
+    assert holder.num_sessions == 1
+
+    holder.release(session_ids=["s"])
+    assert manager.block_pool.get_num_free_blocks() == free_before
