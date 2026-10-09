@@ -327,13 +327,14 @@ def rl_chess_qwen3_5_35b_a3b(
 
 
 def rl_chess_qwen3_5_4b_gb300(
-    max_plies: int = 120,
+    max_plies: int = 60,
     max_thinking_tokens: int = 1024,
     opening_max_thinking_tokens: int = 2048,
     max_context_tokens: int = 131072,
 ) -> Controller.Config:
-    """The 35B GB300 recipe with Qwen3.5-4B (instruct): same games, thinking budget, context, and
-    eight one-GPU generators on hosts 1-2; host 0 trains the dense 4B with FSDP 4.
+    """The 35B GB300 recipe with Qwen3.5-4B (instruct): same thinking budget, context, and eight
+    one-GPU generators on hosts 1-2; host 0 trains the dense 4B with FSDP 4. Games stop at 60 plies
+    and a step trains 96 positions x 8 games, half the 35B's, so a step takes ~1/4 of the tokens.
 
     The 4B's fp32 weights, grads and Adam state take ~16 GB per trainer GPU (the 35B's ~140 GB), so
     the trainer spends the memory on selective activation checkpointing instead of full recompute.
@@ -348,6 +349,7 @@ def rl_chess_qwen3_5_4b_gb300(
         "4B", seq_len=max_context_tokens, attn_backend="varlen"
     )
     config.hf_assets_path = "torchtitan/rl/example_checkpoint/Qwen3.5-4B"
+    config.async_loop.num_prompts_per_train_step = 96
     config.dump_folder = "outputs/rl/qwen3_5_4b_chess_gb300"
     trainer = config.trainer
     trainer.parallelism = ParallelismConfig(data_parallel_shard_degree=4)
