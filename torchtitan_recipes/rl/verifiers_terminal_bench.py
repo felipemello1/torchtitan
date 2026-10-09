@@ -590,22 +590,20 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2() -> Controller.Config:
 def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_adaptive_buffer() -> Controller.Config:
     """`rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2` with the adaptive rollout buffer: the slot
     count follows how many groups were not ready at recent step starts, capped so the mean policy
-    age stays at or under 5. Sized for the live run's 24 x 16 (`DOME_V2_PROMPTS=24`).
+    age stays at or under the fixed recipe's target. Sizes follow `DOME_V2_PROMPTS`.
     """
     config = rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2()
+    loop = config.async_loop
     config.async_loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
-        # The fixed recipe's target, which sizes its (5 + 1) x 24 slots.
-        target_offpolicy_steps=5,
+        target_offpolicy_steps=loop.target_offpolicy_steps,
         # No age drops, as with the fixed buffer.
         max_offpolicy_steps=None,
-        # Start at the fixed buffer's (5 + 1) x 24 = 144 slots, so a resume does not restart at 3 x 24.
-        start_batches=6,
-        # Never binds: the demand peaks at 157 on the first step start, then holds near 144. Each idle
-        # rollout worker rescans on every buffer change, so not much higher.
-        generation_capacity=192,
+        # Start at the fixed buffer's (target + 1) x P slots, so a resume does not restart at 3P.
+        start_batches=loop.target_offpolicy_steps + 1,
+        # The fixed buffer's slots: as many groups generate at once as today, so rollout workers,
+        # vLLM's max_num_seqs and Sandoq load stay the fixed recipe's at any prompt count.
+        generation_capacity=loop.max_active_rollout_groups,
     )
-    # vLLM's max_num_seqs stays the fixed recipe's 298 = (144 x 16 + 78 validation) / 8 engines; 192 groups give 394.
-    config.async_loop.max_num_seqs_per_generator = 298
     return config
 
 
