@@ -48,6 +48,14 @@ class ThinkingBudget(Configurable):
         """Tokens a turn may think before its end of thinking is forced; must leave room for the
         forced text and the answer within `SamplingConfig.max_tokens`."""
 
+        opening_max_thinking_tokens: int | None = None
+        """`max_thinking_tokens` for a rollout's first `opening_turns` turns; it too must leave room for
+        the forced text and the answer within `SamplingConfig.max_tokens`."""
+
+        opening_turns: int = 0
+        """How many of a rollout's first turns think up to `opening_max_thinking_tokens`. Leave at 0
+        on the Verifiers path, which wraps one `GenerateFn` per group, not per rollout."""
+
         close_text: str = (
             "\n\nConsidering the limited time by the user, I have to give the solution based on "
             "the thinking directly now.\n</think>\n\n"
@@ -58,6 +66,15 @@ class ThinkingBudget(Configurable):
         """Appended after `close_text` so the answer starts in the expected format, e.g. "\\boxed{".
         Without it, Qwen3.5-4B kept reasoning in its answer (chess: 89% of answers cut at 256 tokens)."""
 
+        answer_end_text: str | None = None
+        """After a forced close, stop the answer at the first token containing this text and end the
+        turn there, e.g. "}" right after `\\boxed{e4}`. Chess 35B: forced answers kept talking after
+        the move until the turn hit `max_tokens` and forfeited."""
+
+        end_of_turn_token: str = "<|im_end|>"
+        """The tokenizer's single end-of-turn token, appended untrained when `answer_end_text` stops
+        the answer."""
+
         think_start_token: str = "<think>"
         """The tokenizer's single start-of-thinking token."""
 
@@ -67,6 +84,8 @@ class ThinkingBudget(Configurable):
 
     def __init__(self, config: Config, *, tokenizer: HuggingFaceTokenizer) -> None:
         self._max_thinking_tokens = config.max_thinking_tokens
+        self._opening_max_thinking_tokens = config.opening_max_thinking_tokens
+        self._opening_turns = config.opening_turns
         self._think_start_id = tokenizer.token_to_id(config.think_start_token)
         self._think_end_id = tokenizer.token_to_id(config.think_end_token)
         if self._think_start_id is None or self._think_end_id is None:
@@ -76,9 +95,23 @@ class ThinkingBudget(Configurable):
         self._forced_ids = tokenizer.encode(
             config.close_text + config.answer_prefix, add_bos=False, add_eos=False
         )
+        # Every token whose text contains `answer_end_text` ("}", "}.", "}\n", ...): vLLM stops on ids,
+        # not text, because the generator runs without detokenizing.
+        self._answer_end_ids = set()
+        if config.answer_end_text is not None:
+            self._answer_end_ids = {
+                token_id
+                for token_id in range(tokenizer.get_vocab_size())
+                if config.answer_end_text in tokenizer.decode([token_id])
+            }
+            self._end_of_turn_id = tokenizer.token_to_id(config.end_of_turn_token)
+            if self._end_of_turn_id is None:
+                raise ValueError(f"{config.end_of_turn_token!r} must be one token")
 
     def wrap(self, generate_fn: GenerateFn) -> GenerateFn:
-        """Return a `GenerateFn` that applies the budget around `generate_fn`."""
+        """Return a `GenerateFn` that applies the budget around `generate_fn`. Wrap once per rollout:
+        each call is the rollout's next turn, which `opening_turns` counts."""
+        num_turns = 0
 
         async def generate(
             prompt_token_ids: list[int],
@@ -88,10 +121,20 @@ class ThinkingBudget(Configurable):
             routing_session_id: str | None = None,
             sampling_config: SamplingConfig | None = None,
         ) -> Completion | None:
+            nonlocal num_turns
+            max_thinking_tokens = (
+                self._opening_max_thinking_tokens
+                if num_turns < self._opening_turns
+                else self._max_thinking_tokens
+            )
+            num_turns += 1
             max_tokens = sampling_config.max_tokens
-            if self._max_thinking_tokens + len(self._forced_ids) >= max_tokens:
+            if (
+                max_thinking_tokens + len(self._forced_ids) + bool(self._answer_end_ids)
+                >= max_tokens
+            ):
                 raise ValueError(
-                    f"max_thinking_tokens ({self._max_thinking_tokens}) + {len(self._forced_ids)} forced "
+                    f"this turn's thinking budget ({max_thinking_tokens}) + {len(self._forced_ids)} forced "
                     f"tokens must be below SamplingConfig.max_tokens ({max_tokens}), which caps the turn"
                 )
             first = await generate_fn(
@@ -100,7 +143,7 @@ class ThinkingBudget(Configurable):
                 group_id=group_id,
                 routing_session_id=routing_session_id,
                 sampling_config=replace(
-                    sampling_config, max_tokens=self._max_thinking_tokens
+                    sampling_config, max_tokens=max_thinking_tokens
                 ),
             )
             # "length" with fewer tokens than asked: the context is full, so a second call would
@@ -108,7 +151,7 @@ class ThinkingBudget(Configurable):
             if (
                 first is None
                 or first.finish_reason != "length"
-                or len(first.token_ids) < self._max_thinking_tokens
+                or len(first.token_ids) < max_thinking_tokens
             ):
                 if first is not None:
                     first.metrics.append(
@@ -121,6 +164,7 @@ class ThinkingBudget(Configurable):
                 forced_ids = self._forced_ids
             else:
                 forced_ids = []
+            answer_end_ids = sorted(self._answer_end_ids) if forced_ids else []
             second = await generate_fn(
                 prompt_token_ids + first.token_ids + forced_ids,
                 request_id=f"{request_id}/answer",
@@ -128,11 +172,24 @@ class ThinkingBudget(Configurable):
                 routing_session_id=routing_session_id,
                 sampling_config=replace(
                     sampling_config,
-                    max_tokens=max_tokens - len(first.token_ids) - len(forced_ids),
+                    # one token of room for the end of turn appended below
+                    max_tokens=max_tokens
+                    - len(first.token_ids)
+                    - len(forced_ids)
+                    - bool(answer_end_ids),
+                    stop_token_ids=(sampling_config.stop_token_ids or [])
+                    + answer_end_ids,
                 ),
             )
             if second is None:
                 return None
+            end_ids = []
+            if (
+                answer_end_ids
+                and second.token_ids[-1:]
+                and second.token_ids[-1] in self._answer_end_ids
+            ):
+                end_ids = [self._end_of_turn_id]
             return Completion(
                 min_policy_version=min(
                     first.min_policy_version, second.min_policy_version
@@ -141,25 +198,35 @@ class ThinkingBudget(Configurable):
                     first.max_policy_version, second.max_policy_version
                 ),
                 request_id=request_id,
-                token_ids=first.token_ids + forced_ids + second.token_ids,
+                token_ids=first.token_ids + forced_ids + second.token_ids + end_ids,
                 # NaN: the forced tokens have no sampling logprob. The batcher and the loss also
                 # drop non-finite logprobs, so a path that loses the mask still never trains them.
                 token_logprobs=(
                     first.token_logprobs
                     + [math.nan] * len(forced_ids)
                     + second.token_logprobs
+                    + [math.nan] * len(end_ids)
                 ),
                 loss_mask=(
                     [True] * len(first.token_ids)
                     + [False] * len(forced_ids)
                     + [True] * len(second.token_ids)
+                    + [False] * len(end_ids)
                 ),
-                routed_expert_ids=_join_routed_expert_ids(first, second),
+                routed_expert_ids=_join_routed_expert_ids(
+                    first, second, num_end_rows=len(end_ids)
+                ),
                 topk_token_ids=_join_topk_rows(
-                    first.topk_token_ids, len(forced_ids), second.topk_token_ids
+                    first.topk_token_ids,
+                    len(forced_ids),
+                    second.topk_token_ids,
+                    num_end_rows=len(end_ids),
                 ),
                 topk_logprobs=_join_topk_rows(
-                    first.topk_logprobs, len(forced_ids), second.topk_logprobs
+                    first.topk_logprobs,
+                    len(forced_ids),
+                    second.topk_logprobs,
+                    num_end_rows=len(end_ids),
                 ),
                 finish_reason=second.finish_reason,
                 metrics=[
@@ -192,29 +259,47 @@ class ThinkingBudget(Configurable):
 
 
 def _join_routed_expert_ids(
-    first: Completion, second: Completion
+    first: Completion, second: Completion, *, num_end_rows: int
 ) -> torch.Tensor | None:
     """Rows of the merged turn: the first call's, then the second call's from where the first
-    stops (its last token, the forced tokens and its own completion ran forward only there).
+    stops (its last token, the forced tokens and its own completion ran forward only there),
+    then `num_end_rows` zero rows for the answer's last token when an end of turn is appended.
 
     Example:
         # prompt [P0, P1], first [A0, A1], forced [F0], second [B0]
         # first rows: P0 P1 A0 (A1 never ran forward); second rows: P0 P1 A0 A1 F0
         # -> P0 P1 A0 from first, A1 F0 from second
+        # with an appended end of turn [E]: + a zero row for B0, which no call ran forward
     """
     if first.routed_expert_ids is None or second.routed_expert_ids is None:
         return None
     num_first_rows = len(first.routed_expert_ids)
+    # TODO: the next turn's prefill runs the answer's last token forward; taking its row there
+    # would replay the generator's routing for it instead of a zero row.
+    end_rows = second.routed_expert_ids.new_zeros(
+        num_end_rows, *second.routed_expert_ids.shape[1:]
+    )
     return torch.cat(
-        [first.routed_expert_ids, second.routed_expert_ids[num_first_rows:]]
+        [first.routed_expert_ids, second.routed_expert_ids[num_first_rows:], end_rows]
     )
 
 
 def _join_topk_rows(
-    first: torch.Tensor | None, num_forced: int, second: torch.Tensor | None
+    first: torch.Tensor | None,
+    num_forced: int,
+    second: torch.Tensor | None,
+    *,
+    num_end_rows: int,
 ) -> torch.Tensor | None:
-    """The first call's top-k rows, zero rows for the forced tokens (the loss skips them), then
-    the second call's."""
+    """The first call's top-k rows, zero rows for the forced tokens (the loss skips them), the
+    second call's, then zero rows for an appended end of turn."""
     if first is None or second is None:
         return None
-    return torch.cat([first, first.new_zeros(num_forced, *first.shape[1:]), second])
+    return torch.cat(
+        [
+            first,
+            first.new_zeros(num_forced, *first.shape[1:]),
+            second,
+            first.new_zeros(num_end_rows, *first.shape[1:]),
+        ]
+    )

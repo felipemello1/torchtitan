@@ -20,7 +20,7 @@ from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
 from torchtitan.rl.types import Completion, RolloutTurnID
 
-THINK, END_THINK = 1, 2
+THINK, END_THINK, END_OF_TURN, BRACE, BRACE_DOT = 1, 2, 3, 4, 5
 FORCED = [90, 91, 92]
 
 
@@ -28,10 +28,18 @@ class _Tokenizer:
     """`<think>` and `</think>` are one token each; the forced text encodes to `FORCED`."""
 
     def token_to_id(self, token: str) -> int | None:
-        return {"<think>": THINK, "</think>": END_THINK}.get(token)
+        return {"<think>": THINK, "</think>": END_THINK, "<|im_end|>": END_OF_TURN}.get(
+            token
+        )
 
     def encode(self, text: str, *, add_bos: bool, add_eos: bool) -> list[int]:
         return list(FORCED)
+
+    def get_vocab_size(self) -> int:
+        return 100
+
+    def decode(self, token_ids: list[int]) -> str:
+        return {BRACE: "}", BRACE_DOT: "}."}.get(token_ids[0], "x")
 
 
 class _ScriptedGenerate:
@@ -142,6 +150,55 @@ def test_forced_close_keeps_topk_rows_and_routed_experts() -> None:
     assert completion.routed_expert_ids.flatten().tolist() == [1] * 5 + [2] * 5
 
 
+def test_forced_answer_ends_the_turn_at_its_closing_brace() -> None:
+    thinking = _completion([10, 11, 12, 13], finish_reason="length")
+    answer = _completion([20, BRACE_DOT], finish_reason="stop")
+    generate = _ScriptedGenerate(thinking, answer)
+    budget = ThinkingBudget(
+        ThinkingBudget.Config(max_thinking_tokens=4, answer_end_text="}"),
+        tokenizer=_Tokenizer(),
+    )
+    completion = _run(budget, generate, [THINK])
+
+    answer_sampling = generate.calls[1]["sampling_config"]
+    assert answer_sampling.stop_token_ids == [BRACE, BRACE_DOT]
+    assert (
+        answer_sampling.max_tokens == 12 - 4 - len(FORCED) - 1
+    )  # room for the end of turn
+    assert completion.token_ids == [10, 11, 12, 13, *FORCED, 20, BRACE_DOT, END_OF_TURN]
+    assert completion.loss_mask == [True] * 4 + [False] * 3 + [True] * 2 + [False]
+    assert math.isnan(completion.token_logprobs[-1])
+    assert completion.finish_reason == "stop"
+    # the thinking call does not stop at braces
+    assert generate.calls[0]["sampling_config"].stop_token_ids is None
+
+
+def test_appended_end_of_turn_gets_zero_topk_and_routed_rows() -> None:
+    # prompt [THINK]; first call [10, 11, 12, 13]; forced [90, 91, 92]; second call [20, BRACE]
+    thinking = _completion([10, 11, 12, 13], finish_reason="length")
+    thinking.topk_token_ids = torch.tensor([[10], [11], [12], [13]], dtype=torch.int32)
+    thinking.topk_logprobs = torch.full((4, 1), -0.5)
+    thinking.routed_expert_ids = torch.full((1 + 4 - 1, 1, 1), 1, dtype=torch.uint8)
+    answer = _completion([20, BRACE], finish_reason="stop")
+    answer.topk_token_ids = torch.tensor([[20], [BRACE]], dtype=torch.int32)
+    answer.topk_logprobs = torch.full((2, 1), -0.25)
+    answer.routed_expert_ids = torch.full(
+        (1 + 4 + 3 + 2 - 1, 1, 1), 2, dtype=torch.uint8
+    )
+    budget = ThinkingBudget(
+        ThinkingBudget.Config(max_thinking_tokens=4, answer_end_text="}"),
+        tokenizer=_Tokenizer(),
+    )
+    completion = _run(budget, _ScriptedGenerate(thinking, answer), [THINK])
+
+    assert completion.token_ids == [10, 11, 12, 13, *FORCED, 20, BRACE, END_OF_TURN]
+    # One top-k row per completion token: zero rows on the forced tokens and the end of turn.
+    topk_token_ids = completion.topk_token_ids.flatten().tolist()
+    assert topk_token_ids == [10, 11, 12, 13, 0, 0, 0, 20, BRACE, 0]
+    # 1 prompt + 10 completion tokens - 1 rows: a zero row for BRACE, which no call ran forward.
+    assert completion.routed_expert_ids.flatten().tolist() == [1] * 4 + [2] * 5 + [0]
+
+
 def test_reply_cut_while_answering_continues_without_forcing() -> None:
     cut = _completion([10, END_THINK, 11, 12], finish_reason="length")
     rest = _completion([13], finish_reason="stop")
@@ -202,6 +259,46 @@ def test_budget_that_leaves_no_room_for_the_answer_raises() -> None:
             prompt=[5, THINK],
             max_tokens=12,
         )
+
+
+def test_opening_turns_think_up_to_the_opening_budget() -> None:
+    budget = ThinkingBudget(
+        ThinkingBudget.Config(
+            max_thinking_tokens=4, opening_max_thinking_tokens=6, opening_turns=2
+        ),
+        tokenizer=_Tokenizer(),
+    )
+    generate = _ScriptedGenerate(
+        *(_completion([10, END_THINK, 11], finish_reason="stop") for _ in range(4))
+    )
+
+    async def play_rollout(num_turns: int) -> None:
+        wrapped = budget.wrap(generate)
+        for turn_idx in range(num_turns):
+            await wrapped(
+                [5, THINK],
+                request_id=f"group=0/rollout=0/turn={turn_idx}",
+                group_id=0,
+                sampling_config=SamplingConfig(temperature=1.0, max_tokens=12),
+            )
+
+    asyncio.run(play_rollout(num_turns=3))
+    asyncio.run(play_rollout(num_turns=1))
+    # turns 0-1 think up to 6 tokens and turn 2 up to 4; the next rollout starts over
+    thinking_caps = [call["sampling_config"].max_tokens for call in generate.calls]
+    assert thinking_caps == [6, 6, 4, 6]
+
+
+def test_opening_budget_that_leaves_no_room_for_the_answer_raises() -> None:
+    # 4 thinking tokens + 3 forced fit in 12, but the opening turn's 9 + 3 do not
+    budget = ThinkingBudget(
+        ThinkingBudget.Config(
+            max_thinking_tokens=4, opening_max_thinking_tokens=9, opening_turns=1
+        ),
+        tokenizer=_Tokenizer(),
+    )
+    with pytest.raises(ValueError, match="must be below SamplingConfig.max_tokens"):
+        _run(budget, _ScriptedGenerate(), prompt=[5, THINK], max_tokens=12)
 
 
 def test_delimiters_must_be_single_tokens() -> None:
