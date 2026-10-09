@@ -201,7 +201,7 @@ class ChessGame:
             )
 
     async def play(self, color: chess.Color, move_text: str | None) -> None:
-        """Play `color`'s move, given in SAN (`Nf3`) or UCI (`g1f3`); an illegal or missing move forfeits.
+        """Play `color`'s move, written as the prompt lists it (`Nf3`); any other text forfeits.
         Does nothing once the game is over, e.g. after the other player forfeited."""
         async with self._turn_changed:
             if self.is_over:
@@ -368,37 +368,10 @@ def _resolve_captures(
 
 
 def _parse_move(board: chess.Board, move_text: str) -> chess.Move | None:
-    """Return the legal move that `move_text` names in SAN (`Nf3`) or UCI (`g1f3`), else `None`.
-    Also reads a LaTeX-escaped `Qf1\\#`, a pawn written with the prompt's `P` key (`Pe4`), and a
-    prompt key followed by the move or its square (`Ng1-Nf3`, `Ng8 -> f6`)."""
-    text = move_text.replace("\\", "").strip().rstrip("!?")
-    try:
-        move = board.parse_san(re.sub(r"^P(?=[a-h])", "", text))
-    except ValueError:
-        move = _parse_key_then_square(board, text)
-    # `parse_san` also reads UCI, and reads "--" as a null move, which is not legal
-    return move if move is not None and board.is_legal(move) else None
-
-
-def _parse_key_then_square(board: chess.Board, text: str) -> chess.Move | None:
-    """The move of the piece that a prompt key names (`Ng1`) to the last square written after it."""
-    match = re.match(r"([KQRBNP])([a-h][1-8])(.+)", text)
-    squares = re.findall(r"[a-h][1-8]", match.group(3)) if match else []
-    if not squares:
-        return None
-    from_square = chess.parse_square(match.group(2))
-    piece = board.piece_at(from_square)
-    if (
-        piece is None
-        or piece.color != board.turn
-        or piece.symbol().upper() != match.group(1)
-    ):
-        return None
-    to_square = chess.parse_square(squares[-1])
-    moves = [
-        m
-        for m in board.legal_moves
-        if (m.from_square, m.to_square) == (from_square, to_square)
-    ]
-    # several only for an underpromotion choice, which this form does not name
-    return moves[0] if len(moves) == 1 else None
+    """Return the legal move whose SAN, as the prompt lists it, is `move_text`, else `None`.
+    The check mark is optional, plain or LaTeX-escaped: `Qf1#`, `Qf1\\#` and `Qf1` all match."""
+    text = re.sub(r"\\?[+#]$", "", move_text.strip())
+    for move in board.legal_moves:
+        if board.san(move).rstrip("+#") == text:
+            return move
+    return None

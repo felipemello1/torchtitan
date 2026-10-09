@@ -74,7 +74,8 @@ def test_checkmate_ends_the_game() -> None:
 
 
 @pytest.mark.parametrize(
-    "move_text", ["Ke9", "e5", "--", "", None, "Nb1-Nf3", "Nd4-Nf3"]
+    "move_text",
+    ["Ke9", "e5", "--", "", None, "g1f3", "Pe4", "Ng1-Nf3", "Nxf3", "Ngf3", "Nf3!?"],
 )
 def test_illegal_or_missing_move_forfeits(move_text) -> None:
     async def run() -> None:
@@ -86,33 +87,13 @@ def test_illegal_or_missing_move_forfeits(move_text) -> None:
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("move_text", ["Nf3", "g1f3", " Nf3 ", "Nf3!?"])
-def test_san_and_uci_are_accepted(move_text) -> None:
+@pytest.mark.parametrize("move_text", ["Nf3", " Nf3 ", "Nf3+", "Nf3\\#"])
+def test_the_listed_move_is_accepted(move_text) -> None:
     async def run() -> None:
         game = _new_game()
         await game.play(chess.WHITE, move_text)
         assert not game.is_over
         assert game.board.peek() == chess.Move.from_uci("g1f3")
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize(
-    "move_text, uci",
-    [
-        ("Pe4", "e2e4"),
-        ("Pe2-e4", "e2e4"),
-        ("Nf3\\#", "g1f3"),
-        ("Ng1-Nf3", "g1f3"),
-        ("Ng1 -> f3", "g1f3"),
-        ("Pe2 e4", "e2e4"),
-    ],
-)
-def test_prompt_style_moves_are_accepted(move_text, uci) -> None:
-    async def run() -> None:
-        game = _new_game()
-        await game.play(chess.WHITE, move_text)
-        assert game.board.peek() == chess.Move.from_uci(uci)
 
     asyncio.run(run())
 
