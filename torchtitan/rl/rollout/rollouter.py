@@ -156,15 +156,22 @@ class Rollouter(Configurable):
         Warns when the datasets are configured differently from the run that saved
         the positions: the config may differ only in fields that do not change the
         samples, but if the datasets changed, the positions may not match them.
+        On a mismatch, training still resumes its position, but validation restarts from its
+        first sample: a 240-problem validation set given a 30-problem set's position would
+        grade only its first 30 problems.
         """
-        if state_dict["datasets_config"] != self._datasets_config():
+        datasets_changed = state_dict["datasets_config"] != self._datasets_config()
+        if datasets_changed:
             logger.warning(
                 "The train/validation dataset config differs from the checkpoint's; "
-                "restoring its dataset positions anyway.\n  checkpoint: %s\n  current:    %s",
+                "restoring the train position anyway, and restarting validation from its "
+                "first sample.\n  checkpoint: %s\n  current:    %s",
                 state_dict["datasets_config"],
                 self._datasets_config(),
             )
         for name, dataset in self._datasets():
+            if name == "validation" and datasets_changed:
+                continue
             dataset_state = state_dict.get(name)
             if dataset_state is None:
                 logger.warning(

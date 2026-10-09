@@ -124,11 +124,17 @@ def test_load_rejects_an_unknown_version(tmp_path) -> None:
         DataStreamState().load(str(tmp_path), _Rollouter())
 
 
-def _bare_rollouter(train_dataset, validation_dataset, *, seed: int = 42) -> Rollouter:
+def _bare_rollouter(
+    train_dataset,
+    validation_dataset,
+    *,
+    seed: int = 42,
+    validation_config: str = "validation",
+) -> Rollouter:
     """A Rollouter with only the fields ``state_dict`` / ``load_state_dict`` read."""
     rollouter = Rollouter.__new__(Rollouter)
     rollouter._config = types.SimpleNamespace(
-        train_dataset=f"train(seed={seed})", validation_dataset="validation"
+        train_dataset=f"train(seed={seed})", validation_dataset=validation_config
     )
     rollouter._train_dataset = train_dataset
     rollouter._validation_dataset = validation_dataset
@@ -157,6 +163,29 @@ def test_rollouter_warns_on_positions_saved_for_other_datasets(caplog) -> None:
     with caplog.at_level(logging.WARNING):
         resumed.load_state_dict(saved)
     assert "dataset config differs from the checkpoint's" in caplog.text
+
+
+def test_rollouter_restarts_validation_saved_for_other_datasets(caplog) -> None:
+    """A position saved for another validation set would index the new set by the old
+    set's rows; validation restarts instead, while training resumes."""
+    rollouter = _bare_rollouter(_CountingDataset(), _CountingDataset())
+    next(rollouter._train_dataset)
+    next(rollouter._validation_dataset)
+    saved = rollouter.state_dict()
+
+    resumed = _bare_rollouter(
+        _CountingDataset(), _CountingDataset(), validation_config="math_eval_suite"
+    )
+    with caplog.at_level(logging.WARNING):
+        resumed.load_state_dict(saved)
+    assert resumed.get_training_sample() == 1
+    assert resumed.get_validation_sample() == 0
+    assert "restarting validation from its first sample" in caplog.text
+
+    # Same datasets: validation resumes too.
+    unchanged = _bare_rollouter(_CountingDataset(), _CountingDataset())
+    unchanged.load_state_dict(saved)
+    assert unchanged.get_validation_sample() == 1
 
 
 class _Checkpointer:
