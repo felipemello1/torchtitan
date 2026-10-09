@@ -9,6 +9,7 @@
 import ast
 import asyncio
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -22,6 +23,10 @@ import verifiers.v1 as vf
 
 from torchtitan.config import ConfigLoader
 from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.rl.components.work_buffer import (
+    AdaptiveRolloutGroupWorkBuffer,
+    RolloutGroupWorkBuffer,
+)
 from torchtitan.rl.controller import Controller, ValidationConfig, ValidationLoopMode
 from torchtitan.rl.examples.verifiers.data import (
     VerifiersTaskDataset,
@@ -468,3 +473,54 @@ def test_35b_sandoq_1x2_recipe_fits_three_hosts(monkeypatch) -> None:
     serve = config.rollouter.verifiers_env_server.serve
     assert serve.pool.num_workers == 39
     assert serve.pool.num_workers * serve.max_concurrent >= 920
+
+
+def test_35b_sandoq_1x2_adaptive_buffer_recipe_changes_only_the_buffer(
+    monkeypatch,
+) -> None:
+    """At the live run's 24 x 16, the adaptive variant differs from the fixed recipe only in the
+    buffer, and vLLM's max_num_seqs stays 298 in both."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq
+
+    monkeypatch.syspath_prepend(str(Path(terminal_bench_sandoq.__file__).parent))
+    monkeypatch.setenv("VF_SANDBOX_PROVIDER", "oci-runner")
+    monkeypatch.setenv("OCI_RUNNER_TASK_NETWORK", "host")
+    monkeypatch.setenv("DOME_SANDOQ_POOL", "1840")
+    monkeypatch.setenv("DOME_V2_PROMPTS", "24")
+    fixed = _terminal_bench_config("rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2")
+    adaptive = _terminal_bench_config(
+        "rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_adaptive_buffer"
+    )
+
+    assert fixed.async_loop.group_buffer == RolloutGroupWorkBuffer.Config()
+    assert adaptive.async_loop.group_buffer == AdaptiveRolloutGroupWorkBuffer.Config(
+        target_offpolicy_steps=5,
+        max_offpolicy_steps=None,
+        start_batches=6,
+        generation_capacity=192,
+    )
+    # Rollout workers: the fixed buffer's (5 + 1) x 24 slots, or generation_capacity.
+    assert fixed.async_loop.max_concurrent_rollout_groups == 144
+    assert adaptive.async_loop.max_concurrent_rollout_groups == 192
+    # max_num_seqs as `Controller.setup_async` sizes it, with the overlapped validation pass.
+    for config in (fixed, adaptive):
+        loop = config.async_loop
+        rollout_concurrency = (
+            loop.max_concurrent_rollout_groups * loop.num_samples_per_prompt
+            + loop.validation.num_samples
+        )
+        assert (
+            min(
+                math.ceil(rollout_concurrency / config.num_generators),
+                loop.max_num_seqs_per_generator,
+            )
+            == 298
+        )
+    fixed_fields, adaptive_fields = fixed.to_dict(), adaptive.to_dict()
+    for fields in (fixed_fields, adaptive_fields):
+        # `model` holds param-init closures, new function objects on every build.
+        del fields["model"]
+        del fields["async_loop"]["group_buffer"]
+        del fields["async_loop"]["max_num_seqs_per_generator"]
+    assert adaptive_fields == fixed_fields

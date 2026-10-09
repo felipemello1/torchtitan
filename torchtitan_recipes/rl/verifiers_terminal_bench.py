@@ -35,6 +35,7 @@ from torchtitan.distributed.activation_checkpoint import FullAC, RegionAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 from torchtitan.models.qwen3_5 import build_model_config
+from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
 from torchtitan.rl.controller import (
     AsyncLoopConfig,
     Controller,
@@ -583,6 +584,28 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2() -> Controller.Config:
     )
     config.async_loop.validation.interval_steps = 10
     config.async_loop.validation.loop_mode = ValidationLoopMode.OVERLAP_TRAINING
+    return config
+
+
+def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_adaptive_buffer() -> Controller.Config:
+    """`rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2` with the adaptive rollout buffer: the slot
+    count follows how many groups were not ready at recent step starts, capped so the mean policy
+    age stays at or under 5. Sized for the live run's 24 x 16 (`DOME_V2_PROMPTS=24`).
+    """
+    config = rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2()
+    config.async_loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
+        # The fixed recipe's target, which sizes its (5 + 1) x 24 slots.
+        target_offpolicy_steps=5,
+        # No age drops, as with the fixed buffer.
+        max_offpolicy_steps=None,
+        # Start at the fixed buffer's (5 + 1) x 24 = 144 slots, so a resume does not restart at 3 x 24.
+        start_batches=6,
+        # Never binds: the demand peaks at 157 on the first step start, then holds near 144. Each idle
+        # rollout worker rescans on every buffer change, so not much higher.
+        generation_capacity=192,
+    )
+    # vLLM's max_num_seqs stays the fixed recipe's 298 = (144 x 16 + 78 validation) / 8 engines; 192 groups give 394.
+    config.async_loop.max_num_seqs_per_generator = 298
     return config
 
 
