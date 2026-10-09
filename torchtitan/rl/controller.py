@@ -95,6 +95,7 @@ import os
 import time
 import warnings
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 
 # PYTORCH_CUDA_ALLOC_CONF is set in torchtitan/rl/__init__.py (before torch is imported)
 # and in train.py; see the note there.
@@ -141,14 +142,30 @@ from torchtitan.rl.types import Completion, TrainerStepBatch
 logger = logging.getLogger(__name__)
 
 
+class ValidationLoopMode(StrEnum):
+    """What training does while the pre-training or a periodic validation pass runs."""
+
+    PAUSE_TRAINER = "pause_trainer"
+    """Training waits for each pass, so every rollout in it samples one policy."""
+
+    OVERLAP_TRAINING = "overlap_training"
+    """The pass runs beside training, on the same generators. A long rollout's later turns can
+    then sample newer policies; see `validation/max_policy_version/max`. That includes the step-0
+    pass, so use PAUSE_TRAINER, or evaluate a saved checkpoint offline, for a clean pre-training
+    score."""
+
+    # TODO: DRAIN_TRAINER (single-policy pass while the trainer trains its backlog): see fork branch 61-periodic-validation.
+
+
 @dataclass(kw_only=True, slots=True)
 class ValidationConfig:
     """Held-out validation that runs before training, every `interval_steps`, and after the last step.
 
-    Example, `interval_steps=25`, `overlap_training=True`, 100 steps:
+    Example, `interval_steps=25`, `loop_mode=OVERLAP_TRAINING`, 100 steps:
         step 0:   a pass starts on policy 0; training starts at once.
-        step 7:   the pass ends and is logged at step 7. Its slowest rollouts sampled policies 0
-                  to 6: `validation/min_policy_version/min` 0, `validation/max_policy_version/max` 6.
+        step 7:   the pass ends and is logged at step 7, with `validation/launch_step` 0. Its slowest
+                  rollouts sampled policies 0 to 6: `validation/min_policy_version/min` 0,
+                  `validation/max_policy_version/max` 6.
         step 25:  the next pass starts on policy 25 or later. If a pass were still running, it
                   would start at the end of the step in which that one ends.
         step 100: a pass still running is logged at step 100; then the final pass runs alone.
@@ -163,12 +180,8 @@ class ValidationConfig:
     greedy: bool = True
     """Sample at temperature 0; False samples like training (the generator's sampling config)."""
 
-    overlap_training: bool = False
-    """False: training waits for each pass, so every rollout in it samples one policy.
-    True: the pre-training and periodic passes run beside training, on the same generators. A
-    long rollout's later turns can then sample newer policies; see `validation/max_policy_version/max`.
-    That includes the step-0 pass, so keep False, or evaluate a saved checkpoint offline, for a
-    clean pre-training score."""
+    loop_mode: ValidationLoopMode = ValidationLoopMode.PAUSE_TRAINER
+    """What training does while a pass runs; see `ValidationLoopMode`."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -488,7 +501,7 @@ class Controller(Configurable):
         self.rollout_recorder = config.rollout_recorder.build(
             dump_dir=config.dump_folder
         )
-        # With `validation.overlap_training`: the pass running beside training.
+        # With `ValidationLoopMode.OVERLAP_TRAINING`: the pass running beside training.
         self._validation_task: asyncio.Task[list[m.Metric]] | None = None
 
     async def close(self):
@@ -628,7 +641,7 @@ class Controller(Configurable):
         validation = async_loop.validation
         rollout_concurrency = (
             num_training_rollouts + validation.num_samples
-            if validation.overlap_training
+            if validation.loop_mode == ValidationLoopMode.OVERLAP_TRAINING
             else max(num_training_rollouts, validation.num_samples)
         )
         config = self.config
@@ -799,6 +812,8 @@ class Controller(Configurable):
         metrics.append(
             m.Metric("validation/group_failures", m.Sum(float(num_failed_groups)))
         )
+        # An overlapped pass is logged at the step it ends; this keeps the step it started at.
+        metrics.append(m.Metric("validation/launch_step", m.NoReduce(step)))
         # Policies the pass sampled. One, unless the pass overlaps training: then a weight sync
         # during a rollout makes its later tokens sample a newer policy.
         turns = [turn for rollout in rollouts for turn in rollout.turns]
@@ -890,7 +905,7 @@ class Controller(Configurable):
                 f"Running pre-training validation; then {num_training_steps} steps of async RL training"
             )
             sl.log_trace_instant("validation_start")
-            if async_loop.validation.overlap_training:
+            if async_loop.validation.loop_mode == ValidationLoopMode.OVERLAP_TRAINING:
                 # Generators already hold policy 0 (setup_async), so training can start right away.
                 self._start_validation(step=0)
                 pre_validation_task = self._validation_task
@@ -1068,7 +1083,7 @@ class Controller(Configurable):
         """If the pass started by `_start_validation` has ended, log it at `step`; re-raise its error.
 
         Example: a pass started at step 25 that ends during step 31 is logged at step 31, with
-        `validation/min_policy_version/min` 25. Metric backends need steps that never go back.
+        `validation/launch_step` 25. Metric backends need steps that never go back.
         """
         task = self._validation_task
         if task is None or not task.done():
@@ -1083,7 +1098,7 @@ class Controller(Configurable):
         reward_keys = sorted(key for key in set(pre) | set(post) if "reward" in key)
         logger.info("=" * 60)
         logger.info("Validation reward (pre / post):")
-        # With `overlap_training`, "pre" is the step-0 pass, which ran beside training.
+        # With `ValidationLoopMode.OVERLAP_TRAINING`, "pre" is the step-0 pass, which ran beside training.
         newest_pre_policy = pre.get("validation/max_policy_version/max", 0)
         if newest_pre_policy > 0:
             logger.info(
@@ -1249,8 +1264,8 @@ class Controller(Configurable):
             waits for:    a TrainerStepBatch in the queue
             unblocked by: _batcher_loop training_batch_queue.put()
         """
-        # With `validation.overlap_training`: a validation step asked for a pass, which waits
-        # while another pass runs.
+        # With `ValidationLoopMode.OVERLAP_TRAINING`: a validation step asked for a pass, which
+        # waits while another pass runs.
         validation_requested = False
         for step in range(self.start_step + 1, num_training_steps + 1):
             sl.set_step(step)  # propagate the step counter to the actors
@@ -1384,7 +1399,7 @@ class Controller(Configurable):
                 and step % validation.interval_steps == 0
                 and step < num_training_steps
             )
-            if validation.overlap_training:
+            if validation.loop_mode == ValidationLoopMode.OVERLAP_TRAINING:
                 self._log_finished_validation(step=step)
                 if is_validation_step:
                     validation_requested = True
