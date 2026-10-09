@@ -199,14 +199,12 @@ def rl_chess_qwen3_5_4b(
 def rl_chess_qwen3_5_35b_a3b(
     max_plies: int = 120,
     max_thinking_tokens: int = 1024,
-    opening_max_thinking_tokens: int = 2048,
     max_context_tokens: int = 131072,
 ) -> Controller.Config:
     """Qwen3.5-35B-A3B (instruct) with thinking on, 150 steps on three GB300 hosts, 192 positions x 8
     games per step.
 
-    A turn thinks up to `max_thinking_tokens` (a player's first 5 turns up to
-    `opening_max_thinking_tokens`); then `ThinkingBudget` closes the thinking and starts
+    A turn thinks up to `max_thinking_tokens`; then `ThinkingBudget` closes the thinking and starts
     the answer with "\\boxed{", and the reward loses up to 0.1 for force-closed turns. A player keeps
     its own past thinking in its history (never the opponent's), so the history grows up to
     ~`max_thinking_tokens` per turn: 120 plies x 1k thinking need ~100k of `max_context_tokens`
@@ -217,9 +215,8 @@ def rl_chess_qwen3_5_35b_a3b(
     runs. Hosts 1-2 run eight one-GPU generators, each with every expert, FULL CUDA graphs: with
     thinking on, generation is the bottleneck.
     """
-    # Room for the answer after the thinking ends, forced or not. The opening budget sets every turn's
-    # cap: by default 2,560 instead of 1,536, and `max_rollout_tokens` drops to 128,512.
-    max_response_tokens = max(max_thinking_tokens, opening_max_thinking_tokens) + 512
+    # room for the answer after the thinking ends, forced or not
+    max_response_tokens = max_thinking_tokens + 512
     # `max_context_tokens` must be a multiple of 1,024 so ChunkedLossWrapper splits each TP rank's
     # sequence into equal chunks.
     max_rollout_tokens = max_context_tokens - max_response_tokens
@@ -250,11 +247,8 @@ def rl_chess_qwen3_5_35b_a3b(
         "sf_elo2500",
     )
     # The answer ends at the box's closing brace, so a forced move is never lost to the token cap.
-    # A player's first 5 turns think longer: at 1,024 tokens, 76-100% of them were force-closed.
     worker.thinking_budget = ThinkingBudget.Config(
         max_thinking_tokens=max_thinking_tokens,
-        opening_max_thinking_tokens=opening_max_thinking_tokens,
-        opening_turns=5,
         answer_prefix="\\boxed{",
         answer_end_text="}",
     )
@@ -327,14 +321,13 @@ def rl_chess_qwen3_5_35b_a3b(
 
 
 def rl_chess_qwen3_5_4b_gb300(
-    max_plies: int = 60,
+    max_plies: int = 50,
     max_thinking_tokens: int = 1024,
-    opening_max_thinking_tokens: int = 2048,
     max_context_tokens: int = 131072,
 ) -> Controller.Config:
     """The 35B GB300 recipe with Qwen3.5-4B (instruct): same thinking budget, context, and eight
-    one-GPU generators on hosts 1-2; host 0 trains the dense 4B with FSDP 4. Games stop at 60 plies
-    and a step trains 96 positions x 8 games, half the 35B's, so a step takes ~1/4 of the tokens.
+    one-GPU generators on hosts 1-2; host 0 trains the dense 4B with FSDP 4. A step trains 96
+    positions x 8 games, half the 35B's, and the ply cap grows from 50 to 150 over steps 50-150.
 
     The 4B's fp32 weights, grads and Adam state take ~16 GB per trainer GPU (the 35B's ~140 GB), so
     the trainer spends the memory on selective activation checkpointing instead of full recompute.
@@ -342,7 +335,6 @@ def rl_chess_qwen3_5_4b_gb300(
     config = rl_chess_qwen3_5_35b_a3b(
         max_plies=max_plies,
         max_thinking_tokens=max_thinking_tokens,
-        opening_max_thinking_tokens=opening_max_thinking_tokens,
         max_context_tokens=max_context_tokens,
     )
     config.model = build_model_config(
@@ -350,6 +342,8 @@ def rl_chess_qwen3_5_4b_gb300(
     )
     config.hf_assets_path = "torchtitan/rl/example_checkpoint/Qwen3.5-4B"
     config.async_loop.num_prompts_per_train_step = 96
+    # The ply cap grows one ply per step: 50 at step 50 (the resume point) to 150 at step 150.
+    config.rollouter.worker.max_plies_schedule = ((50, 50), (150, 150))
     config.dump_folder = "outputs/rl/qwen3_5_4b_chess_gb300"
     trainer = config.trainer
     trainer.parallelism = ParallelismConfig(data_parallel_shard_degree=4)

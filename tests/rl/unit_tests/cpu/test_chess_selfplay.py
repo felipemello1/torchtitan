@@ -17,6 +17,8 @@ from renderers import Qwen3RendererConfig
 
 from torchtitan.components.renderer import from_renderers
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
+
+from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.examples.chess_selfplay import (
     BOTS,
     BotSpec,
@@ -808,3 +810,19 @@ def test_worker_puts_a_bot_game_forfeit_on_its_turn(
         ]
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "step,expected",
+    [(None, 40), (10, 50), (50, 50), (100, 100), (149, 149), (400, 150)],
+)
+def test_max_plies_schedule_follows_the_train_step(monkeypatch, step, expected) -> None:
+    worker = ChessSelfPlayWorker.Config(
+        rubric=Rubric.Config(reward_fns=[RewardChessScore.Config()]),
+        message_env=ChessPlayerEnv.Config(),
+        token_env=TokenEnv.Config(step_timeout_s=None),
+        max_plies=40,
+        max_plies_schedule=((50, 50), (150, 150)),
+    ).build()
+    monkeypatch.setattr(sl, "get_step", lambda: step)
+    assert worker._scheduled_max_plies() == expected

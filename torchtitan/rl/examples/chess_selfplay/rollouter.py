@@ -14,6 +14,8 @@ from typing import ClassVar, TYPE_CHECKING
 
 import chess
 
+from torchtitan.observability import structured_logger as sl
+
 from torchtitan.rl.examples.chess_selfplay.bots import (
     BOTS,
     centipawn_losses,
@@ -73,6 +75,10 @@ class ChessSelfPlayWorker(RolloutWorker):
         """Plies (half-moves, both players) after which a game ends as a draw, adjusted by material.
         Rewards scale with the share of it played (see `ChessGame.rewards`), so any value works."""
 
+        max_plies_schedule: tuple[tuple[int, int], ...] = ()
+        """(train step, max plies) points: a new game's cap moves linearly between them and holds past
+        the ends, e.g. ((50, 50), (150, 150)) grows it by one ply per step. Empty: always `max_plies`."""
+
         stockfish_path: str | None = None
         """Stockfish binary for bot games and for scoring the policy's moves (centipawn loss).
         `None`: self-play only, and no move scoring."""
@@ -92,6 +98,7 @@ class ChessSelfPlayWorker(RolloutWorker):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self._max_plies = config.max_plies
+        self._max_plies_schedule = config.max_plies_schedule
         self._stockfish_path = executable_stockfish(config.stockfish_path)
         self._curriculum = config.bot_curriculum
         self._curriculum_win_rate = config.curriculum_win_rate
@@ -122,6 +129,7 @@ class ChessSelfPlayWorker(RolloutWorker):
             One scored `RolloutGroup`, one rollout per player that made at least one move.
         """
         level = self._level
+        max_plies = self._scheduled_max_plies()
         curriculum_group = sample.opponent == "curriculum"
         if curriculum_group:
             sample = replace(sample, opponent=self._curriculum[level])
@@ -139,7 +147,7 @@ class ChessSelfPlayWorker(RolloutWorker):
         games = [
             ChessGame(
                 sample=sample,
-                max_plies=self._max_plies,
+                max_plies=max_plies,
                 seed=sample.seed + game_idx,
                 bot=bot,
             )
@@ -262,6 +270,9 @@ class ChessSelfPlayWorker(RolloutWorker):
                     games, rollouts, sample=sample, losses_per_game=losses_per_game
                 )
             )
+            rollouts[0].turns[-1].metrics.append(
+                m.Metric("chess_games/max_plies", m.Mean(float(max_plies)))
+            )
             if curriculum_group:
                 rollouts[0].turns[-1].metrics.append(
                     m.Metric(
@@ -270,6 +281,24 @@ class ChessSelfPlayWorker(RolloutWorker):
                     )
                 )
         return RolloutGroup(group_id=group_id, rollouts=rollouts)
+
+    def _scheduled_max_plies(self) -> int:
+        """`max_plies`, or `max_plies_schedule` read at the controller's current train step.
+
+        Example: schedule ((50, 50), (150, 150)) -> 50 up to step 50, 100 at step 100, 150 from step 150.
+        """
+        step = sl.get_step()
+        points = self._max_plies_schedule
+        if not points or step is None:
+            return self._max_plies
+        if step <= points[0][0]:
+            return points[0][1]
+        for (step0, plies0), (step1, plies1) in zip(points, points[1:]):
+            if step <= step1:
+                return round(
+                    plies0 + (plies1 - plies0) * (step - step0) / (step1 - step0)
+                )
+        return points[-1][1]
 
     async def _run_player(
         self,
