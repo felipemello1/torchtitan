@@ -462,7 +462,7 @@ def test_35b_sandoq_1x2_recipe_fits_three_hosts(monkeypatch) -> None:
     assert loop.target_offpolicy_steps == 5
     assert loop.validation == ValidationConfig(
         num_samples=78,
-        interval_steps=10,
+        interval_steps=25,
         greedy=True,
         loop_mode=ValidationLoopMode.OVERLAP_TRAINING,
     )
