@@ -190,7 +190,8 @@ def test_training_samples_skip_the_forced_tokens() -> None:
     # turn 0 was force-closed; turn 1 continues the same prefix and was not
     turn0 = RolloutTurn(
         rollout_id=RolloutTurnID(group_id=0, rollout_id=0, turn_id=0),
-        prompt_token_ids=[5, THINK],
+        prompt_prefix_len=0,
+        prompt_delta_token_ids=[5, THINK],
         completion_token_ids=[10, 11, *FORCED, 20],
         completion_logprobs=[-0.5, -0.5, math.nan, math.nan, math.nan, -0.5],
         completion_loss_mask=[True, True, False, False, False, True],
@@ -200,7 +201,9 @@ def test_training_samples_skip_the_forced_tokens() -> None:
     turn1 = replace(
         turn0,
         rollout_id=RolloutTurnID(group_id=0, rollout_id=0, turn_id=1),
-        prompt_token_ids=[5, THINK, 10, 11, *FORCED, 20, 6],
+        # continues turn 0's prompt + completion with the env reply [6]
+        prompt_prefix_len=len([5, THINK, 10, 11, *FORCED, 20]),
+        prompt_delta_token_ids=[6],
         completion_token_ids=[30],
         completion_logprobs=[-0.5],
         completion_loss_mask=None,

@@ -43,6 +43,7 @@ from torchtitan.rl.rollout.types import (
     RolloutGroup,
     RolloutStatus,
     RolloutTurn,
+    split_prompt,
 )
 from torchtitan.rl.rubric import RewardFn, Rubric
 from torchtitan.rl.types import RolloutTurnID
@@ -396,6 +397,8 @@ class VerifiersRollouter(Rollouter):
         replied_nodes: set[int] = set()
         last_turn_by_node: dict[int, RolloutTurn] = {}
         turns: list[RolloutTurn] = []
+        # The last appended turn's prompt + completion, across branches
+        previous_token_ids: list[int] = []
 
         for branch in trace.branches:
             token_ids = branch.token_ids
@@ -413,6 +416,10 @@ class VerifiersRollouter(Rollouter):
                 for start, end in _trainable_token_spans(mask):
                     absolute_start = branch_offset + start
                     absolute_end = branch_offset + end
+                    prompt_prefix_len, prompt_delta_token_ids = split_prompt(
+                        token_ids[:absolute_start], previous_token_ids
+                    )
+                    previous_token_ids = token_ids[:absolute_end]
                     completion_token_ids = list(token_ids[absolute_start:absolute_end])
                     completion_logprobs = list(logprobs[absolute_start:absolute_end])
                     loss_mask = generation_metadata.loss_masks.get(
@@ -432,7 +439,8 @@ class VerifiersRollouter(Rollouter):
                                 rollout_id=rollout_id,
                                 turn_id=len(turns),
                             ),
-                            prompt_token_ids=list(token_ids[:absolute_start]),
+                            prompt_prefix_len=prompt_prefix_len,
+                            prompt_delta_token_ids=prompt_delta_token_ids,
                             completion_token_ids=completion_token_ids,
                             completion_logprobs=completion_logprobs,
                             completion_loss_mask=loss_mask,
