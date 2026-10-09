@@ -81,8 +81,8 @@ class ChessPlayerEnv(MessageEnv):
             "positions and legal moves are already given: avoid restating them. Analyze which move "
             "is best, then end your reply with that move, written exactly as listed, inside "
             '\\boxed{}. For example, "Pe2": ["e4"] means \\boxed{e4}, not \\boxed{Pe4}; '
-            '"Nb1": ["Nbd2"] means \\boxed{Nbd2}, not \\boxed{Nd2}. An illegal or missing move '
-            "loses the game."
+            '"Nb1": ["Nbd2"] means \\boxed{Nbd2}, not \\boxed{Nd2}. An x marks a capture: '
+            '"Nf3": ["Nxe5"] means \\boxed{Nxe5}. An illegal or missing move loses the game.'
         )
         return MessageEnvInitOutput(
             init_prompt_messages=[
@@ -372,9 +372,11 @@ def _resolve_captures(
 
 def _parse_move(board: chess.Board, move_text: str) -> chess.Move | None:
     """Return the legal move whose SAN, as the prompt lists it, is `move_text`, else `None`.
-    The check mark is optional, plain or LaTeX-escaped: `Qf1#`, `Qf1\\#` and `Qf1` all match."""
-    text = re.sub(r"\\?[+#]$", "", move_text.strip())
+    The check mark (plain or LaTeX-escaped) and the capture's `x` are optional: `Qxf1#`, `Qxf1\\#`,
+    `Qf1#` and `Qf1` all match `Qxf1#`. A move to a square is a capture or not, never both, so each
+    legal move still has one form without them."""
+    text = re.sub(r"\\?[+#]$", "", move_text.strip()).replace("x", "")
     for move in board.legal_moves:
-        if board.san(move).rstrip("+#") == text:
+        if board.san(move).rstrip("+#").replace("x", "") == text:
             return move
     return None

@@ -75,7 +75,7 @@ def test_checkmate_ends_the_game() -> None:
 
 @pytest.mark.parametrize(
     "move_text",
-    ["Ke9", "e5", "--", "", None, "g1f3", "Pe4", "Ng1-Nf3", "Nxf3", "Ngf3", "Nf3!?"],
+    ["Ke9", "e5", "--", "", None, "g1f3", "Pe4", "Ng1-Nf3", "Ngf3", "Nf3!?"],
 )
 def test_illegal_or_missing_move_forfeits(move_text) -> None:
     async def run() -> None:
@@ -87,13 +87,24 @@ def test_illegal_or_missing_move_forfeits(move_text) -> None:
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("move_text", ["Nf3", " Nf3 ", "Nf3+", "Nf3\\#"])
+@pytest.mark.parametrize("move_text", ["Nf3", " Nf3 ", "Nf3+", "Nf3\\#", "Nxf3"])
 def test_the_listed_move_is_accepted(move_text) -> None:
     async def run() -> None:
         game = _new_game()
         await game.play(chess.WHITE, move_text)
         assert not game.is_over
         assert game.board.peek() == chess.Move.from_uci("g1f3")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("move_text", ["Qxf7+", "Qf7+", "Qf7"])
+def test_a_capture_is_accepted_with_or_without_its_x(move_text) -> None:
+    async def run() -> None:
+        game = _new_game()
+        await _play_moves(game, ["e4", "e5", "Qh5", "Nc6", move_text])
+        assert not game.is_over
+        assert game.board.peek() == chess.Move.from_uci("h5f7")
 
     asyncio.run(run())
 
@@ -355,6 +366,7 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
         assert prompt.endswith("Write your best legal move inside \\boxed{}.")
         # one right and one wrong way to write a move
         assert "means \\boxed{Nbd2}, not \\boxed{Nd2}" in prompt
+        assert "An x marks a capture" in prompt
 
         white_step = asyncio.create_task(
             white.step({"role": "assistant", "content": "I open. \\boxed{e4}"})

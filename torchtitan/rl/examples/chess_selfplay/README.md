@@ -18,7 +18,7 @@ Black's first prompt after 1. e4, in full (games start a random number of plies 
 ```text
 You are playing chess as Black. Play to win.
 
-Each turn you see your pieces and your opponent's pieces, keyed by piece letter and square (Ke1 is a king on e1; P is a pawn), each with its legal moves. The current positions and legal moves are already given: avoid restating them. Analyze which move is best, then end your reply with that move, written exactly as listed, inside \boxed{}. For example, "Pe2": ["e4"] means \boxed{e4}, not \boxed{Pe4}; "Nb1": ["Nbd2"] means \boxed{Nbd2}, not \boxed{Nd2}. An illegal or missing move loses the game.
+Each turn you see your pieces and your opponent's pieces, keyed by piece letter and square (Ke1 is a king on e1; P is a pawn), each with its legal moves. The current positions and legal moves are already given: avoid restating them. Analyze which move is best, then end your reply with that move, written exactly as listed, inside \boxed{}. For example, "Pe2": ["e4"] means \boxed{e4}, not \boxed{Pe4}; "Nb1": ["Nbd2"] means \boxed{Nbd2}, not \boxed{Nd2}. An x marks a capture: "Nf3": ["Nxe5"] means \boxed{Nxe5}. An illegal or missing move loses the game.
 
 White played e4.
 
