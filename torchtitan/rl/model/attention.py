@@ -13,6 +13,8 @@ import torch
 from torch.nn.attention import (
     activate_flash_attention_impl,
     current_flash_attention_impl,
+    sdpa_kernel,
+    SDPBackend,
 )
 from torch.nn.attention.varlen import AuxRequest
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
@@ -249,21 +251,25 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         if self.out_transform is not None:
             extra_kwargs["return_aux"] = AuxRequest(lse=True)
 
-        result = torch.nn.attention.varlen.varlen_attn_out(
-            output[:num_actual_tokens],
-            query[:num_actual_tokens],
-            key_cache,
-            value_cache,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            scale=self.scale,
-            window_size=sliding_window_size,
-            block_table=block_table,
-            seqused_k=seqused_k,
-            **extra_kwargs,
-        )
+        # On SM90/SM100/SM103, torch's varlen_attn_out runs cuDNN whenever cuDNN
+        # supports the batch and page size; pin Flash so the FA3/FA4 activated in
+        # __init__ runs. vLLM's import disables cuDNN SDP today; don't rely on that.
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            result = torch.nn.attention.varlen.varlen_attn_out(
+                output[:num_actual_tokens],
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                scale=self.scale,
+                window_size=sliding_window_size,
+                block_table=block_table,
+                seqused_k=seqused_k,
+                **extra_kwargs,
+            )
         if self.out_transform is None:
             return result
 
