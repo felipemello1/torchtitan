@@ -46,6 +46,13 @@ class ThinkingBudget(Configurable):
         """Tokens a turn may think before its end of thinking is forced; must leave room for the
         forced text and the answer within `SamplingConfig.max_tokens`."""
 
+        opening_max_thinking_tokens: int | None = None
+        """`max_thinking_tokens` for a rollout's first `opening_turns` turns, with the same room needed
+        within `SamplingConfig.max_tokens`."""
+
+        opening_turns: int = 0
+        """How many of a rollout's first turns think up to `opening_max_thinking_tokens`."""
+
         close_text: str = (
             "\n\nConsidering the limited time by the user, I have to give the solution based on "
             "the thinking directly now.\n</think>\n\n"
@@ -74,6 +81,8 @@ class ThinkingBudget(Configurable):
 
     def __init__(self, config: Config, *, tokenizer: HuggingFaceTokenizer) -> None:
         self._max_thinking_tokens = config.max_thinking_tokens
+        self._opening_max_thinking_tokens = config.opening_max_thinking_tokens
+        self._opening_turns = config.opening_turns
         self._think_start_id = tokenizer.token_to_id(config.think_start_token)
         self._think_end_id = tokenizer.token_to_id(config.think_end_token)
         if self._think_start_id is None or self._think_end_id is None:
@@ -97,7 +106,9 @@ class ThinkingBudget(Configurable):
                 raise ValueError(f"{config.end_of_turn_token!r} must be one token")
 
     def wrap(self, generate_fn: GenerateFn) -> GenerateFn:
-        """Return a `GenerateFn` that applies the budget around `generate_fn`."""
+        """Return a `GenerateFn` that applies the budget around `generate_fn`. Wrap once per rollout:
+        each call is the rollout's next turn, which `opening_turns` counts."""
+        num_turns = 0
 
         async def generate(
             prompt_token_ids: list[int],
@@ -107,15 +118,20 @@ class ThinkingBudget(Configurable):
             routing_session_id: str | None = None,
             sampling_config: SamplingConfig | None = None,
         ) -> Completion | None:
+            nonlocal num_turns
+            max_thinking_tokens = (
+                self._opening_max_thinking_tokens
+                if num_turns < self._opening_turns
+                else self._max_thinking_tokens
+            )
+            num_turns += 1
             max_tokens = sampling_config.max_tokens
             if (
-                self._max_thinking_tokens
-                + len(self._forced_ids)
-                + bool(self._answer_end_ids)
+                max_thinking_tokens + len(self._forced_ids) + bool(self._answer_end_ids)
                 >= max_tokens
             ):
                 raise ValueError(
-                    f"max_thinking_tokens ({self._max_thinking_tokens}) + {len(self._forced_ids)} forced "
+                    f"this turn's thinking budget ({max_thinking_tokens}) + {len(self._forced_ids)} forced "
                     f"tokens must be below SamplingConfig.max_tokens ({max_tokens}), which caps the turn"
                 )
             first = await generate_fn(
@@ -124,7 +140,7 @@ class ThinkingBudget(Configurable):
                 group_id=group_id,
                 routing_session_id=routing_session_id,
                 sampling_config=replace(
-                    sampling_config, max_tokens=self._max_thinking_tokens
+                    sampling_config, max_tokens=max_thinking_tokens
                 ),
             )
             if first is None or first.finish_reason != "length":

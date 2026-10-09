@@ -200,6 +200,46 @@ def test_budget_that_leaves_no_room_for_the_answer_raises() -> None:
         )
 
 
+def test_opening_turns_think_up_to_the_opening_budget() -> None:
+    budget = ThinkingBudget(
+        ThinkingBudget.Config(
+            max_thinking_tokens=4, opening_max_thinking_tokens=6, opening_turns=2
+        ),
+        tokenizer=_Tokenizer(),
+    )
+    generate = _ScriptedGenerate(
+        *(_completion([10, END_THINK, 11], finish_reason="stop") for _ in range(4))
+    )
+
+    async def play_rollout(num_turns: int) -> None:
+        wrapped = budget.wrap(generate)
+        for turn_idx in range(num_turns):
+            await wrapped(
+                [5, THINK],
+                request_id=f"group=0/rollout=0/turn={turn_idx}",
+                group_id=0,
+                sampling_config=SamplingConfig(temperature=1.0, max_tokens=12),
+            )
+
+    asyncio.run(play_rollout(num_turns=3))
+    asyncio.run(play_rollout(num_turns=1))
+    # turns 0-1 think up to 6 tokens and turn 2 up to 4; the next rollout starts over
+    thinking_caps = [call["sampling_config"].max_tokens for call in generate.calls]
+    assert thinking_caps == [6, 6, 4, 6]
+
+
+def test_opening_budget_that_leaves_no_room_for_the_answer_raises() -> None:
+    # 4 thinking tokens + 3 forced fit in 12, but the opening turn's 9 + 3 do not
+    budget = ThinkingBudget(
+        ThinkingBudget.Config(
+            max_thinking_tokens=4, opening_max_thinking_tokens=9, opening_turns=1
+        ),
+        tokenizer=_Tokenizer(),
+    )
+    with pytest.raises(ValueError, match="must be below SamplingConfig.max_tokens"):
+        _run(budget, _ScriptedGenerate(), prompt=[5, THINK], max_tokens=12)
+
+
 def test_delimiters_must_be_single_tokens() -> None:
     with pytest.raises(ValueError, match="must each be one token"):
         ThinkingBudget(
