@@ -346,6 +346,35 @@ def test_math_verifier_compares_at_the_precision_of_a_rounded_gold() -> None:
     assert score_math_response(r"\boxed{0.31831}", "0.3183098") == 1.0
 
 
+def test_math_verifier_drops_units_but_not_variables() -> None:
+    # Math-Verify's units include these letters, so it reads `2 - c` as `2 -`.
+    for letter in "cmgthsdlo":
+        response = r"\boxed{-c + 2}".replace("c", letter)
+        assert score_math_response(response, "2 - " + letter) == 1.0
+    assert score_math_response(r"\boxed{2 - c}", "2-c") == 1.0
+    assert score_math_response(r"\boxed{3x + a + b + c}", "a + b + c + 3x") == 1.0
+    assert score_math_response(r"\boxed{\frac{8h}{5}}", r"\frac{8}{5} h") == 1.0
+    assert score_math_response(r"\boxed{100a+b+c}", " 100a + b + c ") == 1.0
+    # A unit after a number, or in `\text`, still drops.
+    assert score_math_response(r"\boxed{5 cm}", "5") == 1.0
+    assert score_math_response(r"\boxed{3 h}", "3") == 1.0
+    assert score_math_response(r"\boxed{1}", r"1 \text{ cm}") == 1.0
+    assert score_math_response(r"\boxed{EF = 8}", r"EF = 8 \text{ cm}") == 1.0
+    assert score_math_response(r"\boxed{2^{n-1} \text{ ways}}", "2^{n-1}") == 1.0
+    # If keeping the units does not parse, Math-Verify's parse is used.
+    response = r"\boxed{f(x) = a x + b \text{ where } a, b \in \mathbb{R}}"
+    assert score_math_response(response, "f(x)=ax+b") == 1.0
+    # A dropped variable no longer matches what is left.
+    assert score_math_response(r"\boxed{a + c}", "a + b + c") == 0.0
+    assert score_math_response(r"\boxed{2 - m}", "2 - c") == 0.0
+    assert score_math_response(r"\boxed{4}", "n = 4m") == 0.0
+    assert score_math_response(r"\boxed{70}", "15+55m") == 0.0
+    assert score_math_response(r"\boxed{\frac{2}{3} R^2}", r"\frac{2}{3} R^2 h") == 0.0
+    # Math-Verify reads the padded gold as 100, and `12 + 3 h (` as 3.
+    assert score_math_response(r"\boxed{100}", " 100a + b + c ") == 0.0
+    assert score_math_response(r"\boxed{12 + 3 h (}", "3") == 0.0
+
+
 def test_math_verifier_uses_the_last_boxed_answer() -> None:
     response = r"Work: \boxed{2003^{2002^{2001}}}" "\n" r"Answer: \boxed{34}"
     assert score_math_response(response, "34") == 1.0
