@@ -476,30 +476,57 @@ def test_stall_driven_demand_quantile_uses_every_point_of_the_lookback() -> None
 
     history = [44, 46, 41, 48, 45, 47, 50, 43, 46, 45]
     # mean 45.5, sd 2.55, Student-t prediction multiplier for 10 samples at 95% = 1.92 -> 50.4 -> 51 (above the max seen)
-    assert estimate_next_unavailable_upper_bound(history=history, probability=0.95) == 51
-    assert estimate_next_unavailable_upper_bound(history=[45, 45, 45], probability=0.95) == 45
+    assert (
+        estimate_next_unavailable_upper_bound(history=history, probability=0.95) == 51
+    )
+    assert (
+        estimate_next_unavailable_upper_bound(history=[45, 45, 45], probability=0.95)
+        == 45
+    )
     assert estimate_next_unavailable_upper_bound(history=[24], probability=0.95) == 24
     assert round(prediction_multiplier(samples=10, probability=0.95), 3) == 1.923
     assert round(prediction_multiplier(samples=1000, probability=0.95), 2) == 1.65
     assert mean_age_ceiling(
-        num_prompts_per_train_step=8, mean_age_limit=4, groups_generating=40, untrainable_share=0.36
+        num_prompts_per_train_step=8,
+        mean_age_limit=4,
+        groups_generating=40,
+        untrainable_share=0.36,
     ) == pytest.approx(54.4)
     # half the gap, the same up and down, rounded away from the current value
-    assert smooth_demand_toward_needed(current_demand=64, demand_needed=59, damping_factor=0.5) == 61
-    assert smooth_demand_toward_needed(current_demand=64, demand_needed=73, damping_factor=0.5) == 69
-    assert smooth_demand_toward_needed(current_demand=64, demand_needed=65, damping_factor=0.5) == 65
+    assert (
+        smooth_demand_toward_needed(
+            current_demand=64, demand_needed=59, damping_factor=0.5
+        )
+        == 61
+    )
+    assert (
+        smooth_demand_toward_needed(
+            current_demand=64, demand_needed=73, damping_factor=0.5
+        )
+        == 69
+    )
+    assert (
+        smooth_demand_toward_needed(
+            current_demand=64, demand_needed=65, damping_factor=0.5
+        )
+        == 65
+    )
 
 
 def test_stall_driven_demand_starts_at_three_batches_and_moves_half_the_gap() -> None:
     demand = StallDrivenDemand(num_prompts_per_train_step=8, max_offpolicy_steps=10)
     assert demand.demand == 24
     # nothing ready: unavailable 24, one sample -> quantile 24, needed 8 + 24 + 1 = 33, half the gap up: 24 + 5
-    assert demand.observe(step=1, ready=0, generating=24, completed=0, trainable=0) == 29
+    assert (
+        demand.observe(step=1, ready=0, generating=24, completed=0, trainable=0) == 29
+    )
     assert demand.state == "ok"
     # a full shelf: unavailable max(0, 29 - 40) = 0; history [24, 0] -> mean 12, sd 17, two samples give a wide
     # margin (t = 7.5): quantile 128 -> needed 137. The ceiling at the max caps it: 10 x 8 + 8 + mean(24, 0) x
     # (1 - 40 / 40) = 88. Half the gap up from 29: 29 + 30
-    assert demand.observe(step=2, ready=40, generating=0, completed=40, trainable=40) == 59
+    assert (
+        demand.observe(step=2, ready=40, generating=0, completed=40, trainable=40) == 59
+    )
     assert demand.state == "age-limited"
 
 
@@ -533,17 +560,22 @@ def test_stall_driven_demand_without_a_max_has_no_ceiling_and_drops_nothing() ->
     demand = StallDrivenDemand(num_prompts_per_train_step=2, max_offpolicy_steps=None)
     for step in range(1, 11):
         demand.observe(step=step, ready=0, generating=6, completed=0, trainable=0)
-    assert demand.demand > 8 and demand.state == "ok"  # with a max of 1 the ceiling would have held it at 8
+    # with a max of 1 the ceiling would have held it at 8
+    assert demand.demand > 8 and demand.state == "ok"
 
     async def run() -> None:
         buffer = AdaptiveRolloutGroupWorkBuffer.Config(
             max_offpolicy_steps=None, generation_capacity=4
         ).build(num_prompts_per_train_step=2)
-        assert buffer.max_offpolicy_steps is None and buffer.max_active_rollout_groups is None
+        assert (
+            buffer.max_offpolicy_steps is None
+            and buffer.max_active_rollout_groups is None
+        )
         await _admit(buffer, 0)
         await buffer.claim_next()  # g0 generates under version 0
         await _finalize(buffer, 0)
-        selected = await buffer.take_finalized(consuming_policy_version=50)  # 50 versions old: kept
+        # 50 versions old: kept
+        selected = await buffer.take_finalized(consuming_policy_version=50)
         assert selected is not None and selected.group_id == 0
         assert _metric_value(buffer.metrics(), "rollout_buffer/dropped_too_old") == 0
 
@@ -664,20 +696,24 @@ def test_adaptive_buffer_target_offpolicy_steps_caps_demand() -> None:
     config = AdaptiveRolloutGroupWorkBuffer.Config(
         max_offpolicy_steps=10, generation_capacity=40, target_offpolicy_steps=5
     )
-    assert config.max_active_rollout_groups(num_prompts_per_train_step=4) == 84  # physical: 40 + 11 x 4
+    # physical: 40 + 11 x 4
+    assert config.max_active_rollout_groups(num_prompts_per_train_step=4) == 84
     buffer = config.build(num_prompts_per_train_step=4)
     assert buffer._active_group_limit() == 12  # three batches to start
 
     async def run() -> None:
         for _ in range(12):
-            await buffer.record_step_start(trainer_policy_version=0)  # nothing generating, nothing completed
+            # nothing generating, nothing completed
+            await buffer.record_step_start(trainer_policy_version=0)
         # nothing generating and no completions: ceiling 20 + 4 + 0 = 24, however short the shelf
         assert buffer._active_group_limit() == 24
         assert buffer._demand.state == "age-limited"
 
     asyncio.run(run())
     with pytest.raises(ValueError, match="target_offpolicy_steps"):
-        AdaptiveRolloutGroupWorkBuffer.Config(generation_capacity=40, target_offpolicy_steps=0)
+        AdaptiveRolloutGroupWorkBuffer.Config(
+            generation_capacity=40, target_offpolicy_steps=0
+        )
     with pytest.raises(ValueError, match="target_offpolicy_steps"):
         AdaptiveRolloutGroupWorkBuffer.Config(
             max_offpolicy_steps=4, generation_capacity=40, target_offpolicy_steps=5

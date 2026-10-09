@@ -99,7 +99,8 @@ class StallDrivenDemand:
     start_batches: int = 3
     damping_factor: float = 0.5
     demand: int = field(init=False)
-    state: str = field(default="ok", init=False)  # "ok", or "age-limited" while the ceiling binds
+    # "ok", or "age-limited" while the ceiling binds
+    state: str = field(default="ok", init=False)
     _unavailable: deque = field(init=False)
     _generating: deque = field(init=False)
     _completed: deque = field(init=False)
@@ -156,7 +157,8 @@ class StallDrivenDemand:
                 num_prompts_per_train_step=P,
                 mean_age_limit=mean_age_limit,
                 groups_generating=statistics.mean(self._generating),
-                untrainable_share=1.0 - sum(self._trainable) / max(1, sum(self._completed)),
+                untrainable_share=1.0
+                - sum(self._trainable) / max(1, sum(self._completed)),
             )
             demand_needed, self.state = clamp_demand_needed(
                 demand_needed=demand_needed,
@@ -226,7 +228,8 @@ def prediction_multiplier(
     # Student-t quantile from the normal quantile z (no library function for it without scipy). Cornish-Fisher series
     # in powers of 1 / dof:
     #   t = z + (z^3 + z) / (4 dof) + (5 z^5 + 16 z^3 + 3 z) / (96 dof^2) + (3 z^7 + 19 z^5 + 17 z^3 - 15 z) / (384 dof^3)
-    # Table check: dof 9 at 95% -> 1.833 (exact 1.833); dof 4 at 95% -> 2.13 (exact 2.132). Same as scipy.stats.t.ppf(probability, dof).
+    # Table check: dof 9 at 95% -> 1.833 (exact 1.833); dof 4 at 95% -> 2.13 (exact 2.132).
+    # Same as scipy.stats.t.ppf(probability, dof).
     t = (
         z
         + (z**3 + z) / (4 * dof)

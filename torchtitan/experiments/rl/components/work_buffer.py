@@ -754,7 +754,9 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
                     "deployment limit"
                 )
 
-        def max_active_rollout_groups(self, num_prompts_per_train_step: int) -> int | None:
+        def max_active_rollout_groups(
+            self, num_prompts_per_train_step: int
+        ) -> int | None:
             """Most groups the pipeline can physically hold: generation capacity plus the age window; None without an age cap."""
             assert self.generation_capacity is not None
             if self.max_offpolicy_steps is None:
@@ -927,7 +929,9 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
             # the rule's observable: slots that held no ready group at the step start
             m.Metric(
                 "rollout_buffer/unavailable_at_step_start",
-                m.NoReduce(float(max(0, self._demand.demand - self._ready_at_step_start))),
+                m.NoReduce(
+                    float(max(0, self._demand.demand - self._ready_at_step_start))
+                ),
             ),
             m.Metric(
                 "rollout_buffer/dropped_too_old",
