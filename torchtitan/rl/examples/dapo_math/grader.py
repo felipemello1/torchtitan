@@ -26,7 +26,8 @@ from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import connection
 
 from math_verify import parse, verify
-from sympy import Eq
+from sympy import And, Eq, Symbol
+from sympy.core.relational import Relational
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +36,11 @@ _BOXED_START = r"\boxed{"
 _THIN_SPACE_IN_NUMBER = re.compile(r"(?<=\d)\\,(?=\d{3}(?!\d))")
 # `\leqq` and `\geqq`; Math-Verify reads `p\leqq0` as `p \le q \cdot 0`.
 _LEQQ = re.compile(r"\\([lg]e)qq")
-# Where a trailing qualifier starts, once LaTeX spaces are plain spaces: `, k \in \mathbb{Z}`,
-# `(a,b \in \mathbb{R})`, `\text{ for all } n`, `\forall n`.
+# Where a trailing qualifier starts, once LaTeX spaces are plain spaces: `\text{ for all } n`,
+# `\forall n`, `, k \in \mathbb{Z}`, `(a,b \in \mathbb{R})`.
 _QUALIFIER = re.compile(
-    r"\\text\{\s*for\s+(?:all|any|each|every|some)\b|\\forall\b"
+    r"\\text\{\s*for\s+(?:all|any|each|every|some)\b"
+    r"|\\forall\b"
     r"|[,(]\s*[A-Za-z](?:\s*,\s*[A-Za-z]){0,3}\s*\\in\s*\\mathbb"
 )
 # A decimal gold like `16.67`, often rounded from an exact `\frac{50}{3}`.
@@ -121,15 +123,15 @@ def score_math_response(response: str, ground_truth: str) -> float:
     """Score the final `\\boxed{}` expression with Math-Verify, in this process.
 
     If answer and gold are each a 3+ letter word, they compare as lowercase strings.
-    A boxed `A_{\\min} = \\frac12` scores by its right side; so does a gold `\\frac{9}{9} = 1`
-    against an answer without `=`.
+    A boxed `A_{\\min} = \\frac12` scores by its right side.
     Degrees read as radians when only one side has a `\\pi`: `60^\\circ` matches `\\frac{\\pi}{3}`.
-    These also match, though Math-Verify alone misses them:
-    - `-12\\%` and `-12`: a `\\%` on one side;
-    - `\\frac{50}{3}` and `16.67`: a gold rounded to 3+ significant digits;
-    - `-1 < x < 2` and `(-1, 2)`;
+    These answer and gold pairs also match, though Math-Verify alone misses them:
     - `p \\le 0` and `p \\leqq 0`;
-    - `x = 2k\\pi,\\ k \\in \\mathbb{Z}` and `2k\\pi`: a trailing qualifier.
+    - `-12\\%` and `-12`: a `\\%` on one side;
+    - `x = 2k\\pi,\\ k \\in \\mathbb{Z}` and `2k\\pi`: a trailing qualifier;
+    - `-1 < x < 2` and `(-1, 2)`: a solved inequality and its interval;
+    - `1` and `\\frac{9}{9} = 1`: a gold whose left side has no symbols;
+    - `\\frac{50}{3}` and `16.67`: a gold rounded to 3+ significant digits.
     No timeout: on an event loop, use `MathVerifyPool.score` instead.
 
     Args:
@@ -163,7 +165,8 @@ def score_math_response(response: str, ground_truth: str) -> float:
     try:
         if _matches(ground_truth, boxed_text):
             return 1.0
-        # Math-Verify matches `12\%` with `12`, but not `-12\%` with `-12`; retry without `\%`.
+        # Math-Verify matches `12\%` with `12`, but not `-12\%` with `-12`. Retry without `\%`,
+        # so `0.5\%` also matches gold 0.5.
         if "\\%" in ground_truth + boxed_text and _matches(
             ground_truth.replace("\\%", ""), boxed_text.replace("\\%", "")
         ):
@@ -176,11 +179,16 @@ def score_math_response(response: str, ground_truth: str) -> float:
             return 1.0
         # For an answer without `=`, Math-Verify drops a gold's left side only if it is all
         # symbols (`x = 5`). Drop one with no symbols too: `\frac{9}{9} = 1`, or `\gamma = 120^\circ`
-        # (`\gamma` reads as Euler's constant).
-        if "=" in ground_truth and "=" not in boxed_text:
+        # (`\gamma` reads as Euler's constant). Skip an `=` in braces, as in `\sum_{k=1}^{10} k`.
+        gold_left_side, _, gold_right_side = ground_truth.rpartition("=")
+        if (
+            gold_left_side
+            and "=" not in boxed_text
+            and gold_right_side.count("{") == gold_right_side.count("}")
+        ):
             gold = parse(_BOXED_START + ground_truth + "}", parsing_timeout=None)
             if gold and isinstance(gold[0], Eq) and not gold[0].lhs.free_symbols:
-                return score_math_response(response, ground_truth.rpartition("=")[2])
+                return score_math_response(response, gold_right_side)
         # Math-Verify reads `x = 5` as 5 but cannot parse a named left side like `A_{\min} = \frac12`.
         # Retry on the right side of the last `=`, unless that `=` is in `>=`, `<=`, `!=` or braces,
         # the box is a list, or the gold is an equation (`y = 3` would then match gold `x = 3`).
@@ -216,37 +224,55 @@ def _last_boxed_expression(text: str) -> str | None:
 
 
 def _matches(gold: str, answer: str) -> bool:
-    """Return whether Math-Verify equates two boxed texts.
+    """Return whether Math-Verify equates a gold and an answer, each boxed first.
 
-    A decimal gold with 3+ significant digits compares at its own decimals (6 at most), so
-    `\\frac{50}{3}` matches `16.67`; `\\frac{19}{100}` still misses `0.2`, which is likely exact.
+    A decimal gold with 3+ significant digits compares at its own decimals (at most 6,
+    Math-Verify's default), so `\\frac{50}{3}` matches `16.67`, while `\\frac{19}{100}` still
+    misses `0.2`, which is likely exact. An exact `12.5` then also accepts `12.46`.
     """
+    float_rounding = 6
     decimal = _DECIMAL.fullmatch(gold)
-    rounded = decimal and len((decimal[1] + decimal[2]).lstrip("0")) >= 3
+    if decimal and len((decimal[1] + decimal[2]).lstrip("0")) >= 3:
+        float_rounding = min(len(decimal[2]), 6)
+    answer_parsed = parse(_BOXED_START + answer + "}", parsing_timeout=None)
     return verify(
         # Box the gold like the answer: a bare `2\sqrt{3}` parses as 2, and a
         # bare `(1,2)` or `\pi/4` parses to nothing.
         parse(_BOXED_START + gold + "}", parsing_timeout=None),
-        parse(_BOXED_START + answer + "}", parsing_timeout=None),
-        float_rounding=min(len(decimal[2]), 6) if rounded else 6,
-        # Also match an answer `-1 < x < 2` with gold `(-1, 2)`; the reverse matches by default.
-        allow_set_relation_comp=True,
+        answer_parsed,
+        float_rounding=float_rounding,
+        # Also match a solved `-1 < x < 2` with gold `(-1, 2)`; the reverse matches by default.
+        # Math-Verify would solve an unsolved `x^2 - 3x + 2 < 0`, e.g. copied from the problem.
+        allow_set_relation_comp=bool(answer_parsed) and _is_solved(answer_parsed[0]),
         timeout_seconds=None,
+    )
+
+
+def _is_solved(answer: object) -> bool:
+    """Return whether each relation compares a lone symbol with a constant, as in `-1 < x < 2`."""
+    relations = answer.args if isinstance(answer, And) else (answer,)
+    return all(
+        isinstance(relation, Relational)
+        and (
+            (isinstance(relation.lhs, Symbol) and not relation.rhs.free_symbols)
+            or (isinstance(relation.rhs, Symbol) and not relation.lhs.free_symbols)
+        )
+        for relation in relations
     )
 
 
 def _drop_trailing_qualifier(answer: str) -> str:
     """Drop a trailing qualifier: `x = 2k\\pi,\\ k \\in \\mathbb{Z}` becomes `x = 2k\\pi`.
 
-    Keeps the answer whole when another `\\text` or a later `=` shows more cases, as in the
-    piecewise `1 \\text{ for all } n > 1,\\ 0 \\text{ for } n = 1`.
+    Keeps a piecewise answer whole: one with `\\begin{cases}` rows, or with a `=`, `,`, `;` or
+    `\\text` after the qualifier, as in `2 \\forall n \\ge 3,\\ 1\\ (n < 3)`.
     """
     spaced = _SPACING.sub(" ", answer).replace("\\qquad", " ").replace("\\quad", " ")
     match = _QUALIFIER.search(spaced)
     if (
         match is None
-        or "\\text" in spaced[: match.start()]
-        or re.search(r"=|\\text", spaced[match.end() :])
+        or re.search(r"&|\\\\", answer)
+        or re.search(r"[=,;]|\\text", spaced[match.end() :])
     ):
         return answer
     return spaced[: match.start()].rstrip(" ,")
