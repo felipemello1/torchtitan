@@ -25,6 +25,7 @@ from torchtitan.rl.rollout.environment import MessageEnv, TokenEnv
 from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
 from torchtitan.rl.rollout.types import (
     GenerateFn,
+    ReleaseSessionFn,
     Rollout,
     RolloutGroup,
     RolloutStatus,
@@ -158,6 +159,7 @@ class Rollouter(Configurable):
         tokenizer_config: HuggingFaceTokenizer.Config,
         renderer_config: RendererConfig,
         hf_assets_path: str,
+        release_session_fn: ReleaseSessionFn | None = None,
     ) -> None:
         """Spawn and initialize the owned worker proc mesh and actor pool."""
         # Import lazily to avoid a circular dependency through Rollouter.Config.
@@ -179,6 +181,7 @@ class Rollouter(Configurable):
             tokenizer_config=tokenizer_config,
             renderer_config=renderer_config,
             hf_assets_path=hf_assets_path,
+            release_session_fn=release_session_fn,
         )
 
     async def close(self) -> None:
@@ -272,6 +275,7 @@ class RolloutWorker(Configurable):
         self.advantage_estimator: AdvantageEstimator = config.advantage.build()
         self._renderer: Renderer
         self._thinking_budget: ThinkingBudget | None = None
+        self._release_session_fn: ReleaseSessionFn | None = None
 
     async def setup_async(
         self,
@@ -279,8 +283,10 @@ class RolloutWorker(Configurable):
         tokenizer_config: HuggingFaceTokenizer.Config,
         renderer_config: RendererConfig,
         hf_assets_path: str,
+        release_session_fn: ReleaseSessionFn | None = None,
     ) -> None:
         """Build runtime dependencies after the worker actor is spawned."""
+        self._release_session_fn = release_session_fn
         tokenizer = tokenizer_config.build(tokenizer_path=hf_assets_path)
         self._renderer = renderer_config.build(tokenizer=tokenizer)
         if self._thinking_budget_config is not None:
@@ -431,6 +437,10 @@ class RolloutWorker(Configurable):
         """
         if self._thinking_budget is not None:
             generate_fn = self._thinking_budget.wrap(generate_fn)
+        # Per-sample sticky key: a sample's turns reuse one generator's prefix cache.
+        routing_session_id = RolloutTurnID(
+            group_id=group_id, rollout_id=rollout_id, turn_id=0
+        ).to_string(include_turn=False)
         turns: list[RolloutTurn] = []
         # The previous turn's prompt + completion; each turn stores only what its prompt adds to it
         previous_token_ids: list[int] = []
@@ -449,8 +459,7 @@ class RolloutWorker(Configurable):
                     prompt_token_ids=env_step.next_prompt_token_ids,
                     request_id=turn_rollout_id.to_string(),
                     group_id=group_id,
-                    # Per-sample sticky key: a sample's turns reuse one generator's prefix cache.
-                    routing_session_id=turn_rollout_id.to_string(include_turn=False),
+                    routing_session_id=routing_session_id,
                     sampling_config=sampling,
                 )
 
@@ -494,6 +503,16 @@ class RolloutWorker(Configurable):
             )
             status = RolloutStatus.ERROR
 
+        if self._release_session_fn is not None:
+            try:
+                await self._release_session_fn(
+                    group_id=group_id, routing_session_id=routing_session_id
+                )
+            except Exception:
+                # Not fatal: the group's release frees the session too.
+                logger.exception(
+                    "releasing routing session %s failed", routing_session_id
+                )
         return Rollout(
             group_id=group_id,
             rollout_id=rollout_id,
