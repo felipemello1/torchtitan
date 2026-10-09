@@ -711,6 +711,7 @@ class Controller(Configurable):
                 generators=generators,
                 enable_cpu_weight_prefetch=config.generator.enable_cpu_weight_prefetch,
                 forward_session_releases=config.generator.hold_session_kv,
+                group_size=config.async_loop.num_samples_per_prompt,
             )
 
             await self._rollouter.setup_async(

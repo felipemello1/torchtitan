@@ -40,9 +40,10 @@ from torchtitan.models.common.attention import VarlenInnerAttention
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.distributed.routing.strategies import LeastLoadedRoutingStrategy
-from torchtitan.rl.distributed.routing.types import KVCacheBudget
+from torchtitan.rl.distributed.routing.types import EngineLoad, KVCacheBudget
 from torchtitan.rl.generator import (
     _extract_request_metrics_inputs,
+    _PreemptionCounter,
     _prepare_generation_request_metrics,
     EngineRequest,
     LoopAction,
@@ -68,6 +69,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
+from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 
 class _FakeRenderer:
@@ -305,7 +307,8 @@ def test_kv_cache_budget_matches_vllm_capacity():
         num_blocks=8169, kv_cache_tensors=[], kv_cache_groups=groups
     )
     vllm_config = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=1152, mamba_cache_mode="align")
+        cache_config=SimpleNamespace(block_size=1152, mamba_cache_mode="align"),
+        model_config=SimpleNamespace(max_model_len=131072),
     )
     scheduler = SimpleNamespace(kv_cache_config=kv_cache_config)
     generator = SimpleNamespace(
@@ -325,9 +328,38 @@ def test_kv_cache_budget_matches_vllm_capacity():
         block_size=1152,
         num_growing_groups=1,
         fixed_blocks_per_session=6,
+        max_model_len=131072,
     )
     # vLLM logs "GPU KV cache size: 8,922,726 tokens" for 131,072-token requests.
     assert int(8169 / budget.session_blocks(131072) * 131072) == 8922726
+
+
+def test_engine_load_reads_vllm_usage_queue_and_preemptions():
+    scheduler = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(usage=0.62),
+        running=["r0", "r1", "r2"],
+        waiting=["w0"],
+        skipped_waiting=["s0"],
+    )
+    generator = SimpleNamespace(
+        _engine=SimpleNamespace(
+            engine_core=SimpleNamespace(
+                engine_core=SimpleNamespace(scheduler=scheduler)
+            )
+        ),
+        _preemption_counter=_PreemptionCounter(),
+    )
+    # vLLM records every step; a step without request outputs has no IterationStats.
+    for num_preempted_reqs in (2, None, 1):
+        iteration_stats = None
+        if num_preempted_reqs is not None:
+            iteration_stats = IterationStats()
+            iteration_stats.num_preempted_reqs = num_preempted_reqs
+        generator._preemption_counter.record(SchedulerStats(), iteration_stats)
+
+    assert VLLMGenerator.engine_load(generator) == EngineLoad(
+        kv_usage=0.62, num_running=3, num_waiting=2, num_preemptions=3
+    )
 
 
 def test_build_sampling_params_matches_contract():
