@@ -307,7 +307,8 @@ def test_reward_loses_the_share_of_force_closed_turns() -> None:
     ) -> RolloutTurn:
         return RolloutTurn(
             rollout_id=RolloutTurnID(group_id=0, rollout_id=0, turn_id=turn_id),
-            prompt_token_ids=[1],
+            prompt_prefix_len=0,
+            prompt_delta_token_ids=[1],
             completion_token_ids=[2, 3],
             completion_logprobs=[-0.1, -0.1],
             completion_loss_mask=loss_mask,
