@@ -73,7 +73,9 @@ def test_checkmate_ends_the_game() -> None:
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("move_text", ["Ke9", "e5", "--", "", None])
+@pytest.mark.parametrize(
+    "move_text", ["Ke9", "e5", "--", "", None, "Nb1-Nf3", "Nd4-Nf3"]
+)
 def test_illegal_or_missing_move_forfeits(move_text) -> None:
     async def run() -> None:
         game = _new_game()
@@ -96,9 +98,17 @@ def test_san_and_uci_are_accepted(move_text) -> None:
 
 
 @pytest.mark.parametrize(
-    "move_text, uci", [("Pe4", "e2e4"), ("Pe2-e4", "e2e4"), ("Nf3\\#", "g1f3")]
+    "move_text, uci",
+    [
+        ("Pe4", "e2e4"),
+        ("Pe2-e4", "e2e4"),
+        ("Nf3\\#", "g1f3"),
+        ("Ng1-Nf3", "g1f3"),
+        ("Ng1 -> f3", "g1f3"),
+        ("Pe2 e4", "e2e4"),
+    ],
 )
-def test_p_prefixed_and_escaped_moves_are_accepted(move_text, uci) -> None:
+def test_prompt_style_moves_are_accepted(move_text, uci) -> None:
     async def run() -> None:
         game = _new_game()
         await game.play(chess.WHITE, move_text)
