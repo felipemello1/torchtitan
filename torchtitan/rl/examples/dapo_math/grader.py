@@ -25,13 +25,23 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import connection
 
-from math_verify import parse, verify
-from sympy import And, Eq, Symbol
+from math_verify import LatexExtractionConfig, LatexNormalizationConfig, parse, verify
+from sympy import And, Eq, Mul, Symbol
 from sympy.core.relational import Relational
 
 logger = logging.getLogger(__name__)
 
 _BOXED_START = r"\boxed{"
+# Parse only the box, with trailing units kept: `5 cm` reads as 5*c*m, not 5. Unlike
+# Math-Verify's default, no fallback to other text or to a plain number in the box.
+_KEEP_UNITS = [
+    LatexExtractionConfig(
+        try_extract_without_anchor=False,
+        normalization_config=LatexNormalizationConfig(
+            basic_latex=True, units=False, malformed_operators=True, nits=True
+        ),
+    )
+]
 # The thin space in `10\,002`; Math-Verify reads it as 10 + 002 = 12.
 _THIN_SPACE_IN_NUMBER = re.compile(r"(?<=\d)\\,(?=\d{3}(?!\d))")
 # `\leqq` and `\geqq`; Math-Verify reads `p\leqq0` as `p \le q \cdot 0`.
@@ -131,7 +141,8 @@ def score_math_response(response: str, ground_truth: str) -> float:
     - `x = 2k\\pi,\\ k \\in \\mathbb{Z}` and `2k\\pi`: a trailing qualifier;
     - `-1 < x < 2` and `(-1, 2)`: a solved inequality and its interval;
     - `1` and `\\frac{9}{9} = 1`: a gold whose left side has no symbols;
-    - `\\frac{50}{3}` and `16.67`: a gold rounded to 3+ significant digits.
+    - `\\frac{50}{3}` and `16.67`: a gold rounded to 3+ significant digits;
+    - `-c + 2` and `2 - c`: Math-Verify drops a trailing `c`, `m` or `h` as a unit.
     No timeout: on an event loop, use `MathVerifyPool.score` instead.
 
     Args:
@@ -234,11 +245,16 @@ def _matches(gold: str, answer: str) -> bool:
     decimal = _DECIMAL.fullmatch(gold)
     if decimal and len((decimal[1] + decimal[2]).lstrip("0")) >= 3:
         float_rounding = min(len(decimal[2]), 6)
-    answer_parsed = parse(_BOXED_START + answer + "}", parsing_timeout=None)
+    # Box the gold like the answer: a bare `2\sqrt{3}` parses as 2, and a
+    # bare `(1,2)` or `\pi/4` parses to nothing.
+    gold_box, answer_box = _BOXED_START + gold + "}", _BOXED_START + answer + "}"
+    gold_dropped = parse(gold_box, parsing_timeout=None)
+    answer_dropped = parse(answer_box, parsing_timeout=None)
+    gold_kept = parse(gold_box, extraction_config=_KEEP_UNITS, parsing_timeout=None)
+    answer_kept = parse(answer_box, extraction_config=_KEEP_UNITS, parsing_timeout=None)
+    answer_parsed = _drop_units(answer_dropped, answer_kept, other=gold_kept)
     return verify(
-        # Box the gold like the answer: a bare `2\sqrt{3}` parses as 2, and a
-        # bare `(1,2)` or `\pi/4` parses to nothing.
-        parse(_BOXED_START + gold + "}", parsing_timeout=None),
+        _drop_units(gold_dropped, gold_kept, other=answer_kept),
         answer_parsed,
         float_rounding=float_rounding,
         # Also match a solved `-1 < x < 2` with gold `(-1, 2)`; the reverse matches by default.
@@ -246,6 +262,31 @@ def _matches(gold: str, answer: str) -> bool:
         allow_set_relation_comp=bool(answer_parsed) and _is_solved(answer_parsed[0]),
         timeout_seconds=None,
     )
+
+
+def _drop_units(dropped: list, kept: list, other: list) -> list:
+    """Return `dropped`, Math-Verify's parse, or `kept` if a unit it drops is a variable.
+
+    Math-Verify's units include `c`, `h` and `m`: it reads `2 - c` as `2 -`, `n = 4m` as
+    `n = 4`, and `15+55m` as `15+55`. `dropped` is used if `kept` does not parse, or if:
+    (a) it parses,
+    (b) `other`, the other side with units kept, has none of the dropped symbols, and
+    (c) the unit is in `\\text` (`2^{n-1} \\text{ ways}`) or multiplies a number (`5 cm`).
+    """
+    # `parse` gives [expression, normalized LaTeX], or [normalized LaTeX] if that does not parse.
+    if not kept or isinstance(kept[0], str):
+        return dropped
+    if not dropped or isinstance(dropped[0], str):
+        return kept
+    dropped_symbols = kept[0].free_symbols - dropped[0].free_symbols
+    other_symbols = (
+        set() if not other or isinstance(other[0], str) else other[0].free_symbols
+    )
+    in_text = dropped[-1].count("\\text") < kept[-1].count("\\text")
+    is_quantity = isinstance(kept[0], Mul) and not dropped[0].free_symbols
+    if (in_text or is_quantity) and dropped_symbols.isdisjoint(other_symbols):
+        return dropped
+    return kept
 
 
 def _is_solved(answer: object) -> bool:
