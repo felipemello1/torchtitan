@@ -87,7 +87,7 @@ def test_illegal_or_missing_move_forfeits(move_text) -> None:
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("move_text", ["Nf3", " Nf3 ", "Nf3+", "Nf3\\#", "Nxf3"])
+@pytest.mark.parametrize("move_text", ["Nf3", " Nf3 ", "Nf3+", "Nf3\\#"])
 def test_the_listed_move_is_accepted(move_text) -> None:
     async def run() -> None:
         game = _new_game()
@@ -105,6 +105,15 @@ def test_a_capture_is_accepted_with_or_without_its_x(move_text) -> None:
         await _play_moves(game, ["e4", "e5", "Qh5", "Nc6", move_text])
         assert not game.is_over
         assert game.board.peek() == chess.Move.from_uci("h5f7")
+
+    asyncio.run(run())
+
+
+def test_an_x_on_a_move_that_does_not_capture_is_ignored() -> None:
+    async def run() -> None:
+        game = _new_game()
+        await game.play(chess.WHITE, "Nxf3")
+        assert game.board.peek() == chess.Move.from_uci("g1f3")
 
     asyncio.run(run())
 
@@ -478,7 +487,8 @@ def test_self_play_dataset_mixes_in_bot_groups() -> None:
 
 
 class _ScriptedPolicy:
-    """Answers each player's turns from a script keyed by rollout id (even = White, odd = Black)."""
+    """Answers each player's turns from a script keyed by rollout id (even = White, odd = Black).
+    An exception in the script is raised instead, like a failed generator call."""
 
     def __init__(
         self, tokenizer, moves_by_rollout: dict[int, list[str]], *, truncate_at=None
@@ -492,7 +502,10 @@ class _ScriptedPolicy:
     async def __call__(self, prompt_token_ids, *, request_id, **kwargs) -> Completion:
         fields = dict(part.split("=") for part in request_id.split("/"))
         rollout_id, turn_id = int(fields["rollout"]), int(fields["turn"])
-        text = f"\\boxed{{{self._moves_by_rollout[rollout_id][turn_id]}}}"
+        move = self._moves_by_rollout[rollout_id][turn_id]
+        if isinstance(move, Exception):
+            raise move
+        text = f"\\boxed{{{move}}}"
         token_ids = self._tokenizer.encode(text, add_bos=False, add_eos=False)
         finish_reason = "stop"
         if (rollout_id, turn_id) == self._truncate_at:
@@ -560,67 +573,104 @@ def test_worker_trains_both_colors_with_per_color_advantages() -> None:
             {
                 0: ["f3", "g4"],  # game 0: fool's mate, Black wins
                 1: ["e5", "Qh4#"],
-                2: ["e4", "d4"],  # game 1: Black forfeits on its second move
-                3: ["e5", "Ke9"],
+                2: ["e4"],  # game 1: Black forfeits on its first move
+                3: ["Ke9"],
             },
             group_size=2,
         )
         by_id = {rollout.rollout_id: rollout for rollout in group.rollouts}
         assert sorted(by_id) == [0, 1, 2, 3]
         assert all(r.status == RolloutStatus.COMPLETED for r in group.rollouts)
-        # White is mated on ply 4 of 40; Black's forfeit at ply 3 costs -1 * (1 - 3 / 80) and
+        # White is mated on ply 4 of 40; Black's forfeit at ply 1 costs -1 * (1 - 1 / 80) and
         # gives White a draw's 0.5 at even material, not a win
         assert [by_id[i].reward for i in range(4)] == pytest.approx(
-            [-0.225, 1.0, 0.5, -0.9625]
+            [-0.225, 1.0, 0.5, -0.9875]
         )
-        # each color is centered on its own mean (White 0.1375, Black 0.01875)
+        # each color is centered on its own mean, Black's forfeit counted as its 0.5 at the cap
+        # (White 0.1375, Black 0.75); Black's forfeiting turn alone pays -0.25 - (0.5 + 0.9875)
         assert [by_id[i].advantage for i in range(4)] == pytest.approx(
-            [-0.3625, 0.98125, 0.3625, -0.98125]
+            [-0.3625, 0.25, 0.3625, -0.25]
         )
-        assert [len(by_id[i].turns) for i in range(4)] == [2, 2, 2, 2]
-        # Black's turn before its forfeit is centered as if the game had stopped at the cap there:
-        # its 0.5 against (1.0 + 0.5) / 2; every other turn trains on its rollout's advantage
+        assert [len(by_id[i].turns) for i in range(4)] == [2, 2, 1, 1]
         assert [[turn.advantage for turn in by_id[i].turns] for i in range(4)] == [
             [None, None],
             [None, None],
-            [None, None],
-            [pytest.approx(-0.25), None],
+            [None],
+            [pytest.approx(-1.7375)],
         ]
 
         reduced = _reduced_metrics(group.rollouts)
         assert reduced["chess_games/end_self_play/checkmate/mean"] == 0.5
         assert reduced["chess_games/end_self_play/illegal_move/mean"] == 0.5
-        # 8 policy replies, 1 of them illegal
+        # 6 policy replies, 1 of them illegal
         assert reduced[
             "chess_games/forfeits_per_reply_self_play/mean"
-        ] == pytest.approx(1 / 8)
+        ] == pytest.approx(1 / 6)
 
     asyncio.run(run())
 
 
-def test_worker_centers_earlier_turns_as_if_every_forfeit_was_capped() -> None:
+def test_worker_centers_each_color_as_if_its_forfeits_ended_at_the_cap() -> None:
     async def run() -> None:
         group = await _run_group(
             {
-                0: ["e4", "d4"],  # game 0: Black forfeits at ply 3
-                1: ["e5", "Ke9"],
-                2: ["e4", "d3", "c3"],  # game 1: Black forfeits at ply 5
-                3: ["e5", "d6", "Ke9"],
+                0: ["f3", "g4"],  # game 0: White is mated on ply 4
+                1: ["e5", "Qh4#"],
+                2: ["e4", "exd5", "Ke9"],  # game 1: White forfeits on ply 4, a pawn up
+                3: ["d5", "Nf6"],
+                4: ["d4", "Ke9"],  # game 2: White forfeits on ply 2, even material
+                5: ["d5"],
+            },
+            group_size=3,
+        )
+        by_id = {rollout.rollout_id: rollout for rollout in group.rollouts}
+        white, black = (0, 2, 4), (1, 3, 5)
+        assert [by_id[i].reward for i in white] == pytest.approx(
+            [-0.225, -0.95, -0.975]
+        )
+        # White centers on [-0.225, 0.5311, 0.5]: each forfeit counts as White's reward at the cap,
+        # 0.5 + 0.5 * (material_score - 0.5) with a pawn up, then 0.5 at even material; mean 0.2687
+        assert [by_id[i].advantage for i in white] == pytest.approx(
+            [-0.4937, 0.2624, 0.2313], abs=1e-4
+        )
+        # each forfeiting turn alone pays: its reward against that mean, -0.95 - 0.2687, -0.975 - 0.2687
+        assert [[turn.advantage for turn in by_id[i].turns] for i in white] == [
+            [None, None],
+            [None, None, pytest.approx(-1.2187, abs=1e-4)],
+            [None, pytest.approx(-1.2437, abs=1e-4)],
+        ]
+        # Black never forfeits: plain centering on [1.0, 0.4689, 0.5], and no turn overrides
+        assert [by_id[i].advantage for i in black] == pytest.approx(
+            [0.3437, -0.1874, -0.1563], abs=1e-4
+        )
+        assert all(turn.advantage is None for i in black for turn in by_id[i].turns)
+
+    asyncio.run(run())
+
+
+def test_worker_centers_an_infra_error_as_if_its_game_ended_at_the_cap() -> None:
+    async def run() -> None:
+        group = await _run_group(
+            {
+                0: ["f3", "g4"],  # game 0: White is mated on ply 4
+                1: ["e5", "Qh4#"],
+                # game 1: White's third generator call fails on ply 4, at even material
+                2: ["e4", "Nf3", RuntimeError("generator lost")],
+                3: ["e5", "Nc6"],
             },
             group_size=2,
         )
         by_id = {rollout.rollout_id: rollout for rollout in group.rollouts}
-        black_0, black_1 = by_id[1], by_id[3]
-        assert (black_0.advantage, black_1.advantage) == pytest.approx(
-            (-0.0125, 0.0125)
+        white = by_id[2]
+        assert white.status == RolloutStatus.ERROR
+        assert white.reward == pytest.approx(-1 * (1 - 4 / 80))
+        # it counts as its 0.5 at the cap, White centers on [-0.225, 0.5], and no turn pays
+        assert [by_id[0].advantage, white.advantage] == pytest.approx([-0.3625, 0.3625])
+        assert [turn.advantage for turn in white.turns] == [None, None]
+        assert (
+            _reduced_metrics(group.rollouts)["chess_games/end_self_play/error/mean"]
+            == 0.5
         )
-        # both would have stopped at 0.5 (even material), so every earlier turn is 0.5 - 0.5
-        assert [turn.advantage for turn in black_0.turns] == [pytest.approx(0.0), None]
-        assert [turn.advantage for turn in black_1.turns] == [
-            pytest.approx(0.0),
-            pytest.approx(0.0),
-            None,
-        ]
 
     asyncio.run(run())
 
@@ -648,9 +698,10 @@ def test_worker_forfeits_a_player_that_stops_mid_game() -> None:
         assert (white.reward, black.reward) == pytest.approx((-0.975, 0.5))
         assert white.turns[-1].env_rewards == {"score": pytest.approx(-0.975)}
         assert black.turns[-1].env_rewards == {"score": 0.5}
-        # a reply cut at max_tokens is a forfeit too: White's first turn is centered as if capped,
-        # its 0.5 against a mean of 0.5
-        assert [turn.advantage for turn in white.turns] == [pytest.approx(0.0), None]
+        # a reply cut at max_tokens is a reply forfeit too: White centers on its 0.5 at the cap,
+        # and the cut turn alone pays -0.975 - 0.5
+        assert white.advantage == pytest.approx(0.0)
+        assert [turn.advantage for turn in white.turns] == [None, pytest.approx(-1.475)]
         assert [turn.advantage for turn in black.turns] == [None]
         assert (
             _reduced_metrics(group.rollouts)[
@@ -732,5 +783,28 @@ def test_worker_plays_only_the_policy_against_a_bot(
         assert reduced["val_chess_strength/elo/fit"] == pytest.approx(
             0.0, abs=1e-6
         )  # one loss
+
+    asyncio.run(run())
+
+
+def test_worker_puts_a_bot_game_forfeit_on_its_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(BOTS, "test_bot", _RANDOM_BOT)
+
+    async def run() -> None:
+        sample = ChessSample(fen=chess.STARTING_FEN, opponent="test_bot", seed=1)
+        group = await _run_group({0: ["e4", "Nf3", "Ke9"]}, group_size=1, sample=sample)
+        (rollout,) = group.rollouts
+        # the bot answers 1. e4 Nc6 2. Nf3 h5, and White forfeits on ply 4 at even material
+        assert "Black played h5." in rollout.turns[2].prompt_messages[-1]["content"]
+        assert rollout.reward == pytest.approx(-0.95)
+        # alone in its group, it centers on its 0.5 at the cap; the forfeiting turn pays -0.95 - 0.5
+        assert rollout.advantage == pytest.approx(0.0)
+        assert [turn.advantage for turn in rollout.turns] == [
+            None,
+            None,
+            pytest.approx(-1.45),
+        ]
 
     asyncio.run(run())

@@ -51,17 +51,18 @@ class ChessSelfPlayWorker(RolloutWorker):
     against White, Black against Black), so the player that moves first does not get a free
     positive advantage. Against a Stockfish bot, only the policy's player is a rollout.
 
-    A forfeit caused by one reply (illegal, unparsable, or cut at `max_tokens`) costs only that turn.
-    The forfeiter's earlier turns get the advantage they would have had if every such forfeit of
-    their color had ended its game at `max_plies` instead (`ChessGame.material_rewards`).
+    A forfeit caused by one reply (illegal, unparsable, or cut at `max_tokens`) costs only that turn:
+    each color is centered as if every such forfeit had ended its game at `max_plies` instead
+    (`ChessGame.material_rewards`), and the forfeiting turn alone pays the difference. A player
+    stopped by an infra error is centered the same way, and none of its turns pays.
 
     Example (group_size=2, self-play, max_plies=60):
 
         game 0: White mates on ply 31                   -> rewards White 1.0, Black -0.25 * (1 - 31 / 60) = -0.12
         game 1: Black forfeits on ply 41, even material -> rewards White 0.5, Black -1 * (1 - 41 / 120) = -0.66
-        advantages: White [+0.25, -0.25], Black [+0.27, -0.27]   (each color's mean is subtracted)
-        Black's game-1 turns: the forfeiting one -0.27; earlier ones as if capped at 0.5,
-                              0.5 - (-0.12 + 0.5) / 2 = +0.31
+        advantages: White [+0.25, -0.25], Black [-0.31, +0.31]   (each color's mean is subtracted;
+                    Black's forfeit counts as the 0.5 it had at the cap)
+        Black's forfeiting turn: +0.31 - (0.5 + 0.66) = -0.85
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -188,38 +189,39 @@ class ChessSelfPlayWorker(RolloutWorker):
             rollout.reward = output.reward
             rollout.reward_breakdown = output.reward_breakdown
 
-        # Post-scoring: center each color against its own mean.
+        # Post-scoring: center each color on its rewards with every reply forfeit and infra error scored
+        # as if its game had ended at `max_plies`; a reply forfeit's last turn alone pays the forfeit.
         for color in policy_colors:
             color_players = [
-                (rollout, game) for rollout, game, c in played if c == color
+                (rollout, game)
+                for rollout, game, player_color in played
+                if player_color == color
             ]
             if not color_players:
                 continue
-            color_rollouts = [rollout for rollout, _ in color_players]
-            advantages = self.advantage_estimator(
-                RolloutGroup(group_id=group_id, rollouts=color_rollouts)
-            )
-            for rollout, advantage in zip(color_rollouts, advantages, strict=True):
-                rollout.advantage = advantage
-
-            # A forfeit is one bad reply, so only the forfeiting turn takes it. The forfeiter's earlier
-            # turns get the advantage they would have had if every forfeit of this color had ended its
-            # game at `max_plies` instead: each forfeit's cost added back, then re-centered.
             forfeit_costs = [
                 game.material_rewards[color] - game.rewards[color]
-                if game.end_reason in _REPLY_FORFEITS and game.forfeiter == color
+                if game.forfeiter == color
+                and game.end_reason in (*_REPLY_FORFEITS, "error")
                 else 0.0
                 for _, game in color_players
             ]
-            mean_forfeit_cost = sum(forfeit_costs) / len(forfeit_costs)
-            for rollout, forfeit_cost in zip(
-                color_rollouts, forfeit_costs, strict=True
+            capped_rollouts = [
+                replace(rollout, reward=rollout.reward + forfeit_cost)
+                for (rollout, _), forfeit_cost in zip(
+                    color_players, forfeit_costs, strict=True
+                )
+            ]
+            advantages = self.advantage_estimator(
+                RolloutGroup(group_id=group_id, rollouts=capped_rollouts)
+            )
+            for (rollout, game), forfeit_cost, advantage in zip(
+                color_players, forfeit_costs, advantages, strict=True
             ):
-                if forfeit_cost:
-                    for rollout_turn in rollout.turns[:-1]:
-                        rollout_turn.advantage = (
-                            rollout.advantage + forfeit_cost - mean_forfeit_cost
-                        )
+                rollout.advantage = advantage
+                if game.forfeiter == color and game.end_reason in _REPLY_FORFEITS:
+                    # assumes mean-centered advantages (the recipe's `should_std_normalize=False`)
+                    rollout.turns[-1].advantage = advantage - forfeit_cost
 
         # Games started before a move to the next bot do not count toward it.
         if curriculum_group and level == self._level:

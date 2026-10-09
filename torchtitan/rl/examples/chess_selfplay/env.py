@@ -164,8 +164,7 @@ class ChessGame:
         (b) stalemate or insufficient material: 0.5 * played each;
         (c) `max_plies` plies: a draw, 0.5, moved halfway toward the material score, so within [0.25, 0.75];
         (d) a forfeit: -1 * (1 - played / 2), so within [-1, -0.5], below being checkmated at any ply;
-            the other color is scored as in (c), not as a win. When one reply caused the forfeit,
-            `ChessSelfPlayWorker` credits the forfeiter's earlier turns as if it had scored (c).
+            the other color is scored as in (c), not as a win.
 
         Example (max_plies=60):
 
@@ -380,9 +379,9 @@ def _resolve_captures(
 
 def _parse_move(board: chess.Board, move_text: str) -> chess.Move | None:
     """Return the legal move whose SAN, as the prompt lists it, is `move_text`, else `None`.
-    The check mark (plain or LaTeX-escaped) and the capture's `x` are optional: `Qxf1#`, `Qxf1\\#`,
-    `Qf1#` and `Qf1` all match `Qxf1#`. A move to a square is a capture or not, never both, so each
-    legal move still has one form without them."""
+    The check mark (plain or LaTeX-escaped) and any `x` are ignored: `Qxf1#`, `Qf1\\#` and `Qf1`
+    all match `Qxf1#`, and `Nxf3` matches `Nf3`. No two legal moves differ only by an `x`: a move
+    to a square either captures or it doesn't."""
     text = re.sub(r"\\?[+#]$", "", move_text.strip()).replace("x", "")
     for move in board.legal_moves:
         if board.san(move).rstrip("+#").replace("x", "") == text:

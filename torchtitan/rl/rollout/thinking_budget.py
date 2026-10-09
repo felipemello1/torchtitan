@@ -47,8 +47,8 @@ class ThinkingBudget(Configurable):
         forced text and the answer within `SamplingConfig.max_tokens`."""
 
         opening_max_thinking_tokens: int | None = None
-        """`max_thinking_tokens` for a rollout's first `opening_turns` turns, with the same room needed
-        within `SamplingConfig.max_tokens`."""
+        """`max_thinking_tokens` for a rollout's first `opening_turns` turns; it too must leave room for
+        the forced text and the answer within `SamplingConfig.max_tokens`."""
 
         opening_turns: int = 0
         """How many of a rollout's first turns think up to `opening_max_thinking_tokens`."""

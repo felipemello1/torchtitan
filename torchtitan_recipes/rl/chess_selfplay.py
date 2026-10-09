@@ -217,7 +217,8 @@ def rl_chess_qwen3_5_35b_a3b(
     runs. Hosts 1-2 run eight one-GPU generators, each with every expert, FULL CUDA graphs: with
     thinking on, generation is the bottleneck.
     """
-    # room for the answer after the thinking ends, forced or not
+    # Room for the answer after the thinking ends, forced or not. The opening budget sets every turn's
+    # cap: by default 2,560 instead of 1,536, and `max_rollout_tokens` drops to 128,512.
     max_response_tokens = max(max_thinking_tokens, opening_max_thinking_tokens) + 512
     # `max_context_tokens` must be a multiple of 1,024 so ChunkedLossWrapper splits each TP rank's
     # sequence into equal chunks.
@@ -230,8 +231,8 @@ def rl_chess_qwen3_5_35b_a3b(
     config.renderer = from_renderers(
         Qwen35RendererConfig(enable_thinking=True, thinking_retention="all")
     )
-    # Bot groups start against a random mover and move ~200 Elo up once the policy wins over 40%.
-    # Only checkmates count, not a material lead at the ply cap, where most won games still end.
+    # Bot groups start against a random mover and move ~200 Elo up once the policy wins over 40%:
+    # only checkmates count, and most games the policy leads still end at the ply cap.
     config.rollouter.train_dataset.bots = ("curriculum",)
     worker = config.rollouter.worker
     worker.curriculum_win_rate = 0.4
