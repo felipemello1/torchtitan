@@ -17,11 +17,14 @@ prime-rl line references are to prime-rl@0bcb868e9, `src/prime_rl/orchestrator/`
 
 from __future__ import annotations
 
+import bisect
+import itertools
 import logging
 import math
 import time
 from abc import ABC, abstractmethod
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -450,9 +453,9 @@ class KVEstimateAdmission(AdmissionPolicy):
         skip_queue: bool,
     ) -> int | None:
         first_call_blocks = self._budget.session_blocks(num_prompt_tokens)
-        # Each session also reserves `growth` blocks (0 in this mode).
+        # Sessions also reserve blocks for their growth, each new one `growth` (0 in this mode).
         growth = self._growth_per_session()
-        charged = [b + growth * s for b, s in zip(self.blocks, self.sessions)]
+        charged = [b + self._reserved_growth(g) for g, b in enumerate(self.blocks)]
         generator = max(serving, key=lambda g: self.limits[g] - charged[g])
         expected_sessions = 0 if skip_queue else self._new_group_sessions()
         new_charged = charged[generator] + expected_sessions * (
@@ -498,14 +501,17 @@ class KVEstimateAdmission(AdmissionPolicy):
         self.sessions[group.generator] += group.sessions - old_sessions
 
     def summary(self) -> str:
-        growth = self._growth_per_session()
         fractions = [
-            round((b + growth * s) / limit, 2)
-            for b, s, limit in zip(self.blocks, self.sessions, self.limits)
+            round((b + self._reserved_growth(g)) / limit, 2)
+            for g, (b, limit) in enumerate(zip(self.blocks, self.limits))
         ]
         return f"KV blocks / limit per generator: {fractions}"
 
     def _growth_per_session(self) -> float:
+        return 0.0
+
+    def _reserved_growth(self, generator: int) -> float:
+        """Return the blocks `generator`'s sessions reserve for their growth: none in this mode."""
         return 0.0
 
     def _new_group_sessions(self) -> int:
@@ -514,9 +520,7 @@ class KVEstimateAdmission(AdmissionPolicy):
 
 # R averages over this window; 5 to 30 minutes changed simulated throughput by at most 3%.
 GROWTH_WINDOW_S = 900.0
-# R until 50 sessions have ended in the window, in vLLM blocks (1,152 tokens each for Qwen3.5 on a
-# GB300); 10 to 100 blocks changed simulated throughput by at most 3%.
-INITIAL_GROWTH_BLOCKS = 40.0
+# R is half a max-length context until this many sessions have ended in the window.
 MIN_ENDED_SESSIONS = 50
 # A new group reserves the mean sessions of this many recently finished groups.
 GROUP_SIZE_HISTORY = 256
@@ -524,28 +528,31 @@ GROUP_SIZE_HISTORY = 256
 
 class KVGrowthEstimateAdmission(KVEstimateAdmission):
     """The router's KV estimate plus the blocks each session is expected to add before it ends,
-    so a group counts at its expected peak, not its current size (the "growth ledger").
+    so a group counts at its expected final size, not its current size (the "growth ledger").
 
-    Every live or not-yet-started session also reserves R blocks:
+    A session that grew g blocks since its first call reserves its expected remaining growth, from
+    the total growth G of each session that ended in the last 15 minutes:
 
-        R = blocks the live sessions added / sessions that ended, over the last 15 minutes.
+        max(mean(G - g) over the G above g, R - g),  R = blocks live sessions added / sessions ended
 
+    R, one whole session's growth by Little's law, is also what a seat not started yet reserves.
     A new group reserves the mean sessions of recently finished groups; until one finishes, the
-    largest group so far, and at least one session per sample.
+    largest group so far, and at least two sessions per sample (self-play opens one per player).
+    Reserves are re-estimated at each poll.
 
-    Example (limit 1.0, 150 blocks per generator)::
+    Example (limit 1.0, 150 blocks per generator; ended sessions grew G = 4, 10, 16, so R = 10)::
 
-        last 15 min: live sessions added 3,000 blocks, 300 sessions ended -> R = 10
-        generator 0: 60 blocks, 4 sessions -> charged 60 + 4 x 10 = 100
-        a new group of 2 sessions with 5-block first calls -> + 2 x (5 + 10) = 130 <= 150: admitted
+        generator 0: two live 20-block sessions; one grew 0 (reserves mean(4, 10, 16) = 10), one
+        grew 12 (reserves 16 - 12 = 4) -> charged 40 + 10 + 4 = 54
+        a new group of 2 sessions with 5-block first calls -> + 2 x (5 + 10) = 84 <= 150: admitted
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        limit: float = 1.5
+        limit: float = 1.6
         """How far the sessions' expected final sizes may overcommit each generator's KV cache.
-        1.0: every live session could reach its expected final size at once and still fit. Sessions
-        end at different times, so 1.5 holds across 1x-3x game lengths and bot mixes untuned."""
+        A live session has about as much growth ahead as behind, so KV usage settles near
+        limit / 2."""
 
     def __init__(
         self,
@@ -556,11 +563,17 @@ class KVGrowthEstimateAdmission(KVEstimateAdmission):
     ):
         super().__init__(config, budgets=budgets, group_size=group_size)
         self._group_size = group_size
-        # (time, blocks) for each growth of a live session, their sum, and when sessions ended.
+        # (time, blocks) for each growth of a live session, their sum, and (time, total growth) of
+        # each session that ended.
         self._growth: deque[tuple[float, int]] = deque()
         self._growth_sum = 0
-        self._ended_at: deque[float] = deque()
+        self._ended: deque[tuple[float, int]] = deque()
         self._sessions_per_group: deque[int] = deque(maxlen=GROUP_SIZE_HISTORY)
+        self._initial_growth = (
+            self._budget.session_blocks(self._budget.max_model_len) / 2
+        )
+        # Per generator: the blocks its sessions reserve for growth, as of the last poll.
+        self._reserve = [0.0] * len(budgets)
 
     def release(self, group_id: int, *, num_completion_tokens: int) -> None:
         # Validation groups (negative ids, see the controller) have their own size.
@@ -569,19 +582,62 @@ class KVGrowthEstimateAdmission(KVEstimateAdmission):
             self._sessions_per_group.append(len(group.started_sessions))
         super().release(group_id, num_completion_tokens=num_completion_tokens)
 
+    def admit(
+        self,
+        group_id: int,
+        *,
+        num_prompt_tokens: int,
+        serving: list[int],
+        skip_queue: bool,
+    ) -> int | None:
+        generator = super().admit(
+            group_id,
+            num_prompt_tokens=num_prompt_tokens,
+            serving=serving,
+            skip_queue=skip_queue,
+        )
+        if generator is not None:
+            # Until the next poll, each of the new group's seats reserves R.
+            seats = self._groups[group_id].expected_sessions
+            self._reserve[generator] += seats * self._growth_per_session()
+        return generator
+
+    def observe(self, loads: dict[int, EngineLoad]) -> None:
+        """Re-estimate the growth each generator's sessions reserve."""
+        del loads
+        growth = self._growth_per_session()
+        remaining = None
+        if len(self._ended) >= MIN_ENDED_SESSIONS:
+            remaining = _remaining_growth([g for _, g in self._ended])
+        reserve = [0.0] * len(self._reserve)
+        for group in self._groups.values():
+            for session_id, blocks in group.blocks_by_session.items():
+                grown = blocks - group.first_blocks_by_session[session_id]
+                expected = growth if remaining is None else remaining(grown)
+                reserve[group.generator] += max(expected, growth - grown)
+            not_started = max(0, group.expected_sessions - len(group.started_sessions))
+            reserve[group.generator] += not_started * growth
+        self._reserve = reserve
+
     def set_session_tokens(
         self, group_id: int, *, session_id: str | None, num_tokens: int | None
     ) -> None:
-        old_blocks = self._groups[group_id].blocks_by_session.get(session_id)
+        group = self._groups[group_id]
+        old_blocks = group.blocks_by_session.get(session_id)
         if old_blocks is not None:
             now = time.monotonic()
             if num_tokens is None:
-                self._ended_at.append(now)
+                first = group.first_blocks_by_session.pop(session_id)
+                self._ended.append((now, old_blocks - first))
             else:
                 grown = self._budget.session_blocks(num_tokens) - old_blocks
                 if grown > 0:
                     self._growth.append((now, grown))
                     self._growth_sum += grown
+        elif num_tokens is not None:
+            group.first_blocks_by_session[session_id] = self._budget.session_blocks(
+                num_tokens
+            )
         super().set_session_tokens(
             group_id, session_id=session_id, num_tokens=num_tokens
         )
@@ -591,24 +647,44 @@ class KVGrowthEstimateAdmission(KVEstimateAdmission):
         return f"growth {growth:.0f} blocks per session; {super().summary()}"
 
     def _growth_per_session(self) -> float:
-        """Return R, the blocks a live session is expected to add before it ends.
+        """Return R, the blocks a session adds over its whole life.
 
         Example: in the last 15 min live sessions added 9,000 blocks and 300 sessions ended -> 30.
         """
         cutoff = time.monotonic() - GROWTH_WINDOW_S
         while self._growth and self._growth[0][0] < cutoff:
             self._growth_sum -= self._growth.popleft()[1]
-        while self._ended_at and self._ended_at[0] < cutoff:
-            self._ended_at.popleft()
-        if len(self._ended_at) < MIN_ENDED_SESSIONS:
-            return INITIAL_GROWTH_BLOCKS
+        while self._ended and self._ended[0][0] < cutoff:
+            self._ended.popleft()
+        if len(self._ended) < MIN_ENDED_SESSIONS:
+            return self._initial_growth
         # Little's law: blocks added per second / sessions ended per second = one session's growth.
-        return self._growth_sum / len(self._ended_at)
+        return self._growth_sum / len(self._ended)
+
+    def _reserved_growth(self, generator: int) -> float:
+        return self._reserve[generator]
 
     def _new_group_sessions(self) -> int:
         if not self._sessions_per_group:
-            return max(self._group_size, self._largest_group)
+            return max(2 * self._group_size, self._largest_group)
         return math.ceil(sum(self._sessions_per_group) / len(self._sessions_per_group))
+
+
+def _remaining_growth(ended_growth: list[int]) -> Callable[[int], float]:
+    """Return g -> mean of G - g over the ended sessions' growths G above g (0 if none is).
+
+    Example: _remaining_growth([4, 10, 16])(0) -> 10.0; (12) -> 4.0; (16) -> 0.0
+    """
+    growth = sorted(ended_growth)
+    # suffix[i] = sum(growth[i:])
+    suffix = list(itertools.accumulate(reversed(growth)))[::-1] + [0]
+
+    def remaining(grown: int) -> float:
+        i = bisect.bisect_right(growth, grown)
+        above = len(growth) - i
+        return suffix[i] / above - grown if above else 0.0
+
+    return remaining
 
 
 @dataclass(kw_only=True, slots=True)
@@ -625,6 +701,9 @@ class _EstimatedGroup:
 
     blocks_by_session: dict[str | None, int] = field(default_factory=dict)
     """Blocks each live session holds for its context so far."""
+
+    first_blocks_by_session: dict[str | None, int] = field(default_factory=dict)
+    """Blocks each live session held at its first call (growth ledger only)."""
 
     started_sessions: set[str | None] = field(default_factory=set)
     """Sessions that have made a call, ended ones included."""

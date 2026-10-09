@@ -244,7 +244,7 @@ def test_validation_groups_take_no_permit():
 
 
 # KVGrowthEstimateAdmission. 10-token blocks, no fixed blocks: an N-token session holds N / 10.
-# Its reserve R starts at 40 blocks.
+# Its reserve R starts at half a max-length context: 5 blocks.
 
 
 def _growth_policy(limit=1.0, group_size=1) -> KVGrowthEstimateAdmission:
@@ -262,51 +262,62 @@ def test_growth_reserve_is_the_growth_per_ended_session(monkeypatch):
     clock = _Clock(monkeypatch)
     policy = _growth_policy()
     assert _admit(policy, 0) == 0
-    # 49 sessions grow from 1 to 7 blocks, then end: the reserve is still the initial 40.
+    # 49 sessions grow from 1 to 7 blocks, then end: the reserve is still the initial 5.
     for i in range(49):
         _play(policy, 0, f"s{i}", 10, 70, None)
-    assert policy._growth_per_session() == 40.0
+    assert policy._growth_per_session() == 5.0
     # The 50th ended session switches to growth / ends: (49 x 6 + 12) / 50 = 6.12 blocks.
     _play(policy, 0, "s49", 10, 130, None)
     assert policy._growth_per_session() == pytest.approx(6.12)
     # Growth and ends older than 15 min leave the window.
     clock.now += 901.0
-    assert policy._growth_per_session() == 40.0
+    assert policy._growth_per_session() == 5.0
 
 
 def test_growth_reserve_is_charged_to_every_session():
-    policy = _growth_policy(limit=0.2)  # 200 blocks per generator
-    assert _admit(policy, 0, num_prompt_tokens=100) == 0
-    _play(policy, 0, "s0", 400)
-    # Generator 0: 40 blocks + 1 session x 40 = 80. Generator 1 is empty, so group 1 goes there.
-    assert _admit(policy, 1, num_prompt_tokens=100) == 1
-    _play(policy, 1, "s1", 460)
-    # Group 2 reserves 1 session of 10 + 40 blocks on the roomier generator 0: 80 + 50 = 130.
-    assert _admit(policy, 2, num_prompt_tokens=100) == 0
-    _play(policy, 2, "s2", 400)
-    # Generator 1 is now roomier: 86 + 50 = 136.
-    assert _admit(policy, 3, num_prompt_tokens=100) == 1
-    _play(policy, 3, "s3", 400)
-    # Both full: 160 + 50 > 200 and 166 + 50 > 200. Without the reserve, 80 + 10 would fit.
-    assert _admit(policy, 4, num_prompt_tokens=100) is None
+    policy = _growth_policy(limit=0.1)  # 100 blocks per generator
+    # Each group reserves 2 seats of 10 + 5 blocks, then its 2 sessions grow to 40 blocks each.
+    for group_id, generator in [(0, 0), (1, 1)]:
+        assert _admit(policy, group_id, num_prompt_tokens=100) == generator
+        for session in ("s0", "s1"):
+            _play(policy, group_id, session, 100, 400)
+    policy.observe({})
+    # Both generators: 80 blocks + 2 sessions x 5 = 90; a third group would add 2 x 15.
+    # Without the reserve, 80 + 2 x 10 = 100 would fit.
+    assert _admit(policy, 2, num_prompt_tokens=100) is None
     assert policy.summary() == (
-        "growth 40 blocks per session; KV blocks / limit per generator: [0.8, 0.83]"
+        "growth 5 blocks per session; KV blocks / limit per generator: [0.9, 0.9]"
     )
+
+
+def test_live_session_reserves_its_expected_remaining_growth():
+    policy = _growth_policy()
+    assert _admit(policy, 0) == 0
+    # 50 sessions end having grown G = 4 (26 of them) or 16 (24) blocks.
+    for i in range(50):
+        _play(policy, 0, f"ended{i}", 10, 50 if i < 26 else 170, None)
+    # Two live sessions grew g = 0 and g = 12: R = (26 x 4 + 24 x 16 + 12) / 50 = 10.
+    _play(policy, 0, "young", 10)
+    _play(policy, 0, "old", 10, 130)
+    assert policy._growth_per_session() == pytest.approx(10.0)
+    policy.observe({})
+    # Each reserves max(mean(G - g | G > g), R - g): young max(9.76, 10), old max(16 - 12, -2).
+    assert policy._reserved_growth(0) == pytest.approx(10.0 + 4.0)
 
 
 def test_new_group_reserves_the_mean_sessions_of_finished_groups():
     policy = _growth_policy(group_size=8)
-    # Until a group finishes: one session per sample, or the largest group so far.
+    # Until a group finishes: two sessions per sample, or the largest group so far.
     assert _admit(policy, 0) == 0
-    assert policy._new_group_sessions() == 8
-    for i in range(16):
-        _play(policy, 0, f"g0/s{i}", 10)
     assert policy._new_group_sessions() == 16
-    # Finished groups opened 16 and 7 sessions; validation groups (negative ids) do not count.
+    for i in range(18):
+        _play(policy, 0, f"g0/s{i}", 10)
+    assert policy._new_group_sessions() == 18
+    # Finished groups opened 18 and 7 sessions; validation groups (negative ids) do not count.
     policy.release(0, num_completion_tokens=50)
     for group_id, num_sessions in [(1, 7), (-1, 1)]:
         _admit(policy, group_id, skip_queue=group_id < 0)
         for i in range(num_sessions):
             _play(policy, group_id, f"g{group_id}/s{i}", 10)
         policy.release(group_id, num_completion_tokens=50)
-    assert policy._new_group_sessions() == 12  # ceil((16 + 7) / 2)
+    assert policy._new_group_sessions() == 13  # ceil((18 + 7) / 2)

@@ -314,7 +314,10 @@ def rl_chess_qwen3_5_35b_a3b(
     # expected final size, still fit. The other modes, as a one-line switch:
     #   admission.KVEstimateAdmission.Config(limit=0.9, sessions_per_group=16)  # current size only
     #   admission.KVUsageAdmission.Config(initial_inflight=512)  # vLLM's measured KV usage
-    config.generator_router.admission = admission.KVGrowthEstimateAdmission.Config()
+    # 1.8, not the default 1.6: a bot group opens 8 of the 12 seats a new group reserves.
+    config.generator_router.admission = admission.KVGrowthEstimateAdmission.Config(
+        limit=1.8
+    )
     # Hold each player's prefix (attention + GDN state) between its turns; below 5% free blocks,
     # release the sessions idle longest. The watermark keeps 3% free for running requests to grow.
     config.generator.hold_session_kv = True
