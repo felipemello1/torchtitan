@@ -270,6 +270,31 @@ class AsyncLoopConfig(Configurable.Config):
         ) // self.num_prompts_per_train_step
 
 
+def _log_slow_controller_gc(threshold_s: float = 1.0) -> None:
+    """Experiment-only: log every full GC in this process slower than ``threshold_s``.
+
+    The controller froze for 10-30 s every ~160 groups in a GB300 run (likely full GC over per-turn
+    token lists); this confirms or rules that out.
+    """
+    import gc
+
+    start = {}
+
+    def callback(phase: str, info: dict) -> None:
+        if info["generation"] != 2:
+            return
+        if phase == "start":
+            start["t"] = time.monotonic()
+        elif time.monotonic() - start.get("t", time.monotonic()) > threshold_s:
+            logger.warning(
+                "controller full GC took %.1f s (collected %d)",
+                time.monotonic() - start["t"],
+                info["collected"],
+            )
+
+    gc.callbacks.append(callback)
+
+
 class Controller(Configurable):
     """Top-level RL async training orchestrator.
 
@@ -600,6 +625,7 @@ class Controller(Configurable):
             trainer_mesh: ProcMesh the trainer actor is spawned on.
             generator_meshes: ProcMesh objects the generator actors are spawned on.
         """
+        _log_slow_controller_gc()
         # Peak concurrent rollout sequences (groups * num_samples_per_prompt, or the validation pass); sizes max_num_seqs below.
         async_loop = self.config.async_loop
         max_active_rollout_groups = async_loop.max_active_rollout_groups
