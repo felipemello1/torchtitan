@@ -291,6 +291,24 @@ def test_stockfish_bot_at_uci_elo_plays_legal_moves() -> None:
 
 
 @_needs_stockfish
+def test_centipawn_losses_ignore_repetitions() -> None:
+    # White, a queen up, shuffles its king until the position repeats a third time: each move keeps
+    # the win, so it costs little, not the ~2000 of a position Stockfish would call a draw.
+    moves = [
+        chess.Move.from_uci(uci)
+        for uci in ["e1d1", "e8d8", "d1e1", "d8e8", "e1d1", "e8d8", "d1e1", "d8e8"]
+    ]
+    losses = centipawn_losses(
+        fen="4k3/8/8/8/8/8/8/Q3K3 w - - 0 1",
+        moves=moves,
+        scored_color=chess.WHITE,
+        engine_path=_STOCKFISH,
+    )
+    assert len(losses) == 4
+    assert max(losses) < 200
+
+
+@_needs_stockfish
 def test_centipawn_losses_rank_moves() -> None:
     moves = [chess.Move.from_uci(uci) for uci in ["e2e4", "e7e5", "f2f3"]]
     losses = centipawn_losses(
