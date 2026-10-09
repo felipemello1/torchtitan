@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import auto, Enum
@@ -618,6 +619,19 @@ class InterGeneratorRouter(Actor, Configurable):
     async def sync_log_step(self, step: int) -> None:
         """Set the step counter in this process and in every generator rank, and log KV admission."""
         sl.set_step(step)
+        # Experiment-only: router memory and in-flight calls, to diagnose a router crash.
+        rss_gib = (
+            int(open("/proc/self/statm").read().split()[1])
+            * os.sysconf("SC_PAGE_SIZE")
+            / 2**30
+        )
+        logger.info(
+            "Router at step %d: RSS %.2f GiB, %d calls in flight, %d tracked groups",
+            step,
+            rss_gib,
+            sum(h.reserved_load for h in self._generators),
+            len(self._group_sessions),
+        )
         if self._config.kv_admission_limit is not None:
             logger.info(
                 "KV admission at step %d: %d groups placed, %d waiting; "
