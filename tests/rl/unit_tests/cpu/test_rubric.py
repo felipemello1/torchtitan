@@ -68,6 +68,7 @@ def test_kimi_length_reward() -> None:
         1.0,
         0.0,
     ]
-    # Weight 0 (the default): rewards are the graded ones.
-    no_length_reward = Rubric.Config(reward_fns=[_RewardLastToken.Config()])
-    assert _score(no_length_reward, rollouts) == [1.0, 1.0, 1.0, 0.0, 0.0]
+    # Weight 0 (the default): no `length_reward` in the breakdown, so no metric series for it.
+    no_length_reward = Rubric.Config(reward_fns=[_RewardLastToken.Config()]).build()
+    outputs = asyncio.run(no_length_reward.score_group(rollouts, None))
+    assert all("length_reward" not in output.reward_breakdown for output in outputs)
