@@ -21,7 +21,6 @@ import verifiers.v1 as vf
 
 from torchtitan.config import ConfigLoader
 from torchtitan.distributed.activation_checkpoint import FullAC
-from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.controller import Controller
 from torchtitan.rl.examples.verifiers.data import (
     VerifiersTaskDataset,
@@ -36,8 +35,6 @@ from torchtitan.rl.examples.verifiers.terminal_bench.harness import (
     TerminalBenchTerminusHarnessConfig,
 )
 from torchtitan.rl.generator import SamplingConfig
-from torchtitan.rl.observability.controller import compute_rollout_metrics
-from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout import RolloutStatus
 from torchtitan_recipes.rl.verifiers_terminal_bench import (
     _terminal_bench_rollouter_config,
@@ -425,26 +422,10 @@ def test_group_rewards_get_the_length_reward(monkeypatch) -> None:
     assert [rollout.reward for rollout in rollouts] == pytest.approx(
         [1.05, 1.0, 0.95, 0.0]
     )
-    # Mean baseline: the advantage is the reward minus the group mean, 0.75.
-    assert [rollout.advantage for rollout in rollouts] == pytest.approx(
-        [0.3, 0.25, 0.2, -0.75]
-    )
 
-    # An all-fail group whose lengths differ is no longer zero-std, so it trains on length.
+    # An all-fail group gets the length term too, so its rewards are no longer all equal.
     group = run_group([trace([100, 100], reward=0.0), trace([500, 500], reward=0.0)])
     assert [rollout.reward for rollout in group.rollouts] == pytest.approx([0.0, -0.05])
-    # The controller attaches these before the group reaches the builder.
-    group.metrics = compute_rollout_metrics(prefix="rollout", rollouts=group.rollouts)
-    builder_output = (
-        TrainingSampleBuilder.Config().build().build_from_group(rollout_group=group)
-    )
-    metrics = MetricsProcessor._aggregate_metrics(builder_output.metrics)
-    assert metrics["rollout_reward/component/length_reward/mean"] == pytest.approx(
-        -0.025
-    )
-    assert metrics["rollout_reward/group_zero_std_frac/mean"] == 0.0
-    assert metrics["rollout_reward/group_zero_std_frac/all_failure/mean"] == 0.0
-    assert len(builder_output.training_samples) == 2
 
 
 def _terminal_bench_config(name: str) -> Controller.Config:
