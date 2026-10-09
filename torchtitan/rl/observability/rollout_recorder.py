@@ -86,6 +86,9 @@ class RolloutSampleRecorder(Configurable):
 
     The filter selects which rollouts to record each step (default: highest + lowest reward per group);
     raw token / logprob arrays are recorded only when `Config.log_tensors` / `log_logprobs` opt in.
+    Each turn records only the prompt messages it adds: `prompt_messages` holds what follows the
+    previous turn's first `prompt_message_prefix_len` messages (prompt + completion + env replies), so
+    a long multi-turn rollout does not repeat its history every turn.
 
     Example:
 
@@ -145,17 +148,40 @@ class RolloutSampleRecorder(Configurable):
             "reward_breakdown": rollout.reward_breakdown,
             "advantage": rollout.advantage,
             "logs": rollout.logs,
-            "turns": [self._encode_turn(turn) for turn in rollout.turns],
+            "turns": self._encode_turns(rollout.turns),
         }
 
-    def _encode_turn(self, turn: RolloutTurn) -> dict:
+    def _encode_turns(self, turns: list[RolloutTurn]) -> list[dict]:
+        """Encode each turn with its prompt as messages added to the previous turn's conversation."""
+        encoded, previous = [], []
+        for turn in turns:
+            prefix_len = 0
+            while (
+                prefix_len < min(len(previous), len(turn.prompt_messages))
+                and previous[prefix_len] == turn.prompt_messages[prefix_len]
+            ):
+                prefix_len += 1
+            encoded.append(
+                self._encode_turn(turn, prompt_message_prefix_len=prefix_len)
+            )
+            previous = [
+                *turn.prompt_messages,
+                turn.completion_message,
+                *turn.env_messages,
+            ]
+        return encoded
+
+    def _encode_turn(
+        self, turn: RolloutTurn, prompt_message_prefix_len: int = 0
+    ) -> dict:
         """One JSON object per turn. The large token / logprob arrays are opt-in
         (`log_tensors` / `log_logprobs`)."""
         encoded = {
             "turn_id": turn.rollout_id.turn_id,
             "min_policy_version": turn.min_policy_version,
             "max_policy_version": turn.max_policy_version,
-            "prompt_messages": turn.prompt_messages,
+            "prompt_message_prefix_len": prompt_message_prefix_len,
+            "prompt_messages": turn.prompt_messages[prompt_message_prefix_len:],
             "completion_message": turn.completion_message,
             "env_messages": turn.env_messages,
             "env_rewards": turn.env_rewards,

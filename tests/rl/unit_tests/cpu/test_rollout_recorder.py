@@ -230,6 +230,32 @@ def test_none_policy_version_and_completion_message(tmp_path) -> None:
     assert record["turns"][0]["completion_message"] is None
 
 
+def test_later_turns_record_only_the_prompt_messages_they_add(tmp_path) -> None:
+    first = _turn(completion_logprobs=[-0.5])
+    second = dataclasses.replace(
+        first,
+        rollout_id=RolloutTurnID(group_id=0, rollout_id=0, turn_id=1),
+        prompt_messages=[
+            *first.prompt_messages,
+            first.completion_message,
+            *first.env_messages,
+        ],
+    )
+    rewritten = dataclasses.replace(
+        second, prompt_messages=[{"role": "user", "content": "new"}]
+    )
+    turns = _recorder(tmp_path)._encode_turns([first, second, rewritten])
+
+    assert turns[0]["prompt_message_prefix_len"] == 0
+    assert turns[0]["prompt_messages"] == first.prompt_messages
+    assert (
+        turns[1]["prompt_message_prefix_len"] == 3 and turns[1]["prompt_messages"] == []
+    )
+    # a rewritten history shares no prefix, so the whole prompt is recorded
+    assert turns[2]["prompt_message_prefix_len"] == 0
+    assert turns[2]["prompt_messages"] == [{"role": "user", "content": "new"}]
+
+
 def test_encode_turn_covers_all_rollout_turn_fields(tmp_path) -> None:
     recorder = _recorder(tmp_path, log_tensors=True, log_logprobs=True)
     encoded = recorder._encode_turn(_turn(completion_logprobs=[-0.5, -1.5]))
