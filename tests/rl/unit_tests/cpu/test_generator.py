@@ -42,8 +42,8 @@ from torchtitan.rl.distributed.routing.intra_generator import IntraGeneratorRout
 from torchtitan.rl.distributed.routing.strategies import LeastLoadedRoutingStrategy
 from torchtitan.rl.distributed.routing.types import EngineLoad, KVCacheBudget
 from torchtitan.rl.generator import (
+    _EngineStatsLogger,
     _extract_request_metrics_inputs,
-    _PreemptionCounter,
     _prepare_generation_request_metrics,
     EngineRequest,
     LoopAction,
@@ -334,31 +334,35 @@ def test_kv_cache_budget_matches_vllm_capacity():
     assert int(8169 / budget.session_blocks(131072) * 131072) == 8922726
 
 
-def test_engine_load_reads_vllm_usage_queue_and_preemptions():
-    scheduler = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(usage=0.62),
-        running=["r0", "r1", "r2"],
-        waiting=["w0"],
-        skipped_waiting=["s0"],
-    )
+def test_engine_load_reads_usage_now_and_the_last_steps_counts():
+    scheduler = SimpleNamespace(kv_cache_manager=SimpleNamespace(usage=0.62))
     generator = SimpleNamespace(
         _engine=SimpleNamespace(
             engine_core=SimpleNamespace(
                 engine_core=SimpleNamespace(scheduler=scheduler)
             )
         ),
-        _preemption_counter=_PreemptionCounter(),
+        _engine_stats=_EngineStatsLogger(),
     )
     # vLLM records every step; a step without request outputs has no IterationStats.
-    for num_preempted_reqs in (2, None, 1):
+    for num_running, num_preempted_reqs in [(5, 2), (4, None), (3, 1)]:
         iteration_stats = None
         if num_preempted_reqs is not None:
             iteration_stats = IterationStats()
             iteration_stats.num_preempted_reqs = num_preempted_reqs
-        generator._preemption_counter.record(SchedulerStats(), iteration_stats)
+        scheduler_stats = SchedulerStats(
+            num_running_reqs=num_running,
+            num_waiting_reqs=1,
+            num_skipped_waiting_reqs=1,
+        )
+        generator._engine_stats.record(scheduler_stats, iteration_stats)
 
     assert VLLMGenerator.engine_load(generator) == EngineLoad(
-        kv_usage=0.62, num_running=3, num_waiting=2, num_preemptions=3
+        kv_usage=0.62,
+        num_running=3,
+        num_waiting=2,
+        num_waiting_for_capacity=1,
+        num_preemptions=3,
     )
 
 

@@ -168,12 +168,15 @@ def _prepare_generation_request_metrics(
     ]
 
 
-class _PreemptionCounter(StatLoggerBase):
-    """Counts the engine's preemptions as vLLM's ``num_preemptions`` metric does. vLLM calls
-    ``record`` on the engine thread after each step."""
+class _EngineStatsLogger(StatLoggerBase):
+    """Keeps the engine's request counts after its last step and its preemptions so far, as vLLM's
+    metrics do. vLLM calls ``record`` on the engine thread after each step."""
 
     def __init__(self) -> None:
-        # A plain int, so `engine_load` can read it from the actor thread.
+        # Plain ints, so `engine_load` can read them from the actor thread.
+        self.num_running = 0
+        self.num_waiting = 0
+        self.num_waiting_for_capacity = 0
         self.num_preemptions = 0
 
     def record(
@@ -183,6 +186,13 @@ class _PreemptionCounter(StatLoggerBase):
         mm_cache_stats: MultiModalCacheStats | None = None,
         engine_idx: int = 0,
     ) -> None:
+        if scheduler_stats is not None:
+            self.num_running = scheduler_stats.num_running_reqs
+            self.num_waiting_for_capacity = scheduler_stats.num_waiting_reqs
+            self.num_waiting = (
+                scheduler_stats.num_waiting_reqs
+                + scheduler_stats.num_skipped_waiting_reqs
+            )
         if iteration_stats is not None:
             self.num_preemptions += iteration_stats.num_preempted_reqs
 
@@ -726,8 +736,8 @@ class VLLMGenerator(Configurable):
     Three endpoints are exceptions. `release_groups` pops cache-salt pins directly: each pop, like the engine loop's
     `setdefault`, is a single dict operation, atomic under the GIL. `prefetch_model_state_dict` writes the staging
     buffers the engine loop reads on a pull: the router awaits it before `pull_model_state_dict`, and the
-    controller awaits that pull before the next weight sync, so the two never overlap. `engine_load` reads a few
-    scheduler counters, each one attribute or `len`.
+    controller awaits that pull before the next weight sync, so the two never overlap. `engine_load` reads the
+    scheduler's free-block count and the counts the engine thread wrote, each one attribute (a skewed snapshot).
 
     A weight sync rides the same loop: `pull_model_state_dict` puts a `ModelStateDictPullMessage` on the queue, which
     rank 0 turns into a `LoopDecision(LoopAction.PULL_MODEL_STATE_DICT)` applied between step bursts. The engine does
@@ -1031,9 +1041,9 @@ class VLLMGenerator(Configurable):
 
         with sl.log_trace_span("vllm_init"):
             logger.info("Initializing LLMEngine from EngineArgs...")
-            # `engine_load` reads vLLM's preemption count from this logger.
-            self._preemption_counter = _PreemptionCounter()
-            stat_loggers = [lambda vllm_config, engine_index: self._preemption_counter]
+            # `engine_load` reads vLLM's request counts and preemptions from this logger.
+            self._engine_stats = _EngineStatsLogger()
+            stat_loggers = [lambda vllm_config, engine_index: self._engine_stats]
             if self._tp_rank == 0:
                 if config.vllm_stat_logger is None:
                     logger.info(
@@ -1255,18 +1265,20 @@ class VLLMGenerator(Configurable):
         )
 
     def engine_load(self) -> EngineLoad:
-        """Return vLLM's KV usage, queue, and preemption count now, for the router's admission policy.
+        """Return vLLM's KV usage, queue, and preemption count, for the router's admission policy.
 
-        Read from the actor thread rather than written after each engine step: releasing held
-        sessions frees blocks without a step, so a per-step copy of an idle generator would keep its
-        old usage. With data parallelism this is rank 0's replica; assumes the replicas are alike.
+        The request counts are the last step's, after scheduling, as vLLM's metrics report them. KV
+        usage is read now: releasing held sessions frees blocks without a step, so an idle
+        generator's last-step usage would stay high. With data parallelism this is rank 0's replica;
+        assumes the replicas are alike.
         """
-        scheduler = self._engine.engine_core.engine_core.scheduler
+        stats = self._engine_stats
         return EngineLoad(
-            kv_usage=scheduler.kv_cache_manager.usage,
-            num_running=len(scheduler.running),
-            num_waiting=len(scheduler.waiting) + len(scheduler.skipped_waiting),
-            num_preemptions=self._preemption_counter.num_preemptions,
+            kv_usage=self._engine.engine_core.engine_core.scheduler.kv_cache_manager.usage,
+            num_running=stats.num_running,
+            num_waiting=stats.num_waiting,
+            num_waiting_for_capacity=stats.num_waiting_for_capacity,
+            num_preemptions=stats.num_preemptions,
         )
 
     async def start_engine_loop(self) -> None:

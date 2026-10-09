@@ -9,10 +9,11 @@ from types import SimpleNamespace
 
 import pytest
 
+import torchtitan.rl.distributed.routing.admission as admission_module
 import torchtitan.rl.distributed.routing.inter_generator as inter_generator_module
 from torchtitan.rl.distributed.routing.admission import (
     KVEstimateAdmission,
-    UsageAIMDAdmission,
+    KVUsageAdmission,
 )
 from torchtitan.rl.distributed.routing.inter_generator import (
     _GeneratorState,
@@ -94,6 +95,7 @@ def _router(
         ),
         generators=actors,
         enable_cpu_weight_prefetch=enable_cpu_weight_prefetch,
+        group_size=1,
     )
 
 
@@ -576,12 +578,13 @@ _BUDGET = KVCacheBudget(
 )
 
 
-def _load(kv_usage: float = 0.0, num_preemptions: int = 0) -> EngineLoad:
+def _load(kv_usage: float = 0.0) -> EngineLoad:
     return EngineLoad(
         kv_usage=kv_usage,
         num_running=1,
         num_waiting=0,
-        num_preemptions=num_preemptions,
+        num_waiting_for_capacity=0,
+        num_preemptions=0,
     )
 
 
@@ -794,23 +797,30 @@ def test_no_admission_starts_every_group_at_once():
     asyncio.run(_run())
 
 
-def test_usage_admission_places_waiting_groups_on_the_lowest_usage_generator():
+def test_usage_admission_places_waiting_groups_on_the_lowest_usage_generator(
+    monkeypatch,
+):
+    now = [0.0]
+    monkeypatch.setattr(
+        admission_module, "time", SimpleNamespace(monotonic=lambda: now[0])
+    )
+
     async def _run():
         actors = [_KVActor("gen0"), _KVActor("gen1")]
         actors[0].engine_load.value = _load(0.6)
         actors[1].engine_load.value = _load(0.2)
-        router = _router(
-            actors, admission=UsageAIMDAdmission.Config(initial_inflight=2)
-        )
+        router = _router(actors, admission=KVUsageAdmission.Config(initial_inflight=2))
         await router._start_admission()
 
-        # A cap of 2 admits one new group per poll.
+        # A cap of 2 admits one new group per 5 s.
         assert await _kv_generate(router, group_id=0, session_id="g0/r0") == "gen1"
         waiting = asyncio.create_task(
             _kv_generate(router, group_id=1, session_id="g1/r0")
         )
         await asyncio.sleep(0)
         assert not waiting.done()
+        # The next poll, 5 s later, finds a new window.
+        now[0] += 5.0
         await router._read_engine_loads()
         assert await waiting == "gen1"
 
@@ -829,25 +839,22 @@ def test_usage_admission_places_waiting_groups_on_the_lowest_usage_generator():
     asyncio.run(_run())
 
 
-def test_loads_are_polled_only_while_groups_are_placed_or_waiting(monkeypatch):
-    monkeypatch.setattr(inter_generator_module, "_ENGINE_LOAD_POLL_INTERVAL_S", 0)
+def test_load_poll_skips_a_generator_that_fails_or_times_out(monkeypatch):
+    monkeypatch.setattr(inter_generator_module, "_ENGINE_LOAD_TIMEOUT_S", 0.01)
 
     async def _run():
-        actor = _KVActor("gen0")
-        router = _router([actor], admission=UsageAIMDAdmission.Config())
+        actors = [_KVActor("gen0"), _KVActor("gen1"), _KVActor("gen2")]
+        actors[0].engine_load.value = _load(0.6)
+        router = _router(actors, admission=KVUsageAdmission.Config())
         await router._start_admission()
-        poll = asyncio.create_task(router._poll_engine_loads())
-        await asyncio.sleep(0.01)
-        assert len(actor.engine_load.calls) == 1  # the read at start
 
-        await _kv_generate(router, group_id=0, session_id="g0/r0")
-        # A failed read does not stop the polling.
-        actor.engine_load.raises = True
-        await asyncio.sleep(0.01)
-        actor.engine_load.raises = False
-        num_calls = len(actor.engine_load.calls)
-        await asyncio.sleep(0.01)
-        assert len(actor.engine_load.calls) > num_calls
-        poll.cancel()
+        actors[0].engine_load.value = _load(0.7)
+        actors[1].engine_load.raises = True
+        actors[2].engine_load.release.clear()  # never answers
+        observed = []
+        monkeypatch.setattr(router._admission, "observe", observed.append)
+        await router._read_engine_loads()
+        assert [list(loads) for loads in observed] == [[0]]
+        assert router._kv_usage == [0.7, 0.0, 0.0]
 
     asyncio.run(_run())

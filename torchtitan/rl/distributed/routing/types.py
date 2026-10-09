@@ -86,17 +86,21 @@ class KVCacheBudget:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class EngineLoad:
-    """A generator's vLLM load now, for the inter-generator router's admission policy."""
+    """A generator's vLLM load, for the inter-generator router's admission policy."""
 
     kv_usage: float
     """Fraction of KV cache blocks in use (vLLM's ``kv_cache_usage_perc``). Held session blocks
     count (``VLLMGenerator.Config.hold_session_kv``); finished requests' cached blocks do not."""
 
     num_running: int
-    """Requests vLLM is running."""
+    """Requests vLLM ran at its last step (vLLM's ``num_requests_running``)."""
 
     num_waiting: int
-    """Requests waiting in vLLM's queue (vLLM's ``num_requests_waiting``)."""
+    """Requests waiting in vLLM's queue at its last step (vLLM's ``num_requests_waiting``)."""
+
+    num_waiting_for_capacity: int
+    """The waiting requests that wait for scheduling capacity, KV blocks or batch slots (vLLM's
+    ``num_requests_waiting_by_reason{reason="capacity"}``)."""
 
     num_preemptions: int
     """Preemptions since the engine started (vLLM's ``num_preemptions``)."""
