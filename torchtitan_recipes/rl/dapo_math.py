@@ -30,15 +30,21 @@ from torchtitan.models.qwen3 import build_model_config
 from torchtitan.models.qwen3_5 import build_model_config as build_qwen3_5_model_config
 from torchtitan.rl.components.batcher import Batcher
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
-from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
+from torchtitan.rl.controller import (
+    AsyncLoopConfig,
+    Controller,
+    ValidationConfig,
+    ValidationLoopMode,
+)
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.examples.dapo_math.data import (
     AIME2025Dataset,
     DapoMathDataset,
     Intellect3MathDataset,
+    MathEvalDataset,
 )
 from torchtitan.rl.examples.dapo_math.env import DapoMathEnv
-from torchtitan.rl.examples.dapo_math.rubric import RewardMathVerify
+from torchtitan.rl.examples.dapo_math.rubric import PerBenchmarkRubric, RewardMathVerify
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
 from torchtitan.rl.losses import DAPOLoss
 from torchtitan.rl.observability.metrics import MetricsProcessor
@@ -46,7 +52,7 @@ from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import TokenEnv
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
-from torchtitan.rl.rubric import CorrectLengthPenalty, Rubric
+from torchtitan.rl.rubric import CorrectLengthPenalty
 from torchtitan.rl.trainer import Trainer
 
 # TODO: Enable CUDA graphs for RL trainers after eager/graph numerics parity is
@@ -62,7 +68,7 @@ def _dapo_math_rollouter_config(
         train_dataset=DapoMathDataset.Config(),
         validation_dataset=validation_dataset,
         worker=RolloutWorker.Config(
-            rubric=Rubric.Config(
+            rubric=PerBenchmarkRubric.Config(
                 reward_fns=[RewardMathVerify.Config(weight=1.0)],
                 error_reward=0.0,
             ),
@@ -248,7 +254,7 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math() -> Controller.Config:
     The `rl_dapo_qwen3_5_35b_a3b_base_math` layout with 32 prompts x 16 samples, 131K
     responses with a forced answer at the cap and a length penalty (`_apply_length_control`),
     and 1-row microbatches. Truncated rollouts score `DOME_V2_TRUNCATION_REWARD` (default 0).
-    No online validation: the checkpoints are evaluated offline.
+    Every 25 steps, validates at avg@4 on the 240-problem `MathEvalDataset`, beside training.
     """
     return _intellect3_math_config(default_prompts=32, default_microbatch_rows=1)
 
@@ -331,7 +337,24 @@ def _intellect3_math_config(
         os.environ.get("DOME_V2_TRUNCATION_REWARD", 0.0)
     )
     _apply_length_control(config, max_response_tokens=max_response_tokens)
-    config.async_loop.validation = ValidationConfig(num_samples=0)
+    # avg@4: MathEvalDataset cycles in order, so 4 * 240 draws grade each problem 4 times.
+    config.rollouter.validation_dataset = MathEvalDataset.Config()
+    config.async_loop.validation = ValidationConfig(
+        num_samples=4 * 240,
+        interval_steps=25,
+        greedy=False,
+        loop_mode=ValidationLoopMode.OVERLAP_TRAINING,
+    )
+    config.metrics.console_log_keys_validation = [
+        "validation_reward/component/core/mean",
+        "validation_reward/component/hard/mean",
+        "validation/response_length/mean",
+        "validation/launch_step",
+        "validation/min_policy_version/min",
+        "validation/max_policy_version/max",
+        "validation/mixed_policy_rollouts/mean",
+        "timing/validate",
+    ]
     return config
 
 
