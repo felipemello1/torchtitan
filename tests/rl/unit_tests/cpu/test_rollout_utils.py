@@ -201,7 +201,47 @@ def test_zero_std_groups_split_into_all_success_and_all_failure() -> None:
         group = RolloutGroup(group_id=group_id, rollouts=rollouts)
         metrics += builder.build_from_group(rollout_group=group).metrics
     aggregated = m.MetricsProcessor._aggregate_metrics(metrics)
-    prefix = "rollout_reward/group_zero_std_frac"
+    for prefix in [
+        "rollout_reward/group_zero_std_frac",
+        # Without a length reward, the graded reward is the reward.
+        "rollout_reward/task_zero_std_frac",
+    ]:
+        assert aggregated[f"{prefix}/mean"] == pytest.approx(2 / 3)
+        assert aggregated[f"{prefix}/all_success/mean"] == pytest.approx(1 / 3)
+        assert aggregated[f"{prefix}/all_failure/mean"] == pytest.approx(1 / 3)
+
+
+def test_task_zero_std_split_reads_the_graded_reward() -> None:
+    # The length reward makes an all-solved and an all-failed group non-zero-std; the task split
+    # still finds them by the graded reward, and every group still trains.
+    builder = TrainingSampleBuilder.Config().build()
+    metrics: list[m.Metric] = []
+    num_training_samples = []
+    groups = [
+        # (final reward, length reward)
+        [(1.05, 0.05), (0.95, -0.05)],
+        [(0.0, 0.0), (-0.05, -0.05)],
+        [(1.05, 0.05), (-0.05, -0.05)],
+    ]
+    for group_id, rewards in enumerate(groups):
+        rollouts = [
+            _scored_rollout(
+                [_turn(prompt_token_ids=[1], completion_token_ids=[2], version=0)],
+                reward=reward,
+                advantage=0.0,
+            )
+            for reward, _ in rewards
+        ]
+        for rollout, (_, length_reward) in zip(rollouts, rewards, strict=True):
+            rollout.reward_breakdown = {"length_reward": length_reward}
+        group = RolloutGroup(group_id=group_id, rollouts=rollouts)
+        output = builder.build_from_group(rollout_group=group)
+        metrics += output.metrics
+        num_training_samples.append(len(output.training_samples))
+    aggregated = m.MetricsProcessor._aggregate_metrics(metrics)
+    assert aggregated["rollout_reward/group_zero_std_frac/mean"] == 0.0
+    prefix = "rollout_reward/task_zero_std_frac"
     assert aggregated[f"{prefix}/mean"] == pytest.approx(2 / 3)
     assert aggregated[f"{prefix}/all_success/mean"] == pytest.approx(1 / 3)
     assert aggregated[f"{prefix}/all_failure/mean"] == pytest.approx(1 / 3)
+    assert num_training_samples == [2, 2, 2]
