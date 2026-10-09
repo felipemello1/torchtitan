@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import torch
 
 from torchtitan.rl.components.data_stream_state import DataStreamState
-from torchtitan.rl.controller import Controller
+from torchtitan.rl.controller import Controller, ValidationConfig
 from torchtitan.rl.distributed.weight_sync import WeightSyncManager
 from torchtitan.rl.types import OptimizerStepOutput, TrainerStepBatch
 
@@ -302,7 +302,7 @@ async def _run_trainer_loop(*, num_training_steps):
             async_loop=SimpleNamespace(
                 target_offpolicy_steps=1,
                 max_offpolicy_steps=None,
-                validation=SimpleNamespace(interval_steps=0),
+                validation=ValidationConfig(interval_steps=0),
             )
         ),
         _get_rank_0_value=lambda result: result,
