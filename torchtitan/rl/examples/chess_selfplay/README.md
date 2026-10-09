@@ -103,9 +103,14 @@ An infra error is centered the same way, but no turn pays. A history longer than
 
 ## Thinking budget
 
-The recipe turns thinking off: unbounded, Qwen3.5-4B thinks past 4,096 tokens on every move. To turn it on, render with `Qwen35RendererConfig(enable_thinking=True, thinking_retention="all")` and cap each turn with `RolloutWorker.Config.thinking_budget`. Our multi-host runs used:
+The recipe turns thinking off: unbounded, Qwen3.5-4B thinks past 4,096 tokens on every move. To turn it on, cap each turn with `RolloutWorker.Config.thinking_budget`. Our multi-host runs (120 plies, 192 start positions x 8 games per step) changed the recipe like this:
 
 ```python
+config = rl_chess_qwen3_5_4b(max_plies=120, max_rollout_tokens=128512, max_response_tokens=2560)
+config.renderer = from_renderers(
+    Qwen35RendererConfig(enable_thinking=True, thinking_retention="all")
+)
+worker = config.rollouter.worker
 worker.thinking_budget = ThinkingBudget.Config(
     max_thinking_tokens=1024,
     opening_max_thinking_tokens=2048,  # for a player's first `opening_turns` turns
@@ -114,17 +119,23 @@ worker.thinking_budget = ThinkingBudget.Config(
     answer_end_text="}",
 )
 worker.rubric.reward_fns = [RewardChessScore.Config(forced_close_penalty=0.1)]
+# bot groups climb a curriculum of bots instead of drawing from a fixed ladder
+config.rollouter.training_dataloader.dataset.bots = ("curriculum",)
+worker.bot_curriculum = (
+    "sf_random", "sf_eps75", "sf_eps50", "sf_eps25", "sf_elo1320",
+    "sf_elo1500", "sf_elo1700", "sf_elo1900", "sf_elo2100", "sf_elo2300", "sf_elo2500",
+)
 ```
 
 1. A turn still thinking at its budget gets a forced end: Qwen's thinking-budget sentence, `</think>`, and `\boxed{`.
 2. The answer stops at the box's closing brace, which ends the turn, so a forced move is never lost to the token cap.
 3. The forced tokens are masked out of the loss, and the reward loses up to 0.1 for force-closed turns.
 
-`SamplingConfig.max_tokens` must fit the larger budget plus a short answer (2,560 there). A player keeps its own past thinking, never the opponent's, so a 120-ply game needs ~100k tokens of context. That multi-host GB300 recipe stays on an experiment branch until main has the pieces it needs at that scale:
+Each turn's `max_tokens` (`max_response_tokens`, 2,560 here) must fit the larger budget plus a short answer. A player keeps its own past thinking, never the opponent's, so a 120-ply game needs ~100k tokens of context. That multi-host GB300 recipe is not included yet: at that scale it also needs pieces that are not on main:
 
 - router admission by KV room, so the groups in flight fit the generators' KV cache;
 - session KV holding and the vLLM watermark, so a waiting player keeps its cached history between turns;
-- per-turn prompt deltas, tensor training samples, and recorder deltas, so a 120-ply rollout costs memory linear in its turns.
+- each turn's prompt stored as a delta on the previous turn, training samples stored as tensors, and the rollout recorder storing each turn's new messages only, so a 120-ply rollout costs memory linear in its turns.
 
 ## Bots, validation, and metrics
 
