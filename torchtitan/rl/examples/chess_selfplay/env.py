@@ -368,9 +368,11 @@ def _resolve_captures(
 
 
 def _parse_move(board: chess.Board, move_text: str) -> chess.Move | None:
-    """Return the legal move that `move_text` names in SAN (`Nf3`) or UCI (`g1f3`), else `None`."""
+    """Return the legal move that `move_text` names in SAN (`Nf3`) or UCI (`g1f3`), else `None`.
+    Also reads a LaTeX-escaped `Qf1\\#` and a pawn written with the prompt's `P` key (`Pe4`, `Pe2-e4`)."""
+    text = move_text.replace("\\", "").strip().rstrip("!?")
     try:
-        move = board.parse_san(move_text.strip().rstrip("!?"))
+        move = board.parse_san(re.sub(r"^P(?=[a-h])", "", text))
     except ValueError:
         return None
     # `parse_san` also reads UCI, and reads "--" as a null move, which is not legal

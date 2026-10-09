@@ -95,6 +95,18 @@ def test_san_and_uci_are_accepted(move_text) -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    "move_text, uci", [("Pe4", "e2e4"), ("Pe2-e4", "e2e4"), ("Nf3\\#", "g1f3")]
+)
+def test_p_prefixed_and_escaped_moves_are_accepted(move_text, uci) -> None:
+    async def run() -> None:
+        game = _new_game()
+        await game.play(chess.WHITE, move_text)
+        assert game.board.peek() == chess.Move.from_uci(uci)
+
+    asyncio.run(run())
+
+
 def test_a_move_after_the_game_ended_changes_nothing() -> None:
     async def run() -> None:
         game = _new_game()
