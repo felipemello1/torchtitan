@@ -19,7 +19,7 @@ from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
 from torchtitan.rl.types import Completion, RolloutTurnID
 
-THINK, END_THINK = 1, 2
+THINK, END_THINK, END_OF_TURN, BRACE, BRACE_DOT = 1, 2, 3, 4, 5
 FORCED = [90, 91, 92]
 
 
@@ -27,10 +27,18 @@ class _Tokenizer:
     """`<think>` and `</think>` are one token each; the forced text encodes to `FORCED`."""
 
     def token_to_id(self, token: str) -> int | None:
-        return {"<think>": THINK, "</think>": END_THINK}.get(token)
+        return {"<think>": THINK, "</think>": END_THINK, "<|im_end|>": END_OF_TURN}.get(
+            token
+        )
 
     def encode(self, text: str, *, add_bos: bool, add_eos: bool) -> list[int]:
         return list(FORCED)
+
+    def get_vocab_size(self) -> int:
+        return 100
+
+    def decode(self, token_ids: list[int]) -> str:
+        return {BRACE: "}", BRACE_DOT: "}."}.get(token_ids[0], "x")
 
 
 class _ScriptedGenerate:
@@ -114,6 +122,29 @@ def test_reply_cut_while_thinking_gets_a_forced_close() -> None:
     assert completion.finish_reason == "stop"
     assert completion.request_id == "group=0/rollout=0/turn=0"
     assert _forced_close_rate(completion) == 1.0
+
+
+def test_forced_answer_ends_the_turn_at_its_closing_brace() -> None:
+    thinking = _completion([10, 11, 12, 13], finish_reason="length")
+    answer = _completion([20, BRACE_DOT], finish_reason="stop")
+    generate = _ScriptedGenerate(thinking, answer)
+    budget = ThinkingBudget(
+        ThinkingBudget.Config(max_thinking_tokens=4, answer_end_text="}"),
+        tokenizer=_Tokenizer(),
+    )
+    completion = _run(budget, generate, [THINK])
+
+    answer_sampling = generate.calls[1]["sampling_config"]
+    assert answer_sampling.stop_token_ids == [BRACE, BRACE_DOT]
+    assert (
+        answer_sampling.max_tokens == 12 - 4 - len(FORCED) - 1
+    )  # room for the end of turn
+    assert completion.token_ids == [10, 11, 12, 13, *FORCED, 20, BRACE_DOT, END_OF_TURN]
+    assert completion.loss_mask == [True] * 4 + [False] * 3 + [True] * 2 + [False]
+    assert math.isnan(completion.token_logprobs[-1])
+    assert completion.finish_reason == "stop"
+    # the thinking call does not stop at braces
+    assert generate.calls[0]["sampling_config"].stop_token_ids is None
 
 
 def test_reply_cut_while_answering_continues_without_forcing() -> None:

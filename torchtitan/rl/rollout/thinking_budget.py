@@ -56,6 +56,15 @@ class ThinkingBudget(Configurable):
         """Appended after `close_text` so the answer starts in the expected format, e.g. "\\boxed{".
         Without it, Qwen3.5-4B kept reasoning in its answer (chess: 89% of answers cut at 256 tokens)."""
 
+        answer_end_text: str | None = None
+        """After a forced close, stop the answer at the first token containing this text and end the
+        turn there, e.g. "}" right after `\\boxed{e4}`. Chess 35B: forced answers kept talking after
+        the move until the turn hit `max_tokens` and forfeited."""
+
+        end_of_turn_token: str = "<|im_end|>"
+        """The tokenizer's single end-of-turn token, appended untrained when `answer_end_text` stops
+        the answer."""
+
         think_start_token: str = "<think>"
         """The tokenizer's single start-of-thinking token."""
 
@@ -74,6 +83,18 @@ class ThinkingBudget(Configurable):
         self._forced_ids = tokenizer.encode(
             config.close_text + config.answer_prefix, add_bos=False, add_eos=False
         )
+        # Every token whose text contains `answer_end_text` ("}", "}.", "}\n", ...): vLLM stops on ids,
+        # not text, because the generator runs without detokenizing.
+        self._answer_end_ids = set()
+        if config.answer_end_text is not None:
+            self._answer_end_ids = {
+                token_id
+                for token_id in range(tokenizer.get_vocab_size())
+                if config.answer_end_text in tokenizer.decode([token_id])
+            }
+            self._end_of_turn_id = tokenizer.token_to_id(config.end_of_turn_token)
+            if self._end_of_turn_id is None:
+                raise ValueError(f"{config.end_of_turn_token!r} must be one token")
 
     def wrap(self, generate_fn: GenerateFn) -> GenerateFn:
         """Return a `GenerateFn` that applies the budget around `generate_fn`."""
@@ -87,7 +108,12 @@ class ThinkingBudget(Configurable):
             sampling_config: SamplingConfig | None = None,
         ) -> Completion | None:
             max_tokens = sampling_config.max_tokens
-            if self._max_thinking_tokens + len(self._forced_ids) >= max_tokens:
+            if (
+                self._max_thinking_tokens
+                + len(self._forced_ids)
+                + bool(self._answer_end_ids)
+                >= max_tokens
+            ):
                 raise ValueError(
                     f"max_thinking_tokens ({self._max_thinking_tokens}) + {len(self._forced_ids)} forced "
                     f"tokens must be below SamplingConfig.max_tokens ({max_tokens}), which caps the turn"
@@ -113,6 +139,7 @@ class ThinkingBudget(Configurable):
                 forced_ids = self._forced_ids
             else:
                 forced_ids = []
+            answer_end_ids = sorted(self._answer_end_ids) if forced_ids else []
             second = await generate_fn(
                 prompt_token_ids + first.token_ids + forced_ids,
                 request_id=f"{request_id}/answer",
@@ -120,11 +147,24 @@ class ThinkingBudget(Configurable):
                 routing_session_id=routing_session_id,
                 sampling_config=replace(
                     sampling_config,
-                    max_tokens=max_tokens - len(first.token_ids) - len(forced_ids),
+                    # one token of room for the end of turn appended below
+                    max_tokens=max_tokens
+                    - len(first.token_ids)
+                    - len(forced_ids)
+                    - bool(answer_end_ids),
+                    stop_token_ids=(sampling_config.stop_token_ids or [])
+                    + answer_end_ids,
                 ),
             )
             if second is None:
                 return None
+            end_ids = []
+            if (
+                answer_end_ids
+                and second.token_ids[-1:]
+                and second.token_ids[-1] in self._answer_end_ids
+            ):
+                end_ids = [self._end_of_turn_id]
             return Completion(
                 min_policy_version=min(
                     first.min_policy_version, second.min_policy_version
@@ -133,18 +173,20 @@ class ThinkingBudget(Configurable):
                     first.max_policy_version, second.max_policy_version
                 ),
                 request_id=request_id,
-                token_ids=first.token_ids + forced_ids + second.token_ids,
+                token_ids=first.token_ids + forced_ids + second.token_ids + end_ids,
                 # NaN: the forced tokens have no sampling logprob. The batcher and the loss also
                 # drop non-finite logprobs, so a path that loses the mask still never trains them.
                 token_logprobs=(
                     first.token_logprobs
                     + [math.nan] * len(forced_ids)
                     + second.token_logprobs
+                    + [math.nan] * len(end_ids)
                 ),
                 loss_mask=(
                     [True] * len(first.token_ids)
                     + [False] * len(forced_ids)
                     + [True] * len(second.token_ids)
+                    + [False] * len(end_ids)
                 ),
                 finish_reason=second.finish_reason,
                 metrics=[

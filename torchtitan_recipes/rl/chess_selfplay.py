@@ -243,8 +243,11 @@ def rl_chess_qwen3_5_35b_a3b(
         "sf_elo2300",
         "sf_elo2500",
     )
+    # The answer ends at the box's closing brace, so a forced move is never lost to the token cap.
     worker.thinking_budget = ThinkingBudget.Config(
-        max_thinking_tokens=max_thinking_tokens, answer_prefix="\\boxed{"
+        max_thinking_tokens=max_thinking_tokens,
+        answer_prefix="\\boxed{",
+        answer_end_text="}",
     )
     worker.rubric.reward_fns = [RewardChessScore.Config(forced_close_penalty=0.1)]
     config.model = build_model_config(
