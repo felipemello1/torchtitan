@@ -862,8 +862,8 @@ def _validation_rollout(versions: list[tuple[int, int]]) -> Rollout:
 
 
 def test_validation_logs_its_launch_step_and_sampled_policies() -> None:
-    """A pass logs the step it started at. A weight sync during a rollout shows as a newer max
-    version and a mixed-policy rollout."""
+    """A pass logs the step it started at, and the policies its turns sampled: a first turn admitted
+    after the next pull, and a weight sync during a rollout, which makes it mixed-policy."""
     controller = object.__new__(Controller)
     controller.generator_router = SimpleNamespace(
         release_groups=SimpleNamespace(call_one=AsyncMock())
@@ -875,9 +875,9 @@ def test_validation_logs_its_launch_step_and_sampled_policies() -> None:
                 # A sync to policy 27 landed during the second turn.
                 RolloutGroup(
                     group_id=-1,
-                    rollouts=[_validation_rollout([(25, 25), (25, 27)])],
+                    rollouts=[_validation_rollout([(26, 26), (26, 27)])],
                 ),
-                RolloutGroup(group_id=-2, rollouts=[_validation_rollout([(25, 25)])]),
+                RolloutGroup(group_id=-2, rollouts=[_validation_rollout([(26, 26)])]),
             ]
         ),
     )
@@ -890,7 +890,7 @@ def test_validation_logs_its_launch_step_and_sampled_policies() -> None:
 
     reduced = m.MetricsProcessor._aggregate_metrics(metrics)
     assert reduced["validation/launch_step"] == 25
-    assert reduced["validation/min_policy_version/min"] == 25
+    assert reduced["validation/min_policy_version/min"] == 26
     assert reduced["validation/max_policy_version/max"] == 27
     assert reduced["validation/mixed_policy_rollouts/mean"] == 0.5
 
@@ -1143,6 +1143,38 @@ def test_overlapped_validation_starts_no_pass_at_the_last_step() -> None:
     assert controller._validation_task is None
 
 
+def test_overlapped_validation_after_a_resume_starts_at_the_next_validation_step() -> None:
+    """A run resumed at step 3 starts no pass at steps 4 and 5; the step-6 pass starts at 6."""
+    controller, validation = _controller_for_trainer_loop(
+        ValidationConfig(
+            num_samples=2,
+            interval_steps=3,
+            loop_mode=ValidationLoopMode.OVERLAP_TRAINING,
+        )
+    )
+    controller.start_step = 3
+
+    async def run() -> None:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        trainer = asyncio.create_task(
+            controller._trainer_loop(queue, num_training_steps=7)
+        )
+        for step in (4, 5):
+            await queue.put(_training_batch(step))
+        await _run_until(lambda: 5 in _logged_steps(controller, is_validation=False))
+        assert validation.started_steps == []
+
+        await queue.put(_training_batch(6))
+        await _run_until(lambda: validation.started_steps == [6])
+        validation.end(6)
+        await _run_until(lambda: controller._validation_task.done())
+        await queue.put(_training_batch(7))
+        await asyncio.wait_for(trainer, timeout=5)
+
+    asyncio.run(run())
+    assert _logged_steps(controller, is_validation=True) == [7]
+
+
 def test_validation_pauses_training_by_default() -> None:
     controller, validation = _controller_for_trainer_loop(
         ValidationConfig(num_samples=2, interval_steps=2)
@@ -1262,3 +1294,26 @@ def test_close_cancels_a_running_pass_before_closing_the_rollouter() -> None:
     asyncio.run(run())
     assert controller._validation_task.cancelled()
     assert pass_done_at_rollouter_close == [True]
+
+
+def test_close_logs_a_pass_error_that_training_never_raised(caplog) -> None:
+    """If training crashed before logging a failed pass, `close()` logs the pass's error."""
+    controller = object.__new__(Controller)
+    controller.trainer = None
+    controller.generator_router = None
+    controller.metrics_processor = Mock()
+    controller._proc_meshes = []
+    controller._rollouter = SimpleNamespace(close=AsyncMock())
+    validation = _FakeValidation()
+    controller.validate = validation
+
+    async def run() -> None:
+        controller._start_validation(step=0)
+        validation.end(0, error=RuntimeError("generator died"))
+        await _run_until(lambda: controller._validation_task.done())
+        with caplog.at_level(logging.ERROR):
+            await asyncio.wait_for(controller.close(), timeout=5)
+
+    asyncio.run(run())
+    assert "validation_step_0 failed" in caplog.text
+    assert "generator died" in caplog.text
