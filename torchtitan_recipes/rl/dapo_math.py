@@ -27,16 +27,15 @@ from torchtitan.models.qwen3 import build_model_config
 from torchtitan.rl.components.data import IterableRLDataLoader
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
-from torchtitan.rl.examples.dapo_math.data import AIME2025Dataset, DapoMathDataset
+from torchtitan.rl.examples.dapo_math.data import DapoMathDataset, MathEvalDataset
 from torchtitan.rl.examples.dapo_math.env import DapoMathEnv
-from torchtitan.rl.examples.dapo_math.rubric import RewardMathVerify
+from torchtitan.rl.examples.dapo_math.rubric import PerBenchmarkRubric, RewardMathVerify
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
 from torchtitan.rl.losses import DAPOLoss
 from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import TokenEnv
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
-from torchtitan.rl.rubric import Rubric
 from torchtitan.rl.trainer import Trainer
 
 # TODO: Enable CUDA graphs for RL trainers after eager/graph numerics parity is
@@ -45,7 +44,7 @@ from torchtitan.rl.trainer import Trainer
 
 def _dapo_math_rollouter_config(
     *,
-    validation_dataset: AIME2025Dataset.Config,
+    validation_dataset: MathEvalDataset.Config,
     token_env: TokenEnv.Config,
 ) -> Rollouter.Config:
     return Rollouter.Config(
@@ -54,7 +53,7 @@ def _dapo_math_rollouter_config(
         ),
         validation_dataset=validation_dataset,
         worker=RolloutWorker.Config(
-            rubric=Rubric.Config(
+            rubric=PerBenchmarkRubric.Config(
                 reward_fns=[RewardMathVerify.Config(weight=1.0)],
                 error_reward=0.0,
             ),
@@ -72,8 +71,11 @@ def _qwen3_4b_dapo_math_config(
     dump_folder: str,
 ) -> Controller.Config:
     """Build the shared Qwen3-4B DAPO-Math configuration."""
-    num_validation_samples = 30
-    validation_dataset = AIME2025Dataset.Config()
+    # avg@4: each of `MathEvalDataset`'s 240 problems (193 core, 47 hard), sampled like training.
+    # TODO: the hard tier reads near 0 at 8K/32K and needs >=64K responses. Not wired: validation
+    #   shares training's max_tokens, and the generators share the trainer's max_context_length.
+    num_validation_samples = 4 * 240
+    validation_dataset = MathEvalDataset.Config()
     model_config = build_model_config(
         "4B",
         seq_len=max_total_tokens,
@@ -92,6 +94,7 @@ def _qwen3_4b_dapo_math_config(
             target_offpolicy_steps=4,
             validation=ValidationConfig(
                 steps=num_validation_samples,
+                greedy=False,
             ),
         ),
         rollouter=_dapo_math_rollouter_config(
@@ -106,7 +109,8 @@ def _qwen3_4b_dapo_math_config(
         metrics=MetricsProcessor.Config(
             enable_wandb=True,
             console_log_keys_validation=[
-                "validation_reward/_mean",
+                "validation_reward/component/core/mean",
+                "validation_reward/component/hard/mean",
                 "validation_reward/_max",
                 "validation/response_length/mean",
                 "timing/validate",

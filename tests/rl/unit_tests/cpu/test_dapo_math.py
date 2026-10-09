@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import asyncio
+import pickle
 import time
+from collections import Counter
 
 import pytest
 from datasets import Dataset
@@ -22,10 +24,16 @@ from torchtitan.rl.examples.dapo_math import (
     data as math_data,
     grader,
     Intellect3MathDataset,
+    MathEvalBenchmark,
+    MathEvalDataset,
+    MathEvalSample,
     MathVerifyPool,
+    PerBenchmarkRubric,
     RewardMathVerify,
     score_math_response,
 )
+from torchtitan.rl.observability.controller import compute_rollout_metrics
+from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
 from torchtitan.rl.types import RolloutTurnID
 
@@ -197,6 +205,80 @@ def test_intellect3_dataset_unescapes_golds(monkeypatch) -> None:
     assert score_math_response(r"\boxed{0 \text{ or } 5}", golds[0]) == 1.0
     assert score_math_response(r"\boxed{5}", golds[0]) == 0.0
     assert score_math_response(r"\boxed{\{\frac12, 2\}}", golds[1]) == 1.0
+
+
+def test_math_eval_dataset_reads_benchmarks_in_order(monkeypatch) -> None:
+    rows_by_repo_id = {
+        "MathArena/aime_2026": [
+            {"problem": "aime problem 1", "answer": 277},
+            {"problem": "aime problem 2", "answer": 62},
+        ],
+        "MathArena/hmmt_feb_2026": [
+            {"problem": "hmmt problem 1", "answer": r"-\frac{1}{21}"}
+        ],
+    }
+    load_calls = []
+
+    def load_dataset(repo_id, *, split, revision):
+        load_calls.append((repo_id, split, revision))
+        return Dataset.from_list(rows_by_repo_id[repo_id])
+
+    monkeypatch.setattr(math_data, "load_dataset", load_dataset)
+    dataset = MathEvalDataset.Config(
+        benchmarks=(
+            MathEvalBenchmark(
+                repo_id="MathArena/aime_2026", revision="rev1", tier="core"
+            ),
+            MathEvalBenchmark(
+                repo_id="MathArena/hmmt_feb_2026",
+                revision="rev2",
+                tier="hard",
+                split="test",
+            ),
+        )
+    ).build()
+    samples = [next(dataset) for _ in range(3)]
+
+    assert load_calls == [
+        ("MathArena/aime_2026", "train", "rev1"),
+        ("MathArena/hmmt_feb_2026", "test", "rev2"),
+    ]
+    assert [
+        (sample.tier, sample.benchmark, sample.ground_truth) for sample in samples
+    ] == [
+        ("core", "aime_2026", "277"),
+        ("core", "aime_2026", "62"),
+        ("hard", "hmmt_feb_2026", r"-\frac{1}{21}"),
+    ]
+    assert "aime problem 1" in samples[0].prompt
+    assert all(r"Answer: \boxed{" in sample.prompt for sample in samples)
+    # The next pass starts over in the same order.
+    assert next(dataset) == samples[0]
+
+
+def test_math_eval_suite_has_240_problems_with_their_gold() -> None:
+    """Load the pinned suite from the Hub; every gold must verify against itself."""
+    try:
+        dataset = MathEvalDataset.Config().build()
+    except ConnectionError as exc:  # offline; a wrong revision still fails
+        pytest.skip(f"math eval datasets unavailable: {exc}")
+    samples = [next(dataset) for _ in range(240)]
+    assert Counter(sample.benchmark for sample in samples) == {
+        "aime_2026": 30,
+        "hmmt_feb_2026": 33,
+        "hmmt_nov_2025": 30,
+        "BeyondAIME": 100,
+        "apex-shortlist": 47,
+    }
+    # Hand-checked gold: AIME 2026 problem 1 and HMMT Nov 2025 problem 20.
+    hmmt_nov_golds = [
+        sample.ground_truth for sample in samples if sample.benchmark == "hmmt_nov_2025"
+    ]
+    assert samples[0].ground_truth == "277"
+    assert hmmt_nov_golds[19] == r"\frac{\sqrt{7} + 1}{2}"
+    for sample in samples:
+        response = f"Answer: \\boxed{{{sample.ground_truth}}}"
+        assert score_math_response(response, sample.ground_truth) == 1.0, sample
 
 
 def test_env_is_single_turn() -> None:
@@ -499,3 +581,42 @@ def test_reward_handles_equivalent_latex_and_units() -> None:
     sample = DapoMathSample(prompt="problem", ground_truth=r"336^\circ")
     assert asyncio.run(reward(_rollout(r"work\nAnswer: \boxed{336}"), sample)) == 1.0
     assert asyncio.run(reward(_rollout(r"work\nAnswer: \boxed{335}"), sample)) == 0.0
+
+
+def test_per_benchmark_rubric_logs_reward_under_benchmark_and_tier() -> None:
+    rubric = PerBenchmarkRubric.Config(reward_fns=[RewardMathVerify.Config()]).build()
+    rollouts = [_rollout(r"Answer: \boxed{34}"), _rollout(r"Answer: \boxed{35}")]
+    sample = MathEvalSample(
+        prompt="problem", ground_truth="34", benchmark="aime_2026", tier="core"
+    )
+    outputs = asyncio.run(rubric.score_group(rollouts, sample))
+    assert [output.reward_breakdown for output in outputs] == [
+        {"RewardMathVerify": 1.0, "aime_2026": 1.0, "core": 1.0},
+        {"RewardMathVerify": 0.0, "aime_2026": 0.0, "core": 0.0},
+    ]
+
+    for rollout, output in zip(rollouts, outputs, strict=True):
+        rollout.reward = output.reward
+        rollout.reward_breakdown = output.reward_breakdown
+    metrics = MetricsProcessor._aggregate_metrics(
+        compute_rollout_metrics(prefix="validation", rollouts=rollouts)
+    )
+    assert metrics["validation_reward/component/aime_2026/mean"] == 0.5
+    assert metrics["validation_reward/component/core/mean"] == 0.5
+
+    untagged_sample = DapoMathSample(prompt="problem", ground_truth="34")
+    untagged = asyncio.run(rubric.score_group(rollouts[:1], untagged_sample))
+    assert untagged[0].reward_breakdown == {"RewardMathVerify": 1.0}
+
+
+def test_dapo_math_sample_loads_from_a_checkpoint_saved_before_math_eval_sample() -> None:
+    """Data stream checkpoints pickle training samples; a resumed run loads and saves them again."""
+    # pickle.dumps(DapoMathSample(prompt="problem", ground_truth="34")), as a checkpoint saved
+    # before MathEvalSample existed stores it.
+    saved = (
+        b"\x80\x04\x95S\x00\x00\x00\x00\x00\x00\x00\x8c%torchtitan.rl.examples.dapo_math.data"
+        b"\x94\x8c\x0eDapoMathSample\x94\x93\x94)\x81\x94]\x94(\x8c\x07problem\x94\x8c\x0234\x94eb."
+    )
+    sample = pickle.loads(saved)
+    assert sample == DapoMathSample(prompt="problem", ground_truth="34")
+    assert pickle.loads(pickle.dumps(sample)) == sample
