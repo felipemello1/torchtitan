@@ -22,12 +22,24 @@ import verifiers.v1 as vf
 
 from torchtitan.config import ConfigLoader
 from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.controller import Controller
+from torchtitan.rl.examples.verifiers.data import (
+    VerifiersTaskDataset,
+    VerifiersTaskSample,
+)
+from torchtitan.rl.examples.verifiers.generation_server import (
+    VerifiersGenerationMetadata,
+)
 from torchtitan.rl.examples.verifiers.terminal_bench import taskset
 from torchtitan.rl.examples.verifiers.terminal_bench.harness import (
     TerminalBenchTerminusHarness,
     terminus_program_source,
 )
+from torchtitan.rl.generator import SamplingConfig
+from torchtitan.rl.observability.controller import compute_rollout_metrics
+from torchtitan.rl.observability.metrics import MetricsProcessor
+from torchtitan.rl.rollout import RolloutStatus
 from torchtitan_recipes.rl.verifiers_terminal_bench import (
     _terminal_bench_rollouter_config,
 )
@@ -160,6 +172,129 @@ print(type(load_harness(env_config.agent.harness)).__name__)
 def test_training_cannot_read_benchmark_as_training_data() -> None:
     with pytest.raises(ValueError, match="different datasets"):
         _rollouter_config(EVAL_DATASET, EVAL_DATASET)
+
+
+def test_group_rewards_get_the_length_reward(monkeypatch) -> None:
+    """A Terminal-Bench group is graded first, truncated rollouts included, then gets Kimi's
+    length reward over completion tokens (terminal output does not count)."""
+    from verifiers.v1.types import AssistantMessage, UserMessage
+
+    def trace(completion_lens, *, reward, stop_condition=None):
+        # The task prompt, then per turn: the sampled reply and 3,000 tokens of terminal output.
+        nodes = [SimpleNamespace(token_ids=[0] * 10, mask=[False] * 10, sampled=False)]
+        for completion_len in completion_lens:
+            nodes += [
+                SimpleNamespace(
+                    token_ids=[1] * completion_len,
+                    mask=[True] * completion_len,
+                    sampled=True,
+                    message=AssistantMessage(content="{}"),
+                ),
+                SimpleNamespace(
+                    token_ids=[2] * 3000,
+                    mask=[False] * 3000,
+                    sampled=False,
+                    message=UserMessage(content="$ ls"),
+                ),
+            ]
+        token_ids = [token_id for node in nodes for token_id in node.token_ids]
+        span = SimpleNamespace(duration=1.0)
+        return SimpleNamespace(
+            id="trace",
+            agent=SimpleNamespace(trainable=True),
+            nodes=nodes,
+            branches=[
+                SimpleNamespace(
+                    nodes=nodes, token_ids=token_ids, logprobs=[-0.1] * len(token_ids)
+                )
+            ],
+            ok=True,
+            is_truncated=stop_condition is not None,
+            stop_condition=stop_condition,
+            reward=reward,
+            task=SimpleNamespace(key="task"),
+            timing=SimpleNamespace(
+                setup=span,
+                agent=SimpleNamespace(duration=1.0, model=span, harness=span),
+                scoring=span,
+            ),
+            calls=[],
+            errors=[],
+        )
+
+    class EnvClient:
+        def __init__(self, traces) -> None:
+            self.traces = traces
+
+        async def run(self, *, sampling, **kwargs):
+            return SimpleNamespace(
+                ok=True, errors=[], traces=[self.traces[sampling.seed]]
+            )
+
+    def run_group(traces):
+        rollouter._verifiers_env_client = EnvClient(traces)
+        return asyncio.run(
+            rollouter.run_group_rollouts(
+                generate_fn=None,
+                sample=VerifiersTaskSample(verifiers_task_data={}),
+                group_id=0,
+                group_size=len(traces),
+                sampling=SamplingConfig(seed=0),
+            )
+        )
+
+    # Skip loading the Harbor datasets; the env server is never started.
+    monkeypatch.setattr(VerifiersTaskDataset, "__init__", lambda self, config: None)
+    config = _rollouter_config(TRAIN_DATASET, EVAL_DATASET)
+    config.rubric.length_reward_weight = 0.1
+    rollouter = config.build()
+    rollouter._generation_server = SimpleNamespace(
+        model_id="torchtitan",
+        set_generate_fn=lambda generate_fn: None,
+        pop_generation_metadata=lambda trace_id: VerifiersGenerationMetadata(
+            min_policy_version=0, max_policy_version=0, metrics=[]
+        ),
+    )
+    rollouter._verifiers_train_client_config = object()
+
+    # lam = 0.5 - (len - 200) / 800 over completion tokens: +0.5, 0, -0.5 at 200 / 600 / 1,000.
+    group = run_group(
+        [
+            trace([100, 100], reward=1.0),
+            trace([300, 300], reward=1.0),
+            # Stopped at the context cap, then graded: its tests passed.
+            trace([500, 500], reward=1.0, stop_condition="context_length"),
+            trace([100, 100], reward=0.0),
+        ]
+    )
+    rollouts = group.rollouts
+    assert rollouts[2].status == RolloutStatus.TRUNCATED_LENGTH
+    assert rollouts[2].reward_breakdown == pytest.approx(
+        {"RewardFromVerifiers": 1.0, "length_reward": -0.05}
+    )
+    assert [rollout.reward for rollout in rollouts] == pytest.approx(
+        [1.05, 1.0, 0.95, 0.0]
+    )
+    # Mean baseline: the advantage is the reward minus the group mean, 0.75.
+    assert [rollout.advantage for rollout in rollouts] == pytest.approx(
+        [0.3, 0.25, 0.2, -0.75]
+    )
+
+    # An all-fail group whose lengths differ is no longer zero-std, so it trains on length.
+    group = run_group([trace([100, 100], reward=0.0), trace([500, 500], reward=0.0)])
+    assert [rollout.reward for rollout in group.rollouts] == pytest.approx([0.0, -0.05])
+    # The controller attaches these before the group reaches the builder.
+    group.metrics = compute_rollout_metrics(prefix="rollout", rollouts=group.rollouts)
+    builder_output = (
+        TrainingSampleBuilder.Config().build().build_from_group(rollout_group=group)
+    )
+    metrics = MetricsProcessor._aggregate_metrics(builder_output.metrics)
+    assert metrics["rollout_reward/component/length_reward/mean"] == pytest.approx(
+        -0.025
+    )
+    assert metrics["rollout_reward/group_zero_std_frac/mean"] == 0.0
+    assert metrics["rollout_reward/group_zero_std_frac/all_failure/mean"] == 0.0
+    assert len(builder_output.training_samples) == 2
 
 
 def _terminal_bench_config(name: str) -> Controller.Config:
@@ -315,6 +450,7 @@ def test_35b_sandoq_1x2_recipe_fits_three_hosts(monkeypatch) -> None:
     monkeypatch.setenv("DOME_SANDOQ_POOL", "920")
     monkeypatch.delenv("DOME_V2_PROMPTS", raising=False)
     monkeypatch.delenv("DOME_V2_THINKING_BUDGET", raising=False)
+    monkeypatch.delenv("DOME_V2_LENGTH_REWARD_WEIGHT", raising=False)
     config = _terminal_bench_config("rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2")
 
     trainer = config.trainer.parallelism
@@ -336,6 +472,9 @@ def test_35b_sandoq_1x2_recipe_fits_three_hosts(monkeypatch) -> None:
     assert loop.target_offpolicy_steps == 5
     assert loop.validation.num_samples == 0
     assert config.rollouter.thinking_budget.max_thinking_tokens == 12288
+    # Kimi's length reward assumes the mean baseline.
+    assert config.rollouter.rubric.length_reward_weight == 0.1
+    assert not config.rollouter.advantage.should_std_normalize
     serve = config.rollouter.verifiers_env_server.serve
     assert serve.pool.num_workers == 39
     assert serve.pool.num_workers * serve.max_concurrent >= 920

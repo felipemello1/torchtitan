@@ -97,6 +97,11 @@ class Rubric(Configurable):
         """Reward for a errored rollout. If set, the reward fns are SKIPPED and this fixed
         reward is used. If None, the reward fns run on the errored rollout."""
 
+        length_reward_weight: float = 0.0
+        """Weight of Kimi k1.5's length reward (`kimi_length_rewards`), added once the group is
+        graded; 0: off. Groups whose lengths differ are never zero-std, so all-correct and
+        all-wrong groups pass `drop_zero_std_reward_groups` and train on length alone."""
+
     def __init__(self, config: Config) -> None:
         self._config = config
         self._reward_fns = [rwd_cfg.build() for rwd_cfg in config.reward_fns]
@@ -160,7 +165,7 @@ class Rubric(Configurable):
         rollouts: list[Rollout],
         env_input: object,
     ) -> list[RubricOutput]:
-        """Score every rollout in one prompt group.
+        """Score every rollout in one prompt group, then add the length reward.
 
         Override for cross-rollout rewards (pairwise comparison, diversity,
         rank normalization).
@@ -172,6 +177,58 @@ class Rubric(Configurable):
         Returns:
             One `RubricOutput` per rollout, in input order.
         """
-        return await asyncio.gather(
+        outputs = await asyncio.gather(
             *(self._score_single_rollout(r, env_input) for r in rollouts)
         )
+        if self._config.length_reward_weight == 0:
+            return outputs
+        length_rewards = kimi_length_rewards(
+            rollouts=rollouts,
+            rewards=[output.reward for output in outputs],
+            weight=self._config.length_reward_weight,
+        )
+        return [
+            RubricOutput(
+                reward=output.reward + length_reward,
+                reward_breakdown={
+                    **output.reward_breakdown,
+                    "length_reward": length_reward,
+                },
+            )
+            for output, length_reward in zip(outputs, length_rewards, strict=True)
+        ]
+
+
+def kimi_length_rewards(
+    *, rollouts: list[Rollout], rewards: list[float], weight: float
+) -> list[float]:
+    """Kimi k1.5's length reward (arXiv 2501.12599, section 2.3.3), one per rollout in group order.
+
+    Over the group, `lam = 0.5 - (len - min_len) / (max_len - min_len)`, with `len` the
+    completion tokens of all turns. A correct rollout (reward > 0) gets `weight * lam`; a wrong
+    one gets `weight * min(0, lam)`, so only its length above the group's midpoint costs it. All
+    lengths equal: 0 for every rollout.
+
+    Assumes the mean baseline (`should_std_normalize=False`), as k1.5 does: with std
+    normalization, a group that differs only in length trains at full advantage scale for any
+    `weight`.
+
+    Example:
+        weight=0.1; lengths 1,000 / 2,000 / 1,000 / 3,000 tokens, the first two correct
+        correct, 1,000 -> 0.1 * 0.5          = +0.05
+        correct, 2,000 -> 0.1 * 0.0          =  0.0
+        wrong,   1,000 -> 0.1 * min(0, 0.5)  =  0.0
+        wrong,   3,000 -> 0.1 * min(0, -0.5) = -0.05
+    """
+    lengths = [
+        sum(len(rollout_turn.completion_token_ids) for rollout_turn in rollout.turns)
+        for rollout in rollouts
+    ]
+    min_len, max_len = min(lengths), max(lengths)
+    if min_len == max_len:
+        return [0.0] * len(rollouts)
+    length_rewards = []
+    for length, reward in zip(lengths, rewards, strict=True):
+        lam = 0.5 - (length - min_len) / (max_len - min_len)
+        length_rewards.append(weight * (lam if reward > 0 else min(0.0, lam)))
+    return length_rewards
