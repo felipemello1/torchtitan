@@ -46,7 +46,11 @@ from torchtitan.rl.model.vllm_registry import (
     TORCHTITAN_WORKER_CLS,
 )
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.observability.vllm import StatLoggerContext, VllmOtelStatLogger
+from torchtitan.rl.observability.vllm import (
+    StatLoggerContext,
+    VllmOtelStatLogger,
+    VllmPreemptionStatLogger,
+)
 from torchtitan.rl.types import Completion
 from torchtitan.tools.utils import has_cuda_capability
 
@@ -128,10 +132,9 @@ def _prepare_generation_request_metrics(
         metric_values[f"{prefix}/queue_time_ms"] = (
             inputs.scheduled_ts - inputs.queued_ts
         ) * 1000
-        # Times vLLM preempted this request and later re-prefilled it: because the KV cache was full,
-        # or at a weight sync with reset_kv_cache_on_weight_sync, which preempts every running request.
-        # TODO: also log re-prefilled tokens (the cost). vLLM counts them per engine step, so they belong
-        # in VllmOtelStatLogger: SchedulerStats.prefix_cache_stats.preempted_queries - preempted_hits.
+        # Times vLLM preempted this request: because the KV cache was full, or at a weight sync with
+        # reset_kv_cache_on_weight_sync, which preempts every running request.
+        # VllmPreemptionStatLogger logs each engine's count and re-prefilled tokens (the cost) to stdout.
         metric_values[f"{prefix}/num_preemptions"] = inputs.num_preemptions
 
         if inputs.num_generation_tokens > 0:
@@ -968,6 +971,7 @@ class VLLMGenerator(Configurable):
             logger.info("Initializing LLMEngine from EngineArgs...")
             stat_loggers = None
             if self._tp_rank == 0:
+                stat_loggers = [VllmPreemptionStatLogger]
                 if config.vllm_stat_logger is None:
                     logger.info(
                         "VllmOtelStatLogger inactive because "
@@ -992,7 +996,7 @@ class VLLMGenerator(Configurable):
                             context=logger_context,
                         )
 
-                    stat_loggers = [build_stat_logger]
+                    stat_loggers.append(build_stat_logger)
 
             # Start the thread that runs vllm engine.
             self._engine_event_loop = asyncio.new_event_loop()
