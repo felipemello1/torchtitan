@@ -744,6 +744,7 @@ class Controller(Configurable):
                 InterGeneratorRouter,
                 config.generator_router,
                 generators=generators,
+                forward_session_releases=config.generator.hold_session_kv,
             )
 
             await self._rollouter.setup_async(
