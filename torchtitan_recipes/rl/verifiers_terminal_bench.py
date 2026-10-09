@@ -581,7 +581,7 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2() -> Controller.Config:
     config.rollouter.rubric.length_reward_weight = float(
         os.environ.get("DOME_V2_LENGTH_REWARD_WEIGHT", 0.1)
     )
-    config.async_loop.validation.interval_steps = 10
+    config.async_loop.validation.interval_steps = 25
     config.async_loop.validation.loop_mode = ValidationLoopMode.OVERLAP_TRAINING
     return config
 
