@@ -22,7 +22,7 @@ class SessionKVHolder:
     blocks and the matching GDN state blocks), and lets go of the session's previous hold. Held blocks
     count as used in vLLM's ``kv_cache_usage``.
 
-    When free blocks fall below ``free_floor_blocks``, whole idle sessions (no request in vLLM) are
+    When free blocks fall below ``free_floor_blocks``, whole sessions without a running request are
     released, the one idle longest first. Every mutating method must run
     on the engine thread of every rank, in the same order, so the schedulers of all TP ranks stay
     identical.
@@ -79,15 +79,21 @@ class SessionKVHolder:
                 self._hold(request, session_id, group_id)
 
     def evict_until_free(self) -> None:
-        """Release idle sessions, idle longest first, until enough blocks are free.
+        """Release sessions with no running request, idle longest first, until enough blocks are free.
 
-        A session with a request in vLLM is skipped: its own request still references most of its
-        blocks, so releasing it frees little and costs its next call a recompute.
+        A session whose request is running is skipped: that request still references most of its
+        blocks, so releasing it frees little. A session whose next request is still waiting is
+        released: its hold is all that keeps those blocks, and keeping it once memory is full stops
+        every waiting request from starting.
         """
+        if self._block_pool.get_num_free_blocks() >= self.free_floor_blocks:
+            return
+        running_ids = {request.request_id for request in self._scheduler.running}
+        running = {self._live[i][0] for i in running_ids if i in self._live}
         for session_id in list(self._held):
             if self._block_pool.get_num_free_blocks() >= self.free_floor_blocks:
                 return
-            if session_id not in self._busy_sessions:
+            if session_id not in running:
                 self._release(session_id)
                 self.num_evicted += 1
 

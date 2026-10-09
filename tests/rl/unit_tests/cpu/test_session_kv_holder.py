@@ -104,8 +104,10 @@ def _churn(manager, tag: str) -> None:
         manager.free(request)
 
 
-def _holder(manager, requests, floor=0) -> SessionKVHolder:
-    scheduler = SimpleNamespace(kv_cache_manager=manager, requests=requests)
+def _holder(manager, requests, floor=0, running=()) -> SessionKVHolder:
+    scheduler = SimpleNamespace(
+        kv_cache_manager=manager, requests=requests, running=running
+    )
     return SessionKVHolder(scheduler, free_floor_blocks=floor)
 
 
@@ -185,10 +187,10 @@ def test_evict_until_free_releases_the_session_idle_longest_first(manager):
     assert holder.num_sessions == 0
 
 
-def test_evict_until_free_skips_a_session_with_a_request_in_vllm(manager):
+def test_evict_until_free_skips_a_session_with_a_running_request(manager):
     requests = {}
-    holder = _holder(manager, requests)
     busy = _request("busy", list(range(50)))
+    holder = _holder(manager, requests, running=[busy])
     requests["busy"] = busy
     holder.track("busy", session_id="busy", group_id=0)
     _prefill(manager, busy)
@@ -197,6 +199,19 @@ def test_evict_until_free_skips_a_session_with_a_request_in_vllm(manager):
     holder.free_floor_blocks = manager.block_pool.get_num_free_blocks() + 1
     holder.evict_until_free()
     assert holder.num_sessions == 1 and holder.num_evicted == 0
+
+
+def test_evict_until_free_releases_a_session_whose_next_request_is_waiting(manager):
+    requests = {}
+    holder = _holder(manager, requests)
+    _finished_turn(manager, holder, requests, "s", list(range(50)))
+    # The next turn is in vLLM but not scheduled yet: only the hold keeps its blocks.
+    requests["s/turn2"] = _request("s/turn2", list(range(60)))
+    holder.track("s/turn2", session_id="s", group_id=0)
+
+    holder.free_floor_blocks = manager.block_pool.get_num_free_blocks() + 1
+    holder.evict_until_free()
+    assert holder.num_sessions == 0 and holder.num_evicted == 1
 
 
 def test_release_before_prefill_takes_no_hold(manager):
