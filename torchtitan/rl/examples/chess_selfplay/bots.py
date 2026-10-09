@@ -7,10 +7,7 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import random
-import shutil
-import tempfile
 from dataclasses import dataclass
 
 import chess
@@ -57,16 +54,12 @@ class StockfishBot:
 
     Example:
 
-        bot = StockfishBot(BOTS["sf_eps75"], name="sf_eps75", engine_path="stockfish", seed=7)
+        bot = StockfishBot(BOTS["sf_eps75"], engine_path="stockfish", seed=7)
         move = await bot.move(chess.Board())  # a random move 75% of the time, else Stockfish's
         bot.close()
     """
 
-    def __init__(
-        self, spec: BotSpec, *, name: str, engine_path: str, seed: int
-    ) -> None:
-        self.name = name
-        self.elo = spec.elo
+    def __init__(self, spec: BotSpec, *, engine_path: str, seed: int) -> None:
         self._spec = spec
         self._engine_path = engine_path
         self._rng = random.Random(seed)
@@ -128,20 +121,3 @@ def centipawn_losses(
             # the eval after this move is the best eval for the next mover
             best = after
     return losses
-
-
-def executable_stockfish(path: str | None) -> str | None:
-    """Return `path`, or an executable copy of it when the file lacks the execute bit, e.g. a binary
-    copied from a store that keeps no file modes onto a read-only mount.
-
-    Example:
-
-        executable_stockfish("stockfish")              # "stockfish" (found on PATH)
-        executable_stockfish("/mnt/staged/stockfish")  # "/tmp/stockfish_x1y2/stockfish", mode 0755
-    """
-    if path is None or not os.path.isfile(path) or os.access(path, os.X_OK):
-        return path
-    copy = os.path.join(tempfile.mkdtemp(prefix="stockfish_"), os.path.basename(path))
-    shutil.copyfile(path, copy)
-    os.chmod(copy, 0o755)
-    return copy

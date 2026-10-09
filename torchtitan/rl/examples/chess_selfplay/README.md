@@ -1,6 +1,6 @@
 # Chess self-play
 
-One policy plays chess against itself, and both colors are trained. Half the groups instead play a Stockfish bot from a ladder of measured strengths, which anchors the score to Elo. This example trains Qwen3.5-4B with the DAPO loss: thinking off on one node, or thinking on with a [thinking budget](#thinking-budget) on three GB300 hosts.
+One policy plays chess against itself, and both colors are trained. Half the groups instead play a Stockfish bot from a ladder of measured strengths, which anchors the score to Elo. This example trains Qwen3.5-4B (thinking off) with the DAPO loss on one node; see [Thinking budget](#thinking-budget) to turn thinking on.
 
 ## Environment
 
@@ -65,36 +65,70 @@ Opponent pieces (White) and the moves they could make on their turn:
 Your move as Black. Write your best legal move inside \boxed{}.
 ```
 
-The player's own legal moves are shuffled per piece with a per-game seed (the opponent's are sorted), so copying the first listed move plays a random move: in python-chess's fixed order, always playing it beat a random mover. Each turn appends the opponent's move and the new pieces to the player's chat. The model's reasoning stays in its history, so a player's whole game packs into one training sample.
+The player's own legal moves are shuffled every turn (the opponent's are sorted): in python-chess's fixed order, always playing the first listed move beats a random mover. Each turn appends the opponent's move and the new pieces to the player's chat. The model's reasoning stays in its history, so a player's whole game packs into one training sample.
 
 ## Rewards and advantages
 
 A game ends on:
 
-- checkmate, stalemate, or insufficient material. A repetition plays on: a repetition draw would lock in a reward while playing on risks a forfeit, so self-play could learn to repeat moves;
+- checkmate, stalemate, or insufficient material. A repetition does not end the game: a draw would lock in its reward, so self-play could learn to repeat moves instead of risking a forfeit;
 - an illegal, missing, or unparsable move, a reply cut at `max_tokens`, or a history longer than `max_rollout_tokens`: that player forfeits. A move must be written as listed, but its check mark and a capture's `x` are optional (`Nxe5`, `Ne5` and `Ne5+` all play `Nxe5+`);
-- `max_plies` plies (required; the one-node recipe uses 60, the GB300 recipe 120): a draw, adjusted by material after the side to move plays out its captures. White's material score is `1 / (1 + exp(-pawns / 4))`.
+- `max_plies` plies (required; the recipe uses 60): a draw, adjusted by material after the side to move plays out its captures. White's material score is `1 / (1 + exp(-pawns / 4))`.
 
-The training reward (`ChessGame.rewards`) is 1 for a win, at any length. A game that reaches `max_plies`, or is forfeited by the opponent, is a draw moved toward the material score: 0.25 to 0.75, so more material scores more and an opponent's forfeit is not a free win. With `played` the share of `max_plies` played, a stalemate or insufficient material scores 0.5 * `played`, being checkmated -0.25 * (1 - `played`), and a forfeit -1 * (1 - `played` / 2), between -1 and -0.5. A win beats every other ending, and a forfeit is worse than any loss at any ply. The Elo metrics use the chess result instead (`ChessGame.scores`: 1 / 0.5 / 0, material at the cap).
+The training reward (`ChessGame.rewards`), with `played` = plies played / `max_plies`:
+
+- win by checkmate: 1, at any length;
+- ply cap, or the opponent forfeits: a draw, 0.5, moved halfway toward the material score, so 0.25 to 0.75 (an opponent's forfeit is not a free win);
+- stalemate or insufficient material: 0.5 * `played`;
+- checkmated: -0.25 * (1 - `played`);
+- forfeit: -1 * (1 - `played` / 2), so -1 to -0.5, below any loss.
+
+The Elo metrics use the chess result instead (`ChessGame.scores`: 1 / 0.5 / 0, material at the cap).
 
 Advantages are centered per color within a group: White's rollouts against White's mean, Black's against Black's. With one baseline over both colors, the mean of complementary scores is 0.5, so the color that moves first would collect a free positive advantage.
 
-A rollout's advantage lands on every turn. A late forfeit would push dozens of legal moves down with it, and lift its color's other rollouts by lowering their mean. A forfeit caused by one reply (an illegal, missing, or unparsable move, or a reply cut at `max_tokens`) costs only that turn instead. Each color is centered as if its forfeits had ended at `max_plies` at that moment. The forfeiting turn alone pays the difference, through `RolloutTurn.advantage`. A player stopped by an infra error is centered the same way, and none of its turns pays. A history longer than `max_rollout_tokens` is still a forfeit on every turn. A group whose rewards tie still trains when one of its turns carries its own advantage.
+A rollout's advantage normally lands on every turn, so one illegal move on ply 80 would also push down the ~40 legal moves before it. Instead, a forfeit caused by one reply (an illegal, missing, or unparsable move, or a reply cut at `max_tokens`) costs only that reply:
+
+1. The baseline counts the forfeited game as if it had stopped at the cap on that ply, scored by material.
+2. Each rollout's advantage is its reward minus its color's mean, with that substitution.
+3. The forfeiting turn alone gets that advantage minus the forfeit's cost, through `RolloutTurn.advantage`.
+
+```text
+Black's side of a 2-game group, max_plies=60:
+game 0: mated on ply 31             reward -0.12               advantage -0.31 on every turn
+game 1: forfeits on ply 41 (even)   reward -0.66, counted 0.5  advantage +0.31, forfeiting turn -0.85
+```
+
+An infra error is centered the same way, but no turn pays. A history longer than `max_rollout_tokens` stays a forfeit on every turn. A group whose rewards tie still trains when one of its turns carries its own advantage.
 
 ## Thinking budget
 
-The GB300 recipe turns thinking on. Unbounded, Qwen3.5-4B thinks past 4,096 tokens on every move, so `RolloutWorker.Config.thinking_budget` caps it:
+The recipe turns thinking off: unbounded, Qwen3.5-4B thinks past 4,096 tokens on every move. To turn it on, render with `Qwen35RendererConfig(enable_thinking=True, thinking_retention="all")` and cap each turn with `RolloutWorker.Config.thinking_budget`. Our multi-host runs used:
 
-1. A turn thinks up to 1,024 tokens, or 2,048 on a player's first 5 turns.
-2. A turn still thinking then gets a forced end: Qwen's thinking-budget sentence, `</think>`, and `\boxed{`.
-3. The answer stops at the box's closing brace, which ends the turn, so a forced move is never lost to the token cap.
-4. The forced tokens are masked out of the loss, and the reward loses up to 0.1 for force-closed turns (`RewardChessScore.Config.forced_close_penalty`).
+```python
+worker.thinking_budget = ThinkingBudget.Config(
+    max_thinking_tokens=1024,
+    opening_max_thinking_tokens=2048,  # for a player's first `opening_turns` turns
+    opening_turns=5,
+    answer_prefix="\\boxed{",
+    answer_end_text="}",
+)
+worker.rubric.reward_fns = [RewardChessScore.Config(forced_close_penalty=0.1)]
+```
 
-A player keeps its own past thinking in its history, never the opponent's, so a 120-ply game needs ~100k tokens of context.
+1. A turn still thinking at its budget gets a forced end: Qwen's thinking-budget sentence, `</think>`, and `\boxed{`.
+2. The answer stops at the box's closing brace, which ends the turn, so a forced move is never lost to the token cap.
+3. The forced tokens are masked out of the loss, and the reward loses up to 0.1 for force-closed turns.
+
+`SamplingConfig.max_tokens` must fit the larger budget plus a short answer (2,560 there). A player keeps its own past thinking, never the opponent's, so a 120-ply game needs ~100k tokens of context. That multi-host GB300 recipe stays on an experiment branch until main has the pieces it needs at that scale:
+
+- router admission by KV room, so the groups in flight fit the generators' KV cache;
+- session KV holding and the vLLM watermark, so a waiting player keeps its cached history between turns;
+- per-turn prompt deltas, tensor training samples, and recorder deltas, so a 120-ply rollout costs memory linear in its turns.
 
 ## Bots, validation, and metrics
 
-`bots.BOTS` is a ladder of Stockfish opponents, rated on a full-rules scale anchored at Stockfish's `UCI_Elo` 1320:
+`bots.BOTS` is a ladder of Stockfish opponents, rated from full games with no ply cap and anchored at Stockfish's `UCI_Elo` 1320:
 
 ```text
 sf_random  360   a random legal move
@@ -107,11 +141,11 @@ sf_elo1500 1500
 sf_elo1700 to sf_elo2500  unmeasured, rated at their UCI_Elo
 ```
 
-Half the training groups play a bot; the other half are self-play. The one-node recipe draws each bot group's bot uniformly from a ladder and validates on 64 fixed greedy-decoded games against it. The GB300 recipe climbs `bot_curriculum` instead, from `sf_random` to `sf_elo2500`: each rollout worker moves to the next bot once the policy checkmates the current one in over 40% of a 128-game block. Each bot runs its own Stockfish process, off the event loop; set `ChessSelfPlayWorker.Config.stockfish_path`.
+Half the training groups play a bot; the other half are self-play. The recipe draws each bot group's bot uniformly from a ladder, and validates on 64 fixed greedy-decoded games against the same ladder. Groups whose opponent is `"curriculum"` climb `ChessSelfPlayWorker.Config.bot_curriculum` instead: each rollout worker moves to the next bot once the policy checkmates the current one in over 40% of a 128-game block. Each bot runs its own Stockfish process, off the event loop.
 
 Logged every step in two sections (validation prefixes each with `val_`):
 
-- `chess_strength/elo`: one Elo fitted to the step's bot games, the rating whose expected score matches the actual one;
+- `chess_strength/elo`: one Elo fitted to the step's bot games, the rating whose expected score matches the actual one. A game cut at the ply cap counts by material, so the fit reads below the ladder for weak play: a uniform random mover reads ~280 at 60 plies, not 360;
 - `chess_strength/score_vs_<bot>`: the policy's mean chess result against each bot;
 - `chess_strength/acpl_{self_play,vs_bot}`: Stockfish's centipawn loss of the policy's moves at depth 8, a strength measure that does not depend on the opponent;
 - `chess_games/{reward,plies,forfeits_per_reply}_{self_play,vs_bot}` and `chess_games/end_{self_play,vs_bot}/<end>`, with `<end>` one of checkmate, draw, ply_limit, illegal_move, reply_too_long, context_full, error.
@@ -120,7 +154,7 @@ The self-play reward is not a progress metric: both players are the same policy,
 
 ## Setup
 
-Follow the [RL environment setup](../../README.md), install python-chess, put a [Stockfish](https://stockfishchess.org/download/) binary on `PATH` (or point `CHESS_STOCKFISH_PATH` at it for the GB300 recipe), and download the checkpoint:
+Follow the [RL environment setup](../../README.md), install python-chess, put a [Stockfish](https://stockfishchess.org/download/) binary on `PATH` (or set `ChessSelfPlayWorker.Config.stockfish_path`), and download the checkpoint:
 
 ```bash
 pip install -r torchtitan/rl/examples/chess_selfplay/requirements.txt
@@ -133,7 +167,7 @@ python scripts/download_hf_assets.py \
 
 ## Run
 
-`rl_chess_qwen3_5_4b` runs on one eight-GPU node: an FSDP=4 trainer and four TP=1 generators.
+The recipe runs on one eight-GPU node: an FSDP=4 trainer and four TP=1 generators.
 
 ```bash
 python -m torchtitan.rl.train \
@@ -142,8 +176,6 @@ python -m torchtitan.rl.train \
   --output-dir outputs/rl/qwen3_5_4b_chess
 ```
 
-`rl_chess_qwen3_5_4b_gb300` runs on three four-GPU GB300 hosts: an FSDP=4 trainer on one and eight one-GPU generators on the other two, with 192 start positions x 8 games per step.
-
 ## Results
 
-TODO: add the 150-step reference run.
+None yet for this recipe. TODO: add its 150-step reference run.
