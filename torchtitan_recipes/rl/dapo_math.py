@@ -313,8 +313,9 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_8_generators_adaptive_buffer() 
         max_offpolicy_steps=None,
         # Start at the fixed buffer's (6 + 1) x 64 = 448 slots, so a resume does not restart at 3 x 64.
         start_batches=7,
-        # Never binds (the demand stays near 448); a cap at the engines' ~160-256 running groups starves them.
-        generation_capacity=1024,
+        # Never binds (the demand stays at or under ~481); a cap at the engines' ~160-256 running groups
+        # starves them. Each idle rollout worker rescans on every buffer change, so not much higher.
+        generation_capacity=640,
     )
     return config
 
