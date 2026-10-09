@@ -530,6 +530,37 @@ def test_stall_driven_demand_starts_at_three_batches_and_moves_half_the_gap() ->
     assert demand.state == "age-limited"
 
 
+def test_stall_driven_demand_moves_down_one_group_per_step() -> None:
+    for damping_factor in (0.5, 1.0):
+        demand = StallDrivenDemand(
+            num_prompts_per_train_step=8, start_batches=8, damping_factor=damping_factor
+        )
+        # a full shelf: unavailable 0 -> needed 8 + 0 + 1 = 9; one group down from 64, whatever the damping
+        assert (
+            demand.observe(step=1, ready=64, generating=0, completed=64, trainable=64)
+            == 63
+        )
+        assert demand.state == "ok"
+
+
+def test_stall_driven_demand_above_the_ceiling_moves_down_half_the_gap() -> None:
+    # ceiling with a max of 1: 1 x 8 + 8 + generating x untrainable share = 16 + 0 in both cases below
+    # nothing ready: needed 8 + 64 + 1 = 73, capped at 16; half the gap down: 64 - 24
+    demand = StallDrivenDemand(
+        num_prompts_per_train_step=8, max_offpolicy_steps=1, start_batches=8
+    )
+    assert demand.observe(step=1, ready=0, generating=0, completed=0, trainable=0) == 40
+    assert demand.state == "age-limited"
+    # a full shelf: needed 8 + 4 + 1 = 13 is under the ceiling, but demand 64 is above it; half the gap down too
+    demand = StallDrivenDemand(
+        num_prompts_per_train_step=8, max_offpolicy_steps=1, start_batches=8
+    )
+    assert (
+        demand.observe(step=1, ready=60, generating=4, completed=60, trainable=60) == 40
+    )
+    assert demand.state == "age-limited"
+
+
 def test_stall_driven_demand_is_capped_by_the_mean_age_ceiling() -> None:
     # target 4 with 40 generating and 36% rejected: ceiling 4 x 8 + 8 + 40 x 0.36 = 54.4 -> 54
     demand = StallDrivenDemand(

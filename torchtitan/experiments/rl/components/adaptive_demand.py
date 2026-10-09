@@ -27,9 +27,13 @@ stalls when fewer than P groups are ready, so the demand that would have avoided
 
     demand_needed = P + quantile(unavailable over the last lookback_steps, 1 - stall_probability) + 1
 
-then move `damping_factor` of the gap toward it, the same going up and down. `+ 1` is one spare group. Nothing is
-assumed about how long groups take: the count already contains everything (slow groups, refills of rejected
-groups, a workload getting slower).
+then move toward it: up by `damping_factor` of the gap, down by one group per step. `+ 1` is one spare group.
+Nothing is assumed about how long groups take: the count already contains everything (slow groups, refills of
+rejected groups, a workload getting slower).
+
+Down is slow because a large ready shelf makes `unavailable` small while it lasts. Cutting the demand below the
+groups already admitted stops admission; the trainer uses up the shelf, then stalls on groups admitted too late. A
+demand above the mean-age ceiling (see below) still comes down by `damping_factor` of the gap to the ceiling.
 
 `unavailable` is a sum of one "not finished yet" coin flip per group in the buffer, so it is close to normal whatever
 the distribution of generation times. The quantile is read off a normal fitted to the window, `mean + t x sd`,
@@ -49,7 +53,8 @@ Example (P = 8, lookback 10, stall probability 5%):
     unavailable over the last 10 step starts = [44, 46, 41, 48, 45, 47, 50, 43, 46, 45]
     mean 45.5, sd 2.55, t = 1.92                 ->  quantile = 45.5 + 1.92 x 2.55 = 50.4 -> 51
     demand_needed = 8 + 51 + 1 = 60
-    demand was 64 -> half the gap: 64 - ceil(4 x 0.5) = 62
+    demand was 56 -> half the gap up: 56 + ceil(4 x 0.5) = 58
+    demand was 64 -> one group down: 63
 """
 
 import logging
@@ -63,7 +68,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StallDrivenDemand:
-    """Demand = P + quantile of the unavailable count + 1, a share of the gap per step, under the mean-age ceiling.
+    """Demand = P + quantile of the unavailable count + 1, up a share of the gap or down one group per step, under a ceiling.
 
     Args:
         num_prompts_per_train_step: P, groups the trainer consumes per step.
@@ -78,8 +83,9 @@ class StallDrivenDemand:
             the generators' capacity caps the demand below what the workload needs, and it assumes some finished
             groups are trainable.
         start_batches: demand at the first step, in batches of P; the rule learns the rest from the run itself.
-        damping_factor: how much of the gap between the current demand and `demand_needed` is closed per step, up
-            or down alike. 0.5 moves half the way each step; 1.0 jumps straight to `demand_needed`.
+        damping_factor: how much of the gap between the current demand and `demand_needed` is closed per step going
+            up, or coming down to the mean-age ceiling; otherwise demand comes down one group per step. 0.5 moves
+            half the way each step; 1.0 jumps straight there.
 
     The name: the rule is driven by what the trainer would have stalled on. `demand - ready` at a step start is the
     number of groups that were not there for it; the rule sizes the buffer for the value that number stays under.
@@ -146,6 +152,9 @@ class StallDrivenDemand:
         )
         demand_needed = P + unavailable_upper_bound + 1
 
+        # At most one group down per step, so a large shelf cannot stop admission; the ceiling below can cut faster
+        demand_needed = max(demand_needed, self.demand - 1)
+
         # Cap the demand so the mean policy age stays under the target, or under the max if no target was given
         mean_age_limit = (
             self.target_offpolicy_steps
@@ -168,7 +177,7 @@ class StallDrivenDemand:
                 previous_state=self.state,
             )
 
-        # Move part of the way toward demand_needed, the same going up and down
+        # Move part of the way toward demand_needed
         self.demand = smooth_demand_toward_needed(
             current_demand=self.demand,
             demand_needed=demand_needed,

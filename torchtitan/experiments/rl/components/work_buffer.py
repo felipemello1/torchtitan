@@ -659,9 +659,9 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
 
     1. Demand. At every step start the buffer counts the groups that are not ready (generating, or the batch
        being trained) and hands the count to `StallDrivenDemand`: demand = one batch + the value that count stays
-       under on 95% of steps + one spare group, moved half the gap per step, never above the mean-age ceiling
-       (see `adaptive_demand.py`). Generator capacity ``C`` stays a separate deployment limit that admission
-       enforces, so demand cannot enlarge vLLM concurrency.
+       under on 95% of steps + one spare group, moved up half the gap or down one group per step, never above the
+       mean-age ceiling (see `adaptive_demand.py`). Generator capacity ``C`` stays a separate deployment limit that
+       admission enforces, so demand cannot enlarge vLLM concurrency.
     2. Selection. `take_finalized` returns the oldest FINALIZED group wherever it sits; a slow group never
        blocks younger finished ones and keeps its slot until it finishes.
     3. Age. A finalized group that would be consumed more than `max_offpolicy_steps` versions after it was
@@ -706,7 +706,8 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         """Demand at the first step, in batches of P; the rule learns the rest from the run itself."""
 
         damping_factor: float = 0.5
-        """Share of the gap between the current demand and the computed need closed per step, up or down alike."""
+        """Share of the gap to the computed need closed per step going up, or coming down to the mean-age ceiling;
+        otherwise demand comes down one group per step."""
 
         generation_capacity: int | None = None
         """Fixed maximum prompt groups the generator service can hold.
