@@ -60,13 +60,12 @@ class ThinkingBudget(Configurable):
         """Appended when thinking runs out: Qwen's thinking-budget sentence, then the end-of-thinking tag."""
 
         answer_prefix: str = ""
-        """Appended after `close_text` so the answer starts in the expected format, e.g. "\\boxed{".
-        Without it, Qwen3.5-4B kept reasoning in its answer (chess: 89% of answers cut at 256 tokens)."""
+        """Appended after `close_text` so a forced answer starts in the expected format, e.g. "\\boxed{".
+        Without it, a forced answer tends to keep reasoning until `max_tokens` cuts it."""
 
         answer_end_text: str | None = None
-        """After a forced close, stop the answer at the first token containing this text and end the
-        turn there, e.g. "}" right after `\\boxed{e4}`. Chess 35B: forced answers kept talking after
-        the move until the turn hit `max_tokens` and forfeited."""
+        """After a forced close, end the turn at the first token containing this text, e.g. "}" after
+        `\\boxed{e4}`. Without it, a forced answer can keep talking until `max_tokens` cuts the turn."""
 
         end_of_turn_token: str = "<|im_end|>"
         """The tokenizer's single end-of-turn token, appended untrained when `answer_end_text` stops
