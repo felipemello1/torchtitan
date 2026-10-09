@@ -44,6 +44,7 @@ from torchtitan.rl.generator import (
     ModelStateDictPullMessage,
     RequestDispatcher,
     SamplingConfig,
+    SessionReleaseMessage,
     VLLMGenerator,
 )
 from vllm.logprobs import FlatLogprobs, Logprob
@@ -872,6 +873,8 @@ def test_crash_fails_outstanding_and_queued_calls_and_later_calls(
         failing_pull = asyncio.create_task(generator.pull_model_state_dict(3))
         assert await asyncio.to_thread(reading.wait, _TIMEOUT_S)
 
+        # A session release (no reply) queued ahead of the calls must not stop them from failing.
+        generator._engine_loop_queue.put(SessionReleaseMessage(session_ids=["s"]))
         queued = [
             _generate(generator, "r0"),
             asyncio.create_task(generator.pull_model_state_dict(4)),

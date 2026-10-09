@@ -155,21 +155,54 @@ def test_release_returns_every_held_block(manager):
     assert manager.block_pool.get_num_free_blocks() < free_before
 
     pins.release(group_ids=[3])
-    assert pins.num_sessions == 0
+    assert pins.num_sessions == 0 and pins.num_blocks == 0
     assert manager.block_pool.get_num_free_blocks() == free_before
 
 
-def test_ensure_free_releases_the_least_recently_held_session_first(manager):
+def _finished_turn(manager, pins, requests, session: str, tokens: list[int]) -> None:
+    """One turn of `session`: admit, prefill (held), finish."""
+    request = _request(session, tokens)
+    requests[session] = request
+    pins.track(session, session_id=session, group_id=0)
+    _prefill(manager, request)
+    pins.after_step()
+    manager.free(request)
+    del requests[session]
+    pins.after_step()
+
+
+def test_ensure_free_releases_the_session_idle_longest_first(manager):
     requests = {}
     pins = _pins(manager, requests)
-    for session in ("old", "new"):
-        request = _request(session, [hash(session) % 997 + j for j in range(50)])
-        requests[session] = request
-        pins.track(session, session_id=session, group_id=0)
-        _prefill(manager, request)
-        pins.after_step()
-        manager.free(request)
+    _finished_turn(manager, pins, requests, "old", list(range(50)))
+    _finished_turn(manager, pins, requests, "new", list(range(500, 550)))
 
     pins._free_floor_blocks = manager.block_pool.get_num_free_blocks() + 1
     pins.ensure_free()
     assert list(pins._held) == ["new"]
+
+
+def test_ensure_free_skips_a_session_with_a_request_in_vllm(manager):
+    requests = {}
+    pins = _pins(manager, requests)
+    busy = _request("busy", list(range(50)))
+    requests["busy"] = busy
+    pins.track("busy", session_id="busy", group_id=0)
+    _prefill(manager, busy)
+    pins.after_step()
+
+    pins._free_floor_blocks = manager.block_pool.get_num_free_blocks() + 1
+    pins.ensure_free()
+    assert pins.num_sessions == 1
+
+
+def test_release_before_prefill_takes_no_hold(manager):
+    requests = {}
+    pins = _pins(manager, requests)
+    request = _request("t1", list(range(50)))
+    requests["t1"] = request
+    pins.track("t1", session_id="s", group_id=7)
+    pins.release(session_ids=["s"], group_ids=[7])
+    _prefill(manager, request)
+    pins.after_step()
+    assert pins.num_sessions == 0

@@ -191,6 +191,7 @@ class InterGeneratorRouter(Actor, Configurable):
         *,
         generators: Sequence[Any],
         enable_cpu_weight_prefetch: bool,
+        forward_session_releases: bool = False,
     ):
         num_actors = math.prod(current_size().values())
         assert (
@@ -199,6 +200,8 @@ class InterGeneratorRouter(Actor, Configurable):
 
         self._config = config
         self._enable_cpu_weight_prefetch = enable_cpu_weight_prefetch
+        # Tell generators when a session ends, so they release its held KV (`hold_session_kv`).
+        self._forward_session_releases = forward_session_releases
         self._generators = [
             _GeneratorHandle(
                 actor=generator,
@@ -648,15 +651,25 @@ class InterGeneratorRouter(Actor, Configurable):
         """Forget a routing session after its rollout's last generation call."""
         placed = self._placed_groups.get(group_id)
         self._release_session(group_id, routing_session_id)
-        # Generators holding the session's KV (`hold_session_kv`) let go of it; KV admission knows
-        # the session's generator, otherwise every generator is told.
+        if not self._forward_session_releases:
+            return
+        # Generators hold the session's KV (`hold_session_kv`); KV admission knows the session's
+        # generator, otherwise every generator is told.
         targets = [placed.handle] if placed is not None else self._generators
-        await asyncio.gather(
+        results = await asyncio.gather(
             *[
                 h.rank0_actor.release_sessions.call_one([routing_session_id])
                 for h in targets
-            ]
+            ],
+            return_exceptions=True,
         )
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "releasing session %s on a generator failed: %r",
+                    routing_session_id,
+                    result,
+                )
 
     @concurrent_endpoint
     async def release_groups(self, group_ids: list[int]) -> None:

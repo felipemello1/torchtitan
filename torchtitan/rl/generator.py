@@ -841,6 +841,13 @@ class VLLMGenerator(Configurable):
                     "hold_session_kv needs reset_kv_cache_on_weight_sync=False: vLLM cannot reset "
                     "the prefix cache while blocks are held"
                 )
+            if self.hold_session_kv and self.session_kv_free_floor <= (
+                self.watermark or 0.0
+            ):
+                raise ValueError(
+                    f"session_kv_free_floor ({self.session_kv_free_floor}) must be above "
+                    f"watermark ({self.watermark}), or held blocks can stall every waiting turn"
+                )
             # The generator runs vLLM full expert parallelism: vLLM forms the EP
             # group from all DP*TP ranks, so expert_parallel_degree must equal
             # data_parallel_degree * tensor_parallel_degree (or 1 to disable EP).
@@ -1122,6 +1129,10 @@ class VLLMGenerator(Configurable):
         self._session_kv: SessionKVPins | None = None
         if config.hold_session_kv:
             scheduler = self._engine.engine_core.engine_core.scheduler
+            # A finer hash than the block (TP>1) or speculative decoding moves the replay point
+            # away from the prompt-end block that SessionKVPins holds.
+            assert not scheduler.kv_cache_manager.coordinator.enable_partial_hash_hits
+            assert self._engine.vllm_config.speculative_config is None
             self._session_kv = SessionKVPins(
                 scheduler,
                 free_floor_blocks=int(
@@ -1459,7 +1470,7 @@ class VLLMGenerator(Configurable):
         await asyncio.sleep(0)
         while not self._engine_loop_queue.empty():
             message = self._engine_loop_queue.get_nowait()
-            if isinstance(message, CloseMessage):
+            if isinstance(message, (CloseMessage, SessionReleaseMessage)):
                 continue
             if message.reply.set_running_or_notify_cancel():
                 message.reply.set_exception(exc)
@@ -1608,7 +1619,7 @@ class VLLMGenerator(Configurable):
         Args:
             session_ids: Routing session ids with no more generation calls.
         """
-        if self._session_kv is not None:
+        if self._session_kv is not None and self._rank == 0:
             self._engine_loop_queue.put(SessionReleaseMessage(session_ids=session_ids))
 
     @sl.log_trace_span("pull_model_state_dict")
@@ -1751,6 +1762,7 @@ class VLLMGenerator(Configurable):
                 logger.info("Shutting down vLLM renderer")
                 renderer.shutdown()
             self._engine = None
+            self._session_kv = None
 
 
 # ===================== helpers =====================

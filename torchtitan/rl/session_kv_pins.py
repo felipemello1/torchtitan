@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from typing import Any
 
 
@@ -22,9 +22,10 @@ class SessionKVPins:
     blocks and the matching GDN state blocks), and lets go of the session's previous hold. Held blocks
     count as used in vLLM's ``kv_cache_usage``.
 
-    When free blocks fall below ``free_floor_blocks``, whole sessions are released, least recently
-    held first (TBR's ``evict_until_free``). Every method must run on the engine thread of every rank,
-    in the same order, so the schedulers of all TP ranks stay identical.
+    When free blocks fall below ``free_floor_blocks``, whole idle sessions (no request in vLLM) are
+    released, the one idle longest first (TBR's ``evict_until_free``). Every mutating method must run
+    on the engine thread of every rank, in the same order, so the schedulers of all TP ranks stay
+    identical.
 
     Example::
 
@@ -38,7 +39,7 @@ class SessionKVPins:
 
     Args:
         scheduler: The vLLM v1 scheduler of this rank's in-process engine.
-        free_floor_blocks: Release whole sessions while fewer blocks than this are free.
+        free_floor_blocks: Release idle sessions while fewer blocks than this are free.
     """
 
     def __init__(self, scheduler: Any, free_floor_blocks: int) -> None:
@@ -46,74 +47,87 @@ class SessionKVPins:
         self._coordinator = scheduler.kv_cache_manager.coordinator
         self._block_pool = scheduler.kv_cache_manager.block_pool
         self._free_floor_blocks = free_floor_blocks
-        # Requests admitted but not yet past prefill: internal request id -> (session, group).
-        self._awaiting_prefill: dict[str, tuple[str, int]] = {}
-        # Held blocks per session, least recently held first.
+        # Requests in vLLM: internal request id -> (session, group, prefill seen).
+        self._live: dict[str, tuple[str, int, bool]] = {}
+        self._busy_sessions: Counter[str] = Counter()
+        # Held blocks per session, idle longest first.
         self._held: OrderedDict[str, list[Any]] = OrderedDict()
         self._session_groups: dict[str, int] = {}
         self._group_sessions: dict[int, set[str]] = {}
-
-    @property
-    def num_sessions(self) -> int:
-        return len(self._held)
-
-    @property
-    def num_blocks(self) -> int:
-        return sum(len(blocks) for blocks in self._held.values())
+        # Plain ints, so other threads (e.g. a logging endpoint) can read them safely.
+        self.num_sessions = 0
+        self.num_blocks = 0
 
     def track(self, internal_request_id: str, session_id: str, group_id: int) -> None:
         """Hold this request's prefix once its prefill finishes."""
-        self._awaiting_prefill[internal_request_id] = (session_id, group_id)
+        self._live[internal_request_id] = (session_id, group_id, False)
+        self._busy_sessions[session_id] += 1
 
     def after_step(self) -> None:
-        """Hold the prefix of every tracked request whose prefill finished."""
-        for internal_id, (session_id, group_id) in list(self._awaiting_prefill.items()):
+        """Hold the prefix of requests whose prefill finished; mark sessions whose request left."""
+        for internal_id, (session_id, group_id, held) in list(self._live.items()):
             request = self._scheduler.requests.get(internal_id)
-            if request is None:  # finished or aborted before its prefill was seen
-                del self._awaiting_prefill[internal_id]
-            elif request.num_computed_tokens >= request.num_prompt_tokens:
-                del self._awaiting_prefill[internal_id]
+            if request is None:  # finished or aborted: the session is idle from now on
+                del self._live[internal_id]
+                self._busy_sessions[session_id] -= 1
+                if self._busy_sessions[session_id] <= 0:
+                    del self._busy_sessions[session_id]
+                if session_id in self._held:
+                    self._held.move_to_end(session_id)
+            elif not held and request.num_computed_tokens >= request.num_prompt_tokens:
+                self._live[internal_id] = (session_id, group_id, True)
                 self._hold(request, session_id, group_id)
 
     def ensure_free(self) -> None:
-        """Release whole sessions, least recently held first, until enough blocks are free."""
-        while (
-            self._held
-            and self._block_pool.get_num_free_blocks() < self._free_floor_blocks
-        ):
-            session_id, blocks = self._held.popitem(last=False)
-            self._forget(session_id)
-            self._block_pool.free_blocks(reversed(blocks))
+        """Release idle sessions, idle longest first, until enough blocks are free.
+
+        A session with a request in vLLM is skipped: its own request still references most of its
+        blocks, so releasing it frees little and costs its next call a recompute.
+        """
+        for session_id in list(self._held):
+            if self._block_pool.get_num_free_blocks() >= self._free_floor_blocks:
+                return
+            if session_id not in self._busy_sessions:
+                self._release(session_id)
 
     def release(self, session_ids: list[str] = (), group_ids: list[int] = ()) -> None:
         """Release sessions that make no more calls, and every session of finished groups."""
-        session_ids = list(session_ids)
+        released = set(session_ids)
         for group_id in group_ids:
-            session_ids.extend(self._group_sessions.pop(group_id, ()))
-        for session_id in session_ids:
-            blocks = self._held.pop(session_id, None)
-            self._forget(session_id)
-            if blocks:
-                self._block_pool.free_blocks(reversed(blocks))
+            released |= self._group_sessions.pop(group_id, set())
+        for session_id in released:
+            self._release(session_id)
+        # A request still before its prefill must not re-hold a released session.
+        dropped_groups = set(group_ids)
+        for internal_id, (session_id, group_id, held) in list(self._live.items()):
+            if session_id in released or group_id in dropped_groups:
+                self._live[internal_id] = (session_id, group_id, True)
 
     def _hold(self, request: Any, session_id: str, group_id: int) -> None:
         # The prompt's last token is recomputed for its logits, so a continuation hits at most
         # num_prompt_tokens - 1 tokens; the lookup returns the attention blocks and, per GDN
-        # group, the state block that ends on that aligned boundary.
+        # group, the state block that ends on that aligned boundary. vLLM returns the oldest
+        # cached copy of each block, so the hold may take a duplicate of a block this request's
+        # table also owns (about one extra block per session while it decodes).
         hit_blocks, _, _ = self._coordinator.find_longest_cache_hit(
             request.block_hashes, request.num_prompt_tokens - 1
         )
         blocks = [b for group in hit_blocks for b in group if not b.is_null]
         # Take the new hold before dropping the old one, so shared prefix blocks stay held.
         self._block_pool.touch(blocks)
-        previous = self._held.pop(session_id, None)
+        self._release(session_id)
         self._held[session_id] = blocks
         self._session_groups[session_id] = group_id
         self._group_sessions.setdefault(group_id, set()).add(session_id)
-        if previous:
-            self._block_pool.free_blocks(reversed(previous))
+        self.num_sessions += 1
+        self.num_blocks += len(blocks)
 
-    def _forget(self, session_id: str) -> None:
+    def _release(self, session_id: str) -> None:
+        blocks = self._held.pop(session_id, None)
         group_id = self._session_groups.pop(session_id, None)
         if group_id is not None:
             self._group_sessions.get(group_id, set()).discard(session_id)
+        if blocks is not None:
+            self.num_sessions -= 1
+            self.num_blocks -= len(blocks)
+            self._block_pool.free_blocks(reversed(blocks))
