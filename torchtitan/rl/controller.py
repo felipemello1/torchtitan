@@ -1094,6 +1094,10 @@ class Controller(Configurable):
             # The group makes no more generation calls, so its cache salts can go.
             await self.generator_router.release_groups.call_one([work.group_id])
             await group_buffer.finalize_work(group)
+            # Drop the finished group now: this task waits on its next group for up to hours, and
+            # 1,000+ held groups (every turn's full prompt as Python lists) made each full GC
+            # freeze the controller for 10-30+ s.
+            del group, work
 
     async def _batcher_loop(
         self,
