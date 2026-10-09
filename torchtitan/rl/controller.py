@@ -143,33 +143,34 @@ logger = logging.getLogger(__name__)
 
 
 class ValidationLoopMode(StrEnum):
-    """What training does while the pre-training or a periodic validation pass runs."""
+    """What the trainer does while the step-0 or a periodic validation pass runs. The final pass
+    always runs after training.
 
-    PAUSE_TRAINER = "pause_trainer"
-    """Training waits for each pass, so every rollout in it samples one policy."""
-
-    OVERLAP_TRAINING = "overlap_training"
-    """The pass runs beside training, on the same generators. A long rollout's later turns can
-    then sample newer policies; see `validation/max_policy_version/max`. That includes the step-0
-    pass, so use PAUSE_TRAINER, or evaluate a saved checkpoint offline, for a clean pre-training
-    score."""
-
-    # TODO: DRAIN_TRAINER (single-policy pass while the trainer trains its backlog): see fork branch 61-periodic-validation.
-
-
-@dataclass(kw_only=True, slots=True)
-class ValidationConfig:
-    """Held-out validation that runs before training, every `interval_steps`, and after the last step.
-
-    Example, `interval_steps=25`, `loop_mode=OVERLAP_TRAINING`, 100 steps:
+    Example, OVERLAP_TRAINING with `interval_steps=25` and 100 steps:
         step 0:   a pass starts on policy 0; training starts at once.
         step 7:   the pass ends and is logged at step 7, with `validation/launch_step` 0. Its slowest
                   rollouts sampled policies 0 to 6: `validation/min_policy_version/min` 0,
                   `validation/max_policy_version/max` 6.
-        step 25:  the next pass starts on policy 25 or later. If a pass were still running, it
-                  would start at the end of the step in which that one ends.
-        step 100: a pass still running is logged at step 100; then the final pass runs alone.
+        step 25:  the next pass starts on policy 25 or later. If the step-0 pass were still
+                  running, this one would start at the end of the step where the step-0 pass ends.
+        step 100: a pass still running is logged at step 100; then the final pass runs alone and
+                  is also logged at step 100, with `validation/launch_step` 100.
     """
+
+    PAUSE_TRAINER = "pause_trainer"
+    """The trainer waits for each pass, so every rollout in it samples one policy."""
+
+    OVERLAP_TRAINING = "overlap_training"
+    """The trainer keeps stepping during each pass, so a long rollout's later turns can sample
+    newer policies, also in the step-0 pass. For a clean step-0 score, use PAUSE_TRAINER or
+    evaluate the checkpoint offline."""
+
+    # TODO: DRAIN_TRAINER, one policy per pass while the trainer trains its backlog: fork branch 61-periodic-validation.
+
+
+@dataclass(kw_only=True, slots=True)
+class ValidationConfig:
+    """Held-out validation that runs before training, every `interval_steps`, and after the last step."""
 
     num_samples: int = 20
     """Held-out prompts per validation pass, one rollout each. 0 skips validation."""
@@ -508,11 +509,17 @@ class Controller(Configurable):
         """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
         logger.info("Closing: tearing down actors and process meshes.")
 
-        # Still set only if training crashed; a healthy run() awaits it. Wait for the cancel to
-        # finish before the rollouter it uses is closed below.
+        # Still set only if run() raised or was cancelled. Wait for the cancel to finish before
+        # the rollouter it uses is closed below, and log an error nothing re-raised.
         if self._validation_task is not None:
             self._validation_task.cancel()
-            await asyncio.gather(self._validation_task, return_exceptions=True)
+            (result,) = await asyncio.gather(
+                self._validation_task, return_exceptions=True
+            )
+            if isinstance(result, Exception):
+                logger.error(
+                    f"{self._validation_task.get_name()} failed", exc_info=result
+                )
 
         if self.trainer is not None:
             try:
@@ -631,8 +638,10 @@ class Controller(Configurable):
             trainer_mesh: ProcMesh the trainer actor is spawned on.
             generator_meshes: ProcMesh objects the generator actors are spawned on.
         """
-        # Peak concurrent rollout sequences (groups * num_samples_per_prompt, or the validation pass,
-        # or both when validation overlaps training); sizes max_num_seqs below.
+        # Peak concurrent rollout sequences; sizes max_num_seqs below. An overlapped pass adds its
+        # rollouts to training's.
+        # TODO: training rollouts also keep generating during a paused periodic pass, so max()
+        #   under-sizes that case too; kept to leave the default mode's max_num_seqs unchanged.
         async_loop = self.config.async_loop
         max_active_rollout_groups = async_loop.max_active_rollout_groups
         num_training_rollouts = (
@@ -1043,12 +1052,13 @@ class Controller(Configurable):
 
         # A pass that overlapped training may still be running; no new training rollouts start now.
         # Awaited, not cancelled: the generators would keep serving its requests, and the final
-        # pass can reuse their request ids.
+        # pass reuses their request ids.
         if self._validation_task is not None:
             logger.info(
                 f"Training done; waiting for {self._validation_task.get_name()} before the final pass"
             )
-            await self._validation_task
+            # Wait without raising; `_log_finished_validation` re-raises a failed pass's error.
+            await asyncio.wait([self._validation_task])
             self._log_finished_validation(step=num_training_steps)
         if pre_validation_task is not None:
             pre_validation = m.MetricsProcessor._aggregate_metrics(
@@ -1082,14 +1092,13 @@ class Controller(Configurable):
     def _log_finished_validation(self, *, step: int) -> None:
         """If the pass started by `_start_validation` has ended, log it at `step`; re-raise its error.
 
-        Example: a pass started at step 25 that ends during step 31 is logged at step 31, with
-        `validation/launch_step` 25. Metric backends need steps that never go back.
+        Logged at the current step, not its launch step: metric backends need steps that never go back.
         """
         task = self._validation_task
         if task is None or not task.done():
             return
-        metrics = task.result()
         self._validation_task = None
+        metrics = task.result()
         logger.info(f"{task.get_name()} ended; logging it at step {step}")
         self.metrics_processor.log(step=step, metrics=metrics, is_validation=True)
 
