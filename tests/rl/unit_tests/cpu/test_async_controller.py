@@ -22,7 +22,12 @@ from torchtitan.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
-from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
+from torchtitan.rl.controller import (
+    AsyncLoopConfig,
+    Controller,
+    ValidationConfig,
+    ValidationLoopMode,
+)
 from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
@@ -869,8 +874,9 @@ def _validation_rollout(versions: list[tuple[int, int]]) -> Rollout:
     )
 
 
-def test_validation_logs_the_policies_its_rollouts_sampled() -> None:
-    """A weight sync during a rollout shows as a newer max version and a mixed-policy rollout."""
+def test_validation_logs_its_launch_step_and_sampled_policies() -> None:
+    """A pass logs the step it started at. A weight sync during a rollout shows as a newer max
+    version and a mixed-policy rollout."""
     controller = object.__new__(Controller)
     controller.generator_router = SimpleNamespace(
         release_groups=SimpleNamespace(call_one=AsyncMock())
@@ -896,6 +902,7 @@ def test_validation_logs_the_policies_its_rollouts_sampled() -> None:
     )
 
     reduced = m.MetricsProcessor._aggregate_metrics(metrics)
+    assert reduced["validation/launch_step"] == 25
     assert reduced["validation/min_policy_version/min"] == 25
     assert reduced["validation/max_policy_version/max"] == 27
     assert reduced["validation/mixed_policy_rollouts/mean"] == 0.5
@@ -1045,7 +1052,11 @@ def test_overlapped_validation_runs_beside_training() -> None:
     """Training keeps stepping while a pass runs; the pass is logged at the step it ends, and a
     validation step that comes meanwhile starts the next pass once it ends."""
     controller, validation = _controller_for_trainer_loop(
-        ValidationConfig(num_samples=2, interval_steps=2, overlap_training=True)
+        ValidationConfig(
+            num_samples=2,
+            interval_steps=2,
+            loop_mode=ValidationLoopMode.OVERLAP_TRAINING,
+        )
     )
 
     async def run() -> None:
@@ -1092,7 +1103,11 @@ def test_overlapped_validation_runs_beside_training() -> None:
 def test_overlapped_validation_failure_stops_training() -> None:
     """A pass that raises stops training at the end of the next step."""
     controller, validation = _controller_for_trainer_loop(
-        ValidationConfig(num_samples=2, interval_steps=1, overlap_training=True)
+        ValidationConfig(
+            num_samples=2,
+            interval_steps=1,
+            loop_mode=ValidationLoopMode.OVERLAP_TRAINING,
+        )
     )
 
     async def run() -> None:
@@ -1114,7 +1129,11 @@ def test_overlapped_validation_starts_no_pass_at_the_last_step() -> None:
     """A pass asked for while another runs does not start at the last step; the final pass
     after training covers it."""
     controller, validation = _controller_for_trainer_loop(
-        ValidationConfig(num_samples=2, interval_steps=1, overlap_training=True)
+        ValidationConfig(
+            num_samples=2,
+            interval_steps=1,
+            loop_mode=ValidationLoopMode.OVERLAP_TRAINING,
+        )
     )
 
     async def run() -> None:
@@ -1171,7 +1190,9 @@ def test_overlapped_validation_before_and_after_training() -> None:
     controller.config = SimpleNamespace(
         async_loop=AsyncLoopConfig(
             num_training_steps=4,
-            validation=ValidationConfig(num_samples=2, overlap_training=True),
+            validation=ValidationConfig(
+                num_samples=2, loop_mode=ValidationLoopMode.OVERLAP_TRAINING
+            ),
         ),
         trainer=SimpleNamespace(
             training=SimpleNamespace(
