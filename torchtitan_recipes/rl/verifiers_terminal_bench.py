@@ -577,9 +577,10 @@ def rl_grpo_qwen3_5_4b_base_terminal_bench_dev() -> Controller.Config:
 
     8 GB300 GPUs on 2 hosts: trainer FSDP 4 on one, four TP1 generators on the other.
     2 prompts x 4 samples per step, 20 turns, a pool of 16 sandboxes over two env-server
-    workers, no validation.
+    workers, no validation. `DOME_V2_THINKING_BUDGET` (default 0, off) caps thinking per turn,
+    so a short run can check the forced end of thinking.
     """
-    return _qwen3_5_base_terminal_bench_config(
+    config = _qwen3_5_base_terminal_bench_config(
         flavor="4B",
         num_prompts_per_train_step=2,
         num_samples_per_prompt=4,
@@ -592,6 +593,12 @@ def rl_grpo_qwen3_5_4b_base_terminal_bench_dev() -> Controller.Config:
         parallelism=ParallelismConfig(data_parallel_shard_degree=4),
         dump_folder="outputs/rl/qwen3_5_4b_base_terminal_bench_dev",
     )
+    max_thinking_tokens = int(os.environ.get("DOME_V2_THINKING_BUDGET", 0))
+    if max_thinking_tokens > 0:
+        config.rollouter.thinking_budget = ThinkingBudget.Config(
+            max_thinking_tokens=max_thinking_tokens
+        )
+    return config
 
 
 def rl_grpo_qwen3_5_9b_base_terminal_bench_fast() -> Controller.Config:
