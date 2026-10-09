@@ -14,17 +14,10 @@ from torchtitan.rl.rubric import RewardFn
 
 
 class RewardChessScore(RewardFn):
-    """This player's reward from `ChessGame.rewards`: a win is 1, a game cut at the ply cap or forfeited
-    by the other player scores 0.25 to 0.75 by material, a draw up to 0.5, and being checkmated or
-    forfeiting is negative. Draws, checkmates against the player, and forfeits score better the more
-    moves the player lasted.
+    """This player's `ChessGame.rewards`, minus `forced_close_penalty` x its share of force-closed turns.
 
-    The env puts the reward on the last turn. For a player that stopped mid-game (its reply hit
-    `max_tokens`, its history outgrew `max_rollout_tokens`), `ChessSelfPlayWorker` puts the game's
-    forfeit reward there; leave the rubric's `truncation_reward` / `error_reward` unset so this fn scores it.
-
-    With `forced_close_penalty`, a turn whose thinking the `ThinkingBudget` had to close costs its share:
-    reward - penalty * (force-closed turns / turns).
+    The env puts the reward on the last turn; for a player that stopped mid-game, `ChessSelfPlayWorker`
+    puts the forfeit reward there. Leave the rubric's `truncation_reward` / `error_reward` unset.
 
     Example:
 

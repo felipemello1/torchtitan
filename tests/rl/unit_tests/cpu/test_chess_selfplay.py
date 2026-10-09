@@ -8,7 +8,6 @@
 
 import asyncio
 import json
-import os
 import shutil
 
 import chess
@@ -31,10 +30,7 @@ from torchtitan.rl.examples.chess_selfplay import (
     RewardChessScore,
     StockfishBot,
 )
-from torchtitan.rl.examples.chess_selfplay.bots import (
-    centipawn_losses,
-    executable_stockfish,
-)
+from torchtitan.rl.examples.chess_selfplay.bots import centipawn_losses
 from torchtitan.rl.examples.chess_selfplay.openings import OPENINGS
 from torchtitan.rl.examples.chess_selfplay.rollouter import EloFit
 from torchtitan.rl.generator import SamplingConfig
@@ -47,7 +43,7 @@ from torchtitan.rl.types import Completion, RolloutTurnID
 
 _SELF_PLAY = ChessSample(fen=chess.STARTING_FEN, opponent="self")
 _TOKENIZER_PATH = "tests/assets/tokenizer"
-_STOCKFISH = os.environ.get("STOCKFISH_PATH") or shutil.which("stockfish")
+_STOCKFISH = shutil.which("stockfish")
 _needs_stockfish = pytest.mark.skipif(
     _STOCKFISH is None, reason="needs a Stockfish binary"
 )
@@ -250,7 +246,7 @@ def _bot_game(
     sample = ChessSample(
         fen=chess.STARTING_FEN, opponent="test_bot", policy_color=policy_color, seed=3
     )
-    bot = StockfishBot(spec, name="test_bot", engine_path=engine_path, seed=3)
+    bot = StockfishBot(spec, engine_path=engine_path, seed=3)
     return ChessGame(sample=sample, max_plies=40, seed=0, bot=bot), bot
 
 
@@ -311,19 +307,6 @@ def test_centipawn_losses_rank_moves() -> None:
     assert len(white_only) == 2
 
 
-def test_executable_stockfish_copies_a_binary_without_the_execute_bit(tmp_path) -> None:
-    staged = tmp_path / "stockfish"
-    staged.write_bytes(b"binary")
-    staged.chmod(0o444)
-    copy = executable_stockfish(str(staged))
-    assert copy != str(staged)
-    assert os.access(copy, os.X_OK) and open(copy, "rb").read() == b"binary"
-    staged.chmod(0o755)
-    assert executable_stockfish(str(staged)) == str(staged)
-    assert executable_stockfish("stockfish") == "stockfish"
-    assert executable_stockfish(None) is None
-
-
 def test_reward_loses_the_share_of_force_closed_turns() -> None:
     def turn(
         turn_id: int, loss_mask: list[bool] | None, score: float | None = None
@@ -364,13 +347,18 @@ def test_elo_fit() -> None:
     assert EloFit.reduce([EloFit([(1500, 0.0)])])["fit"] == pytest.approx(0.0, abs=1e-6)
 
 
-@pytest.mark.parametrize("name", ["rl_chess_qwen3_5_4b", "rl_chess_qwen3_5_4b_gb300"])
-def test_recipe_builds(name: str) -> None:
+def test_recipe_builds() -> None:
     config = ConfigLoader().load(
-        ["--module", "torchtitan_recipes.rl.chess_selfplay", "--config", name]
+        [
+            "--module",
+            "torchtitan_recipes.rl.chess_selfplay",
+            "--config",
+            "rl_chess_qwen3_5_4b",
+        ]
     )
     # ChunkedLossWrapper splits each sequence into equal chunks
-    assert config.trainer.training.max_context_length % 1024 == 0
+    training, loss = config.trainer.training, config.trainer.loss
+    assert training.max_context_length % loss.num_chunks == 0
 
 
 def test_player_env_shows_the_board_and_scores_the_end() -> None:
@@ -543,6 +531,7 @@ async def _run_group(
             message_env=ChessPlayerEnv.Config(),
             token_env=TokenEnv.Config(step_timeout_s=None),
             max_plies=40,
+            stockfish_path=None,
         ).build()
     )
     tokenizer_config = HuggingFaceTokenizer.Config()
@@ -732,6 +721,7 @@ def test_worker_moves_up_the_bot_curriculum(monkeypatch: pytest.MonkeyPatch) -> 
             message_env=ChessPlayerEnv.Config(),
             token_env=TokenEnv.Config(step_timeout_s=None),
             max_plies=40,
+            stockfish_path=None,
             bot_curriculum=("bot_a", "bot_b"),
             curriculum_win_rate=win_rate,
             curriculum_games=1,

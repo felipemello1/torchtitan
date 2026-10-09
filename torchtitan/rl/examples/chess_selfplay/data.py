@@ -51,7 +51,7 @@ class ChessSelfPlayDataset(RLDataset):
     Example:
 
         dataset = ChessSelfPlayDataset.Config(bots=("sf_eps90", "sf_eps50"), bot_fraction=0.5).build()
-        [next(dataset).opponent for _ in range(4)]  # ["self", "sf_eps90", "self", "sf_eps90"]
+        [next(dataset).opponent for _ in range(4)]  # ["self", "sf_eps90", "self", "sf_eps50"]
     """
 
     @dataclass(kw_only=True, slots=True)

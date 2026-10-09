@@ -41,9 +41,7 @@ _PIECE_VALUES = {
     chess.QUEEN: 9,
 }
 _BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
-# Training rewards (see `ChessGame.rewards`). A checkmate against you costs its full reward on the
-# first ply, shrinking to 0 at `max_plies`; a draw grows to 0.5 by then. A forfeit costs its full
-# reward on the first ply and half at `max_plies`, so it is below any loss.
+# Training rewards (see `ChessGame.rewards`).
 _FORFEIT_REWARD = -1.0
 _CHECKMATED_REWARD = -0.25
 # Share of the material score in an unfinished game's reward: 0.5 keeps it within [0.25, 0.75].
@@ -51,16 +49,16 @@ _MATERIAL_WEIGHT = 0.5
 
 
 class ChessPlayerEnv(MessageEnv):
-    """One player's half of a `ChessGame`, as a chat: each user message shows the board and the legal
-    moves, and each assistant reply ends with a move in `\\boxed{}`.
+    """One player's half of a `ChessGame`, as a chat: each user message shows both sides' pieces with
+    their legal moves, and each assistant reply ends with a move in `\\boxed{}`.
 
     `step` plays the move, then waits for the other player's reply. The rollout ends when the game
     does, and the last step's `env_rewards["score"]` is this player's reward (see `ChessGame.rewards`).
 
     Example (self-play; White's view):
 
-        init:                    "You are playing chess as White ... Legal moves: c3 Nf3 ... e4 ..."
-        step("... \\boxed{e4}")   -> waits for Black's move -> "Black played c5. <board> Legal moves: ..."
+        init:                    "You are playing chess as White ... Your pieces (White) and their legal moves: {...}"
+        step("... \\boxed{e4}")   -> waits for Black's move -> "Black played c5. Your pieces (White) ..."
         step("... \\boxed{Ke9}")  -> illegal: White forfeits -> done, env_rewards={"score": -0.975}  (max_plies=40)
     """
 
@@ -158,20 +156,14 @@ class ChessGame:
 
     @property
     def rewards(self) -> dict[chess.Color, float]:
-        """Each color's training reward once the game is over, with `played` the share of `max_plies`
-        played, so it works for any `max_plies`:
-        (a) checkmate: 1 for the winner however long it took, -0.25 * (1 - played) for the loser;
-        (b) stalemate or insufficient material: 0.5 * played each;
-        (c) `max_plies` plies: a draw, 0.5, moved halfway toward the material score, so within [0.25, 0.75];
-        (d) a forfeit: -1 * (1 - played / 2), so within [-1, -0.5], below being checkmated at any ply;
-            the other color is scored as in (c), not as a win.
+        """Each color's training reward once the game is over; the rules are in the example's README.
 
         Example (max_plies=60):
 
             max_plies, White up a knight              -> {WHITE: 0.59, BLACK: 0.41}
             White checkmates on ply 19                -> {WHITE: 1.0, BLACK: -0.25 * (1 - 19 / 60) = -0.17}
-            Black forfeits at ply 20, up a queen      -> {WHITE: 0.30, BLACK: -1 * (1 - 20 / 120) = -0.83}
-            Black forfeits at ply 1, even material    -> {WHITE: 0.5, BLACK: -1 * (1 - 1 / 120) = -0.99}
+            Black forfeits at ply 20, up a queen      -> {WHITE: 0.30, BLACK: -1 * (1 - 20 / 60 / 2) = -0.83}
+            Black forfeits at ply 1, even material    -> {WHITE: 0.5, BLACK: -1 * (1 - 1 / 60 / 2) = -0.99}
         """
         played = self.num_plies / self._max_plies
         if self.end_reason == "checkmate":
@@ -240,9 +232,9 @@ class ChessGame:
         lines = []
         if self._last_move_san is not None:
             lines.append(f"{opponent} played {self._last_move_san}.\n")
-        # Pieces keyed by square instead of a board: on a drawn board Qwen3.5-35B spent most of its
-        # thinking counting cells to name squares (no FEN either: it re-parsed it rank by rank). The
-        # opponent's moves cost legal moves in a local probe (86% vs 93%); kept to show its threats.
+        # Pieces by square, not an ASCII board or a FEN: with either, Qwen3.5 spent its thinking
+        # working out which piece stands where. The opponent's moves show its threats, though in a
+        # probe they lowered the share of legal replies from 93% to 86%.
         lines += [
             f"Your pieces ({me}) and their legal moves:",
             _moves_by_piece(board, board.turn, self._rng),
@@ -295,8 +287,8 @@ def _moves_by_piece(board: chess.Board, color: chess.Color, rng: random.Random) 
     """Each piece of `color`, keyed by letter and square, with the moves it could make on its turn: a
     pinned or blocked piece shows `[]`, a captured one is absent.
 
-    The side to move's moves are shuffled with `rng`: in python-chess's order the first listed move
-    is always legal, and always playing it beats a random mover. The other side's moves are sorted,
+    The side to move's moves are shuffled with `rng`: in python-chess's fixed order, always playing
+    the first listed move beats a random mover. The other side's moves are sorted,
     without king captures, and without check marks when the side to move is in check (every move
     would read as check).
 

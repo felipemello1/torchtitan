@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -17,7 +18,6 @@ import chess
 from torchtitan.rl.examples.chess_selfplay.bots import (
     BOTS,
     centipawn_losses,
-    executable_stockfish,
     StockfishBot,
 )
 from torchtitan.rl.examples.chess_selfplay.data import ChessSample
@@ -61,7 +61,7 @@ class ChessSelfPlayWorker(RolloutWorker):
     Example (group_size=2, self-play, max_plies=60):
 
         game 0: White mates on ply 31                   -> rewards White 1.0, Black -0.25 * (1 - 31 / 60) = -0.12
-        game 1: Black forfeits on ply 41, even material -> rewards White 0.5, Black -1 * (1 - 41 / 120) = -0.66
+        game 1: Black forfeits on ply 41, even material -> rewards White 0.5, Black -1 * (1 - 41 / 60 / 2) = -0.66
         advantages: White [+0.25, -0.25], Black [-0.31, +0.31]   (each color's mean is subtracted;
                     Black's forfeit counts as the 0.5 it had at the cap)
         Black's forfeiting turn: +0.31 - (0.5 + 0.66) = -0.85
@@ -73,18 +73,18 @@ class ChessSelfPlayWorker(RolloutWorker):
         """Plies (half-moves, both players) after which a game ends as a draw, adjusted by material.
         Rewards scale with the share of it played (see `ChessGame.rewards`), so any value works."""
 
-        stockfish_path: str | None = None
-        """Stockfish binary for bot games and for scoring the policy's moves (centipawn loss).
-        `None`: self-play only, and no move scoring."""
+        stockfish_path: str | None = "stockfish"
+        """Stockfish binary, a path or a name on `PATH`, for bot games and for scoring the policy's
+        moves (centipawn loss). `None`: self-play only, and no move scoring."""
 
         bot_curriculum: tuple[str, ...] = ()
         """Bots from `bots.BOTS`, easiest first, for groups whose opponent is "curriculum". Each worker
         plays its current bot and moves to the next once the policy wins more than
         `curriculum_win_rate` of a block of `curriculum_games` games against it."""
 
-        curriculum_win_rate: float = 0.6
-        """Share of won games (checkmate or the bot's forfeit; not a material lead at the ply limit)
-        that moves a worker to the next bot."""
+        curriculum_win_rate: float = 0.4
+        """Share of games won by checkmate (a material lead at the ply cap does not count) that moves a
+        worker to the next bot. Kept low: most games the policy leads still end at the cap."""
 
         curriculum_games: int = 128
         """Games per block; each full block is checked once, then cleared."""
@@ -92,7 +92,14 @@ class ChessSelfPlayWorker(RolloutWorker):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self._max_plies = config.max_plies
-        self._stockfish_path = executable_stockfish(config.stockfish_path)
+        if (
+            config.stockfish_path is not None
+            and shutil.which(config.stockfish_path) is None
+        ):
+            raise ValueError(
+                f"Stockfish not found at {config.stockfish_path!r}; install it or set stockfish_path=None"
+            )
+        self._stockfish_path = config.stockfish_path
         self._curriculum = config.bot_curriculum
         self._curriculum_win_rate = config.curriculum_win_rate
         # index into `_curriculum`, and whether the policy won its recent games against that bot
@@ -130,7 +137,6 @@ class ChessSelfPlayWorker(RolloutWorker):
             if sample.opponent == "self"
             else StockfishBot(
                 BOTS[sample.opponent],
-                name=sample.opponent,
                 engine_path=self._stockfish_path,
                 seed=sample.seed + game_idx,
             )
