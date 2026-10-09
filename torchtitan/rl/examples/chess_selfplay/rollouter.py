@@ -97,7 +97,8 @@ class ChessSelfPlayWorker(RolloutWorker):
             and shutil.which(config.stockfish_path) is None
         ):
             raise ValueError(
-                f"Stockfish not found at {config.stockfish_path!r}; install it or set stockfish_path=None"
+                f"Stockfish not found at {config.stockfish_path!r}; install it, or set "
+                "stockfish_path=None with a self-play-only dataset (bots=())"
             )
         self._stockfish_path = config.stockfish_path
         self._curriculum = config.bot_curriculum

@@ -41,7 +41,6 @@ _PIECE_VALUES = {
     chess.QUEEN: 9,
 }
 _BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
-# Training rewards (see `ChessGame.rewards`).
 _FORFEIT_REWARD = -1.0
 _CHECKMATED_REWARD = -0.25
 # Share of the material score in an unfinished game's reward: 0.5 keeps it within [0.25, 0.75].
