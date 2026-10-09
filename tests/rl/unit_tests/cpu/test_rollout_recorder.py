@@ -120,7 +120,9 @@ def test_logs_all_groups_no_cap(tmp_path) -> None:
 
 def test_record_dumps_the_rollout_minus_token_arrays(tmp_path) -> None:
     recorder = _recorder(tmp_path)
-    recorder.record(is_validation=True, rollout_groups=[_group(0, rewards=[1.0])])
+    group = _group(0, rewards=[1.0])
+    group.rollouts[0].turns[0].advantage = -1.2
+    recorder.record(is_validation=True, rollout_groups=[group])
 
     (record,) = _read_lines(tmp_path / "rollout_samples.jsonl")
     assert "step" not in record and record["is_validation"] is True
@@ -135,6 +137,7 @@ def test_record_dumps_the_rollout_minus_token_arrays(tmp_path) -> None:
     assert turn["min_policy_version"] == 1
     assert turn["completion_message"] == {"role": "assistant", "content": "a b c"}
     assert turn["env_messages"] == [{"role": "user", "content": "ok"}]
+    assert turn["advantage"] == -1.2
     # token-id / logprob arrays are large, so they are dropped unless opted in.
     assert "prompt_delta_token_ids" not in turn
     assert "completion_token_ids" not in turn

@@ -145,6 +145,9 @@ class RolloutTurn:
     completion_topk_logprobs: torch.Tensor | None = None  # [num_completion_tokens, k]
     """The generator's logprobs of `completion_topk_token_ids`."""
 
+    advantage: float | None = None
+    """Overrides `Rollout.advantage` on this turn's completion tokens; `None` uses the rollout's."""
+
     # Filtering
     min_policy_version: int | None = None
     """Oldest policy version this turn was sampled under; `None` if no generation happened."""
