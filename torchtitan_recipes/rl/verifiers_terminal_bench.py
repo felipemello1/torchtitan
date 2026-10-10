@@ -257,7 +257,7 @@ def rl_grpo_qwen35_9b_terminal_bench() -> Controller.Config:
                 max_tokens=max_output_tokens,
             ),
             # Keep 3% of KV blocks free at admission, so running turns are preempted less often.
-            extra_engine_args={"watermark": 0.03},
+            extra_vllm_engine_args={"watermark": 0.03},
         ),
     )
 
@@ -397,6 +397,6 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
                 max_tokens=max_output_tokens,
             ),
             # Keep 3% of KV blocks free at admission, so running turns are preempted less often.
-            extra_engine_args={"watermark": 0.03},
+            extra_vllm_engine_args={"watermark": 0.03},
         ),
     )
