@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
@@ -127,17 +128,22 @@ class Rollouter(Configurable):
         if not isinstance(training_dataloader, RLDataLoader):
             raise ValueError("training_dataloader must build an RLDataLoader")
         self._training_dataloader = iter(training_dataloader)
+        # The controller reads samples and saves state from separate asyncio.to_thread calls.
+        # Resuming from a state_dict taken in the middle of a read would skip that sample.
+        self._training_dataloader_lock = threading.Lock()
 
         self._worker_actors: RolloutWorkerActor | None = None
         self._worker_mesh: ProcMesh | None = None
 
     def get_training_sample(self) -> tuple[int, object]:
         """Return the next globally identified input from the training loader."""
-        return next(self._training_dataloader)
+        with self._training_dataloader_lock:
+            return next(self._training_dataloader)
 
     def acknowledge_training_sample_ids(self, sample_ids: Iterable[int]) -> None:
         """Mark training samples as safe to omit from the next checkpoint."""
-        self._training_dataloader.acknowledge(sample_ids)
+        with self._training_dataloader_lock:
+            self._training_dataloader.acknowledge(sample_ids)
 
     def get_validation_samples(self, steps: int) -> list[object]:
         """Materialize one fresh validation pass, optionally bounded by steps."""
@@ -232,11 +238,13 @@ class Rollouter(Configurable):
 
     def state_dict(self) -> dict[str, object]:
         """Return the checkpoint state of the training input iterator."""
-        return self._training_dataloader.state_dict()
+        with self._training_dataloader_lock:
+            return self._training_dataloader.state_dict()
 
     def load_state_dict(self, state_dict: dict[str, object]) -> None:
         """Restore the training iterator, including unacknowledged inputs."""
-        self._training_dataloader.load_state_dict(state_dict)
+        with self._training_dataloader_lock:
+            self._training_dataloader.load_state_dict(state_dict)
 
 
 class RolloutWorker(Configurable):
