@@ -752,7 +752,10 @@ class Controller(Configurable):
         if steps == 0:  # skip validation (e.g. loss guard CI)
             return []
         samples = self._rollouter.get_validation_samples(steps)
-        greedy = replace(self._sampling, temperature=0.0, top_p=1.0)
+        # Validation rollouts are never trained, so skip the top-k transport.
+        greedy = replace(
+            self._sampling, temperature=0.0, top_p=1.0, num_topk_logprobs=0
+        )
 
         rollout_groups, validation_metrics = await self._collect_validation_rollouts(
             samples=samples, sampling=greedy, step=step
@@ -825,6 +828,7 @@ class Controller(Configurable):
             dp_degree=self.trainer_dp_degree,
             pad_id=self.tokenizer.eos_id,
             temperature=self._sampling.temperature,
+            num_topk_logprobs=self._sampling.num_topk_logprobs,
         )
 
         # training_batch_queue

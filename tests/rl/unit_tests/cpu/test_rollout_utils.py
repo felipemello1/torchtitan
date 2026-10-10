@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
@@ -230,3 +231,35 @@ def test_group_filters_preserve_group_id_for_acknowledgement() -> None:
     filtered_groups = [failed, untrainable, zero_std, no_valid_tokens]
     assert [group.group_id for group in filtered_groups] == [7, 8, 9, 10]
     assert all(not group.training_samples for group in filtered_groups)
+
+
+def test_topk_rows_align_with_token_ids_across_turns() -> None:
+    first = _turn(prompt_token_ids=[1, 2], completion_token_ids=[4, 5], version=0)
+    first.completion_topk_token_ids = torch.tensor([[4, 9], [5, 8]], dtype=torch.int32)
+    first.completion_topk_logprobs = torch.tensor([[-0.1, -2.0], [-0.2, -3.0]])
+    second = _turn(
+        prompt_token_ids=[1, 2, 4, 5, 9], completion_token_ids=[7], version=0
+    )
+    second.completion_topk_token_ids = torch.tensor([[7, 3]], dtype=torch.int32)
+    second.completion_topk_logprobs = torch.tensor([[-0.3, -1.5]])
+
+    [training_sample] = rollout_to_training_samples(
+        _scored_rollout([first, second], reward=1.0, advantage=0.5)
+    )
+
+    # Zero rows on the prompt and the env reply (token 9), like their 0.0 logprobs.
+    assert training_sample.token_ids == [1, 2, 4, 5, 9, 7]
+    assert training_sample.topk_token_ids.tolist() == [
+        [0, 0],
+        [0, 0],
+        [4, 9],
+        [5, 8],
+        [0, 0],
+        [7, 3],
+    ]
+    torch.testing.assert_close(
+        training_sample.topk_logprobs,
+        torch.tensor(
+            [[0, 0], [0, 0], [-0.1, -2.0], [-0.2, -3.0], [0, 0], [-0.3, -1.5]]
+        ),
+    )

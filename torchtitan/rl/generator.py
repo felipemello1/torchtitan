@@ -69,6 +69,7 @@ def add_extra_vllm_engine_args(
     # field is set (or derives from it), so they may be absent from engine_kwargs.
     config_field_by_engine_arg = {
         "max_num_batched_tokens": "max_num_batched_tokens",
+        "max_logprobs": "sampling.num_topk_logprobs",
         "compilation_config": "cuda_graph",
         "seed": "debug.seed",
     }
@@ -354,6 +355,11 @@ class SamplingConfig:
     max_tokens: int = 100
     """Maximum number of tokens to generate per completion."""
 
+    num_topk_logprobs: int = 0
+    """Per generated token, also return the generator's k most likely token ids and their
+    logprobs, which `ScoreCenteringLoss` needs. 0 returns only the sampled token's logprob.
+    Costs 8 * k bytes per token; k = 32 matched the full vocab in arXiv 2609.20807."""
+
     seed: int | None = None
     """Per-request RNG seed. The rollouter offsets this per sample so a group's
     n=1 requests stay diverse while remaining reproducible (None = nondeterministic)."""
@@ -593,6 +599,19 @@ class RequestDispatcher:
             completion_output = request_output.outputs[0]
             flat_logprobs = completion_output.logprobs
             token_logprobs = list(flat_logprobs.logprobs)
+            topk_token_ids = topk_logprobs = None
+            num_tokens = len(completion_output.token_ids)
+            if len(token_logprobs) > num_tokens:
+                # logprobs=k > 0: each token holds k + 1 entries, [sampled, top-1, ..., top-k].
+                # k is per request (validation asks for 0), so read it from the layout.
+                row_width = len(token_logprobs) // num_tokens
+                topk_token_ids = torch.tensor(
+                    flat_logprobs.token_ids, dtype=torch.int32
+                )
+                topk_logprobs = torch.tensor(token_logprobs)
+                topk_token_ids = topk_token_ids.view(-1, row_width)[:, 1:].contiguous()
+                topk_logprobs = topk_logprobs.view(-1, row_width)[:, 1:].contiguous()
+                token_logprobs = token_logprobs[::row_width]
 
             completions.append(
                 (
@@ -607,6 +626,8 @@ class RequestDispatcher:
                         request_id=request_output.request_id,
                         token_ids=list(completion_output.token_ids),
                         token_logprobs=token_logprobs,
+                        topk_token_ids=topk_token_ids,
+                        topk_logprobs=topk_logprobs,
                         finish_reason=completion_output.finish_reason,
                     ),
                     _extract_request_metrics_inputs(request_output),
@@ -961,6 +982,8 @@ class VLLMGenerator(Configurable):
         # Return logprobs of the distribution vLLM samples from (after temperature). vLLM's default
         # returns the raw model's logprobs, before temperature.
         engine_kwargs["logprobs_mode"] = "processed_logprobs"
+        if config.sampling.num_topk_logprobs > 0:
+            engine_kwargs["max_logprobs"] = config.sampling.num_topk_logprobs
         engine_kwargs["max_num_seqs"] = self._max_num_seqs
         if config.max_num_batched_tokens is not None:
             engine_kwargs["max_num_batched_tokens"] = config.max_num_batched_tokens
@@ -1482,7 +1505,8 @@ class VLLMGenerator(Configurable):
             # stop_token_ids even with skip_tokenizer_init.
             ignore_eos=True,
             seed=sampling.seed,
-            logprobs=0,  # return only the sampled token's logprob (for the GRPO ratio)
+            # The sampled token's logprob (for the GRPO ratio), plus the top-k if requested.
+            logprobs=sampling.num_topk_logprobs,
             # Token ids in, token ids and logprob floats out: stops are token ids and nothing reads
             # text, so skip vLLM's per-token detokenization and per-token logprob dicts.
             detokenize=False,
