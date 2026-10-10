@@ -31,7 +31,6 @@ from torchtitan.rl.components.data import IterableRLDataLoader
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.examples.dapo_math.data import (
-    AIME2025Dataset,
     DapoMathDataset,
     Intellect3MathDataset,
     MathEvalDataset,
@@ -45,7 +44,6 @@ from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import TokenEnv
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
-from torchtitan.rl.rubric import Rubric
 from torchtitan.rl.trainer import Trainer
 
 # TODO: Enable CUDA graphs for RL trainers after eager/graph numerics parity is
@@ -209,10 +207,10 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k() -> Controller.Config:
     with no environment knobs.
 
     12 GPUs: the trainer on 4 (FSDP 2 x TP 2 x EP 4, Dist-MoE experts, 1-row microbatches)
-    and eight TP1 vLLM engines. 64 prompts x 16 samples per step, from the problems
-    Qwen3-4B-Thinking-2507 solves in 1-6 of 8 tries. Thinking still open at 126,976 tokens is
-    closed and answered, and a correct forced answer scores 0.5. No length reward and no
-    online validation.
+    and eight TP1 vLLM engines (vLLM watermark 0.03). 64 prompts x 16 samples per step, from
+    the problems Qwen3-4B-Thinking-2507 solves in 1-6 of 8 tries. Thinking still open at
+    126,976 tokens is closed and answered, and a correct forced answer scores 0.5. No length
+    reward. Validates at avg@4 on the 240-problem `MathEvalDataset`, sampled like training.
     """
     max_response_tokens = 131072
     # 2,048 tokens for the prompt.
@@ -232,17 +230,16 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k() -> Controller.Config:
             num_prompts_per_train_step=64,
             num_samples_per_prompt=16,
             target_offpolicy_steps=6,
-            max_num_seqs_per_generator=400,
-            validation=ValidationConfig(steps=0),
+            # avg@4: MathEvalDataset cycles in order, so 4 * 240 draws grade each problem 4 times.
+            validation=ValidationConfig(steps=4 * 240, greedy=False),
         ),
         rollouter=Rollouter.Config(
             training_dataloader=IterableRLDataLoader.Config(
                 dataset=Intellect3MathDataset.Config(max_pass_rate=0.75)
             ),
-            # Required by the rollouter; never sampled while validation is off.
-            validation_dataset=AIME2025Dataset.Config(num_samples=30),
+            validation_dataset=MathEvalDataset.Config(),
             worker=RolloutWorker.Config(
-                rubric=Rubric.Config(
+                rubric=PerBenchmarkRubric.Config(
                     reward_fns=[RewardMathVerify.Config(weight=1.0)],
                     error_reward=0.0,
                     # A truncated rollout has no final answer; grading the last \boxed{} of
@@ -268,7 +265,15 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k() -> Controller.Config:
             Qwen35RendererConfig(enable_thinking=True, thinking_retention="all")
         ),
         num_generators=8,
-        metrics=MetricsProcessor.Config(enable_wandb=True),
+        metrics=MetricsProcessor.Config(
+            enable_wandb=True,
+            console_log_keys_validation=[
+                "validation_reward/component/core/mean",
+                "validation_reward/component/hard/mean",
+                "validation/response_length/mean",
+                "timing/validate",
+            ],
+        ),
         trainer=Trainer.Config(
             optim=Optim.Config(
                 optimizer=OptimizersContainer.Config(
@@ -342,6 +347,9 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k() -> Controller.Config:
             cuda_graph=VLLMCudaGraphConfig(mode="FULL"),
             gpu_memory_limit=0.9,
             max_num_batched_tokens=8192,
+            # At the default 512 max_num_seqs the engines fill their KV cache; keep 3% of KV
+            # blocks free at admission, so new requests preempt running ones less often.
+            extra_vllm_engine_args={"watermark": 0.03},
             checkpointer=None,
             sampling=SamplingConfig(
                 temperature=1.0,
