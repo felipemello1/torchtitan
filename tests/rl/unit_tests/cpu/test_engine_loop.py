@@ -73,10 +73,10 @@ def _bare_generator(
     generator = object.__new__(VLLMGenerator)
     generator.config = SimpleNamespace(
         reset_kv_cache_on_weight_sync=reset_kv_cache_on_weight_sync,
+        enable_cpu_weight_prefetch=False,
     )
     generator.policy_version = 0
     generator._group_min_policy_versions = {}
-    generator._prefetched_model_state_dict = {}
     # Engine-thread tests bind the queue once the engine thread's event loop exists.
     if event_loop is not None:
         generator._engine_loop_queue = EngineLoopQueue(event_loop)
@@ -623,6 +623,7 @@ def engine_thread(monkeypatch):
             sampling=SamplingConfig(stop_token_ids=[]),
             max_engine_steps_between_decisions=16,
             reset_kv_cache_on_weight_sync=False,
+            enable_cpu_weight_prefetch=False,
         )
         generator.policy_version = 0
         generator._rank = 0
@@ -639,20 +640,17 @@ def engine_thread(monkeypatch):
         _stop_engine_thread(generator)
 
 
-def _pulling_engine(monkeypatch, pull_pre_hook=None) -> _FakeEngine:
-    """A fake engine whose weight pull first awaits `pull_pre_hook`."""
-    original_pull = VLLMGenerator._pull_model_state_dict
-
-    async def new_pull(self, version):
-        if pull_pre_hook is not None:
-            await pull_pre_hook()
-        await original_pull(self, version)
-
-    monkeypatch.setattr(VLLMGenerator, "_pull_model_state_dict", new_pull)
+def _pulling_engine(monkeypatch, get_state_dict) -> _FakeEngine:
+    """A fake engine whose weight pull reads TorchStore through `get_state_dict`."""
+    monkeypatch.setattr(generator_module.ts, "get_state_dict", get_state_dict)
+    monkeypatch.setattr(
+        generator_module, "plain_tensor_to_dtensor_state_dict", lambda sd, **k: sd
+    )
+    monkeypatch.setattr(generator_module, "dtensor_to_plain_tensor_state_dict", dict)
     model = SimpleNamespace(
-        model=SimpleNamespace(load_state_dict=lambda sd, strict: None),
-        prepare_for_state_dict_load=lambda: None,
-        prepare_for_forward=lambda: None,
+        model=SimpleNamespace(state_dict=dict, load_state_dict=lambda sd, strict: None),
+        get_state_dict_layouts=dict,
+        parallelism_context=None,
     )
     engine = _FakeEngine()
     engine.model_executor = SimpleNamespace(
@@ -760,13 +758,13 @@ def test_actor_loop_takes_calls_while_the_engine_steps(engine_thread) -> None:
     asyncio.run(run())
 
 
-def test_pull_runs_on_the_engine_thread(engine_thread, monkeypatch) -> None:
+def test_pull_reads_torchstore_on_the_engine_thread(engine_thread, monkeypatch) -> None:
     # Monarch finds the calling actor through a ContextVar, so the engine loop's work must
     # see the context of the endpoint that started it.
     endpoint_context = contextvars.ContextVar("endpoint_context", default=None)
     reads: list[tuple] = []
 
-    async def pull_pre_hook():
+    async def get_state_dict(*args, **kwargs):
         reads.append(
             (
                 threading.current_thread(),
@@ -776,7 +774,7 @@ def test_pull_runs_on_the_engine_thread(engine_thread, monkeypatch) -> None:
         )
 
     async def run() -> None:
-        generator = engine_thread(_pulling_engine(monkeypatch, pull_pre_hook))
+        generator = engine_thread(_pulling_engine(monkeypatch, get_state_dict))
         # Set after the engine thread started, so only `start_engine_loop` can carry it there.
         endpoint_context.set("endpoint")
         await generator.start_engine_loop()
@@ -803,13 +801,14 @@ def test_prefetch_reads_torchstore_on_the_actor_loop_while_the_engine_steps(
     async def get_state_dict(*args, **kwargs):
         reads.append((threading.current_thread(), asyncio.get_running_loop()))
 
-    monkeypatch.setattr(generator_module.ts, "get_state_dict", get_state_dict)
     gate = _StepGate()
-    engine = _pulling_engine(monkeypatch)
+    engine = _pulling_engine(monkeypatch, get_state_dict)
     engine.step_hook = gate
 
     async def run() -> None:
         generator = engine_thread(engine)
+        generator.config.enable_cpu_weight_prefetch = True
+        generator._prefetched_model_state_dict = {}
         await generator.start_engine_loop()
         first = _generate(generator, "r0")
         assert await asyncio.to_thread(gate.entered.wait, _TIMEOUT_S)
@@ -837,14 +836,14 @@ def test_pulls_queued_during_a_pull_are_applied_together_after_it(
     released = [threading.Event(), threading.Event()]
     reads: list[int] = []
 
-    async def pull_pre_hook():
+    async def get_state_dict(*args, **kwargs):
         read = len(reads)
         reads.append(read)
         reading[read].set()
         assert await asyncio.to_thread(released[read].wait, _TIMEOUT_S)
 
     async def run() -> None:
-        generator = engine_thread(_pulling_engine(monkeypatch, pull_pre_hook))
+        generator = engine_thread(_pulling_engine(monkeypatch, get_state_dict))
         await generator.start_engine_loop()
         first = asyncio.create_task(generator.pull_model_state_dict(3))
         assert await asyncio.to_thread(reading[0].wait, _TIMEOUT_S)
@@ -878,13 +877,13 @@ def test_crash_fails_outstanding_and_queued_calls_and_later_calls(
 ) -> None:
     reading, released = threading.Event(), threading.Event()
 
-    async def pull_pre_hook():
+    async def get_state_dict(*args, **kwargs):
         reading.set()
         assert await asyncio.to_thread(released.wait, _TIMEOUT_S)
         raise RuntimeError("TorchStore is down")
 
     async def run() -> None:
-        generator = engine_thread(_pulling_engine(monkeypatch, pull_pre_hook))
+        generator = engine_thread(_pulling_engine(monkeypatch, get_state_dict))
         await generator.start_engine_loop()
         failing_pull = asyncio.create_task(generator.pull_model_state_dict(3))
         assert await asyncio.to_thread(reading.wait, _TIMEOUT_S)
@@ -1181,11 +1180,11 @@ def test_follower_applies_broadcast_decisions_on_the_engine_thread(
     )
     reads: list[threading.Thread] = []
 
-    async def pull_pre_hook():
+    async def get_state_dict(*args, **kwargs):
         reads.append(threading.current_thread())
 
     async def run() -> None:
-        engine = _pulling_engine(monkeypatch, pull_pre_hook)
+        engine = _pulling_engine(monkeypatch, get_state_dict)
         stepped: list[list[str]] = []
         engine.step_hook = lambda: stepped.append(list(engine.running))
         generator = engine_thread(engine)
