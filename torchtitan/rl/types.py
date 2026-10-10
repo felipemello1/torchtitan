@@ -60,6 +60,11 @@ class Completion:
     ordered completions or map by id."""
     token_ids: list[int]
     token_logprobs: list[float]
+    topk_token_ids: torch.Tensor | None = None
+    """[num_tokens, k] int32 ids of the generator's k most likely tokens at each position;
+    None unless `SamplingConfig.num_topk_logprobs` > 0."""
+    topk_logprobs: torch.Tensor | None = None
+    """[num_tokens, k] float32 generator logprobs of `topk_token_ids`."""
     finish_reason: str | None = None
     """vLLM `CompletionOutput.finish_reason` ("stop" | "length" | "abort")"""
 
@@ -100,6 +105,11 @@ class TrainingSample:
     """[L] generator logprobs; 0.0 where loss_mask is False."""
     advantage: list[float]
     """[L] advantage on assistant tokens, 0.0 elsewhere."""
+    topk_token_ids: torch.Tensor | None = None
+    """[L, k] generator top-k token ids; zero rows where loss_mask is False. None unless
+    `SamplingConfig.num_topk_logprobs` > 0."""
+    topk_logprobs: torch.Tensor | None = None
+    """[L, k] generator logprobs of `topk_token_ids`; zero rows where loss_mask is False."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,14 +139,20 @@ class TrainingMicrobatch(TokenizedTrainingMicrobatch):
     temperature: torch.Tensor  # [T]
     loss_mask: torch.Tensor  # [T]
     advantages: torch.Tensor  # [T]
+    generator_topk_token_ids: torch.Tensor | None = None  # [T, k]
+    generator_topk_logprobs: torch.Tensor | None = None  # [T, k]
 
     def loss_kwargs(self) -> dict[str, torch.Tensor]:
-        return {
+        loss_kwargs = {
             "generator_logprobs": self.generator_logprobs,
             "temperature": self.temperature,
             "loss_mask": self.loss_mask,
             "advantages": self.advantages,
         }
+        if self.generator_topk_token_ids is not None:
+            loss_kwargs["generator_topk_token_ids"] = self.generator_topk_token_ids
+            loss_kwargs["generator_topk_logprobs"] = self.generator_topk_logprobs
+        return loss_kwargs
 
 
 @dataclass(frozen=True, slots=True)

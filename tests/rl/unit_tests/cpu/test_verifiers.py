@@ -13,6 +13,7 @@ import logging
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 pytest.importorskip("verifiers")
 
@@ -122,6 +123,84 @@ def test_verifiers_multiturn_trace_matches_titanrl_rollout_structure() -> None:
     assert [turn.prompt_token_ids for turn in turns] == [[10], [10, 11, 12]]
     assert [turn.completion_token_ids for turn in turns] == [[11], [13]]
     assert [turn.completion_logprobs for turn in turns] == [[-0.1], [-0.2]]
+
+
+def _two_turn_trace():
+    from verifiers.v1.types import AssistantMessage as VerifiersAssistantMessage
+
+    first_node = SimpleNamespace(
+        token_ids=[10, 11],
+        mask=[False, True],
+        sampled=True,
+        message=VerifiersAssistantMessage(content="first"),
+    )
+    second_node = SimpleNamespace(
+        token_ids=[12, 13, 14],
+        mask=[False, True, True],
+        sampled=True,
+        message=VerifiersAssistantMessage(content="second"),
+    )
+    return SimpleNamespace(
+        nodes=[first_node, second_node],
+        branches=[
+            SimpleNamespace(
+                nodes=[first_node, second_node],
+                token_ids=[10, 11, 12, 13, 14],
+                logprobs=[0.0, -0.1, 0.0, -0.2, -0.3],
+            )
+        ],
+    )
+
+
+def test_verifiers_trace_attaches_each_generations_topk_rows() -> None:
+    # Generations are keyed by (prompt length, completion tokens): prompts [10] and
+    # [10, 11, 12] sampled completions [11] and [13, 14].
+    topk_by_generation = {
+        (1, (11,)): (torch.tensor([[11, 7]]), torch.tensor([[-0.1, -2.0]])),
+        (3, (13, 14)): (
+            torch.tensor([[13, 8], [14, 9]]),
+            torch.tensor([[-0.2, -1.5], [-0.3, -1.2]]),
+        ),
+    }
+    turns = VerifiersRollouter.trace_to_rollout_turns(
+        trace=_two_turn_trace(),
+        generation_metadata=VerifiersGenerationMetadata(
+            min_policy_version=3,
+            max_policy_version=4,
+            metrics=[],
+            topk_by_generation=topk_by_generation,
+        ),
+        group_id=5,
+        rollout_id=2,
+    )
+
+    assert [turn.completion_token_ids for turn in turns] == [[11], [13, 14]]
+    assert [turn.completion_topk_token_ids.tolist() for turn in turns] == [
+        [[11, 7]],
+        [[13, 8], [14, 9]],
+    ]
+    torch.testing.assert_close(
+        turns[1].completion_topk_logprobs, torch.tensor([[-0.2, -1.5], [-0.3, -1.2]])
+    )
+
+
+def test_verifiers_trace_rejects_a_node_without_its_topk_rows() -> None:
+    # Top-k was requested, but no generation produced the second node's tokens.
+    topk_by_generation = {
+        (1, (11,)): (torch.tensor([[11, 7]]), torch.tensor([[-0.1, -2.0]])),
+    }
+    with pytest.raises(ValueError, match="top-k logprobs are unknown"):
+        VerifiersRollouter.trace_to_rollout_turns(
+            trace=_two_turn_trace(),
+            generation_metadata=VerifiersGenerationMetadata(
+                min_policy_version=3,
+                max_policy_version=4,
+                metrics=[],
+                topk_by_generation=topk_by_generation,
+            ),
+            group_id=5,
+            rollout_id=2,
+        )
 
 
 def test_verifiers_trace_attaches_env_replies_to_the_preceding_turn() -> None:
@@ -331,6 +410,59 @@ def test_generation_server_forwards_token_request() -> None:
         assert generation_metadata is not None
         assert generation_metadata.min_policy_version == 6
         assert generation_metadata.max_policy_version == 9
+
+    asyncio.run(run_test())
+
+
+def test_generation_server_records_topk_logprobs_per_generation() -> None:
+    async def run_test() -> None:
+        received = []
+
+        async def generate_fn(prompt_token_ids, *, request_id, group_id, **kwargs):
+            received.append(kwargs["sampling_config"])
+            return Completion(
+                min_policy_version=7,
+                max_policy_version=7,
+                request_id=request_id,
+                token_ids=[31, 32],
+                token_logprobs=[-0.1, -0.2],
+                topk_token_ids=torch.tensor([[31, 5], [32, 6]], dtype=torch.int32),
+                topk_logprobs=torch.tensor([[-0.1, -2.4], [-0.2, -1.9]]),
+                finish_reason="stop",
+            )
+
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+        try:
+            async with ClientSession() as session:
+                response = await session.post(
+                    f"http://{server.host}:{server.port}/inference/v1/generate",
+                    headers={"X-Session-ID": "group=1/rollout=2"},
+                    json={
+                        "token_ids": [10, 11],
+                        "sampling_params": {
+                            "max_tokens": 2,
+                            "torchtitan_group_id": 1,
+                            "stop_token_ids": [99],
+                            "num_topk_logprobs": 2,
+                        },
+                    },
+                )
+                assert response.status == 200
+            generation_metadata = server.pop_generation_metadata("group=1/rollout=2")
+        finally:
+            await server.close()
+
+        assert received[0].num_topk_logprobs == 2
+        [
+            (key, (topk_token_ids, topk_logprobs))
+        ] = generation_metadata.topk_by_generation.items()
+        assert key == (2, (31, 32))
+        assert topk_token_ids.tolist() == [[31, 5], [32, 6]]
+        torch.testing.assert_close(
+            topk_logprobs, torch.tensor([[-0.1, -2.4], [-0.2, -1.9]])
+        )
 
     asyncio.run(run_test())
 
