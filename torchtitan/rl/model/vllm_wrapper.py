@@ -243,6 +243,12 @@ def _patch_vllm_all_reduce() -> None:
     )
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+    }
+)
 def _keep_unsharded_storage(model: FSDPModule) -> None:
     """`model.set_keep_unsharded_storage(True)`, or the same effect on torch builds that predate it.
 
@@ -270,12 +276,6 @@ def _keep_unsharded_storage(model: FSDPModule) -> None:
                     param.keep_unsharded_storage = True
 
 
-@support_torch_compile(
-    dynamic_arg_dims={
-        "input_ids": 0,
-        "positions": 0,
-    }
-)
 class VLLMModelWrapper(Module):
     """
     Generic vLLM-compatible model wrapper for TorchTitan models. Implemented
