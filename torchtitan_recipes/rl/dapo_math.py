@@ -401,6 +401,9 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
             # 640 binds only when over ~30% of groups have zero reward variance, and then it still
             # keeps a vLLM queue; each idle group worker costs controller time on buffer changes.
             generation_capacity=640,
+            # Start at the fixed buffer's (6 + 1) x 64 groups: from 3 x 64, the first steps underfeed
+            # the engines while the demand rule ramps up.
+            start_batches=7,
         ),
         # Groups whose 16 rewards are equal carry no gradient: the batch takes the next group.
         training_sample_builder=dataclasses.replace(
@@ -423,6 +426,11 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
         config.trainer,
         # Each token takes the experts the generator routed it to.
         replay_routed_experts=True,
+        # Synchronous saves: an async save's ~420 GB CPU copy, on top of the 4 trainer ranks each
+        # unpacking the 13-21 GB batch at 2-3x, can exceed the trainer host's 900 GB job memory.
+        checkpointer=dataclasses.replace(
+            config.trainer.checkpointer, async_mode="disabled"
+        ),
         optim=Optim.Config(
             optimizer=OptimizersContainer.Config(
                 optimizers=[
