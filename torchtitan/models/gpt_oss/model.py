@@ -67,6 +67,21 @@ class Attention(BaseAttention):
         """Per-layer causal sliding-window size"""
         rope: RoPE.Config
 
+        @property
+        def softmax_scale(self) -> float:
+            """1/sqrt(head_dim), times YaRN's mscale squared when YaRN extends context.
+
+            On the config so the vLLM generator, which builds attention from configs,
+            uses it too.
+            """
+            softmax_scale = 1.0 / math.sqrt(self.head_dim)
+            if self.rope.scaling == "yarn" and self.rope.rope_factor > 1.0:
+                mscale = 0.1 * math.log(self.rope.rope_factor) + 1.0
+                # Merge YaRN attention mscale into softmax_scale, with
+                # m**2 being equivalent to scaling q / k each by mscale.
+                softmax_scale *= mscale * mscale
+            return softmax_scale
+
     def __init__(self, config: Config):
         super().__init__()
         self.head_dim = config.head_dim
@@ -76,13 +91,7 @@ class Attention(BaseAttention):
 
         self.n_rep = self.n_heads // self.n_kv_heads
 
-        # Standard attention softmax scale (1/sqrt(head_dim))
-        self.softmax_scale = 1.0 / math.sqrt(self.head_dim)
-        if config.rope.scaling == "yarn" and config.rope.rope_factor > 1.0:
-            mscale = 0.1 * math.log(config.rope.rope_factor) + 1.0
-            # Merge YaRN attention mscale into softmax_scale, with
-            # m**2 being equivalent to scaling q / k each by mscale.
-            self.softmax_scale *= mscale * mscale
+        self.softmax_scale = config.softmax_scale
 
         self.qkv_linear = config.qkv_linear.build()
         self.wo = config.wo.build()

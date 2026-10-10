@@ -77,6 +77,11 @@ def _replace_vllm_layer_configs(model_config):
                 head_dim=head_dim,
                 value_head_dim=value_head_dim,
                 sliding_window_size=getattr(attention_cfg, "sliding_window_size", None),
+                # vLLM's attention takes the softmax scale at construction only.
+                # TODO: DeepSeek V3 and Kimi K2.7 (same attention) fold YaRN's mscale
+                # into the scale in __init__, so VLLMAttentionWrapper.forward rejects
+                # them. Add this property to run them in the generator.
+                scale=getattr(attention_cfg, "softmax_scale", None),
                 sharding_config=attention_cfg.inner_attention.sharding_config,
             )
             new_layer_cfg = dataclasses.replace(
