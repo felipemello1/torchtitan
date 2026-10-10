@@ -13,6 +13,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import Any, TYPE_CHECKING
 
+import torch
 from verifiers.v1.configs.client import TrainClientConfig as VerifiersTrainClientConfig
 from verifiers.v1.configs.taskset import TasksetConfig as VerifiersTasksetConfig
 from verifiers.v1.dialects.chat import message_to_wire
@@ -33,6 +34,7 @@ from torchtitan.rl.examples.verifiers.generation_server import (
     GROUP_ID_SAMPLING_PARAM,
     VerifiersGenerationMetadata,
 )
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 from torchtitan.rl.rollout.types import (
@@ -378,6 +380,17 @@ class VerifiersRollouter(Rollouter):
         by the generation server for the whole rollout. Generator metrics are
         attached once to avoid double counting. A turn's top-k rows come from the
         generation whose prompt length and completion tokens match its node.
+
+        With routed expert ids, a turn takes its branch's rows from position
+        ``prompt_prefix_len - 1`` on (see ``RolloutTurn.routed_expert_ids``): the
+        nodes' rows, except the previous completion's last token, whose row comes
+        from ``VerifiersGenerationMetadata.routed_expert_boundary_rows``.
+
+        Raises:
+            ValueError: A trained node has no generation with its prompt length and
+                completion tokens, or the generator returns routed expert ids and a
+                branch with trained tokens lacks some. The controller then drops the
+                group (``rollout/group_failures``).
         """
         if generation_metadata is None:
             if any(any(node.mask) for node in trace.nodes):
@@ -399,6 +412,9 @@ class VerifiersRollouter(Rollouter):
             logprobs = branch.logprobs
             branch_offset = 0
             reply_to: RolloutTurn | None = None
+            # Built once, at the branch's first trained span: (rows, positions still
+            # holding Verifiers' copy of the previous row)
+            branch_routed: tuple[torch.Tensor, set[int]] | None = None
             for node in branch.nodes:
                 index = node_index[id(node)]
                 mask = list(node.mask)
@@ -409,16 +425,7 @@ class VerifiersRollouter(Rollouter):
                         trained_nodes.add(index)
                 topk = None
                 if generation_metadata.topk_by_generation and any(mask):
-                    # The prompt this node's completion was sampled from ends at its first
-                    # sampled token.
-                    key = (
-                        branch_offset + node.mask.index(True),
-                        tuple(
-                            token_id
-                            for token_id, sampled in zip(node.token_ids, node.mask)
-                            if sampled
-                        ),
-                    )
+                    key = _generation_key(node, branch_offset)
                     if key not in generation_metadata.topk_by_generation:
                         raise ValueError(
                             "Verifiers node has no generation with the same prompt length "
@@ -428,15 +435,32 @@ class VerifiersRollouter(Rollouter):
                 for start, end in _trainable_token_spans(mask):
                     absolute_start = branch_offset + start
                     absolute_end = branch_offset + end
-                    # TODO: router replay. Return Completion.routed_expert_ids through the
-                    # generation server and slice them per turn here; until then
-                    # Trainer.Config.replay_routed_experts=True raises on this rollouter.
                     # Completion rows of this span: sampled tokens before `start` in the node.
                     row = sum(node.mask[:start])
                     prompt_prefix_len, prompt_delta_token_ids = split_prompt(
                         token_ids[:absolute_start], previous_token_ids
                     )
                     previous_token_ids = token_ids[:absolute_end]
+                    routed_expert_ids = None
+                    turn_metrics: list[m.Metric] = []
+                    if generation_metadata.routed_experts_expected:
+                        if branch_routed is None:
+                            branch_routed = _branch_routed_expert_ids(
+                                branch, generation_metadata
+                            )
+                        branch_rows, copied_positions = branch_routed
+                        first_row = max(prompt_prefix_len - 1, 0)
+                        # A copy, so pickling the turn doesn't send the branch's other rows
+                        routed_expert_ids = branch_rows[
+                            first_row : absolute_end - 1
+                        ].clone()
+                        if prompt_prefix_len > 0 and first_row in copied_positions:
+                            turn_metrics.append(
+                                m.Metric(
+                                    "rollout/routed_experts_copied_boundary_rows",
+                                    m.Sum(1.0),
+                                )
+                            )
                     turns.append(
                         RolloutTurn(
                             rollout_id=RolloutTurnID(
@@ -452,6 +476,7 @@ class VerifiersRollouter(Rollouter):
                             completion_logprobs=list(
                                 logprobs[absolute_start:absolute_end]
                             ),
+                            routed_expert_ids=routed_expert_ids,
                             completion_topk_token_ids=(
                                 None
                                 if topk is None
@@ -467,7 +492,8 @@ class VerifiersRollouter(Rollouter):
                             completion_message=message_to_wire(node.message),
                             metrics=(
                                 list(generation_metadata.metrics) if not turns else []
-                            ),
+                            )
+                            + turn_metrics,
                         )
                     )
                     last_turn_by_node[index] = turns[-1]
@@ -478,6 +504,62 @@ class VerifiersRollouter(Rollouter):
                     reply_to.env_messages.append(message_to_wire(node.message))
                 branch_offset += len(node.token_ids)
         return turns
+
+
+def _generation_key(node: Any, branch_offset: int) -> tuple[int, tuple[int, ...]]:
+    """Key of the generation that sampled a node: its prompt length and completion tokens.
+
+    The prompt ends at the node's first sampled token. Example: a node at branch offset 4
+    with tokens [20, 21, 22] and mask [False, True, True] -> (5, (21, 22)).
+    """
+    return (
+        branch_offset + node.mask.index(True),
+        tuple(
+            token_id for token_id, sampled in zip(node.token_ids, node.mask) if sampled
+        ),
+    )
+
+
+def _branch_routed_expert_ids(
+    branch: Any, generation_metadata: VerifiersGenerationMetadata
+) -> tuple[torch.Tensor, set[int]]:
+    """Routed expert ids for every position of a Verifiers branch.
+
+    Verifiers gives each node the rows of its tokens, but a turn's last token never ran
+    forward in that turn, so Verifiers copies the row before it there; the next turn's
+    prefill computed the real row, which the generation server keeps in
+    `routed_expert_boundary_rows`. Returns the rows with those real rows written back,
+    and the positions that still hold a copy (the branch's last token, and a boundary
+    whose next turn sits on another branch).
+
+    Example: nodes [10, 11] (user), [12, 13] (assistant), [14] (tool), [15, 16]
+    (assistant, prompt [10..14] ran 13 forward first) -> rows for positions 0..6,
+    position 3 from the boundary rows; positions {6} still copied.
+
+    Raises:
+        ValueError: A node of the branch has no routed expert ids.
+    """
+    rows = branch.routed_experts
+    if rows is None:
+        raise ValueError(
+            "the generator returns routed expert ids, but this Verifiers branch lacks "
+            "them for some tokens, so its turns cannot replay their routing"
+        )
+    rows = torch.from_numpy(rows)
+    copied_positions: set[int] = set()
+    offset = 0
+    for node in branch.nodes:
+        if node.sampled and any(node.mask):
+            copied_positions.add(offset + len(node.token_ids) - 1)
+            boundary = generation_metadata.routed_expert_boundary_rows.get(
+                _generation_key(node, offset)
+            )
+            if boundary is not None:
+                position, row = boundary
+                rows[position] = row
+                copied_positions.discard(position)
+        offset += len(node.token_ids)
+    return rows, copied_positions
 
 
 def _trainable_token_spans(mask: list[bool]) -> list[tuple[int, int]]:
