@@ -136,10 +136,11 @@ class StickySessionRoutingStrategy(RoutingStrategy):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        max_sessions: int = 65536
+        max_sessions: int = 262144
         """Maximum session assignments kept; past it the least-recently-used one is
         evicted. Rollouts release their session when they end, so keep it above the
-        rollouts in flight, or live sessions lose their cached KV."""
+        rollouts in flight, or live sessions lose their cached KV. Each entry costs ~150 B
+        of host memory (262144 entries is ~35 MiB)."""
 
         fallback_strategy: RoutingStrategy.Config = field(
             default_factory=LeastLoadedRoutingStrategy.Config
