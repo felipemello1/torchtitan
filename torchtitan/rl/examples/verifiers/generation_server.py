@@ -64,6 +64,27 @@ class VerifiersGenerationMetadata:
         {(2, (12, 13)): (tensor([[12, 5], [13, 6]]), tensor([[-0.1, -2.4], [-0.2, -1.9]]))}
     """
 
+    routed_expert_boundary_rows: dict[
+        tuple[int, tuple[int, ...]], tuple[int, torch.Tensor]
+    ] = field(default_factory=dict)
+    """Per generation, keyed like `topk_by_generation`: `(position, [num_layers, top_k])`,
+    the routed experts of the previous completion's last token, which only this
+    generation's prefill ran forward. Verifiers' trace fills that position with a copy
+    of the row before it, so the rollouter takes the real row from here. Empty unless
+    the generator returns routed experts.
+
+    Example: turn 0 was prompt [10, 11] + completion [12, 13]; turn 1's prompt
+    [10, 11, 12, 13, 14] ran token 13 (position 3) forward first:
+
+        {(5, (15, 16)): (3, tensor([[4, 9], [1, 7]]))}
+    """
+
+    routed_experts_expected: bool = False
+    """True once the generator has returned routed expert ids, to this rollout or any
+    other: it then returns them for every generation, so the rollouter rejects a
+    trained turn without them instead of sending the trainer a batch that mixes turns
+    with and without rows."""
+
 
 class GenerationServer(Configurable):
     """Expose a TorchTitan ``GenerateFn`` through Verifiers' model API.
@@ -110,6 +131,10 @@ class GenerationServer(Configurable):
         self.bound_port: int | None = None
         self.request_counts: dict[str, int] = {}
         self.generation_metadata: dict[str, VerifiersGenerationMetadata] = {}
+        # Prompt + completion length of each session's latest generation.
+        self.last_num_tokens: dict[str, int] = {}
+        # Set by the first completion that carries routed expert ids.
+        self.returns_routed_experts = False
 
     @property
     def port(self) -> int:
@@ -153,12 +178,14 @@ class GenerationServer(Configurable):
         self.bound_port = None
         self.request_counts.clear()
         self.generation_metadata.clear()
+        self.last_num_tokens.clear()
 
     def pop_generation_metadata(
         self, session_id: str
     ) -> VerifiersGenerationMetadata | None:
         """Detach the generation metadata accumulated for one rollout."""
         self.request_counts.pop(session_id, None)
+        self.last_num_tokens.pop(session_id, None)
         return self.generation_metadata.pop(session_id, None)
 
     async def _handle_health_request(self, request: web.Request) -> web.Response:
@@ -257,13 +284,34 @@ class GenerationServer(Configurable):
             )
 
         previous = self.generation_metadata.get(session_id)
+        key = (len(prompt_token_ids), tuple(completion.token_ids))
         topk_by_generation = {} if previous is None else previous.topk_by_generation
         if completion.topk_token_ids is not None:
-            key = (len(prompt_token_ids), tuple(completion.token_ids))
             topk_by_generation = {
                 **topk_by_generation,
                 key: (completion.topk_token_ids, completion.topk_logprobs),
             }
+        if completion.routed_expert_ids is not None:
+            self.returns_routed_experts = True
+        boundary_rows = {} if previous is None else previous.routed_expert_boundary_rows
+        # The previous completion's last token: Verifiers' start when it bridged the
+        # turn, else where this session's latest generation ended. The generator returns
+        # rows from position 0, so row i is position i.
+        boundary = (
+            routed_experts_prompt_start
+            if routed_experts_prompt_start > 0
+            else self.last_num_tokens.get(session_id, 0) - 1
+        )
+        if completion.routed_expert_ids is not None and 0 <= boundary < len(
+            prompt_token_ids
+        ):
+            boundary_rows = {
+                **boundary_rows,
+                key: (boundary, completion.routed_expert_ids[boundary].clone()),
+            }
+        self.last_num_tokens[session_id] = len(prompt_token_ids) + len(
+            completion.token_ids
+        )
         self.generation_metadata[session_id] = VerifiersGenerationMetadata(
             min_policy_version=(
                 completion.min_policy_version
@@ -281,6 +329,8 @@ class GenerationServer(Configurable):
                 else [*previous.metrics, *completion.metrics]
             ),
             topk_by_generation=topk_by_generation,
+            routed_expert_boundary_rows=boundary_rows,
+            routed_experts_expected=self.returns_routed_experts,
         )
         return web.json_response(
             {

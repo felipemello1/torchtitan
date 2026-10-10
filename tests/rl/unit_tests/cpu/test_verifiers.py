@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -287,7 +288,10 @@ def test_verifiers_trace_gives_each_turn_its_routed_expert_ids() -> None:
     turns = VerifiersRollouter.trace_to_rollout_turns(
         trace=trace,
         generation_metadata=VerifiersGenerationMetadata(
-            min_policy_version=0, max_policy_version=0, metrics=[]
+            min_policy_version=0,
+            max_policy_version=0,
+            metrics=[],
+            routed_experts_expected=True,
         ),
         group_id=5,
         rollout_id=2,
@@ -832,3 +836,379 @@ def test_rollouter_removes_the_groups_generate_fn_when_a_rollout_raises() -> Non
 def test_parse_sampling_config_requires_stop_token_ids() -> None:
     with pytest.raises(ValueError, match="stop_token_ids"):
         _parse_sampling_config({"temperature": 1.0})
+
+
+def _post_one_generation(*, routed_expert_ids, prompt_start=None):
+    """POST prompt [10, 11, 12] to a server whose generation completes [31, 32].
+
+    Returns the status, the raw response body, and the SamplingConfig the generation got.
+    """
+
+    async def run_test():
+        received = []
+
+        async def generate_fn(prompt_token_ids, *, request_id, group_id, **kwargs):
+            received.append(kwargs["sampling_config"])
+            return Completion(
+                min_policy_version=7,
+                max_policy_version=7,
+                request_id=request_id,
+                token_ids=[31, 32],
+                token_logprobs=[-0.1, -0.2],
+                routed_expert_ids=routed_expert_ids,
+                finish_reason="stop",
+            )
+
+        sampling_params = {"torchtitan_group_id": 1, "stop_token_ids": [99]}
+        if prompt_start is not None:
+            sampling_params["routed_experts_prompt_start"] = prompt_start
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.generate_fns[1] = generate_fn
+        await server.start()
+        try:
+            async with ClientSession() as session:
+                response = await session.post(
+                    f"http://{server.host}:{server.port}/inference/v1/generate",
+                    headers={"X-Session-ID": "group=1/rollout=2"},
+                    json={
+                        "token_ids": [10, 11, 12],
+                        "sampling_params": sampling_params,
+                    },
+                )
+                return response.status, await response.read(), received
+        finally:
+            await server.close()
+
+    return asyncio.run(run_test())
+
+
+def _routed_rows(num_rows: int) -> torch.Tensor:
+    """uint8 [num_rows, 2 layers, 2 experts per token]; row i holds 10 * i + [0..3]."""
+    return (
+        torch.arange(num_rows * 4, dtype=torch.uint8).view(num_rows, 2, 2)
+        + torch.arange(num_rows, dtype=torch.uint8).view(num_rows, 1, 1) * 6
+    )
+
+
+def test_generation_server_keeps_the_real_row_of_each_turn_boundary() -> None:
+    # Turn 0: [10, 11] -> [12, 13]. Turn 1 (Verifiers bridged it, start 3):
+    # [10..14] -> [15, 16]. Turn 2 (not bridged, no start): [10..17] -> [18].
+    # The generator returns rows from position 0; the server trims what it sends.
+    turns = [
+        ([10, 11], [12, 13], None),
+        ([10, 11, 12, 13, 14], [15, 16], 3),
+        ([10, 11, 12, 13, 14, 15, 16, 17], [18], None),
+    ]
+
+    async def run_test():
+        async def generate_fn(prompt_token_ids, *, request_id, group_id, **kwargs):
+            _, completion, _ = turns[int(request_id.rsplit("=", 1)[1])]
+            num_rows = len(prompt_token_ids) + len(completion) - 1
+            return Completion(
+                min_policy_version=7,
+                max_policy_version=7,
+                request_id=request_id,
+                token_ids=completion,
+                token_logprobs=[-0.1] * len(completion),
+                # Row of position i holds 10 * i + [0..3], whatever turn computed it.
+                routed_expert_ids=_routed_rows(num_rows),
+                finish_reason="stop",
+            )
+
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.generate_fns[1] = generate_fn
+        await server.start()
+        try:
+            async with ClientSession() as session:
+                for prompt, _, start in turns:
+                    sampling_params = {"torchtitan_group_id": 1, "stop_token_ids": [99]}
+                    if start is not None:
+                        sampling_params["routed_experts_prompt_start"] = start
+                    response = await session.post(
+                        f"http://{server.host}:{server.port}/inference/v1/generate",
+                        headers={"X-Session-ID": "group=1/rollout=2"},
+                        json={"token_ids": prompt, "sampling_params": sampling_params},
+                    )
+                    assert response.status == 200
+            return server.pop_generation_metadata("group=1/rollout=2")
+        finally:
+            await server.close()
+
+    boundary_rows = asyncio.run(run_test()).routed_expert_boundary_rows
+
+    rows = _routed_rows(8)
+    assert set(boundary_rows) == {(5, (15, 16)), (8, (18,))}
+    position, row = boundary_rows[(5, (15, 16))]
+    assert (position, row.tolist()) == (3, rows[3].tolist())
+    position, row = boundary_rows[(8, (18,))]
+    assert (position, row.tolist()) == (6, rows[6].tolist())
+
+
+def test_generation_server_omits_routed_experts_without_them() -> None:
+    status, body, received = _post_one_generation(routed_expert_ids=None)
+
+    assert status == 200
+    assert "routed_experts" not in json.loads(body)["choices"][0]
+
+
+def _true_routing(position: int, *, branch: int = 0) -> list[list[int]]:
+    """One routed-expert row [1 layer, 2 experts]: position p routes to (p, 100 + p), plus
+    50 on a second branch's own tokens."""
+    return [[position + 50 * branch, 100 + position + 50 * branch]]
+
+
+def _routed_node(role: str, token_ids, first_position: int, *, branch: int = 0):
+    """A real Verifiers node holding the routed-expert rows Verifiers attributes to it.
+
+    An assistant node's first token is the generation scaffold and the rest is sampled;
+    its last token never ran forward in its turn, so Verifiers repeats the row before it.
+    """
+    from verifiers.v1.graph import MessageNode
+    from verifiers.v1.types import AssistantMessage, ToolMessage, UserMessage
+
+    sampled = role == "assistant"
+    rows = [
+        _true_routing(first_position + offset, branch=branch)
+        for offset in range(len(token_ids))
+    ]
+    if sampled:
+        rows[-1] = rows[-2]
+    message = {
+        "user": lambda: UserMessage(content="task"),
+        "tool": lambda: ToolMessage(content="result", tool_call_id="call"),
+        "assistant": lambda: AssistantMessage(content="reply"),
+    }[role]()
+    return MessageNode(
+        message=message,
+        sampled=sampled,
+        token_ids=list(token_ids),
+        mask=[False] + [True] * (len(token_ids) - 1)
+        if sampled
+        else [False] * len(token_ids),
+        logprobs=[-0.1] * (len(token_ids) - 1) if sampled else [],
+        routed_experts=np.array(rows, dtype=np.uint8),
+    )
+
+
+def _routed_three_turn_trace():
+    """user [10, 11]; turn 0 [12 | 13, 14]; tool [15, 16]; turn 1 [17 | 18, 19];
+    tool [20]; turn 2 [21 | 22, 23]. Positions 0..13."""
+    from verifiers.v1.trace import Branch
+
+    nodes = [
+        _routed_node("user", [10, 11], 0),
+        _routed_node("assistant", [12, 13, 14], 2),
+        _routed_node("tool", [15, 16], 5),
+        _routed_node("assistant", [17, 18, 19], 7),
+        _routed_node("tool", [20], 10),
+        _routed_node("assistant", [21, 22, 23], 11),
+    ]
+    return SimpleNamespace(nodes=nodes, branches=[Branch(index=0, nodes=nodes)])
+
+
+def _routed_metadata(**boundary_rows) -> VerifiersGenerationMetadata:
+    """Turns 1 and 2's prefills ran tokens 14 (position 4) and 19 (position 9) forward."""
+    rows = {
+        (8, (18, 19)): (4, torch.tensor(_true_routing(4), dtype=torch.uint8)),
+        (12, (22, 23)): (9, torch.tensor(_true_routing(9), dtype=torch.uint8)),
+    }
+    return VerifiersGenerationMetadata(
+        min_policy_version=3,
+        max_policy_version=3,
+        metrics=[],
+        routed_expert_boundary_rows={**rows, **boundary_rows},
+        routed_experts_expected=True,
+    )
+
+
+def _routing(positions, *, branch: int = 0) -> list[list[list[int]]]:
+    return [_true_routing(position, branch=branch) for position in positions]
+
+
+def test_verifiers_trace_gives_each_turn_its_routed_experts_from_the_prefix_boundary() -> (
+    None
+):
+    turns = VerifiersRollouter.trace_to_rollout_turns(
+        trace=_routed_three_turn_trace(),
+        generation_metadata=_routed_metadata(),
+        group_id=5,
+        rollout_id=2,
+    )
+
+    assert [turn.prompt_prefix_len for turn in turns] == [0, 5, 10]
+    # Rows from prompt_prefix_len - 1 to the completion's second-to-last token; positions 4
+    # and 9 (each turn's last token) come from the next turn's prefill, not Verifiers' copy.
+    assert turns[0].routed_expert_ids.tolist() == _routing(range(0, 4))
+    assert turns[1].routed_expert_ids.tolist() == _routing(range(4, 9))
+    assert turns[2].routed_expert_ids.tolist() == _routing(range(9, 13))
+    # Each turn owns only its rows, so pickling it doesn't carry the branch.
+    assert all(
+        turn.routed_expert_ids.untyped_storage().nbytes()
+        == turn.routed_expert_ids.numel()
+        for turn in turns
+    )
+    assert not any(
+        metric.key == "rollout/routed_experts_copied_boundary_rows"
+        for turn in turns
+        for metric in turn.metrics
+    )
+
+
+def test_verifiers_routed_experts_pack_one_row_per_trainer_input() -> None:
+    from torchtitan.rl.components.batcher import Batcher
+    from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
+    from torchtitan.rl.rollout import Rollout, RolloutStatus
+
+    turns = VerifiersRollouter.trace_to_rollout_turns(
+        trace=_routed_three_turn_trace(),
+        generation_metadata=_routed_metadata(),
+        group_id=5,
+        rollout_id=2,
+    )
+    rollout = Rollout(
+        group_id=5,
+        rollout_id=2,
+        status=RolloutStatus.COMPLETED,
+        turns=turns,
+        reward=1.0,
+        advantage=0.5,
+    )
+    [sample] = (
+        TrainingSampleBuilder.Config().build().rollout_to_training_samples(rollout)
+    )
+    batcher = Batcher.Config().build(
+        num_tokens_per_microbatch_per_dp_rank=16,
+        max_context_length=16,
+        num_prompts_per_train_step=1,
+        dp_degree=1,
+        pad_id=0,
+        temperature=1.0,
+    )
+    microbatch = batcher._pack_training_samples([sample])
+
+    assert sample.token_ids.tolist() == list(range(10, 24))
+    assert len(sample.routed_expert_ids) == len(sample.token_ids) - 1
+    packed = microbatch.model_kwargs["routed_expert_ids"]
+    assert packed[:13].tolist() == _routing(range(13))
+    assert packed[13:].count_nonzero() == 0
+
+
+def test_verifiers_branch_takes_its_shared_prefix_routing_from_the_previous_sample() -> (
+    None
+):
+    from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
+    from torchtitan.rl.rollout import Rollout, RolloutStatus
+    from verifiers.v1.trace import Branch
+
+    # Branch A: user [10, 11]; turn 0 [12 | 13, 14]; tool [15, 16]; turn 1 [17 | 18, 19].
+    # Branch B rewrites the tool reply to [15, 26]: its turn [27 | 28, 29] shares 6 tokens.
+    user = _routed_node("user", [10, 11], 0)
+    turn0 = _routed_node("assistant", [12, 13, 14], 2)
+    branch_a = [user, turn0, _routed_node("tool", [15, 16], 5)]
+    branch_a.append(_routed_node("assistant", [17, 18, 19], 7))
+    tool_b = _routed_node("tool", [15, 26], 5)
+    tool_b.routed_experts[1] = _true_routing(6, branch=1)
+    branch_b = [
+        user,
+        turn0,
+        tool_b,
+        _routed_node("assistant", [27, 28, 29], 7, branch=1),
+    ]
+    trace = SimpleNamespace(
+        nodes=[*branch_a, *branch_b[2:]],
+        branches=[Branch(index=0, nodes=branch_a), Branch(index=1, nodes=branch_b)],
+    )
+    metadata = _routed_metadata()
+
+    turns = VerifiersRollouter.trace_to_rollout_turns(
+        trace=trace, generation_metadata=metadata, group_id=5, rollout_id=2
+    )
+    rollout = Rollout(
+        group_id=5,
+        rollout_id=2,
+        status=RolloutStatus.COMPLETED,
+        turns=turns,
+        reward=1.0,
+        advantage=0.5,
+    )
+    first, second = (
+        TrainingSampleBuilder.Config().build().rollout_to_training_samples(rollout)
+    )
+
+    assert [turn.prompt_prefix_len for turn in turns] == [0, 5, 6]
+    assert first.routed_expert_ids.tolist() == _routing(range(9))
+    # Positions 0..4 from branch A's sample, 5 onward from branch B's own rows.
+    assert second.token_ids.tolist() == [10, 11, 12, 13, 14, 15, 26, 27, 28, 29]
+    assert second.routed_expert_ids.tolist() == [
+        *_routing(range(6)),
+        *_routing(range(6, 9), branch=1),
+    ]
+
+
+def test_verifiers_turn_without_routed_experts_fails_when_the_generator_returns_them() -> (
+    None
+):
+    trace = _routed_three_turn_trace()
+    trace.nodes[4].routed_experts = None  # e.g. a payload Verifiers could not attribute
+
+    with pytest.raises(ValueError, match="lacks them"):
+        VerifiersRollouter.trace_to_rollout_turns(
+            trace=trace,
+            generation_metadata=_routed_metadata(),
+            group_id=5,
+            rollout_id=2,
+        )
+
+
+def test_verifiers_turns_carry_no_routed_experts_unless_the_generator_returns_them() -> (
+    None
+):
+    metadata = _routed_metadata()
+    turns = VerifiersRollouter.trace_to_rollout_turns(
+        trace=_routed_three_turn_trace(),
+        generation_metadata=VerifiersGenerationMetadata(
+            min_policy_version=3, max_policy_version=3, metrics=[]
+        ),
+        group_id=5,
+        rollout_id=2,
+    )
+
+    assert metadata.routed_experts_expected
+    assert all(turn.routed_expert_ids is None for turn in turns)
+
+
+def test_verifiers_turn_without_its_boundary_row_keeps_verifiers_copy_and_counts_it() -> (
+    None
+):
+    metadata = _routed_metadata()
+    del metadata.routed_expert_boundary_rows[(8, (18, 19))]
+
+    turns = VerifiersRollouter.trace_to_rollout_turns(
+        trace=_routed_three_turn_trace(),
+        generation_metadata=metadata,
+        group_id=5,
+        rollout_id=2,
+    )
+
+    # Position 4 keeps Verifiers' copy of position 3's row.
+    assert turns[1].routed_expert_ids.tolist() == _routing([3, 5, 6, 7, 8])
+    assert [
+        metric.key
+        for metric in turns[1].metrics
+        if metric.key.startswith("rollout/routed_experts")
+    ] == ["rollout/routed_experts_copied_boundary_rows"]
+
+
+def test_verifiers_node_routed_experts_survive_the_env_server_wire() -> None:
+    import msgpack
+    from verifiers.v1.graph import MessageNode
+    from verifiers.v1.serve.encoding import msgpack_encoder
+
+    node = _routed_node("assistant", [12, 13, 14], 2)
+    wire = msgpack.packb(
+        node.model_dump(mode="python"), default=msgpack_encoder, use_bin_type=True
+    )
+    decoded = MessageNode.model_validate(msgpack.unpackb(wire, raw=False))
+
+    assert decoded.routed_experts.dtype == np.uint8
+    assert decoded.routed_experts.tolist() == node.routed_experts.tolist()
