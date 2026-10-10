@@ -42,6 +42,9 @@ class _OpenSample:
     loss_mask: list[bool] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     advantage: list[float] = field(default_factory=list)
+    routed_expert_ids: torch.Tensor | None = None
+    topk_token_ids: torch.Tensor | None = None
+    topk_logprobs: torch.Tensor | None = None
 
     def to_training_sample(self) -> TrainingSample:
         return TrainingSample(
@@ -52,6 +55,9 @@ class _OpenSample:
             loss_mask=torch.tensor(self.loss_mask, dtype=torch.bool),
             logprobs=torch.tensor(self.logprobs, dtype=torch.float32),
             advantage=torch.tensor(self.advantage, dtype=torch.float32),
+            routed_expert_ids=self.routed_expert_ids,
+            topk_token_ids=self.topk_token_ids,
+            topk_logprobs=self.topk_logprobs,
         )
 
 
@@ -242,6 +248,10 @@ class TrainingSampleBuilder(Configurable):
         = the oldest (opening) turn's version (the off-policy filter reads it), `max_policy_version` = the
         newest version any of its turns reached.
 
+        With routed expert ids, each turn keeps its own rows, so trained tokens replay the routing they were
+        sampled with. A continuing turn also supplies the row of the previous completion's last token,
+        which only its prefill ran forward (`len(routed_expert_ids) == len(token_ids) - 1`).
+
         Example (5 turns; the env compacts history before turn 3, so the prefix breaks -> 2 training_samples).
         P = prompt; C = completion; E = env reply. A turn stores its prompt as
         (prompt_prefix_len, prompt_delta_token_ids), the delta on the previous turn's prompt + completion:
@@ -303,7 +313,8 @@ class TrainingSampleBuilder(Configurable):
             # True when this prompt continues the previous one (prefix-preserving);
             # False when the env edited history -> open a new training_sample (branch).
             extends_prev = prompt_prefix_len == len(prev_prompt_and_completion)
-            if not training_samples or not extends_prev:
+            opens_sample = not training_samples or not extends_prev
+            if opens_sample:
                 # Start a new training_sample; its RolloutTurnID marks the turn the segment begins at.
                 training_samples.append(
                     _OpenSample(
@@ -341,7 +352,50 @@ class TrainingSampleBuilder(Configurable):
             )
             training_sample.logprobs += rollout_turn.completion_logprobs
             training_sample.advantage += [rollout_advantage] * num_completion
+            if rollout_turn.routed_expert_ids is not None:
+                # Row i is position i. A continuing turn adds rows from prompt_prefix_len - 1: the
+                # previous completion's last token only ran forward in this turn's prefill.
+                training_sample.routed_expert_ids = (
+                    rollout_turn.routed_expert_ids
+                    if opens_sample
+                    else torch.cat(
+                        [
+                            training_sample.routed_expert_ids,
+                            rollout_turn.routed_expert_ids[prompt_prefix_len - 1 :],
+                        ]
+                    )
+                )
+                assert (
+                    len(training_sample.routed_expert_ids)
+                    == len(training_sample.token_ids) - 1
+                )
+            if rollout_turn.completion_topk_token_ids is not None:
+                training_sample.topk_token_ids = _append_rows(
+                    training_sample.topk_token_ids,
+                    num_zero_rows=num_delta,
+                    new_rows=rollout_turn.completion_topk_token_ids,
+                )
+                training_sample.topk_logprobs = _append_rows(
+                    training_sample.topk_logprobs,
+                    num_zero_rows=num_delta,
+                    new_rows=rollout_turn.completion_topk_logprobs,
+                )
 
         return [
             training_sample.to_training_sample() for training_sample in training_samples
         ]
+
+
+def _append_rows(
+    rows: torch.Tensor | None, *, num_zero_rows: int, new_rows: torch.Tensor
+) -> torch.Tensor:
+    """Append `num_zero_rows` zero rows (the untrained prompt delta), then `new_rows`.
+
+    Example:
+
+        _append_rows(None, num_zero_rows=2, new_rows=[[7, 3]])  # -> [[0, 0], [0, 0], [7, 3]]
+    """
+    zero_rows = new_rows.new_zeros(num_zero_rows, new_rows.shape[1])
+    return torch.cat(
+        [zero_rows, new_rows] if rows is None else [rows, zero_rows, new_rows]
+    )

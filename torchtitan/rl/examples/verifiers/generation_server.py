@@ -12,6 +12,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 
+import torch
 from aiohttp import web
 
 from torchtitan.config import Configurable
@@ -35,8 +36,8 @@ class VerifiersGenerationMetadata:
     """TorchTitan generation data aggregated over one Verifiers rollout.
 
     Verifiers sends the trace ID as the generation session ID, but does not
-    retain TorchTitan policy versions or generator metrics in the returned
-    trace. The generation server therefore records their rollout-wide span.
+    retain TorchTitan policy versions, generator metrics, or top-k logprobs in
+    the returned trace. The generation server therefore records them per rollout.
     """
 
     min_policy_version: int
@@ -52,6 +53,18 @@ class VerifiersGenerationMetadata:
     """`Completion.loss_mask` of each completion with appended tokens, keyed by its token ids.
     Verifiers' client rejects NaN, so the reply sends 0.0 where the mask is False, and
     `trace_to_rollout_turns` restores the mask."""
+
+    topk_by_generation: dict[
+        tuple[int, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]
+    ] = field(default_factory=dict)
+    """The generator's top-k ids and logprobs `[num_completion_tokens, k]` per generation,
+    keyed by `(len(prompt_token_ids), completion_token_ids)`; empty unless
+    `SamplingConfig.num_topk_logprobs` > 0.
+
+    Example:
+
+        {(2, (12, 13)): (tensor([[12, 5], [13, 6]]), tensor([[-0.1, -2.4], [-0.2, -1.9]]))}
+    """
 
 
 class GenerationServer(Configurable):
@@ -248,6 +261,13 @@ class GenerationServer(Configurable):
                     reply_logprobs, completion.loss_mask, strict=True
                 )
             ]
+        topk_by_generation = {} if previous is None else previous.topk_by_generation
+        if completion.topk_token_ids is not None:
+            key = (len(prompt_token_ids), tuple(completion.token_ids))
+            topk_by_generation = {
+                **topk_by_generation,
+                key: (completion.topk_token_ids, completion.topk_logprobs),
+            }
         self.generation_metadata[session_id] = VerifiersGenerationMetadata(
             min_policy_version=(
                 completion.min_policy_version
@@ -265,6 +285,7 @@ class GenerationServer(Configurable):
                 else [*previous.metrics, *completion.metrics]
             ),
             loss_masks=loss_masks,
+            topk_by_generation=topk_by_generation,
         )
         return web.json_response(
             {
@@ -315,6 +336,7 @@ def _parse_sampling_config(value: object):
         "max_tokens",
         "seed",
         "stop_token_ids",
+        "num_topk_logprobs",
     }
     protocol_fields = {
         "logprobs",
@@ -337,4 +359,7 @@ def _parse_sampling_config(value: object):
         max_tokens=int(value.get("max_tokens", defaults.max_tokens)),
         seed=value.get("seed"),
         stop_token_ids=stop_token_ids,
+        num_topk_logprobs=int(
+            value.get("num_topk_logprobs", defaults.num_topk_logprobs)
+        ),
     )

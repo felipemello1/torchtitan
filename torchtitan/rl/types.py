@@ -60,6 +60,16 @@ class Completion:
     ordered completions or map by id."""
     token_ids: list[int]
     token_logprobs: list[float]
+    routed_expert_ids: torch.Tensor | None = None
+    """[num_prompt_tokens + len(token_ids) - 1, num_layers, top_k] expert ids each forward
+    input was routed to, in every decoder layer: uint8, or int16 above 256 experts. Rows of
+    dense layers are 0; the last token never ran forward, so it has no row. None unless the
+    generator returns routed experts."""
+    topk_token_ids: torch.Tensor | None = None
+    """[num_tokens, k] int32 ids of the generator's k most likely tokens at each position;
+    None unless `SamplingConfig.num_topk_logprobs` > 0."""
+    topk_logprobs: torch.Tensor | None = None
+    """[num_tokens, k] float32 generator logprobs of `topk_token_ids`."""
     finish_reason: str | None = None
     """vLLM `CompletionOutput.finish_reason` ("stop" | "length" | "abort")"""
 
@@ -105,6 +115,14 @@ class TrainingSample:
     """[L] generator logprobs; 0.0 on prompt and env tokens, NaN on tokens the rollout appended."""
     advantage: torch.Tensor  # [L] float32
     """[L] advantage on assistant tokens, 0.0 elsewhere."""
+    routed_expert_ids: torch.Tensor | None = None
+    """[L - 1, num_layers, top_k] generator expert ids for the trainer inputs
+    `token_ids[:-1]`; see `Completion.routed_expert_ids`."""
+    topk_token_ids: torch.Tensor | None = None
+    """[L, k] generator top-k token ids; zero rows where loss_mask is False. None unless
+    `SamplingConfig.num_topk_logprobs` > 0."""
+    topk_logprobs: torch.Tensor | None = None
+    """[L, k] generator logprobs of `topk_token_ids`; zero rows where loss_mask is False."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,14 +152,20 @@ class TrainingMicrobatch(TokenizedTrainingMicrobatch):
     temperature: torch.Tensor  # [T]
     loss_mask: torch.Tensor  # [T]
     advantages: torch.Tensor  # [T]
+    generator_topk_token_ids: torch.Tensor | None = None  # [T, k]
+    generator_topk_logprobs: torch.Tensor | None = None  # [T, k]
 
     def loss_kwargs(self) -> dict[str, torch.Tensor]:
-        return {
+        loss_kwargs = {
             "generator_logprobs": self.generator_logprobs,
             "temperature": self.temperature,
             "loss_mask": self.loss_mask,
             "advantages": self.advantages,
         }
+        if self.generator_topk_token_ids is not None:
+            loss_kwargs["generator_topk_token_ids"] = self.generator_topk_token_ids
+            loss_kwargs["generator_topk_logprobs"] = self.generator_topk_logprobs
+        return loss_kwargs
 
 
 @dataclass(frozen=True, slots=True)

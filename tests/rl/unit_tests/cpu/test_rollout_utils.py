@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.observability import metrics as m
@@ -380,3 +381,107 @@ def test_task_zero_std_split_reads_the_graded_reward() -> None:
     assert aggregated[f"{prefix}/all_success/mean"] == pytest.approx(1 / 3)
     assert aggregated[f"{prefix}/all_failure/mean"] == pytest.approx(1 / 3)
     assert num_training_samples == [2, 2, 2]
+
+
+def _routed_expert_ids(*, turn: int, num_positions: int) -> torch.Tensor:
+    """Rows tagged ``16 * turn + position``, so a test can tell which turn and position a row came from."""
+    return (16 * turn + torch.arange(num_positions, dtype=torch.uint8)).view(-1, 1, 1)
+
+
+def test_routed_expert_ids_keep_each_turns_rows_and_take_the_boundary_from_the_next_prefill() -> (
+    None
+):
+    turns = [
+        _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=2),
+        _turn(prompt_token_ids=[1, 2, 4, 8], completion_token_ids=[5, 6], version=2),
+        _turn(
+            prompt_token_ids=[1, 2, 4, 8, 5, 6, 9], completion_token_ids=[7], version=2
+        ),
+    ]
+    # vLLM returns one row per forward input: the prompt plus every completion token but the last.
+    # `_turn` holds the full prompt until `_scored_rollout` stores it as a delta.
+    for turn_id, rollout_turn in enumerate(turns):
+        num_inputs = (
+            len(rollout_turn.prompt_delta_token_ids)
+            + len(rollout_turn.completion_token_ids)
+            - 1
+        )
+        rollout_turn.routed_expert_ids = _routed_expert_ids(
+            turn=turn_id, num_positions=num_inputs
+        )
+    rollout = _scored_rollout(turns, reward=0.8, advantage=-0.2)
+
+    [training_sample] = rollout_to_training_samples(rollout)
+
+    # inputs:           1       2       4       8       5       6       9
+    # Token 4 (turn 0's last completion token) and token 6 (turn 1's) never ran forward in
+    # their own turn, so their rows come from the next turn's prefill.
+    assert training_sample.routed_expert_ids.flatten().tolist() == [
+        16 * 0 + 0,
+        16 * 0 + 1,
+        16 * 1 + 2,
+        16 * 1 + 3,
+        16 * 1 + 4,
+        16 * 2 + 5,
+        16 * 2 + 6,
+    ]
+    assert len(training_sample.routed_expert_ids) == len(training_sample.token_ids) - 1
+
+
+def test_routed_expert_ids_restart_at_a_branch() -> None:
+    turns = [
+        _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=1),
+        _turn(prompt_token_ids=[90, 91], completion_token_ids=[5], version=1),
+    ]
+    turns[0].routed_expert_ids = _routed_expert_ids(turn=0, num_positions=2)
+    turns[1].routed_expert_ids = _routed_expert_ids(turn=1, num_positions=2)
+    rollout = _scored_rollout(turns, reward=0.5, advantage=0.1)
+
+    first, second = rollout_to_training_samples(rollout)
+
+    assert first.routed_expert_ids.flatten().tolist() == [0, 1]
+    assert second.routed_expert_ids.flatten().tolist() == [16, 17]
+
+
+def test_samples_without_routed_expert_ids_keep_none() -> None:
+    rollout = _scored_rollout(
+        [_turn(prompt_token_ids=[1, 2], completion_token_ids=[4, 5], version=2)],
+        reward=1.0,
+        advantage=0.5,
+    )
+
+    [training_sample] = rollout_to_training_samples(rollout)
+
+    assert training_sample.routed_expert_ids is None
+
+
+def test_topk_rows_align_with_token_ids_across_turns() -> None:
+    first = _turn(prompt_token_ids=[1, 2], completion_token_ids=[4, 5], version=0)
+    first.completion_topk_token_ids = torch.tensor([[4, 9], [5, 8]], dtype=torch.int32)
+    first.completion_topk_logprobs = torch.tensor([[-0.1, -2.0], [-0.2, -3.0]])
+    second = _turn(
+        prompt_token_ids=[1, 2, 4, 5, 9], completion_token_ids=[7], version=0
+    )
+    second.completion_topk_token_ids = torch.tensor([[7, 3]], dtype=torch.int32)
+    second.completion_topk_logprobs = torch.tensor([[-0.3, -1.5]])
+
+    [training_sample] = rollout_to_training_samples(
+        _scored_rollout([first, second], reward=1.0, advantage=0.5)
+    )
+
+    # Zero rows on the prompt and the env reply (token 9), like their 0.0 logprobs.
+    assert training_sample.token_ids.tolist() == [1, 2, 4, 5, 9, 7]
+    assert training_sample.topk_token_ids.tolist() == [
+        [0, 0],
+        [0, 0],
+        [4, 9],
+        [5, 8],
+        [0, 0],
+        [7, 3],
+    ]
+    torch.testing.assert_close(
+        training_sample.topk_logprobs,
+        torch.tensor(
+            [[0, 0], [0, 0], [-0.1, -2.0], [-0.2, -3.0], [0, 0], [-0.3, -1.5]]
+        ),
+    )

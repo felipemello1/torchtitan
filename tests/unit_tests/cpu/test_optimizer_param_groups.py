@@ -19,7 +19,13 @@ from torchtitan.components.optim import (
     LRSchedulersContainer,
     OptimizersContainer,
 )
-from torchtitan.models.common.moe import register_moe_load_balancing_hook
+from torchtitan.models.common import HiMidLoLinear, Sigmoid
+from torchtitan.models.common.moe import (
+    MoE,
+    QuantileBalancedTopKRouter,
+    register_moe_load_balancing_hook,
+    register_moe_quantile_balancing_hook,
+)
 
 
 class SimpleModel(nn.Module):
@@ -59,6 +65,7 @@ class FakeMoE(nn.Module):
     def __init__(self, load_balance_coeff, tokens):
         super().__init__()
         self.load_balance_coeff = load_balance_coeff
+        self.freeze_expert_bias = False
         self.router = FakeRouter(tokens)
         if load_balance_coeff is not None:
             self.register_buffer("expert_bias_E", torch.zeros(len(tokens)))
@@ -225,6 +232,57 @@ class TestOptimizerConfig(unittest.TestCase):
             model.layers["1"].moe.router.tokens_per_expert_E,
             torch.tensor([0, 0]),
         )
+
+    def test_moe_load_balancing_frozen_bias_only_zeroes_counts(self):
+        model = FakeMoEModel()
+        for block in model.layers.values():
+            block.moe.freeze_expert_bias = True
+        config = OptimizersContainer.Config(
+            optimizers=[
+                AdamW.Config(pattern=r".*", fused=False, lr=0.0, weight_decay=0.0),
+            ],
+        )
+        container = config.build(model_parts=[model])
+        register_moe_load_balancing_hook(container, [model], FakeParallelismContext())
+
+        container.step()
+
+        for block in model.layers.values():
+            torch.testing.assert_close(block.moe.expert_bias_E, torch.zeros(2))
+            torch.testing.assert_close(
+                block.moe.router.tokens_per_expert_E, torch.tensor([0, 0])
+            )
+
+    def test_moe_quantile_balancing_frozen_bias_only_zeroes_counts(self):
+        moe = MoE.__new__(MoE)
+        nn.Module.__init__(moe)
+        moe.router = QuantileBalancedTopKRouter.Config(
+            num_experts=4,
+            top_k=2,
+            gate=HiMidLoLinear.Config(in_features=4, out_features=4, bias=False),
+            score_func=Sigmoid.Config(),
+            num_bins=10,
+        ).build()
+        moe.freeze_expert_bias = True
+        moe.register_buffer("expert_bias_E", torch.tensor([0.3, -0.1, 0.0, -0.2]))
+        moe.router.quantile_balancer.required_bias_histogram_EB.fill_(1)
+        moe.router.tokens_per_expert_E.fill_(5)
+        container = OptimizersContainer.Config(
+            optimizers=[
+                AdamW.Config(pattern=r".*", fused=False, lr=0.0, weight_decay=0.0),
+            ],
+        ).build(model_parts=[moe])
+        register_moe_quantile_balancing_hook(container, [moe], FakeParallelismContext())
+
+        container.step()
+
+        torch.testing.assert_close(
+            moe.expert_bias_E, torch.tensor([0.3, -0.1, 0.0, -0.2])
+        )
+        self.assertEqual(
+            moe.router.quantile_balancer.required_bias_histogram_EB.count_nonzero(), 0
+        )
+        self.assertEqual(moe.router.tokens_per_expert_E.count_nonzero(), 0)
 
     def test_moe_load_balancing_rejects_inconsistent_coeffs(self):
         model = FakeMoEModel(load_balance_coeffs=(None, 0.2))
@@ -775,6 +833,49 @@ class TestLRSchedulerWithMixedOptimizers(unittest.TestCase):
                 self.assertAlmostEqual(base_lr, 5e-4, places=6)
             else:
                 self.assertAlmostEqual(base_lr, 1e-3, places=6)
+
+    def test_resume_uses_the_configured_lr_from_the_first_step(self):
+        """Saved at lr 1e-6 after 2 of 4 warmup steps, resumed with lr 1e-5: the
+        first step runs at 1e-5 x 3/4, whichever of the two states loads first.
+
+        DCP loads the lr scheduler first (sorted keys); torch_checkpointing loads the
+        optimizer first.
+        """
+        lr_config = LRSchedulersContainer.Config(warmup_steps=4)
+        saved_model = SimpleModel()
+        saved_scheduler, saved_container = self._build_scheduler(
+            OptimizersContainer.Config(
+                optimizers=[AdamW.Config(pattern=r".*", fused=False, lr=1e-6)]
+            ),
+            lr_config,
+            saved_model,
+        )
+        saved_model(torch.randint(0, 32, (2, 4))).sum().backward()
+        for _ in range(2):
+            saved_container.step()
+            saved_scheduler.step()
+
+        for scheduler_first in (True, False):
+            with self.subTest(scheduler_first=scheduler_first):
+                scheduler, container = self._build_scheduler(
+                    OptimizersContainer.Config(
+                        optimizers=[AdamW.Config(pattern=r".*", fused=False, lr=1e-5)]
+                    ),
+                    lr_config,
+                    SimpleModel(),
+                )
+                if scheduler_first:
+                    scheduler.load_state_dict(saved_scheduler.state_dict())
+                container.load_state_dict(saved_container.state_dict())
+                if not scheduler_first:
+                    scheduler.load_state_dict(saved_scheduler.state_dict())
+
+                group = container.optimizers[0].param_groups[0]
+                self.assertAlmostEqual(group["lr"], 7.5e-6, places=12)
+                self.assertAlmostEqual(group["initial_lr"], 1e-5, places=12)
+                self.assertAlmostEqual(
+                    scheduler.get_metrics()["lr/AdamW"], 7.5e-6, places=12
+                )
 
     def test_first_capturable_step_uses_stable_tensor_lr(self):
         model = torch.nn.Linear(2, 2)

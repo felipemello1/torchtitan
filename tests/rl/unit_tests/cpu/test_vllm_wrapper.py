@@ -7,10 +7,15 @@
 import importlib.metadata
 
 import pytest
+import torch
+
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.model.attention import _fa4_splits_paged_kv
-from torchtitan.rl.model.vllm_wrapper import _replace_vllm_layer_configs
+from torchtitan.rl.model.vllm_wrapper import (
+    _replace_vllm_layer_configs,
+    VLLMModelWrapper,
+)
 
 
 def test_vllm_replacement_preserves_attention_sharding() -> None:
@@ -55,3 +60,55 @@ def test_fa4_splits_paged_kv_only_from_the_version_that_supports_it(
         assert _fa4_splits_paged_kv() is splits
     finally:
         _fa4_splits_paged_kv.cache_clear()
+
+
+def test_routers_expose_routed_experts_to_vllm_capture():
+    """vLLM binds ``capture_fn`` by attribute; every MoE router must call it with its ids."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from torchtitan.models.common.activation import Sigmoid
+    from torchtitan.models.common.config_utils import make_router_config
+
+    def build_router():
+        router = make_router_config(
+            dim=4,
+            num_experts=4,
+            score_func=Sigmoid.Config(),
+            gate_param_init={"weight": torch.nn.init.zeros_},
+            top_k=2,
+        ).build()
+        router.init_states()
+        return router
+
+    for tp_enabled, gathered_rows in ((False, 3), (True, 6)):
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleDict(
+            {"0": torch.nn.Module(), "1": torch.nn.Module()}
+        )
+        model.layers["0"].feed_forward = torch.nn.Linear(4, 4)
+        model.layers["1"].router = build_router()
+        wrapper = VLLMModelWrapper.__new__(VLLMModelWrapper)
+        torch.nn.Module.__init__(wrapper)
+        wrapper.model = model
+        wrapper.parallelism_context = SimpleNamespace(
+            ep_enabled=True, tp_enabled=tp_enabled
+        )
+        tp_group = SimpleNamespace(
+            all_gather=lambda tensor, dim: torch.cat([tensor, tensor], dim=dim)
+        )
+        captured = []
+
+        with patch(
+            "torchtitan.rl.model.vllm_wrapper.get_tp_group", return_value=tp_group
+        ):
+            wrapper._expose_routed_experts_to_vllm()
+            router = model.layers["1"].router
+            assert router.layer_id == 1 and router.capture_fn is None
+            router(torch.randn(3, 4))  # before vLLM binds capture_fn: no capture
+            router.capture_fn = captured.append
+            _, topk_expert_ids_TK, _ = router(torch.randn(3, 4))
+
+        assert not hasattr(model.layers["0"].feed_forward, "layer_id")
+        assert len(captured) == 1 and captured[0].shape == (gathered_rows, 2)
+        assert torch.equal(captured[0][:3], topk_expert_ids_TK)

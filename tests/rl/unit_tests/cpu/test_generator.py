@@ -99,7 +99,7 @@ class _FakeEngine:
         self.reset_prefix_cache_calls.append((args, kwargs))
 
 
-def _sample(*, token_ids=(10, 11), finish_reason="stop"):
+def _sample(*, token_ids=(10, 11), finish_reason="stop", routed_experts=None):
     # What vLLM returns with flat_logprobs=True and logprobs=0: one logprob (-0.1) per generated token.
     logprobs = FlatLogprobs()
     for tok in token_ids:
@@ -108,6 +108,7 @@ def _sample(*, token_ids=(10, 11), finish_reason="stop"):
         token_ids=list(token_ids),
         logprobs=logprobs,
         finish_reason=finish_reason,
+        routed_experts=routed_experts,
     )
 
 
@@ -240,6 +241,7 @@ def test_process_finished_requests_resolves_reply_with_completion():
         assert completion.request_id == "r0"
         assert completion.token_ids == [10, 11]
         assert completion.token_logprobs == [-0.1, -0.1]
+        assert completion.topk_token_ids is None
         assert completion.finish_reason == "length"
         assert completion.min_policy_version == 7  # min = version it was admitted under
         assert completion.max_policy_version == 8  # max = live version at finish
@@ -251,6 +253,45 @@ def test_process_finished_requests_resolves_reply_with_completion():
                 "generator/inflight_requests_at_completion/max"
             ]
             == 1
+        )
+
+    asyncio.run(main())
+
+
+def test_process_finished_requests_splits_topk_logprobs():
+    async def main():
+        dispatcher = _dispatcher()
+        reply = concurrent.futures.Future()
+        reply.set_running_or_notify_cancel()
+        generation = OutstandingGeneration(reply=reply, metrics_prefix="generator")
+        generation.min_policy_version = 7
+        dispatcher._rank0_outstanding_generations = {"r0": generation}
+        # vLLM's layout with logprobs=2: each position holds [sampled, top-1, top-2], and
+        # the sampled token repeats when it is also in the top-k.
+        logprobs = FlatLogprobs()
+        logprobs.append_fast(
+            [10, 10, 3], [-0.1, -0.1, -2.5], iter([1, 1, 2]), [None] * 3
+        )
+        logprobs.append_fast(
+            [11, 4, 11], [-0.7, -0.5, -0.7], iter([2, 1, 2]), [None] * 3
+        )
+        sample = SimpleNamespace(
+            token_ids=[10, 11],
+            logprobs=logprobs,
+            finish_reason="stop",
+            routed_experts=None,
+        )
+
+        dispatcher.process_finished_requests(
+            [_request_output(outputs=[sample])], policy_version=7
+        )
+
+        completion = await asyncio.wrap_future(reply)
+        assert completion.token_logprobs == [-0.1, -0.7]
+        assert completion.topk_token_ids.dtype == torch.int32
+        assert completion.topk_token_ids.tolist() == [[10, 3], [4, 11]]
+        torch.testing.assert_close(
+            completion.topk_logprobs, torch.tensor([[-0.1, -2.5], [-0.5, -0.7]])
         )
 
     asyncio.run(main())
@@ -318,6 +359,14 @@ def test_build_sampling_params_matches_contract():
     assert params.seed == 44
 
 
+def test_build_sampling_params_requests_topk_logprobs():
+    generator = _generator()
+    params = generator._build_sampling_params(
+        SamplingConfig(max_tokens=8, stop_token_ids=[99], num_topk_logprobs=32)
+    )
+    assert params.logprobs == 32
+
+
 def test_build_sampling_params_seed_defaults_to_none():
     generator = _generator()
     params = generator._build_sampling_params(
@@ -341,7 +390,7 @@ def _admit_through_engine_loop(monkeypatch, generator, requests):
     generator._decide_next_action = decide_next_action
     generator._request_dispatcher = SimpleNamespace(
         setup=lambda: None,
-        rank0_stamp_min_policy_version=lambda *args: None,
+        process_rejected_requests=lambda rejected_requests: None,
         shutdown=AsyncMock(),
         fail_outstanding_generations=lambda exc: None,
         _dp_rank=0,
@@ -362,7 +411,22 @@ def _engine_request(request_id: str, *, min_policy_version: int):
         routing_session_id="group=3/rollout=0",
     )
     request.min_policy_version = min_policy_version
+    request.arrival_time = 1.5  # rank 0's clock at admission
     return request
+
+
+def test_admission_passes_pinned_version_as_priority(monkeypatch):
+    # The pinned version (6), not the installed one (7), is the priority; arrival_time is rank 0's stamp.
+    generator = _generator()
+    engine = cast(_FakeEngine, generator._engine)
+
+    _admit_through_engine_loop(
+        monkeypatch, generator, [_engine_request("r0", min_policy_version=6)]
+    )
+
+    _, kwargs = engine.add_requests[0]
+    assert kwargs["priority"] == 6
+    assert kwargs["arrival_time"] == 1.5
 
 
 def test_admission_salts_prompt_with_min_policy_version(monkeypatch):
@@ -563,7 +627,7 @@ def test_extra_vllm_engine_args_reach_engine_args(monkeypatch, tmp_path):
         VLLMGenerator.Config(extra_vllm_engine_args={"watermark": 0.03}),
     )
     assert engine_kwargs["watermark"] == 0.03
-    assert engine_kwargs["scheduling_policy"] == "fcfs"
+    assert engine_kwargs["scheduling_policy"] == "priority"
 
 
 @pytest.mark.parametrize(
@@ -793,6 +857,7 @@ def test_vllm_uneven_decode_tp_padding():
     )
 
     config = rl_grpo_qwen3_moe_debug_varlen()
+    config.model = config.model_defaults.apply_(config.model)
     config.generator.parallelism.data_parallel_degree = 1
     config.generator.parallelism.tensor_parallel_degree = 4
     config.generator.gpu_memory_limit = 0.5
@@ -848,3 +913,22 @@ def test_vllm_uneven_decode_tp_padding():
         torch.cuda.empty_cache()
         if temporary_dump_folder is not None:
             shutil.rmtree(temporary_dump_folder, ignore_errors=True)
+
+
+def test_build_completions_keeps_routed_expert_ids_picklable() -> None:
+    """vLLM returns uint16 ids above 256 experts; torch cannot unpickle uint16 tensors."""
+    import pickle
+
+    import numpy as np
+
+    dispatcher = RequestDispatcher.__new__(RequestDispatcher)
+    for ids, expected_dtype in (
+        (np.array([[[3, 255]]], dtype=np.uint8), torch.uint8),
+        (np.array([[[3, 895]]], dtype=np.uint16), torch.int16),
+    ):
+        [(_, completion, _)] = dispatcher._build_completions(
+            [_request_output(outputs=[_sample(routed_experts=ids)])], policy_version=0
+        )
+        routed_expert_ids = pickle.loads(pickle.dumps(completion)).routed_expert_ids
+        assert routed_expert_ids.dtype == expected_dtype
+        assert routed_expert_ids.long().tolist() == ids.astype(np.int64).tolist()

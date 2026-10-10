@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, TYPE_CHECKING
 
+import torch
 from renderers import Message
 
 from torchtitan.rl.observability import metrics as m
@@ -132,6 +133,15 @@ class RolloutTurn:
 
     completion_loss_mask: list[bool] | None = None  # [num_completion_tokens] or None
     """`Completion.loss_mask`: False on tokens the rollout appended, which the loss skips. None: train every token."""
+
+    routed_expert_ids: torch.Tensor | None = None
+    """[num_prompt_tokens + num_completion_tokens - 1, num_layers, top_k] expert ids the
+    generator routed this turn's prompt and completion to; see `Completion.routed_expert_ids`."""
+    completion_topk_token_ids: torch.Tensor | None = None  # [num_completion_tokens, k]
+    """The generator's top-k token ids at each completion position (`Completion.topk_token_ids`)."""
+
+    completion_topk_logprobs: torch.Tensor | None = None  # [num_completion_tokens, k]
+    """The generator's logprobs of `completion_topk_token_ids`."""
 
     # Filtering
     min_policy_version: int | None = None

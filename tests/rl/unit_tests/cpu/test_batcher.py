@@ -233,3 +233,96 @@ def test_microbatch_carries_the_sampling_temperature_into_the_loss() -> None:
     temperature = microbatch.loss_kwargs()["temperature"]
     assert temperature.dtype == torch.float32
     assert temperature.tolist() == [0.5] * 8
+
+
+def test_routed_expert_ids_follow_input_ids_through_padding() -> None:
+    batcher = Batcher.Config(per_sample_pad_multiple=4).build(
+        num_tokens_per_microbatch_per_dp_rank=16,
+        max_context_length=16,
+        num_prompts_per_train_step=1,
+        dp_degree=1,
+        pad_id=0,
+        temperature=1.0,
+    )
+    samples = _make_samples([3, 2])
+    for index, sample in enumerate(samples):
+        # One row per input token (token_ids[:-1]), tagged with its sample and position.
+        num_inputs = len(sample.token_ids) - 1
+        sample.routed_expert_ids = (
+            10 * (index + 1) + torch.arange(num_inputs, dtype=torch.uint8)
+        ).view(-1, 1, 1)
+
+    microbatch = batcher._pack_training_samples(samples)
+
+    routed_expert_ids = microbatch.model_kwargs["routed_expert_ids"]
+    assert routed_expert_ids.shape == (16, 1, 1)
+    assert routed_expert_ids.dtype == torch.uint8
+    #             sample 0 (3 inputs + 1 pad)  sample 1 (2 inputs + 2 pad)  tail padding
+    assert (
+        routed_expert_ids.flatten().tolist() == [10, 11, 12, 0, 20, 21, 0, 0] + [0] * 8
+    )
+    assert (
+        microbatch.padding_mask.tolist()
+        == [False] * 3 + [True] + [False] * 2 + [True] * 10
+    )
+
+
+def test_microbatch_without_routed_expert_ids_has_no_model_kwargs() -> None:
+    batcher = Batcher.Config().build(
+        num_tokens_per_microbatch_per_dp_rank=16,
+        max_context_length=16,
+        num_prompts_per_train_step=1,
+        dp_degree=1,
+        pad_id=0,
+        temperature=1.0,
+    )
+
+    assert batcher._pack_training_samples(_make_samples([3, 2])).model_kwargs == {}
+    assert batcher._pack_training_samples([]).model_kwargs == {}
+
+
+def test_microbatch_carries_topk_rows_aligned_with_labels() -> None:
+    batcher = Batcher.Config().build(
+        num_tokens_per_microbatch_per_dp_rank=8,
+        max_context_length=8,
+        num_prompts_per_train_step=1,
+        dp_degree=1,
+        pad_id=0,
+        temperature=1.0,
+        num_topk_logprobs=2,
+    )
+    [sample] = _make_samples([3])
+    sample.topk_token_ids = torch.tensor(
+        [[0, 0], [5, 6], [7, 8], [9, 4]], dtype=torch.int32
+    )
+    sample.topk_logprobs = torch.tensor(
+        [[0.0, 0.0], [-0.1, -2.0], [-0.2, -3.0], [-0.3, -4.0]]
+    )
+
+    loss_kwargs = batcher._pack_training_samples([sample]).loss_kwargs()
+
+    # Shifted like generator_logprobs: row t holds the top-k that sampled labels[t].
+    assert loss_kwargs["generator_topk_token_ids"].tolist() == (
+        [[5, 6], [7, 8], [9, 4]] + [[0, 0]] * 5
+    )
+    torch.testing.assert_close(
+        loss_kwargs["generator_topk_logprobs"],
+        torch.tensor([[-0.1, -2.0], [-0.2, -3.0], [-0.3, -4.0]] + [[0.0, 0.0]] * 5),
+    )
+    # An empty bin still carries [T, k] rows, so every rank calls the loss the same way.
+    empty_loss_kwargs = batcher._pack_training_samples([]).loss_kwargs()
+    assert empty_loss_kwargs["generator_topk_token_ids"].shape == (8, 2)
+
+
+def test_microbatch_has_no_topk_kwargs_by_default() -> None:
+    # DAPOLoss and GRPOLoss take no top-k arguments.
+    batcher = Batcher.Config().build(
+        num_tokens_per_microbatch_per_dp_rank=8,
+        max_context_length=8,
+        num_prompts_per_train_step=1,
+        dp_degree=1,
+        pad_id=0,
+        temperature=1.0,
+    )
+    loss_kwargs = batcher._pack_training_samples(_make_samples([3])).loss_kwargs()
+    assert "generator_topk_token_ids" not in loss_kwargs

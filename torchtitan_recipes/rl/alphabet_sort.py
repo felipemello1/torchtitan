@@ -28,13 +28,10 @@ from torchtitan.config import DebugConfig, OverrideConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import (
     BatchInvariantFlexConverter,
-    LMHeadFP32OutputConverter,
-    ModelConfigConverter,
     MXFP8LinearConverter,
 )
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
-from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.gpt_oss import build_model_config as build_gpt_oss_model_config
 from torchtitan.models.qwen3 import build_model_config
 from torchtitan.models.qwen3_5 import build_model_config as build_qwen3_5_model_config
@@ -70,32 +67,10 @@ def _alphabet_sort_rollouter_config() -> Rollouter.Config:
     )
 
 
-def _build_qwen3_rl_model_config(
-    flavor: str,
-    *,
-    seq_len: int,
-    attn_backend: str,
-    converters: list[ModelConfigConverter.Config] | None = None,
-) -> Decoder.Config:
-    """``qwen3.build_model_config`` for RL, with fp32 lm_head logits.
-
-    RL logprob / KL math needs the lm_head logits in fp32, so every RL config
-    runs ``LMHeadFP32OutputConverter`` on top of whatever converters it passes.
-    """
-    converters = list(converters or [])
-    converters.append(LMHeadFP32OutputConverter.Config())
-    spec = build_model_config(
-        flavor, seq_len=seq_len, attn_backend=attn_backend, converters=converters
-    )
-    return spec
-
-
 def rl_grpo_qwen3_0_6b_varlen(*, seq_len: int = 2048) -> Controller.Config:
     """GRPO training config for Qwen3-0.6B (6 GPUs: 4 gen + 2 train)."""
     num_samples_per_prompt = 8
-    model_config = _build_qwen3_rl_model_config(
-        "0.6B", seq_len=seq_len, attn_backend="varlen"
-    )
+    model_config = build_model_config("0.6B", seq_len=seq_len, attn_backend="varlen")
     return Controller.Config(
         model=model_config,
         hf_assets_path="torchtitan/rl/example_checkpoint/Qwen3-0.6B",
@@ -165,9 +140,7 @@ def rl_grpo_qwen3_0_6b_flex() -> Controller.Config:
     """GRPO training config for Qwen3-0.6B with flex attention (4 GPUs: 2 gen + 2 train)."""
     num_samples_per_prompt = 8
     seq_len = 2048
-    model_config = _build_qwen3_rl_model_config(
-        "0.6B", seq_len=seq_len, attn_backend="flex"
-    )
+    model_config = build_model_config("0.6B", seq_len=seq_len, attn_backend="flex")
     return Controller.Config(
         model=model_config,
         hf_assets_path="torchtitan/rl/example_checkpoint/Qwen3-0.6B",
@@ -247,7 +220,7 @@ def rl_grpo_qwen3_0_6b_flex_batch_invariant() -> Controller.Config:
     forward (even at data_parallel_shard_degree=1), matching the bf16 generator.
     """
     config = rl_grpo_qwen3_0_6b_flex()
-    config.model = _build_qwen3_rl_model_config(
+    config.model = build_model_config(
         "0.6B",
         seq_len=config.trainer.training.max_context_length,
         attn_backend="flex",
@@ -293,7 +266,6 @@ def rl_grpo_gpt_oss_20b_varlen() -> Controller.Config:
         "20b",
         seq_len=seq_len,
         attn_backend="varlen",
-        converters=[LMHeadFP32OutputConverter.Config()],
     )
     return Controller.Config(
         model=model_config,
@@ -362,9 +334,7 @@ def rl_grpo_qwen3_1_7b() -> Controller.Config:
     """GRPO training config for Qwen3-1.7B (6 GPUs: 4 gen + 2 train)."""
     num_samples_per_prompt = 8
     seq_len = 2048
-    model_config = _build_qwen3_rl_model_config(
-        "1.7B", seq_len=seq_len, attn_backend="varlen"
-    )
+    model_config = build_model_config("1.7B", seq_len=seq_len, attn_backend="varlen")
     return Controller.Config(
         model=model_config,
         hf_assets_path="torchtitan/rl/example_checkpoint/Qwen3-1.7B",
@@ -427,9 +397,7 @@ def rl_grpo_qwen3_14b() -> Controller.Config:
     """GRPO training config for Qwen3-14B (16 GPUs: 8 gen + 8 train)."""
     num_samples_per_prompt = 8
     seq_len = 2048
-    model_config = _build_qwen3_rl_model_config(
-        "14B", seq_len=seq_len, attn_backend="varlen"
-    )
+    model_config = build_model_config("14B", seq_len=seq_len, attn_backend="varlen")
     return Controller.Config(
         model=model_config,
         hf_assets_path="torchtitan/rl/example_checkpoint/Qwen3-14B",
@@ -502,7 +470,6 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> Controller.Config:
         "30B-A3B",
         seq_len=seq_len,
         attn_backend="varlen",
-        converters=[LMHeadFP32OutputConverter.Config()],
     )
     return Controller.Config(
         model=model_config,
@@ -612,9 +579,7 @@ def rl_grpo_qwen3_0_6b_varlen_batch_invariant(
     """
     batch_invariant_config = DebugConfig(batch_invariant=True, deterministic=True)
     num_samples_per_prompt = 8
-    model_config = _build_qwen3_rl_model_config(
-        "0.6B", seq_len=seq_len, attn_backend="varlen"
-    )
+    model_config = build_model_config("0.6B", seq_len=seq_len, attn_backend="varlen")
     # Local compile regions do not support batch-invariant mode.
     model_config.local_compile_regions = []
     return Controller.Config(
@@ -684,33 +649,11 @@ def rl_grpo_qwen3_0_6b_varlen_batch_invariant(
     )
 
 
-def _build_qwen3_5_rl_model_config(
-    flavor: str,
-    *,
-    seq_len: int,
-    attn_backend: str = "varlen",
-    converters: list[ModelConfigConverter.Config] | None = None,
-) -> Decoder.Config:
-    """``qwen3_5.build_model_config`` for RL, with fp32 lm_head logits.
-
-    RL logprob / KL math needs the lm_head logits in fp32, so every RL config
-    runs ``LMHeadFP32OutputConverter`` on top of whatever converters it passes.
-    """
-    converters = list(converters or [])
-    converters.append(LMHeadFP32OutputConverter.Config())
-    return build_qwen3_5_model_config(
-        flavor,
-        seq_len=seq_len,
-        attn_backend=attn_backend,
-        converters=converters,
-    )
-
-
 def rl_grpo_qwen3_5_9b_varlen() -> Controller.Config:
     """Qwen3.5-9B GRPO with trainer and generator TP=2 (6 GPUs)."""
     num_samples_per_prompt = 8
     seq_len = 2048
-    model_config = _build_qwen3_5_rl_model_config(
+    model_config = build_qwen3_5_model_config(
         "9B", seq_len=seq_len, attn_backend="varlen"
     )
     return Controller.Config(
@@ -807,7 +750,7 @@ def rl_grpo_qwen3_6_27b_varlen_perf() -> Controller.Config:
     """
     seq_len = 65536
     config = rl_grpo_qwen3_5_9b_varlen()
-    config.model = _build_qwen3_5_rl_model_config(
+    config.model = build_qwen3_5_model_config(
         "27B", seq_len=seq_len, attn_backend="varlen"
     )
     config.hf_assets_path = "torchtitan/rl/example_checkpoint/Qwen3.6-27B"
