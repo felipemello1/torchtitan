@@ -39,7 +39,8 @@ def _rollout(
     """A one-turn rollout of `num_tokens` completion tokens ending in `answer`."""
     turn = RolloutTurn(
         rollout_id=RolloutTurnID(group_id=0, rollout_id=0, turn_id=0),
-        prompt_token_ids=[0] * prompt_len,
+        prompt_prefix_len=0,
+        prompt_delta_token_ids=[0] * prompt_len,
         completion_token_ids=[1] * (num_tokens - 1) + [answer],
         completion_logprobs=[-0.5] * num_tokens,
     )

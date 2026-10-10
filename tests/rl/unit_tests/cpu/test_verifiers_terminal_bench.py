@@ -397,7 +397,7 @@ def test_group_rewards_get_the_length_reward(monkeypatch) -> None:
     rollouter = config.build()
     rollouter._generation_server = SimpleNamespace(
         model_id="torchtitan",
-        set_generate_fn=lambda generate_fn: None,
+        generate_fns={},
         pop_generation_metadata=lambda trace_id: VerifiersGenerationMetadata(
             min_policy_version=0, max_policy_version=0, metrics=[]
         ),
