@@ -441,6 +441,7 @@ def test_35b_sandoq_1x2_recipe_fits_three_hosts(monkeypatch) -> None:
     monkeypatch.delenv("DOME_V2_PROMPTS", raising=False)
     monkeypatch.delenv("DOME_V2_THINKING_BUDGET", raising=False)
     monkeypatch.delenv("DOME_V2_LENGTH_REWARD_WEIGHT", raising=False)
+    monkeypatch.delenv("DOME_V2_LR", raising=False)
     config = _terminal_bench_config("rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2")
 
     trainer = config.trainer.parallelism
@@ -453,6 +454,7 @@ def test_35b_sandoq_1x2_recipe_fits_three_hosts(monkeypatch) -> None:
         "torchtitan_recipes.overrides.dist_moe.dist_moe_routed_experts"
     ]
     assert config.trainer.training.num_tokens_per_microbatch_per_dp_rank == 131072
+    assert config.trainer.optim.optimizer.optimizers[0].lr == 1e-5
     assert config.num_generators == 8
     assert config.generator.parallelism.tensor_parallel_degree == 1
     assert config.generator.cuda_graph.mode == "FULL"
