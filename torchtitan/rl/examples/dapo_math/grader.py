@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import connection
 
 from math_verify import LatexExtractionConfig, LatexNormalizationConfig, parse, verify
-from sympy import And, Eq, FiniteSet, Mul, Symbol
+from sympy import And, EmptySet, Eq, FiniteSet, Mul, Symbol
 from sympy.core.relational import Relational
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,8 @@ _THIN_SPACE_IN_NUMBER = re.compile(r"(?<=\d)\\,(?=\d{3}(?!\d))")
 _LEQQ = re.compile(r"\\([lg]e)qq")
 # A delimiter size like the `\bigl` in `\bigl(2-\sqrt3\bigr)` (not `\bigcup`), which Math-Verify cannot parse.
 _DELIMITER_SIZE = re.compile(r"(?<!\\)\\[Bb]igg?[lrm]?(?![A-Za-z])")
+# `\varnothing` and `\text{no solution}`, which Math-Verify reads as symbols, not the empty set.
+_EMPTY_SET = re.compile(r"\\varnothing|\\text\{\s*no\s+solutions?\s*\}", re.IGNORECASE)
 # Where a trailing qualifier starts, once LaTeX spaces are plain spaces: `\text{ for all } n`,
 # `\forall n`, `, k \in \mathbb{Z}`, `(a,b \in \mathbb{R})`.
 _QUALIFIER = re.compile(
@@ -67,6 +69,8 @@ _NON_LETTER = re.compile(r"\\[A-Za-z]+|[^A-Za-z]")
 _DEGREES = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*\^\s*(?:\{\\circ\}|\\circ)")
 # A `,` or `;` (not the spaces `\,` `\;`), or the word `or` or `and`: a list, not `name = value`.
 _LIST = re.compile(r"(?<!\\)[,;]|\b(?:or|and)\b")
+# A one-letter function of one letter, like the `f(n)` in `f(n) = 2n`.
+_FUNCTION = re.compile(r"\s*[A-Za-z]\s*\(\s*[A-Za-z]\s*\)\s*")
 # From <sys/prctl.h>: signal this process when the thread that started it exits.
 _PR_SET_PDEATHSIG = 1
 
@@ -144,10 +148,12 @@ def score_math_response(response: str, ground_truth: str) -> float:
     These answer and gold pairs also match, though Math-Verify alone misses them:
     - `p \\le 0` and `p \\leqq 0`;
     - `4\\pi\\bigl(2-\\sqrt3\\bigr)` and `4\\pi(2-\\sqrt3)`: a delimiter size;
+    - `\\varnothing` or `\\text{no solution}` and `\\emptyset`;
     - `-12\\%` and `-12`: a `\\%` on one side;
     - `x = 2k\\pi,\\ k \\in \\mathbb{Z}` and `2k\\pi`: a trailing qualifier;
     - `-1 < x < 2` and `(-1, 2)`: a solved inequality and its interval;
     - `1` and `\\frac{9}{9} = 1`: a gold whose left side has no symbols;
+    - `f(n) = 2n` and `m = 2n`: an answer whose left side is a function;
     - `\\frac{50}{3}` and `16.67`: a gold rounded to 3+ significant digits;
     - `-c + 2` and `2 - c`: Math-Verify drops a trailing `c`, `m` or `h` as a unit.
     No timeout: on an event loop, use `MathVerifyPool.score` instead.
@@ -170,6 +176,8 @@ def score_math_response(response: str, ground_truth: str) -> float:
     ground_truth = _LEQQ.sub(r"\\\1 ", ground_truth)
     prediction = _DELIMITER_SIZE.sub("", prediction)
     ground_truth = _DELIMITER_SIZE.sub("", ground_truth)
+    prediction = _EMPTY_SET.sub(r"\\emptyset", prediction)
+    ground_truth = _EMPTY_SET.sub(r"\\emptyset", ground_truth)
     if "\\pi" in ground_truth and "\\pi" not in prediction:
         prediction = _DEGREES.sub(r"(\1\\pi/180)", prediction)
     elif "\\pi" in prediction and "\\pi" not in ground_truth:
@@ -221,10 +229,11 @@ def score_math_response(response: str, ground_truth: str) -> float:
         # Math-Verify reads `x = 5` as 5 but cannot parse a named left side like `A_{\min} = \frac12`.
         # Retry on the right side of the last `=`, unless that `=` is in `>=`, `<=`, `!=` or braces,
         # the box is a list, or the gold is an equation (`y = 3` would then match gold `x = 3`).
+        # A function like `f(n)` only names the formula, so `f(n) = 2n` still matches gold `m = 2n`.
         left_side, _, right_side = boxed_text.rpartition("=")
         if (
             not left_side
-            or "=" in ground_truth
+            or ("=" in ground_truth and not _FUNCTION.fullmatch(left_side))
             or left_side[-1] in "<>!"
             or right_side.count("{") != right_side.count("}")
             or _LIST.search(boxed_text)
@@ -272,6 +281,16 @@ def _matches(gold: str, answer: str) -> bool:
     answer_kept = parse(answer_box, extraction_config=_KEEP_UNITS, parsing_timeout=None)
     answer_parsed = _drop_units(answer_dropped, answer_kept, other=gold_kept)
     gold_parsed = _drop_units(gold_dropped, gold_kept, other=answer_kept)
+    # Math-Verify reads a gold like `e = \frac35` (Euler's e) as false, so its solution set is
+    # empty and an empty-set answer would match.
+    if (
+        answer_parsed
+        and answer_parsed[0] is EmptySet
+        and gold_parsed
+        and isinstance(gold_parsed[0], Relational)
+        and not gold_parsed[0].free_symbols
+    ):
+        return False
     return verify(
         gold_parsed,
         answer_parsed,
