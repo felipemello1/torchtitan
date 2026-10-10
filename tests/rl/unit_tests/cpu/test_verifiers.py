@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -544,3 +545,83 @@ def test_generation_server_requires_group_id() -> None:
 def test_parse_sampling_config_requires_stop_token_ids() -> None:
     with pytest.raises(ValueError, match="stop_token_ids"):
         _parse_sampling_config({"temperature": 1.0})
+
+
+def test_forced_turns_reach_verifiers_client_and_keep_their_loss_mask() -> None:
+    """Completions with appended tokens go through Verifiers' own client and trace graph, then
+    back to turns whose appended tokens are out of the loss, including two identical turns."""
+    from openai import AsyncOpenAI
+    from renderers.client import generate
+
+    from verifiers.v1.clients.train import response_from_generate
+    from verifiers.v1.graph import prepare_turn
+    from verifiers.v1.trace import AgentInfo, Trace, TraceTask
+    from verifiers.v1.types import UserMessage
+
+    completion_ids = [31, 32, 33, 34]
+    loss_mask = [True, False, False, True]  # 32 and 33 were appended
+
+    class _Renderer:
+        def get_stop_token_ids(self) -> list[int]:
+            return [99]
+
+        def parse_response(self, token_ids, tools=None):
+            return SimpleNamespace(content="", reasoning_content=None, tool_calls=[])
+
+    async def generate_fn(prompt_token_ids, **kwargs):
+        return Completion(
+            min_policy_version=3,
+            max_policy_version=3,
+            request_id=kwargs["request_id"],
+            token_ids=completion_ids,
+            token_logprobs=[-0.1, math.nan, math.nan, -0.4],
+            loss_mask=loss_mask,
+            finish_reason="stop",
+        )
+
+    trace = Trace(task=TraceTask(type="task", data={}), agent=AgentInfo(config={}))
+
+    async def run_test():
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+        try:
+            prompt, prompt_ids = [UserMessage(content="q")], [10, 11]
+            for _ in range(2):  # two forced turns with identical completions
+                turn = prepare_turn(trace, prompt)
+                reply = await generate(
+                    client=AsyncOpenAI(base_url=server.base_url, api_key="EMPTY"),
+                    renderer=_Renderer(),
+                    messages=[],
+                    model=server.model_id,
+                    prompt_ids=prompt_ids,
+                    sampling_params={"max_tokens": 8, "torchtitan_group_id": 1},
+                    extra_headers={"X-Session-ID": trace.id},
+                )
+                # Verifiers' client rejects NaN, so the reply carries 0.0 on appended tokens.
+                assert reply["completion_logprobs"] == [-0.1, 0.0, 0.0, -0.4]
+                response = response_from_generate(reply, model=server.model_id)
+                turn.commit(response)
+                prompt = [*prompt, response.message, UserMessage(content="tool")]
+                prompt_ids = [*prompt_ids, *completion_ids, 12]
+            return server.pop_generation_metadata(trace.id)
+        finally:
+            await server.close()
+
+    generation_metadata = asyncio.run(run_test())
+    turns = VerifiersRollouter.trace_to_rollout_turns(
+        trace=trace,
+        generation_metadata=generation_metadata,
+        group_id=1,
+        rollout_id=0,
+    )
+    assert len(turns) == 2
+    for turn in turns:
+        assert turn.completion_token_ids == completion_ids
+        assert turn.completion_loss_mask == loss_mask
+        assert [math.isnan(logprob) for logprob in turn.completion_logprobs] == [
+            False,
+            True,
+            True,
+            False,
+        ]
