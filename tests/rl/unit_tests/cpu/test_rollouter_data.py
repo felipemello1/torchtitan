@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 from torchtitan.rl.components.data import IterableRLDataLoader, RLDataset
+from torchtitan.rl.rollout.curriculum import Curriculum
 from torchtitan.rl.rollout.rollouter import Rollouter
 
 
@@ -74,7 +75,8 @@ def test_state_dict_waits_for_in_flight_training_sample() -> None:
             self.position = state_dict["position"]
 
     config = SimpleNamespace(
-        training_dataloader=IterableRLDataLoader.Config(dataset=_SlowDataset.Config())
+        training_dataloader=IterableRLDataLoader.Config(dataset=_SlowDataset.Config()),
+        curriculum=Curriculum.Config(),
     )
     rollouter = Rollouter(config)
     reader = threading.Thread(target=rollouter.get_training_sample)

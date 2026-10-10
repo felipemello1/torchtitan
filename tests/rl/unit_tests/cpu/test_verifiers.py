@@ -45,6 +45,7 @@ from torchtitan.rl.examples.verifiers.rollouter import (
 )
 from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.observability import metrics as m
+from torchtitan.rl.rollout.curriculum import Curriculum
 from torchtitan.rl.rollout.rubric import Rubric
 from torchtitan.rl.rollout.types import Completion, Rollout, RolloutStatus
 from verifiers.v1.errors import model_error, OverlongPromptError
@@ -879,6 +880,9 @@ def test_rollouter_registers_the_groups_generate_fn_while_it_runs() -> None:
 
     async def run_test() -> None:
         rollouter = object.__new__(VerifiersRollouter)
+        rollouter._curriculum = Curriculum.Config().build()
+        rollouter._step = 0
+        rollouter._summaries = {}
         rollouter._generation_server = GenerationServer.Config(
             max_rollout_tokens=40960
         ).build()
@@ -943,6 +947,9 @@ def test_rollouter_gives_truncation_reward_to_training_groups_only() -> None:
         reward_fns=[RewardFromVerifiers.Config()], truncation_reward=0.0
     )
     rollouter = object.__new__(VerifiersRollouter)
+    rollouter._curriculum = Curriculum.Config().build()
+    rollouter._step = 0
+    rollouter._summaries = {}
     rollouter._thinking_budget = None
     rollouter._generation_server = GenerationServer.Config(
         max_rollout_tokens=40960
@@ -986,6 +993,9 @@ def test_rollouter_gives_truncation_reward_to_training_groups_only() -> None:
 
 def test_rollouter_removes_the_groups_generate_fn_when_a_rollout_raises() -> None:
     rollouter = object.__new__(VerifiersRollouter)
+    rollouter._curriculum = Curriculum.Config().build()
+    rollouter._step = 0
+    rollouter._summaries = {}
     rollouter._generation_server = GenerationServer.Config(
         max_rollout_tokens=40960
     ).build()

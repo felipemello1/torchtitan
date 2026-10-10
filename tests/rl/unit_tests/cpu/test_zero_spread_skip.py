@@ -20,6 +20,7 @@ from torchtitan.rl.components.data import (
     ZeroSpreadSkip,
 )
 from torchtitan.rl.examples.dapo_math.data import _CyclingDataset, DapoMathSample
+from torchtitan.rl.rollout.curriculum import Curriculum
 from torchtitan.rl.rollout.rollouter import Rollouter
 from torchtitan.rl.rollout.types import RolloutStatus
 
@@ -188,6 +189,9 @@ def _rollouter(loader: IterableRLDataLoader) -> Rollouter:
     rollouter._group_outcomes = {}
     rollouter._training_dataloader = loader
     rollouter._training_dataloader_lock = threading.Lock()
+    rollouter._curriculum = Curriculum.Config().build()
+    rollouter._step = 0
+    rollouter._summaries = {}
     return rollouter
 
 
