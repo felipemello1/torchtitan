@@ -82,9 +82,9 @@ class ChessSelfPlayWorker(RolloutWorker):
         plays its current bot and moves to the next once the policy wins more than
         `curriculum_win_rate` of a block of `curriculum_games` games against it."""
 
-        curriculum_win_rate: float = 0.4
+        curriculum_win_rate: float = 0.6
         """Share of games won by checkmate (a material lead at the ply cap does not count) that moves a
-        worker to the next bot. Kept low: most games the policy leads still end at the cap."""
+        worker to the next bot."""
 
         curriculum_games: int = 128
         """Games per block; each full block is checked once, then cleared."""
