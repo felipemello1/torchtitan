@@ -481,7 +481,7 @@ def test_generation_server_records_topk_logprobs_per_generation() -> None:
             )
 
         server = GenerationServer.Config(max_rollout_tokens=40960).build()
-        server.set_generate_fn(generate_fn)
+        server.generate_fns[1] = generate_fn
         await server.start()
         try:
             async with ClientSession() as session:
