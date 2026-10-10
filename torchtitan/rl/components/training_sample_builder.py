@@ -52,6 +52,11 @@ class TrainingSampleBuilder(Configurable):
         drop_zero_std_reward_groups: bool = True
         """Drop zero-reward-variance groups;"""
 
+        solved_reward_above: float = 0.9
+        """A group is solved when every reward is above this; see `RLDataset.mark_solved`. Assumes a
+        correct answer scores near 1 and anything else below this: a reward shaping that moves correct
+        answers below it turns the skip off."""
+
     def __init__(self, config: Config) -> None:
         self.config = config
 
@@ -90,6 +95,7 @@ class TrainingSampleBuilder(Configurable):
         # Zero-std reward: no learning signal across siblings.
         rewards = [rollout.reward for rollout in rollout_group.rollouts]
         is_zero_std = len(rewards) > 1 and statistics.pstdev(rewards) == 0.0
+        solved = all(reward > self.config.solved_reward_above for reward in rewards)
         metrics.append(
             m.Metric(
                 "rollout_reward/group_zero_std_frac",
@@ -103,7 +109,10 @@ class TrainingSampleBuilder(Configurable):
                 )
             )
             return TrainingSampleGroup(
-                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
+                group_id=rollout_group.group_id,
+                training_samples=[],
+                metrics=metrics,
+                solved=solved,
             )
 
         # One rollout may branch into multiple trainable training_samples.
@@ -165,6 +174,7 @@ class TrainingSampleBuilder(Configurable):
             group_id=rollout_group.group_id,
             training_samples=training_samples,
             metrics=metrics,
+            solved=solved,
         )
 
     def rollout_to_training_samples(self, rollout: Rollout) -> list[TrainingSample]:
@@ -271,7 +281,9 @@ class TrainingSampleBuilder(Configurable):
                 training_sample.max_policy_version, rollout_turn.max_policy_version
             )
             training_sample.token_ids += rollout_turn.completion_token_ids
-            training_sample.loss_mask += [True] * num_completion
+            training_sample.loss_mask += (
+                rollout_turn.completion_loss_mask or [True] * num_completion
+            )
             training_sample.logprobs += rollout_turn.completion_logprobs
             training_sample.advantage += [rollout_advantage] * num_completion
             if rollout_turn.routed_expert_ids is not None:

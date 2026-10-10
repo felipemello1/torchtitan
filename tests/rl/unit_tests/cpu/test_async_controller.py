@@ -12,7 +12,7 @@ import gc
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 import torch
@@ -41,7 +41,13 @@ from torchtitan.rl.observability.controller import (
 )
 from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.types import Rollout, RolloutStatus, RolloutTurn
-from torchtitan.rl.types import RolloutTurnID, TrainingSample, TrainingSampleGroup
+from torchtitan.rl.types import (
+    OptimizerStepOutput,
+    RolloutTurnID,
+    TrainerStepBatch,
+    TrainingSample,
+    TrainingSampleGroup,
+)
 
 
 def test_controller_config_maybe_log(tmp_path, caplog) -> None:
@@ -182,6 +188,88 @@ def test_batcher_carries_metric_only_groups_until_trainable_batch() -> None:
     assert batch.global_loss_token_counts[0] > 0
     assert batch.global_routing_token_counts.shape == (1,)
     assert batch.group_ids == [0, 1]
+
+
+def test_batcher_reports_solved_groups_including_metric_only_ones() -> None:
+    batcher = _build_batcher(num_prompts_per_train_step=1)
+    solved_zero_std = TrainingSampleGroup(
+        group_id=0, training_samples=[], metrics=[], solved=True
+    )
+    batcher.add_training_samples(training_sample_group=solved_zero_std)
+    batch, _ = batcher.add_training_samples(
+        training_sample_group=_trainable_group(1, num_samples=2)
+    )
+    assert batch is not None
+    assert batch.group_ids == [0, 1]
+    assert batch.solved_group_ids == [0]
+
+
+def test_trainer_loop_acknowledges_solved_groups_before_saving_the_state() -> None:
+    def rank_0(value):
+        return SimpleNamespace(get=lambda rank: value)
+
+    calls = []
+    rollouter = SimpleNamespace(
+        sync_log_step=AsyncMock(),
+        acknowledge_training_sample_ids=lambda sample_ids, *, solved_ids: calls.append(
+            ("acknowledge", list(sample_ids), list(solved_ids))
+        ),
+        state_dict=lambda: calls.append(("state_dict",)) or {},
+    )
+    optim_step_output = OptimizerStepOutput(policy_version=1, metrics={})
+    controller = Controller.__new__(Controller)
+    controller.start_step = 0
+    controller._trainer_policy_version = 0
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(
+            target_offpolicy_steps=1,
+            max_offpolicy_steps=None,
+            validation=ValidationConfig(),
+        )
+    )
+    controller._rollouter = rollouter
+    controller.trainer = SimpleNamespace(
+        sync_log_step=SimpleNamespace(call=AsyncMock()),
+        forward_backward=SimpleNamespace(
+            call=AsyncMock(return_value=rank_0({"loss/mean": 0.0}))
+        ),
+        optim_step=SimpleNamespace(
+            call=AsyncMock(return_value=rank_0(optim_step_output))
+        ),
+    )
+    controller.generator_router = SimpleNamespace(
+        sync_log_step=SimpleNamespace(call_one=AsyncMock())
+    )
+    controller._weight_sync = SimpleNamespace(
+        wait_prev_push=AsyncMock(return_value=[]),
+        wait_prev_pull=AsyncMock(return_value=[]),
+        start_async_push_pull=MagicMock(),
+        wait_inflight_push_pull=AsyncMock(),
+    )
+    controller.metrics_processor = MagicMock()
+    controller._group_buffer = SimpleNamespace(
+        metrics=lambda: [],
+        record_step_start=AsyncMock(),
+        pop_dropped_group_ids=lambda: [],
+    )
+    batch = TrainerStepBatch(
+        microbatches=[],
+        global_loss_token_counts=torch.ones(1),
+        global_routing_token_counts=torch.ones(1),
+        metrics=[],
+        group_ids=[0, 1],
+        solved_group_ids=[1],
+        min_policy_versions=[0],
+    )
+
+    async def train_one_step() -> None:
+        queue = asyncio.Queue()
+        queue.put_nowait(batch)
+        await controller._trainer_loop(queue, num_training_steps=1)
+
+    asyncio.run(train_one_step())
+    # The saved state already reflects the acknowledgement, solved subset included.
+    assert calls == [("acknowledge", [0, 1], [1]), ("state_dict",)]
 
 
 def test_batcher_prepares_per_depth_mtp_token_counts() -> None:
@@ -977,6 +1065,7 @@ def _training_batch(step: int) -> SimpleNamespace:
         global_loss_token_counts=[1],
         global_routing_token_counts=[1],
         group_ids=[step],
+        solved_group_ids=[],
     )
 
 
@@ -1670,3 +1759,57 @@ def test_batcher_passes_the_version_that_trains_each_group() -> None:
     # [0, 1, 2] trains at version 5, [3, 4] at 6; the last call returns None
     assert consuming_policy_versions == [5, 5, 5, 6, 6, 7]
     assert queue.qsize() == 3  # two batches and the None sentinel
+
+
+@pytest.mark.parametrize(
+    ("greedy", "expected_temperature"), [(True, 0.0), (False, 1.0)]
+)
+def test_validation_samples_greedily_or_like_training(
+    greedy: bool, expected_temperature: float
+) -> None:
+    """Greedy validation runs at temperature 0; otherwise it reuses the training sampling."""
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(validation=ValidationConfig(steps=2, greedy=greedy))
+    )
+    controller._sampling = SamplingConfig(temperature=1.0, top_p=1.0, max_tokens=4096)
+    controller._rollouter = Mock()
+    controller._rollouter.get_validation_samples.return_value = []
+    controller._collect_validation_rollouts = AsyncMock(return_value=([], []))
+    controller.rollout_recorder = Mock()
+
+    asyncio.run(controller.validate(step=25))
+
+    sampling = controller._collect_validation_rollouts.call_args.kwargs["sampling"]
+    assert sampling.temperature == expected_temperature
+    assert sampling.max_tokens == 4096
+
+
+@pytest.mark.parametrize(
+    ("seed", "expected_seeds"), [(None, [None] * 3), (7, [7, 8, 9])]
+)
+def test_validation_gives_each_group_its_own_seed(
+    seed: int | None, expected_seeds: list[int | None]
+) -> None:
+    """A seeded run gets one seed per validation group, so repeat passes over a prompt differ."""
+    controller = object.__new__(Controller)
+    controller._make_generate_fn = Mock()
+    controller._rollouter = Mock()
+    controller._rollouter.run_group_rollouts = AsyncMock(
+        side_effect=lambda **kwargs: RolloutGroup(
+            group_id=kwargs["group_id"], rollouts=[]
+        )
+    )
+    controller.generator_router = SimpleNamespace(
+        release_groups=SimpleNamespace(call_one=AsyncMock())
+    )
+    sampling = SamplingConfig(temperature=1.0, top_p=1.0, max_tokens=4096, seed=seed)
+
+    asyncio.run(
+        controller._collect_validation_rollouts(
+            samples=[object()] * 3, sampling=sampling, step=0
+        )
+    )
+
+    calls = controller._rollouter.run_group_rollouts.call_args_list
+    assert [call.kwargs["sampling"].seed for call in calls] == expected_seeds

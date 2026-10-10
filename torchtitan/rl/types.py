@@ -73,6 +73,10 @@ class Completion:
     finish_reason: str | None = None
     """vLLM `CompletionOutput.finish_reason` ("stop" | "length" | "abort")"""
 
+    loss_mask: list[bool] | None = None  # [num_completion_tokens] or None
+    """False on tokens the rollout appended (e.g. a forced end of thinking), which the loss skips.
+    None: train every token."""
+
     metrics: list[m.Metric] = field(default_factory=list)
     """Per-generation metrics measured by the generator (latencies); the
     controller attaches them to the rollout turn."""
@@ -107,7 +111,7 @@ class TrainingSample:
     loss_mask: list[bool]
     """[L] True on assistant tokens to train."""
     logprobs: list[float]
-    """[L] generator logprobs; 0.0 where loss_mask is False."""
+    """[L] generator logprobs; 0.0 on prompt and env tokens, NaN on tokens the rollout appended."""
     advantage: list[float]
     """[L] advantage on assistant tokens, 0.0 elsewhere."""
     routed_expert_ids: torch.Tensor | None = None
@@ -132,6 +136,8 @@ class TrainingSampleGroup:
     group_id: int
     training_samples: list[TrainingSample]
     metrics: list[m.Metric]
+    solved: bool = False
+    """Every rollout's reward is above `TrainingSampleBuilder.Config.solved_reward_above`."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -184,6 +190,8 @@ class TrainerStepBatch:
     metrics: list[m.Metric]
     group_ids: list[int]
     """Every consumed rollout group, including metric-only groups."""
+    solved_group_ids: list[int]
+    """The subset of `group_ids` whose group came back solved."""
     # one per packed training_sample; trainer computes policy_age at consume time
     min_policy_versions: list[int]
 

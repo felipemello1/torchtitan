@@ -26,6 +26,11 @@ class RLDataset(Configurable, ABC):
     class Config(Configurable.Config):
         pass
 
+    def mark_solved(self, sample: object) -> None:
+        """Called at the acknowledgement when a consumed group of `sample` came back solved. No-op
+        here; a dataset may skip `sample` later. Runs on the event loop while `__next__` may run
+        in a thread."""
+
 
 class RLDataLoader(Stateful, ABC, Configurable):
     """Checkpointable iterator of globally identified RL inputs.
@@ -48,8 +53,10 @@ class RLDataLoader(Stateful, ABC, Configurable):
         ...
 
     @abstractmethod
-    def acknowledge(self, indices: Iterable[int]) -> None:
-        ...
+    def acknowledge(
+        self, indices: Iterable[int], *, solved_indices: Iterable[int] = ()
+    ) -> None:
+        """Forget the consumed `indices`; `solved_indices`, a subset, also reach the dataset's `mark_solved`."""
 
 
 class IterableRLDataLoader(RLDataLoader):
@@ -69,8 +76,12 @@ class IterableRLDataLoader(RLDataLoader):
 
     def __init__(self, config: Config) -> None:
         dataset = config.dataset.build()
-        if not isinstance(dataset, Iterable) or not isinstance(dataset, Stateful):
-            raise ValueError("RL dataset must be a stateful iterable")
+        if not (
+            isinstance(dataset, RLDataset)
+            and isinstance(dataset, Iterable)
+            and isinstance(dataset, Stateful)
+        ):
+            raise ValueError("RL dataset must be a stateful, iterable RLDataset")
         self._dataset: Stateful = dataset
         self._iterator: Iterator[object] = iter(dataset)
         self._next_index = 0
@@ -90,10 +101,15 @@ class IterableRLDataLoader(RLDataLoader):
         self._pending[index] = sample
         return index, sample
 
-    def acknowledge(self, indices: Iterable[int]) -> None:
+    def acknowledge(
+        self, indices: Iterable[int], *, solved_indices: Iterable[int] = ()
+    ) -> None:
+        solved = set(solved_indices)
         for index in indices:
             if index not in self._pending:
                 raise RuntimeError(f"cannot acknowledge an unyielded index {index}")
+            if index in solved:
+                self._dataset.mark_solved(self._pending[index])
             del self._pending[index]
 
     def state_dict(self) -> dict[str, Any]:
@@ -183,7 +199,12 @@ class MapStyleRLDataLoader(RLDataLoader):
         self._pending.add(index)
         return index, self._dataset[index]
 
-    def acknowledge(self, indices: Iterable[int]) -> None:
+    def acknowledge(
+        self, indices: Iterable[int], *, solved_indices: Iterable[int] = ()
+    ) -> None:
+        # TODO: skip solved rows here too, by advancing `_next_index` past them. Needs the
+        # shuffled index -> row map; no map-style RL dataset uses it yet.
+        del solved_indices
         for index in indices:
             if index not in self._pending:
                 raise RuntimeError(f"cannot acknowledge an unyielded index {index}")

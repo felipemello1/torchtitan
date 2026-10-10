@@ -160,6 +160,9 @@ class ValidationConfig:
     steps: int = 20
     """Maximum prompts per pass. -1 consumes one finite source pass; 0 disables."""
 
+    greedy: bool = True
+    """Sample at temperature 0; False samples like training (the generator's sampling config)."""
+
     freq: int | None = None
     """Also validate after every `freq` train steps; None validates only before and after."""
 
@@ -241,6 +244,11 @@ class AsyncLoopConfig(Configurable.Config):
     group in the buffer. Maximum policy age is bounded by
     `target_offpolicy_steps + n`. A value of 1 is FIFO by batch. See
     ``torchtitan/rl/docs/windowed_fifo.md``."""
+
+    max_num_seqs_per_generator: int = 512
+    """Cap on each vLLM engine's `max_num_seqs` (one engine per generator DP rank), which is otherwise
+    the peak in-flight rollouts split across engines. In vLLM's stats log, raise it if Running sits at
+    the cap with requests Waiting and KV cache usage well below 100%; lower it if Preemptions appear."""
 
     group_buffer: RolloutGroupWorkBuffer.Config | AdaptiveRolloutGroupWorkBuffer.Config = field(
         default_factory=RolloutGroupWorkBuffer.Config
@@ -675,7 +683,8 @@ class Controller(Configurable):
         # upper bound on concurrently scheduled sequences. vLLM may admit fewer if KV
         # is tight; this also sets CUDA-graph capture sizes.
         max_num_seqs = min(
-            math.ceil(rollout_concurrency / num_generator_dp_shards), 512
+            math.ceil(rollout_concurrency / num_generator_dp_shards),
+            async_loop.max_num_seqs_per_generator,
         )
 
         logger.info(
@@ -803,7 +812,7 @@ class Controller(Configurable):
     async def _collect_validation_rollouts(
         self, *, samples: list[object], sampling: SamplingConfig, step: int
     ) -> tuple[list[RolloutGroup], list[m.Metric]]:
-        """Sample held-out prompts, run each greedily (n=1) concurrently, and emit validation metrics."""
+        """Sample held-out prompts, run each once (n=1) concurrently, and emit validation metrics."""
         # TODO: group_size=1 (best-of-1) only. Support best-of-N.
         generate = self._make_generate_fn(metrics_prefix="validation_generator")
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
@@ -816,7 +825,12 @@ class Controller(Configurable):
                     # request_ids can't collide in the shared engine (e.g. post-validation).
                     group_id=-(i + 1),
                     group_size=1,
-                    sampling=sampling,
+                    # One seed per group, so a seeded run's repeat passes over a prompt differ.
+                    sampling=(
+                        sampling
+                        if sampling.seed is None
+                        else replace(sampling, seed=sampling.seed + i)
+                    ),
                 )
                 for i, sample in enumerate(samples)
             ),
@@ -870,7 +884,7 @@ class Controller(Configurable):
 
     @sl.log_trace_span("validate")
     async def validate(self, *, step: int) -> list[m.Metric]:
-        """Run greedy validation on held-out prompts.
+        """Run one rollout per held-out prompt.
 
         Args:
             step: Training step this validation pass belongs to (0 for the
@@ -888,12 +902,12 @@ class Controller(Configurable):
         # In a thread: building the dataset would otherwise block the training loops.
         samples = await asyncio.to_thread(self._rollouter.get_validation_samples, steps)
         # Validation rollouts are never trained, so skip the top-k transport.
-        greedy = replace(
-            self._sampling, temperature=0.0, top_p=1.0, num_topk_logprobs=0
-        )
+        sampling = replace(self._sampling, num_topk_logprobs=0)
+        if self.config.async_loop.validation.greedy:
+            sampling = replace(sampling, temperature=0.0, top_p=1.0)
 
         rollout_groups, validation_metrics = await self._collect_validation_rollouts(
-            samples=samples, sampling=greedy, step=step
+            samples=samples, sampling=sampling, step=step
         )
 
         self.rollout_recorder.record(is_validation=True, rollout_groups=rollout_groups)
@@ -1375,7 +1389,11 @@ class Controller(Configurable):
                     # metric-only zero-std groups excluded from model inputs, plus
                     # the groups the buffer dropped as too old.
                     self._rollouter.acknowledge_training_sample_ids(
-                        [*packed.group_ids, *self._group_buffer.pop_dropped_group_ids()]
+                        [
+                            *packed.group_ids,
+                            *self._group_buffer.pop_dropped_group_ids(),
+                        ],
+                        solved_ids=packed.solved_group_ids,
                     )
                     controller_state = {
                         DATALOADER_STATE_KEY: self._rollouter.state_dict()

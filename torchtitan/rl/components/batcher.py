@@ -278,6 +278,7 @@ class Batcher(Configurable):
             num_rollout_groups,
             num_metric_only_groups,
             group_ids,
+            solved_group_ids,
         ) = self._take_groups()
         assignments = self._assign_training_samples_to_microbatches(training_samples)
         microbatches = [
@@ -329,6 +330,7 @@ class Batcher(Configurable):
                 ),
             ],
             group_ids=group_ids,
+            solved_group_ids=solved_group_ids,
             # Trainer computes policy_age from these at consume time (faithful to what it trains on).
             # min_policy_version is the oldest version this training_sample was sampled under.
             min_policy_versions=[
@@ -339,7 +341,7 @@ class Batcher(Configurable):
 
     def _take_groups(
         self,
-    ) -> tuple[list[TrainingSample], list[m.Metric], int, int, list[int]]:
+    ) -> tuple[list[TrainingSample], list[m.Metric], int, int, list[int], list[int]]:
         """Pop accumulated groups oldest-first until `num_prompts_per_train_step` are taken."""
         taken_training_samples: list[TrainingSample] = []
         taken_metrics: list[m.Metric] = []
@@ -370,6 +372,7 @@ class Batcher(Configurable):
             num_trainable_groups,
             num_metric_only_groups,
             [group.group_id for group in taken_groups],
+            [group.group_id for group in taken_groups if group.solved],
         )
 
     def _assign_training_samples_to_microbatches(

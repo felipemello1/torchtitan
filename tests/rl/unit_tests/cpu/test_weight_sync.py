@@ -299,7 +299,7 @@ async def _run_trainer_loop(*, num_training_steps):
         generator_router=SimpleNamespace(sync_log_step=_Endpoint(_rpc)),
         _rollouter=SimpleNamespace(
             sync_log_step=_rpc,
-            acknowledge_training_sample_ids=lambda sample_ids: None,
+            acknowledge_training_sample_ids=lambda sample_ids, *, solved_ids: None,
             state_dict=dict,
         ),
         _trainer_policy_version=0,
@@ -332,6 +332,7 @@ async def _run_trainer_loop(*, num_training_steps):
                 global_routing_token_counts=torch.tensor([10]),
                 metrics=[],
                 group_ids=[0],
+                solved_group_ids=[],
                 min_policy_versions=[0],
             )
         )

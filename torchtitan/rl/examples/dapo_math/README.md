@@ -39,7 +39,12 @@ Reward: 1
 
 Training uses the 12,643-row [filtered DAPO-Math dataset](https://huggingface.co/datasets/hamishivi/DAPO-Math-17k-Processed_filtered). Each row contains one user prompt and its verifiable final answer.
 
-Validation uses all 30 problems from [AIME 2025](https://huggingface.co/datasets/opencompass/AIME2025). The same single-turn environment and Math-Verify reward are used for training and validation.
+Validation samples each problem 4 times at the training temperature (avg@4), in two tiers:
+
+- core, 193 problems: [AIME 2026](https://huggingface.co/datasets/MathArena/aime_2026) (30), [HMMT February 2026](https://huggingface.co/datasets/MathArena/hmmt_feb_2026) (33), [HMMT November 2025](https://huggingface.co/datasets/MathArena/hmmt_nov_2025) (30) and [BeyondAIME](https://huggingface.co/datasets/ByteDance-Seed/BeyondAIME) (100);
+- hard, 47 problems: the [MathArena Apex shortlist](https://huggingface.co/datasets/MathArena/apex-shortlist).
+
+The same prompt template, single-turn environment and Math-Verify reward are used for training and validation. W&B logs `validation_reward/component/<tier or benchmark>/mean`, e.g. `core` or `aime_2026`; `validation_reward/_mean` pools both tiers.
 
 ## Reference configurations
 

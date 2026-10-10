@@ -12,7 +12,7 @@ import pytest
 from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.qwen3 import build_model_config
-from torchtitan.rl import train
+from torchtitan.rl import controller, train
 from torchtitan.rl.controller import AsyncLoopConfig, RLModelDefaults
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
@@ -124,6 +124,62 @@ def test_async_loop_config_rejects_bad_windowed_fifo_batches() -> None:
         AsyncLoopConfig(windowed_fifo_batches=0)
     with pytest.raises(TypeError, match="window_fraction"):
         AsyncLoopConfig(window_fraction=0.3)  # type: ignore[call-arg]
+
+
+def test_max_num_seqs_per_generator_caps_derived_value(monkeypatch) -> None:
+    class _GeneratorSpawned(Exception):
+        pass
+
+    class _FakeMesh:
+        def spawn(self, name, actor_class, *args, **kwargs):
+            if actor_class is controller.VLLMGeneratorActor:
+                raise _GeneratorSpawned(kwargs["max_num_seqs"])
+
+    async def _setup_torch_elastic_env(mesh):
+        pass
+
+    monkeypatch.setattr(
+        controller,
+        "this_host",
+        lambda: SimpleNamespace(spawn_procs=lambda **kwargs: _FakeMesh()),
+    )
+    monkeypatch.setattr(controller, "setup_torch_elastic_env", _setup_torch_elastic_env)
+
+    def generator_max_num_seqs(**async_loop_kwargs) -> int:
+        rl_trainer = _make_stub_rl_trainer()
+        # setup_async also sizes for the validation pass; this one has no prompts.
+        rl_trainer._rollouter.get_validation_samples = lambda steps: []
+        rl_trainer.config = SimpleNamespace(
+            async_loop=AsyncLoopConfig(
+                num_prompts_per_train_step=64,
+                num_samples_per_prompt=16,
+                target_offpolicy_steps=2,
+                **async_loop_kwargs,
+            ),
+            trainer=SimpleNamespace(
+                parallelism=SimpleNamespace(
+                    data_parallel_shard_degree=1, data_parallel_replicate_degree=1
+                )
+            ),
+            generator=SimpleNamespace(
+                parallelism=SimpleNamespace(data_parallel_degree=1), model_dtype=None
+            ),
+            model=None,
+            hf_assets_path=None,
+            dump_folder=None,
+        )
+        with pytest.raises(_GeneratorSpawned) as spawned:
+            asyncio.run(
+                rl_trainer.setup_async(
+                    trainer_mesh=_FakeMesh(), generator_meshes=[_FakeMesh()] * 4
+                )
+            )
+        return spawned.value.args[0]
+
+    # (2 + 1) * 64 groups * 16 samples over 4 generators = 768 in-flight rollouts each
+    assert generator_max_num_seqs() == 512
+    assert generator_max_num_seqs(max_num_seqs_per_generator=320) == 320
+    assert generator_max_num_seqs(max_num_seqs_per_generator=1024) == 768
 
 
 def _make_stub_rl_trainer():
