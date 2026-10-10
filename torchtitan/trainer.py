@@ -28,6 +28,7 @@ from torchtitan.config.validation import validate_model_training_config
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.cuda_graph import cuda_graphs_supported
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
+from torchtitan.models.common.moe import collect_moe_load_metrics
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.metrics import ensure_pp_loss_visible, MetricsProcessor
 from torchtitan.protocols.model import BaseModel
@@ -452,6 +453,7 @@ class Trainer(Configurable):
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,
             **collect_aux_loss_metrics(parallelism_context),
+            **collect_moe_load_metrics(engine.model_parts, parallelism_context),
         }
         self.metrics_processor.log(
             engine.num_completed_steps,

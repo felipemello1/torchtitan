@@ -24,6 +24,7 @@ from torchtitan.config.validation import validate_model_training_config
 from torchtitan.distributed import maybe_apply_numa_binding, utils as dist_utils
 from torchtitan.distributed.utils import get_local_tensor
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
+from torchtitan.models.common.moe import collect_moe_load_metrics
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.observability.metrics import compute_training_performance_metrics
@@ -346,6 +347,9 @@ class Trainer(Configurable):
                 ),
                 "trainer/memory/num_ooms": float(device_mem_stats.num_ooms),
                 **collect_aux_loss_metrics(engine.parallelism_context),
+                **collect_moe_load_metrics(
+                    engine.model_parts, engine.parallelism_context
+                ),
                 **(
                     {"trainer/mfu_percent": performance["mfu_percent"]}
                     if "mfu_percent" in performance
