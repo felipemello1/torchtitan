@@ -19,8 +19,10 @@ class GraphTrainerDeepSeekV3Model(GraphTrainerModel, DeepSeekV3Model):
     def __init__(self, config: Config):
         super().__init__(config)
 
-    def parallelize(self, *, compile_config, **kwargs):
+    def parallelize(self, *, compile_config, skip_dp: bool = False, **kwargs):
         if compile_config.enable_autoparallel:
+            if skip_dp:
+                raise ValueError("GraphTrainer models do not support skip_dp=True.")
             from .parallelize_autoparallel import parallelize_autoparallel_deepseekv3
 
             return parallelize_autoparallel_deepseekv3(
@@ -30,5 +32,6 @@ class GraphTrainerDeepSeekV3Model(GraphTrainerModel, DeepSeekV3Model):
             )
         return super().parallelize(
             compile_config=compile_config,
+            skip_dp=skip_dp,
             **kwargs,
         )

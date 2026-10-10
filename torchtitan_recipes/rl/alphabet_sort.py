@@ -30,7 +30,6 @@ from torchtitan.config.transform import (
     BatchInvariantFlexConverter,
     LMHeadFP32OutputConverter,
     ModelConfigConverter,
-    MXFP8LinearConverter,
 )
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
@@ -225,17 +224,6 @@ def rl_grpo_qwen3_0_6b_flex() -> Controller.Config:
             ),
         ),
     )
-
-
-def rl_grpo_qwen3_0_6b_varlen_mxfp8() -> Controller.Config:
-    """Qwen3-0.6B GRPO with FSDP-managed MXFP8 inference weights."""
-    config = rl_grpo_qwen3_0_6b_varlen()
-    # TODO: Allow LMHeadCastConverter and QuantizationConverter to
-    # co-exist, since they target different layers
-    config.model = (
-        MXFP8LinearConverter.Config(fqns=["layers."]).build().convert(config.model)
-    )
-    return config
 
 
 def rl_grpo_qwen3_0_6b_flex_batch_invariant() -> Controller.Config:

@@ -199,6 +199,7 @@ class FluxModel(BaseModel):
         local_compile_regions: list[str],
         ac_config: ActivationCheckpointingConfig | None,
         dump_folder: str,
+        skip_dp: bool = False,
     ) -> Self:
         """Apply Flux's AC-before-SPMD parallelization lifecycle."""
         # Bind local implementations early; torch.compile traces on first use.
@@ -223,11 +224,12 @@ class FluxModel(BaseModel):
             self._parallelize(parallelism_context)
             annotate_replicated_parameters(self, parallelism_context)
 
-            self._apply_fsdp(
-                parallelism_context=parallelism_context,
-                training=training,
-                parallelism=parallelism,
-            )
+            if not skip_dp:
+                self._apply_fsdp(
+                    parallelism_context=parallelism_context,
+                    training=training,
+                    parallelism=parallelism,
+                )
         return self
 
     def _apply_fsdp(

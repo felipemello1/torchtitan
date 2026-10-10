@@ -745,6 +745,7 @@ class Controller(Configurable):
                 config.generator_router,
                 generators=generators,
                 forward_session_releases=config.generator.hold_session_kv,
+                enable_cpu_weight_prefetch=config.generator.enable_cpu_weight_prefetch,
             )
 
             await self._rollouter.setup_async(
