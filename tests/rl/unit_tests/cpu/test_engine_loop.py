@@ -521,7 +521,7 @@ class _FakeEngine:
         self.running: list[str] = []
         self.threads: set[threading.Thread] = set()
 
-    def add_request(self, *, request_id, prompt, params):
+    def add_request(self, *, request_id, prompt, params, arrival_time, priority):
         self.threads.add(threading.current_thread())
         self.running.append(request_id)
 
@@ -562,13 +562,13 @@ class _RejectingEngine(_FakeEngine):
 
     error_type: type[Exception] = VLLMValidationError
 
-    def add_request(self, *, request_id, prompt, params):
+    def add_request(self, *, request_id, **kwargs):
         if request_id == "too_long":
             raise self.error_type(
                 "The decoder prompt (length 2) plus the number of requested output tokens "
                 "(at least 1) is longer than the maximum model length of 2."
             )
-        super().add_request(request_id=request_id, prompt=prompt, params=params)
+        super().add_request(request_id=request_id, **kwargs)
 
 
 class _StepGate:
@@ -1089,7 +1089,7 @@ def test_admission_error_that_is_not_a_rejection_crashes_the_loop(
     engine_thread, error
 ) -> None:
     class BrokenEngine(_FakeEngine):
-        def add_request(self, *, request_id, prompt, params):
+        def add_request(self, **kwargs):
             raise error
 
     async def run() -> None:
@@ -1157,6 +1157,7 @@ def test_follower_applies_broadcast_decisions_on_the_engine_thread(
 ) -> None:
     request = _request("r0")
     request.min_policy_version = 0  # rank 0 pins it on admission
+    request.arrival_time = 0.0  # and stamps it
     decisions = iter(
         [
             LoopDecision(action=LoopAction.STEP, requests_per_dp_rank=[[request]]),
