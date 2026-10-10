@@ -25,7 +25,10 @@ from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import ShardingConfig
 from torchtitan.tools.utils import get_cuda_flash_attention_impl
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.attention.attention import get_attention_context
+from vllm.model_executor.layers.attention.attention import (
+    get_attention_context,
+    set_default_quant_scales,
+)
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -295,6 +298,11 @@ class TorchTitanVarlenInnerAttentionDiffKVImpl(TorchTitanVarlenInnerAttentionImp
 
 class _VLLMAttention(Attention, Module):
     """vLLM attention that participates in the TorchTitan Module protocol."""
+
+    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
+        # to_empty leaves the scales uninitialized. vLLM fills them after loading,
+        # but the weight-sync buffers copy them before that.
+        set_default_quant_scales(self)
 
 
 class VLLMAttentionWrapper(Module):
