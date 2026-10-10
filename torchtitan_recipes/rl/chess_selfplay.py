@@ -387,9 +387,7 @@ def rl_chess_qwen3_5_4b_gb300(
     trainer = config.trainer
     # 1e-6, not 1e-5: at 1e-5 the policy drifted -3.4 nats/token from its samples by step 7; at 3e-6
     # entropy fell 0.72 -> 0.24 by step 22, thinking 1,040 -> 210 tokens, ladder Elo 669 -> 494.
-    # The warmup softens fresh Adam's first steps.
     trainer.optim.optimizer.optimizers[0].lr = 1e-6
-    trainer.optim.lr_scheduler.warmup_steps = 10
     trainer.parallelism = ParallelismConfig(data_parallel_shard_degree=4)
     trainer.activation_checkpoint = SelectiveAC.Config()
     trainer.override = OverrideConfig()
