@@ -109,7 +109,7 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
 from torchtitan.config.transform import LMHeadFP32OutputConverter
 from torchtitan.models.common.decoder import Decoder
-from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.moe import MoE, TokenChoiceTopKRouter
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.components.batcher import Batcher
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
@@ -163,8 +163,19 @@ class RLModelDefaults:
     choices between the trainer and generator each step, so their logprob gap keeps growing.
     No-op on dense models."""
 
-    # TODO: decide an RL aux-loss default once Qwen3 or GPT-OSS MoE trains with one
-    #   (https://github.com/pytorch/torchtitan/pull/4772).
+    freeze_router_gate: bool = True
+    """Keep every MoE router's gate (weight and bias) at its loaded value, so expert choices move
+    only with the hidden states and the expert bias. The Qwen3.5 shared-expert gate still trains.
+    Side effects:
+    - an optimizer group that matches only gates fails with "matched no parameters";
+    - LoRA adapters on a gate are frozen too;
+    - a checkpoint saved with this on cannot resume with it off: "Missing key ... gate.weight.step".
+    """
+
+    disable_router_aux_loss: bool = True
+    """Remove every MoE router's load-balancing aux loss. Its gradient also reaches the hidden
+    states, so it would push the model toward uniform expert load even with the gate frozen.
+    No-op on models built without one."""
 
     def apply_(self, model: Decoder.Config) -> Decoder.Config:
         """Rewrite `model` in place with these defaults and return its root. Idempotent.
@@ -174,12 +185,20 @@ class RLModelDefaults:
             config.model = config.model_defaults.apply_(config.model)
             # lm_head: Linear.Config -> HiMidLoLinear.Config
             # layers[i].moe.freeze_expert_bias: False -> True, for all 48 layers
+            # layers[i].moe.router.freeze_gate: False -> True
         """
         if self.fp32_lm_head:
             model = LMHeadFP32OutputConverter.Config().build().convert(model)
         if self.freeze_expert_bias:
             for _fqn, moe_config, _parent, _attr in model.traverse(MoE.Config):
                 moe_config.freeze_expert_bias = True
+        for _fqn, router_config, _parent, _attr in model.traverse(
+            TokenChoiceTopKRouter.Config
+        ):
+            if self.freeze_router_gate:
+                router_config.freeze_gate = True
+            if self.disable_router_aux_loss:
+                router_config.aux_loss = None
         return model
 
 
@@ -293,7 +312,8 @@ class Controller(Configurable):
         either copies it."""
 
         model_defaults: RLModelDefaults = field(default_factory=RLModelDefaults)
-        """RL changes to `model`: fp32 logits and a frozen MoE expert bias."""
+        """RL changes to `model`: fp32 logits, a frozen MoE expert bias and router gate, and no
+        router aux loss."""
 
         hf_assets_path: str = "./tests/assets/tokenizer"
         """Path to HF assets folder (model weights, tokenizer, config files)."""
