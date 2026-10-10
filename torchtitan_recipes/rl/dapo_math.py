@@ -295,6 +295,10 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_8_generators() -> Controller.Co
     )
     config.rollouter.train_dataset.max_pass_rate = 0.75
     config.generator.watermark = 0.03
+    # The shared 1e-6 learned too slowly; DOME_V2_LR sets another lr at launch.
+    config.trainer.optim.optimizer.optimizers[0].lr = float(
+        os.environ.get("DOME_V2_LR", 1e-5)
+    )
     return config
 
 
