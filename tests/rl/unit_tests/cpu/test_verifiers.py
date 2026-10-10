@@ -520,6 +520,7 @@ def test_rollouter_registers_the_groups_generate_fn_while_it_runs() -> None:
 
     async def run_test() -> None:
         rollouter = object.__new__(VerifiersRollouter)
+        rollouter._thinking_budget = None
         rollouter._generation_server = GenerationServer.Config(
             max_rollout_tokens=40960
         ).build()
@@ -572,6 +573,7 @@ def test_rollouter_registers_the_groups_generate_fn_while_it_runs() -> None:
 
 def test_rollouter_removes_the_groups_generate_fn_when_a_rollout_raises() -> None:
     rollouter = object.__new__(VerifiersRollouter)
+    rollouter._thinking_budget = None
     rollouter._generation_server = GenerationServer.Config(
         max_rollout_tokens=40960
     ).build()

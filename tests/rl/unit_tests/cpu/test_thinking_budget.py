@@ -218,8 +218,8 @@ def test_training_samples_skip_the_forced_tokens() -> None:
     (sample,) = (
         TrainingSampleBuilder.Config().build().rollout_to_training_samples(rollout)
     )
-    assert sample.token_ids == [5, THINK, 10, 11, *FORCED, 20, 6, 30]
-    assert sample.loss_mask == [
+    assert sample.token_ids.tolist() == [5, THINK, 10, 11, *FORCED, 20, 6, 30]
+    assert sample.loss_mask.tolist() == [
         False,
         False,
         True,
