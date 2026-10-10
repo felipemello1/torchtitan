@@ -48,9 +48,9 @@ class DAPOLoss(Loss[torch.Tensor]):
     loss rather than trained as if it were on-policy.
 
     The scalar loss is the sum of per-token losses over positions with a finite
-    old-policy logprob divided by ``global_loss_token_counts``, so gradient accumulation
-    matches a single large batch. ``logits`` is the current-policy output passed to
-    ``compute_logprobs``.
+    old-policy logprob (and, with ``ratio_mask``, a ratio inside the band) divided by
+    ``global_loss_token_counts``, so gradient accumulation matches a single large batch.
+    ``logits`` is the current-policy output passed to ``compute_logprobs``.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -62,6 +62,16 @@ class DAPOLoss(Loss[torch.Tensor]):
         """Upper clip: the ratio is clamped to ``<= 1 + ratio_clip_high``. Set larger
         than ``ratio_clip_low`` for DAPO "clip-higher" (e.g. 0.28)."""
 
+        ratio_mask: tuple[float, float] | None = None
+        """Zeroes the loss of tokens whose ratio is outside ``[low, high]``, whatever the
+        advantage's sign; the clip lets a high ratio with a negative advantage train with
+        weight up to e^10, e.g. after an MoE routing flip. Bounds are ratios, not offsets
+        from 1. ``loss/ratio_clipped_frac`` still counts masked tokens. None: off.
+
+        Example: IcePop's ``(0.5, 5.0)`` (https://arxiv.org/abs/2510.18855) with ratios
+        ``[0.4, 1.1, 6.0]`` trains only the 1.1 token, and the loss still divides by 3.
+        """
+
         global_vocab_size: int | None = None
         """Full vocabulary size from the model spec, set when building RL configs.
         Leave unset for batch-invariant mode to retain the full-gather path."""
@@ -69,6 +79,7 @@ class DAPOLoss(Loss[torch.Tensor]):
     def __init__(self, config: Config) -> None:
         self.ratio_clip_low = config.ratio_clip_low
         self.ratio_clip_high = config.ratio_clip_high
+        self.ratio_mask = config.ratio_mask
         self.global_vocab_size = config.global_vocab_size
 
     @local_compile("loss", batch_invariant=False)
@@ -124,7 +135,14 @@ class DAPOLoss(Loss[torch.Tensor]):
         )
         token_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
 
-        masked_loss = token_loss * effective_loss_mask
+        # Masked tokens stay in global_loss_token_counts, so kept tokens' gradients don't grow.
+        policy_gradient_mask = effective_loss_mask
+        if self.ratio_mask is not None:
+            mask_low, mask_high = self.ratio_mask
+            policy_gradient_mask = (
+                effective_loss_mask & (ratio >= mask_low) & (ratio <= mask_high)
+            )
+        masked_loss = token_loss * policy_gradient_mask
         loss = _normalize(masked_loss.sum(), global_loss_token_counts)
 
         with torch.no_grad():
@@ -164,5 +182,10 @@ class DAPOLoss(Loss[torch.Tensor]):
                     global_loss_token_counts,
                 ),
             }
+            if self.ratio_mask is not None:
+                metrics["loss/ratio_masked_frac"] = _normalize(
+                    (effective_loss_mask & ~policy_gradient_mask).float().sum(),
+                    global_loss_token_counts,
+                )
 
         return loss, metrics
