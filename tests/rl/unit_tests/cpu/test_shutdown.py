@@ -144,6 +144,8 @@ def test_max_num_seqs_per_generator_caps_derived_value(monkeypatch) -> None:
 
     def generator_max_num_seqs(**async_loop_kwargs) -> int:
         rl_trainer = _make_stub_rl_trainer()
+        # setup_async also sizes for the validation pass; this one has no prompts.
+        rl_trainer._rollouter.get_validation_samples = lambda steps: []
         rl_trainer.config = SimpleNamespace(
             async_loop=AsyncLoopConfig(
                 num_prompts_per_train_step=64,
