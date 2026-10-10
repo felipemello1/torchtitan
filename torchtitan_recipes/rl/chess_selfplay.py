@@ -374,6 +374,10 @@ def rl_chess_qwen3_5_4b_gb300(
     config.generator_router.admission.limit = 1.6
     config.dump_folder = "outputs/rl/qwen3_5_4b_chess_gb300"
     trainer = config.trainer
+    # 3e-6, not 1e-5: the fresh run at 1e-5 drifted -3.4 nats/token from its samples by step 7
+    # (entropy 0.72 -> 0.30, 79-87% of rollouts truncated). The warmup softens fresh Adam's first steps.
+    trainer.optim.optimizer.optimizers[0].lr = 3e-6
+    trainer.optim.lr_scheduler.warmup_steps = 10
     trainer.parallelism = ParallelismConfig(data_parallel_shard_degree=4)
     trainer.activation_checkpoint = SelectiveAC.Config()
     trainer.override = OverrideConfig()
