@@ -433,7 +433,22 @@ def _engine_request(request_id: str, *, min_policy_version: int):
         routing_session_id="group=3/rollout=0",
     )
     request.min_policy_version = min_policy_version
+    request.arrival_time = 1.5  # rank 0's clock at admission
     return request
+
+
+def test_admission_passes_pinned_version_as_priority(monkeypatch):
+    # The pinned version (6), not the installed one (7), is the priority; arrival_time is rank 0's stamp.
+    generator = _generator()
+    engine = cast(_FakeEngine, generator._engine)
+
+    _admit_through_engine_loop(
+        monkeypatch, generator, [_engine_request("r0", min_policy_version=6)]
+    )
+
+    _, kwargs = engine.add_requests[0]
+    assert kwargs["priority"] == 6
+    assert kwargs["arrival_time"] == 1.5
 
 
 def test_admission_salts_prompt_with_min_policy_version(monkeypatch):
@@ -635,6 +650,7 @@ def test_watermark_reaches_engine_args(monkeypatch, tmp_path, watermark):
         assert "watermark" not in engine_kwargs
     else:
         assert engine_kwargs["watermark"] == watermark
+    assert engine_kwargs["scheduling_policy"] == "priority"
 
 
 # --- CUDA graph config (VLLMCudaGraphConfig.get_vllm_compilation_config) ---
