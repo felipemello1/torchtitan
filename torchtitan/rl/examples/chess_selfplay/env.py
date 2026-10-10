@@ -46,7 +46,7 @@ _BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
 # reward on the first ply and half at `max_plies`, so it is below any loss.
 _FORFEIT_REWARD = -1.0
 _CHECKMATED_REWARD = -0.25
-# A checkmate pays 10x a win, so mating beats any material lead at `max_plies` (at most 0.75).
+# A checkmate pays 10 (a win was 1), so a mate dominates its group's advantages.
 _CHECKMATE_REWARD = 10.0
 # Share of the material score in an unfinished game's reward: 0.5 keeps it within [0.25, 0.75].
 _MATERIAL_WEIGHT = 0.5
@@ -85,9 +85,10 @@ class ChessPlayerEnv(MessageEnv):
             '\\boxed{}. For example, "Pe2": ["e4"] means \\boxed{e4}, not \\boxed{Pe4}; '
             '"Nb1": ["Nbd2"] means \\boxed{Nbd2}, not \\boxed{Nd2}. An x marks a capture: '
             '"Nf3": ["Nxe5"] means \\boxed{Nxe5}. An illegal or missing move loses the game.\n\n'
-            f"Checkmate scores 10. The game stops after {self._game.max_plies} plies (a ply is one "
-            "move by either side); a game that reaches that limit without checkmate scores 0.25 to "
-            "0.75 by material (queen 9, rook 5, bishop and knight 3, pawn 1), and a stalemate less."
+            f"Checkmating your opponent scores 10. The game stops after {self._game.max_plies} plies "
+            "(a ply is one move by either side); a game that reaches that limit without checkmate "
+            "scores 0.25 to 0.75 by material (queen 9, rook 5, bishop and knight 3, pawn 1), and a "
+            "stalemate scores at most 0.5."
         )
         return MessageEnvInitOutput(
             init_prompt_messages=[

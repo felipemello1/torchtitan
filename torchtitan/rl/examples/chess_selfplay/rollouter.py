@@ -62,9 +62,9 @@ class ChessSelfPlayWorker(RolloutWorker):
 
     Example (group_size=2, self-play, max_plies=60):
 
-        game 0: White mates on ply 31                   -> rewards White 1.0, Black -0.25 * (1 - 31 / 60) = -0.12
+        game 0: White mates on ply 31                   -> rewards White 10.0, Black -0.25 * (1 - 31 / 60) = -0.12
         game 1: Black forfeits on ply 41, even material -> rewards White 0.5, Black -1 * (1 - 41 / 120) = -0.66
-        advantages: White [+0.25, -0.25], Black [-0.31, +0.31]   (each color's mean is subtracted;
+        advantages: White [+4.75, -4.75], Black [-0.31, +0.31]   (each color's mean is subtracted;
                     Black's forfeit counts as the 0.5 it had at the cap)
         Black's forfeiting turn: +0.31 - (0.5 + 0.66) = -0.85
     """

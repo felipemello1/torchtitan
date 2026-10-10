@@ -263,6 +263,7 @@ def test_bot_opens_on_start_when_policy_plays_black() -> None:
         assert game.board.turn == chess.BLACK
         assert game.num_plies == 1
         assert "White played" in game.turn_message()
+        assert "(ply 2 of 40)" in game.turn_message()
 
     asyncio.run(run())
 
@@ -396,6 +397,7 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
         # one right and one wrong way to write a move
         assert "means \\boxed{Nbd2}, not \\boxed{Nd2}" in prompt
         assert "An x marks a capture" in prompt
+        assert "stops after 40 plies" in prompt and "(ply 1 of 40)" in prompt
 
         white_step = asyncio.create_task(
             white.step({"role": "assistant", "content": "I open. \\boxed{e4}"})
@@ -406,6 +408,7 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
         step_output = await asyncio.wait_for(white_step, timeout=1)
         assert not step_output.done
         assert step_output.env_messages[0]["content"].startswith("Black played e5.")
+        assert "(ply 3 of 40)" in step_output.env_messages[0]["content"]
 
         step_output = await white.step({"role": "assistant", "content": "\\boxed{Ke9}"})
         assert step_output.done

@@ -14,7 +14,7 @@ from torchtitan.rl.rubric import RewardFn
 
 
 class RewardChessScore(RewardFn):
-    """This player's reward from `ChessGame.rewards`: a win is 1, a game cut at the ply cap or forfeited
+    """This player's reward from `ChessGame.rewards`: a checkmate is 10, a game cut at the ply cap or forfeited
     by the other player scores 0.25 to 0.75 by material, a draw up to 0.5, and being checkmated or
     forfeiting is negative. Draws, checkmates against the player, and forfeits score better the more
     moves the player lasted.
@@ -29,13 +29,13 @@ class RewardChessScore(RewardFn):
     Example:
 
         RewardChessScore.Config(forced_close_penalty=0.1)
-        # a win with 10 of 30 turns force-closed -> 1.0 - 0.1 * 10 / 30 = 0.967
+        # a checkmate with 10 of 30 turns force-closed -> 10.0 - 0.1 * 10 / 30 = 9.967
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(RewardFn.Config):
         forced_close_penalty: float = 0.0
-        """The most a rollout loses when every turn's thinking was force-closed; 0.1 keeps a win (0.9)
+        """The most a rollout loses when every turn's thinking was force-closed; 0.1 keeps a checkmate (9.9)
         above every non-win (at most 0.75)."""
 
     def __init__(self, config: Config) -> None:
