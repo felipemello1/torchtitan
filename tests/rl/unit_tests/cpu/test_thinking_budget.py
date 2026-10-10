@@ -8,7 +8,7 @@
 
 import asyncio
 import math
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pytest
 import torch
@@ -117,29 +117,49 @@ def test_reply_cut_while_thinking_gets_a_forced_close() -> None:
     assert _forced_close_rate(completion) == 1.0
 
 
-def test_forced_close_keeps_topk_rows_and_routed_experts() -> None:
-    # prompt [5, THINK]; first call [10, 11, 12, 13]; forced [90, 91, 92]; second call [20, 21]
-    thinking = _completion([10, 11, 12, 13], finish_reason="length")
-    thinking.topk_token_ids = torch.tensor([[10], [11], [12], [13]], dtype=torch.int32)
-    thinking.topk_logprobs = torch.full((4, 1), -0.5)
-    # One row per forward input: the prompt and every completion token but the last.
-    thinking.routed_expert_ids = torch.full((2 + 4 - 1, 1, 1), 1, dtype=torch.uint8)
-    answer = _completion([20, 21], finish_reason="stop")
-    answer.topk_token_ids = torch.tensor([[20], [21]], dtype=torch.int32)
-    answer.topk_logprobs = torch.full((2, 1), -0.25)
-    answer.routed_expert_ids = torch.full(
-        (2 + 4 + 3 + 2 - 1, 1, 1), 2, dtype=torch.uint8
+@pytest.mark.parametrize(
+    "first_token_ids, forced_ids, second_call_rows",
+    [
+        ([10, 11, 12, 13], FORCED, [25, 26, 27, 28, 29]),
+        ([10, END_THINK, 11, 12], [], [25, 26]),
+    ],
+    ids=["cut_while_thinking", "cut_while_answering"],
+)
+def test_merge_keeps_topk_rows_and_routed_experts(
+    first_token_ids, forced_ids, second_call_rows
+) -> None:
+    # prompt [5, THINK]; first call: 4 tokens, cut; then forced_ids; second call [20, 21]
+    first = _completion(first_token_ids, finish_reason="length")
+    first.topk_token_ids = torch.tensor(
+        [[token_id] for token_id in first_token_ids], dtype=torch.int32
     )
-    completion = _run(_budget(), _ScriptedGenerate(thinking, answer), prompt=[5, THINK])
+    first.topk_logprobs = torch.full((4, 1), -0.5)
+    # One row per forward input (prompt + completion - 1). Row i holds 10 + i in the first call,
+    # 20 + i in the second.
+    first.routed_expert_ids = torch.arange(10, 15, dtype=torch.uint8).view(-1, 1, 1)
+    second = _completion([20, 21], finish_reason="stop")
+    second.topk_token_ids = torch.tensor([[20], [21]], dtype=torch.int32)
+    second.topk_logprobs = torch.full((2, 1), -0.25)
+    num_second_rows = 2 + 4 + len(forced_ids) + 2 - 1
+    second.routed_expert_ids = torch.arange(
+        20, 20 + num_second_rows, dtype=torch.uint8
+    ).view(-1, 1, 1)
+    completion = _run(_budget(), _ScriptedGenerate(first, second), prompt=[5, THINK])
 
     # Zero rows on the forced tokens, which the loss skips.
+    zero_rows = [0] * len(forced_ids)
     topk_token_ids = completion.topk_token_ids.flatten().tolist()
-    assert topk_token_ids == [10, 11, 12, 13, 0, 0, 0, 20, 21]
+    assert topk_token_ids == first_token_ids + zero_rows + [20, 21]
     topk_logprobs = completion.topk_logprobs.flatten().tolist()
-    assert topk_logprobs == [-0.5] * 4 + [0.0] * 3 + [-0.25] * 2
-    # 2 prompt + 9 completion tokens - 1: the first call's 5 rows, then the second call's from
-    # token 13 (which only the second call ran forward) on.
-    assert completion.routed_expert_ids.flatten().tolist() == [1] * 5 + [2] * 5
+    assert topk_logprobs == [-0.5] * 4 + zero_rows + [-0.25] * 2
+    # The first call ran positions 0-4 forward but not its last token (position 5), so rows
+    # from position 5 on come from the second call.
+    routed_expert_ids = completion.routed_expert_ids.flatten().tolist()
+    assert routed_expert_ids == [10, 11, 12, 13, 14] + second_call_rows
+    # The merge lists Completion's fields by hand: this fails if a new field is left out.
+    assert all(
+        getattr(completion, field.name) is not None for field in fields(Completion)
+    )
 
 
 def test_reply_cut_while_answering_continues_without_forcing() -> None:
