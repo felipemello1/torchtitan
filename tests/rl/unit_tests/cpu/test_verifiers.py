@@ -679,3 +679,54 @@ def test_forced_turns_reach_verifiers_client_and_keep_their_loss_mask() -> None:
             True,
             False,
         ]
+
+
+def test_terminus_max_tokens_turn_stays_on_its_branch() -> None:
+    """Terminus-2 re-sends a max_tokens turn without its reasoning; the plugin restores it so
+    the next prompt still bridges from the sampled tokens instead of forking a new branch."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins.terminal_bench_sandoq import (
+        restore_sampled_reasoning,
+    )
+    from verifiers.v1 import graph
+    from verifiers.v1.configs.agent import AgentConfig
+    from verifiers.v1.dialects.chat import parse_message
+    from verifiers.v1.trace import AgentInfo, Trace, TraceTask
+    from verifiers.v1.types import AssistantMessage, Response, TurnTokens
+
+    trace = Trace(
+        task=TraceTask(type="Task", data={}), agent=AgentInfo(config=AgentConfig())
+    )
+    task = {"role": "user", "content": "Write a.py"}
+    # Hit max_tokens after </think>: reasoning is set, content is partial JSON.
+    truncated = AssistantMessage(
+        content='{"analysis": "Wri', reasoning_content="I will write it."
+    )
+    graph.prepare_turn(trace, [parse_message(task)]).commit(
+        Response(
+            id="r0",
+            created=0,
+            model="torchtitan",
+            message=truncated,
+            finish_reason="length",
+            tokens=TurnTokens(
+                prompt_ids=[1, 2], completion_ids=[3, 4], completion_logprobs=[0.0] * 2
+            ),
+        )
+    )
+    # Terminus-2's history after its max_tokens re-prompt (terminus_2.py:1142-1143).
+    history = [
+        task,
+        {"role": "assistant", "content": '{"analysis": "Wri'},
+        {
+            "role": "user",
+            "content": "ERROR!! NONE of the actions you just requested ...",
+        },
+    ]
+
+    def bridges(messages: list[dict]) -> bool:
+        prompt = [parse_message(message) for message in messages]
+        return graph.prepare_turn(trace, prompt).previous_token_ids() is not None
+
+    assert not bridges(history)
+    assert bridges(restore_sampled_reasoning(history, trace))
