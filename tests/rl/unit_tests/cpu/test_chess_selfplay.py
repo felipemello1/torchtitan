@@ -9,6 +9,8 @@
 import asyncio
 import json
 import shutil
+from dataclasses import replace
+from types import SimpleNamespace
 
 import chess
 import pytest
@@ -20,6 +22,7 @@ from torchtitan.config import ConfigLoader
 from torchtitan.rl.examples.chess_selfplay import (
     BOTS,
     BotSpec,
+    ChessCurriculum,
     ChessGame,
     ChessPlayerEnv,
     ChessSample,
@@ -405,7 +408,10 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
         step_output = await white.step({"role": "assistant", "content": "\\boxed{Ke9}"})
         assert step_output.done
         # White forfeits at ply 2 of 40
-        assert step_output.env_rewards == {"score": pytest.approx(-1.0 * (1 - 2 / 80))}
+        assert step_output.env_rewards == {
+            "score": pytest.approx(-1.0 * (1 - 2 / 80)),
+            "won": 0.0,
+        }
 
     asyncio.run(run())
 
@@ -538,20 +544,17 @@ class _ScriptedPolicy:
 
 
 async def _run_group(
-    moves_by_rollout, *, group_size, sample=_SELF_PLAY, truncate_at=None, worker=None
+    moves_by_rollout, *, group_size, sample=_SELF_PLAY, truncate_at=None
 ):
-    worker = (
-        worker
-        or ChessSelfPlayWorker.Config(
-            rubric=Rubric.Config(
-                reward_fns=[RewardChessScore.Config()],
-            ),
-            message_env=ChessPlayerEnv.Config(),
-            token_env=TokenEnv.Config(step_timeout_s=None),
-            max_plies=40,
-            stockfish_path=None,
-        ).build()
-    )
+    worker = ChessSelfPlayWorker.Config(
+        rubric=Rubric.Config(
+            reward_fns=[RewardChessScore.Config()],
+        ),
+        message_env=ChessPlayerEnv.Config(),
+        token_env=TokenEnv.Config(step_timeout_s=None),
+        max_plies=40,
+        stockfish_path=None,
+    ).build()
     tokenizer_config = HuggingFaceTokenizer.Config()
     await worker.setup_async(
         tokenizer_config=tokenizer_config,
@@ -607,6 +610,9 @@ def test_worker_trains_both_colors_with_per_color_advantages() -> None:
         assert [by_id[i].advantage for i in range(4)] == pytest.approx(
             [-0.3625, 0.25, 0.3625, -0.25]
         )
+        # wins by checkmate (rollout 1) and by the opponent's forfeit (rollout 2)
+        wins = [by_id[i].turns[-1].env_rewards["won"] for i in range(4)]
+        assert wins == [0.0, 1.0, 1.0, 0.0]
         assert [len(by_id[i].turns) for i in range(4)] == [2, 2, 1, 1]
         assert [[turn.advantage for turn in by_id[i].turns] for i in range(4)] == [
             [None, None],
@@ -712,8 +718,11 @@ def test_worker_forfeits_a_player_that_stops_mid_game() -> None:
         assert black.status == RolloutStatus.COMPLETED
         # White forfeits at ply 2 of 40; Black gets the even-material 0.5
         assert (white.reward, black.reward) == pytest.approx((-0.975, 0.5))
-        assert white.turns[-1].env_rewards == {"score": pytest.approx(-0.975)}
-        assert black.turns[-1].env_rewards == {"score": 0.5}
+        assert white.turns[-1].env_rewards == {
+            "score": pytest.approx(-0.975),
+            "won": 0.0,
+        }
+        assert black.turns[-1].env_rewards == {"score": 0.5, "won": 1.0}
         # a reply cut at max_tokens is a reply forfeit too: White centers on its 0.5 at the cap,
         # and the cut turn alone pays -0.975 - 0.5
         assert white.advantage == pytest.approx(0.0)
@@ -729,43 +738,34 @@ def test_worker_forfeits_a_player_that_stops_mid_game() -> None:
     asyncio.run(run())
 
 
-def test_worker_moves_up_the_bot_curriculum(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_worker_plays_the_curriculum_bot(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(BOTS, "bot_a", BotSpec(elo=100, random_move_prob=1.0))
-    monkeypatch.setitem(BOTS, "bot_b", BotSpec(elo=300, random_move_prob=1.0))
-
-    async def run(win_rate: float) -> list[float]:
-        worker = ChessSelfPlayWorker.Config(
-            rubric=Rubric.Config(reward_fns=[RewardChessScore.Config()]),
-            message_env=ChessPlayerEnv.Config(),
-            token_env=TokenEnv.Config(step_timeout_s=None),
-            max_plies=40,
-            stockfish_path=None,
-            bot_curriculum=("bot_a", "bot_b"),
-            curriculum_win_rate=win_rate,
-            curriculum_games=1,
-        ).build()
-        sample = ChessSample(
+    curriculum = ChessCurriculum.Config(bots=("bot_a",)).build()
+    sample = curriculum.prepare(
+        ChessSample(
             fen=chess.STARTING_FEN,
             opponent="curriculum",
             policy_color=chess.BLACK,
             seed=3,
-        )
-        elos = []
-        for _ in range(3):
-            group = await _run_group(
-                {0: ["Ke9"]}, group_size=1, sample=sample, worker=worker
-            )
-            elos.append(
-                _reduced_metrics(group.rollouts)[
-                    "chess_strength/curriculum_bot_elo/mean"
-                ]
-            )
-        return elos
+        ),
+        step=0,
+    )
 
-    # each game is a forfeit, a loss: the worker stays on bot_a
-    assert asyncio.run(run(win_rate=0.6)) == [100, 100, 100]
-    # any win rate clears -1: it moves up after the first game, then stays on the last bot
-    assert asyncio.run(run(win_rate=-1.0)) == [100, 300, 300]
+    group = asyncio.run(_run_group({0: ["Ke9"]}, group_size=1, sample=sample))
+    assert (
+        _reduced_metrics(group.rollouts)["chess_strength/curriculum_bot_elo/mean"]
+        == 100
+    )
+    # Black forfeits: a loss
+    assert curriculum.summarize(sample, group) == (0, [0.0])
+
+    # the same bot outside the curriculum: no curriculum metric, no summary
+    fixed = replace(sample, curriculum_level=None)
+    group = asyncio.run(_run_group({0: ["Ke9"]}, group_size=1, sample=fixed))
+    assert "chess_strength/curriculum_bot_elo/mean" not in _reduced_metrics(
+        group.rollouts
+    )
+    assert curriculum.summarize(fixed, group) is None
 
 
 def test_worker_plays_only_the_policy_against_a_bot(
@@ -825,3 +825,64 @@ def test_worker_puts_a_bot_game_forfeit_on_its_turn(
         ]
 
     asyncio.run(run())
+
+
+# ======== ChessCurriculum: the bot ladder ========
+
+
+def test_curriculum_prepare_resolves_the_bot() -> None:
+    curriculum = ChessCurriculum.Config(bots=("sf_random", "sf_eps75")).build()
+    curriculum.level = 1
+    sample = ChessSample(fen=chess.STARTING_FEN, opponent="curriculum", seed=7)
+    assert curriculum.prepare(sample, step=0) == replace(
+        sample, opponent="sf_eps75", curriculum_level=1
+    )
+    # self-play and fixed-bot games are unchanged
+    fixed = ChessSample(fen=chess.STARTING_FEN, opponent="sf_eps75", seed=7)
+    assert curriculum.prepare(fixed, step=0) == fixed
+    assert curriculum.prepare(_SELF_PLAY, step=0) == _SELF_PLAY
+
+
+def test_curriculum_summarize_reads_each_games_win() -> None:
+    curriculum = ChessCurriculum.Config(bots=("sf_random",)).build()
+    sample = curriculum.prepare(
+        ChessSample(fen=chess.STARTING_FEN, opponent="curriculum"), step=0
+    )
+    group = SimpleNamespace(
+        rollouts=[
+            SimpleNamespace(turns=[SimpleNamespace(env_rewards={"won": won})])
+            for won in (1.0, 0.0)
+        ]
+    )
+    assert curriculum.summarize(sample, group) == (0, [1.0, 0.0])
+    assert curriculum.summarize(_SELF_PLAY, group) is None
+
+
+def test_curriculum_promotes_once_per_step_on_the_current_bots_games() -> None:
+    curriculum = ChessCurriculum.Config(
+        bots=("sf_random", "sf_eps75", "sf_eps50"), promote_win_rate=0.6, min_games=4
+    ).build()
+    # 7 of 8 games won at level 0, and a self-play group: one promotion per step
+    curriculum.update(step=1, summaries=[(0, [1.0] * 4), (0, [1.0] * 3 + [0.0]), None])
+    assert curriculum.level == 1
+    # games prepared before the promotion don't count, and 2 games at level 1 are too few to test
+    curriculum.update(step=2, summaries=[(0, [1.0] * 4), (1, [1.0, 1.0])])
+    assert curriculum.level == 1
+    # 3 of 5 is not more than 60%
+    curriculum.update(step=3, summaries=[(1, [1.0, 1.0, 1.0, 0.0, 0.0])])
+    assert curriculum.level == 1
+    curriculum.update(step=4, summaries=[(1, [1.0] * 4)])
+    assert curriculum.level == 2
+    # the last bot stays
+    curriculum.update(step=5, summaries=[(2, [1.0] * 4)])
+    assert curriculum.level == 2
+
+
+def test_curriculum_state_round_trip() -> None:
+    bots = ("sf_random", "sf_eps75")
+    curriculum = ChessCurriculum.Config(bots=bots, min_games=1).build()
+    curriculum.update(step=1, summaries=[(0, [1.0])])
+    restored = ChessCurriculum.Config(bots=bots).build()
+    restored.load_state_dict(curriculum.state_dict())
+    sample = ChessSample(fen=chess.STARTING_FEN, opponent="curriculum")
+    assert restored.prepare(sample, step=1).opponent == "sf_eps75"

@@ -31,14 +31,16 @@ class ChessSample:
 
     fen: str
     opponent: str
-    """"self", "curriculum" (the worker picks the bot, see `ChessSelfPlayWorker.Config.bot_curriculum`),
-    or the name of a bot in `bots.BOTS`."""
+    """"self", "curriculum" (`ChessCurriculum.prepare` replaces it with the current bot), or the name
+    of a bot in `bots.BOTS`."""
     policy_color: chess.Color = chess.WHITE
     """The policy's color against a bot; unused in self-play."""
     seed: int = 0
     """Seeds the legal-move order shown to the model and the bot's random moves."""
     split: Literal["train", "validation"] = "train"
     """Keeps validation metrics apart: they log under `val_chess_*` instead of `chess_*`."""
+    curriculum_level: int | None = None
+    """On a "curriculum" game, the index of its bot in `ChessCurriculum.Config.bots`; None otherwise."""
 
 
 class ChessSelfPlayDataset(RLDataset):

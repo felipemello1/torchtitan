@@ -121,9 +121,11 @@ worker.thinking_budget = ThinkingBudget.Config(
 worker.rubric.reward_fns = [RewardChessScore.Config(forced_close_penalty=0.1)]
 # bot groups climb a curriculum of bots instead of drawing from a fixed ladder
 config.rollouter.training_dataloader.dataset.bots = ("curriculum",)
-worker.bot_curriculum = (
-    "sf_random", "sf_eps75", "sf_eps50", "sf_eps25", "sf_elo1320",
-    "sf_elo1500", "sf_elo1700", "sf_elo1900", "sf_elo2100", "sf_elo2300", "sf_elo2500",
+config.rollouter.curriculum = ChessCurriculum.Config(
+    bots=(
+        "sf_random", "sf_eps75", "sf_eps50", "sf_eps25", "sf_elo1320",
+        "sf_elo1500", "sf_elo1700", "sf_elo1900", "sf_elo2100", "sf_elo2300", "sf_elo2500",
+    ),
 )
 ```
 
@@ -152,7 +154,7 @@ sf_elo1500 1500
 sf_elo1700 to sf_elo2500  unmeasured, rated at their UCI_Elo
 ```
 
-Half the training groups play a bot; the other half are self-play. The recipe draws each bot group's bot uniformly from a ladder, and validates on 64 fixed greedy-decoded games against the same ladder. Groups whose opponent is `"curriculum"` climb `ChessSelfPlayWorker.Config.bot_curriculum` instead: each rollout worker moves to the next bot once the policy checkmates the current one in over 60% of a 128-game block. Each bot runs its own Stockfish process, off the event loop.
+Half the training groups play a bot; the other half are self-play. The recipe draws each bot group's bot uniformly from a ladder, and validates on 64 fixed greedy-decoded games against the same ladder. With `Rollouter.Config.curriculum = ChessCurriculum.Config(...)`, groups whose opponent is `"curriculum"` climb its `bots` instead: it moves to the next bot once the policy checkmates the current one in over 60% of a train step's games against it. A step with fewer than `min_games` (64) of those games, as right after a promotion, skips the test. The level is saved in the checkpoint. Each bot runs its own Stockfish process, off the event loop.
 
 Logged every step in two sections (validation prefixes each with `val_`):
 
