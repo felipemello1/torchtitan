@@ -350,6 +350,7 @@ def rl_chess_qwen3_5_4b_gb300(
     config.rollouter.worker.bot_curriculum = ladder[ladder.index("sf_eps75") :]
     config.dump_folder = "outputs/rl/qwen3_5_4b_chess_gb300"
     trainer = config.trainer
+    trainer.optim.optimizer.optimizers[0].lr = 1e-5  # 10x the 35B recipe's
     trainer.parallelism = ParallelismConfig(data_parallel_shard_degree=4)
     trainer.activation_checkpoint = SelectiveAC.Config()
     trainer.override = OverrideConfig()

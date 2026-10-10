@@ -166,7 +166,7 @@ def test_rewards_make_a_forfeit_cost_more_than_a_loss_and_no_free_win() -> None:
         await _play_moves(mate, ["f3", "e5", "g4", "Qh4#"])
         assert mate.rewards == {
             chess.WHITE: pytest.approx(-0.25 * (1 - 4 / 40)),
-            chess.BLACK: 1.0,
+            chess.BLACK: 10.0,
         }
 
         # 1. e4 d5 2. exd5 Nf6: White is a pawn up
@@ -604,19 +604,19 @@ def test_worker_trains_both_colors_with_per_color_advantages() -> None:
         # White is mated on ply 4 of 40; Black's forfeit at ply 1 costs -1 * (1 - 1 / 80) and
         # gives White a draw's 0.5 at even material, not a win
         assert [by_id[i].reward for i in range(4)] == pytest.approx(
-            [-0.225, 1.0, 0.5, -0.9875]
+            [-0.225, 10.0, 0.5, -0.9875]
         )
         # each color is centered on its own mean, Black's forfeit counted as its 0.5 at the cap
-        # (White 0.1375, Black 0.75); Black's forfeiting turn alone pays -0.25 - (0.5 + 0.9875)
+        # (White 0.1375, Black 5.25); Black's forfeiting turn alone pays -4.75 - (0.5 + 0.9875)
         assert [by_id[i].advantage for i in range(4)] == pytest.approx(
-            [-0.3625, 0.25, 0.3625, -0.25]
+            [-0.3625, 4.75, 0.3625, -4.75]
         )
         assert [len(by_id[i].turns) for i in range(4)] == [2, 2, 1, 1]
         assert [[turn.advantage for turn in by_id[i].turns] for i in range(4)] == [
             [None, None],
             [None, None],
             [None],
-            [pytest.approx(-1.7375)],
+            [pytest.approx(-6.2375)],
         ]
 
         reduced = _reduced_metrics(group.rollouts)
@@ -659,9 +659,9 @@ def test_worker_centers_each_color_as_if_its_forfeits_ended_at_the_cap() -> None
             [None, None, pytest.approx(-1.2187, abs=1e-4)],
             [None, pytest.approx(-1.2437, abs=1e-4)],
         ]
-        # Black never forfeits: plain centering on [1.0, 0.4689, 0.5], and no turn overrides
+        # Black never forfeits: plain centering on [10.0, 0.4689, 0.5], and no turn overrides
         assert [by_id[i].advantage for i in black] == pytest.approx(
-            [0.3437, -0.1874, -0.1563], abs=1e-4
+            [6.3437, -3.1874, -3.1563], abs=1e-4
         )
         assert all(turn.advantage is None for i in black for turn in by_id[i].turns)
 

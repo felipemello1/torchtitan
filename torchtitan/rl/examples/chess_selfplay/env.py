@@ -46,6 +46,8 @@ _BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
 # reward on the first ply and half at `max_plies`, so it is below any loss.
 _FORFEIT_REWARD = -1.0
 _CHECKMATED_REWARD = -0.25
+# A checkmate pays 10x a win, so mating beats any material lead at `max_plies` (at most 0.75).
+_CHECKMATE_REWARD = 10.0
 # Share of the material score in an unfinished game's reward: 0.5 keeps it within [0.25, 0.75].
 _MATERIAL_WEIGHT = 0.5
 
@@ -82,7 +84,10 @@ class ChessPlayerEnv(MessageEnv):
             "is best, then end your reply with that move, written exactly as listed, inside "
             '\\boxed{}. For example, "Pe2": ["e4"] means \\boxed{e4}, not \\boxed{Pe4}; '
             '"Nb1": ["Nbd2"] means \\boxed{Nbd2}, not \\boxed{Nd2}. An x marks a capture: '
-            '"Nf3": ["Nxe5"] means \\boxed{Nxe5}. An illegal or missing move loses the game.'
+            '"Nf3": ["Nxe5"] means \\boxed{Nxe5}. An illegal or missing move loses the game.\n\n'
+            f"Checkmate scores 10. The game stops after {self._game.max_plies} plies (a ply is one "
+            "move by either side); a game that reaches that limit without checkmate scores 0.25 to "
+            "0.75 by material (queen 9, rook 5, bishop and knight 3, pawn 1), and a stalemate less."
         )
         return MessageEnvInitOutput(
             init_prompt_messages=[
@@ -160,7 +165,7 @@ class ChessGame:
     def rewards(self) -> dict[chess.Color, float]:
         """Each color's training reward once the game is over, with `played` the share of `max_plies`
         played, so it works for any `max_plies`:
-        (a) checkmate: 1 for the winner however long it took, -0.25 * (1 - played) for the loser;
+        (a) checkmate: 10 for the winner however long it took, -0.25 * (1 - played) for the loser;
         (b) stalemate or insufficient material: 0.5 * played each;
         (c) `max_plies` plies: a draw, 0.5, moved halfway toward the material score, so within [0.25, 0.75];
         (d) a forfeit: -1 * (1 - played / 2), so within [-1, -0.5], below being checkmated at any ply;
@@ -169,14 +174,17 @@ class ChessGame:
         Example (max_plies=60):
 
             max_plies, White up a knight              -> {WHITE: 0.59, BLACK: 0.41}
-            White checkmates on ply 19                -> {WHITE: 1.0, BLACK: -0.25 * (1 - 19 / 60) = -0.17}
+            White checkmates on ply 19                -> {WHITE: 10.0, BLACK: -0.25 * (1 - 19 / 60) = -0.17}
             Black forfeits at ply 20, up a queen      -> {WHITE: 0.30, BLACK: -1 * (1 - 20 / 120) = -0.83}
             Black forfeits at ply 1, even material    -> {WHITE: 0.5, BLACK: -1 * (1 - 1 / 120) = -0.99}
         """
         played = self.num_plies / self._max_plies
         if self.end_reason == "checkmate":
             loser = self.board.turn
-            return {not loser: 1.0, loser: _CHECKMATED_REWARD * (1.0 - played)}
+            return {
+                not loser: _CHECKMATE_REWARD,
+                loser: _CHECKMATED_REWARD * (1.0 - played),
+            }
         if self.end_reason != "max_plies" and self.forfeiter is None:
             return {chess.WHITE: 0.5 * played, chess.BLACK: 0.5 * played}
         rewards = self.material_rewards
@@ -190,6 +198,10 @@ class ChessGame:
         the material score."""
         white_reward = 0.5 + _MATERIAL_WEIGHT * (material_score(self.board) - 0.5)
         return {chess.WHITE: white_reward, chess.BLACK: 1.0 - white_reward}
+
+    @property
+    def max_plies(self) -> int:
+        return self._max_plies
 
     @property
     def num_plies(self) -> int:
@@ -254,7 +266,8 @@ class ChessGame:
             lines += ["", f"{me} is in check."]
         lines += [
             "",
-            f"Your move as {me}. Write your best legal move inside \\boxed{{}}.",
+            f"Your move as {me} (ply {self.num_plies + 1} of {self._max_plies}). Write your best "
+            "legal move inside \\boxed{}.",
         ]
         return "\n".join(lines)
 
