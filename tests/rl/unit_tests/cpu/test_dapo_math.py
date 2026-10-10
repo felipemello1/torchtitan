@@ -178,6 +178,10 @@ def test_math_verifier_scores_the_right_side_of_a_named_answer() -> None:
     # A gold equation keeps its left side: Math-Verify drops it when the answer has none.
     assert score_math_response(r"\boxed{y = 3}", "x = 3") == 0.0
     assert score_math_response(r"\boxed{f(f(x)) = x}", "f(x) = x") == 0.0
+    # Unless the answer's left side is a function like `f(n)`, which only names the formula.
+    assert score_math_response(r"\boxed{f(n)=2n}", "m = 2n") == 1.0
+    assert score_math_response(r"\boxed{g(x) = x}", "f(x) = x") == 1.0
+    assert score_math_response(r"\boxed{f(n)=2n+1}", "m = 2n") == 0.0
 
 
 def test_math_verifier_reads_degrees_as_radians_against_pi() -> None:
@@ -196,6 +200,15 @@ def test_math_verifier_reads_leqq_as_le() -> None:
     assert score_math_response(r"\boxed{p \leqq 0}", r"p \le 0") == 1.0
     assert score_math_response(r"\boxed{[1, 2]}", r"1\leqqx\leqq2") == 1.0
     assert score_math_response(r"\boxed{p \ge 0}", r"p\leqq0") == 0.0
+
+
+def test_math_verifier_reads_varnothing_and_no_solution_as_the_empty_set() -> None:
+    # Math-Verify alone reads `\varnothing` and `\text{no solution}` as symbols.
+    assert score_math_response(r"\boxed{\varnothing}", r"\emptyset") == 1.0
+    assert score_math_response(r"\boxed{\text{No solution}}", r"\emptyset") == 1.0
+    assert score_math_response(r"\boxed{\emptyset}", r"\varnothing") == 1.0
+    # Math-Verify reads `e = \frac35` (Euler's e) as false, whose solution set is empty.
+    assert score_math_response(r"\boxed{\text{no solution}}", r"e = \frac{3}{5}") == 0.0
 
 
 def test_math_verifier_drops_delimiter_sizes() -> None:
