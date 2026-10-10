@@ -405,6 +405,7 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
             reset_peak_stats=MagicMock(),
         )
         engine = SimpleNamespace(
+            model_parts=[],
             optim=SimpleNamespace(
                 lr_schedulers=SimpleNamespace(
                     get_metrics=MagicMock(
@@ -444,6 +445,10 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
                 return_value={"aux_loss/mean": 0.5},
             ),
             patch(
+                "torchtitan.rl.trainer.collect_moe_load_metrics",
+                return_value={"moe_load/cv/mean": 0.75},
+            ),
+            patch(
                 "torchtitan.rl.trainer.compute_training_performance_metrics",
                 return_value={
                     "tokens_per_second": 10.0,
@@ -476,6 +481,7 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
             "trainer/memory/num_ooms": 0.0,
             "trainer/mfu_percent": 50.0,
             "aux_loss/mean": 0.5,
+            "moe_load/cv/mean": 0.75,
         }
         engine.optim_step.assert_called_once_with()
         assert trainer._controller_state.value == {"dataloader": {"next_index": 3}}

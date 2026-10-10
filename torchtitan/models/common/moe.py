@@ -191,6 +191,9 @@ class TokenChoiceTopKRouter(Module):
             torch.zeros(config.num_experts, dtype=torch.float32),
             persistent=False,
         )
+        # tokens_per_expert_E of the last optimizer step, summed over the ranks that route
+        # distinct tokens. Set by the `register_moe_load_balancing_hook` pre-hook.
+        self.step_tokens_per_expert_E: torch.Tensor | None = None
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         if buffer_device is None:
@@ -295,6 +298,9 @@ class TokenChoiceTopKRouter(Module):
                 else routing_map_TE & ~padding_mask_T.unsqueeze(-1)
             )
             if not remat.is_recomputing():
+                # TODO: log routing sharpness. Per-token entropy of scores_TE costs +30 us per
+                # layer (T=16K, E=256, H100 eager), ~1% of router + experts; prime-rl's routing
+                # confidence (top-k score mass) sums only [T, K]. Reduce it with the hook's counts.
                 with torch.no_grad():
                     self.tokens_per_expert_E.add_(masked_routing_map_TE.sum(dim=0))
             if self.aux_loss is not None:
@@ -852,6 +858,7 @@ class MoE(Module):
 
 class _MoERouterLike(Protocol):
     tokens_per_expert_E: torch.Tensor  # noqa: N815
+    step_tokens_per_expert_E: torch.Tensor | None  # noqa: N815
 
 
 class _MoELike(Protocol):
@@ -865,10 +872,13 @@ def register_moe_load_balancing_hook(
     model_parts: list[nn.Module],
     parallelism_context: ParallelismContext,
 ) -> None:
-    """Register an optimizer step pre-hook for MoE auxiliary-loss-free load balancing.
+    """Register an optimizer step pre-hook that consumes the MoE expert counts.
 
-    This function checks if MoE load balancing is enabled and, if so, registers
-    a hook that updates expert biases before each optimizer step.
+    Before each optimizer step, for every MoE layer, the hook:
+    1. sums `tokens_per_expert_E` over the ranks that route distinct tokens;
+    2. keeps the sums in `router.step_tokens_per_expert_E` for `collect_moe_load_metrics`;
+    3. zeroes `tokens_per_expert_E`;
+    4. updates the expert bias, if `load_balance_coeff` is set.
 
     Args:
         optimizers: The optimizers container to register the hook on.
@@ -895,7 +905,8 @@ def register_moe_load_balancing_hook(
                     if getattr(transformer_block, "moe_enabled", False):
                         yield transformer_block, cast(_MoELike, transformer_block.moe)
 
-    def _should_register_moe_balancing_hook(model_parts: list[nn.Module]) -> bool:
+    def _has_moe_layers(model_parts: list[nn.Module]) -> bool:
+        """Whether `model_parts` hold MoE layers; raises if only some set `load_balance_coeff`."""
         moe_layers = list(_iter_moe_layers(model_parts))
         if not moe_layers:
             return False
@@ -908,10 +919,9 @@ def register_moe_load_balancing_hook(
                     "across all MoE layers. Either set it for every MoE layer "
                     "or leave it unset for all MoE layers."
                 )
-        return load_balance_enabled
+        return True
 
-    # for MoE auxiliary-loss-free load balancing
-    def _update_expert_bias(
+    def _consume_tokens_per_expert(
         model_parts: list[nn.Module],
         parallelism_context: ParallelismContext,
     ):
@@ -942,12 +952,15 @@ def register_moe_load_balancing_hook(
         with torch.no_grad():
             for _transformer_block, moe in _iter_moe_layers(model_parts):
                 load_balance_coeff = moe.load_balance_coeff
-                assert load_balance_coeff is not None
 
                 tokens_per_expert_E = tokens_per_expert_E_by_layer[
                     moe_layer_idx
                 ].float()
                 moe_layer_idx += 1
+                moe.router.step_tokens_per_expert_E = tokens_per_expert_E
+                moe.router.tokens_per_expert_E.zero_()
+                if load_balance_coeff is None:
+                    continue
 
                 # update the expert bias
                 # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
@@ -956,14 +969,110 @@ def register_moe_load_balancing_hook(
                 )
                 expert_bias_delta_E = expert_bias_delta_E - expert_bias_delta_E.mean()
                 moe.expert_bias_E.add_(expert_bias_delta_E)
-                moe.router.tokens_per_expert_E.zero_()
 
-    if _should_register_moe_balancing_hook(model_parts):
+    if _has_moe_layers(model_parts):
         optimizers.register_step_pre_hook(
-            lambda *args, **kwargs: _update_expert_bias(
+            lambda *args, **kwargs: _consume_tokens_per_expert(
                 model_parts, parallelism_context=parallelism_context
             )
         )
+
+
+def collect_moe_load_metrics(
+    model_parts: list[nn.Module],
+    parallelism_context: ParallelismContext,
+) -> dict[str, float]:
+    """Measure how evenly the last optimizer step spread tokens over each layer's experts.
+
+    Per MoE layer, from its expert token counts over the global batch:
+    - `cv`: std / mean of the counts. If n of 64 experts split all tokens evenly, cv is
+      sqrt(64 / n - 1): 0 for n = 64, 1.0 for 32, 2.65 for 8 (the fewest top-8 can use).
+    - `max_vio`: max / mean - 1. 0 when even; 7 when one expert gets every token (top-8 of 64).
+    - `cold_frac`: fraction of experts under 0.1x the mean count. At most 0.875 for top-8 of 64.
+
+    DeepSeek V4's hash-routed layers count too: the token distribution fixes their load, so
+    they set a floor under the max. Reads the counts the `register_moe_load_balancing_hook`
+    pre-hook keeps. Call on every rank: with PP, it all-reduces over the stages.
+
+    Args:
+        model_parts: This rank's model parts.
+        parallelism_context: Provides the PP mesh.
+
+    Example:
+        # counts after a step with 2 MoE layers of 4 experts (mean 4)
+        # layers.0.moe.router: [4, 4, 4, 4]   cv 0.0, max_vio 0.0, cold_frac 0.0
+        # layers.1.moe.router: [12, 4, 0, 0]  cv 1.22, max_vio 2.0, cold_frac 0.5
+        collect_moe_load_metrics(model_parts, parallelism_context)
+        # {"moe_load/cv/mean": 0.61, "moe_load/cv/max": 1.22,
+        #  "moe_load/max_vio/mean": 1.0, "moe_load/max_vio/max": 2.0,
+        #  "moe_load/cold_frac/mean": 0.25, "moe_load/cold_frac/max": 0.5}
+        # {} without MoE layers, or before the first optimizer step.
+    """
+    # TODO: skip DeepSeek V4's hash-routed layers (`router.hash`), so the stats cover learned
+    # routing only. In a simulation with Zipf token frequencies, a hash layer has max_vio ~3.
+    step_tokens_per_expert_E_list = [
+        module.step_tokens_per_expert_E
+        for model_part in model_parts
+        for module in model_part.modules()
+        if isinstance(module, TokenChoiceTopKRouter)
+        and module.step_tokens_per_expert_E is not None
+    ]
+    pp_mesh = parallelism_context.get_optional_mesh("pp")
+    stat_names = ("cv", "max_vio", "cold_frac")
+    if step_tokens_per_expert_E_list:
+        tokens_per_expert_E_by_layer = torch.stack(step_tokens_per_expert_E_list)
+        mean_by_layer = tokens_per_expert_E_by_layer.mean(dim=1)
+        cv_by_layer = (
+            tokens_per_expert_E_by_layer.std(dim=1, correction=0) / mean_by_layer
+        )
+        max_vio_by_layer = tokens_per_expert_E_by_layer.amax(dim=1) / mean_by_layer - 1
+        cold_frac_by_layer = (
+            tokens_per_expert_E_by_layer.lt(0.1 * mean_by_layer[:, None])
+            .float()
+            .mean(dim=1)
+        )
+        # [num_layers, len(stat_names)]
+        stats_by_layer = torch.stack(
+            [cv_by_layer, max_vio_by_layer, cold_frac_by_layer], dim=1
+        )
+        stat_maxes = stats_by_layer.amax(dim=0)
+    elif pp_mesh is not None:
+        # A PP stage without MoE layers still joins the stage reductions below.
+        # Every stat is >= 0, so its zeros leave the max unchanged.
+        stats_by_layer = torch.zeros(
+            0, len(stat_names), dtype=torch.float32, device=pp_mesh.device_type
+        )
+        stat_maxes = torch.zeros(
+            len(stat_names), dtype=torch.float32, device=pp_mesh.device_type
+        )
+    else:
+        return {}
+
+    stat_sums_and_num_layers = torch.cat(
+        [stats_by_layer.sum(dim=0), stats_by_layer.new_tensor([len(stats_by_layer)])]
+    )
+    if pp_mesh is not None:
+        torch.distributed.all_reduce(
+            stat_sums_and_num_layers,
+            group=pp_mesh.get_group(),
+            op=torch.distributed.ReduceOp.SUM,
+        )
+        torch.distributed.all_reduce(
+            stat_maxes,
+            group=pp_mesh.get_group(),
+            op=torch.distributed.ReduceOp.MAX,
+        )
+    *stat_sums, num_layers = stat_sums_and_num_layers.tolist()
+    if num_layers == 0:
+        return {}
+
+    metrics = {}
+    for name, stat_sum, stat_max in zip(stat_names, stat_sums, stat_maxes.tolist()):
+        metrics[f"moe_load/{name}/mean"] = stat_sum / num_layers
+        metrics[f"moe_load/{name}/max"] = stat_max
+    # TODO: per-layer keys (e.g. `moe_load/cv/layers.7`) would show which layer collapses.
+    # Not done: 3 keys per layer, and with PP the logging rank lacks the other stages' FQNs.
+    return metrics
 
 
 def register_moe_quantile_balancing_hook(
@@ -1022,6 +1131,8 @@ def register_moe_quantile_balancing_hook(
             )
             expert_bias_E.copy_(next_expert_bias_E)
             quantile_balancer.required_bias_histogram_EB.zero_()
+            # TODO: reduce these counts too and keep them for `collect_moe_load_metrics`,
+            # as `register_moe_load_balancing_hook` does, so quantile-balanced MoEs log load.
             router.tokens_per_expert_E.zero_()
 
     optimizers.register_step_pre_hook(lambda *args, **kwargs: _update_expert_bias())
