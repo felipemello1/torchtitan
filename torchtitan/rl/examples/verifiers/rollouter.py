@@ -229,7 +229,7 @@ class VerifiersRollouter(Rollouter):
                 self._generation_server = None
                 await self._verifiers_env_server.close()
 
-    async def run_group_rollouts(
+    async def _run_group_rollouts(
         self,
         *,
         generate_fn: GenerateFn,

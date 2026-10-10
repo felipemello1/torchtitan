@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from torchtitan.rl.distributed.actors.rollout_worker import RolloutWorkerActor
 
 from torchtitan.rl.rollout import rollouter as rollouter_module, RolloutGroup
+from torchtitan.rl.rollout.curriculum import Curriculum
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 
 
@@ -102,6 +103,9 @@ def _rollouter_without_datasets() -> Rollouter:
         worker_pool_size=3,
         num_threads_per_worker=2,
     )
+    rollouter._curriculum = Curriculum.Config().build()
+    rollouter._step = 0
+    rollouter._summaries = {}
     rollouter._worker_actors = None
     rollouter._worker_mesh = None
     return rollouter
