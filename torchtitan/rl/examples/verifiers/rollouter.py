@@ -13,6 +13,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import Any, TYPE_CHECKING
 
+import torch
 from verifiers.v1.configs.client import TrainClientConfig as VerifiersTrainClientConfig
 from verifiers.v1.configs.taskset import TasksetConfig as VerifiersTasksetConfig
 from verifiers.v1.dialects.chat import message_to_wire
@@ -378,6 +379,11 @@ class VerifiersRollouter(Rollouter):
         by the generation server for the whole rollout. Generator metrics are
         attached once to avoid double counting. A turn's top-k rows come from the
         generation whose prompt length and completion tokens match its node.
+
+        With router replay, a turn takes the branch's routed expert ids from position
+        ``prompt_prefix_len - 1`` through its completion's second-to-last token (see
+        ``RolloutTurn.routed_expert_ids``): the second turn above, with
+        ``prompt_prefix_len`` 4, gets the rows of ``[4, 5, 6, 7]``.
         """
         if generation_metadata is None:
             if any(any(node.mask) for node in trace.nodes):
@@ -397,6 +403,11 @@ class VerifiersRollouter(Rollouter):
         for branch in trace.branches:
             token_ids = branch.token_ids
             logprobs = branch.logprobs
+            # [len(token_ids), num_layers, top_k] from the generation server; None without replay.
+            # TODO: Verifiers gives a continued turn's last token the row of the token before it,
+            # so 1 input per turn boundary replays its neighbor's experts. Native TitanRL uses
+            # the next prefill's row; Verifiers' `_attribute_routed_experts` would need to do so.
+            routed_expert_ids = branch.routed_experts
             branch_offset = 0
             reply_to: RolloutTurn | None = None
             for node in branch.nodes:
@@ -428,9 +439,6 @@ class VerifiersRollouter(Rollouter):
                 for start, end in _trainable_token_spans(mask):
                     absolute_start = branch_offset + start
                     absolute_end = branch_offset + end
-                    # TODO: router replay. Return Completion.routed_expert_ids through the
-                    # generation server and slice them per turn here; until then
-                    # Trainer.Config.replay_routed_experts=True raises on this rollouter.
                     # Completion rows of this span: sampled tokens before `start` in the node.
                     row = sum(node.mask[:start])
                     prompt_prefix_len, prompt_delta_token_ids = split_prompt(
@@ -451,6 +459,17 @@ class VerifiersRollouter(Rollouter):
                             ),
                             completion_logprobs=list(
                                 logprobs[absolute_start:absolute_end]
+                            ),
+                            routed_expert_ids=(
+                                None
+                                if routed_expert_ids is None
+                                # A copy, so pickling the turn doesn't send the branch's
+                                # other rows.
+                                else torch.from_numpy(
+                                    routed_expert_ids[
+                                        max(prompt_prefix_len - 1, 0) : absolute_end - 1
+                                    ].copy()
+                                )
                             ),
                             completion_topk_token_ids=(
                                 None
