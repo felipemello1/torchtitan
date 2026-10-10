@@ -115,6 +115,7 @@ from torchtitan.rl.controller.metrics import (
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     compute_rollout_metrics,
+    GCTimer,
     MetricsTimer,
 )
 from torchtitan.rl.controller.work_buffer import (
@@ -1129,6 +1130,7 @@ class Controller(Configurable):
         # The previous step's push and pull, each returning its wall time; None before the first.
         push_task: asyncio.Task[float] | None = None
         pull_task: asyncio.Task[float] | None = None
+        gc_timer = GCTimer()
         for step in range(self.start_step + 1, num_training_steps + 1):
             sl.set_step(step)  # propagate the step counter to the actors
             with sl.log_trace_span("sync_log_step"):
@@ -1248,6 +1250,7 @@ class Controller(Configurable):
                         ],
                         *self._group_buffer.metrics(),
                         *time_metrics,
+                        *gc_timer.flush(),
                         *policy_age_panel,
                         # Background push/pull work time; the trainer's wait for it is timing/step/blocking_*.
                         m.Metric(
@@ -1259,13 +1262,14 @@ class Controller(Configurable):
                             m.NoReduce(pull_s),
                         ),
                         *compute_perf_ratio_metrics(
-                            num_global_valid_tokens=int(
-                                packed.global_loss_token_counts[0]
+                            num_global_tokens=int(
+                                packed.global_routing_token_counts[0]
                             ),
                             time_metrics=time_metrics,
                         ),
                     ],
                 )
+        gc_timer.close()
 
         # Finish the last push and pull so generators hold the final weights for post-validation.
         if push_task is not None:
