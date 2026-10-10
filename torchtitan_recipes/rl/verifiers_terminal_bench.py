@@ -661,10 +661,10 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
         max_offpolicy_steps=12,
         # Start at (6 + 1) x 24 = 168 groups, the pool; the default 3 x 24 leaves 57% of it idle.
         start_batches=target_offpolicy_steps + 1,
-        # 163 x 16 = 2,608 training rollouts + one 78-task validation pass fit the 2,688 VMs and
-        # env-server slots; a larger capacity only queues rollouts for a VM.
-        generation_capacity=(sandbox_pool - num_validation_samples)
-        // num_samples_per_prompt,
+        # 112 groups keeps each engine's running requests under ~60% KV. At 163, contexts of 30-48
+        # turns pushed KV to ~70%, the prefix cache collapsed (96% -> 15% hits), and every turn
+        # re-prefilled its whole history: decode fell 3x and rollouts hit the 2 h agent timeout.
+        generation_capacity=112,
     )
     # Validate at step 0 and every 10 steps beside training; starting a pass makes the trainer
     # wait only for that step's weight pull.
