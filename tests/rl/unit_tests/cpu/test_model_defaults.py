@@ -14,7 +14,7 @@ _RECIPE_MODULES = [
     "torchtitan_recipes.rl.dapo_math",
     "torchtitan_recipes.rl.search_r1",
     "torchtitan_recipes.rl.verifiers_dapo_math",
-    "torchtitan_recipes.tests.rl",
+    "torchtitan_recipes.tests.rl.alphabet_sort",
 ]
 
 

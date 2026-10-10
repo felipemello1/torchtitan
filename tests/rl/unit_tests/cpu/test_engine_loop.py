@@ -563,13 +563,19 @@ class _RejectingEngine(_FakeEngine):
 
     error_type: type[Exception] = VLLMValidationError
 
-    def add_request(self, *, request_id, prompt, params):
+    def add_request(self, *, request_id, prompt, params, arrival_time, priority):
         if request_id == "too_long":
             raise self.error_type(
                 "The decoder prompt (length 2) plus the number of requested output tokens "
                 "(at least 1) is longer than the maximum model length of 2."
             )
-        super().add_request(request_id=request_id, prompt=prompt, params=params)
+        super().add_request(
+            request_id=request_id,
+            prompt=prompt,
+            params=params,
+            arrival_time=arrival_time,
+            priority=priority,
+        )
 
 
 class _StepGate:
@@ -1090,7 +1096,7 @@ def test_admission_error_that_is_not_a_rejection_crashes_the_loop(
     engine_thread, error
 ) -> None:
     class BrokenEngine(_FakeEngine):
-        def add_request(self, *, request_id, prompt, params):
+        def add_request(self, *, request_id, prompt, params, arrival_time, priority):
             raise error
 
     async def run() -> None:
