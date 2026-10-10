@@ -346,7 +346,9 @@ class VLLMModelWrapper(Module):
             parallelism_context=self.parallelism_context,
             training=TrainingConfig(),
             parallelism=training_parallelism,
-            local_compile_regions=self.config.local_compile_regions,
+            # Eager on the generator: with FSDP on the generator, the image's torch 0926 recompiles the
+            # local-compile regions past dynamo's recompile limit (8) during vLLM's CUDA graph capture.
+            local_compile_regions=[],
             ac_config=None,
             dump_folder="",
         )
