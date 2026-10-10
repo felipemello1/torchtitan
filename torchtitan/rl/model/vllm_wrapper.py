@@ -249,33 +249,6 @@ def _patch_vllm_all_reduce() -> None:
         "positions": 0,
     }
 )
-def _keep_unsharded_storage(model: FSDPModule) -> None:
-    """`model.set_keep_unsharded_storage(True)`, or the same effect on torch builds that predate it.
-
-    The GB300 image's torch (2.15.0.dev20260926) has no `set_keep_unsharded_storage`; there
-    `FSDPParam.free_unsharded_param` is called only on reshard, which is exactly what the newer
-    flag skips, so a per-parameter flag checked in that method gives the same behavior.
-    """
-    if hasattr(model, "set_keep_unsharded_storage"):
-        model.set_keep_unsharded_storage(True)
-        return
-    from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
-
-    if not hasattr(FSDPParam, "_free_unsharded_param_without_keep"):
-        FSDPParam._free_unsharded_param_without_keep = FSDPParam.free_unsharded_param
-
-        def free_unsharded_param(self) -> None:
-            if not getattr(self, "keep_unsharded_storage", False):
-                self._free_unsharded_param_without_keep()
-
-        FSDPParam.free_unsharded_param = free_unsharded_param
-    for module in model.modules():
-        if isinstance(module, FSDPModule):
-            for param_group in module._get_fsdp_state()._fsdp_param_groups:
-                for param in param_group.fsdp_params:
-                    param.keep_unsharded_storage = True
-
-
 class VLLMModelWrapper(Module):
     """
     Generic vLLM-compatible model wrapper for TorchTitan models. Implemented
@@ -355,7 +328,7 @@ class VLLMModelWrapper(Module):
 
         # Preserve compute storage addresses across weight syncs for CUDA graphs
         assert isinstance(self.model, FSDPModule)
-        _keep_unsharded_storage(self.model)
+        self.model.set_keep_unsharded_storage(True)
 
         # Load initial weights based on checkpoint config.
         self._checkpointer_config = checkpointer_config
