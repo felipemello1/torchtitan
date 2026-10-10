@@ -291,7 +291,33 @@ class TrainingSampleBuilder(Configurable):
                     len(training_sample.routed_expert_ids)
                     == len(training_sample.token_ids) - 1
                 )
+            if rollout_turn.completion_topk_token_ids is not None:
+                training_sample.topk_token_ids = _append_rows(
+                    training_sample.topk_token_ids,
+                    num_zero_rows=num_delta,
+                    new_rows=rollout_turn.completion_topk_token_ids,
+                )
+                training_sample.topk_logprobs = _append_rows(
+                    training_sample.topk_logprobs,
+                    num_zero_rows=num_delta,
+                    new_rows=rollout_turn.completion_topk_logprobs,
+                )
 
             prev_prompt_and_completion = prompt + rollout_turn.completion_token_ids
 
         return training_samples
+
+
+def _append_rows(
+    rows: torch.Tensor | None, *, num_zero_rows: int, new_rows: torch.Tensor
+) -> torch.Tensor:
+    """Append `num_zero_rows` zero rows (the untrained prompt delta), then `new_rows`.
+
+    Example:
+
+        _append_rows(None, num_zero_rows=2, new_rows=[[7, 3]])  # -> [[0, 0], [0, 0], [7, 3]]
+    """
+    zero_rows = new_rows.new_zeros(num_zero_rows, new_rows.shape[1])
+    return torch.cat(
+        [zero_rows, new_rows] if rows is None else [rows, zero_rows, new_rows]
+    )

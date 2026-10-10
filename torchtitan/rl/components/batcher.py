@@ -149,6 +149,7 @@ class Batcher(Configurable):
         dp_degree: int,
         pad_id: int,
         temperature: float,
+        num_topk_logprobs: int = 0,
     ) -> None:
         self.seq_len = max_context_length
         self._num_rows_per_microbatch, remainder = divmod(
@@ -163,6 +164,7 @@ class Batcher(Configurable):
             )
         self.pad_id = pad_id
         self._temperature = temperature
+        self._num_topk_logprobs = num_topk_logprobs
         self._per_sample_pad_multiple = config.per_sample_pad_multiple
         self._max_num_documents = config.max_num_documents
         self._num_mtp_layers = config.num_mtp_layers
@@ -666,6 +668,14 @@ class Batcher(Configurable):
         positions: list[int] = []
         padding_mask: list[bool] = []
         routed_expert_ids: list[torch.Tensor] = []
+        num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
+        topk_token_ids = topk_logprobs = None
+        if self._num_topk_logprobs > 0:
+            # Zero rows wherever no sample writes (padding, empty bins); the loss masks them out.
+            topk_token_ids = torch.zeros(
+                num_tokens_per_rank, self._num_topk_logprobs, dtype=torch.int32
+            )
+            topk_logprobs = torch.zeros(num_tokens_per_rank, self._num_topk_logprobs)
 
         # Shift labels/logits and pad to per_sample_pad_multiple.
         for training_sample in training_samples:
@@ -690,6 +700,14 @@ class Batcher(Configurable):
                 sample_len = padded_len
 
             # extend row
+            if topk_token_ids is not None:
+                start = len(positions)
+                topk_token_ids[
+                    start : start + unpadded_len
+                ] = training_sample.topk_token_ids[1:]
+                topk_logprobs[
+                    start : start + unpadded_len
+                ] = training_sample.topk_logprobs[1:]
             for key in keys:
                 packed_fields[key].extend(sample[key])
             positions.extend(range(sample_len))
@@ -702,7 +720,6 @@ class Batcher(Configurable):
                     _pad_rows(training_sample.routed_expert_ids, num_rows=sample_len)
                 )
 
-        num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
         pad_len = num_tokens_per_rank - len(positions)
         assert pad_len >= 0
         if pad_len > 0:
@@ -750,6 +767,8 @@ class Batcher(Configurable):
                 if routed_expert_ids
                 else {}
             ),
+            generator_topk_token_ids=topk_token_ids,
+            generator_topk_logprobs=topk_logprobs,
         )
 
     def _padding_fraction(
