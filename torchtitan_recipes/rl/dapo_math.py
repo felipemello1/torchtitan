@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from renderers import Qwen35RendererConfig, Qwen3RendererConfig
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -27,7 +29,13 @@ from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 from torchtitan.models.qwen3 import build_model_config
 from torchtitan.models.qwen3_5 import build_model_config as build_qwen3_5_model_config
 from torchtitan.rl.components.data import IterableRLDataLoader
-from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
+from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
+from torchtitan.rl.controller import (
+    AsyncLoopConfig,
+    Controller,
+    RLModelDefaults,
+    ValidationConfig,
+)
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.examples.dapo_math.data import (
     DapoMathDataset,
@@ -37,7 +45,7 @@ from torchtitan.rl.examples.dapo_math.data import (
 from torchtitan.rl.examples.dapo_math.env import DapoMathEnv
 from torchtitan.rl.examples.dapo_math.rubric import PerBenchmarkRubric, RewardMathVerify
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
-from torchtitan.rl.losses import DAPOLoss
+from torchtitan.rl.losses import DAPOLoss, ScoreCenteringLoss
 from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import TokenEnv
@@ -366,4 +374,90 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_kimi() -> Controller.Confi
     """
     config = rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k()
     config.rollouter.worker.rubric.length_reward_weight = 0.1
+    return config
+
+
+def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Config:
+    """`rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k` as a fresh 300-step run with score
+    centering, router replay, the adaptive rollout buffer, and validation beside training.
+
+    Same 12 GPUs, 64 x 16 batch, 131K budget and forced answer; no length reward.
+    """
+    config = rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k()
+    config.dump_folder = "outputs/rl/qwen3_5_35b_a3b_base_intellect3_math_131k_tonight"
+    # fp32 logits on the trainer and the generator, and every expert bias kept at its loaded value.
+    config.model_defaults = RLModelDefaults(fp32_lm_head=True, freeze_expert_bias=True)
+    config.async_loop = dataclasses.replace(
+        config.async_loop,
+        num_training_steps=300,
+        # Under the adaptive buffer, this only sets train_batch/pct_samples_over_target_age.
+        target_offpolicy_steps=6,
+        group_buffer=AdaptiveRolloutGroupWorkBuffer.Config(
+            # The demand keeps the mean policy age of trained groups under 6 steps.
+            target_offpolicy_steps=6,
+            # A group older than 12 steps when consumed is dropped and its prompt not retried.
+            max_offpolicy_steps=12,
+            # The engines are KV-bound at ~2,850 running sequences (~285 groups at ~10 live seats).
+            # 640 binds only when over ~30% of groups have zero reward variance, and then it still
+            # keeps a vLLM queue; each idle group worker costs controller time on buffer changes.
+            generation_capacity=640,
+        ),
+        # Groups whose 16 rewards are equal carry no gradient: the batch takes the next group.
+        training_sample_builder=dataclasses.replace(
+            config.async_loop.training_sample_builder,
+            drop_zero_std_reward_groups=True,
+        ),
+        # avg@4 on the 240 problems every 10 steps, beside training (the first at step 0). A
+        # pass took 3.2-3.6 h on the last run, so the next one starts when the previous ends.
+        validation=ValidationConfig(
+            steps=4 * 240, greedy=False, freq=10, overlap_training=True
+        ),
+    )
+    config.rollouter.training_dataloader.dataset = dataclasses.replace(
+        config.rollouter.training_dataloader.dataset,
+        # A problem whose group comes back with every reward above 0.9 (all 16 correct
+        # without a forced answer) is skipped in later epochs.
+        skip_solved_prompts=True,
+    )
+    config.trainer = dataclasses.replace(
+        config.trainer,
+        # Each token takes the experts the generator routed it to.
+        replay_routed_experts=True,
+        optim=Optim.Config(
+            optimizer=OptimizersContainer.Config(
+                optimizers=[
+                    AdamW.Config(
+                        pattern=r".*",
+                        lr=1e-5,
+                        betas=(0.9, 0.98),
+                        weight_decay=0.1,
+                    )
+                ]
+            ),
+            # Fresh weights: ramp linearly to 1e-5 over 10 steps, then hold it.
+            lr_scheduler=LRSchedulersContainer.Config(
+                warmup_steps=10,
+                min_lr_factor=1.0,
+            ),
+        ),
+        loss=ChunkedLossWrapper.Config(
+            num_chunks=16,
+            loss_fn=ScoreCenteringLoss.Config(
+                # Truncated IS at 2, the paper's TIS+SC arm: better than SC alone at high staleness.
+                max_ratio=2.0,
+                global_vocab_size=decoder_vocab_size(config.model),
+            ),
+        ),
+    )
+    config.generator = dataclasses.replace(
+        config.generator,
+        # The routed experts the trainer replays.
+        return_routed_experts=True,
+        sampling=dataclasses.replace(
+            config.generator.sampling,
+            # ScoreCenteringLoss's top-k. 32 is the smallest k arXiv 2609.20807 tested, and it
+            # matched the full vocabulary (Fig. 5); 256 bytes per generated token.
+            num_topk_logprobs=32,
+        ),
+    )
     return config
