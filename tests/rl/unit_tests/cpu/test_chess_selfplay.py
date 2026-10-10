@@ -13,12 +13,15 @@ import shutil
 
 import chess
 import pytest
+import torch
 from renderers import Qwen3RendererConfig
 
 from torchtitan.components.renderer import from_renderers
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
 from torchtitan.observability import structured_logger as sl
+from torchtitan.rl.components.batcher import Batcher
+from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.examples.chess_selfplay import (
     BOTS,
     BotSpec,
@@ -511,16 +514,23 @@ def test_self_play_dataset_mixes_in_bot_groups() -> None:
 
 class _ScriptedPolicy:
     """Answers each player's turns from a script keyed by rollout id (even = White, odd = Black).
-    An exception in the script is raised instead, like a failed generator call."""
+    An exception in the script is raised instead, like a failed generator call. With `num_topk=2`,
+    each token's top-k rows are [token, 1000 + turn_id] with logprobs [-0.1, -2.0]."""
 
     def __init__(
-        self, tokenizer, moves_by_rollout: dict[int, list[str]], *, truncate_at=None
+        self,
+        tokenizer,
+        moves_by_rollout: dict[int, list[str]],
+        *,
+        truncate_at=None,
+        num_topk: int = 0,
     ) -> None:
         self._tokenizer = tokenizer
         self._moves_by_rollout = moves_by_rollout
         self._truncate_at = (
             truncate_at  # (rollout_id, turn_id) whose reply hits max_tokens
         )
+        self._num_topk = num_topk
 
     async def __call__(self, prompt_token_ids, *, request_id, **kwargs) -> Completion:
         fields = dict(part.split("=") for part in request_id.split("/"))
@@ -535,18 +545,33 @@ class _ScriptedPolicy:
             finish_reason = "length"
         else:
             token_ids.append(self._tokenizer.tokenizer.token_to_id("<|im_end|>"))
+        topk_token_ids = topk_logprobs = None
+        if self._num_topk:
+            topk_token_ids = torch.tensor(
+                [[token_id, 1000 + turn_id] for token_id in token_ids],
+                dtype=torch.int32,
+            )
+            topk_logprobs = torch.tensor([[-0.1, -2.0]] * len(token_ids))
         return Completion(
             min_policy_version=0,
             max_policy_version=0,
             request_id=request_id,
             token_ids=token_ids,
             token_logprobs=[-0.1] * len(token_ids),
+            topk_token_ids=topk_token_ids,
+            topk_logprobs=topk_logprobs,
             finish_reason=finish_reason,
         )
 
 
 async def _run_group(
-    moves_by_rollout, *, group_size, sample=_SELF_PLAY, truncate_at=None, worker=None
+    moves_by_rollout,
+    *,
+    group_size,
+    sample=_SELF_PLAY,
+    truncate_at=None,
+    worker=None,
+    num_topk=0,
 ):
     worker = (
         worker
@@ -571,6 +596,7 @@ async def _run_group(
         tokenizer_config.build(tokenizer_path=_TOKENIZER_PATH),
         moves_by_rollout,
         truncate_at=truncate_at,
+        num_topk=num_topk,
     )
     return await asyncio.wait_for(
         worker.run_group(
@@ -629,6 +655,58 @@ def test_worker_trains_both_colors_with_per_color_advantages() -> None:
         assert reduced[
             "chess_games/forfeits_per_reply_self_play/mean"
         ] == pytest.approx(1 / 6)
+
+    asyncio.run(run())
+
+
+def test_worker_carries_each_turns_topk_rows_into_the_packed_training_sample() -> None:
+    async def run() -> None:
+        # fool's mate: two turns per player, the opponent's move and the next board between them
+        group = await _run_group(
+            {0: ["f3", "g4"], 1: ["e5", "Qh4#"]}, group_size=1, num_topk=2
+        )
+        builder = TrainingSampleBuilder.Config().build()
+        samples = []
+        for rollout in group.rollouts:
+            [sample] = builder.rollout_to_training_samples(rollout)
+            samples.append(sample)
+            loss_mask = sample.loss_mask
+            assert sample.topk_token_ids.shape == (len(sample.token_ids), 2)
+            # completion tokens: the policy's rows, from the turn that sampled them
+            assert torch.equal(
+                sample.topk_token_ids[loss_mask, 0], sample.token_ids[loss_mask]
+            )
+            assert sample.topk_token_ids[loss_mask, 1].tolist() == [
+                1000 + turn_id
+                for turn_id, turn in enumerate(rollout.turns)
+                for _ in turn.completion_token_ids
+            ]
+            torch.testing.assert_close(
+                sample.topk_logprobs[loss_mask],
+                torch.tensor([[-0.1, -2.0]] * int(loss_mask.sum())),
+            )
+            # prompt, opponent move and board tokens: zero rows
+            assert not sample.topk_token_ids[~loss_mask].any()
+            assert not sample.topk_logprobs[~loss_mask].any()
+
+        # Packed: row t holds the top-k that sampled labels[t], zero rows elsewhere.
+        num_tokens = 64 * -(-sum(len(sample.token_ids) for sample in samples) // 64)
+        batcher = Batcher.Config().build(
+            num_tokens_per_microbatch_per_dp_rank=num_tokens,
+            max_context_length=num_tokens,
+            num_prompts_per_train_step=1,
+            dp_degree=1,
+            pad_id=0,
+            temperature=1.0,
+            num_topk_logprobs=2,
+        )
+        microbatch = batcher._pack_training_samples(samples)
+        topk_token_ids = microbatch.generator_topk_token_ids
+        loss_mask = microbatch.loss_mask
+        assert topk_token_ids.shape == (num_tokens, 2)
+        assert torch.equal(topk_token_ids[loss_mask, 0], microbatch.labels[loss_mask])
+        assert not topk_token_ids[~loss_mask].any()
+        assert not microbatch.generator_topk_logprobs[~loss_mask].any()
 
     asyncio.run(run())
 

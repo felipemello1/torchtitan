@@ -505,6 +505,8 @@ class RolloutWorker(Configurable):
                         completion_token_ids=completion.token_ids,
                         completion_logprobs=completion.token_logprobs,
                         completion_loss_mask=completion.loss_mask,
+                        completion_topk_token_ids=completion.topk_token_ids,
+                        completion_topk_logprobs=completion.topk_logprobs,
                         completion_message=next_env_step.completion_message,
                         env_messages=next_env_step.env_messages,
                         env_rewards=next_env_step.env_rewards,

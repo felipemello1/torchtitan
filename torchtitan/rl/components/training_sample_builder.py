@@ -42,6 +42,9 @@ class _OpenSample:
     loss_mask: list[bool] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     advantage: list[float] = field(default_factory=list)
+    topk_token_ids: list[torch.Tensor] = field(default_factory=list)
+    """`[num_tokens, k]` blocks, one per prompt delta and completion; empty without top-k."""
+    topk_logprobs: list[torch.Tensor] = field(default_factory=list)
 
     def to_training_sample(self) -> TrainingSample:
         return TrainingSample(
@@ -52,6 +55,10 @@ class _OpenSample:
             loss_mask=torch.tensor(self.loss_mask, dtype=torch.bool),
             logprobs=torch.tensor(self.logprobs, dtype=torch.float32),
             advantage=torch.tensor(self.advantage, dtype=torch.float32),
+            topk_token_ids=(
+                torch.cat(self.topk_token_ids) if self.topk_token_ids else None
+            ),
+            topk_logprobs=torch.cat(self.topk_logprobs) if self.topk_logprobs else None,
         )
 
 
@@ -332,6 +339,19 @@ class TrainingSampleBuilder(Configurable):
                 if rollout_turn.advantage is None
                 else rollout_turn.advantage
             ] * num_completion
+            if rollout_turn.completion_topk_token_ids is not None:
+                # Zero rows on the untrained prompt delta, then the completion's rows.
+                completion_topk_token_ids = rollout_turn.completion_topk_token_ids
+                completion_topk_logprobs = rollout_turn.completion_topk_logprobs
+                num_topk = completion_topk_token_ids.shape[1]
+                training_sample.topk_token_ids += [
+                    completion_topk_token_ids.new_zeros(num_delta, num_topk),
+                    completion_topk_token_ids,
+                ]
+                training_sample.topk_logprobs += [
+                    completion_topk_logprobs.new_zeros(num_delta, num_topk),
+                    completion_topk_logprobs,
+                ]
 
         return [
             training_sample.to_training_sample() for training_sample in training_samples

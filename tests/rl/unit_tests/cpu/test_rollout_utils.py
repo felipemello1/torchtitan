@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.observability import metrics as m
@@ -329,3 +330,57 @@ def test_zero_std_groups_split_into_all_success_and_all_failure() -> None:
     assert aggregated[f"{prefix}/mean"] == pytest.approx(2 / 3)
     assert aggregated[f"{prefix}/all_success/mean"] == pytest.approx(1 / 3)
     assert aggregated[f"{prefix}/all_failure/mean"] == pytest.approx(1 / 3)
+
+
+def test_topk_rows_align_with_token_ids_across_turns() -> None:
+    first = _turn(prompt_token_ids=[1, 2], completion_token_ids=[4, 5], version=0)
+    first.completion_topk_token_ids = torch.tensor([[4, 9], [5, 8]], dtype=torch.int32)
+    first.completion_topk_logprobs = torch.tensor([[-0.1, -2.0], [-0.2, -3.0]])
+    second = _turn(
+        prompt_token_ids=[1, 2, 4, 5, 9], completion_token_ids=[7], version=0
+    )
+    second.completion_topk_token_ids = torch.tensor([[7, 3]], dtype=torch.int32)
+    second.completion_topk_logprobs = torch.tensor([[-0.3, -1.5]])
+
+    [training_sample] = rollout_to_training_samples(
+        _scored_rollout([first, second], reward=1.0, advantage=0.5)
+    )
+
+    # Zero rows on the prompt and the env reply (token 9), like their 0.0 logprobs.
+    assert training_sample.token_ids.tolist() == [1, 2, 4, 5, 9, 7]
+    assert training_sample.topk_token_ids.tolist() == [
+        [0, 0],
+        [0, 0],
+        [4, 9],
+        [5, 8],
+        [0, 0],
+        [7, 3],
+    ]
+    torch.testing.assert_close(
+        training_sample.topk_logprobs,
+        torch.tensor(
+            [[0, 0], [0, 0], [-0.1, -2.0], [-0.2, -3.0], [0, 0], [-0.3, -1.5]]
+        ),
+    )
+
+
+def test_topk_rows_of_a_new_branch_start_with_zero_prompt_rows() -> None:
+    # The second turn rewrites history ([1, 3] keeps only [1]), so it opens a new sample whose
+    # prompt rows, the shared [1] included, are zero.
+    first = _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=0)
+    first.completion_topk_token_ids = torch.tensor([[4, 9]], dtype=torch.int32)
+    first.completion_topk_logprobs = torch.tensor([[-0.1, -2.0]])
+    second = _turn(prompt_token_ids=[1, 3], completion_token_ids=[7], version=0)
+    second.completion_topk_token_ids = torch.tensor([[7, 3]], dtype=torch.int32)
+    second.completion_topk_logprobs = torch.tensor([[-0.3, -1.5]])
+
+    first_sample, second_sample = rollout_to_training_samples(
+        _scored_rollout([first, second], reward=1.0, advantage=0.5)
+    )
+
+    assert first_sample.topk_token_ids.tolist() == [[0, 0], [0, 0], [4, 9]]
+    assert second_sample.token_ids.tolist() == [1, 3, 7]
+    assert second_sample.topk_token_ids.tolist() == [[0, 0], [0, 0], [7, 3]]
+    torch.testing.assert_close(
+        second_sample.topk_logprobs, torch.tensor([[0, 0], [0, 0], [-0.3, -1.5]])
+    )

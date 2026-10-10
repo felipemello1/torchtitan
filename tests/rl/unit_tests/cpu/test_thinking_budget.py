@@ -11,6 +11,7 @@ import math
 from dataclasses import replace
 
 import pytest
+import torch
 
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.generator import SamplingConfig
@@ -145,6 +146,43 @@ def test_forced_answer_ends_the_turn_at_its_closing_brace() -> None:
     assert completion.finish_reason == "stop"
     # the thinking call does not stop at braces
     assert generate.calls[0]["sampling_config"].stop_token_ids is None
+
+
+def test_forced_close_joins_the_topk_rows_with_zero_rows_on_unsampled_tokens() -> None:
+    # k=2: each sampled token's rows are [token, token + 50] with logprobs [-0.5, -3.0].
+    def with_topk(completion: Completion) -> Completion:
+        completion.topk_token_ids = torch.tensor(
+            [[token_id, token_id + 50] for token_id in completion.token_ids],
+            dtype=torch.int32,
+        )
+        completion.topk_logprobs = torch.tensor(
+            [[-0.5, -3.0]] * len(completion.token_ids)
+        )
+        return completion
+
+    thinking = with_topk(_completion([10, 11, 12, 13], finish_reason="length"))
+    answer = with_topk(_completion([20, BRACE], finish_reason="stop"))
+    budget = ThinkingBudget(
+        ThinkingBudget.Config(max_thinking_tokens=4, answer_end_text="}"),
+        tokenizer=_Tokenizer(),
+    )
+    completion = _run(budget, _ScriptedGenerate(thinking, answer), [THINK])
+
+    # [10, 11, 12, 13, *FORCED, 20, BRACE, END_OF_TURN]: zero rows on the forced and end tokens
+    assert completion.topk_token_ids.tolist() == (
+        [[10, 60], [11, 61], [12, 62], [13, 63]]
+        + [[0, 0]] * len(FORCED)
+        + [[20, 70], [BRACE, BRACE + 50], [0, 0]]
+    )
+    torch.testing.assert_close(
+        completion.topk_logprobs,
+        torch.tensor(
+            [[-0.5, -3.0]] * 4
+            + [[0.0, 0.0]] * len(FORCED)
+            + [[-0.5, -3.0]] * 2
+            + [[0.0, 0.0]]
+        ),
+    )
 
 
 def test_reply_cut_while_answering_continues_without_forcing() -> None:

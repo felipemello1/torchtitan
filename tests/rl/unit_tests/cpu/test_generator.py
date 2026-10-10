@@ -234,6 +234,7 @@ def test_process_finished_requests_resolves_reply_with_completion():
         assert completion.request_id == "r0"
         assert completion.token_ids == [10, 11]
         assert completion.token_logprobs == [-0.1, -0.1]
+        assert completion.topk_token_ids is None
         assert completion.finish_reason == "length"
         assert completion.min_policy_version == 7  # min = version it was admitted under
         assert completion.max_policy_version == 8  # max = live version at finish
@@ -245,6 +246,42 @@ def test_process_finished_requests_resolves_reply_with_completion():
                 "generator/inflight_requests_at_completion/max"
             ]
             == 1
+        )
+
+    asyncio.run(main())
+
+
+def test_process_finished_requests_splits_topk_logprobs():
+    async def main():
+        dispatcher = _dispatcher()
+        reply = concurrent.futures.Future()
+        reply.set_running_or_notify_cancel()
+        generation = OutstandingGeneration(reply=reply, metrics_prefix="generator")
+        generation.min_policy_version = 7
+        dispatcher._rank0_outstanding_generations = {"r0": generation}
+        # vLLM's layout with logprobs=2: each position holds [sampled, top-1, top-2], and
+        # the sampled token repeats when it is also in the top-k.
+        logprobs = FlatLogprobs()
+        logprobs.append_fast(
+            [10, 10, 3], [-0.1, -0.1, -2.5], iter([1, 1, 2]), [None] * 3
+        )
+        logprobs.append_fast(
+            [11, 4, 11], [-0.7, -0.5, -0.7], iter([2, 1, 2]), [None] * 3
+        )
+        sample = SimpleNamespace(
+            token_ids=[10, 11], logprobs=logprobs, finish_reason="stop"
+        )
+
+        dispatcher.process_finished_requests(
+            [_request_output(outputs=[sample])], policy_version=7
+        )
+
+        completion = await asyncio.wrap_future(reply)
+        assert completion.token_logprobs == [-0.1, -0.7]
+        assert completion.topk_token_ids.dtype == torch.int32
+        assert completion.topk_token_ids.tolist() == [[10, 3], [4, 11]]
+        torch.testing.assert_close(
+            completion.topk_logprobs, torch.tensor([[-0.1, -2.5], [-0.5, -0.7]])
         )
 
     asyncio.run(main())
@@ -387,6 +424,14 @@ def test_build_sampling_params_matches_contract():
     assert params.stop_token_ids == [99]
     assert params.ignore_eos
     assert params.seed == 44
+
+
+def test_build_sampling_params_requests_topk_logprobs():
+    generator = _generator()
+    params = generator._build_sampling_params(
+        SamplingConfig(max_tokens=8, stop_token_ids=[99], num_topk_logprobs=32)
+    )
+    assert params.logprobs == 32
 
 
 def test_build_sampling_params_seed_defaults_to_none():

@@ -923,6 +923,8 @@ class Controller(Configurable):
             if validation.greedy
             else self._sampling
         )
+        # Validation rollouts are never trained, so skip the top-k transport.
+        sampling = replace(sampling, num_topk_logprobs=0)
 
         rollout_groups, validation_metrics = await self._collect_validation_rollouts(
             num_groups=validation.num_samples, sampling=sampling, step=step
@@ -1017,6 +1019,7 @@ class Controller(Configurable):
             dp_degree=self.trainer_dp_degree,
             pad_id=self.tokenizer.eos_id,
             temperature=self._sampling.temperature,
+            num_topk_logprobs=self._sampling.num_topk_logprobs,
         )
 
         # training_batch_queue

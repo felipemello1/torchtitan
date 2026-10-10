@@ -10,6 +10,8 @@ import math
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
+import torch
+
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
 from torchtitan.rl.observability import metrics as m
@@ -181,6 +183,9 @@ class ThinkingBudget(Configurable):
                 and second.token_ids[-1] in self._answer_end_ids
             ):
                 end_ids = [self._end_of_turn_id]
+            topk_token_ids, topk_logprobs = _join_topk(
+                first, second, num_forced=len(forced_ids), num_end=len(end_ids)
+            )
             return Completion(
                 min_policy_version=min(
                     first.min_policy_version, second.min_policy_version
@@ -198,6 +203,8 @@ class ThinkingBudget(Configurable):
                     + second.token_logprobs
                     + [math.nan] * len(end_ids)
                 ),
+                topk_token_ids=topk_token_ids,
+                topk_logprobs=topk_logprobs,
                 loss_mask=(
                     [True] * len(first.token_ids)
                     + [False] * len(forced_ids)
@@ -232,3 +239,36 @@ class ThinkingBudget(Configurable):
             if token_id == self._think_start_id:
                 return True
         return False
+
+
+def _join_topk(
+    first: Completion, second: Completion, *, num_forced: int, num_end: int
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Top-k ids and logprobs `[num_tokens, k]` of `first + forced + second + end of turn`, with zero
+    rows on the forced and end-of-turn tokens, which were not sampled; `(None, None)` without top-k.
+
+    Example (k=2, 2 forced tokens, no end of turn):
+
+        first rows [[7, 3]], second rows [[5, 1]]  ->  [[7, 3], [0, 0], [0, 0], [5, 1]]
+    """
+    if first.topk_token_ids is None:
+        return None, None
+    joined = []
+    for first_rows, second_rows in (
+        (first.topk_token_ids, second.topk_token_ids),
+        (first.topk_logprobs, second.topk_logprobs),
+    ):
+        if not second.token_ids:  # vLLM returns no top-k for an empty completion
+            second_rows = first_rows[:0]
+        num_topk = first_rows.shape[1]
+        joined.append(
+            torch.cat(
+                [
+                    first_rows,
+                    first_rows.new_zeros(num_forced, num_topk),
+                    second_rows,
+                    first_rows.new_zeros(num_end, num_topk),
+                ]
+            )
+        )
+    return joined[0], joined[1]
