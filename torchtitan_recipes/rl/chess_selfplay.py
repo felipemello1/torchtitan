@@ -45,7 +45,7 @@ from torchtitan.rl.examples.chess_selfplay import (
     RewardChessScore,
 )
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
-from torchtitan.rl.losses import DAPOLoss
+from torchtitan.rl.losses import DAPOLoss, ScoreCenteringLoss
 from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import TokenEnv
@@ -358,6 +358,7 @@ def rl_chess_qwen3_5_4b_gb300(
     # Generation paces itself: the mean policy age stays under 6 steps, every trained group under 12.
     # At most 6 batches generate at once, as v8's fixed buffer: that bounds the rollout workers,
     # vLLM's max_num_seqs, and the Stockfish processes on host 0 (one per bot game in flight).
+    config.async_loop.target_offpolicy_steps = 6
     config.async_loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
         max_offpolicy_steps=12,
         target_offpolicy_steps=6,
@@ -377,5 +378,10 @@ def rl_chess_qwen3_5_4b_gb300(
     trainer.activation_checkpoint = SelectiveAC.Config()
     trainer.override = OverrideConfig()
     trainer.dist_moe = None
-    trainer.loss.loss_fn.global_vocab_size = decoder_vocab_size(config.model)
+    # Score centering instead of DAPO's clipped objective: REINFORCE weighted by min(p/q, 2), with the
+    # generator's top-16 logprobs as each token's baseline (k=16 halves the k=32 transport to the trainer).
+    trainer.loss.loss_fn = ScoreCenteringLoss.Config(
+        max_ratio=2.0, global_vocab_size=decoder_vocab_size(config.model)
+    )
+    config.generator.sampling.num_topk_logprobs = 16
     return config

@@ -457,7 +457,8 @@ class KVEstimateAdmission(AdmissionPolicy):
         growth = self._growth_per_session()
         charged = [b + self._reserved_growth(g) for g, b in enumerate(self.blocks)]
         generator = max(serving, key=lambda g: self.limits[g] - charged[g])
-        expected_sessions = 0 if skip_queue else self._new_group_sessions()
+        # A validation group never waits, but reserves one session so the next one spreads out.
+        expected_sessions = 1 if skip_queue else self._new_group_sessions()
         new_charged = charged[generator] + expected_sessions * (
             first_call_blocks + growth
         )
