@@ -424,8 +424,8 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
     )
     config.trainer = dataclasses.replace(
         config.trainer,
-        # No router replay: math trainers with it died at step 3 twice, with the dispatcher's
-        # op registry corrupted; replay's routed experts are ~2/3 of each step's 14-24 GB batch.
+        # No router replay for now: its routed experts are ~2/3 of each step's batch, which every
+        # trainer rank receives; at step 3 (~30 GB) delivery outlasted monarch's 60 s supervision poll.
         replay_routed_experts=False,
         # Synchronous saves: an async save's ~420 GB CPU copy, on top of the 4 trainer ranks each
         # unpacking the 13-21 GB batch at 2-3x, can exceed the trainer host's 900 GB job memory.
