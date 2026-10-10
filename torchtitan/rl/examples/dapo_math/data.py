@@ -205,6 +205,8 @@ class Intellect3MathDataset(_CyclingDataset):
     @dataclass(kw_only=True, slots=True)
     class Config(RLDataset.Config):
         repo_id: str = "PrimeIntellect/INTELLECT-3-RL"
+        revision: str = "a9eb9183224cec63fe9a71e7a3a80cff14868624"
+        """Hub commit the row counts above hold for; pinned so a dataset update cannot change the rows."""
         split: str = "train"
         min_pass_rate: float = 0.125
         """Keep problems solved in at least this fraction of the 8 tries; 0.125 is 1 of 8."""
@@ -217,7 +219,9 @@ class Intellect3MathDataset(_CyclingDataset):
         `TrainingSampleBuilder.Config.solved_reward_above`."""
 
     def __init__(self, config: Config) -> None:
-        dataset = load_dataset(config.repo_id, "math", split=config.split)
+        dataset = load_dataset(
+            config.repo_id, "math", split=config.split, revision=config.revision
+        )
         samples = [
             DapoMathSample(
                 prompt=_MATH_PROMPT_TEMPLATE.format(problem=row["question"]),

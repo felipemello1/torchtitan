@@ -157,11 +157,12 @@ def test_aime_dataset_restarts_after_configured_num_samples(monkeypatch) -> None
 def test_intellect3_dataset_keeps_partially_solved_problems(monkeypatch) -> None:
     pass_rates = [0.0, 0.125, 0.875, 1.0]
 
-    def load_dataset(repo_id, subset, *, split):
-        assert (repo_id, subset, split) == (
+    def load_dataset(repo_id, subset, *, split, revision):
+        assert (repo_id, subset, split, revision) == (
             "PrimeIntellect/INTELLECT-3-RL",
             "math",
             "train",
+            "a9eb9183224cec63fe9a71e7a3a80cff14868624",
         )
         return Dataset.from_list(
             [
@@ -190,8 +191,8 @@ def test_intellect3_dataset_keeps_partially_solved_problems(monkeypatch) -> None
 def _intellect3_dataset(
     monkeypatch, rows: list[tuple[str, str]]
 ) -> Intellect3MathDataset:
-    def load_dataset(repo_id, subset, *, split):
-        del repo_id, subset, split
+    def load_dataset(repo_id, subset, *, split, revision):
+        del repo_id, subset, split, revision
         return Dataset.from_list(
             [
                 {
