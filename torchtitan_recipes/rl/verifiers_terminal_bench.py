@@ -722,9 +722,6 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     # Admit a request only while 3% of KV blocks stay free, so running requests have room to
     # grow before vLLM preempts one.
     generator.extra_vllm_engine_args = {"watermark": 0.03}
-    # Each weight sync holds a second bf16 copy of the model (~66 GiB, FSDP on the generator);
-    # at 0.9 it OOMs. TB used ~45% of the KV cache at 0.9, so the smaller cache still fits.
-    generator.gpu_memory_limit = 0.65
     return config
 
 
