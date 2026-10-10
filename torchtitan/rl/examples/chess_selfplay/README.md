@@ -152,7 +152,7 @@ sf_elo1500 1500
 sf_elo1700 to sf_elo2500  unmeasured, rated at their UCI_Elo
 ```
 
-Half the training groups play a bot; the other half are self-play. The recipe draws each bot group's bot uniformly from a ladder, and validates on 64 fixed greedy-decoded games against the same ladder. Groups whose opponent is `"curriculum"` climb `ChessSelfPlayWorker.Config.bot_curriculum` instead: each rollout worker moves to the next bot once the policy checkmates the current one in over 40% of a 128-game block. Each bot runs its own Stockfish process, off the event loop.
+Half the training groups play a bot; the other half are self-play. The recipe draws each bot group's bot uniformly from a ladder, and validates on 64 fixed greedy-decoded games against the same ladder. Groups whose opponent is `"curriculum"` climb `ChessSelfPlayWorker.Config.bot_curriculum` instead: each rollout worker moves to the next bot once the policy checkmates the current one in over 60% of a 128-game block. Each bot runs its own Stockfish process, off the event loop.
 
 Logged every step in two sections (validation prefixes each with `val_`):
 
