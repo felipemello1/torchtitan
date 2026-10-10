@@ -414,6 +414,7 @@ class VLLMAttentionWrapper(Module):
         v_THV: torch.Tensor,
         *,
         attention_metadata: None = None,
+        scale: float | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Run vLLM paged attention on local (non-DTensor) tensors.
@@ -422,6 +423,7 @@ class VLLMAttentionWrapper(Module):
             q_THK: ``(num_tokens, num_heads, query/key_head_dim)``
             k_THK: ``(num_tokens, num_kv_heads, query/key_head_dim)``
             v_THV: ``(num_tokens, num_kv_heads, value_head_dim)``
+            scale: The outer attention's softmax scale; must equal ``Config.scale``.
 
         Returns:
             ``(num_tokens, num_heads, value_head_dim)``.
@@ -430,6 +432,12 @@ class VLLMAttentionWrapper(Module):
             raise ValueError(
                 "VLLMAttentionWrapper does not support attention_metadata; vLLM "
                 "manages causal masking and the KV-cache internally."
+            )
+        # vLLM fixes the softmax scale at construction (Config.scale).
+        if scale is not None and scale != self.scale:
+            raise ValueError(
+                f"Per-call attention scale {scale} != vLLM attention scale "
+                f"{self.scale}; expose it as the attention config's softmax_scale."
             )
 
         if self.value_head_dim != self.head_dim:

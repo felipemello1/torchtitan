@@ -4,7 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
+
+import pytest
+
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.models.gpt_oss import build_model_config as build_gpt_oss_model_config
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.model.vllm_wrapper import _replace_vllm_layer_configs
 
@@ -37,3 +42,17 @@ def test_vllm_replacement_preserves_attention_sharding() -> None:
         assert vllm_sharding.local_spmd is model_sharding.local_spmd
         for name, layout in model_sharding.state_shardings.items():
             assert vllm_sharding.state_shardings[name] is layout
+
+
+@pytest.mark.parametrize("flavor", ["debugmodel", "20b", "120b"])
+def test_vllm_replacement_passes_gpt_oss_yarn_scale(flavor: str) -> None:
+    """The vLLM attention gets gpt-oss's YaRN softmax scale, not head_dim**-0.5."""
+    model_config = build_gpt_oss_model_config(flavor, attn_backend="varlen")
+    vllm_config = _replace_vllm_layer_configs(model_config)
+    expected = 64**-0.5 * (0.1 * math.log(32) + 1) ** 2  # 0.2267
+    for model_layer, vllm_layer in zip(
+        model_config.layers, vllm_config.layers, strict=True
+    ):
+        scale = vllm_layer.attention.inner_attention.scale
+        assert scale == pytest.approx(expected)
+        assert scale == model_layer.attention.softmax_scale
