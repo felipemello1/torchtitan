@@ -379,7 +379,7 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_kimi() -> Controller.Confi
 
 def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Config:
     """`rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k` as a fresh 300-step run with score
-    centering, router replay, the adaptive rollout buffer, and validation beside training.
+    centering, the adaptive rollout buffer, and validation beside training.
 
     Same 12 GPUs, 64 x 16 batch, 131K budget and forced answer; no length reward.
     """
@@ -431,8 +431,9 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
     )
     config.trainer = dataclasses.replace(
         config.trainer,
-        # Each token takes the experts the generator routed it to.
-        replay_routed_experts=True,
+        # No router replay: math trainers with it died at step 3 twice, with the dispatcher's
+        # op registry corrupted; replay's routed experts are ~2/3 of each step's 14-24 GB batch.
+        replay_routed_experts=False,
         # Synchronous saves: an async save's ~420 GB CPU copy, on top of the 4 trainer ranks each
         # unpacking the 13-21 GB batch at 2-3x, can exceed the trainer host's 900 GB job memory.
         checkpointer=dataclasses.replace(
@@ -466,8 +467,7 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
     )
     config.generator = dataclasses.replace(
         config.generator,
-        # The routed experts the trainer replays.
-        return_routed_experts=True,
+        return_routed_experts=False,
         sampling=dataclasses.replace(
             config.generator.sampling,
             # ScoreCenteringLoss's top-k. 32 is the smallest k arXiv 2609.20807 tested, and it
