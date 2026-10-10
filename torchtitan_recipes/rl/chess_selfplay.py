@@ -45,7 +45,7 @@ from torchtitan.rl.examples.chess_selfplay import (
     RewardChessScore,
 )
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
-from torchtitan.rl.losses import DAPOLoss, ScoreCenteringLoss
+from torchtitan.rl.losses import DAPOLoss
 from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import TokenEnv
@@ -383,10 +383,6 @@ def rl_chess_qwen3_5_4b_gb300(
     trainer.activation_checkpoint = SelectiveAC.Config()
     trainer.override = OverrideConfig()
     trainer.dist_moe = None
-    # Score centering instead of DAPO's clipped objective: REINFORCE weighted by min(p/q, 2), with the
-    # generator's top-16 logprobs as each token's baseline (k=16 halves the k=32 transport to the trainer).
-    trainer.loss.loss_fn = ScoreCenteringLoss.Config(
-        max_ratio=2.0, global_vocab_size=decoder_vocab_size(config.model)
-    )
-    config.generator.sampling.num_topk_logprobs = 16
+    # DAPO's clipped objective (the base recipe's), not score centering: with score centering, entropy
+    # fell 0.38 -> 0.25 over steps 62-81 at lr 1e-6; v8 held 0.62 with DAPO at the same lr.
     return config
