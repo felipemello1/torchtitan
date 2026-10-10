@@ -438,14 +438,18 @@ def test_generation_server_returns_routed_experts_from_the_prompt_start() -> Non
     routed_expert_ids = torch.arange(4 * 2 * 2, dtype=torch.uint8).reshape(4, 2, 2)
 
     async def run_test() -> bytes:
-        async def generate_fn(prompt_token_ids, *, request_id, **kwargs):
+        async def generate_fn(
+            prompt_token_ids, *, request_id, sampling_config, **kwargs
+        ):
+            # Like the generator, return rows from the prompt start on.
+            start = sampling_config.routed_experts_prompt_start
             return Completion(
                 min_policy_version=0,
                 max_policy_version=0,
                 request_id=request_id,
                 token_ids=[31, 32],
                 token_logprobs=[-0.1, -0.2],
-                routed_expert_ids=routed_expert_ids,
+                routed_expert_ids=routed_expert_ids[start:],
                 finish_reason="stop",
             )
 

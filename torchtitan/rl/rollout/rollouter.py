@@ -410,7 +410,8 @@ class RolloutWorker(Configurable):
             generate_fn: Async callable that runs one generation; keeps the worker
                 decoupled from the generator actor.
             env: The env for this rollout; `run_group` closes it.
-            sampling: Sampling config for every generate call.
+            sampling: Sampling config for every generate call; each turn sets its own
+                `routed_experts_prompt_start`.
             group_id: The GRPO group id.
             rollout_id: Sibling index within the group; combined with the turn index into the
                 per-turn `RolloutTurnID`, and stored as `Rollout.rollout_id`.
@@ -429,6 +430,20 @@ class RolloutWorker(Configurable):
                     turn_id=len(turns),
                 )
 
+                # With router replay, a prompt that continues the previous turn needs expert ids
+                # only from the previous completion's last token on; earlier turns returned the rest.
+                routed_experts_prompt_start = 0
+                if turns:
+                    prev_prompt_and_completion = (
+                        turns[-1].prompt_token_ids + turns[-1].completion_token_ids
+                    )
+                    num_prev = len(prev_prompt_and_completion)
+                    if (
+                        env_step.next_prompt_token_ids[:num_prev]
+                        == prev_prompt_and_completion
+                    ):
+                        routed_experts_prompt_start = num_prev - 1
+
                 # generator call
                 completion = await generate_fn(
                     prompt_token_ids=env_step.next_prompt_token_ids,
@@ -436,7 +451,10 @@ class RolloutWorker(Configurable):
                     group_id=group_id,
                     # Per-sample sticky key: a sample's turns reuse one generator's prefix cache.
                     routing_session_id=turn_rollout_id.to_string(include_turn=False),
-                    sampling_config=sampling,
+                    sampling_config=replace(
+                        sampling,
+                        routed_experts_prompt_start=routed_experts_prompt_start,
+                    ),
                 )
 
                 # env call

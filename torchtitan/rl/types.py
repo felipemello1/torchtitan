@@ -61,10 +61,14 @@ class Completion:
     token_ids: list[int]
     token_logprobs: list[float]
     routed_expert_ids: torch.Tensor | None = None
-    """[num_prompt_tokens + len(token_ids) - 1, num_layers, top_k] expert ids each forward
-    input was routed to, in every decoder layer: uint8, or int16 above 256 experts. Rows of
-    dense layers are 0; the last token never ran forward, so it has no row. None unless the
-    generator returns routed experts."""
+    """[num_rows, num_layers, top_k] expert ids each forward input was routed to, in every decoder
+    layer: uint8, or int16 above 256 experts. Rows of dense layers are 0. None unless the generator
+    returns routed experts. Rows start at `SamplingConfig.routed_experts_prompt_start` and stop
+    before the last token, which never ran forward:
+
+        prompt [p0, p1, p2, p3], token_ids [c0, c1], routed_experts_prompt_start=2
+        # -> 3 rows: p2, p3, c0
+    """
     finish_reason: str | None = None
     """vLLM `CompletionOutput.finish_reason` ("stop" | "length" | "abort")"""
 

@@ -163,3 +163,47 @@ def test_worker_executes_group_without_actor_mesh() -> None:
         ]
 
     asyncio.run(run())
+
+
+class _MultiTurnTokenEnv:
+    """Turn 1 continues turn 0 after an env reply, turn 2 continues with no reply, turn 3
+    starts over. Every completion is [4]."""
+
+    def __init__(self) -> None:
+        self.prompts = iter([[1, 2], [1, 2, 4, 8], [1, 2, 4, 8, 4], [90, 91]])
+
+    async def init(self) -> TokenEnvOutput:
+        return TokenEnvOutput(
+            next_prompt_token_ids=next(self.prompts), status=RolloutStatus.ONGOING
+        )
+
+    async def step(self, completion: Completion) -> TokenEnvOutput:
+        prompt = next(self.prompts, None)
+        return TokenEnvOutput(
+            next_prompt_token_ids=prompt,
+            status=RolloutStatus.COMPLETED if prompt is None else RolloutStatus.ONGOING,
+        )
+
+
+def test_worker_requests_routed_experts_from_the_previous_turns_last_token() -> None:
+    generate_fn = _GenerateFn()
+    worker = RolloutWorker.__new__(RolloutWorker)
+
+    rollout = asyncio.run(
+        worker._run_single_rollout(
+            generate_fn=generate_fn,
+            env=_MultiTurnTokenEnv(),
+            sampling=SamplingConfig(),
+            group_id=7,
+            rollout_id=0,
+        )
+    )
+
+    assert rollout.status == RolloutStatus.COMPLETED
+    # Turn 1 continues [1, 2] + [4]: rows from position 2, the completion's last token.
+    # Turn 2 continues [1, 2, 4, 8] + [4]: rows from position 4, its prompt's last token.
+    # Turn 3 starts over, so it needs every row.
+    assert [
+        call[1]["sampling_config"].routed_experts_prompt_start
+        for call in generate_fn.calls
+    ] == [0, 2, 4, 0]
