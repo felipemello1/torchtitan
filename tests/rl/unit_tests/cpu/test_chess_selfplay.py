@@ -162,6 +162,17 @@ def test_max_plies_scores_by_material() -> None:
     asyncio.run(run())
 
 
+def test_material_weight_zero_scores_the_cap_as_a_plain_draw() -> None:
+    async def run() -> None:
+        game = ChessGame(sample=_SELF_PLAY, max_plies=4, seed=0, material_weight=0.0)
+        # White is a pawn up at the cap, but the reward ignores material
+        await _play_moves(game, ["e4", "d5", "exd5", "Nf6"])
+        assert game.end_reason == "max_plies"
+        assert game.rewards == {chess.WHITE: 0.5, chess.BLACK: 0.5}
+
+    asyncio.run(run())
+
+
 def test_rewards_make_a_forfeit_cost_more_than_a_loss_and_no_free_win() -> None:
     async def run() -> None:
         # White is checkmated on ply 4 of 40

@@ -75,6 +75,10 @@ class ChessSelfPlayWorker(RolloutWorker):
         """Plies (half-moves, both players) after which a game ends as a draw, adjusted by material.
         Rewards scale with the share of it played (see `ChessGame.rewards`), so any value works."""
 
+        material_weight: float = 0.5
+        """Share of the material score in the reward of a game cut at `max_plies`: 0.5 keeps it within
+        [0.25, 0.75]; 0 scores every such game as a plain 0.5 draw, so stalling earns nothing."""
+
         max_plies_schedule: tuple[tuple[int, int], ...] = ()
         """(train step, max plies) points: a new game's cap moves linearly between them and holds past
         the ends, e.g. ((50, 50), (150, 150)) grows it by one ply per step. Empty: always `max_plies`."""
@@ -97,6 +101,7 @@ class ChessSelfPlayWorker(RolloutWorker):
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
+        self._material_weight = config.material_weight
         self._max_plies = config.max_plies
         self._max_plies_schedule = config.max_plies_schedule
         self._stockfish_path = executable_stockfish(config.stockfish_path)
@@ -150,6 +155,7 @@ class ChessSelfPlayWorker(RolloutWorker):
                 max_plies=max_plies,
                 seed=sample.seed + game_idx,
                 bot=bot,
+                material_weight=self._material_weight,
             )
             for game_idx, bot in enumerate(bots)
         ]

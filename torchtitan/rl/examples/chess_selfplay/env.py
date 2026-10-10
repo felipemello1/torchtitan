@@ -141,6 +141,7 @@ class ChessGame:
         max_plies: int,
         seed: int,
         bot: StockfishBot | None = None,
+        material_weight: float = _MATERIAL_WEIGHT,
     ) -> None:
         self.board = chess.Board(sample.fen)
         self.scores: dict[chess.Color, float] | None = None
@@ -150,6 +151,7 @@ class ChessGame:
         self.forfeiter: chess.Color | None = None
         """The color that lost by forfeit (an illegal move or `forfeit`); `None` otherwise."""
         self._max_plies = max_plies
+        self._material_weight = material_weight
         self._bot = bot
         self._bot_color = None if bot is None else not sample.policy_color
         # Shuffles each piece's legal moves.
@@ -197,7 +199,7 @@ class ChessGame:
     def material_rewards(self) -> dict[chess.Color, float]:
         """Each color's reward if the game ended at `max_plies` now: a draw, 0.5, moved halfway toward
         the material score."""
-        white_reward = 0.5 + _MATERIAL_WEIGHT * (material_score(self.board) - 0.5)
+        white_reward = 0.5 + self._material_weight * (material_score(self.board) - 0.5)
         return {chess.WHITE: white_reward, chess.BLACK: 1.0 - white_reward}
 
     @property
