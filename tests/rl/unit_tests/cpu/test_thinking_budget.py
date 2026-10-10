@@ -11,6 +11,7 @@ import math
 from dataclasses import replace
 
 import pytest
+import torch
 
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.generator import SamplingConfig
@@ -114,6 +115,31 @@ def test_reply_cut_while_thinking_gets_a_forced_close() -> None:
     assert completion.finish_reason == "stop"
     assert completion.request_id == "group=0/rollout=0/turn=0"
     assert _forced_close_rate(completion) == 1.0
+
+
+def test_forced_close_keeps_topk_rows_and_routed_experts() -> None:
+    # prompt [5, THINK]; first call [10, 11, 12, 13]; forced [90, 91, 92]; second call [20, 21]
+    thinking = _completion([10, 11, 12, 13], finish_reason="length")
+    thinking.topk_token_ids = torch.tensor([[10], [11], [12], [13]], dtype=torch.int32)
+    thinking.topk_logprobs = torch.full((4, 1), -0.5)
+    # One row per forward input: the prompt and every completion token but the last.
+    thinking.routed_expert_ids = torch.full((2 + 4 - 1, 1, 1), 1, dtype=torch.uint8)
+    answer = _completion([20, 21], finish_reason="stop")
+    answer.topk_token_ids = torch.tensor([[20], [21]], dtype=torch.int32)
+    answer.topk_logprobs = torch.full((2, 1), -0.25)
+    answer.routed_expert_ids = torch.full(
+        (2 + 4 + 3 + 2 - 1, 1, 1), 2, dtype=torch.uint8
+    )
+    completion = _run(_budget(), _ScriptedGenerate(thinking, answer), prompt=[5, THINK])
+
+    # Zero rows on the forced tokens, which the loss skips.
+    topk_token_ids = completion.topk_token_ids.flatten().tolist()
+    assert topk_token_ids == [10, 11, 12, 13, 0, 0, 0, 20, 21]
+    topk_logprobs = completion.topk_logprobs.flatten().tolist()
+    assert topk_logprobs == [-0.5] * 4 + [0.0] * 3 + [-0.25] * 2
+    # 2 prompt + 9 completion tokens - 1: the first call's 5 rows, then the second call's from
+    # token 13 (which only the second call ran forward) on.
+    assert completion.routed_expert_ids.flatten().tolist() == [1] * 5 + [2] * 5
 
 
 def test_reply_cut_while_answering_continues_without_forcing() -> None:
