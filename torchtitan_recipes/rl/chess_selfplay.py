@@ -326,14 +326,14 @@ def rl_chess_qwen3_5_35b_a3b(
 
 
 def rl_chess_qwen3_5_4b_gb300(
-    max_plies: int = 50,
+    max_plies: int = 60,
     max_thinking_tokens: int = 1024,
     max_context_tokens: int = 131072,
 ) -> Controller.Config:
     """The 35B GB300 recipe with Qwen3.5-4B (instruct): same thinking budget, context, and eight
-    one-GPU generators on hosts 1-2; host 0 trains the dense 4B with FSDP 4. A step trains 96
-    positions x 8 games against the curriculum bot (no self-play), and the ply cap grows from 50 to 150
-    over steps 0-150. 64 fixed games against the bot ladder validate every 10 steps, beside training.
+    one-GPU generators on hosts 1-2; host 0 trains the dense 4B with FSDP 4. A step trains 48
+    positions x 8 self-play games (16 rollouts per position, one per color), every game capped at 60
+    plies. 56 fixed games against a 7-bot ladder validate every 5 steps, beside training.
 
     The 4B's fp32 weights, grads and Adam state take ~16 GB per trainer GPU (the 35B's ~140 GB), so
     the trainer spends the memory on selective activation checkpointing instead of full recompute.
@@ -350,15 +350,10 @@ def rl_chess_qwen3_5_4b_gb300(
     for _fqn, kernel, _parent, _attr in config.model.traverse(GatedDeltaKernel.Config):
         kernel.chunk_backend = os.environ.get("CHESS_GDN_BACKEND", "auto")
     config.hf_assets_path = "torchtitan/rl/example_checkpoint/Qwen3.5-4B"
-    config.async_loop.num_prompts_per_train_step = 96
-    # The ply cap grows from 50 at step 0 to 150 at step 150.
-    config.rollouter.worker.max_plies_schedule = ((0, 50), (150, 150))
-    # Bot games only: late self-play games were both sides walking their kings to the ply cap.
-    config.rollouter.train_dataset.bot_fraction = 1.0
-    # Promote on 512 games over 65%: with 128 over 60%, each of the 4 workers tested a block every
-    # ~0.7 steps, and noise moved them all up at a true win rate of ~53%.
-    config.rollouter.worker.curriculum_win_rate = 0.65
-    config.rollouter.worker.curriculum_games = 512
+    # 48 self-play positions x 8 games x 2 colors = 768 rollouts per step, as 96 bot positions x 8.
+    config.async_loop.num_prompts_per_train_step = 48
+    # Self-play only: no bot curriculum to tune; the ladder validation below measures strength.
+    config.rollouter.train_dataset.bot_fraction = 0.0
     # Generation paces itself: the mean policy age stays under 6 steps, every trained group under 12.
     # At most 6 batches generate at once, as v8's fixed buffer: that bounds the rollout workers,
     # vLLM's max_num_seqs, and the Stockfish processes on host 0 (one per bot game in flight).
@@ -368,14 +363,26 @@ def rl_chess_qwen3_5_4b_gb300(
         target_offpolicy_steps=6,
         generation_capacity=6 * config.async_loop.num_prompts_per_train_step,
     )
-    # The fixed games against the ladder (see the base recipe) every 10 steps, without pausing training.
+    # 8 fixed games (4 per color) against each of 7 bots, every 5 steps, without pausing training.
+    ladder = (
+        "sf_random",
+        "sf_eps90",
+        "sf_eps75",
+        "sf_eps50",
+        "sf_eps25",
+        "sf_elo1320",
+        "sf_elo1500",
+    )
+    config.rollouter.validation_dataset = ChessVsBotDataset.Config(
+        num_games=8 * len(ladder), opponents=ladder
+    )
     config.async_loop.validation = ValidationConfig(
-        num_samples=64,
-        interval_steps=10,
+        num_samples=8 * len(ladder),
+        interval_steps=5,
         loop_mode=ValidationLoopMode.OVERLAP_TRAINING,
     )
-    # One generator at a time filled its KV and thrashed session holds at 1.8 (v8, 20:49-20:58).
-    config.generator_router.admission.limit = 1.6
+    # 1.6 let lengthening games fill the KV cache and evict held sessions (2026-10-10, steps 54-120).
+    config.generator_router.admission.limit = 1.4
     config.dump_folder = "outputs/rl/qwen3_5_4b_chess_gb300"
     trainer = config.trainer
     # 1e-6, not 1e-5: at 1e-5 the policy drifted -3.4 nats/token from its samples by step 7; at 3e-6
