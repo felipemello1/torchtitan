@@ -210,7 +210,11 @@ def test_trainer_loop_acknowledges_solved_groups_before_saving_the_state() -> No
     controller.start_step = 0
     controller._trainer_policy_version = 0
     controller.config = SimpleNamespace(
-        async_loop=SimpleNamespace(target_offpolicy_steps=1, max_offpolicy_steps=None)
+        async_loop=SimpleNamespace(
+            target_offpolicy_steps=1,
+            max_offpolicy_steps=None,
+            validation=ValidationConfig(),
+        )
     )
     controller._rollouter = rollouter
     controller.trainer = SimpleNamespace(
