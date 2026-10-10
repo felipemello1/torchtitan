@@ -226,6 +226,31 @@ class TestOptimizerConfig(unittest.TestCase):
             torch.tensor([0, 0]),
         )
 
+    def test_moe_hook_keeps_step_counts_with_or_without_load_balancing(self):
+        for load_balance_coeffs in ((0.1, 0.2), (None, None)):
+            with self.subTest(load_balance_coeffs=load_balance_coeffs):
+                model = FakeMoEModel(load_balance_coeffs=load_balance_coeffs)
+                container = OptimizersContainer.Config(
+                    optimizers=[
+                        AdamW.Config(
+                            pattern=r".*", fused=False, lr=0.0, weight_decay=0.0
+                        ),
+                    ],
+                ).build(model_parts=[model])
+                register_moe_load_balancing_hook(
+                    container, [model], FakeParallelismContext()
+                )
+
+                container.step()
+
+                router = model.layers["0"].moe.router
+                torch.testing.assert_close(
+                    router.step_tokens_per_expert_E, torch.tensor([10.0, 0.0])
+                )
+                torch.testing.assert_close(
+                    router.tokens_per_expert_E, torch.tensor([0, 0])
+                )
+
     def test_moe_load_balancing_rejects_inconsistent_coeffs(self):
         model = FakeMoEModel(load_balance_coeffs=(None, 0.2))
         config = OptimizersContainer.Config(
