@@ -677,6 +677,9 @@ def test_forced_turns_reach_verifiers_client_and_keep_their_loss_mask() -> None:
             token_ids=completion_ids,
             token_logprobs=[-0.1, math.nan, math.nan, -0.4],
             loss_mask=loss_mask,
+            # A forced close's top-k rows: zero on the appended tokens.
+            topk_token_ids=torch.tensor([[31], [0], [0], [34]], dtype=torch.int32),
+            topk_logprobs=torch.tensor([[-0.1], [0.0], [0.0], [-0.4]]),
             finish_reason="stop",
         )
 
@@ -720,6 +723,7 @@ def test_forced_turns_reach_verifiers_client_and_keep_their_loss_mask() -> None:
     for turn in turns:
         assert turn.completion_token_ids == completion_ids
         assert turn.completion_loss_mask == loss_mask
+        assert turn.completion_topk_token_ids.flatten().tolist() == [31, 0, 0, 34]
         assert [math.isnan(logprob) for logprob in turn.completion_logprobs] == [
             False,
             True,

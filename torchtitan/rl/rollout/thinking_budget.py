@@ -10,6 +10,8 @@ import math
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
+import torch
+
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
 from torchtitan.rl.observability import metrics as m
@@ -152,6 +154,19 @@ class ThinkingBudget(Configurable):
                     + [False] * len(forced_ids)
                     + [True] * len(second.token_ids)
                 ),
+                routed_expert_ids=_merge_routed_expert_ids(
+                    first.routed_expert_ids, second.routed_expert_ids
+                ),
+                topk_token_ids=_merge_topk_rows(
+                    first.topk_token_ids,
+                    second.topk_token_ids,
+                    num_forced=len(forced_ids),
+                ),
+                topk_logprobs=_merge_topk_rows(
+                    first.topk_logprobs,
+                    second.topk_logprobs,
+                    num_forced=len(forced_ids),
+                ),
                 finish_reason=second.finish_reason,
                 metrics=[
                     *first.metrics,
@@ -180,3 +195,37 @@ class ThinkingBudget(Configurable):
             if token_id == self._think_start_id:
                 return True
         return False
+
+
+def _merge_routed_expert_ids(
+    first_rows: torch.Tensor | None, second_rows: torch.Tensor | None
+) -> torch.Tensor | None:
+    """The first call's rows, then the second call's for the positions the first never ran forward.
+
+    Where both calls have a row, keep the first: its tokens were sampled with that routing,
+    and the second call may have recomputed it (e.g. after a KV cache reset).
+
+    Example:
+
+        prompt [P0, P1], first [A0, A1], forced [F0], second [B0]
+        first rows:  P0 P1 A0          (A1 never ran forward in the first call)
+        second rows: P0 P1 A0 A1 F0
+        merged:      P0 P1 A0 (first) + A1 F0 (second)
+    """
+    if first_rows is None or second_rows is None:
+        return None
+    return torch.cat([first_rows, second_rows[len(first_rows) :]])
+
+
+def _merge_topk_rows(
+    first_rows: torch.Tensor | None,
+    second_rows: torch.Tensor | None,
+    *,
+    num_forced: int,
+) -> torch.Tensor | None:
+    """The first call's top-k rows, a zero row per forced token (the loss skips them), then
+    the second call's."""
+    if first_rows is None or second_rows is None:
+        return None
+    zero_rows = first_rows.new_zeros(num_forced, *first_rows.shape[1:])
+    return torch.cat([first_rows, zero_rows, second_rows])
