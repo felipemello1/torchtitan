@@ -387,13 +387,6 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
     config.dump_folder = "outputs/rl/qwen3_5_35b_a3b_base_intellect3_math_131k_tonight"
     # fp32 logits on the trainer and the generator, and every expert bias kept at its loaded value.
     config.model_defaults = RLModelDefaults(fp32_lm_head=True, freeze_expert_bias=True)
-    # These two regions see only loss tokens, a new size every microbatch; on the image's torch
-    # a recompile raised InternalTorchDynamoError (prims has no as_strided) at step 3.
-    config.model.local_compile_regions = [
-        region
-        for region in config.model.local_compile_regions
-        if region not in ("loss", "fp32_to_bf16_split")
-    ]
     config.async_loop = dataclasses.replace(
         config.async_loop,
         num_training_steps=300,
