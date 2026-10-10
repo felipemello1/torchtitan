@@ -13,7 +13,7 @@ import base64
 import functools
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from aiohttp import web
@@ -39,8 +39,8 @@ class VerifiersGenerationMetadata:
     """TorchTitan generation data aggregated over one Verifiers rollout.
 
     Verifiers sends the trace ID as the generation session ID, but does not
-    retain TorchTitan policy versions or generator metrics in the returned
-    trace. The generation server therefore records their rollout-wide span.
+    retain TorchTitan policy versions, generator metrics, or top-k logprobs in
+    the returned trace. The generation server therefore records them per rollout.
     """
 
     min_policy_version: int
@@ -51,6 +51,18 @@ class VerifiersGenerationMetadata:
 
     metrics: list[m.Metric]
     """Metrics from every generation in the rollout."""
+
+    topk_by_generation: dict[
+        tuple[int, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]
+    ] = field(default_factory=dict)
+    """The generator's top-k ids and logprobs `[num_completion_tokens, k]` per generation,
+    keyed by `(len(prompt_token_ids), completion_token_ids)`; empty unless
+    `SamplingConfig.num_topk_logprobs` > 0.
+
+    Example:
+
+        {(2, (12, 13)): (tensor([[12, 5], [13, 6]]), tensor([[-0.1, -2.4], [-0.2, -1.9]]))}
+    """
 
 
 class GenerationServer(Configurable):
@@ -245,6 +257,13 @@ class GenerationServer(Configurable):
             )
 
         previous = self.generation_metadata.get(session_id)
+        topk_by_generation = {} if previous is None else previous.topk_by_generation
+        if completion.topk_token_ids is not None:
+            key = (len(prompt_token_ids), tuple(completion.token_ids))
+            topk_by_generation = {
+                **topk_by_generation,
+                key: (completion.topk_token_ids, completion.topk_logprobs),
+            }
         self.generation_metadata[session_id] = VerifiersGenerationMetadata(
             min_policy_version=(
                 completion.min_policy_version
@@ -261,6 +280,7 @@ class GenerationServer(Configurable):
                 if previous is None
                 else [*previous.metrics, *completion.metrics]
             ),
+            topk_by_generation=topk_by_generation,
         )
         return web.json_response(
             {
@@ -345,6 +365,7 @@ def _parse_sampling_config(value: object):
         "max_tokens",
         "seed",
         "stop_token_ids",
+        "num_topk_logprobs",
     }
     protocol_fields = {
         "logprobs",
@@ -366,4 +387,7 @@ def _parse_sampling_config(value: object):
         max_tokens=int(value.get("max_tokens", defaults.max_tokens)),
         seed=value.get("seed"),
         stop_token_ids=stop_token_ids,
+        num_topk_logprobs=int(
+            value.get("num_topk_logprobs", defaults.num_topk_logprobs)
+        ),
     )
