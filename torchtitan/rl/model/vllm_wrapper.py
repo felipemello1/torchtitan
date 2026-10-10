@@ -13,6 +13,8 @@ TorchTitan models for vLLM.
 
 import copy
 import dataclasses
+from collections import defaultdict
+from collections.abc import Iterable
 from typing import cast
 
 import spmd_types as spmd
@@ -377,7 +379,44 @@ class VLLMModelWrapper(Module):
         # based on the model's actual representation used during forward
         self.prepare_for_forward()
 
-    def prepare_for_state_dict_load(self) -> None:
+    def load_model_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
+        """
+        Copy new weights into the model, one FSDP module at a time.
+
+        Why hooks, not one `load_state_dict` per FSDP module: that call also loads the
+        nested FSDP modules, whose sharded buffers are still freed.
+
+        Args:
+            state_dict: Same keys and shards as `self.model.state_dict()`, e.g. the
+                generator's pinned CPU copy.
+        """
+        # Modules sharded together share one FSDP state, e.g. [norm, lm_head]: re-allocate
+        # before the first one loads and unshard after the last one. With tied embeddings
+        # the group is [tok_embeddings, norm, lm_head], so its sharded buffers stay
+        # allocated for the whole load.
+        modules_by_fsdp_state = defaultdict(list)
+        for module in self.model.modules():
+            if isinstance(module, FSDPModule):
+                modules_by_fsdp_state[module._get_fsdp_state()].append(module)
+        handles = []
+        for modules in modules_by_fsdp_state.values():
+            handles.append(
+                modules[0].register_load_state_dict_pre_hook(
+                    lambda module, *args: self.prepare_for_state_dict_load([module])
+                )
+            )
+            handles.append(
+                modules[-1].register_load_state_dict_post_hook(
+                    lambda module, *args: self.prepare_for_forward([module])
+                )
+            )
+        self.model.load_state_dict(state_dict, strict=True)
+        for handle in handles:
+            handle.remove()
+
+    def prepare_for_state_dict_load(
+        self, modules: Iterable[torch.nn.Module] | None = None
+    ) -> None:
         """
         Re-allocate previously freed sharded buffers for receiving weights.
 
@@ -391,28 +430,30 @@ class VLLMModelWrapper(Module):
         memory. Sharded buffers are only re-allocated temporarily to receive
         updated weights during weight sync, and are promptly freed afterwards.
 
-        Note: This currently incurs a memory spike every weight sync (step 2),
-        since FSDP maintains separate buffers for sharded and unsharded weights,
-        and both must be resident during the weight sync. E.g. for bf16 generator
-        and fsdp=1, weight sync currently maintains 2x model memory. This may be
-        fine since this is not peak memory, but we should revisit in the future.
+        `load_model_state_dict` runs this per FSDP module, so a sync adds about one
+        module's weights instead of the whole model's: 1.6 GiB vs 64.6 GiB for bf16
+        Qwen3.5-35B-A3B at TP1 on an H100.
+
+        Args:
+            modules: Modules to prepare. Defaults to `self.model.modules()`.
         """
         from torch.distributed.fsdp._fully_shard._fsdp_param import alloc_storage
 
-        for module in self.model.modules():
+        for module in self.model.modules() if modules is None else modules:
             if not isinstance(module, FSDPModule):
                 continue
             # TODO: replace this with FSDPModule._restore_sharded_params()
             for param_group in module._get_fsdp_state()._fsdp_param_groups:
-                if param_group.is_sharded:
-                    continue
+                # Don't skip is_sharded groups: FSDP's load pre-hook reshards e.g. tok_embeddings before ours.
                 for param in param_group.fsdp_params:
                     sharded_data = param._sharded_param_data
                     if isinstance(sharded_data, _ShardedFSDPTensor):
                         sharded_data = sharded_data._tensor
                     alloc_storage(sharded_data)
 
-    def prepare_for_forward(self) -> None:
+    def prepare_for_forward(
+        self, modules: Iterable[torch.nn.Module] | None = None
+    ) -> None:
         """
         After weight sync, prepare the model for prefill/decode by:
           1. Explicitly unsharding model to refill existing unsharded operands
@@ -424,11 +465,14 @@ class VLLMModelWrapper(Module):
 
         This should be called during initialization and after each weight sync.
         For the full weight sync lifecycle, see `prepare_for_state_dict_load`.
+
+        Args:
+            modules: Modules to prepare. Defaults to `self.model.modules()`.
         """
         from torch.distributed.fsdp._fully_shard._fsdp_param import free_storage
 
         with torch.inference_mode():
-            for module in self.model.modules():
+            for module in self.model.modules() if modules is None else modules:
                 if not isinstance(module, FSDPModule):
                     continue
                 module.unshard()
