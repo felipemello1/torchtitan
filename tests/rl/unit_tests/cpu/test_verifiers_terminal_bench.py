@@ -21,6 +21,7 @@ import verifiers.v1 as vf
 
 from torchtitan.config import ConfigLoader
 from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
 from torchtitan.rl.controller import Controller, ValidationConfig
 from torchtitan.rl.examples.verifiers.data import (
     VerifiersTaskDataset,
@@ -35,6 +36,7 @@ from torchtitan.rl.examples.verifiers.terminal_bench.harness import (
     TerminalBenchTerminusHarnessConfig,
 )
 from torchtitan.rl.generator import SamplingConfig
+from torchtitan.rl.losses import ScoreCenteringLoss
 from torchtitan.rl.rollout import RolloutStatus
 from torchtitan_recipes.rl.verifiers_terminal_bench import (
     _terminal_bench_rollouter_config,
@@ -614,3 +616,52 @@ def test_35b_sandoq_1x2_recipe_fits_three_hosts(monkeypatch) -> None:
     serve = config.rollouter.verifiers_env_server.serve
     assert serve.pool.num_workers == 39
     assert serve.pool.num_workers * serve.max_concurrent >= 920
+
+
+def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) -> None:
+    """With the 1x2 recipe's launch knobs set to other values, the recipe keeps its own: score
+    centering, the adaptive buffer, and a pool that fits every generating rollout plus a
+    validation pass."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq
+
+    monkeypatch.syspath_prepend(str(Path(terminal_bench_sandoq.__file__).parent))
+    monkeypatch.setenv("VF_SANDBOX_PROVIDER", "oci-runner")
+    monkeypatch.setenv("OCI_RUNNER_TASK_NETWORK", "host")
+    monkeypatch.setenv("DOME_SANDOQ_POOL", "920")
+    monkeypatch.setenv("DOME_V2_PROMPTS", "12")
+    monkeypatch.setenv("DOME_V2_THINKING_BUDGET", "0")
+    monkeypatch.setenv("DOME_V2_LENGTH_REWARD_WEIGHT", "0.1")
+    config = _terminal_bench_config(
+        "rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight"
+    )
+
+    loop = config.async_loop
+    assert (loop.num_prompts_per_train_step, loop.num_samples_per_prompt) == (24, 16)
+    assert loop.num_training_steps == 300
+    assert loop.group_buffer == AdaptiveRolloutGroupWorkBuffer.Config(
+        target_offpolicy_steps=6,
+        max_offpolicy_steps=12,
+        start_batches=7,
+        generation_capacity=163,
+    )
+    assert loop.validation == ValidationConfig(steps=78, freq=10, overlap_training=True)
+    assert loop.training_sample_builder.drop_zero_std_reward_groups
+    assert config.rollouter.rubric.length_reward_weight == 0.0
+    assert config.rollouter.thinking_budget.max_thinking_tokens == 4096
+    # The pool, (6 + 1) x 24 x 16, holds every generating rollout plus a validation pass.
+    serve = config.rollouter.verifiers_env_server.serve
+    assert serve.pool.num_workers * serve.max_concurrent == 2688
+    assert loop.max_concurrent_rollout_groups * 16 + loop.validation.steps <= 2688
+
+    trainer = config.trainer
+    (optimizer,) = trainer.optim.optimizer.optimizers
+    assert optimizer.lr == 1e-5
+    assert trainer.optim.lr_scheduler.warmup_steps == 10
+    assert trainer.checkpointer.interval == 10
+    assert trainer.checkpointer.async_mode == "disabled"
+    assert isinstance(trainer.loss.loss_fn, ScoreCenteringLoss.Config)
+    assert trainer.loss.loss_fn.max_ratio == 2.0
+    assert config.generator.sampling.num_topk_logprobs == 32
+    assert not trainer.replay_routed_experts
+    assert config.generator.extra_vllm_engine_args == {"watermark": 0.03}

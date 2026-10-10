@@ -37,7 +37,13 @@ from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.components.data import IterableRLDataLoader
-from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
+from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
+from torchtitan.rl.controller import (
+    AsyncLoopConfig,
+    Controller,
+    RLModelDefaults,
+    ValidationConfig,
+)
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.distributed.routing.strategies import (
@@ -60,7 +66,7 @@ from torchtitan.rl.examples.verifiers.terminal_bench.taskset import (
     TerminalTasksetConfig,
 )
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
-from torchtitan.rl.losses import DAPOLoss, GRPOLoss
+from torchtitan.rl.losses import DAPOLoss, GRPOLoss, ScoreCenteringLoss
 from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.observability.rollout_recorder import (
     KeepExtremeRewardsFilter,
@@ -592,6 +598,130 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2() -> Controller.Config:
     )
     config.async_loop.validation.freq = 10
     config.async_loop.validation.overlap_training = True
+    return config
+
+
+def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Config:
+    """`rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2`'s layout for a fresh run, with its
+    launch knobs (`DOME_SANDOQ_POOL`, `DOME_V2_*`) fixed in code.
+
+    Changes from the 1x2 recipe:
+    - 24 prompts x 16 samples per step (was 12) for 300 steps (was 150);
+    - lr 1e-5 with a 10-step warmup (was 1e-6, constant);
+    - `ScoreCenteringLoss` with the generator's top-32 logprobs (was DAPO);
+    - the adaptive rollout buffer, mean policy age <= 6 and max 12 (was a fixed 5-step buffer);
+    - no length reward, so all-pass and all-fail groups are dropped (was weight 0.1);
+    - a 4,096-token thinking budget per turn (was 12,288);
+    - 2,688 Sandoq VMs, every generating rollout plus a validation pass;
+    - a synchronous save every 10 steps (was async).
+
+    DOME's `--train-iters` and `--save-interval` still override the steps and the save interval.
+    """
+    num_prompts_per_train_step = 24
+    num_samples_per_prompt = 16
+    target_offpolicy_steps = 6
+    # (6 + 1) x 24 x 16 = 2,688: the buffer at a mean policy age of 6, with no group dropped.
+    sandbox_pool = (
+        (target_offpolicy_steps + 1)
+        * num_prompts_per_train_step
+        * num_samples_per_prompt
+    )
+    # The 78 Terminal-Bench 2.1 tasks that fit a small Sandoq VM, one greedy rollout each.
+    num_validation_samples = 78
+    expert_parallel_degree = 4
+    config = _qwen3_5_base_terminal_bench_config(
+        flavor="35B-A3B",
+        num_prompts_per_train_step=num_prompts_per_train_step,
+        num_samples_per_prompt=num_samples_per_prompt,
+        microbatch_rows=1,
+        max_turns=150,
+        sandbox_pool=sandbox_pool,
+        # At most 24 rollouts per env-server worker: each waiting rollout holds one of the worker's
+        # 32 executor threads, and Sandoq needs a free thread to ready a VM. 112 workers.
+        num_env_workers=math.ceil(sandbox_pool / 24),
+        num_validation_samples=num_validation_samples,
+        num_generators=8,
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=2,
+            tensor_parallel_degree=2,
+            expert_parallel_degree=expert_parallel_degree,
+        ),
+        dump_folder="outputs/rl/qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight",
+        # Under the adaptive buffer this only sets train_batch/pct_samples_over_target_age.
+        target_offpolicy_steps=target_offpolicy_steps,
+    )
+    # One fp32 logits op in trainer and generator; a frozen expert bias keeps their expert choices
+    # from drifting apart.
+    config.model_defaults = RLModelDefaults(fp32_lm_head=True, freeze_expert_bias=True)
+
+    loop = config.async_loop
+    loop.num_training_steps = 300
+    loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
+        target_offpolicy_steps=target_offpolicy_steps,
+        max_offpolicy_steps=12,
+        # Start at (6 + 1) x 24 = 168 groups, the pool; the default 3 x 24 leaves 57% of it idle.
+        start_batches=target_offpolicy_steps + 1,
+        # 163 x 16 = 2,608 training rollouts + one 78-task validation pass fit the 2,688 VMs and
+        # env-server slots; a larger capacity only queues rollouts for a VM.
+        generation_capacity=(sandbox_pool - num_validation_samples)
+        // num_samples_per_prompt,
+    )
+    # Validate at step 0 and every 10 steps beside training; starting a pass makes the trainer
+    # wait only for that step's weight pull.
+    loop.validation.freq = 10
+    loop.validation.overlap_training = True
+    # All-pass and all-fail groups (~45% of them in the last 1x2 run) carry no signal: drop each
+    # and admit a new prompt in its slot.
+    loop.training_sample_builder.drop_zero_std_reward_groups = True
+    # No length reward: it breaks reward ties, so all-pass and all-fail groups would train on
+    # length alone instead of being dropped.
+    config.rollouter.rubric.length_reward_weight = 0.0
+    # The last 1x2 run's budget: a turn still thinking after 4,096 tokens gets a forced end of
+    # thinking, which leaves the rest of its 16,384 tokens for the command.
+    config.rollouter.thinking_budget = ThinkingBudget.Config(max_thinking_tokens=4096)
+
+    trainer = config.trainer
+    # Recompute every op in the block except the Dist-MoE call, which is never recomputed.
+    trainer.activation_checkpoint = RegionAC.Config(save_regions=[])
+    # Dist-MoE experts on the trainer's model copy only; generators keep stock experts.
+    trainer.override = OverrideConfig(
+        imports=["torchtitan_recipes.overrides.dist_moe.dist_moe_routed_experts"]
+    )
+    # Worst case, every EP rank routes all its tokens to one rank; a smaller scratch
+    # buffer is an illegal memory access.
+    trainer.dist_moe = DistMoeRuntime.Config(
+        scratch_capacity_factor=float(expert_parallel_degree)
+    )
+    (optimizer,) = trainer.optim.optimizer.optimizers
+    # 10x the 1x2 recipe's lr: at 1e-6 and one optimizer step per batch the policy moved too
+    # slowly. A fresh run ramps to it linearly over 10 steps, then holds it.
+    optimizer.lr = 1e-5
+    trainer.optim.lr_scheduler.warmup_steps = 10
+    trainer.checkpointer.interval = 10
+    # Synchronous saves: an async save stages a ~420 GB CPU copy of the trainer state on host 0,
+    # which also runs the controller and 112 env-server workers. The trainer mostly waits for
+    # batches, so a blocking save costs little.
+    trainer.checkpointer.async_mode = "disabled"
+    # Score centering (arXiv 2609.20807) cancels the drift a trainer/generator mismatch adds.
+    # max_ratio 2 is the paper's TIS+SC cap on p / q, among its best under large staleness.
+    trainer.loss = ChunkedLossWrapper.Config(
+        num_chunks=32,
+        loss_fn=ScoreCenteringLoss.Config(
+            max_ratio=2.0, global_vocab_size=decoder_vocab_size(config.model)
+        ),
+    )
+    # No router replay: the Verifiers rollouter returns no routed experts, so a trainer with
+    # replay raises at its first step, and the generator need not return them.
+    trainer.replay_routed_experts = False
+    config.generator.return_routed_experts = False
+
+    generator = config.generator
+    # k = 32 matched full-vocabulary score centering in every setting of the paper, whose default
+    # is 128.
+    generator.sampling.num_topk_logprobs = 32
+    # Admit a request only while 3% of KV blocks stay free, so running requests have room to
+    # grow before vLLM preempts one.
+    generator.extra_vllm_engine_args = {"watermark": 0.03}
     return config
 
 
