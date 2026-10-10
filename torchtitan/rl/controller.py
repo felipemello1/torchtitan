@@ -647,6 +647,26 @@ class Controller(Configurable):
                 ),
             )
 
+        # Torch ranks follow this mesh's order and the trainer lays them out as
+        # (dp, cp, tp) with no PP, so a DP replica is cp * tp consecutive ranks.
+        trainer_by_dp_rank = self.trainer.flatten("rank").split(
+            rank=("dp", "cp_tp"), dp=self.trainer_dp_degree
+        )
+        self._trainer_dp_replicas = [
+            trainer_by_dp_rank.slice(dp=dp_rank)
+            for dp_rank in range(self.trainer_dp_degree)
+        ]
+        # Check that layout once: if it drifts, ranks would train on the wrong column.
+        for dp_rank, trainer_dp_replica in enumerate(self._trainer_dp_replicas):
+            reported = await trainer_dp_replica.get_dp_rank.call()
+            reported_dp_ranks = [value for _, value in reported.items()]
+            if set(reported_dp_ranks) != {dp_rank}:
+                raise RuntimeError(
+                    f"Trainer ranks in DP replica {dp_rank} report DP ranks "
+                    f"{reported_dp_ranks}; the controller assumes the trainer orders "
+                    "ranks as (dp, cp, tp)."
+                )
+
         # Resume: __init__ ran CheckpointManager.load(); read back the restored
         # policy version and controller-owned data state.
         rank_0_trainer = self.trainer.flatten("rank").slice(rank=0)
@@ -1119,13 +1139,20 @@ class Controller(Configurable):
                     sl.log_trace_span("forward_backward"),
                     step_timer.record("timing/step/forward_backward"),
                 ):
-                    fwd_bwd_metrics = self._get_rank_0_value(
-                        await self.trainer.forward_backward.call(
-                            packed.microbatches,
-                            packed.global_loss_token_counts,
-                            packed.global_routing_token_counts,
+                    # Each DP replica receives only its column of the grid.
+                    fwd_bwd_results = await asyncio.gather(
+                        *(
+                            trainer_dp_replica.forward_backward.call(
+                                [row[dp_rank] for row in packed.microbatches],
+                                packed.global_loss_token_counts,
+                                packed.global_routing_token_counts,
+                            )
+                            for dp_rank, trainer_dp_replica in enumerate(
+                                self._trainer_dp_replicas
+                            )
                         )
                     )
+                    fwd_bwd_metrics = self._get_rank_0_value(fwd_bwd_results[0])
 
                     if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
                         logger.error("Loss is NaN/Inf; training diverged")
