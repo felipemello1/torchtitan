@@ -347,7 +347,6 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
         )
         trainer.engine = engine
         trainer.config = Trainer.Config()
-        trainer.dp_rank = 0
         trainer._reduce_forward_backward_metrics = MagicMock(
             side_effect=lambda *, sum_reduced_metrics, max_reduced_metrics: {
                 key: float(value.item())
@@ -372,7 +371,7 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
 
         result = await Trainer.forward_backward(
             trainer,
-            [[batch], [batch]],
+            [batch, batch],
             torch.tensor([3]),
             torch.tensor([2]),
         )
