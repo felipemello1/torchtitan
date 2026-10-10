@@ -8,6 +8,7 @@
 
 import random
 
+import pytest
 import torch
 
 from torchtitan.rl.components.batcher import Batcher
@@ -235,7 +236,7 @@ def test_microbatch_carries_the_sampling_temperature_into_the_loss() -> None:
     assert temperature.tolist() == [0.5] * 8
 
 
-def test_microbatch_carries_topk_rows_aligned_with_labels() -> None:
+def test_microbatch_ships_topk_rows_for_loss_tokens_only() -> None:
     batcher = Batcher.Config().build(
         num_tokens_per_microbatch_per_dp_rank=8,
         max_context_length=8,
@@ -245,27 +246,41 @@ def test_microbatch_carries_topk_rows_aligned_with_labels() -> None:
         temperature=1.0,
         num_topk_logprobs=2,
     )
-    [sample] = _make_samples([3])
-    sample.topk_token_ids = torch.tensor(
-        [[0, 0], [5, 6], [7, 8], [9, 4]], dtype=torch.int32
-    )
-    sample.topk_logprobs = torch.tensor(
-        [[0.0, 0.0], [-0.1, -2.0], [-0.2, -3.0], [-0.3, -4.0]]
-    )
+    first, second = _make_samples([3, 3])
+    # Prompt, completion, env reply, completion: two loss tokens, so two top-k rows.
+    first.loss_mask = [False, True, False, True]
+    first.topk_token_ids = torch.tensor([[5, 6], [9, 4]], dtype=torch.int32)
+    first.topk_logprobs = torch.tensor([[-0.1, -2.0], [-0.3, -4.0]])
+    second.loss_mask = [False, False, True, True]
+    second.topk_token_ids = torch.tensor([[1, 2], [3, 7]], dtype=torch.int32)
+    second.topk_logprobs = torch.tensor([[-0.5, -1.0], [-0.6, -1.1]])
 
-    loss_kwargs = batcher._pack_training_samples([sample]).loss_kwargs()
+    microbatch = batcher._pack_training_samples([first, second])
+    loss_kwargs = microbatch.to_loss_kwargs("cpu")
 
+    assert microbatch.generator_topk_token_ids.shape == (4, 2)
     # Shifted like generator_logprobs: row t holds the top-k that sampled labels[t].
     assert loss_kwargs["generator_topk_token_ids"].tolist() == (
-        [[5, 6], [7, 8], [9, 4]] + [[0, 0]] * 5
+        [[5, 6], [0, 0], [9, 4]] + [[0, 0], [1, 2], [3, 7]] + [[0, 0]] * 2
     )
-    torch.testing.assert_close(
+    assert torch.equal(
         loss_kwargs["generator_topk_logprobs"],
-        torch.tensor([[-0.1, -2.0], [-0.2, -3.0], [-0.3, -4.0]] + [[0.0, 0.0]] * 5),
+        torch.tensor(
+            [[-0.1, -2.0], [0.0, 0.0], [-0.3, -4.0]]
+            + [[0.0, 0.0], [-0.5, -1.0], [-0.6, -1.1]]
+            + [[0.0, 0.0]] * 2
+        ),
     )
-    # An empty bin still carries [T, k] rows, so every rank calls the loss the same way.
-    empty_loss_kwargs = batcher._pack_training_samples([]).loss_kwargs()
-    assert empty_loss_kwargs["generator_topk_token_ids"].shape == (8, 2)
+    # An empty bin ships no rows but still gives the loss [T, k], so every rank calls it alike.
+    empty_microbatch = batcher._pack_training_samples([])
+    assert empty_microbatch.generator_topk_token_ids.shape == (0, 2)
+    empty_loss_kwargs = empty_microbatch.to_loss_kwargs("cpu")
+    assert empty_loss_kwargs["generator_topk_token_ids"].tolist() == [[0, 0]] * 8
+    # One row more than loss tokens would shift every later row, so packing refuses it.
+    first.topk_token_ids = torch.tensor([[5, 6], [9, 4], [8, 8]], dtype=torch.int32)
+    first.topk_logprobs = torch.tensor([[-0.1, -2.0], [-0.3, -4.0], [-0.2, -0.2]])
+    with pytest.raises(AssertionError):
+        batcher._pack_training_samples([first, second])
 
 
 def test_microbatch_has_no_topk_kwargs_by_default() -> None:

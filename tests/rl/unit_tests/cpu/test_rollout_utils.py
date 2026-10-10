@@ -233,7 +233,7 @@ def test_group_filters_preserve_group_id_for_acknowledgement() -> None:
     assert all(not group.training_samples for group in filtered_groups)
 
 
-def test_topk_rows_align_with_token_ids_across_turns() -> None:
+def test_topk_rows_follow_loss_tokens_across_turns() -> None:
     first = _turn(prompt_token_ids=[1, 2], completion_token_ids=[4, 5], version=0)
     first.completion_topk_token_ids = torch.tensor([[4, 9], [5, 8]], dtype=torch.int32)
     first.completion_topk_logprobs = torch.tensor([[-0.1, -2.0], [-0.2, -3.0]])
@@ -247,19 +247,11 @@ def test_topk_rows_align_with_token_ids_across_turns() -> None:
         _scored_rollout([first, second], reward=1.0, advantage=0.5)
     )
 
-    # Zero rows on the prompt and the env reply (token 9), like their 0.0 logprobs.
+    # One row per loss token; the prompt and the env reply (token 9) get none.
     assert training_sample.token_ids == [1, 2, 4, 5, 9, 7]
-    assert training_sample.topk_token_ids.tolist() == [
-        [0, 0],
-        [0, 0],
-        [4, 9],
-        [5, 8],
-        [0, 0],
-        [7, 3],
-    ]
+    assert training_sample.loss_mask == [False, False, True, True, False, True]
+    assert training_sample.topk_token_ids.tolist() == [[4, 9], [5, 8], [7, 3]]
     torch.testing.assert_close(
         training_sample.topk_logprobs,
-        torch.tensor(
-            [[0, 0], [0, 0], [-0.1, -2.0], [-0.2, -3.0], [0, 0], [-0.3, -1.5]]
-        ),
+        torch.tensor([[-0.1, -2.0], [-0.2, -3.0], [-0.3, -1.5]]),
     )

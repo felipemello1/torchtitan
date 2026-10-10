@@ -665,14 +665,19 @@ class Batcher(Configurable):
         packed_fields: dict[str, list] = {key: [] for key in keys}
         positions: list[int] = []
         padding_mask: list[bool] = []
-        num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
         topk_token_ids = topk_logprobs = None
         if self._num_topk_logprobs > 0:
-            # Zero rows wherever no sample writes (padding, empty bins); the loss masks them out.
-            topk_token_ids = torch.zeros(
-                num_tokens_per_rank, self._num_topk_logprobs, dtype=torch.int32
+            # The label shift below drops each sample's first token, a prompt token with no row.
+            # The [0, k] seed gives an empty bin [0, k] rows; torch.cat rejects an empty list.
+            num_topk = self._num_topk_logprobs
+            topk_token_ids = torch.cat(
+                [torch.zeros(0, num_topk, dtype=torch.int32)]
+                + [sample.topk_token_ids for sample in training_samples]
             )
-            topk_logprobs = torch.zeros(num_tokens_per_rank, self._num_topk_logprobs)
+            topk_logprobs = torch.cat(
+                [torch.zeros(0, num_topk)]
+                + [sample.topk_logprobs for sample in training_samples]
+            )
 
         # Shift labels/logits and pad to per_sample_pad_multiple.
         for training_sample in training_samples:
@@ -697,20 +702,13 @@ class Batcher(Configurable):
                 sample_len = padded_len
 
             # extend row
-            if topk_token_ids is not None:
-                start = len(positions)
-                topk_token_ids[
-                    start : start + unpadded_len
-                ] = training_sample.topk_token_ids[1:]
-                topk_logprobs[
-                    start : start + unpadded_len
-                ] = training_sample.topk_logprobs[1:]
             for key in keys:
                 packed_fields[key].extend(sample[key])
             positions.extend(range(sample_len))
             padding_mask.extend([False] * unpadded_len)
             padding_mask.extend([True] * (sample_len - unpadded_len))
 
+        num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
         pad_len = num_tokens_per_rank - len(positions)
         assert pad_len >= 0
         if pad_len > 0:
@@ -723,6 +721,8 @@ class Batcher(Configurable):
             packed_fields["generator_logprobs"], dtype=_DTYPES["generator_logprobs"]
         )
         loss_mask = torch.tensor(packed_fields["loss_mask"], dtype=_DTYPES["loss_mask"])
+        # to_loss_kwargs scatters one row per True in loss_mask; a wrong count shifts later rows.
+        assert topk_token_ids is None or len(topk_token_ids) == int(loss_mask.sum())
         target_mask = loss_mask & torch.isfinite(generator_logprobs)
         positions_tensor = torch.tensor(positions, dtype=torch.long)
         padding_mask_tensor = torch.tensor(padding_mask, dtype=torch.bool)

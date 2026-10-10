@@ -106,10 +106,10 @@ class TrainingSample:
     advantage: list[float]
     """[L] advantage on assistant tokens, 0.0 elsewhere."""
     topk_token_ids: torch.Tensor | None = None
-    """[L, k] generator top-k token ids; zero rows where loss_mask is False. None unless
-    `SamplingConfig.num_topk_logprobs` > 0."""
+    """[num_loss_tokens, k] generator top-k token ids, one row per True in loss_mask. None
+    unless `SamplingConfig.num_topk_logprobs` > 0."""
     topk_logprobs: torch.Tensor | None = None
-    """[L, k] generator logprobs of `topk_token_ids`; zero rows where loss_mask is False."""
+    """[num_loss_tokens, k] generator logprobs of `topk_token_ids`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,10 +139,12 @@ class TrainingMicrobatch(TokenizedTrainingMicrobatch):
     temperature: torch.Tensor  # [T]
     loss_mask: torch.Tensor  # [T]
     advantages: torch.Tensor  # [T]
-    generator_topk_token_ids: torch.Tensor | None = None  # [T, k]
-    generator_topk_logprobs: torch.Tensor | None = None  # [T, k]
+    generator_topk_token_ids: torch.Tensor | None = None  # [num_loss_tokens, k]
+    """One row per True in loss_mask; `to_loss_kwargs` expands them to [T, k] for the loss."""
+    generator_topk_logprobs: torch.Tensor | None = None  # [num_loss_tokens, k]
 
     def loss_kwargs(self) -> dict[str, torch.Tensor]:
+        """Loss kwargs on the CPU; top-k rows stay one per loss token until `to_loss_kwargs`."""
         loss_kwargs = {
             "generator_logprobs": self.generator_logprobs,
             "temperature": self.temperature,
@@ -152,6 +154,32 @@ class TrainingMicrobatch(TokenizedTrainingMicrobatch):
         if self.generator_topk_token_ids is not None:
             loss_kwargs["generator_topk_token_ids"] = self.generator_topk_token_ids
             loss_kwargs["generator_topk_logprobs"] = self.generator_topk_logprobs
+        return loss_kwargs
+
+    def to_loss_kwargs(
+        self, device: torch.device | str, *, non_blocking: bool = False
+    ) -> dict[str, torch.Tensor]:
+        """Move the loss kwargs to `device`, then expand the top-k to one row per token.
+
+        Expanding after the move copies only the loss-token rows to `device`.
+
+        Example:
+
+            loss_mask                = [False, True, True, False]
+            generator_topk_token_ids = [[5, 6], [7, 8]]
+            # -> generator_topk_token_ids = [[0, 0], [5, 6], [7, 8], [0, 0]]
+        """
+        # slots=True breaks zero-arg super(), so call the parent explicitly.
+        loss_kwargs = TokenizedTrainingMicrobatch.to_loss_kwargs(
+            self, device, non_blocking=non_blocking
+        )
+        if self.generator_topk_token_ids is not None:
+            loss_mask = loss_kwargs["loss_mask"].unsqueeze(-1)
+            for key in ("generator_topk_token_ids", "generator_topk_logprobs"):
+                loss_rows = loss_kwargs[key]
+                rows = loss_rows.new_zeros(loss_mask.shape[0], loss_rows.shape[1])
+                # masked_scatter_, unlike indexing with the mask, needs no host sync on CUDA.
+                loss_kwargs[key] = rows.masked_scatter_(loss_mask, loss_rows)
         return loss_kwargs
 
 
