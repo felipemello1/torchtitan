@@ -502,7 +502,10 @@ def _post_one_generation(*, routed_expert_ids, prompt_start=None):
                 response = await session.post(
                     f"http://{server.host}:{server.port}/inference/v1/generate",
                     headers={"X-Session-ID": "group=1/rollout=2"},
-                    json={"token_ids": [10, 11, 12], "sampling_params": sampling_params},
+                    json={
+                        "token_ids": [10, 11, 12],
+                        "sampling_params": sampling_params,
+                    },
                 )
                 return response.status, await response.read(), received
         finally:
@@ -526,14 +529,20 @@ def test_generation_server_returns_routed_experts_from_the_prompt_start() -> Non
     # Verifiers already holds positions 0..1, so it asks from position 2: tokens 12 and 31
     # (32, the last token, never ran forward).
     rows = _routed_rows(2)
-    status, body, received = _post_one_generation(routed_expert_ids=rows, prompt_start=2)
+    status, body, received = _post_one_generation(
+        routed_expert_ids=rows, prompt_start=2
+    )
 
     assert status == 200
     assert received[0].routed_experts_prompt_start == 2
     # The Verifiers client splices the base64 out of the raw bytes by this prefix.
     assert b'"routed_experts":{"data":"' in body
     payload = parse_generate_response(body)["choices"][0]["routed_experts"]
-    assert (payload["shape"], payload["start"], payload["dtype"]) == ([2, 2, 2], 2, "uint8")
+    assert (payload["shape"], payload["start"], payload["dtype"]) == (
+        [2, 2, 2],
+        2,
+        "uint8",
+    )
 
     # Verifiers' own attribution: the turn's new nodes tile positions 2.. ([12] then
     # [31, 32]); the final position gets the last row repeated.
@@ -559,7 +568,9 @@ def test_generation_server_trims_rows_a_generator_returned_from_position_zero() 
 
 
 def test_generation_server_rejects_routed_experts_with_the_wrong_row_count() -> None:
-    status, body, _ = _post_one_generation(routed_expert_ids=_routed_rows(3), prompt_start=2)
+    status, body, _ = _post_one_generation(
+        routed_expert_ids=_routed_rows(3), prompt_start=2
+    )
 
     assert status == 500
     assert "expected 2" in json.loads(body)["error"]

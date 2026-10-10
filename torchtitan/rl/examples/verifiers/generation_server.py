@@ -281,7 +281,9 @@ class GenerationServer(Configurable):
             )
         except ValueError as error:
             return web.json_response({"error": str(error)}, status=500)
-        choice_extra = {} if routed_experts is None else {"routed_experts": routed_experts}
+        choice_extra = (
+            {} if routed_experts is None else {"routed_experts": routed_experts}
+        )
         return web.json_response(
             {
                 "request_id": completion.request_id,
