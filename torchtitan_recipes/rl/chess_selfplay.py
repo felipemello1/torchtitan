@@ -355,6 +355,10 @@ def rl_chess_qwen3_5_4b_gb300(
     config.rollouter.worker.max_plies_schedule = ((0, 50), (150, 150))
     # Bot games only: late self-play games were both sides walking their kings to the ply cap.
     config.rollouter.train_dataset.bot_fraction = 1.0
+    # Promote on 512 games over 65%: with 128 over 60%, each of the 4 workers tested a block every
+    # ~0.7 steps, and noise moved them all up at a true win rate of ~53%.
+    config.rollouter.worker.curriculum_win_rate = 0.65
+    config.rollouter.worker.curriculum_games = 512
     # Generation paces itself: the mean policy age stays under 6 steps, every trained group under 12.
     # At most 6 batches generate at once, as v8's fixed buffer: that bounds the rollout workers,
     # vLLM's max_num_seqs, and the Stockfish processes on host 0 (one per bot game in flight).
