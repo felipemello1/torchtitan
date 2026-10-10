@@ -70,12 +70,18 @@ class _Actor:
 
 
 def _router(
-    actors, *, strategy=None, hot_swap=False, forward_session_releases=False
+    actors,
+    *,
+    strategy=None,
+    hot_swap=False,
+    forward_session_releases=False,
+    max_concurrent_weight_pulls=None,
 ) -> InterGeneratorRouter:
     return InterGeneratorRouter(
         InterGeneratorRouter.Config(
             strategy=strategy or LeastLoadedRoutingStrategy.Config(),
             hot_swap=hot_swap,
+            max_concurrent_weight_pulls=max_concurrent_weight_pulls,
         ),
         generators=actors,
         forward_session_releases=forward_session_releases,
@@ -544,6 +550,38 @@ def test_prefetch_keeps_generator_serving_before_drain():
         assert actor.prefetch_model_state_dict.calls == [((), {})]
 
     asyncio.run(_run())
+
+
+def test_max_concurrent_weight_pulls_fetches_in_waves():
+    async def _run():
+        actors = [_Actor(f"gen{i}", wait_prefetch=True) for i in range(5)]
+        router = _router(
+            actors,
+            hot_swap=True,
+            max_concurrent_weight_pulls=2,
+        )
+
+        pull_task = asyncio.create_task(router._pull_model_state_dict(policy_version=4))
+        await asyncio.sleep(0.01)
+        started = [a.prefetch_model_state_dict.started.is_set() for a in actors]
+        assert started == [True, True, False, False, False]
+
+        # Finishing one fetch frees a slot for the next generator.
+        actors[0].prefetch_model_state_dict.release.set()
+        await asyncio.wait_for(actors[2].prefetch_model_state_dict.started.wait(), 1.0)
+        assert not actors[3].prefetch_model_state_dict.started.is_set()
+
+        for actor in actors:
+            actor.prefetch_model_state_dict.release.set()
+        await pull_task
+        assert [a.pull_model_state_dict.calls for a in actors] == [[((4,), {})]] * 5
+
+    asyncio.run(_run())
+
+
+def test_max_concurrent_weight_pulls_rejects_zero():
+    with pytest.raises(ValueError, match="max_concurrent_weight_pulls"):
+        InterGeneratorRouter.Config(max_concurrent_weight_pulls=0)
 
 
 def test_single_generator_blocks_routes_while_draining():

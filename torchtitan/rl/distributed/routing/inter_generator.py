@@ -108,6 +108,23 @@ class InterGeneratorRouter(Actor, Configurable):
         under different policy versions. A turn whose session is pinned to a
         draining generator waits for it instead of moving to another one."""
 
+        max_concurrent_weight_pulls: int | None = None
+        """Generators that fetch a weight sync from TorchStore at the same time;
+        None fetches on all at once. Every generator reads the whole model from the
+        trainer hosts, so with many generators one sync is a burst of
+        ``num_generators x model size`` on those hosts. Example: 24 one-GPU 35B-A3B
+        generators read 24 x 65 GiB in ~12 s; ``6`` spreads it over 4 waves."""
+
+        def __post_init__(self):
+            if (
+                self.max_concurrent_weight_pulls is not None
+                and self.max_concurrent_weight_pulls < 1
+            ):
+                raise ValueError(
+                    "max_concurrent_weight_pulls must be >= 1 or None, got "
+                    f"{self.max_concurrent_weight_pulls}"
+                )
+
     def __init__(
         self,
         config: Config,
@@ -291,7 +308,14 @@ class InterGeneratorRouter(Actor, Configurable):
             policy_version: Trainer policy version whose state dict to pull.
         """
 
+        limit = self._config.max_concurrent_weight_pulls
+        pull_slots = asyncio.Semaphore(limit or len(self._generators) or 1)
+
         async def _pull_one(h: _GeneratorHandle) -> None:
+            async with pull_slots:
+                await _pull_one_unbounded(h)
+
+        async def _pull_one_unbounded(h: _GeneratorHandle) -> None:
             # Transfer over RDMA while the generator remains available
             await h.actor.prefetch_model_state_dict.call()
             if self._config.hot_swap:
@@ -312,12 +336,7 @@ class InterGeneratorRouter(Actor, Configurable):
                 finally:
                     self._set_state(h, _GeneratorState.SERVING)
 
-        # Start the pulls in parallel. Technically we could do rolling sync to
-        # maintain availability during weight sync, but that's not a priority
-        # for now.
-        # TODO(perf): stagger the per-generator fetches when num_generators is large so they don't
-        #   all read the trainer's CPU-staged weights at once -- bounds trainer host RAM. Matters for
-        #   big models / many generators, not at small scale.
+        # Start the pulls in parallel, at most `max_concurrent_weight_pulls` at a time.
         await asyncio.gather(*[_pull_one(h) for h in self._generators])
 
     @concurrent_endpoint
