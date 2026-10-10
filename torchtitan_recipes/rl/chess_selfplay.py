@@ -346,7 +346,8 @@ def rl_chess_qwen3_5_4b_gb300(
     # Bot games only: late self-play games were both sides walking their kings to the ply cap.
     config.rollouter.train_dataset.bot_fraction = 1.0
     # Start at sf_eps75, which the resumed policy already plays: the level isn't checkpointed.
-    config.rollouter.worker.bot_curriculum = config.rollouter.worker.bot_curriculum[1:]
+    ladder = config.rollouter.worker.bot_curriculum
+    config.rollouter.worker.bot_curriculum = ladder[ladder.index("sf_eps75") :]
     config.dump_folder = "outputs/rl/qwen3_5_4b_chess_gb300"
     trainer = config.trainer
     trainer.parallelism = ParallelismConfig(data_parallel_shard_degree=4)

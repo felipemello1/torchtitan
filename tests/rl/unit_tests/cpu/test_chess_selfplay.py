@@ -796,6 +796,7 @@ def test_worker_plays_only_the_policy_against_a_bot(
         assert reduced["validation_reward/_mean"] == pytest.approx(-0.9875)
         # the Elo metrics use the chess result: a forfeit is a loss
         assert reduced["val_chess_strength/score_vs_test_bot/mean"] == 0.0
+        assert reduced["val_chess_games/end_vs_bot/checkmate_by_policy/mean"] == 0.0
         assert reduced["val_chess_games/forfeits_per_reply_vs_bot/mean"] == 1.0
         assert (
             reduced["val_chess_games/plies_vs_bot/mean"] == 1.0

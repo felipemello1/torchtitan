@@ -400,6 +400,7 @@ def _game_metrics(
         chess_games/forfeits_per_reply_{self_play,vs_bot}
         chess_games/end_{self_play,vs_bot}/<end>    share of games ending in checkmate, draw,
                                                     ply_limit, illegal_move, reply_too_long, context_full, error
+        chess_games/end_vs_bot/checkmate_by_policy  share of bot games the policy mates (checkmate counts both sides)
     """
     val = "" if sample.split == "train" else "val_"
     strength, games_section = f"{val}chess_strength", f"{val}chess_games"
@@ -449,5 +450,14 @@ def _game_metrics(
                 f"{strength}/score_vs_{sample.opponent}", m.Mean.from_list(scores)
             ),
             m.Metric(f"{strength}/elo", EloFit([(bot_elo, score) for score in scores])),
+            m.Metric(
+                f"{games_section}/end_vs_bot/checkmate_by_policy",
+                m.Mean.from_list(
+                    [
+                        float(game.end_reason == "checkmate" and score == 1.0)
+                        for game, score in zip(games, scores, strict=True)
+                    ]
+                ),
+            ),
         ]
     return metrics
