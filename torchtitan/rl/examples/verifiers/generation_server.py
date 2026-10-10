@@ -9,6 +9,9 @@
 from __future__ import annotations
 
 import asyncio
+import binascii
+import functools
+import json
 import logging
 from dataclasses import dataclass, field
 
@@ -61,6 +64,27 @@ class VerifiersGenerationMetadata:
         {(2, (12, 13)): (tensor([[12, 5], [13, 6]]), tensor([[-0.1, -2.4], [-0.2, -1.9]]))}
     """
 
+    routed_expert_boundary_rows: dict[
+        tuple[int, tuple[int, ...]], tuple[int, torch.Tensor]
+    ] = field(default_factory=dict)
+    """Per generation, keyed like `topk_by_generation`: `(position, [num_layers, top_k])`,
+    the routed experts of the previous completion's last token, which only this
+    generation's prefill ran forward. Verifiers' trace fills that position with a copy
+    of the row before it, so a turn that continues the previous one takes it from here.
+    Empty unless the generator returns routed experts.
+
+    Example: turn 0 was prompt [10, 11] + completion [12, 13]; turn 1's prompt
+    [10, 11, 12, 13, 14] ran token 13 (position 3) forward first:
+
+        {(5, (15, 16)): (3, tensor([[4, 9], [1, 7]]))}
+    """
+
+    routed_experts_expected: bool = False
+    """True once the generator has returned routed expert ids, to this rollout or any
+    other: the generator then returns them for every generation, so the rollouter
+    rejects a trained turn without them instead of sending the trainer a batch that
+    mixes turns with and without rows."""
+
 
 class GenerationServer(Configurable):
     """Expose a TorchTitan ``GenerateFn`` through Verifiers' model API.
@@ -107,6 +131,10 @@ class GenerationServer(Configurable):
         self.bound_port: int | None = None
         self.request_counts: dict[str, int] = {}
         self.generation_metadata: dict[str, VerifiersGenerationMetadata] = {}
+        # Prompt + completion length of each session's latest generation.
+        self.last_num_tokens: dict[str, int] = {}
+        # Set by the first completion that carries routed expert ids.
+        self.returns_routed_experts = False
 
     @property
     def port(self) -> int:
@@ -150,12 +178,14 @@ class GenerationServer(Configurable):
         self.bound_port = None
         self.request_counts.clear()
         self.generation_metadata.clear()
+        self.last_num_tokens.clear()
 
     def pop_generation_metadata(
         self, session_id: str
     ) -> VerifiersGenerationMetadata | None:
         """Detach the generation metadata accumulated for one rollout."""
         self.request_counts.pop(session_id, None)
+        self.last_num_tokens.pop(session_id, None)
         return self.generation_metadata.pop(session_id, None)
 
     async def _handle_health_request(self, request: web.Request) -> web.Response:
@@ -195,7 +225,9 @@ class GenerationServer(Configurable):
                 raise ValueError(
                     f"sampling_params.{GROUP_ID_SAMPLING_PARAM} must be an integer"
                 )
-            sampling = _parse_sampling_config(sampling_params)
+            sampling = _parse_sampling_config(
+                sampling_params, num_prompt_tokens=len(prompt_token_ids)
+            )
             if body.get("features") is not None:
                 raise ValueError("multimodal features are not supported")
         except (TypeError, ValueError) as error:
@@ -242,14 +274,35 @@ class GenerationServer(Configurable):
                 status=502,
             )
 
+        start = sampling.routed_experts_prompt_start
+        num_tokens = len(prompt_token_ids) + len(completion.token_ids)
+        try:
+            routed_expert_ids = _routed_expert_ids_from(
+                completion.routed_expert_ids, start=start, num_tokens=num_tokens
+            )
+        except ValueError as error:
+            return web.json_response({"error": str(error)}, status=500)
+
+        if routed_expert_ids is not None:
+            self.returns_routed_experts = True
         previous = self.generation_metadata.get(session_id)
+        key = (len(prompt_token_ids), tuple(completion.token_ids))
         topk_by_generation = {} if previous is None else previous.topk_by_generation
         if completion.topk_token_ids is not None:
-            key = (len(prompt_token_ids), tuple(completion.token_ids))
             topk_by_generation = {
                 **topk_by_generation,
                 key: (completion.topk_token_ids, completion.topk_logprobs),
             }
+        boundary_rows = {} if previous is None else previous.routed_expert_boundary_rows
+        # The previous completion's last token: Verifiers' start when it bridged the
+        # turn, else where this session's latest generation ended.
+        boundary = start if start > 0 else self.last_num_tokens.get(session_id, 0) - 1
+        if routed_expert_ids is not None and 0 <= boundary < len(prompt_token_ids):
+            boundary_rows = {
+                **boundary_rows,
+                key: (boundary, routed_expert_ids[boundary - start].clone()),
+            }
+        self.last_num_tokens[session_id] = num_tokens
         self.generation_metadata[session_id] = VerifiersGenerationMetadata(
             min_policy_version=(
                 completion.min_policy_version
@@ -267,12 +320,20 @@ class GenerationServer(Configurable):
                 else [*previous.metrics, *completion.metrics]
             ),
             topk_by_generation=topk_by_generation,
+            routed_expert_boundary_rows=boundary_rows,
+            routed_experts_expected=self.returns_routed_experts,
+        )
+        choice_extra = (
+            {}
+            if routed_expert_ids is None
+            else {"routed_experts": _routed_experts_payload(routed_expert_ids, start)}
         )
         return web.json_response(
             {
                 "request_id": completion.request_id,
                 "choices": [
                     {
+                        **choice_extra,
                         "index": 0,
                         "token_ids": completion.token_ids,
                         "logprobs": {
@@ -293,8 +354,59 @@ class GenerationServer(Configurable):
                 ],
                 "prompt_logprobs": None,
                 "kv_transfer_params": None,
-            }
+            },
+            # Compact separators keep `"routed_experts":{"data":"` contiguous, so the
+            # Verifiers client splices the base64 out instead of json-decoding it.
+            dumps=_compact_json_dumps,
         )
+
+
+_compact_json_dumps = functools.partial(json.dumps, separators=(",", ":"))
+
+
+def _routed_expert_ids_from(
+    routed_expert_ids: torch.Tensor | None, *, start: int, num_tokens: int
+) -> torch.Tensor | None:
+    """Check a completion's routed expert ids cover positions `start .. num_tokens - 2`.
+
+    The engine never runs the last token forward, so it has no row. A generator that
+    ignores `routed_experts_prompt_start` returns rows from position 0; those are trimmed.
+
+    Example: prompt [10, 11, 12] + completion [31, 32], start 2 -> 2 rows (tokens 12, 31).
+    """
+    if routed_expert_ids is None:
+        return None
+    if routed_expert_ids.shape[0] == num_tokens - 1 and start > 0:
+        routed_expert_ids = routed_expert_ids[start:]
+    if routed_expert_ids.shape[0] != num_tokens - 1 - start:
+        raise ValueError(
+            f"generation returned {routed_expert_ids.shape[0]} routed-expert rows; "
+            f"expected {num_tokens - 1 - start} for {num_tokens} tokens from position "
+            f"{start}"
+        )
+    return routed_expert_ids
+
+
+def _routed_experts_payload(
+    routed_expert_ids: torch.Tensor, start: int
+) -> dict[str, object]:
+    """Encode routed expert ids as Verifiers' `RoutedExperts` payload.
+
+    Verifiers decodes `data` with `np.frombuffer(dtype).reshape(shape)` and gives each
+    trace node its rows, positioned by `start`.
+
+    Example:
+
+        {"data": "<base64>", "shape": [2, num_layers, top_k], "start": 2, "dtype": "uint8"}
+    """
+    array = routed_expert_ids.contiguous().numpy()
+    # `data` stays the first key: the Verifiers client finds it by that prefix.
+    return {
+        "data": binascii.b2a_base64(array.tobytes(), newline=False).decode("ascii"),
+        "shape": list(array.shape),
+        "start": start,
+        "dtype": str(array.dtype),
+    }
 
 
 def _validate_token_ids(value: object, *, field_name: str) -> list[int]:
@@ -307,7 +419,7 @@ def _validate_token_ids(value: object, *, field_name: str) -> list[int]:
     return list(value)
 
 
-def _parse_sampling_config(value: object):
+def _parse_sampling_config(value: object, *, num_prompt_tokens: int):
     """Convert Verifiers' vLLM sampling payload to TorchTitan config."""
     from torchtitan.rl.generator import SamplingConfig
 
@@ -320,11 +432,11 @@ def _parse_sampling_config(value: object):
         "seed",
         "stop_token_ids",
         "num_topk_logprobs",
+        "routed_experts_prompt_start",
     }
     protocol_fields = {
         "logprobs",
         "skip_special_tokens",
-        "routed_experts_prompt_start",
     }
     unsupported = set(value) - supported - protocol_fields
     if unsupported:
@@ -335,6 +447,21 @@ def _parse_sampling_config(value: object):
         value.get("stop_token_ids"),
         field_name="stop_token_ids",
     )
+    # Verifiers sends it on a turn that extends the previous one: the previous turn's
+    # prompt + completion length - 1, the first position whose rows it does not hold yet.
+    routed_experts_prompt_start = value.get("routed_experts_prompt_start") or 0
+    if isinstance(routed_experts_prompt_start, bool) or not isinstance(
+        routed_experts_prompt_start, int
+    ):
+        raise ValueError("routed_experts_prompt_start must be an integer")
+    if routed_experts_prompt_start < 0 or (
+        routed_experts_prompt_start > 0
+        and routed_experts_prompt_start >= num_prompt_tokens
+    ):
+        raise ValueError(
+            f"routed_experts_prompt_start ({routed_experts_prompt_start}) must be in "
+            f"[0, {num_prompt_tokens}), the prompt length"
+        )
     defaults = SamplingConfig()
     return SamplingConfig(
         temperature=float(value.get("temperature", defaults.temperature)),
@@ -345,4 +472,5 @@ def _parse_sampling_config(value: object):
         num_topk_logprobs=int(
             value.get("num_topk_logprobs", defaults.num_topk_logprobs)
         ),
+        routed_experts_prompt_start=routed_experts_prompt_start,
     )
