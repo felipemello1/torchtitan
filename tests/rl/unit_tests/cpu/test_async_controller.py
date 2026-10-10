@@ -956,7 +956,11 @@ def _controller_for_trainer_loop(
         state_dict=dict,
     )
     controller._weight_sync = _FakeWeightSync()
-    controller._group_buffer = SimpleNamespace(metrics=lambda: [])
+    controller._group_buffer = SimpleNamespace(
+        metrics=lambda: [],
+        record_step_start=AsyncMock(),
+        pop_dropped_group_ids=lambda: [],
+    )
     controller.metrics_processor = Mock()
     controller._validation_task = None
     fake_validation = _FakeValidation()
@@ -971,7 +975,7 @@ def _training_batch(step: int) -> SimpleNamespace:
         min_policy_versions=[step - 1],
         microbatches=[],
         global_loss_token_counts=[1],
-        global_routing_token_counts=[],
+        global_routing_token_counts=[1],
         group_ids=[step],
     )
 
