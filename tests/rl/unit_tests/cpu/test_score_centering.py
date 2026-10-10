@@ -155,7 +155,7 @@ def test_score_centering_is_reinforce_when_generator_matches_trainer() -> None:
 
 
 def test_score_centering_skips_masked_and_non_finite_tokens() -> None:
-    # Rows 0-1 are prompt tokens with the batcher's zero placeholder top-k rows. Row 2 has
+    # Rows 0-1 are prompt tokens with the zero top-k rows from `to_loss_kwargs`. Row 2 has
     # NaN generator logprobs. None of them gets gradient, and nothing turns NaN.
     torch.manual_seed(0)
     num_tokens, vocab_size, num_topk = 6, 16, 4

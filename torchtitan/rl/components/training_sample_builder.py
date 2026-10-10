@@ -54,10 +54,10 @@ class TrainingSample:
     advantage: list[float]
     """[L] advantage on assistant tokens, 0.0 elsewhere."""
     topk_token_ids: torch.Tensor | None = None
-    """[L, k] generator top-k token ids; zero rows where loss_mask is False. None unless
-    `SamplingConfig.num_topk_logprobs` > 0."""
+    """[num_loss_tokens, k] generator top-k token ids, one row per True in loss_mask. None
+    unless `SamplingConfig.num_topk_logprobs` > 0."""
     topk_logprobs: torch.Tensor | None = None
-    """[L, k] generator logprobs of `topk_token_ids`; zero rows where loss_mask is False."""
+    """[num_loss_tokens, k] generator logprobs of `topk_token_ids`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,12 +322,10 @@ class TrainingSampleBuilder(Configurable):
             if rollout_turn.completion_topk_token_ids is not None:
                 training_sample.topk_token_ids = _append_rows(
                     training_sample.topk_token_ids,
-                    num_zero_rows=num_delta,
                     new_rows=rollout_turn.completion_topk_token_ids,
                 )
                 training_sample.topk_logprobs = _append_rows(
                     training_sample.topk_logprobs,
-                    num_zero_rows=num_delta,
                     new_rows=rollout_turn.completion_topk_logprobs,
                 )
 
@@ -337,15 +335,12 @@ class TrainingSampleBuilder(Configurable):
 
 
 def _append_rows(
-    rows: torch.Tensor | None, *, num_zero_rows: int, new_rows: torch.Tensor
+    rows: torch.Tensor | None, *, new_rows: torch.Tensor
 ) -> torch.Tensor:
-    """Append `num_zero_rows` zero rows (the untrained prompt delta), then `new_rows`.
+    """Append one completion's top-k rows; prompt and env-reply tokens get no rows.
 
     Example:
 
-        _append_rows(None, num_zero_rows=2, new_rows=[[7, 3]])  # -> [[0, 0], [0, 0], [7, 3]]
+        _append_rows([[7, 3]], new_rows=[[5, 1]])  # -> [[7, 3], [5, 1]]
     """
-    zero_rows = new_rows.new_zeros(num_zero_rows, new_rows.shape[1])
-    return torch.cat(
-        [zero_rows, new_rows] if rows is None else [rows, zero_rows, new_rows]
-    )
+    return new_rows if rows is None else torch.cat([rows, new_rows])
