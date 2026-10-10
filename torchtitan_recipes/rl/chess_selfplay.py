@@ -325,7 +325,8 @@ def rl_chess_qwen3_5_4b_gb300(
 ) -> Controller.Config:
     """The 35B GB300 recipe with Qwen3.5-4B (instruct): same thinking budget, context, and eight
     one-GPU generators on hosts 1-2; host 0 trains the dense 4B with FSDP 4. A step trains 96
-    positions x 8 games, half the 35B's, and the ply cap grows from 50 to 150 over steps 50-150.
+    positions x 8 games against the curriculum bot (no self-play), and the ply cap grows from 50 to 150
+    over steps 50-150.
 
     The 4B's fp32 weights, grads and Adam state take ~16 GB per trainer GPU (the 35B's ~140 GB), so
     the trainer spends the memory on selective activation checkpointing instead of full recompute.
@@ -342,6 +343,8 @@ def rl_chess_qwen3_5_4b_gb300(
     config.async_loop.num_prompts_per_train_step = 96
     # The ply cap grows one ply per step: 50 at step 50 (the resume point) to 150 at step 150.
     config.rollouter.worker.max_plies_schedule = ((50, 50), (150, 150))
+    # Bot games only: late self-play games were both sides walking their kings to the ply cap.
+    config.rollouter.train_dataset.bot_fraction = 1.0
     config.dump_folder = "outputs/rl/qwen3_5_4b_chess_gb300"
     trainer = config.trainer
     trainer.parallelism = ParallelismConfig(data_parallel_shard_degree=4)
