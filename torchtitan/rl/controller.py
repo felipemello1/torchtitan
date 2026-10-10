@@ -103,6 +103,7 @@ import torchstore as ts
 
 from monarch.actor import ProcMesh, this_host
 
+from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.renderer import RendererConfig
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
@@ -121,6 +122,7 @@ from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRout
 from torchtitan.rl.distributed.torch_elastic import setup_torch_elastic_env
 from torchtitan.rl.distributed.weight_sync import WeightSyncManager
 from torchtitan.rl.generator import SamplingConfig, VLLMGenerator
+from torchtitan.rl.losses import ScoreCenteringLoss
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
@@ -354,6 +356,18 @@ class Controller(Configurable):
                         f"({max_context_length}) must be divisible "
                         f"by sequence parallel degree ({sp_degree})."
                     )
+
+            loss_config = self.trainer.loss
+            if isinstance(loss_config, ChunkedLossWrapper.Config):
+                loss_config = loss_config.loss_fn
+            uses_score_centering = isinstance(loss_config, ScoreCenteringLoss.Config)
+            if uses_score_centering != (self.generator.sampling.num_topk_logprobs > 0):
+                raise ValueError(
+                    "ScoreCenteringLoss needs generator.sampling.num_topk_logprobs > 0, "
+                    "and other losses need 0 (they take no top-k inputs). Got "
+                    f"{type(loss_config).__qualname__} with num_topk_logprobs="
+                    f"{self.generator.sampling.num_topk_logprobs}."
+                )
 
             # TODO: add a check so that all seq_len related variables make sense
             # e.g. rollout max length cannot be larger than the model max_seq_len
