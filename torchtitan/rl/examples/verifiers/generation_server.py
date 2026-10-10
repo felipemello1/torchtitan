@@ -52,6 +52,11 @@ class VerifiersGenerationMetadata:
     metrics: list[m.Metric]
     """Metrics from every generation in the rollout."""
 
+    loss_masks: dict[tuple[int, ...], list[bool]] = field(default_factory=dict)
+    """`Completion.loss_mask` of each completion with appended tokens, keyed by its token ids.
+    Verifiers' client rejects NaN, so the reply sends 0.0 where the mask is False, and
+    `trace_to_rollout_turns` restores the mask."""
+
     topk_by_generation: dict[
         tuple[int, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]
     ] = field(default_factory=dict)
@@ -257,6 +262,19 @@ class GenerationServer(Configurable):
             )
 
         previous = self.generation_metadata.get(session_id)
+        reply_logprobs = completion.token_logprobs
+        loss_masks = {} if previous is None else previous.loss_masks
+        if completion.loss_mask is not None and not all(completion.loss_mask):
+            loss_masks = {
+                **loss_masks,
+                tuple(completion.token_ids): completion.loss_mask,
+            }
+            reply_logprobs = [
+                logprob if keep else 0.0
+                for logprob, keep in zip(
+                    reply_logprobs, completion.loss_mask, strict=True
+                )
+            ]
         topk_by_generation = {} if previous is None else previous.topk_by_generation
         if completion.topk_token_ids is not None:
             key = (len(prompt_token_ids), tuple(completion.token_ids))
@@ -280,6 +298,7 @@ class GenerationServer(Configurable):
                 if previous is None
                 else [*previous.metrics, *completion.metrics]
             ),
+            loss_masks=loss_masks,
             topk_by_generation=topk_by_generation,
         )
         return web.json_response(
@@ -296,9 +315,7 @@ class GenerationServer(Configurable):
                                     "logprob": logprob,
                                 }
                                 for token_id, logprob in zip(
-                                    completion.token_ids,
-                                    completion.token_logprobs,
-                                    strict=True,
+                                    completion.token_ids, reply_logprobs, strict=True
                                 )
                             ]
                         },
