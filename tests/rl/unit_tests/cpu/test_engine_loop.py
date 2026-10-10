@@ -897,6 +897,34 @@ def test_crash_fails_outstanding_and_queued_calls_and_later_calls(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("routed_experts_prompt_start", [-1, 2])
+def test_generate_rejects_a_routed_experts_prompt_start_outside_the_prompt(
+    engine_thread, routed_experts_prompt_start
+) -> None:
+    # vLLM would assert inside engine.step and take down the loop for every request.
+    engine = _FakeEngine()
+
+    async def run() -> None:
+        generator = engine_thread(engine)
+        await generator.start_engine_loop()
+        with pytest.raises(AssertionError, match="routed_experts_prompt_start"):
+            await generator.generate(
+                [1, 2],
+                request_id="r0",
+                group_id=0,
+                routing_session_id="r0",
+                sampling_config=SamplingConfig(
+                    stop_token_ids=[],
+                    routed_experts_prompt_start=routed_experts_prompt_start,
+                ),
+            )
+        assert engine.threads == set()
+
+        await asyncio.wait_for(generator.close(), _TIMEOUT_S)
+
+    asyncio.run(run())
+
+
 def test_generate_cancelled_on_the_queue_never_reaches_the_engine(
     engine_thread,
 ) -> None:

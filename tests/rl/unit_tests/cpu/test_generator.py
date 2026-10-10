@@ -305,6 +305,7 @@ def test_build_sampling_params_matches_contract():
             max_tokens=64,
             seed=44,
             stop_token_ids=[99],
+            routed_experts_prompt_start=5,
         )
     )
     assert params.temperature == 0.3 and params.top_p == 1.0
@@ -316,6 +317,7 @@ def test_build_sampling_params_matches_contract():
     assert params.stop_token_ids == [99]
     assert params.ignore_eos
     assert params.seed == 44
+    assert params.routed_experts_prompt_start == 5
 
 
 def test_build_sampling_params_seed_defaults_to_none():

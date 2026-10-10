@@ -275,15 +275,21 @@ class TrainingSampleBuilder(Configurable):
             training_sample.logprobs += rollout_turn.completion_logprobs
             training_sample.advantage += [rollout_advantage] * num_completion
             if rollout_turn.routed_expert_ids is not None:
-                # Row i is position i. A continuing turn adds rows from prefix_len - 1: the
-                # previous completion's last token only ran forward in this turn's prefill.
+                # A continuing turn adds one row per new token, from position prefix_len - 1 (the
+                # previous completion's last token only ran forward in this turn's prefill). Take
+                # them from the end: native turns skip the prefix's rows, Verifiers turns keep them.
+                num_new_rows = num_delta + num_completion
+                assert prefix_len == 0 or len(rollout_turn.routed_expert_ids) in (
+                    num_new_rows,
+                    len(prompt) + num_completion - 1,
+                )
                 training_sample.routed_expert_ids = (
                     rollout_turn.routed_expert_ids
                     if prefix_len == 0
                     else torch.cat(
                         [
                             training_sample.routed_expert_ids,
-                            rollout_turn.routed_expert_ids[prefix_len - 1 :],
+                            rollout_turn.routed_expert_ids[-num_new_rows:],
                         ]
                     )
                 )

@@ -238,9 +238,18 @@ def _routed_expert_ids(*, turn: int, num_positions: int) -> torch.Tensor:
     return (16 * turn + torch.arange(num_positions, dtype=torch.uint8)).view(-1, 1, 1)
 
 
-def test_routed_expert_ids_keep_each_turns_rows_and_take_the_boundary_from_the_next_prefill() -> (
-    None
-):
+@pytest.mark.parametrize(
+    "routed_experts_prompt_starts",
+    [
+        # Verifiers turns: every row from position 0.
+        [0, 0, 0],
+        # Native rollouter: rows from the previous completion's last token on.
+        [0, 2, 5],
+    ],
+)
+def test_routed_expert_ids_keep_each_turns_rows_and_take_the_boundary_from_the_next_prefill(
+    routed_experts_prompt_starts: list[int],
+) -> None:
     turns = [
         _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=2),
         _turn(prompt_token_ids=[1, 2, 4, 8], completion_token_ids=[5, 6], version=2),
@@ -257,7 +266,7 @@ def test_routed_expert_ids_keep_each_turns_rows_and_take_the_boundary_from_the_n
         )
         rollout_turn.routed_expert_ids = _routed_expert_ids(
             turn=turn_id, num_positions=num_inputs
-        )
+        )[routed_experts_prompt_starts[turn_id] :]
     rollout = _scored_rollout(turns, reward=0.8, advantage=-0.2)
 
     [training_sample] = rollout_to_training_samples(rollout)
@@ -290,6 +299,20 @@ def test_routed_expert_ids_restart_at_a_branch() -> None:
 
     assert first.routed_expert_ids.flatten().tolist() == [0, 1]
     assert second.routed_expert_ids.flatten().tolist() == [16, 17]
+
+
+def test_routed_expert_ids_reject_a_continuing_turn_with_the_wrong_row_count() -> None:
+    turns = [
+        _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=1),
+        _turn(prompt_token_ids=[1, 2, 4, 8], completion_token_ids=[5], version=1),
+    ]
+    turns[0].routed_expert_ids = _routed_expert_ids(turn=0, num_positions=2)
+    # Turn 1 carries its 2 new rows (positions 2-3) or all 4; 3 rows is neither.
+    turns[1].routed_expert_ids = _routed_expert_ids(turn=1, num_positions=3)
+    rollout = _scored_rollout(turns, reward=0.5, advantage=0.1)
+
+    with pytest.raises(AssertionError):
+        rollout_to_training_samples(rollout)
 
 
 def test_samples_without_routed_expert_ids_keep_none() -> None:
