@@ -67,7 +67,7 @@ class Completion:
     generator returns routed experts."""
     topk_token_ids: torch.Tensor | None = None
     """[num_tokens, k] int32 ids of the generator's k most likely tokens at each position;
-    None unless `SamplingConfig.num_topk_logprobs` > 0."""
+    zero rows where `loss_mask` is False. None unless `SamplingConfig.num_topk_logprobs` > 0."""
     topk_logprobs: torch.Tensor | None = None
     """[num_tokens, k] float32 generator logprobs of `topk_token_ids`."""
     finish_reason: str | None = None
