@@ -13,6 +13,7 @@ import contextlib
 import logging
 import time
 from collections import defaultdict
+from collections.abc import Iterable
 
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.types import Rollout
@@ -291,10 +292,40 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
 
     # Per-generation turn metrics (latencies, output tokens) measured by the generator.
     # They carry their own keys (e.g. "generator/..."), so they ride through unprefixed.
+    # Merged per key: a held group would otherwise keep every turn's records, and each full GC walks them.
     out.extend(
-        metric
-        for rollout in rollouts
-        for rollout_turn in rollout.turns
-        for metric in rollout_turn.metrics
+        merge_metrics(
+            metric
+            for rollout in rollouts
+            for rollout_turn in rollout.turns
+            for metric in rollout_turn.metrics
+        )
     )
+    return out
+
+
+def merge_metrics(metrics: Iterable[m.Metric]) -> list[m.Metric]:
+    """Merge records that share a key and type into one, for Mean, Max, Min and Sum; other types
+    pass through. `MetricsProcessor` logs the same values for the output as for the input.
+
+    Example:
+        merge_metrics([Metric("a", Mean(1.0)), Metric("a", Mean(3.0)), Metric("a", Max(3.0))])
+        # -> [Metric("a", Mean(4.0, count=2.0)), Metric("a", Max(3.0))]
+    """
+    values_by_key: dict[tuple[str, type], list[m.MetricValue]] = defaultdict(list)
+    out: list[m.Metric] = []
+    for metric in metrics:
+        if type(metric.value) in (m.Mean, m.Max, m.Min, m.Sum):
+            values_by_key[metric.key, type(metric.value)].append(metric.value)
+        else:
+            out.append(metric)
+    for (key, value_type), values in values_by_key.items():
+        if value_type is m.Mean:
+            total = sum(record.value for record in values)
+            count = sum(record.count for record in values)
+            value = m.Mean(total, count=count)
+        else:
+            # the type's own reduce: Max and Min skip NaN, Sum adds
+            value = value_type(value_type.reduce(values)[value_type.output_suffix])
+        out.append(m.Metric(key, value))
     return out

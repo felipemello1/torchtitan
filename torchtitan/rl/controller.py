@@ -994,6 +994,10 @@ class Controller(Configurable):
                     is_validation=False,
                     rollout_groups=[group],
                 )
+                # group.metrics holds the merged records; free the per-turn ones while the group waits to train.
+                for rollout in group.rollouts:
+                    for rollout_turn in rollout.turns:
+                        rollout_turn.metrics = []
             except Exception:
                 logger.exception(f"rollout group {work.group_id} failed; dropping")
                 group = RolloutGroup(

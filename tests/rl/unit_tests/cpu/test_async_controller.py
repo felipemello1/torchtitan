@@ -23,6 +23,7 @@ from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
+    merge_metrics,
     MetricsTimer,
 )
 from torchtitan.rl.rollout import RolloutGroup
@@ -569,6 +570,33 @@ def test_compute_perf_ratio_metrics_returns_empty_without_total() -> None:
     assert (
         compute_perf_ratio_metrics(num_global_valid_tokens=100, time_metrics=[]) == []
     )
+
+
+def test_merge_metrics_reduces_like_the_unmerged_records() -> None:
+    nan = float("nan")
+    records = [
+        m.Metric("a", m.Mean(1.0)),
+        m.Metric("a", m.Mean(6.0, count=2)),
+        m.Metric("a", m.Max(nan)),
+        m.Metric("a", m.Max(3.0)),
+        m.Metric("b", m.Min(2.0)),
+        m.Metric("b", m.Min(nan)),
+        m.Metric("b", m.Sum(1.0)),
+        m.Metric("b", m.Sum(2.0)),
+        m.Metric("c", m.Std(5.0)),
+        m.Metric("c", m.NoReduce(7.0)),
+    ]
+    aggregate = m.MetricsProcessor._aggregate_metrics
+    merged = merge_metrics(records)
+    # one record per (key, type) for Mean / Max / Min / Sum; Std and NoReduce pass through
+    assert len(merged) == 6
+    assert aggregate(merged) == aggregate(records)
+    # two groups, as the batcher sees them; the first group's Max is all-NaN
+    assert aggregate(
+        merge_metrics(records[:3]) + merge_metrics(records[3:])
+    ) == aggregate(records)
+    zero_count = [m.Metric("z", m.Mean(5.0, count=0))]
+    assert aggregate(merge_metrics(zero_count)) == aggregate(zero_count) == {}
 
 
 def test_metrics_timer_flush_drains() -> None:

@@ -129,7 +129,8 @@ class RolloutTurn:
     """This turn optional reward signals the env attached; the rubric decides how to use them."""
 
     metrics: list[m.Metric] = field(default_factory=list)
-    """Per-turn metrics produced during rollouts"""
+    """Per-turn metrics produced during rollouts. The controller merges them into
+    `RolloutGroup.metrics` and empties this list when the group finishes."""
 
 
 @dataclass(kw_only=True, slots=True)
