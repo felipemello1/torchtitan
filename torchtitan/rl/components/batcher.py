@@ -42,14 +42,20 @@ class TrainingMicrobatch(TokenizedTrainingMicrobatch):
     temperature: torch.Tensor  # [T]
     loss_mask: torch.Tensor  # [T]
     advantages: torch.Tensor  # [T]
+    generator_topk_token_ids: torch.Tensor | None = None  # [T, k]
+    generator_topk_logprobs: torch.Tensor | None = None  # [T, k]
 
     def loss_kwargs(self) -> dict[str, torch.Tensor]:
-        return {
+        loss_kwargs = {
             "generator_logprobs": self.generator_logprobs,
             "temperature": self.temperature,
             "loss_mask": self.loss_mask,
             "advantages": self.advantages,
         }
+        if self.generator_topk_token_ids is not None:
+            loss_kwargs["generator_topk_token_ids"] = self.generator_topk_token_ids
+            loss_kwargs["generator_topk_logprobs"] = self.generator_topk_logprobs
+        return loss_kwargs
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +204,7 @@ class Batcher(Configurable):
         dp_degree: int,
         pad_id: int,
         temperature: float,
+        num_topk_logprobs: int = 0,
     ) -> None:
         self.seq_len = max_context_length
         self._num_rows_per_microbatch, remainder = divmod(
@@ -212,6 +219,7 @@ class Batcher(Configurable):
             )
         self.pad_id = pad_id
         self._temperature = temperature
+        self._num_topk_logprobs = num_topk_logprobs
         self._per_sample_pad_multiple = config.per_sample_pad_multiple
         self._max_num_documents = config.max_num_documents
         self._num_mtp_layers = config.num_mtp_layers
@@ -712,6 +720,14 @@ class Batcher(Configurable):
         packed_fields: dict[str, list] = {key: [] for key in keys}
         positions: list[int] = []
         padding_mask: list[bool] = []
+        num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
+        topk_token_ids = topk_logprobs = None
+        if self._num_topk_logprobs > 0:
+            # Zero rows wherever no sample writes (padding, empty bins); the loss masks them out.
+            topk_token_ids = torch.zeros(
+                num_tokens_per_rank, self._num_topk_logprobs, dtype=torch.int32
+            )
+            topk_logprobs = torch.zeros(num_tokens_per_rank, self._num_topk_logprobs)
 
         # Shift labels/logits and pad to per_sample_pad_multiple.
         for training_sample in training_samples:
@@ -736,13 +752,20 @@ class Batcher(Configurable):
                 sample_len = padded_len
 
             # extend row
+            if topk_token_ids is not None:
+                start = len(positions)
+                topk_token_ids[
+                    start : start + unpadded_len
+                ] = training_sample.topk_token_ids[1:]
+                topk_logprobs[
+                    start : start + unpadded_len
+                ] = training_sample.topk_logprobs[1:]
             for key in keys:
                 packed_fields[key].extend(sample[key])
             positions.extend(range(sample_len))
             padding_mask.extend([False] * unpadded_len)
             padding_mask.extend([True] * (sample_len - unpadded_len))
 
-        num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
         pad_len = num_tokens_per_rank - len(positions)
         assert pad_len >= 0
         if pad_len > 0:
@@ -779,6 +802,8 @@ class Batcher(Configurable):
             padding_mask=padding_mask_tensor,
             loss_token_counts=loss_token_counts,
             routing_token_counts=routing_token_counts,
+            generator_topk_token_ids=topk_token_ids,
+            generator_topk_logprobs=topk_logprobs,
         )
 
     def _padding_fraction(
