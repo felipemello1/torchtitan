@@ -255,6 +255,9 @@ class _FakeMetricsProcessor:
             metric.key: metric.value.value for metric in metrics
         }
 
+    def commit(self):
+        pass
+
 
 async def _run_trainer_loop(*, num_training_steps):
     """Run `Controller._trainer_loop` on fakes; return each step's logged values and the event order.
