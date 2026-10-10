@@ -132,6 +132,7 @@ from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     compute_rollout_metrics,
+    GCTimer,
     MetricsTimer,
 )
 from torchtitan.rl.observability.rollout_recorder import RolloutSampleRecorder
@@ -1331,6 +1332,7 @@ class Controller(Configurable):
         # With `ValidationLoopMode.OVERLAP_TRAINING`: a validation step asked for a pass, which
         # waits while another pass runs.
         validation_requested = False
+        gc_timer = GCTimer()
         for step in range(self.start_step + 1, num_training_steps + 1):
             # Push the previous step; the last step stays open for post-training validation.
             self.metrics_processor.commit()
@@ -1450,13 +1452,14 @@ class Controller(Configurable):
                         ],
                         *self._group_buffer.metrics(),
                         *time_metrics,
+                        *gc_timer.flush(),
                         *policy_age_panel,
                         # Push/pull start to done in the background; the loop's waits are timing/step/wait_for_*.
                         *push_metrics,
                         *pull_metrics,
                         *compute_perf_ratio_metrics(
-                            num_global_valid_tokens=int(
-                                packed.global_loss_token_counts[0]
+                            num_global_tokens=int(
+                                packed.global_routing_token_counts[0]
                             ),
                             time_metrics=time_metrics,
                         ),
@@ -1495,6 +1498,8 @@ class Controller(Configurable):
                 # keep generating meanwhile.
                 await self._weight_sync.wait_inflight_push_pull()
                 await self._validate_and_log(step=step)
+
+        gc_timer.close()
 
         # Finish the last in-flight sync so generators hold the final weights for post-validation.
         await self._weight_sync.wait_inflight_push_pull()
