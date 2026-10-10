@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import torch
 
-from torchtitan.rl.controller import Controller
+from torchtitan.rl.controller import Controller, ValidationLoopMode
 from torchtitan.rl.distributed.weight_sync import WeightSyncManager
 from torchtitan.rl.types import OptimizerStepOutput, TrainerStepBatch
 
@@ -303,7 +303,11 @@ async def _run_trainer_loop(*, num_training_steps):
             async_loop=SimpleNamespace(
                 target_offpolicy_steps=1,
                 max_offpolicy_steps=None,
-                validation=SimpleNamespace(num_samples=0, interval_steps=0),
+                validation=SimpleNamespace(
+                    num_samples=0,
+                    interval_steps=0,
+                    loop_mode=ValidationLoopMode.PAUSE_TRAINER,
+                ),
             )
         ),
         _get_rank_0_value=lambda result: result,
@@ -312,7 +316,7 @@ async def _run_trainer_loop(*, num_training_steps):
             router=_FakeRouter(pull_model_state_dict),
             buffer=_FakeBuffer(events),  # records "release"
         ),
-        _group_buffer=SimpleNamespace(metrics=lambda: []),
+        _group_buffer=SimpleNamespace(metrics=lambda: [], record_step_start=_rpc),
         _data_stream=SimpleNamespace(consume=lambda group_ids: None),
         metrics_processor=_FakeMetricsProcessor(),
     )
