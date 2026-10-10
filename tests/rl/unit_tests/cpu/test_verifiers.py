@@ -9,9 +9,12 @@
 from __future__ import annotations
 
 import asyncio
+import binascii
+import json
 import logging
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -467,6 +470,117 @@ def test_generation_server_records_topk_logprobs_per_generation() -> None:
     asyncio.run(run_test())
 
 
+def _post_one_generation(*, routed_expert_ids, prompt_start=None):
+    """POST prompt [10, 11, 12] to a server whose generation completes [31, 32].
+
+    Returns the status, the raw response body, and the SamplingConfig the generation got.
+    """
+
+    async def run_test():
+        received = []
+
+        async def generate_fn(prompt_token_ids, *, request_id, group_id, **kwargs):
+            received.append(kwargs["sampling_config"])
+            return Completion(
+                min_policy_version=7,
+                max_policy_version=7,
+                request_id=request_id,
+                token_ids=[31, 32],
+                token_logprobs=[-0.1, -0.2],
+                routed_expert_ids=routed_expert_ids,
+                finish_reason="stop",
+            )
+
+        sampling_params = {"torchtitan_group_id": 1, "stop_token_ids": [99]}
+        if prompt_start is not None:
+            sampling_params["routed_experts_prompt_start"] = prompt_start
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+        try:
+            async with ClientSession() as session:
+                response = await session.post(
+                    f"http://{server.host}:{server.port}/inference/v1/generate",
+                    headers={"X-Session-ID": "group=1/rollout=2"},
+                    json={"token_ids": [10, 11, 12], "sampling_params": sampling_params},
+                )
+                return response.status, await response.read(), received
+        finally:
+            await server.close()
+
+    return asyncio.run(run_test())
+
+
+def _routed_rows(num_rows: int) -> torch.Tensor:
+    """uint8 [num_rows, 2 layers, 2 experts per token]; row i holds 10 * i + [0..3]."""
+    return (
+        torch.arange(num_rows * 4, dtype=torch.uint8).view(num_rows, 2, 2)
+        + torch.arange(num_rows, dtype=torch.uint8).view(num_rows, 1, 1) * 6
+    )
+
+
+def test_generation_server_returns_routed_experts_from_the_prompt_start() -> None:
+    from renderers.client import parse_generate_response
+    from verifiers.v1.graph import _attribute_routed_experts
+
+    # Verifiers already holds positions 0..1, so it asks from position 2: tokens 12 and 31
+    # (32, the last token, never ran forward).
+    rows = _routed_rows(2)
+    status, body, received = _post_one_generation(routed_expert_ids=rows, prompt_start=2)
+
+    assert status == 200
+    assert received[0].routed_experts_prompt_start == 2
+    # The Verifiers client splices the base64 out of the raw bytes by this prefix.
+    assert b'"routed_experts":{"data":"' in body
+    payload = parse_generate_response(body)["choices"][0]["routed_experts"]
+    assert (payload["shape"], payload["start"], payload["dtype"]) == ([2, 2, 2], 2, "uint8")
+
+    # Verifiers' own attribution: the turn's new nodes tile positions 2.. ([12] then
+    # [31, 32]); the final position gets the last row repeated.
+    nodes = [
+        SimpleNamespace(token_ids=[10, 11], routed_experts=None),
+        SimpleNamespace(token_ids=[12], routed_experts=None),
+        SimpleNamespace(token_ids=[31, 32], routed_experts=None),
+    ]
+    _attribute_routed_experts(SimpleNamespace(nodes=nodes), [1, 2], 2, payload)
+    assert nodes[0].routed_experts is None
+    assert nodes[1].routed_experts.tolist() == rows[:1].tolist()
+    assert nodes[2].routed_experts.tolist() == [rows[1].tolist(), rows[1].tolist()]
+
+
+def test_generation_server_trims_rows_a_generator_returned_from_position_zero() -> None:
+    rows = _routed_rows(4)  # positions 0..3: a generator that ignored the start
+    status, body, _ = _post_one_generation(routed_expert_ids=rows, prompt_start=2)
+
+    assert status == 200
+    payload = json.loads(body)["choices"][0]["routed_experts"]
+    data = np.frombuffer(binascii.a2b_base64(payload["data"]), dtype=payload["dtype"])
+    assert data.reshape(payload["shape"]).tolist() == rows[2:].tolist()
+
+
+def test_generation_server_rejects_routed_experts_with_the_wrong_row_count() -> None:
+    status, body, _ = _post_one_generation(routed_expert_ids=_routed_rows(3), prompt_start=2)
+
+    assert status == 500
+    assert "expected 2" in json.loads(body)["error"]
+
+
+def test_generation_server_omits_routed_experts_without_them() -> None:
+    status, body, received = _post_one_generation(routed_expert_ids=None)
+
+    assert status == 200
+    assert received[0].routed_experts_prompt_start == 0
+    assert "routed_experts" not in json.loads(body)["choices"][0]
+
+
+def test_parse_sampling_config_rejects_a_prompt_start_past_the_prompt() -> None:
+    with pytest.raises(ValueError, match="routed_experts_prompt_start"):
+        _parse_sampling_config(
+            {"stop_token_ids": [99], "routed_experts_prompt_start": 3},
+            num_prompt_tokens=3,
+        )
+
+
 def test_generation_server_rejects_aborted_generation() -> None:
     async def run_test() -> None:
         async def generate_fn(
@@ -543,4 +657,4 @@ def test_generation_server_requires_group_id() -> None:
 
 def test_parse_sampling_config_requires_stop_token_ids() -> None:
     with pytest.raises(ValueError, match="stop_token_ids"):
-        _parse_sampling_config({"temperature": 1.0})
+        _parse_sampling_config({"temperature": 1.0}, num_prompt_tokens=2)

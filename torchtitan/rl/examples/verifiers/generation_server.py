@@ -9,6 +9,9 @@
 from __future__ import annotations
 
 import asyncio
+import binascii
+import functools
+import json
 import logging
 from dataclasses import dataclass, field
 
@@ -200,7 +203,9 @@ class GenerationServer(Configurable):
                 raise ValueError(
                     f"sampling_params.{GROUP_ID_SAMPLING_PARAM} must be an integer"
                 )
-            sampling = _parse_sampling_config(sampling_params)
+            sampling = _parse_sampling_config(
+                sampling_params, num_prompt_tokens=len(prompt_token_ids)
+            )
             if body.get("features") is not None:
                 raise ValueError("multimodal features are not supported")
         except (TypeError, ValueError) as error:
@@ -268,11 +273,21 @@ class GenerationServer(Configurable):
             ),
             topk_by_generation=topk_by_generation,
         )
+        try:
+            routed_experts = _routed_experts_payload(
+                completion.routed_expert_ids,
+                start=sampling.routed_experts_prompt_start,
+                num_tokens=len(prompt_token_ids) + len(completion.token_ids),
+            )
+        except ValueError as error:
+            return web.json_response({"error": str(error)}, status=500)
+        choice_extra = {} if routed_experts is None else {"routed_experts": routed_experts}
         return web.json_response(
             {
                 "request_id": completion.request_id,
                 "choices": [
                     {
+                        **choice_extra,
                         "index": 0,
                         "token_ids": completion.token_ids,
                         "logprobs": {
@@ -293,8 +308,48 @@ class GenerationServer(Configurable):
                 ],
                 "prompt_logprobs": None,
                 "kv_transfer_params": None,
-            }
+            },
+            # Compact separators keep `"routed_experts":{"data":"` contiguous, so the
+            # Verifiers client splices the base64 out instead of json-decoding it.
+            dumps=_compact_json_dumps,
         )
+
+
+_compact_json_dumps = functools.partial(json.dumps, separators=(",", ":"))
+
+
+def _routed_experts_payload(
+    routed_expert_ids: torch.Tensor | None, *, start: int, num_tokens: int
+) -> dict[str, object] | None:
+    """Encode a completion's routed expert ids as Verifiers' `RoutedExperts` payload.
+
+    Verifiers decodes `data` with `np.frombuffer(dtype).reshape(shape)` and gives each
+    trace node its rows, positioned by `start`. The engine never runs the last token
+    forward, so rows cover positions `start .. num_tokens - 2`.
+
+    Example: prompt [10, 11, 12] + completion [31, 32], start 2 -> 2 rows (tokens 12, 31):
+
+        {"data": "<base64>", "shape": [2, num_layers, top_k], "start": 2, "dtype": "uint8"}
+    """
+    if routed_expert_ids is None:
+        return None
+    expected_rows = num_tokens - 1 - start
+    if routed_expert_ids.shape[0] == num_tokens - 1 and start > 0:
+        # A generator that ignores routed_experts_prompt_start returns every row.
+        routed_expert_ids = routed_expert_ids[start:]
+    if routed_expert_ids.shape[0] != expected_rows:
+        raise ValueError(
+            f"generation returned {routed_expert_ids.shape[0]} routed-expert rows; "
+            f"expected {expected_rows} for {num_tokens} tokens from position {start}"
+        )
+    array = routed_expert_ids.contiguous().numpy()
+    # `data` stays the first key: the Verifiers client finds it by that prefix.
+    return {
+        "data": binascii.b2a_base64(array.tobytes(), newline=False).decode("ascii"),
+        "shape": list(array.shape),
+        "start": start,
+        "dtype": str(array.dtype),
+    }
 
 
 def _validate_token_ids(value: object, *, field_name: str) -> list[int]:
@@ -307,7 +362,7 @@ def _validate_token_ids(value: object, *, field_name: str) -> list[int]:
     return list(value)
 
 
-def _parse_sampling_config(value: object):
+def _parse_sampling_config(value: object, *, num_prompt_tokens: int):
     """Convert Verifiers' vLLM sampling payload to TorchTitan config."""
     from torchtitan.rl.generator import SamplingConfig
 
@@ -320,11 +375,11 @@ def _parse_sampling_config(value: object):
         "seed",
         "stop_token_ids",
         "num_topk_logprobs",
+        "routed_experts_prompt_start",
     }
     protocol_fields = {
         "logprobs",
         "skip_special_tokens",
-        "routed_experts_prompt_start",
     }
     unsupported = set(value) - supported - protocol_fields
     if unsupported:
@@ -335,6 +390,21 @@ def _parse_sampling_config(value: object):
         value.get("stop_token_ids"),
         field_name="stop_token_ids",
     )
+    # Verifiers sends it on a turn that extends the previous one: the previous turn's
+    # prompt + completion length - 1, the first position whose rows it does not hold yet.
+    routed_experts_prompt_start = value.get("routed_experts_prompt_start") or 0
+    if isinstance(routed_experts_prompt_start, bool) or not isinstance(
+        routed_experts_prompt_start, int
+    ):
+        raise ValueError("routed_experts_prompt_start must be an integer")
+    if routed_experts_prompt_start < 0 or (
+        routed_experts_prompt_start > 0
+        and routed_experts_prompt_start >= num_prompt_tokens
+    ):
+        raise ValueError(
+            f"routed_experts_prompt_start ({routed_experts_prompt_start}) must be in "
+            f"[0, {num_prompt_tokens}), the prompt length"
+        )
     defaults = SamplingConfig()
     return SamplingConfig(
         temperature=float(value.get("temperature", defaults.temperature)),
@@ -345,4 +415,5 @@ def _parse_sampling_config(value: object):
         num_topk_logprobs=int(
             value.get("num_topk_logprobs", defaults.num_topk_logprobs)
         ),
+        routed_experts_prompt_start=routed_experts_prompt_start,
     )

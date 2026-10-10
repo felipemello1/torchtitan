@@ -371,6 +371,16 @@ class SamplingConfig:
     generation time: these are the only ids that end a request (vLLM's EOS stops
     are off)."""
 
+    routed_experts_prompt_start: int = 0
+    """With `VLLMGenerator.Config.return_routed_experts`, return routed expert ids from this
+    prompt position on, so `Completion.routed_expert_ids` has
+    `len(prompt) + len(token_ids) - 1 - routed_experts_prompt_start` rows. A multi-turn caller
+    that already holds the previous turn's rows sets it per request to skip them.
+
+    Example: the previous turn's prompt + completion were 10 tokens, so its rows covered
+    positions 0..8; the next turn sets 9, the previous completion's last token, which only
+    this turn's prefill runs forward."""
+
     def __post_init__(self) -> None:
         # TODO(mask-replay): to allow top_p < 1, turn on vLLM's `return_sampling_mask` (needs a vLLM
         # upgrade, the V2 model runner, top_k > 0 and processed logprobs), carry each token's kept
@@ -379,6 +389,11 @@ class SamplingConfig:
             raise ValueError(
                 f"top_p must be 1.0, got {self.top_p}: the trainer computes logprobs "
                 "over the full vocabulary."
+            )
+        if self.routed_experts_prompt_start < 0:
+            raise ValueError(
+                "routed_experts_prompt_start must be non-negative, got "
+                f"{self.routed_experts_prompt_start}"
             )
 
 
@@ -1288,6 +1303,13 @@ class VLLMGenerator(Configurable):
         assert (
             sampling.stop_token_ids is not None
         ), f"{request_id}: stop_token_ids must be set from the renderer"
+        if sampling.routed_experts_prompt_start >= len(prompt_token_ids):
+            # vLLM asserts this inside the engine step, which would stop the generator.
+            raise ValueError(
+                f"{request_id}: routed_experts_prompt_start "
+                f"({sampling.routed_experts_prompt_start}) must be smaller than the "
+                f"prompt length ({len(prompt_token_ids)})"
+            )
 
         # Put the call on the queue; the engine loop will admit + process it, then resolve `reply`.
         reply: concurrent.futures.Future[Completion] = concurrent.futures.Future()
@@ -1568,6 +1590,7 @@ class VLLMGenerator(Configurable):
             # stop_token_ids even with skip_tokenizer_init.
             ignore_eos=True,
             seed=sampling.seed,
+            routed_experts_prompt_start=sampling.routed_experts_prompt_start,
             # The sampled token's logprob (for the GRPO ratio), plus the top-k if requested.
             logprobs=sampling.num_topk_logprobs,
             # Token ids in, token ids and logprob floats out: stops are token ids and nothing reads
