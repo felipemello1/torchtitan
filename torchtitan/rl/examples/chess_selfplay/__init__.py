@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.rl.examples.chess_selfplay.bots import BOTS, BotSpec, StockfishBot
+from torchtitan.rl.examples.chess_selfplay.curriculum import ChessCurriculum
 from torchtitan.rl.examples.chess_selfplay.data import (
     ChessSample,
     ChessSelfPlayDataset,
@@ -21,6 +22,7 @@ from torchtitan.rl.examples.chess_selfplay.rubric import RewardChessScore
 __all__ = [
     "BOTS",
     "BotSpec",
+    "ChessCurriculum",
     "ChessGame",
     "ChessPlayerEnv",
     "ChessSample",

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import ClassVar, TYPE_CHECKING
@@ -77,18 +76,6 @@ class ChessSelfPlayWorker(RolloutWorker):
         """Stockfish binary, a path or a name on `PATH`, for bot games and for scoring the policy's
         moves (centipawn loss). `None`: self-play only, and no move scoring."""
 
-        bot_curriculum: tuple[str, ...] = ()
-        """Bots from `bots.BOTS`, easiest first, for groups whose opponent is "curriculum". Each worker
-        plays its current bot and moves to the next once the policy wins more than
-        `curriculum_win_rate` of a block of `curriculum_games` games against it."""
-
-        curriculum_win_rate: float = 0.6
-        """Share of games won by checkmate (a material lead at the ply cap does not count) that moves a
-        worker to the next bot."""
-
-        curriculum_games: int = 128
-        """Games per block; each full block is checked once, then cleared."""
-
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self._max_plies = config.max_plies
@@ -101,12 +88,6 @@ class ChessSelfPlayWorker(RolloutWorker):
                 "stockfish_path=None with a self-play-only dataset (bots=())"
             )
         self._stockfish_path = config.stockfish_path
-        self._curriculum = config.bot_curriculum
-        self._curriculum_win_rate = config.curriculum_win_rate
-        # index into `_curriculum`, and whether the policy won its recent games against that bot
-        # TODO: the level is not checkpointed; a resumed run restarts at the first bot.
-        self._level = 0
-        self._level_wins: deque[bool] = deque(maxlen=config.curriculum_games)
 
     async def run_group(
         self,
@@ -129,10 +110,6 @@ class ChessSelfPlayWorker(RolloutWorker):
         Returns:
             One scored `RolloutGroup`, one rollout per player that made at least one move.
         """
-        level = self._level
-        curriculum_group = sample.opponent == "curriculum"
-        if curriculum_group:
-            sample = replace(sample, opponent=self._curriculum[level])
         bots = [
             None
             if sample.opponent == "self"
@@ -232,17 +209,6 @@ class ChessSelfPlayWorker(RolloutWorker):
                     # assumes mean-centered advantages (the recipe's `should_std_normalize=False`)
                     rollout.turns[-1].advantage = advantage - forfeit_cost
 
-        # Games started before a move to the next bot do not count toward it.
-        if curriculum_group and level == self._level:
-            wins = self._level_wins
-            wins.extend(game.scores[sample.policy_color] == 1.0 for game in games)
-            if len(wins) == wins.maxlen:
-                if sum(wins) / len(
-                    wins
-                ) > self._curriculum_win_rate and level + 1 < len(self._curriculum):
-                    self._level += 1
-                wins.clear()
-
         # Score the policy's moves with Stockfish: a strength measure that does not depend on the opponent.
         losses_per_game = []
         if self._stockfish_path is not None:
@@ -269,7 +235,7 @@ class ChessSelfPlayWorker(RolloutWorker):
                     games, rollouts, sample=sample, losses_per_game=losses_per_game
                 )
             )
-            if curriculum_group:
+            if sample.curriculum_level is not None:
                 rollouts[0].turns[-1].metrics.append(
                     m.Metric(
                         "chess_strength/curriculum_bot_elo",
@@ -321,7 +287,10 @@ class ChessSelfPlayWorker(RolloutWorker):
                 and not rollout.turns[-1].env_rewards
             ):
                 # the env never stepped the reply that stopped this player: score the forfeit here
-                rollout.turns[-1].env_rewards = {"score": game.rewards[color]}
+                rollout.turns[-1].env_rewards = {
+                    "score": game.rewards[color],
+                    "won": float(game.scores[color] == 1.0),
+                }
             await env.close()
 
 

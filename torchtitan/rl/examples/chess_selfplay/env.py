@@ -52,13 +52,14 @@ class ChessPlayerEnv(MessageEnv):
     their legal moves, and each assistant reply ends with a move in `\\boxed{}`.
 
     `step` plays the move, then waits for the other player's reply. The rollout ends when the game
-    does, and the last step's `env_rewards["score"]` is this player's reward (see `ChessGame.rewards`).
+    does. The last step's `env_rewards["score"]` is this player's reward (see `ChessGame.rewards`),
+    and `env_rewards["won"]` is 1.0 if it won the game, else 0.0.
 
     Example (self-play; White's view):
 
         init:                    "You are playing chess as White ... Your pieces (White) and their legal moves: {...}"
         step("... \\boxed{e4}")   -> waits for Black's move -> "Black played c5. Your pieces (White) ..."
-        step("... \\boxed{Ke9}")  -> illegal: White forfeits -> done, env_rewards={"score": -0.975}  (max_plies=40)
+        step("... \\boxed{Ke9}")  -> illegal: White forfeits -> done, env_rewards={"score": -0.975, "won": 0.0}  (max_plies=40)
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -94,7 +95,11 @@ class ChessPlayerEnv(MessageEnv):
         await self._game.wait_for_turn(self._color)
         if self._game.is_over:
             return MessageEnvStepOutput(
-                done=True, env_rewards={"score": self._game.rewards[self._color]}
+                done=True,
+                env_rewards={
+                    "score": self._game.rewards[self._color],
+                    "won": float(self._game.scores[self._color] == 1.0),
+                },
             )
         return MessageEnvStepOutput(
             env_messages=[{"role": "user", "content": self._game.turn_message()}]
