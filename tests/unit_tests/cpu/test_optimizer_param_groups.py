@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import itertools
 import unittest
 from dataclasses import dataclass
 from tempfile import TemporaryDirectory
@@ -676,8 +677,12 @@ class TestMixedOptimizers(unittest.TestCase):
 
 
 class TestLRSchedulerWithMixedOptimizers(unittest.TestCase):
-    def _build_scheduler(self, config, lr_config, model, training_steps=100):
-        container = config.build(model_parts=[model])
+    def _build_scheduler(
+        self, config, lr_config, model, training_steps=100, enable_cuda_graph=False
+    ):
+        container = config.build(
+            model_parts=[model], enable_cuda_graph=enable_cuda_graph
+        )
         for opt in container.optimizers:
             opt._opt_called = True
         return (
@@ -775,6 +780,55 @@ class TestLRSchedulerWithMixedOptimizers(unittest.TestCase):
                 self.assertAlmostEqual(base_lr, 5e-4, places=6)
             else:
                 self.assertAlmostEqual(base_lr, 1e-3, places=6)
+
+    def test_resume_uses_the_configured_lr_from_the_first_step(self):
+        """Saved at lr 1e-6 after 2 of 4 warmup steps, resumed with lr 1e-5: the
+        first step runs at 1e-5 x 3/4, whichever of the two states loads first.
+
+        DCP loads the lr scheduler first (sorted keys); torch_checkpointing loads the
+        optimizer first. With CUDA graphs the lr stays a tensor.
+        """
+        lr_config = LRSchedulersContainer.Config(warmup_steps=4)
+        for enable_cuda_graph, scheduler_first in itertools.product(
+            (False, True), (True, False)
+        ):
+            with self.subTest(
+                enable_cuda_graph=enable_cuda_graph, scheduler_first=scheduler_first
+            ):
+                saved_scheduler, saved_container = self._build_scheduler(
+                    OptimizersContainer.Config(
+                        optimizers=[AdamW.Config(pattern=r".*", lr=1e-6)]
+                    ),
+                    lr_config,
+                    SimpleModel(),
+                    enable_cuda_graph=enable_cuda_graph,
+                )
+                for _ in range(2):
+                    saved_scheduler.step()
+
+                scheduler, container = self._build_scheduler(
+                    OptimizersContainer.Config(
+                        optimizers=[AdamW.Config(pattern=r".*", lr=1e-5)]
+                    ),
+                    lr_config,
+                    SimpleModel(),
+                    enable_cuda_graph=enable_cuda_graph,
+                )
+                if scheduler_first:
+                    scheduler.load_state_dict(saved_scheduler.state_dict())
+                container.load_state_dict(saved_container.state_dict())
+                if not scheduler_first:
+                    scheduler.load_state_dict(saved_scheduler.state_dict())
+
+                group = container.optimizers[0].param_groups[0]
+                self.assertEqual(
+                    isinstance(group["lr"], torch.Tensor), enable_cuda_graph
+                )
+                self.assertAlmostEqual(float(group["lr"]), 7.5e-6, places=12)
+                self.assertAlmostEqual(group["initial_lr"], 1e-5, places=12)
+                self.assertAlmostEqual(
+                    scheduler.get_metrics()["lr/AdamW"], 7.5e-6, places=12
+                )
 
     def test_first_capturable_step_uses_stable_tensor_lr(self):
         model = torch.nn.Linear(2, 2)
