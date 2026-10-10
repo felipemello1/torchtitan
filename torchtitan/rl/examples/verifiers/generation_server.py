@@ -64,6 +64,21 @@ class VerifiersGenerationMetadata:
         {(2, (12, 13)): (tensor([[12, 5], [13, 6]]), tensor([[-0.1, -2.4], [-0.2, -1.9]]))}
     """
 
+    routed_expert_boundary_rows: dict[
+        tuple[int, tuple[int, ...]], tuple[int, torch.Tensor]
+    ] = field(default_factory=dict)
+    """Per generation, keyed like `topk_by_generation`: `(position, [num_layers, top_k])`,
+    the routed experts of the previous completion's last token, which only this
+    generation's prefill ran forward. Verifiers' trace fills that position with a copy
+    of the row before it, so a turn that continues the previous one takes it from here.
+    Empty unless the generator returns routed experts.
+
+    Example: turn 0 was prompt [10, 11] + completion [12, 13]; turn 1's prompt
+    [10, 11, 12, 13, 14] ran token 13 (position 3) forward first:
+
+        {(5, (15, 16)): (3, tensor([[4, 9], [1, 7]]))}
+    """
+
 
 class GenerationServer(Configurable):
     """Expose a TorchTitan ``GenerateFn`` through Verifiers' model API.
@@ -108,6 +123,8 @@ class GenerationServer(Configurable):
         self.bound_port: int | None = None
         self.request_counts: dict[str, int] = {}
         self.generation_metadata: dict[str, VerifiersGenerationMetadata] = {}
+        # Prompt + completion length of each session's latest generation.
+        self.last_num_tokens: dict[str, int] = {}
 
     @property
     def port(self) -> int:
@@ -154,12 +171,14 @@ class GenerationServer(Configurable):
         self.bound_port = None
         self.request_counts.clear()
         self.generation_metadata.clear()
+        self.last_num_tokens.clear()
 
     def pop_generation_metadata(
         self, session_id: str
     ) -> VerifiersGenerationMetadata | None:
         """Detach the generation metadata accumulated for one rollout."""
         self.request_counts.pop(session_id, None)
+        self.last_num_tokens.pop(session_id, None)
         return self.generation_metadata.pop(session_id, None)
 
     async def _handle_health_request(self, request: web.Request) -> web.Response:
@@ -247,14 +266,33 @@ class GenerationServer(Configurable):
                 status=502,
             )
 
+        start = sampling.routed_experts_prompt_start
+        num_tokens = len(prompt_token_ids) + len(completion.token_ids)
+        try:
+            routed_expert_ids = _routed_expert_ids_from(
+                completion.routed_expert_ids, start=start, num_tokens=num_tokens
+            )
+        except ValueError as error:
+            return web.json_response({"error": str(error)}, status=500)
+
         previous = self.generation_metadata.get(session_id)
+        key = (len(prompt_token_ids), tuple(completion.token_ids))
         topk_by_generation = {} if previous is None else previous.topk_by_generation
         if completion.topk_token_ids is not None:
-            key = (len(prompt_token_ids), tuple(completion.token_ids))
             topk_by_generation = {
                 **topk_by_generation,
                 key: (completion.topk_token_ids, completion.topk_logprobs),
             }
+        boundary_rows = {} if previous is None else previous.routed_expert_boundary_rows
+        # The previous completion's last token: Verifiers' start when it bridged the
+        # turn, else where this session's latest generation ended.
+        boundary = start if start > 0 else self.last_num_tokens.get(session_id, 0) - 1
+        if routed_expert_ids is not None and 0 <= boundary < len(prompt_token_ids):
+            boundary_rows = {
+                **boundary_rows,
+                key: (boundary, routed_expert_ids[boundary - start].clone()),
+            }
+        self.last_num_tokens[session_id] = num_tokens
         self.generation_metadata[session_id] = VerifiersGenerationMetadata(
             min_policy_version=(
                 completion.min_policy_version
@@ -272,17 +310,12 @@ class GenerationServer(Configurable):
                 else [*previous.metrics, *completion.metrics]
             ),
             topk_by_generation=topk_by_generation,
+            routed_expert_boundary_rows=boundary_rows,
         )
-        try:
-            routed_experts = _routed_experts_payload(
-                completion.routed_expert_ids,
-                start=sampling.routed_experts_prompt_start,
-                num_tokens=len(prompt_token_ids) + len(completion.token_ids),
-            )
-        except ValueError as error:
-            return web.json_response({"error": str(error)}, status=500)
         choice_extra = (
-            {} if routed_experts is None else {"routed_experts": routed_experts}
+            {}
+            if routed_expert_ids is None
+            else {"routed_experts": _routed_experts_payload(routed_expert_ids, start)}
         )
         return web.json_response(
             {
@@ -320,30 +353,41 @@ class GenerationServer(Configurable):
 _compact_json_dumps = functools.partial(json.dumps, separators=(",", ":"))
 
 
-def _routed_experts_payload(
+def _routed_expert_ids_from(
     routed_expert_ids: torch.Tensor | None, *, start: int, num_tokens: int
-) -> dict[str, object] | None:
-    """Encode a completion's routed expert ids as Verifiers' `RoutedExperts` payload.
+) -> torch.Tensor | None:
+    """Check a completion's routed expert ids cover positions `start .. num_tokens - 2`.
 
-    Verifiers decodes `data` with `np.frombuffer(dtype).reshape(shape)` and gives each
-    trace node its rows, positioned by `start`. The engine never runs the last token
-    forward, so rows cover positions `start .. num_tokens - 2`.
+    The engine never runs the last token forward, so it has no row. A generator that
+    ignores `routed_experts_prompt_start` returns rows from position 0; those are trimmed.
 
-    Example: prompt [10, 11, 12] + completion [31, 32], start 2 -> 2 rows (tokens 12, 31):
-
-        {"data": "<base64>", "shape": [2, num_layers, top_k], "start": 2, "dtype": "uint8"}
+    Example: prompt [10, 11, 12] + completion [31, 32], start 2 -> 2 rows (tokens 12, 31).
     """
     if routed_expert_ids is None:
         return None
-    expected_rows = num_tokens - 1 - start
     if routed_expert_ids.shape[0] == num_tokens - 1 and start > 0:
-        # A generator that ignores routed_experts_prompt_start returns every row.
         routed_expert_ids = routed_expert_ids[start:]
-    if routed_expert_ids.shape[0] != expected_rows:
+    if routed_expert_ids.shape[0] != num_tokens - 1 - start:
         raise ValueError(
             f"generation returned {routed_expert_ids.shape[0]} routed-expert rows; "
-            f"expected {expected_rows} for {num_tokens} tokens from position {start}"
+            f"expected {num_tokens - 1 - start} for {num_tokens} tokens from position "
+            f"{start}"
         )
+    return routed_expert_ids
+
+
+def _routed_experts_payload(
+    routed_expert_ids: torch.Tensor, start: int
+) -> dict[str, object]:
+    """Encode routed expert ids as Verifiers' `RoutedExperts` payload.
+
+    Verifiers decodes `data` with `np.frombuffer(dtype).reshape(shape)` and gives each
+    trace node its rows, positioned by `start`.
+
+    Example:
+
+        {"data": "<base64>", "shape": [2, num_layers, top_k], "start": 2, "dtype": "uint8"}
+    """
     array = routed_expert_ids.contiguous().numpy()
     # `data` stays the first key: the Verifiers client finds it by that prefix.
     return {

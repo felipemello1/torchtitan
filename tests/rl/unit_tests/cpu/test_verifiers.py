@@ -576,6 +576,60 @@ def test_generation_server_rejects_routed_experts_with_the_wrong_row_count() -> 
     assert "expected 2" in json.loads(body)["error"]
 
 
+def test_generation_server_keeps_the_real_row_of_each_turn_boundary() -> None:
+    # Turn 0: [10, 11] -> [12, 13]. Turn 1 (Verifiers bridged it, start 3):
+    # [10..14] -> [15, 16]. Turn 2 (not bridged, no start): [10..17] -> [18].
+    turns = [
+        ([10, 11], [12, 13], None),
+        ([10, 11, 12, 13, 14], [15, 16], 3),
+        ([10, 11, 12, 13, 14, 15, 16, 17], [18], None),
+    ]
+
+    async def run_test():
+        async def generate_fn(prompt_token_ids, *, request_id, group_id, **kwargs):
+            start = kwargs["sampling_config"].routed_experts_prompt_start
+            _, completion, _ = turns[int(request_id.rsplit("=", 1)[1])]
+            num_rows = len(prompt_token_ids) + len(completion) - 1
+            return Completion(
+                min_policy_version=7,
+                max_policy_version=7,
+                request_id=request_id,
+                token_ids=completion,
+                token_logprobs=[-0.1] * len(completion),
+                # Row of position i holds 10 * i + [0..3], whatever turn computed it.
+                routed_expert_ids=_routed_rows(num_rows)[start:],
+                finish_reason="stop",
+            )
+
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+        try:
+            async with ClientSession() as session:
+                for prompt, _, start in turns:
+                    sampling_params = {"torchtitan_group_id": 1, "stop_token_ids": [99]}
+                    if start is not None:
+                        sampling_params["routed_experts_prompt_start"] = start
+                    response = await session.post(
+                        f"http://{server.host}:{server.port}/inference/v1/generate",
+                        headers={"X-Session-ID": "group=1/rollout=2"},
+                        json={"token_ids": prompt, "sampling_params": sampling_params},
+                    )
+                    assert response.status == 200
+            return server.pop_generation_metadata("group=1/rollout=2")
+        finally:
+            await server.close()
+
+    boundary_rows = asyncio.run(run_test()).routed_expert_boundary_rows
+
+    rows = _routed_rows(8)
+    assert set(boundary_rows) == {(5, (15, 16)), (8, (18,))}
+    position, row = boundary_rows[(5, (15, 16))]
+    assert (position, row.tolist()) == (3, rows[3].tolist())
+    position, row = boundary_rows[(8, (18,))]
+    assert (position, row.tolist()) == (6, rows[6].tolist())
+
+
 def test_generation_server_omits_routed_experts_without_them() -> None:
     status, body, received = _post_one_generation(routed_expert_ids=None)
 
