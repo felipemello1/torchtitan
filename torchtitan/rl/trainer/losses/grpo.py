@@ -26,6 +26,9 @@ class GRPOLoss(DAPOLoss):
         clip_eps: float = 0.2
         """Symmetric PPO clip: the ratio is clamped to ``[1 - clip_eps, 1 + clip_eps]``."""
 
+        ratio_mask: tuple[float, float] | None = None
+        """See ``DAPOLoss.Config.ratio_mask``."""
+
         global_vocab_size: int | None = None
         """Full vocabulary size from the model spec."""
 
@@ -34,6 +37,7 @@ class GRPOLoss(DAPOLoss):
             DAPOLoss.Config(
                 ratio_clip_low=config.clip_eps,
                 ratio_clip_high=config.clip_eps,
+                ratio_mask=config.ratio_mask,
                 global_vocab_size=config.global_vocab_size,
             ),
             **kwargs,
