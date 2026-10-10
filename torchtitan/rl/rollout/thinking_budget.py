@@ -10,6 +10,8 @@ import math
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
+import torch
+
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
 from torchtitan.rl.observability import metrics as m
@@ -146,6 +148,13 @@ class ThinkingBudget(Configurable):
                     + [False] * len(forced_ids)
                     + [True] * len(second.token_ids)
                 ),
+                routed_expert_ids=_join_routed_expert_ids(first, second),
+                topk_token_ids=_join_topk_rows(
+                    first.topk_token_ids, len(forced_ids), second.topk_token_ids
+                ),
+                topk_logprobs=_join_topk_rows(
+                    first.topk_logprobs, len(forced_ids), second.topk_logprobs
+                ),
                 finish_reason=second.finish_reason,
                 metrics=[
                     *first.metrics,
@@ -174,3 +183,32 @@ class ThinkingBudget(Configurable):
             if token_id == self._think_start_id:
                 return True
         return False
+
+
+def _join_routed_expert_ids(
+    first: Completion, second: Completion
+) -> torch.Tensor | None:
+    """Rows of the merged turn: the first call's, then the second call's from where the first
+    stops (its last token, the forced tokens and its own completion ran forward only there).
+
+    Example:
+        # prompt [P0, P1], first [A0, A1], forced [F0], second [B0]
+        # first rows: P0 P1 A0 (A1 never ran forward); second rows: P0 P1 A0 A1 F0
+        # -> P0 P1 A0 from first, A1 F0 from second
+    """
+    if first.routed_expert_ids is None or second.routed_expert_ids is None:
+        return None
+    num_first_rows = len(first.routed_expert_ids)
+    return torch.cat(
+        [first.routed_expert_ids, second.routed_expert_ids[num_first_rows:]]
+    )
+
+
+def _join_topk_rows(
+    first: torch.Tensor | None, num_forced: int, second: torch.Tensor | None
+) -> torch.Tensor | None:
+    """The first call's top-k rows, zero rows for the forced tokens (the loss skips them), then
+    the second call's."""
+    if first is None or second is None:
+        return None
+    return torch.cat([first, first.new_zeros(num_forced, *first.shape[1:]), second])
