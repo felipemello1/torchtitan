@@ -94,7 +94,17 @@ class TrainingSampleBuilder(Configurable):
                 m.Mean(1.0 if is_zero_std else 0.0),
             )
         )
-        if self.config.drop_zero_std_reward_groups and is_zero_std:
+        # A turn with its own advantage (e.g. a forfeit's penalty) still trains in a tied group.
+        has_turn_advantages = any(
+            turn.advantage is not None
+            for rollout in rollout_group.rollouts
+            for turn in rollout.turns
+        )
+        if (
+            self.config.drop_zero_std_reward_groups
+            and is_zero_std
+            and not has_turn_advantages
+        ):
             metrics.append(
                 m.Metric(
                     "training_sample_builder/num_groups_dropped_zero_std", m.Sum(1.0)
@@ -265,9 +275,15 @@ class TrainingSampleBuilder(Configurable):
                 training_sample.max_policy_version, rollout_turn.max_policy_version
             )
             training_sample.token_ids += rollout_turn.completion_token_ids
-            training_sample.loss_mask += [True] * num_completion
+            training_sample.loss_mask += (
+                rollout_turn.completion_loss_mask or [True] * num_completion
+            )
             training_sample.logprobs += rollout_turn.completion_logprobs
-            training_sample.advantage += [rollout_advantage] * num_completion
+            training_sample.advantage += [
+                rollout_advantage
+                if rollout_turn.advantage is None
+                else rollout_turn.advantage
+            ] * num_completion
 
             prev_prompt_and_completion = prompt + rollout_turn.completion_token_ids
 

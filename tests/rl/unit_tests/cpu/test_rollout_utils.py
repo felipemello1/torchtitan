@@ -132,6 +132,41 @@ def test_multiturn_with_growing_prefix_packs_into_one_training_sample() -> None:
     )
 
 
+def test_turn_advantage_overrides_the_rollout_advantage() -> None:
+    first = _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=2)
+    first.advantage = 0.3
+    second = _turn(
+        prompt_token_ids=[1, 2, 4, 8], completion_token_ids=[5, 6], version=2
+    )
+    rollout = _scored_rollout([first, second], reward=-1.0, advantage=-0.9)
+    [training_sample] = rollout_to_training_samples(rollout)
+    # turn 0 trains on its own advantage, turn 1 on the rollout's
+    assert training_sample.advantage == pytest.approx([0.0, 0.0, 0.3, 0.0, -0.9, -0.9])
+
+
+def test_tied_group_with_a_turn_advantage_still_trains() -> None:
+    # two forfeits on move 1: rewards tie, but each forfeiting turn carries its own penalty
+    rollouts = []
+    for rollout_id in range(2):
+        turn = _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=2)
+        turn.advantage = -1.5
+        rollout = _scored_rollout([turn], reward=-1.0, advantage=0.0)
+        rollout.rollout_id = rollout_id
+        rollouts.append(rollout)
+    builder = TrainingSampleBuilder.Config().build()
+    group = builder.build_from_group(
+        rollout_group=RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+    )
+    assert len(group.training_samples) == 2
+
+    for rollout in rollouts:
+        rollout.turns[0].advantage = None
+    group = builder.build_from_group(
+        rollout_group=RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+    )
+    assert group.training_samples == []
+
+
 def test_history_edit_branches_into_separate_training_samples() -> None:
     # Turn 1's prompt does NOT extend turn 0's prompt+completion (the env rewrote history),
     # so the trajectory splits into two training_samples.
