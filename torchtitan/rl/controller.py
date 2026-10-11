@@ -355,6 +355,16 @@ class Controller(Configurable):
                         f"by sequence parallel degree ({sp_degree})."
                     )
 
+            if (
+                self.trainer.replay_routed_experts
+                and not self.generator.return_routed_experts
+            ):
+                raise ValueError(
+                    "trainer.replay_routed_experts needs "
+                    "generator.return_routed_experts: the trainer replays the experts "
+                    "the generator returns."
+                )
+
             # TODO: add a check so that all seq_len related variables make sense
             # e.g. rollout max length cannot be larger than the model max_seq_len
             # or the packing len, etc.

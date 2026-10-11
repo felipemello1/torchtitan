@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
@@ -122,3 +123,55 @@ def test_load_state_dict_allocates_one_fsdp_group_at_a_time(tmp_path) -> None:
             assert param.equal(new_state_dict[name].to_local()), name
     finally:
         dist.destroy_process_group()
+
+
+def test_routers_expose_routed_experts_to_vllm_capture():
+    """vLLM binds ``capture_fn`` by attribute; every MoE router must call it with its ids."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from torchtitan.models.common.activation import Sigmoid
+    from torchtitan.models.common.config_utils import make_router_config
+
+    def build_router():
+        router = make_router_config(
+            dim=4,
+            num_experts=4,
+            score_func=Sigmoid.Config(),
+            gate_param_init={"weight": torch.nn.init.zeros_},
+            top_k=2,
+        ).build()
+        router.init_states()
+        return router
+
+    for tp_enabled, gathered_rows in ((False, 3), (True, 6)):
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleDict(
+            {"0": torch.nn.Module(), "1": torch.nn.Module()}
+        )
+        model.layers["0"].feed_forward = torch.nn.Linear(4, 4)
+        model.layers["1"].router = build_router()
+        wrapper = VLLMModelWrapper.__new__(VLLMModelWrapper)
+        torch.nn.Module.__init__(wrapper)
+        wrapper.model = model
+        wrapper.parallelism_context = SimpleNamespace(
+            ep_enabled=True, tp_enabled=tp_enabled
+        )
+        tp_group = SimpleNamespace(
+            all_gather=lambda tensor, dim: torch.cat([tensor, tensor], dim=dim)
+        )
+        captured = []
+
+        with patch(
+            "torchtitan.rl.model.vllm_wrapper.get_tp_group", return_value=tp_group
+        ):
+            wrapper._expose_routed_experts_to_vllm()
+            router = model.layers["1"].router
+            assert router.layer_id == 1 and router.capture_fn is None
+            router(torch.randn(3, 4))  # before vLLM binds capture_fn: no capture
+            router.capture_fn = captured.append
+            _, topk_expert_ids_TK, _ = router(torch.randn(3, 4))
+
+        assert not hasattr(model.layers["0"].feed_forward, "layer_id")
+        assert len(captured) == 1 and captured[0].shape == (gathered_rows, 2)
+        assert torch.equal(captured[0][:3], topk_expert_ids_TK)

@@ -706,12 +706,16 @@ class Batcher(Configurable):
             input_ids = [10, 11, 20, 21, 0, 0, 0, 0]
             labels    = [11, 12, 21, 22, 0, 0, 0, 0]
             positions = [ 0,  1,  0,  1, 0, 1, 2, 3]
+            # With router replay: one [num_layers, top_k] row of generator expert ids per
+            # input token, e.g. e10 for token 10. Padding rows are 0; routers keep their own choice.
+            model_kwargs["routed_expert_ids"] = [e10, e11, e20, e21, 0, 0, 0, 0]
         """
         pad_values = {**_PAD_VALUES, "input_ids": self.pad_id, "labels": self.pad_id}
         keys = list(pad_values)
         packed_fields: dict[str, list[torch.Tensor]] = {key: [] for key in keys}
         positions: list[torch.Tensor] = []
         padding_mask: list[torch.Tensor] = []
+        routed_expert_ids: list[torch.Tensor] = []
 
         def pad(key: str, num_tokens: int) -> torch.Tensor:
             return torch.full((num_tokens,), pad_values[key], dtype=_DTYPES[key])
@@ -738,6 +742,12 @@ class Batcher(Configurable):
                 packed_fields[key] += [sample[key], pad(key, sample_len - unpadded_len)]
             positions.append(torch.arange(sample_len))
             padding_mask.append(torch.arange(sample_len) >= unpadded_len)
+            if training_sample.routed_expert_ids is not None:
+                # One row per input token; a short tensor would zero-pad real tokens to expert 0.
+                assert len(training_sample.routed_expert_ids) == unpadded_len
+                routed_expert_ids.append(
+                    _pad_rows(training_sample.routed_expert_ids, num_rows=sample_len)
+                )
 
         num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
         pad_len = num_tokens_per_rank - sum(map(len, positions))
@@ -747,6 +757,8 @@ class Batcher(Configurable):
                 packed_fields[key].append(pad(key, pad_len))
             positions.append(torch.arange(pad_len) % self.seq_len)
             padding_mask.append(torch.ones(pad_len, dtype=torch.bool))
+        # All samples or none carry routed expert ids; a gap would shift later rows.
+        assert len(routed_expert_ids) in (0, len(training_samples))
 
         packed = {key: torch.cat(packed_fields[key]) for key in keys}
         generator_logprobs = packed["generator_logprobs"]
@@ -773,6 +785,15 @@ class Batcher(Configurable):
             padding_mask=padding_mask_tensor,
             loss_token_counts=loss_token_counts,
             routing_token_counts=routing_token_counts,
+            model_kwargs=(
+                {
+                    "routed_expert_ids": _pad_rows(
+                        torch.cat(routed_expert_ids), num_rows=num_tokens_per_rank
+                    )
+                }
+                if routed_expert_ids
+                else {}
+            ),
         )
 
     def _padding_fraction(
@@ -819,3 +840,9 @@ class Batcher(Configurable):
                 m.NoReduce(float(len(training_samples))),
             ),
         ]
+
+
+def _pad_rows(rows: torch.Tensor, *, num_rows: int) -> torch.Tensor:
+    """Append zero rows along dim 0 up to ``num_rows``."""
+    padding = rows.new_zeros(num_rows - len(rows), *rows.shape[1:])
+    return torch.cat([rows, padding])
