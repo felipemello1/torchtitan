@@ -551,6 +551,32 @@ def test_extra_vllm_engine_args_reach_engine_args(monkeypatch, tmp_path):
     assert engine_kwargs["scheduling_policy"] == "fcfs"
 
 
+@pytest.mark.parametrize("set_dir", [True, False])
+def test_compile_cache_dir_points_kernel_caches_before_engine_build(
+    monkeypatch, tmp_path, set_dir
+):
+    cache_variables = {
+        "TRITON_CACHE_DIR": "triton",
+        "TORCHINDUCTOR_CACHE_DIR": "inductor",
+        "CUTE_DSL_CACHE_DIR": "cute_dsl",
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": "flash_attn_cute",
+        "VLLM_CACHE_ROOT": "vllm",
+    }
+    for name in [*cache_variables, "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED"]:
+        monkeypatch.setenv(name, "launcher value")
+    cache_dir = str(tmp_path / "compile_cache") if set_dir else None
+
+    _build_engine_kwargs(
+        monkeypatch, tmp_path, VLLMGenerator.Config(compile_cache_dir=cache_dir)
+    )
+
+    for name, subdir in cache_variables.items():
+        expected = f"{cache_dir}/{subdir}" if set_dir else "launcher value"
+        assert os.environ[name] == expected, name
+    expected = "1" if set_dir else "launcher value"
+    assert os.environ["FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED"] == expected
+
+
 @pytest.mark.parametrize(
     "key, match",
     [
