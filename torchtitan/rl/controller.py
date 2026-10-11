@@ -1221,6 +1221,7 @@ class Controller(Configurable):
                 group.metrics = compute_rollout_metrics(
                     prefix="rollout", rollouts=group.rollouts
                 )
+                self._rollouter.record_group_outcome(group)
 
                 # save rollout for inspection
                 self.rollout_recorder.record(
@@ -1420,11 +1421,15 @@ class Controller(Configurable):
                     # batcher includes every consumed group ID here, including
                     # metric-only zero-std groups excluded from model inputs, plus
                     # the groups the buffer dropped as too old.
-                    self._rollouter.acknowledge_training_sample_ids(
-                        [*packed.group_ids, *self._group_buffer.pop_dropped_group_ids()]
+                    # to_thread: both wait for an in-flight sample read; don't block the loop on it.
+                    await asyncio.to_thread(
+                        self._rollouter.acknowledge_training_sample_ids,
+                        [*packed.group_ids, *self._group_buffer.pop_dropped_group_ids()],
                     )
                     controller_state = {
-                        DATALOADER_STATE_KEY: self._rollouter.state_dict()
+                        DATALOADER_STATE_KEY: await asyncio.to_thread(
+                            self._rollouter.state_dict
+                        )
                     }
                     optimizer_result = self._get_rank_0_value(
                         await self.trainer.optim_step.call(
@@ -1449,6 +1454,8 @@ class Controller(Configurable):
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.
             time_metrics = step_timer.flush()
+            # to_thread: the loader's metrics wait for an in-flight sample read; don't block the loop on it.
+            data_metrics = await asyncio.to_thread(self._rollouter.training_data_metrics)
             with sl.log_trace_span("metrics_log"):
                 self.metrics_processor.log(
                     step=step,
@@ -1464,6 +1471,7 @@ class Controller(Configurable):
                             for key, value in optimizer_result.metrics.items()
                         ],
                         *self._group_buffer.metrics(),
+                        *data_metrics,
                         *time_metrics,
                         *gc_timer.flush(),
                         *policy_age_panel,

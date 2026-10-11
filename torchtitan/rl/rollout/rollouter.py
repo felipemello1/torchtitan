@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import statistics
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
@@ -19,7 +21,8 @@ from torchtitan.components.renderer import RendererConfig
 
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
-from torchtitan.rl.components.data import RLDataLoader, RLDataset
+from torchtitan.rl.components.data import GroupOutcome, RLDataLoader, RLDataset
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import MessageEnv, TokenEnv
 from torchtitan.rl.rollout.types import (
@@ -129,17 +132,68 @@ class Rollouter(Configurable):
         if not isinstance(training_dataloader, RLDataLoader):
             raise ValueError("training_dataloader must build an RLDataLoader")
         self._training_dataloader = iter(training_dataloader)
+        # The controller reads samples and saves state from separate asyncio.to_thread calls.
+        # Resuming from a state_dict taken in the middle of a read would skip that sample.
+        self._training_dataloader_lock = threading.Lock()
+        # Group id -> its outcome, until acknowledged. Written on the event loop, popped by
+        # acknowledge on a worker thread: they touch different keys (a group finishes before it
+        # is acknowledged), and single dict operations are atomic, so it needs no lock.
+        self._group_outcomes: dict[int, GroupOutcome] = {}
 
         self._worker_actors: RolloutWorkerActor | None = None
         self._worker_mesh: ProcMesh | None = None
 
     def get_training_sample(self) -> tuple[int, object]:
         """Return the next globally identified input from the training loader."""
-        return next(self._training_dataloader)
+        with self._training_dataloader_lock:
+            return next(self._training_dataloader)
+
+    def record_group_outcome(self, group: RolloutGroup) -> None:
+        """Remember a finished training group's outcome, for the loader at acknowledgement.
+
+        Zero spread is the training sample builder's drop rule. Truncated rollouts count with
+        their rubric reward: their group is as wasted as any other zero-spread group. A group
+        gets no outcome if a rollout errored (an infrastructure failure scores a fixed reward that
+        says nothing about the task), produced no tokens, or the group has fewer than 2 rollouts.
+        A group later dropped as too old still delivers its outcome: it was scored on a real policy.
+
+        Example:
+            rewards [1, 1, 1, 1]                 -> GroupOutcome(mean_reward=1.0, zero_spread=True)
+            rewards [0, 0, 0, 0], 2 truncated    -> GroupOutcome(mean_reward=0.0, zero_spread=True)
+            rewards [0, 1, 0, 0]                 -> GroupOutcome(mean_reward=0.25, zero_spread=False)
+            any rollout errored                  -> nothing recorded
+        """
+        rollouts = group.rollouts
+        if len(rollouts) < 2 or any(
+            rollout.status.is_error()
+            or rollout.reward is None
+            or not any(turn.completion_token_ids for turn in rollout.turns)
+            for rollout in rollouts
+        ):
+            return
+        rewards = [rollout.reward for rollout in rollouts]
+        self._group_outcomes[group.group_id] = GroupOutcome(
+            mean_reward=statistics.fmean(rewards),
+            zero_spread=statistics.pstdev(rewards) == 0.0,
+        )
 
     def acknowledge_training_sample_ids(self, sample_ids: Iterable[int]) -> None:
-        """Mark training samples as safe to omit from the next checkpoint."""
-        self._training_dataloader.acknowledge(sample_ids)
+        """Mark training samples as safe to omit from the next checkpoint, after telling the loader
+        how their groups went."""
+        sample_ids = list(sample_ids)
+        outcomes = {
+            sample_id: self._group_outcomes.pop(sample_id)
+            for sample_id in sample_ids
+            if sample_id in self._group_outcomes
+        }
+        with self._training_dataloader_lock:
+            self._training_dataloader.record_group_outcomes(outcomes)
+            self._training_dataloader.acknowledge(sample_ids)
+
+    def training_data_metrics(self) -> list[m.Metric]:
+        """The training loader's metrics since the last call."""
+        with self._training_dataloader_lock:
+            return self._training_dataloader.metrics()
 
     def get_validation_samples(self, steps: int) -> list[object]:
         """Materialize one fresh validation pass, optionally bounded by steps."""
@@ -236,11 +290,13 @@ class Rollouter(Configurable):
 
     def state_dict(self) -> dict[str, object]:
         """Return the checkpoint state of the training input iterator."""
-        return self._training_dataloader.state_dict()
+        with self._training_dataloader_lock:
+            return self._training_dataloader.state_dict()
 
     def load_state_dict(self, state_dict: dict[str, object]) -> None:
         """Restore the training iterator, including unacknowledged inputs."""
-        self._training_dataloader.load_state_dict(state_dict)
+        with self._training_dataloader_lock:
+            self._training_dataloader.load_state_dict(state_dict)
 
 
 class RolloutWorker(Configurable):
