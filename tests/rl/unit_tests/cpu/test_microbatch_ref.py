@@ -88,7 +88,9 @@ def test_microbatch_ref_round_trips_every_field_and_drops_its_buffers(
     for field in dataclasses.fields(microbatch):
         expected = getattr(microbatch, field.name)
         actual = getattr(read_microbatch, field.name)
-        if field.name == "model_kwargs":
+        if expected is None:  # optional fields, e.g. top-k logprobs without score centering
+            assert actual is None
+        elif field.name == "model_kwargs":
             assert expected.keys() == actual.keys()
             for key in expected:
                 assert torch.equal(expected[key], actual[key])

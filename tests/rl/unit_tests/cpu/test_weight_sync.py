@@ -17,10 +17,11 @@ import asyncio
 import contextlib
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import torch
 
-from torchtitan.rl.controller import Controller
+from torchtitan.rl.controller import Controller, ValidationConfig
 from torchtitan.rl.distributed.weight_sync import WeightSyncManager
 from torchtitan.rl.types import OptimizerStepOutput, TrainerStepBatch
 
@@ -255,6 +256,9 @@ class _FakeMetricsProcessor:
             metric.key: metric.value.value for metric in metrics
         }
 
+    def commit(self) -> None:
+        pass
+
 
 async def _run_trainer_loop(*, num_training_steps):
     """Run `Controller._trainer_loop` on fakes; return each step's logged values and the event order.
@@ -302,7 +306,9 @@ async def _run_trainer_loop(*, num_training_steps):
         _trainer_policy_version=0,
         config=SimpleNamespace(
             async_loop=SimpleNamespace(
-                target_offpolicy_steps=1, max_offpolicy_steps=None
+                target_offpolicy_steps=1,
+                max_offpolicy_steps=None,
+                validation=ValidationConfig(),
             )
         ),
         _get_rank_0_value=lambda result: result,
@@ -311,7 +317,12 @@ async def _run_trainer_loop(*, num_training_steps):
             router=_FakeRouter(pull_model_state_dict),
             buffer=_FakeBuffer(events),  # records "release"
         ),
-        _group_buffer=SimpleNamespace(metrics=lambda: []),
+        _group_buffer=SimpleNamespace(
+            metrics=lambda: [],
+            record_step_start=AsyncMock(),
+            pop_dropped_group_ids=lambda: [],
+            release_active_groups=AsyncMock(),
+        ),
         metrics_processor=_FakeMetricsProcessor(),
     )
     training_batch_queue = asyncio.Queue()

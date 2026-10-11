@@ -152,11 +152,13 @@ def test_verifiers_second_branch_stores_its_prompt_as_a_delta_on_the_first() -> 
                 nodes=[shared, first_leaf],
                 token_ids=[10, 11, 12, 13],
                 logprobs=[0.0, -0.1, 0.0, -0.2],
+                routed_experts=None,
             ),
             SimpleNamespace(
                 nodes=[shared, second_leaf],
                 token_ids=[10, 11, 14, 15],
                 logprobs=[0.0, -0.1, 0.0, -0.3],
+                routed_experts=None,
             ),
         ],
     )
@@ -676,6 +678,7 @@ def _two_turn_trace():
                 nodes=[first_node, second_node],
                 token_ids=[10, 11, 12, 13, 14],
                 logprobs=[0.0, -0.1, 0.0, -0.2, -0.3],
+                routed_experts=None,
             )
         ],
     )

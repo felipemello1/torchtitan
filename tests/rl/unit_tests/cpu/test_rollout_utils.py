@@ -336,9 +336,10 @@ def test_routed_expert_ids_keep_each_turns_rows_and_take_the_boundary_from_the_n
         ),
     ]
     # vLLM returns one row per forward input: the prompt plus every completion token but the last.
+    # Until `_scored_rollout` splits it, `prompt_delta_token_ids` holds the full prompt.
     for turn_id, rollout_turn in enumerate(turns):
         num_inputs = (
-            len(rollout_turn.prompt_token_ids)
+            len(rollout_turn.prompt_delta_token_ids)
             + len(rollout_turn.completion_token_ids)
             - 1
         )
