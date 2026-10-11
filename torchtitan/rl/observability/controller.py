@@ -10,6 +10,7 @@
 # but components/ may not be the right home either.
 
 import contextlib
+import gc
 import logging
 import time
 from collections import defaultdict
@@ -56,6 +57,45 @@ class MetricsTimer:
         ]
 
 
+class GCTimer:
+    """Time this process spends in Python's garbage collector; flush() drains it once per step.
+
+    Example:
+        gc_timer = GCTimer()  # registers a gc callback until close()
+        ...                   # collections run during the step
+        gc_timer.flush()
+        # -> [Metric("perf/controller/gc_seconds", Sum(1.9)),   # every collection this step
+        #     Metric("perf/controller/gc_seconds", Max(1.2))]   # the longest pause
+        gc_timer.close()
+    """
+
+    def __init__(self) -> None:
+        self._start = time.perf_counter()
+        self._total_s = 0.0
+        self._max_s = 0.0
+        gc.callbacks.append(self._on_gc)
+
+    def _on_gc(self, phase: str, info: dict) -> None:
+        if phase == "start":
+            self._start = time.perf_counter()
+            return
+        seconds = time.perf_counter() - self._start
+        self._total_s += seconds
+        self._max_s = max(self._max_s, seconds)
+
+    def flush(self) -> list[m.Metric]:
+        """Return the GC time since the last flush, then reset."""
+        total_s, max_s = self._total_s, self._max_s
+        self._total_s = self._max_s = 0.0
+        return [
+            m.Metric("perf/controller/gc_seconds", m.Sum(total_s)),
+            m.Metric("perf/controller/gc_seconds", m.Max(max_s)),
+        ]
+
+    def close(self) -> None:
+        gc.callbacks.remove(self._on_gc)
+
+
 def combine_microbatch_metrics(
     microbatch_metrics: list[dict[str, float]],
 ) -> dict[str, float]:
@@ -83,10 +123,11 @@ def combine_microbatch_metrics(
 
 
 def compute_perf_ratio_metrics(
-    *, num_global_valid_tokens: int, time_metrics: list[m.Metric]
+    *, num_global_tokens: int, time_metrics: list[m.Metric]
 ) -> list[m.Metric]:
     """Trainer throughput, and each loop phase's share of `timing/step/total`. A phase not recorded
     this step gets no ratio, and then there is no `unaccounted` either (no fallback zeros).
+    `num_global_tokens` counts every non-padding token in the step, prompts included.
 
     Example:
         # 100 tokens; total 10 s = wait_for_training_batch 2 + forward_backward 4 + optimizer 1
@@ -110,14 +151,12 @@ def compute_perf_ratio_metrics(
         out.append(m.Metric(key, m.NoReduce(value)))
 
     # Throughput over the whole step (includes the idle wait for the next batch).
-    _add_metric(
-        "perf/trainer/tokens_per_second_full_step", num_global_valid_tokens / step_s
-    )
+    _add_metric("perf/trainer/tokens_per_second_full_step", num_global_tokens / step_s)
     fwd_bwd_s = seconds.get("timing/step/forward_backward")
     if fwd_bwd_s:
         _add_metric(
             "perf/trainer/tokens_per_second_forward_backward",
-            num_global_valid_tokens / fwd_bwd_s,
+            num_global_tokens / fwd_bwd_s,
         )
 
     # Each phase's share of the step (skip a phase that was not recorded).
