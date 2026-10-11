@@ -32,6 +32,7 @@ from torchtitan.rl.components.data import IterableRLDataLoader
 from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
+from torchtitan.rl.distributed.routing.admission import KVGrowthEstimateAdmission
 from torchtitan.rl.examples.dapo_math.data import (
     DapoMathDataset,
     Intellect3MathDataset,
@@ -462,4 +463,6 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
             num_topk_logprobs=32,
         ),
     )
+    # Start a group only while every placed session fits the KV cache at its expected final length.
+    config.generator_router.admission = KVGrowthEstimateAdmission.Config()
     return config
