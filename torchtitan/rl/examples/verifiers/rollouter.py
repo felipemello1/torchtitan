@@ -33,6 +33,8 @@ from torchtitan.rl.examples.verifiers.generation_server import (
     GROUP_ID_SAMPLING_PARAM,
     VerifiersGenerationMetadata,
 )
+from torchtitan.rl.examples.verifiers.sandbox_limiter import SandboxCreationLimiter
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 from torchtitan.rl.rollout.rubric import RewardFn, Rubric
@@ -124,6 +126,10 @@ class VerifiersRollouter(Rollouter):
         connection_timeout_sec: float = 120.0
         """Maximum time to wait for the Verifiers server to become healthy."""
 
+        sandbox_creation_limiter: SandboxCreationLimiter.Config | None = None
+        """Caps rollout starts per minute, and so sandbox creation, in this controller.
+        None: every rollout starts as soon as the controller sends it."""
+
         def __post_init__(self) -> None:
             Rollouter.Config.__post_init__(self)
             configured_taskset = self.verifiers_env_server.environment.taskset
@@ -161,6 +167,11 @@ class VerifiersRollouter(Rollouter):
         self._generation_server: GenerationServer | None = None
         self._verifiers_env_client: VerifiersEnvClient | None = None
         self._verifiers_train_client_config: VerifiersTrainClientConfig | None = None
+        self._sandbox_creation_limiter: SandboxCreationLimiter | None = (
+            config.sandbox_creation_limiter.build()
+            if config.sandbox_creation_limiter is not None
+            else None
+        )
 
     async def setup_async(
         self,
@@ -287,6 +298,25 @@ class VerifiersRollouter(Rollouter):
         ):
             raise RuntimeError("Verifiers rollouter is not initialized")
 
+        sandbox_wait_sec = None
+        if self._sandbox_creation_limiter is not None:
+            try:
+                sandbox_wait_sec = await self._sandbox_creation_limiter.wait_for_slot()
+            except TimeoutError as error:
+                # End like a failed sandbox creation: an ERROR rollout with no turns.
+                logger.warning(
+                    "Verifiers rollout failed: group=%d rollout=%d %s",
+                    group_id,
+                    rollout_id,
+                    error,
+                )
+                return Rollout(
+                    group_id=group_id,
+                    rollout_id=rollout_id,
+                    status=RolloutStatus.ERROR,
+                    logs={"errors": [{"type": "TimeoutError", "message": str(error)}]},
+                )
+
         # One VerifiersEnvClient.run executes a complete rollout. The harness
         # owns the multi-turn model/tool loop and calls the generation server once per
         # generation; run returns only after the rollout stops.
@@ -318,6 +348,11 @@ class VerifiersRollouter(Rollouter):
             group_id=group_id,
             rollout_id=rollout_id,
         )
+        if sandbox_wait_sec is not None and turns:
+            turns[0].metrics += [
+                m.Metric("sandbox/wait_sec", m.Mean(sandbox_wait_sec)),
+                m.Metric("sandbox/wait_sec", m.Max(sandbox_wait_sec)),
+            ]
         status = self.rollout_status(verifiers_episode=verifiers_episode, trace=trace)
         if not turns:
             status = RolloutStatus.ERROR
