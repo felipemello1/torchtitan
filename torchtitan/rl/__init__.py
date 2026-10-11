@@ -33,15 +33,5 @@ from torchtitan.rl._runtime import apply_env_defaults
 
 
 # ``python -m torchtitan.rl.train`` executes this package initializer
-# before train.py. Apply the defaults before the re-exports below import
-# vllm_wrapper, which imports torch.
+# before train.py, so the defaults are set before train.py imports torch.
 apply_env_defaults()
-
-from torchtitan.rl.model.vllm_registry import register_to_vllm
-from torchtitan.rl.model.vllm_wrapper import VLLMModelWrapper
-
-
-__all__ = [
-    "VLLMModelWrapper",
-    "register_to_vllm",  # Export register function for manual use
-]
