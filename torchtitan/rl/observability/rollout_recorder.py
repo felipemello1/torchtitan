@@ -14,6 +14,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from torchtitan.config import Configurable
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutTurn
@@ -27,6 +29,8 @@ def _json_default(value: Any) -> Any:
         return asdict(value)
     if isinstance(value, Enum):
         return value.value
+    if isinstance(value, torch.Tensor):
+        return value.tolist()
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
@@ -105,7 +109,8 @@ class RolloutSampleRecorder(Configurable):
         log_tensors: bool = False
         """Also record the raw prompt/completion token-id arrays per turn."""
         log_logprobs: bool = False
-        """Also record the raw per-token completion logprob arrays per turn."""
+        """Also record the raw per-token completion logprob arrays per turn, plus the
+        generator's top-k when `SamplingConfig.num_topk_logprobs` > 0."""
 
     def __init__(self, config: Config, *, dump_dir: str) -> None:
         self._filter = config.filter.build()
@@ -164,4 +169,6 @@ class RolloutSampleRecorder(Configurable):
             encoded["completion_token_ids"] = turn.completion_token_ids
         if self._log_logprobs:
             encoded["completion_logprobs"] = turn.completion_logprobs
+            encoded["completion_topk_token_ids"] = turn.completion_topk_token_ids
+            encoded["completion_topk_logprobs"] = turn.completion_topk_logprobs
         return encoded

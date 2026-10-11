@@ -13,6 +13,8 @@ import math
 import statistics
 from dataclasses import dataclass
 
+import torch
+
 from torchtitan.config import Configurable
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout, RolloutGroup
@@ -51,6 +53,11 @@ class TrainingSample:
     """[L] generator logprobs; 0.0 where loss_mask is False."""
     advantage: list[float]
     """[L] advantage on assistant tokens, 0.0 elsewhere."""
+    topk_token_ids: torch.Tensor | None = None
+    """[num_loss_tokens, k] generator top-k token ids, one row per True in loss_mask. None
+    unless `SamplingConfig.num_topk_logprobs` > 0."""
+    topk_logprobs: torch.Tensor | None = None
+    """[num_loss_tokens, k] generator logprobs of `topk_token_ids`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,7 +319,28 @@ class TrainingSampleBuilder(Configurable):
             training_sample.loss_mask += [True] * num_completion
             training_sample.logprobs += rollout_turn.completion_logprobs
             training_sample.advantage += [rollout_advantage] * num_completion
+            if rollout_turn.completion_topk_token_ids is not None:
+                training_sample.topk_token_ids = _append_rows(
+                    training_sample.topk_token_ids,
+                    new_rows=rollout_turn.completion_topk_token_ids,
+                )
+                training_sample.topk_logprobs = _append_rows(
+                    training_sample.topk_logprobs,
+                    new_rows=rollout_turn.completion_topk_logprobs,
+                )
 
             prev_prompt_and_completion = prompt + rollout_turn.completion_token_ids
 
         return training_samples
+
+
+def _append_rows(
+    rows: torch.Tensor | None, *, new_rows: torch.Tensor
+) -> torch.Tensor:
+    """Append one completion's top-k rows; prompt and env-reply tokens get no rows.
+
+    Example:
+
+        _append_rows([[7, 3]], new_rows=[[5, 1]])  # -> [[7, 3], [5, 1]]
+    """
+    return new_rows if rows is None else torch.cat([rows, new_rows])
