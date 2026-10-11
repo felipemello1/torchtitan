@@ -599,7 +599,7 @@ def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) ->
         target_offpolicy_steps=6,
         max_offpolicy_steps=12,
         start_batches=7,
-        generation_capacity=60,
+        generation_capacity=48,
     )
     assert loop.validation == ValidationConfig(steps=78, freq=10, overlap_training=True)
     assert loop.training_sample_builder.drop_zero_std_reward_groups
