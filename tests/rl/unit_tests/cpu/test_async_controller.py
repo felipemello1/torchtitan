@@ -1143,11 +1143,6 @@ def test_adaptive_buffer_demand_stays_under_the_mean_age_ceiling() -> None:
     asyncio.run(run())
 
 
-def test_adaptive_buffer_requires_explicit_generation_capacity() -> None:
-    with pytest.raises(ValueError, match="generation_capacity"):
-        AdaptiveRolloutGroupWorkBuffer.Config()
-
-
 def test_adaptive_buffer_does_not_queue_ahead_of_generation() -> None:
     async def run() -> None:
         buffer = _adaptive_buffer(num_prompts=2, generation_capacity=2)
@@ -1235,3 +1230,31 @@ def test_batcher_passes_the_version_that_trains_each_group() -> None:
     # [0, 1, 2] trains at version 5, [3, 4] at 6; the last call returns None
     assert consuming_policy_versions == [5, 5, 5, 6, 6, 7]
     assert queue.qsize() == 3  # two batches and the None sentinel
+
+
+def test_generation_capacity_defaults_to_the_groups_that_can_still_train() -> None:
+    config = AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=12)
+    # (12 + 1) versions x 16 prompts: a later group would finish too old to train.
+    assert config.resolve_generation_capacity(16) == 208
+    loop = AsyncLoopConfig(num_prompts_per_train_step=16, group_buffer=config)
+    assert loop.max_concurrent_rollout_groups == 208
+    explicit = AdaptiveRolloutGroupWorkBuffer.Config(
+        max_offpolicy_steps=12, generation_capacity=96
+    )
+    assert explicit.resolve_generation_capacity(16) == 96
+    with pytest.raises(ValueError, match="set generation_capacity or max_offpolicy_steps"):
+        AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=None)
+
+
+def test_adaptive_buffer_warns_once_when_generation_capacity_caps_demand(caplog) -> None:
+    # Demand starts at 3 batches (24 groups), above the capacity of 10.
+    buffer = _adaptive_buffer(num_prompts=8, generation_capacity=10)
+
+    async def run() -> None:
+        with caplog.at_level(logging.WARNING):
+            await buffer.record_step_start(trainer_policy_version=0)
+            await buffer.record_step_start(trainer_policy_version=1)
+
+    asyncio.run(run())
+    warnings = [r for r in caplog.records if "> generation_capacity 10" in r.message]
+    assert len(warnings) == 1

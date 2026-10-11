@@ -18,6 +18,7 @@ Two buffers share one interface:
 import asyncio
 import collections
 import enum
+import logging
 from dataclasses import dataclass, field
 
 from torchtitan.config import Configurable
@@ -25,6 +26,8 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.components.adaptive_demand import StallDrivenDemand
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import RolloutGroup
+
+logger = logging.getLogger(__name__)
 
 
 class _RolloutGroupWorkState(enum.Enum):
@@ -365,8 +368,17 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         otherwise demand comes down one group per step."""
 
         generation_capacity: int | None = None
-        """Most prompt groups generating at once, set from the generator deployment; sizes rollout
-        workers and vLLM `max_num_seqs`."""
+        """Most prompt groups generating at once; sizes rollout workers and vLLM `max_num_seqs`.
+
+        None: `(max_offpolicy_steps + 1) * num_prompts_per_train_step`, the most groups that can
+        still be trained when they finish; the demand then picks how many of them run. vLLM
+        admits only what fits in its KV cache and queues the rest. Set it lower only for a hard
+        limit outside the GPUs, e.g. `sandboxes // num_samples_per_prompt`.
+
+        Example:
+            # max_offpolicy_steps=12, 16 prompts per step -> 208 groups at most
+            AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=12)
+        """
 
         def __post_init__(self) -> None:
             if self.max_offpolicy_steps is not None and self.max_offpolicy_steps < 1:
@@ -400,11 +412,22 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
                 raise ValueError(
                     f"damping_factor must be in (0, 1], got {self.damping_factor}"
                 )
-            if self.generation_capacity is None or self.generation_capacity < 1:
+            if self.generation_capacity is None and self.max_offpolicy_steps is None:
                 raise ValueError(
-                    "generation_capacity must be explicitly set to a positive "
-                    "deployment limit"
+                    "set generation_capacity or max_offpolicy_steps: the default capacity "
+                    "is (max_offpolicy_steps + 1) * num_prompts_per_train_step"
                 )
+            if self.generation_capacity is not None and self.generation_capacity < 1:
+                raise ValueError(
+                    f"generation_capacity must be >= 1, got {self.generation_capacity}"
+                )
+
+        def resolve_generation_capacity(self, num_prompts_per_train_step: int) -> int:
+            """`generation_capacity`, or its default when None (see the field)."""
+            if self.generation_capacity is not None:
+                return self.generation_capacity
+            assert self.max_offpolicy_steps is not None
+            return (self.max_offpolicy_steps + 1) * num_prompts_per_train_step
 
     def __init__(
         self,
@@ -430,7 +453,10 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         )
         self._num_prompts_per_train_step = num_prompts_per_train_step
         self._max_offpolicy_steps = config.max_offpolicy_steps
-        self._generation_capacity = config.generation_capacity
+        self._generation_capacity = config.resolve_generation_capacity(
+            num_prompts_per_train_step
+        )
+        self._warned_capacity_binds = False
         self._generator_policy_version = policy_version
         self._trainer_policy_version = policy_version
         # metrics: the shelf and the generating count at the last step start; flow since the last step start
@@ -578,6 +604,18 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
             self._completed_since_step_start = 0
             self._untrainable_since_step_start = 0
             self._dropped_since_step_start = 0
+            # Warn once: past the capacity, extra demand cannot run and the trainer waits instead.
+            if (
+                self._demand.demand > self._generation_capacity
+                and not self._warned_capacity_binds
+            ):
+                self._warned_capacity_binds = True
+                logger.warning(
+                    f"Rollout buffer: demand {self._demand.demand} groups > generation_capacity "
+                    f"{self._generation_capacity}, so the trainer can wait for batches. If "
+                    "generator/num_preemptions stays 0, the generators have room: raise "
+                    "generation_capacity or leave it unset."
+                )
             grew = self._demand.demand > self._max_active_rollout_groups
             self._max_active_rollout_groups = self._demand.demand
             if grew:
