@@ -90,6 +90,11 @@ def _forced_close_rate(completion: Completion) -> float:
     return reduced["thinking_budget/forced_close_rate/mean"]
 
 
+def _stopped_while_thinking_rate(completion: Completion) -> float:
+    reduced = MetricsProcessor._aggregate_metrics(completion.metrics)
+    return reduced["thinking_budget/stopped_while_thinking_rate/mean"]
+
+
 def test_reply_within_budget_is_returned_unchanged() -> None:
     reply = _completion([10, END_THINK, 11], finish_reason="stop")
     generate = _ScriptedGenerate(reply)
@@ -99,6 +104,7 @@ def test_reply_within_budget_is_returned_unchanged() -> None:
     assert len(generate.calls) == 1
     assert generate.calls[0]["sampling_config"].max_tokens == 4
     assert _forced_close_rate(completion) == 0.0
+    assert _stopped_while_thinking_rate(completion) == 0.0
 
 
 def test_reply_cut_while_thinking_gets_a_forced_close() -> None:
@@ -123,6 +129,7 @@ def test_reply_cut_while_thinking_gets_a_forced_close() -> None:
     assert completion.finish_reason == "stop"
     assert completion.request_id == "group=0/rollout=0/turn=0"
     assert _forced_close_rate(completion) == 1.0
+    assert _stopped_while_thinking_rate(completion) == 0.0
 
 
 def test_forced_close_keeps_topk_rows_and_routed_experts() -> None:
@@ -197,6 +204,44 @@ def test_appended_end_of_turn_gets_zero_topk_and_routed_rows() -> None:
     assert topk_token_ids == [10, 11, 12, 13, 0, 0, 0, 20, BRACE, 0]
     # 1 prompt + 10 completion tokens - 1 rows: a zero row for BRACE, which no call ran forward.
     assert completion.routed_expert_ids.flatten().tolist() == [1] * 4 + [2] * 5 + [0]
+
+
+def test_reply_that_stops_while_thinking_gets_a_forced_close() -> None:
+    # the model samples its end of turn before </think>: no answer, so close and ask for one
+    stopped = _completion([10, 11, END_OF_TURN], finish_reason="stop")
+    answer = _completion([20], finish_reason="stop")
+    generate = _ScriptedGenerate(stopped, answer)
+    completion = _run(_budget(), generate, prompt=[5, THINK])
+    assert generate.calls[1]["prompt_token_ids"] == [5, THINK, 10, 11, *FORCED]
+    assert generate.calls[1]["sampling_config"].max_tokens == 12 - 2 - len(FORCED)
+    assert completion.token_ids == [10, 11, *FORCED, 20]
+    assert len(completion.token_logprobs) == len(completion.token_ids)
+    assert completion.loss_mask == [True] * 2 + [False] * 3 + [True]
+    assert _forced_close_rate(completion) == 1.0
+    assert _stopped_while_thinking_rate(completion) == 1.0
+
+
+def test_reply_that_stops_while_thinking_drops_the_stop_tokens_rows() -> None:
+    # prompt [5, THINK]; first call [10, 11, END_OF_TURN] -> [10, 11]; forced [90, 91, 92]; second [20]
+    stopped = _completion([10, 11, END_OF_TURN], finish_reason="stop")
+    stopped.topk_token_ids = torch.tensor(
+        [[10], [11], [END_OF_TURN]], dtype=torch.int32
+    )
+    stopped.topk_logprobs = torch.full((3, 1), -0.5)
+    stopped.routed_expert_ids = torch.full((2 + 3 - 1, 1, 1), 1, dtype=torch.uint8)
+    answer = _completion([20], finish_reason="stop")
+    answer.topk_token_ids = torch.tensor([[20]], dtype=torch.int32)
+    answer.topk_logprobs = torch.full((1, 1), -0.25)
+    answer.routed_expert_ids = torch.full(
+        (2 + 2 + 3 + 1 - 1, 1, 1), 2, dtype=torch.uint8
+    )
+    completion = _run(_budget(), _ScriptedGenerate(stopped, answer), prompt=[5, THINK])
+
+    assert completion.token_ids == [10, 11, *FORCED, 20]
+    assert completion.topk_token_ids.flatten().tolist() == [10, 11, 0, 0, 0, 20]
+    # 2 prompt + 6 completion tokens - 1: the first call's rows up to 10, then the second
+    # call's from 11 (now the first call's last token) on.
+    assert completion.routed_expert_ids.flatten().tolist() == [1] * 3 + [2] * 4
 
 
 def test_reply_cut_while_answering_continues_without_forcing() -> None:

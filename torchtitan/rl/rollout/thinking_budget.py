@@ -38,6 +38,8 @@ class ThinkingBudget(Configurable):
         call 1: 1024 thinking tokens, finish "length", thinking still open    -> force the close
         call 2: prompt + thinking + "...directly now.\\n</think>\\n\\n\\boxed{"  -> "e4}" finish "stop"
         Completion: 1024 + 28 + 3 tokens; loss_mask False on the 28 forced tokens
+
+        call 1: 500 thinking tokens + <|im_end|>, finish "stop", still open   -> drop <|im_end|>, force the close
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -145,20 +147,52 @@ class ThinkingBudget(Configurable):
                     sampling_config, max_tokens=max_thinking_tokens
                 ),
             )
+            if first is None:
+                return None
+            # A reply that samples its stop token before </think> has no answer: drop the stop token
+            # and force the close, as when the budget runs out.
+            # TODO: the dropped stop token is never trained against; watch stopped_while_thinking_rate.
+            stopped_while_thinking = (
+                first.finish_reason == "stop"
+                and self._is_thinking(prompt_token_ids + first.token_ids)
+            )
+            if stopped_while_thinking:
+                # The stop token's top-k row and its input's routed-expert row go with it.
+                first = replace(
+                    first,
+                    token_ids=first.token_ids[:-1],
+                    token_logprobs=first.token_logprobs[:-1],
+                    routed_expert_ids=(
+                        None
+                        if first.routed_expert_ids is None
+                        else first.routed_expert_ids[:-1]
+                    ),
+                    topk_token_ids=(
+                        None
+                        if first.topk_token_ids is None
+                        else first.topk_token_ids[:-1]
+                    ),
+                    topk_logprobs=(
+                        None
+                        if first.topk_logprobs is None
+                        else first.topk_logprobs[:-1]
+                    ),
+                )
             # "length" with fewer tokens than asked: the context is full, so a second call would
             # be rejected; end the turn cut, as without a budget.
-            if (
-                first is None
-                or first.finish_reason != "length"
+            elif (
+                first.finish_reason != "length"
                 or len(first.token_ids) < max_thinking_tokens
             ):
-                if first is not None:
-                    first.metrics.append(
-                        m.Metric("thinking_budget/forced_close_rate", m.Mean(0.0))
-                    )
+                first.metrics.append(
+                    m.Metric("thinking_budget/forced_close_rate", m.Mean(0.0))
+                )
+                first.metrics.append(
+                    m.Metric("thinking_budget/stopped_while_thinking_rate", m.Mean(0.0))
+                )
                 return first
 
-            # Cut while thinking: force the close. Cut while answering: let the answer continue.
+            # Cut or stopped while thinking: force the close. Cut while answering: continue.
             if self._is_thinking(prompt_token_ids + first.token_ids):
                 forced_ids = self._forced_ids
             else:
@@ -234,6 +268,10 @@ class ThinkingBudget(Configurable):
                     m.Metric(
                         "thinking_budget/forced_close_rate",
                         m.Mean(float(bool(forced_ids))),
+                    ),
+                    m.Metric(
+                        "thinking_budget/stopped_while_thinking_rate",
+                        m.Mean(float(stopped_while_thinking)),
                     ),
                 ],
             )
