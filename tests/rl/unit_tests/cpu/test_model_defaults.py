@@ -27,6 +27,7 @@ from torchtitan.rl.controller import RLModelDefaults
 
 _RECIPE_MODULES = [
     "torchtitan_recipes.rl.alphabet_sort",
+    "torchtitan_recipes.rl.chess_selfplay",
     "torchtitan_recipes.rl.dapo_math",
     "torchtitan_recipes.rl.search_r1",
     "torchtitan_recipes.rl.verifiers_dapo_math",
