@@ -80,6 +80,7 @@ class DAPOLoss(BaseLoss):
         temperature: torch.Tensor,
         advantages: torch.Tensor,
         loss_mask: torch.Tensor,
+        is_policy_age_0: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the per-token clip-higher surrogate loss.
 
@@ -90,6 +91,7 @@ class DAPOLoss(BaseLoss):
             temperature: [T] temperature each token was sampled at.
             loss_mask: [T] bool mask; True for response tokens.
             advantages: [T] per-token advantages (0.0 for prompt/padding).
+            is_policy_age_0: [T] bool mask; True for tokens sampled by the trainer's current weights.
             global_loss_token_counts: total response tokens with finite generator logprobs
                 across all microbatches and DP ranks; the loss denominator.
 
@@ -132,6 +134,9 @@ class DAPOLoss(BaseLoss):
                 raw_log_ratio,
                 torch.zeros_like(raw_log_ratio),
             )
+            age_0_diff = torch.where(
+                is_policy_age_0, diff_for_metrics, torch.zeros_like(diff_for_metrics)
+            )
             masked_ratio = ratio * effective_loss_mask
             metrics = {
                 "loss/mean": loss.detach(),
@@ -157,6 +162,15 @@ class DAPOLoss(BaseLoss):
                     global_loss_token_counts,
                 ),
                 "bit_wise/logprob_diff/max": diff_for_metrics.abs().max(),
+                # logprob_diff over policy-age-0 tokens: mismatch without off-policy drift.
+                # Normalized by all loss tokens; the trainer divides it by age_0_tokens/frac.
+                "bit_wise/logprob_diff_age_0/mean": _normalize(
+                    age_0_diff.float().sum(), global_loss_token_counts
+                ),
+                "bit_wise/age_0_tokens/frac": _normalize(
+                    (effective_loss_mask & is_policy_age_0).float().sum(),
+                    global_loss_token_counts,
+                ),
                 # Mean entropy of softmax(logits / temperature) over tokens used by the loss.
                 "trainer/entropy/mean": _normalize(
                     (token_entropy * effective_loss_mask).sum(),

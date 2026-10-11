@@ -323,7 +323,23 @@ def test_get_controller_state_returns_restored_state() -> None:
     asyncio.run(run())
 
 
-def test_forward_backward_accumulates_microbatch_metrics() -> None:
+@pytest.mark.parametrize(
+    "age_0_frac, age_0_metrics",
+    [
+        # The age-0 sum (0.125 + 0.175) over the age-0 share (0.25 + 0.25) is their mean.
+        (
+            0.25,
+            {
+                "bit_wise/age_0_tokens/frac": 0.5,
+                "bit_wise/logprob_diff_age_0/mean": 0.6,
+            },
+        ),
+        (0.0, {"bit_wise/age_0_tokens/frac": 0.0}),
+    ],
+)
+def test_forward_backward_accumulates_microbatch_metrics(
+    age_0_frac, age_0_metrics
+) -> None:
     async def run() -> None:
         trainer = object.__new__(Trainer)
         engine = SimpleNamespace(
@@ -339,10 +355,14 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
                     {
                         "loss/mean": torch.tensor(1.0),
                         "loss/max": torch.tensor(4.0),
+                        "bit_wise/logprob_diff_age_0/mean": torch.tensor(0.125),
+                        "bit_wise/age_0_tokens/frac": torch.tensor(age_0_frac),
                     },
                     {
                         "loss/mean": torch.tensor(2.0),
                         "loss/max": torch.tensor(3.0),
+                        "bit_wise/logprob_diff_age_0/mean": torch.tensor(0.175),
+                        "bit_wise/age_0_tokens/frac": torch.tensor(age_0_frac),
                     },
                 ],
             )
@@ -360,16 +380,18 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
             }
         )
         batch = TrainingMicrobatch(
-            input=torch.tensor([1]),
-            labels=torch.tensor([2]),
-            positions=torch.tensor([0]),
-            padding_mask=torch.tensor([False]),
-            loss_token_counts=torch.tensor([1]),
-            routing_token_counts=torch.tensor([1]),
-            generator_logprobs=torch.tensor([0.0]),
-            temperature=torch.tensor([1.0]),
-            loss_mask=torch.tensor([True]),
-            advantages=torch.tensor([1.0]),
+            input=torch.tensor([1, 1]),
+            labels=torch.tensor([2, 2]),
+            positions=torch.tensor([0, 0]),
+            padding_mask=torch.tensor([False, False]),
+            loss_token_counts=torch.tensor([2]),
+            routing_token_counts=torch.tensor([2]),
+            generator_logprobs=torch.tensor([0.0, 0.0]),
+            temperature=torch.tensor([1.0, 1.0]),
+            loss_mask=torch.tensor([True, True]),
+            advantages=torch.tensor([1.0, 1.0]),
+            # The trainer is at policy 4 (num_completed_steps).
+            min_policy_versions=torch.tensor([3, 4], dtype=torch.int32),
         )
 
         result = await Trainer.forward_backward(
@@ -384,9 +406,12 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
             global_loss_token_counts=torch.tensor([3]),
             global_routing_token_counts=torch.tensor([2]),
         )
-        assert trainer._step_num_tokens_per_dp_rank == 2
+        assert batch.is_policy_age_0.tolist() == [False, True]
+        assert trainer._step_num_tokens_per_dp_rank == 4
         assert trainer._reduce_forward_backward_metrics.call_count == 2
-        assert result == {"loss/mean": 3.0, "loss/max": 4.0}
+        assert result == pytest.approx(
+            {"loss/mean": 3.0, "loss/max": 4.0, **age_0_metrics}
+        )
 
     asyncio.run(run())
 

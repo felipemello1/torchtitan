@@ -42,13 +42,17 @@ class TrainingMicrobatch(TokenizedTrainingMicrobatch):
     temperature: torch.Tensor  # [T]
     loss_mask: torch.Tensor  # [T]
     advantages: torch.Tensor  # [T]
+    min_policy_versions: torch.Tensor  # [T] its sample's min_policy_version; -1 on padding
+    is_policy_age_0: torch.Tensor | None = None
+    """[T] True where `min_policy_versions` equals the trainer's version; set in `Trainer.forward_backward`."""
 
-    def loss_kwargs(self) -> dict[str, torch.Tensor]:
+    def loss_kwargs(self) -> dict[str, torch.Tensor | None]:
         return {
             "generator_logprobs": self.generator_logprobs,
             "temperature": self.temperature,
             "loss_mask": self.loss_mask,
             "advantages": self.advantages,
+            "is_policy_age_0": self.is_policy_age_0,
         }
 
 
@@ -86,6 +90,7 @@ _PAD_VALUES: dict[str, int | float | bool] = {
     "generator_logprobs": 0.0,
     "loss_mask": False,
     "advantages": 0.0,
+    "min_policy_versions": -1,
 }
 _DTYPES: dict[str, torch.dtype] = {
     "input_ids": torch.long,
@@ -93,6 +98,7 @@ _DTYPES: dict[str, torch.dtype] = {
     "generator_logprobs": torch.float,
     "loss_mask": torch.bool,
     "advantages": torch.float,
+    "min_policy_versions": torch.int32,
 }
 
 
@@ -721,6 +727,8 @@ class Batcher(Configurable):
                 "generator_logprobs": training_sample.logprobs[1:],
                 "loss_mask": training_sample.loss_mask[1:],
                 "advantages": training_sample.advantage[1:],
+                "min_policy_versions": [training_sample.min_policy_version]
+                * (len(training_sample.token_ids) - 1),
             }
             sample_len = len(sample["input_ids"])
             unpadded_len = sample_len
@@ -775,6 +783,10 @@ class Batcher(Configurable):
             loss_mask=loss_mask,
             advantages=torch.tensor(
                 packed_fields["advantages"], dtype=_DTYPES["advantages"]
+            ),
+            min_policy_versions=torch.tensor(
+                packed_fields["min_policy_versions"],
+                dtype=_DTYPES["min_policy_versions"],
             ),
             padding_mask=padding_mask_tensor,
             loss_token_counts=loss_token_counts,

@@ -43,6 +43,33 @@ def test_dapo_loss_matches_vllm_tempered_logprobs_bitwise() -> None:
         temperature=temperature,
         advantages=torch.ones(64),
         loss_mask=torch.ones(64, dtype=torch.bool),
+        is_policy_age_0=torch.ones(64, dtype=torch.bool),
     )
 
     assert metrics["bit_wise/logprob_diff/max"] == 0
+
+
+def test_dapo_loss_sums_the_logprob_gap_over_policy_age_0_tokens() -> None:
+    # Uniform logits over 4 tokens: every trainer logprob is log(1/4).
+    trainer_logprob = torch.tensor(0.25).log()
+    generator_logprobs = trainer_logprob - torch.tensor([0.1, 0.2, 0.4, 0.8])
+    #                                        policy age: 0    0    1    0 (no loss)
+
+    _, metrics = DAPOLoss.Config().build()(
+        torch.zeros(4, 4),
+        torch.zeros(4, dtype=torch.long),
+        torch.tensor(3),
+        generator_logprobs=generator_logprobs,
+        temperature=torch.ones(4),
+        advantages=torch.ones(4),
+        loss_mask=torch.tensor([True, True, True, False]),
+        is_policy_age_0=torch.tensor([True, True, False, True]),
+    )
+
+    # Shares of the 3 loss tokens; the trainer divides the first by the second.
+    torch.testing.assert_close(
+        metrics["bit_wise/logprob_diff_age_0/mean"], torch.tensor((0.1 + 0.2) / 3)
+    )
+    torch.testing.assert_close(
+        metrics["bit_wise/age_0_tokens/frac"], torch.tensor(2 / 3)
+    )
