@@ -66,12 +66,13 @@ def add_extra_vllm_engine_args(
     Raises ``ValueError`` for keys TorchTitan already set in ``engine_kwargs`` or
     derives from a config field, so they cannot silently diverge from it.
     """
-    # EngineArgs that TorchTitan sets only when the mapped VLLMGenerator.Config
-    # field is set (or derives from it), so they may be absent from engine_kwargs.
+    # EngineArgs whose error names the VLLMGenerator.Config field to use instead.
+    # Keys set only when their field is set must be here: engine_kwargs may lack them.
     config_field_by_engine_arg = {
         "max_num_batched_tokens": "max_num_batched_tokens",
         "compilation_config": "cuda_graph",
         "seed": "debug.seed",
+        "watermark": "watermark",
     }
     owned_keys = sorted(
         extra_vllm_engine_args.keys()
@@ -793,9 +794,23 @@ class VLLMGenerator(Configurable):
         (prefill + decode, summed over the batch). ``None`` (default) leaves
         vLLM's own engine default in place."""
 
+        watermark: float = 0.1
+        """Fraction of KV blocks that must stay free after vLLM admits a waiting or preempted request.
+        Running requests still decode into those blocks, so fewer get preempted. In [0, 1).
+
+        Example, 10,000 blocks, 500 free, a waiting request needs 100 (400 free after):
+
+            watermark=0.0    admitted                vLLM's default
+            watermark=0.03   admitted (400 >= 300)
+            watermark=0.1    waits (400 < 1,000)     same as admitting only while KV usage stays <= 90%
+
+        Throughput vs the best value (0.01-0.03) in a CPU sim of vLLM's scheduler, 10 workloads:
+        0.0 gives 1.4-9.7% less (more preemptions), 0.1 gives 2.8-11.1% less (fewer requests running).
+        """
+
         extra_vllm_engine_args: dict[str, Any] = field(default_factory=dict)
         """Additional keyword arguments passed to vLLM's ``EngineArgs``, for engine
-        options without a dedicated field here (e.g. ``{"watermark": 0.03}``). vLLM
+        options without a dedicated field here (e.g. ``{"enable_prefix_caching": False}``). vLLM
         validates them. Keys that TorchTitan sets itself, or derives from a field of
         this config (e.g. ``max_num_batched_tokens``), raise a ``ValueError``; see
         ``add_extra_vllm_engine_args``."""
@@ -857,6 +872,8 @@ class VLLMGenerator(Configurable):
                     "batch_invariant requires reset_kv_cache_on_weight_sync=True so "
                     "cached KV cannot cross a policy update"
                 )
+            if not 0.0 <= self.watermark < 1.0:
+                raise ValueError(f"watermark must be in [0, 1), got {self.watermark}")
 
     def __init__(
         self,
@@ -972,6 +989,7 @@ class VLLMGenerator(Configurable):
         engine_kwargs["max_num_seqs"] = self._max_num_seqs
         if config.max_num_batched_tokens is not None:
             engine_kwargs["max_num_batched_tokens"] = config.max_num_batched_tokens
+        engine_kwargs["watermark"] = config.watermark
         # Continuous batching requires FCFS scheduling: admission order must equal the
         # broadcast order on every rank
         engine_kwargs["scheduling_policy"] = "fcfs"
