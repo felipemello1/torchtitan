@@ -205,19 +205,16 @@ def rl_chess_qwen3_5_4b_gb300(
     max_thinking_tokens: int = 1024,
     max_context_tokens: int = 131072,
 ) -> Controller.Config:
-    """Qwen3.5-4B (instruct) self-play with thinking on, on three GB300 hosts: host 0 trains with
-    FSDP 4, hosts 1-2 run eight one-GPU generators. A step trains 48 positions x 8 self-play games
-    (16 rollouts per position, one per color), every game capped at `max_plies`. 56 fixed games
-    against a 7-bot ladder validate every 5 steps, beside training.
+    """Qwen3.5-4B (instruct) self-play with thinking on, on three GB300 hosts:
 
-    A turn thinks up to `max_thinking_tokens`; then `ThinkingBudget` closes the thinking, starts the
-    answer with "\\boxed{" and ends it at the closing brace, and the reward loses up to 0.1 for
-    force-closed turns. A player keeps its own past thinking, so its history grows ~1.6k tokens a turn.
+        host 0:     the trainer, FSDP 4
+        hosts 1-2:  eight one-GPU generators
+
+    A player keeps its own past thinking, so its history grows ~1.6k tokens a turn.
     """
     # room for the answer after the thinking ends, forced or not
     max_response_tokens = max_thinking_tokens + 512
-    # `max_context_tokens` must be a multiple of 1,024 so ChunkedLossWrapper splits each sequence
-    # into equal chunks.
+    # ChunkedLossWrapper needs `max_context_tokens` divisible by its 16 chunks.
     config = rl_chess_qwen3_5_4b(
         max_plies=max_plies,
         max_rollout_tokens=max_context_tokens - max_response_tokens,
@@ -247,9 +244,10 @@ def rl_chess_qwen3_5_4b_gb300(
         num_games=num_validation_games, opponents=ladder
     )
     worker = rollouter.worker
-    # The launcher sets the path of a Stockfish build for the host's architecture.
+    # The launcher points this at an executable Stockfish build for the host's architecture.
     worker.stockfish_path = os.environ.get("CHESS_STOCKFISH_PATH", "stockfish")
-    # A mate pays 10x a win at the cap's best (0.75), so it dominates its group's advantages.
+    # A mate pays 10; a game cut at the ply cap pays at most 0.75, so a mate dominates its group's
+    # advantages.
     worker.checkmate_reward = 10.0
     # The answer ends at the box's closing brace, so a forced move is never lost to the token cap.
     worker.thinking_budget = ThinkingBudget.Config(
@@ -266,12 +264,13 @@ def rl_chess_qwen3_5_4b_gb300(
     # Generation paces itself: the mean policy age stays under 6 steps, every trained group under
     # 12. At most 6 batches generate at once, which bounds the rollout workers, vLLM's
     # max_num_seqs, and the Stockfish processes on host 0.
-    loop.target_offpolicy_steps = 6
     loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
         max_offpolicy_steps=12,
         target_offpolicy_steps=6,
         generation_capacity=6 * loop.num_prompts_per_train_step,
     )
+    # Under the adaptive buffer this only sets train_batch/pct_samples_over_target_age.
+    loop.target_offpolicy_steps = loop.group_buffer.target_offpolicy_steps
     # Validate at step 0, every 5 steps and after the last, without pausing training.
     loop.validation = ValidationConfig(
         steps=num_validation_games, freq=5, overlap_training=True
@@ -309,6 +308,6 @@ def rl_chess_qwen3_5_4b_gb300(
     # Admit a request only while 3% of KV blocks stay free, so running requests have room to grow.
     generator.extra_vllm_engine_args = {"watermark": 0.03}
     # Start a new group only while every placed group, at its expected final size, fits the
-    # generators' KV cache; `ChessRollouter` books 16 sessions per self-play group.
+    # generators' KV cache; `ChessRollouter` books two sessions per self-play game.
     config.generator_router.admission = KVGrowthEstimateAdmission.Config()
     return config
