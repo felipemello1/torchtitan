@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -19,11 +20,18 @@ from monarch.actor import Actor, concurrent_endpoint, current_size
 
 from torchtitan.config import Configurable
 from torchtitan.observability import structured_logger as sl
+from torchtitan.rl.distributed.routing.admission import KVGrowthEstimateAdmission
 from torchtitan.rl.distributed.routing.strategies import (
     RoutingStrategy,
     StickySessionRoutingStrategy,
 )
 from torchtitan.rl.distributed.routing.types import RoutingCandidate, RoutingContext
+
+logger = logging.getLogger(__name__)
+
+# How often waiting groups retry admission: ended sessions, idle groups, the growth window and
+# generators back from a drain change what fits without a group release.
+_ADMISSION_RETRY_S = 1.0
 
 
 class _GeneratorState(Enum):
@@ -108,11 +116,20 @@ class InterGeneratorRouter(Actor, Configurable):
         under different policy versions. A turn whose session is pinned to a
         draining generator waits for it instead of moving to another one."""
 
+        admission: KVGrowthEstimateAdmission.Config | None = None
+        """When each new rollout group starts, and on which generator:
+            None (default):  every group starts at once; ``strategy`` routes each call
+            set:             a group waits in ``acquire_group`` until a generator's KV cache has
+                             room for it, then all its calls go there (``strategy`` routes only
+                             calls of groups not placed); validation groups never wait
+        Set it for multi-turn rollouts, so their histories stay cached between turns."""
+
     def __init__(
         self,
         config: Config,
         *,
         generators: Sequence[Any],
+        group_size: int,
     ):
         num_actors = math.prod(current_size().values())
         assert (
@@ -138,6 +155,15 @@ class InterGeneratorRouter(Actor, Configurable):
         self._refresh_serving_status()
         # Routing sessions of each rollout group, so `release_groups` drops any a rollout did not release.
         self._group_sessions: dict[int, set[str]] = {}
+
+        # Admission state, used when `admission` is set; `start_engine_loop` builds the policy from
+        # the generators' KV cache sizes.
+        self._group_size = group_size
+        self._admission: KVGrowthEstimateAdmission | None = None
+        self._retry_task: asyncio.Task | None = None
+        self._placed_groups: dict[int, _GeneratorHandle] = {}
+        # Groups waiting in `acquire_group`; each future resolves once the group is placed.
+        self._waiting_groups: dict[int, asyncio.Future[None]] = {}
 
     def _candidates(self) -> list[_GeneratorHandle]:
         """Return generator handles that are currently routable."""
@@ -200,25 +226,87 @@ class InterGeneratorRouter(Actor, Configurable):
         candidates = self._candidates()
         assert candidates, "serving event was set with no serving generators"
         h = self._strategy.choose(routing_ctx, candidates)
-        self._reserve(h, routing_ctx.estimated_cost)
+        return await self._call(
+            h, method, *args, cost=routing_ctx.estimated_cost, **kwargs
+        )
+
+    async def _call(
+        self, h: _GeneratorHandle, method: str, *args, cost: int, **kwargs
+    ) -> Any:
+        """Call ``method`` on a generator's rank 0, reserving ``cost`` while it runs."""
+        self._reserve(h, cost)
         # TODO: a generator whose engine loop crashed fails every call at once, so it looks idle and
         # gets most new sessions (61 of 64 rollouts with 1 of 4 dead, in a CPU sim). Detect it with a
         # typed "closed" error from VLLMGenerator, then skip the dead generator, or fail the job.
         try:
             return await getattr(h.rank0_actor, method).call_one(*args, **kwargs)
         finally:
-            self._release(h, routing_ctx.estimated_cost)
+            self._release(h, cost)
+
+    def _admit_waiting_groups(self) -> None:
+        """Place waiting groups, lowest id first, until the policy keeps one waiting."""
+        serving = [
+            i
+            for i, h in enumerate(self._generators)
+            if h.state is _GeneratorState.SERVING
+        ]
+        while self._waiting_groups and serving:
+            group_id = min(self._waiting_groups)
+            generator = self._admission.admit(group_id, serving=serving)
+            if generator is None:
+                return
+            self._placed_groups[group_id] = self._generators[generator]
+            self._waiting_groups.pop(group_id).set_result(None)
+
+    async def _acquire_group(self, group_id: int) -> None:
+        """Wait until the admission policy places this group on a generator. Validation groups
+        (negative ids) come first in group id order, and the policy never keeps them waiting."""
+        if self._admission is None:
+            raise RuntimeError(
+                "acquire_group needs InterGeneratorRouter.Config.admission"
+            )
+        placed = asyncio.get_running_loop().create_future()
+        self._waiting_groups[group_id] = placed
+        self._admit_waiting_groups()
+        # Shielded: a cancelled caller must not drop the group from the queue; `release_groups` does.
+        await asyncio.shield(placed)
+
+    async def _start_admission(self) -> None:
+        """Build the admission policy from every generator's KV cache size, and retry waiting
+        groups every second."""
+        budgets = await asyncio.gather(
+            *[h.rank0_actor.kv_cache_budget.call_one() for h in self._generators]
+        )
+        self._admission = self._config.admission.build(
+            budgets=list(budgets),
+            group_size=self._group_size,
+        )
+        self._retry_task = asyncio.create_task(self._retry_waiting_groups())
+
+    async def _retry_waiting_groups(self) -> None:
+        while True:
+            await asyncio.sleep(_ADMISSION_RETRY_S)
+            self._admit_waiting_groups()
 
     def _release_session(self, group_id: int, session_id: str) -> None:
-        """Drop a session's affinity."""
+        """Drop a session's affinity, and release it from the admission policy."""
         self._group_sessions.get(group_id, set()).discard(session_id)
+        if group_id in self._placed_groups:
+            self._admission.release_session(group_id, session_id=session_id)
         self._strategy.release_session(session_id)
 
     def _release_groups(self, group_ids: list[int]) -> None:
-        """Drop the affinity of every session left in these groups."""
+        """Drop the affinity of every session left in these groups, and release them from the
+        admission policy."""
         for group_id in group_ids:
             for session_id in self._group_sessions.pop(group_id, ()):
                 self._strategy.release_session(session_id)
+            if self._placed_groups.pop(group_id, None) is not None:
+                self._admission.release_group(group_id)
+            waiting = self._waiting_groups.pop(group_id, None)
+            if waiting is not None:
+                waiting.cancel()
+        self._admit_waiting_groups()
 
     async def _generate(
         self,
@@ -233,6 +321,38 @@ class InterGeneratorRouter(Actor, Configurable):
         """Body of the ``generate`` endpoint."""
         if routing_session_id is not None:
             self._group_sessions.setdefault(group_id, set()).add(routing_session_id)
+        h = self._placed_groups.get(group_id)
+        # Not placed: no admission, or a call that outlived its group (e.g. a sibling still running
+        # after its group failed), routed below without admission.
+        if h is not None:
+            # The admission policy sees the session's prompt while the call runs, then its prompt
+            # plus completion.
+            num_prompt_tokens = len(prompt_token_ids)
+            self._admission.set_session_tokens(
+                group_id, session_id=routing_session_id, num_tokens=num_prompt_tokens
+            )
+            # Wait out a drain on the group's generator: it is short, and it keeps the group's KV.
+            while not h.serving.is_set():
+                await h.serving.wait()
+            completion = await self._call(
+                h,
+                "generate",
+                prompt_token_ids,
+                request_id=request_id,
+                group_id=group_id,
+                routing_session_id=routing_session_id,
+                sampling_config=sampling_config,
+                metrics_prefix=metrics_prefix,
+                cost=1,
+            )
+            # Skipped if the group was released while the call ran.
+            if group_id in self._placed_groups:
+                self._admission.set_session_tokens(
+                    group_id,
+                    session_id=routing_session_id,
+                    num_tokens=num_prompt_tokens + len(completion.token_ids),
+                )
+            return completion
         return await self._route(
             "generate",
             prompt_token_ids,
@@ -337,13 +457,28 @@ class InterGeneratorRouter(Actor, Configurable):
 
     @concurrent_endpoint
     async def start_engine_loop(self) -> None:
-        """Start the engine loop on every rank of every generator."""
+        """Start the engine loop on every rank of every generator, then the admission policy."""
         await self._fanout("start_engine_loop")
+        if self._config.admission is not None:
+            await self._start_admission()
+
+    @concurrent_endpoint
+    async def acquire_group(self, group_id: int) -> None:
+        """Wait until ``admission`` places this rollout group on a generator. Call it before the
+        group builds its envs, and ``release_groups`` once it is done."""
+        await self._acquire_group(group_id)
 
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:
-        """Set the step counter in this process and in every generator rank."""
+        """Set the step counter in this process and in every generator rank, and log admission."""
         sl.set_step(step)
+        if self._admission is not None:
+            logger.info(
+                "Admission at step %d: %d groups waiting, %s",
+                step,
+                len(self._waiting_groups),
+                self._admission.summary(),
+            )
         await self._fanout("sync_log_step", step)
 
     @concurrent_endpoint
@@ -353,7 +488,8 @@ class InterGeneratorRouter(Actor, Configurable):
 
     @concurrent_endpoint
     async def release_groups(self, group_ids: list[int]) -> None:
-        """Tell every generator that these rollout groups are finished."""
+        """Tell every generator that these rollout groups are finished, and release their
+        admission placement or waiting ``acquire_group``."""
         self._release_groups(group_ids)
         await self._fanout("release_groups", group_ids)
 
@@ -367,4 +503,6 @@ class InterGeneratorRouter(Actor, Configurable):
     @concurrent_endpoint
     async def close_generators(self) -> list[Any | BaseException]:
         """Close every generator, returning each one's result or exception."""
+        if self._retry_task is not None:
+            self._retry_task.cancel()
         return await self._fanout("close", return_exceptions=True)
