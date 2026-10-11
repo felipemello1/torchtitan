@@ -12,6 +12,7 @@ Black:          (waits for White's first move) -> "White played e4." + pieces ->
 ```
 
 `ChessSelfPlayWorker` overrides `RolloutWorker.run_group`. It builds `group_size` games from one start position and drives both players of every game with the stock rollout loop.
+`ChessRollouter` tells KV admission (`InterGeneratorRouter.Config.admission`) that a self-play game opens two routing sessions, one per player.
 
 Black's first prompt after 1. e4, in full (games start a random number of plies into a book opening):
 

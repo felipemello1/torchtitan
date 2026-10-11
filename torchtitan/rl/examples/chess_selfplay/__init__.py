@@ -16,7 +16,10 @@ from torchtitan.rl.examples.chess_selfplay.env import (
     ChessPlayerEnv,
     material_score,
 )
-from torchtitan.rl.examples.chess_selfplay.rollouter import ChessSelfPlayWorker
+from torchtitan.rl.examples.chess_selfplay.rollouter import (
+    ChessRollouter,
+    ChessSelfPlayWorker,
+)
 from torchtitan.rl.examples.chess_selfplay.rubric import RewardChessScore
 
 __all__ = [
@@ -25,6 +28,7 @@ __all__ = [
     "ChessCurriculum",
     "ChessGame",
     "ChessPlayerEnv",
+    "ChessRollouter",
     "ChessSample",
     "ChessSelfPlayDataset",
     "ChessSelfPlayWorker",

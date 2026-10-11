@@ -22,7 +22,7 @@ from torchtitan.rl.examples.chess_selfplay.bots import (
 from torchtitan.rl.examples.chess_selfplay.data import ChessSample
 from torchtitan.rl.examples.chess_selfplay.env import ChessGame
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.rollout.rollouter import RolloutWorker
+from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 from torchtitan.rl.rollout.types import GenerateFn, Rollout, RolloutGroup, RolloutStatus
 
 if TYPE_CHECKING:
@@ -292,6 +292,18 @@ class ChessSelfPlayWorker(RolloutWorker):
                     "won": float(game.scores[color] == 1.0),
                 }
             await env.close()
+
+
+class ChessRollouter(Rollouter):
+    """The chess `Rollouter`: tells KV admission that a self-play game opens two routing sessions."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Rollouter.Config):
+        pass
+
+    def num_sessions(self, sample: ChessSample, *, group_size: int) -> int:
+        """One session per policy player: two per self-play game, one per bot game."""
+        return 2 * group_size if sample.opponent == "self" else group_size
 
 
 class EloFit:

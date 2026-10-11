@@ -29,6 +29,7 @@ from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConf
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.examples.chess_selfplay import (
     ChessPlayerEnv,
+    ChessRollouter,
     ChessSelfPlayDataset,
     ChessSelfPlayWorker,
     ChessVsBotDataset,
@@ -39,7 +40,6 @@ from torchtitan.rl.losses import DAPOLoss
 from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import TokenEnv
-from torchtitan.rl.rollout.rollouter import Rollouter
 from torchtitan.rl.rubric import Rubric
 from torchtitan.rl.trainer import Trainer
 
@@ -85,7 +85,7 @@ def rl_chess_qwen3_5_4b(
             target_offpolicy_steps=4,
             validation=ValidationConfig(steps=num_validation_games),
         ),
-        rollouter=Rollouter.Config(
+        rollouter=ChessRollouter.Config(
             training_dataloader=IterableRLDataLoader.Config(
                 dataset=ChessSelfPlayDataset.Config(bots=ladder)
             ),

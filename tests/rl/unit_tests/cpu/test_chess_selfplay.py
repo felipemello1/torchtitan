@@ -25,6 +25,7 @@ from torchtitan.rl.examples.chess_selfplay import (
     ChessCurriculum,
     ChessGame,
     ChessPlayerEnv,
+    ChessRollouter,
     ChessSample,
     ChessSelfPlayDataset,
     ChessSelfPlayWorker,
@@ -381,6 +382,14 @@ def test_recipe_builds() -> None:
     # ChunkedLossWrapper splits each sequence into equal chunks
     training, loss = config.trainer.training, config.trainer.loss
     assert training.max_context_length % loss.num_chunks == 0
+
+
+def test_rollouter_reports_two_sessions_per_self_play_game() -> None:
+    # KV admission books these before a group starts: one routing session per policy player.
+    rollouter = object.__new__(ChessRollouter)
+    bot_game = replace(_SELF_PLAY, opponent="sf_eps75")
+    assert rollouter.num_sessions(_SELF_PLAY, group_size=8) == 16
+    assert rollouter.num_sessions(bot_game, group_size=8) == 8
 
 
 def test_player_env_shows_the_board_and_scores_the_end() -> None:

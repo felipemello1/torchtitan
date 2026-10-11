@@ -165,8 +165,9 @@ class InterGeneratorRouter(Actor, Configurable):
         self._admission: KVGrowthEstimateAdmission | None = None
         self._retry_task: asyncio.Task | None = None
         self._placed_groups: dict[int, _GeneratorHandle] = {}
-        # Groups waiting in `acquire_group`; each future resolves once the group is placed.
-        self._waiting_groups: dict[int, asyncio.Future[None]] = {}
+        # Groups waiting in `acquire_group`, with the sessions each will open; each future
+        # resolves once the group is placed.
+        self._waiting_groups: dict[int, tuple[asyncio.Future[None], int | None]] = {}
 
     def _candidates(self) -> list[_GeneratorHandle]:
         """Return generator handles that are currently routable."""
@@ -255,13 +256,19 @@ class InterGeneratorRouter(Actor, Configurable):
         ]
         while self._waiting_groups and serving:
             group_id = min(self._waiting_groups)
-            generator = self._admission.admit(group_id, serving=serving)
+            placed, num_sessions = self._waiting_groups[group_id]
+            generator = self._admission.admit(
+                group_id, serving=serving, num_sessions=num_sessions
+            )
             if generator is None:
                 return
             self._placed_groups[group_id] = self._generators[generator]
-            self._waiting_groups.pop(group_id).set_result(None)
+            del self._waiting_groups[group_id]
+            placed.set_result(None)
 
-    async def _acquire_group(self, group_id: int) -> None:
+    async def _acquire_group(
+        self, group_id: int, num_sessions: int | None = None
+    ) -> None:
         """Wait until the admission policy places this group on a generator. Validation groups
         (negative ids) come first in group id order, and the policy never keeps them waiting."""
         if self._admission is None:
@@ -269,7 +276,7 @@ class InterGeneratorRouter(Actor, Configurable):
                 "acquire_group needs InterGeneratorRouter.Config.admission"
             )
         placed = asyncio.get_running_loop().create_future()
-        self._waiting_groups[group_id] = placed
+        self._waiting_groups[group_id] = (placed, num_sessions)
         self._admit_waiting_groups()
         # Shielded: a cancelled caller must not drop the group from the queue; `release_groups` does.
         await asyncio.shield(placed)
@@ -314,7 +321,8 @@ class InterGeneratorRouter(Actor, Configurable):
                 self._admission.release_group(group_id)
             waiting = self._waiting_groups.pop(group_id, None)
             if waiting is not None:
-                waiting.cancel()
+                placed, _ = waiting
+                placed.cancel()
         self._admit_waiting_groups()
 
     async def _generate(
@@ -472,10 +480,13 @@ class InterGeneratorRouter(Actor, Configurable):
             await self._start_admission()
 
     @concurrent_endpoint
-    async def acquire_group(self, group_id: int) -> None:
+    async def acquire_group(
+        self, group_id: int, num_sessions: int | None = None
+    ) -> None:
         """Wait until ``admission`` places this rollout group on a generator. Call it before the
-        group builds its envs, and ``release_groups`` once it is done."""
-        await self._acquire_group(group_id)
+        group builds its envs, and ``release_groups`` once it is done. ``num_sessions``: routing
+        sessions the group will open (``Rollouter.num_sessions``); None books one per sample."""
+        await self._acquire_group(group_id, num_sessions)
 
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:

@@ -928,7 +928,10 @@ def _rollout_loop_controller(router, run_group_rollouts) -> SimpleNamespace:
             generator_router=router._config,
         ),
         generator_router=_RouterHandle(router),
-        _rollouter=SimpleNamespace(run_group_rollouts=run_group_rollouts),
+        _rollouter=SimpleNamespace(
+            run_group_rollouts=run_group_rollouts,
+            num_sessions=lambda sample, *, group_size: group_size,
+        ),
         _sampling=SamplingConfig(),
         rollout_recorder=SimpleNamespace(record=lambda **kwargs: None),
     )
@@ -967,6 +970,29 @@ def test_rollout_loop_acquires_a_generator_before_building_envs():
         assert envs_built == [0, 1]
         assert [len(group.rollouts) for group in work_buffer.finalized] == [0, 0]
         assert router._placed_groups == {}
+
+    asyncio.run(_run())
+
+
+def test_rollout_loop_books_the_sessions_the_rollouter_reports():
+    """A self-play rollouter reports two sessions per sample; the placed group books both."""
+
+    async def _run():
+        router = await _admission_router([_KVActor("gen0")])
+        booked: list[int] = []
+
+        async def run_group_rollouts(*, group_id: int, **kwargs) -> RolloutGroup:
+            booked.append(router._admission._groups[group_id].expected_sessions)
+            return RolloutGroup(group_id=group_id, rollouts=[])
+
+        controller = _rollout_loop_controller(router, run_group_rollouts)
+        controller._rollouter.num_sessions = (
+            lambda sample, *, group_size: 2 * group_size
+        )
+        await Controller._rollout_loop(
+            controller, group_buffer=_WorkBuffer([0]), generate_fn=None
+        )
+        assert booked == [2]
 
     asyncio.run(_run())
 
@@ -1012,7 +1038,10 @@ def test_validation_places_its_groups_before_building_envs():
         controller = SimpleNamespace(
             config=SimpleNamespace(generator_router=router._config),
             generator_router=_RouterHandle(router),
-            _rollouter=SimpleNamespace(run_group_rollouts=run_group_rollouts),
+            _rollouter=SimpleNamespace(
+                run_group_rollouts=run_group_rollouts,
+                num_sessions=lambda sample, *, group_size: group_size,
+            ),
             _make_generate_fn=lambda metrics_prefix: None,
         )
         groups, _ = await Controller._collect_validation_rollouts(
