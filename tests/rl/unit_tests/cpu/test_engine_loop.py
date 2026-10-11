@@ -1078,6 +1078,35 @@ def test_sampling_params_rejection_fails_only_its_reply(engine_thread) -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("routed_experts_prompt_start", [-1, 2])
+def test_routed_experts_prompt_start_outside_the_prompt_fails_only_its_call(
+    engine_thread, routed_experts_prompt_start
+) -> None:
+    # vLLM would assert inside engine.step and stop the loop for every request.
+    async def run() -> None:
+        generator = engine_thread(_FakeEngine())
+        await generator.start_engine_loop()
+        rejected = generator.generate(
+            [1, 2],
+            request_id="r0",
+            group_id=0,
+            routing_session_id="s",
+            sampling_config=SamplingConfig(
+                stop_token_ids=[],
+                routed_experts_prompt_start=routed_experts_prompt_start,
+            ),
+        )
+        with pytest.raises(ValueError, match="routed_experts_prompt_start"):
+            await asyncio.wait_for(rejected, _TIMEOUT_S)
+
+        completion = await asyncio.wait_for(_generate(generator, "r1"), _TIMEOUT_S)
+        assert completion.request_id == "r1"
+
+        await asyncio.wait_for(generator.close(), _TIMEOUT_S)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(
     "error",
     [

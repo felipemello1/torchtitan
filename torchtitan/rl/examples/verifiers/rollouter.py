@@ -405,10 +405,9 @@ class VerifiersRollouter(Rollouter):
         gets back its loss mask, and NaN logprobs on those tokens. A turn's top-k rows
         come from the generation whose prompt length and completion tokens match its node.
 
-        With router replay, a turn takes the branch's routed expert ids of its
-        prompt and completion but the last token, as in
-        ``Completion.routed_expert_ids``: the second turn above gets the rows of
-        ``[1, 2, 3, 4, 5, 6, 7]``.
+        With router replay, a turn takes the branch's routed expert ids as in
+        ``RolloutTurn.routed_expert_ids``: the first turn gets the rows of
+        ``[1, 2, 3]``, and the second, which continues it, those of ``[4, 5, 6, 7]``.
         """
         if generation_metadata is None:
             if any(any(node.mask) for node in trace.nodes):
@@ -469,6 +468,13 @@ class VerifiersRollouter(Rollouter):
                     prompt_prefix_len, prompt_delta_token_ids = split_prompt(
                         token_ids[:absolute_start], previous_token_ids
                     )
+                    # Take only the routed expert rows earlier turns lack; see `RolloutTurn.routed_expert_ids`.
+                    routed_experts_prompt_start = (
+                        prompt_prefix_len - 1
+                        if previous_token_ids
+                        and prompt_prefix_len == len(previous_token_ids)
+                        else 0
+                    )
                     previous_token_ids = token_ids[:absolute_end]
                     completion_token_ids = list(token_ids[absolute_start:absolute_end])
                     completion_logprobs = list(logprobs[absolute_start:absolute_end])
@@ -508,7 +514,9 @@ class VerifiersRollouter(Rollouter):
                                 None
                                 if routed_expert_ids is None
                                 else torch.from_numpy(
-                                    routed_expert_ids[: absolute_end - 1]
+                                    routed_expert_ids[
+                                        routed_experts_prompt_start : absolute_end - 1
+                                    ]
                                 )
                             ),
                             min_policy_version=generation_metadata.min_policy_version,

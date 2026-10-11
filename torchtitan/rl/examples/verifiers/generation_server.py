@@ -212,17 +212,6 @@ class GenerationServer(Configurable):
                 raise ValueError(
                     f"sampling_params.{GROUP_ID_SAMPLING_PARAM} must be an integer"
                 )
-            # Set by Verifiers on a turn that continues the previous one, whose response
-            # already carried the routed expert ids before this position.
-            routed_experts_prompt_start = sampling_params.pop(
-                "routed_experts_prompt_start", 0
-            )
-            if isinstance(routed_experts_prompt_start, bool) or not isinstance(
-                routed_experts_prompt_start, int
-            ):
-                raise ValueError(
-                    "sampling_params.routed_experts_prompt_start must be an integer"
-                )
             sampling = _parse_sampling_config(sampling_params)
             if body.get("features") is not None:
                 raise ValueError("multimodal features are not supported")
@@ -335,7 +324,7 @@ class GenerationServer(Configurable):
                             else {
                                 "routed_experts": _routed_experts_payload(
                                     completion.routed_expert_ids,
-                                    start=routed_experts_prompt_start,
+                                    start=sampling.routed_experts_prompt_start,
                                 )
                             }
                         ),
@@ -353,14 +342,15 @@ class GenerationServer(Configurable):
 def _routed_experts_payload(
     routed_expert_ids: torch.Tensor, *, start: int
 ) -> dict[str, object]:
-    """Verifiers' ``routed_experts`` response field: the rows from position ``start`` on.
+    """Verifiers' ``routed_experts`` response field for rows that begin at prompt position ``start``.
 
     Example:
 
-        _routed_experts_payload(routed_expert_ids, start=3)  # uint8 [6, 48, 8]
-        # -> {"data": <base64 of rows 3..5>, "shape": [3, 48, 8], "start": 3, "dtype": "uint8"}
+        # routed_expert_ids: uint8 [3, 48, 8], positions 3..5
+        _routed_experts_payload(routed_expert_ids, start=3)
+        # -> {"data": <base64 of the 3 rows>, "shape": [3, 48, 8], "start": 3, "dtype": "uint8"}
     """
-    rows = routed_expert_ids[start:].numpy()
+    rows = routed_expert_ids.numpy()
     return {
         "data": base64.b64encode(rows.tobytes()).decode("ascii"),
         "shape": list(rows.shape),
@@ -392,6 +382,8 @@ def _parse_sampling_config(value: object):
         "seed",
         "stop_token_ids",
         "num_topk_logprobs",
+        # Set by Verifiers on a turn that continues the previous one.
+        "routed_experts_prompt_start",
     }
     protocol_fields = {
         "logprobs",
@@ -415,5 +407,10 @@ def _parse_sampling_config(value: object):
         stop_token_ids=stop_token_ids,
         num_topk_logprobs=int(
             value.get("num_topk_logprobs", defaults.num_topk_logprobs)
+        ),
+        routed_experts_prompt_start=int(
+            value.get(
+                "routed_experts_prompt_start", defaults.routed_experts_prompt_start
+            )
         ),
     )

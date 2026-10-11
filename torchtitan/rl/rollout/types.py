@@ -137,8 +137,12 @@ class RolloutTurn:
     """`Completion.loss_mask`: False on tokens the rollout appended, which the loss skips. None: train every token."""
 
     routed_expert_ids: torch.Tensor | None = None
-    """[num_prompt_tokens + num_completion_tokens - 1, num_layers, top_k] expert ids the
-    generator routed this turn's prompt and completion to; see `Completion.routed_expert_ids`."""
+    """[num_rows, num_layers, top_k] expert ids the generator routed this turn's forward inputs to
+    (`Completion.routed_expert_ids`). Rows start where earlier turns' rows stop, so no row is sent twice:
+
+        turn continues the previous one:   prompt_prefix_len - 1 (the previous completion's last token)
+        first turn, or history rewritten:  0
+    """
     completion_topk_token_ids: torch.Tensor | None = None  # [num_completion_tokens, k]
     """The generator's top-k token ids at each completion position (`Completion.topk_token_ids`)."""
 

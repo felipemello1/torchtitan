@@ -129,6 +129,10 @@ class ThinkingBudget(Configurable):
                 sampling_config=replace(
                     sampling_config,
                     max_tokens=max_tokens - len(first.token_ids) - len(forced_ids),
+                    # Start at the first call's last token; the first call returned the rows before it.
+                    routed_experts_prompt_start=(
+                        len(prompt_token_ids) + len(first.token_ids) - 1
+                    ),
                 ),
             )
             if second is None:
@@ -194,20 +198,17 @@ class ThinkingBudget(Configurable):
 def _join_routed_expert_ids(
     first: Completion, second: Completion
 ) -> torch.Tensor | None:
-    """Rows of the merged turn: the first call's, then the second call's from where the first
-    stops (its last token, the forced tokens and its own completion ran forward only there).
+    """Rows of the merged turn: the first call's, then the second call's, which start at the first
+    call's last token.
 
     Example:
         # prompt [P0, P1], first [A0, A1], forced [F0], second [B0]
-        # first rows: P0 P1 A0 (A1 never ran forward); second rows: P0 P1 A0 A1 F0
-        # -> P0 P1 A0 from first, A1 F0 from second
+        # first rows: P0 P1 A0 (A1 never ran forward); second rows, from position 3: A1 F0
+        # -> P0 P1 A0 A1 F0
     """
     if first.routed_expert_ids is None or second.routed_expert_ids is None:
         return None
-    num_first_rows = len(first.routed_expert_ids)
-    return torch.cat(
-        [first.routed_expert_ids, second.routed_expert_ids[num_first_rows:]]
-    )
+    return torch.cat([first.routed_expert_ids, second.routed_expert_ids])
 
 
 def _join_topk_rows(

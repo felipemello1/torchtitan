@@ -354,7 +354,7 @@ class TrainingSampleBuilder(Configurable):
             training_sample.logprobs += rollout_turn.completion_logprobs
             training_sample.advantage += [rollout_advantage] * num_completion
             if rollout_turn.routed_expert_ids is not None:
-                # Row i is position i. A continuing turn adds rows from prompt_prefix_len - 1: the
+                # Row i is position i. A continuing turn's rows start at prompt_prefix_len - 1: the
                 # previous completion's last token only ran forward in this turn's prefill.
                 training_sample.routed_expert_ids = (
                     rollout_turn.routed_expert_ids
@@ -362,14 +362,19 @@ class TrainingSampleBuilder(Configurable):
                     else torch.cat(
                         [
                             training_sample.routed_expert_ids,
-                            rollout_turn.routed_expert_ids[prompt_prefix_len - 1 :],
+                            rollout_turn.routed_expert_ids,
                         ]
                     )
                 )
-                assert (
+                if (
                     len(training_sample.routed_expert_ids)
-                    == len(training_sample.token_ids) - 1
-                )
+                    != len(training_sample.token_ids) - 1
+                ):
+                    raise ValueError(
+                        f"rollout {rollout.group_id}/rollout={rollout.rollout_id}: turn "
+                        f"{turn_idx} has {len(rollout_turn.routed_expert_ids)} routed expert "
+                        "rows; see `RolloutTurn.routed_expert_ids` for where they start"
+                    )
             if rollout_turn.completion_topk_token_ids is not None:
                 training_sample.topk_token_ids = _append_rows(
                     training_sample.topk_token_ids,

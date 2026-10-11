@@ -127,18 +127,20 @@ def test_forced_close_keeps_topk_rows_and_routed_experts() -> None:
     answer = _completion([20, 21], finish_reason="stop")
     answer.topk_token_ids = torch.tensor([[20], [21]], dtype=torch.int32)
     answer.topk_logprobs = torch.full((2, 1), -0.25)
-    answer.routed_expert_ids = torch.full(
-        (2 + 4 + 3 + 2 - 1, 1, 1), 2, dtype=torch.uint8
-    )
-    completion = _run(_budget(), _ScriptedGenerate(thinking, answer), prompt=[5, THINK])
+    # The second call asks for rows from token 13, which only it ran forward: 13, 90, 91, 92, 20.
+    answer.routed_expert_ids = torch.full((5, 1, 1), 2, dtype=torch.uint8)
+    generate = _ScriptedGenerate(thinking, answer)
+    completion = _run(_budget(), generate, prompt=[5, THINK])
+    assert [
+        call["sampling_config"].routed_experts_prompt_start for call in generate.calls
+    ] == [0, 5]
 
     # Zero rows on the forced tokens, which the loss skips.
     topk_token_ids = completion.topk_token_ids.flatten().tolist()
     assert topk_token_ids == [10, 11, 12, 13, 0, 0, 0, 20, 21]
     topk_logprobs = completion.topk_logprobs.flatten().tolist()
     assert topk_logprobs == [-0.5] * 4 + [0.0] * 3 + [-0.25] * 2
-    # 2 prompt + 9 completion tokens - 1: the first call's 5 rows, then the second call's from
-    # token 13 (which only the second call ran forward) on.
+    # 2 prompt + 9 completion tokens - 1: the first call's 5 rows, then the second call's 5.
     assert completion.routed_expert_ids.flatten().tolist() == [1] * 5 + [2] * 5
 
 
