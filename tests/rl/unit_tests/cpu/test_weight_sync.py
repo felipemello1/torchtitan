@@ -302,6 +302,7 @@ async def _run_trainer_loop(*, num_training_steps):
             sync_log_step=_rpc,
             acknowledge_training_sample_ids=lambda sample_ids: None,
             state_dict=dict,
+            training_data_metrics=list,
         ),
         _trainer_policy_version=0,
         config=SimpleNamespace(
