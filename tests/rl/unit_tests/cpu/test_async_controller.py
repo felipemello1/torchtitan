@@ -10,6 +10,8 @@ the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID
 import asyncio
 import json
 import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
@@ -19,6 +21,8 @@ from torchtitan.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
+from torchtitan.rl.controller import Controller
+from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
@@ -771,3 +775,30 @@ def test_no_window_takes_oldest_ready_group_past_a_stuck_head() -> None:
         assert taker.result().group_id == 6
 
     asyncio.run(run())
+
+
+def test_validation_groups_get_negative_ids() -> None:
+    """The generator schedules negative group ids ahead of training, so validation must use them."""
+    controller = object.__new__(Controller)
+    controller.generator_router = SimpleNamespace(
+        release_groups=SimpleNamespace(call_one=AsyncMock())
+    )
+    controller._rollouter = SimpleNamespace(
+        run_group_rollouts=AsyncMock(
+            side_effect=lambda *, group_id, **kwargs: RolloutGroup(
+                group_id=group_id, rollouts=[]
+            )
+        )
+    )
+
+    asyncio.run(
+        controller._collect_validation_rollouts(
+            samples=["prompt_a", "prompt_b"], sampling=SamplingConfig(), step=0
+        )
+    )
+
+    group_ids = [
+        call.kwargs["group_id"]
+        for call in controller._rollouter.run_group_rollouts.call_args_list
+    ]
+    assert group_ids == [-1, -2]

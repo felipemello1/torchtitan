@@ -697,6 +697,7 @@ class Controller(Configurable):
                     sample=sample,
                     # Negative ids keep validation disjoint from training group ids, so their
                     # request_ids can't collide in the shared engine (e.g. post-validation).
+                    # The generator also schedules negative ids ahead of training.
                     group_id=-(i + 1),
                     group_size=1,
                     sampling=sampling,
