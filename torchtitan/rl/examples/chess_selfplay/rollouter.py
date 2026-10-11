@@ -21,6 +21,7 @@ from torchtitan.rl.examples.chess_selfplay.bots import (
 )
 from torchtitan.rl.examples.chess_selfplay.data import ChessSample
 from torchtitan.rl.examples.chess_selfplay.env import ChessGame
+from torchtitan.rl.examples.chess_selfplay.rubric import is_force_closed
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 from torchtitan.rl.rollout.types import GenerateFn, Rollout, RolloutGroup, RolloutStatus
@@ -56,7 +57,9 @@ class ChessSelfPlayWorker(RolloutWorker):
     A forfeit caused by one reply (illegal, unparsable, or cut at `max_tokens`) costs only that turn:
     each color is centered as if every such forfeit had ended its game at `max_plies` instead
     (`ChessGame.material_rewards`), and the forfeiting turn alone pays the difference. A player
-    stopped by an infra error is centered the same way, and none of its turns pays.
+    stopped by an infra error is centered the same way, and none of its turns pays. Separately,
+    every force-closed turn gets a negative advantage, whatever the game's outcome
+    (`forced_close_cost`).
 
     Example (group_size=2, self-play, max_plies=60):
 
@@ -81,11 +84,15 @@ class ChessSelfPlayWorker(RolloutWorker):
         """The winner's reward for a checkmate, at any length; the prompt states it.
             1:   a mate beats the best score of a game cut at `max_plies` (0.75)
             10:  a mate dominates its group's advantages"""
+        forced_close_cost: float = 0.0
+        """Lowers each force-closed turn's own advantage to at most -`forced_close_cost`, so a
+        thinking loop is pushed down even in a won game: +0.4 -> -0.25 and -0.3 -> -0.55 at 0.25."""
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self._max_plies = config.max_plies
         self._checkmate_reward = config.checkmate_reward
+        self._forced_close_cost = config.forced_close_cost
         if (
             config.stockfish_path is not None
             and shutil.which(config.stockfish_path) is None
@@ -216,6 +223,17 @@ class ChessSelfPlayWorker(RolloutWorker):
                 if game.forfeiter == color and game.end_reason in _REPLY_FORFEITS:
                     # assumes mean-centered advantages (the recipe's `should_std_normalize=False`)
                     rollout.turns[-1].advantage = advantage - forfeit_cost
+                if self._forced_close_cost:
+                    # a forfeiting turn that was also force-closed pays both; assumes mean-centered
+                    # advantages, as the forfeit does
+                    for turn in rollout.turns:
+                        if is_force_closed(turn):
+                            turn_advantage = (
+                                advantage if turn.advantage is None else turn.advantage
+                            )
+                            turn.advantage = (
+                                min(turn_advantage, 0.0) - self._forced_close_cost
+                            )
 
         # Score the policy's moves with Stockfish: a strength measure that does not depend on the opponent.
         losses_per_game = []
