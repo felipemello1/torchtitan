@@ -107,7 +107,8 @@ class RolloutSampleRecorder(Configurable):
         filename: str = "rollout_samples.jsonl"
         """JSONL filename written under `dump_dir`."""
         log_tensors: bool = False
-        """Also record the raw prompt/completion token-id arrays per turn."""
+        """Also record each turn's token ids: the prompt as `prompt_prefix_len` + `prompt_delta_token_ids`
+        (replay the turns to rebuild a full prompt) and the completion."""
         log_logprobs: bool = False
         """Also record the raw per-token completion logprob arrays per turn, plus the
         generator's top-k when `SamplingConfig.num_topk_logprobs` > 0."""
@@ -165,7 +166,8 @@ class RolloutSampleRecorder(Configurable):
             "env_rewards": turn.env_rewards,
         }
         if self._log_tensors:
-            encoded["prompt_token_ids"] = turn.prompt_token_ids
+            encoded["prompt_prefix_len"] = turn.prompt_prefix_len
+            encoded["prompt_delta_token_ids"] = turn.prompt_delta_token_ids
             encoded["completion_token_ids"] = turn.completion_token_ids
             encoded["completion_loss_mask"] = turn.completion_loss_mask
         if self._log_logprobs:

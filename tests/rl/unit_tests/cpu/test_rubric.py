@@ -47,7 +47,8 @@ def _rollout(
     token_ids = [1] * (num_tokens - 1) + [answer]
     turn = RolloutTurn(
         rollout_id=RolloutTurnID(group_id=0, rollout_id=0, turn_id=0),
-        prompt_token_ids=[0] * prompt_len,
+        prompt_prefix_len=0,
+        prompt_delta_token_ids=[0] * prompt_len,
         completion_token_ids=token_ids,
         completion_logprobs=[-0.5] * num_tokens,
         completion_loss_mask=(
