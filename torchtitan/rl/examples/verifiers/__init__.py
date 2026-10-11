@@ -16,10 +16,12 @@ from torchtitan.rl.examples.verifiers.rollouter import (
     RewardFromVerifiers,
     VerifiersRollouter,
 )
+from torchtitan.rl.examples.verifiers.sandbox_limiter import SandboxCreationLimiter
 
 __all__ = [
     "GenerationServer",
     "RewardFromVerifiers",
+    "SandboxCreationLimiter",
     "VerifiersEnvServer",
     "VerifiersRollouter",
     "VerifiersTaskDataset",
