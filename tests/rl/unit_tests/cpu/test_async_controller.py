@@ -1670,12 +1670,12 @@ def test_batcher_passes_the_version_that_trains_each_group() -> None:
     assert queue.qsize() == 3  # two batches and the None sentinel
 
 
-def test_generation_capacity_defaults_to_the_groups_that_can_still_train() -> None:
+def test_generation_capacity_default_leaves_room_for_dropped_groups() -> None:
     config = AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=12)
-    # (12 + 1) versions x 16 prompts: a later group would finish too old to train.
-    assert config.resolve_generation_capacity(16) == 208
+    # 2 x (12 + 1) versions x 16 prompts: room for up to half the groups being dropped.
+    assert config.resolve_generation_capacity(16) == 416
     loop = AsyncLoopConfig(num_prompts_per_train_step=16, group_buffer=config)
-    assert loop.max_concurrent_rollout_groups == 208
+    assert loop.max_concurrent_rollout_groups == 416
     explicit = AdaptiveRolloutGroupWorkBuffer.Config(
         max_offpolicy_steps=12, generation_capacity=96
     )

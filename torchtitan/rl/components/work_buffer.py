@@ -370,13 +370,16 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         generation_capacity: int | None = None
         """Most prompt groups generating at once; sizes rollout workers and vLLM `max_num_seqs`.
 
-        None: `(max_offpolicy_steps + 1) * num_prompts_per_train_step`, the most groups that can
-        still be trained when they finish; the demand then picks how many of them run. vLLM
-        admits only what fits in its KV cache and queues the rest. Set it lower only for a hard
-        limit outside the GPUs, e.g. `sandboxes // num_samples_per_prompt`.
+        None: `2 * (max_offpolicy_steps + 1) * num_prompts_per_train_step`. A step consumes
+        `num_prompts_per_train_step / (1 - drop_rate)` groups, trained and dropped (zero-std,
+        untrainable), so the groups worth keeping in flight grow with the drop rate. The factor 2
+        leaves room for up to half the groups being dropped; the demand, under its mean-age
+        ceiling, picks how many run. vLLM admits only what fits in its KV cache and queues the
+        rest. Set it lower only for a hard limit outside the GPUs, e.g.
+        `sandboxes // num_samples_per_prompt`.
 
         Example:
-            # max_offpolicy_steps=12, 16 prompts per step -> 208 groups at most
+            # max_offpolicy_steps=12, 16 prompts per step -> 2 * 13 * 16 = 416 groups at most
             AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=12)
         """
 
@@ -415,7 +418,7 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
             if self.generation_capacity is None and self.max_offpolicy_steps is None:
                 raise ValueError(
                     "set generation_capacity or max_offpolicy_steps: the default capacity "
-                    "is (max_offpolicy_steps + 1) * num_prompts_per_train_step"
+                    "is 2 * (max_offpolicy_steps + 1) * num_prompts_per_train_step"
                 )
             if self.generation_capacity is not None and self.generation_capacity < 1:
                 raise ValueError(
@@ -427,7 +430,7 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
             if self.generation_capacity is not None:
                 return self.generation_capacity
             assert self.max_offpolicy_steps is not None
-            return (self.max_offpolicy_steps + 1) * num_prompts_per_train_step
+            return 2 * (self.max_offpolicy_steps + 1) * num_prompts_per_train_step
 
     def __init__(
         self,
