@@ -38,6 +38,7 @@ from torchtitan.rl.examples.verifiers.rollouter import (
     VerifiersRollouter,
 )
 from torchtitan.rl.generator import SamplingConfig
+from torchtitan.rl.rollout.curriculum import Curriculum
 from torchtitan.rl.rollout.types import Rollout, RolloutStatus
 from torchtitan.rl.types import Completion
 from verifiers.v1.errors import model_error, OverlongPromptError
@@ -749,6 +750,9 @@ def test_rollouter_registers_the_groups_generate_fn_while_it_runs() -> None:
     async def run_test() -> None:
         rollouter = object.__new__(VerifiersRollouter)
         rollouter._thinking_budget = None
+        rollouter._curriculum = Curriculum.Config().build()
+        rollouter._step = 0
+        rollouter._summaries = {}
         rollouter._generation_server = GenerationServer.Config(
             max_rollout_tokens=40960
         ).build()
@@ -802,6 +806,9 @@ def test_rollouter_registers_the_groups_generate_fn_while_it_runs() -> None:
 def test_rollouter_removes_the_groups_generate_fn_when_a_rollout_raises() -> None:
     rollouter = object.__new__(VerifiersRollouter)
     rollouter._thinking_budget = None
+    rollouter._curriculum = Curriculum.Config().build()
+    rollouter._step = 0
+    rollouter._summaries = {}
     rollouter._generation_server = GenerationServer.Config(
         max_rollout_tokens=40960
     ).build()
