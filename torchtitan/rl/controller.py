@@ -627,6 +627,7 @@ class Controller(Configurable):
                 InterGeneratorRouter,
                 config.generator_router,
                 generators=generators,
+                group_size=config.async_loop.num_samples_per_prompt,
                 forward_session_releases=config.generator.hold_session_kv,
             )
 
@@ -701,6 +702,14 @@ class Controller(Configurable):
         """Sample held-out prompts, run each greedily (n=1) concurrently, and emit validation metrics."""
         # TODO: group_size=1 (best-of-1) only. Support best-of-N.
         generate = self._make_generate_fn(metrics_prefix="validation_generator")
+        if self.config.generator_router.admission is not None:
+            # Place every group before its envs start; validation groups never wait.
+            await asyncio.gather(
+                *(
+                    self.generator_router.acquire_group.call_one(-(i + 1))
+                    for i in range(len(samples))
+                )
+            )
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
         group_results = await asyncio.gather(
             *(
@@ -979,6 +988,9 @@ class Controller(Configurable):
         consumes: a WAITING RolloutGroupWork (group_buffer.claim_next)
             waits for:    a claimable WAITING entry
             unblocked by: _data_input_loop group_buffer.add_work()
+        acquires (with generator_router.admission): a generator for the group (acquire_group)
+            waits for:    KV room on a generator, after older groups
+            unblocked by: other groups' release_groups, or their sessions ending or going idle
         produces: RolloutGroup (group_buffer.finalize_work)
             waits for:    nothing (admits its own claimed slot)
             unblocked by: n/a
@@ -989,6 +1001,13 @@ class Controller(Configurable):
                 logger.info("Buffer closed; rollout worker stopping")
                 return
             try:
+                if self.config.generator_router.admission is not None:
+                    # Wait for a generator before the group builds its envs, so a waiting group
+                    # holds no sandbox or env process.
+                    with sl.log_trace_span("admission_wait"):
+                        await self.generator_router.acquire_group.call_one(
+                            work.group_id
+                        )
                 with sl.log_trace_span("rollout_group"):
                     group = await self._rollouter.run_group_rollouts(
                         generate_fn=generate_fn,
@@ -1013,9 +1032,10 @@ class Controller(Configurable):
                     rollouts=[],
                     metrics=[m.Metric("rollout/group_failures", m.Sum(1.0))],
                 )
-            # The group makes no more generation calls, so its cache salts can go.
-            # Keep outside the `try`: it raises once every generator is closed, which fails the job.
-            await self.generator_router.release_groups.call_one([work.group_id])
+            finally:
+                # The group makes no more generation calls, so its cache salts and its generator
+                # placement can go. Raises once every generator is closed, which fails the job.
+                await self.generator_router.release_groups.call_one([work.group_id])
             await group_buffer.finalize_work(group)
 
             # Drop both refs (work.rollout_group is the group too): held groups made every full GC slow.
