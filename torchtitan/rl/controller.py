@@ -106,7 +106,9 @@ from monarch.actor import ProcMesh, this_host
 from torchtitan.components.renderer import RendererConfig
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
+from torchtitan.config.transform import LMHeadFP32OutputConverter
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.moe import MoE
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.components.batcher import Batcher
 from torchtitan.rl.components.checkpointer import DATALOADER_STATE_KEY
@@ -150,6 +152,58 @@ class ValidationConfig:
     def __post_init__(self) -> None:
         if self.steps < -1:
             raise ValueError("validation steps must be -1 or non-negative")
+
+
+@dataclass(kw_only=True, slots=True)
+class RLModelDefaults:
+    """Model changes every RL run needs, applied to the shared model config before the trainer
+    and generators copy it."""
+
+    fp32_lm_head: bool = True
+    """Swap the lm_head to `HiMidLoLinear`, so the trainer and generator compute fp32 logits with
+    the same op. Turn off for a head `LMHeadFP32OutputConverter` cannot convert."""
+
+    freeze_expert_bias: bool = True
+    """Keep every MoE layer's expert bias at its loaded value. A moving bias flips more expert
+    choices between the trainer and generator each step, so their logprob gap keeps growing.
+    No-op on dense models and on MoE layers without an expert bias."""
+
+    # TODO: consider training the router at a lower lr instead of freezing it: set this
+    # False and add an optimizer group matching `router\.gate\.` before the catch-all.
+    freeze_router_gate: bool = True
+    """Keep every MoE router's gate (weight and bias) at its loaded value, so expert choices move
+    only with the hidden states and the expert bias. The Qwen3.5 shared-expert gate still trains.
+    Side effects:
+    - an optimizer group that matches only gates fails with "matched no parameters";
+    - LoRA adapters on a gate are frozen too;
+    - a checkpoint saved with this on cannot resume with it off: "Missing key ... gate.weight.step".
+    """
+
+    disable_router_aux_loss: bool = True
+    """Remove every MoE router's load-balancing aux loss. Its gradient also reaches the hidden
+    states, so it would push the model toward uniform expert load even with the gate frozen.
+    No-op on models built without one."""
+
+    def apply_(self, model: Decoder.Config) -> Decoder.Config:
+        """Rewrite `model` in place with these defaults and return its root. Idempotent.
+
+        Example:
+            config = rl_grpo_qwen3_30b_a3b_varlen()
+            config.model = config.model_defaults.apply_(config.model)
+            # lm_head: Linear.Config -> HiMidLoLinear.Config
+            # layers[i].moe.freeze_expert_bias: False -> True, for all 48 layers
+            # layers[i].moe.router.freeze_gate: False -> True
+        """
+        if self.fp32_lm_head:
+            model = LMHeadFP32OutputConverter.Config().build().convert(model)
+        for _fqn, moe_config, _parent, _attr in model.traverse(MoE.Config):
+            if self.freeze_expert_bias:
+                moe_config.freeze_expert_bias = True
+            if self.freeze_router_gate:
+                moe_config.router.freeze_gate = True
+            if self.disable_router_aux_loss:
+                moe_config.router.aux_loss = None
+        return model
 
 
 @dataclass(kw_only=True, slots=True)
@@ -259,6 +313,10 @@ class Controller(Configurable):
 
         model: Decoder.Config | None = None
         """Model config shared by the trainer and generator."""
+
+        model_defaults: RLModelDefaults = field(default_factory=RLModelDefaults)
+        """RL changes to `model`: fp32 logits, a frozen MoE expert bias and router gate, and no
+        router aux loss."""
 
         hf_assets_path: str = "./tests/assets/tokenizer"
         """Path to HF assets folder (model weights, tokenizer, config files)."""
@@ -396,6 +454,9 @@ class Controller(Configurable):
                     )
 
     def __init__(self, config: Config):
+        # Here, not in `Config.__post_init__`, which also runs when a recipe constructs the
+        # config: the lm_head swap cannot be undone, so a later `model_defaults` opt-out would be lost.
+        config.model = config.model_defaults.apply_(config.model)
         self.config = config
         config.maybe_log()
         self.trainer: Trainer | None = None

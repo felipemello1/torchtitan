@@ -183,10 +183,15 @@ class TokenChoiceTopKRouter(Module):
         route_norm_epsilon: float = 1e-20
         route_scale: float = 1.0
         aux_loss: AuxLoss.Config | None = None
+        freeze_gate: bool = False
+        """Keep `gate.weight` (and `gate.bias`, if any) at their loaded values: no gradient, no
+        optimizer state. The gate's input still gets gradients."""
 
     def __init__(self, config: Config):
         super().__init__()
         self.gate = config.gate.build()
+        if config.freeze_gate:
+            self.gate.requires_grad_(False)
         self.num_experts = config.num_experts
         self.top_k = config.top_k
         self.score_func = config.score_func.build()
@@ -658,6 +663,9 @@ class MoE(Module):
         routed_experts: RoutedExperts.Config
         router: TokenChoiceTopKRouter.Config
         load_balance_coeff: float | None = 1e-3
+        freeze_expert_bias: bool = False
+        """Keep `expert_bias_E` at its loaded value instead of updating it before each optimizer
+        step. The balancing hook still zeroes its per-step expert counts."""
         shared_experts: FeedForward.Config | None = None
 
         def __post_init__(self) -> None:
@@ -689,6 +697,7 @@ class MoE(Module):
         #       expert_bias_E is updated outside the model in an optimizer step pre hook
         #       to work with gradient accumulation.
         self.load_balance_coeff = config.load_balance_coeff
+        self.freeze_expert_bias = config.freeze_expert_bias
         if self.load_balance_coeff is not None:
             assert self.load_balance_coeff > 0.0
             self.register_buffer(
@@ -866,6 +875,7 @@ class _MoERouterLike(Protocol):
 
 class _MoELike(Protocol):
     load_balance_coeff: float | None
+    freeze_expert_bias: bool
     expert_bias_E: torch.Tensor  # noqa: N815
     router: _MoERouterLike
 
@@ -965,7 +975,8 @@ def register_moe_load_balancing_hook(
                     tokens_per_expert_E.mean() - tokens_per_expert_E
                 )
                 expert_bias_delta_E = expert_bias_delta_E - expert_bias_delta_E.mean()
-                moe.expert_bias_E.add_(expert_bias_delta_E)
+                if not moe.freeze_expert_bias:
+                    moe.expert_bias_E.add_(expert_bias_delta_E)
                 moe.router.tokens_per_expert_E.zero_()
 
     if _should_register_moe_balancing_hook(model_parts):
@@ -1030,7 +1041,8 @@ def register_moe_quantile_balancing_hook(
                 histogram_EB,
                 expert_bias_E,
             )
-            expert_bias_E.copy_(next_expert_bias_E)
+            if not moe.freeze_expert_bias:
+                expert_bias_E.copy_(next_expert_bias_E)
             quantile_balancer.required_bias_histogram_EB.zero_()
             router.tokens_per_expert_E.zero_()
 
