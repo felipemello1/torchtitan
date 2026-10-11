@@ -10,10 +10,12 @@ from types import SimpleNamespace
 import pytest
 
 from torchtitan.rl import train
+from torchtitan.rl.components.work_buffer import RolloutGroupWork
 from torchtitan.rl.controller import AsyncLoopConfig
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
 from torchtitan.rl.observability.rollout_recorder import RolloutSampleRecorder
+from torchtitan.rl.rollout import RolloutGroup
 
 
 class _FakeController:
@@ -121,6 +123,70 @@ def test_async_loop_config_rejects_bad_windowed_fifo_batches() -> None:
         AsyncLoopConfig(windowed_fifo_batches=0)
     with pytest.raises(TypeError, match="window_fraction"):
         AsyncLoopConfig(window_fraction=0.3)  # type: ignore[call-arg]
+
+
+def test_async_loop_config_ramps_rollout_workers_after_the_first_batch() -> None:
+    # P=2, S=2: 6 workers; the first batch's 2 start at once, the other 4 join over 8 s
+    ramped = AsyncLoopConfig(
+        num_prompts_per_train_step=2, target_offpolicy_steps=2, start_ramp_s=8.0
+    )
+    assert ramped.rollout_worker_start_delays_s == [0.0, 0.0, 2.0, 4.0, 6.0, 8.0]
+    # S=0: every worker serves the first batch, so none waits
+    on_policy = AsyncLoopConfig(num_prompts_per_train_step=2, target_offpolicy_steps=0)
+    assert on_policy.rollout_worker_start_delays_s == [0.0, 0.0]
+    no_ramp = AsyncLoopConfig(
+        num_prompts_per_train_step=2, target_offpolicy_steps=2, start_ramp_s=0.0
+    )
+    assert no_ramp.rollout_worker_start_delays_s == [0.0] * 6
+    with pytest.raises(ValueError, match="start_ramp_s"):
+        AsyncLoopConfig(start_ramp_s=-1.0)
+
+
+def test_rollout_loop_waits_its_start_delay_once_before_its_first_claim(monkeypatch):
+    # A buffer that hands out groups 0..2, then None (closed)
+    waiting = [
+        RolloutGroupWork(group_id=group_id, sample=None) for group_id in range(3)
+    ]
+    finalized_group_ids: list[int] = []
+
+    async def claim_next() -> RolloutGroupWork | None:
+        return waiting.pop(0) if waiting else None
+
+    async def finalize_work(rollout_group: RolloutGroup) -> None:
+        finalized_group_ids.append(rollout_group.group_id)
+
+    group_buffer = SimpleNamespace(claim_next=claim_next, finalize_work=finalize_work)
+    sleeps: list[tuple[float, int]] = []  # (seconds, groups still waiting)
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append((seconds, len(waiting)))
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def run_group_rollouts(*, group_id: int, **kwargs) -> RolloutGroup:
+        return RolloutGroup(group_id=group_id, rollouts=[])
+
+    async def release_groups(group_ids: list[int]) -> None:
+        pass
+
+    controller = SimpleNamespace(
+        config=SimpleNamespace(async_loop=SimpleNamespace(num_samples_per_prompt=1)),
+        generator_router=SimpleNamespace(
+            release_groups=SimpleNamespace(call_one=release_groups)
+        ),
+        _rollouter=SimpleNamespace(run_group_rollouts=run_group_rollouts),
+        _sampling=SamplingConfig(),
+        rollout_recorder=SimpleNamespace(record=lambda **kwargs: None),
+    )
+    asyncio.run(
+        train.Controller._rollout_loop(
+            controller, group_buffer=group_buffer, generate_fn=None, start_delay_s=7.5
+        )
+    )
+
+    # one wait, before the first claim; later groups are claimed without waiting
+    assert sleeps == [(7.5, 3)]
+    assert finalized_group_ids == [0, 1, 2]
 
 
 def _make_stub_rl_trainer():
