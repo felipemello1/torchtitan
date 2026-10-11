@@ -496,6 +496,12 @@ def test_batch_invariant_requires_kv_cache_reset():
         )
 
 
+@pytest.mark.parametrize("watermark", [-0.1, 1.0])
+def test_watermark_rejects_out_of_range(watermark):
+    with pytest.raises(ValueError, match=r"watermark must be in \[0, 1\)"):
+        VLLMGenerator.Config(watermark=watermark)
+
+
 def test_qwen36_27b_perf_config():
     from torchtitan_recipes.rl.alphabet_sort import rl_grpo_qwen3_6_27b_varlen_perf
 
@@ -545,10 +551,19 @@ def test_extra_vllm_engine_args_reach_engine_args(monkeypatch, tmp_path):
     engine_kwargs = _build_engine_kwargs(
         monkeypatch,
         tmp_path,
-        VLLMGenerator.Config(extra_vllm_engine_args={"watermark": 0.03}),
+        VLLMGenerator.Config(extra_vllm_engine_args={"enable_prefix_caching": False}),
     )
-    assert engine_kwargs["watermark"] == 0.03
+    assert engine_kwargs["enable_prefix_caching"] is False
     assert engine_kwargs["scheduling_policy"] == "fcfs"
+
+
+def test_watermark_reaches_engine_args(monkeypatch, tmp_path):
+    default = _build_engine_kwargs(monkeypatch, tmp_path, VLLMGenerator.Config())
+    assert default["watermark"] == 0.1
+    override = _build_engine_kwargs(
+        monkeypatch, tmp_path, VLLMGenerator.Config(watermark=0.03)
+    )
+    assert override["watermark"] == 0.03
 
 
 @pytest.mark.parametrize(
@@ -562,6 +577,8 @@ def test_extra_vllm_engine_args_reach_engine_args(monkeypatch, tmp_path):
             r"use VLLMGenerator\.Config\.max_num_batched_tokens",
         ),
         ("seed", r"use VLLMGenerator\.Config\.debug\.seed"),
+        # Always set by TorchTitan, but from a config field, so the error names the field.
+        ("watermark", r"use VLLMGenerator\.Config\.watermark"),
     ],
 )
 def test_extra_vllm_engine_args_rejects_torchtitan_owned_keys(key, match):
