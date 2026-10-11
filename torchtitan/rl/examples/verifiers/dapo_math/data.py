@@ -24,7 +24,7 @@ from torchtitan.rl.examples.dapo_math import (
 )
 
 # Threads and Math-Verify processes start on the first score, not at import.
-_MATH_VERIFY_POOL = MathVerifyPool(num_processes=4, timeout_seconds=5.0)
+_MATH_VERIFY_POOL = MathVerifyPool(num_processes=4, timeout_seconds=60.0)
 
 
 class VerifiersMathData(vf.TaskData):

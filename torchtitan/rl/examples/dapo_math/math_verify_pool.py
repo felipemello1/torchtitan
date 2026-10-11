@@ -49,9 +49,9 @@ class MathVerifyPool:
        monarch actor thread.
 
     Example:
-        pool = MathVerifyPool(num_processes=4, timeout_seconds=5.0)
+        pool = MathVerifyPool(num_processes=4, timeout_seconds=60.0)
         await pool.score(r"Answer: \\boxed{34}", "34")  # 1.0
-        await pool.score(r"Answer: \\boxed{2000^{2000^{2000}}}", "34")  # 0.0 after 5 s
+        await pool.score(r"Answer: \\boxed{2000^{2000^{2000}}}", "34")  # 0.0 after 60 s
     """
 
     def __init__(self, *, num_processes: int, timeout_seconds: float) -> None:
