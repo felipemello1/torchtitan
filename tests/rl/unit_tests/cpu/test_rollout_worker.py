@@ -124,6 +124,7 @@ def test_worker_executes_group_without_actor_mesh() -> None:
             message_env=_MessageEnvConfig(),
             token_env=token_env_config,
             advantage=_Config(_AdvantageEstimator()),
+            thinking_budget=None,
         )
         worker = _CustomWorker(worker_config)
         await worker.setup_async(
