@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import pytest
+import torchtitan.config.transform.quantization as quantization_transform
 
 from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
 from torchtitan.models.common.moe import MoE
@@ -20,9 +21,13 @@ _RECIPE_MODULES = [
 
 
 @pytest.mark.parametrize("module_name", _RECIPE_MODULES)
-def test_rl_recipes_get_model_defaults(module_name: str) -> None:
+def test_rl_recipes_get_model_defaults(
+    module_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # dapo_math and the verifiers recipes import optional reward packages (math_verify, verifiers).
     module = pytest.importorskip(module_name)
+    # rl_grpo_qwen3_0_6b_varlen_mxfp8 converts its model at load time, which checks for SM100.
+    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
     recipes = [
         fn
         for name, fn in vars(module).items()
@@ -31,7 +36,13 @@ def test_rl_recipes_get_model_defaults(module_name: str) -> None:
     assert recipes
 
     for recipe in recipes:
-        config = recipe()
+        try:
+            config = recipe()
+        except ModuleNotFoundError as error:
+            # rl_grpo_moe_debug_dist_moe_tp2_ep4 needs the optional dist_moe package.
+            if error.name != "dist_moe":
+                raise
+            continue
         regions_before = list(config.model.local_compile_regions)
 
         model = config.model_defaults.apply_(config.model)
