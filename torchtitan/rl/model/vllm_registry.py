@@ -32,6 +32,7 @@ from typing import Any
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.config import OverrideConfig
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.dist_moe import DistMoeRuntime
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 
 # Model-agnostic name used for vLLM model registration.
@@ -132,6 +133,7 @@ def register_to_vllm(
     checkpointer_config: CheckpointManager.Config | None,
     override: OverrideConfig,
     return_routed_experts: bool = False,
+    dist_moe_runtime: DistMoeRuntime.Config | None = None,
 ) -> None:
     """Register the TorchTitan model class and the TorchTitan config parser with vLLM.
 
@@ -166,6 +168,8 @@ def register_to_vllm(
             model finalization and build (empty ``OverrideConfig`` for no overrides).
         return_routed_experts: Expose every MoE router to vLLM's routed-experts
             capture; pair it with ``EngineArgs.enable_return_routed_experts``.
+        dist_moe_runtime: ``DistMoeRuntime.Config(inference=True)`` for models
+            with Dist-MoE routed experts; ``None`` otherwise.
     """
     has_gdn = any(
         getattr(layer, "delta_net", None) is not None for layer in model_config.layers
@@ -204,6 +208,7 @@ def register_to_vllm(
                 prefix=prefix,
                 override=override,
                 return_routed_experts=return_routed_experts,
+                dist_moe_runtime=dist_moe_runtime,
             )
 
     VLLMModelFromSpec.__name__ = VLLM_MODEL_NAME
