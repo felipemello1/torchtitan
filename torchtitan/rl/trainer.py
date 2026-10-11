@@ -271,6 +271,12 @@ class Trainer(Configurable):
         self._step_num_tokens_per_dp_rank = sum(
             rank_batches[self.dp_rank].labels.numel() for rank_batches in training_data
         )
+        # Policy age 0: tokens these weights sampled. Their logprob gap is mismatch, not off-policy drift.
+        for rank_batches in training_data:
+            microbatch = rank_batches[self.dp_rank]
+            microbatch.is_policy_age_0 = (
+                microbatch.min_policy_versions == self.policy_version
+            )
         result = engine.forward_backward(
             microbatch_groups=[
                 [rank_batches[self.dp_rank]] for rank_batches in training_data
@@ -295,7 +301,15 @@ class Trainer(Configurable):
                 )
             )
 
-        return combine_microbatch_metrics(microbatch_metrics)
+        metrics = combine_microbatch_metrics(microbatch_metrics)
+        # Turn the loss's age-0 sum (normalized by all loss tokens) into a mean over age-0 tokens.
+        # No age-0 tokens: drop the key; a 0 would read as a perfect trainer/generator match.
+        age_0_frac = metrics["bit_wise/age_0_tokens/frac"]
+        if age_0_frac > 0:
+            metrics["bit_wise/logprob_diff_age_0/mean"] /= age_0_frac
+        else:
+            del metrics["bit_wise/logprob_diff_age_0/mean"]
+        return metrics
 
     @sl.log_trace_span("optim_step")
     async def optim_step(

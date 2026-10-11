@@ -234,3 +234,21 @@ def test_microbatch_carries_the_sampling_temperature_into_the_loss() -> None:
     temperature = microbatch.loss_kwargs()["temperature"]
     assert temperature.dtype == torch.float32
     assert temperature.tolist() == [0.5] * 8
+
+
+def test_microbatch_tags_each_token_with_its_sample_policy_version() -> None:
+    batcher = Batcher.Config().build(
+        num_tokens_per_microbatch_per_dp_rank=8,
+        max_context_length=8,
+        num_prompts_per_train_step=1,
+        dp_degree=1,
+        pad_id=0,
+        temperature=1.0,
+    )
+    old, new = _make_samples([2, 3])
+    old.min_policy_version = 4
+    new.min_policy_version = 6
+
+    microbatch = batcher._pack_training_samples([old, new])
+
+    assert microbatch.min_policy_versions.tolist() == [4, 4, 6, 6, 6, -1, -1, -1]
