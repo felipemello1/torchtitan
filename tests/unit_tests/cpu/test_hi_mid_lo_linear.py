@@ -190,11 +190,13 @@ def test_lora_wraps_hi_mid_lo_linear():
 
 def test_lm_head_converter_swaps_only_lm_head():
     from torchtitan.config.transform import LMHeadFP32OutputConverter
+    from torchtitan.models.muse_glimmer.model import SoftCappedLinear
     from torchtitan.models.qwen3 import MODEL_FLAVORS
 
     build_config, max_context_length = MODEL_FLAVORS["0.6B"]
     config = build_config(attn_backend="flex", seq_len=max_context_length)
     lm_head_before = config.lm_head
+    regions_before = list(config.local_compile_regions)
 
     LMHeadFP32OutputConverter.Config().build().convert(config)
 
@@ -210,8 +212,8 @@ def test_lm_head_converter_swaps_only_lm_head():
         )
     # The head keeps 2 pieces: summed over the vocab, a third doesn't help.
     assert config.lm_head.backward_mode == "hi_mid"
-    # It turns on the split's local_compile region.
-    assert "fp32_to_bf16_split" in config.local_compile_regions
+    # Compile regions stay the model config's choice, e.g. a recipe that turned them off.
+    assert config.local_compile_regions == regions_before
     # Converting an already converted head is a no-op.
     converted = config.lm_head
     LMHeadFP32OutputConverter.Config().build().convert(config)
@@ -221,6 +223,20 @@ def test_lm_head_converter_swaps_only_lm_head():
     converter = LMHeadFP32OutputConverter.Config(backward_mode="hi_mid_lo").build()
     converter.convert(config)
     assert config.lm_head.backward_mode == "hi_mid_lo"
+    # A later default pass keeps the converted head's backward_mode.
+    LMHeadFP32OutputConverter.Config().build().convert(config)
+    assert config.lm_head.backward_mode == "hi_mid_lo"
+
+    # A Linear subclass would lose its own fields and forward, e.g. a soft cap.
+    config.lm_head = SoftCappedLinear.Config(
+        **{
+            field.name: getattr(lm_head_before, field.name)
+            for field in fields(lm_head_before)
+        },
+        output_soft_cap_temp=30.0,
+    )
+    with pytest.raises(ValueError, match="cannot convert the SoftCappedLinear"):
+        LMHeadFP32OutputConverter.Config().build().convert(config)
 
     config.lm_head = None
     with pytest.raises(ValueError, match="lm_head"):
