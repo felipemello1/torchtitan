@@ -372,8 +372,8 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
             advantages=torch.tensor([1.0]),
         )
 
-        other_rank_ref = SimpleNamespace(read=MagicMock())
-        ref = SimpleNamespace(read=lambda: batch)
+        other_rank_ref = SimpleNamespace(read=MagicMock(), fields={"model_kwargs": {}})
+        ref = SimpleNamespace(read=lambda: batch, fields={"model_kwargs": {}})
 
         result = await Trainer.forward_backward(
             trainer,
@@ -524,9 +524,10 @@ def test_replay_without_routed_expert_ids_raises_before_training() -> None:
             advantages=torch.tensor([1.0]),
         )
 
+        ref = SimpleNamespace(read=lambda: batch, fields={"model_kwargs": {}})
         with pytest.raises(ValueError, match="no microbatch carries routed expert ids"):
             await Trainer.forward_backward(
-                trainer, [[batch]], torch.tensor([1]), torch.tensor([1])
+                trainer, [[ref]], torch.tensor([1]), torch.tensor([1])
             )
         trainer.engine.forward_backward.assert_not_called()
 

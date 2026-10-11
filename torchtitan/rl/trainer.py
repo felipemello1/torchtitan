@@ -296,10 +296,11 @@ class Trainer(Configurable):
             microbatch.labels.numel() for microbatch in microbatches
         )
         # Every rank receives the whole grid, so all ranks agree on joining the reduce below.
+        # Each ref keeps its microbatch's `model_kwargs` keys, so this check reads no tensors.
         has_routed_expert_ids = any(
-            "routed_expert_ids" in microbatch.model_kwargs
-            for rank_batches in training_data
-            for microbatch in rank_batches
+            "routed_expert_ids" in ref.fields["model_kwargs"]
+            for rank_refs in training_data
+            for ref in rank_refs
         )
         if self.config.replay_routed_experts and not has_routed_expert_ids:
             raise ValueError(
