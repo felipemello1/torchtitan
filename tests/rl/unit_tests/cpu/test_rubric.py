@@ -103,6 +103,20 @@ def test_kimi_length_reward() -> None:
     ]
 
 
+def test_kimi_length_reward_leaves_out_errored_rollouts() -> None:
+    rubric = Rubric.Config(
+        reward_fns=[_RewardLastToken.Config()],
+        error_reward=0.0,
+        length_reward_weight=0.1,
+    )
+    # A 5,000-token errored rollout gets 0 and does not stretch the group's range.
+    errored = _rollout(5000, answer=RIGHT, status=RolloutStatus.ERROR)
+    rollouts = [_rollout(1000, answer=RIGHT), _rollout(3000, answer=RIGHT), errored]
+    assert _score(rubric, rollouts) == pytest.approx([1.05, 0.95, 0.0])
+    # No graded rollout: no length reward.
+    assert _score(rubric, [errored, errored]) == [0.0, 0.0]
+
+
 def test_rollout_metrics_split_forced_answers() -> None:
     rollouts = [
         _rollout(10, answer=RIGHT, forced=True),
