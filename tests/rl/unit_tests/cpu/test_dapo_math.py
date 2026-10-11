@@ -4,11 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU tests for the DAPO-Math dataset, environment, and rubric."""
+"""CPU tests for the DAPO-Math dataset, environment, rubric, and worker."""
 
 from __future__ import annotations
 
 import asyncio
+import pickle
 import time
 
 import pytest
@@ -18,15 +19,20 @@ from torchtitan.rl.examples.dapo_math import (
     AIME2025Dataset,
     DapoMathDataset,
     DapoMathEnv,
+    DapoMathRolloutWorker,
     DapoMathSample,
     data as math_data,
     Intellect3MathDataset,
+    Intellect3MathSample,
     math_verify_pool,
     MathVerifyPool,
     RewardMathVerify,
     score_math_response,
 )
-from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
+from torchtitan.rl.observability import metrics as m
+from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
+from torchtitan.rl.rollout.rollouter import RolloutWorker
+from torchtitan.rl.rubric import Rubric
 from torchtitan.rl.types import RolloutTurnID
 
 
@@ -120,6 +126,7 @@ def test_intellect3_dataset_keeps_partially_solved_problems(monkeypatch) -> None
         r"2\sqrt{2}",
         r"1\sqrt{2}",
     ]
+    assert [sample.pass_rate for sample in samples] == [0.125, 0.875, 0.125]
     assert "q1" in samples[0].prompt
     assert r"Answer: \boxed{" in samples[0].prompt
 
@@ -240,3 +247,71 @@ def test_reward_handles_equivalent_latex_and_units() -> None:
     sample = DapoMathSample(prompt="problem", ground_truth=r"336^\circ")
     assert asyncio.run(reward(_rollout(r"work\nAnswer: \boxed{336}"), sample)) == 1.0
     assert asyncio.run(reward(_rollout(r"work\nAnswer: \boxed{335}"), sample)) == 0.0
+
+
+def _scored_group(rewards: list[float]) -> RolloutGroup:
+    rollouts = [
+        Rollout(
+            group_id=0,
+            rollout_id=rollout_id,
+            status=RolloutStatus.COMPLETED,
+            turns=[],
+            reward=reward,
+        )
+        for rollout_id, reward in enumerate(rewards)
+    ]
+    return RolloutGroup(group_id=0, rollouts=rollouts)
+
+
+def test_worker_logs_zero_std_groups_by_pass_rate(monkeypatch) -> None:
+    groups = iter(
+        [
+            # A correct answer another rubric term scaled to 0.5 still counts.
+            _scored_group([0.5, 0.5]),
+            _scored_group([1.0, 0.0]),
+            _scored_group([0.0, 0.0]),
+            _scored_group([1.0, 1.0]),
+            # Both correct, one forced to 0.5: rewards differ, so the group trains.
+            _scored_group([1.0, 0.5]),
+        ]
+    )
+
+    async def run_group(self, **kwargs) -> RolloutGroup:
+        return next(groups)
+
+    # The stock run_group needs a generator; stand in with already scored groups.
+    monkeypatch.setattr(RolloutWorker, "run_group", run_group)
+    worker = DapoMathRolloutWorker.Config(
+        rubric=Rubric.Config(reward_fns=[RewardMathVerify.Config()]),
+        message_env=DapoMathEnv.Config(),
+    ).build()
+    metrics: list[m.Metric] = []
+    # 0.75 is the top bin's lower edge; a DapoMathSample (no pass rate) logs nothing.
+    samples = [
+        Intellect3MathSample(prompt="p", ground_truth="1", pass_rate=0.875),
+        Intellect3MathSample(prompt="p", ground_truth="1", pass_rate=0.75),
+        Intellect3MathSample(prompt="p", ground_truth="1", pass_rate=0.125),
+        DapoMathSample(prompt="p", ground_truth="1"),
+        Intellect3MathSample(prompt="p", ground_truth="1", pass_rate=0.875),
+    ]
+    for sample in samples:
+        metrics += asyncio.run(worker.run_group(sample=sample)).metrics
+    assert m.MetricsProcessor._aggregate_metrics(metrics) == {
+        # 1 of the 3 top-bin groups was all correct.
+        "math/zero_std/all_correct/avg8_ge0.75/mean": 1 / 3,
+        "math/zero_std/all_wrong/avg8_ge0.75/mean": 0.0,
+        "math/zero_std/all_correct/avg8_lt0.25/mean": 0.0,
+        "math/zero_std/all_wrong/avg8_lt0.25/mean": 1.0,
+    }
+
+
+def test_dapo_math_sample_loads_from_an_older_checkpoint() -> None:
+    """Data stream checkpoints pickle training samples; a resumed run loads and saves them again."""
+    # pickle.dumps(DapoMathSample(prompt="problem", ground_truth="34")), its two fields only.
+    saved = (
+        b"\x80\x04\x95S\x00\x00\x00\x00\x00\x00\x00\x8c%torchtitan.rl.examples.dapo_math.data"
+        b"\x94\x8c\x0eDapoMathSample\x94\x93\x94)\x81\x94]\x94(\x8c\x07problem\x94\x8c\x0234\x94eb."
+    )
+    sample = pickle.loads(saved)
+    assert sample == DapoMathSample(prompt="problem", ground_truth="34")
+    assert pickle.loads(pickle.dumps(sample)) == sample

@@ -31,6 +31,18 @@ class DapoMathSample:
     ground_truth: str
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Intellect3MathSample(DapoMathSample):
+    """A `DapoMathSample` with its pass rate, which `DapoMathRolloutWorker` bins zero-std groups by.
+
+    A subclass, not a new `DapoMathSample` field: data stream checkpoints pickle training samples,
+    and a slots dataclass loads an older pickle with the new field unset.
+    """
+
+    pass_rate: float
+    """Fraction of 8 tries Qwen3-4B-Thinking-2507 solved (INTELLECT-3-RL's avg@8)."""
+
+
 # TODO: Share this cycling iterator with other RL datasets instead of keeping
 # per-environment implementations.
 class _CyclingDataset(RLDataset):
@@ -137,9 +149,10 @@ class Intellect3MathDataset(_CyclingDataset):
     def __init__(self, config: Config) -> None:
         dataset = load_dataset(config.repo_id, "math", split=config.split)
         samples = [
-            DapoMathSample(
+            Intellect3MathSample(
                 prompt=_MATH_PROMPT_TEMPLATE.format(problem=row["question"]),
                 ground_truth=str(row["answer"]),
+                pass_rate=row["avg@8_qwen3_4b_thinking_2507"],
             )
             for row in dataset
             if config.min_pass_rate
