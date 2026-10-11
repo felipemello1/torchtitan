@@ -7,7 +7,7 @@
 """Math-Verify scoring, run in worker processes with a hard timeout.
 
 `MathVerifyPool` runs this file as a script in each worker process, so it must not
-import torchtitan: importing `torchtitan.rl` loads vLLM (~9 s and ~1 GB per process).
+import torchtitan: its package, `torchtitan.rl.examples.dapo_math`, imports torch and grain.
 """
 
 from __future__ import annotations
