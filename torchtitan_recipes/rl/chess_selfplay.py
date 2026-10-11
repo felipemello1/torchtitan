@@ -300,7 +300,7 @@ def rl_chess_qwen3_5_4b_gb300(
     # The launcher uploads every saved step and prunes, so torchtitan keeps them all.
     trainer.checkpointer = CheckpointManager.Config(
         initial_load_in_hf=True,
-        interval=25,
+        interval=10,
         enable_first_step_checkpoint=True,
         async_mode="async",
         keep_latest_k=0,
