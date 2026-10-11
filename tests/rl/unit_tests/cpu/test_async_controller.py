@@ -1232,21 +1232,27 @@ def test_batcher_passes_the_version_that_trains_each_group() -> None:
     assert queue.qsize() == 3  # two batches and the None sentinel
 
 
-def test_generation_capacity_defaults_to_the_groups_that_can_still_train() -> None:
+def test_generation_capacity_default_leaves_room_for_untrainable_groups() -> None:
     config = AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=12)
-    # (12 + 1) versions x 16 prompts: a later group would finish too old to train.
-    assert config.resolve_generation_capacity(16) == 208
+    # 2 x (12 + 1) versions x 16 prompts: room for up to half the groups being untrainable.
+    assert config.resolve_generation_capacity(16) == 416
     loop = AsyncLoopConfig(num_prompts_per_train_step=16, group_buffer=config)
-    assert loop.max_concurrent_rollout_groups == 208
+    assert loop.max_concurrent_rollout_groups == 416
+    buffer = config.build(num_prompts_per_train_step=16)
+    assert _buffer_metric(buffer, "rollout_buffer/generation_capacity_groups") == 416
     explicit = AdaptiveRolloutGroupWorkBuffer.Config(
         max_offpolicy_steps=12, generation_capacity=96
     )
     assert explicit.resolve_generation_capacity(16) == 96
-    with pytest.raises(ValueError, match="set generation_capacity or max_offpolicy_steps"):
+    with pytest.raises(
+        ValueError, match="set generation_capacity or max_offpolicy_steps"
+    ):
         AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=None)
 
 
-def test_adaptive_buffer_warns_once_when_generation_capacity_caps_demand(caplog) -> None:
+def test_adaptive_buffer_warns_once_when_generation_capacity_caps_demand(
+    caplog,
+) -> None:
     # Demand starts at 3 batches (24 groups), above the capacity of 10.
     buffer = _adaptive_buffer(num_prompts=8, generation_capacity=10)
 
