@@ -230,3 +230,29 @@ def test_group_filters_preserve_group_id_for_acknowledgement() -> None:
     filtered_groups = [failed, untrainable, zero_std, no_valid_tokens]
     assert [group.group_id for group in filtered_groups] == [7, 8, 9, 10]
     assert all(not group.training_samples for group in filtered_groups)
+
+
+def test_group_is_solved_when_every_reward_is_above_the_threshold() -> None:
+    builder = TrainingSampleBuilder.Config(solved_reward_above=0.9).build()
+
+    def solved(rewards: list[float]) -> bool:
+        rollouts = [
+            _scored_rollout(
+                [_turn(prompt_token_ids=[1], completion_token_ids=[2], version=1)],
+                reward=reward,
+                advantage=0.0,
+            )
+            for reward in rewards
+        ]
+        rollout_group = RolloutGroup(group_id=0, rollouts=rollouts)
+        return builder.build_from_group(rollout_group=rollout_group).solved
+
+    assert solved([1.0, 1.0])  # zero std, dropped from training
+    assert solved([1.05, 0.95])  # right answers shaped by a bonus, still trained
+    assert not solved([1.0, 0.0])
+    assert not solved([0.9, 1.0])  # strictly above the threshold
+    assert not solved([0.5, 0.5])  # partial credit
+    failed = builder.build_from_group(
+        rollout_group=RolloutGroup(group_id=0, rollouts=[])
+    )
+    assert not failed.solved
