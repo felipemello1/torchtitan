@@ -108,6 +108,29 @@ class TrainingSampleBuilder(Configurable):
                 m.Mean(1.0 if all_failure else 0.0),
             ),
         ]
+        # The same split on the graded reward, i.e. without the `Rubric`'s length reward, which
+        # breaks ties: with 0/1 rewards these are the groups that would be zero-std without it.
+        # Logged only; the drop below still reads the final reward.
+        is_solved = [
+            rollout.reward - rollout.reward_breakdown.get("length_reward", 0.0) > 0.0
+            for rollout in rollout_group.rollouts
+        ]
+        task_all_success = all(is_solved)
+        task_all_failure = not any(is_solved)
+        metrics += [
+            m.Metric(
+                "rollout_reward/task_zero_std_frac",
+                m.Mean(1.0 if task_all_success or task_all_failure else 0.0),
+            ),
+            m.Metric(
+                "rollout_reward/task_zero_std_frac/all_success",
+                m.Mean(1.0 if task_all_success else 0.0),
+            ),
+            m.Metric(
+                "rollout_reward/task_zero_std_frac/all_failure",
+                m.Mean(1.0 if task_all_failure else 0.0),
+            ),
+        ]
         if self.config.drop_zero_std_reward_groups and is_zero_std:
             metrics.append(
                 m.Metric(
