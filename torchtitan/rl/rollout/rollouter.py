@@ -416,7 +416,8 @@ class RolloutWorker(Configurable):
             generate_fn: Async callable that runs one generation; keeps the worker
                 decoupled from the generator actor.
             env: The env for this rollout; `run_group` closes it.
-            sampling: Sampling config for every generate call.
+            sampling: Sampling config for every generate call; each turn sets its own
+                `routed_experts_prompt_start`.
             group_id: The GRPO group id.
             rollout_id: Sibling index within the group; combined with the turn index into the
                 per-turn `RolloutTurnID`, and stored as `Rollout.rollout_id`.
@@ -437,6 +438,19 @@ class RolloutWorker(Configurable):
                     turn_id=len(turns),
                 )
 
+                # this turn's prompt as a delta on the previous turn's prompt + completion
+                prompt_token_ids = env_step.next_prompt_token_ids or []
+                prompt_prefix_len, prompt_delta_token_ids = split_prompt(
+                    prompt_token_ids, previous_token_ids
+                )
+                # Ask only for the rows earlier turns lack; see `RolloutTurn.routed_expert_ids`.
+                routed_experts_prompt_start = (
+                    prompt_prefix_len - 1
+                    if previous_token_ids
+                    and prompt_prefix_len == len(previous_token_ids)
+                    else 0
+                )
+
                 # generator call
                 completion = await generate_fn(
                     prompt_token_ids=env_step.next_prompt_token_ids,
@@ -444,17 +458,15 @@ class RolloutWorker(Configurable):
                     group_id=group_id,
                     # Per-sample sticky key: a sample's turns reuse one generator's prefix cache.
                     routing_session_id=turn_rollout_id.to_string(include_turn=False),
-                    sampling_config=sampling,
+                    sampling_config=replace(
+                        sampling,
+                        routed_experts_prompt_start=routed_experts_prompt_start,
+                    ),
                 )
 
                 # env call
                 next_env_step = await env.step(completion)
 
-                # this turn from a token and message perspective
-                prompt_token_ids = env_step.next_prompt_token_ids or []
-                prompt_prefix_len, prompt_delta_token_ids = split_prompt(
-                    prompt_token_ids, previous_token_ids
-                )
                 turns.append(
                     RolloutTurn(
                         rollout_id=turn_rollout_id,
