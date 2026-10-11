@@ -54,6 +54,9 @@ class _GeneratorHandle(RoutingCandidate):
     idle: asyncio.Event = field(default_factory=asyncio.Event)
     """Set when this generator has no reserved routed calls."""
 
+    serving: asyncio.Event = field(default_factory=asyncio.Event)
+    """Set while this generator is ``SERVING``."""
+
 
 class InterGeneratorRouter(Actor, Configurable):
     """Routes generation calls across generator meshes and pulls model's state dict.
@@ -102,13 +105,15 @@ class InterGeneratorRouter(Actor, Configurable):
         Draining only waits for a generator's in-flight ``_route`` call (one
         turn) to finish; between turns of a multi-turn rollout the generator is
         idle, so a weight sync may land mid-rollout and successive turns can run
-        under different policy versions."""
+        under different policy versions. A turn whose session is pinned to a
+        draining generator waits for it instead of moving to another one."""
 
     def __init__(
         self,
         config: Config,
         *,
         generators: Sequence[Any],
+        forward_session_releases: bool = False,
     ):
         num_actors = math.prod(current_size().values())
         assert (
@@ -116,6 +121,8 @@ class InterGeneratorRouter(Actor, Configurable):
         ), f"InterGeneratorRouter must be a singleton, but its mesh holds {num_actors} actors"
 
         self._config = config
+        # Tell generators when a session ends, so they release its held KV (`hold_session_kv`).
+        self._forward_session_releases = forward_session_releases
         self._generators = [
             _GeneratorHandle(
                 actor=generator,
@@ -127,10 +134,13 @@ class InterGeneratorRouter(Actor, Configurable):
             raise ValueError("InterGeneratorRouter requires at least one generator")
         for h in self._generators:
             h.idle.set()
+            h.serving.set()
 
         self._strategy = config.strategy.build()
         self._serving = asyncio.Event()
         self._refresh_serving_status()
+        # Routing sessions of each rollout group, so `release_groups` drops any a rollout did not release.
+        self._group_sessions: dict[int, set[str]] = {}
 
     def _candidates(self) -> list[_GeneratorHandle]:
         """Return generator handles that are currently routable."""
@@ -149,6 +159,10 @@ class InterGeneratorRouter(Actor, Configurable):
         """Move a generator between serving and syncing states."""
 
         h.state = state
+        if state is _GeneratorState.SERVING:
+            h.serving.set()
+        else:
+            h.serving.clear()
         self._refresh_serving_status()
 
     def _reserve(self, h: _GeneratorHandle, cost: int) -> None:
@@ -180,6 +194,11 @@ class InterGeneratorRouter(Actor, Configurable):
         """Dispatch one call to a strategy-chosen serving generator's rank 0;
         return its result.
         """
+        # A turn pinned to a draining generator waits for it instead of re-pinning
+        # elsewhere: the drain is short, and the generator keeps the session's KV.
+        pinned = self._strategy.pinned_candidate(routing_ctx)
+        if pinned is not None:
+            await pinned.serving.wait()
         await self._serving.wait()
         candidates = self._candidates()
         assert candidates, "serving event was set with no serving generators"
@@ -189,6 +208,51 @@ class InterGeneratorRouter(Actor, Configurable):
             return await getattr(h.rank0_actor, method).call_one(*args, **kwargs)
         finally:
             self._release(h, routing_ctx.estimated_cost)
+
+    async def _release_session(self, group_id: int, session_id: str) -> None:
+        """Drop a session's affinity, and tell its generator to release the session's held KV."""
+        self._group_sessions.get(group_id, set()).discard(session_id)
+        pinned = self._strategy.pinned_candidate(RoutingContext(session_id=session_id))
+        self._strategy.release_session(session_id)
+        # Without a pin (non-sticky routing), `release_groups` frees the held KV at group end.
+        if self._forward_session_releases and pinned is not None:
+            await pinned.rank0_actor.release_sessions.call_one([session_id])
+
+    def _release_groups(self, group_ids: list[int]) -> None:
+        """Drop the affinity of every session left in these groups."""
+        for group_id in group_ids:
+            for session_id in self._group_sessions.pop(group_id, ()):
+                self._strategy.release_session(session_id)
+
+    async def _generate(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        request_id: str,
+        group_id: int,
+        routing_session_id: str | None,
+        sampling_config: Any | None,
+        metrics_prefix: str,
+    ) -> Any:
+        """Body of the ``generate`` endpoint."""
+        if routing_session_id is not None:
+            self._group_sessions.setdefault(group_id, set()).add(routing_session_id)
+        return await self._route(
+            "generate",
+            prompt_token_ids,
+            request_id=request_id,
+            group_id=group_id,
+            # VLLMGenerator.generate also requires this field for its
+            # intra-mesh DP routing.
+            routing_session_id=routing_session_id,
+            sampling_config=sampling_config,
+            metrics_prefix=metrics_prefix,
+            # Load is measured as in-flight request count (one unit per call).
+            routing_ctx=RoutingContext(
+                estimated_cost=1,
+                session_id=routing_session_id,
+            ),
+        )
 
     async def _fanout(
         self,
@@ -253,6 +317,36 @@ class InterGeneratorRouter(Actor, Configurable):
         #   big models / many generators, not at small scale.
         await asyncio.gather(*[_pull_one(h) for h in self._generators])
 
+    async def _abort_generation(self, request_id: str) -> None:
+        """Send the abort to every generator's rank 0; the ones not running `request_id` ignore it.
+
+        Aborts are rare (one per abandoned call), so the router keeps no request -> generator map.
+        During a drain (`hot_swap=False`) the call can be in two places, so the abort goes out twice:
+
+            on its generator, which the drain waits for   -> the first send, at once, frees it
+            parked in `_route` until the drain ends        -> the second send, after the drain, frees it
+        """
+
+        async def abort_on_every_generator() -> None:
+            await asyncio.gather(
+                *[
+                    h.rank0_actor.abort_generation.call_one(request_id)
+                    for h in self._generators
+                ]
+            )
+
+        # TODO(hot_swap=False): the second send waits on the global `_serving`, not on the call's
+        # pinned `serving` (see `_route`), so a call parked there can miss both sends.
+        # Read before yielding: a drain that ends during the yield must still get the second send.
+        draining = not self._serving.is_set()
+        # Yield once, so a call in `_route` that `_serving.set()` just woke is dispatched first.
+        await asyncio.sleep(0)
+        await abort_on_every_generator()
+        if draining:
+            await self._serving.wait()
+            await asyncio.sleep(0)  # same yield as above
+            await abort_on_every_generator()
+
     @concurrent_endpoint
     async def generate(
         self,
@@ -265,22 +359,20 @@ class InterGeneratorRouter(Actor, Configurable):
         metrics_prefix: str,
     ) -> Any:
         """Route one generation call to a generator and return its completion."""
-        return await self._route(
-            "generate",
+        # The logic lives in a private method so tests can call it without an actor mesh.
+        return await self._generate(
             prompt_token_ids,
             request_id=request_id,
             group_id=group_id,
-            # VLLMGenerator.generate also requires this field for its
-            # intra-mesh DP routing.
             routing_session_id=routing_session_id,
             sampling_config=sampling_config,
             metrics_prefix=metrics_prefix,
-            # Load is measured as in-flight request count (one unit per call).
-            routing_ctx=RoutingContext(
-                estimated_cost=1,
-                session_id=routing_session_id,
-            ),
         )
+
+    @concurrent_endpoint
+    async def abort_generation(self, request_id: str) -> None:
+        """Stop a `generate` call so its generator frees the KV. No-op if it already finished."""
+        await self._abort_generation(request_id)
 
     @concurrent_endpoint
     async def start_engine_loop(self) -> None:
@@ -294,8 +386,15 @@ class InterGeneratorRouter(Actor, Configurable):
         await self._fanout("sync_log_step", step)
 
     @concurrent_endpoint
+    async def release_session(self, group_id: int, routing_session_id: str) -> None:
+        """Forget a routing session after its rollout's last generation call, and tell its
+        generator to release the session's held KV."""
+        await self._release_session(group_id, routing_session_id)
+
+    @concurrent_endpoint
     async def release_groups(self, group_ids: list[int]) -> None:
         """Tell every generator that these rollout groups are finished."""
+        self._release_groups(group_ids)
         await self._fanout("release_groups", group_ids)
 
     @concurrent_endpoint

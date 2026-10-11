@@ -10,15 +10,21 @@ the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID
 import asyncio
 import json
 import logging
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from torchtitan.rl.components.batcher import Batcher
+from torchtitan.rl.components.training_sample_builder import (
+    TrainingSample,
+    TrainingSampleGroup,
+)
 from torchtitan.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
+from torchtitan.rl.controller import Controller
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
@@ -26,7 +32,7 @@ from torchtitan.rl.observability.controller import (
     MetricsTimer,
 )
 from torchtitan.rl.rollout import RolloutGroup
-from torchtitan.rl.types import RolloutTurnID, TrainingSample, TrainingSampleGroup
+from torchtitan.rl.rollout.types import RolloutTurnID
 
 
 def test_controller_config_maybe_log(tmp_path, caplog) -> None:
@@ -769,5 +775,35 @@ def test_no_window_takes_oldest_ready_group_past_a_stuck_head() -> None:
         await asyncio.sleep(0)
         assert taker.done()
         assert taker.result().group_id == 6
+
+    asyncio.run(run())
+
+
+def test_cancelled_generate_fn_aborts_only_its_request() -> None:
+    async def run() -> None:
+        started = asyncio.Event()
+        aborted: list[str] = []
+
+        async def generate_call_one(prompt_token_ids, *, request_id, **kwargs):
+            if request_id == "finished":
+                return "completion"
+            started.set()
+            await asyncio.Event().wait()
+
+        controller = object.__new__(Controller)
+        controller.generator_router = SimpleNamespace(
+            generate=SimpleNamespace(call_one=generate_call_one),
+            abort_generation=SimpleNamespace(call_one=aborted.append),
+        )
+        generate_fn = controller._make_generate_fn(metrics_prefix="generator")
+
+        assert await generate_fn([1], request_id="finished", group_id=0) == "completion"
+        cancelled = asyncio.create_task(generate_fn([1], request_id="r1", group_id=0))
+        await started.wait()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+
+        assert aborted == ["r1"]
 
     asyncio.run(run())

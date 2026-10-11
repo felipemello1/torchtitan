@@ -21,21 +21,25 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
 from torchtitan.rl.components.data import RLDataLoader, RLDataset
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
-from torchtitan.rl.rollout.environment import MessageEnv, TokenEnv
+from torchtitan.rl.rollout.message_env import MessageEnv
+from torchtitan.rl.rollout.rubric import Rubric, RubricOutput
+from torchtitan.rl.rollout.token_env import TokenEnv
 from torchtitan.rl.rollout.types import (
     GenerateFn,
+    ReleaseSessionFn,
     Rollout,
     RolloutGroup,
     RolloutStatus,
     RolloutTurn,
+    RolloutTurnID,
 )
-from torchtitan.rl.rubric import Rubric, RubricOutput
-from torchtitan.rl.types import RolloutTurnID
 
 if TYPE_CHECKING:
     from renderers import Renderer
 
-    from torchtitan.rl.distributed.actors.rollout_worker import RolloutWorkerActor
+    from torchtitan.rl.distributed.monarch_actors.rollout_worker import (
+        RolloutWorkerActor,
+    )
 
     # Type-only: importing the generator module here would pull in vLLM at import time.
     from torchtitan.rl.generator import SamplingConfig
@@ -156,10 +160,13 @@ class Rollouter(Configurable):
         tokenizer_config: HuggingFaceTokenizer.Config,
         renderer_config: RendererConfig,
         hf_assets_path: str,
+        release_session_fn: ReleaseSessionFn | None = None,
     ) -> None:
         """Spawn and initialize the owned worker proc mesh and actor pool."""
         # Import lazily to avoid a circular dependency through Rollouter.Config.
-        from torchtitan.rl.distributed.actors.rollout_worker import RolloutWorkerActor
+        from torchtitan.rl.distributed.monarch_actors.rollout_worker import (
+            RolloutWorkerActor,
+        )
 
         if self._worker_mesh is not None or self._worker_actors is not None:
             raise RuntimeError("rollout worker pool is already initialized")
@@ -177,6 +184,7 @@ class Rollouter(Configurable):
             tokenizer_config=tokenizer_config,
             renderer_config=renderer_config,
             hf_assets_path=hf_assets_path,
+            release_session_fn=release_session_fn,
         )
 
     async def close(self) -> None:
@@ -265,6 +273,7 @@ class RolloutWorker(Configurable):
         self._token_env_config = config.token_env
         self.advantage_estimator: AdvantageEstimator = config.advantage.build()
         self._renderer: Renderer
+        self._release_session_fn: ReleaseSessionFn | None = None
 
     async def setup_async(
         self,
@@ -272,8 +281,10 @@ class RolloutWorker(Configurable):
         tokenizer_config: HuggingFaceTokenizer.Config,
         renderer_config: RendererConfig,
         hf_assets_path: str,
+        release_session_fn: ReleaseSessionFn | None = None,
     ) -> None:
         """Build runtime dependencies after the worker actor is spawned."""
+        self._release_session_fn = release_session_fn
         tokenizer = tokenizer_config.build(tokenizer_path=hf_assets_path)
         self._renderer = renderer_config.build(tokenizer=tokenizer)
 
@@ -418,6 +429,10 @@ class RolloutWorker(Configurable):
         Returns:
             One unscored `Rollout`; `run_group` fills its reward later.
         """
+        # Per-sample sticky key: a sample's turns reuse one generator's prefix cache.
+        routing_session_id = RolloutTurnID(
+            group_id=group_id, rollout_id=rollout_id, turn_id=0
+        ).to_string(include_turn=False)
         turns: list[RolloutTurn] = []
         status = RolloutStatus.ERROR
         try:
@@ -434,8 +449,7 @@ class RolloutWorker(Configurable):
                     prompt_token_ids=env_step.next_prompt_token_ids,
                     request_id=turn_rollout_id.to_string(),
                     group_id=group_id,
-                    # Per-sample sticky key: a sample's turns reuse one generator's prefix cache.
-                    routing_session_id=turn_rollout_id.to_string(include_turn=False),
+                    routing_session_id=routing_session_id,
                     sampling_config=sampling,
                 )
 
@@ -472,6 +486,16 @@ class RolloutWorker(Configurable):
             )
             status = RolloutStatus.ERROR
 
+        if self._release_session_fn is not None:
+            try:
+                await self._release_session_fn(
+                    group_id=group_id, routing_session_id=routing_session_id
+                )
+            except Exception:
+                # Not fatal: the group's release frees the session too.
+                logger.exception(
+                    "releasing routing session %s failed", routing_session_id
+                )
         return Rollout(
             group_id=group_id,
             rollout_id=rollout_id,

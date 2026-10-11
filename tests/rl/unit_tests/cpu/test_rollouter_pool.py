@@ -9,7 +9,7 @@
 import asyncio
 from types import SimpleNamespace
 
-from torchtitan.rl.distributed.actors.rollout_worker import RolloutWorkerActor
+from torchtitan.rl.distributed.monarch_actors.rollout_worker import RolloutWorkerActor
 
 from torchtitan.rl.rollout import rollouter as rollouter_module, RolloutGroup
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
@@ -150,6 +150,7 @@ def test_setup_spawns_worker_pool_on_controller_host(monkeypatch) -> None:
                 "tokenizer_config": "tokenizer_config",
                 "renderer_config": "renderer_config",
                 "hf_assets_path": "hf_assets_path",
+                "release_session_fn": None,
             }
         ]
         await rollouter.close()
