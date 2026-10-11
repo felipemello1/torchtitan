@@ -85,7 +85,11 @@ def _forward_with_routed_mask(
     """Run ``moe_cls.forward`` on stubs; return the mask the routed branch sees."""
     routed_mask_T = padding_mask_T.clone()  # stands for the TP-sharded mask
     moe = SimpleNamespace(
-        _maybe_shard_routed_branch_inputs_across_tp=lambda x, mask: (x, routed_mask_T),
+        _maybe_shard_routed_branch_inputs_across_tp=lambda x, mask, expert_ids: (
+            x,
+            routed_mask_T,
+            expert_ids,
+        ),
         router=lambda x, bias, padding_mask_T=None, **kwargs: (
             torch.zeros(x.shape[0], 2),
             torch.zeros(x.shape[0], 2, dtype=torch.int64),
@@ -601,6 +605,10 @@ class TestMoE(unittest.TestCase):
                 return_value=object(),
             ),
             patch(
+                "torchtitan.models.common.moe.spmd_dense_sp_enabled",
+                return_value=True,
+            ),
+            patch(
                 "torchtitan.models.common.moe.spmd_mesh_group",
                 return_value=tp_group,
             ),
@@ -609,7 +617,9 @@ class TestMoE(unittest.TestCase):
                 side_effect=lambda tensor, *_args, **_kwargs: tensor,
             ) as redistribute,
         ):
-            moe._maybe_shard_routed_expert_ids_across_tp(routed_expert_ids_TK)
+            moe._maybe_shard_routed_branch_inputs_across_tp(
+                torch.randn(4, 8), None, routed_expert_ids_TK
+            )
 
         redistribute.assert_called_once_with(
             routed_expert_ids_TK,
@@ -821,10 +831,12 @@ class TestMoE(unittest.TestCase):
             (
                 actual_x_TD,
                 actual_padding_mask_T,
+                actual_routed_expert_ids_TK,
             ) = moe._maybe_shard_routed_branch_inputs_across_tp(x_TD, padding_mask_T)
 
         self.assertIs(actual_x_TD, x_TD)
         self.assertIs(actual_padding_mask_T, padding_mask_T)
+        self.assertIsNone(actual_routed_expert_ids_TK)
         redistribute.assert_called_once_with(
             padding_mask_T,
             tp_group,
