@@ -178,8 +178,8 @@ class ThinkingBudget(Configurable):
                         else first.topk_logprobs[:-1]
                     ),
                 )
-            # "length" with fewer tokens than asked: the context is full, so a second call would
-            # be rejected; end the turn cut, as without a budget.
+            # Done: the reply finished, or the context cut it ("length" below the budget, so a
+            # second call would be rejected); end the turn as without a budget.
             elif (
                 first.finish_reason != "length"
                 or len(first.token_ids) < max_thinking_tokens
@@ -299,21 +299,22 @@ def _join_routed_expert_ids(
     first: Completion, second: Completion, *, num_end_rows: int
 ) -> torch.Tensor | None:
     """Rows of the merged turn: the first call's, then the second call's from where the first
-    stops (its last token, the forced tokens and its own completion ran forward only there),
-    then `num_end_rows` zero rows for the answer's last token when an end of turn is appended.
+    stops (its last token, the forced tokens and its own completion ran forward only there).
+    An appended end of turn needs a row for the answer's last token, which no call ran forward:
+    it repeats the row before it, since a zero row would route every top-k slot to expert 0.
 
     Example:
-        # prompt [P0, P1], first [A0, A1], forced [F0], second [B0]
-        # first rows: P0 P1 A0 (A1 never ran forward); second rows: P0 P1 A0 A1 F0
-        # -> P0 P1 A0 from first, A1 F0 from second
-        # with an appended end of turn [E]: + a zero row for B0, which no call ran forward
+        # prompt [P0, P1], first [A0, A1], forced [F0], second [B0, B1]
+        # first rows: P0 P1 A0 (A1 never ran forward); second rows: P0 P1 A0 A1 F0 B0
+        # -> P0 P1 A0 from first, A1 F0 B0 from second
+        # with an appended end of turn [E]: + B0's row again, for B1
     """
     if first.routed_expert_ids is None or second.routed_expert_ids is None:
         return None
     num_first_rows = len(first.routed_expert_ids)
     # TODO: the next turn's prefill runs the answer's last token forward; taking its row there
-    # would replay the generator's routing for it instead of a zero row.
-    end_rows = second.routed_expert_ids.new_zeros(
+    # would replay the generator's routing for it instead of a copy.
+    end_rows = second.routed_expert_ids[-1:].expand(
         num_end_rows, *second.routed_expert_ids.shape[1:]
     )
     return torch.cat(

@@ -180,7 +180,7 @@ def test_forced_answer_ends_the_turn_at_its_closing_brace() -> None:
     assert generate.calls[0]["sampling_config"].stop_token_ids is None
 
 
-def test_appended_end_of_turn_gets_zero_topk_and_routed_rows() -> None:
+def test_appended_end_of_turn_gets_a_zero_topk_row_and_a_copied_routed_row() -> None:
     # prompt [THINK]; first call [10, 11, 12, 13]; forced [90, 91, 92]; second call [20, BRACE]
     thinking = _completion([10, 11, 12, 13], finish_reason="length")
     thinking.topk_token_ids = torch.tensor([[10], [11], [12], [13]], dtype=torch.int32)
@@ -192,6 +192,7 @@ def test_appended_end_of_turn_gets_zero_topk_and_routed_rows() -> None:
     answer.routed_expert_ids = torch.full(
         (1 + 4 + 3 + 2 - 1, 1, 1), 2, dtype=torch.uint8
     )
+    answer.routed_expert_ids[-1] = 3  # 20's row, the last token that ran forward
     budget = ThinkingBudget(
         ThinkingBudget.Config(max_thinking_tokens=4, answer_end_text="}"),
         tokenizer=_Tokenizer(),
@@ -202,8 +203,10 @@ def test_appended_end_of_turn_gets_zero_topk_and_routed_rows() -> None:
     # One top-k row per completion token: zero rows on the forced tokens and the end of turn.
     topk_token_ids = completion.topk_token_ids.flatten().tolist()
     assert topk_token_ids == [10, 11, 12, 13, 0, 0, 0, 20, BRACE, 0]
-    # 1 prompt + 10 completion tokens - 1 rows: a zero row for BRACE, which no call ran forward.
-    assert completion.routed_expert_ids.flatten().tolist() == [1] * 4 + [2] * 5 + [0]
+    # 1 prompt + 10 completion tokens - 1 rows: BRACE, which no call ran forward, repeats 20's
+    # row, a valid routing; a zero row would send all top-k slots to expert 0.
+    routed = completion.routed_expert_ids.flatten().tolist()
+    assert routed == [1] * 4 + [2] * 4 + [3, 3]
 
 
 def test_reply_that_stops_while_thinking_gets_a_forced_close() -> None:
