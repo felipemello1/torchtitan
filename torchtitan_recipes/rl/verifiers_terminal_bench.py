@@ -530,7 +530,7 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench() -> Controller.Config:
     )
     # Worst case, every EP rank routes all its tokens to one rank; a smaller scratch
     # buffer is an illegal memory access.
-    trainer.dist_moe = DistMoeRuntime.Config(
+    trainer.dist_moe_runtime = DistMoeRuntime.Config(
         scratch_capacity_factor=float(expert_parallel_degree)
     )
     return config
@@ -582,7 +582,7 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2() -> Controller.Config:
     )
     # Worst case, every EP rank routes all its tokens to one rank; a smaller scratch
     # buffer is an illegal memory access.
-    trainer.dist_moe = DistMoeRuntime.Config(
+    trainer.dist_moe_runtime = DistMoeRuntime.Config(
         scratch_capacity_factor=float(expert_parallel_degree)
     )
     # Admit a request only while 3% of KV blocks stay free, so running requests have room to
@@ -690,7 +690,7 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     )
     # Worst case, every EP rank routes all its tokens to one rank; a smaller scratch
     # buffer is an illegal memory access.
-    trainer.dist_moe = DistMoeRuntime.Config(
+    trainer.dist_moe_runtime = DistMoeRuntime.Config(
         scratch_capacity_factor=float(expert_parallel_degree)
     )
     (optimizer,) = trainer.optim.optimizer.optimizers
