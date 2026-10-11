@@ -834,6 +834,9 @@ def _validation_rollout(versions: list[tuple[int, int]]) -> Rollout:
 def test_validation_logs_the_policies_its_rollouts_sampled() -> None:
     """A weight sync during a rollout shows as a newer max version and a mixed-policy rollout."""
     controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        generator_router=SimpleNamespace(admission=None)
+    )
     controller.generator_router = SimpleNamespace(
         release_groups=SimpleNamespace(call_one=AsyncMock())
     )
