@@ -89,6 +89,11 @@ def _forced_close_rate(completion: Completion) -> float:
     return reduced["thinking_budget/forced_close_rate/mean"]
 
 
+def _stopped_while_thinking_rate(completion: Completion) -> float:
+    reduced = MetricsProcessor._aggregate_metrics(completion.metrics)
+    return reduced["thinking_budget/stopped_while_thinking_rate/mean"]
+
+
 def test_reply_within_budget_is_returned_unchanged() -> None:
     reply = _completion([10, END_THINK, 11], finish_reason="stop")
     generate = _ScriptedGenerate(reply)
@@ -98,6 +103,7 @@ def test_reply_within_budget_is_returned_unchanged() -> None:
     assert len(generate.calls) == 1
     assert generate.calls[0]["sampling_config"].max_tokens == 4
     assert _forced_close_rate(completion) == 0.0
+    assert _stopped_while_thinking_rate(completion) == 0.0
 
 
 def test_reply_cut_while_thinking_gets_a_forced_close() -> None:
@@ -122,6 +128,7 @@ def test_reply_cut_while_thinking_gets_a_forced_close() -> None:
     assert completion.finish_reason == "stop"
     assert completion.request_id == "group=0/rollout=0/turn=0"
     assert _forced_close_rate(completion) == 1.0
+    assert _stopped_while_thinking_rate(completion) == 0.0
 
 
 def test_forced_answer_ends_the_turn_at_its_closing_brace() -> None:
@@ -145,6 +152,21 @@ def test_forced_answer_ends_the_turn_at_its_closing_brace() -> None:
     assert completion.finish_reason == "stop"
     # the thinking call does not stop at braces
     assert generate.calls[0]["sampling_config"].stop_token_ids is None
+
+
+def test_reply_that_stops_while_thinking_gets_a_forced_close() -> None:
+    # the model samples its end of turn before </think>: no answer, so close and ask for one
+    stopped = _completion([10, 11, END_OF_TURN], finish_reason="stop")
+    answer = _completion([20], finish_reason="stop")
+    generate = _ScriptedGenerate(stopped, answer)
+    completion = _run(_budget(), generate, prompt=[5, THINK])
+    assert generate.calls[1]["prompt_token_ids"] == [5, THINK, 10, 11, *FORCED]
+    assert generate.calls[1]["sampling_config"].max_tokens == 12 - 2 - len(FORCED)
+    assert completion.token_ids == [10, 11, *FORCED, 20]
+    assert len(completion.token_logprobs) == len(completion.token_ids)
+    assert completion.loss_mask == [True] * 2 + [False] * 3 + [True]
+    assert _forced_close_rate(completion) == 1.0
+    assert _stopped_while_thinking_rate(completion) == 1.0
 
 
 def test_reply_cut_while_answering_continues_without_forcing() -> None:

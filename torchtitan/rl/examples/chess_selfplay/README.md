@@ -129,7 +129,7 @@ config.rollouter.curriculum = ChessCurriculum.Config(
 )
 ```
 
-1. A turn still thinking at its budget gets a forced end: Qwen's thinking-budget sentence, `</think>`, and `\boxed{`.
+1. A turn still thinking at its budget, or one that ends its turn before `</think>`, gets a forced end: Qwen's thinking-budget sentence, `</think>`, and `\boxed{`.
 2. The answer stops at the box's closing brace, which ends the turn, so a forced move is never lost to the token cap.
 3. The forced tokens are masked out of the loss, and the reward loses up to 0.1 for force-closed turns.
 
