@@ -634,7 +634,10 @@ class RequestDispatcher:
             inflight_requests_at_completion = float(
                 len(self._rank0_outstanding_generations)
             )
-            generation = self._rank0_outstanding_generations.pop(request_id)
+            generation = self._rank0_outstanding_generations.pop(request_id, None)
+            if generation is None:
+                # Aborted while a peer DP rank was sending its completion; the abort already answered it.
+                continue
 
             # Replace the placeholder min (the builder set min == max) with the true admitted
             # version stamped on the outstanding generation at admission.
@@ -667,6 +670,32 @@ class RequestDispatcher:
             completions = await self._rank0_result_receiver.recv()
             self._rank0_resolve_generations(completions)
 
+    def rank0_abort_generation(
+        self, request_id: str, *, policy_version: int, routed: bool
+    ) -> bool:
+        """RANK 0: answer an aborted generation with an empty "abort" `Completion`, so its `generate`
+        call returns and the router releases its load. If `routed`, also release its DP-rank reservation.
+
+            still outstanding -> reply resolved, entry removed  -> True
+            already finished  -> nothing to do                  -> False
+        """
+        generation = self._rank0_outstanding_generations.pop(request_id, None)
+        if generation is None:
+            return False
+        generation.reply.set_result(
+            Completion(
+                min_policy_version=policy_version,
+                max_policy_version=policy_version,
+                request_id=request_id,
+                token_ids=[],
+                token_logprobs=[],
+                finish_reason="abort",
+            )
+        )
+        if routed and self._rank0_dp_router is not None:
+            self._rank0_dp_router.release(request_id)
+        return True
+
     def fail_outstanding_generations(self, exc: BaseException) -> None:
         """RANK 0: fail the reply of every outstanding generation after an exception or
         teardown (no-op elsewhere, where the map is empty)."""
@@ -690,7 +719,8 @@ class VLLMGenerator(Configurable):
     """vLLM engine to drive concurrent `generate` calls through one SPMD engine loop.
 
     The controller fires independent calls (`generate`, `pull_model_state_dict`, `close`),
-    and the router calls `prefetch_model_state_dict` before `pull_model_state_dict` to prefetch weights into CPU.
+    and the router calls `prefetch_model_state_dict` before `pull_model_state_dict` to prefetch weights into CPU,
+    and `abort_generation` when a caller gives up.
     Rank 0 puts each call on a thread-safe queue and awaits its reply. One background `_engine_loop` per rank
     executes the `LoopDecision` rank 0 makes from the queue. Rank 0 resolves each reply when its request finishes and
     return the result back to the controller.
@@ -1294,6 +1324,28 @@ class VLLMGenerator(Configurable):
         )
         return await asyncio.wrap_future(reply)
 
+    async def abort_generation(self, request_id: str) -> None:
+        """Stops one `generate` call so vLLM frees its KV. No-op if the call already finished.
+
+        Rank 0 only; returns once the call is answered.
+
+        Example:
+
+            task = asyncio.create_task(generator.generate([1, 2], request_id="r0", ...))
+            await generator.abort_generation("r0")
+            (await task).finish_reason
+            # -> "abort"
+        """
+        if self._engine_loop_queue.closed:
+            # Closing fails every outstanding call, so there is nothing to abort.
+            return
+        self._rank0_check_engine_loop_running("abort_generation")
+        reply: concurrent.futures.Future[None] = concurrent.futures.Future()
+        self._engine_loop_queue.put(
+            GenerationAbortMessage(request_id=request_id, reply=reply)
+        )
+        await asyncio.wrap_future(reply)
+
     @sl.log_trace_span("engine_loop")
     async def _engine_loop(self) -> None:
         """Non-stop loop running on all ranks to produce new tokens.
@@ -1364,6 +1416,9 @@ class VLLMGenerator(Configurable):
                     self._session_kv.release(
                         decision.released_session_ids, decision.released_group_ids
                     )
+                # Every rank calls this; vLLM skips ids it doesn't hold: another DP rank's, or finished.
+                if decision.abort_request_ids:
+                    self._engine.abort_request(decision.abort_request_ids)
 
                 if decision.action is LoopAction.PULL_MODEL_STATE_DICT:
                     await self._pull_model_state_dict(decision.pull_version)
@@ -1490,6 +1545,7 @@ class VLLMGenerator(Configurable):
 
         released_session_ids: list[str] = []
         released_group_ids: list[int] = []
+        abort_request_ids: list[str] = []
         for message in messages:
             if isinstance(message, CloseMessage):
                 # Drops nothing: the queue rejects puts once closed, so the `CloseMessage` is the last message.
@@ -1504,6 +1560,21 @@ class VLLMGenerator(Configurable):
                 continue
             if isinstance(message, ModelStateDictPullMessage):
                 pending_pull_messages.append(message)
+            elif isinstance(message, GenerationAbortMessage):
+                request_id = message.request_id
+                pending_ids = [
+                    request.request_id for request in pending_engine_requests
+                ]
+                # Not routed yet (e.g. held back by a pull): drop it so it never reaches the engine.
+                routed = request_id not in pending_ids
+                if not routed:
+                    pending_engine_requests.pop(pending_ids.index(request_id))
+                aborted = self._request_dispatcher.rank0_abort_generation(
+                    request_id, policy_version=self.policy_version, routed=routed
+                )
+                if aborted and routed:
+                    abort_request_ids.append(request_id)
+                message.reply.set_result(None)
             else:
                 self._request_dispatcher.rank0_register_generation(
                     message.engine_request.request_id,
@@ -1522,6 +1593,7 @@ class VLLMGenerator(Configurable):
                 pull_version=max(pull.version for pull in pending_pull_messages),
                 released_session_ids=released_session_ids,
                 released_group_ids=released_group_ids,
+                abort_request_ids=abort_request_ids,
             )
 
         # `LoopAction.STEP`: admit whatever is pending (may be empty -> just keep stepping in-flight work).
@@ -1542,6 +1614,7 @@ class VLLMGenerator(Configurable):
             requests_per_dp_rank=requests_per_dp_rank,
             released_session_ids=released_session_ids,
             released_group_ids=released_group_ids,
+            abort_request_ids=abort_request_ids,
         )
 
     def _build_sampling_params(self, sampling: SamplingConfig) -> SamplingParams:
@@ -1760,6 +1833,15 @@ class ModelStateDictPullMessage:
     reply: concurrent.futures.Future[None]
 
 
+@dataclass(kw_only=True, slots=True)
+class GenerationAbortMessage:
+    """A queued `abort_generation` call: the `request_id` to drop, and the `reply` the engine loop
+    resolves once that generation is answered."""
+
+    request_id: str
+    reply: concurrent.futures.Future[None]
+
+
 def _fail_pulls(
     pending_pull_messages: list[ModelStateDictPullMessage], exc: BaseException
 ) -> None:
@@ -1785,7 +1867,11 @@ class SessionReleaseMessage:
 
 
 EngineLoopMessage = (
-    GenerationMessage | ModelStateDictPullMessage | CloseMessage | SessionReleaseMessage
+    GenerationMessage
+    | ModelStateDictPullMessage
+    | GenerationAbortMessage
+    | CloseMessage
+    | SessionReleaseMessage
 )
 
 
@@ -1887,3 +1973,6 @@ class LoopDecision:
     released_session_ids: list[str] = field(default_factory=list)
     released_group_ids: list[int] = field(default_factory=list)
     # sessions (and groups) whose held KV every rank releases before acting (hold_session_kv)
+
+    abort_request_ids: list[str] = field(default_factory=list)
+    # Requests to drop from the engine before acting on `action`.

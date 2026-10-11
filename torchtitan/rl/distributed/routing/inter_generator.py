@@ -317,6 +317,36 @@ class InterGeneratorRouter(Actor, Configurable):
         #   big models / many generators, not at small scale.
         await asyncio.gather(*[_pull_one(h) for h in self._generators])
 
+    async def _abort_generation(self, request_id: str) -> None:
+        """Send the abort to every generator's rank 0; the ones not running `request_id` ignore it.
+
+        Aborts are rare (one per abandoned call), so the router keeps no request -> generator map.
+        During a drain (`hot_swap=False`) the call can be in two places, so the abort goes out twice:
+
+            on its generator, which the drain waits for   -> the first send, at once, frees it
+            parked in `_route` until the drain ends        -> the second send, after the drain, frees it
+        """
+
+        async def abort_on_every_generator() -> None:
+            await asyncio.gather(
+                *[
+                    h.rank0_actor.abort_generation.call_one(request_id)
+                    for h in self._generators
+                ]
+            )
+
+        # TODO(hot_swap=False): the second send waits on the global `_serving`, not on the call's
+        # pinned `serving` (see `_route`), so a call parked there can miss both sends.
+        # Read before yielding: a drain that ends during the yield must still get the second send.
+        draining = not self._serving.is_set()
+        # Yield once, so a call in `_route` that `_serving.set()` just woke is dispatched first.
+        await asyncio.sleep(0)
+        await abort_on_every_generator()
+        if draining:
+            await self._serving.wait()
+            await asyncio.sleep(0)  # same yield as above
+            await abort_on_every_generator()
+
     @concurrent_endpoint
     async def generate(
         self,
@@ -338,6 +368,11 @@ class InterGeneratorRouter(Actor, Configurable):
             sampling_config=sampling_config,
             metrics_prefix=metrics_prefix,
         )
+
+    @concurrent_endpoint
+    async def abort_generation(self, request_id: str) -> None:
+        """Stop a `generate` call so its generator frees the KV. No-op if it already finished."""
+        await self._abort_generation(request_id)
 
     @concurrent_endpoint
     async def start_engine_loop(self) -> None:
