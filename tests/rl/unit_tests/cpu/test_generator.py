@@ -345,13 +345,13 @@ def _admit_through_engine_loop(monkeypatch, generator, requests):
     asyncio.run(generator._engine_loop())
 
 
-def _engine_request(request_id: str, *, min_policy_version: int):
+def _engine_request(request_id: str, *, min_policy_version: int, group_id: int = 3):
     request = EngineRequest(
         request_id=request_id,
         prompt_token_ids=[1, 2],
         sampling=SamplingConfig(),
-        group_id=3,
-        routing_session_id="group=3/rollout=0",
+        group_id=group_id,
+        routing_session_id=f"group={group_id}/rollout=0",
     )
     request.min_policy_version = min_policy_version
     request.arrival_time = 1.5  # rank 0's clock at admission
@@ -370,6 +370,23 @@ def test_admission_passes_pinned_version_as_priority(monkeypatch):
     _, kwargs = engine.add_requests[0]
     assert kwargs["priority"] == 6
     assert kwargs["arrival_time"] == 1.5
+
+
+def test_admission_puts_validation_ahead_of_every_policy_version(monkeypatch):
+    # Validation (negative group id) gets priority -1; training keeps its pinned version, even 0.
+    generator = _generator()
+    engine = cast(_FakeEngine, generator._engine)
+
+    _admit_through_engine_loop(
+        monkeypatch,
+        generator,
+        [
+            _engine_request("train", min_policy_version=0),
+            _engine_request("validation", min_policy_version=7, group_id=-1),
+        ],
+    )
+
+    assert [kwargs["priority"] for _, kwargs in engine.add_requests] == [0, -1]
 
 
 def test_admission_salts_prompt_with_min_policy_version(monkeypatch):
