@@ -4,9 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Single-node Qwen3.5-4B chess recipe: self-play mixed with games against Stockfish bots."""
+"""Qwen3.5-4B chess recipes: one node with self-play mixed with games against Stockfish bots, and
+three GB300 hosts with thinking on and self-play only."""
 
 from __future__ import annotations
+
+import os
 
 from renderers import Qwen35RendererConfig
 
@@ -21,12 +24,14 @@ from torchtitan.components.optim import (
 from torchtitan.components.renderer import from_renderers
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.components.data import IterableRLDataLoader
+from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
+from torchtitan.rl.distributed.routing.admission import KVGrowthEstimateAdmission
 from torchtitan.rl.examples.chess_selfplay import (
     ChessPlayerEnv,
     ChessRollouter,
@@ -36,10 +41,11 @@ from torchtitan.rl.examples.chess_selfplay import (
     RewardChessScore,
 )
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
-from torchtitan.rl.losses import DAPOLoss
+from torchtitan.rl.losses import DAPOLoss, ScoreCenteringLoss
 from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import TokenEnv
+from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
 from torchtitan.rl.rubric import Rubric
 from torchtitan.rl.trainer import Trainer
 
@@ -192,3 +198,117 @@ def rl_chess_qwen3_5_4b(
             ),
         ),
     )
+
+
+def rl_chess_qwen3_5_4b_gb300(
+    max_plies: int = 60,
+    max_thinking_tokens: int = 1024,
+    max_context_tokens: int = 131072,
+) -> Controller.Config:
+    """Qwen3.5-4B (instruct) self-play with thinking on, on three GB300 hosts: host 0 trains with
+    FSDP 4, hosts 1-2 run eight one-GPU generators. A step trains 48 positions x 8 self-play games
+    (16 rollouts per position, one per color), every game capped at `max_plies`. 56 fixed games
+    against a 7-bot ladder validate every 5 steps, beside training.
+
+    A turn thinks up to `max_thinking_tokens`; then `ThinkingBudget` closes the thinking, starts the
+    answer with "\\boxed{" and ends it at the closing brace, and the reward loses up to 0.1 for
+    force-closed turns. A player keeps its own past thinking, so its history grows ~1.6k tokens a turn.
+    """
+    # room for the answer after the thinking ends, forced or not
+    max_response_tokens = max_thinking_tokens + 512
+    # `max_context_tokens` must be a multiple of 1,024 so ChunkedLossWrapper splits each sequence
+    # into equal chunks.
+    config = rl_chess_qwen3_5_4b(
+        max_plies=max_plies,
+        max_rollout_tokens=max_context_tokens - max_response_tokens,
+        max_response_tokens=max_response_tokens,
+    )
+    config.dump_folder = "outputs/rl/qwen3_5_4b_chess_gb300"
+    config.renderer = from_renderers(
+        Qwen35RendererConfig(enable_thinking=True, thinking_retention="all")
+    )
+
+    # ======== Rollouts ========
+    rollouter = config.rollouter
+    # Self-play only: the ladder validation below measures strength.
+    rollouter.training_dataloader.dataset.bots = ()
+    # 8 fixed games (4 per color) against each of 7 bots.
+    ladder = (
+        "sf_random",
+        "sf_eps90",
+        "sf_eps75",
+        "sf_eps50",
+        "sf_eps25",
+        "sf_elo1320",
+        "sf_elo1500",
+    )
+    num_validation_games = 8 * len(ladder)
+    rollouter.validation_dataset = ChessVsBotDataset.Config(
+        num_games=num_validation_games, opponents=ladder
+    )
+    worker = rollouter.worker
+    # The launcher sets the path of a Stockfish build for the host's architecture.
+    worker.stockfish_path = os.environ.get("CHESS_STOCKFISH_PATH", "stockfish")
+    # A mate pays 10x a win at the cap's best (0.75), so it dominates its group's advantages.
+    worker.checkmate_reward = 10.0
+    # The answer ends at the box's closing brace, so a forced move is never lost to the token cap.
+    worker.thinking_budget = ThinkingBudget.Config(
+        max_thinking_tokens=max_thinking_tokens,
+        answer_prefix="\\boxed{",
+        answer_end_text="}",
+    )
+    worker.rubric.reward_fns = [RewardChessScore.Config(forced_close_penalty=0.1)]
+
+    # ======== Async loop ========
+    loop = config.async_loop
+    # 48 positions x 8 games x 2 colors = 768 rollouts per step.
+    loop.num_prompts_per_train_step = 48
+    # Generation paces itself: the mean policy age stays under 6 steps, every trained group under
+    # 12. At most 6 batches generate at once, which bounds the rollout workers, vLLM's
+    # max_num_seqs, and the Stockfish processes on host 0.
+    loop.target_offpolicy_steps = 6
+    loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
+        max_offpolicy_steps=12,
+        target_offpolicy_steps=6,
+        generation_capacity=6 * loop.num_prompts_per_train_step,
+    )
+    # Validate at step 0, every 5 steps and after the last, without pausing training.
+    loop.validation = ValidationConfig(
+        steps=num_validation_games, freq=5, overlap_training=True
+    )
+
+    # ======== Trainer ========
+    trainer = config.trainer
+    # The 4B's fp32 weights, grads and Adam state take ~16 GB of a GB300's memory, so the trainer
+    # spends it on selective activation checkpointing instead of full recompute.
+    trainer.activation_checkpoint = SelectiveAC.Config()
+    # Score centering instead of DAPO's clipped objective: REINFORCE weighted by min(p / q, 2), with
+    # the generator's top-16 logprobs as each token's baseline.
+    trainer.loss.loss_fn = ScoreCenteringLoss.Config(
+        max_ratio=2.0, global_vocab_size=decoder_vocab_size(config.model)
+    )
+    # The launcher uploads every saved step and prunes, so torchtitan keeps them all.
+    trainer.checkpointer = CheckpointManager.Config(
+        initial_load_in_hf=True,
+        interval=25,
+        enable_first_step_checkpoint=True,
+        async_mode="async",
+        keep_latest_k=0,
+        last_save_in_hf=False,
+        last_save_model_only=False,
+    )
+
+    # ======== Generators ========
+    config.num_generators = 8
+    generator = config.generator
+    generator.max_num_batched_tokens = 8192
+    generator.sampling.num_topk_logprobs = 16
+    # Hold each player's prefix (attention + GDN state) between its turns; below 5% free blocks
+    # (`session_kv_free_floor`), release the sessions idle longest.
+    generator.hold_session_kv = True
+    # Admit a request only while 3% of KV blocks stay free, so running requests have room to grow.
+    generator.extra_vllm_engine_args = {"watermark": 0.03}
+    # Start a new group only while every placed group, at its expected final size, fits the
+    # generators' KV cache; `ChessRollouter` books 16 sessions per self-play group.
+    config.generator_router.admission = KVGrowthEstimateAdmission.Config()
+    return config

@@ -136,7 +136,7 @@ config.rollouter.curriculum = ChessCurriculum.Config(
 2. The answer stops at the box's closing brace, which ends the turn, so a forced move is never lost to the token cap.
 3. The forced tokens are masked out of the loss, and the reward loses up to 0.1 for force-closed turns.
 
-Each turn's `max_tokens` (`max_response_tokens`, 2,560 here) must fit the larger budget plus a short answer. A player keeps its own past thinking, never the opponent's, so a 120-ply game needs ~100k tokens of context. That multi-host GB300 recipe is not included yet: at that scale it also needs pieces that are not on main:
+Each turn's `max_tokens` (`max_response_tokens`, 2,560 here) must fit the larger budget plus a short answer. A player keeps its own past thinking, never the opponent's, so a 120-ply game needs ~100k tokens of context. `rl_chess_qwen3_5_4b_gb300` runs this setup self-play only at 60 plies on three GB300 hosts, with `checkmate_reward=10`, score centering and the adaptive rollout buffer. At that scale it relies on:
 
 - router admission by KV room, so the groups in flight fit the generators' KV cache;
 - session KV holding and the vLLM watermark, so a waiting player keeps its cached history between turns;
