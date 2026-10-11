@@ -32,6 +32,7 @@ from torchtitan.rl.distributed.routing.strategies import (
     RoutingStrategy,
     StickySessionRoutingStrategy,
 )
+from torchtitan.rl.distributed.routing.types import GeneratorClosedError
 
 from torchtitan.rl.generator import (
     CloseMessage,
@@ -855,6 +856,17 @@ def test_pulls_queued_during_a_pull_are_applied_together_after_it(
     asyncio.run(run())
 
 
+def test_releases_after_the_queue_closes_are_no_ops(runner) -> None:
+    generator = _bare_generator(event_loop=runner.get_loop())
+    generator._rank = 0
+    # A crash closes the queue before the loop drops `_session_kv`.
+    generator._session_kv = object()
+    generator._engine_loop_queue.close(CloseMessage(), reason="engine loop crashed")
+
+    runner.run(generator.release_groups([1]))
+    runner.run(generator.release_sessions(["s0"]))
+
+
 def test_crash_fails_outstanding_and_queued_calls_and_later_calls(
     engine_thread, monkeypatch
 ) -> None:
@@ -885,7 +897,7 @@ def test_crash_fails_outstanding_and_queued_calls_and_later_calls(
         for call in (failing_pull, *queued):
             with pytest.raises(RuntimeError, match="TorchStore is down"):
                 await asyncio.wait_for(call, _TIMEOUT_S)
-        with pytest.raises(RuntimeError, match="generator is closed"):
+        with pytest.raises(GeneratorClosedError, match="generator is closed"):
             await asyncio.wait_for(_generate(generator, "r1"), _TIMEOUT_S)
         # `close` only logs the loop's error, so check that failing the queue didn't replace it.
         exc = generator._engine_loop_future.exception(timeout=_TIMEOUT_S)

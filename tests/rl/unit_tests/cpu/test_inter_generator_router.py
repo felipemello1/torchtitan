@@ -7,6 +7,7 @@
 import asyncio
 
 import pytest
+from monarch.actor import ActorError
 
 from torchtitan.rl.distributed.routing.inter_generator import (
     _GeneratorState,
@@ -17,13 +18,15 @@ from torchtitan.rl.distributed.routing.strategies import (
     RoundRobinRoutingStrategy,
     StickySessionRoutingStrategy,
 )
-from torchtitan.rl.distributed.routing.types import RoutingContext
+from torchtitan.rl.distributed.routing.types import GeneratorClosedError, RoutingContext
 
 
 class _Endpoint:
     def __init__(self, value=None, *, wait: bool = False, raises: bool = False):
         self.value = value
         self.raises = raises
+        # Raised at the start of every call, as Monarch delivers an actor's error.
+        self.error: ActorError | None = None
         self.calls = []
         self.started = asyncio.Event()
         self.release = asyncio.Event()
@@ -32,6 +35,8 @@ class _Endpoint:
 
     async def call_one(self, *args, **kwargs):
         self.calls.append((args, kwargs))
+        if self.error is not None:
+            raise self.error
         self.started.set()
         await self.release.wait()
         if self.raises:
@@ -58,6 +63,13 @@ class _Actor:
         self.prefetch_model_state_dict = _Endpoint(wait=wait_prefetch)
         self.pull_model_state_dict = _Endpoint(None, wait=wait_pull, raises=raises_pull)
         self.release_sessions = _Endpoint()
+        self.release_groups = _Endpoint()
+
+    def crash(self):
+        """Make later generate and pull calls fail as after an engine-loop crash."""
+        error = ActorError(GeneratorClosedError("generator is closed"))
+        self.generate.error = error
+        self.pull_model_state_dict.error = error
 
     def flatten(self, *args, **kwargs):
         return self
@@ -395,7 +407,7 @@ def test_sticky_session_release_drops_its_assignment(release):
         if release == "session":
             await router._release_session(group_id=0, session_id="s0")
         else:
-            router._release_groups([0])
+            await router._release_groups([0])
         # Released, s0 is a new session: least-loaded picks idle gen1 over busy gen0.
         assert await _generate(router, group_id=0, session_id="s0") == "gen1"
 
@@ -595,5 +607,152 @@ def test_pull_model_state_dict_pulls_every_generator():
             [((7,), {})],
             [((7,), {})],
         ]
+
+    asyncio.run(_run())
+
+
+def test_closed_generator_gets_no_new_sessions():
+    async def _run():
+        actors = [_Actor(f"gen{i}") for i in range(3)]
+        actors[0].crash()
+        router = _router(actors, strategy=StickySessionRoutingStrategy.Config())
+
+        # The first session lands on idle gen0 and finds it closed; later ones avoid it,
+        # including s0, which is still pinned to gen0 (a timeout instead of a hang if not).
+        with pytest.raises(ActorError):
+            await router._route("generate", routing_ctx=RoutingContext(session_id="s0"))
+        chosen = [
+            await asyncio.wait_for(
+                router._route(
+                    "generate", routing_ctx=RoutingContext(session_id=f"s{i}")
+                ),
+                timeout=5.0,
+            )
+            for i in range(6)
+        ]
+
+        assert router._generators[0].state is _GeneratorState.CLOSED
+        assert len(actors[0].generate.calls) == 1
+        assert [chosen.count(f"gen{i}") for i in range(3)] == [0, 3, 3]
+
+    asyncio.run(_run())
+
+
+def test_ordinary_generate_error_keeps_generator_routable():
+    async def _run():
+        actors = [_Actor("gen0")]
+        router = _router(actors)
+        actors[0].generate.error = ActorError(ValueError("vLLM rejected request r0"))
+
+        with pytest.raises(ActorError):
+            await router._route("generate", routing_ctx=RoutingContext())
+
+        assert router._generators[0].state is _GeneratorState.SERVING
+        actors[0].generate.error = None
+        assert await router._route("generate", routing_ctx=RoutingContext()) == "gen0"
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("hot_swap", [True, False])
+def test_pull_skips_closed_generator(hot_swap):
+    async def _run():
+        actors = [_Actor("gen0"), _Actor("gen1")]
+        router = _router(actors, hot_swap=hot_swap)
+        actors[0].crash()
+
+        # The first pull finds gen0 closed and finishes without it.
+        await router._pull_model_state_dict(policy_version=1)
+        assert router._generators[0].state is _GeneratorState.CLOSED
+        assert router._generators[1].state is _GeneratorState.SERVING
+
+        # Later pulls skip gen0 entirely.
+        await router._pull_model_state_dict(policy_version=2)
+        assert len(actors[0].prefetch_model_state_dict.calls) == 1
+        assert len(actors[0].pull_model_state_dict.calls) == 1
+        assert actors[1].pull_model_state_dict.calls == [((1,), {}), ((2,), {})]
+
+    asyncio.run(_run())
+
+
+def test_all_generators_closed_raises_instead_of_hanging():
+    async def _run():
+        actors = [_Actor("gen0"), _Actor("gen1")]
+        for actor in actors:
+            actor.crash()
+        router = _router(actors)
+
+        for _ in actors:
+            with pytest.raises(ActorError):
+                await router._route("generate", routing_ctx=RoutingContext())
+        with pytest.raises(RuntimeError, match="All 2 generators are closed"):
+            await asyncio.wait_for(
+                router._route("generate", routing_ctx=RoutingContext()), timeout=1.0
+            )
+        with pytest.raises(RuntimeError, match="All 2 generators are closed"):
+            await router._release_groups([0])
+
+    asyncio.run(_run())
+
+
+def test_route_waiting_on_drain_survives_closed_generators():
+    async def _run():
+        actors = [
+            _Actor("gen0", wait_generate=True),
+            _Actor("gen1", wait_generate=True),
+        ]
+        router = _router(actors)
+        in_flight = [
+            asyncio.create_task(router._route("generate", routing_ctx=RoutingContext()))
+            for _ in actors
+        ]
+        # Both generators drain behind their in-flight routes, so a new route waits.
+        pull_task = asyncio.create_task(router._pull_model_state_dict(policy_version=1))
+        while any(h.state is not _GeneratorState.SYNCING for h in router._generators):
+            await asyncio.sleep(0)
+        waiting = asyncio.create_task(
+            router._route("generate", routing_ctx=RoutingContext())
+        )
+
+        # gen0 crashes after its turn; its pull finds it closed, and the route waits for gen1.
+        actors[0].crash()
+        actors[0].generate.release.set()
+        assert await in_flight[0] == "gen0"
+        while router._generators[0].state is not _GeneratorState.CLOSED:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not waiting.done()
+
+        # gen1 crashes too: the route raises instead of waiting forever.
+        actors[1].crash()
+        actors[1].generate.release.set()
+        assert await in_flight[1] == "gen1"
+        with pytest.raises(RuntimeError, match="All 2 generators are closed"):
+            await asyncio.wait_for(waiting, timeout=1.0)
+        await pull_task
+
+    asyncio.run(_run())
+
+
+def test_releases_skip_closed_generators():
+    async def _run():
+        actors = [_Actor("gen0"), _Actor("gen1")]
+        router = _router(
+            actors,
+            strategy=StickySessionRoutingStrategy.Config(),
+            forward_session_releases=True,
+        )
+        assert await _generate(router, group_id=0, session_id="s0") == "gen0"
+        actors[0].crash()
+        with pytest.raises(ActorError):
+            await _generate(router, group_id=0, session_id="s0")
+        assert router._generators[0].state is _GeneratorState.CLOSED
+
+        await router._release_session(group_id=0, session_id="s0")
+        await router._release_groups([0])
+
+        assert actors[0].release_sessions.calls == []
+        assert actors[0].release_groups.calls == []
+        assert actors[1].release_groups.calls == [(([0],), {})]
 
     asyncio.run(_run())
