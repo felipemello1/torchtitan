@@ -382,6 +382,9 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
     config.dump_folder = "outputs/rl/qwen3_5_35b_a3b_base_intellect3_math_131k_tonight"
     config.async_loop = dataclasses.replace(
         config.async_loop,
+        # 20 x 16 rollouts per step keeps forward/backward near 300-600 s at ~55-65K-token responses
+        # (64 x 16 took 1,100-1,900 s).
+        num_prompts_per_train_step=20,
         num_training_steps=300,
         # Under the adaptive buffer, this only sets train_batch/pct_samples_over_target_age.
         target_offpolicy_steps=6,
@@ -390,12 +393,10 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
             target_offpolicy_steps=6,
             # A group older than 12 steps when consumed is dropped and its prompt not retried.
             max_offpolicy_steps=12,
-            # The engines are KV-bound at ~2,850 running sequences (~285 groups at ~10 live seats).
-            # 640 binds only when over ~30% of groups have zero reward variance, and then it still
-            # keeps a vLLM queue; each idle group worker costs controller time on buffer changes.
-            generation_capacity=640,
-            # Start at the fixed buffer's (6 + 1) x 64 groups: from 3 x 64, the first steps underfeed
-            # the engines while the demand rule ramps up.
+            # ~10 batches: about twice the groups the engines' KV holds at ~55K-token responses, so
+            # the vLLM queue stays short instead of holding ~10K requests for hours.
+            generation_capacity=200,
+            # Start at (6 + 1) batches, as the fixed buffer would.
             start_batches=7,
         ),
         # Groups whose 16 rewards are equal carry no gradient: the batch takes the next group.
