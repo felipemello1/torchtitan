@@ -83,8 +83,12 @@ class ChessPlayerEnv(MessageEnv):
             "positions and legal moves are already given: avoid restating them. Analyze which move "
             "is best, then end your reply with that move, written exactly as listed, inside "
             '\\boxed{}. For example, "Pe2": ["e4"] means \\boxed{e4}, not \\boxed{Pe4}; '
-            '"Nb1": ["Nbd2"] means \\boxed{Nbd2}, not \\boxed{Nd2}. An x marks a capture: '
-            '"Nf3": ["Nxe5"] means \\boxed{Nxe5}. An illegal or missing move loses the game.\n\n'
+            '"Bc8": ["Be6"] means \\boxed{Be6}, not \\boxed{e6} or \\boxed{be6}; '
+            '"Nb1": ["Nbd2"] means \\boxed{Nbd2}, not \\boxed{Nd2}; '
+            '"Ph7": ["h8=Q", "h8=N"] means \\boxed{h8=Q}, not \\boxed{h8}. An x marks a capture: '
+            '"Nf3": ["Nxe5"] means \\boxed{Nxe5}. Pick only from the moves listed under your '
+            "pieces this turn, not from an earlier turn's list or your opponent's list. An illegal "
+            "or missing move loses the game.\n\n"
             f"Checkmating your opponent scores 10. The game stops after {self._game.max_plies} plies "
             "(a ply is one move by either side); a game that reaches that limit without checkmate "
             "scores 0.25 to 0.75 by material (queen 9, rook 5, bishop and knight 3, pawn 1), and a "
