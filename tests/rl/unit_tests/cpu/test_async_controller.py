@@ -8,6 +8,7 @@
 the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID."""
 
 import asyncio
+import dataclasses
 import gc
 import json
 import logging
@@ -39,6 +40,7 @@ from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConf
 from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
+    append_heap_census,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     GCTimer,
@@ -118,6 +120,14 @@ def test_setup_async_caps_max_num_seqs_per_generator(monkeypatch, caplog) -> Non
         "(rollout_concurrency=4096" in caplog.text
     )
     assert controller_module.MAX_NUM_SEQS_PER_GENERATOR == 512
+
+def test_controller_config_heap_census_off_by_default() -> None:
+    from torchtitan_recipes.tests.rl.alphabet_sort import rl_grpo_qwen3_5_debug_varlen
+
+    config = rl_grpo_qwen3_5_debug_varlen()
+    assert config.heap_census_every_n_steps == 0
+    with pytest.raises(ValueError, match="heap_census_every_n_steps"):
+        dataclasses.replace(config, heap_census_every_n_steps=-1)
 
 
 def _training_sample(*, group_id: int, rollout_id: int) -> TrainingSample:
@@ -691,6 +701,27 @@ def test_gc_timer_times_collections_per_generation() -> None:
     assert values[("perf/controller/gc_seconds", m.Max)] == max(max_s) > 0.0
     gc.collect(0)  # after close(): not timed, and the flush above reset the totals
     assert all(metric.value.value == 0.0 for metric in gc_timer.flush())
+
+
+def test_append_heap_census_counts_tracked_objects_by_type(tmp_path) -> None:
+    class Probe:
+        pass
+
+    probes = [Probe() for _ in range(100_000)]
+    path = str(tmp_path / "heap_census.jsonl")
+    append_heap_census(path=path, step=3)
+    append_heap_census(path=path, step=6)
+    with open(path) as file:
+        censuses = [json.loads(line) for line in file]
+
+    assert [census["step"] for census in censuses] == [3, 6]
+    census = censuses[0]
+    top_types = dict(census["top_types"])
+    assert len(top_types) == 40
+    assert top_types[f"{Probe.__module__}.{Probe.__qualname__}"] == len(probes)
+    assert sum(census["objects_per_generation"]) > len(probes)
+    assert census["rss_gib"] > 0.0
+    assert census["census_seconds"] >= 0.0
 
 
 def test_metrics_timer_flush_drains() -> None:
