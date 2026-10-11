@@ -642,7 +642,7 @@ def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) ->
         target_offpolicy_steps=6,
         max_offpolicy_steps=12,
         start_batches=7,
-        generation_capacity=168,
+        generation_capacity=163,
     )
     assert loop.validation == ValidationConfig(steps=78, freq=10, overlap_training=True)
     assert loop.training_sample_builder.drop_zero_std_reward_groups
@@ -651,7 +651,8 @@ def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) ->
     # The pool, (6 + 1) x 24 x 16, holds every rollout of the cap's groups; the KV gate admits fewer.
     serve = config.rollouter.verifiers_env_server.serve
     assert serve.pool.num_workers * serve.max_concurrent == 2688
-    assert loop.max_concurrent_rollout_groups * 16 == 2688
+    # Training groups plus a validation pass fit in the sandbox pool.
+    assert loop.max_concurrent_rollout_groups * 16 + loop.validation.steps <= 2688
     assert config.generator_router.admission == KVGrowthEstimateAdmission.Config(
         limit=0.95
     )

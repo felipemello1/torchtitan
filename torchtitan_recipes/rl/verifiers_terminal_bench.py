@@ -652,8 +652,10 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
         max_offpolicy_steps=12,
         # Start at (6 + 1) x 24 = 168 groups, the pool; the default 3 x 24 leaves 57% of it idle.
         start_batches=target_offpolicy_steps + 1,
-        # The KV gate (`generator_router.admission`) admits groups; this cap is only the pool's.
-        generation_capacity=sandbox_pool // num_samples_per_prompt,
+        # The KV gate (`generator_router.admission`) admits groups; this cap only leaves validation
+        # its sandboxes.
+        generation_capacity=(sandbox_pool - num_validation_samples)
+        // num_samples_per_prompt,
     )
     # Validate at step 0 and every 10 steps beside training; starting a pass makes the trainer
     # wait only for that step's weight pull.
