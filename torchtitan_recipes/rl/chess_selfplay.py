@@ -203,7 +203,7 @@ def rl_chess_qwen3_5_4b(
 
 
 def rl_chess_qwen3_5_4b_gb300(
-    max_plies: int = 60,
+    max_plies: int = 120,
     max_thinking_tokens: int = 1024,
     max_context_tokens: int = 131072,
 ) -> Controller.Config:
