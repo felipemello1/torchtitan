@@ -1222,6 +1222,7 @@ class Controller(Configurable):
                 group.metrics = compute_rollout_metrics(
                     prefix="rollout", rollouts=group.rollouts
                 )
+                self._rollouter.record_group_outcome(group)
 
                 # save rollout for inspection
                 self.rollout_recorder.record(
@@ -1467,6 +1468,7 @@ class Controller(Configurable):
                             for key, value in optimizer_result.metrics.items()
                         ],
                         *self._group_buffer.metrics(),
+                        *self._rollouter.training_data_metrics(),
                         *time_metrics,
                         *gc_timer.flush(),
                         *policy_age_panel,
