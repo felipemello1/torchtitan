@@ -185,6 +185,9 @@ class InterGeneratorRouter(Actor, Configurable):
         assert candidates, "serving event was set with no serving generators"
         h = self._strategy.choose(routing_ctx, candidates)
         self._reserve(h, routing_ctx.estimated_cost)
+        # TODO: a generator whose engine loop crashed fails every call at once, so it looks idle and
+        # gets most new sessions (61 of 64 rollouts with 1 of 4 dead, in a CPU sim). Detect it with a
+        # typed "closed" error from VLLMGenerator, then skip the dead generator, or fail the job.
         try:
             return await getattr(h.rank0_actor, method).call_one(*args, **kwargs)
         finally:
