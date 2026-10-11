@@ -284,11 +284,12 @@ class Trainer(Configurable):
         self._step_num_tokens_per_dp_rank = (
             len(refs) * self.config.training.num_tokens_per_microbatch_per_dp_rank
         )
-        # Every rank receives the whole grid, so all ranks agree on joining the reduce below.
+        # Every rank receives the whole grid of refs, so all ranks agree on joining the reduce
+        # below. A ref keeps each microbatch's `model_kwargs` keys, so no read is needed.
         has_routed_expert_ids = any(
-            "routed_expert_ids" in microbatch.model_kwargs
-            for rank_batches in training_data
-            for microbatch in rank_batches
+            "routed_expert_ids" in ref.fields["model_kwargs"]
+            for rank_refs in training_data
+            for ref in rank_refs
         )
         if self.config.replay_routed_experts and not has_routed_expert_ids:
             raise ValueError(
