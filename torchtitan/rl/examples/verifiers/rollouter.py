@@ -319,10 +319,10 @@ class VerifiersRollouter(Rollouter):
             rollout_id=rollout_id,
         )
         status = self.rollout_status(verifiers_episode=verifiers_episode, trace=trace)
-        if not turns:
+        if not turns and status is not RolloutStatus.ERROR_TIMEOUT:
             status = RolloutStatus.ERROR
         logs = verifiers_rollout_logs(verifiers_episode, trace)
-        if status == RolloutStatus.ERROR:
+        if status.is_error():
             log_failed_rollout(logs, group_id=group_id, rollout_id=rollout_id)
         else:
             turns[-1].env_rewards[VERIFIERS_REWARD_KEY] = trace.reward
@@ -336,6 +336,20 @@ class VerifiersRollouter(Rollouter):
 
     @staticmethod
     def rollout_status(*, verifiers_episode: Any, trace: Any) -> RolloutStatus:
+        # Verifiers 0.3.1 fails a rollout over its time budget with HarnessError("agent
+        # timeout: ..."). Check `ok`: a retry that succeeded keeps the earlier errors. A failed
+        # trace can have no error (`ok` defaults to False).
+        # TODO: Verifiers main flags timeouts with `trace.is_timeout` and ok=True; check it
+        # here when the pin moves, or timeouts will train as completed rollouts.
+        # TODO: mask only timeouts spent mostly waiting on the model (`model_sec` /
+        # `agent_sec` in `verifiers_rollout_logs`), if policy-caused timeouts start to matter.
+        last_error = trace.last_error
+        if (
+            not trace.ok
+            and last_error is not None
+            and last_error.message.startswith("agent timeout")
+        ):
+            return RolloutStatus.ERROR_TIMEOUT
         if not verifiers_episode.ok or not trace.ok:
             return RolloutStatus.ERROR
         if not trace.is_truncated:

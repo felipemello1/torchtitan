@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from torchtitan.config import Configurable
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.rollout import Rollout, RolloutGroup
+from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus
 from torchtitan.rl.rollout.types import RolloutTurnID
 
 
@@ -115,10 +115,27 @@ class TrainingSampleBuilder(Configurable):
                 group_id=rollout_group.group_id, training_samples=[], metrics=metrics
             )
 
+        # Timed out (usually slow infra, not the policy): drop just those rollouts.
+        # The advantage estimator already left them out of the group mean/std.
+        rollouts = [
+            rollout
+            for rollout in rollout_group.rollouts
+            if rollout.status is not RolloutStatus.ERROR_TIMEOUT
+        ]
+        if not rollouts:
+            metrics.append(
+                m.Metric(
+                    "training_sample_builder/num_groups_dropped_timed_out", m.Sum(1.0)
+                )
+            )
+            return TrainingSampleGroup(
+                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
+            )
+
         # Untrainable: any sibling with no completion tokens -> drop the whole group
         if any(
             not any(turn.completion_token_ids for turn in rollout.turns)
-            for rollout in rollout_group.rollouts
+            for rollout in rollouts
         ):
             metrics.append(
                 m.Metric(
@@ -130,8 +147,11 @@ class TrainingSampleBuilder(Configurable):
             )
 
         # Zero-std reward: no learning signal across siblings.
-        rewards = [rollout.reward for rollout in rollout_group.rollouts]
-        is_zero_std = len(rewards) > 1 and statistics.pstdev(rewards) == 0.0
+        rewards = [rollout.reward for rollout in rollouts]
+        # One survivor of a larger group has advantage 0.0, so it counts as zero-std too.
+        is_zero_std = (
+            len(rollout_group.rollouts) > 1 and statistics.pstdev(rewards) == 0.0
+        )
         metrics.append(
             m.Metric(
                 "rollout_reward/group_zero_std_frac",
@@ -153,7 +173,7 @@ class TrainingSampleBuilder(Configurable):
         unfiltered_training_samples: list[TrainingSample] = []
         branches_per_rollout: list[float] = []
         num_samples_dropped_no_valid_tokens = 0
-        for rollout in rollout_group.rollouts:
+        for rollout in rollouts:
             rollout_training_samples = self.rollout_to_training_samples(rollout)
             unfiltered_training_samples.extend(rollout_training_samples)
             kept = [
@@ -183,7 +203,7 @@ class TrainingSampleBuilder(Configurable):
             training_sample.max_policy_version
             for training_sample in unfiltered_training_samples
         ]
-        advantages = [rollout.advantage for rollout in rollout_group.rollouts]
+        advantages = [rollout.advantage for rollout in rollouts]
         metrics += [
             m.Metric(
                 "training_sample_builder/num_training_samples",

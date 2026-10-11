@@ -11,7 +11,10 @@ from __future__ import annotations
 import pytest
 
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
+from torchtitan.rl.observability import metrics as m
+from torchtitan.rl.observability.controller import compute_rollout_metrics
 from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
+from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.types import RolloutTurnID
 
 _GROUP_ID = "step=1/group=0"
@@ -227,6 +230,136 @@ def test_group_filters_preserve_group_id_for_acknowledgement() -> None:
         rollout_group=RolloutGroup(group_id=10, rollouts=[invalid_logprob])
     )
 
-    filtered_groups = [failed, untrainable, zero_std, no_valid_tokens]
-    assert [group.group_id for group in filtered_groups] == [7, 8, 9, 10]
+    timed_out = _scored_rollout(
+        [_turn(prompt_token_ids=[1], completion_token_ids=[2], version=1)],
+        reward=0.0,
+        advantage=0.0,
+    )
+    timed_out.group_id = 11
+    timed_out.status = RolloutStatus.ERROR_TIMEOUT
+    all_timed_out = builder.build_from_group(
+        rollout_group=RolloutGroup(group_id=11, rollouts=[timed_out])
+    )
+
+    filtered_groups = [failed, untrainable, zero_std, no_valid_tokens, all_timed_out]
+    assert [group.group_id for group in filtered_groups] == [7, 8, 9, 10, 11]
     assert all(not group.training_samples for group in filtered_groups)
+    assert "training_sample_builder/num_groups_dropped_timed_out" in [
+        metric.key for metric in all_timed_out.metrics
+    ]
+
+
+_COMPLETED = RolloutStatus.COMPLETED
+_TIMEOUT = RolloutStatus.ERROR_TIMEOUT
+
+
+def _group(statuses: list[RolloutStatus], rewards: list[float]) -> RolloutGroup:
+    """One single-turn group; rollout i completes with token 10 + i."""
+    return RolloutGroup(
+        group_id=0,
+        rollouts=[
+            Rollout(
+                group_id=0,
+                rollout_id=rollout_id,
+                status=status,
+                turns=[
+                    _turn(
+                        prompt_token_ids=[1],
+                        completion_token_ids=[10 + rollout_id],
+                        version=1,
+                    )
+                ],
+                reward=reward,
+            )
+            for rollout_id, (status, reward) in enumerate(
+                zip(statuses, rewards, strict=True)
+            )
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "should_std_normalize, expected",
+    [
+        # Mean of the 3 kept rewards is 2/3; the timed-out 0.0 doesn't drag it down.
+        (False, [1 / 3, -2 / 3, 0.0, 1 / 3]),
+        # Std of the kept rewards [1, 0, 1] is sqrt(2)/3.
+        (True, [2**-0.5, -(2**0.5), 0.0, 2**-0.5]),
+    ],
+)
+def test_timed_out_rollout_is_left_out_of_group_advantage_stats(
+    should_std_normalize: bool, expected: list[float]
+) -> None:
+    estimator = AdvantageEstimator.Config(
+        should_std_normalize=should_std_normalize
+    ).build()
+    group = _group(
+        [_COMPLETED, _COMPLETED, _TIMEOUT, _COMPLETED], rewards=[1.0, 0.0, 0.0, 1.0]
+    )
+
+    assert estimator(group) == pytest.approx(expected, rel=1e-5)
+
+
+def test_all_timed_out_group_gets_zero_advantages() -> None:
+    estimator = AdvantageEstimator.Config(should_std_normalize=True).build()
+    group = _group([_TIMEOUT, _TIMEOUT], rewards=[1.0, 0.0])
+
+    assert estimator(group) == [0.0, 0.0]
+
+
+def test_timed_out_rollout_is_dropped_from_training_samples() -> None:
+    builder = TrainingSampleBuilder.Config().build()
+    group = _group([_COMPLETED, _TIMEOUT, _COMPLETED], rewards=[1.0, 0.0, 0.0])
+    for rollout, advantage in zip(
+        group.rollouts, AdvantageEstimator.Config().build()(group), strict=True
+    ):
+        rollout.advantage = advantage
+
+    output = builder.build_from_group(rollout_group=group)
+
+    assert [sample.token_ids for sample in output.training_samples] == [
+        [1, 10],
+        [1, 12],
+    ]
+    assert [sample.advantage for sample in output.training_samples] == [
+        [0.0, 0.5],
+        [0.0, -0.5],
+    ]
+
+
+@pytest.mark.parametrize(
+    "statuses, rewards",
+    [
+        # Kept rewards are [1.0, 1.0]: no learning signal once the timeout is left out.
+        ([_TIMEOUT, _COMPLETED, _COMPLETED], [0.0, 1.0, 1.0]),
+        # One survivor: its advantage is 0.0.
+        ([_TIMEOUT, _TIMEOUT, _COMPLETED], [0.0, 0.0, 1.0]),
+    ],
+)
+def test_zero_std_check_ignores_timed_out_rollouts(
+    statuses: list[RolloutStatus], rewards: list[float]
+) -> None:
+    builder = TrainingSampleBuilder.Config().build()
+    group = _group(statuses, rewards=rewards)
+    for rollout in group.rollouts:
+        rollout.advantage = 0.0
+
+    output = builder.build_from_group(rollout_group=group)
+
+    assert output.training_samples == []
+    assert "training_sample_builder/num_groups_dropped_zero_std" in [
+        metric.key for metric in output.metrics
+    ]
+
+
+def test_rollout_metrics_report_timeout_rate() -> None:
+    group = _group(
+        [_COMPLETED, _TIMEOUT, _COMPLETED, _TIMEOUT], rewards=[1.0, 0.0, 0.0, 0.0]
+    )
+
+    metrics = compute_rollout_metrics(prefix="validation", rollouts=group.rollouts)
+
+    (timeout_rate,) = [
+        metric.value for metric in metrics if metric.key == "validation/timeout_rate"
+    ]
+    assert m.Mean.reduce([timeout_rate]) == {"mean": 0.5}

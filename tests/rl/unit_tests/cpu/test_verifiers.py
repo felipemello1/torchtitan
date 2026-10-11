@@ -29,6 +29,7 @@ from torchtitan.rl.examples.verifiers.rollouter import (
     verifiers_rollout_logs,
     VerifiersRollouter,
 )
+from torchtitan.rl.rollout import RolloutStatus
 from torchtitan.rl.rollout.types import Completion
 from verifiers.v1.errors import model_error, OverlongPromptError
 
@@ -243,6 +244,45 @@ def test_verifiers_rollout_logs_keep_the_failure_reason(caplog) -> None:
         log_failed_rollout({**logs, "errors": []}, group_id=3, rollout_id=2)
     assert "error=HarnessError: agent timeout" in caplog.text
     assert "error=None: None" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "trace_ok, error_message, expected",
+    [
+        (
+            False,
+            "agent timeout: rollout exceeded its 7200s budget",
+            RolloutStatus.ERROR_TIMEOUT,
+        ),
+        (False, "harness exited with code 1", RolloutStatus.ERROR),
+        (False, None, RolloutStatus.ERROR),
+        # A retry that succeeded keeps the earlier attempt's timeout in its errors.
+        (
+            True,
+            "agent timeout: rollout exceeded its 7200s budget",
+            RolloutStatus.COMPLETED,
+        ),
+    ],
+)
+def test_rollout_status_maps_agent_timeout(trace_ok, error_message, expected) -> None:
+    from verifiers.v1.trace import Error
+
+    last_error = (
+        None
+        if error_message is None
+        else Error(type="HarnessError", message=error_message)
+    )
+    trace = SimpleNamespace(
+        ok=trace_ok,
+        last_error=last_error,
+        is_truncated=False,
+        stop_condition="error",
+    )
+    status = VerifiersRollouter.rollout_status(
+        verifiers_episode=SimpleNamespace(ok=trace_ok), trace=trace
+    )
+
+    assert status is expected
 
 
 def test_generation_server_forwards_token_request() -> None:
