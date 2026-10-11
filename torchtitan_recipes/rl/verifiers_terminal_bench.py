@@ -607,6 +607,7 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     - a 4,096-token thinking budget per turn (was 12,288);
     - new groups start only while their sessions fit in KV, and each session's prefix stays
       held between its turns (was every group at once);
+    - router replay (was off);
     - 2,688 Sandoq VMs, one per rollout of the 168 groups the buffer starts with;
     - a synchronous save every 10 steps (was async).
 
@@ -701,10 +702,9 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
             max_ratio=2.0, global_vocab_size=decoder_vocab_size(config.model)
         ),
     )
-    # No router replay: the Verifiers rollouter returns no routed experts, so a trainer with
-    # replay raises at its first step, and the generator need not return them.
-    trainer.replay_routed_experts = False
-    config.generator.return_routed_experts = False
+    # Router replay: the trainer routes each token to the experts the generator chose.
+    trainer.replay_routed_experts = True
+    config.generator.return_routed_experts = True
 
     generator = config.generator
     # k = 32 matched full-vocabulary score centering in every setting of the paper, whose default

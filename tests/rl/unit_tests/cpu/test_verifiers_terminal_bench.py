@@ -672,5 +672,6 @@ def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) ->
     assert isinstance(trainer.loss.loss_fn, ScoreCenteringLoss.Config)
     assert trainer.loss.loss_fn.max_ratio == 2.0
     assert config.generator.sampling.num_topk_logprobs == 32
-    assert not trainer.replay_routed_experts
+    assert trainer.replay_routed_experts
+    assert config.generator.return_routed_experts
     assert config.generator.extra_vllm_engine_args == {"watermark": 0.03}
