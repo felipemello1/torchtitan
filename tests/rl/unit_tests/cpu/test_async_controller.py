@@ -1013,9 +1013,16 @@ def _rank_0_result(value: object) -> SimpleNamespace:
 
 
 def _controller_for_trainer_loop(
-    validation: ValidationConfig,
+    validation: ValidationConfig, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Controller, _FakeValidation]:
     """A `Controller` whose `_trainer_loop` runs on fakes: each step trains instantly."""
+
+    # The loop registers microbatch refs in a thread; run it inline so `_run_until`'s yields
+    # see each step finish.
+    async def to_thread(fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", to_thread)
     controller = object.__new__(Controller)
     controller.config = SimpleNamespace(
         async_loop=AsyncLoopConfig(validation=validation)
@@ -1087,11 +1094,11 @@ async def _run_until(condition) -> None:
     raise AssertionError("condition never held")
 
 
-def test_overlapped_validation_runs_beside_training() -> None:
+def test_overlapped_validation_runs_beside_training(monkeypatch) -> None:
     """Training keeps stepping while a pass runs; the pass is logged at the step it ends, and a
     validation step that comes meanwhile starts the next pass once it ends."""
     controller, validation = _controller_for_trainer_loop(
-        ValidationConfig(freq=2, overlap_training=True)
+        ValidationConfig(freq=2, overlap_training=True), monkeypatch
     )
 
     async def run() -> None:
@@ -1147,10 +1154,10 @@ def test_overlapped_validation_runs_beside_training() -> None:
     assert calls[validation_log + 1][0] == "commit"
 
 
-def test_overlapped_validation_failure_stops_training() -> None:
+def test_overlapped_validation_failure_stops_training(monkeypatch) -> None:
     """A pass that raises stops training at the end of the next step."""
     controller, validation = _controller_for_trainer_loop(
-        ValidationConfig(freq=1, overlap_training=True)
+        ValidationConfig(freq=1, overlap_training=True), monkeypatch
     )
 
     async def run() -> None:
@@ -1168,11 +1175,11 @@ def test_overlapped_validation_failure_stops_training() -> None:
     asyncio.run(run())
 
 
-def test_overlapped_validation_starts_no_pass_at_the_last_step() -> None:
+def test_overlapped_validation_starts_no_pass_at_the_last_step(monkeypatch) -> None:
     """A pass asked for while another runs does not start at the last step; the final pass
     after training covers it."""
     controller, validation = _controller_for_trainer_loop(
-        ValidationConfig(freq=1, overlap_training=True)
+        ValidationConfig(freq=1, overlap_training=True), monkeypatch
     )
 
     async def run() -> None:
@@ -1195,8 +1202,10 @@ def test_overlapped_validation_starts_no_pass_at_the_last_step() -> None:
     assert controller._validation_task is None
 
 
-def test_validation_pauses_training_by_default() -> None:
-    controller, validation = _controller_for_trainer_loop(ValidationConfig(freq=2))
+def test_validation_pauses_training_by_default(monkeypatch) -> None:
+    controller, validation = _controller_for_trainer_loop(
+        ValidationConfig(freq=2), monkeypatch
+    )
 
     async def run() -> None:
         queue: asyncio.Queue = asyncio.Queue(maxsize=1)
