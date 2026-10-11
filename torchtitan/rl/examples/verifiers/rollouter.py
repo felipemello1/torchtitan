@@ -301,6 +301,7 @@ class VerifiersRollouter(Rollouter):
                 top_p=sampling.top_p,
                 max_tokens=sampling.max_tokens,
                 seed=sampling.seed,
+                num_topk_logprobs=sampling.num_topk_logprobs,
                 **{GROUP_ID_SAMPLING_PARAM: group_id},
             ),
         )
@@ -367,7 +368,8 @@ class VerifiersRollouter(Rollouter):
         Verifiers does not return TorchTitan policy metadata, so every emitted
         turn receives the conservative min/max policy-version span accumulated
         by the generation server for the whole rollout. Generator metrics are
-        attached once to avoid double counting.
+        attached once to avoid double counting. A turn's top-k rows come from the
+        generation whose prompt length and completion tokens match its node.
 
         With router replay, a turn takes the branch's routed expert ids of its
         prompt and completion but the last token, as in
@@ -407,6 +409,24 @@ class VerifiersRollouter(Rollouter):
                         mask = [False] * len(mask)
                     else:
                         trained_nodes.add(index)
+                topk = None
+                if generation_metadata.topk_by_generation and any(mask):
+                    # The prompt this node's completion was sampled from ends at its first
+                    # sampled token.
+                    key = (
+                        branch_offset + node.mask.index(True),
+                        tuple(
+                            token_id
+                            for token_id, sampled in zip(node.token_ids, node.mask)
+                            if sampled
+                        ),
+                    )
+                    if key not in generation_metadata.topk_by_generation:
+                        raise ValueError(
+                            "Verifiers node has no generation with the same prompt length "
+                            "and completion tokens, so its top-k logprobs are unknown"
+                        )
+                    topk = generation_metadata.topk_by_generation[key]
                 for start, end in _trainable_token_spans(mask):
                     absolute_start = branch_offset + start
                     absolute_end = branch_offset + end
@@ -414,6 +434,8 @@ class VerifiersRollouter(Rollouter):
                         token_ids[:absolute_start], previous_token_ids
                     )
                     previous_token_ids = token_ids[:absolute_end]
+                    # Completion rows of this span: sampled tokens before `start` in the node.
+                    row = sum(node.mask[:start])
                     turns.append(
                         RolloutTurn(
                             rollout_id=RolloutTurnID(
@@ -435,6 +457,16 @@ class VerifiersRollouter(Rollouter):
                                 else torch.from_numpy(
                                     routed_expert_ids[: absolute_end - 1]
                                 )
+                            ),
+                            completion_topk_token_ids=(
+                                None
+                                if topk is None
+                                else topk[0][row : row + end - start]
+                            ),
+                            completion_topk_logprobs=(
+                                None
+                                if topk is None
+                                else topk[1][row : row + end - start]
                             ),
                             min_policy_version=generation_metadata.min_policy_version,
                             max_policy_version=generation_metadata.max_policy_version,

@@ -16,6 +16,8 @@ import torch
 
 import torch
 
+import torch
+
 from torchtitan.config import Configurable
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout, RolloutGroup
@@ -45,6 +47,8 @@ class _OpenSample:
     logprobs: list[float] = field(default_factory=list)
     advantage: list[float] = field(default_factory=list)
     routed_expert_ids: torch.Tensor | None = None
+    topk_token_ids: torch.Tensor | None = None
+    topk_logprobs: torch.Tensor | None = None
 
     def to_training_sample(self) -> TrainingSample:
         return TrainingSample(
@@ -56,6 +60,8 @@ class _OpenSample:
             logprobs=torch.tensor(self.logprobs, dtype=torch.float32),
             advantage=torch.tensor(self.advantage, dtype=torch.float32),
             routed_expert_ids=self.routed_expert_ids,
+            topk_token_ids=self.topk_token_ids,
+            topk_logprobs=self.topk_logprobs,
         )
 
 
@@ -329,7 +335,33 @@ class TrainingSampleBuilder(Configurable):
                     len(training_sample.routed_expert_ids)
                     == len(training_sample.token_ids) - 1
                 )
+            if rollout_turn.completion_topk_token_ids is not None:
+                training_sample.topk_token_ids = _append_rows(
+                    training_sample.topk_token_ids,
+                    num_zero_rows=num_delta,
+                    new_rows=rollout_turn.completion_topk_token_ids,
+                )
+                training_sample.topk_logprobs = _append_rows(
+                    training_sample.topk_logprobs,
+                    num_zero_rows=num_delta,
+                    new_rows=rollout_turn.completion_topk_logprobs,
+                )
 
         return [
             training_sample.to_training_sample() for training_sample in training_samples
         ]
+
+
+def _append_rows(
+    rows: torch.Tensor | None, *, num_zero_rows: int, new_rows: torch.Tensor
+) -> torch.Tensor:
+    """Append `num_zero_rows` zero rows (the untrained prompt delta), then `new_rows`.
+
+    Example:
+
+        _append_rows(None, num_zero_rows=2, new_rows=[[7, 3]])  # -> [[0, 0], [0, 0], [7, 3]]
+    """
+    zero_rows = new_rows.new_zeros(num_zero_rows, new_rows.shape[1])
+    return torch.cat(
+        [zero_rows, new_rows] if rows is None else [rows, zero_rows, new_rows]
+    )

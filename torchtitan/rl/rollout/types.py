@@ -121,6 +121,12 @@ class RolloutTurn:
     """[num_prompt_tokens + num_completion_tokens - 1, num_layers, top_k] expert ids the
     generator routed this turn's prompt and completion to; see `Completion.routed_expert_ids`."""
 
+    completion_topk_token_ids: torch.Tensor | None = None  # [num_completion_tokens, k]
+    """The generator's top-k token ids at each completion position (`Completion.topk_token_ids`)."""
+
+    completion_topk_logprobs: torch.Tensor | None = None  # [num_completion_tokens, k]
+    """The generator's logprobs of `completion_topk_token_ids`."""
+
     # Filtering
     min_policy_version: int | None = None
     """Oldest policy version this turn was sampled under; `None` if no generation happened."""
