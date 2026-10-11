@@ -1014,6 +1014,7 @@ class Controller(Configurable):
                     metrics=[m.Metric("rollout/group_failures", m.Sum(1.0))],
                 )
             # The group makes no more generation calls, so its cache salts can go.
+            # Keep outside the `try`: it raises once every generator is closed, which fails the job.
             await self.generator_router.release_groups.call_one([work.group_id])
             await group_buffer.finalize_work(group)
 

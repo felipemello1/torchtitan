@@ -10,6 +10,8 @@
   routing layer supplies its own candidate type (``_GeneratorHandle`` for
   generator meshes, ``_DPRankHandle`` for DP ranks).
 - ``RoutingContext``: per-request metadata a strategy may consult.
+- ``GeneratorClosedError``: raised by a closed generator; the inter-generator
+  router routes around it.
 
 A ``RoutingStrategy`` (see ``strategies.py``) picks one ``RoutingCandidate``
 given a ``RoutingContext``.
@@ -41,3 +43,7 @@ class RoutingContext:
     """Stable session key consumed only by sticky routing strategies; other
     strategies ignore it. ``None`` means the request is unpinned and uses fallback
     routing without session affinity."""
+
+
+class GeneratorClosedError(RuntimeError):
+    """A call reached a closed generator (engine loop crashed or shut down); the call did no work."""

@@ -9,13 +9,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import auto, Enum
 from typing import Any
 
-from monarch.actor import Actor, concurrent_endpoint, current_size
+from monarch.actor import Actor, ActorError, concurrent_endpoint, current_size
 
 from torchtitan.config import Configurable
 from torchtitan.observability import structured_logger as sl
@@ -23,14 +24,25 @@ from torchtitan.rl.distributed.routing.strategies import (
     RoutingStrategy,
     StickySessionRoutingStrategy,
 )
-from torchtitan.rl.distributed.routing.types import RoutingCandidate, RoutingContext
+from torchtitan.rl.distributed.routing.types import (
+    GeneratorClosedError,
+    RoutingCandidate,
+    RoutingContext,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class _GeneratorState(Enum):
-    """Lifecycle state controlling routability; ``SYNCING`` is only entered when draining (i.e. hot-swap is off)."""
+    """Lifecycle state controlling routability.
+
+    SERVING -> SYNCING -> SERVING   drained for a weight sync (hot-swap off)
+    any     -> CLOSED               raised ``GeneratorClosedError``; final
+    """
 
     SERVING = auto()
     SYNCING = auto()
+    CLOSED = auto()
 
 
 @dataclass(kw_only=True, slots=True)
@@ -55,7 +67,7 @@ class _GeneratorHandle(RoutingCandidate):
     """Set when this generator has no reserved routed calls."""
 
     serving: asyncio.Event = field(default_factory=asyncio.Event)
-    """Set while this generator is ``SERVING``."""
+    """Set unless this generator is ``SYNCING``."""
 
 
 class InterGeneratorRouter(Actor, Configurable):
@@ -84,6 +96,16 @@ class InterGeneratorRouter(Actor, Configurable):
        Python class, that instance's cannot be accessed from other processes or
        hosts. To solve this problem, we model the router as Monarch Actor, and
        pass the actor reference around.
+
+    Closed generators:
+        A generator whose engine loop crashed raises ``GeneratorClosedError`` on
+        every later call. The first such call fails, and the router marks the
+        generator CLOSED for good:
+          * new sessions, and sessions pinned to it, go to the other generators;
+          * weight syncs and releases skip it;
+          * once every generator is closed, routed calls and ``release_groups``
+            raise. The rollout loop survives a failed rollout but not a failed
+            ``release_groups``, so the job stops instead of starving.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -147,23 +169,45 @@ class InterGeneratorRouter(Actor, Configurable):
 
         return [h for h in self._generators if h.state is _GeneratorState.SERVING]
 
-    def _refresh_serving_status(self) -> None:
-        """Update whether any generator can serve; only changes while draining (i.e. hot-swap is off)."""
+    def _all_closed(self) -> bool:
+        return all(h.state is _GeneratorState.CLOSED for h in self._generators)
 
-        if self._candidates():
+    def _refresh_serving_status(self) -> None:
+        """Update whether routes may proceed: some generator serves, or all are closed and routes raise."""
+
+        if self._candidates() or self._all_closed():
             self._serving.set()
         else:
             self._serving.clear()
 
     def _set_state(self, h: _GeneratorHandle, state: _GeneratorState) -> None:
-        """Move a generator between serving and syncing states."""
+        """Move a generator between states; ``CLOSED`` is final."""
 
-        h.state = state
-        if state is _GeneratorState.SERVING:
-            h.serving.set()
-        else:
+        if h.state is not _GeneratorState.CLOSED:
+            h.state = state
+        # A CLOSED generator keeps `serving` set, so turns pinned to it wake and re-pin.
+        if h.state is _GeneratorState.SYNCING:
             h.serving.clear()
+        else:
+            h.serving.set()
         self._refresh_serving_status()
+
+    def _mark_closed(self, h: _GeneratorHandle) -> None:
+        """Stop routing to a generator for good after it raised ``GeneratorClosedError``."""
+
+        if h.state is _GeneratorState.CLOSED:
+            return
+        self._set_state(h, _GeneratorState.CLOSED)
+        num_left = sum(
+            other.state is not _GeneratorState.CLOSED for other in self._generators
+        )
+        # TODO: export the number of closed generators as a metric. Capacity drops to (N-1)/N with
+        # only this log line to show it, and any engine-loop exception closes a generator, even one
+        # rejected prompt.
+        logger.error(
+            f"Generator {self._generators.index(h)} is closed; its own log has the engine loop "
+            f"traceback. Routing around it: {num_left} of {len(self._generators)} generators left."
+        )
 
     def _reserve(self, h: _GeneratorHandle, cost: int) -> None:
         """Reserve estimated generation work on a handle before dispatch."""
@@ -199,13 +243,21 @@ class InterGeneratorRouter(Actor, Configurable):
         pinned = self._strategy.pinned_candidate(routing_ctx)
         if pinned is not None:
             await pinned.serving.wait()
-        await self._serving.wait()
-        candidates = self._candidates()
-        assert candidates, "serving event was set with no serving generators"
+        # Re-check after each wake: `_serving` may be cleared again before this waiter runs.
+        while not (candidates := self._candidates()):
+            if self._all_closed():
+                raise RuntimeError(
+                    f"All {len(self._generators)} generators are closed; cannot route {method}"
+                )
+            await self._serving.wait()
         h = self._strategy.choose(routing_ctx, candidates)
         self._reserve(h, routing_ctx.estimated_cost)
         try:
             return await getattr(h.rank0_actor, method).call_one(*args, **kwargs)
+        except ActorError as error:
+            if isinstance(error.exception, GeneratorClosedError):
+                self._mark_closed(h)
+            raise
         finally:
             self._release(h, routing_ctx.estimated_cost)
 
@@ -215,14 +267,30 @@ class InterGeneratorRouter(Actor, Configurable):
         pinned = self._strategy.pinned_candidate(RoutingContext(session_id=session_id))
         self._strategy.release_session(session_id)
         # Without a pin (non-sticky routing), `release_groups` frees the held KV at group end.
-        if self._forward_session_releases and pinned is not None:
+        # A closed generator holds no KV, and its release raises on the closed engine-loop queue.
+        if (
+            self._forward_session_releases
+            and pinned is not None
+            and pinned.state is not _GeneratorState.CLOSED
+        ):
             await pinned.rank0_actor.release_sessions.call_one([session_id])
 
-    def _release_groups(self, group_ids: list[int]) -> None:
-        """Drop the affinity of every session left in these groups."""
+    async def _release_groups(self, group_ids: list[int]) -> None:
+        """Drop the affinity of every session left in these groups, then tell every generator that
+        is not closed. Raises once all are closed."""
         for group_id in group_ids:
             for session_id in self._group_sessions.pop(group_id, ()):
                 self._strategy.release_session(session_id)
+        if self._all_closed():
+            raise RuntimeError(f"All {len(self._generators)} generators are closed")
+        # A closed generator holds no KV, and its release raises on the closed engine-loop queue.
+        await asyncio.gather(
+            *[
+                h.actor.release_groups.call(group_ids)
+                for h in self._generators
+                if h.state is not _GeneratorState.CLOSED
+            ]
+        )
 
     async def _generate(
         self,
@@ -282,20 +350,22 @@ class InterGeneratorRouter(Actor, Configurable):
         )
 
     async def _pull_model_state_dict(self, *, policy_version: int) -> None:
-        """Pull the given policy version's state dict into every generator.
+        """Pull the given policy version's state dict into every generator that is not closed.
 
         Args:
             policy_version: Trainer policy version whose state dict to pull.
         """
 
         async def _pull_one(h: _GeneratorHandle) -> None:
+            if h.state is _GeneratorState.CLOSED:
+                return
             # Transfer over RDMA while the generator remains available
             await h.actor.prefetch_model_state_dict.call()
             if self._config.hot_swap:
                 # Hot swap: pull concurrently with in-flight generation, without
                 # draining. Whether the pull is genuinely concurrent and safe is
                 # up to the generator's implementation.
-                await h.rank0_actor.pull_model_state_dict.call_one(policy_version)
+                await _pull_or_mark_closed(h)
             else:
                 # Drain: stop routing to this generator and wait for in-flight
                 # work to finish before pulling, then re-admit it.
@@ -305,9 +375,18 @@ class InterGeneratorRouter(Actor, Configurable):
                 try:
                     with sl.log_trace_span("router_drain_wait"):
                         await h.idle.wait()
-                    await h.rank0_actor.pull_model_state_dict.call_one(policy_version)
+                    await _pull_or_mark_closed(h)
                 finally:
                     self._set_state(h, _GeneratorState.SERVING)
+
+        async def _pull_or_mark_closed(h: _GeneratorHandle) -> None:
+            # Runs inside the drain's `try`, so h is CLOSED before its `finally` re-admits it.
+            try:
+                await h.rank0_actor.pull_model_state_dict.call_one(policy_version)
+            except ActorError as error:
+                if not isinstance(error.exception, GeneratorClosedError):
+                    raise
+                self._mark_closed(h)
 
         # Start the pulls in parallel. Technically we could do rolling sync to
         # maintain availability during weight sync, but that's not a priority
@@ -358,13 +437,13 @@ class InterGeneratorRouter(Actor, Configurable):
 
     @concurrent_endpoint
     async def release_groups(self, group_ids: list[int]) -> None:
-        """Tell every generator that these rollout groups are finished."""
-        self._release_groups(group_ids)
-        await self._fanout("release_groups", group_ids)
+        """Tell every generator that these rollout groups are finished. Raises once all are closed."""
+        # The logic lives in a private method so tests can call it without an actor mesh.
+        await self._release_groups(group_ids)
 
     @concurrent_endpoint
     async def pull_model_state_dict(self, policy_version: int) -> None:
-        """Pull the given policy version's state dict into every generator."""
+        """Pull the given policy version's state dict into every generator that is not closed."""
         # Wrapper the logic in a private method so we can test it independently
         # without the need to spawn the Monarch actor mesh.
         await self._pull_model_state_dict(policy_version=policy_version)

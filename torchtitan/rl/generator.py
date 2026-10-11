@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import enum
 import gc
 import logging
@@ -40,6 +41,7 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.intra_generator import IntraGeneratorRouter
+from torchtitan.rl.distributed.routing.types import GeneratorClosedError
 from torchtitan.rl.model.batch_invariance import force_logprobs_fn_for_batch_invariance
 from torchtitan.rl.model.vllm_registry import (
     register_to_vllm,
@@ -1222,7 +1224,9 @@ class VLLMGenerator(Configurable):
         """Guard for the rank-0-only endpoints"""
         assert self._rank == 0, f"{endpoint_name} must be routed to rank 0 only"
         if self._engine_loop_queue.closed:
-            raise RuntimeError(f"generator is closed; cannot call {endpoint_name}")
+            raise GeneratorClosedError(
+                f"generator is closed; cannot call {endpoint_name}"
+            )
         if self._engine_loop_future is None:
             raise RuntimeError(
                 "engine loop not started; call start_engine_loop on all ranks "
@@ -1592,7 +1596,9 @@ class VLLMGenerator(Configurable):
         for group_id in group_ids:
             self._group_min_policy_versions.pop(group_id, None)
         if self._session_kv is not None and self._rank == 0:
-            self._engine_loop_queue.put(SessionReleaseMessage(group_ids=group_ids))
+            # A crash closes the queue before the loop drops `_session_kv`; the held KV is gone too.
+            with contextlib.suppress(GeneratorClosedError):
+                self._engine_loop_queue.put(SessionReleaseMessage(group_ids=group_ids))
 
     async def release_sessions(self, session_ids: list[str]) -> None:
         """Release the held KV of sessions whose rollout ended (rank 0; a no-op without
@@ -1602,7 +1608,10 @@ class VLLMGenerator(Configurable):
             session_ids: Routing session ids with no more generation calls.
         """
         if self._session_kv is not None and self._rank == 0:
-            self._engine_loop_queue.put(SessionReleaseMessage(session_ids=session_ids))
+            with contextlib.suppress(GeneratorClosedError):
+                self._engine_loop_queue.put(
+                    SessionReleaseMessage(session_ids=session_ids)
+                )
 
     async def initialize_torchstore_client(self, requester_index: int) -> None:
         """Initialize this process as a TorchStore routing requester.
@@ -1812,15 +1821,16 @@ class EngineLoopQueue:
         return self._closed_reason is not None
 
     def put(self, message: EngineLoopMessage) -> None:
-        """Enqueue `message`; it lands on the next iteration of `event_loop`. Raises once closed."""
+        """Enqueue `message`; it lands on the next iteration of `event_loop`. Raises
+        `GeneratorClosedError` once closed."""
         with self._lock:
             if self._closed_reason is not None:
-                raise RuntimeError(self._closed_reason)
+                raise GeneratorClosedError(self._closed_reason)
             # asyncio.Queue is not thread-safe, so hand the put to the loop that owns it.
             self._event_loop.call_soon_threadsafe(self._queue.put_nowait, message)
 
     def close(self, last_message: EngineLoopMessage, reason: str) -> None:
-        """Queue `last_message` behind every message already put; later puts raise `RuntimeError(reason)`.
+        """Queue `last_message` behind every message already put; later puts raise `GeneratorClosedError(reason)`.
         No-op once closed."""
         with self._lock:
             if self._closed_reason is not None:
