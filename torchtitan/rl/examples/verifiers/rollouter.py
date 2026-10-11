@@ -169,6 +169,7 @@ class VerifiersRollouter(Rollouter):
         self._verifiers_env_client: VerifiersEnvClient | None = None
         self._verifiers_train_client_config: VerifiersTrainClientConfig | None = None
         self._thinking_budget: ThinkingBudget | None = None
+        self._release_session_fn: ReleaseSessionFn | None = None
 
     async def setup_async(
         self,
@@ -179,10 +180,9 @@ class VerifiersRollouter(Rollouter):
         release_session_fn: ReleaseSessionFn | None = None,
     ) -> None:
         """Start the EnvServer and connect it to TorchTitan generation."""
-        # This rollouter's sessions are released with their group (`release_groups`).
-        del release_session_fn
         if self._verifiers_env_client is not None:
             return
+        self._release_session_fn = release_session_fn
         if self._verifiers_config.thinking_budget is not None:
             self._thinking_budget = self._verifiers_config.thinking_budget.build(
                 tokenizer=tokenizer_config.build(tokenizer_path=hf_assets_path)
@@ -324,6 +324,19 @@ class VerifiersRollouter(Rollouter):
                 **{GROUP_ID_SAMPLING_PARAM: group_id},
             ),
         )
+        # The rollout makes no more generation calls; Verifiers sends each trace's id as its
+        # routing session id. Releasing now, not at group end, frees the session's held KV.
+        if self._release_session_fn is not None:
+            for episode_trace in verifiers_episode.traces:
+                try:
+                    await self._release_session_fn(
+                        group_id=group_id, routing_session_id=episode_trace.id
+                    )
+                except Exception:
+                    # Not fatal: the group's release frees the session too.
+                    logger.exception(
+                        "releasing routing session %s failed", episode_trace.id
+                    )
         traces = [trace for trace in verifiers_episode.traces if trace.agent.trainable]
         if len(traces) != 1:
             raise ValueError(

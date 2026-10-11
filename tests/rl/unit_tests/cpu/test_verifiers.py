@@ -322,6 +322,57 @@ def test_verifiers_trace_attaches_env_replies_to_the_preceding_turn() -> None:
     ]
 
 
+def test_verifiers_rollout_releases_its_session_when_it_ends() -> None:
+    """A finished rollout releases its trace's session at once, not when its group ends."""
+    from torchtitan.rl.examples.verifiers.data import VerifiersTaskSample
+    from torchtitan.rl.generator import SamplingConfig
+
+    released = []
+
+    async def release_session(*, group_id: int, routing_session_id: str) -> None:
+        released.append((group_id, routing_session_id))
+
+    span = SimpleNamespace(duration=0.0)
+    trace = SimpleNamespace(
+        id="trace-1",
+        agent=SimpleNamespace(trainable=True),
+        ok=False,
+        nodes=[],
+        task=SimpleNamespace(key="task-1"),
+        stop_condition="error",
+        errors=[],
+        timing=SimpleNamespace(
+            setup=span,
+            agent=SimpleNamespace(duration=0.0, model=span, harness=span),
+            scoring=span,
+        ),
+        calls=[],
+    )
+    episode = SimpleNamespace(ok=False, errors=[], traces=[trace])
+
+    async def run(**kwargs):
+        return episode
+
+    rollouter = object.__new__(VerifiersRollouter)
+    rollouter._generation_server = SimpleNamespace(
+        model_id="model", pop_generation_metadata=lambda session_id: None
+    )
+    rollouter._verifiers_env_client = SimpleNamespace(run=run)
+    rollouter._verifiers_train_client_config = object()
+    rollouter._release_session_fn = release_session
+
+    asyncio.run(
+        rollouter._run_single_rollout(
+            sample=VerifiersTaskSample(verifiers_task_data={}),
+            sampling=SamplingConfig(stop_token_ids=[0]),
+            group_id=3,
+            rollout_id=0,
+        )
+    )
+
+    assert released == [(3, "trace-1")]
+
+
 def test_verifiers_rollout_logs_keep_the_failure_reason(caplog) -> None:
     from verifiers.v1.trace import Error
 
