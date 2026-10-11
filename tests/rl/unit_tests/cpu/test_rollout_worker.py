@@ -10,6 +10,7 @@ import asyncio
 import random
 from types import SimpleNamespace
 
+import torch
 from renderers import Qwen3RendererConfig
 
 from torchtitan.components.renderer import from_renderers
@@ -255,3 +256,126 @@ def test_delta_prompts_rebuild_the_full_prompt_samples() -> None:
             ] == expected
 
     asyncio.run(run())
+
+
+class _ScriptedTokenEnv:
+    """Each step builds the next prompt from the last prompt and completion with the next edit."""
+
+    def __init__(self, edits) -> None:
+        self.edits = list(edits)
+        self.prompt = [3, 4, 5]
+
+    async def init(self) -> TokenEnvOutput:
+        return TokenEnvOutput(
+            next_prompt_token_ids=self.prompt, status=RolloutStatus.ONGOING
+        )
+
+    async def step(self, completion: Completion) -> TokenEnvOutput:
+        if not self.edits:
+            return TokenEnvOutput(
+                next_prompt_token_ids=None, status=RolloutStatus.COMPLETED
+            )
+        self.prompt = self.edits.pop(0)(self.prompt, completion.token_ids)
+        return TokenEnvOutput(
+            next_prompt_token_ids=self.prompt, status=RolloutStatus.ONGOING
+        )
+
+
+class _RoutedGenerateFn:
+    """Returns routed expert rows as vLLM does: one per forward input, from
+    `routed_experts_prompt_start` on. Row `[call, position]` tells which call routed which position."""
+
+    def __init__(self, completions: list[list[int]]) -> None:
+        self.completions = list(completions)
+        # Rows from position 0 per call, for the full-context comparison.
+        self.full_rows: list[torch.Tensor] = []
+        self.starts: list[int] = []
+
+    async def __call__(
+        self, prompt_token_ids, *, request_id, sampling_config, **kwargs
+    ) -> Completion:
+        token_ids = self.completions.pop(0)
+        num_inputs = len(prompt_token_ids) + len(token_ids) - 1
+        call = torch.full((num_inputs,), len(self.full_rows))
+        rows = torch.stack([call, torch.arange(num_inputs)], dim=1).view(-1, 2, 1)
+        start = sampling_config.routed_experts_prompt_start
+        self.full_rows.append(rows)
+        self.starts.append(start)
+        return Completion(
+            min_policy_version=1,
+            max_policy_version=1,
+            request_id=request_id,
+            token_ids=token_ids,
+            token_logprobs=[-0.5] * len(token_ids),
+            routed_expert_ids=rows[start:],
+            finish_reason="stop",
+        )
+
+
+def _rows_from_full_context(rollout, full_rows) -> list[torch.Tensor]:
+    """Each sample's rows built from every call's full-context rows (from position 0): a
+    continuing turn adds its rows from `prompt_prefix_len - 1` on."""
+    samples: list[torch.Tensor] = []
+    previous_token_ids: list[int] = []
+    for turn, rows in zip(rollout.turns, full_rows, strict=True):
+        if samples and turn.prompt_prefix_len == len(previous_token_ids):
+            samples[-1] = torch.cat([samples[-1], rows[turn.prompt_prefix_len - 1 :]])
+        else:
+            samples.append(rows)
+        prompt_token_ids = (
+            previous_token_ids[: turn.prompt_prefix_len] + turn.prompt_delta_token_ids
+        )
+        previous_token_ids = prompt_token_ids + turn.completion_token_ids
+    return samples
+
+
+def test_routed_expert_ids_are_sent_once_and_match_the_full_context_rows() -> None:
+    # Each turn asks only for the rows the sample lacks; the stitched rows must equal the rows
+    # assembled from full-context calls, through a rewritten history.
+    env = _ScriptedTokenEnv(
+        [
+            # turn 1 continues turn 0 with an env reply
+            lambda prompt, completion: prompt + completion + [20],
+            # turn 2 continues turn 1
+            lambda prompt, completion: prompt + completion + [21],
+            # turn 3 rewrites the history: it keeps only 4 of the previous 11 tokens
+            lambda prompt, completion: prompt[:4] + [22],
+            # turn 4 continues turn 3
+            lambda prompt, completion: prompt + completion + [23],
+        ]
+    )
+    generate_fn = _RoutedGenerateFn([[10, 11, 12], [13, 14], [15], [16, 17], [18, 19]])
+    worker = RolloutWorker(
+        SimpleNamespace(
+            rubric=_Config(None),
+            message_env=None,
+            token_env=None,
+            advantage=_Config(None),
+        )
+    )
+
+    rollout = asyncio.run(
+        worker._run_single_rollout(
+            generate_fn=generate_fn,
+            env=env,
+            sampling=SamplingConfig(),
+            group_id=0,
+            rollout_id=0,
+        )
+    )
+    assert rollout.status == RolloutStatus.COMPLETED
+    rollout.advantage = 1.0
+    samples = (
+        TrainingSampleBuilder.Config().build().rollout_to_training_samples(rollout)
+    )
+
+    #                 turn 0, turn 1, turn 2, turn 3 (rewritten), turn 4
+    assert generate_fn.starts == [0, 5, 8, 0, 6]
+    expected = _rows_from_full_context(rollout, generate_fn.full_rows)
+    assert len(samples) == len(expected) == 2
+    for sample, rows in zip(samples, expected, strict=True):
+        assert torch.equal(sample.routed_expert_ids, rows)
+    # Each sample row is sent once: 19 rows instead of 38 full-context rows.
+    num_rows = sum(len(turn.routed_expert_ids) for turn in rollout.turns)
+    assert num_rows == sum(len(sample.routed_expert_ids) for sample in samples) == 19
+    assert sum(len(rows) for rows in generate_fn.full_rows) == 38

@@ -335,13 +335,15 @@ def test_routed_expert_ids_keep_each_turns_rows_and_take_the_boundary_from_the_n
         ),
     ]
     # vLLM returns one row per forward input: the prompt plus every completion token but the last.
+    # A continuing turn asks for rows from the previous completion's last token on.
+    routed_experts_prompt_starts = [0, 2, 5]
     for turn_id, rollout_turn in enumerate(turns):
         num_inputs = (
             rollout_turn.num_prompt_tokens + len(rollout_turn.completion_token_ids) - 1
         )
         rollout_turn.routed_expert_ids = _routed_expert_ids(
             turn=turn_id, num_positions=num_inputs
-        )
+        )[routed_experts_prompt_starts[turn_id] :]
     rollout = _scored_rollout(turns, reward=0.8, advantage=-0.2)
 
     [training_sample] = rollout_to_training_samples(rollout)
@@ -383,18 +385,33 @@ def test_routed_expert_ids_restart_at_a_branch_that_keeps_leading_prompt_tokens(
         _turn(prompt_token_ids=[1, 2, 3, 4, 5], completion_token_ids=[6], version=1),
         _turn(prompt_token_ids=[1, 9], completion_token_ids=[7], version=1),
     ]
+    # Turn 1 continues turn 0, so its rows start at position 3 (token 4); turn 2 opens a sample.
+    routed_experts_prompt_starts = [0, 3, 0]
     for turn_id, num_inputs in enumerate([3, 5, 2]):  # prompt + completion - 1
         turns[turn_id].routed_expert_ids = _routed_expert_ids(
             turn=turn_id, num_positions=num_inputs
-        )
+        )[routed_experts_prompt_starts[turn_id] :]
     rollout = _scored_rollout(turns, reward=0.5, advantage=0.1)
     assert turns[2].prompt_prefix_len == 1
 
     first, second = rollout_to_training_samples(rollout)
 
-    # Turn 1 adds rows from position 3 (token 4); turn 2's rows open the second sample whole.
     assert first.routed_expert_ids.flatten().tolist() == [0, 1, 2, 16 + 3, 16 + 4]
     assert second.routed_expert_ids.flatten().tolist() == [32 + 0, 32 + 1]
+
+
+def test_routed_expert_ids_reject_a_continuing_turn_with_full_context_rows() -> None:
+    turns = [
+        _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=1),
+        _turn(prompt_token_ids=[1, 2, 4, 8], completion_token_ids=[5], version=1),
+    ]
+    turns[0].routed_expert_ids = _routed_expert_ids(turn=0, num_positions=2)
+    # Turn 1 continues turn 0, so its rows start at position 2; these start at 0.
+    turns[1].routed_expert_ids = _routed_expert_ids(turn=1, num_positions=4)
+    rollout = _scored_rollout(turns, reward=0.5, advantage=0.1)
+
+    with pytest.raises(ValueError, match="turn 1 has 4 routed expert rows"):
+        rollout_to_training_samples(rollout)
 
 
 def test_samples_without_routed_expert_ids_keep_none() -> None:

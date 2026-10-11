@@ -212,10 +212,10 @@ def test_verifiers_trace_gives_each_turn_its_routed_expert_ids() -> None:
         rollout_id=2,
     )
 
-    # Prompt + completion but the last token: [10] -> 11 and [10, 11, 12] -> 13.
+    # [10] -> 11, then the second turn continues it: [11, 12] -> 13.
     assert [turn.routed_expert_ids.flatten().tolist() for turn in turns] == [
         [0],
-        [0, 1, 2],
+        [1, 2],
     ]
 
 
@@ -487,14 +487,18 @@ def test_generation_server_returns_routed_experts_from_the_prompt_start() -> Non
     routed_expert_ids = torch.arange(4 * 2 * 2, dtype=torch.uint8).reshape(4, 2, 2)
 
     async def run_test() -> bytes:
-        async def generate_fn(prompt_token_ids, *, request_id, **kwargs):
+        async def generate_fn(
+            prompt_token_ids, *, request_id, sampling_config, **kwargs
+        ):
+            assert sampling_config.routed_experts_prompt_start == 2
             return Completion(
                 min_policy_version=0,
                 max_policy_version=0,
                 request_id=request_id,
                 token_ids=[31, 32],
                 token_logprobs=[-0.1, -0.2],
-                routed_expert_ids=routed_expert_ids,
+                # Like the generator, return rows from the prompt start on.
+                routed_expert_ids=routed_expert_ids[2:],
                 finish_reason="stop",
             )
 
