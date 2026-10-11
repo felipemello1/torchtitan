@@ -803,6 +803,12 @@ class VLLMGenerator(Configurable):
         cuda_graph: VLLMCudaGraphConfig = field(default_factory=VLLMCudaGraphConfig)
         """CUDA graph capture settings for the vLLM engine."""
 
+        compile_cache_dir: str | None = None
+        """Directory for the kernel compile caches (Triton, Inductor, CuTe DSL, FlashAttention-4, vLLM),
+        one subdirectory each, so the next job on this node skips recompiling. Also turns on
+        FlashAttention-4's disk cache, which is off by default. None leaves those env vars as they are.
+        Use a node-local disk: nodes sharing one network directory hit "Stale file handle" errors."""
+
         checkpointer: CheckpointManager.Config | None = None
         """Optional initial-weight loader for the vLLM wrapper.
 
@@ -910,6 +916,23 @@ class VLLMGenerator(Configurable):
         ), "Only varlen and flex attention backends are allowed."
 
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+        if config.compile_cache_dir is not None:
+            # Before the engine build: FlashAttention-4 reads these at import, the rest at first compile.
+            # TODO: a fresh node still starts cold (Qwen3.5-4B, H100: engine init 116 s vs 12.4 s warm);
+            # seeding this directory from a shared read-only copy belongs in the launcher.
+            # TODO: VLLM_ENABLE_STARTUP_PLAN=1 would also skip memory profiling (12.3 -> 8.4 s), but its
+            # cache key hashes vLLM's config, not our model config, so it could reuse a stale KV size.
+            cache_dir = os.path.abspath(os.path.expanduser(config.compile_cache_dir))
+            os.environ.update(
+                {
+                    "TRITON_CACHE_DIR": f"{cache_dir}/triton",
+                    "TORCHINDUCTOR_CACHE_DIR": f"{cache_dir}/inductor",
+                    "CUTE_DSL_CACHE_DIR": f"{cache_dir}/cute_dsl",
+                    "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",
+                    "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": f"{cache_dir}/flash_attn_cute",
+                    "VLLM_CACHE_ROOT": f"{cache_dir}/vllm",
+                }
+            )
         set_batch_invariance(config.debug.batch_invariant)
         if config.debug.batch_invariant:
             # The vLLM v2 logprob Triton kernel bypasses the aten overrides above;
