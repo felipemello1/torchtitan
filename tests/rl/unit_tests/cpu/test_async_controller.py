@@ -10,6 +10,7 @@ the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID
 import asyncio
 import json
 import logging
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -23,6 +24,7 @@ from torchtitan.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
+from torchtitan.rl.controller import AsyncLoopConfig, Controller
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
@@ -775,3 +777,50 @@ def test_no_window_takes_oldest_ready_group_past_a_stuck_head() -> None:
         assert taker.result().group_id == 6
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "start_step, validated_steps",
+    [(0, [0, 3]), (2, [3])],
+    ids=["fresh", "resume"],
+)
+def test_run_skips_pre_training_validation_on_resume(
+    start_step, validated_steps
+) -> None:
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=AsyncLoopConfig(num_training_steps=3),
+        trainer=SimpleNamespace(
+            training=SimpleNamespace(
+                num_tokens_per_microbatch_per_dp_rank=8, max_context_length=8
+            )
+        ),
+    )
+    controller.start_step = start_step
+    controller.trainer = controller.generator_router = None
+    controller.trainer_dp_degree = 1
+    controller.tokenizer = SimpleNamespace(eos_id=0)
+    controller._sampling = SimpleNamespace(temperature=1.0)
+    controller._make_generate_fn = lambda **kwargs: None
+
+    # Producers idle until run() cancels them; the trainer finishes at once.
+    async def idle(*args, **kwargs) -> None:
+        await asyncio.Event().wait()
+
+    async def finish(*args, **kwargs) -> None:
+        pass
+
+    controller._data_input_loop = controller._rollout_loop = idle
+    controller._batcher_loop = idle
+    controller._trainer_loop = finish
+
+    steps = []
+
+    async def validate_and_log(*, step: int) -> dict[str, float]:
+        steps.append(step)
+        return {}
+
+    controller._validate_and_log = validate_and_log
+
+    asyncio.run(controller.run())
+    assert steps == validated_steps

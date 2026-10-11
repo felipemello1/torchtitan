@@ -139,7 +139,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True, slots=True)
 class ValidationConfig:
-    """Held-out validation that runs at the start and end of training"""
+    """Held-out validation that runs at the start (not on resume) and end of training"""
 
     # TODO: enable periodic validation with proper overlapping
 
@@ -777,12 +777,20 @@ class Controller(Configurable):
         """
         async_loop = self.config.async_loop
         num_training_steps = async_loop.num_training_steps
-        logger.info(
-            f"Running pre-training validation; then {num_training_steps} steps of async RL training"
-        )
+        if self.start_step == 0:
+            logger.info(
+                f"Running pre-training validation; then {num_training_steps} steps of async RL training"
+            )
 
-        sl.log_trace_instant("validation_start")
-        pre_validation = await self._validate_and_log(step=self.start_step)
+            sl.log_trace_instant("validation_start")
+            pre_validation = await self._validate_and_log(step=self.start_step)
+        else:
+            # The first run measured the pre-training baseline; re-validating costs a full pass per resume.
+            logger.info(
+                f"Resuming at step {self.start_step}: skipping pre-training validation; "
+                f"training through step {num_training_steps}"
+            )
+            pre_validation = {}
         sl.log_trace_instant("training_start")
 
         # Trainer policy version, seeded from the resumed step; advances at each optimizer step.
