@@ -396,9 +396,16 @@ class VLLMModelWrapper(Module):
         With tied embeddings the group is [tok_embeddings, norm, lm_head], so it stays
         allocated for the whole load.
 
+        Why this shape:
+          - Memory: allocating every sharded buffer first would hold a second copy of the weights.
+          - Per group: modules from one `fully_shard` call share one FSDP state, so unsharding
+            after `norm` would all-gather `lm_head` before it loads.
+          - Hooks: a `load_state_dict` per module would also load its nested FSDP modules
+            (the root holds every block), whose sharded buffers are still freed.
+
         Args:
-            state_dict: Keyed and sharded like `self.model.state_dict()`, e.g. the
-                generator's pinned CPU copy.
+            state_dict: Keyed like `self.model.state_dict()`, not `self.state_dict()`
+                (no `model.` prefix), e.g. the generator's pinned CPU copy.
             strict: As in `nn.Module.load_state_dict`.
             assign: As in `nn.Module.load_state_dict`.
         """
@@ -408,8 +415,8 @@ class VLLMModelWrapper(Module):
         for module in self.model.modules():
             if isinstance(module, FSDPModule):
                 modules_by_fsdp_state[module._get_fsdp_state()].append(module)
-        # Hooks run inside the one load_state_dict call, just before and after each module
-        # loads, so we keep its key matching and strict check instead of re-implementing them.
+        # Hooks run inside the one load_state_dict call, just before and after each group
+        # loads; a call per module would also load its nested modules while they are freed.
         handles = []
         for modules in modules_by_fsdp_state.values():
             handles.append(
