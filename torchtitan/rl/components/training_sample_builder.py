@@ -90,6 +90,7 @@ class _SampleInProgress:
     loss_mask: list[bool] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     advantage: list[float] = field(default_factory=list)
+    routed_expert_ids: torch.Tensor | None = None
 
     def to_training_sample(self) -> TrainingSample:
         return TrainingSample(
@@ -100,6 +101,7 @@ class _SampleInProgress:
             loss_mask=torch.tensor(self.loss_mask, dtype=torch.bool),
             logprobs=torch.tensor(self.logprobs, dtype=torch.float32),
             advantage=torch.tensor(self.advantage, dtype=torch.float32),
+            routed_expert_ids=self.routed_expert_ids,
         )
 
 
@@ -319,7 +321,8 @@ class TrainingSampleBuilder(Configurable):
             # True when this prompt continues the previous one (prefix-preserving);
             # False when the env edited history -> open a new training_sample (branch).
             extends_prev = prompt_prefix_len == len(prev_prompt_and_completion)
-            if not training_samples or not extends_prev:
+            opens_sample = not training_samples or not extends_prev
+            if opens_sample:
                 # Start a new training_sample; its RolloutTurnID marks the turn the segment begins at.
                 training_samples.append(
                     _SampleInProgress(
@@ -356,15 +359,15 @@ class TrainingSampleBuilder(Configurable):
             training_sample.logprobs += rollout_turn.completion_logprobs
             training_sample.advantage += [rollout_advantage] * num_completion
             if rollout_turn.routed_expert_ids is not None:
-                # Row i is position i. A continuing turn adds rows from prefix_len - 1: the
-                # previous completion's last token only ran forward in this turn's prefill.
+                # Row i is position i. A continuing turn adds rows from prompt_prefix_len - 1:
+                # the previous completion's last token only ran forward in this turn's prefill.
                 training_sample.routed_expert_ids = (
                     rollout_turn.routed_expert_ids
-                    if prefix_len == 0
+                    if opens_sample
                     else torch.cat(
                         [
                             training_sample.routed_expert_ids,
-                            rollout_turn.routed_expert_ids[prefix_len - 1 :],
+                            rollout_turn.routed_expert_ids[prompt_prefix_len - 1 :],
                         ]
                     )
                 )
