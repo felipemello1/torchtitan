@@ -23,6 +23,7 @@ from torchtitan.config import ConfigLoader
 from torchtitan.rl.examples.dapo_math import DapoMathSample
 from torchtitan.rl.examples.verifiers import VerifiersRollouter, VerifiersTaskDataset
 from torchtitan.rl.examples.verifiers.dapo_math import data
+from torchtitan_recipes.rl.dapo_math import rl_dapo_qwen3_4b_math_8k
 from torchtitan_recipes.rl.verifiers_dapo_math import _verifiers_math_rollouter_config
 from verifiers.v1.harnesses.null import NullHarnessConfig as VerifiersNullHarnessConfig
 
@@ -104,6 +105,10 @@ def test_verifiers_config_keeps_dapo_training_recipe() -> None:
     assert config.generator.sampling.max_tokens == 8192
     assert config.rollouter.generation_server.max_rollout_tokens == 10240
     assert config.dump_folder == "outputs/rl/qwen3_4b_verifiers_8k"
+    assert (
+        config.trainer.activation_checkpoint
+        == rl_dapo_qwen3_4b_math_8k().trainer.activation_checkpoint
+    )
     assert isinstance(config.renderer, RenderersConfigAdapter)
     assert config.renderer.renderers_config.name == "qwen3"
     assert config.renderer.renderers_config.enable_thinking

@@ -22,6 +22,7 @@ from torchtitan.components.renderer import from_renderers
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import LMHeadFP32OutputConverter
+from torchtitan.distributed.activation_checkpoint import RegionAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.qwen3 import build_model_config
 from torchtitan.rl.components.data import IterableRLDataLoader
@@ -139,6 +140,11 @@ def _qwen3_4b_dapo_math_config(
                 data_parallel_replicate_degree=1,
                 data_parallel_shard_degree=1,
                 tensor_parallel_degree=2,
+            ),
+            # SelectiveAC (the default) saves every region: 92 GiB per GPU at 32K, OOM.
+            # Recompute FFN w13 and its all-gather: 63 GiB, 15% less time than FullAC.
+            activation_checkpoint=RegionAC.Config(
+                save_regions=["*"], recompute_regions=["feed_forward.w13.*"]
             ),
             checkpointer=CheckpointManager.Config(
                 initial_load_in_hf=True,
