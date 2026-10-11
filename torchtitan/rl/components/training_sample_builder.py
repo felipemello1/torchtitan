@@ -9,9 +9,14 @@
 RolloutGroup -> group filters -> rollout_to_training_samples -> sample filters -> TrainingSampleGroup
 """
 
-import math
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+import torch
+
+import torch
+
+import torch
 
 from torchtitan.config import Configurable
 from torchtitan.rl.observability import metrics as m
@@ -25,14 +30,39 @@ from torchtitan.rl.types import (
 
 def _has_valid_loss_token(training_sample: TrainingSample) -> bool:
     """Return whether the shifted sample has a token usable by the RL loss."""
-    return any(
-        include_in_loss and math.isfinite(generator_logprob)
-        for include_in_loss, generator_logprob in zip(
-            training_sample.loss_mask[1:],
-            training_sample.logprobs[1:],
-            strict=True,
+    loss_mask, logprobs = training_sample.loss_mask[1:], training_sample.logprobs[1:]
+    return bool((loss_mask & logprobs.isfinite()).any())
+
+
+@dataclass(kw_only=True, slots=True)
+class _OpenSample:
+    """A training_sample while turns are appended to it: per-token Python lists (cheap appends),
+    converted to tensors once by `to_training_sample`."""
+
+    rollout_id: RolloutTurnID
+    min_policy_version: int
+    max_policy_version: int
+    token_ids: list[int] = field(default_factory=list)
+    loss_mask: list[bool] = field(default_factory=list)
+    logprobs: list[float] = field(default_factory=list)
+    advantage: list[float] = field(default_factory=list)
+    routed_expert_ids: torch.Tensor | None = None
+    topk_token_ids: torch.Tensor | None = None
+    topk_logprobs: torch.Tensor | None = None
+
+    def to_training_sample(self) -> TrainingSample:
+        return TrainingSample(
+            rollout_id=self.rollout_id,
+            min_policy_version=self.min_policy_version,
+            max_policy_version=self.max_policy_version,
+            token_ids=torch.tensor(self.token_ids, dtype=torch.long),
+            loss_mask=torch.tensor(self.loss_mask, dtype=torch.bool),
+            logprobs=torch.tensor(self.logprobs, dtype=torch.float32),
+            advantage=torch.tensor(self.advantage, dtype=torch.float32),
+            routed_expert_ids=self.routed_expert_ids,
+            topk_token_ids=self.topk_token_ids,
+            topk_logprobs=self.topk_logprobs,
         )
-    )
 
 
 class TrainingSampleBuilder(Configurable):
@@ -185,13 +215,19 @@ class TrainingSampleBuilder(Configurable):
         = the oldest (opening) turn's version (the off-policy filter reads it), `max_policy_version` = the
         newest version any of its turns reached.
 
+        With routed expert ids, each turn keeps its own rows, so trained tokens replay the routing they were
+        sampled with. A continuing turn also supplies the row of the previous completion's last token,
+        which only its prefill ran forward (`len(routed_expert_ids) == len(token_ids) - 1`).
+
         Example (5 turns; the env compacts history before turn 3, so the prefix breaks -> 2 training_samples).
-        P = prompt; C = completion; E = env reply
-            turn0 (v5): prompt=[P1]              completion=[C1]
-            turn1 (v6): prompt=[P1,C1,E1]        completion=[C2]
-            turn2 (v6): prompt=[P1,C1,E1,C2,E2]  completion=[C3]
-            turn3 (v6): prompt=[P2]              completion=[C4]   # history compacted -> prefix breaks
-            turn4 (v7): prompt=[P2,C4,E4]        completion=[C5]
+        P = prompt; C = completion; E = env reply. A turn stores its prompt as
+        (prompt_prefix_len, prompt_delta_token_ids), the delta on the previous turn's prompt + completion
+        (k = how many leading tokens P2 keeps from P1, e.g. BOS + system prompt):
+            turn0 (v5): prompt=[P1]              stored (0, [P1])                 completion=[C1]
+            turn1 (v6): prompt=[P1,C1,E1]        stored (len(P1+C1), [E1])        completion=[C2]
+            turn2 (v6): prompt=[P1,C1,E1,C2,E2]  stored (len(P1+C1+E1+C2), [E2])  completion=[C3]
+            turn3 (v6): prompt=[P2]              stored (k, P2[k:])               completion=[C4]   # prefix breaks
+            turn4 (v7): prompt=[P2,C4,E4]        stored (len(P2+C4), [E4])        completion=[C5]
             # -> training_sample 0: token_ids=[P1,C1,E1,C2,E2,C3], loss_mask=[0,1,0,1,0,1]
             #              rollout_id.turn_id=0, min_policy_version=5, max_policy_version=6
             #    training_sample 1: token_ids=[P2,C4,E4,C5],        loss_mask=[0,1,0,1]
@@ -203,10 +239,7 @@ class TrainingSampleBuilder(Configurable):
                 f"rollout {rollout.group_id}/rollout={rollout.rollout_id} has no advantage; the Rollouter "
                 "must fill it (via its advantage estimator) before training_samples are built."
             )
-        training_samples: list[TrainingSample] = []
-
-        # Used to check if [P1, C1] is prefix of [P1,C1,E1] in the docstring example
-        prev_prompt_and_completion: list[int] = []
+        training_samples: list[_OpenSample] = []
 
         # Skip if no completion (nothing to train on). This happens when the prompt is too
         # long in the first turn, before any generation. We keep these rollouts for debugging.
@@ -223,16 +256,36 @@ class TrainingSampleBuilder(Configurable):
                     f"non-final turn {turn_idx} has no completion"
                 )
 
-            prompt = rollout_turn.prompt_token_ids
+            # The previous turn's prompt + completion is the last training_sample's token_ids: a
+            # training_sample opens at the turn whose prompt breaks that prefix, and later turns join it.
+            prev_prompt_and_completion = (
+                training_samples[-1].token_ids if training_samples else []
+            )
+            # `split_prompt` keeps the longest shared prefix: never past the previous turn's end, and
+            # never stopping where the next prompt token still matches.
+            prompt_prefix_len = rollout_turn.prompt_prefix_len
+            prompt_delta_token_ids = rollout_turn.prompt_delta_token_ids
+            if prompt_prefix_len > len(prev_prompt_and_completion) or (
+                prompt_prefix_len < len(prev_prompt_and_completion)
+                and prompt_delta_token_ids
+                and prompt_delta_token_ids[0]
+                == prev_prompt_and_completion[prompt_prefix_len]
+            ):
+                raise ValueError(
+                    f"rollout {rollout.group_id}/rollout={rollout.rollout_id}: turn "
+                    f"{turn_idx}'s prompt_prefix_len={prompt_prefix_len} is not the "
+                    "longest prefix shared with the previous turn's "
+                    f"{len(prev_prompt_and_completion)} tokens; build it with "
+                    "`split_prompt`"
+                )
             # True when this prompt continues the previous one (prefix-preserving);
             # False when the env edited history -> open a new training_sample (branch).
-            extends_prev = (
-                prompt[: len(prev_prompt_and_completion)] == prev_prompt_and_completion
-            )
-            if not training_samples or not extends_prev:
+            extends_prev = prompt_prefix_len == len(prev_prompt_and_completion)
+            opens_sample = not training_samples or not extends_prev
+            if opens_sample:
                 # Start a new training_sample; its RolloutTurnID marks the turn the segment begins at.
                 training_samples.append(
-                    TrainingSample(
+                    _OpenSample(
                         min_policy_version=rollout_turn.min_policy_version,
                         max_policy_version=rollout_turn.max_policy_version,
                         rollout_id=RolloutTurnID(
@@ -240,20 +293,17 @@ class TrainingSampleBuilder(Configurable):
                             rollout_id=rollout.rollout_id,
                             turn_id=turn_idx,
                         ),
-                        token_ids=[],
-                        loss_mask=[],
-                        logprobs=[],
-                        advantage=[],
                     )
                 )
-                # New branch (first turn or a branch): no shared prefix.
-                prefix_len = 0
+                # New branch (first turn or a branch): append this turn's full prompt, not just its delta.
+                prompt_delta = (
+                    prev_prompt_and_completion[:prompt_prefix_len] + prompt_delta_token_ids
+                )
             else:
-                prefix_len = len(prev_prompt_and_completion)
+                prompt_delta = prompt_delta_token_ids
 
             # Append this turn's new info to `training_sample`: prefix delta (untrained) + completion (trained).
             training_sample = training_samples[-1]
-            prompt_delta = prompt[prefix_len:]
             num_delta = len(prompt_delta)
             num_completion = len(rollout_turn.completion_token_ids)
             training_sample.token_ids += prompt_delta
@@ -268,7 +318,50 @@ class TrainingSampleBuilder(Configurable):
             training_sample.loss_mask += [True] * num_completion
             training_sample.logprobs += rollout_turn.completion_logprobs
             training_sample.advantage += [rollout_advantage] * num_completion
+            if rollout_turn.routed_expert_ids is not None:
+                # Row i is position i. A continuing turn adds rows from prompt_prefix_len - 1:
+                # the previous completion's last token only ran forward in this turn's prefill.
+                training_sample.routed_expert_ids = (
+                    rollout_turn.routed_expert_ids
+                    if opens_sample
+                    else torch.cat(
+                        [
+                            training_sample.routed_expert_ids,
+                            rollout_turn.routed_expert_ids[prompt_prefix_len - 1 :],
+                        ]
+                    )
+                )
+                assert (
+                    len(training_sample.routed_expert_ids)
+                    == len(training_sample.token_ids) - 1
+                )
+            if rollout_turn.completion_topk_token_ids is not None:
+                training_sample.topk_token_ids = _append_rows(
+                    training_sample.topk_token_ids,
+                    num_zero_rows=num_delta,
+                    new_rows=rollout_turn.completion_topk_token_ids,
+                )
+                training_sample.topk_logprobs = _append_rows(
+                    training_sample.topk_logprobs,
+                    num_zero_rows=num_delta,
+                    new_rows=rollout_turn.completion_topk_logprobs,
+                )
 
-            prev_prompt_and_completion = prompt + rollout_turn.completion_token_ids
+        return [
+            training_sample.to_training_sample() for training_sample in training_samples
+        ]
 
-        return training_samples
+
+def _append_rows(
+    rows: torch.Tensor | None, *, num_zero_rows: int, new_rows: torch.Tensor
+) -> torch.Tensor:
+    """Append `num_zero_rows` zero rows (the untrained prompt delta), then `new_rows`.
+
+    Example:
+
+        _append_rows(None, num_zero_rows=2, new_rows=[[7, 3]])  # -> [[0, 0], [0, 0], [7, 3]]
+    """
+    zero_rows = new_rows.new_zeros(num_zero_rows, new_rows.shape[1])
+    return torch.cat(
+        [zero_rows, new_rows] if rows is None else [rows, zero_rows, new_rows]
+    )

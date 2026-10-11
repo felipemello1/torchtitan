@@ -13,6 +13,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import Any, TYPE_CHECKING
 
+import torch
 from verifiers.v1.configs.client import TrainClientConfig as VerifiersTrainClientConfig
 from verifiers.v1.configs.taskset import TasksetConfig as VerifiersTasksetConfig
 from verifiers.v1.dialects.chat import message_to_wire
@@ -37,10 +38,12 @@ from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 from torchtitan.rl.rollout.types import (
     GenerateFn,
+    ReleaseSessionFn,
     Rollout,
     RolloutGroup,
     RolloutStatus,
     RolloutTurn,
+    split_prompt,
 )
 from torchtitan.rl.rubric import RewardFn, Rubric
 from torchtitan.rl.types import RolloutTurnID
@@ -168,9 +171,11 @@ class VerifiersRollouter(Rollouter):
         tokenizer_config: HuggingFaceTokenizer.Config,
         renderer_config: RendererConfig,
         hf_assets_path: str,
+        release_session_fn: ReleaseSessionFn | None = None,
     ) -> None:
         """Start the EnvServer and connect it to TorchTitan generation."""
-        del tokenizer_config
+        # This rollouter's sessions are released with their group (`release_groups`).
+        del tokenizer_config, release_session_fn
         if self._verifiers_env_client is not None:
             return
         if not isinstance(renderer_config, RenderersConfigAdapter):
@@ -299,6 +304,7 @@ class VerifiersRollouter(Rollouter):
                 top_p=sampling.top_p,
                 max_tokens=sampling.max_tokens,
                 seed=sampling.seed,
+                num_topk_logprobs=sampling.num_topk_logprobs,
                 **{GROUP_ID_SAMPLING_PARAM: group_id},
             ),
         )
@@ -365,7 +371,13 @@ class VerifiersRollouter(Rollouter):
         Verifiers does not return TorchTitan policy metadata, so every emitted
         turn receives the conservative min/max policy-version span accumulated
         by the generation server for the whole rollout. Generator metrics are
-        attached once to avoid double counting.
+        attached once to avoid double counting. A turn's top-k rows come from the
+        generation whose prompt length and completion tokens match its node.
+
+        With router replay, a turn takes the branch's routed expert ids of its
+        prompt and completion but the last token, as in
+        ``Completion.routed_expert_ids``: the second turn above gets the rows of
+        ``[1, 2, 3, 4, 5, 6, 7]``.
         """
         if generation_metadata is None:
             if any(any(node.mask) for node in trace.nodes):
@@ -379,10 +391,17 @@ class VerifiersRollouter(Rollouter):
         replied_nodes: set[int] = set()
         last_turn_by_node: dict[int, RolloutTurn] = {}
         turns: list[RolloutTurn] = []
+        # The last appended turn's prompt + completion, across branches
+        previous_token_ids: list[int] = []
 
         for branch in trace.branches:
             token_ids = branch.token_ids
             logprobs = branch.logprobs
+            # [len(token_ids), num_layers, top_k] from the generation server; None without replay.
+            # TODO: Verifiers gives a continued turn's last token the row of the token before it,
+            # so 1 input per turn boundary replays its neighbor's experts. Native TitanRL uses
+            # the next prefill's row; Verifiers' `_attribute_routed_experts` would need to do so.
+            routed_expert_ids = branch.routed_experts
             branch_offset = 0
             reply_to: RolloutTurn | None = None
             for node in branch.nodes:
@@ -393,9 +412,33 @@ class VerifiersRollouter(Rollouter):
                         mask = [False] * len(mask)
                     else:
                         trained_nodes.add(index)
+                topk = None
+                if generation_metadata.topk_by_generation and any(mask):
+                    # The prompt this node's completion was sampled from ends at its first
+                    # sampled token.
+                    key = (
+                        branch_offset + node.mask.index(True),
+                        tuple(
+                            token_id
+                            for token_id, sampled in zip(node.token_ids, node.mask)
+                            if sampled
+                        ),
+                    )
+                    if key not in generation_metadata.topk_by_generation:
+                        raise ValueError(
+                            "Verifiers node has no generation with the same prompt length "
+                            "and completion tokens, so its top-k logprobs are unknown"
+                        )
+                    topk = generation_metadata.topk_by_generation[key]
                 for start, end in _trainable_token_spans(mask):
                     absolute_start = branch_offset + start
                     absolute_end = branch_offset + end
+                    prompt_prefix_len, prompt_delta_token_ids = split_prompt(
+                        token_ids[:absolute_start], previous_token_ids
+                    )
+                    previous_token_ids = token_ids[:absolute_end]
+                    # Completion rows of this span: sampled tokens before `start` in the node.
+                    row = sum(node.mask[:start])
                     turns.append(
                         RolloutTurn(
                             rollout_id=RolloutTurnID(
@@ -403,12 +446,30 @@ class VerifiersRollouter(Rollouter):
                                 rollout_id=rollout_id,
                                 turn_id=len(turns),
                             ),
-                            prompt_token_ids=list(token_ids[:absolute_start]),
+                            prompt_prefix_len=prompt_prefix_len,
+                            prompt_delta_token_ids=prompt_delta_token_ids,
                             completion_token_ids=list(
                                 token_ids[absolute_start:absolute_end]
                             ),
                             completion_logprobs=list(
                                 logprobs[absolute_start:absolute_end]
+                            ),
+                            routed_expert_ids=(
+                                None
+                                if routed_expert_ids is None
+                                else torch.from_numpy(
+                                    routed_expert_ids[: absolute_end - 1]
+                                )
+                            ),
+                            completion_topk_token_ids=(
+                                None
+                                if topk is None
+                                else topk[0][row : row + end - start]
+                            ),
+                            completion_topk_logprobs=(
+                                None
+                                if topk is None
+                                else topk[1][row : row + end - start]
                             ),
                             min_policy_version=generation_metadata.min_policy_version,
                             max_policy_version=generation_metadata.max_policy_version,

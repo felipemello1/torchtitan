@@ -7,13 +7,16 @@
 """Unit tests for direct rollout worker execution."""
 
 import asyncio
+import random
 from types import SimpleNamespace
 
+import torch
 from renderers import Qwen3RendererConfig
 
 from torchtitan.components.renderer import from_renderers
 
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
+from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 
 from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.rollout import RolloutStatus
@@ -108,6 +111,8 @@ class _GenerateFn:
             request_id=kwargs["request_id"],
             token_ids=[4],
             token_logprobs=[-0.5],
+            topk_token_ids=torch.tensor([[4, 9]], dtype=torch.int32),
+            topk_logprobs=torch.tensor([[-0.5, -1.5]]),
             finish_reason="stop",
         )
 
@@ -126,10 +131,16 @@ def test_worker_executes_group_without_actor_mesh() -> None:
             advantage=_Config(_AdvantageEstimator()),
         )
         worker = _CustomWorker(worker_config)
+        released = []
+
+        async def release_session_fn(**kwargs) -> None:
+            released.append(kwargs)
+
         await worker.setup_async(
             tokenizer_config=HuggingFaceTokenizer.Config(),
             renderer_config=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
             hf_assets_path="tests/assets/tokenizer",
+            release_session_fn=release_session_fn,
         )
         group = await worker.run_group(
             generate_fn=generate_fn,
@@ -148,6 +159,8 @@ def test_worker_executes_group_without_actor_mesh() -> None:
         assert worker.score_group_called
         assert [rollout.reward for rollout in group.rollouts] == [1.0, 2.0]
         assert [rollout.advantage for rollout in group.rollouts] == [10.0, 20.0]
+        # The generator's top-k rides on the turn, for ScoreCenteringLoss.
+        assert group.rollouts[0].turns[0].completion_topk_token_ids.tolist() == [[4, 9]]
         assert all(env.closed for env in token_env_config.envs)
         assert [type(r).__name__ for r in token_env_config.renderers] == [
             "Qwen3Renderer",
@@ -161,5 +174,100 @@ def test_worker_executes_group_without_actor_mesh() -> None:
             11,
             12,
         ]
+        # Each rollout releases its routing session after its last turn.
+        assert released == [
+            {"group_id": 7, "routing_session_id": "group=7/rollout=0"},
+            {"group_id": 7, "routing_session_id": "group=7/rollout=1"},
+        ]
+
+    asyncio.run(run())
+
+
+class _RewritingTokenEnv:
+    """Each step continues the history, strips the completion's first token (thinking), shrinks
+    to a prefix, or keeps only BOS, at random."""
+
+    def __init__(self, rng: random.Random, num_turns: int) -> None:
+        self.rng, self.num_turns = rng, num_turns
+        self.prompts: list[list[int]] = []
+
+    def _prompt(self, prompt_token_ids: list[int]) -> TokenEnvOutput:
+        self.prompts.append(prompt_token_ids)
+        return TokenEnvOutput(
+            next_prompt_token_ids=prompt_token_ids, status=RolloutStatus.ONGOING
+        )
+
+    async def init(self) -> TokenEnvOutput:
+        return self._prompt([1, 2, 3])
+
+    async def step(self, completion: Completion) -> TokenEnvOutput:
+        if len(self.prompts) == self.num_turns:
+            return TokenEnvOutput(
+                next_prompt_token_ids=None, status=RolloutStatus.COMPLETED
+            )
+        prompt, reply = self.prompts[-1], [self.rng.randrange(100)]
+        kind = self.rng.choice(["continue", "strip_thinking", "prefix", "reset"])
+        if kind == "continue":
+            return self._prompt(prompt + completion.token_ids + reply)
+        if kind == "strip_thinking":
+            return self._prompt(prompt + completion.token_ids[1:] + reply)
+        if kind == "prefix":
+            return self._prompt(prompt[: self.rng.randint(0, len(prompt))])
+        return self._prompt([1] + reply)
+
+
+def test_delta_prompts_rebuild_the_full_prompt_samples() -> None:
+    # The worker stores each turn's prompt as a delta; the builder must open and fill samples as
+    # the full-prompt rule does: a turn joins the last sample iff its prompt extends the
+    # previous turn's prompt + completion.
+    rng = random.Random(0)
+    worker = RolloutWorker(
+        SimpleNamespace(
+            rubric=_Config(None),
+            message_env=None,
+            token_env=None,
+            advantage=_Config(None),
+        )
+    )
+    builder = TrainingSampleBuilder.Config().build()
+
+    async def generate_fn(prompt_token_ids, **kwargs) -> Completion:
+        token_ids = [rng.randrange(100) for _ in range(rng.randint(1, 3))]
+        return Completion(
+            min_policy_version=1,
+            max_policy_version=1,
+            request_id=kwargs["request_id"],
+            token_ids=token_ids,
+            token_logprobs=[-0.5] * len(token_ids),
+        )
+
+    async def run() -> None:
+        for rollout_id in range(20):
+            env = _RewritingTokenEnv(rng, num_turns=rng.randint(1, 6))
+            rollout = await worker._run_single_rollout(
+                generate_fn=generate_fn,
+                env=env,
+                sampling=SamplingConfig(),
+                group_id=0,
+                rollout_id=rollout_id,
+            )
+            assert rollout.status == RolloutStatus.COMPLETED
+            rollout.advantage = 1.0
+
+            expected, previous = [], []
+            for turn_id, (turn, prompt) in enumerate(
+                zip(rollout.turns, env.prompts, strict=True)
+            ):
+                completion = turn.completion_token_ids
+                if expected and prompt[: len(previous)] == previous:
+                    expected[-1][1].extend(prompt[len(previous) :] + completion)
+                else:
+                    expected.append((turn_id, prompt + completion))
+                previous = prompt + completion
+
+            samples = builder.rollout_to_training_samples(rollout)
+            assert [
+                (s.rollout_id.turn_id, s.token_ids.tolist()) for s in samples
+            ] == expected
 
     asyncio.run(run())

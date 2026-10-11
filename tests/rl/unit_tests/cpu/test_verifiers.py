@@ -9,10 +9,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 
 pytest.importorskip("verifiers")
 
@@ -56,6 +59,7 @@ def test_verifiers_trace_preserves_generation_metadata() -> None:
                 nodes=[node],
                 token_ids=[10, 11, 12, 13],
                 logprobs=[0.0, 0.0, -0.2, -0.3],
+                routed_experts=None,
             )
         ],
     )
@@ -71,7 +75,8 @@ def test_verifiers_trace_preserves_generation_metadata() -> None:
     )
 
     assert len(turns) == 1
-    assert turns[0].prompt_token_ids == [10, 11]
+    assert turns[0].prompt_prefix_len == 0
+    assert turns[0].prompt_delta_token_ids == [10, 11]
     assert turns[0].completion_token_ids == [12, 13]
     assert turns[0].completion_logprobs == [-0.2, -0.3]
     assert turns[0].completion_message == {
@@ -104,6 +109,7 @@ def test_verifiers_multiturn_trace_matches_titanrl_rollout_structure() -> None:
                 nodes=[first_node, second_node],
                 token_ids=[10, 11, 12, 13],
                 logprobs=[0.0, -0.1, 0.0, -0.2],
+                routed_experts=None,
             )
         ],
     )
@@ -120,9 +126,97 @@ def test_verifiers_multiturn_trace_matches_titanrl_rollout_structure() -> None:
 
     assert [turn.min_policy_version for turn in turns] == [3, 3]
     assert [turn.max_policy_version for turn in turns] == [8, 8]
-    assert [turn.prompt_token_ids for turn in turns] == [[10], [10, 11, 12]]
+    # turn 1's prompt [10, 11, 12] continues turn 0's [10] + [11], so it stores only [12]
+    stored = [(turn.prompt_prefix_len, turn.prompt_delta_token_ids) for turn in turns]
+    assert stored == [(0, [10]), (2, [12])]
     assert [turn.completion_token_ids for turn in turns] == [[11], [13]]
     assert [turn.completion_logprobs for turn in turns] == [[-0.1], [-0.2]]
+
+
+def test_verifiers_second_branch_stores_its_prompt_as_a_delta_on_the_first() -> None:
+    from verifiers.v1.types import AssistantMessage as VerifiersAssistantMessage
+
+    def node(token_ids: list[int], content: str) -> SimpleNamespace:
+        message = VerifiersAssistantMessage(content=content)
+        return SimpleNamespace(
+            token_ids=token_ids, mask=[False, True], sampled=True, message=message
+        )
+
+    shared = node([10, 11], "a")
+    first_leaf = node([12, 13], "b")
+    second_leaf = node([14, 15], "c")
+    trace = SimpleNamespace(
+        nodes=[shared, first_leaf, second_leaf],
+        branches=[
+            SimpleNamespace(
+                nodes=[shared, first_leaf],
+                token_ids=[10, 11, 12, 13],
+                logprobs=[0.0, -0.1, 0.0, -0.2],
+                routed_experts=None,
+            ),
+            SimpleNamespace(
+                nodes=[shared, second_leaf],
+                token_ids=[10, 11, 14, 15],
+                logprobs=[0.0, -0.1, 0.0, -0.3],
+                routed_experts=None,
+            ),
+        ],
+    )
+    turns = VerifiersRollouter.trace_to_rollout_turns(
+        trace=trace,
+        generation_metadata=VerifiersGenerationMetadata(
+            min_policy_version=1, max_policy_version=1, metrics=[]
+        ),
+        group_id=5,
+        rollout_id=2,
+    )
+
+    # The shared node trains once; the second branch's prompt [10, 11, 14] keeps [10, 11] of the
+    # previous turn's [10, 11, 12, 13], so it stores (2, [14]) and the builder opens a new sample.
+    stored = [(turn.prompt_prefix_len, turn.prompt_delta_token_ids) for turn in turns]
+    assert stored == [(0, [10]), (2, [12]), (2, [14])]
+    assert [turn.completion_token_ids for turn in turns] == [[11], [13], [15]]
+
+
+def test_verifiers_trace_gives_each_turn_its_routed_expert_ids() -> None:
+    from verifiers.v1.types import AssistantMessage as VerifiersAssistantMessage
+
+    # Row i holds the experts of position i, so turn rows read as positions.
+    routed_experts = np.arange(4, dtype=np.uint8).reshape(4, 1, 1)
+    nodes = [
+        SimpleNamespace(
+            token_ids=[10 + offset, 11 + offset],
+            mask=[False, True],
+            sampled=True,
+            message=VerifiersAssistantMessage(content="answer"),
+        )
+        for offset in (0, 2)
+    ]
+    trace = SimpleNamespace(
+        nodes=nodes,
+        branches=[
+            SimpleNamespace(
+                nodes=nodes,
+                token_ids=[10, 11, 12, 13],
+                logprobs=[0.0, -0.1, 0.0, -0.2],
+                routed_experts=routed_experts,
+            )
+        ],
+    )
+    turns = VerifiersRollouter.trace_to_rollout_turns(
+        trace=trace,
+        generation_metadata=VerifiersGenerationMetadata(
+            min_policy_version=0, max_policy_version=0, metrics=[]
+        ),
+        group_id=5,
+        rollout_id=2,
+    )
+
+    # Prompt + completion but the last token: [10] -> 11 and [10, 11, 12] -> 13.
+    assert [turn.routed_expert_ids.flatten().tolist() for turn in turns] == [
+        [0],
+        [0, 1, 2],
+    ]
 
 
 def test_verifiers_trace_attaches_env_replies_to_the_preceding_turn() -> None:
@@ -157,6 +251,7 @@ def test_verifiers_trace_attaches_env_replies_to_the_preceding_turn() -> None:
                 nodes=branch_nodes,
                 token_ids=[0] * len(branch_nodes),
                 logprobs=[0.0] * len(branch_nodes),
+                routed_experts=None,
             )
             for branch_nodes in (
                 [task, first, out, second],
@@ -336,6 +431,59 @@ def test_generation_server_forwards_token_request() -> None:
     asyncio.run(run_test())
 
 
+def test_generation_server_records_topk_logprobs_per_generation() -> None:
+    async def run_test() -> None:
+        received = []
+
+        async def generate_fn(prompt_token_ids, *, request_id, group_id, **kwargs):
+            received.append(kwargs["sampling_config"])
+            return Completion(
+                min_policy_version=7,
+                max_policy_version=7,
+                request_id=request_id,
+                token_ids=[31, 32],
+                token_logprobs=[-0.1, -0.2],
+                topk_token_ids=torch.tensor([[31, 5], [32, 6]], dtype=torch.int32),
+                topk_logprobs=torch.tensor([[-0.1, -2.4], [-0.2, -1.9]]),
+                finish_reason="stop",
+            )
+
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+        try:
+            async with ClientSession() as session:
+                response = await session.post(
+                    f"http://{server.host}:{server.port}/inference/v1/generate",
+                    headers={"X-Session-ID": "group=1/rollout=2"},
+                    json={
+                        "token_ids": [10, 11],
+                        "sampling_params": {
+                            "max_tokens": 2,
+                            "torchtitan_group_id": 1,
+                            "stop_token_ids": [99],
+                            "num_topk_logprobs": 2,
+                        },
+                    },
+                )
+                assert response.status == 200
+            generation_metadata = server.pop_generation_metadata("group=1/rollout=2")
+        finally:
+            await server.close()
+
+        assert received[0].num_topk_logprobs == 2
+        [
+            (key, (topk_token_ids, topk_logprobs))
+        ] = generation_metadata.topk_by_generation.items()
+        assert key == (2, (31, 32))
+        assert topk_token_ids.tolist() == [[31, 5], [32, 6]]
+        torch.testing.assert_close(
+            topk_logprobs, torch.tensor([[-0.1, -2.4], [-0.2, -1.9]])
+        )
+
+    asyncio.run(run_test())
+
+
 def test_generation_server_rejects_aborted_generation() -> None:
     async def run_test() -> None:
         async def generate_fn(
@@ -383,6 +531,60 @@ def test_generation_server_rejects_aborted_generation() -> None:
         assert generation_metadata is None
 
     asyncio.run(run_test())
+
+
+def test_generation_server_returns_routed_experts_from_the_prompt_start() -> None:
+    from renderers.client import parse_generate_response
+
+    # Prompt [10, 11, 12] + completion [31, 32]: rows for positions 0..3.
+    routed_expert_ids = torch.arange(4 * 2 * 2, dtype=torch.uint8).reshape(4, 2, 2)
+
+    async def run_test() -> bytes:
+        async def generate_fn(prompt_token_ids, *, request_id, **kwargs):
+            return Completion(
+                min_policy_version=0,
+                max_policy_version=0,
+                request_id=request_id,
+                token_ids=[31, 32],
+                token_logprobs=[-0.1, -0.2],
+                routed_expert_ids=routed_expert_ids,
+                finish_reason="stop",
+            )
+
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+        try:
+            async with ClientSession() as session:
+                response = await session.post(
+                    f"http://{server.host}:{server.port}/inference/v1/generate",
+                    headers={"X-Session-ID": "group=1/rollout=2"},
+                    json={
+                        "token_ids": [10, 11, 12],
+                        "sampling_params": {
+                            "torchtitan_group_id": 1,
+                            "stop_token_ids": [99],
+                            # Verifiers: the previous turn returned positions 0 and 1.
+                            "routed_experts_prompt_start": 2,
+                        },
+                    },
+                )
+                assert response.status == 200
+                return await response.read()
+        finally:
+            await server.close()
+
+    # Verifiers' client parser, which splices the base64 data out of the raw bytes.
+    payload = parse_generate_response(asyncio.run(run_test()))
+    routed_experts = payload["choices"][0]["routed_experts"]
+    assert isinstance(routed_experts["data"], memoryview)
+    assert routed_experts["shape"] == [2, 2, 2]
+    assert routed_experts["start"] == 2
+    rows = np.frombuffer(
+        base64.b64decode(bytes(routed_experts["data"])),
+        dtype=routed_experts["dtype"],
+    ).reshape(routed_experts["shape"])
+    assert torch.equal(torch.from_numpy(rows.copy()), routed_expert_ids[2:])
 
 
 def test_generation_server_requires_group_id() -> None:
@@ -452,3 +654,82 @@ def test_generation_server_rejects_prompt_without_room_for_output() -> None:
 def test_parse_sampling_config_requires_stop_token_ids() -> None:
     with pytest.raises(ValueError, match="stop_token_ids"):
         _parse_sampling_config({"temperature": 1.0})
+
+
+def _two_turn_trace():
+    from verifiers.v1.types import AssistantMessage as VerifiersAssistantMessage
+
+    first_node = SimpleNamespace(
+        token_ids=[10, 11],
+        mask=[False, True],
+        sampled=True,
+        message=VerifiersAssistantMessage(content="first"),
+    )
+    second_node = SimpleNamespace(
+        token_ids=[12, 13, 14],
+        mask=[False, True, True],
+        sampled=True,
+        message=VerifiersAssistantMessage(content="second"),
+    )
+    return SimpleNamespace(
+        nodes=[first_node, second_node],
+        branches=[
+            SimpleNamespace(
+                nodes=[first_node, second_node],
+                token_ids=[10, 11, 12, 13, 14],
+                logprobs=[0.0, -0.1, 0.0, -0.2, -0.3],
+                routed_experts=None,
+            )
+        ],
+    )
+
+
+def test_verifiers_trace_attaches_each_generations_topk_rows() -> None:
+    # Generations are keyed by (prompt length, completion tokens): prompts [10] and
+    # [10, 11, 12] sampled completions [11] and [13, 14].
+    topk_by_generation = {
+        (1, (11,)): (torch.tensor([[11, 7]]), torch.tensor([[-0.1, -2.0]])),
+        (3, (13, 14)): (
+            torch.tensor([[13, 8], [14, 9]]),
+            torch.tensor([[-0.2, -1.5], [-0.3, -1.2]]),
+        ),
+    }
+    turns = VerifiersRollouter.trace_to_rollout_turns(
+        trace=_two_turn_trace(),
+        generation_metadata=VerifiersGenerationMetadata(
+            min_policy_version=3,
+            max_policy_version=4,
+            metrics=[],
+            topk_by_generation=topk_by_generation,
+        ),
+        group_id=5,
+        rollout_id=2,
+    )
+
+    assert [turn.completion_token_ids for turn in turns] == [[11], [13, 14]]
+    assert [turn.completion_topk_token_ids.tolist() for turn in turns] == [
+        [[11, 7]],
+        [[13, 8], [14, 9]],
+    ]
+    torch.testing.assert_close(
+        turns[1].completion_topk_logprobs, torch.tensor([[-0.2, -1.5], [-0.3, -1.2]])
+    )
+
+
+def test_verifiers_trace_rejects_a_node_without_its_topk_rows() -> None:
+    # Top-k was requested, but no generation produced the second node's tokens.
+    topk_by_generation = {
+        (1, (11,)): (torch.tensor([[11, 7]]), torch.tensor([[-0.1, -2.0]])),
+    }
+    with pytest.raises(ValueError, match="top-k logprobs are unknown"):
+        VerifiersRollouter.trace_to_rollout_turns(
+            trace=_two_turn_trace(),
+            generation_metadata=VerifiersGenerationMetadata(
+                min_policy_version=3,
+                max_policy_version=4,
+                metrics=[],
+                topk_by_generation=topk_by_generation,
+            ),
+            group_id=5,
+            rollout_id=2,
+        )

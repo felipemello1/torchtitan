@@ -28,17 +28,15 @@ from torchtitan.config import DebugConfig, OverrideConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import (
     apply_transforms,
-    LMHeadFP32OutputConverter,
-    ModelConfigConverter,
     ModelConfigTransformContext,
     TokenDispatcherTransform,
 )
 from torchtitan.models.common.config_utils import decoder_vocab_size
-from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.token_dispatcher import DeepEPTokenDispatcher
 from torchtitan.models.gpt_oss import build_model_config as build_gpt_oss_model_config
 from torchtitan.models.kimi_k3 import build_model_config as build_kimi_k3_model_config
 from torchtitan.models.qwen3 import build_model_config
+from torchtitan.models.qwen3_5 import build_model_config as build_qwen3_5_model_config
 from torchtitan.rl.components.batcher import Batcher
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
@@ -51,7 +49,6 @@ from torchtitan.rl.trainer import Trainer
 from torchtitan_recipes.rl.alphabet_sort import (
     _alphabet_sort_rollouter_config,
     _BATCH_INVARIANT_DEBUG,
-    _build_qwen3_5_rl_model_config,
     rl_grpo_qwen3_0_6b_varlen,
     rl_grpo_qwen3_0_6b_varlen_batch_invariant,
     rl_grpo_qwen3_0_6b_varlen_no_compile,
@@ -75,7 +72,6 @@ def rl_grpo_gpt_oss_debug_varlen(*, seq_len: int = 2048) -> Controller.Config:
         "debugmodel",
         seq_len=seq_len,
         attn_backend="varlen",
-        converters=[LMHeadFP32OutputConverter.Config()],
     )
     return Controller.Config(
         model=model_config,
@@ -161,7 +157,6 @@ def rl_grpo_gpt_oss_debug_varlen_batch_invariant() -> Controller.Config:
         "debugmodel",
         seq_len=seq_len,
         attn_backend="varlen",
-        converters=[LMHeadFP32OutputConverter.Config()],
     )
     # Local compile regions do not support batch-invariant mode.
     model_config.local_compile_regions = []
@@ -255,7 +250,6 @@ def rl_grpo_qwen3_moe_debug_varlen() -> Controller.Config:
         "debugmodel_moe",
         seq_len=seq_len,
         attn_backend="varlen",
-        converters=[LMHeadFP32OutputConverter.Config()],
     )
     return Controller.Config(
         model=model_config,
@@ -342,7 +336,6 @@ def rl_grpo_qwen3_moe_debug_deepep() -> Controller.Config:
         "debugmodel_moe",
         seq_len=config.trainer.training.max_context_length,
         attn_backend="varlen",
-        converters=[LMHeadFP32OutputConverter.Config()],
     )
     loss_config = config.trainer.loss
     assert isinstance(loss_config, ChunkedLossWrapper.Config)
@@ -403,7 +396,6 @@ def rl_grpo_qwen3_moe_debug_varlen_batch_invariant(
         "debugmodel_moe",
         seq_len=seq_len,
         attn_backend="varlen",
-        converters=[LMHeadFP32OutputConverter.Config()],
     )
     # Local compile regions do not support batch-invariant mode.
     model_config.local_compile_regions = []
@@ -480,7 +472,7 @@ def rl_grpo_qwen3_moe_debug_varlen_batch_invariant(
 def rl_grpo_qwen3_5_debug_varlen(*, seq_len: int = 2048) -> Controller.Config:
     """Random-init Qwen3.5 GRPO config for CI."""
     num_samples_per_prompt = 8
-    model_config = _build_qwen3_5_rl_model_config(
+    model_config = build_qwen3_5_model_config(
         "debugmodel", seq_len=seq_len, attn_backend="varlen"
     )
     return Controller.Config(
@@ -571,27 +563,9 @@ def rl_grpo_qwen3_5_debug_varlen_batch_invariant(
     return config
 
 
-def _build_kimi_k3_rl_model_config(
-    flavor: str,
-    *,
-    seq_len: int,
-    attn_backend: str = "varlen",
-    converters: list[ModelConfigConverter.Config] | None = None,
-) -> Decoder.Config:
-    """``kimi_k3.build_model_config`` for RL, with the lm_head fp32 cast always on."""
-    converters = list(converters or [])
-    converters.append(LMHeadFP32OutputConverter.Config())
-    return build_kimi_k3_model_config(
-        flavor,
-        seq_len=seq_len,
-        attn_backend=attn_backend,
-        converters=converters,
-    )
-
-
 def rl_grpo_kimi_k3_debug_varlen(*, seq_len: int = 2048) -> Controller.Config:
     """Random-init Kimi K3 GRPO config for Blackwell integration testing."""
-    model_config = _build_kimi_k3_rl_model_config(
+    model_config = build_kimi_k3_model_config(
         "debugmodel", seq_len=seq_len, attn_backend="varlen"
     )
     model_config.local_compile_regions = []

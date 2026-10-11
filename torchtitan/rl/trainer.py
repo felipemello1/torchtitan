@@ -24,13 +24,18 @@ from torchtitan.config.validation import validate_model_training_config
 from torchtitan.distributed import maybe_apply_numa_binding, utils as dist_utils
 from torchtitan.distributed.utils import get_local_tensor
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
+from torchtitan.models.common.moe import (
+    collect_routing_mismatch_metrics,
+    TokenChoiceTopKRouter,
+)
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.observability.metrics import compute_training_performance_metrics
 from torchtitan.protocols.model import BaseModel
 from torchtitan.rl.components.checkpointer import CONTROLLER_STATE_KEY, MirroredState
+from torchtitan.rl.distributed.microbatch_ref import MicrobatchRef, MicrobatchStream
 from torchtitan.rl.observability.controller import combine_microbatch_metrics
-from torchtitan.rl.types import OptimizerStepOutput, TrainingMicrobatch
+from torchtitan.rl.types import OptimizerStepOutput
 from torchtitan.tools import utils
 from torchtitan.training_engine import TrainingEngine
 
@@ -56,6 +61,11 @@ class Trainer(Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(TrainingEngine.Config):
         """Trainer configuration for optimizer, training, and parallelism."""
+
+        replay_routed_experts: bool = False
+        """MoE only. True: route real tokens to the experts the generator chose (needs
+        `VLLMGenerator.Config.return_routed_experts`). False: route with the trainer's own
+        top-k. Both log how often the two differ (`moe_routing/*`) when the ids arrive."""
 
         def __post_init__(self) -> None:
             TrainingEngine.Config.__post_init__(self)
@@ -90,6 +100,10 @@ class Trainer(Configurable):
         self.config = config
         model_config = copy.deepcopy(model_config)
         model_config.set_sharding_(config.parallelism)
+        for _, router_config, _, _ in model_config.traverse(
+            TokenChoiceTopKRouter.Config
+        ):
+            router_config.replay_routed_experts = config.replay_routed_experts
 
         if config.override.imports:
             apply_overrides(config.override, model_config)
@@ -237,15 +251,16 @@ class Trainer(Configurable):
     @sl.log_trace_span("forward_backward")
     async def forward_backward(
         self,
-        training_data: list[list[TrainingMicrobatch]],
+        training_data: list[list[MicrobatchRef]],
         global_loss_token_counts: torch.Tensor,
         global_routing_token_counts: torch.Tensor,
     ) -> dict[str, float]:
         """Run one optimizer step's forward/backward microbatches.
 
         Args:
-            training_data: Microbatch-major grid with shape
-                ``[num_microbatches][dp_degree]``.
+            training_data: Microbatch-major grid of `MicrobatchRef`s with shape
+                ``[num_microbatches][dp_degree]``. This rank reads only its column,
+                a few microbatches ahead of training.
             global_loss_token_counts: Per-objective loss-token counts across the
                 global batch.
             global_routing_token_counts: Per-depth non-padding routing-token
@@ -260,13 +275,30 @@ class Trainer(Configurable):
         )
         engine = self.engine
         self._step_compute_start = time.perf_counter()
-        self._step_num_tokens_per_dp_rank = sum(
-            rank_batches[self.dp_rank].labels.numel() for rank_batches in training_data
+        # TODO: the cp * tp ranks of a DP replica read the same column. Reading it once per
+        # replica and broadcasting it would cut the controller's reads by cp * tp: over the TCP
+        # fallback, 16 readers get ~230 MB/s each, vs ~1 GB/s for one. Needs a per-replica
+        # process group, with the broadcast on the main thread to keep NCCL calls in order.
+        refs = [rank_refs[self.dp_rank] for rank_refs in training_data]
+        # The batcher pads every microbatch to the same token count.
+        self._step_num_tokens_per_dp_rank = (
+            len(refs) * self.config.training.num_tokens_per_microbatch_per_dp_rank
         )
+        # Every rank receives the whole grid of refs, so all ranks agree on joining the reduce
+        # below. A ref keeps each microbatch's `model_kwargs` keys, so no read is needed.
+        has_routed_expert_ids = any(
+            "routed_expert_ids" in ref.fields["model_kwargs"]
+            for rank_refs in training_data
+            for ref in rank_refs
+        )
+        if self.config.replay_routed_experts and not has_routed_expert_ids:
+            raise ValueError(
+                "trainer.replay_routed_experts is set, but no microbatch carries routed "
+                "expert ids: the rollouter must copy `Completion.routed_expert_ids` into "
+                "`RolloutTurn.routed_expert_ids`."
+            )
         result = engine.forward_backward(
-            microbatch_groups=[
-                [rank_batches[self.dp_rank]] for rank_batches in training_data
-            ],
+            microbatch_groups=MicrobatchStream(refs),
             global_loss_token_counts=global_loss_token_counts,
             global_routing_token_counts=global_routing_token_counts,
         )
@@ -287,7 +319,14 @@ class Trainer(Configurable):
                 )
             )
 
-        return combine_microbatch_metrics(microbatch_metrics)
+        metrics = combine_microbatch_metrics(microbatch_metrics)
+        if has_routed_expert_ids:
+            metrics.update(
+                collect_routing_mismatch_metrics(
+                    engine.model_parts, engine.parallelism_context
+                )
+            )
+        return metrics
 
     @sl.log_trace_span("optim_step")
     async def optim_step(
@@ -333,7 +372,6 @@ class Trainer(Configurable):
                 "trainer/grad_norm/mean": float(grad_norm.item()),
                 **{f"trainer/{key}": value for key, value in lr_metrics.items()},
                 "trainer/policy_version": float(self.policy_version),
-                "trainer/tokens_per_second": performance["tokens_per_second"],
                 "trainer/tflops": performance["tflops"],
                 "trainer/memory/max_active_gib": device_mem_stats.max_active_gib,
                 "trainer/memory/max_active_percent": device_mem_stats.max_active_pct,

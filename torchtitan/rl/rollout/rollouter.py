@@ -24,10 +24,12 @@ from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.environment import MessageEnv, TokenEnv
 from torchtitan.rl.rollout.types import (
     GenerateFn,
+    ReleaseSessionFn,
     Rollout,
     RolloutGroup,
     RolloutStatus,
     RolloutTurn,
+    split_prompt,
 )
 from torchtitan.rl.rubric import Rubric, RubricOutput
 from torchtitan.rl.types import RolloutTurnID
@@ -156,6 +158,7 @@ class Rollouter(Configurable):
         tokenizer_config: HuggingFaceTokenizer.Config,
         renderer_config: RendererConfig,
         hf_assets_path: str,
+        release_session_fn: ReleaseSessionFn | None = None,
     ) -> None:
         """Spawn and initialize the owned worker proc mesh and actor pool."""
         # Import lazily to avoid a circular dependency through Rollouter.Config.
@@ -177,6 +180,7 @@ class Rollouter(Configurable):
             tokenizer_config=tokenizer_config,
             renderer_config=renderer_config,
             hf_assets_path=hf_assets_path,
+            release_session_fn=release_session_fn,
         )
 
     async def close(self) -> None:
@@ -265,6 +269,7 @@ class RolloutWorker(Configurable):
         self._token_env_config = config.token_env
         self.advantage_estimator: AdvantageEstimator = config.advantage.build()
         self._renderer: Renderer
+        self._release_session_fn: ReleaseSessionFn | None = None
 
     async def setup_async(
         self,
@@ -272,8 +277,10 @@ class RolloutWorker(Configurable):
         tokenizer_config: HuggingFaceTokenizer.Config,
         renderer_config: RendererConfig,
         hf_assets_path: str,
+        release_session_fn: ReleaseSessionFn | None = None,
     ) -> None:
         """Build runtime dependencies after the worker actor is spawned."""
+        self._release_session_fn = release_session_fn
         tokenizer = tokenizer_config.build(tokenizer_path=hf_assets_path)
         self._renderer = renderer_config.build(tokenizer=tokenizer)
 
@@ -418,7 +425,13 @@ class RolloutWorker(Configurable):
         Returns:
             One unscored `Rollout`; `run_group` fills its reward later.
         """
+        # Per-sample sticky key: a sample's turns reuse one generator's prefix cache.
+        routing_session_id = RolloutTurnID(
+            group_id=group_id, rollout_id=rollout_id, turn_id=0
+        ).to_string(include_turn=False)
         turns: list[RolloutTurn] = []
+        # The previous turn's prompt + completion; each turn stores only what its prompt adds to it
+        previous_token_ids: list[int] = []
         status = RolloutStatus.ERROR
         try:
             env_step = await env.init()
@@ -434,22 +447,29 @@ class RolloutWorker(Configurable):
                     prompt_token_ids=env_step.next_prompt_token_ids,
                     request_id=turn_rollout_id.to_string(),
                     group_id=group_id,
-                    # Per-sample sticky key: a sample's turns reuse one generator's prefix cache.
-                    routing_session_id=turn_rollout_id.to_string(include_turn=False),
+                    routing_session_id=routing_session_id,
                     sampling_config=sampling,
                 )
 
                 # env call
                 next_env_step = await env.step(completion)
 
-                # full snapshot of this turn from a token and message perspective
+                # this turn from a token and message perspective
+                prompt_token_ids = env_step.next_prompt_token_ids or []
+                prompt_prefix_len, prompt_delta_token_ids = split_prompt(
+                    prompt_token_ids, previous_token_ids
+                )
                 turns.append(
                     RolloutTurn(
                         rollout_id=turn_rollout_id,
-                        prompt_token_ids=env_step.next_prompt_token_ids or [],
+                        prompt_prefix_len=prompt_prefix_len,
+                        prompt_delta_token_ids=prompt_delta_token_ids,
                         prompt_messages=env_step.next_prompt_messages or [],
                         completion_token_ids=completion.token_ids,
                         completion_logprobs=completion.token_logprobs,
+                        routed_expert_ids=completion.routed_expert_ids,
+                        completion_topk_token_ids=completion.topk_token_ids,
+                        completion_topk_logprobs=completion.topk_logprobs,
                         completion_message=next_env_step.completion_message,
                         env_messages=next_env_step.env_messages,
                         env_rewards=next_env_step.env_rewards,
@@ -459,6 +479,7 @@ class RolloutWorker(Configurable):
                     )
                 )
 
+                previous_token_ids = prompt_token_ids + completion.token_ids
                 # holds the input for next generation call
                 env_step = next_env_step
 
@@ -472,6 +493,16 @@ class RolloutWorker(Configurable):
             )
             status = RolloutStatus.ERROR
 
+        if self._release_session_fn is not None:
+            try:
+                await self._release_session_fn(
+                    group_id=group_id, routing_session_id=routing_session_id
+                )
+            except Exception:
+                # Not fatal: the group's release frees the session too.
+                logger.exception(
+                    "releasing routing session %s failed", routing_session_id
+                )
         return Rollout(
             group_id=group_id,
             rollout_id=rollout_id,
