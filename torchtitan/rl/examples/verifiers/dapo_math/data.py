@@ -23,7 +23,7 @@ from torchtitan.rl.examples.dapo_math import (
     MathVerifyPool,
 )
 
-# Threads and grader processes start on the first score, not at import.
+# Threads and Math-Verify processes start on the first score, not at import.
 _MATH_VERIFY_POOL = MathVerifyPool(num_processes=4, timeout_seconds=5.0)
 
 

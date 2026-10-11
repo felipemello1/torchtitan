@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from torchtitan.rl.examples.dapo_math.data import DapoMathSample
-from torchtitan.rl.examples.dapo_math.grader import MathVerifyPool
+from torchtitan.rl.examples.dapo_math.math_verify_pool import MathVerifyPool
 from torchtitan.rl.rollout import Rollout
 from torchtitan.rl.rubric import RewardFn
 
@@ -20,12 +20,13 @@ class RewardMathVerify(RewardFn):
     @dataclass(kw_only=True, slots=True)
     class Config(RewardFn.Config):
         timeout_seconds: float = 5.0
-        """Limit to score one answer, counted from when a grader process receives it
+        """Limit to score one answer, counted from when a Math-Verify process receives it
         (queue wait and process start excluded); a slower answer scores 0. Most answers
         take 2-20 ms; the slowest symbolic answers we measured took ~4 s."""
 
         num_processes: int = 4
-        """Grader processes per rollout worker (~70 MB each); each scores one answer at a time."""
+        """Math-Verify processes per rollout worker (~70 MB each); each scores one answer
+        at a time."""
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)

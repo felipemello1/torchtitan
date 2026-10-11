@@ -10,7 +10,10 @@ from torchtitan.rl.examples.dapo_math.data import (
     DapoMathSample,
 )
 from torchtitan.rl.examples.dapo_math.env import DapoMathEnv
-from torchtitan.rl.examples.dapo_math.grader import MathVerifyPool, score_math_response
+from torchtitan.rl.examples.dapo_math.math_verify_pool import (
+    MathVerifyPool,
+    score_math_response,
+)
 from torchtitan.rl.examples.dapo_math.rubric import RewardMathVerify
 
 __all__ = [

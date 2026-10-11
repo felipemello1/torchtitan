@@ -4,9 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Math-Verify scoring, run in grader processes with a hard timeout.
+"""Math-Verify scoring, run in worker processes with a hard timeout.
 
-`MathVerifyPool` runs this file as a script in each grader process, so it must not
+`MathVerifyPool` runs this file as a script in each worker process, so it must not
 import torchtitan: importing `torchtitan.rl` loads vLLM (~9 s and ~1 GB per process).
 """
 
@@ -34,12 +34,12 @@ _PR_SET_PDEATHSIG = 1
 
 
 class MathVerifyPool:
-    """Score answers in grader processes, so an answer that hangs Math-Verify cannot
+    """Score answers in worker processes, so an answer that hangs Math-Verify cannot
     stall the caller.
 
-    Each grader process (a "worker" below) scores one answer at a time. A worker that
-    gives no score within `timeout_seconds` is killed, the answer scores 0, and the next
-    score starts a new worker. Pool threads, not the caller's event loop, wait on them.
+    Each worker process scores one answer at a time. A worker that gives no score within
+    `timeout_seconds` is killed, the answer scores 0, and the next score starts a new
+    worker. Pool threads, not the caller's event loop, wait on them.
 
     Why processes: for `\\boxed{2000^{2000^{2000}}}`, sympy computes 2000**(2000**2000)
     in one C call that never finishes and holds the GIL. In-process:

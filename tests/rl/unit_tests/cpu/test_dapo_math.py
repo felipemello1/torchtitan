@@ -20,7 +20,7 @@ from torchtitan.rl.examples.dapo_math import (
     DapoMathEnv,
     DapoMathSample,
     data as math_data,
-    grader,
+    math_verify_pool,
     MathVerifyPool,
     RewardMathVerify,
     score_math_response,
@@ -170,7 +170,7 @@ def test_reward_scores_a_hung_answer_zero_while_other_answers_finish() -> None:
 
     start = time.monotonic()
     assert asyncio.run(score_all()) == [0.0, 1.0, 1.0, 1.0, 1.0]
-    # The 2 s timeout, plus up to 5 s to start the grader process.
+    # The 2 s timeout, plus up to 5 s to start the worker process.
     assert finish_seconds["hung"] < 2.0 + 5.0
     assert max(finish_seconds[f"normal_{i}"] for i in range(4)) < finish_seconds["hung"]
 
@@ -188,7 +188,7 @@ def test_math_verify_pool_raises_when_a_process_fails_to_start(
     # A process that prints something other than "ready" and keeps running.
     script = tmp_path / "noisy.py"
     script.write_text("import sys\nprint('noise', flush=True)\nsys.stdin.read()\n")
-    monkeypatch.setattr(grader, "__file__", str(script))
+    monkeypatch.setattr(math_verify_pool, "__file__", str(script))
     pool = MathVerifyPool(num_processes=1, timeout_seconds=1.0)
     with pytest.raises(RuntimeError, match="noise"):
         asyncio.run(pool.score(r"\boxed{34}", "34"))
