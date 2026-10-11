@@ -835,6 +835,7 @@ class _FakeValidation:
 
     def __init__(self) -> None:
         self.events: list[tuple[str, int]] = []
+        self.beside_training: dict[int, bool] = {}
         self._end_events: dict[int, asyncio.Event] = {}
         self._errors: dict[int, Exception] = {}
 
@@ -842,8 +843,11 @@ class _FakeValidation:
     def started_steps(self) -> list[int]:
         return [step for event, step in self.events if event == "start"]
 
-    async def __call__(self, *, step: int) -> list[m.Metric]:
+    async def __call__(
+        self, *, step: int, beside_training: bool = False
+    ) -> list[m.Metric]:
         self.events.append(("start", step))
+        self.beside_training[step] = beside_training
         await self._end_event(step).wait()
         self.events.append(("end", step))
         if step in self._errors:
@@ -1155,6 +1159,8 @@ def test_overlapped_validation_before_and_after_training() -> None:
         ("end", 4),
     ]
     assert _logged_steps(controller, is_validation=True) == [2, 4, 4]
+    # Only the post-training pass blocks.
+    assert validation.beside_training == {0: True, 3: True, 4: False}
     controller._log_reward_delta.assert_called_once_with(
         {"validation_reward/mean": 0.0}, {"validation_reward/mean": 4.0}
     )
@@ -1185,3 +1191,31 @@ def test_close_cancels_a_running_pass_before_closing_the_rollouter() -> None:
     asyncio.run(run())
     assert controller._validation_task.cancelled()
     assert pass_done_at_rollouter_close == [True]
+
+
+@pytest.mark.parametrize(
+    "beside_training, key",
+    [
+        (False, "timing/validation/blocking"),
+        (True, "timing/validation/beside_training"),
+    ],
+)
+def test_validation_wall_time_says_whether_the_pass_blocked(
+    beside_training, key
+) -> None:
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(validation=ValidationConfig(steps=1))
+    )
+    controller._rollouter = SimpleNamespace(
+        get_validation_samples=lambda steps: ["prompt"]
+    )
+    controller._sampling = SamplingConfig()
+    controller.rollout_recorder = Mock()
+
+    async def collect(*, samples, sampling, step):
+        return [], []
+
+    controller._collect_validation_rollouts = collect
+    metrics = asyncio.run(controller.validate(step=5, beside_training=beside_training))
+    assert [metric.key for metric in metrics] == [key]
