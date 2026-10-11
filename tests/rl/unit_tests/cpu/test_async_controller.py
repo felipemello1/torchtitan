@@ -1806,6 +1806,9 @@ def test_validation_gives_each_group_its_own_seed(
 ) -> None:
     """A seeded run gets one seed per validation group, so repeat passes over a prompt differ."""
     controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        generator_router=SimpleNamespace(admission=None)
+    )
     controller._make_generate_fn = Mock()
     controller._rollouter = Mock()
     controller._rollouter.run_group_rollouts = AsyncMock(
