@@ -186,10 +186,15 @@ class TokenChoiceTopKRouter(Module):
         replay_routed_experts: bool = True
         """Only read when ``forward`` gets ``routed_expert_ids_TK``. True: real tokens go to those
         experts. False: keep this router's top-k and only count how often it differs."""
+        freeze_gate: bool = False
+        """Keep `gate.weight` (and `gate.bias`, if any) at their loaded values: no gradient, no
+        optimizer state. The gate's input still gets gradients."""
 
     def __init__(self, config: Config):
         super().__init__()
         self.gate = config.gate.build()
+        if config.freeze_gate:
+            self.gate.requires_grad_(False)
         self.num_experts = config.num_experts
         self.top_k = config.top_k
         self.score_func = config.score_func.build()
@@ -1203,11 +1208,11 @@ def register_moe_quantile_balancing_hook(
             expert_bias_E = moe.expert_bias_E
             assert expert_bias_E is not None
             quantile_balancer = router.quantile_balancer
+            next_expert_bias_E = quantile_balancer.estimate_expert_bias(
+                histogram_EB,
+                expert_bias_E,
+            )
             if not moe.freeze_expert_bias:
-                next_expert_bias_E = quantile_balancer.estimate_expert_bias(
-                    histogram_EB,
-                    expert_bias_E,
-                )
                 expert_bias_E.copy_(next_expert_bias_E)
             quantile_balancer.required_bias_histogram_EB.zero_()
             router.tokens_per_expert_E.zero_()

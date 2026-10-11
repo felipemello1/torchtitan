@@ -30,12 +30,7 @@ from torchtitan.models.qwen3 import build_model_config
 from torchtitan.models.qwen3_5 import build_model_config as build_qwen3_5_model_config
 from torchtitan.rl.components.data import IterableRLDataLoader
 from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
-from torchtitan.rl.controller import (
-    AsyncLoopConfig,
-    Controller,
-    RLModelDefaults,
-    ValidationConfig,
-)
+from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.examples.dapo_math.data import (
     DapoMathDataset,
@@ -385,8 +380,6 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
     """
     config = rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k()
     config.dump_folder = "outputs/rl/qwen3_5_35b_a3b_base_intellect3_math_131k_tonight"
-    # fp32 logits on the trainer and the generator, and every expert bias kept at its loaded value.
-    config.model_defaults = RLModelDefaults(fp32_lm_head=True, freeze_expert_bias=True)
     config.async_loop = dataclasses.replace(
         config.async_loop,
         num_training_steps=300,
