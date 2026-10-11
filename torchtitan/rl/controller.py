@@ -851,8 +851,11 @@ class Controller(Configurable):
             # Place every group before its envs start; validation groups never wait.
             await asyncio.gather(
                 *(
-                    self.generator_router.acquire_group.call_one(-(i + 1))
-                    for i in range(len(samples))
+                    self.generator_router.acquire_group.call_one(
+                        -(i + 1),
+                        num_sessions=self._rollouter.num_sessions(sample, group_size=1),
+                    )
+                    for i, sample in enumerate(samples)
                 )
             )
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
@@ -1241,7 +1244,11 @@ class Controller(Configurable):
                     # holds no sandbox or env process.
                     with sl.log_trace_span("admission_wait"):
                         await self.generator_router.acquire_group.call_one(
-                            work.group_id
+                            work.group_id,
+                            num_sessions=self._rollouter.num_sessions(
+                                work.sample,
+                                group_size=self.config.async_loop.num_samples_per_prompt,
+                            ),
                         )
                 with sl.log_trace_span("rollout_group"):
                     group = await self._rollouter.run_group_rollouts(
