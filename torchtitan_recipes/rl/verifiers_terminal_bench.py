@@ -661,10 +661,10 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
         max_offpolicy_steps=12,
         # Start at (6 + 1) x 24 = 168 groups, the pool; the default 3 x 24 leaves 57% of it idle.
         start_batches=target_offpolicy_steps + 1,
-        # 112 groups keeps each engine's running requests under ~60% KV. At 163, contexts of 30-48
-        # turns pushed KV to ~70%, the prefix cache collapsed (96% -> 15% hits), and every turn
-        # re-prefilled its whole history: decode fell 3x and rollouts hit the 2 h agent timeout.
-        generation_capacity=112,
+        # A stopgap until KV-aware admission: past ~50 turns, 112 groups grew to ~150 running requests
+        # per engine at ~90% KV, idle histories no longer fit, prefix hits fell to 21-85%, and over
+        # half the rollouts hit the 2 h agent timeout. 88 keeps running requests near ~120 (~70% KV).
+        generation_capacity=88,
     )
     # Validate at step 0 and every 10 steps beside training; starting a pass makes the trainer
     # wait only for that step's weight pull.
