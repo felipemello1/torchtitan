@@ -425,6 +425,23 @@ def test_weight_sync_reset_kv_cache_flag_controls_cache_reset(
     asyncio.run(run())
 
 
+def test_pull_model_state_dict_runs_no_gc_collect():
+    """A full collection here stalls decoding while it walks every in-flight request's token lists."""
+
+    async def run() -> None:
+        generator = _generator()
+        generator._prefetched_model_state_dict = {}
+        model = SimpleNamespace(load_state_dict=lambda state_dict: None)
+        generator._get_model = lambda: model
+
+        with patch.object(gc, "collect") as collect:
+            await generator._pull_model_state_dict(version=8)
+
+        collect.assert_not_called()
+
+    asyncio.run(run())
+
+
 def test_sampling_config_rejects_top_p_below_one():
     with pytest.raises(ValueError, match="top_p must be 1.0, got 0.95"):
         SamplingConfig(top_p=0.95)

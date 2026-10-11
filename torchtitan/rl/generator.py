@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import enum
-import gc
 import logging
 import math
 import os
@@ -1576,7 +1575,6 @@ class VLLMGenerator(Configurable):
             self._engine.reset_prefix_cache(
                 reset_running_requests=True,
             )
-        gc.collect()
 
     async def close(self) -> None:
         """Stop the engine loop, which releases the dispatcher and the vLLM engine on exit.
