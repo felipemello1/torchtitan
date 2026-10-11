@@ -310,7 +310,10 @@ def test_group_rewards_get_the_length_reward(monkeypatch) -> None:
             nodes=nodes,
             branches=[
                 SimpleNamespace(
-                    nodes=nodes, token_ids=token_ids, logprobs=[-0.1] * len(token_ids)
+                    nodes=nodes,
+                    token_ids=token_ids,
+                    logprobs=[-0.1] * len(token_ids),
+                    routed_experts=None,
                 )
             ],
             ok=ok,
