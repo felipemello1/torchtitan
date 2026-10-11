@@ -21,6 +21,8 @@ You are playing chess as Black. Play to win.
 
 Each turn you see your pieces and your opponent's pieces, keyed by piece letter and square (Ke1 is a king on e1; P is a pawn), each with its legal moves. The current positions and legal moves are already given: avoid restating them. Analyze which move is best, then end your reply with that move, written exactly as listed, inside \boxed{}. For example, "Pe2": ["e4"] means \boxed{e4}, not \boxed{Pe4}; "Bc8": ["Be6"] means \boxed{Be6}, not \boxed{e6} or \boxed{be6}; "Nb1": ["Nbd2"] means \boxed{Nbd2}, not \boxed{Nd2}; "Ph7": ["h8=Q", "h8=N"] means \boxed{h8=Q}, not \boxed{h8}. An x marks a capture: "Nf3": ["Nxe5"] means \boxed{Nxe5}. Pick only from the moves listed under your pieces this turn, not from an earlier turn's list or your opponent's list. An illegal or missing move loses the game.
 
+Checkmating your opponent scores 1. The game stops after 60 plies (a ply is one move by either side); a game that reaches that limit without checkmate scores 0.25 to 0.75 by material (queen 9, rook 5, bishop and knight 3, pawn 1), and a stalemate scores at most 0.5.
+
 White played e4.
 
 Your pieces (Black) and their legal moves:
@@ -63,7 +65,7 @@ Opponent pieces (White) and the moves they could make on their turn:
   "Pe4": ["e5"]
 }
 
-Your move as Black. Write your best legal move inside \boxed{}.
+Your move as Black (ply 2 of 60). Write your best legal move inside \boxed{}.
 ```
 
 The player's own legal moves are shuffled every turn (the opponent's are sorted): in python-chess's fixed order, always playing the first listed move beats a random mover. Each turn appends the opponent's move and the new pieces to the player's chat. The model's reasoning stays in its history, so a player's whole game packs into one training sample.
@@ -78,7 +80,7 @@ A game ends on:
 
 The training reward (`ChessGame.rewards`), with `played` = plies played / `max_plies`:
 
-- win by checkmate: 1, at any length;
+- win by checkmate: `ChessSelfPlayWorker.Config.checkmate_reward` (1 by default), at any length;
 - ply cap, or the opponent forfeits: a draw, 0.5, moved halfway toward the material score, so 0.25 to 0.75 (an opponent's forfeit is not a free win);
 - stalemate or insufficient material: 0.5 * `played`;
 - checkmated: -0.25 * (1 - `played`);

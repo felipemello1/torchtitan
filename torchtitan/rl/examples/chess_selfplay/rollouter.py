@@ -76,9 +76,15 @@ class ChessSelfPlayWorker(RolloutWorker):
         """Stockfish binary, a path or a name on `PATH`, for bot games and for scoring the policy's
         moves (centipawn loss). `None`: self-play only, and no move scoring."""
 
+        checkmate_reward: float = 1.0
+        """The winner's reward for a checkmate, at any length; the prompt states it. Above 0.75, the
+        most a game cut at `max_plies` scores, a mate beats every other ending; 10 makes a mate
+        dominate its group's advantages."""
+
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self._max_plies = config.max_plies
+        self._checkmate_reward = config.checkmate_reward
         if (
             config.stockfish_path is not None
             and shutil.which(config.stockfish_path) is None
@@ -126,6 +132,7 @@ class ChessSelfPlayWorker(RolloutWorker):
                 max_plies=self._max_plies,
                 seed=sample.seed + game_idx,
                 bot=bot,
+                checkmate_reward=self._checkmate_reward,
             )
             for game_idx, bot in enumerate(bots)
         ]
