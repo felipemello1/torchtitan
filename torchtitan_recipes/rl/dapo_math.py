@@ -321,7 +321,7 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k() -> Controller.Config:
             ),
             # Worst case, every EP rank routes all its tokens to one rank; a smaller scratch
             # buffer is an illegal memory access.
-            dist_moe=DistMoeRuntime.Config(
+            dist_moe_runtime=DistMoeRuntime.Config(
                 scratch_capacity_factor=float(expert_parallel_degree)
             ),
             # A full resumable checkpoint (~420 GB) every 10 steps, all kept for offline eval.

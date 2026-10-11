@@ -14,7 +14,7 @@ actor that lists it::
     trainer.override = OverrideConfig(
         imports=["torchtitan_recipes.overrides.dist_moe.dist_moe_routed_experts"]
     )
-    trainer.dist_moe = DistMoeRuntime.Config(scratch_capacity_factor=4.0)
+    trainer.dist_moe_runtime = DistMoeRuntime.Config(scratch_capacity_factor=4.0)
 
 The generator keeps the stock ``RoutedExperts``. Checkpoint and weight-sync keys
 do not change.
@@ -31,7 +31,7 @@ __all__ = ["dist_moe_routed_experts"]
 
 @override(
     target=RoutedExperts.Config,
-    description="BF16 Dist-MoE routed experts (SM100+); needs trainer.dist_moe.",
+    description="BF16 Dist-MoE routed experts (SM100+); needs trainer.dist_moe_runtime.",
 )
 def dist_moe_routed_experts(cfg: RoutedExperts.Config) -> Module.Config:
     # The functional WGRAD path (gradients returned through autograd), as v1 and
