@@ -190,6 +190,13 @@ def test_rewards_make_a_forfeit_cost_more_than_a_loss_and_no_free_win() -> None:
         # a forfeit, however late, costs more than a checkmate, however early
         assert forfeited.rewards[chess.WHITE] < mate.rewards[chess.WHITE]
 
+        # `checkmate_reward` pays the winner; the loser's reward does not change
+        mate_10 = ChessGame(
+            sample=_SELF_PLAY, max_plies=40, seed=0, checkmate_reward=10.0
+        )
+        await _play_moves(mate_10, ["f3", "e5", "g4", "Qh4#"])
+        assert mate_10.rewards == {**mate.rewards, chess.BLACK: 10.0}
+
         # forfeiting before the first move costs the full -1
         early = _new_game()
         await early.play(chess.WHITE, "Ke9")
@@ -397,6 +404,11 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
         assert "means \\boxed{Nbd2}, not \\boxed{Nd2}" in prompt
         assert "means \\boxed{h8=Q}, not \\boxed{h8}" in prompt
         assert "An x marks a capture" in prompt
+        assert (
+            "Checkmating your opponent scores 1. The game stops after 40 plies"
+            in prompt
+        )
+        assert "(ply 1 of 40)" in prompt
 
         white_step = asyncio.create_task(
             white.step({"role": "assistant", "content": "I open. \\boxed{e4}"})
@@ -407,6 +419,7 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
         step_output = await asyncio.wait_for(white_step, timeout=1)
         assert not step_output.done
         assert step_output.env_messages[0]["content"].startswith("Black played e5.")
+        assert "(ply 3 of 40)" in step_output.env_messages[0]["content"]
 
         step_output = await white.step({"role": "assistant", "content": "\\boxed{Ke9}"})
         assert step_output.done
@@ -547,7 +560,12 @@ class _ScriptedPolicy:
 
 
 async def _run_group(
-    moves_by_rollout, *, group_size, sample=_SELF_PLAY, truncate_at=None
+    moves_by_rollout,
+    *,
+    group_size,
+    sample=_SELF_PLAY,
+    truncate_at=None,
+    checkmate_reward=1.0,
 ):
     worker = ChessSelfPlayWorker.Config(
         rubric=Rubric.Config(
@@ -557,6 +575,7 @@ async def _run_group(
         token_env=TokenEnv.Config(step_timeout_s=None),
         max_plies=40,
         stockfish_path=None,
+        checkmate_reward=checkmate_reward,
     ).build()
     tokenizer_config = HuggingFaceTokenizer.Config()
     await worker.setup_async(
@@ -636,6 +655,18 @@ def test_worker_trains_both_colors_with_per_color_advantages() -> None:
         assert reduced[
             "chess_games/forfeits_per_reply_self_play/mean"
         ] == pytest.approx(1 / 6)
+
+    asyncio.run(run())
+
+
+def test_worker_pays_its_checkmate_reward() -> None:
+    async def run() -> None:
+        # fool's mate: Black mates on ply 4
+        group = await _run_group(
+            {0: ["f3", "g4"], 1: ["e5", "Qh4#"]}, group_size=1, checkmate_reward=10.0
+        )
+        by_id = {rollout.rollout_id: rollout for rollout in group.rollouts}
+        assert [by_id[i].reward for i in range(2)] == pytest.approx([-0.225, 10.0])
 
     asyncio.run(run())
 

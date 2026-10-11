@@ -84,7 +84,11 @@ class ChessPlayerEnv(MessageEnv):
             '"Ph7": ["h8=Q", "h8=N"] means \\boxed{h8=Q}, not \\boxed{h8}. An x marks a capture: '
             '"Nf3": ["Nxe5"] means \\boxed{Nxe5}. Pick only from the moves listed under your '
             "pieces this turn, not from an earlier turn's list or your opponent's list. An illegal "
-            "or missing move loses the game."
+            "or missing move loses the game.\n\n"
+            f"Checkmating your opponent scores {self._game.checkmate_reward:g}. The game stops after "
+            f"{self._game.max_plies} plies (a ply is one move by either side); a game that reaches "
+            "that limit without checkmate scores 0.25 to 0.75 by material (queen 9, rook 5, bishop "
+            "and knight 3, pawn 1), and a stalemate scores at most 0.5."
         )
         return MessageEnvInitOutput(
             init_prompt_messages=[
@@ -141,6 +145,7 @@ class ChessGame:
         max_plies: int,
         seed: int,
         bot: StockfishBot | None = None,
+        checkmate_reward: float = 1.0,
     ) -> None:
         self.board = chess.Board(sample.fen)
         self.scores: dict[chess.Color, float] | None = None
@@ -149,6 +154,8 @@ class ChessGame:
         """Why the game ended, e.g. "checkmate", "max_plies", "illegal_move"; `None` while it runs."""
         self.forfeiter: chess.Color | None = None
         """The color that lost by forfeit (an illegal move or `forfeit`); `None` otherwise."""
+        self.checkmate_reward = checkmate_reward
+        """The winner's training reward for a checkmate, at any length."""
         self._max_plies = max_plies
         self._bot = bot
         self._bot_color = None if bot is None else not sample.policy_color
@@ -166,7 +173,7 @@ class ChessGame:
     def rewards(self) -> dict[chess.Color, float]:
         """Each color's training reward once the game is over; the rules are in the example's README.
 
-        Example (max_plies=60):
+        Example (max_plies=60, checkmate_reward=1):
 
             max_plies, White up a knight              -> {WHITE: 0.59, BLACK: 0.41}
             White checkmates on ply 19                -> {WHITE: 1.0, BLACK: -0.25 * (1 - 19 / 60) = -0.17}
@@ -176,7 +183,10 @@ class ChessGame:
         played = self.num_plies / self._max_plies
         if self.end_reason == "checkmate":
             loser = self.board.turn
-            return {not loser: 1.0, loser: _CHECKMATED_REWARD * (1.0 - played)}
+            return {
+                not loser: self.checkmate_reward,
+                loser: _CHECKMATED_REWARD * (1.0 - played),
+            }
         if self.end_reason != "max_plies" and self.forfeiter is None:
             return {chess.WHITE: 0.5 * played, chess.BLACK: 0.5 * played}
         rewards = self.material_rewards
@@ -190,6 +200,10 @@ class ChessGame:
         the material score."""
         white_reward = 0.5 + _MATERIAL_WEIGHT * (material_score(self.board) - 0.5)
         return {chess.WHITE: white_reward, chess.BLACK: 1.0 - white_reward}
+
+    @property
+    def max_plies(self) -> int:
+        return self._max_plies
 
     @property
     def num_plies(self) -> int:
@@ -254,7 +268,8 @@ class ChessGame:
             lines += ["", f"{me} is in check."]
         lines += [
             "",
-            f"Your move as {me}. Write your best legal move inside \\boxed{{}}.",
+            f"Your move as {me} (ply {self.num_plies + 1} of {self._max_plies}). Write your best "
+            "legal move inside \\boxed{}.",
         ]
         return "\n".join(lines)
 
