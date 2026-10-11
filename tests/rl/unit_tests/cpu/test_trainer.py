@@ -8,7 +8,7 @@ import asyncio
 import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -254,13 +254,12 @@ def test_forward_backward_uses_global_token_count() -> None:
             fsdp_enabled=False, dp_enabled=False, pp_enabled=False
         ),
         model_parts=[],
-        _preprocess_microbatch_groups=MagicMock(
-            return_value=[("input", "labels", {}, {}) for _ in range(3)]
-        ),
+        _preprocess_microbatch_groups=MagicMock(),
         _run_forward_backward=MagicMock(
             return_value=ForwardBackwardResult(torch.tensor(1.0), [])
         ),
         _cuda_graph_per_accumulation_group_enabled=False,
+        _preprocess_groups_lazily=True,
         sdc_replayer=None,
     )
     microbatch_groups = [[object()], [object()], [object()]]
@@ -276,7 +275,14 @@ def test_forward_backward_uses_global_token_count() -> None:
     engine.garbage_collector.run.assert_called_once_with(1)
     engine.optim.zero_grad.assert_called_once_with(set_to_none=True)
     assert engine.num_accumulation_steps == 3
-    engine._preprocess_microbatch_groups.assert_called_once_with(microbatch_groups)
+    # RL runs eager, so each group is preprocessed inside the accumulation loop.
+    engine._preprocess_microbatch_groups.assert_not_called()
+    [(step_inputs, global_loss_token_counts)] = [
+        call.args for call in engine._run_forward_backward.call_args_list
+    ]
+    assert step_inputs is microbatch_groups
+    torch.testing.assert_close(global_loss_token_counts, torch.tensor(17))
+    torch.testing.assert_close(engine._global_routing_token_counts, torch.tensor([19]))
 
 
 def test_close_stops_training_engine() -> None:
@@ -347,7 +353,7 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
         )
         trainer.engine = engine
         trainer.config = Trainer.Config()
-        trainer.dp_rank = 0
+        trainer.dp_rank = 1
         trainer._reduce_forward_backward_metrics = MagicMock(
             side_effect=lambda *, sum_reduced_metrics, max_reduced_metrics: {
                 key: float(value.item())
@@ -370,19 +376,27 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
             advantages=torch.tensor([1.0]),
         )
 
+        other_rank_ref = SimpleNamespace(read=MagicMock())
+        ref = SimpleNamespace(read=lambda: batch)
+
         result = await Trainer.forward_backward(
             trainer,
-            [[batch], [batch]],
+            [[other_rank_ref, ref], [other_rank_ref, ref]],
             torch.tensor([3]),
             torch.tensor([2]),
         )
 
         engine.forward_backward.assert_called_once_with(
-            microbatch_groups=[[batch], [batch]],
+            microbatch_groups=ANY,
             global_loss_token_counts=torch.tensor([3]),
             global_routing_token_counts=torch.tensor([2]),
         )
-        assert trainer._step_num_tokens_per_dp_rank == 2
+        stream = engine.forward_backward.call_args.kwargs["microbatch_groups"]
+        assert list(stream) == [[batch], [batch]]
+        other_rank_ref.read.assert_not_called()
+        assert trainer._step_num_tokens_per_dp_rank == (
+            2 * trainer.config.training.num_tokens_per_microbatch_per_dp_rank
+        )
         assert trainer._reduce_forward_backward_metrics.call_count == 2
         assert result == {"loss/mean": 3.0, "loss/max": 4.0}
 
