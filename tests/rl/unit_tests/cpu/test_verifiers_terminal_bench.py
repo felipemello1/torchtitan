@@ -24,6 +24,7 @@ from torchtitan.config import ConfigLoader
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
 from torchtitan.rl.controller import Controller, ValidationConfig
+from torchtitan.rl.distributed.routing.admission import KVGrowthEstimateAdmission
 from torchtitan.rl.examples.verifiers import env_server
 from torchtitan.rl.examples.verifiers.data import (
     VerifiersTaskDataset,
@@ -618,8 +619,8 @@ def test_35b_sandoq_1x2_recipe_fits_three_hosts(monkeypatch) -> None:
 
 def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) -> None:
     """With the 1x2 recipe's launch knobs set to other values, the recipe keeps its own: score
-    centering, the adaptive buffer, and a pool that fits every generating rollout plus a
-    validation pass."""
+    centering, the adaptive buffer, KV admission, and a pool that fits every rollout the cap
+    allows."""
     pytest.importorskip("harbor")
     from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq
 
@@ -641,16 +642,22 @@ def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) ->
         target_offpolicy_steps=6,
         max_offpolicy_steps=12,
         start_batches=7,
-        generation_capacity=48,
+        generation_capacity=168,
     )
     assert loop.validation == ValidationConfig(steps=78, freq=10, overlap_training=True)
     assert loop.training_sample_builder.drop_zero_std_reward_groups
     assert config.rollouter.rubric.length_reward_weight == 0.0
     assert config.rollouter.thinking_budget.max_thinking_tokens == 4096
-    # The pool, (6 + 1) x 24 x 16, holds every generating rollout plus a validation pass.
+    # The pool, (6 + 1) x 24 x 16, holds every rollout of the cap's groups; the KV gate admits fewer.
     serve = config.rollouter.verifiers_env_server.serve
     assert serve.pool.num_workers * serve.max_concurrent == 2688
-    assert loop.max_concurrent_rollout_groups * 16 + loop.validation.steps <= 2688
+    assert loop.max_concurrent_rollout_groups * 16 == 2688
+    assert config.generator_router.admission == KVGrowthEstimateAdmission.Config(
+        limit=0.95
+    )
+    assert config.generator.hold_session_kv
+    assert not config.generator.reset_kv_cache_on_weight_sync
+    assert config.generator.session_kv_free_floor > 0.03  # vLLM's watermark
 
     trainer = config.trainer
     (optimizer,) = trainer.optim.optimizer.optimizers

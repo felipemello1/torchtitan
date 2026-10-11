@@ -39,6 +39,7 @@ from torchtitan.rl.components.data import IterableRLDataLoader
 from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
+from torchtitan.rl.distributed.routing.admission import KVGrowthEstimateAdmission
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.distributed.routing.strategies import (
     LeastLoadedRoutingStrategy,
@@ -604,7 +605,9 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     - the adaptive rollout buffer, mean policy age <= 6 and max 12 (was a fixed 5-step buffer);
     - no length reward, so all-pass and all-fail groups are dropped (was weight 0.1);
     - a 4,096-token thinking budget per turn (was 12,288);
-    - 2,688 Sandoq VMs, every generating rollout plus a validation pass;
+    - new groups start only while their sessions fit in KV, and each session's prefix stays
+      held between its turns (was every group at once);
+    - 2,688 Sandoq VMs, one per rollout of the 168 groups the buffer starts with;
     - a synchronous save every 10 steps (was async).
 
     DOME's `--train-iters` and `--save-interval` still override the steps and the save interval.
@@ -649,11 +652,8 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
         max_offpolicy_steps=12,
         # Start at (6 + 1) x 24 = 168 groups, the pool; the default 3 x 24 leaves 57% of it idle.
         start_batches=target_offpolicy_steps + 1,
-        # A stopgap until KV-aware admission. Every session's history must fit in KV, or prefix hits
-        # collapse and rollouts hit the 2 h agent timeout: 112, 88 and 60 groups all did in a resume
-        # wave, where every session grows at once (~8.95M-token KV per engine). 48 groups plus 78
-        # validation rollouts is ~106 sessions per engine.
-        generation_capacity=48,
+        # The KV gate (`generator_router.admission`) admits groups; this cap is only the pool's.
+        generation_capacity=sandbox_pool // num_samples_per_prompt,
     )
     # Validate at step 0 and every 10 steps beside training; starting a pass makes the trainer
     # wait only for that step's weight pull.
@@ -711,6 +711,12 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     # Admit a request only while 3% of KV blocks stay free, so running requests have room to
     # grow before vLLM preempts one.
     generator.extra_vllm_engine_args = {"watermark": 0.03}
+    # Hold each session's prefix (attention + GDN state) between its turns; below 5% free blocks
+    # (`session_kv_free_floor`), release the sessions idle longest.
+    generator.hold_session_kv = True
+    # Start a new group only while every placed group, at its expected final size, fits the
+    # generators' KV cache; fixed caps from 163 down to 48 groups all lost their prefix hits.
+    config.generator_router.admission = KVGrowthEstimateAdmission.Config()
     return config
 
 
