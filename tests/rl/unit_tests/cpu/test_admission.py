@@ -133,6 +133,15 @@ def test_live_session_expects_its_remaining_growth():
     assert policy.charged[0] == pytest.approx(1 + 10.0 + 13 + 4.0)
 
 
+def test_group_books_the_sessions_it_will_open():
+    # 8 samples of two-player self-play open 16 sessions; each counts as a max-length context (20).
+    policy = _policy(limit=1.0, group_size=8)
+    assert policy.admit(0, serving=[0], num_sessions=16) == 0
+    assert policy.admit(1, serving=[1]) == 1
+    policy.summary()
+    assert policy.charged == [16 * 20.0, 8 * 20.0]
+
+
 def test_remaining_growth_averages_the_ended_sessions_that_grew_more():
     remaining = admission_module._remaining_growth([4, 10, 16])
     # A session that grew 4 counts only 10 and 16 as above it; past 16, none is.

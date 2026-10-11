@@ -138,6 +138,17 @@ class Rollouter(Configurable):
         """Return the next globally identified input from the training loader."""
         return next(self._training_dataloader)
 
+    def num_sessions(self, sample: object, *, group_size: int) -> int:
+        """Return how many routing sessions a group of `sample` opens, for KV admission
+        (`InterGeneratorRouter.Config.admission`) to book. `sample` is the dataset's.
+
+        Example:
+
+            rollouter.num_sessions(sample, group_size=8)  # -> 8, one per rollout
+            # an override for two-player self-play returns 16: one per player of each game
+        """
+        return group_size
+
     def acknowledge_training_sample_ids(self, sample_ids: Iterable[int]) -> None:
         """Mark training samples as safe to omit from the next checkpoint."""
         self._training_dataloader.acknowledge(sample_ids)

@@ -70,7 +70,8 @@ class KVGrowthEstimateAdmission(Configurable):
 
     Args:
         budgets: Each generator's KV cache size, by generator index.
-        group_size: Samples per training group, one session each; a validation group has one.
+        group_size: Samples per training group; without `num_sessions`, `admit` books one
+            session per sample, and one for a validation group.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -119,12 +120,16 @@ class KVGrowthEstimateAdmission(Configurable):
             self._budget,
         )
 
-    def admit(self, group_id: int, *, serving: list[int]) -> int | None:
+    def admit(
+        self, group_id: int, *, serving: list[int], num_sessions: int | None = None
+    ) -> int | None:
         """Place a new group on the serving generator with the most room; None keeps it waiting.
 
         Args:
             group_id: The group to place; negative for a validation group, which always is.
             serving: Indices of the generators that can take a group now (non-empty).
+            num_sessions: Routing sessions the group will open, e.g. two per game in two-player
+                self-play; None: one per sample.
         """
         now = time.monotonic()
         validation = group_id < 0
@@ -139,9 +144,9 @@ class KVGrowthEstimateAdmission(Configurable):
                 self.limits[index] - self.charged[index],
             ),
         )
-        # TODO: an env that opens several sessions per sample (e.g. two-player self-play) books too
-        # few here; learn sessions per group from finished groups once such an env lands.
-        expected_sessions = 1 if validation else self._group_size
+        expected_sessions = num_sessions
+        if expected_sessions is None:
+            expected_sessions = 1 if validation else self._group_size
         new_charge = expected_sessions * self._new_session_blocks
         if (
             not validation
