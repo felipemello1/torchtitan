@@ -86,6 +86,7 @@ def generate() -> None:
     model_config = config.model
     if model_config is None:
         raise ValueError("RL config must define a model.")
+    model_config = config.model_defaults.apply_(model_config)
     model_path = config.hf_assets_path
     max_num_seqs = args.max_num_seqs
     is_rank0 = os.environ.get("RANK", "0") == "0"

@@ -113,6 +113,9 @@ and apply the legacy `ModelConfigConverter` interface. This dependency will be
 removed when converters are
 replaced by `ModelConfigTransform`.
 
+The RL controller also imports `LMHeadFP32OutputConverter`: it applies the RL
+model defaults (`RLModelDefaults` in `torchtitan/rl/controller.py`) to every run.
+
 Keep shared types outside this package. For example, `CPInnerAttention` lives
 with the attention code. Only the transform that installs it belongs here.
 

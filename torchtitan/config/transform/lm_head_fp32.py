@@ -43,6 +43,16 @@ class LMHeadFP32OutputConverter(ModelConfigConverter):
             if fqn.rsplit(".", 1)[-1] != self._TARGET:
                 continue
             found = True
+            # Already converted, e.g. by a recipe: keep its backward_mode.
+            if isinstance(linear_config, HiMidLoLinear.Config):
+                continue
+            # A Linear subclass has fields or a forward that HiMidLoLinear would drop,
+            # e.g. a soft cap on the logits.
+            if type(linear_config) is not Linear.Config:
+                raise ValueError(
+                    f"LMHeadFP32OutputConverter cannot convert the "
+                    f"{type(linear_config).__qualname__} at {fqn!r}."
+                )
             kwargs = {
                 f.name: getattr(linear_config, f.name) for f in fields(linear_config)
             }
@@ -58,6 +68,4 @@ class LMHeadFP32OutputConverter(ModelConfigConverter):
                 "the model config. The torchtitan decoder names its output projection "
                 f"{self._TARGET!r} (see torchtitan/models/common/decoder.py)."
             )
-        if "fp32_to_bf16_split" not in model_config.local_compile_regions:
-            model_config.local_compile_regions.append("fp32_to_bf16_split")
         return model_config
