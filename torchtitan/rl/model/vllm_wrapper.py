@@ -381,23 +381,22 @@ class VLLMModelWrapper(Module):
             if isinstance(module, FSDPModule):
                 self.prepare_for_forward(module)
 
-    def load_state_dict(
-        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
-    ):
+    def load_state_dict(self, state_dict: Mapping[str, Any]):
         """Copy new weights into `self.model`, allocating about one FSDP group's sharded buffers at a time.
 
         Each group is allocated right before its first module loads and freed right after its last:
 
-            load order:  tok_embeddings | layers.0 | ... | layers.N | norm     lm_head
-            FSDP group:  [emb]          | [l0]     |     | [lN]     | [norm,   lm_head]
-            allocate:    emb            | l0       |     | lN       | norm
-            free:        emb            | l0       |     | lN       |          lm_head
+            load order:     tok_embeddings | layers.0 | ... | layers.N | norm     lm_head
+            FSDP group:     [emb]          | [l0]     |     | [lN]     | [norm,   lm_head]
+            allocate:       emb            | l0       |     | lN       | norm
+            unshard, free:  emb            | l0       |     | lN       |          lm_head
 
         With tied embeddings the group is [tok_embeddings, norm, lm_head], so it stays
         allocated for the whole load.
 
         Why this shape:
-          - Memory: allocating every sharded buffer first would hold a second copy of the weights.
+          - Memory: allocating every sharded buffer first adds a second copy of the weights at
+            FSDP degree 1: 64.6 GiB extra for bf16 Qwen3.5-35B-A3B at TP1, vs 1.6 GiB here.
           - Per group: modules from one `fully_shard` call share one FSDP state, so unsharding
             after `norm` would all-gather `lm_head` before it loads.
           - Hooks: a `load_state_dict` per module would also load its nested FSDP modules
@@ -406,8 +405,6 @@ class VLLMModelWrapper(Module):
         Args:
             state_dict: Keyed like `self.model.state_dict()`, not `self.state_dict()`
                 (no `model.` prefix), e.g. the generator's pinned CPU copy.
-            strict: As in `nn.Module.load_state_dict`.
-            assign: As in `nn.Module.load_state_dict`.
         """
         # One entry per FSDP group: fully_shard([norm, lm_head]) gives both modules one
         # state, and its sharded buffers are allocated and freed together.
@@ -429,9 +426,7 @@ class VLLMModelWrapper(Module):
                     lambda module, *args: self.prepare_for_forward(module)
                 )
             )
-        incompatible_keys = self.model.load_state_dict(
-            state_dict, strict=strict, assign=assign
-        )
+        incompatible_keys = self.model.load_state_dict(state_dict, strict=True)
         for handle in handles:
             handle.remove()
         return incompatible_keys
@@ -439,14 +434,15 @@ class VLLMModelWrapper(Module):
     def prepare_for_state_dict_load(self, module: FSDPModule) -> None:
         """Re-allocate the sharded buffers of `module`'s FSDP group so new weights can be copied in.
 
-        between syncs:  sharded: freed                     unsharded: weights CUDA graphs read
-        after this:     sharded: allocated, uninitialized  unsharded: unchanged
+        before:  sharded: freed                     unsharded: old weights (what CUDA graphs read)
+        after:   sharded: allocated, uninitialized  unsharded: unchanged
         """
         from torch.distributed.fsdp._fully_shard._fsdp_param import alloc_storage
 
         # TODO: replace this with FSDPModule._restore_sharded_params()
         for param_group in module._get_fsdp_state()._fsdp_param_groups:
-            # Don't skip is_sharded groups: FSDP's load pre-hook reshards e.g. tok_embeddings before ours.
+            # FSDP's own load pre-hook may have resharded this group already (e.g.
+            # tok_embeddings), so is_sharded can be True while the storage is still freed.
             for param in param_group.fsdp_params:
                 sharded_data = param._sharded_param_data
                 if isinstance(sharded_data, _ShardedFSDPTensor):
