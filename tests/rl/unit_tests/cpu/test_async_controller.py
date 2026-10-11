@@ -1155,7 +1155,8 @@ def test_overlapped_validation_before_and_after_training() -> None:
         trainer=SimpleNamespace(
             training=SimpleNamespace(
                 num_tokens_per_microbatch_per_dp_rank=64, max_context_length=64
-            )
+            ),
+            replay_routed_experts=False,
         ),
     )
     controller.start_step = 0

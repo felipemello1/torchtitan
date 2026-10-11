@@ -1008,7 +1008,9 @@ class Controller(Configurable):
         )
 
         # training_sample_builder
-        training_sample_builder = async_loop.training_sample_builder.build()
+        training_sample_builder = async_loop.training_sample_builder.build(
+            replay_routed_experts=self.config.trainer.replay_routed_experts
+        )
 
         # batcher
         batcher = async_loop.batcher.build(
