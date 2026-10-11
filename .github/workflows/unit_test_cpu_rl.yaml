@@ -46,6 +46,9 @@ jobs:
 
         python -m pip install uv
 
+        # Fail a hung test after 10 minutes instead of at the 60-minute job timeout.
+        uv pip install pytest-timeout==2.4.0
+
         # The DAPO math example's rubric needs math-verify.
         uv pip install -r torchtitan/rl/examples/dapo_math/requirements.txt
 
@@ -67,7 +70,7 @@ jobs:
         ')"
 
         export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-        pytest tests/rl/unit_tests/cpu --strict-markers --durations=20 -vv
+        pytest --timeout=600 tests/rl/unit_tests/cpu --strict-markers --durations=20 -vv
 
         # Cover the optional Verifiers example last, without installing it for all
         # RL jobs. Verifiers 0.3.1 requires mcp<2 while current vLLM nightlies
@@ -81,6 +84,6 @@ jobs:
         ' > "${RUNNER_TEMP}/nightly-constraints.txt"
         uv pip install -r torchtitan/rl/examples/verifiers/dapo_math/requirements.txt \
           --constraint "${RUNNER_TEMP}/nightly-constraints.txt"
-        pytest tests/rl/unit_tests/cpu/test_verifiers.py \
+        pytest --timeout=600 tests/rl/unit_tests/cpu/test_verifiers.py \
           tests/rl/unit_tests/cpu/test_verifiers_example.py \
           --strict-markers --durations=20 -vv
