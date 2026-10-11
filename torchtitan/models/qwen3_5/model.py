@@ -448,7 +448,6 @@ class Qwen35Model(MultimodalModel):
         local_compile_regions: list[str],
         ac_config: ActivationCheckpointingConfig | None,
         dump_folder: str,
-        skip_dp: bool = False,
     ) -> Qwen35Model:
         return super().parallelize(
             parallelism_context=parallelism_context,
@@ -457,7 +456,6 @@ class Qwen35Model(MultimodalModel):
             local_compile_regions=local_compile_regions,
             ac_config=ac_config,
             dump_folder=dump_folder,
-            skip_dp=skip_dp,
         )
 
     def preprocess_inputs(
