@@ -633,7 +633,7 @@ def _pulling_engine(monkeypatch, pull_pre_hook=None) -> _FakeEngine:
         await original_pull(self, version)
 
     monkeypatch.setattr(VLLMGenerator, "_pull_model_state_dict", new_pull)
-    model = SimpleNamespace(load_model_state_dict=lambda state_dict: None)
+    model = SimpleNamespace(load_state_dict=lambda state_dict: None)
     engine = _FakeEngine()
     engine.model_executor = SimpleNamespace(
         driver_worker=SimpleNamespace(get_model=lambda: model)

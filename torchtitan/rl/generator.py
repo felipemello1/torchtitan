@@ -1567,7 +1567,7 @@ class VLLMGenerator(Configurable):
         model = self._get_model()
         model_sd = self._prefetched_model_state_dict
         # Perform the local CPU-to-GPU copy
-        model.load_model_state_dict(model_sd)
+        model.load_state_dict(model_sd)
         self.policy_version = version
         if self.config.reset_kv_cache_on_weight_sync:
             # Always reset running requests too: the only reason to reset is a strict

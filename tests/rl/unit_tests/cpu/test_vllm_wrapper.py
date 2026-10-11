@@ -49,14 +49,14 @@ def test_vllm_replacement_preserves_attention_sharding() -> None:
 class _Wrapper:
     """Stand-in `self` for VLLMModelWrapper's real weight-sync methods (no vLLM)."""
 
-    load_model_state_dict = VLLMModelWrapper.load_model_state_dict
+    load_state_dict = VLLMModelWrapper.load_state_dict
     prepare_for_forward = VLLMModelWrapper.prepare_for_forward
 
     def __init__(self, model: nn.Module):
         self.model = model
 
 
-def test_load_model_state_dict_one_fsdp_group_at_a_time(tmp_path) -> None:
+def test_load_state_dict_one_fsdp_group_at_a_time(tmp_path) -> None:
     """Load new weights with at most two FSDP groups' sharded buffers allocated at once.
 
     Guards that each group's sharded buffers are allocated before its copy, even when
@@ -97,20 +97,18 @@ def test_load_model_state_dict_one_fsdp_group_at_a_time(tmp_path) -> None:
         wrapper = _Wrapper(model)
         max_allocated_groups = 0
 
-        def prepare_for_state_dict_load(modules) -> None:
+        def prepare_for_state_dict_load(module) -> None:
             nonlocal max_allocated_groups
-            VLLMModelWrapper.prepare_for_state_dict_load(wrapper, modules)
+            VLLMModelWrapper.prepare_for_state_dict_load(wrapper, module)
             # The load copies into these buffers next, so freed ones would be overrun.
-            assert all(
-                map(is_allocated, modules[0]._get_fsdp_state()._fsdp_param_groups)
-            )
+            assert all(map(is_allocated, module._get_fsdp_state()._fsdp_param_groups))
             max_allocated_groups = max(
                 max_allocated_groups, sum(map(is_allocated, groups))
             )
 
         wrapper.prepare_for_state_dict_load = prepare_for_state_dict_load
         wrapper.prepare_for_forward()  # as after the initial load
-        wrapper.load_model_state_dict(new_state_dict)
+        wrapper.load_state_dict(new_state_dict)
 
         assert max_allocated_groups <= 2
         assert all(

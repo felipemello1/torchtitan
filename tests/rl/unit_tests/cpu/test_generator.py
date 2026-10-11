@@ -168,10 +168,8 @@ def test_prefetch_model_state_dict_updates_staging_buffers_in_place():
             staging_state_dict["weight"] = "fetched"
             return {"weight": "fetched"}
 
-        load_model_state_dict = Mock()
-        generator._get_model = lambda: SimpleNamespace(
-            load_model_state_dict=load_model_state_dict
-        )
+        load_state_dict = Mock()
+        generator._get_model = lambda: SimpleNamespace(load_state_dict=load_state_dict)
         generator._rank = 1
         generator.config.reset_kv_cache_on_weight_sync = False
 
@@ -187,7 +185,7 @@ def test_prefetch_model_state_dict_updates_staging_buffers_in_place():
             strict=False,
             direct_rdma=False,
         )
-        load_model_state_dict.assert_called_once_with({"weight": "fetched"})
+        load_state_dict.assert_called_once_with({"weight": "fetched"})
 
     asyncio.run(main())
 
@@ -415,7 +413,7 @@ def test_weight_sync_reset_kv_cache_flag_controls_cache_reset(
         engine = cast(_FakeEngine, generator._engine)
         generator.config.reset_kv_cache_on_weight_sync = reset_kv_cache
         generator._prefetched_model_state_dict = {}
-        model = SimpleNamespace(load_model_state_dict=lambda state_dict: None)
+        model = SimpleNamespace(load_state_dict=lambda state_dict: None)
         monkeypatch.setattr(generator, "_get_model", lambda: model)
 
         await generator._pull_model_state_dict(version=8)
