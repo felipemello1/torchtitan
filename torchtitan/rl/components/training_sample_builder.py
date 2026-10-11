@@ -13,6 +13,8 @@ import math
 import statistics
 from dataclasses import dataclass
 
+import torch
+
 from torchtitan.config import Configurable
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout, RolloutGroup
@@ -51,6 +53,9 @@ class TrainingSample:
     """[L] generator logprobs; 0.0 where loss_mask is False."""
     advantage: list[float]
     """[L] advantage on assistant tokens, 0.0 elsewhere."""
+    routed_expert_ids: torch.Tensor | None = None
+    """[L - 1, num_layers, top_k] generator expert ids for the trainer inputs
+    `token_ids[:-1]`; see `Completion.routed_expert_ids`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +234,10 @@ class TrainingSampleBuilder(Configurable):
         = the oldest (opening) turn's version (the off-policy filter reads it), `max_policy_version` = the
         newest version any of its turns reached.
 
+        With routed expert ids, each turn keeps its own rows, so trained tokens replay the routing they were
+        sampled with. A continuing turn also supplies the row of the previous completion's last token,
+        which only its prefill ran forward (`len(routed_expert_ids) == len(token_ids) - 1`).
+
         Example (5 turns; the env compacts history before turn 3, so the prefix breaks -> 2 training_samples).
         P = prompt; C = completion; E = env reply
             turn0 (v5): prompt=[P1]              completion=[C1]
@@ -312,6 +321,23 @@ class TrainingSampleBuilder(Configurable):
             training_sample.loss_mask += [True] * num_completion
             training_sample.logprobs += rollout_turn.completion_logprobs
             training_sample.advantage += [rollout_advantage] * num_completion
+            if rollout_turn.routed_expert_ids is not None:
+                # Row i is position i. A continuing turn adds rows from prefix_len - 1: the
+                # previous completion's last token only ran forward in this turn's prefill.
+                training_sample.routed_expert_ids = (
+                    rollout_turn.routed_expert_ids
+                    if prefix_len == 0
+                    else torch.cat(
+                        [
+                            training_sample.routed_expert_ids,
+                            rollout_turn.routed_expert_ids[prefix_len - 1 :],
+                        ]
+                    )
+                )
+                assert (
+                    len(training_sample.routed_expert_ids)
+                    == len(training_sample.token_ids) - 1
+                )
 
             prev_prompt_and_completion = prompt + rollout_turn.completion_token_ids
 
