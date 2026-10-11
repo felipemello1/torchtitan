@@ -10,6 +10,8 @@ three GB300 hosts with thinking on and self-play only."""
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 
 from renderers import Qwen35RendererConfig
 
@@ -244,8 +246,15 @@ def rl_chess_qwen3_5_4b_gb300(
         num_games=num_validation_games, opponents=ladder
     )
     worker = rollouter.worker
-    # The launcher points this at an executable Stockfish build for the host's architecture.
-    worker.stockfish_path = os.environ.get("CHESS_STOCKFISH_PATH", "stockfish")
+    # The launcher points this at a Stockfish build for the host's architecture. DOME stages it
+    # read-only without the execute bit, so run a copy (the rollout workers share this host).
+    stockfish = os.environ.get("CHESS_STOCKFISH_PATH", "stockfish")
+    if os.path.isfile(stockfish) and not os.access(stockfish, os.X_OK):
+        executable = os.path.join(tempfile.mkdtemp(prefix="stockfish_"), "stockfish")
+        shutil.copy(stockfish, executable)
+        os.chmod(executable, 0o755)
+        stockfish = executable
+    worker.stockfish_path = stockfish
     # A mate pays 10; a game cut at the ply cap pays at most 0.75, so a mate dominates its group's
     # advantages.
     worker.checkmate_reward = 10.0
