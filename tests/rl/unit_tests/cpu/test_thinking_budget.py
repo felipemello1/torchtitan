@@ -91,6 +91,11 @@ def _forced_close_rate(completion: Completion) -> float:
     return reduced["thinking_budget/forced_close_rate/mean"]
 
 
+def _stopped_while_thinking_rate(completion: Completion) -> float:
+    reduced = MetricsProcessor._aggregate_metrics(completion.metrics)
+    return reduced["thinking_budget/stopped_while_thinking_rate/mean"]
+
+
 def test_reply_within_budget_is_returned_unchanged() -> None:
     reply = _completion([10, END_THINK, 11], finish_reason="stop")
     generate = _ScriptedGenerate(reply)
@@ -100,6 +105,7 @@ def test_reply_within_budget_is_returned_unchanged() -> None:
     assert len(generate.calls) == 1
     assert generate.calls[0]["sampling_config"].max_tokens == 4
     assert _forced_close_rate(completion) == 0.0
+    assert _stopped_while_thinking_rate(completion) == 0.0
 
 
 def test_reply_cut_while_thinking_gets_a_forced_close() -> None:
@@ -124,6 +130,7 @@ def test_reply_cut_while_thinking_gets_a_forced_close() -> None:
     assert completion.finish_reason == "stop"
     assert completion.request_id == "group=0/rollout=0/turn=0"
     assert _forced_close_rate(completion) == 1.0
+    assert _stopped_while_thinking_rate(completion) == 0.0
 
 
 @pytest.mark.parametrize(
@@ -224,6 +231,45 @@ def test_appended_end_of_turn_gets_a_zero_topk_row_and_a_copied_routed_row() -> 
     # row, a valid routing; a zero row would send all top-k slots to expert 0.
     routed = completion.routed_expert_ids.flatten().tolist()
     assert routed == [1] * 4 + [2] * 4 + [3, 3]
+
+
+def test_reply_that_stops_while_thinking_gets_a_forced_close() -> None:
+    # the model samples its end of turn before </think>: no answer, so close and ask for one
+    stopped = _completion([10, 11, END_OF_TURN], finish_reason="stop")
+    answer = _completion([20], finish_reason="stop")
+    generate = _ScriptedGenerate(stopped, answer)
+    completion = _run(_budget(), generate, prompt=[5, THINK])
+    assert generate.calls[1]["prompt_token_ids"] == [5, THINK, 10, 11, *FORCED]
+    assert generate.calls[1]["sampling_config"].max_tokens == 12 - 2 - len(FORCED)
+    assert completion.token_ids == [10, 11, *FORCED, 20]
+    assert len(completion.token_logprobs) == len(completion.token_ids)
+    assert completion.loss_mask == [True] * 2 + [False] * 3 + [True]
+    assert _forced_close_rate(completion) == 1.0
+    assert _stopped_while_thinking_rate(completion) == 1.0
+
+
+def test_reply_that_stops_while_thinking_drops_the_stop_tokens_rows() -> None:
+    # prompt [5, THINK]; first call [10, 11, END_OF_TURN] -> [10, 11]; forced [90, 91, 92]; second [20]
+    stopped = _completion([10, 11, END_OF_TURN], finish_reason="stop")
+    stopped.topk_token_ids = torch.tensor(
+        [[10], [11], [END_OF_TURN]], dtype=torch.int32
+    )
+    stopped.topk_logprobs = torch.full((3, 1), -0.5)
+    stopped.routed_expert_ids = np.full((2 + 3 - 1, 1, 1), 1, dtype=np.uint8)
+    answer = _completion([20], finish_reason="stop")
+    answer.topk_token_ids = torch.tensor([[20]], dtype=torch.int32)
+    answer.topk_logprobs = torch.full((1, 1), -0.25)
+    # From position 3, 11 (now the first call's last token): 11 and the forced tokens.
+    answer.routed_expert_ids = np.full((2 + 2 + 3 + 1 - 1 - 3, 1, 1), 2, dtype=np.uint8)
+    generate = _ScriptedGenerate(stopped, answer)
+    completion = _run(_budget(), generate, prompt=[5, THINK])
+
+    assert generate.calls[1]["sampling_config"].routed_experts_prompt_start == 3
+    assert completion.token_ids == [10, 11, *FORCED, 20]
+    assert completion.topk_token_ids.flatten().tolist() == [10, 11, 0, 0, 0, 20]
+    # 2 prompt + 6 completion tokens - 1: the first call's rows up to 10, then the second
+    # call's from 11 on.
+    assert completion.routed_expert_ids.flatten().tolist() == [1] * 3 + [2] * 4
 
 
 def test_reply_cut_while_answering_continues_without_forcing() -> None:
