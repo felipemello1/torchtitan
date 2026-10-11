@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import pickle
 import time
 
 import pytest
@@ -22,6 +23,7 @@ from torchtitan.rl.examples.dapo_math import (
     DapoMathSample,
     data as math_data,
     Intellect3MathDataset,
+    Intellect3MathSample,
     math_verify_pool,
     MathVerifyPool,
     RewardMathVerify,
@@ -124,6 +126,7 @@ def test_intellect3_dataset_keeps_partially_solved_problems(monkeypatch) -> None
         r"2\sqrt{2}",
         r"1\sqrt{2}",
     ]
+    assert [sample.pass_rate for sample in samples] == [0.125, 0.875, 0.125]
     assert "q1" in samples[0].prompt
     assert r"Answer: \boxed{" in samples[0].prompt
 
@@ -283,9 +286,15 @@ def test_worker_logs_zero_std_groups_by_pass_rate(monkeypatch) -> None:
         message_env=DapoMathEnv.Config(),
     ).build()
     metrics: list[m.Metric] = []
-    # 0.75 is the top bin's lower edge; a sample without a pass rate logs nothing.
-    for pass_rate in [0.875, 0.75, 0.125, None, 0.875]:
-        sample = DapoMathSample(prompt="p", ground_truth="1", pass_rate=pass_rate)
+    # 0.75 is the top bin's lower edge; a DapoMathSample (no pass rate) logs nothing.
+    samples = [
+        Intellect3MathSample(prompt="p", ground_truth="1", pass_rate=0.875),
+        Intellect3MathSample(prompt="p", ground_truth="1", pass_rate=0.75),
+        Intellect3MathSample(prompt="p", ground_truth="1", pass_rate=0.125),
+        DapoMathSample(prompt="p", ground_truth="1"),
+        Intellect3MathSample(prompt="p", ground_truth="1", pass_rate=0.875),
+    ]
+    for sample in samples:
         metrics += asyncio.run(worker.run_group(sample=sample)).metrics
     assert m.MetricsProcessor._aggregate_metrics(metrics) == {
         # 1 of the 3 top-bin groups was all correct.
@@ -294,3 +303,15 @@ def test_worker_logs_zero_std_groups_by_pass_rate(monkeypatch) -> None:
         "math/zero_std/all_correct/avg8_lt0.25/mean": 0.0,
         "math/zero_std/all_wrong/avg8_lt0.25/mean": 1.0,
     }
+
+
+def test_dapo_math_sample_loads_from_an_older_checkpoint() -> None:
+    """Data stream checkpoints pickle training samples; a resumed run loads and saves them again."""
+    # pickle.dumps(DapoMathSample(prompt="problem", ground_truth="34")), its two fields only.
+    saved = (
+        b"\x80\x04\x95S\x00\x00\x00\x00\x00\x00\x00\x8c%torchtitan.rl.examples.dapo_math.data"
+        b"\x94\x8c\x0eDapoMathSample\x94\x93\x94)\x81\x94]\x94(\x8c\x07problem\x94\x8c\x0234\x94eb."
+    )
+    sample = pickle.loads(saved)
+    assert sample == DapoMathSample(prompt="problem", ground_truth="34")
+    assert pickle.loads(pickle.dumps(sample)) == sample

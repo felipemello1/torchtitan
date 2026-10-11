@@ -9,6 +9,7 @@ from torchtitan.rl.examples.dapo_math.data import (
     DapoMathDataset,
     DapoMathSample,
     Intellect3MathDataset,
+    Intellect3MathSample,
 )
 from torchtitan.rl.examples.dapo_math.env import DapoMathEnv
 from torchtitan.rl.examples.dapo_math.math_verify_pool import (
@@ -25,6 +26,7 @@ __all__ = [
     "DapoMathRolloutWorker",
     "DapoMathSample",
     "Intellect3MathDataset",
+    "Intellect3MathSample",
     "MathVerifyPool",
     "RewardMathVerify",
     "score_math_response",

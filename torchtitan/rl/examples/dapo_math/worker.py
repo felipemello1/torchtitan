@@ -9,7 +9,7 @@ from __future__ import annotations
 import statistics
 from dataclasses import dataclass
 
-from torchtitan.rl.examples.dapo_math.data import DapoMathSample
+from torchtitan.rl.examples.dapo_math.data import DapoMathSample, Intellect3MathSample
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.rollouter import RolloutWorker
@@ -22,7 +22,7 @@ class DapoMathRolloutWorker(RolloutWorker):
     """`RolloutWorker` that also logs, per pass-rate bin, the fraction of groups all correct or all wrong.
 
     Each group logs 1 or 0 under its bin; 1 only if its rewards have zero std (it does not train).
-    Only samples with a `pass_rate` log, i.e. `Intellect3MathDataset` ones.
+    Only `Intellect3MathSample`s log, i.e. `Intellect3MathDataset` ones.
 
     Example:
         # 4 groups with pass_rate 0.875: 3 all correct, 1 mixed
@@ -36,7 +36,7 @@ class DapoMathRolloutWorker(RolloutWorker):
 
     async def run_group(self, *, sample: DapoMathSample, **kwargs) -> RolloutGroup:
         group = await super().run_group(sample=sample, **kwargs)
-        if sample.pass_rate is None:
+        if not isinstance(sample, Intellect3MathSample):
             return group
 
         rewards = [rollout.reward for rollout in group.rollouts]
