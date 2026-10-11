@@ -12,6 +12,7 @@ import asyncio
 import time
 
 import pytest
+import torch
 from datasets import Dataset
 
 from torchtitan.rl.examples.dapo_math import (
@@ -27,6 +28,7 @@ from torchtitan.rl.examples.dapo_math import (
 )
 from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.types import RolloutTurnID
+from torchtitan_recipes.rl.dapo_math import rl_dapo_qwen3_4b_math_32k
 
 
 def _dapo_rows() -> list[dict]:
@@ -206,3 +208,16 @@ def test_reward_handles_equivalent_latex_and_units() -> None:
     sample = DapoMathSample(prompt="problem", ground_truth=r"336^\circ")
     assert asyncio.run(reward(_rollout(r"work\nAnswer: \boxed{336}"), sample)) == 1.0
     assert asyncio.run(reward(_rollout(r"work\nAnswer: \boxed{335}"), sample)) == 0.0
+
+
+def test_32k_trainer_recomputes_ffn_w13() -> None:
+    # RegionAC ignores patterns that match nothing, so check them against a real block.
+    config = rl_dapo_qwen3_4b_math_32k()
+    ac = config.trainer.activation_checkpoint
+    with torch.device("meta"):
+        block = config.model.layers[0].build()
+    block.configure_remat_regions(ac.save_regions, ac.recompute_regions)
+
+    assert block.feed_forward.w13.remat_should_recompute("linear")
+    assert not block.feed_forward.w2.remat_should_recompute("linear")
+    assert not block.attention.remat_should_recompute("inner_attention")
