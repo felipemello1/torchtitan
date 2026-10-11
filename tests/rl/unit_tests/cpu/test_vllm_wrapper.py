@@ -7,7 +7,7 @@
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp import FSDPModule, fully_shard
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.model.vllm_wrapper import (
@@ -56,7 +56,7 @@ class _Wrapper:
         self.model = model
 
 
-def test_load_state_dict_one_fsdp_group_at_a_time(tmp_path) -> None:
+def test_load_state_dict_allocates_one_fsdp_group_at_a_time(tmp_path) -> None:
     """Load new weights with at most two FSDP groups' sharded buffers allocated at once.
 
     Guards that each group's sharded buffers are allocated before its copy, even when
@@ -107,7 +107,9 @@ def test_load_state_dict_one_fsdp_group_at_a_time(tmp_path) -> None:
             )
 
         wrapper.prepare_for_state_dict_load = prepare_for_state_dict_load
-        wrapper.prepare_for_forward()  # as after the initial load
+        for module in model.modules():  # as after the initial load
+            if isinstance(module, FSDPModule):
+                wrapper.prepare_for_forward(module)
         wrapper.load_state_dict(new_state_dict)
 
         assert max_allocated_groups <= 2
