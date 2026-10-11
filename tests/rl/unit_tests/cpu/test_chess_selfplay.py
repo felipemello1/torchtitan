@@ -35,6 +35,7 @@ from torchtitan.rl.examples.chess_selfplay import (
     StockfishBot,
 )
 from torchtitan.rl.examples.chess_selfplay.bots import centipawn_losses
+from torchtitan.rl.examples.chess_selfplay.env import _BOXED_RE
 from torchtitan.rl.examples.chess_selfplay.openings import OPENINGS
 from torchtitan.rl.examples.chess_selfplay.rollouter import EloFit
 from torchtitan.rl.generator import SamplingConfig
@@ -88,7 +89,9 @@ def test_illegal_or_missing_move_forfeits(move_text) -> None:
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("move_text", ["Nf3", " Nf3 ", "Nf3+", "Nf3\\#"])
+@pytest.mark.parametrize(
+    "move_text", ["Nf3", " Nf3 ", "Nf3+", "Nf3\\#", "Nf3\\text{+}", "Nf3\\mathrm{+}"]
+)
 def test_the_listed_move_is_accepted(move_text) -> None:
     async def run() -> None:
         game = _new_game()
@@ -97,6 +100,11 @@ def test_the_listed_move_is_accepted(move_text) -> None:
         assert game.board.peek() == chess.Move.from_uci("g1f3")
 
     asyncio.run(run())
+
+
+def test_a_boxed_move_may_hold_one_level_of_braces() -> None:
+    assert _BOXED_RE.findall("I play \\boxed{Bxf7\\text{+}}.") == ["Bxf7\\text{+}"]
+    assert _BOXED_RE.findall("\\boxed{e4} then \\boxed{d4}") == ["e4", "d4"]
 
 
 @pytest.mark.parametrize("move_text", ["Qxf7+", "Qf7+", "Qf7"])

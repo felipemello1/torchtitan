@@ -40,7 +40,8 @@ _PIECE_VALUES = {
     chess.ROOK: 5,
     chess.QUEEN: 9,
 }
-_BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
+# One level of nested braces, e.g. \boxed{Bxf7\text{+}}.
+_BOXED_RE = re.compile(r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}")
 _FORFEIT_REWARD = -1.0
 _CHECKMATED_REWARD = -0.25
 # Share of the material score in an unfinished game's reward: 0.5 keeps it within [0.25, 0.75].
@@ -397,7 +398,10 @@ def _parse_move(board: chess.Board, move_text: str) -> chess.Move | None:
     The check mark (plain or LaTeX-escaped) and any `x` are ignored: `Qxf1#`, `Qf1\\#` and `Qf1`
     all match `Qxf1#`, and `Nxf3` matches `Nf3`. No two legal moves differ only by an `x`: a move
     to a square either captures or it doesn't."""
-    text = re.sub(r"\\?[+#]$", "", move_text.strip()).replace("x", "")
+    text = re.sub(
+        r"\\(?:text|mathrm|textbf|mathbf)\{([^{}]*)\}", r"\1", move_text.strip()
+    )
+    text = re.sub(r"\\?[+#]$", "", text).replace("x", "")
     for move in board.legal_moves:
         if board.san(move).rstrip("+#").replace("x", "") == text:
             return move
