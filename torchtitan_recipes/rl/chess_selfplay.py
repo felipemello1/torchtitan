@@ -33,6 +33,7 @@ from torchtitan.rl.components.data import IterableRLDataLoader
 from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
+from torchtitan.rl.distributed.routing.admission import KVGrowthEstimateAdmission
 from torchtitan.rl.examples.chess_selfplay import (
     ChessPlayerEnv,
     ChessRollouter,
@@ -313,13 +314,15 @@ def rl_chess_qwen3_5_4b_gb300(
     generator = config.generator
     generator.max_num_batched_tokens = 8192
     generator.sampling.num_topk_logprobs = 16
-    # Hold each player's prefix (attention + GDN state) between its turns; below 15% free blocks
-    # (`session_kv_free_floor`, which must sit above the watermark), release the sessions idle longest.
+    # Hold each player's prefix (attention + GDN state) between its turns; below 5% free blocks
+    # (`session_kv_free_floor`), release the sessions idle longest.
     generator.hold_session_kv = True
-    generator.session_kv_free_floor = 0.15
-    # Admit a request only while 10% of KV blocks stay free, so running requests have room to grow.
-    # No router admission gate: at 120 plies it held ~90 groups back at ~50% real KV (chess118gcm).
-    generator.extra_vllm_engine_args = {"watermark": 0.1}
+    # Admit a request only while 3% of KV blocks stay free, so running requests have room to grow.
+    generator.extra_vllm_engine_args = {"watermark": 0.03}
+    # Start a new group only while the placed groups' expected final sizes stay under 1.2x the
+    # generators' KV cache; `ChessRollouter` books two sessions per self-play game. At 0.95 real KV
+    # sat at ~50% (chess118gcm); with no gate, evictions slowed steps 4 -> 21 min (chess118gcn).
+    config.generator_router.admission = KVGrowthEstimateAdmission.Config(limit=1.2)
     return config
 
 
