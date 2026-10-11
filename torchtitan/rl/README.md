@@ -161,6 +161,12 @@ Train a model to issue search queries, consume tool responses, and answer with a
 
 [Run Search-R1](./examples/search_r1)
 
+### Chess self-play: two-player games
+
+Train one policy on both colors of its own games, mixed with games against Stockfish bots for an Elo score.
+
+[Run chess self-play](./examples/chess_selfplay)
+
 ## Quick Start
 ### Prerequisites
 
