@@ -123,6 +123,7 @@ from torchtitan.rl.distributed.weight_sync import WeightSyncManager
 from torchtitan.rl.generator import SamplingConfig, VLLMGenerator
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
+    append_heap_census,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     compute_rollout_metrics,
@@ -287,6 +288,11 @@ class Controller(Configurable):
         )
         """JSONL recorder to save sampled rollouts to disk for further inspection and debugging."""
 
+        heap_census_every_n_steps: int = 0
+        """Every N train steps, append to `dump_folder/heap_census.jsonl` the objects a full GC
+        scans, counted by type; see `append_heap_census`. 0 disables.
+        Each census pauses the controller ~0.25 s at 1.5M objects (a full GC there: ~0.65 s)."""
+
         trainer: Trainer.Config
         """Trainer config. Controls optimizer, training, parallelism."""
 
@@ -331,6 +337,11 @@ class Controller(Configurable):
             if self.num_generators < 1:
                 raise ValueError(
                     f"num_generators must be at least 1, got {self.num_generators}"
+                )
+            if self.heap_census_every_n_steps < 0:
+                raise ValueError(
+                    "heap_census_every_n_steps must be >= 0 (0 disables), got "
+                    f"{self.heap_census_every_n_steps}"
                 )
             if self.generator.checkpointer is not None:
                 raise ValueError(
@@ -1208,6 +1219,14 @@ class Controller(Configurable):
                         ),
                     ],
                 )
+
+            heap_census_every_n_steps = self.config.heap_census_every_n_steps
+            if heap_census_every_n_steps and step % heap_census_every_n_steps == 0:
+                with sl.log_trace_span("heap_census"):
+                    append_heap_census(
+                        path=os.path.join(self.config.dump_folder, "heap_census.jsonl"),
+                        step=step,
+                    )
         gc_timer.close()
 
         # Finish the last in-flight sync so generators hold the final weights for post-validation.
