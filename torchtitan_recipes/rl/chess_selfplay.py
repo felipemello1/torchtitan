@@ -320,3 +320,12 @@ def rl_chess_qwen3_5_4b_gb300(
     # generators' KV cache; `ChessRollouter` books two sessions per self-play game.
     config.generator_router.admission = KVGrowthEstimateAdmission.Config()
     return config
+
+
+def rl_chess_qwen3_5_4b_gb300_resume_old_stack() -> Controller.Config:
+    """`rl_chess_qwen3_5_4b_gb300` for one resume from a checkpoint saved before the new stack, which
+    kept the data stream in a separate file: restore the model, optimizer and train state, and start
+    the controller's data stream fresh. Later resumes use `rl_chess_qwen3_5_4b_gb300`."""
+    config = rl_chess_qwen3_5_4b_gb300()
+    config.trainer.checkpointer.exclude_from_loading = ["controller"]
+    return config
