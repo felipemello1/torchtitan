@@ -140,11 +140,15 @@ def test_merge_keeps_topk_rows_and_routed_experts(
     second = _completion([20, 21], finish_reason="stop")
     second.topk_token_ids = torch.tensor([[20], [21]], dtype=torch.int32)
     second.topk_logprobs = torch.full((2, 1), -0.25)
-    num_second_rows = 2 + 4 + len(forced_ids) + 2 - 1
+    # Positions 5 to 6 + len(forced_ids): the first call's last token, forced_ids and 20.
     second.routed_expert_ids = torch.arange(
-        20, 20 + num_second_rows, dtype=torch.uint8
+        25, 27 + len(forced_ids), dtype=torch.uint8
     ).view(-1, 1, 1)
-    completion = _run(_budget(), _ScriptedGenerate(first, second), prompt=[5, THINK])
+    generate = _ScriptedGenerate(first, second)
+    completion = _run(_budget(), generate, prompt=[5, THINK])
+    assert [
+        call["sampling_config"].routed_experts_prompt_start for call in generate.calls
+    ] == [0, 5]
 
     # Zero rows on the forced tokens, which the loss skips.
     zero_rows = [0] * len(forced_ids)

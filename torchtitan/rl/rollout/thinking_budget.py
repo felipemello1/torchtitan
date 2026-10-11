@@ -129,6 +129,10 @@ class ThinkingBudget(Configurable):
                 sampling_config=replace(
                     sampling_config,
                     max_tokens=max_tokens - len(first.token_ids) - len(forced_ids),
+                    # Start at the first call's last token; the first call returned the rows before it.
+                    routed_experts_prompt_start=(
+                        len(prompt_token_ids) + len(first.token_ids) - 1
+                    ),
                 ),
             )
             if second is None:
@@ -200,21 +204,18 @@ class ThinkingBudget(Configurable):
 def _merge_routed_expert_ids(
     first_rows: torch.Tensor | None, second_rows: torch.Tensor | None
 ) -> torch.Tensor | None:
-    """The first call's rows, then the second call's for the positions the first never ran forward.
-
-    Where both calls have a row, keep the first: its tokens were sampled with that routing,
-    and the second call may have recomputed it (e.g. after a KV cache reset).
+    """The first call's rows, then the second call's, which start at the first call's last token.
 
     Example:
 
         prompt [P0, P1], first [A0, A1], forced [F0], second [B0]
         first rows:  P0 P1 A0          (A1 never ran forward in the first call)
-        second rows: P0 P1 A0 A1 F0
-        merged:      P0 P1 A0 (first) + A1 F0 (second)
+        second rows: A1 F0             (from position 3, the first call's last token)
+        merged:      P0 P1 A0 A1 F0
     """
     if first_rows is None or second_rows is None:
         return None
-    return torch.cat([first_rows, second_rows[len(first_rows) :]])
+    return torch.cat([first_rows, second_rows])
 
 
 def _merge_topk_rows(
