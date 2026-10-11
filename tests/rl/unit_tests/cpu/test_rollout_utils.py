@@ -471,6 +471,73 @@ def test_samples_without_routed_expert_ids_keep_none() -> None:
     assert training_sample.routed_expert_ids is None
 
 
+def _routed_group(*, group_id: int) -> RolloutGroup:
+    """Two rollouts of two turns; the second turn continues the first, so its rows start at position 2."""
+    rollouts = []
+    for reward in [1.0, 0.0]:
+        turns = [
+            _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=1),
+            _turn(prompt_token_ids=[1, 2, 4, 8], completion_token_ids=[5], version=1),
+        ]
+        turns[0].routed_expert_ids = _routed_expert_ids(turn=0, num_positions=2)
+        turns[1].routed_expert_ids = _routed_expert_ids(turn=1, num_positions=4)[2:]
+        rollouts.append(_scored_rollout(turns, reward=reward, advantage=reward - 0.5))
+    return RolloutGroup(group_id=group_id, rollouts=rollouts)
+
+
+@pytest.mark.parametrize(
+    "unrouted_turn_ids",
+    # Which turns of rollout 1 lack routed expert ids
+    [
+        pytest.param([0, 1], id="every_turn"),
+        pytest.param([0], id="first_turn"),
+        pytest.param([1], id="second_turn"),
+    ],
+)
+def test_replay_drops_a_group_with_a_turn_without_routed_expert_ids(
+    unrouted_turn_ids: list[int],
+) -> None:
+    builder = TrainingSampleBuilder.Config().build(replay_routed_experts=True)
+    unrouted_group = _routed_group(group_id=1)
+    for turn_id in unrouted_turn_ids:
+        unrouted_group.rollouts[1].turns[turn_id].routed_expert_ids = None
+
+    routed = builder.build_from_group(rollout_group=_routed_group(group_id=0))
+    unrouted = builder.build_from_group(rollout_group=unrouted_group)
+
+    assert [
+        training_sample.routed_expert_ids.flatten().tolist()
+        for training_sample in routed.training_samples
+    ] == [[0, 1, 18, 19]] * 2
+    assert unrouted.group_id == 1
+    assert unrouted.training_samples == []
+    aggregated = m.MetricsProcessor._aggregate_metrics(
+        routed.metrics + unrouted.metrics
+    )
+    assert (
+        aggregated[
+            "training_sample_builder/num_groups_dropped_no_routed_expert_ids/sum"
+        ]
+        == 1.0
+    )
+
+
+def test_without_replay_a_group_missing_routed_expert_ids_is_kept() -> None:
+    builder = TrainingSampleBuilder.Config().build(replay_routed_experts=False)
+    group = _routed_group(group_id=0)
+    for rollout_turn in group.rollouts[1].turns:
+        rollout_turn.routed_expert_ids = None
+
+    output = builder.build_from_group(rollout_group=group)
+
+    assert [
+        training_sample.routed_expert_ids is None
+        for training_sample in output.training_samples
+    ] == [False, True]
+    aggregated = m.MetricsProcessor._aggregate_metrics(output.metrics)
+    assert not any("num_groups_dropped" in key for key in aggregated)
+
+
 def test_topk_rows_align_with_token_ids_across_turns() -> None:
     first = _turn(prompt_token_ids=[1, 2], completion_token_ids=[4, 5], version=0)
     first.completion_topk_token_ids = torch.tensor([[4, 9], [5, 8]], dtype=torch.int32)
