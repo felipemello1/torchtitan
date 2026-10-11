@@ -24,6 +24,7 @@ from torchtitan.rl.examples.chess_selfplay.env import ChessGame
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 from torchtitan.rl.rollout.types import GenerateFn, Rollout, RolloutGroup, RolloutStatus
+from torchtitan.rl.types import RolloutTurnID
 
 if TYPE_CHECKING:
     from torchtitan.rl.generator import SamplingConfig
@@ -264,6 +265,14 @@ class ChessSelfPlayWorker(RolloutWorker):
         """Play `color`'s half of `game` as one rollout; `None` if the game ends before its first move."""
         await game.wait_for_turn(color)
         if game.is_over:
+            if self._release_session_fn is not None:
+                # It never generates: free the session KV admission booked for it.
+                await self._release_session_fn(
+                    group_id=group_id,
+                    routing_session_id=RolloutTurnID(
+                        group_id=group_id, rollout_id=rollout_id, turn_id=0
+                    ).to_string(include_turn=False),
+                )
             return None
         env = self._token_env_config.build(
             message_env=self._message_env_config.build(game=game, color=color),

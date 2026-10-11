@@ -570,6 +570,7 @@ async def _run_group(
     sample=_SELF_PLAY,
     truncate_at=None,
     checkmate_reward=1.0,
+    release_session_fn=None,
 ):
     worker = ChessSelfPlayWorker.Config(
         rubric=Rubric.Config(
@@ -588,6 +589,7 @@ async def _run_group(
             Qwen3RendererConfig(enable_thinking=True, thinking_retention="all")
         ),
         hf_assets_path=_TOKENIZER_PATH,
+        release_session_fn=release_session_fn,
     )
     policy = _ScriptedPolicy(
         tokenizer_config.build(tokenizer_path=_TOKENIZER_PATH),
@@ -737,9 +739,18 @@ def test_worker_centers_an_infra_error_as_if_its_game_ended_at_the_cap() -> None
 
 def test_worker_drops_a_player_that_never_moved() -> None:
     async def run() -> None:
-        group = await _run_group({0: ["Ke9"], 1: []}, group_size=1)
+        released: list[str] = []
+
+        async def release_session(*, group_id: int, routing_session_id: str) -> None:
+            released.append(routing_session_id)
+
+        group = await _run_group(
+            {0: ["Ke9"], 1: []}, group_size=1, release_session_fn=release_session
+        )
         assert [rollout.rollout_id for rollout in group.rollouts] == [0]
         assert group.rollouts[0].reward == -1.0
+        # Black never moved, but its session is released too, so KV admission stops booking it.
+        assert sorted(released) == ["group=0/rollout=0", "group=0/rollout=1"]
 
     asyncio.run(run())
 
