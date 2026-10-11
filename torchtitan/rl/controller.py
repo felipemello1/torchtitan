@@ -183,6 +183,15 @@ class AsyncLoopConfig(Configurable.Config):
     `target_offpolicy_steps + n`. A value of 1 is FIFO by batch. See
     ``torchtitan/rl/components/WINDOWED_FIFO.md``."""
 
+    start_ramp_s: float = 45.0
+    """Spreads the first rollout groups of each `run()` (fresh or resumed) over this many
+    seconds, so their envs and prefills don't all start together. 0 starts all at once.
+
+    Example (P = 8, S = 4, so (S + 1) * P = 40 rollout workers; start_ramp_s = 32):
+        worker:       0..7   8     9     ...   39
+        first claim:  0 s    1 s   2 s   ...   32 s     (later claims never wait)
+    """
+
     group_buffer: RolloutGroupWorkBuffer.Config = field(
         default_factory=RolloutGroupWorkBuffer.Config
     )
@@ -206,10 +215,26 @@ class AsyncLoopConfig(Configurable.Config):
             raise ValueError(
                 f"windowed_fifo_batches must be None or >= 1, got {self.windowed_fifo_batches}"
             )
+        if self.start_ramp_s < 0:
+            raise ValueError(f"start_ramp_s must be >= 0, got {self.start_ramp_s}")
 
     @property
     def max_active_rollout_groups(self) -> int:
         return (self.target_offpolicy_steps + 1) * self.num_prompts_per_train_step
+
+    @property
+    def rollout_worker_start_delays_s(self) -> list[float]:
+        """Seconds each rollout worker waits before its first claim; see `start_ramp_s`.
+
+        Example (P = 2, S = 2, start_ramp_s = 8):  [0, 0, 2, 4, 6, 8]
+        """
+        num_ramped_workers = (
+            self.target_offpolicy_steps * self.num_prompts_per_train_step
+        )
+        return [0.0] * self.num_prompts_per_train_step + [
+            self.start_ramp_s * i / num_ramped_workers
+            for i in range(1, num_ramped_workers + 1)
+        ]
 
     @property
     def window_size(self) -> int | None:
@@ -795,7 +820,8 @@ class Controller(Configurable):
             f"max_active_rollout_groups={max_active_rollout_groups}, "
             f"target_offpolicy_steps={async_loop.target_offpolicy_steps}, "
             f"windowed_fifo_batches={async_loop.windowed_fifo_batches}, "
-            f"max_offpolicy_steps={async_loop.max_offpolicy_steps}"
+            f"max_offpolicy_steps={async_loop.max_offpolicy_steps}, "
+            f"start_ramp_s={async_loop.start_ramp_s}"
         )
 
         self._group_buffer = async_loop.group_buffer.build(
@@ -837,11 +863,13 @@ class Controller(Configurable):
         # One rollout worker per active buffer slot: lets generation fill every active slot,
         # including the cold start (step 0 fills every active slot, not just num_prompts_per_train_step per wave).
         # TODO: support warm start
+        start_delays_s = async_loop.rollout_worker_start_delays_s
         rollout_tasks = [
             asyncio.create_task(
                 self._rollout_loop(
                     group_buffer=self._group_buffer,
                     generate_fn=generate_fn,
+                    start_delay_s=start_delays_s[group_worker_id],
                 ),
                 name=f"rollout_worker_{group_worker_id}",
             )
@@ -957,11 +985,13 @@ class Controller(Configurable):
         *,
         group_buffer: RolloutGroupWorkBuffer,
         generate_fn: GenerateFn,
+        start_delay_s: float,
     ) -> None:
         """Generate + score one group at a time; a failed group becomes an empty group + a failure metric.
 
         Staleness is bounded by the buffer's active-slot budget. Raw rollouts are recorded before any drop,
         so dropped groups stay inspectable on disk.
+        Waits `start_delay_s` once, before its first claim (see `AsyncLoopConfig.start_ramp_s`).
 
         consumes: a WAITING RolloutGroupWork (group_buffer.claim_next)
             waits for:    a claimable WAITING entry
@@ -970,6 +1000,7 @@ class Controller(Configurable):
             waits for:    nothing (admits its own claimed slot)
             unblocked by: n/a
         """
+        await asyncio.sleep(start_delay_s)
         while True:
             work = await group_buffer.claim_next()
             if work is None:  # group_buffer closed/shutdown signal
