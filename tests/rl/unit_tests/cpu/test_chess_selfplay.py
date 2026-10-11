@@ -393,6 +393,7 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
         assert prompt.endswith("Write your best legal move inside \\boxed{}.")
         # one right and one wrong way to write a move
         assert "means \\boxed{Nbd2}, not \\boxed{Nd2}" in prompt
+        assert "means \\boxed{h8=Q}, not \\boxed{h8}" in prompt
         assert "An x marks a capture" in prompt
 
         white_step = asyncio.create_task(
