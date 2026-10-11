@@ -307,7 +307,9 @@ class AsyncLoopConfig(Configurable.Config):
         """Most groups generating at once: every active slot of the fixed buffer, or the adaptive
         buffer's `generation_capacity`. Sizes the rollout workers and vLLM's `max_num_seqs`."""
         if isinstance(self.group_buffer, AdaptiveRolloutGroupWorkBuffer.Config):
-            return self.group_buffer.generation_capacity
+            return self.group_buffer.resolve_generation_capacity(
+                self.num_prompts_per_train_step
+            )
         return self.max_active_rollout_groups
 
     @property
