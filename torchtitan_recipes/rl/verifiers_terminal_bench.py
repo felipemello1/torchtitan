@@ -31,19 +31,13 @@ from torchtitan.components.optim import (
 from torchtitan.components.renderer import from_renderers
 from torchtitan.config import OverrideConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.config.transform import LMHeadFP32OutputConverter
 from torchtitan.distributed.activation_checkpoint import FullAC, RegionAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.components.data import IterableRLDataLoader
 from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
-from torchtitan.rl.controller import (
-    AsyncLoopConfig,
-    Controller,
-    RLModelDefaults,
-    ValidationConfig,
-)
+from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.distributed.routing.strategies import (
@@ -238,7 +232,6 @@ def rl_grpo_qwen35_9b_terminal_bench() -> Controller.Config:
         "9B",
         seq_len=max_context_length,
         attn_backend="varlen",
-        converters=[LMHeadFP32OutputConverter.Config()],
     )
     return Controller.Config(
         model=model_config,
@@ -376,7 +369,6 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
         "35B-A3B",
         seq_len=max_context_length,
         attn_backend="varlen",
-        converters=[LMHeadFP32OutputConverter.Config()],
     )
     return Controller.Config(
         model=model_config,
@@ -648,10 +640,6 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
         # Under the adaptive buffer this only sets train_batch/pct_samples_over_target_age.
         target_offpolicy_steps=target_offpolicy_steps,
     )
-    # One fp32 logits op in trainer and generator; a frozen expert bias keeps their expert choices
-    # from drifting apart.
-    config.model_defaults = RLModelDefaults(fp32_lm_head=True, freeze_expert_bias=True)
-
     loop = config.async_loop
     loop.num_training_steps = 300
     loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(

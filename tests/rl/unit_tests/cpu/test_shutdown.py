@@ -190,6 +190,7 @@ def test_controller_applies_model_defaults() -> None:
     assert isinstance(model.lm_head, HiMidLoLinear.Config)
     moe_configs = [moe for _, moe, _, _ in model.traverse(MoE.Config)]
     assert moe_configs and all(moe.freeze_expert_bias for moe in moe_configs)
+    assert all(moe.router.freeze_gate for moe in moe_configs)
 
 
 def test_main_shuts_down_after_success(monkeypatch, stub_mesh_provisioning):
