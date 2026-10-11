@@ -1480,6 +1480,8 @@ class Controller(Configurable):
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.
             time_metrics = step_timer.flush()
+            # to_thread: the loader's metrics wait for an in-flight sample read; don't block the loop on it.
+            data_metrics = await asyncio.to_thread(self._rollouter.training_data_metrics)
             with sl.log_trace_span("metrics_log"):
                 session_kv_metrics = (
                     await self.generator_router.get_session_kv_metrics.call_one()
@@ -1499,7 +1501,7 @@ class Controller(Configurable):
                         ],
                         *self._group_buffer.metrics(),
                         *session_kv_metrics,
-                        *self._rollouter.training_data_metrics(),
+                        *data_metrics,
                         *time_metrics,
                         *gc_timer.flush(),
                         *policy_age_panel,
