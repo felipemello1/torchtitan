@@ -921,7 +921,7 @@ class Controller(Configurable):
             window_size=window_size,
         )
 
-        # Overlaps each step's weight handoff (push -> pull -> buffer-slot release) with the next step's fwd/bwd
+        # Overlaps each step's weight handoff (push -> pull -> buffer-slot release) with the next step
         self._weight_sync = WeightSyncManager(
             trainer=self.trainer,
             generator_router=self.generator_router,
@@ -1235,7 +1235,7 @@ class Controller(Configurable):
         NOTE: Weight sync is overlapped with the training step.
         Trainer push:
             - Called after optimizer.step()
-            - Awaited before next optimizer.step (weights changes then)
+            - Awaited before the next forward/backward (see WeightSyncManager)
         Generator pull:
             - Called after push completes.
             - Awaited before next push (weights changes then)
@@ -1257,6 +1257,8 @@ class Controller(Configurable):
                 await self.trainer.sync_log_step.call(step)
                 await self.generator_router.sync_log_step.call_one(step)
                 await self._rollouter.sync_log_step(step)
+            # timing/step/* splits timing/step/total into phases. A wait_for_* phase is how long the loop
+            # idled on background work, not how long that work took.
             step_timer = MetricsTimer()
 
             with (
@@ -1284,6 +1286,16 @@ class Controller(Configurable):
                     ),
                     max_offpolicy_steps=self.config.async_loop.max_offpolicy_steps,
                 )
+
+                # Forward/backward blocks the trainer's loop and would stall a pending push; see WeightSyncManager.
+                # TODO(perf): run forward_backward in a thread (asyncio.to_thread) to hide the push's 0.2-0.4 s again.
+                #   Not done: the push's copy would queue behind forward/backward on the default stream, its bf16 copy
+                #   would live through forward/backward, and per-thread CUDA/NCCL state needs a review.
+                with (
+                    sl.log_trace_span("wait_for_push"),
+                    step_timer.record("timing/step/wait_for_push"),
+                ):
+                    push_metrics = await self._weight_sync.wait_prev_push()
 
                 # TODO(async): can't stream microbatches (interleave pack->train) -- the loss is normalized by
                 #   global counts over ALL microbatches, needed before any fwd/bwd. To
@@ -1322,15 +1334,6 @@ class Controller(Configurable):
                         logger.error("Loss is NaN/Inf; training diverged")
                         break
 
-                # Await trainer weight push before the optimizer mutates the weights.
-                with (
-                    sl.log_trace_span("blocking_trainer_push_model_state_dict"),
-                    step_timer.record(
-                        "timing/step/blocking_trainer_push_model_state_dict"
-                    ),
-                ):
-                    push_metrics = await self._weight_sync.wait_prev_push()
-
                 with (
                     sl.log_trace_span("optim_step"),
                     step_timer.record("timing/step/optimizer"),
@@ -1354,14 +1357,12 @@ class Controller(Configurable):
 
                 # Await generator weight pull to finish before the trainer's next push.
                 with (
-                    sl.log_trace_span("blocking_generator_pull_model_state_dict"),
-                    step_timer.record(
-                        "timing/step/blocking_generator_pull_model_state_dict"
-                    ),
+                    sl.log_trace_span("wait_for_pull"),
+                    step_timer.record("timing/step/wait_for_pull"),
                 ):
                     pull_metrics = await self._weight_sync.wait_prev_pull()
 
-                # Overlap this step's push -> pull -> buffer-slot release with the next step's fwd/bwd.
+                # The push overlaps the next batch wait; the pull + slot release overlap the next forward/backward.
                 self._weight_sync.start_async_push_pull(
                     version=optimizer_result.policy_version
                 )
@@ -1386,7 +1387,7 @@ class Controller(Configurable):
                         *self._group_buffer.metrics(),
                         *time_metrics,
                         *policy_age_panel,
-                        # Background push/pull work time; the trainer's wait for it is timing/step/blocking_*.
+                        # Push/pull start to done in the background; the loop's waits are timing/step/wait_for_*.
                         *push_metrics,
                         *pull_metrics,
                         *compute_perf_ratio_metrics(
