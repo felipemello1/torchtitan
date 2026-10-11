@@ -26,7 +26,7 @@ from torchtitan.components.optim import (
 from torchtitan.components.renderer import from_renderers
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.distributed.activation_checkpoint import FullAC, RegionAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.components.data import IterableRLDataLoader
@@ -287,9 +287,12 @@ def rl_chess_qwen3_5_4b_gb300(
 
     # ======== Trainer ========
     trainer = config.trainer
-    # The 4B's fp32 weights, grads and Adam state take ~16 GB of a GB300's memory, so the trainer
-    # spends it on selective activation checkpointing instead of full recompute.
-    trainer.activation_checkpoint = SelectiveAC.Config()
+    # The 4B's fp32 weights, grads and Adam state take ~16 GB of a GB300's memory, so the trainer saves
+    # the attention and FFN outputs instead of recomputing everything. Main's SelectiveAC saves every
+    # region, including GDN's, which OOMs at 131K tokens.
+    trainer.activation_checkpoint = RegionAC.Config(
+        save_regions=["attn.inner_attention", "feed_forward.w2.linear"]
+    )
     # Score centering instead of DAPO's clipped objective: REINFORCE weighted by min(p / q, 2), with
     # the generator's top-16 logprobs as each token's baseline.
     trainer.loss.loss_fn = ScoreCenteringLoss.Config(
