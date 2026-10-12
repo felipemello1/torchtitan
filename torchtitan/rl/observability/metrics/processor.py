@@ -90,7 +90,7 @@ class MetricsProcessor(Configurable):
                 "validation/reward/_mean",
                 "validation/reward/_max",
                 "validation/response_length/mean",
-                "timing/validate",
+                "timing/validation/",
             ]
         )
         """Same as console_log_keys_train but used when
@@ -222,6 +222,15 @@ class MetricsProcessor(Configurable):
                     "metric backend %s failed at step %d",
                     type(backend).__name__,
                     step,
+                )
+
+    def commit(self) -> None:
+        for backend in self._backends:
+            try:
+                backend.commit()
+            except Exception:
+                logger.exception(
+                    "metric backend %s failed to commit", type(backend).__name__
                 )
 
     def close(self) -> None:
