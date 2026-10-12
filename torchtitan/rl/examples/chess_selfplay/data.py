@@ -42,7 +42,7 @@ class ChessSample:
     curriculum_level: int | None = None
     """On a "curriculum" game, the index of its bot in `ChessCurriculum.Config.bots`; None otherwise."""
     max_plies: int | None = None
-    """This game's ply cap; None: the worker's `max_plies`. `ChessCurriculum` sets it on a schedule."""
+    """This game's ply cap; None: the worker's `max_plies`. `ChessCurriculum` sets it from the train step."""
 
 
 class ChessSelfPlayDataset(RLDataset):

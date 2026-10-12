@@ -142,12 +142,11 @@ class ChessSelfPlayWorker(RolloutWorker):
             )
             for game_idx in range(group_size)
         ]
+        max_plies = self._max_plies if sample.max_plies is None else sample.max_plies
         games = [
             ChessGame(
                 sample=sample,
-                max_plies=self._max_plies
-                if sample.max_plies is None
-                else sample.max_plies,
+                max_plies=max_plies,
                 seed=sample.seed + game_idx,
                 bot=bot,
                 checkmate_reward=self._checkmate_reward,

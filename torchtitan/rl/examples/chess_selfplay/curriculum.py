@@ -21,15 +21,17 @@ class ChessCurriculum(Curriculum):
     Example:
 
         config.rollouter.training_dataloader.dataset.bots = ("curriculum",)
-        config.rollouter.curriculum = ChessCurriculum.Config(bots=("sf_random", "sf_eps75", "sf_eps50"))
-        # self-play games from 60 plies at step 0 to 120 at step 200, then 120
-        ChessCurriculum.Config(start_max_plies=60, end_max_plies=120, max_plies_ramp_steps=200)
+        config.rollouter.curriculum = ChessCurriculum.Config(
+            bots=("sf_random", "sf_eps75", "sf_eps50"),
+            # every training game's ply cap: 60 at step 0, 90 at step 100, 120 from step 200
+            start_max_plies=60, end_max_plies=120, max_plies_ramp_steps=200,
+        )
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Curriculum.Config):
         bots: tuple[str, ...] = ()
-        """Bots from `bots.BOTS`, easiest first, for games whose opponent is "curriculum"."""
+        """Bots from `bots.BOTS`, easiest first, for games whose opponent is "curriculum". Empty: no bot ladder."""
 
         promote_win_rate: float = 0.6
         """Moves to the next bot once the policy wins more than this share of a train step's games
@@ -40,12 +42,10 @@ class ChessCurriculum(Curriculum):
         rate, a test passes 60% by luck 12.5% of the time with 64 games, 1.3% with 256."""
 
         start_max_plies: int | None = None
-        """A training game's ply cap at step 0, growing linearly to `end_max_plies` at step
-        `max_plies_ramp_steps`, then held: 60 -> 90 at step 100 -> 120 from step 200. None: games
-        keep the worker's `max_plies`."""
+        """Training games' ply cap at step 0, growing linearly to `end_max_plies`. None: the worker's `max_plies`."""
 
         end_max_plies: int = 120
-        """The ply cap from step `max_plies_ramp_steps` on, with `start_max_plies` set."""
+        """Training games' ply cap from step `max_plies_ramp_steps` on; unused without `start_max_plies`."""
 
         max_plies_ramp_steps: int = 200
         """Steps the ply cap takes to grow from `start_max_plies` to `end_max_plies`."""
@@ -64,17 +64,21 @@ class ChessCurriculum(Curriculum):
         """Set the ply cap for `step` (with `start_max_plies`) and resolve a "curriculum" opponent to
         the current bot.
 
-        Example (bots=("sf_random", "sf_eps75"), level 1; start_max_plies=60, end 120 at step 200):
+        Example (bots=("sf_random", "sf_eps75"), level 1, start_max_plies=60, end_max_plies=120,
+        max_plies_ramp_steps=200):
 
-            prepare(ChessSample(opponent="curriculum", ...), step=100)
-            # ChessSample(opponent="sf_eps75", curriculum_level=1, max_plies=90, ...)
+            prepare(ChessSample(opponent="curriculum", ...), step=100)  # opponent="sf_eps75", curriculum_level=1, max_plies=90
+            prepare(ChessSample(opponent="self", ...), step=300)        # max_plies=120
         """
         if self._start_max_plies is not None:
-            ramp = min(step / self._max_plies_ramp_steps, 1.0)
-            max_plies = self._start_max_plies + ramp * (
-                self._end_max_plies - self._start_max_plies
+            ramp_step = min(step, self._max_plies_ramp_steps)
+            max_plies = (
+                self._start_max_plies
+                + (self._end_max_plies - self._start_max_plies)
+                * ramp_step
+                // self._max_plies_ramp_steps
             )
-            sample = replace(sample, max_plies=round(max_plies))
+            sample = replace(sample, max_plies=max_plies)
         if sample.opponent != "curriculum":
             return sample
         return replace(

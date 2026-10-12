@@ -963,8 +963,8 @@ def test_curriculum_ramps_the_ply_cap_with_the_step() -> None:
         curriculum.prepare(_SELF_PLAY, step=step).max_plies
         for step in (0, 1, 100, 199, 200, 300)
     ]
-    assert caps == [60, 60, 90, 120, 120, 120]
-    # without a ramp the worker's max_plies applies
+    assert caps == [60, 60, 90, 119, 120, 120]
+    # without start_max_plies, the sample keeps max_plies=None (the worker's cap)
     assert ChessCurriculum.Config().build().prepare(_SELF_PLAY, step=100) == _SELF_PLAY
 
 
