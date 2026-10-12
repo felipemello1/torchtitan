@@ -445,6 +445,33 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
     asyncio.run(run())
 
 
+def test_player_env_plays_the_first_box_after_thinking_else_the_last() -> None:
+    async def run() -> None:
+        game = _new_game()
+        white = ChessPlayerEnv(ChessPlayerEnv.Config(), game=game, color=chess.WHITE)
+        black = ChessPlayerEnv(ChessPlayerEnv.Config(), game=game, color=chess.BLACK)
+        # Thinking closed: the answer's first box, though it runs on into a next turn.
+        white_reply = "\\boxed{e4}\nBlack played e5.\nI play \\boxed{Nf3}."
+        white_step = asyncio.create_task(
+            white.step(
+                {
+                    "role": "assistant",
+                    "reasoning_content": "e4.",
+                    "content": white_reply,
+                }
+            )
+        )
+        # Thinking off or unclosed: the last box that isn't the copied prompt's empty one.
+        black_reply = (
+            "\\boxed{d5}? No, \\boxed{e5}\nWrite your best legal move inside \\boxed{}."
+        )
+        asyncio.create_task(black.step({"role": "assistant", "content": black_reply}))
+        await asyncio.wait_for(white_step, timeout=1)
+        assert [move.uci() for move in game.board.move_stack] == ["e2e4", "e7e5"]
+
+    asyncio.run(run())
+
+
 def test_legal_moves_are_shuffled_per_game() -> None:
     def listed_moves(seed: int) -> list[str]:
         game = ChessGame(sample=_SELF_PLAY, max_plies=40, seed=seed)
