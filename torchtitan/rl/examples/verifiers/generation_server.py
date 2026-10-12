@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from aiohttp import web
 
@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 _SESSION_ID_HEADER = "X-Session-ID"
 
 GROUP_ID_SAMPLING_PARAM = "torchtitan_group_id"
+# Optional per-request context cap (prompt + output tokens), tighter than `max_rollout_tokens`: lets
+# training and validation use different context lengths on one generation server.
+MAX_ROLLOUT_TOKENS_SAMPLING_PARAM = "torchtitan_max_rollout_tokens"
 """Sampling parameter carrying a request's rollout group id.
 
 Verifiers forwards extra sampling fields verbatim in ``sampling_params``, so the
@@ -179,24 +182,43 @@ class GenerationServer(Configurable):
             prompt_token_ids = _validate_token_ids(
                 body.get("token_ids"), field_name="token_ids"
             )
-            # vLLM needs room for one output token. Verifiers reads this wording as an
-            # overlong prompt and ends the rollout as context_length.
-            if len(prompt_token_ids) >= self.max_rollout_tokens:
-                raise ValueError(
-                    f"This model's maximum context length is {self.max_rollout_tokens} "
-                    f"tokens, and the prompt has {len(prompt_token_ids)} tokens, "
-                    "leaving no room for an output token"
-                )
             sampling_params = body.get("sampling_params")
             if not isinstance(sampling_params, dict):
                 raise ValueError("sampling_params must be an object")
             sampling_params = dict(sampling_params)
+            request_cap = sampling_params.pop(MAX_ROLLOUT_TOKENS_SAMPLING_PARAM, None)
+            if request_cap is not None and (
+                isinstance(request_cap, bool)
+                or not isinstance(request_cap, int)
+                or request_cap <= 0
+            ):
+                raise ValueError(
+                    f"sampling_params.{MAX_ROLLOUT_TOKENS_SAMPLING_PARAM} must be a "
+                    "positive integer"
+                )
+            max_rollout_tokens = (
+                self.max_rollout_tokens
+                if request_cap is None
+                else min(self.max_rollout_tokens, request_cap)
+            )
+            # vLLM needs room for one output token. Verifiers reads this wording as an
+            # overlong prompt and ends the rollout as context_length.
+            if len(prompt_token_ids) >= max_rollout_tokens:
+                raise ValueError(
+                    f"This model's maximum context length is {max_rollout_tokens} "
+                    f"tokens, and the prompt has {len(prompt_token_ids)} tokens, "
+                    "leaving no room for an output token"
+                )
             group_id = sampling_params.pop(GROUP_ID_SAMPLING_PARAM, None)
             if isinstance(group_id, bool) or not isinstance(group_id, int):
                 raise ValueError(
                     f"sampling_params.{GROUP_ID_SAMPLING_PARAM} must be an integer"
                 )
             sampling = _parse_sampling_config(sampling_params)
+            # The rollout's context cap bounds this turn's output too.
+            room = max_rollout_tokens - len(prompt_token_ids)
+            if sampling.max_tokens > room:
+                sampling = replace(sampling, max_tokens=room)
             if body.get("features") is not None:
                 raise ValueError("multimodal features are not supported")
         except (TypeError, ValueError) as error:

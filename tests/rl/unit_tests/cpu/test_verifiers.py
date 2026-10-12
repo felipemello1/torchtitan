@@ -537,6 +537,9 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
         branches=[],
     )
     rollouter = object.__new__(VerifiersRollouter)
+    rollouter._verifiers_config = SimpleNamespace(
+        max_rollout_tokens=None, validation_max_rollout_tokens=None
+    )
     rollouter._generation_server = SimpleNamespace(
         model_id="model", pop_generation_metadata=lambda trace_id: None
     )
@@ -562,3 +565,71 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
 def test_parse_sampling_config_requires_stop_token_ids() -> None:
     with pytest.raises(ValueError, match="stop_token_ids"):
         _parse_sampling_config({"temperature": 1.0})
+
+
+def test_generation_server_enforces_each_request_context_cap() -> None:
+    """Server cap 131,072. A training request capped at 64 (the rollouter's per-source cap) with a
+    70-token prompt is rejected with vLLM's overlong-prompt wording (Verifiers stops it as
+    truncated); the same prompt without a request cap reaches the generator, and a capped request
+    has its `max_tokens` clamped to the room left."""
+
+    async def run_test() -> None:
+        calls = []
+
+        async def generate_fn(prompt_token_ids, **kwargs):
+            calls.append((len(prompt_token_ids), kwargs["sampling_config"].max_tokens))
+            raise RuntimeError("generator reached")
+
+        server = GenerationServer.Config(max_rollout_tokens=131072).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+
+        async def post(session, num_tokens, **extra):
+            response = await session.post(
+                f"http://{server.host}:{server.port}/inference/v1/generate",
+                headers={"X-Session-ID": "group=1/rollout=2"},
+                json={
+                    "token_ids": [1] * num_tokens,
+                    "sampling_params": {
+                        "max_tokens": 50,
+                        "torchtitan_group_id": 1,
+                        "stop_token_ids": [99],
+                        **extra,
+                    },
+                },
+            )
+            return response.status, (await response.json())["error"]
+
+        try:
+            async with ClientSession() as session:
+                over = await post(session, 70, torchtitan_max_rollout_tokens=64)
+                uncapped = await post(session, 70)
+                clamped = await post(session, 40, torchtitan_max_rollout_tokens=64)
+        finally:
+            await server.close()
+
+        assert over[0] == 400
+        assert "maximum context length is 64 tokens" in over[1]
+        assert uncapped[0] == 500  # reached the generator
+        assert clamped[0] == 500
+        assert calls == [(70, 50), (40, 24)]
+
+    asyncio.run(run_test())
+
+
+def test_rollouter_sends_each_sources_context_cap() -> None:
+    from torchtitan.rl.examples.verifiers.generation_server import (
+        MAX_ROLLOUT_TOKENS_SAMPLING_PARAM,
+    )
+
+    rollouter = object.__new__(VerifiersRollouter)
+    rollouter._verifiers_config = SimpleNamespace(
+        max_rollout_tokens=65536, validation_max_rollout_tokens=131072
+    )
+    key = MAX_ROLLOUT_TOKENS_SAMPLING_PARAM
+    assert rollouter._max_rollout_tokens_param(7) == {key: 65536}
+    assert rollouter._max_rollout_tokens_param(-3) == {key: 131072}
+    rollouter._verifiers_config.validation_max_rollout_tokens = None
+    assert rollouter._max_rollout_tokens_param(-3) == {key: 65536}
+    rollouter._verifiers_config.max_rollout_tokens = None
+    assert rollouter._max_rollout_tokens_param(7) == {}
