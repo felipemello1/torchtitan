@@ -222,6 +222,7 @@ def register_to_vllm(
     dist_moe_runtime: DistMoeRuntime.Config | None = None,
     model_state_dict_load_mode: ModelStateDictLoadMode,
     vision_processor: VisionProcessor.Config | None = None,
+    return_routed_experts: bool = False,
 ) -> None:
     """Register the TorchTitan model class and the TorchTitan config parser with vLLM.
 
@@ -269,6 +270,8 @@ def register_to_vllm(
             ``VLLMMultimodalModelWrapper`` (keeps the vision encoder), an image
             processor for vLLM's startup, and M-RoPE in the HF config. ``None``: text
             only.
+        return_routed_experts: Hook every MoE router into vLLM's routed-experts capture;
+            pair it with ``EngineArgs.enable_return_routed_experts``.
     """
     has_gdn = any(
         isinstance(layer.attention, GDN.Config) for layer in model_config.layers
@@ -321,6 +324,7 @@ def register_to_vllm(
                 prefix=prefix,
                 dist_moe_runtime=dist_moe_runtime,
                 model_state_dict_load_mode=model_state_dict_load_mode,
+                return_routed_experts=return_routed_experts,
                 **wrapper_kwargs,
             )
 

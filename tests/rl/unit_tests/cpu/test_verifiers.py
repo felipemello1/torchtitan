@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import os
 import signal
@@ -426,6 +428,7 @@ def test_verifiers_trace_preserves_generation_metadata() -> None:
                 nodes=[node],
                 token_ids=np.array([10, 11, 12, 13], dtype=np.int32),
                 logprobs=[0.0, 0.0, -0.2, -0.3],
+                routed_experts=None,
             )
         ],
     )
@@ -475,6 +478,8 @@ def test_verifiers_multiturn_trace_matches_titanrl_rollout_structure() -> None:
                 nodes=[first_node, second_node],
                 token_ids=np.array([10, 11, 12, 13], dtype=np.int32),
                 logprobs=[0.0, -0.1, 0.0, -0.2],
+                # Row i holds the experts of position i.
+                routed_experts=np.arange(4).reshape(4, 1, 1),
             )
         ],
     )
@@ -497,6 +502,11 @@ def test_verifiers_multiturn_trace_matches_titanrl_rollout_structure() -> None:
     ]
     assert stored == [(0, [10]), (2, [12])]
     assert [turn.completion_token_ids.tolist() for turn in turns] == [[11], [13]]
+    # Like the prompt, a delta: turn 1's rows start at 11, which only its prefill ran.
+    assert [turn.routed_expert_ids.flatten().tolist() for turn in turns] == [
+        [0],
+        [1, 2],
+    ]
     assert [turn.completion_logprobs.tolist() for turn in turns] == [
         pytest.approx([-0.1]),
         pytest.approx([-0.2]),
@@ -593,11 +603,13 @@ def test_verifiers_second_branch_stores_its_prompt_as_a_delta_on_the_first() -> 
                 nodes=[shared, first_leaf],
                 token_ids=np.array([10, 11, 12, 13], dtype=np.int32),
                 logprobs=[0.0, -0.1, 0.0, -0.2],
+                routed_experts=None,
             ),
             SimpleNamespace(
                 nodes=[shared, second_leaf],
                 token_ids=np.array([10, 11, 14, 15], dtype=np.int32),
                 logprobs=[0.0, -0.1, 0.0, -0.3],
+                routed_experts=None,
             ),
         ],
     )
@@ -651,6 +663,7 @@ def test_verifiers_trace_attaches_env_replies_to_the_preceding_turn() -> None:
                 nodes=branch_nodes,
                 token_ids=np.array([0] * len(branch_nodes), dtype=np.int32),
                 logprobs=[0.0] * len(branch_nodes),
+                routed_experts=None,
             )
             for branch_nodes in (
                 [task, first, out, second],
@@ -913,6 +926,71 @@ def test_generation_server_records_topk_per_generation() -> None:
         np.testing.assert_array_equal(logprobs, topk_logprobs)
 
     asyncio.run(run_test())
+
+
+def test_generation_server_returns_routed_experts_from_the_prompt_start() -> None:
+    # Prompt [1, 2, 3] + completion [31, 32]; the previous turn already returned position 0,
+    # so the generator returns the rows of positions 1..3.
+    rows = np.arange(3 * 2 * 2, dtype=np.uint8).reshape(3, 2, 2)
+
+    async def run_test() -> tuple[list[SamplingConfig], int, bytes]:
+        sampling_configs = []
+
+        async def generate_fn(prompt, *, request_id, sampling_config, **kwargs):
+            sampling_configs.append(sampling_config)
+            return Completion(
+                min_policy_version=1,
+                max_policy_version=1,
+                request_id=request_id,
+                token_ids=[31, 32],
+                token_logprobs=[-0.1, -0.2],
+                finish_reason="stop",
+                routed_expert_ids=rows,
+            )
+
+        def body(routed_experts_prompt_start: int) -> dict:
+            return {
+                "token_ids": [1, 2, 3],
+                "sampling_params": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "max_tokens": 2,
+                    "torchtitan_group_id": 1,
+                    "stop_token_ids": [99],
+                    "routed_experts_prompt_start": routed_experts_prompt_start,
+                },
+            }
+
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+        try:
+            async with ClientSession() as session:
+                url = f"http://{server.host}:{server.port}/inference/v1/generate"
+                headers = {"X-Session-ID": "group=1/rollout=0"}
+                response = await session.post(url, headers=headers, json=body(1))
+                assert response.status == 200
+                raw = await response.read()
+                out_of_range = await session.post(url, headers=headers, json=body(3))
+        finally:
+            await server.close()
+        return sampling_configs, out_of_range.status, raw
+
+    sampling_configs, out_of_range_status, raw = asyncio.run(run_test())
+    assert [config.routed_experts_prompt_start for config in sampling_configs] == [1]
+    # A start outside the prompt would assert inside vLLM's engine step; the server
+    # rejects it as a bad request field (422) before it reaches the generator.
+    assert out_of_range_status == 422
+    # Compact JSON: Verifiers' client cuts the base64 out at this exact prefix.
+    assert b'"routed_experts":{"data":"' in raw
+    payload = json.loads(raw)["choices"][0]["routed_experts"]
+    assert (payload["shape"], payload["start"], payload["dtype"]) == (
+        [3, 2, 2],
+        1,
+        "uint8",
+    )
+    data = np.frombuffer(base64.b64decode(payload["data"]), dtype=np.uint8)
+    np.testing.assert_array_equal(data.reshape(payload["shape"]), rows)
 
 
 def test_generation_server_rejects_aborted_generation() -> None:
@@ -1465,6 +1543,7 @@ def test_timed_out_rollout_is_logged_and_keeps_its_verifiers_grade(caplog) -> No
                 nodes=[node],
                 token_ids=np.array([10, 11], dtype=np.int32),
                 logprobs=[0.0, -0.1],
+                routed_experts=None,
             )
         ],
     )

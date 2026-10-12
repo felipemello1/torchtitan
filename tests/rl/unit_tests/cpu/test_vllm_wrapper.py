@@ -23,7 +23,7 @@ from torchtitan.models.kimi_k3 import build_model_config as build_kimi_k3_config
 from torchtitan.models.qwen3 import build_model_config as build_qwen3_config
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.generator.model import ModelStateDictLoader
-from torchtitan.rl.generator.vllm import registry
+from torchtitan.rl.generator.vllm import model_wrapper, registry
 from torchtitan.rl.generator.vllm.attention.attention import VLLMInnerAttention
 
 from torchtitan.rl.generator.vllm.attention.mla import (
@@ -32,7 +32,10 @@ from torchtitan.rl.generator.vllm.attention.mla import (
     VLLMMLAAttention,
     VLLMMLAInnerAttention,
 )
-from torchtitan.rl.generator.vllm.model_wrapper import _replace_vllm_layer_configs
+from torchtitan.rl.generator.vllm.model_wrapper import (
+    _replace_vllm_layer_configs,
+    VLLMModelWrapper,
+)
 from vllm.model_executor.layers.attention import MLAAttention as VLLMNativeMLAAttention
 
 
@@ -315,3 +318,41 @@ def test_vllm_native_mla_rejects_copied_decode_weights() -> None:
         VLLMNativeMLAAttention, "process_weights_after_loading", copy_decode_weights
     ), pytest.raises(AssertionError, match="must be a view of wkv_b.weight"):
         attention.process_weights_after_loading(torch.bfloat16)
+
+
+def test_routers_report_their_experts_to_vllm_capture():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from torchtitan.models.common.activation import Sigmoid
+    from torchtitan.models.common.config_utils import make_router_config
+
+    for tp_enabled, num_captured_rows in ((False, 3), (True, 6)):
+        router = make_router_config(
+            dim=4,
+            num_experts=4,
+            score_func=Sigmoid.Config(),
+            gate_param_init={"weight": nn.init.zeros_},
+            top_k=2,
+        ).build()
+        router.init_states()
+        wrapper = VLLMModelWrapper.__new__(VLLMModelWrapper)
+        nn.Module.__init__(wrapper)
+        wrapper.model = nn.Module()
+        wrapper.model.layers = nn.ModuleDict({"0": nn.Linear(4, 4), "1": router})
+        wrapper.parallelism_context = SimpleNamespace(
+            ep_enabled=True, tp_enabled=tp_enabled
+        )
+        # Under EP x TP each rank routes half the tokens; the hook gathers them back.
+        tp_group = SimpleNamespace(all_gather=lambda t, dim: torch.cat([t, t], dim))
+        captured = []
+
+        with patch.object(model_wrapper, "get_tp_group", return_value=tp_group):
+            wrapper._expose_routed_experts_to_vllm()
+            assert router.layer_id == 1 and router.capture_fn is None
+            router(torch.randn(3, 4))  # vLLM has not bound capture_fn yet
+            router.capture_fn = captured.append
+            _, topk_expert_ids_TK, _ = router(torch.randn(3, 4))
+
+        assert len(captured) == 1 and captured[0].shape == (num_captured_rows, 2)
+        assert torch.equal(captured[0][:3], topk_expert_ids_TK)

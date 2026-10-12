@@ -111,7 +111,7 @@ class _FakeLLMEngine:
         self.reset_encoder_cache_calls += 1
 
 
-def _sample(*, token_ids=(10, 11), finish_reason="stop"):
+def _sample(*, token_ids=(10, 11), finish_reason="stop", routed_experts=None):
     # What vLLM returns with flat_logprobs=True and logprobs=0: one logprob (-0.1) per generated token.
     logprobs = FlatLogprobs()
     for tok in token_ids:
@@ -120,6 +120,7 @@ def _sample(*, token_ids=(10, 11), finish_reason="stop"):
         token_ids=list(token_ids),
         logprobs=logprobs,
         finish_reason=finish_reason,
+        routed_experts=routed_experts,
     )
 
 

@@ -801,6 +801,7 @@ class Controller(Configurable):
                 output_dir=config.dump_folder,
                 enable_structured_logging=config.trainer.debug.enable_structured_logging,
                 vision_processor=config.vision_processor,
+                replay_routed_experts=config.generator.engine.return_routed_experts,
             )
 
             await self._rollouter.setup_async(

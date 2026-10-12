@@ -37,6 +37,7 @@ class _BatcherActorEndpoints:
         output_dir: str,
         enable_structured_logging: bool,
         vision_processor: VisionProcessor.Config | None = None,
+        replay_routed_experts: bool,
     ) -> None:
         init_logger()
         sl.init_structured_logger(
@@ -59,6 +60,7 @@ class _BatcherActorEndpoints:
             num_topk_logprobs=num_topk_logprobs,
             register_rdma_microbatch=MonarchRDMAMicrobatch.register,
             vision_processor=vision_processor,
+            replay_routed_experts=replay_routed_experts,
         )
 
     @endpoint

@@ -44,6 +44,10 @@ class SamplingConfig:
     generation time: these are the only ids that end a request (the engine's EOS stops
     are off)."""
 
+    routed_experts_prompt_start: int = 0
+    """With router replay, return expert ids from this prompt position on. The rollouter sets it
+    per turn to skip the rows earlier turns already returned; leave it at 0 in configs."""
+
     def __post_init__(self) -> None:
         # TODO(mask-replay): to allow top_p < 1, turn on vLLM's `return_sampling_mask` (needs a vLLM
         # upgrade, the V2 model runner, top_k > 0 and processed logprobs), carry each token's kept
@@ -136,3 +140,5 @@ class FinishedRequest:
     """[generated_tokens, k] int32; None unless `SamplingConfig.num_topk_logprobs` > 0."""
     topk_logprobs: np.ndarray | None = None
     """[generated_tokens, k] float32 logprobs of `topk_token_ids`."""
+    routed_expert_ids: np.ndarray | None = None
+    """Router replay rows; see `Completion.routed_expert_ids`."""

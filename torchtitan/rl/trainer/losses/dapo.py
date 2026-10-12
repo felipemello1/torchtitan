@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -159,6 +160,19 @@ class DAPOLoss(Loss[torch.Tensor]):
                     global_loss_token_counts,
                 ),
                 "bit_wise/logprob_diff/max": diff_for_metrics.abs().max(),
+                "bit_wise/logprob_diff_abs/mean": normalize(
+                    diff_for_metrics.float().abs().sum(), global_loss_token_counts
+                ),
+                # k3 = r - 1 - log r with r = p/q: a nonnegative estimate of KL(q || p).
+                "bit_wise/kl_k3/mean": normalize(
+                    (torch.expm1(log_ratio) - log_ratio).float().sum(),
+                    global_loss_token_counts,
+                ),
+                # Tokens whose p/q or q/p exceeds 2, i.e. |log p - log q| > log 2.
+                "bit_wise/ratio_beyond_2x/mean": normalize(
+                    (diff_for_metrics.abs() > math.log(2)).float().sum(),
+                    global_loss_token_counts,
+                ),
                 # Mean entropy of softmax(logits / temperature) over tokens used by the loss.
                 "trainer/entropy/mean": normalize(
                     (token_entropy * effective_loss_mask).sum(),

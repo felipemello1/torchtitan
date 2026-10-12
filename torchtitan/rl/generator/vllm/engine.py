@@ -185,6 +185,7 @@ class VLLMEngine(GenerationEngine):
             batch_invariant=debug.batch_invariant,
             model_state_dict_load_mode=model_state_dict_load_mode,
             vision_processor=vision_processor,
+            return_routed_experts=config.return_routed_experts,
         )
         self._vision_processor: VisionProcessor | None = (
             vision_processor.build() if vision_processor is not None else None
@@ -245,6 +246,7 @@ class VLLMEngine(GenerationEngine):
         batch_invariant: bool,
         model_state_dict_load_mode: ModelStateDictLoadMode,
         vision_processor: VisionProcessor.Config | None,
+        return_routed_experts: bool,
     ) -> None:
         """Process-wide vLLM setup before the engine build: register the TorchTitan model
         and config parser with vLLM, and select vLLM's model runner."""
@@ -256,6 +258,7 @@ class VLLMEngine(GenerationEngine):
             dist_moe_runtime=dist_moe_runtime,
             model_state_dict_load_mode=model_state_dict_load_mode,
             vision_processor=vision_processor,
+            return_routed_experts=return_routed_experts,
         )
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
         if batch_invariant:
@@ -327,6 +330,10 @@ class VLLMEngine(GenerationEngine):
         if max_num_batched_tokens is not None:
             engine_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
         engine_kwargs["watermark"] = self.config.watermark
+        if self.config.return_routed_experts:
+            # TODO: vLLM after 0b7f11a1ee (2026-09-21) captures routed experts only under Model
+            # Runner V2 (forced off in `_setup`); the router hook works unchanged there.
+            engine_kwargs["enable_return_routed_experts"] = True
         # Smaller `priority` runs first and is preempted last; we pass `EngineRequest.group_id`
         # (-1 for all validation), so older groups have higher priority (see its docstring).
         # TODO: validation requests (priority -1) are admitted before training requests, also while a
@@ -586,6 +593,7 @@ def _build_sampling_params(sampling: SamplingConfig) -> SamplingParams:
         # stop_token_ids even with skip_tokenizer_init.
         ignore_eos=True,
         seed=sampling.seed,
+        routed_experts_prompt_start=sampling.routed_experts_prompt_start,
         # The sampled token's logprob (for the GRPO ratio), plus the top-k if requested.
         logprobs=sampling.num_topk_logprobs,
         # Token ids in, token ids and logprob floats out: stops are token ids and nothing reads
@@ -646,6 +654,7 @@ def _finished_request(request_output: RequestOutput) -> FinishedRequest:
         metrics_inputs=_extract_request_metrics_inputs(request_output),
         topk_token_ids=topk_token_ids,
         topk_logprobs=topk_logprobs,
+        routed_expert_ids=completion_output.routed_experts,
     )
 
 

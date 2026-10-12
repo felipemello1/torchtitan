@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from dataclasses import dataclass, field
@@ -26,6 +27,8 @@ _SESSION_ID_HEADER = "X-Session-ID"
 
 # Stands in for the logprobs content list; the handler splices the real list in.
 _LOGPROBS_CONTENT_PLACEHOLDER = "<logprobs content>"
+# Stands in for the routed-experts base64; the handler splices the bytes in.
+_ROUTED_EXPERTS_PLACEHOLDER = "<routed experts data>"
 
 
 GROUP_ID_SAMPLING_PARAM = "torchtitan_group_id"
@@ -213,7 +216,22 @@ class GenerationServer(Configurable):
                 raise ValueError(
                     f"sampling_params.{GROUP_ID_SAMPLING_PARAM} must be an integer"
                 )
+            # Router replay: return expert rows from this prompt position on; earlier rows came
+            # with the previous turn. vLLM asserts the range inside engine.step, where a failure
+            # stops the engine for every request.
+            routed_experts_prompt_start = sampling_params.pop(
+                "routed_experts_prompt_start", 0
+            )
+            if isinstance(routed_experts_prompt_start, bool) or not (
+                isinstance(routed_experts_prompt_start, int)
+                and 0 <= routed_experts_prompt_start < len(prompt_token_ids)
+            ):
+                raise ValueError(
+                    "sampling_params.routed_experts_prompt_start must be an integer in "
+                    f"[0, {len(prompt_token_ids)})"
+                )
             sampling = _parse_sampling_config(sampling_params)
+            sampling.routed_experts_prompt_start = routed_experts_prompt_start
             if body.get("features") is not None:
                 raise ValueError("multimodal features are not supported")
         except (TypeError, ValueError) as error:
@@ -309,18 +327,47 @@ class GenerationServer(Configurable):
                         "token_ids": completion.token_ids,
                         "logprobs": {"content": _LOGPROBS_CONTENT_PLACEHOLDER},
                         "finish_reason": completion.finish_reason,
+                        **(
+                            {}
+                            if completion.routed_expert_ids is None
+                            else {
+                                "routed_experts": {
+                                    "data": _ROUTED_EXPERTS_PLACEHOLDER,
+                                    "shape": list(completion.routed_expert_ids.shape),
+                                    "start": routed_experts_prompt_start,
+                                    "dtype": str(completion.routed_expert_ids.dtype),
+                                }
+                            }
+                        ),
                     }
                 ],
                 "prompt_logprobs": None,
                 "kv_transfer_params": None,
-            }
+            },
+            # Compact, so the client's fast path finds `"routed_experts":{"data":"`.
+            separators=(",", ":"),
         )
         head, _, tail = response_text.rpartition(
             json.dumps(_LOGPROBS_CONTENT_PLACEHOLDER)
         )
-        return web.Response(
-            text=f"{head}[{logprobs_content}]{tail}", content_type="application/json"
+        response_text = f"{head}[{logprobs_content}]{tail}"
+        if completion.routed_expert_ids is None:
+            return web.Response(text=response_text, content_type="application/json")
+        # Base64 needs no JSON escaping: splice it in as bytes instead of json.dumps scanning
+        # and copying it (~33 MB at a 64k-token context; 112 -> 27 ms per response).
+        head, _, tail = response_text.rpartition(
+            json.dumps(_ROUTED_EXPERTS_PLACEHOLDER)
         )
+        body = b"".join(
+            (
+                head.encode(),
+                b'"',
+                base64.b64encode(np.ascontiguousarray(completion.routed_expert_ids)),
+                b'"',
+                tail.encode(),
+            )
+        )
+        return web.Response(body=body, content_type="application/json", charset="utf-8")
 
 
 class _DebugAccessLogger(web.AbstractAccessLogger):
@@ -373,7 +420,6 @@ def _parse_sampling_config(value: object):
     protocol_fields = {
         "logprobs",
         "skip_special_tokens",
-        "routed_experts_prompt_start",
     }
     # Verifiers' train client always sends these switched off, so vLLM ignores the model's
     # generation_config. TorchTitan's generator samples the full vocabulary, which is the
