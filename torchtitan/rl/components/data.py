@@ -113,6 +113,13 @@ class ZeroSpreadSkip:
     """Keep at least this fraction of the tasks seen so far unskipped; past it, the tasks
     skipped longest ago come back first."""
 
+    min_mean_reward: float | None = None
+    """Only a zero-spread group whose mean reward is at least this marks its task; None: any
+    zero-spread group does.
+
+        min_mean_reward=0.9:  all 16 rewards 1.0 -> task skipped    all 16 rewards 0.0 -> task kept
+    """
+
     def __post_init__(self) -> None:
         if self.recheck_after_skips < 1:
             raise ValueError(
@@ -228,6 +235,9 @@ class IterableRLDataLoader(RLDataLoader):
             key = self._sample_key(self._pending[index])
             self._skipped.pop(key, None)
             if not outcome.zero_spread:
+                continue
+            min_mean_reward = self._zero_spread_skip.min_mean_reward
+            if min_mean_reward is not None and outcome.mean_reward < min_mean_reward:
                 continue
             self._skipped[key] = 0  # re-inserted last: the newest skip
             direction = "all_pass" if outcome.mean_reward > 0 else "all_fail"

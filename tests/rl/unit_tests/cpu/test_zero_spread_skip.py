@@ -112,6 +112,17 @@ def test_zero_spread_tasks_are_skipped_then_rechecked() -> None:
     assert metrics["data/zero_spread_skip/marked_all_fail"] == 1
 
 
+def test_min_mean_reward_skips_only_all_pass_tasks() -> None:
+    loader = _loader(recheck_after_skips=2, min_active_frac=0.1, min_mean_reward=0.9)
+    # t0 all pass, t1 all fail, t2 mixed: only t0 is marked.
+    _finish(loader, _draw(loader, 4), {"t0": ALL_PASS, "t1": ALL_FAIL, "t2": MIXED})
+
+    assert [task for _, task in _draw(loader, 3)] == ["t1", "t2", "t3"]
+    metrics = {metric.key: metric.value.value for metric in loader.metrics()}
+    assert metrics["data/zero_spread_skip/marked_all_pass"] == 1
+    assert metrics["data/zero_spread_skip/marked_all_fail"] == 0
+
+
 def test_a_mixed_group_brings_a_task_back() -> None:
     loader = _loader(recheck_after_skips=1, min_active_frac=0.1)
     _finish(loader, _draw(loader, 4), {"t0": ALL_PASS})
