@@ -124,7 +124,11 @@ from torchtitan.rl.distributed.monarch_actors.trainer import TrainerActor
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.distributed.torch_elastic import setup_torch_elastic_env
 from torchtitan.rl.distributed.weight_sync import WeightSyncManager
-from torchtitan.rl.generator import SamplingConfig, VLLMGenerator
+from torchtitan.rl.generator import (
+    EXTRA_VALIDATION_GROUP_ID_STRIDE,
+    SamplingConfig,
+    VLLMGenerator,
+)
 from torchtitan.rl.losses import ScoreCenteringLoss
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
@@ -207,6 +211,58 @@ class ValidationConfig:
 
 
 @dataclass(kw_only=True, slots=True)
+class ExtraValidationConfig:
+    """A named validation set beside `AsyncLoopConfig.validation`, e.g. a slow benchmark.
+
+    Its passes always overlap training, each set keeps at most one pass running, and passes of
+    different sets run concurrently. Unlike the main set it has no pre/post-training blocking pass:
+    a pass starts at the first step and then every `freq` steps; a pass still running when training
+    ends is awaited and logged at the last step. Its generator requests get the lowest vLLM priority
+    (`vllm_priority`), so a long pass never delays training rollouts. Its tasks come from the
+    rollouter's validation set of the same name. Metrics go under `validation/{name}/...`:
+
+        validation/{name}_reward/mean   mean reward over every sample (= pass@1 for 0/1 rewards)
+        validation/{name}/best_of_{k}   each prompt's best sample, averaged (k > 1)
+        validation/{name}/pass_at_{k}   same value, logged only with `binary_reward`
+    """
+
+    name: str
+    """Validation set name; the rollouter must have a validation set of this name."""
+
+    freq: int
+    """Start a pass every `freq` train steps (if the previous one has ended)."""
+
+    steps: int = -1
+    """Maximum prompts per pass; -1 runs the whole set."""
+
+    temperature: float = 1.0
+    """Sampling temperature."""
+
+    num_samples_per_prompt: int = 1
+    """Sibling rollouts sampled per prompt."""
+
+    binary_reward: bool = False
+    """Rewards are 0/1, so `best_of_k` is pass@k and is also logged as `pass_at_{k}`."""
+
+    def __post_init__(self) -> None:
+        if not self.name or "/" in self.name:
+            raise ValueError(f"extra validation name must be non-empty without '/', got {self.name!r}")
+        if self.freq <= 0:
+            raise ValueError(f"extra validation freq must be positive, got {self.freq}")
+        if self.steps == 0 or self.steps < -1:
+            raise ValueError("extra validation steps must be -1 or positive")
+        if self.temperature < 0:
+            raise ValueError("extra validation temperature must be non-negative")
+        if self.num_samples_per_prompt < 1:
+            raise ValueError("extra validation num_samples_per_prompt must be >= 1")
+        if self.temperature == 0 and self.num_samples_per_prompt > 1:
+            raise ValueError(
+                "greedy validation (temperature=0) repeats the same rollout; set "
+                "num_samples_per_prompt=1"
+            )
+
+
+@dataclass(kw_only=True, slots=True)
 class AsyncLoopConfig(Configurable.Config):
     num_training_steps: int = 10
     """Optimizer steps to run."""
@@ -263,7 +319,14 @@ class AsyncLoopConfig(Configurable.Config):
     batcher: Batcher.Config = field(default_factory=Batcher.Config)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
 
+    extra_validations: list[ExtraValidationConfig] = field(default_factory=list)
+    """Named validation sets beside `validation`, each on its own schedule (see
+    `ExtraValidationConfig`)."""
+
     def __post_init__(self) -> None:
+        extra_names = [extra.name for extra in self.extra_validations]
+        if len(set(extra_names)) != len(extra_names):
+            raise ValueError(f"extra_validations names must be unique, got {extra_names}")
         if self.num_prompts_per_train_step < 1:
             raise ValueError(
                 "num_prompts_per_train_step must be >= 1, got "
@@ -560,6 +623,9 @@ class Controller(Configurable):
         )
         # With `validation.overlap_training`: the pass running beside training.
         self._validation_task: asyncio.Task[list[m.Metric]] | None = None
+        # Extra validation sets: the running pass of each, by name; and sets due to start one.
+        self._extra_validation_tasks: dict[str, asyncio.Task[list[m.Metric]]] = {}
+        self._extra_validation_requested: set[str] = set()
 
     async def close(self):
         """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
@@ -569,6 +635,10 @@ class Controller(Configurable):
         if self._validation_task is not None:
             self._validation_task.cancel()
             await asyncio.gather(self._validation_task, return_exceptions=True)
+        extra_tasks = list(self._extra_validation_tasks.values())
+        for task in extra_tasks:
+            task.cancel()
+        await asyncio.gather(*extra_tasks, return_exceptions=True)
 
         if self.trainer is not None:
             try:
@@ -710,6 +780,12 @@ class Controller(Configurable):
             num_training_rollouts + num_validation_groups
             if validation.freq is not None or validation.overlap_training
             else max(num_training_rollouts, num_validation_groups)
+        )
+        # Extra validation passes always overlap training (and each other).
+        rollout_concurrency += sum(
+            len(self._rollouter.get_validation_samples(extra.steps, extra.name))
+            * extra.num_samples_per_prompt
+            for extra in async_loop.extra_validations
         )
 
         trainer_parallelism = config.trainer.parallelism
@@ -900,19 +976,39 @@ class Controller(Configurable):
     # TODO: fold validation into a Validator(Configurable) the controller attaches, instead of these methods.
     @sl.log_trace_span("_collect_validation_rollouts")
     async def _collect_validation_rollouts(
-        self, *, samples: list[object], sampling: SamplingConfig, step: int
+        self,
+        *,
+        samples: list[object],
+        sampling: SamplingConfig,
+        step: int,
+        extra: "ExtraValidationConfig | None" = None,
+        extra_index: int = 0,
     ) -> tuple[list[RolloutGroup], list[m.Metric]]:
         """Run each held-out prompt `num_samples_per_prompt` times concurrently and emit validation metrics.
+
+        `extra` selects an extra validation set (`extra_index` is its position in
+        `extra_validations`): its own group-id range and metric prefix `validation/{name}`.
 
         Example: 2 prompts x 2 samples with rewards [[1, 0], [0, 0]]:
 
             validation_reward/_mean           0.25   # mean over all 4 rollouts
             validation_reward/best_of_2/mean  0.5    # best rollout per prompt, averaged (n > 1 only)
         """
-        num_samples_per_prompt = (
-            self.config.async_loop.validation.num_samples_per_prompt
-        )
-        generate = self._make_generate_fn(metrics_prefix="validation_generator")
+        if extra is None:
+            num_samples_per_prompt = (
+                self.config.async_loop.validation.num_samples_per_prompt
+            )
+            group_id_base = 0
+            prefix = "validation"
+            best_of_prefix = "validation_reward"
+            generator_prefix = "validation_generator"
+        else:
+            num_samples_per_prompt = extra.num_samples_per_prompt
+            group_id_base = -(extra_index + 1) * EXTRA_VALIDATION_GROUP_ID_STRIDE
+            prefix = best_of_prefix = f"validation/{extra.name}"
+            generator_prefix = f"validation_{extra.name}_generator"
+        group_ids = [group_id_base - (i + 1) for i in range(len(samples))]
+        generate = self._make_generate_fn(metrics_prefix=generator_prefix)
         release_session_fn = self._make_release_session_fn()
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
         group_results = await asyncio.gather(
@@ -923,26 +1019,24 @@ class Controller(Configurable):
                     sample=sample,
                     # Negative ids keep validation disjoint from training group ids, so their
                     # request_ids can't collide in the shared engine (e.g. post-validation).
-                    group_id=-(i + 1),
+                    group_id=group_id,
                     group_size=num_samples_per_prompt,
                     sampling=sampling,
                 )
-                for i, sample in enumerate(samples)
+                for group_id, sample in zip(group_ids, samples, strict=True)
             ),
             return_exceptions=True,
         )
         # Validation group ids are reused every validation, so their cache salts must not outlive it.
-        await self.generator_router.release_groups.call_one(
-            [-(i + 1) for i in range(len(samples))]
-        )
+        await self.generator_router.release_groups.call_one(group_ids)
 
         # Keep the groups that succeeded; log + count the ones that raised.
         rollout_groups: list[RolloutGroup] = []
         num_failed_groups = 0
-        for i, result in enumerate(group_results):
+        for group_id, result in zip(group_ids, group_results, strict=True):
             if isinstance(result, BaseException):
                 logger.error(
-                    f"validation group {-(i + 1)} (step={step}) failed; dropping",
+                    f"{prefix} group {group_id} (step={step}) failed; dropping",
                     exc_info=(type(result), result, result.__traceback__),
                 )
                 num_failed_groups += 1
@@ -950,9 +1044,9 @@ class Controller(Configurable):
             rollout_groups.append(result)
 
         rollouts = [rollout for group in rollout_groups for rollout in group.rollouts]
-        metrics = compute_rollout_metrics(prefix="validation", rollouts=rollouts)
+        metrics = compute_rollout_metrics(prefix=prefix, rollouts=rollouts)
         metrics.append(
-            m.Metric("validation/group_failures", m.Sum(float(num_failed_groups)))
+            m.Metric(f"{prefix}/group_failures", m.Sum(float(num_failed_groups)))
         )
         # Policies the pass sampled. One, unless the pass overlaps training: then a weight sync
         # during a rollout makes its later tokens sample a newer policy.
@@ -964,15 +1058,15 @@ class Controller(Configurable):
         ]
         metrics += [
             m.Metric(
-                "validation/min_policy_version",
+                f"{prefix}/min_policy_version",
                 m.Min.from_list([turn.min_policy_version for turn in turns]),
             ),
             m.Metric(
-                "validation/max_policy_version",
+                f"{prefix}/max_policy_version",
                 m.Max.from_list([turn.max_policy_version for turn in turns]),
             ),
             m.Metric(
-                "validation/mixed_policy_rollouts", m.Mean.from_list(is_mixed_policy)
+                f"{prefix}/mixed_policy_rollouts", m.Mean.from_list(is_mixed_policy)
             ),
         ]
         if num_samples_per_prompt > 1:
@@ -983,10 +1077,17 @@ class Controller(Configurable):
             ]
             metrics.append(
                 m.Metric(
-                    f"validation_reward/best_of_{num_samples_per_prompt}",
+                    f"{best_of_prefix}/best_of_{num_samples_per_prompt}",
                     m.Mean.from_list(best_rewards),
                 )
             )
+            if extra is not None and extra.binary_reward:
+                metrics.append(
+                    m.Metric(
+                        f"{prefix}/pass_at_{num_samples_per_prompt}",
+                        m.Mean.from_list(best_rewards),
+                    )
+                )
         return rollout_groups, metrics
 
     @sl.log_trace_span("validate")
@@ -1066,6 +1167,9 @@ class Controller(Configurable):
             pre_validation = {}  # read from the task after training
         else:
             pre_validation = await self._validate_and_log(step=self.start_step)
+        # Extra validation sets start beside training from the first step.
+        for extra_index in range(len(async_loop.extra_validations)):
+            self._start_extra_validation(extra_index=extra_index, step=self.start_step)
         sl.log_trace_instant("training_start")
 
         # Trainer policy version, seeded from the resumed step; advances at each optimizer step.
@@ -1202,6 +1306,15 @@ class Controller(Configurable):
             self._log_finished_validation(step=num_training_steps)
             # At the same step, W&B would keep only the final pass's values for keys both passes log.
             final_pass_step += 1
+        # Await, not cancel, extra passes still running; they log at the last step (their keys
+        # differ from the main set's, so they can share its step).
+        if self._extra_validation_tasks:
+            logger.info(
+                "Training done; waiting for "
+                f"{sorted(task.get_name() for task in self._extra_validation_tasks.values())}"
+            )
+            await asyncio.gather(*self._extra_validation_tasks.values())
+            self._log_finished_extra_validations(step=num_training_steps, wait=True)
         if pre_validation_task is not None:
             pre_validation = m.MetricsProcessor._aggregate_metrics(
                 pre_validation_task.result()
@@ -1250,6 +1363,86 @@ class Controller(Configurable):
         self._validation_task = None
         logger.info(f"{task.get_name()} ended; logging it at step {step}")
         self.metrics_processor.log(step=step, metrics=metrics, is_validation=True)
+
+    @sl.log_trace_span("validate_extra")
+    async def validate_extra(self, *, extra_index: int, step: int) -> list[m.Metric]:
+        """Run one pass of extra validation set `extra_validations[extra_index]` beside training.
+
+        Returns its rollout metrics (`validation/{name}/...`) and its wall time
+        (`timing/validation/{name}`).
+        """
+        extra = self.config.async_loop.extra_validations[extra_index]
+        t_start = time.perf_counter()
+        # In a thread: building the dataset would otherwise block the training loops.
+        samples = await asyncio.to_thread(
+            self._rollouter.get_validation_samples, extra.steps, extra.name
+        )
+        # Validation rollouts are never trained, so skip the top-k transport.
+        sampling = replace(
+            self._sampling, temperature=extra.temperature, num_topk_logprobs=0
+        )
+        rollout_groups, metrics = await self._collect_validation_rollouts(
+            samples=samples,
+            sampling=sampling,
+            step=step,
+            extra=extra,
+            extra_index=extra_index,
+        )
+        self.rollout_recorder.record(is_validation=True, rollout_groups=rollout_groups)
+        metrics.append(
+            m.Metric(
+                f"timing/validation/{extra.name}",
+                m.NoReduce(time.perf_counter() - t_start),
+            )
+        )
+        return metrics
+
+    def _start_extra_validation(self, *, extra_index: int, step: int) -> None:
+        """Start a pass of an extra validation set beside training; the caller makes sure none of
+        that set is running and the generators hold at least policy `step`."""
+        name = self.config.async_loop.extra_validations[extra_index].name
+        logger.info(f"Starting validation set {name!r} at step {step}, beside training")
+        self._extra_validation_tasks[name] = asyncio.create_task(
+            self.validate_extra(extra_index=extra_index, step=step),
+            name=f"validation_{name}_step_{step}",
+        )
+
+    def _log_finished_extra_validations(self, *, step: int, wait: bool = False) -> None:
+        """Log every extra validation pass that has ended (all of them with `wait`, which the
+        caller must have awaited) at `step`; re-raise a pass's error."""
+        for name, task in list(self._extra_validation_tasks.items()):
+            if not task.done():
+                if wait:
+                    raise RuntimeError(f"{task.get_name()} has not ended")
+                continue
+            del self._extra_validation_tasks[name]
+            logger.info(f"{task.get_name()} ended; logging it at step {step}")
+            self.metrics_processor.log(
+                step=step, metrics=task.result(), is_validation=True
+            )
+
+    async def _step_extra_validations(
+        self, *, step: int, num_training_steps: int
+    ) -> None:
+        """At the end of train step `step`: log extra passes that ended, mark sets that are due,
+        and start each due set whose previous pass has ended."""
+        extras = self.config.async_loop.extra_validations
+        if not extras or step >= num_training_steps:
+            # run() awaits and logs passes still running at the end.
+            return
+        self._log_finished_extra_validations(step=step)
+        for extra in extras:
+            if step % extra.freq == 0:
+                self._extra_validation_requested.add(extra.name)
+        for extra_index, extra in enumerate(extras):
+            if (
+                extra.name in self._extra_validation_requested
+                and extra.name not in self._extra_validation_tasks
+            ):
+                # Wait only for this step's weight pull, so the pass starts on at least policy `step`.
+                await self._weight_sync.wait_inflight_push_pull()
+                self._start_extra_validation(extra_index=extra_index, step=step)
+                self._extra_validation_requested.discard(extra.name)
 
     def _log_reward_delta(self, pre: dict[str, float], post: dict[str, float]) -> None:
         """Console pre/post reward summary, visible without scrolling back through the loop."""
@@ -1625,6 +1818,9 @@ class Controller(Configurable):
                 # validation rollout samples this step's policy; training rollouts keep generating.
                 await self._weight_sync.wait_inflight_push_pull()
                 await self._validate_and_log(step=step)
+            await self._step_extra_validations(
+                step=step, num_training_steps=num_training_steps
+            )
 
         gc_timer.close()
 

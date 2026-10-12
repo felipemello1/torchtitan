@@ -1685,7 +1685,7 @@ class VLLMGenerator(Configurable):
                                 prompt=engine_input,
                                 params=self._build_sampling_params(request.sampling),
                                 arrival_time=request.arrival_time,
-                                priority=max(request.group_id, -1),
+                                priority=vllm_priority(request.group_id),
                             )
                             if self._session_kv is not None:
                                 self._session_kv.track(
@@ -2052,6 +2052,26 @@ class VLLMGenerator(Configurable):
 # ---- Engine-loop queue: rank 0's queued calls; a LoopDecision broadcasts only their EngineRequests. ----
 
 
+
+# Group ids of extra validation set k start at -(k + 1) * EXTRA_VALIDATION_GROUP_ID_STRIDE: disjoint
+# from training (>= 0), the main validation set (-1, -2, ...) and each other.
+EXTRA_VALIDATION_GROUP_ID_STRIDE = 1_000_000
+# vLLM priority of extra validation sets: after every training group.
+_BACKGROUND_PRIORITY = 2**31 - 1
+
+
+def vllm_priority(group_id: int) -> int:
+    """vLLM request priority for a rollout group id (lower runs first).
+
+    Example:
+        vllm_priority(7)           # 7: training groups run oldest first
+        vllm_priority(-3)          # -1: main validation runs before training, in arrival order
+        vllm_priority(-1_000_005)  # 2**31 - 1: extra validation sets run after training
+    """
+    if group_id <= -EXTRA_VALIDATION_GROUP_ID_STRIDE:
+        return _BACKGROUND_PRIORITY
+    return max(group_id, -1)
+
 @dataclass(kw_only=True, slots=True)
 class EngineRequest:
     """One `generate` call's request for the engine, awaiting admission; what a `LoopDecision` broadcasts."""
@@ -2060,9 +2080,11 @@ class EngineRequest:
     prompt_token_ids: list[int]  # [prompt_tokens]
     sampling: SamplingConfig
     group_id: int
-    """Rollout group id. Sets the vLLM priority: lower is admitted first and preempted last.
-    Training ids grow as groups start. Validation ids count down (-1, -2, ...) and restart every run,
-    so all validation gets priority -1: it runs in arrival order (not newest first), before training.
+    """Rollout group id. Sets the vLLM priority (`vllm_priority`): lower is admitted first and
+    preempted last. Training ids grow as groups start. Validation ids count down (-1, -2, ...) and
+    restart every run, so all validation gets priority -1: it runs in arrival order (not newest
+    first), before training. Extra validation sets (ids <= -EXTRA_VALIDATION_GROUP_ID_STRIDE) get the
+    lowest priority, so a long benchmark pass never delays training rollouts.
 
         waiting, in arrival order:  g7 turn 1   g9 turn 1   g4 turn 2   val -1      val -2
         priority:                   7           9           4           -1          -1
