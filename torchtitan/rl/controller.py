@@ -179,11 +179,33 @@ class ValidationConfig:
     rollout's later tokens can sample a newer policy (`validation/max_policy_version`). Keep False
     for a clean pre-training score."""
 
+    num_samples_per_prompt: int = 1
+    """Rollouts per validation prompt (k). With k > 1 the pass also logs
+    `validation/pass_at_{k}` (share of prompts with at least one solved rollout) and
+    `validation/best_of_{k}_reward`; `validation/pass_at_1` and `validation_reward/_mean`
+    average over all k rollouts, so no separate k=1 pass is needed."""
+
+    temperature: float = 0.0
+    """Validation sampling temperature; 0.0 is greedy. Use > 0 with `num_samples_per_prompt` > 1,
+    since greedy samples of one prompt are identical up to nondeterminism."""
+
+    success_threshold: float = 1.0
+    """A rollout counts as solved for pass@k when its reward is at least this."""
+
     def __post_init__(self) -> None:
         if self.steps < -1:
             raise ValueError("validation steps must be -1 or non-negative")
         if self.freq is not None and self.freq <= 0:
             raise ValueError(f"validation freq must be positive, got {self.freq}")
+        if self.num_samples_per_prompt < 1:
+            raise ValueError(
+                "validation num_samples_per_prompt must be positive, got "
+                f"{self.num_samples_per_prompt}"
+            )
+        if self.temperature < 0:
+            raise ValueError(
+                f"validation temperature must be non-negative, got {self.temperature}"
+            )
 
 
 @dataclass(kw_only=True, slots=True)
@@ -644,13 +666,14 @@ class Controller(Configurable):
             async_loop.max_concurrent_rollout_groups * async_loop.num_samples_per_prompt
         )
         validation = async_loop.validation
-        num_validation_groups = len(
-            self._rollouter.get_validation_samples(validation.steps)
+        num_validation_rollouts = (
+            len(self._rollouter.get_validation_samples(validation.steps))
+            * validation.num_samples_per_prompt
         )
         rollout_concurrency = (
-            num_training_rollouts + num_validation_groups
+            num_training_rollouts + num_validation_rollouts
             if validation.freq is not None or validation.overlap_training
-            else max(num_training_rollouts, num_validation_groups)
+            else max(num_training_rollouts, num_validation_rollouts)
         )
         config = self.config
         if not generator_meshes:
@@ -805,8 +828,15 @@ class Controller(Configurable):
     async def _collect_validation_rollouts(
         self, *, samples: list[object], sampling: SamplingConfig, step: int
     ) -> tuple[list[RolloutGroup], list[m.Metric]]:
-        """Sample held-out prompts, run each greedily (n=1) concurrently, and emit validation metrics."""
-        # TODO: group_size=1 (best-of-1) only. Support best-of-N.
+        """Sample held-out prompts, run `num_samples_per_prompt` rollouts of each concurrently, and
+        emit validation metrics (mean reward, pass@1 and, for k > 1, pass@k and best-of-k).
+
+        Example, k=3, success_threshold=1.0, rewards [[1, 0, 0], [0, 0, 0]]:
+            validation/pass_at_1 = 1/6, validation/pass_at_3 = 1/2,
+            validation/best_of_3_reward = 0.5
+        """
+        validation_config = self.config.async_loop.validation
+        num_samples = validation_config.num_samples_per_prompt
         generate = self._make_generate_fn(metrics_prefix="validation_generator")
         release_session_fn = self._make_release_session_fn()
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
@@ -819,7 +849,7 @@ class Controller(Configurable):
                     # Negative ids keep validation disjoint from training group ids, so their
                     # request_ids can't collide in the shared engine (e.g. post-validation).
                     group_id=-(i + 1),
-                    group_size=1,
+                    group_size=num_samples,
                     sampling=sampling,
                 )
                 for i, sample in enumerate(samples)
@@ -849,6 +879,33 @@ class Controller(Configurable):
         metrics.append(
             m.Metric("validation/group_failures", m.Sum(float(num_failed_groups)))
         )
+        threshold = validation_config.success_threshold
+        group_rewards = [
+            [r.reward for r in group.rollouts if r.reward is not None]
+            for group in rollout_groups
+        ]
+        group_rewards = [rewards for rewards in group_rewards if rewards]
+        metrics.append(
+            m.Metric(
+                "validation/pass_at_1",
+                m.Mean.from_list(
+                    [float(r >= threshold) for rewards in group_rewards for r in rewards]
+                ),
+            )
+        )
+        if num_samples > 1:
+            metrics += [
+                m.Metric(
+                    f"validation/pass_at_{num_samples}",
+                    m.Mean.from_list(
+                        [float(max(rewards) >= threshold) for rewards in group_rewards]
+                    ),
+                ),
+                m.Metric(
+                    f"validation/best_of_{num_samples}_reward",
+                    m.Mean.from_list([max(rewards) for rewards in group_rewards]),
+                ),
+            ]
         # Policies the pass sampled. One, unless the pass overlaps training: then a weight sync
         # during a rollout makes its later tokens sample a newer policy.
         turns = [turn for rollout in rollouts for turn in rollout.turns]
@@ -874,7 +931,7 @@ class Controller(Configurable):
 
     @sl.log_trace_span("validate")
     async def validate(self, *, step: int, overlapped: bool = False) -> list[m.Metric]:
-        """Run greedy validation on held-out prompts.
+        """Run validation on held-out prompts (greedy by default; see `ValidationConfig`).
 
         Args:
             step: Training step this validation pass belongs to (0 for the
@@ -886,7 +943,6 @@ class Controller(Configurable):
             Validation rollout metrics, generation metrics, and validation
             timing.
         """
-        # TODO: investigate using pass@k for validation.
         t_validate_start = time.perf_counter()
         steps = self.config.async_loop.validation.steps
         if steps == 0:  # skip validation (e.g. loss guard CI)
@@ -894,12 +950,15 @@ class Controller(Configurable):
         # In a thread: building the dataset would otherwise block the training loops.
         samples = await asyncio.to_thread(self._rollouter.get_validation_samples, steps)
         # Validation rollouts are never trained, so skip the top-k transport.
-        greedy = replace(
-            self._sampling, temperature=0.0, top_p=1.0, num_topk_logprobs=0
+        validation_sampling = replace(
+            self._sampling,
+            temperature=self.config.async_loop.validation.temperature,
+            top_p=1.0,
+            num_topk_logprobs=0,
         )
 
         rollout_groups, validation_metrics = await self._collect_validation_rollouts(
-            samples=samples, sampling=greedy, step=step
+            samples=samples, sampling=validation_sampling, step=step
         )
 
         self.rollout_recorder.record(is_validation=True, rollout_groups=rollout_groups)

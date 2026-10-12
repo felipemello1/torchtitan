@@ -90,7 +90,7 @@ def test_setup_async_caps_max_num_seqs_per_generator(monkeypatch, caplog) -> Non
     async_loop = SimpleNamespace(
         max_concurrent_rollout_groups=256,
         num_samples_per_prompt=16,
-        validation=SimpleNamespace(steps=0, freq=None, overlap_training=False),
+        validation=ValidationConfig(steps=0),
     )
     controller = SimpleNamespace(
         config=SimpleNamespace(
@@ -966,13 +966,15 @@ def test_run_fails_when_the_engine_loops_exit_mid_run() -> None:
         _run_with_generator_watcher(exited)
 
 
-def _validation_rollout(versions: list[tuple[int, int]]) -> Rollout:
+def _validation_rollout(
+    versions: list[tuple[int, int]], reward: float = 1.0
+) -> Rollout:
     """One rollout with a turn per `(min_policy_version, max_policy_version)`."""
     return Rollout(
         group_id=-1,
         rollout_id=0,
         status=RolloutStatus.COMPLETED,
-        reward=1.0,
+        reward=reward,
         turns=[
             RolloutTurn(
                 rollout_id=RolloutTurnID(group_id=-1, rollout_id=0, turn_id=turn_id),
@@ -991,6 +993,9 @@ def _validation_rollout(versions: list[tuple[int, int]]) -> Rollout:
 def test_validation_logs_the_policies_its_rollouts_sampled() -> None:
     """A weight sync during a rollout shows as a newer max version and a mixed-policy rollout."""
     controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(validation=ValidationConfig())
+    )
     controller.generator_router = SimpleNamespace(
         release_groups=SimpleNamespace(call_one=AsyncMock())
     )
@@ -1017,6 +1022,51 @@ def test_validation_logs_the_policies_its_rollouts_sampled() -> None:
     assert reduced["validation/min_policy_version/min"] == 25
     assert reduced["validation/max_policy_version/max"] == 27
     assert reduced["validation/mixed_policy_rollouts/mean"] == 0.5
+
+
+def test_validation_with_several_samples_logs_pass_at_k() -> None:
+    """k=3 rollouts per prompt: pass@1 averages all rollouts, pass@3 counts prompts with a solve."""
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(
+            validation=ValidationConfig(num_samples_per_prompt=3, temperature=1.0)
+        )
+    )
+    controller.generator_router = SimpleNamespace(
+        release_groups=SimpleNamespace(call_one=AsyncMock())
+    )
+    run_group_rollouts = AsyncMock(
+        side_effect=[
+            RolloutGroup(
+                group_id=-1,
+                rollouts=[_validation_rollout([(0, 0)], r) for r in (1.0, 0.0, 0.2)],
+            ),
+            RolloutGroup(
+                group_id=-2,
+                rollouts=[_validation_rollout([(0, 0)], r) for r in (0.0, 0.5, 0.0)],
+            ),
+        ]
+    )
+    controller._rollouter = SimpleNamespace(run_group_rollouts=run_group_rollouts)
+
+    _, metrics = asyncio.run(
+        controller._collect_validation_rollouts(
+            samples=["a", "b"], sampling=SamplingConfig(temperature=1.0), step=10
+        )
+    )
+
+    assert {c.kwargs["group_size"] for c in run_group_rollouts.call_args_list} == {3}
+    reduced = m.MetricsProcessor._aggregate_metrics(metrics)
+    assert reduced["validation/pass_at_1/mean"] == pytest.approx(1 / 6)
+    assert reduced["validation/pass_at_3/mean"] == pytest.approx(0.5)
+    assert reduced["validation/best_of_3_reward/mean"] == pytest.approx(0.75)
+
+
+def test_validation_config_rejects_bad_sampling() -> None:
+    with pytest.raises(ValueError, match="num_samples_per_prompt"):
+        ValidationConfig(num_samples_per_prompt=0)
+    with pytest.raises(ValueError, match="temperature"):
+        ValidationConfig(temperature=-1.0)
 
 
 class _FakeValidation:
