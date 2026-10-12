@@ -393,16 +393,17 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
     centering, router replay, the adaptive rollout buffer, and validation beside training.
 
     Same 12 GPUs, 131K budget and forced answer; 24 x 16 per step, lr 5e-6, vLLM watermark 0.1,
-    CPU KV offload, and all-pass problems skipped in later epochs; no length reward.
+    problems the 4B solved at most 3 of 8 times, and all-pass problems skipped in later epochs; no
+    length reward.
     """
     num_prompts_per_train_step = 24
     # ~10 batches generating at once, as 20 prompts -> 200 groups did: about twice the groups the
     # engines' KV holds at ~55K-token responses, so the vLLM queue stays short. With validation
     # alongside, each engine's max_num_seqs is (240 x 16 + 960) / 8 = 600 (was capped at 512).
     generation_capacity = 240
-    # Host RAM per generator for vLLM's CPU KV offload. PLACEHOLDER: confirm before launch. Four
-    # engines per host share its /dev/shm (DOME runs with --ipc=host; ~477 GB on a GB300 host).
-    kv_offload_gib = 96
+    # No CPU KV offload: math is single-turn and the 0.1 watermark leaves no preemptions, so a night
+    # at 96 GiB per engine stored 41 TB and loaded none.
+    kv_offload_gib = 0
     config = rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k()
     config.dump_folder = "outputs/rl/qwen3_5_35b_a3b_base_intellect3_math_131k_tonight"
     config.async_loop = dataclasses.replace(
@@ -416,8 +417,9 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
         group_buffer=AdaptiveRolloutGroupWorkBuffer.Config(
             # The demand keeps the mean policy age of trained groups under 6 steps.
             target_offpolicy_steps=6,
-            # A group older than 10 steps when consumed is dropped and its prompt not retried.
-            max_offpolicy_steps=10,
+            # A group older than 16 steps when consumed is dropped and its prompt not retried. At 10,
+            # the drops were the slowest groups, i.e. the longest, hardest problems.
+            max_offpolicy_steps=16,
             generation_capacity=generation_capacity,
             # Start at (6 + 1) batches, as the fixed buffer would.
             start_batches=7,
@@ -427,11 +429,16 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
             config.async_loop.training_sample_builder,
             drop_zero_std_reward_groups=True,
         ),
-        # avg@4 on the 240 problems every 10 steps, beside training (the first at step 0). A
-        # pass took 3.2-3.6 h on the last run, so the next one starts when the previous ends.
+        # avg@4 on the 240 problems every 25 steps, beside training (the first at step 0). A pass
+        # takes ~3 h, so at 10 steps the passes ran back to back on ~10-12% of the generated tokens.
         validation=ValidationConfig(
-            steps=4 * 240, greedy=False, freq=10, overlap_training=True
+            steps=4 * 240, greedy=False, freq=25, overlap_training=True
         ),
+    )
+    # Problems the 4B solved 1-3 of 8 times (3,474 rows): at max_pass_rate 0.75, 45% of groups
+    # came back all-pass, against ~32% for this band.
+    config.rollouter.training_dataloader.dataset = dataclasses.replace(
+        config.rollouter.training_dataloader.dataset, max_pass_rate=0.375
     )
     # A problem whose 16 rewards all come back 1.0 (all correct without a forced answer) is
     # skipped in later epochs, then re-checked; all-fail problems keep coming back.
@@ -442,8 +449,12 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
         config.trainer,
         # Synchronous saves: an async save's ~420 GB CPU copy, on top of the 4 trainer ranks each
         # unpacking the 13-21 GB batch at 2-3x, can exceed the trainer host's 900 GB job memory.
+        # Resuming d381811b's checkpoint on the harder data: skip its data-stream state, so the
+        # prompt stream starts over on the new filter. Drop this to resume a run of this recipe.
         checkpointer=dataclasses.replace(
-            config.trainer.checkpointer, async_mode="disabled"
+            config.trainer.checkpointer,
+            async_mode="disabled",
+            exclude_from_loading=["controller"],
         ),
         optim=Optim.Config(
             optimizer=OptimizersContainer.Config(
