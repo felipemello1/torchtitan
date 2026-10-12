@@ -6,6 +6,7 @@
 
 import importlib
 import pkgutil
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -58,13 +59,24 @@ def _build_rl_model_configs(build_model_config, flavor, **kwargs):
 
 
 @pytest.mark.parametrize("module_name", _RECIPE_MODULES)
-def test_rl_recipes_get_model_defaults(module_name: str) -> None:
+def test_rl_recipes_get_model_defaults(
+    module_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     try:
         module = importlib.import_module(module_name)
     except ModuleNotFoundError as error:
         if (error.name or "").split(".")[0] not in _OPTIONAL_PACKAGES:
             raise
         pytest.skip(f"{module_name} needs {error.name}")
+    if module_name == "torchtitan_recipes.rl.verifiers_terminal_bench":
+        # Its Sandoq recipes read the sandbox pool at load time and import the Sandoq plugin.
+        pytest.importorskip("harbor")
+        from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq
+
+        monkeypatch.syspath_prepend(str(Path(terminal_bench_sandoq.__file__).parent))
+        monkeypatch.setenv("DOME_SANDOQ_POOL", "920")
+        monkeypatch.setenv("VF_SANDBOX_PROVIDER", "oci-runner")
+        monkeypatch.setenv("OCI_RUNNER_TASK_NETWORK", "host")
     recipes = {
         name: fn
         for name, fn in vars(module).items()
