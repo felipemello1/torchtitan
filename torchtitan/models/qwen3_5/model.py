@@ -364,6 +364,8 @@ class Qwen35Model(MultimodalModel):
                 "partial_rope",
                 "shared_expert_gate",
                 "fp32_to_bf16_split",
+                "router",
+                "moe_aux_loss",
             ]
         )
 
