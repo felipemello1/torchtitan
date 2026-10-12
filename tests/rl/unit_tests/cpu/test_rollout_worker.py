@@ -130,6 +130,7 @@ def test_worker_executes_group_without_actor_mesh() -> None:
             message_env=_MessageEnvConfig(),
             token_env=token_env_config,
             advantage=_Config(_AdvantageEstimator()),
+            thinking_budget=None,
         )
         worker = _CustomWorker(worker_config)
         released = []
@@ -254,6 +255,7 @@ def test_delta_prompts_rebuild_the_full_prompt_samples() -> None:
             message_env=None,
             token_env=None,
             advantage=_Config(None),
+            thinking_budget=None,
         )
     )
     builder = TrainingSampleBuilder.Config().build()
