@@ -26,7 +26,8 @@ from torchtitan.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
-from torchtitan.rl.controller import Controller
+from torchtitan.rl.controller import Controller, ValidationConfig
+from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
@@ -34,7 +35,7 @@ from torchtitan.rl.observability.controller import (
     MetricsTimer,
 )
 from torchtitan.rl.rollout import RolloutGroup
-from torchtitan.rl.rollout.types import RolloutTurnID
+from torchtitan.rl.rollout.types import Rollout, RolloutStatus, RolloutTurnID
 
 
 def test_controller_config_maybe_log(tmp_path, caplog) -> None:
@@ -850,3 +851,78 @@ def test_run_fails_when_the_engine_loops_exit_mid_run() -> None:
         RuntimeError, match="generator_wait_engine_loop exited unexpectedly"
     ):
         _run_with_generator_watcher(exited)
+
+
+def _scored_group(group_id: int, rewards: list[float]) -> RolloutGroup:
+    return RolloutGroup(
+        group_id=group_id,
+        rollouts=[
+            Rollout(
+                group_id=group_id,
+                rollout_id=rollout_id,
+                status=RolloutStatus.COMPLETED,
+                reward=reward,
+            )
+            for rollout_id, reward in enumerate(rewards)
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "num_samples_per_prompt, rewards, expected_mean, expected_best_of",
+    [
+        (1, [[1.0], [0.0]], 0.5, None),
+        (2, [[1.0, 0.0], [0.0, 0.0]], 0.25, 0.5),
+    ],
+)
+def test_validate_rolls_out_each_prompt_n_times(
+    num_samples_per_prompt: int,
+    rewards: list[list[float]],
+    expected_mean: float,
+    expected_best_of: float | None,
+) -> None:
+    """2 prompts x n rollouts at T=1: the mean covers all rollouts; best_of_n, logged only for
+    n > 1, the best rollout per prompt."""
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(
+            validation=ValidationConfig(
+                steps=2, num_samples_per_prompt=num_samples_per_prompt
+            )
+        )
+    )
+    controller._sampling = SamplingConfig(temperature=0.8, seed=7, stop_token_ids=[1])
+    controller.generator_router = SimpleNamespace(
+        release_groups=SimpleNamespace(call_one=AsyncMock())
+    )
+    controller.rollout_recorder = SimpleNamespace(record=lambda **kwargs: None)
+    run_group_rollouts = AsyncMock(
+        side_effect=[
+            _scored_group(-(i + 1), group_rewards)
+            for i, group_rewards in enumerate(rewards)
+        ]
+    )
+    controller._rollouter = SimpleNamespace(
+        get_validation_samples=lambda steps: ["a", "b"],
+        run_group_rollouts=run_group_rollouts,
+    )
+
+    metrics = asyncio.run(controller.validate(step=0))
+
+    calls = run_group_rollouts.call_args_list
+    assert [call.kwargs["group_size"] for call in calls] == [num_samples_per_prompt] * 2
+    expected_sampling = SamplingConfig(temperature=1.0, seed=7, stop_token_ids=[1])
+    assert [call.kwargs["sampling"] for call in calls] == [expected_sampling] * 2
+    aggregated = m.MetricsProcessor._aggregate_metrics(metrics)
+    assert aggregated["validation_reward/_mean"] == expected_mean
+    best_of_key = f"validation_reward/best_of_{num_samples_per_prompt}/mean"
+    assert aggregated.get(best_of_key) == expected_best_of
+
+
+def test_validation_config_rejects_bad_sampling() -> None:
+    with pytest.raises(ValueError, match="temperature"):
+        ValidationConfig(temperature=-1.0)
+    with pytest.raises(ValueError, match="num_samples_per_prompt"):
+        ValidationConfig(num_samples_per_prompt=0)
+    with pytest.raises(ValueError, match="greedy"):
+        ValidationConfig(temperature=0.0, num_samples_per_prompt=4)
