@@ -343,7 +343,9 @@ class VerifiersRollouter(Rollouter):
         )
         status = self.rollout_status(verifiers_episode=verifiers_episode, trace=trace)
         if not turns:
-            if trace.stop_condition == "context_length":
+            # Verifiers <= 0.3.1 stops an overlong prompt as context_length, later ones as
+            # max_input_tokens.
+            if trace.stop_condition in ("context_length", "max_input_tokens"):
                 # The harness builds the first prompt in the env server, so the dataset can't
                 # be filtered for it; flag it here as a data problem, not a policy one.
                 task = sample.verifiers_task_data.get(

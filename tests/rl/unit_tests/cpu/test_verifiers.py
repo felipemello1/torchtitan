@@ -37,7 +37,6 @@ from torchtitan.rl.examples.verifiers.rollouter import (
 from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.types import Completion, RolloutStatus
-from verifiers.v1.errors import model_error, OverlongPromptError
 
 
 def test_trainable_token_spans() -> None:
@@ -706,8 +705,8 @@ def test_generation_server_rejects_prompt_without_room_for_output() -> None:
 
         assert prompt_lengths == [7]
         assert statuses == [500, 400, 400]
-        # Verifiers ends the rollout as context_length on OverlongPromptError.
-        assert isinstance(model_error(errors[1]), OverlongPromptError)
+        # vLLM's and the renderer's overlong-prompt wording, which Verifiers stops as truncated.
+        assert "exceeds maximum context length" in errors[1]
 
     asyncio.run(run_test())
 
