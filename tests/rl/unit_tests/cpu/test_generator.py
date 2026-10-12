@@ -137,6 +137,7 @@ def _generator():
     per-request helpers (`_build_sampling_params`) read."""
     generator = VLLMGenerator.__new__(VLLMGenerator)
     generator._engine = _FakeEngine()
+    generator._session_kv = None
     generator._rank = 0
     generator.policy_version = 7
     generator.config = SimpleNamespace(
@@ -582,6 +583,16 @@ def test_batch_invariant_requires_kv_cache_reset():
             model=_MODEL_CONFIG,
             parallelism=_PARALLELISM,
             debug=DebugConfig(batch_invariant=True),
+        )
+
+
+def test_hold_session_kv_requires_free_floor_above_watermark():
+    VLLMGenerator.Config(parallelism=_PARALLELISM, hold_session_kv=True)
+    with pytest.raises(ValueError, match="must be above vLLM's watermark"):
+        VLLMGenerator.Config(
+            parallelism=_PARALLELISM,
+            hold_session_kv=True,
+            extra_vllm_engine_args={"watermark": 0.05},
         )
 
 
