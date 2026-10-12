@@ -33,6 +33,7 @@ from torchtitan.rl.examples.verifiers.env_server import VerifiersEnvServer
 from torchtitan.rl.examples.verifiers.generation_server import (
     GenerationServer,
     GROUP_ID_SAMPLING_PARAM,
+    MAX_ROLLOUT_TOKENS_SAMPLING_PARAM,
     VerifiersGenerationMetadata,
 )
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
@@ -84,7 +85,13 @@ class VerifiersValidationSet:
     verifiers_env_server: VerifiersEnvServer.Config
     """EnvServer for this set; its taskset is derived from `dataset`."""
 
+    max_rollout_tokens: int | None = None
+    """Context cap (prompt + output tokens) of this set's rollouts; None: the generation server's
+    `max_rollout_tokens`. A turn whose prompt reaches it stops the rollout as truncated."""
+
     def __post_init__(self) -> None:
+        if self.max_rollout_tokens is not None and self.max_rollout_tokens <= 0:
+            raise ValueError("max_rollout_tokens must be positive")
         configured_taskset = self.verifiers_env_server.environment.taskset
         if configured_taskset not in (
             VerifiersTasksetConfig(),
@@ -124,6 +131,15 @@ class VerifiersRollouter(Rollouter):
 
         validation_dataset: VerifiersTaskDataset.Config
         """Verifiers taskset used for validation samples."""
+
+        max_rollout_tokens: int | None = None
+        """Context cap (prompt + output tokens) of training rollouts; None: the generation
+        server's `max_rollout_tokens`. A turn whose prompt reaches it stops the rollout as
+        truncated (graded, with the rubric's truncation penalty) instead of producing a sample the
+        batcher would drop as oversized."""
+
+        validation_max_rollout_tokens: int | None = None
+        """Context cap of the main validation set's rollouts; None: `max_rollout_tokens`."""
 
         extra_validation_sets: dict[str, VerifiersValidationSet] = field(
             default_factory=dict
@@ -188,6 +204,12 @@ class VerifiersRollouter(Rollouter):
                     self.training_dataloader.dataset.verifiers_taskset
                 ),
             )
+            for name, cap in (
+                ("max_rollout_tokens", self.max_rollout_tokens),
+                ("validation_max_rollout_tokens", self.validation_max_rollout_tokens),
+            ):
+                if cap is not None and cap <= 0:
+                    raise ValueError(f"{name} must be positive")
             if self.renderer_multiplex <= 0:
                 raise ValueError("renderer_multiplex must be positive")
             if self.connection_timeout_sec <= 0:
@@ -356,6 +378,25 @@ class VerifiersRollouter(Rollouter):
             rollout.advantage = advantage
         return group
 
+    def _max_rollout_tokens_param(
+        self, sample: VerifiersTaskSample, group_id: int
+    ) -> dict[str, int]:
+        """The context cap to send with this rollout's generation requests, if any.
+
+        Example: training cap 65,536, an extra set "deepswe" at 131,072:
+            training sample (group 7)             -> {MAX_ROLLOUT_TOKENS_SAMPLING_PARAM: 65536}
+            main validation sample (group -3)     -> validation_max_rollout_tokens or 65536
+            "deepswe" sample                      -> {MAX_ROLLOUT_TOKENS_SAMPLING_PARAM: 131072}
+        """
+        config = self._verifiers_config
+        if sample.validation_set is not None:
+            cap = config.extra_validation_sets[sample.validation_set].max_rollout_tokens
+        elif group_id < 0 and config.validation_max_rollout_tokens is not None:
+            cap = config.validation_max_rollout_tokens
+        else:
+            cap = config.max_rollout_tokens
+        return {} if cap is None else {MAX_ROLLOUT_TOKENS_SAMPLING_PARAM: cap}
+
     async def _run_single_rollout(
         self,
         *,
@@ -395,6 +436,7 @@ class VerifiersRollouter(Rollouter):
                 seed=sampling.seed,
                 num_topk_logprobs=sampling.num_topk_logprobs,
                 **{GROUP_ID_SAMPLING_PARAM: group_id},
+                **self._max_rollout_tokens_param(sample, group_id),
             ),
         )
         # The rollout made its last call. Verifiers sent each trace's id as its X-Session-ID.

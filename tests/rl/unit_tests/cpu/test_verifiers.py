@@ -523,6 +523,7 @@ def test_generation_server_records_topk_logprobs_per_generation() -> None:
                     json={
                         "token_ids": [10, 11],
                         "sampling_params": {
+                            "temperature": 1.0,
                             "max_tokens": 2,
                             "torchtitan_group_id": 1,
                             "stop_token_ids": [99],
@@ -578,6 +579,7 @@ def test_generation_server_rejects_aborted_generation() -> None:
                     json={
                         "token_ids": [10, 11],
                         "sampling_params": {
+                            "temperature": 1.0,
                             "torchtitan_group_id": 1,
                             "stop_token_ids": [99],
                         },
@@ -624,6 +626,7 @@ def test_generation_server_returns_routed_experts_from_the_prompt_start() -> Non
                     json={
                         "token_ids": [10, 11, 12],
                         "sampling_params": {
+                            "temperature": 1.0,
                             "max_tokens": 2,
                             "torchtitan_group_id": 1,
                             "stop_token_ids": [99],
@@ -693,6 +696,7 @@ def test_generation_server_rejects_prompt_without_room_for_output() -> None:
                         json={
                             "token_ids": [1] * num_tokens,
                             "sampling_params": {
+                                "temperature": 1.0,
                                 "torchtitan_group_id": 1,
                                 "stop_token_ids": [99],
                             },
@@ -732,6 +736,11 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
         branches=[],
     )
     rollouter = object.__new__(VerifiersRollouter)
+    rollouter._verifiers_config = SimpleNamespace(
+        max_rollout_tokens=None,
+        validation_max_rollout_tokens=None,
+        extra_validation_sets={},
+    )
     rollouter._generation_server = SimpleNamespace(
         model_id="model", pop_generation_metadata=lambda trace_id: None
     )
@@ -779,6 +788,11 @@ def test_rollout_releases_every_trace_session_even_if_one_release_fails(caplog) 
         for trace_id, trainable in [("opponent", False), ("policy", True)]
     ]
     rollouter = object.__new__(VerifiersRollouter)
+    rollouter._verifiers_config = SimpleNamespace(
+        max_rollout_tokens=None,
+        validation_max_rollout_tokens=None,
+        extra_validation_sets={},
+    )
     rollouter._generation_server = SimpleNamespace(
         model_id="model", pop_generation_metadata=lambda trace_id: None
     )
@@ -848,3 +862,79 @@ def test_parse_sampling_config_requires_temperature() -> None:
     assert _parse_sampling_config(
         {"temperature": 0.0, "stop_token_ids": [1]}
     ).temperature == 0.0
+
+
+def test_generation_server_enforces_each_request_context_cap() -> None:
+    """Server cap 131,072. A training request capped at 64 (the rollouter's per-source cap) with a
+    70-token prompt is rejected with vLLM's overlong-prompt wording (Verifiers stops it as
+    truncated); the same prompt without a request cap reaches the generator, and a capped request
+    has its `max_tokens` clamped to the room left."""
+
+    async def run_test() -> None:
+        calls = []
+
+        async def generate_fn(prompt_token_ids, **kwargs):
+            calls.append((len(prompt_token_ids), kwargs["sampling_config"].max_tokens))
+            raise RuntimeError("generator reached")
+
+        server = GenerationServer.Config(max_rollout_tokens=131072).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+
+        async def post(session, num_tokens, **extra):
+            response = await session.post(
+                f"http://{server.host}:{server.port}/inference/v1/generate",
+                headers={"X-Session-ID": "group=1/rollout=2"},
+                json={
+                    "token_ids": [1] * num_tokens,
+                    "sampling_params": {
+                        "temperature": 1.0,
+                        "max_tokens": 50,
+                        "torchtitan_group_id": 1,
+                        "stop_token_ids": [99],
+                        **extra,
+                    },
+                },
+            )
+            return response.status, (await response.json())["error"]
+
+        try:
+            async with ClientSession() as session:
+                over = await post(session, 70, torchtitan_max_rollout_tokens=64)
+                uncapped = await post(session, 70)
+                clamped = await post(session, 40, torchtitan_max_rollout_tokens=64)
+        finally:
+            await server.close()
+
+        assert over[0] == 400
+        assert "Prompt length (70) exceeds maximum context length (64)" in over[1]
+        assert uncapped[0] == 500  # reached the generator
+        assert clamped[0] == 500
+        assert calls == [(70, 50), (40, 24)]
+
+    asyncio.run(run_test())
+
+
+def test_rollouter_sends_each_sources_context_cap() -> None:
+    from torchtitan.rl.examples.verifiers.data import VerifiersTaskSample
+    from torchtitan.rl.examples.verifiers.generation_server import (
+        MAX_ROLLOUT_TOKENS_SAMPLING_PARAM,
+    )
+    from torchtitan.rl.examples.verifiers.rollouter import VerifiersRollouter
+
+    rollouter = object.__new__(VerifiersRollouter)
+    rollouter._verifiers_config = SimpleNamespace(
+        max_rollout_tokens=65536,
+        validation_max_rollout_tokens=None,
+        extra_validation_sets={
+            "deepswe": SimpleNamespace(max_rollout_tokens=131072)
+        },
+    )
+    train = VerifiersTaskSample(verifiers_task_data={})
+    deepswe = VerifiersTaskSample(verifiers_task_data={}, validation_set="deepswe")
+    key = MAX_ROLLOUT_TOKENS_SAMPLING_PARAM
+    assert rollouter._max_rollout_tokens_param(train, 7) == {key: 65536}
+    assert rollouter._max_rollout_tokens_param(train, -3) == {key: 65536}
+    assert rollouter._max_rollout_tokens_param(deepswe, -1_000_001) == {key: 131072}
+    rollouter._verifiers_config.max_rollout_tokens = None
+    assert rollouter._max_rollout_tokens_param(train, 7) == {}
