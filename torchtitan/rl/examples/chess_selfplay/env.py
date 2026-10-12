@@ -99,8 +99,12 @@ class ChessPlayerEnv(MessageEnv):
 
     async def step(self, completion_message: Message) -> MessageEnvStepOutput:
         """Play this player's move, wait for the reply, and show the new board, or end the game."""
-        matches = _BOXED_RE.findall(completion_message.get("content") or "")
-        await self._game.play(self._color, matches[-1] if matches else None)
+        # A reply can run on into the next turn, copying its prompt's empty \boxed{}: skip empty boxes,
+        # and after closed thinking play the answer's first box (thinking off or unclosed: the last).
+        content = completion_message.get("content") or ""
+        matches = [match for match in _BOXED_RE.findall(content) if match.strip()]
+        index = 0 if completion_message.get("reasoning_content") else -1
+        await self._game.play(self._color, matches[index] if matches else None)
         await self._game.wait_for_turn(self._color)
         if self._game.is_over:
             return MessageEnvStepOutput(
