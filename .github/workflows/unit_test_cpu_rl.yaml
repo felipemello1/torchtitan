@@ -48,6 +48,8 @@ jobs:
 
         # The DAPO math example's rubric needs math-verify.
         uv pip install -r torchtitan/rl/examples/dapo_math/requirements.txt
+        # The chess example needs python-chess.
+        uv pip install -r torchtitan/rl/examples/chess_selfplay/requirements.txt
 
         # Install matching CUDA nightlies, constrained to keep math-verify's pins.
         bash scripts/install_rl_env.sh --skip-base --flash-attn none \
