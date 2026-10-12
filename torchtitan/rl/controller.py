@@ -147,6 +147,12 @@ from torchtitan.tools.garbage_collector import GarbageCollector
 
 logger = logging.getLogger(__name__)
 
+# Per-generator ceiling on vLLM's max_num_seqs. It also sets the CUDA-graph capture sizes
+# (`_decode_capture_sizes`): 20 graphs up to 512 vs 37 up to 1024, so less capture time
+# and graph memory. Agent rollouts spend most of their time in tools, so a generator
+# rarely schedules more than a few dozen sequences at once even with hundreds in flight.
+MAX_NUM_SEQS_PER_GENERATOR = 512
+
 
 @dataclass(kw_only=True, slots=True)
 class ValidationConfig:
@@ -663,7 +669,8 @@ class Controller(Configurable):
         # upper bound on concurrently scheduled sequences. vLLM may admit fewer if KV
         # is tight; this also sets CUDA-graph capture sizes.
         max_num_seqs = min(
-            math.ceil(rollout_concurrency / num_generator_dp_shards), 1024
+            math.ceil(rollout_concurrency / num_generator_dp_shards),
+            MAX_NUM_SEQS_PER_GENERATOR,
         )
 
         logger.info(
