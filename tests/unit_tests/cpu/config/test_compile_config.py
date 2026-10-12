@@ -7,7 +7,12 @@
 import pytest
 import torch
 
-from torchtitan.components.loss import compute_logprobs, cross_entropy_loss, mse_loss
+from torchtitan.components.loss import (
+    compute_logprobs,
+    compute_topk_logprobs,
+    cross_entropy_loss,
+    mse_loss,
+)
 from torchtitan.distributed.local_compile import apply_local_compile, local_compile
 from torchtitan.models.common.moe import _microbatch_load_balance_local_stats
 
@@ -118,6 +123,7 @@ def test_loss_functions_use_local_compile(monkeypatch) -> None:
         cross_entropy_loss.__name__,
         mse_loss.__name__,
         compute_logprobs.__name__,
+        compute_topk_logprobs.__name__,
     ]
 
 
