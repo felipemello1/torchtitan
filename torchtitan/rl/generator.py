@@ -12,7 +12,6 @@ import enum
 import gc
 import itertools
 import logging
-import math
 import os
 import shutil
 import sys
@@ -344,10 +343,10 @@ class VLLMCudaGraphConfig:
 
     capture_sizes: list[int] | None = None
     """Explicit CUDA graph capture batch sizes. When ``None`` (default), sizes are
-    auto-derived: powers of 2 up to the cap, plus ``max_num_seqs`` and the cap as
-    exact sizes. When set, these sizes are deduped and sorted. When expert
-    sequence parallelism is enabled, capture sizes that are not multiples of
-    its degree are removed."""
+    auto-derived up to ``max_num_seqs`` (see ``_decode_capture_sizes``), and for
+    ``FULL`` up to ``max_num_batched_tokens``. When set, these sizes are deduped
+    and sorted. When expert sequence parallelism is enabled, capture sizes that
+    are not multiples of its degree are removed."""
 
     # TODO: Validate CUDA graph capture with MoE / Expert Parallelism.
     # MoE routing produces dynamic shapes that may conflict with full
@@ -369,9 +368,9 @@ class VLLMCudaGraphConfig:
         """Build a vLLM ``CompilationConfig`` for the generator.
 
         When ``capture_sizes`` is set, those exact sizes are captured. Otherwise
-        sizes are auto-derived: powers of 2 up to the cap, plus ``max_num_seqs`` and
-        the cap itself as exact sizes so the largest capture size is always the cap
-        (even when it is not a power of 2). The cap is ``max_num_seqs`` for
+        sizes are auto-derived: ``_decode_capture_sizes(max_num_seqs)``, then powers
+        of 2 above ``max_num_seqs`` and the cap itself, so the largest capture size
+        is always the cap. The cap is ``max_num_seqs`` for
         ``FULL_DECODE_ONLY`` (decode batch == num_seqs). ``FULL`` also graphs
         prefill, whose per-step token count is bounded by
         ``max_num_batched_tokens`` (the configured value, else
@@ -420,15 +419,14 @@ class VLLMCudaGraphConfig:
                 )
             sizes = sorted(set(self.capture_sizes))
         else:
-            sizes = [1 << i for i in range(int(math.log2(cap)) + 1)]
-            # Always include max_num_seqs (decode batch) and the cap (largest
-            # prefill chunk) as exact sizes so the largest capture size is the cap
-            # even when it is not a power of 2
-            if max_num_seqs not in sizes:
-                sizes.append(max_num_seqs)
-            if cap not in sizes:
+            sizes = _decode_capture_sizes(max_num_seqs)
+            if cap > max_num_seqs:
+                # FULL's prefill chunks: powers of 2 above max_num_seqs, then the cap itself
+                size = 1 << max_num_seqs.bit_length()
+                while size < cap:
+                    sizes.append(size)
+                    size *= 2
                 sizes.append(cap)
-            sizes = sorted(sizes)
 
         if expert_sequence_parallel_size > 1:
             removed_sizes = [
@@ -459,6 +457,37 @@ class VLLMCudaGraphConfig:
                 sp_min_token_num=1 if enable_sequence_parallel else None,
             ),
         )
+
+
+def _decode_capture_sizes(max_num_seqs: int) -> list[int]:
+    """CUDA graph sizes for every decode batch up to ``max_num_seqs``, densest near the max.
+
+    A batch runs the smallest graph that fits it, padded to that size. Padding a large
+    batch costs time; padding a small one barely does (Qwen3.5-9B decode, H100):
+        300 seqs:  38 ms in a 304 graph, 41 ms in a 512 graph
+        1 seq:     12.3 ms in a 16 graph, 11.4-12.1 ms in a 1 graph
+    RL decode batches often run near the max: ``max_num_seqs`` follows the rollout
+    concurrency.
+
+    Example (max_num_seqs=1024, 37 sizes):
+        16 32 64 128 256          x2 while the doubled size is <= max/3 (341)
+        304 352 ... 592 640       +48 while the next size is <= 2/3 of the max (682)
+        656 672 ... 1008 1024     +16 up to max_num_seqs
+    """
+    # Multiples of 16 (all but the last): sequence parallelism drops sizes its TP
+    # degree can't split, and TP 2, 4, 8 or 16 splits these.
+    sizes = []
+    size = 16
+    while size < max_num_seqs:
+        sizes.append(size)
+        if 2 * size <= max_num_seqs / 3:
+            size *= 2
+        elif size + 48 <= 2 * max_num_seqs / 3:
+            size += 48
+        else:
+            size += 16
+    sizes.append(max_num_seqs)
+    return sizes
 
 
 @dataclass(kw_only=True, slots=True)
