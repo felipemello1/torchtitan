@@ -10,9 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
+import json
 import logging
 import math
+import subprocess
+import sys
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -1094,3 +1099,637 @@ def test_forced_turns_reach_verifiers_client_and_keep_their_loss_mask() -> None:
             True,
             False,
         ]
+
+
+def test_terminus_max_tokens_turn_stays_on_its_branch() -> None:
+    """Terminus-2 re-sends a max_tokens turn without its reasoning; the plugin restores it so
+    the next prompt still bridges from the sampled tokens instead of forking a new branch."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins.terminal_bench_sandoq import (
+        restore_sampled_reasoning,
+    )
+    from verifiers.v1 import graph
+    from verifiers.v1.configs.agent import AgentConfig
+    from verifiers.v1.dialects.chat import parse_message
+    from verifiers.v1.trace import AgentInfo, Trace, TraceTask
+    from verifiers.v1.types import AssistantMessage, Response, TurnTokens
+
+    trace = Trace(
+        task=TraceTask(type="Task", data={}), agent=AgentInfo(config=AgentConfig())
+    )
+    task = {"role": "user", "content": "Write a.py"}
+    # Hit max_tokens after </think>: reasoning is set, content is partial JSON.
+    truncated = AssistantMessage(
+        content='{"analysis": "Wri', reasoning_content="I will write it."
+    )
+    graph.prepare_turn(trace, [parse_message(task)]).commit(
+        Response(
+            id="r0",
+            created=0,
+            model="torchtitan",
+            message=truncated,
+            finish_reason="length",
+            tokens=TurnTokens(
+                prompt_ids=[1, 2], completion_ids=[3, 4], completion_logprobs=[0.0] * 2
+            ),
+        )
+    )
+    # Terminus-2's history after its max_tokens re-prompt (terminus_2.py:1142-1143).
+    history = [
+        task,
+        {"role": "assistant", "content": '{"analysis": "Wri'},
+        {
+            "role": "user",
+            "content": "ERROR!! NONE of the actions you just requested ...",
+        },
+    ]
+
+    def bridges(messages: list[dict]) -> bool:
+        prompt = [parse_message(message) for message in messages]
+        return graph.prepare_turn(trace, prompt).previous_token_ids() is not None
+
+    assert not bridges(history)
+    assert bridges(restore_sampled_reasoning(history, trace))
+
+
+def test_terminus_turns_with_the_same_content_stay_on_one_branch() -> None:
+    """Two sampled turns with content "" but different reasoning (a stray </think> with thinking
+    off) each get their own reasoning back, so the next prompt bridges instead of forking."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins.terminal_bench_sandoq import (
+        restore_sampled_reasoning,
+    )
+    from verifiers.v1 import graph
+    from verifiers.v1.configs.agent import AgentConfig
+    from verifiers.v1.dialects.chat import parse_message
+    from verifiers.v1.trace import AgentInfo, Trace, TraceTask
+    from verifiers.v1.types import AssistantMessage, Response, TurnTokens
+
+    trace = Trace(
+        task=TraceTask(type="Task", data={}), agent=AgentInfo(config=AgentConfig())
+    )
+    task = {"role": "user", "content": "Write a.py"}
+    reply = {"role": "user", "content": "New Terminal Output: $"}
+    first = {"role": "assistant", "content": "", "reasoning_content": "junk A"}
+    second = {"role": "assistant", "content": "", "reasoning_content": "junk B"}
+
+    def commit(messages: list[dict], sampled: dict, prompt_ids: list[int]) -> None:
+        prompt = [parse_message(message) for message in messages]
+        graph.prepare_turn(trace, prompt).commit(
+            Response(
+                id=str(len(prompt_ids)),
+                created=0,
+                model="torchtitan",
+                message=AssistantMessage(
+                    content="", reasoning_content=sampled["reasoning_content"]
+                ),
+                finish_reason="stop",
+                tokens=TurnTokens(
+                    prompt_ids=prompt_ids, completion_ids=[9], completion_logprobs=[0.0]
+                ),
+            )
+        )
+
+    commit([task], first, [1, 2])
+    commit([task, first, reply], second, [1, 2, 9, 3])
+    # Terminus-2 with interleaved thinking off re-sends both turns without their reasoning.
+    resent = {"role": "assistant", "content": ""}
+    history = [task, resent, reply, resent, reply]
+
+    prompt = [
+        parse_message(message) for message in restore_sampled_reasoning(history, trace)
+    ]
+    assert graph.prepare_turn(trace, prompt).previous_token_ids() is not None
+
+
+def test_sandoq_rollout_log_explains_a_tmux_failure(tmp_path, caplog) -> None:
+    """A rollout whose tmux never starts leaves a log with Terminus-2's traceback and log lines."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.errors import HarnessError
+    from verifiers.v1.runtimes import ProgramResult
+
+    class NoTmuxRuntime:
+        async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+            return ProgramResult(exit_code=127, stdout="", stderr="tmux: not found")
+
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    runtime = NoTmuxRuntime()
+
+    async def rollout() -> None:
+        with pytest.raises(HarnessError):
+            await _launch(harness, trace, runtime)
+        sandoq.harbor_logger.warning("logged outside any launch")
+        await harness.cleanup(trace, runtime)
+        # Verifiers' abort() after a cancelled close() calls cleanup again.
+        await harness.cleanup(trace, runtime)
+
+    asyncio.run(rollout())
+    log = _read_rollout_log(tmp_path, trace)
+
+    assert log["verifiers_trace_id"] == trace.id
+    assert "Failed to start tmux session" in log["harness_stderr"]
+    assert "ERROR harbor.utils.logger: Failed to install tmux" in log["terminus_log"]
+    assert "outside any launch" not in log["terminus_log"]
+    # The filter copies Harbor's records; they still reach the job log.
+    assert "Failed to install tmux" in caplog.text
+    assert log["trajectory"] is None
+    assert log["tests"] is None
+    assert log["pane"] is None
+
+
+def test_sandoq_rollout_log_keeps_trajectory_and_test_output(
+    tmp_path, monkeypatch
+) -> None:
+    """A finished rollout's log holds Terminus-2's trajectory, without the API key, and test.sh's
+    capped output; the reward is the one the stock HarborTask reads."""
+    pytest.importorskip("harbor")
+    from harbor.models.trajectories import Step
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.runtimes import ProgramResult
+    from verifiers.v1.tasksets.harbor import HarborTask
+
+    sent_api_keys = []
+    test_stdout = "apt-get update\n" + "x" * 100_000 + "\n1 failed"
+
+    class Terminus2WithoutModel(_terminus2_without_model(sandoq)):
+        async def run(self, instruction, environment, context) -> None:
+            sent_api_keys.append(self._llm._build_base_kwargs()["api_key"])
+            self._context = context
+            self._trajectory_steps = [
+                Step(
+                    step_id=1,
+                    timestamp="2026-10-07T12:00:00Z",
+                    source="user",
+                    message=instruction,
+                )
+            ]
+            self._dump_trajectory()
+
+    class VMRuntime:
+        async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+            if argv == ["bash", "/tests/test.sh"]:
+                return ProgramResult(exit_code=1, stdout=test_stdout, stderr="")
+            return ProgramResult(exit_code=0, stdout="", stderr="")
+
+        async def read(self, path: str, max_bytes: int) -> bytes:
+            if path.endswith("reward.json"):
+                raise OSError(path)
+            return b"0"
+
+    monkeypatch.setattr(sandoq, "Terminus2", Terminus2WithoutModel)
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    runtime = VMRuntime()
+    data = trace.task.data
+
+    async def rollout() -> tuple[ProgramResult, float, float]:
+        result = await _launch(harness, trace, runtime)
+        reward = await sandoq.SandoqHarborTask(data)._graded(runtime, trace)
+        stock_reward = await HarborTask(data)._graded(runtime, trace)
+        trace.record_reward("solved", reward)
+        await harness.cleanup(trace, runtime)
+        return result, reward, stock_reward
+
+    result, reward, stock_reward = asyncio.run(rollout())
+    log = _read_rollout_log(tmp_path, trace)
+
+    # The env server builds tasks as the taskset's task type.
+    assert sandoq.SandoqTerminalTaskset.task_type() is sandoq.SandoqHarborTask
+    assert reward == stock_reward == 0.0
+    assert result.exit_code == 0
+    assert log["task_name"] == "allenai-tmax/task_000000_c19dda5b"
+    assert log["harness_stderr"] == ""
+    assert log["trajectory"]["steps"][0]["message"] == "Write a.py"
+    assert log["trajectory"]["agent"]["extra"]["llm_kwargs"] == {
+        "custom_llm_provider": "openai"
+    }
+    assert sent_api_keys == ["secret"]
+    assert log["tests"]["exit_code"] == 1
+    assert log["tests"]["stdout"].startswith("apt-get update\n")
+    assert log["tests"]["stdout"].endswith("\n1 failed")
+    assert "characters omitted" in log["tests"]["stdout"]
+
+
+def test_sandoq_tests_get_requests_from_a_bundle(tmp_path, monkeypatch) -> None:
+    """A test.sh that imports `requests` and installs nothing gets the packages the image lacks
+    from a pure-Python bundle on its PYTHONPATH; one that pip-installs is left alone."""
+    pytest.importorskip("harbor")
+    import idna
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.runtimes import ProgramResult
+    from verifiers.v1.tasksets.harbor.taskset import HarborData
+
+    def task(name: str, test_sh: str) -> str:
+        (tmp_path / name / "tests").mkdir(parents=True)
+        (tmp_path / name / "tests" / "test.sh").write_text(test_sh)
+        return str(tmp_path / name)
+
+    heredoc = (
+        "cat << 'EOF' > /tmp/t.py\nimport requests\nEOF\npython3 -m pytest /tmp/t.py\n"
+    )
+    tmax = task("tmax", heredoc)
+    installs = task("tb21", "pip install requests==2.32.4\n" + heredoc)
+    assert sandoq.tests_need_requests(tmax)
+    assert not sandoq.tests_need_requests(installs)
+
+    # The image: a python3 without site-packages, whose own PYTHONPATH has idna. Staging must
+    # extract the other 4 packages, and test.sh must keep that PYTHONPATH.
+    deps = tmp_path / "deps"
+    monkeypatch.setattr(sandoq, "_TEST_PYTHON_DEPS", str(deps))
+    (tmp_path / "image_site").mkdir()
+    (tmp_path / "image_site" / "idna").symlink_to(Path(idna.__file__).parent)
+    image_python = tmp_path / "bin" / "python3"
+    image_python.parent.mkdir()
+    image_python.write_text(f'#!/bin/sh\nexec {sys.executable} -S "$@"\n')
+    image_python.chmod(0o755)
+    image_env = {
+        "PATH": f"{image_python.parent}:/usr/bin:/bin",
+        "PYTHONPATH": str(tmp_path / "image_site"),
+    }
+    # Stands in for the pytest file test.sh writes, which starts with `import requests`.
+    pytest_file = ["python3", "-c", "import requests; print(requests.__file__)"]
+
+    class VMRuntime:
+        async def write(self, path: str, data: bytes) -> None:
+            if path.startswith(str(deps)):
+                Path(path).write_bytes(data)
+
+        async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+            if argv[-2:] == ["bash", "/tests/test.sh"]:
+                argv = [*argv[:-2], *pytest_file]
+            elif str(deps) not in argv[-1]:
+                # Harbor's own staging of /tests.
+                return ProgramResult(exit_code=0, stdout="", stderr="")
+            done = subprocess.run(
+                argv, env={**image_env, **env}, capture_output=True, text=True
+            )
+            return ProgramResult(
+                exit_code=done.returncode, stdout=done.stdout, stderr=done.stderr
+            )
+
+        async def read(self, path: str, max_bytes: int) -> bytes:
+            if path.endswith("reward.json"):
+                raise OSError(path)
+            return b"1"
+
+    runtime = VMRuntime()
+    harbor_task = sandoq.SandoqHarborTask(HarborData(prompt="x", task_dir=tmax))
+    trace = _sandoq_harness_and_trace(sandoq, tmp_path)[1]
+    assert asyncio.run(harbor_task.solved(runtime, trace)) == 1.0
+    extracted = sorted(path.name for path in deps.iterdir())
+    assert extracted == ["certifi", "charset_normalizer", "requests", "urllib3"]
+    assert not list(deps.rglob("*.so"))
+    assert trace.info["tests"]["stdout"].startswith(str(deps)), trace.info["tests"]
+
+
+def test_sandoq_task_scores_within_harbor_verifier_timeout(
+    tmp_path, monkeypatch
+) -> None:
+    """Through the recipe's Sandoq config, scoring stops at the task's [verifier] timeout_sec,
+    else Harbor's 600 s; the run-level rollout timeout is unchanged."""
+    pytest.importorskip("harbor")
+    import verifiers.v1.tasksets.harbor.taskset as harbor_taskset
+    from torchtitan.rl.examples.verifiers.terminal_bench.prepare_tmax import task_toml
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq
+    from torchtitan_recipes.rl.verifiers_terminal_bench import (
+        _on_sandoq,
+        _terminal_bench_rollouter_config,
+    )
+    from verifiers.v1.utils.loaders import load_taskset
+
+    monkeypatch.setenv("VF_SANDBOX_PROVIDER", "oci-runner")
+    monkeypatch.setenv("OCI_RUNNER_TASK_NETWORK", "host")
+    monkeypatch.syspath_prepend(str(Path(terminal_bench_sandoq.__file__).parent))
+    monkeypatch.setattr(harbor_taskset, "CACHE", tmp_path)
+    declared = "[verifier]\ntimeout_sec = 1800.0\n"
+    for name, verifier in [("undeclared", ""), ("declared", declared)]:
+        task_dir = tmp_path / "train_1" / name
+        (task_dir / "tests").mkdir(parents=True)
+        (task_dir / "tests" / "test.sh").write_text("true\n")
+        (task_dir / "instruction.md").write_text("x")
+        (task_dir / "task.toml").write_text(
+            task_toml(name, "ubuntu:22.04", 1, 2048, "/app") + verifier
+        )
+
+    rollouter = _on_sandoq(
+        _terminal_bench_rollouter_config(
+            "train@1",
+            "validation@1",
+            max_context_length=1024,
+            max_turns=1,
+            max_concurrent_rollouts=1,
+            num_env_workers=1,
+        ),
+        interleaved_thinking=False,
+        rollout_log_dir=str(tmp_path / "logs"),
+    )
+    agent = rollouter.verifiers_env_server.environment.agent
+    scoring = {
+        task.data.name: agent.timeout.scoring or task.data.timeout.scoring
+        for task in load_taskset(
+            rollouter.training_dataloader.dataset.verifiers_taskset
+        )
+    }
+
+    assert scoring == {
+        "allenai-tmax/declared": 1800.0,
+        "allenai-tmax/undeclared": 600.0,
+    }
+    assert rollouter.validation_dataset.verifiers_taskset.ignore_timeouts is False
+    assert agent.timeout.rollout == 7200
+
+
+def test_sandoq_tmux_outlives_grading(tmp_path, monkeypatch) -> None:
+    """launch leaves tmux running, so test.sh sees the agent's shell jobs as under `harbor run`;
+    cleanup writes the log with the pane, then kills tmux once."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.runtimes import ProgramResult
+
+    monkeypatch.setattr(sandoq, "Terminus2", _terminus2_without_model(sandoq))
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    pane = ProgramResult(exit_code=0, stdout="$ python3 server.py &\n", stderr="")
+    runtime = _RecordingRuntime({"tail": pane})
+
+    asyncio.run(_launch(harness, trace, runtime))
+    assert not any("kill-server" in " ".join(argv) for argv, _ in runtime.calls)
+    asyncio.run(harness.cleanup(trace, runtime))
+    # Verifiers' abort() after a cancelled close() calls cleanup again.
+    asyncio.run(harness.cleanup(trace, runtime))
+    commands = [" ".join(argv) for argv, _ in runtime.calls]
+    kills = [i for i, command in enumerate(commands) if "kill-server" in command]
+    pane_read = next(
+        i for i, command in enumerate(commands) if command.startswith("tail")
+    )
+    assert len(kills) == 1 and pane_read < kills[0]
+    assert _read_rollout_log(tmp_path, trace)["pane"] == "$ python3 server.py &\n"
+
+
+def test_sandoq_exec_keeps_keystrokes_out_of_argv() -> None:
+    """Each exec ships its command in an env var, so an agent's `pkill -f` pattern can't match
+    the exec that typed it; the command still runs as written."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+
+    command = "tmux send-keys -t terminus-2 -- 'pkill -f server.py' Enter"
+    runtime = _RecordingRuntime()
+    environment = sandoq.RuntimeEnvironment(runtime, {"TMUX_TMPDIR": "/tmp/t"})
+    asyncio.run(environment.exec(command, cwd="/app"))
+
+    [(argv, env)] = runtime.calls
+    assert "server.py" not in " ".join(argv)
+    assert env == {"TMUX_TMPDIR": "/tmp/t", "TERMINUS_EXEC": f"cd /app && {command}"}
+    # The wrapper runs a quoted, multi-line command unchanged.
+    script = "cat <<'EOF'\nit's \"quoted\" $HOME\nEOF"
+    output = subprocess.run(
+        argv, env={"TERMINUS_EXEC": script}, capture_output=True, text=True
+    ).stdout
+    assert output == 'it\'s "quoted" $HOME\n'
+
+
+def test_sandoq_exec_rejects_a_null_byte_like_harbor() -> None:
+    """A command with a NUL byte raises ValueError, as Harbor's subprocess exec does, so the
+    rollout fails as HarnessError instead of a retried SandboxError."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+
+    runtime = _RecordingRuntime()
+    environment = sandoq.RuntimeEnvironment(runtime, {})
+    with pytest.raises(ValueError, match="embedded null byte"):
+        asyncio.run(environment.exec("printf 'a\0b'"))
+    assert runtime.calls == []
+
+
+def test_sandoq_session_nests_a_shell(tmp_path, monkeypatch) -> None:
+    """After tmux setup the agent's shell is a child shell, as under Harbor's recording, so its
+    first `exit` returns to the outer shell instead of ending the session."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+
+    sessions = []
+
+    class Terminus2KeepingSession(_terminus2_without_model(sandoq)):
+        async def run(self, instruction, environment, context) -> None:
+            sessions.append(self._session)
+
+    monkeypatch.setattr(sandoq, "Terminus2", Terminus2KeepingSession)
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    result = asyncio.run(_launch(harness, trace, _RecordingRuntime()))
+
+    assert result.exit_code == 0
+    assert sessions[0].keys == [["bash", "Enter"], ["clear", "Enter"]]
+
+
+def test_sandoq_exec_failure_raises_sandbox_error(tmp_path, monkeypatch) -> None:
+    """A lost exec channel leaves launch as a SandboxError, which the agent's retries can rerun
+    on a fresh VM; the rollout log still keeps the traceback."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.errors import SandboxError
+
+    class Terminus2LosingTheVM(_terminus2_without_model(sandoq)):
+        async def run(self, instruction, environment, context) -> None:
+            raise SandboxError("prime exec failed: uncertain transport failure")
+
+    monkeypatch.setattr(sandoq, "Terminus2", Terminus2LosingTheVM)
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    runtime = _RecordingRuntime()
+    with pytest.raises(SandboxError):
+        asyncio.run(_launch(harness, trace, runtime))
+    asyncio.run(harness.cleanup(trace, runtime))
+    assert (
+        "uncertain transport failure"
+        in _read_rollout_log(tmp_path, trace)["harness_stderr"]
+    )
+
+
+def test_sandoq_dead_container_is_not_retried(tmp_path, monkeypatch) -> None:
+    """A container the agent killed fails as HarnessError, which the SandboxError retry skips."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.errors import HarnessError
+
+    class Terminus2KillingItsContainer(_terminus2_without_model(sandoq)):
+        async def run(self, instruction, environment, context) -> None:
+            # What Terminus-2 raises on its next keystroke after `pkill -9 -f sleep`.
+            raise RuntimeError(
+                "failed to send non-blocking keys: return_code=255, stderr='Error: can only "
+                "create exec sessions on running containers'"
+            )
+
+    monkeypatch.setattr(sandoq, "Terminus2", Terminus2KillingItsContainer)
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    with pytest.raises(HarnessError, match="running containers"):
+        asyncio.run(_launch(harness, trace, _RecordingRuntime()))
+
+
+def test_sandoq_model_call_stops_with_the_rollout(tmp_path, monkeypatch) -> None:
+    """Once Verifiers has stopped the rollout, the model call raises at once instead of letting
+    Terminus-2 retry a request Verifiers will refuse."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq as sandoq
+    from verifiers.v1.errors import HarnessError
+
+    class Terminus2AtTheCap(_terminus2_without_model(sandoq)):
+        async def run(self, instruction, environment, context) -> None:
+            trace.stop_condition = "context_length"
+            await self._llm.call(prompt="next turn", message_history=[])
+
+    monkeypatch.setattr(sandoq, "Terminus2", Terminus2AtTheCap)
+    harness, trace = _sandoq_harness_and_trace(sandoq, tmp_path)
+    with pytest.raises(
+        HarnessError,
+        match="ContextLengthExceededError: Verifiers stopped the rollout: context_length",
+    ):
+        asyncio.run(_launch(harness, trace, _RecordingRuntime()))
+
+
+class _RecordingRuntime:
+    """Runtime that records each `run` and answers by the command's first word."""
+
+    def __init__(self, results: dict | None = None) -> None:
+        self.calls: list[tuple[list[str], dict[str, str]]] = []
+        self._results = results or {}
+
+    async def run(self, argv: list[str], env: dict[str, str]):
+        from verifiers.v1.runtimes import ProgramResult
+
+        self.calls.append((argv, env))
+        return self._results.get(
+            argv[0], ProgramResult(exit_code=0, stdout="", stderr="")
+        )
+
+
+def _terminus2_without_model(sandoq):
+    """Terminus-2 that runs no model and no tmux; its session records the keys it is sent."""
+
+    class Session:
+        def __init__(self) -> None:
+            self.keys: list = []
+
+        async def send_keys(self, keys, **kwargs) -> None:
+            self.keys.append(keys)
+
+    class Terminus2WithoutModel(sandoq.Terminus2):
+        async def setup(self, environment) -> None:
+            self._session = Session()
+
+        async def run(self, instruction, environment, context) -> None:
+            pass
+
+    return Terminus2WithoutModel
+
+
+def _sandoq_harness_and_trace(sandoq, log_dir):
+    from verifiers.v1.configs.agent import AgentConfig
+    from verifiers.v1.tasksets.harbor.taskset import HarborData
+    from verifiers.v1.trace import AgentInfo, Trace, TraceTask
+
+    config = sandoq.StockTerminusOutsideConfig(
+        id=sandoq.PLUGIN_ID, rollout_log_dir=str(log_dir)
+    )
+    data = HarborData(name="allenai-tmax/task_000000_c19dda5b", prompt="Write a.py")
+    trace = Trace(
+        task=TraceTask(type="Task", data=data), agent=AgentInfo(config=AgentConfig())
+    )
+    return sandoq.StockTerminusOutsideHarness(config), trace
+
+
+async def _launch(harness, trace, runtime):
+    from verifiers.v1.task import TaskData
+
+    return await harness.launch(
+        SimpleNamespace(model="policy"),
+        trace,
+        runtime,
+        endpoint="http://127.0.0.1:1",
+        secret="secret",
+        mcp_urls={},
+        data=TaskData(prompt="Write a.py"),
+    )
+
+
+def _read_rollout_log(log_dir, trace) -> dict:
+    return json.loads(gzip.decompress((log_dir / f"{trace.id}.json.gz").read_bytes()))
+
+
+def test_text_only_parse_keeps_tool_call_markup(monkeypatch) -> None:
+    """With no tools declared, a reply wrapped in <tool_call> stays in the content, where
+    Terminus-2 reads its JSON; declared tools use the stock parser."""
+    pytest.importorskip("renderers")
+    # The plugin module imports harbor.
+    pytest.importorskip("harbor")
+    from renderers.qwen35 import Qwen35Renderer
+    from torchtitan_recipes.rl.verifiers_plugins.terminal_bench_sandoq import (
+        install_text_only_parse,
+    )
+
+    renderer = _fake_qwen35_renderer(monkeypatch)
+    stock_parse_response = Qwen35Renderer.parse_response
+    wrapped = [4, 7, 6, 7, 5, 0]  # <tool_call>\n{json}\n</tool_call><|im_end|>
+    tools = [{"name": "bash", "parameters": {}}]
+    assert stock_parse_response(renderer, wrapped, tools=None).content == ""
+
+    install_text_only_parse()
+
+    assert (
+        renderer.parse_response(wrapped, tools=None).content
+        == '<tool_call>\n{"analysis": "x"}\n</tool_call>'
+    )
+    assert renderer.parse_response(wrapped, tools=tools) == stock_parse_response(
+        renderer, wrapped, tools=tools
+    )
+
+
+def test_text_only_parse_keeps_a_reply_before_a_stray_think_end(monkeypatch) -> None:
+    """With thinking off, a reply that ends in a stray </think> reaches Terminus-2 as content
+    instead of "", and an empty reply stays "" (not None); a thought before </think> and JSON
+    after it still split, and thinking on keeps the stock split."""
+    pytest.importorskip("renderers")
+    # The plugin module imports harbor.
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins.terminal_bench_sandoq import (
+        install_text_only_parse,
+    )
+
+    renderer = _fake_qwen35_renderer(monkeypatch)
+    install_text_only_parse()
+
+    json_then_think_end = renderer.parse_response([6, 3, 0])
+    assert json_then_think_end.content == '{"analysis": "x"}'
+    assert json_then_think_end.reasoning_content is None
+    assert renderer.parse_response([7, 7, 0]).content == ""
+    thought_then_json = renderer.parse_response([8, 3, 6, 0])
+    assert thought_then_json.content == '{"analysis": "x"}'
+    assert thought_then_json.reasoning_content == "I will look."
+    renderer.config.enable_thinking = True
+    assert renderer.parse_response([6, 3, 0]).content == ""
+
+
+def _fake_qwen35_renderer(monkeypatch):
+    """Thinking-off Qwen3.5 renderer over a toy vocabulary; restores the class
+    install_text_only_parse patches.
+
+    Token ids: 0 <|im_end|>, 1 <|endoftext|>, 2 <think>, 3 </think>, 4 <tool_call>,
+    5 </tool_call>, 6 '{"analysis": "x"}', 7 "\n", 8 "I will look."
+    """
+    from renderers.qwen35 import Qwen35Renderer
+
+    vocab = ["<|im_end|>", "<|endoftext|>", "<think>", "</think>", "<tool_call>"]
+    vocab += ["</tool_call>", '{"analysis": "x"}', "\n", "I will look."]
+
+    class Tokenizer:
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join(vocab[i] for i in ids)
+
+    monkeypatch.setattr(Qwen35Renderer, "parse_response", Qwen35Renderer.parse_response)
+    monkeypatch.setattr(
+        Qwen35Renderer, "_text_only_parse_installed", False, raising=False
+    )
+    renderer = object.__new__(Qwen35Renderer)
+    renderer._tokenizer = Tokenizer()
+    renderer._im_end, renderer._endoftext = 0, 1
+    renderer._think, renderer._think_end = 2, 3
+    renderer._tool_call, renderer._tool_call_end = 4, 5
+    renderer.config = SimpleNamespace(enable_thinking=False)
+    return renderer
