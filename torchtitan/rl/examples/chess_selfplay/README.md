@@ -82,8 +82,8 @@ The training reward (`ChessGame.rewards`), with `played` = plies played / `max_p
 - win by checkmate: `ChessSelfPlayWorker.Config.checkmate_reward` (1 by default), at any length;
 - ply cap, or the opponent forfeits: a draw, 0.5, moved halfway toward the material score, so 0.25 to 0.75 (an opponent's forfeit is not a free win);
 - stalemate or insufficient material: 0.5 * `played`;
-- checkmated: -0.25 * (1 - `played`);
-- forfeit: -1 * (1 - `played` / 2), so -1 to -0.5, below any loss.
+- checkmated: -0.25 * (1 - `played`), or `ChessSelfPlayWorker.Config.checkmated_reward` if set (`1 - checkmate_reward` makes a mate zero-sum around a draw, like a game cut at the cap);
+- forfeit: -1 * (1 - `played` / 2), so -1 to -0.5, below any loss (plus `checkmated_reward` if set).
 
 The Elo metrics use the chess result instead (`ChessGame.scores`: 1 / 0.5 / 0, material at the cap).
 

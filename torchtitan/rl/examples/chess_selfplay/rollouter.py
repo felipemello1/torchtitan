@@ -89,6 +89,12 @@ class ChessSelfPlayWorker(RolloutWorker):
             1:   a mate beats the best score of a game cut at `max_plies` (0.75)
             10:  a mate dominates its group's advantages"""
 
+        checkmated_reward: float | None = None
+        """The loser's reward for a checkmate; the prompt states it. A forfeit scores 0.5 to 1 below it.
+            None:                  -0.25 x the unplayed share of `max_plies`; a forfeit -0.5 to -1
+            1 - checkmate_reward:  a mate is zero-sum around a draw (10 -> -9: +9.5 / -9.5 vs 0.5);
+                                   a forfeiting turn then pays ~10, not ~1.5"""
+
         forced_close_advantage_cap: float | None = None
         """Caps each force-closed turn's advantage; `None`: no cap. At 0.0 a won game never
         reinforces a thinking loop: +0.25 -> 0.0, and -0.3 stays -0.3."""
@@ -97,6 +103,7 @@ class ChessSelfPlayWorker(RolloutWorker):
         super().__init__(config)
         self._max_plies = config.max_plies
         self._checkmate_reward = config.checkmate_reward
+        self._checkmated_reward = config.checkmated_reward
         self._forced_close_advantage_cap = config.forced_close_advantage_cap
         if (
             config.stockfish_path is not None
@@ -150,6 +157,7 @@ class ChessSelfPlayWorker(RolloutWorker):
                 seed=sample.seed + game_idx,
                 bot=bot,
                 checkmate_reward=self._checkmate_reward,
+                checkmated_reward=self._checkmated_reward,
             )
             for game_idx, bot in enumerate(bots)
         ]
