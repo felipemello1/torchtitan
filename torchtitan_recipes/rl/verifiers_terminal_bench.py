@@ -201,8 +201,9 @@ def _on_sandoq(
             "runtime": sandbox_runtime(),
             # SandoqTerminalTaskset.load sets each task's scoring timeout instead.
             "timeout": environment.agent.timeout.model_copy(update={"scoring": None}),
-            # A lost exec channel (Sandoq transport, VM gone) gets one more try on a fresh VM.
-            "retries": RetryConfig(max_retries=1, include=["SandboxError"]),
+            # A lost exec channel (Sandoq transport, VM gone) gets 3 more tries on a fresh VM: a
+            # 7-minute image-pull burst failed 56 rollouts twice with 1.
+            "retries": RetryConfig(max_retries=3, include=["SandboxError"]),
         }
     )
     return dataclasses.replace(
@@ -627,15 +628,14 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     - each session's prefix stays held between its turns, and idle sessions' KV spills to CPU;
     - router replay (was off);
     - vLLM watermark 0.1 (was 0.03);
-    - 2,000 Sandoq VMs (was 2,688), which cap the groups in flight at 120;
+    - 2,000 Sandoq VMs (was 2,688) and 160 groups in flight;
     - a synchronous save every 10 steps (was async).
 
     DOME's `--train-iters` and `--save-interval` still override the steps and the save interval.
     """
     num_prompts_per_train_step = 22
     num_samples_per_prompt = 16
-    # Sandoq VMs the run holds, ~80% of (6 + 1) x 22 x 16; generation_capacity below keeps the
-    # groups in flight within it.
+    # Sandoq VMs the run holds, ~80% of (6 + 1) x 22 x 16.
     sandbox_pool = 2000
     # Host RAM per generator for vLLM's CPU KV offload. PLACEHOLDER: confirm before launch. Four
     # engines per host share its /dev/shm (DOME runs with --ipc=host; ~477 GB on a GB300 host).
@@ -672,9 +672,10 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
         max_offpolicy_steps=10,
         # Start at 5 x 22 = 110 groups: 1,760 rollouts, 88% of the pool.
         start_batches=5,
-        # (2,000 - 78) // 16 = 120 groups: leave validation its sandboxes.
-        generation_capacity=(sandbox_pool - num_validation_samples)
-        // num_samples_per_prompt,
+        # A group keeps its permit until its slowest rollout ends, and its 16 rollouts hold a VM ~54%
+        # of that time: at 120 groups the run leased ~1,000 of 2,000 VMs. 160 groups lease ~1,460.
+        # The env server still runs at most sandbox_pool rollouts at once.
+        generation_capacity=160,
     )
     # Validate at step 0 and every 10 steps beside training; starting a pass makes the trainer
     # wait only for that step's weight pull.
