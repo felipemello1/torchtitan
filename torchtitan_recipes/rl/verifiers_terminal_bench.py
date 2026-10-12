@@ -668,6 +668,10 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     # No length reward: it breaks reward ties, so all-pass and all-fail groups would train on
     # length alone instead of being dropped.
     config.rollouter.rubric.length_reward_weight = 0.0
+    # A truncated training rollout (max_turns, the context, or a last turn cut at max_tokens)
+    # scores 0: the policy learned to loop with empty commands after solving, and the tests still
+    # passed those loops.
+    config.rollouter.rubric.truncation_reward = 0.0
     # The last 1x2 run's budget: a turn still thinking after 4,096 tokens gets a forced end of
     # thinking, which leaves the rest of its 16,384 tokens for the command.
     config.rollouter.thinking_budget = ThinkingBudget.Config(max_thinking_tokens=4096)

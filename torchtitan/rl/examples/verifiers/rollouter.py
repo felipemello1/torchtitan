@@ -109,7 +109,8 @@ class VerifiersRollouter(Rollouter):
         """Environment server spawned and owned by this rollouter."""
 
         rubric: Rubric.Config
-        """TorchTitan rubric that consumes rewards returned by Verifiers."""
+        """TorchTitan rubric that consumes rewards returned by Verifiers. Its `truncation_reward`
+        applies to training groups only; validation scores a truncated rollout on its tests."""
 
         advantage: AdvantageEstimator.Config = field(
             default_factory=AdvantageEstimator.Config
@@ -164,6 +165,10 @@ class VerifiersRollouter(Rollouter):
         super().__init__(config)
         self._verifiers_config = config
         self._rubric: Rubric = config.rubric.build()
+        # Validation skips truncation_reward, so its reward stays the tests' pass rate.
+        self._validation_rubric: Rubric = replace(
+            config.rubric, truncation_reward=None
+        ).build()
         self._advantage_estimator: AdvantageEstimator = config.advantage.build()
         self._verifiers_env_server = config.verifiers_env_server.build()
         self._generation_server: GenerationServer | None = None
@@ -280,7 +285,9 @@ class VerifiersRollouter(Rollouter):
             # The group sends no more generation requests, even when a rollout raised.
             generate_fns.pop(group_id, None)
 
-        outputs = await self._rubric.score_group(rollouts, sample)
+        # Validation groups have negative ids (`Controller._collect_validation_rollouts`).
+        rubric = self._validation_rubric if group_id < 0 else self._rubric
+        outputs = await rubric.score_group(rollouts, sample)
         for rollout, output in zip(rollouts, outputs, strict=True):
             rollout.reward = output.reward
             rollout.reward_breakdown = output.reward_breakdown
