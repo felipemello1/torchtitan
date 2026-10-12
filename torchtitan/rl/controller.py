@@ -742,6 +742,9 @@ class Controller(Configurable):
                 "batcher",
                 BatcherActor,
                 training_sample_builder_config=async_loop.training_sample_builder,
+                training_sample_builder_kwargs=dict(
+                    replay_routed_experts=config.generator.return_routed_experts
+                ),
                 batcher_config=async_loop.batcher,
                 batcher_kwargs=dict(
                     num_tokens_per_microbatch_per_dp_rank=(

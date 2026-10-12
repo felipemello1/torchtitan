@@ -39,7 +39,9 @@ class BatcherActor(Actor):
         in `asyncio.to_thread`:  each GIL release waits up to 5 ms to get it back (the switch interval)
 
     Args:
-        training_sample_builder_config: Built in this process.
+        training_sample_builder_config: Built in this process with `training_sample_builder_kwargs`.
+        training_sample_builder_kwargs: Runtime kwargs for `training_sample_builder_config.build`,
+            e.g. `replay_routed_experts`.
         batcher_config: Built in this process with `batcher_kwargs`.
         batcher_kwargs: Runtime kwargs for `batcher_config.build`, e.g. `dp_degree` and `pad_id`.
         rdma_fast_path_threshold: See `AsyncLoopConfig.rdma_fast_path_threshold`.
@@ -51,6 +53,7 @@ class BatcherActor(Actor):
             "batcher",
             BatcherActor,
             training_sample_builder_config=TrainingSampleBuilder.Config(),
+            training_sample_builder_kwargs=dict(replay_routed_experts=False),
             batcher_config=Batcher.Config(),
             batcher_kwargs=dict(num_prompts_per_train_step=2, dp_degree=1, ...),
             rdma_fast_path_threshold=1024,
@@ -66,6 +69,7 @@ class BatcherActor(Actor):
         self,
         *,
         training_sample_builder_config: TrainingSampleBuilder.Config,
+        training_sample_builder_kwargs: dict[str, Any],
         batcher_config: Batcher.Config,
         batcher_kwargs: dict[str, Any],
         rdma_fast_path_threshold: int | None,
@@ -79,7 +83,9 @@ class BatcherActor(Actor):
             rank=0,
             enable=enable_structured_logging,
         )
-        self._training_sample_builder = training_sample_builder_config.build()
+        self._training_sample_builder = training_sample_builder_config.build(
+            **training_sample_builder_kwargs
+        )
         self._batcher = batcher_config.build(**batcher_kwargs)
         self._rdma_fast_path_threshold = rdma_fast_path_threshold
         if rdma_fast_path_threshold is not None:

@@ -316,6 +316,11 @@ def test_router_forwards_session_releases_with_hold_or_kv_offload(
         )
 
     assert spawn_kwargs["generator_router"]["forward_session_releases"] is forwarded
+    # The batcher actor builds the sample builder and batcher with the generator's settings.
+    assert spawn_kwargs["batcher"]["training_sample_builder_kwargs"] == {
+        "replay_routed_experts": False
+    }
+    assert spawn_kwargs["batcher"]["batcher_kwargs"]["num_topk_logprobs"] == 0
 
 
 def test_main_shuts_down_after_train_failure(monkeypatch, stub_mesh_provisioning):

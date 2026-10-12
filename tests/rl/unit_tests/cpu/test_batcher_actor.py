@@ -90,6 +90,7 @@ def test_batcher_actor_returns_the_in_process_batch(tmp_path, monkeypatch) -> No
         try:
             spawn_kwargs = dict(
                 training_sample_builder_config=TrainingSampleBuilder.Config(),
+                training_sample_builder_kwargs={},
                 batcher_config=Batcher.Config(),
                 batcher_kwargs=_BATCHER_KWARGS,
                 output_dir=str(tmp_path),
