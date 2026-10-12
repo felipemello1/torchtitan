@@ -26,14 +26,18 @@ from torchtitan.components.optim import (
 from torchtitan.components.renderer import from_renderers
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config.transform import apply_transforms
+from torchtitan.config.transform.dist_moe import DistMoeTransform
 from torchtitan.distributed.activation_checkpoint import FullAC, RegionAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.models.common.dist_moe import DistMoeRuntime
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.components.data import IterableRLDataLoader
 from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.examples.chess_selfplay import (
+    ChessCurriculum,
     ChessPlayerEnv,
     ChessSelfPlayDataset,
     ChessSelfPlayWorker,
@@ -333,4 +337,118 @@ def rl_chess_qwen3_5_4b_gb300(
     generator.hold_session_kv = True
     # Admit a request only while 3% of KV blocks stay free, so running requests have room to grow.
     generator.extra_vllm_engine_args = {"watermark": 0.03}
+    return config
+
+
+def rl_chess_qwen3_5_35b_a3b_base_gb300(
+    max_plies: int = 120,
+    start_max_plies: int = 60,
+    max_plies_ramp_steps: int = 200,
+    max_thinking_tokens: int = 1024,
+    max_context_tokens: int = 131072,
+    num_prompts_per_train_step: int = 32,
+    kv_offload_gib: float = 96.0,
+) -> Controller.Config:
+    """Qwen3.5-35B-A3B-Base self-play from scratch, with thinking, on three GB300 hosts:
+
+        host 0:     the trainer, FSDP 2 x TP 2 x EP 4 with Dist-MoE experts
+        hosts 1-2:  eight TP1 generators; idle session KV goes to CPU
+
+    Training games start at `start_max_plies` and grow linearly to `max_plies` by step
+    `max_plies_ramp_steps` (60 -> 120 by step 200); validation games always play `max_plies`.
+    Score centering with router replay, lr 5e-6 after a 10-step warmup.
+    """
+    expert_parallel_degree = 4
+    config = rl_chess_qwen3_5_4b_gb300(
+        max_plies=max_plies,
+        max_thinking_tokens=max_thinking_tokens,
+        max_context_tokens=max_context_tokens,
+    )
+    config.hf_assets_path = "torchtitan/rl/example_checkpoint/Qwen3.5-35B-A3B-Base"
+    config.dump_folder = "outputs/rl/qwen3_5_35b_a3b_base_chess_gb300"
+    trainer_parallelism = ParallelismConfig(
+        data_parallel_shard_degree=2,
+        tensor_parallel_degree=2,
+        expert_parallel_degree=expert_parallel_degree,
+    )
+    trainer_model, generator_model = build_rl_model_configs(
+        build_model_config,
+        "35B-A3B",
+        seq_len=max_context_tokens,
+        attn_backend="varlen",
+        trainer_parallelism=trainer_parallelism,
+        generator_parallelism=config.generator.parallelism,
+    )
+
+    # ======== Rollouts ========
+    config.rollouter.curriculum = ChessCurriculum.Config(
+        start_max_plies=start_max_plies,
+        end_max_plies=max_plies,
+        max_plies_ramp_steps=max_plies_ramp_steps,
+    )
+
+    # ======== Async loop ========
+    loop = config.async_loop
+    loop.num_training_steps = 300
+    # num_prompts positions x 8 games x 2 colors: 32 x 16 = 512 rollouts of ~25K tokens at 60 plies,
+    # ~13M tokens, ~230 s of forward/backward at the 35B trainer's ~55K tokens/s.
+    loop.num_prompts_per_train_step = num_prompts_per_train_step
+    loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
+        # The mean policy age of trained groups stays under 6 steps, every one under 10.
+        target_offpolicy_steps=6,
+        max_offpolicy_steps=10,
+        # (6 + 1) batches generating at once, the mean-age ceiling; sizes vLLM's max_num_seqs.
+        generation_capacity=7 * num_prompts_per_train_step,
+        start_batches=7,
+    )
+    loop.target_offpolicy_steps = loop.group_buffer.target_offpolicy_steps
+    loop.validation.freq = 10
+
+    # ======== Trainer ========
+    trainer = config.trainer
+    trainer.model = trainer_model
+    trainer.parallelism = trainer_parallelism
+    trainer.training.dtype = (
+        "float32"  # fp32 master weights; FSDP unshards bf16 for compute
+    )
+    trainer.training.mixed_precision_param = "bfloat16"
+    # Dist-MoE's activation planner breaks if its forward is replayed in backward, so nothing is saved
+    # and nothing replays it; a rank receiving more rows than the scratch holds faults.
+    trainer.activation_checkpoint = RegionAC.Config(save_regions=[])
+    trainer.dist_moe_runtime = DistMoeRuntime.Config(
+        scratch_capacity_factor=float(expert_parallel_degree)
+    )
+    trainer.optim = Optim.Config(
+        optimizer=OptimizersContainer.Config(
+            optimizers=[
+                AdamW.Config(
+                    pattern=r".*", lr=5e-6, betas=(0.9, 0.98), weight_decay=0.1
+                )
+            ]
+        ),
+        # Fresh weights: ramp to 5e-6 over 10 steps, then hold it.
+        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=10, min_lr_factor=1.0),
+    )
+    trainer.loss.loss_fn = ScoreCenteringLoss.Config(
+        max_ratio=2.0, global_vocab_size=decoder_vocab_size(trainer_model)
+    )
+    # Synchronous saves: an async save's CPU copy of the 35B state (~420 GB) on top of the batch
+    # can exceed the trainer host's job memory.
+    trainer.checkpointer.async_mode = "disabled"
+    config.trainer = apply_transforms(trainer, [DistMoeTransform()])
+
+    # ======== Generators ========
+    generator = config.generator
+    generator.model = generator_model
+    # The routed experts the trainer replays.
+    generator.return_routed_experts = True
+    # ScoreCenteringLoss's top-k: 32 matched the full vocabulary in arXiv 2609.20807.
+    generator.sampling.num_topk_logprobs = 32
+    # Admit a request only while 10% of KV blocks stay free; held idle sessions are released from
+    # 15% free down (must sit above the watermark), and their KV stays in CPU memory.
+    generator.extra_vllm_engine_args = {"watermark": 0.1}
+    generator.session_kv_free_floor = 0.15
+    # Host RAM per engine for vLLM's CPU KV offload: 4 engines x 96 GiB fit a GB300 host's /dev/shm
+    # (half of ~954 GB) with margin.
+    generator.kv_offload_gib = kv_offload_gib
     return config

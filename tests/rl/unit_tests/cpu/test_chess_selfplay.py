@@ -385,7 +385,14 @@ def test_elo_fit() -> None:
     assert EloFit.reduce([EloFit([(1500, 0.0)])])["fit"] == pytest.approx(0.0, abs=1e-6)
 
 
-@pytest.mark.parametrize("recipe", ["rl_chess_qwen3_5_4b", "rl_chess_qwen3_5_4b_gb300"])
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        "rl_chess_qwen3_5_4b",
+        "rl_chess_qwen3_5_4b_gb300",
+        "rl_chess_qwen3_5_35b_a3b_base_gb300",
+    ],
+)
 def test_recipe_builds(recipe) -> None:
     config = ConfigLoader().load(
         ["--module", "torchtitan_recipes.rl.chess_selfplay", "--config", recipe]
