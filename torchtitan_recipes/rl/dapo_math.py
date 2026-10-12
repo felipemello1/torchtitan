@@ -392,26 +392,33 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
     """`rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k` as a fresh 300-step run with score
     centering, router replay, the adaptive rollout buffer, and validation beside training.
 
-    Same 12 GPUs, 64 x 16 batch, 131K budget and forced answer; no length reward.
+    Same 12 GPUs, 131K budget and forced answer; 24 x 16 per step, lr 5e-6, vLLM watermark 0.1,
+    CPU KV offload, and all-pass problems skipped in later epochs; no length reward.
     """
+    num_prompts_per_train_step = 24
+    # ~10 batches generating at once, as 20 prompts -> 200 groups did: about twice the groups the
+    # engines' KV holds at ~55K-token responses, so the vLLM queue stays short. With validation
+    # alongside, each engine's max_num_seqs is (240 x 16 + 960) / 8 = 600 (was capped at 512).
+    generation_capacity = 240
+    # Host RAM per generator for vLLM's CPU KV offload. PLACEHOLDER: confirm before launch. Four
+    # engines per host share its /dev/shm (DOME runs with --ipc=host; ~477 GB on a GB300 host).
+    kv_offload_gib = 96
     config = rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k()
     config.dump_folder = "outputs/rl/qwen3_5_35b_a3b_base_intellect3_math_131k_tonight"
     config.async_loop = dataclasses.replace(
         config.async_loop,
-        # 20 x 16 rollouts per step keeps forward/backward near 300-600 s at ~55-65K-token responses
-        # (64 x 16 took 1,100-1,900 s).
-        num_prompts_per_train_step=20,
+        # 24 x 16 rollouts per step keeps early steps' forward/backward near 200-300 s (20 x 16 took
+        # 300-600 s at ~55-65K-token responses; 64 x 16 took 1,100-1,900 s).
+        num_prompts_per_train_step=num_prompts_per_train_step,
         num_training_steps=300,
         # Under the adaptive buffer, this only sets train_batch/pct_samples_over_target_age.
         target_offpolicy_steps=6,
         group_buffer=AdaptiveRolloutGroupWorkBuffer.Config(
             # The demand keeps the mean policy age of trained groups under 6 steps.
             target_offpolicy_steps=6,
-            # A group older than 12 steps when consumed is dropped and its prompt not retried.
-            max_offpolicy_steps=12,
-            # ~10 batches: about twice the groups the engines' KV holds at ~55K-token responses, so
-            # the vLLM queue stays short instead of holding ~10K requests for hours.
-            generation_capacity=200,
+            # A group older than 10 steps when consumed is dropped and its prompt not retried.
+            max_offpolicy_steps=10,
+            generation_capacity=generation_capacity,
             # Start at (6 + 1) batches, as the fixed buffer would.
             start_batches=7,
         ),
@@ -443,13 +450,13 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
                 optimizers=[
                     AdamW.Config(
                         pattern=r".*",
-                        lr=1e-5,
+                        lr=5e-6,
                         betas=(0.9, 0.98),
                         weight_decay=0.1,
                     )
                 ]
             ),
-            # Fresh weights: ramp linearly to 1e-5 over 10 steps, then hold it.
+            # Fresh weights: ramp linearly to 5e-6 over 10 steps, then hold it.
             lr_scheduler=LRSchedulersContainer.Config(
                 warmup_steps=10,
                 min_lr_factor=1.0,
@@ -475,5 +482,9 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
             # matched the full vocabulary (Fig. 5); 256 bytes per generated token.
             num_topk_logprobs=32,
         ),
+        # Admit a request only while 10% of KV blocks stay free, so running requests have room to
+        # grow before vLLM preempts one.
+        extra_vllm_engine_args={"watermark": 0.1},
+        kv_offload_gib=kv_offload_gib,
     )
     return config
