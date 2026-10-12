@@ -16,6 +16,7 @@ The uneven-decode integration test requires four GPUs and a torchrun launcher.
 """
 
 import asyncio
+import bisect
 import concurrent.futures
 import gc
 import math
@@ -1155,26 +1156,59 @@ def test_cuda_graph_full_mode_no_compile():
 
 
 def test_cuda_graph_decode_only_capture_sizes_cover_max_num_seqs():
-    # FULL_DECODE_ONLY only graphs decode, so capture up to max_num_seqs (plus
-    # max_num_seqs itself when not a power of 2).
+    # FULL_DECODE_ONLY only graphs decode, so capture up to max_num_seqs itself.
+    # Same sizes as the `_decode_capture_sizes` docstring example.
     cfg = VLLMCudaGraphConfig(mode="FULL_DECODE_ONLY").get_vllm_compilation_config(
-        max_num_seqs=500,
+        max_num_seqs=1024,
         expert_sequence_parallel_size=1,
         enable_sequence_parallel=False,
     )
-    assert cfg.cudagraph_capture_sizes == [1, 2, 4, 8, 16, 32, 64, 128, 256, 500]
+    assert cfg.cudagraph_capture_sizes == [
+        *[16, 32, 64, 128, 256],  # x2
+        *range(304, 641, 48),  # +48
+        *range(656, 1025, 16),  # +16
+    ]
+
+
+@pytest.mark.parametrize("max_num_seqs", [1, 20, 128, 256, 300, 500, 768, 1000, 1024])
+def test_cuda_graph_decode_capture_sizes_are_dense_near_max_num_seqs(max_num_seqs):
+    cfg = VLLMCudaGraphConfig(mode="FULL_DECODE_ONLY").get_vllm_compilation_config(
+        max_num_seqs=max_num_seqs,
+        expert_sequence_parallel_size=1,
+        enable_sequence_parallel=False,
+    )
+    sizes = cfg.cudagraph_capture_sizes
+    assert sizes == sorted(set(sizes))
+    assert sizes[-1] == max_num_seqs
+    assert all(size % 16 == 0 for size in sizes[:-1])
+    # A batch in the top third pads by fewer than 16 rows.
+    for batch in range(math.ceil(2 * max_num_seqs / 3), max_num_seqs + 1):
+        assert sizes[bisect.bisect_left(sizes, batch)] - batch < 16
+    # 37 at the 1024 cap: bounds capture time and graph memory.
+    assert len(sizes) <= 37
 
 
 def test_cuda_graph_full_mode_extends_capture_sizes_to_chunk():
     # FULL also graphs prefill, so sizes extend to the chunked-prefill chunk
-    # (max_num_batched_tokens, 2048) on top of max_num_seqs.
+    # (max_num_batched_tokens, 2048) in powers of 2 above max_num_seqs.
+    decode_only = VLLMCudaGraphConfig(
+        mode="FULL_DECODE_ONLY"
+    ).get_vllm_compilation_config(
+        max_num_seqs=500,
+        expert_sequence_parallel_size=1,
+        enable_sequence_parallel=False,
+    )
     cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
         max_num_seqs=500,
         expert_sequence_parallel_size=1,
         enable_sequence_parallel=False,
     )
-    assert cfg.cudagraph_capture_sizes[-1] == 2048
-    assert 500 in cfg.cudagraph_capture_sizes  # decode batch captured exactly
+    assert cfg.cudagraph_capture_sizes == [
+        *decode_only.cudagraph_capture_sizes,
+        512,
+        1024,
+        2048,
+    ]
 
 
 def test_cuda_graph_rejects_nonpositive_max_num_seqs():
