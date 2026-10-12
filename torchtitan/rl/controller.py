@@ -147,9 +147,32 @@ class ValidationConfig:
     steps: int = 20
     """Maximum prompts per pass. -1 consumes one finite source pass; 0 disables."""
 
+    temperature: float = 1.0
+    """Sampling temperature. 1.0 samples the model's distribution as is; 0.0 is greedy and needs
+    `num_samples_per_prompt=1`."""
+
+    num_samples_per_prompt: int = 4
+    """Sibling rollouts sampled per prompt. `validation_reward` averages all of them; 4 halves its
+    sampling std vs 1, at 4x the rollouts. `validation_reward/best_of_{n}` averages each prompt's
+    best reward."""
+
     def __post_init__(self) -> None:
         if self.steps < -1:
             raise ValueError("validation steps must be -1 or non-negative")
+        if self.temperature < 0:
+            raise ValueError(
+                f"validation temperature must be non-negative, got {self.temperature}"
+            )
+        if self.num_samples_per_prompt < 1:
+            raise ValueError(
+                "validation num_samples_per_prompt must be >= 1, got "
+                f"{self.num_samples_per_prompt}"
+            )
+        if self.temperature == 0 and self.num_samples_per_prompt > 1:
+            raise ValueError(
+                "greedy validation (temperature=0) repeats the same rollout; set "
+                f"num_samples_per_prompt=1, got {self.num_samples_per_prompt}"
+            )
 
 
 @dataclass(kw_only=True, slots=True)
@@ -560,12 +583,13 @@ class Controller(Configurable):
         # Peak concurrent rollout sequences (groups * num_samples_per_prompt, or the validation pass); sizes max_num_seqs below.
         async_loop = self.config.async_loop
         max_active_rollout_groups = async_loop.max_active_rollout_groups
-        num_validation_groups = len(
-            self._rollouter.get_validation_samples(async_loop.validation.steps)
+        num_validation_rollouts = (
+            len(self._rollouter.get_validation_samples(async_loop.validation.steps))
+            * async_loop.validation.num_samples_per_prompt
         )
         rollout_concurrency = max(
             max_active_rollout_groups * async_loop.num_samples_per_prompt,
-            num_validation_groups,
+            num_validation_rollouts,
         )
         config = self.config
         if not generator_meshes:
@@ -710,8 +734,16 @@ class Controller(Configurable):
     async def _collect_validation_rollouts(
         self, *, samples: list[object], sampling: SamplingConfig, step: int
     ) -> tuple[list[RolloutGroup], list[m.Metric]]:
-        """Sample held-out prompts, run each greedily (n=1) concurrently, and emit validation metrics."""
-        # TODO: group_size=1 (best-of-1) only. Support best-of-N.
+        """Run each held-out prompt `num_samples_per_prompt` times concurrently and emit validation metrics.
+
+        Example: 2 prompts x 2 samples with rewards [[1, 0], [0, 0]]:
+
+            validation_reward/_mean           0.25   # mean over all 4 rollouts
+            validation_reward/best_of_2/mean  0.5    # best rollout per prompt, averaged
+        """
+        num_samples_per_prompt = (
+            self.config.async_loop.validation.num_samples_per_prompt
+        )
         generate = self._make_generate_fn(metrics_prefix="validation_generator")
         release_session_fn = self._make_release_session_fn()
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
@@ -724,7 +756,7 @@ class Controller(Configurable):
                     # Negative ids keep validation disjoint from training group ids, so their
                     # request_ids can't collide in the shared engine (e.g. post-validation).
                     group_id=-(i + 1),
-                    group_size=1,
+                    group_size=num_samples_per_prompt,
                     sampling=sampling,
                 )
                 for i, sample in enumerate(samples)
@@ -758,11 +790,22 @@ class Controller(Configurable):
         metrics.append(
             m.Metric("validation/group_failures", m.Sum(float(num_failed_groups)))
         )
+        # Equals pass@n when rewards are 0/1.
+        best_rewards = [
+            max(rollout.reward for rollout in group.rollouts)
+            for group in rollout_groups
+        ]
+        metrics.append(
+            m.Metric(
+                f"validation_reward/best_of_{num_samples_per_prompt}",
+                m.Mean.from_list(best_rewards),
+            )
+        )
         return rollout_groups, metrics
 
     @sl.log_trace_span("validate")
     async def validate(self, *, step: int) -> list[m.Metric]:
-        """Run greedy validation on held-out prompts.
+        """Run validation on held-out prompts.
 
         Args:
             step: Training step this validation pass belongs to (0 for the
@@ -772,16 +815,17 @@ class Controller(Configurable):
             Validation rollout metrics, generation metrics, and validation
             timing.
         """
-        # TODO: investigate using pass@k for validation.
         t_validate_start = time.perf_counter()
         steps = self.config.async_loop.validation.steps
         if steps == 0:  # skip validation (e.g. loss guard CI)
             return []
         samples = self._rollouter.get_validation_samples(steps)
-        greedy = replace(self._sampling, temperature=0.0, top_p=1.0)
+        sampling = replace(
+            self._sampling, temperature=self.config.async_loop.validation.temperature
+        )
 
         rollout_groups, validation_metrics = await self._collect_validation_rollouts(
-            samples=samples, sampling=greedy, step=step
+            samples=samples, sampling=sampling, step=step
         )
 
         self.rollout_recorder.record(is_validation=True, rollout_groups=rollout_groups)
