@@ -73,6 +73,11 @@ class ChessPlayerEnv(MessageEnv):
 
     async def init(self) -> MessageEnvInitOutput:
         """Show the rules, the board, and the legal moves for this player's first move."""
+        checkmated = (
+            ""
+            if self._game.checkmated_reward is None
+            else f", being checkmated scores {self._game.checkmated_reward:g}, and an illegal move scores less"
+        )
         rules = (
             f"You are playing chess as {_COLOR_NAMES[self._color]}. Play to win.\n\n"
             "Each turn you see your pieces and your opponent's pieces, keyed by piece letter and "
@@ -86,7 +91,8 @@ class ChessPlayerEnv(MessageEnv):
             '"Nf3": ["Nxe5"] means \\boxed{Nxe5}. Pick only from the moves listed under your '
             "pieces this turn, not from an earlier turn's list or your opponent's list. An illegal "
             "or missing move loses the game.\n\n"
-            f"Checkmating your opponent scores {self._game.checkmate_reward:g}. The game stops after "
+            f"Checkmating your opponent scores {self._game.checkmate_reward:g}{checkmated}. "
+            "The game stops after "
             f"{self._game.max_plies} plies (a ply is one move by either side); a game that reaches "
             "that limit without checkmate scores 0.25 to 0.75 by material (queen 9, rook 5, bishop "
             "and knight 3, pawn 1), and a stalemate scores at most 0.5."
@@ -151,6 +157,7 @@ class ChessGame:
         seed: int,
         bot: StockfishBot | None = None,
         checkmate_reward: float = 1.0,
+        checkmated_reward: float | None = None,
     ) -> None:
         self.board = chess.Board(sample.fen)
         self.scores: dict[chess.Color, float] | None = None
@@ -161,6 +168,8 @@ class ChessGame:
         """The color that lost by forfeit (an illegal move or `forfeit`); `None` otherwise."""
         self.checkmate_reward = checkmate_reward
         """The winner's training reward for a checkmate, at any length."""
+        self.checkmated_reward = checkmated_reward
+        """The loser's training reward for a checkmate; a forfeit scores 0.5 to 1 below it. `None`: see `rewards`."""
         self._max_plies = max_plies
         self._bot = bot
         self._bot_color = None if bot is None else not sample.policy_color
@@ -184,19 +193,31 @@ class ChessGame:
             White checkmates on ply 19                -> {WHITE: 1.0, BLACK: -0.25 * (1 - 19 / 60) = -0.17}
             Black forfeits at ply 20, up a queen      -> {WHITE: 0.30, BLACK: -1 * (1 - 20 / 60 / 2) = -0.83}
             Black forfeits at ply 1, even material    -> {WHITE: 0.5, BLACK: -1 * (1 - 1 / 60 / 2) = -0.99}
+
+        With checkmate_reward=10, checkmated_reward=-9:
+            White checkmates on ply 19                -> {WHITE: 10.0, BLACK: -9.0}
+            Black forfeits at ply 20, up a queen      -> {WHITE: 0.30, BLACK: -9 - 0.83 = -9.83}
         """
         played = self.num_plies / self._max_plies
         if self.end_reason == "checkmate":
             loser = self.board.turn
             return {
                 not loser: self.checkmate_reward,
-                loser: _CHECKMATED_REWARD * (1.0 - played),
+                loser: (
+                    _CHECKMATED_REWARD * (1.0 - played)
+                    if self.checkmated_reward is None
+                    else self.checkmated_reward
+                ),
             }
         if self.end_reason != "max_plies" and self.forfeiter is None:
             return {chess.WHITE: 0.5 * played, chess.BLACK: 0.5 * played}
         rewards = self.material_rewards
         if self.forfeiter is not None:
-            rewards[self.forfeiter] = _FORFEIT_REWARD * (1.0 - played / 2)
+            # Below being checkmated, so a lost position is never better forfeited.
+            forfeit_reward = _FORFEIT_REWARD * (1.0 - played / 2)
+            if self.checkmated_reward is not None:
+                forfeit_reward += self.checkmated_reward
+            rewards[self.forfeiter] = forfeit_reward
         return rewards
 
     @property

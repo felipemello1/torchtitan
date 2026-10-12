@@ -205,6 +205,20 @@ def test_rewards_make_a_forfeit_cost_more_than_a_loss_and_no_free_win() -> None:
         await _play_moves(mate_10, ["f3", "e5", "g4", "Qh4#"])
         assert mate_10.rewards == {**mate.rewards, chess.BLACK: 10.0}
 
+        # `checkmated_reward` replaces the loser's reward, and a forfeit's drops by the same amount
+        mated_9 = ChessGame(
+            sample=_SELF_PLAY, max_plies=40, seed=0, checkmated_reward=-9.0
+        )
+        await _play_moves(mated_9, ["f3", "e5", "g4", "Qh4#"])
+        assert mated_9.rewards == {**mate.rewards, chess.WHITE: -9.0}
+        forfeited_9 = ChessGame(
+            sample=_SELF_PLAY, max_plies=40, seed=0, checkmated_reward=-9.0
+        )
+        await _play_moves(forfeited_9, ["e4", "d5", "exd5", "Nf6", "Ke9"])
+        assert forfeited_9.rewards[chess.WHITE] == pytest.approx(
+            forfeited.rewards[chess.WHITE] - 9.0
+        )
+
         # forfeiting before the first move costs the full -1
         early = _new_game()
         await early.play(chess.WHITE, "Ke9")
@@ -422,6 +436,20 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
             in prompt
         )
         assert "(ply 1 of 40)" in prompt
+        mated_9 = ChessGame(
+            sample=_SELF_PLAY,
+            max_plies=40,
+            seed=0,
+            checkmate_reward=10.0,
+            checkmated_reward=-9.0,
+        )
+        mated_9_init = await ChessPlayerEnv(
+            ChessPlayerEnv.Config(), game=mated_9, color=chess.WHITE
+        ).init()
+        assert (
+            "scores 10, being checkmated scores -9, and an illegal move scores less."
+            in mated_9_init.init_prompt_messages[0]["content"]
+        )
 
         white_step = asyncio.create_task(
             white.step({"role": "assistant", "content": "I open. \\boxed{e4}"})
@@ -621,6 +649,7 @@ async def _run_group(
     sample=_SELF_PLAY,
     truncate_at=None,
     checkmate_reward=1.0,
+    checkmated_reward=None,
     release_session_fn=_release_no_session,
     force_close_at=(),
     forced_close_advantage_cap=None,
@@ -634,6 +663,7 @@ async def _run_group(
         max_plies=40,
         stockfish_path=None,
         checkmate_reward=checkmate_reward,
+        checkmated_reward=checkmated_reward,
         forced_close_advantage_cap=forced_close_advantage_cap,
     ).build()
     tokenizer_config = HuggingFaceTokenizer.Config()
@@ -723,6 +753,15 @@ def test_worker_pays_its_checkmate_reward() -> None:
         )
         by_id = {rollout.rollout_id: rollout for rollout in group.rollouts}
         assert [by_id[i].reward for i in range(2)] == pytest.approx([-0.225, 10.0])
+
+        group = await _run_group(
+            {0: ["f3", "g4"], 1: ["e5", "Qh4#"]},
+            group_size=1,
+            checkmate_reward=10.0,
+            checkmated_reward=-9.0,
+        )
+        by_id = {rollout.rollout_id: rollout for rollout in group.rollouts}
+        assert [by_id[i].reward for i in range(2)] == pytest.approx([-9.0, 10.0])
 
     asyncio.run(run())
 
