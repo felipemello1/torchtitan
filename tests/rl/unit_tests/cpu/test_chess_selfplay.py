@@ -695,8 +695,8 @@ def test_worker_pays_its_checkmate_reward() -> None:
     asyncio.run(run())
 
 
-def test_worker_caps_each_force_closed_turn() -> None:
-    async def run() -> None:
+def test_worker_caps_force_closed_turn_advantage() -> None:
+    async def run(cap):
         group = await _run_group(
             {
                 0: ["f3", "g4"],  # game 0: fool's mate, Black wins
@@ -705,23 +705,31 @@ def test_worker_caps_each_force_closed_turn() -> None:
                 3: ["Ke9"],
             },
             group_size=2,
-            force_close_at=[(1, 0), (3, 0)],
-            forced_close_advantage_cap=0.0,
+            force_close_at=[(0, 0), (1, 0), (3, 0)],
+            forced_close_advantage_cap=cap,
         )
         by_id = {rollout.rollout_id: rollout for rollout in group.rollouts}
         # rollout advantages as in test_worker_trains_both_colors_with_per_color_advantages
         assert [by_id[i].advantage for i in range(4)] == pytest.approx(
             [-0.3625, 0.25, 0.3625, -0.25]
         )
-        # each force-closed turn is capped at 0: in a won game +0.25 -> 0.0, and a forfeit keeps -1.7375
-        assert [[turn.advantage for turn in by_id[i].turns] for i in range(4)] == [
-            [None, None],
-            [pytest.approx(0.0), None],
-            [None],
-            [pytest.approx(-1.7375)],
-        ]
+        return [[turn.advantage for turn in by_id[i].turns] for i in range(4)]
 
-    asyncio.run(run())
+    # at 0: the won game's forced turn +0.25 -> 0.0; the lost game's -0.3625 and the forfeit's
+    # -1.7375 are already below the cap and stay as they were
+    assert asyncio.run(run(0.0)) == [
+        [None, None],
+        [pytest.approx(0.0), None],
+        [None],
+        [pytest.approx(-1.7375)],
+    ]
+    # no cap: only the forfeit sets a turn advantage
+    assert asyncio.run(run(None)) == [
+        [None, None],
+        [None, None],
+        [None],
+        [pytest.approx(-1.7375)],
+    ]
 
 
 def test_worker_centers_each_color_as_if_its_forfeits_ended_at_the_cap() -> None:
