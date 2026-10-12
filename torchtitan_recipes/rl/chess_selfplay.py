@@ -274,15 +274,11 @@ def rl_chess_qwen3_5_4b_gb300(
         max_thinking_tokens=max_thinking_tokens,
         answer_prefix="\\boxed{",
         answer_end_text="}",
-        # A reply that stops inside thinking plays the box it wrote. Force-closed, such turns lost their
-        # credit to the cap and penalty below and grew to 13.5% of turns (chess118gcq, steps 289-302).
+        # A reply that stops inside thinking plays the box it wrote. Force-closed under an advantage cap
+        # at 0, such turns grew to 13.5% of turns (chess118gcq, steps 289-302).
         force_close_on_stop=False,
     )
     worker.rubric.reward_fns = [RewardChessScore.Config(forced_close_penalty=0.1)]
-    # A force-closed turn's advantage is capped at 0: thinking loops ('capturing capturing ...') that a
-    # forced close turned into a legal move shared the game's advantage (chess118gcn, steps 260-274).
-    # A cost of 0.25 below 0 grew an illegal move instead ('O-Ro', chess118gcp, steps 270-279).
-    worker.forced_close_advantage_cap = 0.0
 
     # ======== Async loop ========
     loop = config.async_loop
@@ -381,9 +377,6 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
     config.rollouter.curriculum = ChessCurriculum.Config(
         start_max_plies=60, end_max_plies=max_plies, max_plies_ramp_steps=200
     )
-    # No advantage cap: the Base model force-closes ~95% of its first replies, so a cap at 0 left
-    # positive credit on short replies only, and thinking fell from ~1,000 to ~100 tokens by step 19.
-    config.rollouter.worker.forced_close_advantage_cap = None
 
     # ======== Async loop ========
     loop = config.async_loop
