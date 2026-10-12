@@ -316,7 +316,6 @@ def rl_chess_qwen3_5_4b_gb300(
     trainer.checkpointer = CheckpointManager.Config(
         initial_load_in_hf=True,
         interval=10,
-        enable_first_step_checkpoint=True,
         async_mode="async",
         keep_latest_k=0,
         last_save_in_hf=False,
@@ -413,8 +412,6 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
     # Synchronous saves: an async save's CPU copy of the 35B state (~420 GB) on top of the batch
     # can exceed the trainer host's job memory.
     trainer.checkpointer.async_mode = "disabled"
-    # A step-1 save (~190 s, 420 GB upload) holds weights one update from the HF checkpoint.
-    trainer.checkpointer.enable_first_step_checkpoint = False
     # Dist-MoE experts on the trainer's model only; the generators keep stock experts. The
     # functional WGRAD path, as the GB300 Terminal-Bench 35B runs use.
     config.trainer = apply_transforms(

@@ -952,7 +952,6 @@ def _qwen3_5_base_terminal_bench_config(
             checkpointer=CheckpointManager.Config(
                 initial_load_in_hf=True,
                 interval=25,
-                enable_first_step_checkpoint=True,
                 async_mode="async",
                 keep_latest_k=0,
                 last_save_in_hf=False,
