@@ -12,6 +12,7 @@ import asyncio
 import base64
 import logging
 import math
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -32,11 +33,14 @@ from torchtitan.rl.examples.verifiers.generation_server import (
 from torchtitan.rl.examples.verifiers.rollouter import (
     _trainable_token_spans,
     log_failed_rollout,
+    RewardFromVerifiers,
+    VERIFIERS_REWARD_KEY,
     verifiers_rollout_logs,
     VerifiersRollouter,
 )
 from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.observability import metrics as m
+from torchtitan.rl.rollout.rubric import Rubric
 from torchtitan.rl.rollout.types import Completion, Rollout, RolloutStatus
 from verifiers.v1.errors import model_error, OverlongPromptError
 
@@ -878,6 +882,7 @@ def test_rollouter_registers_the_groups_generate_fn_while_it_runs() -> None:
                 return_value=[SimpleNamespace(reward=1.0, reward_breakdown={})]
             )
         )
+        rollouter._validation_rubric = rollouter._rubric
         rollouter._advantage_estimator = lambda group: [0.0]
         rollouter._thinking_budget = None
         validation_rollout_can_end = asyncio.Event()
@@ -922,6 +927,56 @@ def test_rollouter_registers_the_groups_generate_fn_while_it_runs() -> None:
         assert rollouter._generation_server.generate_fns == {}
 
     asyncio.run(run_test())
+
+
+def test_rollouter_gives_truncation_reward_to_training_groups_only() -> None:
+    """Which rubric scores a rollout cut at max_turns whose tests pass:
+    group 7  (training)   -> truncation_reward, 0
+    group -1 (validation) -> tests' reward, 1
+    """
+    rubric = Rubric.Config(
+        reward_fns=[RewardFromVerifiers.Config()], truncation_reward=0.0
+    )
+    rollouter = object.__new__(VerifiersRollouter)
+    rollouter._thinking_budget = None
+    rollouter._generation_server = GenerationServer.Config(
+        max_rollout_tokens=40960
+    ).build()
+    rollouter._rubric = rubric.build()
+    rollouter._validation_rubric = replace(rubric, truncation_reward=None).build()
+    rollouter._advantage_estimator = lambda group: [0.0]
+
+    async def run_single_rollout(
+        *, release_session_fn, sample, sampling, group_id, rollout_id
+    ):
+        return Rollout(
+            group_id=group_id,
+            rollout_id=rollout_id,
+            status=RolloutStatus.TRUNCATED_MAX_TURNS,
+            turns=[
+                SimpleNamespace(
+                    env_rewards={VERIFIERS_REWARD_KEY: 1.0}, completion_loss_mask=None
+                )
+            ],
+        )
+
+    rollouter._run_single_rollout = run_single_rollout
+
+    def reward(group_id: int) -> float:
+        group = asyncio.run(
+            rollouter.run_group_rollouts(
+                generate_fn="fn",
+                release_session_fn=AsyncMock(),
+                sample=None,
+                group_id=group_id,
+                group_size=1,
+                sampling=SamplingConfig(),
+            )
+        )
+        return group.rollouts[0].reward
+
+    assert reward(7) == 0.0
+    assert reward(-1) == 1.0
 
 
 def test_rollouter_removes_the_groups_generate_fn_when_a_rollout_raises() -> None:
