@@ -47,14 +47,20 @@ class TrainingMicrobatch(TokenizedTrainingMicrobatch):
     temperature: torch.Tensor  # [T]
     loss_mask: torch.Tensor  # [T]
     advantages: torch.Tensor  # [T]
+    generator_topk_token_ids: torch.Tensor | None = None  # [T, k]
+    generator_topk_logprobs: torch.Tensor | None = None  # [T, k]
 
     def loss_kwargs(self) -> dict[str, torch.Tensor]:
-        return {
+        loss_kwargs = {
             "generator_logprobs": self.generator_logprobs,
             "temperature": self.temperature,
             "loss_mask": self.loss_mask,
             "advantages": self.advantages,
         }
+        if self.generator_topk_token_ids is not None:
+            loss_kwargs["generator_topk_token_ids"] = self.generator_topk_token_ids
+            loss_kwargs["generator_topk_logprobs"] = self.generator_topk_logprobs
+        return loss_kwargs
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +210,7 @@ class Batcher(Configurable):
         dp_degree: int,
         pad_id: int,
         temperature: float,
+        num_topk_logprobs: int = 0,
     ) -> None:
         self.seq_len = max_context_length
         self._num_rows_per_microbatch, remainder = divmod(
@@ -218,6 +225,7 @@ class Batcher(Configurable):
             )
         self.pad_id = pad_id
         self._temperature = temperature
+        self._num_topk_logprobs = num_topk_logprobs
         self._per_sample_pad_multiple = config.per_sample_pad_multiple
         self._max_num_documents = config.max_num_documents
         self._num_mtp_layers = config.num_mtp_layers
@@ -727,6 +735,13 @@ class Batcher(Configurable):
             # Torch can't unpickle uint16 tensors; every expert id fits in int16.
             dtype = np.int16 if row.dtype == np.uint16 else row.dtype
             routed_expert_ids = np.zeros((num_tokens_per_rank, *row.shape), dtype)
+        topk_token_ids = topk_logprobs = None
+        if self._num_topk_logprobs > 0:
+            # Zero rows wherever no sample writes (padding, empty bins); the loss masks them out.
+            topk_token_ids = torch.zeros(
+                num_tokens_per_rank, self._num_topk_logprobs, dtype=torch.int32
+            )
+            topk_logprobs = torch.zeros(num_tokens_per_rank, self._num_topk_logprobs)
 
         def pad(key: str, num_tokens: int) -> np.ndarray:
             return np.full(num_tokens, pad_values[key], dtype=_DTYPES[key])
@@ -749,10 +764,17 @@ class Batcher(Configurable):
                 sample_len = ((sample_len + align - 1) // align) * align
 
             # extend row
+            start = sum(map(len, positions))
             if routed_expert_ids is not None:
                 rows = training_sample.routed_expert_ids
-                start = sum(map(len, positions))
                 routed_expert_ids[start : start + len(rows)] = rows
+            if topk_token_ids is not None:
+                topk_token_ids[
+                    start : start + unpadded_len
+                ] = training_sample.topk_token_ids[1:]
+                topk_logprobs[
+                    start : start + unpadded_len
+                ] = training_sample.topk_logprobs[1:]
             for key in keys:
                 packed_fields[key] += [sample[key], pad(key, sample_len - unpadded_len)]
             positions.append(np.arange(sample_len, dtype=np.int64))
@@ -800,6 +822,8 @@ class Batcher(Configurable):
                 if routed_expert_ids is None
                 else {"routed_expert_ids": torch.from_numpy(routed_expert_ids)}
             ),
+            generator_topk_token_ids=topk_token_ids,
+            generator_topk_logprobs=topk_logprobs,
         )
 
     def _padding_fraction(

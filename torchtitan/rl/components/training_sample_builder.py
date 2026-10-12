@@ -13,6 +13,7 @@ import statistics
 from dataclasses import dataclass, field
 
 import numpy as np
+import torch
 
 from torchtitan.config import Configurable
 from torchtitan.rl.observability import metrics as m
@@ -60,6 +61,11 @@ class TrainingSample:
     routed_expert_ids: np.ndarray | None = None
     """[L - 1, num_layers, top_k] generator experts of the trainer inputs ``token_ids[:-1]``;
     None without router replay."""
+    topk_token_ids: torch.Tensor | None = None
+    """[L, k] generator top-k token ids; zero rows where loss_mask is False. None unless
+    `SamplingConfig.num_topk_logprobs` > 0."""
+    topk_logprobs: torch.Tensor | None = None
+    """[L, k] generator logprobs of `topk_token_ids`; zero rows where loss_mask is False."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +101,8 @@ class _SampleInProgress:
     logprobs: list[np.ndarray] = field(default_factory=list)
     advantage: list[np.ndarray] = field(default_factory=list)
     routed_expert_ids: list[np.ndarray] = field(default_factory=list)
+    topk_token_ids: list[torch.Tensor] = field(default_factory=list)
+    topk_logprobs: list[torch.Tensor] = field(default_factory=list)
 
     def to_training_sample(self) -> TrainingSample:
         token_ids = np.concatenate(self.token_ids, dtype=np.int64)
@@ -103,6 +111,10 @@ class _SampleInProgress:
         )
         # One row per trainer input: token_ids[:-1].
         assert routed_expert_ids is None or len(routed_expert_ids) == len(token_ids) - 1
+        topk_token_ids = torch.cat(self.topk_token_ids) if self.topk_token_ids else None
+        topk_logprobs = torch.cat(self.topk_logprobs) if self.topk_logprobs else None
+        # One row per token.
+        assert topk_token_ids is None or len(topk_token_ids) == len(token_ids)
         return TrainingSample(
             rollout_id=self.rollout_id,
             min_policy_version=self.min_policy_version,
@@ -112,6 +124,8 @@ class _SampleInProgress:
             logprobs=np.concatenate(self.logprobs, dtype=np.float32),
             advantage=np.concatenate(self.advantage),
             routed_expert_ids=routed_expert_ids,
+            topk_token_ids=topk_token_ids,
+            topk_logprobs=topk_logprobs,
         )
 
 
@@ -418,6 +432,18 @@ class TrainingSampleBuilder(Configurable):
             sample_in_progress.max_policy_version = max(
                 sample_in_progress.max_policy_version, rollout_turn.max_policy_version
             )
+            if rollout_turn.completion_topk_token_ids is not None:
+                # Zero rows on the untrained prompt delta, then the completion's top-k rows.
+                topk_token_ids = rollout_turn.completion_topk_token_ids
+                topk_logprobs = rollout_turn.completion_topk_logprobs
+                sample_in_progress.topk_token_ids += [
+                    topk_token_ids.new_zeros(num_delta, topk_token_ids.shape[1]),
+                    topk_token_ids,
+                ]
+                sample_in_progress.topk_logprobs += [
+                    topk_logprobs.new_zeros(num_delta, topk_logprobs.shape[1]),
+                    topk_logprobs,
+                ]
 
             prev_len = rollout_turn.num_prompt_tokens + num_completion
 

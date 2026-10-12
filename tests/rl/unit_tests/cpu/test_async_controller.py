@@ -925,7 +925,7 @@ def _run_with_generator_watcher(watcher) -> None:
     controller.batcher = None
     controller.trainer_dp_degree = 1
     controller.tokenizer = SimpleNamespace(eos_id=0)
-    controller._sampling = SimpleNamespace(temperature=1.0)
+    controller._sampling = SimpleNamespace(temperature=1.0, num_topk_logprobs=0)
     controller.generator_router = SimpleNamespace(
         wait_engine_loop=SimpleNamespace(call_one=watcher)
     )
