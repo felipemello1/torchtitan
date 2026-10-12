@@ -381,6 +381,9 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
     config.rollouter.curriculum = ChessCurriculum.Config(
         start_max_plies=60, end_max_plies=max_plies, max_plies_ramp_steps=200
     )
+    # No advantage cap: the Base model force-closes ~95% of its first replies, so a cap at 0 left
+    # positive credit on short replies only, and thinking fell from ~1,000 to ~100 tokens by step 19.
+    config.rollouter.worker.forced_close_advantage_cap = None
 
     # ======== Async loop ========
     loop = config.async_loop
