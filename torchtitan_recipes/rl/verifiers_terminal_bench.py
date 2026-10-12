@@ -12,7 +12,9 @@ Terminal-Bench 2.1 Harbor dataset, which the ``harbor`` CLI downloads into
 ``~/.cache/harbor`` on first use. Edit the ids below to use other datasets.
 """
 
+import dataclasses
 import math
+import os
 
 import verifiers.v1 as vf
 
@@ -29,10 +31,14 @@ from torchtitan.components.optim import (
 from torchtitan.components.renderer import from_renderers
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.config.transform import apply_transforms
+from torchtitan.config.transform.dist_moe import DistMoeTransform
+from torchtitan.distributed.activation_checkpoint import FullAC, RegionAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.components.data import IterableRLDataLoader
+from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
@@ -58,15 +64,17 @@ from torchtitan.rl.examples.verifiers.terminal_bench.taskset import (
     TerminalTasksetConfig,
 )
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
-from torchtitan.rl.losses import GRPOLoss
+from torchtitan.rl.losses import DAPOLoss, GRPOLoss, ScoreCenteringLoss
 from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.observability.rollout_recorder import (
     KeepExtremeRewardsFilter,
     RolloutSampleRecorder,
 )
 from torchtitan.rl.rollout.rubric import Rubric
+from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
 from torchtitan.rl.trainer import Trainer
 from verifiers.v1.configs.agent import TimeoutConfig as AgentTimeoutConfig
+from verifiers.v1.configs.retries import RetryConfig
 from verifiers.v1.tasksets.harbor import HarborEnvConfig
 
 from torchtitan_recipes.rl.model_configs import build_rl_model_configs
@@ -81,14 +89,16 @@ def _terminal_bench_rollouter_config(
     max_context_length: int,
     max_turns: int,
     max_concurrent_rollouts: int,
+    num_env_workers: int = _ENV_SERVER_WORKERS,
 ) -> VerifiersRollouter.Config:
     """Select Harbor datasets by id.
 
     ``max_context_length`` is the generator's sequence length; the generation
-    server caps each rollout at it. ``max_turns`` is the agent turn limit,
-    which Verifiers enforces. ``max_concurrent_rollouts`` sizes the env server;
-    set it to the number of rollouts the controller keeps in flight, or the
-    excess queues in the env server and the generators idle.
+    server caps each rollout at it. ``max_turns`` is the agent turn
+    limit, which Verifiers enforces. ``max_concurrent_rollouts`` sizes the env
+    server; set it to the number of rollouts the controller keeps in flight, or
+    the excess queues in the env server and the generators idle. The env server
+    splits it over ``num_env_workers`` processes.
     """
     if train_dataset == validation_dataset:
         raise ValueError(
@@ -129,8 +139,8 @@ def _terminal_bench_rollouter_config(
                 ),
             ),
             serve=vf.ServeConfig(
-                pool=vf.StaticPoolConfig(num_workers=_ENV_SERVER_WORKERS),
-                max_concurrent=math.ceil(max_concurrent_rollouts / _ENV_SERVER_WORKERS),
+                pool=vf.StaticPoolConfig(num_workers=num_env_workers),
+                max_concurrent=math.ceil(max_concurrent_rollouts / num_env_workers),
                 address="tcp://127.0.0.1:0",
             ),
         ),
@@ -142,6 +152,69 @@ def _terminal_bench_rollouter_config(
             max_rollout_tokens=max_context_length
         ),
         connection_timeout_sec=1800.0,
+    )
+
+
+def _on_sandoq(
+    rollouter: VerifiersRollouter.Config,
+    *,
+    interleaved_thinking: bool,
+    rollout_log_dir: str,
+) -> VerifiersRollouter.Config:
+    """Run the rollouter's Terminus-2 in the env server, with a Sandoq VM per rollout.
+
+    Only the agent's shell commands go to the VM; with ``interleaved_thinking``, each turn's
+    reasoning goes back to the policy.
+    Needs ``torchtitan_recipes/rl/verifiers_plugins`` on PYTHONPATH and the oci-runner provider
+    env (DOME's ``SANDOQ_ENV``).
+    """
+    # Imported here: Verifiers imports plugin ids as top-level modules, and the plugin
+    # directory is on PYTHONPATH only in Sandoq jobs.
+    from terminal_bench_sandoq import (
+        PLUGIN_ID,
+        sandbox_runtime,
+        StockTerminusOutsideConfig,
+    )
+
+    def on_plugin(dataset: VerifiersTaskDataset.Config) -> VerifiersTaskDataset.Config:
+        # Keep each task's declared timeouts; the agent-level rollout timeout still wins.
+        taskset = TerminalTasksetConfig(
+            id=PLUGIN_ID,
+            dataset=dataset.verifiers_taskset.dataset,
+            ignore_timeouts=False,
+        )
+        return dataclasses.replace(dataset, verifiers_taskset=taskset)
+
+    train_dataset = on_plugin(rollouter.training_dataloader.dataset)
+    env_server = rollouter.verifiers_env_server
+    environment = env_server.environment
+    agent = environment.agent.model_copy(
+        update={
+            "harness": StockTerminusOutsideConfig(
+                id=PLUGIN_ID,
+                interleaved_thinking=interleaved_thinking,
+                rollout_log_dir=rollout_log_dir,
+            ),
+            "runtime": sandbox_runtime(),
+            # SandoqTerminalTaskset.load sets each task's scoring timeout instead.
+            "timeout": environment.agent.timeout.model_copy(update={"scoring": None}),
+            # A lost exec channel (Sandoq transport, VM gone) gets one more try on a fresh VM.
+            "retries": RetryConfig(max_retries=1, include=["SandboxError"]),
+        }
+    )
+    return dataclasses.replace(
+        rollouter,
+        training_dataloader=dataclasses.replace(
+            rollouter.training_dataloader, dataset=train_dataset
+        ),
+        validation_dataset=on_plugin(rollouter.validation_dataset),
+        verifiers_env_server=dataclasses.replace(
+            env_server,
+            # The taskset plugin also supplies the env, which leases each rollout's VM.
+            environment=environment.model_copy(
+                update={"agent": agent, "taskset": train_dataset.verifiers_taskset}
+            ),
+        ),
     )
 
 
@@ -409,5 +482,488 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
             ),
             # Keep 3% of KV blocks free at admission, so running turns are preempted less often.
             extra_vllm_engine_args={"watermark": 0.03},
+        ),
+    )
+
+
+def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench() -> Controller.Config:
+    """Qwen3.5-35B-A3B-Base: train on all of TMax-15K; no online validation (the 78
+    Terminal-Bench 2.1 tasks that fit a small Sandoq VM are evaluated offline).
+
+    16 GB300 GPUs on 4 hosts. Trainer on two: FSDP 4 x TP 2 x EP 4 with Dist-MoE experts.
+    Generators: eight TP1 engines, each with every expert, FULL CUDA graphs. 150 turns of
+    up to 16,384 tokens, 131,072 per rollout; Terminus-2 runs in the env server and each
+    rollout's shell commands go to a Sandoq VM (`_on_sandoq`).
+
+    `DOME_SANDOQ_POOL` (required) is the number of sandboxes the run may hold. It sets the
+    rollouts in the env server and, by the pool >= 3 batches rule, the prompts per step:
+    pool 1,000 -> 16 x 16, 600 -> 12 x 16, 400 -> 8 x 16. `DOME_V2_PROMPTS` and
+    `DOME_V2_MICROBATCH_ROWS` (rows of 131,072 tokens, default 1) override the batch at
+    launch, so a resumed job can change it without a new commit.
+    """
+    # Read at load time, not import, so tests and other recipes import this module.
+    sandbox_pool = int(os.environ["DOME_SANDOQ_POOL"])
+    expert_parallel_degree = 4
+    num_samples_per_prompt = 16
+    config = _qwen3_5_base_terminal_bench_config(
+        flavor="35B-A3B",
+        num_prompts_per_train_step=int(
+            os.environ.get(
+                "DOME_V2_PROMPTS", min(16, sandbox_pool // (3 * num_samples_per_prompt))
+            )
+        ),
+        num_samples_per_prompt=num_samples_per_prompt,
+        microbatch_rows=int(os.environ.get("DOME_V2_MICROBATCH_ROWS", 1)),
+        max_turns=150,
+        sandbox_pool=sandbox_pool,
+        # At most 24 rollouts per env-server worker: each waiting rollout holds one of the
+        # worker's 32 executor threads, and Sandoq needs a free thread to ready a VM.
+        num_env_workers=math.ceil(sandbox_pool / 24),
+        # No online eval (Felipe, 2026-10-07): the checkpoints are evaluated offline.
+        num_validation_samples=0,
+        num_generators=8,
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=4,
+            tensor_parallel_degree=2,
+            expert_parallel_degree=expert_parallel_degree,
+        ),
+        dump_folder="outputs/rl/qwen3_5_35b_a3b_base_terminal_bench",
+    )
+    trainer = config.trainer
+    # Recompute every op in the block except the Dist-MoE call, which is never recomputed.
+    trainer.activation_checkpoint = RegionAC.Config(save_regions=[])
+    # Worst case, every EP rank routes all its tokens to one rank; a smaller scratch
+    # buffer is an illegal memory access.
+    trainer.dist_moe_runtime = DistMoeRuntime.Config(
+        scratch_capacity_factor=float(expert_parallel_degree)
+    )
+    # Dist-MoE experts on the trainer's model only; the generators keep stock experts. The
+    # functional WGRAD path, as the earlier runs used.
+    trainer = apply_transforms(trainer, [DistMoeTransform(inplace_wgrad_accum=False)])
+    config.trainer = trainer
+    return config
+
+
+def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2() -> Controller.Config:
+    """`rl_grpo_qwen3_5_35b_a3b_base_terminal_bench` on 3 hosts: 1 trainer host + 2 generator hosts.
+
+    12 GB300 GPUs. Trainer on one host: FSDP 2 x TP 2 x EP 4 with Dist-MoE experts, 1-row
+    microbatches. Generators: eight TP1 engines, FULL CUDA graphs, vLLM watermark 0.03.
+    12 prompts x 16 samples per step, up to 5 steps off-policy. Every 10 steps, a greedy pass
+    over the 78 Terminal-Bench 2.1 tasks runs beside training on the same generators
+    (`ValidationConfig.overlap_training`). A turn still thinking at 12,288 of its 16,384
+    tokens gets a forced end of thinking. Kimi k1.5's length reward, weight 0.1, favors the
+    shorter rollouts in each group (`kimi_length_rewards`).
+
+    `DOME_SANDOQ_POOL` (required) is the number of sandboxes the run may hold; 920 is 80% of
+    the 1,152 training rollouts in flight, (5 + 1) x 12 x 16. `DOME_V2_PROMPTS` overrides the prompts,
+    `DOME_V2_THINKING_BUDGET` the thinking tokens per turn (0 turns the budget off) and
+    `DOME_V2_LENGTH_REWARD_WEIGHT` the length reward's weight (0 turns it off).
+    """
+    # Read at load time, not import, so tests and other recipes import this module.
+    sandbox_pool = int(os.environ["DOME_SANDOQ_POOL"])
+    expert_parallel_degree = 4
+    config = _qwen3_5_base_terminal_bench_config(
+        flavor="35B-A3B",
+        num_prompts_per_train_step=int(os.environ.get("DOME_V2_PROMPTS", 12)),
+        num_samples_per_prompt=16,
+        microbatch_rows=1,
+        max_turns=150,
+        sandbox_pool=sandbox_pool,
+        num_env_workers=math.ceil(sandbox_pool / 24),
+        num_validation_samples=78,
+        num_generators=8,
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=2,
+            tensor_parallel_degree=2,
+            expert_parallel_degree=expert_parallel_degree,
+        ),
+        dump_folder="outputs/rl/qwen3_5_35b_a3b_base_terminal_bench_1x2",
+        target_offpolicy_steps=5,
+    )
+    trainer = config.trainer
+    # Recompute every op in the block except the Dist-MoE call, which is never recomputed.
+    trainer.activation_checkpoint = RegionAC.Config(save_regions=[])
+    # Worst case, every EP rank routes all its tokens to one rank; a smaller scratch
+    # buffer is an illegal memory access.
+    trainer.dist_moe_runtime = DistMoeRuntime.Config(
+        scratch_capacity_factor=float(expert_parallel_degree)
+    )
+    # Dist-MoE experts on the trainer's model only; the generators keep stock experts. The
+    # functional WGRAD path, as the earlier runs used.
+    trainer = apply_transforms(trainer, [DistMoeTransform(inplace_wgrad_accum=False)])
+    config.trainer = trainer
+    # Admit a request only while 3% of KV blocks stay free, so running requests have room to
+    # grow before vLLM preempts one.
+    config.generator.extra_vllm_engine_args = {"watermark": 0.03}
+    max_thinking_tokens = int(os.environ.get("DOME_V2_THINKING_BUDGET", 12288))
+    if max_thinking_tokens > 0:
+        config.rollouter.thinking_budget = ThinkingBudget.Config(
+            max_thinking_tokens=max_thinking_tokens
+        )
+    config.rollouter.rubric.length_reward_weight = float(
+        os.environ.get("DOME_V2_LENGTH_REWARD_WEIGHT", 0.1)
+    )
+    config.async_loop.validation.freq = 10
+    config.async_loop.validation.overlap_training = True
+    return config
+
+
+def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Config:
+    """`rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2`'s layout for a fresh run, with its
+    launch knobs (`DOME_SANDOQ_POOL`, `DOME_V2_*`) fixed in code.
+
+    Changes from the 1x2 recipe:
+    - 24 prompts x 16 samples per step (was 12) for 300 steps (was 150);
+    - lr 1e-5 with a 10-step warmup (was 1e-6, constant);
+    - `ScoreCenteringLoss` with the generator's top-32 logprobs (was DAPO);
+    - the adaptive rollout buffer, mean policy age <= 6 and max 12 (was a fixed 5-step buffer);
+    - no length reward, so all-pass and all-fail groups are dropped (was weight 0.1);
+    - a 4,096-token thinking budget per turn (was 12,288);
+    - each session's prefix stays held between its turns;
+    - router replay (was off);
+    - 2,688 Sandoq VMs, one per rollout of the 168 groups the buffer starts with;
+    - a synchronous save every 10 steps (was async).
+
+    DOME's `--train-iters` and `--save-interval` still override the steps and the save interval.
+    """
+    num_prompts_per_train_step = 24
+    num_samples_per_prompt = 16
+    target_offpolicy_steps = 6
+    # (6 + 1) x 24 x 16 = 2,688: the buffer at a mean policy age of 6, with no group dropped.
+    sandbox_pool = (
+        (target_offpolicy_steps + 1)
+        * num_prompts_per_train_step
+        * num_samples_per_prompt
+    )
+    # The 78 Terminal-Bench 2.1 tasks that fit a small Sandoq VM, one greedy rollout each.
+    num_validation_samples = 78
+    expert_parallel_degree = 4
+    config = _qwen3_5_base_terminal_bench_config(
+        flavor="35B-A3B",
+        num_prompts_per_train_step=num_prompts_per_train_step,
+        num_samples_per_prompt=num_samples_per_prompt,
+        microbatch_rows=1,
+        max_turns=150,
+        sandbox_pool=sandbox_pool,
+        # At most 24 rollouts per env-server worker: each waiting rollout holds one of the worker's
+        # 32 executor threads, and Sandoq needs a free thread to ready a VM. 112 workers.
+        num_env_workers=math.ceil(sandbox_pool / 24),
+        num_validation_samples=num_validation_samples,
+        num_generators=8,
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=2,
+            tensor_parallel_degree=2,
+            expert_parallel_degree=expert_parallel_degree,
+        ),
+        dump_folder="outputs/rl/qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight",
+        # Under the adaptive buffer this only sets train_batch/pct_samples_over_target_age.
+        target_offpolicy_steps=target_offpolicy_steps,
+    )
+    loop = config.async_loop
+    loop.num_training_steps = 300
+    loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
+        target_offpolicy_steps=target_offpolicy_steps,
+        max_offpolicy_steps=12,
+        # Start at (6 + 1) x 24 = 168 groups, the pool; the default 3 x 24 leaves 57% of it idle.
+        start_batches=target_offpolicy_steps + 1,
+        # Leave validation its sandboxes.
+        generation_capacity=(sandbox_pool - num_validation_samples)
+        // num_samples_per_prompt,
+    )
+    # Validate at step 0 and every 10 steps beside training; starting a pass makes the trainer
+    # wait only for that step's weight pull.
+    loop.validation.freq = 10
+    loop.validation.overlap_training = True
+    # All-pass and all-fail groups (~45% of them in the last 1x2 run) carry no signal: drop each
+    # and admit a new prompt in its slot.
+    loop.training_sample_builder.drop_zero_std_reward_groups = True
+    # No length reward: it breaks reward ties, so all-pass and all-fail groups would train on
+    # length alone instead of being dropped.
+    config.rollouter.rubric.length_reward_weight = 0.0
+    # A truncated training rollout (max_turns, the context, or a last turn cut at max_tokens)
+    # scores -1: the policy learned to loop with empty commands after solving, and the tests still
+    # passed those loops. Below a failure's 0, so a loop in an all-fail group still gets a signal.
+    config.rollouter.rubric.truncation_reward = -1.0
+    # The last 1x2 run's budget: a turn still thinking after 4,096 tokens gets a forced end of
+    # thinking, which leaves the rest of its 16,384 tokens for the command.
+    config.rollouter.thinking_budget = ThinkingBudget.Config(max_thinking_tokens=4096)
+
+    trainer = config.trainer
+    # Recompute every op in the block except the Dist-MoE call, which is never recomputed.
+    trainer.activation_checkpoint = RegionAC.Config(save_regions=[])
+    # Worst case, every EP rank routes all its tokens to one rank; a smaller scratch
+    # buffer is an illegal memory access.
+    trainer.dist_moe_runtime = DistMoeRuntime.Config(
+        scratch_capacity_factor=float(expert_parallel_degree)
+    )
+    # Dist-MoE experts on the trainer's model only; the generators keep stock experts. The
+    # functional WGRAD path, as the earlier runs used.
+    trainer = apply_transforms(trainer, [DistMoeTransform(inplace_wgrad_accum=False)])
+    config.trainer = trainer
+    (optimizer,) = trainer.optim.optimizer.optimizers
+    # 10x the 1x2 recipe's lr: at 1e-6 and one optimizer step per batch the policy moved too
+    # slowly. A fresh run ramps to it linearly over 10 steps, then holds it.
+    optimizer.lr = 1e-5
+    trainer.optim.lr_scheduler.warmup_steps = 10
+    trainer.checkpointer.interval = 10
+    # Synchronous saves: an async save stages a ~420 GB CPU copy of the trainer state on host 0,
+    # which also runs the controller and 112 env-server workers. The trainer mostly waits for
+    # batches, so a blocking save costs little.
+    trainer.checkpointer.async_mode = "disabled"
+    # Score centering (arXiv 2609.20807) cancels the drift a trainer/generator mismatch adds.
+    # max_ratio 2 is the paper's TIS+SC cap on p / q, among its best under large staleness.
+    trainer.loss = ChunkedLossWrapper.Config(
+        num_chunks=32,
+        loss_fn=ScoreCenteringLoss.Config(
+            max_ratio=2.0, global_vocab_size=decoder_vocab_size(trainer.model)
+        ),
+    )
+    # Router replay: the trainer routes each token to the experts the generator chose.
+    config.generator.return_routed_experts = True
+
+    generator = config.generator
+    # k = 32 matched full-vocabulary score centering in every setting of the paper, whose default
+    # is 128.
+    generator.sampling.num_topk_logprobs = 32
+    # Admit a request only while 3% of KV blocks stay free, so running requests have room to
+    # grow before vLLM preempts one.
+    generator.extra_vllm_engine_args = {"watermark": 0.03}
+    # Hold each session's prefix (attention + GDN state) between its turns; below 5% free blocks
+    # (`session_kv_free_floor`), release the sessions idle longest.
+    generator.hold_session_kv = True
+    return config
+
+
+def rl_grpo_qwen3_5_4b_base_terminal_bench_dev() -> Controller.Config:
+    """Qwen3.5-4B-Base dev check of the 35B-A3B recipe's Terminal-Bench path on Sandoq.
+
+    8 GB300 GPUs on 2 hosts: trainer FSDP 4 on one, four TP1 generators on the other.
+    2 prompts x 4 samples per step, 20 turns, a pool of 16 sandboxes over two env-server
+    workers, no validation. `DOME_V2_THINKING_BUDGET` (default 0, off) caps thinking per turn,
+    so a short run can check the forced end of thinking.
+    """
+    config = _qwen3_5_base_terminal_bench_config(
+        flavor="4B",
+        num_prompts_per_train_step=2,
+        num_samples_per_prompt=4,
+        microbatch_rows=1,
+        max_turns=20,
+        sandbox_pool=16,
+        num_env_workers=2,
+        num_validation_samples=0,
+        num_generators=4,
+        parallelism=ParallelismConfig(data_parallel_shard_degree=4),
+        dump_folder="outputs/rl/qwen3_5_4b_base_terminal_bench_dev",
+    )
+    max_thinking_tokens = int(os.environ.get("DOME_V2_THINKING_BUDGET", 0))
+    if max_thinking_tokens > 0:
+        config.rollouter.thinking_budget = ThinkingBudget.Config(
+            max_thinking_tokens=max_thinking_tokens
+        )
+    return config
+
+
+def rl_grpo_qwen3_5_9b_base_terminal_bench_fast() -> Controller.Config:
+    """Qwen3.5-9B-Base with thinking off: fast Terminal-Bench steps on Sandoq.
+
+    12 GB300 GPUs on 3 hosts: trainer FSDP 4 on one, eight TP1 generators on the other two.
+    8 samples per prompt, 150 turns, up to 6 steps off-policy, no validation.
+
+    `DOME_SANDOQ_POOL` (default 1,434) is the number of sandboxes the run may hold. It sets the
+    rollouts in the env server and the prompts per step, sized so the pool is 80% of the
+    rollouts in flight, (6 + 1) x prompts x 8: pool 1,434 -> 32 x 8, 717 -> 16 x 8.
+    `DOME_V2_PROMPTS` overrides the prompts.
+    """
+    # Read at load time, not import, so tests and other recipes import this module.
+    sandbox_pool = int(os.environ.get("DOME_SANDOQ_POOL", 1434))
+    num_samples_per_prompt = 8
+    target_offpolicy_steps = 6
+    rollouts_in_flight_per_prompt = (
+        target_offpolicy_steps + 1
+    ) * num_samples_per_prompt
+    return _qwen3_5_base_terminal_bench_config(
+        flavor="9B",
+        num_prompts_per_train_step=int(
+            os.environ.get(
+                "DOME_V2_PROMPTS",
+                round(sandbox_pool / (0.8 * rollouts_in_flight_per_prompt)),
+            )
+        ),
+        num_samples_per_prompt=num_samples_per_prompt,
+        microbatch_rows=1,
+        max_turns=150,
+        sandbox_pool=sandbox_pool,
+        num_env_workers=math.ceil(sandbox_pool / 24),
+        num_validation_samples=0,
+        num_generators=8,
+        parallelism=ParallelismConfig(data_parallel_shard_degree=4),
+        dump_folder="outputs/rl/qwen3_5_9b_base_terminal_bench_fast",
+        enable_thinking=False,
+        # The trainer waits for most of a step; more groups in flight shorten the wait.
+        target_offpolicy_steps=target_offpolicy_steps,
+    )
+
+
+def _qwen3_5_base_terminal_bench_config(
+    *,
+    flavor: str,
+    num_prompts_per_train_step: int,
+    num_samples_per_prompt: int,
+    microbatch_rows: int,
+    max_turns: int,
+    sandbox_pool: int,
+    num_env_workers: int,
+    num_validation_samples: int,
+    num_generators: int,
+    parallelism: ParallelismConfig,
+    dump_folder: str,
+    enable_thinking: bool = True,
+    target_offpolicy_steps: int = 4,
+) -> Controller.Config:
+    """Build a Qwen3.5-Base Terminal-Bench run on Sandoq that saves resumable checkpoints.
+
+    Args:
+        enable_thinking: Qwen3.5 thinking; Terminus-2 then also sends each turn's reasoning
+            back. Off, the renderer prefills an empty think block.
+        microbatch_rows: Tokens per trainer microbatch, in rows of 131,072 tokens.
+        sandbox_pool: Sandoq sessions the run may hold; the env server runs this many
+            rollouts at once.
+        target_offpolicy_steps: How many steps a group's policy may trail the trainer; the
+            controller keeps (this + 1) x prompts groups in flight.
+    """
+    max_context_length = 131072
+    generator_parallelism = InferenceParallelismConfig(
+        data_parallel_degree=1,
+        tensor_parallel_degree=1,
+    )
+    trainer_model, generator_model = build_rl_model_configs(
+        build_model_config,
+        flavor,
+        seq_len=max_context_length,
+        attn_backend="varlen",
+        trainer_parallelism=parallelism,
+        generator_parallelism=generator_parallelism,
+    )
+    return Controller.Config(
+        hf_assets_path=f"./assets/hf/Qwen3.5-{flavor}-Base",
+        dump_folder=dump_folder,
+        # k = the group size keeps every scored rollout; keep_errors adds the errored ones.
+        rollout_recorder=RolloutSampleRecorder.Config(
+            filter=KeepExtremeRewardsFilter.Config(
+                k=num_samples_per_prompt, keep_errors=True
+            )
+        ),
+        async_loop=AsyncLoopConfig(
+            num_training_steps=150,
+            num_prompts_per_train_step=num_prompts_per_train_step,
+            num_samples_per_prompt=num_samples_per_prompt,
+            target_offpolicy_steps=target_offpolicy_steps,
+            windowed_fifo_batches=None,
+            validation=ValidationConfig(steps=num_validation_samples),
+        ),
+        rollouter=_on_sandoq(
+            _terminal_bench_rollouter_config(
+                train_dataset="tmax-15k@7b090eca",
+                validation_dataset="tb21-78@7131e437",
+                max_context_length=max_context_length,
+                max_turns=max_turns,
+                # The controller admits more groups than the pool holds; the excess waits
+                # in the env server, not in Sandoq.
+                max_concurrent_rollouts=sandbox_pool,
+                num_env_workers=num_env_workers,
+            ),
+            interleaved_thinking=enable_thinking,
+            # DOME sets dump_folder with --output-dir $DOME_TTRL_LOCAL_OUT_DIR after this
+            # returns, and the env server, which writes these logs, never sees dump_folder.
+            # Off DOME, --output-dir moves rollout_samples.jsonl but not these logs.
+            rollout_log_dir=os.path.join(
+                os.environ.get("DOME_TTRL_LOCAL_OUT_DIR", dump_folder), "rollout_logs"
+            ),
+        ),
+        renderer=from_renderers(
+            Qwen35RendererConfig(
+                enable_thinking=enable_thinking,
+                thinking_retention="all",
+            )
+        ),
+        num_generators=num_generators,
+        generator_router=InterGeneratorRouter.Config(
+            strategy=StickySessionRoutingStrategy.Config(
+                fallback_strategy=LeastLoadedRoutingStrategy.Config()
+            )
+        ),
+        metrics=MetricsProcessor.Config(
+            console_log_keys_validation=[
+                "validation_reward/_mean",
+                "validation_reward/_max",
+                "validation/min_policy_version/min",
+                "validation/max_policy_version/max",
+                "validation/mixed_policy_rollouts/mean",
+                "timing/validation/",
+            ],
+        ),
+        trainer=Trainer.Config(
+            model=trainer_model,
+            optim=Optim.Config(
+                optimizer=OptimizersContainer.Config(
+                    optimizers=[
+                        AdamW.Config(
+                            pattern=r".*",
+                            lr=1e-6,
+                            betas=(0.9, 0.999),
+                            weight_decay=0.0,
+                        )
+                    ]
+                ),
+                lr_scheduler=LRSchedulersContainer.Config(
+                    warmup_steps=0,
+                    min_lr_factor=1.0,
+                ),
+            ),
+            training=TrainingConfig(
+                disable_cuda_graphs=True,
+                num_tokens_per_microbatch_per_dp_rank=microbatch_rows
+                * max_context_length,
+                max_context_length=max_context_length,
+                # fp32 master weights; FSDP unshards bf16 params for compute.
+                dtype="float32",
+                mixed_precision_param="bfloat16",
+            ),
+            parallelism=parallelism,
+            activation_checkpoint=FullAC.Config(),
+            # Every save is a full resumable DCP; DOME sets the interval and uploads
+            # the steps, so torchtitan purges nothing.
+            checkpointer=CheckpointManager.Config(
+                initial_load_in_hf=True,
+                interval=25,
+                enable_first_step_checkpoint=True,
+                async_mode="async",
+                keep_latest_k=0,
+                last_save_in_hf=False,
+                last_save_model_only=False,
+            ),
+            loss=ChunkedLossWrapper.Config(
+                num_chunks=32,
+                loss_fn=DAPOLoss.Config(
+                    ratio_clip_low=0.2,
+                    ratio_clip_high=0.28,
+                    global_vocab_size=decoder_vocab_size(trainer_model),
+                ),
+            ),
+        ),
+        generator=VLLMGenerator.Config(
+            model=generator_model,
+            model_dtype="bfloat16",
+            cuda_graph=VLLMCudaGraphConfig(mode="FULL"),
+            parallelism=generator_parallelism,
+            gpu_memory_limit=0.9,
+            max_num_batched_tokens=8192,
+            checkpointer=None,
+            sampling=SamplingConfig(
+                temperature=1.0,
+                top_p=1.0,
+                max_tokens=16384,
+            ),
         ),
     )

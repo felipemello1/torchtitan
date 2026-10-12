@@ -11,8 +11,9 @@ import json
 import pickle
 import subprocess
 import sys
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -22,13 +23,25 @@ import verifiers.v1 as vf
 
 from torchtitan.config import ConfigLoader
 from torchtitan.distributed.activation_checkpoint import FullAC
-from torchtitan.rl.controller import Controller
+from torchtitan.models.common.dist_moe import DistMoeRoutedExperts
+from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
+from torchtitan.rl.controller import Controller, ValidationConfig
 from torchtitan.rl.examples.verifiers import env_server
+from torchtitan.rl.examples.verifiers.data import (
+    VerifiersTaskDataset,
+    VerifiersTaskSample,
+)
+from torchtitan.rl.examples.verifiers.generation_server import (
+    VerifiersGenerationMetadata,
+)
 from torchtitan.rl.examples.verifiers.terminal_bench import taskset
 from torchtitan.rl.examples.verifiers.terminal_bench.harness import (
     TerminalBenchTerminusHarness,
     TerminalBenchTerminusHarnessConfig,
 )
+from torchtitan.rl.generator import SamplingConfig
+from torchtitan.rl.losses import ScoreCenteringLoss
+from torchtitan.rl.rollout import RolloutStatus
 from torchtitan_recipes.rl.verifiers_terminal_bench import (
     _terminal_bench_rollouter_config,
 )
@@ -310,6 +323,121 @@ def test_training_cannot_read_benchmark_as_training_data() -> None:
         _rollouter_config(EVAL_DATASET, EVAL_DATASET)
 
 
+def test_group_rewards_get_the_length_reward(monkeypatch) -> None:
+    """A Terminal-Bench group is graded first, truncated rollouts included, then gets Kimi's
+    length reward over completion tokens (terminal output does not count)."""
+    from verifiers.v1.types import AssistantMessage, UserMessage
+
+    def trace(completion_lens, *, reward, stop_condition=None, ok=True):
+        # The task prompt, then per turn: the sampled reply and 3,000 tokens of terminal output.
+        nodes = [SimpleNamespace(token_ids=[0] * 10, mask=[False] * 10, sampled=False)]
+        for completion_len in completion_lens:
+            nodes += [
+                SimpleNamespace(
+                    token_ids=[1] * completion_len,
+                    mask=[True] * completion_len,
+                    sampled=True,
+                    message=AssistantMessage(content="{}"),
+                ),
+                SimpleNamespace(
+                    token_ids=[2] * 3000,
+                    mask=[False] * 3000,
+                    sampled=False,
+                    message=UserMessage(content="$ ls"),
+                ),
+            ]
+        token_ids = [token_id for node in nodes for token_id in node.token_ids]
+        span = SimpleNamespace(duration=1.0)
+        return SimpleNamespace(
+            id="trace",
+            agent=SimpleNamespace(trainable=True),
+            nodes=nodes,
+            branches=[
+                SimpleNamespace(
+                    nodes=nodes,
+                    token_ids=token_ids,
+                    logprobs=[-0.1] * len(token_ids),
+                    routed_experts=None,
+                )
+            ],
+            ok=ok,
+            is_truncated=stop_condition is not None,
+            stop_condition=stop_condition,
+            reward=reward,
+            task=SimpleNamespace(key="task"),
+            timing=SimpleNamespace(
+                setup=span,
+                agent=SimpleNamespace(duration=1.0, model=span, harness=span),
+                scoring=span,
+            ),
+            calls=[],
+            errors=[],
+        )
+
+    class EnvClient:
+        def __init__(self, traces) -> None:
+            self.traces = traces
+
+        async def run(self, *, sampling, **kwargs):
+            return SimpleNamespace(
+                ok=True, errors=[], traces=[self.traces[sampling.seed]]
+            )
+
+    def run_group(traces):
+        rollouter._verifiers_env_client = EnvClient(traces)
+        return asyncio.run(
+            rollouter.run_group_rollouts(
+                generate_fn=None,
+                release_session_fn=AsyncMock(),
+                sample=VerifiersTaskSample(verifiers_task_data={}),
+                group_id=0,
+                group_size=len(traces),
+                sampling=SamplingConfig(seed=0),
+            )
+        )
+
+    # Skip loading the Harbor datasets; the env server is never started.
+    monkeypatch.setattr(VerifiersTaskDataset, "__init__", lambda self, config: None)
+    config = _rollouter_config(TRAIN_DATASET, EVAL_DATASET)
+    config.rubric.length_reward_weight = 0.1
+    rollouter = config.build()
+    rollouter._generation_server = SimpleNamespace(
+        model_id="torchtitan",
+        generate_fns={},
+        pop_generation_metadata=lambda trace_id: VerifiersGenerationMetadata(
+            min_policy_version=0, max_policy_version=0, metrics=[]
+        ),
+    )
+    rollouter._verifiers_train_client_config = object()
+
+    # lam = 0.5 - (len - 200) / 800 over completion tokens: +0.5, 0, -0.5 at 200 / 600 / 1,000.
+    group = run_group(
+        [
+            trace([100, 100], reward=1.0),
+            trace([300, 300], reward=1.0),
+            # Stopped at the context cap, then graded: its tests passed.
+            trace([500, 500], reward=1.0, stop_condition="context_length"),
+            trace([100, 100], reward=0.0),
+            # Errored after 4,000 tokens (e.g. an agent timeout): not graded, no length
+            # reward, and the group's range stays 200 to 1,000.
+            trace([2000, 2000], reward=0.0, ok=False),
+        ]
+    )
+    rollouts = group.rollouts
+    assert rollouts[2].status == RolloutStatus.TRUNCATED_LENGTH
+    assert rollouts[2].reward_breakdown == pytest.approx(
+        {"RewardFromVerifiers": 1.0, "length_reward": -0.05}
+    )
+    assert rollouts[4].reward_breakdown == {"errored": 0.0, "length_reward": 0.0}
+    assert [rollout.reward for rollout in rollouts] == pytest.approx(
+        [1.05, 1.0, 0.95, 0.0, 0.0]
+    )
+
+    # An all-fail group gets the length term too, so its rewards are no longer all equal.
+    group = run_group([trace([100, 100], reward=0.0), trace([500, 500], reward=0.0)])
+    assert [rollout.reward for rollout in group.rollouts] == pytest.approx([0.0, -0.05])
+
+
 def _terminal_bench_config(name: str) -> Controller.Config:
     return ConfigLoader().load(
         [
@@ -450,3 +578,98 @@ def test_recipes_share_the_loop_and_keep_fp32_master_weights(name: str) -> None:
     assert serve.pool.num_workers * serve.max_concurrent >= (
         loop.max_active_rollout_groups * loop.num_samples_per_prompt
     )
+
+
+def test_35b_sandoq_1x2_recipe_fits_three_hosts(monkeypatch) -> None:
+    """A 4-GPU Dist-MoE trainer on one host and eight TP1 engines on two; the pool sizes the
+    env server at 24 rollouts per worker."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq
+
+    monkeypatch.syspath_prepend(str(Path(terminal_bench_sandoq.__file__).parent))
+    monkeypatch.setenv("VF_SANDBOX_PROVIDER", "oci-runner")
+    monkeypatch.setenv("OCI_RUNNER_TASK_NETWORK", "host")
+    monkeypatch.setenv("DOME_SANDOQ_POOL", "920")
+    monkeypatch.delenv("DOME_V2_PROMPTS", raising=False)
+    monkeypatch.delenv("DOME_V2_THINKING_BUDGET", raising=False)
+    monkeypatch.delenv("DOME_V2_LENGTH_REWARD_WEIGHT", raising=False)
+    config = _terminal_bench_config("rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2")
+
+    trainer = config.trainer.parallelism
+    assert (
+        trainer.data_parallel_shard_degree,
+        trainer.tensor_parallel_degree,
+        trainer.expert_parallel_degree,
+    ) == (2, 2, 4)
+    # Dist-MoE experts on the trainer only; the generators keep stock experts.
+    assert list(config.trainer.model.traverse(DistMoeRoutedExperts.Config))
+    assert not list(config.generator.model.traverse(DistMoeRoutedExperts.Config))
+    assert config.trainer.training.num_tokens_per_microbatch_per_dp_rank == 131072
+    assert config.num_generators == 8
+    assert config.generator.parallelism.tensor_parallel_degree == 1
+    assert config.generator.cuda_graph.mode == "FULL"
+    assert config.generator.extra_vllm_engine_args == {"watermark": 0.03}
+    loop = config.async_loop
+    assert (loop.num_prompts_per_train_step, loop.num_samples_per_prompt) == (12, 16)
+    assert loop.target_offpolicy_steps == 5
+    assert loop.validation == ValidationConfig(steps=78, freq=10, overlap_training=True)
+    assert config.rollouter.thinking_budget.max_thinking_tokens == 12288
+    # Kimi's length reward assumes the mean baseline.
+    assert config.rollouter.rubric.length_reward_weight == 0.1
+    assert not config.rollouter.advantage.should_std_normalize
+    serve = config.rollouter.verifiers_env_server.serve
+    assert serve.pool.num_workers == 39
+    assert serve.pool.num_workers * serve.max_concurrent >= 920
+
+
+def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) -> None:
+    """With the 1x2 recipe's launch knobs set to other values, the recipe keeps its own: score
+    centering, the adaptive buffer, held session KV, and a pool that fits every rollout the cap
+    allows."""
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins import terminal_bench_sandoq
+
+    monkeypatch.syspath_prepend(str(Path(terminal_bench_sandoq.__file__).parent))
+    monkeypatch.setenv("VF_SANDBOX_PROVIDER", "oci-runner")
+    monkeypatch.setenv("OCI_RUNNER_TASK_NETWORK", "host")
+    monkeypatch.setenv("DOME_SANDOQ_POOL", "920")
+    monkeypatch.setenv("DOME_V2_PROMPTS", "12")
+    monkeypatch.setenv("DOME_V2_THINKING_BUDGET", "0")
+    monkeypatch.setenv("DOME_V2_LENGTH_REWARD_WEIGHT", "0.1")
+    config = _terminal_bench_config(
+        "rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight"
+    )
+
+    loop = config.async_loop
+    assert (loop.num_prompts_per_train_step, loop.num_samples_per_prompt) == (24, 16)
+    assert loop.num_training_steps == 300
+    assert loop.group_buffer == AdaptiveRolloutGroupWorkBuffer.Config(
+        target_offpolicy_steps=6,
+        max_offpolicy_steps=12,
+        start_batches=7,
+        generation_capacity=163,
+    )
+    assert loop.validation == ValidationConfig(steps=78, freq=10, overlap_training=True)
+    assert loop.training_sample_builder.drop_zero_std_reward_groups
+    assert config.rollouter.rubric.length_reward_weight == 0.0
+    assert config.rollouter.thinking_budget.max_thinking_tokens == 4096
+    # The pool, (6 + 1) x 24 x 16, holds every rollout of the cap's groups.
+    serve = config.rollouter.verifiers_env_server.serve
+    assert serve.pool.num_workers * serve.max_concurrent == 2688
+    # Training groups plus a validation pass fit in the sandbox pool.
+    assert loop.max_concurrent_rollout_groups * 16 + loop.validation.steps <= 2688
+    assert config.generator.hold_session_kv
+    assert not config.generator.reset_kv_cache_on_weight_sync
+    assert config.generator.session_kv_free_floor > 0.03  # vLLM's watermark
+
+    trainer = config.trainer
+    (optimizer,) = trainer.optim.optimizer.optimizers
+    assert optimizer.lr == 1e-5
+    assert trainer.optim.lr_scheduler.warmup_steps == 10
+    assert trainer.checkpointer.interval == 10
+    assert trainer.checkpointer.async_mode == "disabled"
+    assert isinstance(trainer.loss.loss_fn, ScoreCenteringLoss.Config)
+    assert trainer.loss.loss_fn.max_ratio == 2.0
+    assert config.generator.sampling.num_topk_logprobs == 32
+    assert config.generator.return_routed_experts
+    assert config.generator.extra_vllm_engine_args == {"watermark": 0.03}
