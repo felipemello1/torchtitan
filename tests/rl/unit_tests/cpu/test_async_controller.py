@@ -910,7 +910,7 @@ def _run_with_generator_watcher(watcher) -> None:
             group_buffer=SimpleNamespace(
                 build=lambda **kwargs: SimpleNamespace(close=AsyncMock())
             ),
-            training_sample_builder=SimpleNamespace(build=lambda: None),
+            training_sample_builder=SimpleNamespace(build=lambda **kwargs: None),
             batcher=SimpleNamespace(build=lambda **kwargs: None),
             validation=ValidationConfig(),
         ),
@@ -919,6 +919,7 @@ def _run_with_generator_watcher(watcher) -> None:
                 num_tokens_per_microbatch_per_dp_rank=8, max_context_length=8
             )
         ),
+        generator=SimpleNamespace(return_routed_experts=False),
     )
     controller.start_step = 0
     controller.trainer = None
@@ -1313,6 +1314,7 @@ def test_overlapped_validation_before_and_after_training(
                 num_tokens_per_microbatch_per_dp_rank=64, max_context_length=64
             )
         ),
+        generator=SimpleNamespace(return_routed_experts=False),
     )
     controller.start_step = 0
     controller.trainer = Mock()

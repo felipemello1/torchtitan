@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.types import RolloutTurnID, split_prompt
 
@@ -231,6 +232,81 @@ def test_routed_expert_ids_follow_the_trainer_inputs_across_turns_and_branches()
     # copies the shared prefix's row from the first sample, then takes each turn's delta.
     assert first.routed_expert_ids.flatten().tolist() == [0, 1]
     assert second.routed_expert_ids.flatten().tolist() == [0, 101, 102, 203, 204]
+
+
+def _routed_group(*, group_id: int) -> RolloutGroup:
+    """Two rollouts of two turns; the second turn continues the first, so its rows start at
+    position 2. Rows are tagged turn * 100 + position."""
+    rollouts = []
+    for reward in [1.0, 0.0]:
+        turns = [
+            _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=1),
+            _turn(prompt_token_ids=[1, 2, 4, 8], completion_token_ids=[5], version=1),
+        ]
+        turns[0].routed_expert_ids = np.arange(2).reshape(-1, 1, 1)
+        turns[1].routed_expert_ids = np.arange(102, 104).reshape(-1, 1, 1)
+        rollouts.append(_scored_rollout(turns, reward=reward, advantage=reward - 0.5))
+    return RolloutGroup(group_id=group_id, rollouts=rollouts)
+
+
+@pytest.mark.parametrize(
+    "unrouted_turn_ids",
+    # Which turns of rollout 1 lack routed expert ids
+    [
+        pytest.param([0, 1], id="every_turn"),
+        pytest.param([0], id="first_turn"),
+        pytest.param([1], id="second_turn"),
+    ],
+)
+def test_replay_drops_a_group_with_a_turn_without_routed_expert_ids(
+    unrouted_turn_ids: list[int],
+) -> None:
+    builder = TrainingSampleBuilder.Config().build(replay_routed_experts=True)
+    unrouted_group = _routed_group(group_id=1)
+    for turn_id in unrouted_turn_ids:
+        unrouted_group.rollouts[1].turns[turn_id].routed_expert_ids = None
+
+    routed = builder.build_from_group(rollout_group=_routed_group(group_id=0))
+    unrouted = builder.build_from_group(rollout_group=unrouted_group)
+
+    assert [
+        training_sample.routed_expert_ids.flatten().tolist()
+        for training_sample in routed.training_samples
+    ] == [[0, 1, 102, 103]] * 2
+    assert unrouted.group_id == 1
+    assert unrouted.training_samples == []
+    aggregated = m.MetricsProcessor._aggregate_metrics(
+        routed.metrics + unrouted.metrics
+    )
+    assert (
+        aggregated[
+            "training_sample_builder/num_groups_dropped_no_routed_expert_ids/sum"
+        ]
+        == 1.0
+    )
+
+
+def test_replay_keeps_a_group_whose_rollout_has_an_empty_later_turn() -> None:
+    # A later turn aborted before its first token has no rows; only its rollout is dropped.
+    builder = TrainingSampleBuilder.Config().build(replay_routed_experts=True)
+    group = _routed_group(group_id=0)
+    aborted = group.rollouts[1].turns[1]
+    aborted.completion_token_ids = np.empty(0, dtype=np.int32)
+    aborted.completion_logprobs = np.empty(0, dtype=np.float32)
+    aborted.routed_expert_ids = None
+
+    output = builder.build_from_group(rollout_group=group)
+
+    assert len(output.training_samples) == 1
+    aggregated = m.MetricsProcessor._aggregate_metrics(output.metrics)
+    assert (
+        "training_sample_builder/num_groups_dropped_no_routed_expert_ids/sum"
+        not in (aggregated)
+    )
+    assert (
+        aggregated["training_sample_builder/num_rollouts_dropped_empty_completion/sum"]
+        == 1.0
+    )
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,7 @@
 RolloutGroup -> group filters -> rollout_to_training_samples -> sample filters -> TrainingSampleGroup
 """
 
+import logging
 import statistics
 from dataclasses import dataclass, field
 
@@ -19,6 +20,8 @@ from torchtitan.config import Configurable
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout, RolloutGroup
 from torchtitan.rl.rollout.types import RolloutTurnID
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -133,7 +136,9 @@ class TrainingSampleBuilder(Configurable):
     """Build trainable samples and metrics the trainer consumes from rollout groups.
 
     Example:
-        builder = config.async_loop.training_sample_builder.build()
+        builder = config.async_loop.training_sample_builder.build(
+            replay_routed_experts=config.generator.return_routed_experts
+        )
         output: TrainingSampleGroup = builder.build_from_group(rollout_group=rollout_group)
     """
 
@@ -144,8 +149,9 @@ class TrainingSampleBuilder(Configurable):
         drop_zero_std_reward_groups: bool = True
         """Drop zero-reward-variance groups;"""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, *, replay_routed_experts: bool = False) -> None:
         self.config = config
+        self.replay_routed_experts = replay_routed_experts
 
     def build_from_group(self, *, rollout_group: RolloutGroup) -> TrainingSampleGroup:
         """Apply data-validity filters and convert surviving rollouts to training_samples.
@@ -173,6 +179,29 @@ class TrainingSampleBuilder(Configurable):
             metrics.append(
                 m.Metric(
                     "training_sample_builder/num_groups_dropped_untrainable", m.Sum(1.0)
+                )
+            )
+            return TrainingSampleGroup(
+                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
+            )
+
+        # Router replay: a turn without routed expert ids (e.g. Verifiers drops a branch's rows
+        # when one node lacks them) would crash packing. A turn with no completion has no rows
+        # either; the empty-completion filter below drops just its rollout.
+        if self.replay_routed_experts and any(
+            rollout_turn.routed_expert_ids is None
+            for rollout in rollout_group.rollouts
+            for rollout_turn in rollout.turns
+            if len(rollout_turn.completion_token_ids) > 0
+        ):
+            logger.warning(
+                "Dropped group %s: a turn has no routed expert ids, which router replay needs.",
+                rollout_group.group_id,
+            )
+            metrics.append(
+                m.Metric(
+                    "training_sample_builder/num_groups_dropped_no_routed_expert_ids",
+                    m.Sum(1.0),
                 )
             )
             return TrainingSampleGroup(
