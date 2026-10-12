@@ -1232,22 +1232,47 @@ def test_batcher_passes_the_version_that_trains_each_group() -> None:
     assert queue.qsize() == 3  # two batches and the None sentinel
 
 
-def test_generation_capacity_default_leaves_room_for_untrainable_groups() -> None:
-    config = AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=12)
-    # 2 x (12 + 1) versions x 16 prompts: room for up to half the groups being untrainable.
-    assert config.resolve_generation_capacity(16) == 416
-    loop = AsyncLoopConfig(num_prompts_per_train_step=16, group_buffer=config)
-    assert loop.max_concurrent_rollout_groups == 416
-    buffer = config.build(num_prompts_per_train_step=16)
-    assert _buffer_metric(buffer, "rollout_buffer/generation_capacity_groups") == 416
+def test_generation_capacity_default_follows_target_offpolicy_steps() -> None:
+    config = AdaptiveRolloutGroupWorkBuffer.Config(
+        max_offpolicy_steps=10, target_offpolicy_steps=6
+    )
+    # 2 x (6 + 1) versions x 48 prompts: room for up to half the groups being untrainable.
+    assert config.resolve_generation_capacity(48) == 672
+    loop = AsyncLoopConfig(num_prompts_per_train_step=48, group_buffer=config)
+    assert loop.max_concurrent_rollout_groups == 672
+    buffer = config.build(num_prompts_per_train_step=48)
+    assert _buffer_metric(buffer, "rollout_buffer/generation_capacity_groups") == 672
+
+
+def test_generation_capacity_default_without_target_fills_vllm() -> None:
+    config = AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=10)
+    # 512 sequences x 24 generator DP shards / 16 samples per prompt
+    assert (
+        config.resolve_generation_capacity(
+            48, num_generator_dp_shards=24, num_samples_per_prompt=16
+        )
+        == 768
+    )
+    loop = AsyncLoopConfig(
+        num_prompts_per_train_step=48, num_samples_per_prompt=16, group_buffer=config
+    )
+    assert loop.resolve_max_concurrent_rollout_groups(num_generator_dp_shards=12) == 384
+    # Without the generator layout the default can't be computed.
+    with pytest.raises(ValueError, match="needs num_generator_dp_shards"):
+        loop.max_concurrent_rollout_groups
+
+
+def test_generation_capacity_explicit_overrides_default() -> None:
     explicit = AdaptiveRolloutGroupWorkBuffer.Config(
-        max_offpolicy_steps=12, generation_capacity=96
+        max_offpolicy_steps=12, target_offpolicy_steps=6, generation_capacity=96
     )
     assert explicit.resolve_generation_capacity(16) == 96
-    with pytest.raises(
-        ValueError, match="set generation_capacity or max_offpolicy_steps"
-    ):
-        AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=None)
+    assert (
+        explicit.resolve_generation_capacity(
+            16, num_generator_dp_shards=24, num_samples_per_prompt=16
+        )
+        == 96
+    )
 
 
 def test_adaptive_buffer_warns_once_when_generation_capacity_caps_demand(

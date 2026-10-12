@@ -114,6 +114,7 @@ from torchtitan.rl.components.checkpointer import DATALOADER_STATE_KEY
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.components.work_buffer import (
     AdaptiveRolloutGroupWorkBuffer,
+    DEFAULT_SEQS_PER_GENERATOR_DP_SHARD,
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
@@ -229,10 +230,25 @@ class AsyncLoopConfig(Configurable.Config):
     @property
     def max_concurrent_rollout_groups(self) -> int:
         """Most groups generating at once: every active slot of the fixed buffer, or the adaptive
-        buffer's `generation_capacity`. Sizes the rollout workers and vLLM's `max_num_seqs`."""
+        buffer's `generation_capacity`. Sizes the rollout workers and vLLM's `max_num_seqs`.
+        Raises if the adaptive default needs the generator layout (no `target_offpolicy_steps`);
+        the controller then uses `resolve_max_concurrent_rollout_groups`."""
+        return self.resolve_max_concurrent_rollout_groups()
+
+    def resolve_max_concurrent_rollout_groups(
+        self, num_generator_dp_shards: int | None = None
+    ) -> int:
+        """`max_concurrent_rollout_groups`, given the generator layout when the default needs it.
+
+        Example:
+            # adaptive buffer, no target, 24 generator DP shards, 16 samples per prompt
+            async_loop.resolve_max_concurrent_rollout_groups(num_generator_dp_shards=24)  # 768
+        """
         if isinstance(self.group_buffer, AdaptiveRolloutGroupWorkBuffer.Config):
             return self.group_buffer.resolve_generation_capacity(
-                self.num_prompts_per_train_step
+                self.num_prompts_per_train_step,
+                num_generator_dp_shards=num_generator_dp_shards,
+                num_samples_per_prompt=self.num_samples_per_prompt,
             )
         return self.max_active_rollout_groups
 
@@ -551,19 +567,24 @@ class Controller(Configurable):
             trainer_mesh: ProcMesh the trainer actor is spawned on.
             generator_meshes: ProcMesh objects the generator actors are spawned on.
         """
+        config = self.config
+        if not generator_meshes:
+            raise ValueError("setup_async requires at least one generator mesh")
+        generator_dp_degree = max(config.generator.parallelism.data_parallel_degree, 1)
+        num_generator_dp_shards = len(generator_meshes) * generator_dp_degree
+
         # Peak concurrent rollout sequences (groups * num_samples_per_prompt, or the validation pass); sizes max_num_seqs below.
         async_loop = self.config.async_loop
+        self._max_concurrent_rollout_groups = (
+            async_loop.resolve_max_concurrent_rollout_groups(num_generator_dp_shards)
+        )
         num_validation_groups = len(
             self._rollouter.get_validation_samples(async_loop.validation.steps)
         )
         rollout_concurrency = max(
-            async_loop.max_concurrent_rollout_groups
-            * async_loop.num_samples_per_prompt,
+            self._max_concurrent_rollout_groups * async_loop.num_samples_per_prompt,
             num_validation_groups,
         )
-        config = self.config
-        if not generator_meshes:
-            raise ValueError("setup_async requires at least one generator mesh")
 
         trainer_parallelism = config.trainer.parallelism
         dp_shard = max(trainer_parallelism.data_parallel_shard_degree, 1)
@@ -571,14 +592,12 @@ class Controller(Configurable):
             trainer_parallelism.data_parallel_replicate_degree * dp_shard
         )
 
-        generator_dp_degree = max(config.generator.parallelism.data_parallel_degree, 1)
-        num_generator_dp_shards = len(generator_meshes) * generator_dp_degree
-
         # Ceiling (not target) for the generator's max_num_seqs: the per-generator
         # upper bound on concurrently scheduled sequences. vLLM may admit fewer if KV
         # is tight; this also sets CUDA-graph capture sizes.
         max_num_seqs = min(
-            math.ceil(rollout_concurrency / num_generator_dp_shards), 512
+            math.ceil(rollout_concurrency / num_generator_dp_shards),
+            DEFAULT_SEQS_PER_GENERATOR_DP_SHARD,
         )
 
         logger.info(
@@ -811,7 +830,11 @@ class Controller(Configurable):
 
         if isinstance(async_loop.group_buffer, AdaptiveRolloutGroupWorkBuffer.Config):
             logger.info(f"Adaptive rollout buffer: {async_loop.group_buffer}")
-            self._group_buffer = async_loop.group_buffer.build(
+            # The capacity resolved in setup_async, where the generator layout is known.
+            self._group_buffer = replace(
+                async_loop.group_buffer,
+                generation_capacity=self._max_concurrent_rollout_groups,
+            ).build(
                 num_prompts_per_train_step=async_loop.num_prompts_per_train_step,
                 policy_version=self.start_step,
             )
@@ -873,7 +896,7 @@ class Controller(Configurable):
                 ),
                 name=f"rollout_worker_{group_worker_id}",
             )
-            for group_worker_id in range(async_loop.max_concurrent_rollout_groups)
+            for group_worker_id in range(self._max_concurrent_rollout_groups)
         ]
 
         # data_input_loop
