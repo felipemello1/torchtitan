@@ -372,7 +372,7 @@ def test_group_rewards_get_the_length_reward(monkeypatch) -> None:
             ),
             calls=[],
             errors=[],
-            info={},
+            metrics={"tests_passed_frac": 0.5, "unset_metric": None},
         )
 
     class EnvClient:
@@ -425,6 +425,9 @@ def test_group_rewards_get_the_length_reward(monkeypatch) -> None:
         ]
     )
     rollouts = group.rollouts
+    # The trace's metrics reach the last turn's env rewards; unset ones are skipped.
+    assert rollouts[0].turns[-1].env_rewards["tests_passed_frac"] == 0.5
+    assert "unset_metric" not in rollouts[0].turns[-1].env_rewards
     assert rollouts[2].status == RolloutStatus.TRUNCATED_LENGTH
     assert rollouts[2].reward_breakdown == pytest.approx(
         {"RewardFromVerifiers": 1.0, "length_reward": -0.05}

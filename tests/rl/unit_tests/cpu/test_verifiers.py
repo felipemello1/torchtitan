@@ -39,11 +39,15 @@ from torchtitan.rl.examples.verifiers.rollouter import (
     _trainable_token_spans,
     log_failed_rollout,
     RewardFromVerifiers,
-    RewardFromVerifiersPartialCredit,
-    TESTS_PASSED_FRAC_KEY,
     VERIFIERS_REWARD_KEY,
     verifiers_rollout_logs,
     VerifiersRollouter,
+)
+from torchtitan.rl.examples.verifiers.terminal_bench.reward import (
+    RewardFromVerifiersPartialCredit,
+)
+from torchtitan.rl.examples.verifiers.terminal_bench.taskset import (
+    TESTS_PASSED_FRAC_KEY,
 )
 from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.observability import metrics as m
@@ -937,28 +941,45 @@ def test_rollouter_registers_the_groups_generate_fn_while_it_runs() -> None:
 
 
 @pytest.mark.parametrize(
-    "verifiers_reward, passed_frac, status, expected",
-    [
-        (1.0, 1.0, RolloutStatus.COMPLETED, 1.0),
-        (0.0, 2 / 3, RolloutStatus.COMPLETED, 1 / 3),
-        (0.0, 2 / 3, RolloutStatus.TRUNCATED_MAX_TURNS, 1 / 3 - 0.5),
-        (1.0, 1.0, RolloutStatus.TRUNCATED_LENGTH, 0.5),
-        (0.0, None, RolloutStatus.COMPLETED, 0.0),
-    ],
+    "verifiers_reward, passed_frac, expected",
+    [(1.0, 1.0, 1.0), (0.0, 2 / 3, 1 / 3), (0.0, 0.0, 0.0), (0.0, None, 0.0)],
 )
-def test_partial_credit_reward(verifiers_reward, passed_frac, status, expected) -> None:
-    """Full solve 1; otherwise half the passed-test fraction; truncation subtracts 0.5."""
+def test_partial_credit_reward(verifiers_reward, passed_frac, expected) -> None:
+    """A solve scores 1; otherwise half the passed-test fraction."""
     env_rewards = {VERIFIERS_REWARD_KEY: verifiers_reward}
     if passed_frac is not None:
         env_rewards[TESTS_PASSED_FRAC_KEY] = passed_frac
     rollout = Rollout(
         group_id=0,
         rollout_id=0,
-        status=status,
+        status=RolloutStatus.COMPLETED,
         turns=[SimpleNamespace(env_rewards=env_rewards)],
     )
     reward_fn = RewardFromVerifiersPartialCredit.Config().build()
     assert asyncio.run(reward_fn(rollout, None)) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "status, expected",
+    [(RolloutStatus.COMPLETED, 1.0), (RolloutStatus.TRUNCATED_MAX_TURNS, 0.5)],
+)
+def test_rubric_subtracts_the_truncation_penalty(status, expected) -> None:
+    """A truncated rollout is still graded, then loses `truncation_penalty`."""
+    rubric = Rubric.Config(
+        reward_fns=[RewardFromVerifiers.Config()], truncation_penalty=0.5
+    ).build()
+    rollout = Rollout(
+        group_id=0,
+        rollout_id=0,
+        status=status,
+        turns=[
+            SimpleNamespace(
+                env_rewards={VERIFIERS_REWARD_KEY: 1.0}, completion_loss_mask=None
+            )
+        ],
+    )
+    [output] = asyncio.run(rubric.score_group([rollout], None))
+    assert output.reward == pytest.approx(expected)
 
 
 def test_rollouter_gives_truncation_reward_to_training_groups_only() -> None:
@@ -1009,6 +1030,12 @@ def test_rollouter_gives_truncation_reward_to_training_groups_only() -> None:
 
     assert reward(7) == 0.0
     assert reward(-1) == 1.0
+
+    # An explicit validation rubric replaces the derived one for validation groups.
+    rollouter._validation_rubric = Rubric.Config(
+        reward_fns=[RewardFromVerifiers.Config()], truncation_reward=0.25
+    ).build()
+    assert reward(-1) == 0.25
 
 
 def test_rollouter_removes_the_groups_generate_fn_when_a_rollout_raises() -> None:
@@ -1514,7 +1541,7 @@ def test_sandoq_exec_keeps_keystrokes_out_of_argv() -> None:
     assert output == 'it\'s "quoted" $HOME\n'
 
 
-def test_pytest_passed_frac_reads_pytests_summary() -> None:
+def test_pytest_passed_frac_reads_pytest_summary() -> None:
     pytest.importorskip("harbor")
     from torchtitan_recipes.rl.verifiers_plugins.terminal_bench_sandoq import (
         pytest_passed_frac,
@@ -1525,6 +1552,12 @@ def test_pytest_passed_frac_reads_pytests_summary() -> None:
     assert pytest_passed_frac("collected 1 item\n=== 1 passed in 0.1s ===") == 1.0
     assert pytest_passed_frac("collected 4 items\n=== 1 failed in 0.2s ===") == 0.0
     assert pytest_passed_frac("bash: pytest: command not found") == 0.0
+    # A failing test's message can echo "12 passed": only the summary line counts.
+    echoed = "collected 2 items\nE   assert 'run: 12 passed' == 'x'\n=== 1 failed in 0.1s ==="
+    assert pytest_passed_frac(echoed) == 0.0
+    # Two pytest runs: the last one counts.
+    two_runs = "collected 2 items\n=== 2 passed in 0.1s ===\ncollected 5 items\n=== 1 failed, 1 passed in 0.2s ==="
+    assert pytest_passed_frac(two_runs) == pytest.approx(0.2)
 
 
 def test_sandoq_exec_rejects_a_null_byte_like_harbor() -> None:

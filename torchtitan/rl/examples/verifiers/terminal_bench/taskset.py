@@ -27,6 +27,9 @@ from torchtitan.rl.examples.verifiers.terminal_bench.harness import (
 
 register_harness_alias()
 
+# The trace metric the Sandoq plugin records: the fraction of the task's pytest tests that passed.
+TESTS_PASSED_FRAC_KEY = "tests_passed_frac"
+
 
 class TerminalTasksetConfig(HarborConfig):
     """Harbor taskset config; a local class so its module is the worker's entry."""
