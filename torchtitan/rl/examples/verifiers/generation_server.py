@@ -379,9 +379,13 @@ def _parse_sampling_config(value: object):
         value.get("stop_token_ids"),
         field_name="stop_token_ids",
     )
+    # The rollouter always sends the run's sampling; a missing temperature would silently fall
+    # back to SamplingConfig's default and sample a different distribution than configured.
+    if "temperature" not in value:
+        raise ValueError("sampling_params must include temperature")
     defaults = SamplingConfig()
     return SamplingConfig(
-        temperature=float(value.get("temperature", defaults.temperature)),
+        temperature=float(value["temperature"]),
         top_p=float(value.get("top_p", defaults.top_p)),
         max_tokens=int(value.get("max_tokens", defaults.max_tokens)),
         seed=value.get("seed"),

@@ -839,3 +839,12 @@ def test_a_failing_rollout_fails_its_group_only_after_every_sibling_finished() -
 def test_parse_sampling_config_requires_stop_token_ids() -> None:
     with pytest.raises(ValueError, match="stop_token_ids"):
         _parse_sampling_config({"temperature": 1.0})
+
+
+def test_parse_sampling_config_requires_temperature() -> None:
+    # A missing temperature must not silently fall back to SamplingConfig's default.
+    with pytest.raises(ValueError, match="must include temperature"):
+        _parse_sampling_config({"stop_token_ids": [1]})
+    assert _parse_sampling_config(
+        {"temperature": 0.0, "stop_token_ids": [1]}
+    ).temperature == 0.0
