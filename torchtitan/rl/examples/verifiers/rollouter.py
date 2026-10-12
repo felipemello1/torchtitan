@@ -32,6 +32,7 @@ from torchtitan.rl.examples.verifiers.env_server import VerifiersEnvServer
 from torchtitan.rl.examples.verifiers.generation_server import (
     GenerationServer,
     GROUP_ID_SAMPLING_PARAM,
+    MAX_ROLLOUT_TOKENS_SAMPLING_PARAM,
     VerifiersGenerationMetadata,
 )
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
@@ -94,6 +95,15 @@ class VerifiersRollouter(Rollouter):
         validation_dataset: VerifiersTaskDataset.Config
         """Verifiers taskset used for validation samples."""
 
+        max_rollout_tokens: int | None = None
+        """Context cap (prompt + output tokens) of training rollouts; None: the generation
+        server's `max_rollout_tokens`. A turn whose prompt reaches it stops the rollout as
+        truncated (graded, with the rubric's truncation reward) instead of producing a sample the
+        batcher would drop as oversized."""
+
+        validation_max_rollout_tokens: int | None = None
+        """Context cap of validation rollouts; None: `max_rollout_tokens`."""
+
         worker: RolloutWorker.Config | None = None
         """Inherited schema field; hidden because Verifiers replaces that path."""
 
@@ -150,6 +160,12 @@ class VerifiersRollouter(Rollouter):
                     self.training_dataloader.dataset.verifiers_taskset
                 ),
             )
+            for name, cap in (
+                ("max_rollout_tokens", self.max_rollout_tokens),
+                ("validation_max_rollout_tokens", self.validation_max_rollout_tokens),
+            ):
+                if cap is not None and cap <= 0:
+                    raise ValueError(f"{name} must be positive")
             if self.renderer_multiplex <= 0:
                 raise ValueError("renderer_multiplex must be positive")
             if self.connection_timeout_sec <= 0:
@@ -275,6 +291,19 @@ class VerifiersRollouter(Rollouter):
             rollout.advantage = advantage
         return group
 
+    def _max_rollout_tokens_param(self, group_id: int) -> dict[str, int]:
+        """The context cap to send with this rollout's generation requests, if any.
+
+        Example: max_rollout_tokens 65,536, validation_max_rollout_tokens 131,072:
+            training rollout (group 7)       -> {MAX_ROLLOUT_TOKENS_SAMPLING_PARAM: 65536}
+            validation rollout (group -3)    -> {MAX_ROLLOUT_TOKENS_SAMPLING_PARAM: 131072}
+        """
+        config = self._verifiers_config
+        cap = config.max_rollout_tokens
+        if group_id < 0 and config.validation_max_rollout_tokens is not None:
+            cap = config.validation_max_rollout_tokens
+        return {} if cap is None else {MAX_ROLLOUT_TOKENS_SAMPLING_PARAM: cap}
+
     async def _run_single_rollout(
         self,
         *,
@@ -306,6 +335,7 @@ class VerifiersRollouter(Rollouter):
                 max_tokens=sampling.max_tokens,
                 seed=sampling.seed,
                 **{GROUP_ID_SAMPLING_PARAM: group_id},
+                **self._max_rollout_tokens_param(group_id),
             ),
         )
         traces = [trace for trace in verifiers_episode.traces if trace.agent.trainable]
