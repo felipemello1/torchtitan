@@ -265,6 +265,9 @@ def rl_chess_qwen3_5_4b_gb300(
         answer_end_text="}",
     )
     worker.rubric.reward_fns = [RewardChessScore.Config(forced_close_penalty=0.1)]
+    # Each force-closed turn gets at most -0.25: thinking loops ('capturing capturing ...') that a
+    # forced close turned into a legal move shared the game's advantage (chess118gcn, steps 260-274).
+    worker.forced_close_cost = 0.25
 
     # ======== Async loop ========
     loop = config.async_loop
