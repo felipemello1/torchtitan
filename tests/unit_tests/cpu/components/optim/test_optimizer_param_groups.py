@@ -834,6 +834,49 @@ class TestLRSchedulerWithMixedOptimizers(unittest.TestCase):
             else:
                 self.assertAlmostEqual(base_lr, 1e-3, places=6)
 
+    def test_resume_uses_the_configured_lr_from_the_first_step(self):
+        """Saved at lr 1e-6 after 2 of 4 warmup steps, resumed with lr 1e-5: the
+        first step runs at 1e-5 x 3/4, whichever of the two states loads first.
+
+        DCP loads the lr scheduler first (sorted keys); torch_checkpointing loads the
+        optimizer first.
+        """
+        lr_config = LRSchedulersContainer.Config(warmup_steps=4)
+        saved_model = SimpleModel()
+        saved_scheduler, saved_container = self._build_scheduler(
+            OptimizersContainer.Config(
+                optimizers=[AdamW.Config(pattern=r".*", fused=False, lr=1e-6)]
+            ),
+            lr_config,
+            saved_model,
+        )
+        saved_model(torch.randint(0, 32, (2, 4))).sum().backward()
+        for _ in range(2):
+            saved_container.step()
+            saved_scheduler.step()
+
+        for scheduler_first in (True, False):
+            with self.subTest(scheduler_first=scheduler_first):
+                scheduler, container = self._build_scheduler(
+                    OptimizersContainer.Config(
+                        optimizers=[AdamW.Config(pattern=r".*", fused=False, lr=1e-5)]
+                    ),
+                    lr_config,
+                    SimpleModel(),
+                )
+                if scheduler_first:
+                    scheduler.load_state_dict(saved_scheduler.state_dict())
+                container.load_state_dict(saved_container.state_dict())
+                if not scheduler_first:
+                    scheduler.load_state_dict(saved_scheduler.state_dict())
+
+                group = container.optimizers[0].param_groups[0]
+                self.assertAlmostEqual(group["lr"], 7.5e-6, places=12)
+                self.assertAlmostEqual(group["initial_lr"], 1e-5, places=12)
+                self.assertAlmostEqual(
+                    scheduler.get_metrics()["lr/AdamW"], 7.5e-6, places=12
+                )
+
     def test_first_capturable_step_uses_stable_tensor_lr(self):
         model = torch.nn.Linear(2, 2)
         container = OptimizersContainer.Config(
