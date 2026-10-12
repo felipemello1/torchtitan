@@ -32,6 +32,14 @@ class _HostLRScheduler(LRScheduler):
 
     host_lrs: list[float]
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # DCP loads the optimizer after the lr scheduler (sorted keys), and the optimizer
+        # load restores the saved lr, so set the configured lr again after it.
+        self.optimizer.register_load_state_dict_post_hook(
+            lambda optimizer: self.set_optimizer_lrs()
+        )
+
     def get_lr(self) -> list[float | Tensor]:
         # Capturable optimizers keep initial_lr on the host, so scheduler
         # calculations do not read the device lr tensor.
@@ -41,6 +49,22 @@ class _HostLRScheduler(LRScheduler):
 
     def get_last_host_lrs(self) -> list[float]:
         return list(self.host_lrs)
+
+    def set_optimizer_lrs(self) -> None:
+        """Set each param group's lr from the configured base lr and ``last_epoch``.
+
+        A checkpoint load restores the lr the optimizer was saved with. After this,
+        a run saved at lr 1e-6 and resumed with lr 1e-5 steps at 1e-5 right away.
+        """
+        self._last_lr = self.get_lr()
+        for group, base_lr, lr in zip(
+            self.optimizer.param_groups, self.base_lrs, self._last_lr, strict=True
+        ):
+            group["initial_lr"] = base_lr
+            if isinstance(group["lr"], Tensor):
+                group["lr"].fill_(lr)
+            else:
+                group["lr"] = lr
 
 
 class _HostLambdaLR(_HostLRScheduler, LambdaLR):
@@ -66,7 +90,8 @@ class LRSchedulersContainer(Stateful, Configurable):
     ``last_epoch`` is saved. On load, ``last_epoch`` is restored and each
     scheduler recomputes its lr from its own optimizer's ``base_lrs``. This
     handles mixed optimizers (different base lrs) and resharding (different
-    number of schedulers between save and load).
+    number of schedulers between save and load). A changed lr in the config
+    takes effect from the first resumed step.
 
     Args:
         optimizers (OptimizersContainer): The corresponding optimizers for the lr_schedulers.
@@ -305,8 +330,8 @@ class LRSchedulersContainer(Stateful, Configurable):
         return {"last_epoch": self.schedulers[0].last_epoch}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        # Only restore last_epoch. Each scheduler recomputes _last_lr from its
-        # own optimizer's base_lrs and the shared lambda. This is correct for
+        # Only restore last_epoch. Each scheduler recomputes _last_lr and its
+        # optimizer's lr from its base_lrs and the shared lambda. This is correct for
         # mixed optimizers (different base_lrs) and resharding (different number
         # of schedulers between save and load).
         #
@@ -318,4 +343,4 @@ class LRSchedulersContainer(Stateful, Configurable):
         for scheduler in self.schedulers:
             scheduler.last_epoch = last_epoch
             scheduler._step_count = last_epoch + 1
-            scheduler._last_lr = scheduler.get_lr()
+            scheduler.set_optimizer_lrs()
