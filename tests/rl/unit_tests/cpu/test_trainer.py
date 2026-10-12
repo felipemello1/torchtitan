@@ -8,7 +8,7 @@ import asyncio
 import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -23,7 +23,7 @@ from torchtitan.observability.sdc_replayer import SDCReplayer
 from torchtitan.rl.components.batcher import TrainingMicrobatch
 from torchtitan.rl.components.checkpointer import MirroredState
 from torchtitan.rl.distributed.monarch_actors.trainer import TrainerActor
-from torchtitan.rl.distributed.rdma_microbatch import RDMAMicrobatch
+from torchtitan.rl.distributed.rdma_microbatch import MicrobatchStream, RDMAMicrobatch
 from torchtitan.rl.trainer import Trainer
 from torchtitan.trainer import Trainer as DatasetTrainer
 from torchtitan.training_engine import ForwardBackwardResult, TrainingEngine
@@ -269,6 +269,7 @@ def test_forward_backward_uses_global_token_count() -> None:
             return_value=ForwardBackwardResult(torch.tensor(1.0), [])
         ),
         _cuda_graph_per_accumulation_group_enabled=False,
+        _preprocess_groups_lazily=False,
         sdc_replayer=None,
     )
     microbatch_groups = [[object()], [object()], [object()]]
@@ -395,11 +396,17 @@ def test_forward_backward_accumulates_microbatch_metrics(rdma: bool) -> None:
         )
 
         engine.forward_backward.assert_called_once_with(
-            microbatch_groups=[[batch], [batch]],
+            microbatch_groups=ANY,
             global_loss_token_counts=torch.tensor([3]),
             global_routing_token_counts=torch.tensor([2]),
         )
-        assert trainer._step_num_tokens_per_dp_rank == 2
+        # The RDMA fast path reads through the stream; by value, the column is passed as is.
+        groups = engine.forward_backward.call_args.kwargs["microbatch_groups"]
+        assert isinstance(groups, MicrobatchStream) == rdma
+        assert list(groups) == [[batch], [batch]]
+        assert trainer._step_num_tokens_per_dp_rank == (
+            2 * trainer.config.training.num_tokens_per_microbatch_per_dp_rank
+        )
         if rdma:
             other_rank.read.assert_not_called()
             # The read time is reported only when there was a read.
