@@ -23,14 +23,15 @@ logger = logging.getLogger(__name__)
 _SESSION_ID_HEADER = "X-Session-ID"
 
 GROUP_ID_SAMPLING_PARAM = "torchtitan_group_id"
-# Optional per-request context cap (prompt + output tokens), tighter than `max_rollout_tokens`: lets
-# training and validation use different context lengths on one generation server.
-MAX_ROLLOUT_TOKENS_SAMPLING_PARAM = "torchtitan_max_rollout_tokens"
 """Sampling parameter carrying a request's rollout group id.
 
 Verifiers forwards extra sampling fields verbatim in ``sampling_params``, so the
 rollouter tags every request of a group with its id.
 """
+
+# Optional per-request context cap (prompt + output tokens), tighter than `max_rollout_tokens`: lets
+# training and validation use different context lengths on one generation server.
+MAX_ROLLOUT_TOKENS_SAMPLING_PARAM = "torchtitan_max_rollout_tokens"
 
 
 @dataclass(frozen=True, slots=True)
