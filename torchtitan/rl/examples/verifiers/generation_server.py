@@ -63,6 +63,11 @@ class VerifiersGenerationMetadata:
         {(2, (12, 13)): (tensor([[12, 5], [13, 6]]), tensor([[-0.1, -2.4], [-0.2, -1.9]]))}
     """
 
+    loss_masks: dict[tuple[int, ...], list[bool]] = field(default_factory=dict)
+    """`Completion.loss_mask` of each completion with appended tokens, keyed by its token ids.
+    Verifiers' client rejects NaN, so the reply sends 0.0 where the mask is False, and
+    `trace_to_rollout_turns` restores the mask."""
+
 
 class GenerationServer(Configurable):
     """Expose a TorchTitan ``GenerateFn`` through Verifiers' model API.
@@ -265,6 +270,19 @@ class GenerationServer(Configurable):
                 **topk_by_generation,
                 key: (completion.topk_token_ids, completion.topk_logprobs),
             }
+        reply_logprobs = completion.token_logprobs
+        loss_masks = {} if previous is None else previous.loss_masks
+        if completion.loss_mask is not None and not all(completion.loss_mask):
+            loss_masks = {
+                **loss_masks,
+                tuple(completion.token_ids): completion.loss_mask,
+            }
+            reply_logprobs = [
+                logprob if keep else 0.0
+                for logprob, keep in zip(
+                    reply_logprobs, completion.loss_mask, strict=True
+                )
+            ]
         self.generation_metadata[session_id] = VerifiersGenerationMetadata(
             min_policy_version=(
                 completion.min_policy_version
@@ -284,6 +302,7 @@ class GenerationServer(Configurable):
                 else [*previous.metrics, *completion.metrics]
             ),
             topk_by_generation=topk_by_generation,
+            loss_masks=loss_masks,
         )
         return web.json_response(
             {
@@ -299,9 +318,7 @@ class GenerationServer(Configurable):
                                     "logprob": logprob,
                                 }
                                 for token_id, logprob in zip(
-                                    completion.token_ids,
-                                    completion.token_logprobs,
-                                    strict=True,
+                                    completion.token_ids, reply_logprobs, strict=True
                                 )
                             ]
                         },
