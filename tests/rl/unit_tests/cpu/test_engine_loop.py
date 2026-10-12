@@ -111,6 +111,7 @@ def _request(
         sampling=SamplingConfig(),
         group_id=group_id,
         routing_session_id=routing_session_id or request_id,
+        arrival_time=0.0,
     )
 
 
@@ -521,7 +522,7 @@ class _FakeEngine:
         self.running: list[str] = []
         self.threads: set[threading.Thread] = set()
 
-    def add_request(self, *, request_id, prompt, params):
+    def add_request(self, *, request_id, prompt, params, arrival_time, priority):
         self.threads.add(threading.current_thread())
         self.running.append(request_id)
 
@@ -540,10 +541,10 @@ class _RejectingEngine(_FakeEngine):
 
     max_prompt_len = 2
 
-    def add_request(self, *, request_id, prompt, params):
+    def add_request(self, *, request_id, prompt, **kwargs):
         if len(prompt["prompt_token_ids"]) > self.max_prompt_len:
             raise ValueError(f"prompt of {request_id} is too long")
-        super().add_request(request_id=request_id, prompt=prompt, params=params)
+        super().add_request(request_id=request_id, prompt=prompt, **kwargs)
 
 
 class _StuckEngine(_FakeEngine):
