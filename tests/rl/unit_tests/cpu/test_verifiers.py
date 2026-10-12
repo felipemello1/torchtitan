@@ -604,7 +604,10 @@ def test_generation_server_returns_routed_experts_from_the_prompt_start() -> Non
     routed_expert_ids = np.arange(4 * 2 * 2, dtype=np.uint8).reshape(4, 2, 2)
 
     async def run_test() -> dict:
-        async def generate_fn(prompt_token_ids, *, request_id, **kwargs):
+        async def generate_fn(
+            prompt_token_ids, *, request_id, sampling_config, **kwargs
+        ):
+            assert sampling_config.routed_experts_prompt_start == 2
             return Completion(
                 min_policy_version=0,
                 max_policy_version=0,
@@ -612,7 +615,8 @@ def test_generation_server_returns_routed_experts_from_the_prompt_start() -> Non
                 token_ids=[31, 32],
                 token_logprobs=[-0.1, -0.2],
                 finish_reason="stop",
-                routed_expert_ids=routed_expert_ids,
+                # Like the generator, return rows from the prompt start on.
+                routed_expert_ids=routed_expert_ids[2:],
             )
 
         server = GenerationServer.Config(max_rollout_tokens=40960).build()

@@ -463,13 +463,19 @@ class RolloutWorker(Configurable):
                     turn_id=len(turns),
                 )
 
-                # generator call
+                # generator call; ask only for the routed-expert rows this turn adds, see
+                # `RolloutTurn.routed_expert_ids`
                 completion = await generate_fn(
                     prompt_token_ids=env_step.next_prompt_token_ids,
                     request_id=turn_rollout_id.to_string(),
                     group_id=group_id,
                     routing_session_id=routing_session_id,
-                    sampling_config=sampling,
+                    sampling_config=replace(
+                        sampling,
+                        routed_experts_prompt_start=max(
+                            env_step.next_prompt_prefix_len - 1, 0
+                        ),
+                    ),
                 )
 
                 # env call
@@ -493,13 +499,7 @@ class RolloutWorker(Configurable):
                             if completion.loss_mask is None
                             else np.asarray(completion.loss_mask, dtype=bool)
                         ),
-                        routed_expert_ids=(
-                            None
-                            if completion.routed_expert_ids is None
-                            else completion.routed_expert_ids[
-                                max(env_step.next_prompt_prefix_len - 1, 0) :
-                            ]
-                        ),
+                        routed_expert_ids=completion.routed_expert_ids,
                         completion_topk_token_ids=completion.topk_token_ids,
                         completion_topk_logprobs=completion.topk_logprobs,
                         completion_message=next_env_step.completion_message,

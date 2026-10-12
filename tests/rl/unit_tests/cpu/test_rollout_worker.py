@@ -10,6 +10,7 @@ import asyncio
 import random
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 from renderers import ParsedResponse, Qwen3RendererConfig
 
@@ -24,7 +25,7 @@ from torchtitan.rl.rollout.message_env import MessageEnvInitOutput, MessageEnvSt
 from torchtitan.rl.rollout.rollouter import RolloutWorker
 from torchtitan.rl.rollout.rubric import RubricOutput
 from torchtitan.rl.rollout.token_env import TokenEnv, TokenEnvOutput
-from torchtitan.rl.rollout.types import Completion
+from torchtitan.rl.rollout.types import Completion, split_prompt
 
 
 class _Config:
@@ -309,3 +310,127 @@ def test_delta_prompts_rebuild_the_full_prompt_samples() -> None:
             ] == expected
 
     asyncio.run(run())
+
+
+class _ScriptedTokenEnv:
+    """Each step builds the next prompt from the last prompt and completion with the next edit."""
+
+    def __init__(self, edits) -> None:
+        self.edits = list(edits)
+        self.prompt = [3, 4, 5]
+        self.previous_token_ids: list[int] = []
+
+    def _output(self) -> TokenEnvOutput:
+        prompt_prefix_len, _ = split_prompt(self.prompt, self.previous_token_ids)
+        return TokenEnvOutput(
+            next_prompt_token_ids=self.prompt,
+            next_prompt_prefix_len=prompt_prefix_len,
+            status=RolloutStatus.ONGOING,
+        )
+
+    async def init(self) -> TokenEnvOutput:
+        return self._output()
+
+    async def step(self, completion: Completion) -> TokenEnvOutput:
+        self.previous_token_ids = self.prompt + completion.token_ids
+        if not self.edits:
+            return TokenEnvOutput(
+                next_prompt_token_ids=None, status=RolloutStatus.COMPLETED
+            )
+        self.prompt = self.edits.pop(0)(self.prompt, completion.token_ids)
+        return self._output()
+
+
+class _RoutedGenerateFn:
+    """Returns routed expert rows as vLLM does: one per forward input, from
+    `routed_experts_prompt_start` on. Row `[call, position]` tells which call routed which position."""
+
+    def __init__(self, completions: list[list[int]]) -> None:
+        self.completions = list(completions)
+        self.starts: list[int] = []
+
+    async def __call__(
+        self, prompt_token_ids, *, request_id, sampling_config, **kwargs
+    ) -> Completion:
+        token_ids = self.completions.pop(0)
+        num_inputs = len(prompt_token_ids) + len(token_ids) - 1
+        start = sampling_config.routed_experts_prompt_start
+        positions = np.arange(start, num_inputs, dtype=np.uint8)
+        call = np.full_like(positions, len(self.starts))
+        self.starts.append(start)
+        return Completion(
+            min_policy_version=1,
+            max_policy_version=1,
+            request_id=request_id,
+            token_ids=token_ids,
+            token_logprobs=[-0.5] * len(token_ids),
+            routed_expert_ids=np.stack([call, positions], axis=1).reshape(-1, 2, 1),
+            finish_reason="stop",
+        )
+
+
+def test_routed_expert_ids_are_requested_once_per_position() -> None:
+    # Each turn asks vLLM only for the rows its sample lacks, through a rewritten history.
+    env = _ScriptedTokenEnv(
+        [
+            # turn 1 continues turn 0 with an env reply
+            lambda prompt, completion: prompt + completion + [20],
+            # turn 2 continues turn 1
+            lambda prompt, completion: prompt + completion + [21],
+            # turn 3 rewrites the history: it keeps only 4 of the previous 11 tokens
+            lambda prompt, completion: prompt[:4] + [22],
+            # turn 4 continues turn 3
+            lambda prompt, completion: prompt + completion + [23],
+        ]
+    )
+    generate_fn = _RoutedGenerateFn([[10, 11, 12], [13, 14], [15], [16, 17], [18, 19]])
+    worker = RolloutWorker(
+        SimpleNamespace(
+            rubric=_Config(None),
+            message_env=None,
+            token_env=None,
+            advantage=_Config(None),
+            thinking_budget=None,
+        )
+    )
+
+    async def release_session_fn(routing_session_id: str) -> None:
+        pass
+
+    rollout = asyncio.run(
+        worker._run_single_rollout(
+            generate_fn=generate_fn,
+            release_session_fn=release_session_fn,
+            env=env,
+            sampling=SamplingConfig(),
+            group_id=0,
+            rollout_id=0,
+        )
+    )
+    assert rollout.status == RolloutStatus.COMPLETED
+    rollout.advantage = 1.0
+    samples = (
+        TrainingSampleBuilder.Config().build().rollout_to_training_samples(rollout)
+    )
+
+    # Each turn starts at its prefix's last token: turn 3 shares 4 tokens with turn 2.
+    assert generate_fn.starts == [0, 5, 8, 3, 6]
+    # [call, position] per row: one row per trainer input, each position sent once. Sample 1
+    # copies the 3 rows it shares with sample 0 before turn 3's rows.
+    assert [sample.routed_expert_ids.reshape(-1, 2).tolist() for sample in samples] == [
+        [
+            [0, 0],
+            [0, 1],
+            [0, 2],
+            [0, 3],
+            [0, 4],
+            [1, 5],
+            [1, 6],
+            [1, 7],
+            [2, 8],
+            [2, 9],
+        ],
+        [[0, 0], [0, 1], [0, 2], [3, 3], [3, 4], [3, 5], [4, 6], [4, 7], [4, 8]],
+    ]
+    # 16 rows sent, against 38 for full-context calls.
+    assert sum(len(turn.routed_expert_ids) for turn in rollout.turns) == 16
