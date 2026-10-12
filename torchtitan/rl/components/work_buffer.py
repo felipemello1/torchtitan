@@ -29,6 +29,10 @@ from torchtitan.rl.rollout import RolloutGroup
 
 logger = logging.getLogger(__name__)
 
+# Sequences one generator DP shard runs at once when `generation_capacity` falls back to filling vLLM;
+# matches the controller's `max_num_seqs` cap.
+DEFAULT_SEQS_PER_GENERATOR_DP_SHARD = 512
+
 
 class _RolloutGroupWorkState(enum.Enum):
     """Where a RolloutGroupWork is in the WAITING -> INFLIGHT -> FINALIZED lifecycle."""
@@ -370,17 +374,18 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         generation_capacity: int | None = None
         """Most prompt groups generating at once; sizes rollout workers and vLLM `max_num_seqs`.
 
-        None: `2 * (max_offpolicy_steps + 1) * num_prompts_per_train_step`. A step consumes
-        `num_prompts_per_train_step / (1 - untrainable_share)` groups, trained and untrainable
-        (zero-std), so the groups worth keeping in flight grow with the untrainable share. The
-        factor 2 leaves room for up to half the groups being untrainable; the demand, under its
-        mean-age ceiling, picks how many run. vLLM admits only what fits in its KV cache and queues
-        the rest. Set it lower only for a hard limit outside the GPUs, e.g.
-        `sandboxes // num_samples_per_prompt`.
+        None, with `target_offpolicy_steps`: `2 * (target_offpolicy_steps + 1) * num_prompts_per_train_step`.
+        The demand stays under its mean-age ceiling near `(target + 1) * P`; the factor 2 leaves room for
+        up to half the groups being untrainable (zero-std), which a step consumes on top of `P`.
+        None, without `target_offpolicy_steps`: fill vLLM, `DEFAULT_SEQS_PER_GENERATOR_DP_SHARD` (512)
+        sequences per generator DP shard, `512 * num_generator_dp_shards // num_samples_per_prompt`.
+        Set it lower only for a hard limit outside the GPUs, e.g. `sandboxes // num_samples_per_prompt`.
 
         Example:
-            # max_offpolicy_steps=12, 16 prompts per step -> 2 * 13 * 16 = 416 groups at most
-            AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=12)
+            # target_offpolicy_steps=6, 48 prompts per step -> 2 * 7 * 48 = 672 groups at most
+            AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=10, target_offpolicy_steps=6)
+            # no target, 24 generator DP shards, 16 samples per prompt -> 512 * 24 // 16 = 768 groups
+            AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=10)
         """
 
         def __post_init__(self) -> None:
@@ -415,22 +420,44 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
                 raise ValueError(
                     f"damping_factor must be in (0, 1], got {self.damping_factor}"
                 )
-            if self.generation_capacity is None and self.max_offpolicy_steps is None:
-                raise ValueError(
-                    "set generation_capacity or max_offpolicy_steps: the default capacity "
-                    "is 2 * (max_offpolicy_steps + 1) * num_prompts_per_train_step"
-                )
             if self.generation_capacity is not None and self.generation_capacity < 1:
                 raise ValueError(
                     f"generation_capacity must be >= 1, got {self.generation_capacity}"
                 )
 
-        def resolve_generation_capacity(self, num_prompts_per_train_step: int) -> int:
-            """`generation_capacity`, or its default when None (see the field)."""
+        def resolve_generation_capacity(
+            self,
+            num_prompts_per_train_step: int,
+            *,
+            num_generator_dp_shards: int | None = None,
+            num_samples_per_prompt: int | None = None,
+        ) -> int:
+            """`generation_capacity`, or its default when None (see the field).
+
+            Without `target_offpolicy_steps` the default needs the generator layout, known once the
+            generators are spawned.
+
+            Example:
+                config = AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=10)
+                config.resolve_generation_capacity(
+                    48, num_generator_dp_shards=24, num_samples_per_prompt=16
+                )  # 768
+            """
             if self.generation_capacity is not None:
                 return self.generation_capacity
-            assert self.max_offpolicy_steps is not None
-            return 2 * (self.max_offpolicy_steps + 1) * num_prompts_per_train_step
+            if self.target_offpolicy_steps is not None:
+                return 2 * (self.target_offpolicy_steps + 1) * num_prompts_per_train_step
+            if num_generator_dp_shards is None or num_samples_per_prompt is None:
+                raise ValueError(
+                    "generation_capacity defaults to filling vLLM without target_offpolicy_steps, "
+                    "which needs num_generator_dp_shards and num_samples_per_prompt"
+                )
+            return max(
+                1,
+                DEFAULT_SEQS_PER_GENERATOR_DP_SHARD
+                * num_generator_dp_shards
+                // num_samples_per_prompt,
+            )
 
     def __init__(
         self,

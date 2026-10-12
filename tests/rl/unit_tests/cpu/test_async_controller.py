@@ -71,7 +71,7 @@ def test_controller_config_maybe_log(tmp_path, caplog) -> None:
     assert saved_config["trainer"]["training"]["max_context_length"] == 128
 
 
-def test_setup_async_caps_max_num_seqs_at_1024(monkeypatch, caplog) -> None:
+def test_setup_async_caps_max_num_seqs_per_generator(monkeypatch, caplog) -> None:
     from torchtitan.rl import controller as controller_module
 
     class _StopAfterSizing(Exception):
@@ -88,9 +88,9 @@ def test_setup_async_caps_max_num_seqs_at_1024(monkeypatch, caplog) -> None:
         data_parallel_degree=1,
     )
     async_loop = SimpleNamespace(
-        max_concurrent_rollout_groups=256,
+        resolve_max_concurrent_rollout_groups=lambda num_generator_dp_shards: 256,
         num_samples_per_prompt=16,
-        validation=SimpleNamespace(steps=0, freq=None, overlap_training=False),
+        validation=ValidationConfig(steps=0),
     )
     controller = SimpleNamespace(
         config=SimpleNamespace(
@@ -112,7 +112,12 @@ def test_setup_async_caps_max_num_seqs_at_1024(monkeypatch, caplog) -> None:
                 )
             )
 
-    assert "max_num_seqs=1024 per generator (rollout_concurrency=4096" in caplog.text
+    # 256 groups x 16 rollouts on one generator -> 4096, capped.
+    assert (
+        f"max_num_seqs={controller_module.MAX_NUM_SEQS_PER_GENERATOR} per generator "
+        "(rollout_concurrency=4096" in caplog.text
+    )
+    assert controller_module.MAX_NUM_SEQS_PER_GENERATOR == 512
 
 
 def _training_sample(*, group_id: int, rollout_id: int) -> TrainingSample:
@@ -921,6 +926,7 @@ def _run_with_generator_watcher(watcher) -> None:
         ),
     )
     controller.start_step = 0
+    controller._max_concurrent_rollout_groups = 1  # setup_async resolves this
     controller.trainer = None
     controller.trainer_dp_degree = 1
     controller.tokenizer = SimpleNamespace(eos_id=0)
@@ -961,13 +967,15 @@ def test_run_fails_when_the_engine_loops_exit_mid_run() -> None:
         _run_with_generator_watcher(exited)
 
 
-def _validation_rollout(versions: list[tuple[int, int]]) -> Rollout:
+def _validation_rollout(
+    versions: list[tuple[int, int]], reward: float = 1.0
+) -> Rollout:
     """One rollout with a turn per `(min_policy_version, max_policy_version)`."""
     return Rollout(
         group_id=-1,
         rollout_id=0,
         status=RolloutStatus.COMPLETED,
-        reward=1.0,
+        reward=reward,
         turns=[
             RolloutTurn(
                 rollout_id=RolloutTurnID(group_id=-1, rollout_id=0, turn_id=turn_id),
@@ -986,6 +994,9 @@ def _validation_rollout(versions: list[tuple[int, int]]) -> Rollout:
 def test_validation_logs_the_policies_its_rollouts_sampled() -> None:
     """A weight sync during a rollout shows as a newer max version and a mixed-policy rollout."""
     controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(validation=ValidationConfig())
+    )
     controller.generator_router = SimpleNamespace(
         release_groups=SimpleNamespace(call_one=AsyncMock())
     )
@@ -1012,6 +1023,51 @@ def test_validation_logs_the_policies_its_rollouts_sampled() -> None:
     assert reduced["validation/min_policy_version/min"] == 25
     assert reduced["validation/max_policy_version/max"] == 27
     assert reduced["validation/mixed_policy_rollouts/mean"] == 0.5
+
+
+def test_validation_with_several_samples_logs_pass_at_k() -> None:
+    """k=3 rollouts per prompt: pass@1 averages all rollouts, pass@3 counts prompts with a solve."""
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(
+            validation=ValidationConfig(num_samples_per_prompt=3, temperature=1.0)
+        )
+    )
+    controller.generator_router = SimpleNamespace(
+        release_groups=SimpleNamespace(call_one=AsyncMock())
+    )
+    run_group_rollouts = AsyncMock(
+        side_effect=[
+            RolloutGroup(
+                group_id=-1,
+                rollouts=[_validation_rollout([(0, 0)], r) for r in (1.0, 0.0, 0.2)],
+            ),
+            RolloutGroup(
+                group_id=-2,
+                rollouts=[_validation_rollout([(0, 0)], r) for r in (0.0, 0.5, 0.0)],
+            ),
+        ]
+    )
+    controller._rollouter = SimpleNamespace(run_group_rollouts=run_group_rollouts)
+
+    _, metrics = asyncio.run(
+        controller._collect_validation_rollouts(
+            samples=["a", "b"], sampling=SamplingConfig(temperature=1.0), step=10
+        )
+    )
+
+    assert {c.kwargs["group_size"] for c in run_group_rollouts.call_args_list} == {3}
+    reduced = m.MetricsProcessor._aggregate_metrics(metrics)
+    assert reduced["validation/pass_at_1/mean"] == pytest.approx(1 / 6)
+    assert reduced["validation/pass_at_3/mean"] == pytest.approx(0.5)
+    assert reduced["validation/best_of_3_reward/mean"] == pytest.approx(0.75)
+
+
+def test_validation_config_rejects_bad_sampling() -> None:
+    with pytest.raises(ValueError, match="num_samples_per_prompt"):
+        ValidationConfig(num_samples_per_prompt=0)
+    with pytest.raises(ValueError, match="temperature"):
+        ValidationConfig(temperature=-1.0)
 
 
 class _FakeValidation:
@@ -1310,6 +1366,10 @@ def test_overlapped_validation_before_and_after_training(
         ),
     )
     controller.start_step = 0
+    # setup_async resolves this
+    controller._max_concurrent_rollout_groups = (
+        controller.config.async_loop.max_concurrent_rollout_groups
+    )
     controller.trainer = Mock()
     controller.generator_router = Mock()
     # The engine loops run for the whole test.
@@ -1869,22 +1929,47 @@ def test_batcher_passes_the_version_that_trains_each_group() -> None:
     assert queue.qsize() == 3  # two batches and the None sentinel
 
 
-def test_generation_capacity_default_leaves_room_for_untrainable_groups() -> None:
-    config = AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=12)
-    # 2 x (12 + 1) versions x 16 prompts: room for up to half the groups being untrainable.
-    assert config.resolve_generation_capacity(16) == 416
-    loop = AsyncLoopConfig(num_prompts_per_train_step=16, group_buffer=config)
-    assert loop.max_concurrent_rollout_groups == 416
-    buffer = config.build(num_prompts_per_train_step=16)
-    assert _buffer_metric(buffer, "rollout_buffer/generation_capacity_groups") == 416
+def test_generation_capacity_default_follows_target_offpolicy_steps() -> None:
+    config = AdaptiveRolloutGroupWorkBuffer.Config(
+        max_offpolicy_steps=10, target_offpolicy_steps=6
+    )
+    # 2 x (6 + 1) versions x 48 prompts: room for up to half the groups being untrainable.
+    assert config.resolve_generation_capacity(48) == 672
+    loop = AsyncLoopConfig(num_prompts_per_train_step=48, group_buffer=config)
+    assert loop.max_concurrent_rollout_groups == 672
+    buffer = config.build(num_prompts_per_train_step=48)
+    assert _buffer_metric(buffer, "rollout_buffer/generation_capacity_groups") == 672
+
+
+def test_generation_capacity_default_without_target_fills_vllm() -> None:
+    config = AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=10)
+    # 512 sequences x 24 generator DP shards / 16 samples per prompt
+    assert (
+        config.resolve_generation_capacity(
+            48, num_generator_dp_shards=24, num_samples_per_prompt=16
+        )
+        == 768
+    )
+    loop = AsyncLoopConfig(
+        num_prompts_per_train_step=48, num_samples_per_prompt=16, group_buffer=config
+    )
+    assert loop.resolve_max_concurrent_rollout_groups(num_generator_dp_shards=12) == 384
+    # Without the generator layout the default can't be computed.
+    with pytest.raises(ValueError, match="needs num_generator_dp_shards"):
+        loop.max_concurrent_rollout_groups
+
+
+def test_generation_capacity_explicit_overrides_default() -> None:
     explicit = AdaptiveRolloutGroupWorkBuffer.Config(
-        max_offpolicy_steps=12, generation_capacity=96
+        max_offpolicy_steps=12, target_offpolicy_steps=6, generation_capacity=96
     )
     assert explicit.resolve_generation_capacity(16) == 96
-    with pytest.raises(
-        ValueError, match="set generation_capacity or max_offpolicy_steps"
-    ):
-        AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=None)
+    assert (
+        explicit.resolve_generation_capacity(
+            16, num_generator_dp_shards=24, num_samples_per_prompt=16
+        )
+        == 96
+    )
 
 
 def test_adaptive_buffer_warns_once_when_generation_capacity_caps_demand(
