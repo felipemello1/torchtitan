@@ -644,30 +644,31 @@ def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) ->
     )
 
     loop = config.async_loop
-    assert (loop.num_prompts_per_train_step, loop.num_samples_per_prompt) == (24, 16)
+    assert (loop.num_prompts_per_train_step, loop.num_samples_per_prompt) == (22, 16)
     assert loop.num_training_steps == 300
     assert loop.group_buffer == AdaptiveRolloutGroupWorkBuffer.Config(
         target_offpolicy_steps=6,
-        max_offpolicy_steps=12,
-        start_batches=7,
-        generation_capacity=163,
+        max_offpolicy_steps=10,
+        start_batches=5,
+        generation_capacity=120,
     )
     assert loop.validation == ValidationConfig(steps=78, freq=10, overlap_training=True)
     assert loop.training_sample_builder.drop_zero_std_reward_groups
     assert config.rollouter.rubric.length_reward_weight == 0.0
     assert config.rollouter.thinking_budget.max_thinking_tokens == 4096
-    # The pool, (6 + 1) x 24 x 16, holds every rollout of the cap's groups.
+    # The env server runs the 2,000-VM pool; training groups plus a validation pass fit in it.
     serve = config.rollouter.verifiers_env_server.serve
-    assert serve.pool.num_workers * serve.max_concurrent == 2688
-    # Training groups plus a validation pass fit in the sandbox pool.
-    assert loop.max_concurrent_rollout_groups * 16 + loop.validation.steps <= 2688
+    assert serve.pool.num_workers * serve.max_concurrent >= 2000
+    assert loop.max_concurrent_rollout_groups * 16 + loop.validation.steps <= 2000
+    assert config.rollouter.training_dataloader.zero_spread_skip.min_mean_reward == 0.9
     assert config.generator.hold_session_kv
     assert not config.generator.reset_kv_cache_on_weight_sync
-    assert config.generator.session_kv_free_floor > 0.03  # vLLM's watermark
+    assert config.generator.session_kv_free_floor > 0.1  # vLLM's watermark
+    assert config.generator.kv_offload_gib == 96
 
     trainer = config.trainer
     (optimizer,) = trainer.optim.optimizer.optimizers
-    assert optimizer.lr == 1e-5
+    assert optimizer.lr == 5e-6
     assert trainer.optim.lr_scheduler.warmup_steps == 10
     assert trainer.checkpointer.interval == 10
     assert trainer.checkpointer.async_mode == "disabled"
@@ -675,4 +676,4 @@ def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) ->
     assert trainer.loss.loss_fn.max_ratio == 2.0
     assert config.generator.sampling.num_topk_logprobs == 32
     assert config.generator.return_routed_experts
-    assert config.generator.extra_vllm_engine_args == {"watermark": 0.03}
+    assert config.generator.extra_vllm_engine_args == {"watermark": 0.1}

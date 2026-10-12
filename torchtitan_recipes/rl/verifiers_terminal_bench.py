@@ -37,7 +37,7 @@ from torchtitan.distributed.activation_checkpoint import FullAC, RegionAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 from torchtitan.models.qwen3_5 import build_model_config
-from torchtitan.rl.components.data import IterableRLDataLoader
+from torchtitan.rl.components.data import IterableRLDataLoader, ZeroSpreadSkip
 from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
@@ -614,28 +614,30 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     launch knobs (`DOME_SANDOQ_POOL`, `DOME_V2_*`) fixed in code.
 
     Changes from the 1x2 recipe:
-    - 24 prompts x 16 samples per step (was 12) for 300 steps (was 150);
-    - lr 1e-5 with a 10-step warmup (was 1e-6, constant);
+    - 22 prompts x 16 samples per step (was 12) for 300 steps (was 150);
+    - lr 5e-6 with a 10-step warmup (was 1e-6, constant);
     - `ScoreCenteringLoss` with the generator's top-32 logprobs (was DAPO);
-    - the adaptive rollout buffer, mean policy age <= 6 and max 12 (was a fixed 5-step buffer);
+    - the adaptive rollout buffer, mean policy age <= 6 and max 10 (was a fixed 5-step buffer);
     - no length reward, so all-pass and all-fail groups are dropped (was weight 0.1);
+    - tasks whose group came back all pass are skipped in later epochs, then re-checked;
     - a 4,096-token thinking budget per turn (was 12,288);
-    - each session's prefix stays held between its turns;
+    - each session's prefix stays held between its turns, and idle sessions' KV spills to CPU;
     - router replay (was off);
-    - 2,688 Sandoq VMs, one per rollout of the 168 groups the buffer starts with;
+    - vLLM watermark 0.1 (was 0.03);
+    - 2,000 Sandoq VMs (was 2,688), which cap the groups in flight at 120;
     - a synchronous save every 10 steps (was async).
 
     DOME's `--train-iters` and `--save-interval` still override the steps and the save interval.
     """
-    num_prompts_per_train_step = 24
+    num_prompts_per_train_step = 22
     num_samples_per_prompt = 16
+    # Sandoq VMs the run holds, ~80% of (6 + 1) x 22 x 16; generation_capacity below keeps the
+    # groups in flight within it.
+    sandbox_pool = 2000
+    # Host RAM per generator for vLLM's CPU KV offload. PLACEHOLDER: confirm before launch. Four
+    # engines per host share its /dev/shm (DOME runs with --ipc=host; ~477 GB on a GB300 host).
+    kv_offload_gib = 96
     target_offpolicy_steps = 6
-    # (6 + 1) x 24 x 16 = 2,688: the buffer at a mean policy age of 6, with no group dropped.
-    sandbox_pool = (
-        (target_offpolicy_steps + 1)
-        * num_prompts_per_train_step
-        * num_samples_per_prompt
-    )
     # The 78 Terminal-Bench 2.1 tasks that fit a small Sandoq VM, one greedy rollout each.
     num_validation_samples = 78
     expert_parallel_degree = 4
@@ -647,7 +649,7 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
         max_turns=150,
         sandbox_pool=sandbox_pool,
         # At most 24 rollouts per env-server worker: each waiting rollout holds one of the worker's
-        # 32 executor threads, and Sandoq needs a free thread to ready a VM. 112 workers.
+        # 32 executor threads, and Sandoq needs a free thread to ready a VM. 84 workers.
         num_env_workers=math.ceil(sandbox_pool / 24),
         num_validation_samples=num_validation_samples,
         num_generators=8,
@@ -664,10 +666,10 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     loop.num_training_steps = 300
     loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
         target_offpolicy_steps=target_offpolicy_steps,
-        max_offpolicy_steps=12,
-        # Start at (6 + 1) x 24 = 168 groups, the pool; the default 3 x 24 leaves 57% of it idle.
-        start_batches=target_offpolicy_steps + 1,
-        # Leave validation its sandboxes.
+        max_offpolicy_steps=10,
+        # Start at 5 x 22 = 110 groups: 1,760 rollouts, 88% of the pool.
+        start_batches=5,
+        # (2,000 - 78) // 16 = 120 groups: leave validation its sandboxes.
         generation_capacity=(sandbox_pool - num_validation_samples)
         // num_samples_per_prompt,
     )
@@ -688,6 +690,11 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     # The last 1x2 run's budget: a turn still thinking after 4,096 tokens gets a forced end of
     # thinking, which leaves the rest of its 16,384 tokens for the command.
     config.rollouter.thinking_budget = ThinkingBudget.Config(max_thinking_tokens=4096)
+    # A task whose 16 rollouts all pass is skipped in later epochs, then re-checked; all-fail tasks
+    # keep coming back.
+    config.rollouter.training_dataloader.zero_spread_skip = ZeroSpreadSkip(
+        min_mean_reward=0.9
+    )
 
     trainer = config.trainer
     # Recompute every op in the block except the Dist-MoE call, which is never recomputed.
@@ -702,13 +709,13 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     trainer = apply_transforms(trainer, [DistMoeTransform(inplace_wgrad_accum=False)])
     config.trainer = trainer
     (optimizer,) = trainer.optim.optimizer.optimizers
-    # 10x the 1x2 recipe's lr: at 1e-6 and one optimizer step per batch the policy moved too
-    # slowly. A fresh run ramps to it linearly over 10 steps, then holds it.
-    optimizer.lr = 1e-5
+    # 5x the 1x2 recipe's lr: at 1e-6 the policy moved too slowly, and at 1e-5 it grew verbose by
+    # step 18. A fresh run ramps to it linearly over 10 steps, then holds it.
+    optimizer.lr = 5e-6
     trainer.optim.lr_scheduler.warmup_steps = 10
     trainer.checkpointer.interval = 10
     # Synchronous saves: an async save stages a ~420 GB CPU copy of the trainer state on host 0,
-    # which also runs the controller and 112 env-server workers. The trainer mostly waits for
+    # which also runs the controller and 84 env-server workers. The trainer mostly waits for
     # batches, so a blocking save costs little.
     trainer.checkpointer.async_mode = "disabled"
     # Score centering (arXiv 2609.20807) cancels the drift a trainer/generator mismatch adds.
@@ -726,12 +733,20 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     # k = 32 matched full-vocabulary score centering in every setting of the paper, whose default
     # is 128.
     generator.sampling.num_topk_logprobs = 32
-    # Admit a request only while 3% of KV blocks stay free, so running requests have room to
-    # grow before vLLM preempts one.
-    generator.extra_vllm_engine_args = {"watermark": 0.03}
-    # Hold each session's prefix (attention + GDN state) between its turns; below 5% free blocks
-    # (`session_kv_free_floor`), release the sessions idle longest.
-    generator.hold_session_kv = True
+    # replace() re-runs VLLMGenerator.Config's checks (free floor above the watermark).
+    config.generator = dataclasses.replace(
+        generator,
+        # Admit a request only while 10% of KV blocks stay free, so running requests have room to
+        # grow before vLLM preempts one.
+        extra_vllm_engine_args={"watermark": 0.1},
+        # Hold each session's prefix (attention + GDN state) between its turns; below 12% free
+        # blocks, release the sessions idle longest. Above the watermark, or held blocks stall
+        # every waiting turn.
+        hold_session_kv=True,
+        session_kv_free_floor=0.12,
+        # A session whose KV left the GPU reloads its history from CPU instead of recomputing it.
+        kv_offload_gib=kv_offload_gib,
+    )
     return config
 
 
