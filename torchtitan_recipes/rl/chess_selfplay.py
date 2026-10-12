@@ -407,12 +407,14 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
     trainer.dist_moe_runtime = DistMoeRuntime.Config(
         scratch_capacity_factor=float(expert_parallel_degree)
     )
-    # Fresh weights: ramp to 5e-6 over 10 steps, then hold it.
-    trainer.optim.optimizer.optimizers[0].lr = 5e-6
-    trainer.optim.lr_scheduler.warmup_steps = 10
+    # Constant 3e-6, no warmup: at 5e-6 self-play move quality slid from step ~23.
+    trainer.optim.optimizer.optimizers[0].lr = 3e-6
+    trainer.optim.lr_scheduler.warmup_steps = 0
     # Synchronous saves: an async save's CPU copy of the 35B state (~420 GB) on top of the batch
     # can exceed the trainer host's job memory.
     trainer.checkpointer.async_mode = "disabled"
+    # A step-1 save (~190 s, 420 GB upload) holds weights one update from the HF checkpoint.
+    trainer.checkpointer.enable_first_step_checkpoint = False
     # Dist-MoE experts on the trainer's model only; the generators keep stock experts. The
     # functional WGRAD path, as the GB300 Terminal-Bench 35B runs use.
     config.trainer = apply_transforms(
