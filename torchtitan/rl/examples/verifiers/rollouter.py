@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass, field, replace
 from typing import Any, TYPE_CHECKING
 
@@ -37,6 +38,7 @@ from torchtitan.rl.examples.verifiers.generation_server import (
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 from torchtitan.rl.rollout.rubric import RewardFn, Rubric
+from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
 from torchtitan.rl.rollout.types import (
     GenerateFn,
     ReleaseSessionFn,
@@ -117,6 +119,9 @@ class VerifiersRollouter(Rollouter):
         generation_server: GenerationServer.Config
         """Local HTTP bridge from Verifiers to TitanRL generation."""
 
+        thinking_budget: ThinkingBudget.Config | None = None
+        """Caps thinking per turn by forcing its end; None leaves replies to `max_tokens`."""
+
         renderer_multiplex: int = 256
         """Maximum concurrent rollouts sharing one Verifiers renderer instance.
 
@@ -164,6 +169,7 @@ class VerifiersRollouter(Rollouter):
         self._generation_server: GenerationServer | None = None
         self._verifiers_env_client: VerifiersEnvClient | None = None
         self._verifiers_train_client_config: VerifiersTrainClientConfig | None = None
+        self._thinking_budget: ThinkingBudget | None = None
 
     async def setup_async(
         self,
@@ -173,9 +179,12 @@ class VerifiersRollouter(Rollouter):
         hf_assets_path: str,
     ) -> None:
         """Start the EnvServer and connect it to TorchTitan generation."""
-        del tokenizer_config
         if self._verifiers_env_client is not None:
             return
+        if self._verifiers_config.thinking_budget is not None:
+            self._thinking_budget = self._verifiers_config.thinking_budget.build(
+                tokenizer=tokenizer_config.build(tokenizer_path=hf_assets_path)
+            )
         if not isinstance(renderer_config, RenderersConfigAdapter):
             raise ValueError(
                 "Verifiers requires a renderer configured with from_renderers(...) "
@@ -247,6 +256,8 @@ class VerifiersRollouter(Rollouter):
         del release_session_fn
         if self._generation_server is None:
             raise RuntimeError("Verifiers rollouter is not initialized")
+        if self._thinking_budget is not None:
+            generate_fn = self._thinking_budget.wrap(generate_fn)
         generate_fns = self._generation_server.generate_fns
         generate_fns[group_id] = generate_fn
         try:
@@ -391,7 +402,8 @@ class VerifiersRollouter(Rollouter):
         turn receives the conservative min/max policy-version span accumulated
         by the generation server for the whole rollout. Generator metrics are
         attached once to avoid double counting. A turn's top-k rows come from the
-        generation whose prompt length and completion tokens match its node.
+        generation whose prompt length and completion tokens match its node. A completion
+        with appended tokens gets back its loss mask, and NaN logprobs on those tokens.
         """
         if generation_metadata is None:
             if any(any(node.mask) for node in trace.nodes):
@@ -452,6 +464,16 @@ class VerifiersRollouter(Rollouter):
                     previous_token_ids = token_ids[:absolute_end]
                     # Completion rows of this span: sampled tokens before `start` in the node.
                     row = sum(node.mask[:start])
+                    completion_token_ids = token_ids[absolute_start:absolute_end]
+                    completion_logprobs = np.asarray(
+                        logprobs[absolute_start:absolute_end], dtype=np.float32
+                    )
+                    loss_mask = generation_metadata.loss_masks.get(
+                        tuple(completion_token_ids)
+                    )
+                    if loss_mask is not None:
+                        loss_mask = np.asarray(loss_mask, dtype=bool)
+                        completion_logprobs[~loss_mask] = math.nan
                     turns.append(
                         RolloutTurn(
                             rollout_id=RolloutTurnID(
@@ -462,11 +484,10 @@ class VerifiersRollouter(Rollouter):
                             prompt_prefix_len=prompt_prefix_len,
                             prompt_delta_token_ids=prompt_delta_token_ids,
                             completion_token_ids=np.asarray(
-                                token_ids[absolute_start:absolute_end], dtype=np.int32
+                                completion_token_ids, dtype=np.int32
                             ),
-                            completion_logprobs=np.asarray(
-                                logprobs[absolute_start:absolute_end], dtype=np.float32
-                            ),
+                            completion_logprobs=completion_logprobs,
+                            completion_loss_mask=loss_mask,
                             routed_expert_ids=(
                                 None
                                 if routed_expert_ids is None
