@@ -453,10 +453,11 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300_lr1e6() -> Controller.Config:
 
 
 def rl_chess_qwen3_5_35b_a3b_base_gb300_zero_sum() -> Controller.Config:
-    """`rl_chess_qwen3_5_35b_a3b_base_gb300` at lr 1e-6 with a zero-sum mate (10 / -9) and 48 positions
-    per step, to resume a run. With the mated side losing only ~0.25, self-play stopped defending:
-    82% of mates followed a one-move blunder that another move avoided."""
-    config = rl_chess_qwen3_5_35b_a3b_base_gb300(num_prompts_per_train_step=48)
+    """`rl_chess_qwen3_5_35b_a3b_base_gb300` at lr 1e-6 with a zero-sum mate (10 / -9), to resume a run.
+    With the mated side losing only ~0.25, self-play stopped defending: 82% of mates followed a
+    one-move blunder that another move avoided. 48 positions per step (336 groups in flight) filled
+    the KV cache to its 85% floor and re-prefilled evicted histories, so the batch stays at 32."""
+    config = rl_chess_qwen3_5_35b_a3b_base_gb300()
     config.trainer.optim.optimizer.optimizers[0].lr = 1e-6
     config.trainer.checkpointer.enable_first_step_checkpoint = False
     worker = config.rollouter.worker
