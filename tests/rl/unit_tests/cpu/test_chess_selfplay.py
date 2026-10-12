@@ -574,6 +574,10 @@ class _ScriptedPolicy:
         )
 
 
+async def _release_no_session(*, routing_session_id: str) -> None:
+    pass
+
+
 async def _run_group(
     moves_by_rollout,
     *,
@@ -581,6 +585,7 @@ async def _run_group(
     sample=_SELF_PLAY,
     truncate_at=None,
     checkmate_reward=1.0,
+    release_session_fn=_release_no_session,
     force_close_at=(),
     forced_close_advantage_cap=None,
 ):
@@ -609,14 +614,10 @@ async def _run_group(
         truncate_at=truncate_at,
         force_close_at=force_close_at,
     )
-
-    async def release_session(*, routing_session_id: str) -> None:
-        pass
-
     return await asyncio.wait_for(
         worker.run_group(
             generate_fn=policy,
-            release_session_fn=release_session,
+            release_session_fn=release_session_fn,
             sample=sample,
             group_id=0,
             group_size=group_size,
@@ -794,9 +795,18 @@ def test_worker_centers_an_infra_error_as_if_its_game_ended_at_the_cap() -> None
 
 def test_worker_drops_a_player_that_never_moved() -> None:
     async def run() -> None:
-        group = await _run_group({0: ["Ke9"], 1: []}, group_size=1)
+        released: list[str] = []
+
+        async def release_session(*, routing_session_id: str) -> None:
+            released.append(routing_session_id)
+
+        group = await _run_group(
+            {0: ["Ke9"], 1: []}, group_size=1, release_session_fn=release_session
+        )
         assert [rollout.rollout_id for rollout in group.rollouts] == [0]
         assert group.rollouts[0].reward == -1.0
+        # White's rollout releases its routing session; Black never generated, so it has none.
+        assert released == ["group=0/rollout=0"]
 
     asyncio.run(run())
 
