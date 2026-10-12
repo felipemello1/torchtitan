@@ -339,6 +339,54 @@ def test_verifiers_trace_attaches_env_replies_to_the_preceding_turn() -> None:
     ]
 
 
+def test_verifiers_rollout_releases_its_session_when_it_ends() -> None:
+    """A finished rollout releases its trace's session at once, not when its group ends."""
+    released = []
+
+    async def release_session(*, routing_session_id: str) -> None:
+        released.append(routing_session_id)
+
+    span = SimpleNamespace(duration=0.0)
+    trace = SimpleNamespace(
+        id="trace-1",
+        agent=SimpleNamespace(trainable=True),
+        ok=False,
+        nodes=[],
+        task=SimpleNamespace(key="task-1"),
+        stop_condition="error",
+        errors=[],
+        timing=SimpleNamespace(
+            setup=span,
+            agent=SimpleNamespace(duration=0.0, model=span, harness=span),
+            scoring=span,
+        ),
+        calls=[],
+    )
+    episode = SimpleNamespace(ok=False, errors=[], traces=[trace])
+
+    async def run(**kwargs):
+        return episode
+
+    rollouter = object.__new__(VerifiersRollouter)
+    rollouter._generation_server = SimpleNamespace(
+        model_id="model", pop_generation_metadata=lambda session_id: None
+    )
+    rollouter._verifiers_env_client = SimpleNamespace(run=run)
+    rollouter._verifiers_train_client_config = object()
+
+    asyncio.run(
+        rollouter._run_single_rollout(
+            release_session_fn=release_session,
+            sample=VerifiersTaskSample(verifiers_task_data={}),
+            sampling=SamplingConfig(stop_token_ids=[0]),
+            group_id=3,
+            rollout_id=0,
+        )
+    )
+
+    assert released == ["trace-1"]
+
+
 def test_verifiers_rollout_logs_keep_the_failure_reason(caplog) -> None:
     from verifiers.v1.trace import Error
 
@@ -804,6 +852,7 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
     with caplog.at_level(logging.WARNING):
         rollout = asyncio.run(
             rollouter._run_single_rollout(
+                release_session_fn=AsyncMock(),
                 sample=VerifiersTaskSample(verifiers_task_data={"name": "huge-task"}),
                 sampling=SamplingConfig(),
                 group_id=1,
@@ -834,7 +883,9 @@ def test_rollouter_registers_the_groups_generate_fn_while_it_runs() -> None:
         validation_rollout_can_end = asyncio.Event()
         seen: list[tuple[int, str]] = []
 
-        async def run_single_rollout(*, sample, sampling, group_id, rollout_id):
+        async def run_single_rollout(
+            *, release_session_fn, sample, sampling, group_id, rollout_id
+        ):
             seen.append((group_id, rollouter._generation_server.generate_fns[group_id]))
             if group_id == -1:
                 await validation_rollout_can_end.wait()
@@ -880,7 +931,9 @@ def test_rollouter_removes_the_groups_generate_fn_when_a_rollout_raises() -> Non
     ).build()
     rollouter._thinking_budget = None
 
-    async def run_single_rollout(*, sample, sampling, group_id, rollout_id):
+    async def run_single_rollout(
+        *, release_session_fn, sample, sampling, group_id, rollout_id
+    ):
         raise RuntimeError("sandbox lost")
 
     rollouter._run_single_rollout = run_single_rollout
