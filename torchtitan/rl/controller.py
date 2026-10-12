@@ -1313,7 +1313,9 @@ class Controller(Configurable):
                 "Training done; waiting for "
                 f"{sorted(task.get_name() for task in self._extra_validation_tasks.values())}"
             )
-            await asyncio.gather(*self._extra_validation_tasks.values())
+            await asyncio.gather(
+                *self._extra_validation_tasks.values(), return_exceptions=True
+            )
             self._log_finished_extra_validations(step=num_training_steps, wait=True)
         if pre_validation_task is not None:
             pre_validation = m.MetricsProcessor._aggregate_metrics(
@@ -1409,17 +1411,26 @@ class Controller(Configurable):
 
     def _log_finished_extra_validations(self, *, step: int, wait: bool = False) -> None:
         """Log every extra validation pass that has ended (all of them with `wait`, which the
-        caller must have awaited) at `step`; re-raise a pass's error."""
+        caller must have awaited) at `step`. A failed pass is logged as
+        `validation/{name}/pass_errors` and does not stop training; the set's next pass starts on
+        schedule."""
         for name, task in list(self._extra_validation_tasks.items()):
             if not task.done():
                 if wait:
                     raise RuntimeError(f"{task.get_name()} has not ended")
                 continue
             del self._extra_validation_tasks[name]
-            logger.info(f"{task.get_name()} ended; logging it at step {step}")
-            self.metrics_processor.log(
-                step=step, metrics=task.result(), is_validation=True
-            )
+            error = task.exception()
+            if error is not None:
+                logger.error(
+                    f"Validation set {name!r} failed ({task.get_name()}); training continues",
+                    exc_info=error,
+                )
+                metrics = [m.Metric(f"validation/{name}/pass_errors", m.Sum(1))]
+            else:
+                logger.info(f"{task.get_name()} ended; logging it at step {step}")
+                metrics = task.result()
+            self.metrics_processor.log(step=step, metrics=metrics, is_validation=True)
 
     async def _step_extra_validations(
         self, *, step: int, num_training_steps: int
