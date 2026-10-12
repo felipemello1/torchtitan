@@ -58,6 +58,10 @@ class ThinkingBudget(Configurable):
         """How many of a rollout's first turns think up to `opening_max_thinking_tokens`. Leave at 0
         on the Verifiers path, which wraps one `GenerateFn` per group, not per rollout."""
 
+        force_close_on_stop: bool = True
+        """A reply that samples its stop token before `think_end_token`: True drops the stop token and
+        forces the close; False returns it unchanged, so the env reads its thinking text as the answer."""
+
         close_text: str = (
             "\n\nConsidering the limited time by the user, I have to give the solution based on "
             "the thinking directly now.\n</think>\n\n"
@@ -87,6 +91,7 @@ class ThinkingBudget(Configurable):
         self._max_thinking_tokens = config.max_thinking_tokens
         self._opening_max_thinking_tokens = config.opening_max_thinking_tokens
         self._opening_turns = config.opening_turns
+        self._force_close_on_stop = config.force_close_on_stop
         self._think_start_id = tokenizer.token_to_id(config.think_start_token)
         self._think_end_id = tokenizer.token_to_id(config.think_end_token)
         if self._think_start_id is None or self._think_end_id is None:
@@ -149,14 +154,14 @@ class ThinkingBudget(Configurable):
             )
             if first is None:
                 return None
-            # A reply that samples its stop token before </think> has no answer: drop the stop token
-            # and force the close, as when the budget runs out.
+            # A reply that samples its stop token before </think> has not answered: with
+            # `force_close_on_stop`, drop the stop token and force the close, as when the budget runs out.
             # TODO: the dropped stop token is never trained against; watch stopped_while_thinking_rate.
             stopped_while_thinking = (
                 first.finish_reason == "stop"
                 and self._is_thinking(prompt_token_ids + first.token_ids)
             )
-            if stopped_while_thinking:
+            if stopped_while_thinking and self._force_close_on_stop:
                 # The stop token's top-k row and its input's routed-expert row go with it.
                 first = replace(
                     first,
@@ -188,7 +193,10 @@ class ThinkingBudget(Configurable):
                     m.Metric("thinking_budget/forced_close_rate", m.Mean(0.0))
                 )
                 first.metrics.append(
-                    m.Metric("thinking_budget/stopped_while_thinking_rate", m.Mean(0.0))
+                    m.Metric(
+                        "thinking_budget/stopped_while_thinking_rate",
+                        m.Mean(float(stopped_while_thinking)),
+                    )
                 )
                 return first
 

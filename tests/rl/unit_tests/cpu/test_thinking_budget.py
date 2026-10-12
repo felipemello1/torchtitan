@@ -248,6 +248,22 @@ def test_reply_that_stops_while_thinking_gets_a_forced_close() -> None:
     assert _stopped_while_thinking_rate(completion) == 1.0
 
 
+def test_force_close_on_stop_off_returns_a_stopped_reply_as_is() -> None:
+    # no second call: the end of turn stays, and nothing is forced or masked
+    stopped = _completion([10, 11, END_OF_TURN], finish_reason="stop")
+    generate = _ScriptedGenerate(stopped)
+    budget = ThinkingBudget(
+        ThinkingBudget.Config(max_thinking_tokens=4, force_close_on_stop=False),
+        tokenizer=_Tokenizer(),
+    )
+    completion = _run(budget, generate, prompt=[5, THINK])
+    assert len(generate.calls) == 1
+    assert completion.token_ids == [10, 11, END_OF_TURN]
+    assert completion.loss_mask is None
+    assert _forced_close_rate(completion) == 0.0
+    assert _stopped_while_thinking_rate(completion) == 1.0
+
+
 def test_reply_that_stops_while_thinking_drops_the_stop_tokens_rows() -> None:
     # prompt [5, THINK]; first call [10, 11, END_OF_TURN] -> [10, 11]; forced [90, 91, 92]; second [20]
     stopped = _completion([10, 11, END_OF_TURN], finish_reason="stop")
