@@ -948,6 +948,35 @@ def test_curriculum_prepare_resolves_the_bot() -> None:
     assert curriculum.prepare(_SELF_PLAY, step=0) == _SELF_PLAY
 
 
+def test_curriculum_ramps_the_ply_cap_with_the_step() -> None:
+    curriculum = ChessCurriculum.Config(
+        start_max_plies=60, end_max_plies=120, max_plies_ramp_steps=200
+    ).build()
+    caps = [
+        curriculum.prepare(_SELF_PLAY, step=step).max_plies
+        for step in (0, 1, 100, 199, 200, 300)
+    ]
+    assert caps == [60, 60, 90, 120, 120, 120]
+    # without a ramp the worker's max_plies applies
+    assert ChessCurriculum.Config().build().prepare(_SELF_PLAY, step=100) == _SELF_PLAY
+
+
+def test_worker_plays_to_the_samples_ply_cap() -> None:
+    async def run() -> None:
+        # the worker's cap is 40; this sample's game ends at ply 2
+        group = await _run_group(
+            {0: ["e4"], 1: ["e5"]},
+            group_size=1,
+            sample=replace(_SELF_PLAY, max_plies=2),
+        )
+        reduced = _reduced_metrics(group.rollouts)
+        assert reduced["chess_games/end_self_play/ply_limit/mean"] == 1.0
+        assert reduced["chess_games/plies_self_play/mean"] == 2.0
+        assert reduced["chess_games/max_plies_self_play/mean"] == 2.0
+
+    asyncio.run(run())
+
+
 def test_curriculum_summarize_reads_each_games_win() -> None:
     curriculum = ChessCurriculum.Config(bots=("sf_random",)).build()
     sample = curriculum.prepare(

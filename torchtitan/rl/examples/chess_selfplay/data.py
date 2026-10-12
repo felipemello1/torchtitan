@@ -41,6 +41,8 @@ class ChessSample:
     """Keeps validation metrics apart: they log under `val_chess_*` instead of `chess_*`."""
     curriculum_level: int | None = None
     """On a "curriculum" game, the index of its bot in `ChessCurriculum.Config.bots`; None otherwise."""
+    max_plies: int | None = None
+    """This game's ply cap; None: the worker's `max_plies`. `ChessCurriculum` sets it on a schedule."""
 
 
 class ChessSelfPlayDataset(RLDataset):

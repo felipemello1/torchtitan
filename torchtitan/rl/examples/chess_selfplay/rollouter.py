@@ -145,7 +145,9 @@ class ChessSelfPlayWorker(RolloutWorker):
         games = [
             ChessGame(
                 sample=sample,
-                max_plies=self._max_plies,
+                max_plies=self._max_plies
+                if sample.max_plies is None
+                else sample.max_plies,
                 seed=sample.seed + game_idx,
                 bot=bot,
                 checkmate_reward=self._checkmate_reward,
@@ -382,6 +384,7 @@ def _game_metrics(
         chess_strength/acpl_{self_play,vs_bot}      Stockfish centipawn loss of the policy's moves
         chess_games/reward_{self_play,vs_bot}       mean training reward
         chess_games/plies_{self_play,vs_bot}        game length
+        chess_games/max_plies_{self_play,vs_bot}    the games' ply cap
         chess_games/forfeits_per_reply_{self_play,vs_bot}
         chess_games/end_{self_play,vs_bot}/<end>    share of games ending in checkmate, draw,
                                                     ply_limit, illegal_move, reply_too_long, context_full, error
@@ -417,6 +420,10 @@ def _game_metrics(
         m.Metric(
             f"{games_section}/plies_{kind}",
             m.Mean.from_list([game.num_plies for game in games]),
+        ),
+        m.Metric(
+            f"{games_section}/max_plies_{kind}",
+            m.Mean.from_list([game.max_plies for game in games]),
         ),
         m.Metric(
             f"{games_section}/forfeits_per_reply_{kind}",
