@@ -1901,4 +1901,3 @@ def test_adaptive_buffer_warns_once_when_generation_capacity_caps_demand(
     asyncio.run(run())
     warnings = [r for r in caplog.records if "> generation_capacity 10" in r.message]
     assert len(warnings) == 1
-

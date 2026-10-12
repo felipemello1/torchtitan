@@ -1421,7 +1421,10 @@ class Controller(Configurable):
                     # to_thread: both wait for an in-flight sample read; don't block the loop on it.
                     await asyncio.to_thread(
                         self._rollouter.acknowledge_training_sample_ids,
-                        [*packed.group_ids, *self._group_buffer.pop_dropped_group_ids()],
+                        [
+                            *packed.group_ids,
+                            *self._group_buffer.pop_dropped_group_ids(),
+                        ],
                     )
                     controller_state = {
                         DATALOADER_STATE_KEY: await asyncio.to_thread(
@@ -1454,7 +1457,9 @@ class Controller(Configurable):
             # rollout related metrics here, or move all of them to the rollouter.
             time_metrics = step_timer.flush()
             # to_thread: the loader's metrics wait for an in-flight sample read; don't block the loop on it.
-            data_metrics = await asyncio.to_thread(self._rollouter.training_data_metrics)
+            data_metrics = await asyncio.to_thread(
+                self._rollouter.training_data_metrics
+            )
             with sl.log_trace_span("metrics_log"):
                 self.metrics_processor.log(
                     step=step,

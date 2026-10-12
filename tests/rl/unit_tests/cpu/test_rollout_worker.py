@@ -10,8 +10,9 @@ import asyncio
 import random
 from types import SimpleNamespace
 
-from renderers import ParsedResponse, Qwen3RendererConfig
 import torch
+
+from renderers import ParsedResponse, Qwen3RendererConfig
 
 from torchtitan.components.renderer import from_renderers
 

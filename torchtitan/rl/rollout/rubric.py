@@ -104,7 +104,10 @@ class Rubric(Configurable):
         reward is used. If None, the reward fns run on the errored rollout."""
 
     def __init__(self, config: Config) -> None:
-        if config.truncation_reward is not None and config.truncation_penalty is not None:
+        if (
+            config.truncation_reward is not None
+            and config.truncation_penalty is not None
+        ):
             raise ValueError(
                 "set truncation_reward (a fixed score) or truncation_penalty (added to the "
                 "reward fns' score), not both"

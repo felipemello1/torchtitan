@@ -643,7 +643,9 @@ def test_batch_invariant_requires_kv_cache_reset():
 
 
 def test_hold_session_kv_requires_free_floor_above_watermark():
-    VLLMGenerator.Config(model=_MODEL_CONFIG, parallelism=_PARALLELISM, hold_session_kv=True)
+    VLLMGenerator.Config(
+        model=_MODEL_CONFIG, parallelism=_PARALLELISM, hold_session_kv=True
+    )
     with pytest.raises(ValueError, match="must be above vLLM's watermark"):
         VLLMGenerator.Config(
             model=_MODEL_CONFIG,
@@ -665,7 +667,9 @@ def test_kv_offload_rejects_kv_cache_reset_on_weight_sync():
 
 def test_kv_offload_gib_rejects_negative_sizes():
     with pytest.raises(ValueError, match="kv_offload_gib must be >= 0, got -1"):
-        VLLMGenerator.Config(model=_MODEL_CONFIG, parallelism=_PARALLELISM, kv_offload_gib=-1)
+        VLLMGenerator.Config(
+            model=_MODEL_CONFIG, parallelism=_PARALLELISM, kv_offload_gib=-1
+        )
 
 
 def test_qwen36_27b_perf_config():
