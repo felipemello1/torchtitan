@@ -201,8 +201,9 @@ def _on_sandoq(
             "runtime": sandbox_runtime(),
             # SandoqTerminalTaskset.load sets each task's scoring timeout instead.
             "timeout": environment.agent.timeout.model_copy(update={"scoring": None}),
-            # A lost exec channel (Sandoq transport, VM gone) gets one more try on a fresh VM.
-            "retries": RetryConfig(max_retries=1, include=["SandboxError"]),
+            # A lost exec channel (Sandoq transport, VM gone) gets 3 more tries on a fresh VM: a
+            # 7-minute image-pull burst failed 56 rollouts twice with 1.
+            "retries": RetryConfig(max_retries=3, include=["SandboxError"]),
         }
     )
     return dataclasses.replace(
@@ -628,18 +629,19 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     - router replay (was off);
     - vLLM watermark 0.1 (was 0.03);
     - trainer microbatches as RDMA buffers (was in the Monarch message);
-    - 2,000 Sandoq VMs (was 2,688), which cap the groups in flight at 120;
+    - 16 TP1 engines on 4 generator hosts (was 8 on 2), a 5-host job;
+    - 3,000 Sandoq VMs (was 2,688) and 360 groups in flight;
     - a synchronous save every 10 steps (was async).
 
     DOME's `--train-iters` and `--save-interval` still override the steps and the save interval.
     """
     num_prompts_per_train_step = 22
     num_samples_per_prompt = 16
-    # Sandoq VMs the run holds, ~80% of (6 + 1) x 22 x 16; generation_capacity below keeps the
-    # groups in flight within it.
-    sandbox_pool = 2000
-    # Host RAM per generator for vLLM's CPU KV offload. PLACEHOLDER: confirm before launch. Four
-    # engines per host share its /dev/shm (DOME runs with --ipc=host; ~477 GB on a GB300 host).
+    # Sandoq VMs the run holds; the groups in flight queue for them per rollout.
+    sandbox_pool = 3000
+    # Host RAM per generator for vLLM's CPU KV offload. Four engines per host share its /dev/shm
+    # (DOME runs with --ipc=host; ~477 GB on a GB300 host). At 360 groups each engine holds ~190
+    # sessions and KV may near ~65%, where offload starts to load.
     kv_offload_gib = 96
     target_offpolicy_steps = 6
     # The 78 Terminal-Bench 2.1 tasks that fit a small Sandoq VM, one greedy rollout each.
@@ -653,10 +655,11 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
         max_turns=150,
         sandbox_pool=sandbox_pool,
         # At most 24 rollouts per env-server worker: each waiting rollout holds one of the worker's
-        # 32 executor threads, and Sandoq needs a free thread to ready a VM. 84 workers.
+        # 32 executor threads, and Sandoq needs a free thread to ready a VM. 125 workers.
         num_env_workers=math.ceil(sandbox_pool / 24),
         num_validation_samples=num_validation_samples,
-        num_generators=8,
+        # A 5-host job: 16 TP1 engines on 4 generator hosts (was 8 on 2).
+        num_generators=16,
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=2,
             tensor_parallel_degree=2,
@@ -671,11 +674,14 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
         target_offpolicy_steps=target_offpolicy_steps,
         max_offpolicy_steps=10,
-        # Start at 5 x 22 = 110 groups: 1,760 rollouts, 88% of the pool.
+        # Start at 5 x 22 = 110 groups: 1,760 rollouts, 59% of the pool.
         start_batches=5,
-        # (2,000 - 78) // 16 = 120 groups: leave validation its sandboxes.
-        generation_capacity=(sandbox_pool - num_validation_samples)
-        // num_samples_per_prompt,
+        # A group keeps its permit until its slowest rollout ends, and its 16 rollouts hold a VM ~54%
+        # of that time: at 120 groups the run leased ~1,000 of 2,000 VMs. 360 groups (5,760
+        # rollouts, ~3,110 VMs of demand), so the 3,000-VM pool, counted per rollout, binds instead
+        # of the group permits: the env server runs at most sandbox_pool rollouts at once, and a
+        # finished rollout frees its VM for a queued one.
+        generation_capacity=360,
     )
     # Trainer ranks read each microbatch's tensors of 1 KiB or more as RDMA buffers. By value (the
     # default), every rank's call carries the whole batch: 93-100 s at step 3 of a router-replay run.
@@ -964,7 +970,6 @@ def _qwen3_5_base_terminal_bench_config(
             checkpointer=CheckpointManager.Config(
                 initial_load_in_hf=True,
                 interval=25,
-                enable_first_step_checkpoint=True,
                 async_mode="async",
                 keep_latest_k=0,
                 last_save_in_hf=False,

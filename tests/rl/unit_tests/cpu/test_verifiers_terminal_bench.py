@@ -647,6 +647,7 @@ def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) ->
         "rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight"
     )
 
+    assert config.num_generators == 16
     loop = config.async_loop
     assert (loop.num_prompts_per_train_step, loop.num_samples_per_prompt) == (22, 16)
     assert loop.num_training_steps == 300
@@ -654,17 +655,16 @@ def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) ->
         target_offpolicy_steps=6,
         max_offpolicy_steps=10,
         start_batches=5,
-        generation_capacity=120,
+        generation_capacity=360,
     )
     assert loop.validation == ValidationConfig(steps=78, freq=10, overlap_training=True)
     assert loop.rdma_fast_path_threshold == 1024
     assert loop.training_sample_builder.drop_zero_std_reward_groups
     assert config.rollouter.rubric.length_reward_weight == 0.0
     assert config.rollouter.thinking_budget.max_thinking_tokens == 4096
-    # The env server runs the 2,000-VM pool; training groups plus a validation pass fit in it.
+    # The env server runs the 3,000-VM pool; the 360 groups in flight queue for it per rollout.
     serve = config.rollouter.verifiers_env_server.serve
-    assert serve.pool.num_workers * serve.max_concurrent >= 2000
-    assert loop.max_concurrent_rollout_groups * 16 + loop.validation.steps <= 2000
+    assert serve.pool.num_workers * serve.max_concurrent >= 3000
     assert config.rollouter.training_dataloader.zero_spread_skip.min_mean_reward == 0.9
     assert config.generator.hold_session_kv
     assert not config.generator.reset_kv_cache_on_weight_sync
