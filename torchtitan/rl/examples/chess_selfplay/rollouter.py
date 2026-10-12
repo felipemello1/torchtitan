@@ -21,6 +21,7 @@ from torchtitan.rl.examples.chess_selfplay.bots import (
 )
 from torchtitan.rl.examples.chess_selfplay.data import ChessSample
 from torchtitan.rl.examples.chess_selfplay.env import ChessGame
+from torchtitan.rl.examples.chess_selfplay.rubric import is_force_closed
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.rollouter import RolloutWorker
 from torchtitan.rl.rollout.types import GenerateFn, Rollout, RolloutGroup, RolloutStatus
@@ -55,7 +56,8 @@ class ChessSelfPlayWorker(RolloutWorker):
     A forfeit caused by one reply (illegal, unparsable, or cut at `max_tokens`) costs only that turn:
     each color is centered as if every such forfeit had ended its game at `max_plies` instead
     (`ChessGame.material_rewards`), and the forfeiting turn alone pays the difference. A player
-    stopped by an infra error is centered the same way, and none of its turns pays.
+    stopped by an infra error is centered the same way, and none of its turns pays. Separately,
+    `forced_close_advantage_cap` caps each force-closed turn's advantage.
 
     Example (group_size=2, self-play, max_plies=60):
 
@@ -76,9 +78,14 @@ class ChessSelfPlayWorker(RolloutWorker):
         """Stockfish binary, a path or a name on `PATH`, for bot games and for scoring the policy's
         moves (centipawn loss). `None`: self-play only, and no move scoring."""
 
+        forced_close_advantage_cap: float | None = None
+        """Caps each force-closed turn's advantage; `None`: no cap. At 0.0 a won game never
+        reinforces a thinking loop: +0.25 -> 0.0, and -0.3 stays -0.3."""
+
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self._max_plies = config.max_plies
+        self._forced_close_advantage_cap = config.forced_close_advantage_cap
         if (
             config.stockfish_path is not None
             and shutil.which(config.stockfish_path) is None
@@ -208,6 +215,18 @@ class ChessSelfPlayWorker(RolloutWorker):
                 if game.forfeiter == color and game.end_reason in _REPLY_FORFEITS:
                     # assumes mean-centered advantages (the recipe's `should_std_normalize=False`)
                     rollout.turns[-1].advantage = advantage - forfeit_cost
+                if self._forced_close_advantage_cap is not None:
+                    for turn in rollout.turns:
+                        # on a forfeiting turn, cap the forfeit advantage set above, not the rollout's
+                        turn_advantage = (
+                            advantage if turn.advantage is None else turn.advantage
+                        )
+                        # set only when lowered: an untouched turn stays None, so a tied group is still dropped
+                        if (
+                            is_force_closed(turn)
+                            and turn_advantage > self._forced_close_advantage_cap
+                        ):
+                            turn.advantage = self._forced_close_advantage_cap
 
         # Score the policy's moves with Stockfish: a strength measure that does not depend on the opponent.
         losses_per_game = []
