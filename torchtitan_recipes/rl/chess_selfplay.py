@@ -450,3 +450,25 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300_lr1e6() -> Controller.Config:
     config = rl_chess_qwen3_5_35b_a3b_base_gb300()
     config.trainer.optim.optimizer.optimizers[0].lr = 1e-6
     return config
+
+
+def rl_chess_qwen3_5_35b_a3b_base_gb300_zero_sum() -> Controller.Config:
+    """`rl_chess_qwen3_5_35b_a3b_base_gb300` at lr 1e-6 with a zero-sum mate (10 / -9) and 48 positions
+    per step, to resume a run. With the mated side losing only ~0.25, self-play stopped defending:
+    82% of mates followed a one-move blunder that another move avoided."""
+    config = rl_chess_qwen3_5_35b_a3b_base_gb300(num_prompts_per_train_step=48)
+    config.trainer.optim.optimizer.optimizers[0].lr = 1e-6
+    config.trainer.checkpointer.enable_first_step_checkpoint = False
+    worker = config.rollouter.worker
+    worker.checkmated_reward = 1.0 - worker.checkmate_reward
+    return config
+
+
+def rl_chess_qwen3_5_35b_a3b_base_gb300_mate1() -> Controller.Config:
+    """`rl_chess_qwen3_5_35b_a3b_base_gb300_zero_sum` with the env's default mate scores instead:
+    checkmate 1, mated -0.25 x the unplayed share."""
+    config = rl_chess_qwen3_5_35b_a3b_base_gb300_zero_sum()
+    worker = config.rollouter.worker
+    worker.checkmate_reward = 1.0
+    worker.checkmated_reward = None
+    return config
