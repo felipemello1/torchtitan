@@ -372,6 +372,7 @@ def test_group_rewards_get_the_length_reward(monkeypatch) -> None:
             ),
             calls=[],
             errors=[],
+            info={},
         )
 
     class EnvClient:

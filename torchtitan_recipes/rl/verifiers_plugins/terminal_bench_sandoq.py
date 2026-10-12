@@ -406,6 +406,20 @@ def _keep_launch_record(record: logging.LogRecord) -> bool:
     return True
 
 
+def pytest_passed_frac(stdout: str) -> float:
+    """Fraction of the collected pytest tests that passed, from pytest's own summary; 0 without one.
+
+    Example:
+        "collected 3 items ... 1 failed, 2 passed in 0.41s" -> 2/3
+        TMax runs `pytest -x`, so the count stops at the first failure: prefix credit.
+    """
+    collected = re.search(r"collected (\d+) items?", stdout)
+    passed = re.findall(r"(\d+) passed", stdout)
+    if collected is None or not passed or int(collected.group(1)) == 0:
+        return 0.0
+    return min(1.0, int(passed[-1]) / int(collected.group(1)))
+
+
 def truncate_middle(text: str, max_chars: int = _MAX_LOG_CHARS) -> str:
     """Keep the head and tail of `text`, `max_chars` in all, as Terminus-2 does for terminal output.
 
@@ -498,6 +512,7 @@ class SandoqHarborTask(HarborTask):
                 "stdout": truncate_middle(result.stdout),
                 "stderr": truncate_middle(result.stderr),
             }
+            trace.info["tests_passed_frac"] = pytest_passed_frac(result.stdout)
             return result
 
         grading_runtime = SimpleNamespace(run=run_and_keep, read=runtime.read)

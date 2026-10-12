@@ -39,6 +39,8 @@ from torchtitan.rl.examples.verifiers.rollouter import (
     _trainable_token_spans,
     log_failed_rollout,
     RewardFromVerifiers,
+    RewardFromVerifiersPartialCredit,
+    TESTS_PASSED_FRAC_KEY,
     VERIFIERS_REWARD_KEY,
     verifiers_rollout_logs,
     VerifiersRollouter,
@@ -934,6 +936,31 @@ def test_rollouter_registers_the_groups_generate_fn_while_it_runs() -> None:
     asyncio.run(run_test())
 
 
+@pytest.mark.parametrize(
+    "verifiers_reward, passed_frac, status, expected",
+    [
+        (1.0, 1.0, RolloutStatus.COMPLETED, 1.0),
+        (0.0, 2 / 3, RolloutStatus.COMPLETED, 1 / 3),
+        (0.0, 2 / 3, RolloutStatus.TRUNCATED_MAX_TURNS, 1 / 3 - 0.5),
+        (1.0, 1.0, RolloutStatus.TRUNCATED_LENGTH, 0.5),
+        (0.0, None, RolloutStatus.COMPLETED, 0.0),
+    ],
+)
+def test_partial_credit_reward(verifiers_reward, passed_frac, status, expected) -> None:
+    """Full solve 1; otherwise half the passed-test fraction; truncation subtracts 0.5."""
+    env_rewards = {VERIFIERS_REWARD_KEY: verifiers_reward}
+    if passed_frac is not None:
+        env_rewards[TESTS_PASSED_FRAC_KEY] = passed_frac
+    rollout = Rollout(
+        group_id=0,
+        rollout_id=0,
+        status=status,
+        turns=[SimpleNamespace(env_rewards=env_rewards)],
+    )
+    reward_fn = RewardFromVerifiersPartialCredit.Config().build()
+    assert asyncio.run(reward_fn(rollout, None)) == pytest.approx(expected)
+
+
 def test_rollouter_gives_truncation_reward_to_training_groups_only() -> None:
     """Which rubric scores a rollout cut at max_turns whose tests pass:
     group 7  (training)   -> truncation_reward, 0
@@ -1485,6 +1512,19 @@ def test_sandoq_exec_keeps_keystrokes_out_of_argv() -> None:
         argv, env={"TERMINUS_EXEC": script}, capture_output=True, text=True
     ).stdout
     assert output == 'it\'s "quoted" $HOME\n'
+
+
+def test_pytest_passed_frac_reads_pytests_summary() -> None:
+    pytest.importorskip("harbor")
+    from torchtitan_recipes.rl.verifiers_plugins.terminal_bench_sandoq import (
+        pytest_passed_frac,
+    )
+
+    tmax = "collected 3 items\n\n../../tmp/test_final_state.py ..F\n=== 1 failed, 2 passed in 0.41s ==="
+    assert pytest_passed_frac(tmax) == pytest.approx(2 / 3)
+    assert pytest_passed_frac("collected 1 item\n=== 1 passed in 0.1s ===") == 1.0
+    assert pytest_passed_frac("collected 4 items\n=== 1 failed in 0.2s ===") == 0.0
+    assert pytest_passed_frac("bash: pytest: command not found") == 0.0
 
 
 def test_sandoq_exec_rejects_a_null_byte_like_harbor() -> None:
