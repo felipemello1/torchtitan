@@ -151,9 +151,9 @@ class ValidationConfig:
     """Sampling temperature. 1.0 samples the model's distribution as is; 0.0 is greedy and needs
     `num_samples_per_prompt=1`."""
 
-    num_samples_per_prompt: int = 4
-    """Sibling rollouts sampled per prompt. `validation_reward` averages all of them; 4 halves its
-    sampling std vs 1, at 4x the rollouts. `validation_reward/best_of_{n}` averages each prompt's
+    num_samples_per_prompt: int = 1
+    """Sibling rollouts sampled per prompt. `validation_reward` averages all of them; set 4 for
+    lower-noise validation. With n > 1, `validation_reward/best_of_{n}` averages each prompt's
     best reward."""
 
     def __post_init__(self) -> None:
@@ -739,7 +739,7 @@ class Controller(Configurable):
         Example: 2 prompts x 2 samples with rewards [[1, 0], [0, 0]]:
 
             validation_reward/_mean           0.25   # mean over all 4 rollouts
-            validation_reward/best_of_2/mean  0.5    # best rollout per prompt, averaged
+            validation_reward/best_of_2/mean  0.5    # best rollout per prompt, averaged (n > 1 only)
         """
         num_samples_per_prompt = (
             self.config.async_loop.validation.num_samples_per_prompt
@@ -790,17 +790,18 @@ class Controller(Configurable):
         metrics.append(
             m.Metric("validation/group_failures", m.Sum(float(num_failed_groups)))
         )
-        # Equals pass@n when rewards are 0/1.
-        best_rewards = [
-            max(rollout.reward for rollout in group.rollouts)
-            for group in rollout_groups
-        ]
-        metrics.append(
-            m.Metric(
-                f"validation_reward/best_of_{num_samples_per_prompt}",
-                m.Mean.from_list(best_rewards),
+        if num_samples_per_prompt > 1:
+            # Equals pass@n when rewards are 0/1.
+            best_rewards = [
+                max(rollout.reward for rollout in group.rollouts)
+                for group in rollout_groups
+            ]
+            metrics.append(
+                m.Metric(
+                    f"validation_reward/best_of_{num_samples_per_prompt}",
+                    m.Mean.from_list(best_rewards),
+                )
             )
-        )
         return rollout_groups, metrics
 
     @sl.log_trace_span("validate")
