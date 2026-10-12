@@ -391,6 +391,7 @@ def test_elo_fit() -> None:
         "rl_chess_qwen3_5_4b",
         "rl_chess_qwen3_5_4b_gb300",
         "rl_chess_qwen3_5_35b_a3b_base_gb300",
+        "rl_chess_qwen3_5_35b_a3b_base_gb300_lr2e6",
     ],
 )
 def test_recipe_builds(recipe) -> None:

@@ -441,3 +441,11 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
     # (half of ~954 GB) with margin.
     generator.kv_offload_gib = 96.0
     return config
+
+
+def rl_chess_qwen3_5_35b_a3b_base_gb300_lr2e6() -> Controller.Config:
+    """`rl_chess_qwen3_5_35b_a3b_base_gb300` at lr 2e-6, to resume a 5e-6 run. At 5e-6, entropy fell
+    0.74 -> 0.46 and self-play ACPL rose 146 -> 185 over steps 20-29."""
+    config = rl_chess_qwen3_5_35b_a3b_base_gb300()
+    config.trainer.optim.optimizer.optimizers[0].lr = 2e-6
+    return config
