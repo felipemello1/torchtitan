@@ -536,13 +536,20 @@ class _ScriptedPolicy:
     An exception in the script is raised instead, like a failed generator call."""
 
     def __init__(
-        self, tokenizer, moves_by_rollout: dict[int, list[str]], *, truncate_at=None
+        self,
+        tokenizer,
+        moves_by_rollout: dict[int, list[str]],
+        *,
+        truncate_at=None,
+        force_close_at=(),
     ) -> None:
         self._tokenizer = tokenizer
         self._moves_by_rollout = moves_by_rollout
         self._truncate_at = (
             truncate_at  # (rollout_id, turn_id) whose reply hits max_tokens
         )
+        # (rollout_id, turn_id)s whose reply carries a masked token, as a force-closed thinking does
+        self._force_close_at = set(force_close_at)
 
     async def __call__(self, prompt_token_ids, *, request_id, **kwargs) -> Completion:
         fields = dict(part.split("=") for part in request_id.split("/"))
@@ -557,6 +564,9 @@ class _ScriptedPolicy:
             finish_reason = "length"
         else:
             token_ids.append(self._tokenizer.tokenizer.token_to_id("<|im_end|>"))
+        loss_mask = None
+        if (rollout_id, turn_id) in self._force_close_at:
+            loss_mask = [False] + [True] * (len(token_ids) - 1)
         return Completion(
             min_policy_version=0,
             max_policy_version=0,
@@ -564,6 +574,7 @@ class _ScriptedPolicy:
             token_ids=token_ids,
             token_logprobs=[-0.1] * len(token_ids),
             finish_reason=finish_reason,
+            loss_mask=loss_mask,
         )
 
 
@@ -574,6 +585,8 @@ async def _run_group(
     sample=_SELF_PLAY,
     truncate_at=None,
     checkmate_reward=1.0,
+    force_close_at=(),
+    forced_close_advantage_cap=None,
 ):
     worker = ChessSelfPlayWorker.Config(
         rubric=Rubric.Config(
@@ -584,6 +597,7 @@ async def _run_group(
         max_plies=40,
         stockfish_path=None,
         checkmate_reward=checkmate_reward,
+        forced_close_advantage_cap=forced_close_advantage_cap,
     ).build()
     tokenizer_config = HuggingFaceTokenizer.Config()
     await worker.setup_async(
@@ -597,6 +611,7 @@ async def _run_group(
         tokenizer_config.build(tokenizer_path=_TOKENIZER_PATH),
         moves_by_rollout,
         truncate_at=truncate_at,
+        force_close_at=force_close_at,
     )
 
     async def release_session(*, routing_session_id: str) -> None:
@@ -677,6 +692,43 @@ def test_worker_pays_its_checkmate_reward() -> None:
         assert [by_id[i].reward for i in range(2)] == pytest.approx([-0.225, 10.0])
 
     asyncio.run(run())
+
+
+def test_worker_caps_force_closed_turn_advantage() -> None:
+    async def run(cap):
+        group = await _run_group(
+            {
+                0: ["f3", "g4"],  # game 0: fool's mate, Black wins
+                1: ["e5", "Qh4#"],
+                2: ["e4"],  # game 1: Black forfeits on its first move
+                3: ["Ke9"],
+            },
+            group_size=2,
+            force_close_at=[(0, 0), (1, 0), (3, 0)],
+            forced_close_advantage_cap=cap,
+        )
+        by_id = {rollout.rollout_id: rollout for rollout in group.rollouts}
+        # rollout advantages as in test_worker_trains_both_colors_with_per_color_advantages
+        assert [by_id[i].advantage for i in range(4)] == pytest.approx(
+            [-0.3625, 0.25, 0.3625, -0.25]
+        )
+        return [[turn.advantage for turn in by_id[i].turns] for i in range(4)]
+
+    # at 0: the won game's forced turn +0.25 -> 0.0; the lost game's -0.3625 and the forfeit's
+    # -1.7375 are already below the cap and stay as they were
+    assert asyncio.run(run(0.0)) == [
+        [None, None],
+        [pytest.approx(0.0), None],
+        [None],
+        [pytest.approx(-1.7375)],
+    ]
+    # no cap: only the forfeit sets a turn advantage
+    assert asyncio.run(run(None)) == [
+        [None, None],
+        [None, None],
+        [None],
+        [pytest.approx(-1.7375)],
+    ]
 
 
 def test_worker_centers_each_color_as_if_its_forfeits_ended_at_the_cap() -> None:

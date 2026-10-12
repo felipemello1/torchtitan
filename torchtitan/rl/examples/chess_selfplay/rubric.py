@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from torchtitan.rl.examples.chess_selfplay.data import ChessSample
-from torchtitan.rl.rollout import Rollout
+from torchtitan.rl.rollout import Rollout, RolloutTurn
 from torchtitan.rl.rollout.rubric import RewardFn
 
 
@@ -36,14 +36,15 @@ class RewardChessScore(RewardFn):
         self._forced_close_penalty = config.forced_close_penalty
 
     async def __call__(self, rollout: Rollout, env_input: ChessSample) -> float:
-        # the budget masks the tokens it forced out of the loss; no other path does
-        num_forced = sum(
-            turn.completion_loss_mask is not None
-            and not turn.completion_loss_mask.all()
-            for turn in rollout.turns
-        )
+        num_forced = sum(is_force_closed(turn) for turn in rollout.turns)
         forced_share = num_forced / len(rollout.turns)
         return (
             rollout.turns[-1].env_rewards["score"]
             - self._forced_close_penalty * forced_share
         )
+
+
+def is_force_closed(turn: RolloutTurn) -> bool:
+    """Whether the thinking budget force-closed this turn: it masks the tokens it forced out of the
+    loss, and no other path does."""
+    return turn.completion_loss_mask is not None and not turn.completion_loss_mask.all()

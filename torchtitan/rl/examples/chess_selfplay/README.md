@@ -133,7 +133,7 @@ config.rollouter.curriculum = ChessCurriculum.Config(
 
 1. A turn still thinking at its budget, or one that ends its turn before `</think>`, gets a forced end: Qwen's thinking-budget sentence, `</think>`, and `\boxed{`.
 2. The answer stops at the box's closing brace, which ends the turn, so a forced move is never lost to the token cap.
-3. The forced tokens are masked out of the loss, and the reward loses up to 0.1 for force-closed turns.
+3. The forced tokens are masked out of the loss, and the reward loses up to 0.1 for force-closed turns. `ChessSelfPlayWorker.Config.forced_close_advantage_cap` (off by default) also caps each force-closed turn's advantage: at 0, a won game no longer reinforces a thinking loop.
 
 Each turn's `max_tokens` (`max_response_tokens`, 2,560 here) must fit the larger budget plus a short answer. A player keeps its own past thinking, never the opponent's, so a 120-ply game needs ~100k tokens of context. That multi-host GB300 recipe is not included yet: at that scale it also needs pieces that are not on main:
 
