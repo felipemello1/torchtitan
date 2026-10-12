@@ -65,8 +65,14 @@ def _budget(max_thinking_tokens: int = 4) -> ThinkingBudget:
     )
 
 
-def _run(budget: ThinkingBudget, generate: _ScriptedGenerate, prompt, max_tokens=12):
-    wrapped = budget.wrap(generate)
+def _run(
+    budget: ThinkingBudget,
+    generate: _ScriptedGenerate,
+    prompt,
+    max_tokens=12,
+    max_context_length=None,
+):
+    wrapped = budget.wrap(generate, max_context_length=max_context_length)
     return asyncio.run(
         wrapped(
             prompt,
@@ -116,6 +122,24 @@ def test_reply_cut_while_thinking_gets_a_forced_close() -> None:
     assert completion.finish_reason == "stop"
     assert completion.request_id == "group=0/rollout=0/turn=0"
     assert _forced_close_rate(completion) == 1.0
+
+
+@pytest.mark.parametrize("max_context_length, num_calls", [(9, 1), (10, 2)])
+def test_second_call_that_would_not_fit_the_context_is_skipped(
+    max_context_length, num_calls
+) -> None:
+    """2 prompt + 4 thinking + 3 forced = 9 tokens: a 9-token context leaves no room for the
+    answer, so the turn ends cut after one call; a 10-token context runs it."""
+    thinking = _completion([10, 11, 12, 13], finish_reason="length")
+    answer = _completion([20], finish_reason="stop")
+    generate = _ScriptedGenerate(thinking, answer)
+    completion = _run(
+        _budget(), generate, prompt=[5, THINK], max_context_length=max_context_length
+    )
+    assert len(generate.calls) == num_calls
+    if num_calls == 1:
+        assert completion is thinking
+        assert _forced_close_rate(completion) == 0.0
 
 
 @pytest.mark.parametrize(
