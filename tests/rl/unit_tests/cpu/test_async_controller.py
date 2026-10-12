@@ -90,7 +90,10 @@ def test_setup_async_caps_max_num_seqs_per_generator(monkeypatch, caplog) -> Non
     async_loop = SimpleNamespace(
         resolve_max_concurrent_rollout_groups=lambda num_generator_dp_shards: 256,
         num_samples_per_prompt=16,
-        validation=SimpleNamespace(steps=0, freq=None, overlap_training=False),
+        validation=SimpleNamespace(
+            steps=0, freq=None, overlap_training=False, num_samples_per_prompt=1
+        ),
+        extra_validations=[],
     )
     controller = SimpleNamespace(
         config=SimpleNamespace(

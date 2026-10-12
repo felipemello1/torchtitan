@@ -189,3 +189,37 @@ def test_verifiers_rollouter_tags_and_routes_extra_validation_samples() -> None:
     assert {sample.validation_set for sample in samples} == {"deepswe"}
     with pytest.raises(ValueError, match="unknown validation set"):
         rollouter.get_validation_samples(1, "missing")
+
+
+def test_failed_extra_validation_pass_is_counted_and_training_continues() -> None:
+    """freq 1: the step-1 pass raises. Step 2 logs `pass_errors` and starts the next pass."""
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(
+            extra_validations=[ExtraValidationConfig(name="deepswe", freq=1)]
+        )
+    )
+    controller._extra_validation_tasks = {}
+    controller._extra_validation_requested = set()
+    controller._weight_sync = SimpleNamespace(wait_inflight_push_pull=AsyncMock())
+    controller.metrics_processor = Mock()
+    started: list[int] = []
+
+    async def validate_extra(*, extra_index: int, step: int) -> list[m.Metric]:
+        started.append(step)
+        raise RuntimeError("env server down")
+
+    controller.validate_extra = validate_extra
+
+    async def run() -> None:
+        for step in (1, 2):
+            await controller._step_extra_validations(step=step, num_training_steps=10)
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+    controller._extra_validation_tasks.pop("deepswe").exception()  # the step-2 pass
+    assert started == [1, 2]
+    (call,) = controller.metrics_processor.log.call_args_list
+    assert call.kwargs["step"] == 2
+    aggregated = m.MetricsProcessor._aggregate_metrics(call.kwargs["metrics"])
+    assert aggregated == {"validation/deepswe/pass_errors/sum": 1}
