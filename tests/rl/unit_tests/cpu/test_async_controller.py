@@ -921,6 +921,7 @@ def _run_with_generator_watcher(watcher) -> None:
             training_sample_builder=SimpleNamespace(build=lambda: None),
             batcher=SimpleNamespace(build=lambda **kwargs: None),
             validation=SimpleNamespace(overlap_training=False),
+            extra_validations=[],
         ),
         trainer=SimpleNamespace(
             training=SimpleNamespace(
@@ -1130,8 +1131,10 @@ def _controller_for_trainer_loop(
         ),
         optim_step=SimpleNamespace(call=optim_step),
     )
+    controller._trainer_dp_replicas = [controller.trainer]
     controller.generator_router = SimpleNamespace(
-        sync_log_step=SimpleNamespace(call_one=AsyncMock())
+        sync_log_step=SimpleNamespace(call_one=AsyncMock()),
+        get_session_kv_metrics=SimpleNamespace(call_one=AsyncMock(return_value=[])),
     )
     controller._rollouter = SimpleNamespace(
         sync_log_step=AsyncMock(),
@@ -1146,8 +1149,14 @@ def _controller_for_trainer_loop(
         pop_dropped_group_ids=list,
         release_active_groups=AsyncMock(),
     )
+    controller.batcher = SimpleNamespace(
+        sync_log_step=SimpleNamespace(broadcast=Mock()),
+        release_oldest_batch=SimpleNamespace(broadcast=Mock()),
+    )
     controller.metrics_processor = Mock()
     controller._validation_task = None
+    controller._extra_validation_tasks = {}
+    controller._extra_validation_requested = set()
     fake_validation = _FakeValidation()
     controller.validate = fake_validation
     return controller, fake_validation
@@ -1352,6 +1361,9 @@ def test_overlapped_validation_before_and_after_training(
     controller.metrics_processor = Mock()
     controller._log_reward_delta = Mock()
     controller._validation_task = None
+    controller.batcher = None
+    controller._extra_validation_tasks = {}
+    controller._extra_validation_requested = set()
     validation = _FakeValidation()
     controller.validate = validation
 
@@ -1411,6 +1423,7 @@ def test_close_cancels_a_running_pass_before_closing_the_rollouter() -> None:
     controller.generator_router = None
     controller.metrics_processor = Mock()
     controller._proc_meshes = []
+    controller._extra_validation_tasks = {}
     validation = _FakeValidation()
     controller.validate = validation
     pass_done_at_rollouter_close: list[bool] = []
@@ -1886,13 +1899,19 @@ def test_batcher_passes_the_version_that_trains_each_group() -> None:
             else _untrainable_group(rollout_group.group_id)
         )
     )
+    local_batcher = _build_batcher(num_prompts_per_train_step=2)
+
+    async def add_group(*, rollout_group):
+        return local_batcher.add_training_samples(
+            training_sample_group=builder.build_from_group(rollout_group)
+        )
+
     queue: asyncio.Queue = asyncio.Queue()
     asyncio.run(
         Controller._batcher_loop(
             controller,
             group_buffer=_Buffer(),
-            training_sample_builder=builder,
-            batcher=_build_batcher(num_prompts_per_train_step=2),
+            batcher=SimpleNamespace(add_group=SimpleNamespace(call_one=add_group)),
             training_batch_queue=queue,
         )
     )
