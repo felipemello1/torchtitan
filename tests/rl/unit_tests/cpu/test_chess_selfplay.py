@@ -417,6 +417,7 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
         assert "means \\boxed{Nbd2}, not \\boxed{Nd2}" in prompt
         assert "means \\boxed{h8=Q}, not \\boxed{h8}" in prompt
         assert "An x marks a capture" in prompt
+        assert "means \\boxed{Qxd5}, not \\boxed{xd5}" in prompt
         assert (
             "Checkmating your opponent scores 1. The game stops after 40 plies"
             in prompt

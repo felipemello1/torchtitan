@@ -78,12 +78,13 @@ class ChessPlayerEnv(MessageEnv):
             "Each turn you see your pieces and your opponent's pieces, keyed by piece letter and "
             "square (Ke1 is a king on e1; P is a pawn), each with its legal moves. The current "
             "positions and legal moves are already given: avoid restating them. Analyze which move "
-            "is best, then end your reply with that move, written exactly as listed, inside "
-            '\\boxed{}. For example, "Pe2": ["e4"] means \\boxed{e4}, not \\boxed{Pe4}; '
+            "is best, then write that move once, exactly as listed, inside \\boxed{}, and stop. "
+            'For example, "Pe2": ["e4"] means \\boxed{e4}, not \\boxed{Pe4}; '
             '"Bc8": ["Be6"] means \\boxed{Be6}, not \\boxed{e6} or \\boxed{be6}; '
             '"Nb1": ["Nbd2"] means \\boxed{Nbd2}, not \\boxed{Nd2}; '
-            '"Ph7": ["h8=Q", "h8=N"] means \\boxed{h8=Q}, not \\boxed{h8}. An x marks a capture: '
-            '"Nf3": ["Nxe5"] means \\boxed{Nxe5}. Pick only from the moves listed under your '
+            '"Ph7": ["h8=Q", "h8=N"] means \\boxed{h8=Q}, not \\boxed{h8}. An x marks a capture, and '
+            'a piece keeps its letter: "Qd1": ["Qxd5"] means \\boxed{Qxd5}, not \\boxed{xd5}; '
+            '"Pe4": ["exd5"] means \\boxed{exd5}. Pick only from the moves listed under your '
             "pieces this turn, not from an earlier turn's list or your opponent's list. An illegal "
             "or missing move loses the game.\n\n"
             f"Checkmating your opponent scores {self._game.checkmate_reward:g}. The game stops after "
