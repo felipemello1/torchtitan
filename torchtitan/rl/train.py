@@ -50,6 +50,7 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.rl.controller import Controller
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
+from torchtitan.rl.generator import VLLMGenerator
 
 
 logger = logging.getLogger(__name__)
@@ -136,6 +137,28 @@ class HostMeshes:
     trainer: HostMesh
     generators: list[HostMesh]
     gpus_per_node: int
+
+
+def generator_launch_env(generator_config: VLLMGenerator.Config) -> dict[str, str]:
+    """Env generator procs need for CPU KV offload (``kv_offload_gib``), on top of ``RL_ENV_DEFAULTS``:
+    - ``expandable_segments:False``: vLLM refuses a KV connector under ``expandable_segments:True``;
+      other allocator options are kept.
+    - ``PYTHONHASHSEED=0``: TP ranks must iterate vLLM's sets in the same order.
+
+    Example:
+
+        this proc:        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
+        generator procs:  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False,max_split_size_mb:512
+                          PYTHONHASHSEED=0
+    """
+    launch_env = {}
+    if generator_config.kv_offload_gib > 0:
+        for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+            launch_env[key] = os.environ.get(key, "").replace(
+                "expandable_segments:True", "expandable_segments:False"
+            )
+        launch_env["PYTHONHASHSEED"] = "0"
+    return launch_env
 
 
 def _compute_trainer_world_size(p: ParallelismConfig) -> int:
@@ -343,6 +366,7 @@ async def main():
             per_generator_world_size,
             host_meshes=None,
             num_generators=config.num_generators,
+            generator_env=generator_launch_env(config.generator),
         )
         await rl_trainer.setup_async(
             trainer_mesh=trainer_mesh,

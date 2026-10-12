@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -27,8 +28,8 @@ from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.observability.metrics import compute_training_performance_metrics
-from torchtitan.rl.components.batcher import TrainingMicrobatch
 from torchtitan.rl.components.checkpointer import CONTROLLER_STATE_KEY, MirroredState
+from torchtitan.rl.distributed.rdma_microbatch import RDMAMicrobatch
 from torchtitan.rl.observability.controller import combine_microbatch_metrics
 from torchtitan.tools import utils
 from torchtitan.training_engine import TrainingEngine
@@ -239,15 +240,15 @@ class Trainer(Configurable):
     @sl.log_trace_span("forward_backward")
     async def forward_backward(
         self,
-        training_data: list[list[TrainingMicrobatch]],
+        training_data: list[list[RDMAMicrobatch]],
         global_loss_token_counts: torch.Tensor,
         global_routing_token_counts: torch.Tensor,
     ) -> dict[str, float]:
         """Run one optimizer step's forward/backward microbatches.
 
         Args:
-            training_data: Microbatch-major grid with shape
-                ``[num_microbatches][dp_degree]``.
+            training_data: Microbatch-major grid of `RDMAMicrobatch`es,
+                ``[num_microbatches][dp_degree]``; this rank reads its column.
             global_loss_token_counts: Per-objective loss-token counts across the
                 global batch.
             global_routing_token_counts: Per-depth non-padding routing-token
@@ -261,14 +262,22 @@ class Trainer(Configurable):
             f"policy_version={self.policy_version}"
         )
         engine = self.engine
+        # TODO: the cp * tp ranks of a DP replica read the same column. Read it once per replica
+        # and broadcast it, to cut the controller's reads by cp * tp. Needs a per-replica group.
+        # TODO: investigate prefetching
+        with sl.log_trace_span("read_microbatches"):
+            # One at a time, not asyncio.gather: gathered reads share the controller's bandwidth,
+            # so each takes as long as the whole column and can hit its 60 s RDMA timeout.
+            microbatches = [
+                await rank_batches[self.dp_rank].read()
+                for rank_batches in training_data
+            ]
         self._step_compute_start = time.perf_counter()
         self._step_num_tokens_per_dp_rank = sum(
-            rank_batches[self.dp_rank].labels.numel() for rank_batches in training_data
+            microbatch.labels.numel() for microbatch in microbatches
         )
         result = engine.forward_backward(
-            microbatch_groups=[
-                [rank_batches[self.dp_rank]] for rank_batches in training_data
-            ],
+            microbatch_groups=[[microbatch] for microbatch in microbatches],
             global_loss_token_counts=global_loss_token_counts,
             global_routing_token_counts=global_routing_token_counts,
         )
@@ -335,7 +344,6 @@ class Trainer(Configurable):
                 "trainer/grad_norm/mean": float(grad_norm.item()),
                 **{f"trainer/{key}": value for key, value in lr_metrics.items()},
                 "trainer/policy_version": float(self.policy_version),
-                "trainer/tokens_per_second": performance["tokens_per_second"],
                 "trainer/tflops": performance["tflops"],
                 "trainer/memory/max_active_gib": device_mem_stats.max_active_gib,
                 "trainer/memory/max_active_percent": device_mem_stats.max_active_pct,
@@ -357,8 +365,15 @@ class Trainer(Configurable):
         )
 
     @sl.log_trace_span("push_model_state_dict")
-    async def push_model_state_dict(self) -> None:
-        """Publish a CPU snapshot of model weights for generators to pull."""
+    async def push_model_state_dict(
+        self, on_published: Callable[[], None] | None = None
+    ) -> None:
+        """Publish a CPU snapshot of model weights for generators to pull.
+
+        Args:
+            on_published: Called in the worker thread right after the TorchStore put,
+                so it runs even while forward_backward blocks the event loop.
+        """
 
         model_state_dict = self.model.state_dict()
         # Today we copy the model into reusable pinned CPU buffers before calling
@@ -372,6 +387,7 @@ class Trainer(Configurable):
         await asyncio.to_thread(
             self._wait_for_staging_and_put_model_state_dict,
             staging_complete,
+            on_published=on_published,
         )
 
     @sl.log_trace_span("stage_model_state_dict")
@@ -399,7 +415,9 @@ class Trainer(Configurable):
         return staging_complete
 
     def _wait_for_staging_and_put_model_state_dict(
-        self, staging_complete: torch.Event | None
+        self,
+        staging_complete: torch.Event | None,
+        on_published: Callable[[], None] | None,
     ) -> None:
         """Wait for staging and publish without blocking the actor event loop."""
         if staging_complete is not None:
@@ -411,6 +429,9 @@ class Trainer(Configurable):
                 direct_rdma=False,
             )
         )
+        # Keep this last: once it runs, the controller may run the optimizer step and the next push.
+        if on_published is not None:
+            on_published()
 
     def _setup_staging_model_state_dict(self) -> dict[str, torch.Tensor]:
         """Allocate a final-dtype pinned CPU mirror of the model state dict."""

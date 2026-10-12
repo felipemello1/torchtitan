@@ -9,9 +9,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+import numpy as np
+import torch
 from aiohttp import web
 
 from torchtitan.config import Configurable
@@ -35,8 +38,8 @@ class VerifiersGenerationMetadata:
     """TorchTitan generation data aggregated over one Verifiers rollout.
 
     Verifiers sends the trace ID as the generation session ID, but does not
-    retain TorchTitan policy versions or generator metrics in the returned
-    trace. The generation server therefore records their rollout-wide span.
+    retain TorchTitan policy versions, generator metrics, or top-k logprobs in
+    the returned trace. The generation server therefore records them per rollout.
     """
 
     min_policy_version: int
@@ -47,6 +50,18 @@ class VerifiersGenerationMetadata:
 
     metrics: list[m.Metric]
     """Metrics from every generation in the rollout, merged with `m.fold`."""
+
+    topk_by_generation: dict[
+        tuple[int, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]
+    ] = field(default_factory=dict)
+    """The generator's top-k ids and logprobs `[num_completion_tokens, k]` per generation,
+    keyed by `(len(prompt_token_ids), completion_token_ids)`; empty unless
+    `SamplingConfig.num_topk_logprobs` > 0.
+
+    Example:
+
+        {(2, (12, 13)): (tensor([[12, 5], [13, 6]]), tensor([[-0.1, -2.4], [-0.2, -1.9]]))}
+    """
 
 
 class GenerationServer(Configurable):
@@ -196,6 +211,10 @@ class GenerationServer(Configurable):
                 raise ValueError(
                     f"sampling_params.{GROUP_ID_SAMPLING_PARAM} must be an integer"
                 )
+            # Verifiers sets it on a continued turn: earlier rows came with the previous turn.
+            routed_experts_prompt_start = sampling_params.pop(
+                "routed_experts_prompt_start", 0
+            )
             sampling = _parse_sampling_config(sampling_params)
             if body.get("features") is not None:
                 raise ValueError("multimodal features are not supported")
@@ -239,6 +258,13 @@ class GenerationServer(Configurable):
             )
 
         previous = self.generation_metadata.get(session_id)
+        topk_by_generation = {} if previous is None else previous.topk_by_generation
+        if completion.topk_token_ids is not None:
+            key = (len(prompt_token_ids), tuple(completion.token_ids))
+            topk_by_generation = {
+                **topk_by_generation,
+                key: (completion.topk_token_ids, completion.topk_logprobs),
+            }
         self.generation_metadata[session_id] = VerifiersGenerationMetadata(
             min_policy_version=(
                 completion.min_policy_version
@@ -257,6 +283,7 @@ class GenerationServer(Configurable):
                 if previous is None
                 else [*previous.metrics, *completion.metrics]
             ),
+            topk_by_generation=topk_by_generation,
         )
         return web.json_response(
             {
@@ -279,12 +306,41 @@ class GenerationServer(Configurable):
                             ]
                         },
                         "finish_reason": completion.finish_reason,
+                        **(
+                            {}
+                            if completion.routed_expert_ids is None
+                            else {
+                                "routed_experts": _routed_experts_payload(
+                                    completion.routed_expert_ids,
+                                    start=routed_experts_prompt_start,
+                                )
+                            }
+                        ),
                     }
                 ],
                 "prompt_logprobs": None,
                 "kv_transfer_params": None,
             }
         )
+
+
+def _routed_experts_payload(
+    routed_expert_ids: np.ndarray, *, start: int
+) -> dict[str, object]:
+    """Verifiers' ``routed_experts`` field: the rows from position ``start`` on.
+
+    Example:
+
+        _routed_experts_payload(routed_expert_ids, start=3)  # uint8 [6, 48, 8]
+        # -> {"data": <base64 of rows 3..5>, "shape": [3, 48, 8], "start": 3, "dtype": "uint8"}
+    """
+    rows = routed_expert_ids[start:]
+    return {
+        "data": base64.b64encode(rows.tobytes()).decode("ascii"),
+        "shape": list(rows.shape),
+        "start": start,
+        "dtype": str(rows.dtype),
+    }
 
 
 def _validate_token_ids(value: object, *, field_name: str) -> list[int]:
@@ -309,11 +365,11 @@ def _parse_sampling_config(value: object):
         "max_tokens",
         "seed",
         "stop_token_ids",
+        "num_topk_logprobs",
     }
     protocol_fields = {
         "logprobs",
         "skip_special_tokens",
-        "routed_experts_prompt_start",
     }
     unsupported = set(value) - supported - protocol_fields
     if unsupported:
@@ -331,4 +387,7 @@ def _parse_sampling_config(value: object):
         max_tokens=int(value.get("max_tokens", defaults.max_tokens)),
         seed=value.get("seed"),
         stop_token_ids=stop_token_ids,
+        num_topk_logprobs=int(
+            value.get("num_topk_logprobs", defaults.num_topk_logprobs)
+        ),
     )

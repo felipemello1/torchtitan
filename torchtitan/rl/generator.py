@@ -10,12 +10,14 @@ import asyncio
 import concurrent.futures
 import enum
 import gc
+import itertools
 import logging
-import math
 import os
+import sys
 import threading
+import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, TypeVar
 
 import cloudpickle
@@ -24,7 +26,7 @@ import torch.distributed as dist
 import torchstore as ts
 from torchstore import RankRole
 from vllm import EngineArgs, LLMEngine, SamplingParams
-from vllm.config import AttentionConfig, CompilationConfig
+from vllm.config import AttentionConfig, CompilationConfig, KVTransferConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode, PassConfig
 from vllm.exceptions import VLLMClientError
 from vllm.outputs import RequestOutput
@@ -50,6 +52,7 @@ from torchtitan.rl.model.vllm_registry import (
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.vllm import StatLoggerContext, VllmOtelStatLogger
 from torchtitan.rl.rollout.types import Completion
+from torchtitan.rl.session_kv_holder import SessionKVHolder
 from torchtitan.tools.utils import has_cuda_capability
 
 logger = logging.getLogger(__name__)
@@ -71,8 +74,10 @@ def add_extra_vllm_engine_args(
     # field is set (or derives from it), so they may be absent from engine_kwargs.
     config_field_by_engine_arg = {
         "max_num_batched_tokens": "max_num_batched_tokens",
+        "max_logprobs": "sampling.num_topk_logprobs",
         "compilation_config": "cuda_graph",
         "seed": "debug.seed",
+        "kv_offloading_size": "kv_offload_gib",
     }
     owned_keys = sorted(
         extra_vllm_engine_args.keys()
@@ -91,6 +96,90 @@ def add_extra_vllm_engine_args(
             f"extra_vllm_engine_args cannot set EngineArgs that TorchTitan controls: {details}"
         )
     engine_kwargs.update(extra_vllm_engine_args)
+
+
+def _enable_multi_worker_kv_offload(engine: Any) -> None:
+    """Make CPU KV offload work with TP > 1 or DP > 1 under external_launcher.
+
+    vLLM's offload marks a CPU load or store done once every worker of its scheduler has finished
+    it, and only its multiprocess executor merges the workers' finished transfers. Here each rank
+    runs its own scheduler with one worker, so:
+
+    1. Each scheduler waits for its own TP group only (vLLM's world size also counts DP).
+    2. With TP > 1, each engine step all-gathers the TP ranks' finished transfers before the
+       scheduler reads them, and merges them as the multiprocess executor does:
+
+           step s    rank 0: load 7 done   rank 1: -            both schedulers: 1 of 2
+           step s+1  rank 0: -             rank 1: load 7 done  both schedulers: done
+
+    3. The TP ranks' schedulers must stay identical. Request ids get a counter suffix instead of
+       vLLM's random one, generator procs run with PYTHONHASHSEED=0 (vLLM iterates sets), and
+       each step's gather compares a scheduler fingerprint across ranks.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+    from vllm.distributed.parallel_state import get_tp_group
+
+    scheduler = engine.engine_core.engine_core.scheduler
+    connector_scheduler = scheduler.connector.connector_scheduler
+    tp_group = get_tp_group()
+    connector_scheduler.config = connector_scheduler.config._replace(
+        num_workers=tp_group.world_size
+    )
+    if tp_group.world_size == 1:
+        return
+    if sys.flags.hash_randomization:
+        raise ValueError(
+            "kv_offload_gib with tensor_parallel_degree > 1 needs PYTHONHASHSEED=0 in generator "
+            "procs (train.py sets it): TP ranks iterate the same sets and must agree on the order"
+        )
+
+    request_counter = itertools.count()
+
+    def assign_request_id(request) -> None:
+        # Replaces vLLM's "<request_id>-<8 random chars>", which differs per rank.
+        request.external_req_id = request.request_id
+        request.request_id = f"{request.request_id}-{next(request_counter)}"
+
+    if not hasattr(engine.input_processor, "assign_request_id"):
+        raise RuntimeError(
+            "vLLM's InputProcessor has no assign_request_id to replace; update "
+            "_enable_multi_worker_kv_offload for this vLLM version"
+        )
+    engine.input_processor.assign_request_id = assign_request_id
+
+    aggregator = KVOutputAggregator(expected_finished_count=tp_group.world_size)
+    update_from_output = scheduler.update_from_output
+
+    def update_from_merged_output(scheduler_output, model_runner_output):
+        fingerprint = (
+            hash(tuple(scheduler_output.num_scheduled_tokens.items())),
+            connector_scheduler._job_counter,
+        )
+        gathered: list[Any] = [None] * tp_group.world_size
+        # Every rank gathers on every step, even with nothing finished, or the ranks deadlock.
+        dist.all_gather_object(
+            gathered,
+            (fingerprint, model_runner_output.kv_connector_output),
+            group=tp_group.cpu_group,
+        )
+        fingerprints, kv_connector_outputs = zip(*gathered)
+        if any(rank_fingerprint != fingerprint for rank_fingerprint in fingerprints):
+            raise RuntimeError(
+                "TP ranks' vLLM schedulers diverged; (scheduled requests hash, offload jobs) "
+                f"per rank: {fingerprints}"
+            )
+        # A copy per rank: aggregate() writes into its output_rank entry, and steps without work
+        # share vLLM's EMPTY_MODEL_RUNNER_OUTPUT.
+        merged = aggregator.aggregate(
+            [
+                replace(model_runner_output, kv_connector_output=kv_connector_output)
+                for kv_connector_output in kv_connector_outputs
+            ],
+            output_rank=tp_group.rank_in_group,
+        )
+        return update_from_output(scheduler_output, merged)
+
+    scheduler.update_from_output = update_from_merged_output
 
 
 @dataclass(kw_only=True, slots=True)
@@ -225,10 +314,10 @@ class VLLMCudaGraphConfig:
 
     capture_sizes: list[int] | None = None
     """Explicit CUDA graph capture batch sizes. When ``None`` (default), sizes are
-    auto-derived: powers of 2 up to the cap, plus ``max_num_seqs`` and the cap as
-    exact sizes. When set, these sizes are deduped and sorted. When expert
-    sequence parallelism is enabled, capture sizes that are not multiples of
-    its degree are removed."""
+    auto-derived up to ``max_num_seqs`` (see ``_decode_capture_sizes``), and for
+    ``FULL`` up to ``max_num_batched_tokens``. When set, these sizes are deduped
+    and sorted. When expert sequence parallelism is enabled, capture sizes that
+    are not multiples of its degree are removed."""
 
     # TODO: Validate CUDA graph capture with MoE / Expert Parallelism.
     # MoE routing produces dynamic shapes that may conflict with full
@@ -250,9 +339,9 @@ class VLLMCudaGraphConfig:
         """Build a vLLM ``CompilationConfig`` for the generator.
 
         When ``capture_sizes`` is set, those exact sizes are captured. Otherwise
-        sizes are auto-derived: powers of 2 up to the cap, plus ``max_num_seqs`` and
-        the cap itself as exact sizes so the largest capture size is always the cap
-        (even when it is not a power of 2). The cap is ``max_num_seqs`` for
+        sizes are auto-derived: ``_decode_capture_sizes(max_num_seqs)``, then powers
+        of 2 above ``max_num_seqs`` and the cap itself, so the largest capture size
+        is always the cap. The cap is ``max_num_seqs`` for
         ``FULL_DECODE_ONLY`` (decode batch == num_seqs). ``FULL`` also graphs
         prefill, whose per-step token count is bounded by
         ``max_num_batched_tokens`` (the configured value, else
@@ -301,15 +390,14 @@ class VLLMCudaGraphConfig:
                 )
             sizes = sorted(set(self.capture_sizes))
         else:
-            sizes = [1 << i for i in range(int(math.log2(cap)) + 1)]
-            # Always include max_num_seqs (decode batch) and the cap (largest
-            # prefill chunk) as exact sizes so the largest capture size is the cap
-            # even when it is not a power of 2
-            if max_num_seqs not in sizes:
-                sizes.append(max_num_seqs)
-            if cap not in sizes:
+            sizes = _decode_capture_sizes(max_num_seqs)
+            if cap > max_num_seqs:
+                # FULL's prefill chunks: powers of 2 above max_num_seqs, then the cap itself
+                size = 1 << max_num_seqs.bit_length()
+                while size < cap:
+                    sizes.append(size)
+                    size *= 2
                 sizes.append(cap)
-            sizes = sorted(sizes)
 
         if expert_sequence_parallel_size > 1:
             removed_sizes = [
@@ -342,6 +430,37 @@ class VLLMCudaGraphConfig:
         )
 
 
+def _decode_capture_sizes(max_num_seqs: int) -> list[int]:
+    """CUDA graph sizes for every decode batch up to ``max_num_seqs``, densest near the max.
+
+    A batch runs the smallest graph that fits it, padded to that size. Padding a large
+    batch costs time; padding a small one barely does (Qwen3.5-9B decode, H100):
+        300 seqs:  38 ms in a 304 graph, 41 ms in a 512 graph
+        1 seq:     12.3 ms in a 16 graph, 11.4-12.1 ms in a 1 graph
+    RL decode batches often run near the max: ``max_num_seqs`` follows the rollout
+    concurrency.
+
+    Example (max_num_seqs=1024, 37 sizes):
+        16 32 64 128 256          x2 while the doubled size is <= max/3 (341)
+        304 352 ... 592 640       +48 while the next size is <= 2/3 of the max (682)
+        656 672 ... 1008 1024     +16 up to max_num_seqs
+    """
+    # Multiples of 16 (all but the last): sequence parallelism drops sizes its TP
+    # degree can't split, and TP 2, 4, 8 or 16 splits these.
+    sizes = []
+    size = 16
+    while size < max_num_seqs:
+        sizes.append(size)
+        if 2 * size <= max_num_seqs / 3:
+            size *= 2
+        elif size + 48 <= 2 * max_num_seqs / 3:
+            size += 48
+        else:
+            size += 16
+    sizes.append(max_num_seqs)
+    return sizes
+
+
 @dataclass(kw_only=True, slots=True)
 class SamplingConfig:
     """Sampling parameters passed to vLLM's SamplingParams."""
@@ -355,6 +474,11 @@ class SamplingConfig:
 
     max_tokens: int = 100
     """Maximum number of tokens to generate per completion."""
+
+    num_topk_logprobs: int = 0
+    """Per generated token, also return the generator's k most likely token ids and their
+    logprobs, which `ScoreCenteringLoss` needs. 0 returns only the sampled token's logprob.
+    Costs 8 * k bytes per token; k = 32 matched the full vocab in arXiv 2609.20807."""
 
     seed: int | None = None
     """Per-request RNG seed. The rollouter offsets this per sample so a group's
@@ -609,10 +733,23 @@ class RequestDispatcher:
                 )
 
             # flat_logprobs=True: vLLM returns logprobs as plain lists instead of one dict per token.
-            # logprobs=0 keeps only the sampled token, so `.logprobs` has exactly one float per generated token.
+            # logprobs=0 (num_topk_logprobs=0) keeps only the sampled token: one float per generated token.
             completion_output = request_output.outputs[0]
             flat_logprobs = completion_output.logprobs
             token_logprobs = list(flat_logprobs.logprobs)
+            topk_token_ids = topk_logprobs = None
+            num_tokens = len(completion_output.token_ids)
+            if len(token_logprobs) > num_tokens:
+                # logprobs=k > 0: each token holds k + 1 entries, [sampled, top-1, ..., top-k].
+                # k is per request (validation asks for 0), so read it from the layout.
+                row_width = len(token_logprobs) // num_tokens
+                topk_token_ids = torch.tensor(
+                    flat_logprobs.token_ids, dtype=torch.int32
+                )
+                topk_logprobs = torch.tensor(token_logprobs)
+                topk_token_ids = topk_token_ids.view(-1, row_width)[:, 1:].contiguous()
+                topk_logprobs = topk_logprobs.view(-1, row_width)[:, 1:].contiguous()
+                token_logprobs = token_logprobs[::row_width]
 
             completions.append(
                 (
@@ -627,7 +764,10 @@ class RequestDispatcher:
                         request_id=request_output.request_id,
                         token_ids=list(completion_output.token_ids),
                         token_logprobs=token_logprobs,
+                        topk_token_ids=topk_token_ids,
+                        topk_logprobs=topk_logprobs,
                         finish_reason=completion_output.finish_reason,
+                        routed_expert_ids=completion_output.routed_experts,
                     ),
                     _extract_request_metrics_inputs(request_output),
                 )
@@ -867,7 +1007,53 @@ class VLLMGenerator(Configurable):
         vllm_stat_logger: VllmOtelStatLogger.Config | None = None
         """Optional logger instantiated on TP rank 0 to export vLLM metrics."""
 
+        hold_session_kv: bool = False
+        """Hold each multi-turn session's reusable prefix (attention and Gated-DeltaNet state
+        blocks) from the end of a turn's prefill until its next turn or its end, so no other
+        request evicts it (see `SessionKVHolder`). Held blocks count in vLLM's KV usage."""
+
+        session_kv_free_floor: float = 0.05
+        """With ``hold_session_kv``, release whole idle sessions, idle longest first, while
+        fewer than this fraction of KV blocks are free. Keep it above vLLM's ``watermark`` (set in
+        ``extra_vllm_engine_args``): vLLM admits no waiting request (a later turn included) while
+        fewer than ``watermark`` are free."""
+
+        kv_offload_gib: float = 0.0
+        """Host RAM (GiB) per generator for vLLM's native CPU KV offload, split across its DP x TP
+        ranks; 0 disables it.
+        - vLLM copies every computed KV block to CPU; a turn whose history left the GPU reloads it.
+        - Ended sessions' chunks are evicted first (see `SessionKVHolder`).
+        - Generator procs need ``expandable_segments:False`` and ``PYTHONHASHSEED=0``
+          (``train.py`` sets both)."""
+
+        return_routed_experts: bool = False
+        """MoE router replay: return each token's experts with its completion
+        (`Completion.routed_expert_ids`), and the trainer routes those tokens to them."""
+
         def __post_init__(self):
+            if self.hold_session_kv and self.reset_kv_cache_on_weight_sync:
+                raise ValueError(
+                    "hold_session_kv needs reset_kv_cache_on_weight_sync=False: vLLM cannot reset "
+                    "the prefix cache while blocks are held"
+                )
+            # vLLM's default watermark is 0.0.
+            watermark = self.extra_vllm_engine_args.get("watermark", 0.0)
+            if self.hold_session_kv and self.session_kv_free_floor <= watermark:
+                raise ValueError(
+                    f"session_kv_free_floor ({self.session_kv_free_floor}) must be above vLLM's "
+                    f"watermark ({watermark}, set in extra_vllm_engine_args), or held blocks can "
+                    "stall every waiting turn"
+                )
+            if self.kv_offload_gib < 0:
+                raise ValueError(
+                    f"kv_offload_gib must be >= 0, got {self.kv_offload_gib}"
+                )
+            if self.kv_offload_gib > 0 and self.reset_kv_cache_on_weight_sync:
+                raise ValueError(
+                    "kv_offload_gib needs reset_kv_cache_on_weight_sync=False (so no "
+                    "batch_invariant): vLLM cannot reset the prefix cache while a request waits "
+                    "on a CPU load"
+                )
             # The generator runs vLLM full expert parallelism: vLLM forms the EP
             # group from all DP*TP ranks, so expert_parallel_degree must equal
             # data_parallel_degree * tensor_parallel_degree (or 1 to disable EP).
@@ -934,6 +1120,7 @@ class VLLMGenerator(Configurable):
             parallelism=config.parallelism,
             checkpointer_config=config.checkpointer,
             dist_moe_runtime=config.dist_moe_runtime,
+            return_routed_experts=config.return_routed_experts,
         )
 
         # Set vLLM environment variables from config before any vLLM initialization
@@ -956,7 +1143,7 @@ class VLLMGenerator(Configurable):
 
         # Build vLLM engine
         enable_ep = config.parallelism.expert_parallel_degree > 1
-        engine_kwargs = dict(
+        engine_kwargs: dict[str, Any] = dict(
             # ``model`` is the path to the HF checkpoint directory. The
             # config is sourced from TorchTitan's model config via
             # ``config_format=TORCHTITAN_CONFIG_FORMAT`` (no config.json
@@ -1003,12 +1190,18 @@ class VLLMGenerator(Configurable):
         # Return logprobs of the distribution vLLM samples from (after temperature). vLLM's default
         # returns the raw model's logprobs, before temperature.
         engine_kwargs["logprobs_mode"] = "processed_logprobs"
+        if config.sampling.num_topk_logprobs > 0:
+            engine_kwargs["max_logprobs"] = config.sampling.num_topk_logprobs
         engine_kwargs["max_num_seqs"] = self._max_num_seqs
+        if config.return_routed_experts:
+            # TODO: vLLM after 0b7f11a1ee (2026-09-21) captures routed experts only under Model
+            # Runner V2 (forced off above); the router hook works unchanged there.
+            engine_kwargs["enable_return_routed_experts"] = True
         if config.max_num_batched_tokens is not None:
             engine_kwargs["max_num_batched_tokens"] = config.max_num_batched_tokens
-        # Continuous batching requires FCFS scheduling: admission order must equal the
-        # broadcast order on every rank
-        engine_kwargs["scheduling_policy"] = "fcfs"
+        # Priority = `EngineRequest.group_id`; see its docstring.
+        # TODO: validation's negative ids put it ahead of training. Revisit once it overlaps training.
+        engine_kwargs["scheduling_policy"] = "priority"
         # Which sliding-window / Mamba (GDN) state blocks are hashed into the prefix
         # cache; full-attention groups hash every block regardless.
         # - 0 (vLLM default since v0.29): only the replay boundary (the last block
@@ -1033,6 +1226,17 @@ class VLLMGenerator(Configurable):
             engine_kwargs["compilation_config"] = vllm_compilation_config
         if config.debug.seed is not None:
             engine_kwargs["seed"] = config.debug.seed
+        if config.kv_offload_gib > 0:
+            engine_kwargs["kv_offloading_size"] = config.kv_offload_gib
+            engine_kwargs["kv_transfer_config"] = KVTransferConfig(
+                kv_connector_extra_config={
+                    # vLLM's default stores prompt blocks only, but the next turn's prompt also
+                    # holds this turn's completion.
+                    "offload_prompt_only": False,
+                    # SessionKVHolder reorders this LRU so ended sessions are evicted first.
+                    "eviction_policy": "lru",
+                }
+            )
         add_extra_vllm_engine_args(engine_kwargs, config.extra_vllm_engine_args)
         engine_args = EngineArgs(**engine_kwargs)
 
@@ -1110,6 +1314,8 @@ class VLLMGenerator(Configurable):
                 f"({self._dp_rank}) != vLLM data_parallel_rank "
                 f"({vllm_parallel_config.data_parallel_rank})"
             )
+        if config.kv_offload_gib > 0:
+            _enable_multi_worker_kv_offload(self._engine)
 
         self.policy_version = 0
         # RANK 0: group id -> min policy version the group is pinned to, set at the
@@ -1141,6 +1347,36 @@ class VLLMGenerator(Configurable):
 
         # Engine-loop queue (rank 0): messages the endpoints put; the loop takes them off to decide.
         self._engine_loop_queue = EngineLoopQueue(self._engine_event_loop)
+
+        # Every rank holds the same blocks in its own scheduler; only the engine thread touches them.
+        self._session_kv: SessionKVHolder | None = None
+        if config.hold_session_kv or config.kv_offload_gib > 0:
+            scheduler = self._engine.engine_core.engine_core.scheduler
+            if config.hold_session_kv:
+                # Partial-block prefix hits or speculative decoding move the replay point away from
+                # the prompt-end block that SessionKVHolder holds.
+                if scheduler.kv_cache_manager.coordinator.enable_partial_hash_hits:
+                    raise ValueError(
+                        "hold_session_kv does not support partial-block prefix hits"
+                    )
+                if self._engine.vllm_config.speculative_config is not None:
+                    raise ValueError(
+                        "hold_session_kv does not support speculative decoding"
+                    )
+            self._session_kv = SessionKVHolder(
+                scheduler,
+                free_floor_blocks=int(
+                    config.session_kv_free_floor
+                    * scheduler.kv_cache_manager.block_pool.num_gpu_blocks
+                ),
+                hold=config.hold_session_kv,
+                # Built by vLLM from kv_connector_extra_config above.
+                offload_policy=(
+                    scheduler.connector.connector_scheduler.manager._policy
+                    if config.kv_offload_gib > 0
+                    else None
+                ),
+            )
 
         # `_engine_loop` running on the engine thread's event loop, as a future any thread can await;
         # None until start_engine_loop starts it.
@@ -1192,6 +1428,17 @@ class VLLMGenerator(Configurable):
     async def sync_log_step(self, step: int, relative_step: int | None = None) -> None:
         """Sync the structured-logger step counter from the controller."""
         sl.set_step(step, relative_step=relative_step)
+        if (
+            self._session_kv is not None
+            and self.config.hold_session_kv
+            and self._rank == 0
+        ):
+            logger.info(
+                "Session KV at step %d: %d sessions held, %d evicted so far",
+                step,
+                self._session_kv.num_sessions,
+                self._session_kv.num_evicted,
+            )
 
     async def start_engine_loop(self) -> None:
         """Start the background engine loop on every rank (one-time, idempotent)."""
@@ -1248,7 +1495,8 @@ class VLLMGenerator(Configurable):
             prompt_token_ids: One tokenized prompt `[token_ids]`.
             request_id: Unique id for this request, echoed on the `Completion`.
             group_id: Rollout group id. Requests of one group share a prefix cache
-                salt; `release_groups` drops it.
+                salt; `release_groups` drops it. Also the vLLM priority, lower first;
+                see `EngineRequest.group_id`.
             routing_session_id: Stable session key for in-mesh DP routing.
             sampling_config: Optional per-call override for the generator's
                 default SamplingConfig.
@@ -1357,6 +1605,11 @@ class VLLMGenerator(Configurable):
                         )
                     return
 
+                if self._session_kv is not None:
+                    self._session_kv.release(
+                        decision.released_session_ids, decision.released_group_ids
+                    )
+
                 if decision.action is LoopAction.PULL_MODEL_STATE_DICT:
                     await self._pull_model_state_dict(decision.pull_version)
                     # One pull applied every pull this decision coalesced (only rank 0 holds any).
@@ -1376,7 +1629,7 @@ class VLLMGenerator(Configurable):
                         )
                     # Admit only this rank's DP replica slice. TP ranks in the same
                     # replica compute the same _dp_rank, so they add the identical
-                    # set in the same FCFS order.
+                    # set in the same order.
                     local_requests = decision.requests_per_dp_rank[
                         self._request_dispatcher._dp_rank
                     ]
@@ -1401,11 +1654,20 @@ class VLLMGenerator(Configurable):
                             # prompts); the high-level entry stays resilient to vLLM internals vs
                             # vllm.inputs.tokens_input.
                             [engine_input] = self._engine.renderer.render_cmpl([prompt])
-                            self._engine.add_request(
+                            # vLLM appends a suffix to the id; the scheduler knows only that one.
+                            internal_request_id = self._engine.add_request(
                                 request_id=request.request_id,
                                 prompt=engine_input,
                                 params=self._build_sampling_params(request.sampling),
+                                arrival_time=request.arrival_time,
+                                priority=request.group_id,
                             )
+                            if self._session_kv is not None:
+                                self._session_kv.track(
+                                    internal_request_id,
+                                    request.routing_session_id,
+                                    request.group_id,
+                                )
                         except (ValueError, VLLMClientError) as exc:
                             rejected_requests.append((request.request_id, exc))
                     if rejected_requests:
@@ -1420,8 +1682,12 @@ class VLLMGenerator(Configurable):
                     for _ in range(self.config.max_engine_steps_between_decisions):
                         if not self._engine.has_unfinished_requests():
                             break
+                        if self._session_kv is not None:
+                            self._session_kv.evict_until_free()
                         with torch.no_grad():
                             request_outputs = self._engine.step()
+                        if self._session_kv is not None:
+                            self._session_kv.after_step()
                         self._request_dispatcher.process_finished_requests(
                             request_outputs, self.policy_version
                         )
@@ -1445,7 +1711,7 @@ class VLLMGenerator(Configurable):
         await asyncio.sleep(0)
         while not self._engine_loop_queue.empty():
             message = self._engine_loop_queue.get_nowait()
-            if isinstance(message, CloseMessage):
+            if isinstance(message, (CloseMessage, SessionReleaseMessage)):
                 continue
             if message.reply.set_running_or_notify_cancel():
                 message.reply.set_exception(exc)
@@ -1481,10 +1747,16 @@ class VLLMGenerator(Configurable):
         while not self._engine_loop_queue.empty():
             messages.append(self._engine_loop_queue.get_nowait())
 
+        released_session_ids: list[str] = []
+        released_group_ids: list[int] = []
         for message in messages:
             if isinstance(message, CloseMessage):
                 # Drops nothing: the queue rejects puts once closed, so the `CloseMessage` is the last message.
                 return LoopDecision(action=LoopAction.CLOSE, requests_per_dp_rank=[])
+            if isinstance(message, SessionReleaseMessage):
+                released_session_ids.extend(message.session_ids)
+                released_group_ids.extend(message.group_ids)
+                continue
             # Skip a call its caller already cancelled; once running, the reply ignores cancellation, so only
             # the engine loop resolves it.
             if not message.reply.set_running_or_notify_cancel():
@@ -1507,6 +1779,8 @@ class VLLMGenerator(Configurable):
                 action=LoopAction.PULL_MODEL_STATE_DICT,
                 requests_per_dp_rank=[],
                 pull_version=max(pull.version for pull in pending_pull_messages),
+                released_session_ids=released_session_ids,
+                released_group_ids=released_group_ids,
             )
 
         # `LoopAction.STEP`: admit whatever is pending (may be empty -> just keep stepping in-flight work).
@@ -1518,6 +1792,7 @@ class VLLMGenerator(Configurable):
                 request.min_policy_version = self._group_min_policy_versions.setdefault(
                     request.group_id, self.policy_version
                 )
+            request.arrival_time = time.time()
         requests_per_dp_rank = self._request_dispatcher.rank0_route(
             pending_engine_requests
         )
@@ -1525,6 +1800,8 @@ class VLLMGenerator(Configurable):
         return LoopDecision(
             action=LoopAction.STEP,
             requests_per_dp_rank=requests_per_dp_rank,
+            released_session_ids=released_session_ids,
+            released_group_ids=released_group_ids,
         )
 
     def _build_sampling_params(self, sampling: SamplingConfig) -> SamplingParams:
@@ -1551,7 +1828,8 @@ class VLLMGenerator(Configurable):
             # stop_token_ids even with skip_tokenizer_init.
             ignore_eos=True,
             seed=sampling.seed,
-            logprobs=0,  # return only the sampled token's logprob (for the GRPO ratio)
+            # The sampled token's logprob (for the GRPO ratio), plus the top-k if requested.
+            logprobs=sampling.num_topk_logprobs,
             # Token ids in, token ids and logprob floats out: stops are token ids and nothing reads
             # text, so skip vLLM's per-token detokenization and per-token logprob dicts.
             detokenize=False,
@@ -1564,7 +1842,8 @@ class VLLMGenerator(Configurable):
         )
 
     async def release_groups(self, group_ids: list[int]) -> None:
-        """Drop the pinned cache salts of finished rollout groups.
+        """Drop the pinned cache salts and the held KV of finished rollout groups; their
+        CPU-offloaded KV is evicted first.
 
         Args:
             group_ids: Groups with no more generation calls.
@@ -1574,6 +1853,18 @@ class VLLMGenerator(Configurable):
         # consistent snapshot of the pins, send releases through the queue instead.
         for group_id in group_ids:
             self._group_min_policy_versions.pop(group_id, None)
+        if self._session_kv is not None and self._rank == 0:
+            self._engine_loop_queue.put(SessionReleaseMessage(group_ids=group_ids))
+
+    async def release_sessions(self, session_ids: list[str]) -> None:
+        """Release the held KV of sessions whose rollout ended; their CPU-offloaded KV is evicted
+        first (rank 0; a no-op without ``hold_session_kv`` or ``kv_offload_gib``).
+
+        Args:
+            session_ids: Routing session ids with no more generation calls.
+        """
+        if self._session_kv is not None and self._rank == 0:
+            self._engine_loop_queue.put(SessionReleaseMessage(session_ids=session_ids))
 
     async def initialize_torchstore_client(self, requester_index: int) -> None:
         """Initialize this process as a TorchStore routing requester.
@@ -1688,6 +1979,7 @@ class VLLMGenerator(Configurable):
                 logger.info("Shutting down vLLM renderer")
                 renderer.shutdown()
             self._engine = None
+            self._session_kv = None
 
 
 # ===================== helpers =====================
@@ -1704,11 +1996,21 @@ class EngineRequest:
     prompt_token_ids: list[int]  # [prompt_tokens]
     sampling: SamplingConfig
     group_id: int
+    """Rollout group id, and its vLLM priority: lower is admitted first and preempted last.
+    Training ids grow as groups start; validation ids are negative, so validation goes first.
+
+        waiting, in arrival order:  g7 turn 1   g9 turn 1   g4 turn 2   validation (id -1)
+        vLLM admits:                validation  g4 turn 2   g7 turn 1   g9 turn 1
+                                                ^ g4 started before g7
+    """
     routing_session_id: str
     min_policy_version: int = field(init=False)
     """Oldest policy version this request's KV can come from; rank 0 sets it at admission.
     Without a KV reset on weight sync it is the group's pinned version and salts the
     prefix cache."""
+    arrival_time: float = field(init=False)
+    """Rank 0's `time.time()` at admission; vLLM breaks priority ties by it. TP ranks pass rank 0's
+    value, so one rank's clock jumping back cannot make it schedule a different batch."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -1746,7 +2048,17 @@ class CloseMessage:
     returns `LoopAction.CLOSE` when it sees one."""
 
 
-EngineLoopMessage = GenerationMessage | ModelStateDictPullMessage | CloseMessage
+@dataclass(kw_only=True, slots=True)
+class SessionReleaseMessage:
+    """Sessions (and every session of groups) whose held KV the engine loop releases; no reply."""
+
+    session_ids: list[str] = field(default_factory=list)
+    group_ids: list[int] = field(default_factory=list)
+
+
+EngineLoopMessage = (
+    GenerationMessage | ModelStateDictPullMessage | CloseMessage | SessionReleaseMessage
+)
 
 
 class EngineLoopQueue:
@@ -1850,3 +2162,7 @@ class LoopDecision:
 
     pull_version: int | None = None
     # set iff action is PULL_MODEL_STATE_DICT
+
+    released_session_ids: list[str] = field(default_factory=list)
+    released_group_ids: list[int] = field(default_factory=list)
+    # sessions (and groups) whose held KV every rank releases before acting (hold_session_kv)

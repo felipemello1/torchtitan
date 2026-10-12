@@ -10,6 +10,8 @@ import asyncio
 import random
 from types import SimpleNamespace
 
+import torch
+
 from renderers import ParsedResponse, Qwen3RendererConfig
 
 from torchtitan.components.renderer import from_renderers
@@ -111,6 +113,8 @@ class _GenerateFn:
             request_id=kwargs["request_id"],
             token_ids=[4],
             token_logprobs=[-0.5],
+            topk_token_ids=torch.tensor([[4, 9]], dtype=torch.int32),
+            topk_logprobs=torch.tensor([[-0.5, -1.5]]),
             finish_reason="stop",
         )
 
@@ -157,6 +161,8 @@ def test_worker_executes_group_without_actor_mesh() -> None:
         assert worker.score_group_called
         assert [rollout.reward for rollout in group.rollouts] == [1.0, 2.0]
         assert [rollout.advantage for rollout in group.rollouts] == [10.0, 20.0]
+        # The generator's top-k rides on the turn, for ScoreCenteringLoss.
+        assert group.rollouts[0].turns[0].completion_topk_token_ids.tolist() == [[4, 9]]
         assert all(env.closed for env in token_env_config.envs)
         assert [type(r).__name__ for r in token_env_config.renderers] == [
             "Qwen3Renderer",
@@ -264,6 +270,9 @@ def test_delta_prompts_rebuild_the_full_prompt_samples() -> None:
             finish_reason="stop",
         )
 
+    async def release_session_fn(routing_session_id: str) -> None:
+        pass
+
     async def run() -> None:
         for rollout_id in range(20):
             renderer = _RewritingRenderer(rng)
@@ -273,6 +282,7 @@ def test_delta_prompts_rebuild_the_full_prompt_samples() -> None:
             )
             rollout = await worker._run_single_rollout(
                 generate_fn=generate_fn,
+                release_session_fn=release_session_fn,
                 env=env,
                 sampling=SamplingConfig(),
                 group_id=0,
