@@ -432,6 +432,10 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
         validation=ValidationConfig(
             steps=4 * 240, greedy=False, freq=10, overlap_training=True
         ),
+        # Trainer ranks read each microbatch's tensors of 1 KiB or more as RDMA buffers. By value
+        # (the default), every rank's call carries the whole batch: 93-100 s at step 3 of a
+        # router-replay run.
+        rdma_fast_path_threshold=1024,
     )
     # A problem whose 16 rewards all come back 1.0 (all correct without a forced answer) is
     # skipped in later epochs, then re-checked; all-fail problems keep coming back.

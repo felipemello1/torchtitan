@@ -627,6 +627,7 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     - each session's prefix stays held between its turns, and idle sessions' KV spills to CPU;
     - router replay (was off);
     - vLLM watermark 0.1 (was 0.03);
+    - trainer microbatches as RDMA buffers (was in the Monarch message);
     - 2,000 Sandoq VMs (was 2,688), which cap the groups in flight at 120;
     - a synchronous save every 10 steps (was async).
 
@@ -676,6 +677,9 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
         generation_capacity=(sandbox_pool - num_validation_samples)
         // num_samples_per_prompt,
     )
+    # Trainer ranks read each microbatch's tensors of 1 KiB or more as RDMA buffers. By value (the
+    # default), every rank's call carries the whole batch: 93-100 s at step 3 of a router-replay run.
+    loop.rdma_fast_path_threshold = 1024
     # Validate at step 0 and every 10 steps beside training; starting a pass makes the trainer
     # wait only for that step's weight pull.
     loop.validation.freq = 10
@@ -743,17 +747,15 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     # k = 32 matched full-vocabulary score centering in every setting of the paper, whose default
     # is 128.
     generator.sampling.num_topk_logprobs = 32
-    # replace() re-runs VLLMGenerator.Config's checks (free floor above the watermark).
+    # replace() re-runs VLLMGenerator.Config's checks (hold_session_kv needs no KV reset on sync).
     config.generator = dataclasses.replace(
         generator,
         # Admit a request only while 10% of KV blocks stay free, so running requests have room to
         # grow before vLLM preempts one.
         extra_vllm_engine_args={"watermark": 0.1},
-        # Hold each session's prefix (attention + GDN state) between its turns; below 12% free
-        # blocks, release the sessions idle longest. Above the watermark, or held blocks stall
-        # every waiting turn.
+        # Hold each session's prefix (attention + GDN state) between its turns. Before each step,
+        # release the sessions idle longest until the watermark plus the step's growth stays free.
         hold_session_kv=True,
-        session_kv_free_floor=0.12,
         # A session whose KV left the GPU reloads its history from CPU instead of recomputing it.
         kv_offload_gib=kv_offload_gib,
     )

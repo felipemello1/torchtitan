@@ -657,6 +657,7 @@ def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) ->
         generation_capacity=120,
     )
     assert loop.validation == ValidationConfig(steps=78, freq=10, overlap_training=True)
+    assert loop.rdma_fast_path_threshold == 1024
     assert loop.training_sample_builder.drop_zero_std_reward_groups
     assert config.rollouter.rubric.length_reward_weight == 0.0
     assert config.rollouter.thinking_budget.max_thinking_tokens == 4096
@@ -667,7 +668,6 @@ def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) ->
     assert config.rollouter.training_dataloader.zero_spread_skip.min_mean_reward == 0.9
     assert config.generator.hold_session_kv
     assert not config.generator.reset_kv_cache_on_weight_sync
-    assert config.generator.session_kv_free_floor > 0.1  # vLLM's watermark
     assert config.generator.kv_offload_gib == 96
 
     trainer = config.trainer
