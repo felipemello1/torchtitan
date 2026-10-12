@@ -56,6 +56,9 @@ def _microbatch(num_tokens: int) -> TrainingMicrobatch:
         temperature=torch.ones(num_tokens),
         loss_mask=tokens % 2 == 0,
         advantages=tokens.float() / num_tokens,
+        # Score centering's top-k rows, one per loss token.
+        generator_topk_token_ids=torch.arange(num_tokens, dtype=torch.int32).view(-1, 2),
+        generator_topk_logprobs=-torch.arange(num_tokens).float().view(-1, 2),
         model_kwargs={
             "routed_expert_ids": torch.arange(num_tokens * 4, dtype=torch.uint8).view(
                 num_tokens, 2, 2

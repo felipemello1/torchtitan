@@ -278,7 +278,10 @@ def test_process_finished_requests_splits_topk_logprobs():
             [11, 4, 11], [-0.7, -0.5, -0.7], iter([2, 1, 2]), [None] * 3
         )
         sample = SimpleNamespace(
-            token_ids=[10, 11], logprobs=logprobs, finish_reason="stop"
+            token_ids=[10, 11],
+            logprobs=logprobs,
+            finish_reason="stop",
+            routed_experts=None,
         )
 
         dispatcher.process_finished_requests(
@@ -640,9 +643,10 @@ def test_batch_invariant_requires_kv_cache_reset():
 
 
 def test_hold_session_kv_requires_free_floor_above_watermark():
-    VLLMGenerator.Config(parallelism=_PARALLELISM, hold_session_kv=True)
+    VLLMGenerator.Config(model=_MODEL_CONFIG, parallelism=_PARALLELISM, hold_session_kv=True)
     with pytest.raises(ValueError, match="must be above vLLM's watermark"):
         VLLMGenerator.Config(
+            model=_MODEL_CONFIG,
             parallelism=_PARALLELISM,
             hold_session_kv=True,
             extra_vllm_engine_args={"watermark": 0.05},
@@ -652,6 +656,7 @@ def test_hold_session_kv_requires_free_floor_above_watermark():
 def test_kv_offload_rejects_kv_cache_reset_on_weight_sync():
     with pytest.raises(ValueError, match="needs reset_kv_cache_on_weight_sync=False"):
         VLLMGenerator.Config(
+            model=_MODEL_CONFIG,
             parallelism=_PARALLELISM,
             kv_offload_gib=16,
             reset_kv_cache_on_weight_sync=True,
@@ -660,7 +665,7 @@ def test_kv_offload_rejects_kv_cache_reset_on_weight_sync():
 
 def test_kv_offload_gib_rejects_negative_sizes():
     with pytest.raises(ValueError, match="kv_offload_gib must be >= 0, got -1"):
-        VLLMGenerator.Config(parallelism=_PARALLELISM, kv_offload_gib=-1)
+        VLLMGenerator.Config(model=_MODEL_CONFIG, parallelism=_PARALLELISM, kv_offload_gib=-1)
 
 
 def test_qwen36_27b_perf_config():
@@ -718,7 +723,9 @@ def test_extra_vllm_engine_args_reach_engine_args(monkeypatch, tmp_path):
 
 def test_kv_offload_sets_vllm_cpu_offload(monkeypatch, tmp_path):
     engine_kwargs = _build_engine_kwargs(
-        monkeypatch, tmp_path, VLLMGenerator.Config(kv_offload_gib=16)
+        monkeypatch,
+        tmp_path,
+        VLLMGenerator.Config(model=_MODEL_CONFIG, kv_offload_gib=16),
     )
     assert engine_kwargs["kv_offloading_size"] == 16
     # vLLM adds cpu_bytes_to_use from kv_offloading_size when it builds its config.
@@ -727,7 +734,9 @@ def test_kv_offload_sets_vllm_cpu_offload(monkeypatch, tmp_path):
         "eviction_policy": "lru",
     }
 
-    engine_kwargs = _build_engine_kwargs(monkeypatch, tmp_path, VLLMGenerator.Config())
+    engine_kwargs = _build_engine_kwargs(
+        monkeypatch, tmp_path, VLLMGenerator.Config(model=_MODEL_CONFIG)
+    )
     assert not engine_kwargs.keys() & {"kv_offloading_size", "kv_transfer_config"}
 
 

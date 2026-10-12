@@ -217,6 +217,7 @@ def _two_turn_trace():
                 nodes=[first_node, second_node],
                 token_ids=[10, 11, 12, 13, 14],
                 logprobs=[0.0, -0.1, 0.0, -0.2, -0.3],
+                routed_experts=None,
             )
         ],
     )
@@ -244,7 +245,7 @@ def test_verifiers_trace_attaches_each_generations_topk_rows() -> None:
         rollout_id=2,
     )
 
-    assert [turn.completion_token_ids for turn in turns] == [[11], [13, 14]]
+    assert [turn.completion_token_ids.tolist() for turn in turns] == [[11], [13, 14]]
     assert [turn.completion_topk_token_ids.tolist() for turn in turns] == [
         [[11, 7]],
         [[13, 8], [14, 9]],

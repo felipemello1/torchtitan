@@ -383,10 +383,7 @@ def test_sticky_session_release_drops_its_assignment():
         first = asyncio.create_task(_generate(router, group_id=0, session_id="s0"))
         await actors[0].generate.started.wait()
 
-        if release == "session":
-            await router._release_session(session_id="s0")
-        else:
-            router._release_groups([0])
+        await router._release_session(session_id="s0")
         # Released, s0 is a new session: least-loaded picks idle gen1 over busy gen0.
         assert await _generate(router, group_id=0, session_id="s0") == "gen1"
 
@@ -408,7 +405,7 @@ def test_session_release_reaches_only_its_pinned_generator():
         )
         assert await _generate(router, group_id=0, session_id="s0") == "gen0"
 
-        await router._release_session(group_id=0, session_id="s0")
+        await router._release_session(session_id="s0")
 
         assert actors[0].release_sessions.calls == [((["s0"],), {})]
         assert actors[1].release_sessions.calls == []

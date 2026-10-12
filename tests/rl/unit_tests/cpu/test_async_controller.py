@@ -88,9 +88,9 @@ def test_setup_async_caps_max_num_seqs_at_1024(monkeypatch, caplog) -> None:
         data_parallel_degree=1,
     )
     async_loop = SimpleNamespace(
-        max_active_rollout_groups=256,
+        max_concurrent_rollout_groups=256,
         num_samples_per_prompt=16,
-        validation=SimpleNamespace(steps=0),
+        validation=SimpleNamespace(steps=0, freq=None, overlap_training=False),
     )
     controller = SimpleNamespace(
         config=SimpleNamespace(
@@ -901,6 +901,7 @@ def _run_with_generator_watcher(watcher) -> None:
         async_loop=SimpleNamespace(
             num_training_steps=1,
             max_active_rollout_groups=1,
+            max_concurrent_rollout_groups=1,
             window_size=None,
             target_offpolicy_steps=0,
             windowed_fifo_batches=None,
@@ -911,6 +912,7 @@ def _run_with_generator_watcher(watcher) -> None:
             ),
             training_sample_builder=SimpleNamespace(build=lambda: None),
             batcher=SimpleNamespace(build=lambda **kwargs: None),
+            validation=SimpleNamespace(overlap_training=False),
         ),
         trainer=SimpleNamespace(
             training=SimpleNamespace(
@@ -922,7 +924,7 @@ def _run_with_generator_watcher(watcher) -> None:
     controller.trainer = None
     controller.trainer_dp_degree = 1
     controller.tokenizer = SimpleNamespace(eos_id=0)
-    controller._sampling = SimpleNamespace(temperature=1.0)
+    controller._sampling = SimpleNamespace(temperature=1.0, num_topk_logprobs=0)
     controller.generator_router = SimpleNamespace(
         wait_engine_loop=SimpleNamespace(call_one=watcher)
     )
@@ -969,16 +971,16 @@ def _validation_rollout(versions: list[tuple[int, int]]) -> Rollout:
         turns=[
             RolloutTurn(
                 rollout_id=RolloutTurnID(group_id=-1, rollout_id=0, turn_id=turn_id),
-                prompt_token_ids=[1],
-                completion_token_ids=[2],
-                completion_logprobs=[-0.1],
+                prompt_prefix_len=0,
+                prompt_delta_token_ids=np.array([1], dtype=np.int32),
+                completion_token_ids=np.array([2], dtype=np.int32),
+                completion_logprobs=np.array([-0.1], dtype=np.float32),
                 min_policy_version=min_version,
                 max_policy_version=max_version,
             )
             for turn_id, (min_version, max_version) in enumerate(versions)
         ],
     )
-
 
 
 def test_validation_logs_the_policies_its_rollouts_sampled() -> None:
@@ -1012,7 +1014,6 @@ def test_validation_logs_the_policies_its_rollouts_sampled() -> None:
     assert reduced["validation/mixed_policy_rollouts/mean"] == 0.5
 
 
-
 class _FakeValidation:
     """Stands in for `Controller.validate`: each pass runs until the test ends it."""
 
@@ -1044,7 +1045,6 @@ class _FakeValidation:
         return self._end_events.setdefault(step, asyncio.Event())
 
 
-
 class _FakeWeightSync:
     """Stands in for `WeightSyncManager`; a push/pull reaches the generators once awaited."""
 
@@ -1073,11 +1073,9 @@ class _FakeWeightSync:
             self._inflight_version = None
 
 
-
 def _rank_0_result(value: object) -> SimpleNamespace:
     """Stands in for a Monarch ValueMesh; `Controller._get_rank_0_value` calls `.get(0)`."""
     return SimpleNamespace(get=lambda rank: value)
-
 
 
 def _controller_for_trainer_loop(
@@ -1114,13 +1112,17 @@ def _controller_for_trainer_loop(
         training_data_metrics=list,
     )
     controller._weight_sync = _FakeWeightSync()
-    controller._group_buffer = SimpleNamespace(metrics=lambda: [])
+    controller._group_buffer = SimpleNamespace(
+        metrics=lambda: [],
+        record_step_start=AsyncMock(),
+        pop_dropped_group_ids=list,
+        release_active_groups=AsyncMock(),
+    )
     controller.metrics_processor = Mock()
     controller._validation_task = None
     fake_validation = _FakeValidation()
     controller.validate = fake_validation
     return controller, fake_validation
-
 
 
 def _training_batch(step: int) -> SimpleNamespace:
@@ -1130,10 +1132,9 @@ def _training_batch(step: int) -> SimpleNamespace:
         min_policy_versions=[step - 1],
         microbatches=[],
         global_loss_token_counts=[1],
-        global_routing_token_counts=[],
+        global_routing_token_counts=[1],
         group_ids=[step],
     )
-
 
 
 def _logged_steps(controller: Controller, *, is_validation: bool) -> list[int]:
@@ -1144,15 +1145,15 @@ def _logged_steps(controller: Controller, *, is_validation: bool) -> list[int]:
     ]
 
 
-
 async def _run_until(condition) -> None:
-    """Let other tasks run until `condition()` holds."""
-    for _ in range(100):
+    """Let other tasks run until `condition()` holds. Waits in real time: the trainer loop hands
+    microbatch registration and dataloader calls to threads, which no number of bare yields lets
+    finish."""
+    for _ in range(500):
         if condition():
             return
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
     raise AssertionError("condition never held")
-
 
 
 def test_overlapped_validation_runs_beside_training() -> None:
@@ -1215,7 +1216,6 @@ def test_overlapped_validation_runs_beside_training() -> None:
     assert calls[validation_log + 1][0] == "commit"
 
 
-
 def test_overlapped_validation_failure_stops_training() -> None:
     """A pass that raises stops training at the end of the next step."""
     controller, validation = _controller_for_trainer_loop(
@@ -1235,7 +1235,6 @@ def test_overlapped_validation_failure_stops_training() -> None:
             await asyncio.wait_for(trainer, timeout=5)
 
     asyncio.run(run())
-
 
 
 def test_overlapped_validation_starts_no_pass_at_the_last_step() -> None:
@@ -1265,7 +1264,6 @@ def test_overlapped_validation_starts_no_pass_at_the_last_step() -> None:
     assert controller._validation_task.done()
 
 
-
 def test_validation_pauses_training_by_default() -> None:
     controller, validation = _controller_for_trainer_loop(ValidationConfig(freq=2))
 
@@ -1291,7 +1289,6 @@ def test_validation_pauses_training_by_default() -> None:
     asyncio.run(run())
 
 
-
 @pytest.mark.parametrize(
     "pass_3_ends_in_training, logged_steps", [(True, [2, 3, 4]), (False, [2, 4, 5])]
 )
@@ -1315,6 +1312,8 @@ def test_overlapped_validation_before_and_after_training(
     controller.start_step = 0
     controller.trainer = Mock()
     controller.generator_router = Mock()
+    # The engine loops run for the whole test.
+    controller.generator_router.wait_engine_loop.call_one = _block_forever
     controller.trainer_dp_degree = 1
     controller.tokenizer = SimpleNamespace(eos_id=0)
     controller._sampling = SamplingConfig()
@@ -1372,7 +1371,6 @@ def test_overlapped_validation_before_and_after_training(
     )
 
 
-
 def test_close_cancels_a_running_pass_before_closing_the_rollouter() -> None:
     """After a training crash, `close()` cancels the pass and waits for it, then closes the
     rollouter the pass was using."""
@@ -1398,7 +1396,6 @@ def test_close_cancels_a_running_pass_before_closing_the_rollouter() -> None:
     asyncio.run(run())
     assert controller._validation_task.cancelled()
     assert pass_done_at_rollouter_close == [True]
-
 
 
 @pytest.mark.parametrize(
@@ -1462,7 +1459,6 @@ def test_fixed_buffer_ignores_the_adaptive_hooks() -> None:
     assert [entry for entry in log if isinstance(entry, int)] == [0, 1, 2, 3, 5, 7]
 
 
-
 def _adaptive_buffer(
     *,
     num_prompts: int,
@@ -1476,10 +1472,8 @@ def _adaptive_buffer(
     ).build(num_prompts_per_train_step=num_prompts, **kwargs)
 
 
-
 def _buffer_metric(buffer: RolloutGroupWorkBuffer, key: str) -> float:
     return next(metric.value.value for metric in buffer.metrics() if metric.key == key)
-
 
 
 def test_stall_driven_demand_quantile_uses_every_point_of_the_lookback() -> None:
@@ -1522,7 +1516,6 @@ def test_stall_driven_demand_quantile_uses_every_point_of_the_lookback() -> None
     )
 
 
-
 def test_stall_driven_demand_starts_at_three_batches_and_moves_half_the_gap() -> None:
     demand = StallDrivenDemand(num_prompts_per_train_step=8, max_offpolicy_steps=10)
     assert demand.demand == 24
@@ -1540,7 +1533,6 @@ def test_stall_driven_demand_starts_at_three_batches_and_moves_half_the_gap() ->
     assert demand.state == "age-limited"
 
 
-
 def test_stall_driven_demand_moves_down_one_group_per_step() -> None:
     for damping_factor in (0.5, 1.0):
         demand = StallDrivenDemand(
@@ -1552,7 +1544,6 @@ def test_stall_driven_demand_moves_down_one_group_per_step() -> None:
             == 63
         )
         assert demand.state == "ok"
-
 
 
 def test_stall_driven_demand_above_the_ceiling_moves_down_half_the_gap() -> None:
@@ -1571,7 +1562,6 @@ def test_stall_driven_demand_above_the_ceiling_moves_down_half_the_gap() -> None
         demand.observe(step=1, ready=60, generating=4, completed=60, trainable=60) == 40
     )
     assert demand.state == "age-limited"
-
 
 
 def test_stall_driven_demand_is_capped_by_the_mean_age_ceiling() -> None:
@@ -1598,7 +1588,6 @@ def test_stall_driven_demand_is_capped_by_the_mean_age_ceiling() -> None:
     for step in range(9, 21):
         demand.observe(step=step, ready=100, generating=0, completed=8, trainable=8)
     assert demand.state == "ok"
-
 
 
 def test_stall_driven_demand_without_a_max_has_no_ceiling_and_drops_nothing() -> None:
@@ -1635,7 +1624,6 @@ def test_stall_driven_demand_without_a_max_has_no_ceiling_and_drops_nothing() ->
     assert config.max_concurrent_rollout_groups == 4
 
 
-
 def test_adaptive_buffer_takes_oldest_finalized_and_lets_slow_groups_keep_their_slot() -> None:
     async def run() -> None:
         buffer = _adaptive_buffer(num_prompts=2, generation_capacity=4)
@@ -1659,7 +1647,6 @@ def test_adaptive_buffer_takes_oldest_finalized_and_lets_slow_groups_keep_their_
         assert _buffer_metric(buffer, "rollout_buffer/active_slots_in_use_peak") == 4
 
     asyncio.run(run())
-
 
 
 def test_adaptive_buffer_drops_groups_past_max_offpolicy_steps() -> None:
@@ -1706,7 +1693,6 @@ def test_adaptive_buffer_drops_groups_past_max_offpolicy_steps() -> None:
     asyncio.run(run())
 
 
-
 def test_adaptive_buffer_measures_the_shelf_and_moves_demand() -> None:
     async def run() -> None:
         # P=4: demand starts at three batches = 12; the shelf is what is finished and not held by the trainer.
@@ -1745,7 +1731,6 @@ def test_adaptive_buffer_measures_the_shelf_and_moves_demand() -> None:
     asyncio.run(run())
 
 
-
 def test_adaptive_buffer_target_offpolicy_steps_caps_demand() -> None:
     # P=4, target 5 of max 10: the ceiling is 5 x 4 + 4 + generating x untrainable share
     buffer = AdaptiveRolloutGroupWorkBuffer.Config(
@@ -1772,7 +1757,6 @@ def test_adaptive_buffer_target_offpolicy_steps_caps_demand() -> None:
         )
 
 
-
 def test_adaptive_buffer_demand_stays_under_the_mean_age_ceiling() -> None:
     async def run() -> None:
         buffer = _adaptive_buffer(
@@ -1794,7 +1778,6 @@ def test_adaptive_buffer_demand_stays_under_the_mean_age_ceiling() -> None:
         assert await waiter is False
 
     asyncio.run(run())
-
 
 
 def test_adaptive_buffer_does_not_queue_ahead_of_generation() -> None:
@@ -1821,7 +1804,6 @@ def test_adaptive_buffer_does_not_queue_ahead_of_generation() -> None:
     asyncio.run(run())
 
 
-
 def test_adaptive_buffer_admits_a_granted_slot_after_the_demand_drops() -> None:
     async def run() -> None:
         # P=2: demand 6. Five groups finished and none trained: a full shelf.
@@ -1845,7 +1827,6 @@ def test_adaptive_buffer_admits_a_granted_slot_after_the_demand_drops() -> None:
         await buffer.close()
 
     asyncio.run(run())
-
 
 
 def test_batcher_passes_the_version_that_trains_each_group() -> None:
@@ -1888,7 +1869,6 @@ def test_batcher_passes_the_version_that_trains_each_group() -> None:
     assert queue.qsize() == 3  # two batches and the None sentinel
 
 
-
 def test_generation_capacity_default_leaves_room_for_untrainable_groups() -> None:
     config = AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=12)
     # 2 x (12 + 1) versions x 16 prompts: room for up to half the groups being untrainable.
@@ -1905,7 +1885,6 @@ def test_generation_capacity_default_leaves_room_for_untrainable_groups() -> Non
         ValueError, match="set generation_capacity or max_offpolicy_steps"
     ):
         AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=None)
-
 
 
 def test_adaptive_buffer_warns_once_when_generation_capacity_caps_demand(
