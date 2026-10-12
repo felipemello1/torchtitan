@@ -63,6 +63,50 @@ def test_controller_config_maybe_log(tmp_path, caplog) -> None:
     assert saved_config["trainer"]["training"]["max_context_length"] == 128
 
 
+def test_setup_async_caps_max_num_seqs_at_1024(monkeypatch, caplog) -> None:
+    from torchtitan.rl import controller as controller_module
+
+    class _StopAfterSizing(Exception):
+        pass
+
+    def stop():
+        raise _StopAfterSizing
+
+    # setup_async sizes max_num_seqs and logs it before it spawns any mesh: stop there.
+    monkeypatch.setattr(controller_module, "this_host", stop)
+    parallelism = SimpleNamespace(
+        data_parallel_shard_degree=1,
+        data_parallel_replicate_degree=1,
+        data_parallel_degree=1,
+    )
+    async_loop = SimpleNamespace(
+        max_active_rollout_groups=256,
+        num_samples_per_prompt=16,
+        validation=SimpleNamespace(steps=0, freq=None, overlap_training=False),
+    )
+    controller = SimpleNamespace(
+        config=SimpleNamespace(
+            async_loop=async_loop,
+            trainer=SimpleNamespace(parallelism=parallelism),
+            generator=SimpleNamespace(parallelism=parallelism),
+        ),
+        _rollouter=SimpleNamespace(get_validation_samples=lambda steps: []),
+    )
+
+    with caplog.at_level(logging.INFO, logger="torchtitan.rl.controller"):
+        with pytest.raises(_StopAfterSizing):
+            asyncio.run(
+                controller_module.Controller.setup_async(
+                    # pyrefly: ignore [bad-argument-type]
+                    controller,
+                    trainer_mesh=None,
+                    generator_meshes=[None],
+                )
+            )
+
+    assert "max_num_seqs=1024 per generator (rollout_concurrency=4096" in caplog.text
+
+
 def _training_sample(*, group_id: int, rollout_id: int) -> TrainingSample:
     return TrainingSample(
         min_policy_version=0,
