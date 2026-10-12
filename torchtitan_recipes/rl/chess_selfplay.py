@@ -4,8 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Qwen3.5-4B chess recipes: one node with self-play mixed with games against Stockfish bots, and
-three GB300 hosts with thinking on and self-play only."""
+"""Qwen3.5 chess recipes: 4B on one node, self-play mixed with games against Stockfish bots; 4B and
+35B-A3B-Base on three GB300 hosts, thinking on, self-play only."""
 
 from __future__ import annotations
 
@@ -342,21 +342,18 @@ def rl_chess_qwen3_5_4b_gb300(
 
 def rl_chess_qwen3_5_35b_a3b_base_gb300(
     max_plies: int = 120,
-    start_max_plies: int = 60,
-    max_plies_ramp_steps: int = 200,
     max_thinking_tokens: int = 1024,
     max_context_tokens: int = 131072,
     num_prompts_per_train_step: int = 32,
-    kv_offload_gib: float = 96.0,
 ) -> Controller.Config:
-    """Qwen3.5-35B-A3B-Base self-play from scratch, with thinking, on three GB300 hosts:
+    """Qwen3.5-35B-A3B-Base self-play from scratch on three GB300 hosts; games, thinking, rewards and
+    validation as in `rl_chess_qwen3_5_4b_gb300`:
 
         host 0:     the trainer, FSDP 2 x TP 2 x EP 4 with Dist-MoE experts
         hosts 1-2:  eight TP1 generators; idle session KV goes to CPU
 
-    Training games start at `start_max_plies` and grow linearly to `max_plies` by step
-    `max_plies_ramp_steps` (60 -> 120 by step 200); validation games always play `max_plies`.
-    Score centering with router replay, lr 5e-6 after a 10-step warmup.
+    Training games' ply cap grows from 60 at step 0 to `max_plies` at step 200; validation games
+    always play `max_plies`.
     """
     expert_parallel_degree = 4
     config = rl_chess_qwen3_5_4b_gb300(
@@ -382,24 +379,23 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
 
     # ======== Rollouts ========
     config.rollouter.curriculum = ChessCurriculum.Config(
-        start_max_plies=start_max_plies,
-        end_max_plies=max_plies,
-        max_plies_ramp_steps=max_plies_ramp_steps,
+        start_max_plies=60, end_max_plies=max_plies, max_plies_ramp_steps=200
     )
 
     # ======== Async loop ========
     loop = config.async_loop
     loop.num_training_steps = 300
-    # num_prompts positions x 8 games x 2 colors: 32 x 16 = 512 rollouts of ~25K tokens at 60 plies,
-    # ~13M tokens, ~230 s of forward/backward at the 35B trainer's ~55K tokens/s.
+    # 32 positions x 8 games x 2 colors = 512 rollouts per step. 60-ply games averaged 23-29K tokens
+    # per rollout (4B), so ~12-15M tokens: ~220-270 s of forward/backward at ~55K tokens/s.
     loop.num_prompts_per_train_step = num_prompts_per_train_step
     loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
         # The mean policy age of trained groups stays under 6 steps, every one under 10.
         target_offpolicy_steps=6,
         max_offpolicy_steps=10,
-        # (6 + 1) batches generating at once, the mean-age ceiling; sizes vLLM's max_num_seqs.
-        generation_capacity=7 * num_prompts_per_train_step,
-        start_batches=7,
+        # Generate up to (6 + 1) batches at once from the first step, the most a mean age of 6
+        # allows; sizes vLLM's max_num_seqs.
+        generation_capacity=(6 + 1) * num_prompts_per_train_step,
+        start_batches=6 + 1,
     )
     loop.target_offpolicy_steps = loop.group_buffer.target_offpolicy_steps
     loop.validation.freq = 10
@@ -408,47 +404,37 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
     trainer = config.trainer
     trainer.model = trainer_model
     trainer.parallelism = trainer_parallelism
-    trainer.training.dtype = (
-        "float32"  # fp32 master weights; FSDP unshards bf16 for compute
-    )
-    trainer.training.mixed_precision_param = "bfloat16"
-    # Dist-MoE's activation planner breaks if its forward is replayed in backward, so nothing is saved
-    # and nothing replays it; a rank receiving more rows than the scratch holds faults.
+    # Recompute every op in the block except the Dist-MoE call, which is never recomputed.
     trainer.activation_checkpoint = RegionAC.Config(save_regions=[])
+    # Worst case, every EP rank routes all its tokens to one rank; a smaller scratch
+    # buffer is an illegal memory access.
     trainer.dist_moe_runtime = DistMoeRuntime.Config(
         scratch_capacity_factor=float(expert_parallel_degree)
     )
-    trainer.optim = Optim.Config(
-        optimizer=OptimizersContainer.Config(
-            optimizers=[
-                AdamW.Config(
-                    pattern=r".*", lr=5e-6, betas=(0.9, 0.98), weight_decay=0.1
-                )
-            ]
-        ),
-        # Fresh weights: ramp to 5e-6 over 10 steps, then hold it.
-        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=10, min_lr_factor=1.0),
-    )
-    trainer.loss.loss_fn = ScoreCenteringLoss.Config(
-        max_ratio=2.0, global_vocab_size=decoder_vocab_size(trainer_model)
-    )
+    # Fresh weights: ramp to 5e-6 over 10 steps, then hold it.
+    trainer.optim.optimizer.optimizers[0].lr = 5e-6
+    trainer.optim.lr_scheduler.warmup_steps = 10
     # Synchronous saves: an async save's CPU copy of the 35B state (~420 GB) on top of the batch
     # can exceed the trainer host's job memory.
     trainer.checkpointer.async_mode = "disabled"
-    config.trainer = apply_transforms(trainer, [DistMoeTransform()])
+    # Dist-MoE experts on the trainer's model only; the generators keep stock experts. The
+    # functional WGRAD path, as the GB300 Terminal-Bench 35B runs use.
+    config.trainer = apply_transforms(
+        trainer, [DistMoeTransform(inplace_wgrad_accum=False)]
+    )
 
     # ======== Generators ========
     generator = config.generator
     generator.model = generator_model
-    # The routed experts the trainer replays.
+    # Router replay: the trainer routes each token to the experts the generator picked.
     generator.return_routed_experts = True
     # ScoreCenteringLoss's top-k: 32 matched the full vocabulary in arXiv 2609.20807.
     generator.sampling.num_topk_logprobs = 32
-    # Admit a request only while 10% of KV blocks stay free; held idle sessions are released from
-    # 15% free down (must sit above the watermark), and their KV stays in CPU memory.
+    # Admit a request only while 10% of KV blocks stay free. Below 15% free, release the sessions idle
+    # longest; their KV stays in CPU memory.
     generator.extra_vllm_engine_args = {"watermark": 0.1}
     generator.session_kv_free_floor = 0.15
     # Host RAM per engine for vLLM's CPU KV offload: 4 engines x 96 GiB fit a GB300 host's /dev/shm
     # (half of ~954 GB) with margin.
-    generator.kv_offload_gib = kv_offload_gib
+    generator.kv_offload_gib = 96.0
     return config
