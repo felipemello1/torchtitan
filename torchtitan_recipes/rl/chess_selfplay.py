@@ -449,3 +449,11 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300_lr2e6() -> Controller.Config:
     config = rl_chess_qwen3_5_35b_a3b_base_gb300()
     config.trainer.optim.optimizer.optimizers[0].lr = 2e-6
     return config
+
+
+def rl_chess_qwen3_5_35b_a3b_base_gb300_lr1e6() -> Controller.Config:
+    """`rl_chess_qwen3_5_35b_a3b_base_gb300` at lr 1e-6, the 4B's stable rate, to resume a faster run.
+    At 2e-6, from step 20 self-play ACPL rose 162 -> 330 and validation Elo fell 787 -> 620 by step 38."""
+    config = rl_chess_qwen3_5_35b_a3b_base_gb300()
+    config.trainer.optim.optimizer.optimizers[0].lr = 1e-6
+    return config
