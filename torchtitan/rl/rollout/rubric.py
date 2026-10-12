@@ -93,6 +93,11 @@ class Rubric(Configurable):
         """Reward for a truncated rollout. If set, the reward fns are SKIPPED and this fixed
         reward is used. If None, the reward fns run on the truncated rollout."""
 
+        truncation_penalty: float = 0.0
+        """Subtracted from a truncated rollout's reward when `truncation_reward` is None. The
+        rollout is still graded, so e.g. solving and then running out of turns scores below
+        solving and stopping."""
+
         error_reward: float | None = None
         """Reward for a errored rollout. If set, the reward fns are SKIPPED and this fixed
         reward is used. If None, the reward fns run on the errored rollout."""
@@ -163,6 +168,8 @@ class Rubric(Configurable):
             total_reward += (fn.weight / self._weight_sum) * r
         if total_reward > 0 and rollout.has_forced_answer:
             total_reward *= cfg.forced_answer_scale
+        if rollout.status.is_truncated():
+            total_reward -= cfg.truncation_penalty
 
         return RubricOutput(reward=total_reward, reward_breakdown=reward_breakdown)
 

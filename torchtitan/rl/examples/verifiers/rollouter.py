@@ -57,8 +57,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 VERIFIERS_REWARD_KEY = "verifiers_reward"
-# The fraction of the task's tests that passed, when the env reports one in `trace.info`.
-TESTS_PASSED_FRAC_KEY = "tests_passed_frac"
 
 
 class RewardFromVerifiers(RewardFn):
@@ -74,52 +72,6 @@ class RewardFromVerifiers(RewardFn):
             if VERIFIERS_REWARD_KEY in turn.env_rewards:
                 return float(turn.env_rewards[VERIFIERS_REWARD_KEY])
         return 0.0
-
-
-class RewardFromVerifiersPartialCredit(RewardFn):
-    """Verifiers' reward plus partial credit for the tests that passed, minus a truncation penalty.
-
-    Example, with the defaults:
-        all tests pass                    -> 1.0
-        2 of 3 tests pass                 -> 0.5 * 2/3 = 0.33
-        2 of 3 pass, then max_turns hit   -> 0.33 - 0.5 = -0.17
-        all pass, then max_turns hit      -> 1.0 - 0.5 = 0.5
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(RewardFn.Config):
-        partial_credit_weight: float = 0.5
-        """Weight of the passed-test fraction when not every test passes. Below 1 so a full solve
-        always scores highest."""
-
-        truncation_penalty: float = 0.5
-        """Subtracted from a truncated rollout's score: it is still graded on its final state, so
-        solving and then looping scores below solving and stopping."""
-
-    def __init__(self, config: Config) -> None:
-        super().__init__(config)
-        self._partial_credit_weight = config.partial_credit_weight
-        self._truncation_penalty = config.truncation_penalty
-
-    async def __call__(self, rollout: Rollout, env_input: object) -> float:
-        del env_input
-        rewards = next(
-            (
-                turn.env_rewards
-                for turn in reversed(rollout.turns)
-                if VERIFIERS_REWARD_KEY in turn.env_rewards
-            ),
-            {},
-        )
-        if rewards.get(VERIFIERS_REWARD_KEY, 0.0) >= 1.0:
-            score = 1.0
-        else:
-            score = self._partial_credit_weight * rewards.get(
-                TESTS_PASSED_FRAC_KEY, 0.0
-            )
-        if rollout.status.is_truncated():
-            score -= self._truncation_penalty
-        return score
 
 
 class VerifiersRollouter(Rollouter):
@@ -157,12 +109,12 @@ class VerifiersRollouter(Rollouter):
         """Environment server spawned and owned by this rollouter."""
 
         rubric: Rubric.Config
-        """TorchTitan rubric that consumes rewards returned by Verifiers. Its `truncation_reward`
-        applies to training groups only; validation scores a truncated rollout on its tests."""
+        """TorchTitan rubric that consumes rewards returned by Verifiers, for training groups."""
 
         validation_rubric: Rubric.Config | None = None
-        """Rubric for validation groups, e.g. the plain pass/fail reward when training uses partial
-        credit. None: `rubric` without its `truncation_reward`."""
+        """Rubric for validation groups, e.g. pass/fail when training uses partial credit. None:
+        `rubric` without its truncation reward or penalty, so validation scores a truncated
+        rollout on its tests."""
 
         advantage: AdvantageEstimator.Config = field(
             default_factory=AdvantageEstimator.Config
@@ -217,9 +169,9 @@ class VerifiersRollouter(Rollouter):
         super().__init__(config)
         self._verifiers_config = config
         self._rubric: Rubric = config.rubric.build()
-        # Validation skips truncation_reward, so its reward stays the tests' pass rate.
         self._validation_rubric: Rubric = (
-            config.validation_rubric or replace(config.rubric, truncation_reward=None)
+            config.validation_rubric
+            or replace(config.rubric, truncation_reward=None, truncation_penalty=0.0)
         ).build()
         self._advantage_estimator: AdvantageEstimator = config.advantage.build()
         self._verifiers_env_server = config.verifiers_env_server.build()
@@ -431,8 +383,14 @@ class VerifiersRollouter(Rollouter):
             log_failed_rollout(logs, group_id=group_id, rollout_id=rollout_id)
         else:
             turns[-1].env_rewards[VERIFIERS_REWARD_KEY] = trace.reward
-            if (passed_frac := trace.info.get(TESTS_PASSED_FRAC_KEY)) is not None:
-                turns[-1].env_rewards[TESTS_PASSED_FRAC_KEY] = passed_frac
+            # The env's own metrics, e.g. the Sandoq plugin's passed-test fraction.
+            turns[-1].env_rewards.update(
+                {
+                    name: value
+                    for name, value in trace.metrics.items()
+                    if value is not None
+                }
+            )
         return Rollout(
             group_id=group_id,
             rollout_id=rollout_id,

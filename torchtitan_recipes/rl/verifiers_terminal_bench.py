@@ -54,12 +54,14 @@ from torchtitan.rl.examples.verifiers.env_server import VerifiersEnvServer
 from torchtitan.rl.examples.verifiers.generation_server import GenerationServer
 from torchtitan.rl.examples.verifiers.rollouter import (
     RewardFromVerifiers,
-    RewardFromVerifiersPartialCredit,
     VerifiersRollouter,
 )
 from torchtitan.rl.examples.verifiers.terminal_bench.harness import (
     register_harness_alias,
     TerminalBenchTerminusHarnessConfig,
+)
+from torchtitan.rl.examples.verifiers.terminal_bench.reward import (
+    RewardFromVerifiersPartialCredit,
 )
 from torchtitan.rl.examples.verifiers.terminal_bench.taskset import (
     TerminalTasksetConfig,
@@ -684,15 +686,16 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     # No length reward: it breaks reward ties, so all-pass and all-fail groups would train on
     # length alone instead of being dropped.
     config.rollouter.rubric.length_reward_weight = 0.0
-    # Training: half credit for the fraction of tests passed, minus 0.5 when truncated (the policy
-    # learned to loop with empty commands after solving). Validation stays pass/fail.
-    config.rollouter.rubric = dataclasses.replace(
-        config.rollouter.rubric,
-        reward_fns=[RewardFromVerifiersPartialCredit.Config(weight=1.0)],
-        truncation_reward=None,
-    )
-    config.rollouter.validation_rubric = dataclasses.replace(
-        config.rollouter.rubric, reward_fns=[RewardFromVerifiers.Config(weight=1.0)]
+    # Training: full credit for a solve, else up to 0.5 for the tests that passed, minus 0.5 when
+    # truncated (the policy learned to loop with empty commands after solving). The zero-weight
+    # pass/fail fn keeps the pass rate in the metrics. Validation stays pass/fail.
+    config.rollouter.rubric.reward_fns = [
+        RewardFromVerifiersPartialCredit.Config(weight=1.0),
+        RewardFromVerifiers.Config(weight=0.0),
+    ]
+    config.rollouter.rubric.truncation_penalty = 0.5
+    config.rollouter.validation_rubric = Rubric.Config(
+        reward_fns=[RewardFromVerifiers.Config(weight=1.0)], error_reward=0.0
     )
     # The last 1x2 run's budget: a turn still thinking after 4,096 tokens gets a forced end of
     # thinking, which leaves the rest of its 16,384 tokens for the command.

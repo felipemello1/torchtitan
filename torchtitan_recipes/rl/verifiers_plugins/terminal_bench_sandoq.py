@@ -57,6 +57,7 @@ from harbor.utils.logger import logger as harbor_logger
 from torchtitan.rl.examples.verifiers.terminal_bench.taskset import (
     TerminalTaskset,
     TerminalTasksetConfig,
+    TESTS_PASSED_FRAC_KEY,
 )
 from verifiers.v1.clients import ModelContext
 from verifiers.v1.configs.harness import HarnessConfig
@@ -407,17 +408,19 @@ def _keep_launch_record(record: logging.LogRecord) -> bool:
 
 
 def pytest_passed_frac(stdout: str) -> float:
-    """Fraction of the collected pytest tests that passed, from pytest's own summary; 0 without one.
+    """Fraction of the collected pytest tests that passed, read from pytest's last summary line.
 
     Example:
-        "collected 3 items ... 1 failed, 2 passed in 0.41s" -> 2/3
-        TMax runs `pytest -x`, so the count stops at the first failure: prefix credit.
+        "collected 3 items ... === 1 failed, 2 passed in 0.41s ===" -> 2/3
+        "collected 3 items ... === 1 failed in 0.12s ==="           -> 0
+        TMax runs `pytest -x`: it stops at the first failure, and the tests after it count as failed.
     """
-    collected = re.search(r"collected (\d+) items?", stdout)
-    passed = re.findall(r"(\d+) passed", stdout)
-    if collected is None or not passed or int(collected.group(1)) == 0:
+    collected = re.findall(r"collected (\d+) items?", stdout)
+    summaries = re.findall(r"^=+ (.*) in [\d.]+s", stdout, re.MULTILINE)
+    if not collected or not summaries or int(collected[-1]) == 0:
         return 0.0
-    return min(1.0, int(passed[-1]) / int(collected.group(1)))
+    passed = re.search(r"(\d+) passed", summaries[-1])
+    return int(passed.group(1)) / int(collected[-1]) if passed else 0.0
 
 
 def truncate_middle(text: str, max_chars: int = _MAX_LOG_CHARS) -> str:
@@ -512,7 +515,9 @@ class SandoqHarborTask(HarborTask):
                 "stdout": truncate_middle(result.stdout),
                 "stderr": truncate_middle(result.stderr),
             }
-            trace.info["tests_passed_frac"] = pytest_passed_frac(result.stdout)
+            trace.record_metric(
+                TESTS_PASSED_FRAC_KEY, pytest_passed_frac(result.stdout)
+            )
             return result
 
         grading_runtime = SimpleNamespace(run=run_and_keep, read=runtime.read)
