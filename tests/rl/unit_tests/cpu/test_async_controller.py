@@ -986,6 +986,8 @@ def _validation_rollout(versions: list[tuple[int, int]]) -> Rollout:
                 max_policy_version=max_version,
             )
             for turn_id, (min_version, max_version) in enumerate(versions)
+        ],
+    )
 
 
 def _scored_group(group_id: int, rewards: list[float]) -> RolloutGroup:
