@@ -216,6 +216,8 @@ class GenerationServer(Configurable):
                 "routed_experts_prompt_start", 0
             )
             sampling = _parse_sampling_config(sampling_params)
+            # The generator then returns rows from this position on.
+            sampling.routed_experts_prompt_start = routed_experts_prompt_start
             if body.get("features") is not None:
                 raise ValueError("multimodal features are not supported")
         except (TypeError, ValueError) as error:
@@ -344,14 +346,15 @@ class GenerationServer(Configurable):
 def _routed_experts_payload(
     routed_expert_ids: np.ndarray, *, start: int
 ) -> dict[str, object]:
-    """Verifiers' ``routed_experts`` field: the rows from position ``start`` on.
+    """Verifiers' ``routed_experts`` field for rows that start at position ``start``.
 
     Example:
 
-        _routed_experts_payload(routed_expert_ids, start=3)  # uint8 [6, 48, 8]
-        # -> {"data": <base64 of rows 3..5>, "shape": [3, 48, 8], "start": 3, "dtype": "uint8"}
+        # routed_expert_ids: uint8 [3, 48, 8], positions 3..5
+        _routed_experts_payload(routed_expert_ids, start=3)
+        # -> {"data": <base64 of the 3 rows>, "shape": [3, 48, 8], "start": 3, "dtype": "uint8"}
     """
-    rows = routed_expert_ids[start:]
+    rows = routed_expert_ids
     return {
         "data": base64.b64encode(rows.tobytes()).decode("ascii"),
         "shape": list(rows.shape),

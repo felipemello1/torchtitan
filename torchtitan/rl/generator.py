@@ -489,6 +489,10 @@ class SamplingConfig:
     generation time: these are the only ids that end a request (vLLM's EOS stops
     are off)."""
 
+    routed_experts_prompt_start: int = 0
+    """With `return_routed_experts`, return expert ids from this prompt position on. The rollouter
+    sets it per turn to skip the rows earlier turns already returned; leave it at 0 in configs."""
+
     def __post_init__(self) -> None:
         # TODO(mask-replay): to allow top_p < 1, turn on vLLM's `return_sampling_mask` (needs a vLLM
         # upgrade, the V2 model runner, top_k > 0 and processed logprobs), carry each token's kept
@@ -1493,7 +1497,8 @@ class VLLMGenerator(Configurable):
         the controller attaches to the rollout turn. If vLLM rejects the request
         when the engine loop admits it (e.g. a prompt that leaves no room for an
         output token), only this call raises vLLM's error (`VLLMValidationError` or
-        `ValueError`).
+        `ValueError`). A `routed_experts_prompt_start` outside the prompt raises
+        `ValueError` before the call is queued.
 
         Args:
             prompt_token_ids: One tokenized prompt `[token_ids]`.
@@ -1525,6 +1530,12 @@ class VLLMGenerator(Configurable):
         assert (
             sampling.stop_token_ids is not None
         ), f"{request_id}: stop_token_ids must be set from the renderer"
+        # vLLM asserts this inside engine.step, where a failure stops the engine for every request.
+        if not 0 <= sampling.routed_experts_prompt_start < len(prompt_token_ids):
+            raise ValueError(
+                f"{request_id}: routed_experts_prompt_start="
+                f"{sampling.routed_experts_prompt_start} must be in [0, {len(prompt_token_ids)})"
+            )
 
         # Put the call on the queue; the engine loop will admit + process it, then resolve `reply`.
         reply: concurrent.futures.Future[Completion] = concurrent.futures.Future()
@@ -1841,6 +1852,7 @@ class VLLMGenerator(Configurable):
             # stop_token_ids even with skip_tokenizer_init.
             ignore_eos=True,
             seed=sampling.seed,
+            routed_experts_prompt_start=sampling.routed_experts_prompt_start,
             # The sampled token's logprob (for the GRPO ratio), plus the top-k if requested.
             logprobs=sampling.num_topk_logprobs,
             # Token ids in, token ids and logprob floats out: stops are token ids and nothing reads

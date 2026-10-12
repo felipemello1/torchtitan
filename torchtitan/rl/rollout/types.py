@@ -88,11 +88,13 @@ class Completion:
     None: train every token."""
 
     routed_expert_ids: np.ndarray | None = None
-    """Router replay: the experts each forward input went to. ``[P + N - 1, num_layers, top_k]``,
-    uint8 (uint16 above 256 experts). The last token was never fed back, so it has no row:
+    """Router replay: the experts each forward input went to. ``[P + N - 1 - S, num_layers, top_k]``,
+    uint8 (uint16 above 256 experts), from S = `SamplingConfig.routed_experts_prompt_start` on. The
+    last token was never fed back, so it has no row:
 
         prompt | completion   p0 p1 p2 | c0 c1
-        rows                  r0 r1 r2 | r3      # no row for c1
+        rows (S=0)            r0 r1 r2 | r3      # no row for c1
+        rows (S=2)                  r2 | r3
     """
 
     metrics: list[m.Metric] = field(default_factory=list)
