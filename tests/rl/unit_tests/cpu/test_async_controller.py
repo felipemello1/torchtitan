@@ -1886,3 +1886,57 @@ def test_batcher_passes_the_version_that_trains_each_group() -> None:
     # [0, 1, 2] trains at version 5, [3, 4] at 6; the last call returns None
     assert consuming_policy_versions == [5, 5, 5, 6, 6, 7]
     assert queue.qsize() == 3  # two batches and the None sentinel
+
+
+@pytest.mark.parametrize(
+    ("greedy", "expected_temperature"), [(True, 0.0), (False, 1.0)]
+)
+def test_validation_samples_greedily_or_like_training(
+    greedy: bool, expected_temperature: float
+) -> None:
+    """Greedy validation runs at temperature 0; otherwise it reuses the training sampling."""
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(validation=ValidationConfig(steps=2, greedy=greedy))
+    )
+    controller._sampling = SamplingConfig(temperature=1.0, top_p=1.0, max_tokens=4096)
+    controller._rollouter = Mock()
+    controller._rollouter.get_validation_samples.return_value = []
+    controller._collect_validation_rollouts = AsyncMock(return_value=([], []))
+    controller.rollout_recorder = Mock()
+
+    asyncio.run(controller.validate(step=25))
+
+    sampling = controller._collect_validation_rollouts.call_args.kwargs["sampling"]
+    assert sampling.temperature == expected_temperature
+    assert sampling.max_tokens == 4096
+
+
+@pytest.mark.parametrize(
+    ("seed", "expected_seeds"), [(None, [None] * 3), (7, [7, 8, 9])]
+)
+def test_validation_gives_each_group_its_own_seed(
+    seed: int | None, expected_seeds: list[int | None]
+) -> None:
+    """A seeded run gets one seed per validation group, so repeat passes over a prompt differ."""
+    controller = object.__new__(Controller)
+    controller._make_generate_fn = Mock()
+    controller._rollouter = Mock()
+    controller._rollouter.run_group_rollouts = AsyncMock(
+        side_effect=lambda **kwargs: RolloutGroup(
+            group_id=kwargs["group_id"], rollouts=[]
+        )
+    )
+    controller.generator_router = SimpleNamespace(
+        release_groups=SimpleNamespace(call_one=AsyncMock())
+    )
+    sampling = SamplingConfig(temperature=1.0, top_p=1.0, max_tokens=4096, seed=seed)
+
+    asyncio.run(
+        controller._collect_validation_rollouts(
+            samples=[object()] * 3, sampling=sampling, step=0
+        )
+    )
+
+    calls = controller._rollouter.run_group_rollouts.call_args_list
+    assert [call.kwargs["sampling"].seed for call in calls] == expected_seeds
