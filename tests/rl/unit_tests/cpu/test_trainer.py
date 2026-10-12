@@ -8,7 +8,7 @@ import asyncio
 import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -23,6 +23,7 @@ from torchtitan.observability.sdc_replayer import SDCReplayer
 from torchtitan.rl.components.batcher import TrainingMicrobatch
 from torchtitan.rl.components.checkpointer import MirroredState
 from torchtitan.rl.distributed.monarch_actors.trainer import TrainerActor
+from torchtitan.rl.distributed.rdma_microbatch import MicrobatchStream, RDMAMicrobatch
 from torchtitan.rl.trainer import Trainer
 from torchtitan.trainer import Trainer as DatasetTrainer
 from torchtitan.training_engine import ForwardBackwardResult, TrainingEngine
@@ -268,6 +269,7 @@ def test_forward_backward_uses_global_token_count() -> None:
             return_value=ForwardBackwardResult(torch.tensor(1.0), [])
         ),
         _cuda_graph_per_accumulation_group_enabled=False,
+        _preprocess_groups_lazily=False,
         sdc_replayer=None,
     )
     microbatch_groups = [[object()], [object()], [object()]]
@@ -328,7 +330,8 @@ def test_get_controller_state_returns_restored_state() -> None:
     asyncio.run(run())
 
 
-def test_forward_backward_accumulates_microbatch_metrics() -> None:
+@pytest.mark.parametrize("rdma", [False, True])
+def test_forward_backward_accumulates_microbatch_metrics(rdma: bool) -> None:
     async def run() -> None:
         trainer = object.__new__(Trainer)
         engine = SimpleNamespace(
@@ -336,6 +339,7 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
             ntokens_seen=10,
             sdc_replayer=None,
             model_config=SimpleNamespace(mtp_layers=None),
+            device=torch.device("cpu"),
         )
         engine.forward_backward = MagicMock(
             return_value=ForwardBackwardResult(
@@ -354,7 +358,6 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
         )
         trainer.engine = engine
         trainer.config = Trainer.Config(model=MagicMock())
-        trainer.dp_rank = 0
         trainer._reduce_forward_backward_metrics = MagicMock(
             side_effect=lambda *, sum_reduced_metrics, max_reduced_metrics: {
                 key: float(value.item())
@@ -377,20 +380,36 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
             advantages=torch.tensor([1.0]),
         )
 
+        # This rank's column; with the RDMA fast path the trainer reads it.
+        microbatch = (
+            MagicMock(spec=RDMAMicrobatch, read=AsyncMock(return_value=batch))
+            if rdma
+            else batch
+        )
+
         result = await Trainer.forward_backward(
             trainer,
-            [[batch], [batch]],
+            [microbatch, microbatch],
             torch.tensor([3]),
             torch.tensor([2]),
         )
 
         engine.forward_backward.assert_called_once_with(
-            microbatch_groups=[[batch], [batch]],
+            microbatch_groups=ANY,
             global_loss_token_counts=torch.tensor([3]),
             global_routing_token_counts=torch.tensor([2]),
         )
-        assert trainer._step_num_tokens_per_dp_rank == 2
-        assert trainer._reduce_forward_backward_metrics.call_count == 2
+        # The RDMA fast path reads through the stream; by value, the column is passed as is.
+        groups = engine.forward_backward.call_args.kwargs["microbatch_groups"]
+        assert isinstance(groups, MicrobatchStream) == rdma
+        assert list(groups) == [[batch], [batch]]
+        assert trainer._step_num_tokens_per_dp_rank == (
+            2 * trainer.config.training.num_tokens_per_microbatch_per_dp_rank
+        )
+        if rdma:
+            # The read time is reported only when there was a read.
+            assert result.pop("timing/trainer/read_microbatches/max") >= 0
+        assert trainer._reduce_forward_backward_metrics.call_count == (3 if rdma else 2)
         assert result == {"loss/mean": 3.0, "loss/max": 4.0}
 
     asyncio.run(run())

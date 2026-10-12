@@ -40,17 +40,16 @@ RolloutGroupWorkBuffer
                                                   v
 _batcher_loop
 +----------------------------------------------------------------------------------------+
-| training_sample_group = training_sample_builder.build_from_group(rollout_group=group)  |
+| batch, trainable = batcher.add_group.call_one(group)                                   |
 | if no trainable samples: group_buffer.release_active_groups(1, "untrainable_group")    |
-| batch, trainable = batcher.add_training_samples(training_sample_group)                  |
 | training_batch_queue.put(TrainerStepBatch)                                             |
 +-----------------------+------------------------------+---------------------------------+
                         |  ^                           |
           add group     |  | maybe_training_batch      | put batch
                         v  |                           v
-Batcher                                              training_batch_queue
+BatcherActor (own process)                           training_batch_queue
 +-------------------------------------------------+   +----------------------------------------------+
-| accumulated TrainingSampleGroups                |   | size 1; holds TrainerStepBatch | None        |
+| build_from_group -> add_training_samples        |   | size 1; holds TrainerStepBatch | None        |
 | pack at num_prompts_per_train_step               |   +---------------------+------------------------+
 +-------------------------------------------------+                         |
                                                                          | packed = training_batch_queue.get()
@@ -115,6 +114,7 @@ from torchtitan.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
+from torchtitan.rl.distributed.monarch_actors.batcher import BatcherActor
 from torchtitan.rl.distributed.monarch_actors.generator import VLLMGeneratorActor
 from torchtitan.rl.distributed.monarch_actors.trainer import TrainerActor
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
@@ -184,6 +184,16 @@ class AsyncLoopConfig(Configurable.Config):
     `target_offpolicy_steps + n`. A value of 1 is FIFO by batch. See
     ``torchtitan/rl/components/WINDOWED_FIFO.md``."""
 
+    rdma_fast_path_threshold: int | None = None
+    """Trainer microbatches travel in Monarch RPC messages. With a value, tensors of at least that many
+    bytes go as Monarch RDMA buffers instead, and each trainer rank reads only its own microbatches:
+        None (default): no RDMA; every tensor in the message.
+        e.g. 1024: tensors of 1 KiB or more stay in the sender; token counts (8 B) and empty tensors
+            stay in the message.
+    Monarch uses ibverbs where the host has it, else TCP. A host that lists ibverbs devices it can't
+    use fails instead of falling back; MONARCH_RDMA_DISABLE_IBVERBS=1 forces TCP in every process,
+    weight sync included."""
+
     group_buffer: RolloutGroupWorkBuffer.Config = field(
         default_factory=RolloutGroupWorkBuffer.Config
     )
@@ -206,6 +216,14 @@ class AsyncLoopConfig(Configurable.Config):
         if self.windowed_fifo_batches is not None and self.windowed_fifo_batches < 1:
             raise ValueError(
                 f"windowed_fifo_batches must be None or >= 1, got {self.windowed_fifo_batches}"
+            )
+        if (
+            self.rdma_fast_path_threshold is not None
+            and self.rdma_fast_path_threshold < 1
+        ):
+            raise ValueError(
+                "rdma_fast_path_threshold must be None or >= 1 (RDMABuffer rejects empty tensors), "
+                f"got {self.rdma_fast_path_threshold}"
             )
 
     @property
@@ -414,7 +432,10 @@ class Controller(Configurable):
             apply_overrides(config.override, config)
         config.maybe_log()
         self.trainer: Trainer | None = None
+        # One trainer mesh slice per DP replica, in DP-rank order; set in setup_async.
+        self._trainer_dp_replicas = []
         self.generator_router: InterGeneratorRouter | None = None
+        self.batcher: BatcherActor | None = None
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
         self.start_step = 0
         self._proc_meshes = []
@@ -603,8 +624,16 @@ class Controller(Configurable):
             # controller's process so routing does not contend with the training
             # loop for the controller's GIL.
             router_mesh = this_host().spawn_procs(per_host={"cpus": 1})
+            # Same for the batcher: build + pack would contend for the controller's GIL.
+            # It drops its own buffers (release_oldest_batch): Monarch's drop must run on the owner's host.
+            batcher_mesh = this_host().spawn_procs(per_host={"cpus": 1})
             # Store proc meshes for cleanup
-            self._proc_meshes = [router_mesh, trainer_mesh, *generator_meshes]
+            self._proc_meshes = [
+                router_mesh,
+                batcher_mesh,
+                trainer_mesh,
+                *generator_meshes,
+            ]
 
             await setup_torch_elastic_env(trainer_mesh)
             for generator_mesh in generator_meshes:
@@ -646,6 +675,25 @@ class Controller(Configurable):
                     or config.generator.kv_offload_gib > 0
                 ),
             )
+            self.batcher = batcher_mesh.spawn(
+                "batcher",
+                BatcherActor,
+                training_sample_builder_config=async_loop.training_sample_builder,
+                batcher_config=async_loop.batcher,
+                batcher_kwargs=dict(
+                    num_tokens_per_microbatch_per_dp_rank=(
+                        config.trainer.training.num_tokens_per_microbatch_per_dp_rank
+                    ),
+                    max_context_length=config.trainer.training.max_context_length,
+                    num_prompts_per_train_step=async_loop.num_prompts_per_train_step,
+                    dp_degree=self.trainer_dp_degree,
+                    pad_id=self.tokenizer.eos_id,
+                    temperature=self._sampling.temperature,
+                ),
+                rdma_fast_path_threshold=async_loop.rdma_fast_path_threshold,
+                output_dir=config.dump_folder,
+                enable_structured_logging=config.trainer.debug.enable_structured_logging,
+            )
 
             await self._rollouter.setup_async(
                 tokenizer_config=config.tokenizer,
@@ -674,6 +722,27 @@ class Controller(Configurable):
                     for requester_index, generator in enumerate(generators)
                 ),
             )
+
+        # Torch ranks follow this mesh's order and the trainer lays them out as
+        # (dp, cp, tp) with no PP, so a DP replica is cp * tp consecutive ranks.
+        trainer_by_dp_rank = self.trainer.flatten("rank").split(
+            rank=("dp", "cp_tp"), dp=self.trainer_dp_degree
+        )
+        self._trainer_dp_replicas = [
+            trainer_by_dp_rank.slice(dp=dp_rank)
+            for dp_rank in range(self.trainer_dp_degree)
+        ]
+        # Check that layout once: if it drifts, one TP group's ranks get different columns.
+        for dp_rank, trainer_dp_replica in enumerate(self._trainer_dp_replicas):
+            reported_dp_ranks = list(
+                (await trainer_dp_replica.get_dp_rank.call()).values()
+            )
+            if set(reported_dp_ranks) != {dp_rank}:
+                raise RuntimeError(
+                    f"Trainer ranks in DP replica {dp_rank} report DP ranks "
+                    f"{reported_dp_ranks}; the controller assumes the trainer orders "
+                    "ranks as (dp, cp, tp)."
+                )
 
         # Resume: __init__ ran CheckpointManager.load(); read back the restored
         # policy version and controller-owned data state.
@@ -851,21 +920,6 @@ class Controller(Configurable):
             num_prompts_per_train_step=async_loop.num_prompts_per_train_step,
         )
 
-        # training_sample_builder
-        training_sample_builder = async_loop.training_sample_builder.build()
-
-        # batcher
-        batcher = async_loop.batcher.build(
-            num_tokens_per_microbatch_per_dp_rank=(
-                self.config.trainer.training.num_tokens_per_microbatch_per_dp_rank
-            ),
-            max_context_length=self.config.trainer.training.max_context_length,
-            num_prompts_per_train_step=async_loop.num_prompts_per_train_step,
-            dp_degree=self.trainer_dp_degree,
-            pad_id=self.tokenizer.eos_id,
-            temperature=self._sampling.temperature,
-        )
-
         # training_batch_queue
         training_batch_queue: asyncio.Queue[TrainerStepBatch | None] = asyncio.Queue(
             maxsize=1
@@ -899,8 +953,7 @@ class Controller(Configurable):
         batcher_task = asyncio.create_task(
             self._batcher_loop(
                 group_buffer=self._group_buffer,
-                training_sample_builder=training_sample_builder,
-                batcher=batcher,
+                batcher=self.batcher,
                 training_batch_queue=training_batch_queue,
             ),
             name="batcher",
@@ -1066,11 +1119,10 @@ class Controller(Configurable):
         self,
         *,
         group_buffer: RolloutGroupWorkBuffer,
-        training_sample_builder: TrainingSampleBuilder,
-        batcher: Batcher,
+        batcher: BatcherActor,
         training_batch_queue: "asyncio.Queue[TrainerStepBatch | None]",
     ) -> None:
-        """Take finalized groups, build training_samples, accumulate them, and queue each ready training batch.
+        """Send finalized groups to the batcher actor and queue each training batch it returns.
 
         On a clean close/shutdown the group_buffer drains and returns None; we forward a `None` sentinel
         so the trainer stops.
@@ -1087,20 +1139,13 @@ class Controller(Configurable):
             if rollout_group is None:  # closed and drained
                 logger.info("Buffer drained; batcher loop stopping")
                 break
-            # In a thread, so the event loop keeps running while the group's samples are built
-            with sl.log_trace_span("training_sample_builder"):
-                training_sample_group = await asyncio.to_thread(
-                    training_sample_builder.build_from_group,
-                    rollout_group=rollout_group,
-                )
-
             # We put a group in. We may get a batch back
             # if there are enough accumulated trainable groups to return one.
-            with sl.log_trace_span("batcher_pack"):
-                maybe_training_batch, group_is_trainable = await asyncio.to_thread(
-                    batcher.add_training_samples,
-                    training_sample_group=training_sample_group,
-                )
+            with sl.log_trace_span("batcher_add_group"):
+                (
+                    maybe_training_batch,
+                    group_is_trainable,
+                ) = await batcher.add_group.call_one(rollout_group=rollout_group)
             if not group_is_trainable:
                 await group_buffer.release_active_groups(1, reason="untrainable_group")
             if maybe_training_batch is not None:
@@ -1137,6 +1182,8 @@ class Controller(Configurable):
             with sl.log_trace_span("sync_log_step"):
                 await self.trainer.sync_log_step.call(step)
                 await self.generator_router.sync_log_step.call_one(step)
+                # Not awaited: it would wait behind an in-flight add_group.
+                self.batcher.sync_log_step.broadcast(step)
                 await self._rollouter.sync_log_step(step)
             step_timer = MetricsTimer()
 
@@ -1173,13 +1220,29 @@ class Controller(Configurable):
                     sl.log_trace_span("forward_backward"),
                     step_timer.record("timing/step/forward_backward"),
                 ):
-                    fwd_bwd_metrics = self._get_rank_0_value(
-                        await self.trainer.forward_backward.call(
-                            packed.microbatches,
-                            packed.global_loss_token_counts,
-                            packed.global_routing_token_counts,
+                    # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks over
+                    # TCP). Send the RDMAMicrobatches to the trainer during the previous optim_step,
+                    # so each rank reads microbatch 0 then.
+                    try:
+                        # Each DP replica receives only its column of the grid.
+                        fwd_bwd_results = await asyncio.gather(
+                            *(
+                                trainer_dp_replica.forward_backward.call(
+                                    [row[dp_rank] for row in packed.microbatches],
+                                    packed.global_loss_token_counts,
+                                    packed.global_routing_token_counts,
+                                )
+                                for dp_rank, trainer_dp_replica in enumerate(
+                                    self._trainer_dp_replicas
+                                )
+                            )
                         )
-                    )
+                        fwd_bwd_metrics = self._get_rank_0_value(fwd_bwd_results[0])
+                    finally:
+                        if self.config.async_loop.rdma_fast_path_threshold is not None:
+                            # Every rank has read its column from the batcher, or the step failed.
+                            # Not awaited: it would wait behind an in-flight add_group.
+                            self.batcher.release_oldest_batch.broadcast()
 
                     if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
                         logger.error("Loss is NaN/Inf; training diverged")
