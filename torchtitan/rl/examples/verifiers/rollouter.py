@@ -252,8 +252,6 @@ class VerifiersRollouter(Rollouter):
         sampling: SamplingConfig,
     ) -> RolloutGroup:
         """Run sibling rollouts through Verifiers, then compute advantages."""
-        # TODO: release each rollout's session; until then `max_sessions` evicts them.
-        del release_session_fn
         if self._generation_server is None:
             raise RuntimeError("Verifiers rollouter is not initialized")
         if self._thinking_budget is not None:
@@ -264,6 +262,7 @@ class VerifiersRollouter(Rollouter):
             rollouts = await asyncio.gather(
                 *(
                     self._run_single_rollout(
+                        release_session_fn=release_session_fn,
                         sample=sample,
                         sampling=(
                             sampling
@@ -294,6 +293,7 @@ class VerifiersRollouter(Rollouter):
     async def _run_single_rollout(
         self,
         *,
+        release_session_fn: ReleaseSessionFn,
         sample: object,
         sampling: SamplingConfig,
         group_id: int,
@@ -325,6 +325,16 @@ class VerifiersRollouter(Rollouter):
                 **{GROUP_ID_SAMPLING_PARAM: group_id},
             ),
         )
+        # The rollout makes no more generation calls; Verifiers sends each trace's id as its
+        # routing session id. Releasing now, not at group end, frees the session's held KV.
+        for episode_trace in verifiers_episode.traces:
+            try:
+                await release_session_fn(routing_session_id=episode_trace.id)
+            except Exception:
+                # Not fatal: group end frees its held KV, and `max_sessions` evicts its pin.
+                logger.exception(
+                    "releasing routing session %s failed", episode_trace.id
+                )
         traces = [trace for trace in verifiers_episode.traces if trace.agent.trainable]
         if len(traces) != 1:
             raise ValueError(
