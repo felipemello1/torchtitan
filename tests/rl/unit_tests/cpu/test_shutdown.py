@@ -290,7 +290,6 @@ def test_router_forwards_session_releases_with_hold_or_kv_offload(
             data_parallel_shard_degree=1, data_parallel_replicate_degree=1
         )
     )
-    rl_trainer.config.model = None
     rl_trainer.config.generator_router = InterGeneratorRouter.Config()
     rl_trainer.config.generator = VLLMGenerator.Config(
         model=None, hold_session_kv=hold, kv_offload_gib=offload_gib

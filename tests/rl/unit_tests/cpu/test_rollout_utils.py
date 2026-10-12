@@ -404,8 +404,8 @@ def test_topk_rows_follow_loss_tokens_across_turns() -> None:
     )
 
     # One row per loss token; the prompt and the env reply (token 9) get none.
-    assert training_sample.token_ids == [1, 2, 4, 5, 9, 7]
-    assert training_sample.loss_mask == [False, False, True, True, False, True]
+    assert training_sample.token_ids.tolist() == [1, 2, 4, 5, 9, 7]
+    assert training_sample.loss_mask.tolist() == [False, False, True, True, False, True]
     assert training_sample.topk_token_ids.tolist() == [[4, 9], [5, 8], [7, 3]]
     torch.testing.assert_close(
         training_sample.topk_logprobs,
