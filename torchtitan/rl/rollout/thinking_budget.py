@@ -77,8 +77,14 @@ class ThinkingBudget(Configurable):
             config.close_text + config.answer_prefix, add_bos=False, add_eos=False
         )
 
-    def wrap(self, generate_fn: GenerateFn) -> GenerateFn:
-        """Return a `GenerateFn` that applies the budget around `generate_fn`."""
+    def wrap(
+        self, generate_fn: GenerateFn, *, max_context_length: int | None = None
+    ) -> GenerateFn:
+        """Return a `GenerateFn` that applies the budget around `generate_fn`.
+
+        `max_context_length` (the engine's context) skips the second call when its prompt would
+        not fit: the turn ends cut, as without a budget.
+        """
 
         async def generate(
             prompt_token_ids: list[int],
@@ -121,8 +127,18 @@ class ThinkingBudget(Configurable):
                 forced_ids = self._forced_ids
             else:
                 forced_ids = []
+            answer_prompt_token_ids = prompt_token_ids + first.token_ids + forced_ids
+            # vLLM needs room for one output token.
+            if (
+                max_context_length is not None
+                and len(answer_prompt_token_ids) >= max_context_length
+            ):
+                first.metrics.append(
+                    m.Metric("thinking_budget/forced_close_rate", m.Mean(0.0))
+                )
+                return first
             second = await generate_fn(
-                prompt_token_ids + first.token_ids + forced_ids,
+                answer_prompt_token_ids,
                 request_id=f"{request_id}/answer",
                 group_id=group_id,
                 routing_session_id=routing_session_id,

@@ -264,7 +264,10 @@ class VerifiersRollouter(Rollouter):
         if self._generation_server is None:
             raise RuntimeError("Verifiers rollouter is not initialized")
         if self._thinking_budget is not None:
-            generate_fn = self._thinking_budget.wrap(generate_fn)
+            generate_fn = self._thinking_budget.wrap(
+                generate_fn,
+                max_context_length=self._generation_server.max_rollout_tokens,
+            )
         generate_fns = self._generation_server.generate_fns
         generate_fns[group_id] = generate_fn
         try:
