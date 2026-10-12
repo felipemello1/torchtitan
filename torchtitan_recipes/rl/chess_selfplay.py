@@ -4,9 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Single-node Qwen3.5-4B chess recipe: self-play mixed with games against Stockfish bots."""
+"""Qwen3.5-4B chess recipes: one node with self-play mixed with games against Stockfish bots, and
+three GB300 hosts with thinking on and self-play only."""
 
 from __future__ import annotations
+
+import os
+import shutil
+import tempfile
 
 from renderers import Qwen35RendererConfig
 
@@ -21,10 +26,11 @@ from torchtitan.components.optim import (
 from torchtitan.components.renderer import from_renderers
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.distributed.activation_checkpoint import FullAC, RegionAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.components.data import IterableRLDataLoader
+from torchtitan.rl.components.work_buffer import AdaptiveRolloutGroupWorkBuffer
 from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.examples.chess_selfplay import (
@@ -35,11 +41,12 @@ from torchtitan.rl.examples.chess_selfplay import (
     RewardChessScore,
 )
 from torchtitan.rl.generator import SamplingConfig, VLLMCudaGraphConfig, VLLMGenerator
-from torchtitan.rl.losses import DAPOLoss
+from torchtitan.rl.losses import DAPOLoss, ScoreCenteringLoss
 from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.rollouter import Rollouter
 from torchtitan.rl.rollout.rubric import Rubric
+from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
 from torchtitan.rl.rollout.token_env import TokenEnv
 from torchtitan.rl.trainer import Trainer
 
@@ -200,3 +207,130 @@ def rl_chess_qwen3_5_4b(
             ),
         ),
     )
+
+
+def rl_chess_qwen3_5_4b_gb300(
+    max_plies: int = 120,
+    max_thinking_tokens: int = 1024,
+    max_context_tokens: int = 131072,
+) -> Controller.Config:
+    """Qwen3.5-4B (instruct) self-play with thinking on, on three GB300 hosts:
+
+        host 0:     the trainer, FSDP 4
+        hosts 1-2:  eight one-GPU generators
+
+    A player keeps its own past thinking, so its history grows ~1.6k tokens a turn.
+    """
+    # room for the answer after the thinking ends, forced or not
+    max_response_tokens = max_thinking_tokens + 512
+    # ChunkedLossWrapper needs `max_context_tokens` divisible by its 16 chunks.
+    config = rl_chess_qwen3_5_4b(
+        max_plies=max_plies,
+        max_rollout_tokens=max_context_tokens - max_response_tokens,
+        max_response_tokens=max_response_tokens,
+    )
+    config.dump_folder = "outputs/rl/qwen3_5_4b_chess_gb300"
+    config.renderer = from_renderers(
+        Qwen35RendererConfig(enable_thinking=True, thinking_retention="all")
+    )
+
+    # ======== Rollouts ========
+    rollouter = config.rollouter
+    # Self-play only: the ladder validation below measures strength.
+    rollouter.training_dataloader.dataset.bots = ()
+    # 8 fixed games (4 per color) against each of 7 bots.
+    ladder = (
+        "sf_random",
+        "sf_eps90",
+        "sf_eps75",
+        "sf_eps50",
+        "sf_eps25",
+        "sf_elo1320",
+        "sf_elo1500",
+    )
+    num_validation_games = 8 * len(ladder)
+    rollouter.validation_dataset = ChessVsBotDataset.Config(
+        num_games=num_validation_games, opponents=ladder
+    )
+    worker = rollouter.worker
+    # The launcher points this at a Stockfish build for the host's architecture. DOME stages it
+    # read-only without the execute bit, so run a copy (the rollout workers share this host).
+    stockfish = os.environ.get("CHESS_STOCKFISH_PATH", "stockfish")
+    if os.path.isfile(stockfish) and not os.access(stockfish, os.X_OK):
+        executable = os.path.join(tempfile.mkdtemp(prefix="stockfish_"), "stockfish")
+        shutil.copy(stockfish, executable)
+        os.chmod(executable, 0o755)
+        stockfish = executable
+    worker.stockfish_path = stockfish
+    # A mate pays 10; a game cut at the ply cap pays at most 0.75, so a mate dominates its group's
+    # advantages.
+    worker.checkmate_reward = 10.0
+    # The answer ends at the box's closing brace, so a forced move is never lost to the token cap.
+    worker.thinking_budget = ThinkingBudget.Config(
+        max_thinking_tokens=max_thinking_tokens,
+        answer_prefix="\\boxed{",
+        answer_end_text="}",
+        # A reply that stops inside thinking plays the box it wrote. Force-closed, such turns lost their
+        # credit to the cap and penalty below and grew to 13.5% of turns (chess118gcq, steps 289-302).
+        force_close_on_stop=False,
+    )
+    worker.rubric.reward_fns = [RewardChessScore.Config(forced_close_penalty=0.1)]
+    # A force-closed turn's advantage is capped at 0: thinking loops ('capturing capturing ...') that a
+    # forced close turned into a legal move shared the game's advantage (chess118gcn, steps 260-274).
+    # A cost of 0.25 below 0 grew an illegal move instead ('O-Ro', chess118gcp, steps 270-279).
+    worker.forced_close_advantage_cap = 0.0
+
+    # ======== Async loop ========
+    loop = config.async_loop
+    # 48 positions x 8 games x 2 colors = 768 rollouts per step.
+    loop.num_prompts_per_train_step = 48
+    # Generation paces itself: the mean policy age stays under 6 steps, every trained group under
+    # 12. At most 6 batches generate at once, which bounds the rollout workers, vLLM's
+    # max_num_seqs, and the Stockfish processes on host 0.
+    loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
+        max_offpolicy_steps=12,
+        target_offpolicy_steps=6,
+        generation_capacity=6 * loop.num_prompts_per_train_step,
+    )
+    # Under the adaptive buffer this only sets train_batch/pct_samples_over_target_age.
+    loop.target_offpolicy_steps = loop.group_buffer.target_offpolicy_steps
+    # Validate at step 0, every 5 steps and after the last, without pausing training.
+    loop.validation = ValidationConfig(
+        steps=num_validation_games, freq=5, overlap_training=True
+    )
+
+    # ======== Trainer ========
+    trainer = config.trainer
+    # The 4B's fp32 weights, grads and Adam state take ~16 GB of a GB300's memory, so the trainer saves
+    # the attention and FFN outputs instead of recomputing everything. SelectiveAC saves every
+    # region, including GDN's, which OOMs at 131K tokens.
+    trainer.activation_checkpoint = RegionAC.Config(
+        save_regions=["attn.inner_attention", "feed_forward.w2.linear"]
+    )
+    # Score centering instead of DAPO's clipped objective: REINFORCE weighted by min(p / q, 2), with
+    # the generator's top-16 logprobs as each token's baseline.
+    trainer.loss.loss_fn = ScoreCenteringLoss.Config(
+        max_ratio=2.0, global_vocab_size=decoder_vocab_size(trainer.model)
+    )
+    # The launcher uploads every saved step and prunes, so torchtitan keeps them all.
+    trainer.checkpointer = CheckpointManager.Config(
+        initial_load_in_hf=True,
+        interval=10,
+        enable_first_step_checkpoint=True,
+        async_mode="async",
+        keep_latest_k=0,
+        last_save_in_hf=False,
+        last_save_model_only=False,
+    )
+
+    # ======== Generators ========
+    config.num_generators = 8
+    generator = config.generator
+    generator.max_num_batched_tokens = 8192
+    generator.sampling.num_topk_logprobs = 16
+    # Hold each player's prefix (attention + GDN state) between its turns; below 5% free blocks
+    # (`session_kv_free_floor`), release the sessions idle longest.
+    generator.hold_session_kv = True
+    # Admit a request only while 3% of KV blocks stay free, so running requests have room to grow.
+    generator.extra_vllm_engine_args = {"watermark": 0.03}
+    return config

@@ -85,9 +85,9 @@ class ChessSelfPlayWorker(RolloutWorker):
         moves (centipawn loss). `None`: self-play only, and no move scoring."""
 
         checkmate_reward: float = 1.0
-        """The winner's reward for a checkmate, at any length; the prompt states it. Above 0.75, the
-        most a game cut at `max_plies` scores, a mate beats every other ending; 10 makes a mate
-        dominate its group's advantages."""
+        """The winner's reward for a checkmate, at any length; the prompt states it.
+            1:   a mate beats the best score of a game cut at `max_plies` (0.75)
+            10:  a mate dominates its group's advantages"""
 
         forced_close_advantage_cap: float | None = None
         """Caps each force-closed turn's advantage; `None`: no cap. At 0.0 a won game never
