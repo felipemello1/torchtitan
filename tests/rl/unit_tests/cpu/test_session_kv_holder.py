@@ -8,6 +8,7 @@
 16-token blocks standing in for Qwen3.5's 1,152."""
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
@@ -23,7 +24,11 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
-from vllm.v1.request import Request
+from vllm.v1.kv_offload.base import make_offload_key, OffloadKey, ReqContext
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
+from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+from vllm.v1.request import Request, RequestStatus
 
 BLOCK = 16
 
@@ -105,7 +110,14 @@ def _churn(manager, tag: str) -> None:
 
 
 def _holder(
-    manager, requests, floor=0, running=(), waiting=(), skipped_waiting=()
+    manager,
+    requests,
+    floor=0,
+    running=(),
+    waiting=(),
+    skipped_waiting=(),
+    hold=True,
+    offload_policy=None,
 ) -> SessionKVHolder:
     scheduler = SimpleNamespace(
         kv_cache_manager=manager,
@@ -115,7 +127,7 @@ def _holder(
         waiting=waiting,
         skipped_waiting=skipped_waiting,
     )
-    holder = SessionKVHolder(scheduler)
+    holder = SessionKVHolder(scheduler, hold=hold, offload_policy=offload_policy)
     holder.free_floor_blocks = floor
     return holder
 
@@ -170,16 +182,19 @@ def test_release_returns_every_held_block(manager):
     assert manager.block_pool.get_num_free_blocks() == free_before
 
 
-def _finished_turn(manager, holder, requests, session: str, tokens: list[int]) -> None:
+def _finished_turn(
+    manager, holder, requests, session: str, tokens: list[int], group_id: int = 0
+) -> Request:
     """One turn of `session`: admit, prefill (held), finish."""
     request = _request(session, tokens)
     requests[session] = request
-    holder.track(session, session_id=session, group_id=0)
+    holder.track(session, session_id=session, group_id=group_id)
     _prefill(manager, request)
     holder.after_step()
     manager.free(request)
     del requests[session]
     holder.after_step()
+    return request
 
 
 def test_release_frees_sessions_in_sorted_order(manager):
@@ -282,6 +297,137 @@ def test_next_turn_moves_the_hold_and_release_frees_everything(manager):
     assert manager.block_pool.get_num_free_blocks() == free_before
 
 
+# --- CPU offload: ended sessions' chunks are evicted first ---
+
+_CHURN = OffloadKey(b"churn")
+
+
+def _cpu_tier() -> CPUOffloadingManager:
+    """vLLM's CPU offload manager with its default LRU; 1,000 chunks is more than any test stores."""
+    return CPUOffloadingManager(num_chunks=1000)
+
+
+def _store(cpu_tier: CPUOffloadingManager, keys) -> None:
+    """Store `keys` as vLLM's write-through does: prepare the store, then complete it."""
+    keys = list(keys)
+    context = ReqContext(req_id="store")
+    cpu_tier.prepare_store(keys, context)
+    cpu_tier.complete_store(keys, context)
+
+
+def _offload_keys(request: Request) -> list[OffloadKey]:
+    """CPU chunk keys of every full block of `request`, in all 4 KV cache groups."""
+    return [make_offload_key(h, g) for h in request.block_hashes for g in range(4)]
+
+
+def _eviction_order(cpu_tier: CPUOffloadingManager) -> list[OffloadKey]:
+    """Stored chunks, evicted first on the left."""
+    return list(cast(LRUCachePolicy, cpu_tier._policy).evictable_chunks)
+
+
+def test_release_evicts_an_ended_session_first_except_the_prefix_a_live_sibling_uses(
+    manager,
+):
+    requests, cpu_tier = {}, _cpu_tier()
+    holder = _holder(manager, requests, offload_policy=cpu_tier._policy)
+    prompt = list(range(48))  # 3 blocks both siblings share
+    s1 = _finished_turn(manager, holder, requests, "s1", prompt + list(range(100, 134)))
+    s2 = _finished_turn(manager, holder, requests, "s2", prompt + list(range(200, 234)))
+    _store(cpu_tier, [_CHURN])
+    _store(cpu_tier, dict.fromkeys(_offload_keys(s1) + _offload_keys(s2)))
+    # 3 shared blocks x 4 groups, then each sibling's own 2 blocks x 4 groups.
+    shared, s1_own, s2_own = (
+        _offload_keys(s1)[:12],
+        _offload_keys(s1)[12:],
+        _offload_keys(s2)[12:],
+    )
+
+    holder.release(session_ids=["s1"])
+    order = _eviction_order(cpu_tier)
+    assert set(order[: len(s1_own)]) == set(s1_own)
+    assert order[len(s1_own)] == _CHURN  # the shared prefix stays behind it
+
+    holder.release(session_ids=["s2"])
+    order = _eviction_order(cpu_tier)
+    assert set(order[: len(shared) + len(s2_own)]) == set(shared + s2_own)
+
+
+def test_a_sibling_before_its_first_prefill_keeps_the_shared_prefix_in_place(manager):
+    requests, cpu_tier = {}, _cpu_tier()
+    holder = _holder(manager, requests, hold=False, offload_policy=cpu_tier._policy)
+    prompt = list(range(48))  # 3 blocks both siblings share
+    s1 = _finished_turn(manager, holder, requests, "s1", prompt + list(range(100, 134)))
+    # s2's first turn is in vLLM but not prefilled yet.
+    requests["s2"] = _request("s2", prompt + list(range(200, 234)))
+    holder.track("s2", session_id="s2", group_id=0)
+    _store(cpu_tier, [_CHURN] + _offload_keys(s1))
+
+    holder.release(session_ids=["s1"])
+
+    order = _eviction_order(cpu_tier)
+    assert set(order[:8]) == set(_offload_keys(s1)[12:])  # s1's own 2 blocks x 4 groups
+    assert order[8] == _CHURN
+
+
+def test_completion_blocks_of_an_ended_session_are_evicted_first(manager):
+    requests, cpu_tier = {}, _cpu_tier()
+    holder = _holder(manager, requests, hold=False, offload_policy=cpu_tier._policy)
+    turn = _request("t1", list(range(50)))
+    requests["t1"] = turn
+    holder.track("t1", session_id="s", group_id=0)
+    _prefill(manager, turn)
+    holder.after_step()
+    for t in range(20):  # decode fills a 4th block: 50 prompt + 21 sampled tokens
+        _schedule(manager, turn, 1, sample=100 + t)
+    manager.free(turn)
+    del requests["t1"]
+    holder.after_step()
+    assert len(turn.block_hashes) == 4
+    _store(cpu_tier, [_CHURN] + _offload_keys(turn))
+
+    holder.release(session_ids=["s"])
+
+    assert _eviction_order(cpu_tier)[-1] == _CHURN
+
+
+def test_offload_without_hold_holds_nothing_and_evicts_a_finished_group_first(manager):
+    requests, cpu_tier = {}, _cpu_tier()
+    holder = _holder(manager, requests, hold=False, offload_policy=cpu_tier._policy)
+    free_before = manager.block_pool.get_num_free_blocks()
+    s1 = _finished_turn(manager, holder, requests, "s1", list(range(50)), group_id=5)
+    s2 = _finished_turn(manager, holder, requests, "s2", list(range(500, 550)), 5)
+    _store(cpu_tier, [_CHURN] + _offload_keys(s1) + _offload_keys(s2))
+    assert holder.num_sessions == 0
+    assert manager.block_pool.get_num_free_blocks() == free_before
+
+    holder.release(group_ids=[5])
+
+    assert _eviction_order(cpu_tier)[-1] == _CHURN
+
+
+def test_free_floor_release_keeps_the_cpu_chunks_of_a_live_session(manager):
+    """A session dropped from GPU for room is still alive: its CPU copy is what it reloads."""
+    requests, cpu_tier = {}, _cpu_tier()
+    holder = _holder(manager, requests, offload_policy=cpu_tier._policy)
+    old = _finished_turn(manager, holder, requests, "old", list(range(50)))
+    _finished_turn(manager, holder, requests, "new", list(range(500, 550)))
+    _store(cpu_tier, _offload_keys(old) + [_CHURN])
+    order_before = _eviction_order(cpu_tier)
+
+    holder.free_floor_blocks = manager.block_pool.get_num_free_blocks() + 1
+    holder.evict_until_free()
+
+    assert holder.num_evicted == 1
+    assert _eviction_order(cpu_tier) == order_before
+
+
+def test_offload_needs_vllm_lru_policy(manager):
+    with pytest.raises(
+        RuntimeError, match="needs vLLM's LRUCachePolicy, got ARCCachePolicy"
+    ):
+        _holder(manager, {}, offload_policy=ARCCachePolicy(cache_capacity=8))
+
+
 def test_free_floor_is_the_watermark_plus_one_prefill_chunk(manager):
     manager.watermark_blocks = 8  # vLLM's watermark=0.1 of the 80-block pool
     scheduler = SimpleNamespace(kv_cache_manager=manager, max_num_scheduled_tokens=100)
@@ -315,3 +461,14 @@ def test_a_waiting_turn_gets_room_when_held_sessions_fill_the_pool(manager, queu
         holder.after_step()
     else:
         pytest.fail("held sessions stalled the engine: the waiting turn never fit")
+
+
+def test_a_turn_loading_kv_from_cpu_releases_nothing(manager):
+    """A request whose CPU load is in flight waits for the load, not for blocks."""
+    loading = _request("loading", list(range(60)))
+    loading.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    requests = {}
+    holder = _holder(manager, requests, skipped_waiting=[loading])
+    _finished_turn(manager, holder, requests, "s", list(range(50)))
+    assert holder.num_sessions == 1
+    assert holder.num_evicted == 0

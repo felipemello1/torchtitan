@@ -4,7 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Hold each multi-turn session's reusable KV between its turns."""
+"""Hold each multi-turn session's reusable KV between its turns; ended sessions' CPU copies are
+evicted first."""
 
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from collections import OrderedDict
 from typing import Any
 
 from vllm.utils.math_utils import cdiv
+from vllm.v1.request import RequestStatus
 
 
 class SessionKVHolder:
@@ -43,6 +45,14 @@ class SessionKVHolder:
     Every mutating method must run on the engine thread of every rank, in the same order, so the
     schedulers of all TP ranks stay identical.
 
+    With CPU offload, vLLM also copies every computed block to CPU. When a session ends
+    (`release`), its CPU chunks are evicted first, except the chunks a live session also uses:
+
+        CPU eviction queue, evicted first on the left; GRPO siblings s1, s2 share prompt chunk p
+            [churn, p, s1, s2]
+            release(session_ids=["s1"])  ->  [s1, churn, p, s2]   p stays: s2 still uses it
+            release(session_ids=["s2"])  ->  [s2, p, s1, churn]
+
     Example:
 
         holder = SessionKVHolder(scheduler)
@@ -55,9 +65,26 @@ class SessionKVHolder:
 
     Args:
         scheduler: The vLLM v1 scheduler of this rank's in-process engine.
+        hold: Hold sessions' GPU blocks. False: only ended sessions' CPU chunks are evicted first.
+        offload_policy: vLLM's CPU offload `LRUCachePolicy`; None without CPU offload.
     """
 
-    def __init__(self, scheduler: Any) -> None:
+    def __init__(
+        self,
+        scheduler: Any,
+        hold: bool = True,
+        offload_policy: Any | None = None,
+    ) -> None:
+        if offload_policy is not None:
+            # Imported here: runs without CPU offload never load vLLM's offload code.
+            from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+
+            # `release` reorders the LRU's private `evictable_chunks` (pinned vLLM version).
+            if not isinstance(offload_policy, LRUCachePolicy):
+                raise RuntimeError(
+                    "CPU KV offload needs vLLM's LRUCachePolicy, got "
+                    f"{type(offload_policy).__name__}"
+                )
         self._scheduler = scheduler
         kv_cache_manager = scheduler.kv_cache_manager
         self._coordinator = kv_cache_manager.coordinator
@@ -67,37 +94,59 @@ class SessionKVHolder:
             cdiv(scheduler.max_num_scheduled_tokens, group.kv_cache_spec.block_size)
             for group in kv_cache_manager.kv_cache_config.kv_cache_groups
         )
+        self._hold_enabled = hold
+        self._offload_policy = offload_policy
         # Requests in vLLM: internal request id -> (session, group, prefill seen).
         self._live: dict[str, tuple[str, int, bool]] = {}
         # Held blocks per session, idle longest first.
         self._held: OrderedDict[str, list[Any]] = OrderedDict()
+        # Sessions past their first prefill, until `release`.
         self._session_groups: dict[str, int] = {}
         self._group_sessions: dict[int, set[str]] = {}
+        # With offload: each session's latest request's block hashes. Its prompt holds the earlier
+        # turns, and vLLM appends decode blocks to this list. If a turn re-renders the history,
+        # chunks only an earlier turn had are not evicted first.
+        self._session_hashes: dict[str, list[bytes]] = {}
         # Plain ints, so other threads (e.g. a logging endpoint) can read them safely.
         self.num_sessions = 0
         self.num_evicted = 0
 
     def track(self, internal_request_id: str, session_id: str, group_id: int) -> None:
-        """Hold this request's prefix once its prefill finishes."""
+        """Once this request's prefill finishes, track its session (and with `hold`, its prefix)."""
         self._live[internal_request_id] = (session_id, group_id, False)
 
     def after_step(self) -> None:
-        """Hold the prefix of requests whose prefill finished; mark sessions whose request left;
-        release sessions if vLLM could not admit anything."""
-        for internal_id, (session_id, group_id, held) in list(self._live.items()):
+        """Track the sessions of requests whose prefill finished (with `hold`, hold their prefix);
+        mark sessions whose request left; release sessions if vLLM could not admit anything."""
+        for internal_id, (session_id, group_id, prefill_seen) in list(
+            self._live.items()
+        ):
             request = self._scheduler.requests.get(internal_id)
             if request is None:  # finished or aborted: the session is idle from now on
                 del self._live[internal_id]
                 if session_id in self._held:
                     self._held.move_to_end(session_id)
-            elif not held and request.num_computed_tokens >= request.num_prompt_tokens:
+            elif (
+                not prefill_seen
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
                 self._live[internal_id] = (session_id, group_id, True)
-                self._hold(request, session_id, group_id)
+                self._session_groups[session_id] = group_id
+                self._group_sessions.setdefault(group_id, set()).add(session_id)
+                if self._offload_policy is not None:
+                    self._session_hashes[session_id] = request.block_hashes
+                if self._hold_enabled:
+                    self._hold(request, session_id)
 
         # Nothing runs and requests wait: with an empty batch vLLM skips the watermark, so it refused
         # the head for lack of blocks (or the batch just drained: one cheap extra release).
+        # A request loading its KV from CPU waits for the load, not for blocks. One whose CPU lookup
+        # is deferred (a chunk still being stored) still counts: at worst one release per empty step.
         scheduler = self._scheduler
-        if not scheduler.running and (scheduler.waiting or scheduler.skipped_waiting):
+        if not scheduler.running and any(
+            request.status != RequestStatus.WAITING_FOR_REMOTE_KVS
+            for request in (*scheduler.skipped_waiting, *scheduler.waiting)
+        ):
             free_before = self._block_pool.get_num_free_blocks()
             for session_id in list(self._held):
                 self._release(session_id)
@@ -114,6 +163,8 @@ class SessionKVHolder:
         released: its hold is all that keeps those blocks, and keeping it once memory is full stops
         every waiting request from starting.
         """
+        if not self._hold_enabled:
+            return
         running_ids = {request.request_id for request in self._scheduler.running}
         # GRPO siblings decode in lockstep, so all running requests can cross a boundary together.
         floor = self.free_floor_blocks + self._num_kv_cache_groups * len(running_ids)
@@ -130,19 +181,59 @@ class SessionKVHolder:
     def release(self, session_ids: list[str] = (), group_ids: list[int] = ()) -> None:
         """Release sessions that make no more calls, and every session of finished groups."""
         released = set(session_ids)
+        dropped_groups = set(group_ids)
         for group_id in group_ids:
             released |= self._group_sessions.pop(group_id, set())
         # Sorted, not set order: string hashes differ per process, and every TP rank must free
         # blocks in the same order.
-        for session_id in sorted(released):
+        released_in_order = sorted(released)
+        for session_id in released_in_order:
             self._release(session_id)
+            group_id = self._session_groups.pop(session_id, None)
+            if group_id is not None:
+                self._group_sessions.get(group_id, set()).discard(session_id)
+
+        # ======== CPU offload: the ended sessions' chunks are evicted first ========
+        if self._offload_policy is not None:
+            from vllm.v1.kv_offload.base import make_offload_key
+
+            ended_hashes = [
+                block_hash
+                for session_id in released_in_order
+                for block_hash in self._session_hashes.pop(session_id, ())
+            ]
+            # Chunks a live session uses keep their place: sessions past their first prefill,
+            # and requests still before it (e.g. a GRPO sibling's first turn).
+            # TODO: rebuilt on every release: 0.6 ms for 250 live Qwen3.5 sessions of 16k tokens,
+            # 23 ms with 16-token hash blocks (attention-only models). A per-hash refcount,
+            # caught up as sessions grow, would cost only the released sessions' length.
+            live_hashes = set().union(*self._session_hashes.values())
+            for internal_id, (session_id, group_id, prefill_seen) in self._live.items():
+                request = self._scheduler.requests.get(internal_id)
+                ended = session_id in released or group_id in dropped_groups
+                if not prefill_seen and not ended and request is not None:
+                    live_hashes.update(request.block_hashes)
+            # One key per block and KV cache group. Keys vLLM never stored, or is still storing
+            # or loading, are skipped.
+            # TODO: a chunk whose store finishes after the release (the last turn's final blocks,
+            # stored on the next engine step) keeps its LRU place; evict it first once stored.
+            evictable_chunks = self._offload_policy.evictable_chunks
+            for block_hash in ended_hashes:
+                if block_hash in live_hashes:
+                    continue
+                for group_idx in range(self._num_kv_cache_groups):
+                    key = make_offload_key(block_hash, group_idx)
+                    if key in evictable_chunks:
+                        evictable_chunks.move_to_end(key, last=False)
+
         # A request still before its prefill must not re-hold a released session.
-        dropped_groups = set(group_ids)
-        for internal_id, (session_id, group_id, held) in list(self._live.items()):
+        for internal_id, (session_id, group_id, prefill_seen) in list(
+            self._live.items()
+        ):
             if session_id in released or group_id in dropped_groups:
                 self._live[internal_id] = (session_id, group_id, True)
 
-    def _hold(self, request: Any, session_id: str, group_id: int) -> None:
+    def _hold(self, request: Any, session_id: str) -> None:
         # The prompt's last token is recomputed for its logits, so a continuation hits at most
         # num_prompt_tokens - 1 tokens; the lookup returns the attention blocks and, per GDN
         # group, the state block that ends on that aligned boundary. vLLM returns the oldest
@@ -156,15 +247,10 @@ class SessionKVHolder:
         self._block_pool.touch(blocks)
         self._release(session_id)
         self._held[session_id] = blocks
-        self._session_groups[session_id] = group_id
-        self._group_sessions.setdefault(group_id, set()).add(session_id)
         self.num_sessions += 1
 
     def _release(self, session_id: str) -> None:
         blocks = self._held.pop(session_id, None)
-        group_id = self._session_groups.pop(session_id, None)
-        if group_id is not None:
-            self._group_sessions.get(group_id, set()).discard(session_id)
         if blocks is not None:
             self.num_sessions -= 1
             self._block_pool.free_blocks(reversed(blocks))
