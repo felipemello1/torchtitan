@@ -288,7 +288,12 @@ def test_router_forwards_session_releases_with_hold_or_kv_offload(
     rl_trainer.config.trainer = SimpleNamespace(
         parallelism=SimpleNamespace(
             data_parallel_shard_degree=1, data_parallel_replicate_degree=1
-        )
+        ),
+        # Read when the batcher actor spawns.
+        training=SimpleNamespace(
+            num_tokens_per_microbatch_per_dp_rank=8, max_context_length=8
+        ),
+        debug=SimpleNamespace(enable_structured_logging=False),
     )
     rl_trainer.config.model = None
     rl_trainer.config.generator_router = InterGeneratorRouter.Config()

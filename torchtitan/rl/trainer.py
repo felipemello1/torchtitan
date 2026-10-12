@@ -274,7 +274,7 @@ class Trainer(Configurable):
         microbatch_groups = [[microbatch] for microbatch in microbatches]
         if uses_rdma:
             # TODO: the cp * tp ranks of a DP replica read the same column. Read it once per replica
-            # and broadcast it, to cut the controller's reads by cp * tp. Needs a per-replica group.
+            # and broadcast it, to cut the batcher's reads by cp * tp. Needs a per-replica group.
             microbatch_groups = MicrobatchStream(microbatches)
         result = engine.forward_backward(
             microbatch_groups=microbatch_groups,

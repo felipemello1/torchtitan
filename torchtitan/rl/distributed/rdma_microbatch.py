@@ -149,7 +149,7 @@ class MicrobatchStream:
             while reads:
                 yield [_wait_for_microbatch(reads.popleft())]
         finally:
-            # On an error, cancel queued reads: with the controller gone, each would wait out
+            # On an error, cancel queued reads: with the batcher gone, each would wait out
             # the 60 s RDMA timeout.
             pool.shutdown(cancel_futures=True)
 

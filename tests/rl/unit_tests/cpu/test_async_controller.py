@@ -813,6 +813,7 @@ def _run_with_generator_watcher(watcher) -> None:
     )
     controller.start_step = 0
     controller.trainer = None
+    controller.batcher = None
     controller.trainer_dp_degree = 1
     controller.tokenizer = SimpleNamespace(eos_id=0)
     controller._sampling = SimpleNamespace(temperature=1.0)
