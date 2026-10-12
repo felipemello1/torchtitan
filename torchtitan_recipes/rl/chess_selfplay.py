@@ -339,13 +339,13 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
     max_plies: int = 120,
     max_thinking_tokens: int = 1024,
     max_context_tokens: int = 131072,
-    num_prompts_per_train_step: int = 32,
+    num_prompts_per_train_step: int = 48,
 ) -> Controller.Config:
-    """Qwen3.5-35B-A3B-Base self-play from scratch on three GB300 hosts; games, thinking, rewards and
-    validation as in `rl_chess_qwen3_5_4b_gb300`:
+    """Qwen3.5-35B-A3B-Base self-play from scratch on five GB300 hosts; games, thinking and validation
+    as in `rl_chess_qwen3_5_4b_gb300`, with a zero-sum mate (10 / -9):
 
         host 0:     the trainer, FSDP 2 x TP 2 x EP 4 with Dist-MoE experts
-        hosts 1-2:  eight TP1 generators; idle session KV goes to CPU
+        hosts 1-4:  sixteen TP1 generators; idle session KV goes to CPU
 
     Training games' ply cap grows from 60 at step 0 to `max_plies` at step 200; validation games
     always play `max_plies`.
@@ -376,12 +376,16 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
     config.rollouter.curriculum = ChessCurriculum.Config(
         start_max_plies=60, end_max_plies=max_plies, max_plies_ramp_steps=200
     )
+    # Zero-sum mate: with the mated side losing only ~0.25, self-play stopped defending (82% of mates
+    # followed a one-move blunder another move avoided).
+    worker = config.rollouter.worker
+    worker.checkmated_reward = 1.0 - worker.checkmate_reward
 
     # ======== Async loop ========
     loop = config.async_loop
-    loop.num_training_steps = 300
-    # 32 positions x 8 games x 2 colors = 512 rollouts per step. 60-ply games averaged 23-29K tokens
-    # per rollout (4B), so ~12-15M tokens: ~220-270 s of forward/backward at ~55K tokens/s.
+    loop.num_training_steps = 1000
+    # 48 positions x 8 games x 2 colors = 768 rollouts per step: ~200 s of forward/backward at 66
+    # plies, growing with the ply cap. Sixteen generators keep the trainer busy up to ~640-token replies.
     loop.num_prompts_per_train_step = num_prompts_per_train_step
     loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
         # The mean policy age of trained groups stays under 6 steps, every one under 10.
@@ -393,7 +397,7 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
         start_batches=6 + 1,
     )
     loop.target_offpolicy_steps = loop.group_buffer.target_offpolicy_steps
-    loop.validation.freq = 10
+    loop.validation.freq = 5
 
     # ======== Trainer ========
     trainer = config.trainer
@@ -419,6 +423,7 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
     )
 
     # ======== Generators ========
+    config.num_generators = 16
     generator = config.generator
     generator.model = generator_model
     # Router replay: the trainer routes each token to the experts the generator picked.
