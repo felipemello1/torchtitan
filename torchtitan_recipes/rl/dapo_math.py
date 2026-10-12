@@ -335,7 +335,6 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k() -> Controller.Config:
             checkpointer=CheckpointManager.Config(
                 initial_load_in_hf=True,
                 interval=10,
-                enable_first_step_checkpoint=True,
                 async_mode="async",
                 keep_latest_k=0,
                 last_save_in_hf=False,
@@ -392,19 +391,36 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
     """`rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k` as a fresh 300-step run with score
     centering, router replay, the adaptive rollout buffer, and validation beside training.
 
-    Same 12 GPUs, 131K budget and forced answer; 24 x 16 per step, lr 5e-6, vLLM watermark 0.1,
-    CPU KV offload, and all-pass problems skipped in later epochs; no length reward.
+    20 GPUs with 16 TP1 engines (was 8); 64K responses (was 131K) and the same forced answer;
+    24 x 16 per step, lr 5e-6, vLLM watermark 0.1, problems the 4B solved at most 3 of 8 times,
+    and all-pass problems skipped in later epochs; no length reward.
     """
+    # 64K responses (was 131K): ~9% of night-one rollouts ran longer, and they solved 41%.
+    # Validation shares the generator's sampling, so it also stops at 64K.
+    max_response_tokens = 65536
+    # 2,048 tokens for the prompt.
+    max_total_tokens = max_response_tokens + 2048
     num_prompts_per_train_step = 24
-    # ~10 batches generating at once, as 20 prompts -> 200 groups did: about twice the groups the
-    # engines' KV holds at ~55K-token responses, so the vLLM queue stays short. With validation
-    # alongside, each engine's max_num_seqs is (240 x 16 + 960) / 8 = 600 (was capped at 512).
-    generation_capacity = 240
-    # Host RAM per generator for vLLM's CPU KV offload. PLACEHOLDER: confirm before launch. Four
-    # engines per host share its /dev/shm (DOME runs with --ipc=host; ~477 GB on a GB300 host).
-    kv_offload_gib = 96
+    # 30 groups per engine, as 240 groups on 8 engines were: about twice the groups an engine's KV
+    # holds at ~55K-token responses, so the vLLM queue stays short. With validation alongside, each
+    # engine's max_num_seqs is (480 x 16 + 240) / 16 = 495.
+    generation_capacity = 480
+    # No CPU KV offload: math is single-turn and the 0.1 watermark leaves no preemptions, so a night
+    # at 96 GiB per engine stored 41 TB and loaded none.
+    kv_offload_gib = 0
     config = rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k()
     config.dump_folder = "outputs/rl/qwen3_5_35b_a3b_base_intellect3_math_131k_tonight"
+    # A 5-host job: 16 TP1 engines on 4 generator hosts (was 8 on 2). Math is engine-bound.
+    config.num_generators = 16
+    # Both models' context, and so vLLM's max_model_len, is the new total.
+    trainer_model, generator_model = build_rl_model_configs(
+        build_qwen3_5_model_config,
+        "35B-A3B",
+        seq_len=max_total_tokens,
+        attn_backend="varlen",
+        trainer_parallelism=config.trainer.parallelism,
+        generator_parallelism=config.generator.parallelism,
+    )
     config.async_loop = dataclasses.replace(
         config.async_loop,
         # 24 x 16 rollouts per step keeps early steps' forward/backward near 200-300 s (20 x 16 took
@@ -416,8 +432,9 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
         group_buffer=AdaptiveRolloutGroupWorkBuffer.Config(
             # The demand keeps the mean policy age of trained groups under 6 steps.
             target_offpolicy_steps=6,
-            # A group older than 10 steps when consumed is dropped and its prompt not retried.
-            max_offpolicy_steps=10,
+            # A group older than 16 steps when consumed is dropped and its prompt not retried. At 10,
+            # the drops were the slowest groups, i.e. the longest, hardest problems.
+            max_offpolicy_steps=16,
             generation_capacity=generation_capacity,
             # Start at (6 + 1) batches, as the fixed buffer would.
             start_batches=7,
@@ -427,23 +444,47 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
             config.async_loop.training_sample_builder,
             drop_zero_std_reward_groups=True,
         ),
-        # avg@4 on the 240 problems every 10 steps, beside training (the first at step 0). A
-        # pass took 3.2-3.6 h on the last run, so the next one starts when the previous ends.
+        # avg@1 on the 240 problems every 10 steps, beside training (the first at step 0): ~1/4 the
+        # cost of avg@4, at about twice the noise. avg@4 passes took ~3 h and ran back to back.
         validation=ValidationConfig(
-            steps=4 * 240, greedy=False, freq=10, overlap_training=True
+            steps=1 * 240, greedy=False, freq=10, overlap_training=True
         ),
         # Trainer ranks read each microbatch's tensors of 1 KiB or more as RDMA buffers. By value
         # (the default), every rank's call carries the whole batch: 93-100 s at step 3 of a
         # router-replay run.
         rdma_fast_path_threshold=1024,
     )
+    # Problems the 4B solved 1-3 of 8 times (3,474 rows): at max_pass_rate 0.75, 45% of groups
+    # came back all-pass, against ~32% for this band.
+    config.rollouter.training_dataloader.dataset = dataclasses.replace(
+        config.rollouter.training_dataloader.dataset, max_pass_rate=0.375
+    )
     # A problem whose 16 rewards all come back 1.0 (all correct without a forced answer) is
     # skipped in later epochs, then re-checked; all-fail problems keep coming back.
     config.rollouter.training_dataloader.zero_spread_skip = ZeroSpreadSkip(
         min_mean_reward=0.9
     )
+    worker = config.rollouter.worker
+    config.rollouter.worker = dataclasses.replace(
+        worker,
+        token_env=dataclasses.replace(
+            worker.token_env, max_rollout_tokens=max_total_tokens
+        ),
+        # Thinking still open 4,096 tokens before the response cap is closed and answered.
+        thinking_budget=dataclasses.replace(
+            worker.thinking_budget, max_thinking_tokens=max_response_tokens - 4096
+        ),
+    )
     config.trainer = dataclasses.replace(
         config.trainer,
+        model=trainer_model,
+        training=dataclasses.replace(
+            config.trainer.training,
+            # The batcher needs a multiple of max_context_length: 2 x 67,584 = 135,168 tokens, near
+            # the 131K recipe's 133,120.
+            num_tokens_per_microbatch_per_dp_rank=2 * max_total_tokens,
+            max_context_length=max_total_tokens,
+        ),
         # Synchronous saves: an async save's ~420 GB CPU copy, on top of the 4 trainer ranks each
         # unpacking the 13-21 GB batch at 2-3x, can exceed the trainer host's 900 GB job memory.
         checkpointer=dataclasses.replace(
@@ -475,8 +516,13 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
             ),
         ),
     )
+    # Dist-MoE experts on the new trainer model, as in the 131K recipe.
+    config.trainer = apply_transforms(
+        config.trainer, [DistMoeTransform(inplace_wgrad_accum=False)]
+    )
     config.generator = dataclasses.replace(
         config.generator,
+        model=generator_model,
         # Router replay: each token takes the experts the generator routed it to. Trainer ranks
         # read only their own microbatches, so the routed experts don't reach every rank at once.
         return_routed_experts=True,
@@ -485,6 +531,7 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
             # ScoreCenteringLoss's top-k. 32 is the smallest k arXiv 2609.20807 tested, and it
             # matched the full vocabulary (Fig. 5); 256 bytes per generated token.
             num_topk_logprobs=32,
+            max_tokens=max_response_tokens,
         ),
         # Admit a request only while 10% of KV blocks stay free, so running requests have room to
         # grow before vLLM preempts one.
