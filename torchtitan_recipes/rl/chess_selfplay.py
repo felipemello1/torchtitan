@@ -263,6 +263,9 @@ def rl_chess_qwen3_5_4b_gb300(
         max_thinking_tokens=max_thinking_tokens,
         answer_prefix="\\boxed{",
         answer_end_text="}",
+        # A reply that stops inside thinking plays the box it wrote. Force-closed, such turns lost their
+        # credit to the cap and penalty below and grew to 13.5% of turns (chess118gcq, steps 289-302).
+        force_close_on_stop=False,
     )
     worker.rubric.reward_fns = [RewardChessScore.Config(forced_close_penalty=0.1)]
     # A force-closed turn's advantage is capped at 0: thinking loops ('capturing capturing ...') that a
