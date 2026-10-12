@@ -591,7 +591,7 @@ async def _run_group(
     checkmate_reward=1.0,
     release_session_fn=None,
     force_close_at=(),
-    forced_close_cost=0.0,
+    forced_close_advantage_cap=None,
 ):
     worker = ChessSelfPlayWorker.Config(
         rubric=Rubric.Config(
@@ -602,7 +602,7 @@ async def _run_group(
         max_plies=40,
         stockfish_path=None,
         checkmate_reward=checkmate_reward,
-        forced_close_cost=forced_close_cost,
+        forced_close_advantage_cap=forced_close_advantage_cap,
     ).build()
     tokenizer_config = HuggingFaceTokenizer.Config()
     await worker.setup_async(
@@ -695,7 +695,7 @@ def test_worker_pays_its_checkmate_reward() -> None:
     asyncio.run(run())
 
 
-def test_worker_charges_each_force_closed_turn() -> None:
+def test_worker_caps_each_force_closed_turn() -> None:
     async def run() -> None:
         group = await _run_group(
             {
@@ -706,20 +706,19 @@ def test_worker_charges_each_force_closed_turn() -> None:
             },
             group_size=2,
             force_close_at=[(1, 0), (3, 0)],
-            forced_close_cost=0.25,
+            forced_close_advantage_cap=0.0,
         )
         by_id = {rollout.rollout_id: rollout for rollout in group.rollouts}
         # rollout advantages as in test_worker_trains_both_colors_with_per_color_advantages
         assert [by_id[i].advantage for i in range(4)] == pytest.approx(
             [-0.3625, 0.25, 0.3625, -0.25]
         )
-        # each force-closed turn gets at most -0.25: in a won game +0.25 -> -0.25, and on top of a
-        # forfeit -1.7375 -> -1.9875
+        # each force-closed turn is capped at 0: in a won game +0.25 -> 0.0, and a forfeit keeps -1.7375
         assert [[turn.advantage for turn in by_id[i].turns] for i in range(4)] == [
             [None, None],
-            [pytest.approx(-0.25), None],
+            [pytest.approx(0.0), None],
             [None],
-            [pytest.approx(-1.9875)],
+            [pytest.approx(-1.7375)],
         ]
 
     asyncio.run(run())

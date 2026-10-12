@@ -58,8 +58,8 @@ class ChessSelfPlayWorker(RolloutWorker):
     each color is centered as if every such forfeit had ended its game at `max_plies` instead
     (`ChessGame.material_rewards`), and the forfeiting turn alone pays the difference. A player
     stopped by an infra error is centered the same way, and none of its turns pays. Separately,
-    every force-closed turn gets a negative advantage, whatever the game's outcome
-    (`forced_close_cost`).
+    a force-closed turn's advantage can be capped, so a won game never reinforces it
+    (`forced_close_advantage_cap`).
 
     Example (group_size=2, self-play, max_plies=60):
 
@@ -84,15 +84,15 @@ class ChessSelfPlayWorker(RolloutWorker):
         """The winner's reward for a checkmate, at any length; the prompt states it.
             1:   a mate beats the best score of a game cut at `max_plies` (0.75)
             10:  a mate dominates its group's advantages"""
-        forced_close_cost: float = 0.0
-        """Lowers each force-closed turn's own advantage to at most -`forced_close_cost`, so a
-        thinking loop is pushed down even in a won game: +0.4 -> -0.25 and -0.3 -> -0.55 at 0.25."""
+        forced_close_advantage_cap: float | None = None
+        """Caps each force-closed turn's own advantage, so a thinking loop that a forced close
+        turned into a won game is not reinforced. At 0.0: +8.4 -> 0.0, and -2.4 stays -2.4."""
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self._max_plies = config.max_plies
         self._checkmate_reward = config.checkmate_reward
-        self._forced_close_cost = config.forced_close_cost
+        self._forced_close_advantage_cap = config.forced_close_advantage_cap
         if (
             config.stockfish_path is not None
             and shutil.which(config.stockfish_path) is None
@@ -223,16 +223,15 @@ class ChessSelfPlayWorker(RolloutWorker):
                 if game.forfeiter == color and game.end_reason in _REPLY_FORFEITS:
                     # assumes mean-centered advantages (the recipe's `should_std_normalize=False`)
                     rollout.turns[-1].advantage = advantage - forfeit_cost
-                if self._forced_close_cost:
-                    # a forfeiting turn that was also force-closed pays both; assumes mean-centered
-                    # advantages, as the forfeit does
+                if self._forced_close_advantage_cap is not None:
+                    # a forfeiting turn that was also force-closed keeps its forfeit's lower advantage
                     for turn in rollout.turns:
                         if is_force_closed(turn):
                             turn_advantage = (
                                 advantage if turn.advantage is None else turn.advantage
                             )
-                            turn.advantage = (
-                                min(turn_advantage, 0.0) - self._forced_close_cost
+                            turn.advantage = min(
+                                turn_advantage, self._forced_close_advantage_cap
                             )
 
         # Score the policy's moves with Stockfish: a strength measure that does not depend on the opponent.
