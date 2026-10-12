@@ -335,7 +335,6 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k() -> Controller.Config:
             checkpointer=CheckpointManager.Config(
                 initial_load_in_hf=True,
                 interval=10,
-                enable_first_step_checkpoint=True,
                 async_mode="async",
                 keep_latest_k=0,
                 last_save_in_hf=False,
