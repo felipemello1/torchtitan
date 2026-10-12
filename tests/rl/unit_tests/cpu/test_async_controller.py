@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 import pytest
@@ -26,7 +26,8 @@ from torchtitan.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
-from torchtitan.rl.controller import Controller
+from torchtitan.rl.controller import AsyncLoopConfig, Controller, ValidationConfig
+from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
@@ -34,7 +35,12 @@ from torchtitan.rl.observability.controller import (
     MetricsTimer,
 )
 from torchtitan.rl.rollout import RolloutGroup
-from torchtitan.rl.rollout.types import RolloutTurnID
+from torchtitan.rl.rollout.types import (
+    Rollout,
+    RolloutStatus,
+    RolloutTurn,
+    RolloutTurnID,
+)
 
 
 def test_controller_config_maybe_log(tmp_path, caplog) -> None:
@@ -823,6 +829,7 @@ def _run_with_generator_watcher(watcher) -> None:
             ),
             training_sample_builder=SimpleNamespace(build=lambda: None),
             batcher=SimpleNamespace(build=lambda **kwargs: None),
+            validation=ValidationConfig(),
         ),
         trainer=SimpleNamespace(
             training=SimpleNamespace(
@@ -869,3 +876,466 @@ def test_run_fails_when_the_engine_loops_exit_mid_run() -> None:
         RuntimeError, match="generator_wait_engine_loop exited unexpectedly"
     ):
         _run_with_generator_watcher(exited)
+
+
+def _validation_rollout(versions: list[tuple[int, int]]) -> Rollout:
+    """One rollout with a turn per `(min_policy_version, max_policy_version)`."""
+    return Rollout(
+        group_id=-1,
+        rollout_id=0,
+        status=RolloutStatus.COMPLETED,
+        reward=1.0,
+        turns=[
+            RolloutTurn(
+                rollout_id=RolloutTurnID(group_id=-1, rollout_id=0, turn_id=turn_id),
+                prompt_prefix_len=0,
+                prompt_delta_token_ids=np.array([1], dtype=np.int32),
+                completion_token_ids=np.array([2], dtype=np.int32),
+                completion_logprobs=np.array([-0.1], dtype=np.float32),
+                min_policy_version=min_version,
+                max_policy_version=max_version,
+            )
+            for turn_id, (min_version, max_version) in enumerate(versions)
+        ],
+    )
+
+
+def test_validation_logs_the_policies_its_rollouts_sampled() -> None:
+    """A weight sync during a rollout shows as a newer max version and a mixed-policy rollout."""
+    controller = object.__new__(Controller)
+    controller.generator_router = SimpleNamespace(
+        release_groups=SimpleNamespace(call_one=AsyncMock())
+    )
+    controller._rollouter = SimpleNamespace(
+        run_group_rollouts=AsyncMock(
+            side_effect=[
+                # A sync to policy 27 landed during the second turn.
+                RolloutGroup(
+                    group_id=-1,
+                    rollouts=[_validation_rollout([(25, 25), (25, 27)])],
+                ),
+                RolloutGroup(group_id=-2, rollouts=[_validation_rollout([(25, 25)])]),
+            ]
+        ),
+    )
+
+    _, metrics = asyncio.run(
+        controller._collect_validation_rollouts(
+            samples=["prompt", "prompt"], sampling=SamplingConfig(), step=25
+        )
+    )
+
+    reduced = m.MetricsProcessor._aggregate_metrics(metrics)
+    assert reduced["validation/min_policy_version/min"] == 25
+    assert reduced["validation/max_policy_version/max"] == 27
+    assert reduced["validation/mixed_policy_rollouts/mean"] == 0.5
+
+
+class _FakeValidation:
+    """Stands in for `Controller.validate`: each pass runs until the test ends it."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, int]] = []
+        self.overlapped: dict[int, bool] = {}
+        self._end_events: dict[int, asyncio.Event] = {}
+        self._errors: dict[int, Exception] = {}
+
+    @property
+    def started_steps(self) -> list[int]:
+        return [step for event, step in self.events if event == "start"]
+
+    async def __call__(self, *, step: int, overlapped: bool = False) -> list[m.Metric]:
+        self.events.append(("start", step))
+        self.overlapped[step] = overlapped
+        await self._end_event(step).wait()
+        self.events.append(("end", step))
+        if step in self._errors:
+            raise self._errors[step]
+        return [m.Metric("validation_reward", m.Mean(float(step)))]
+
+    def end(self, step: int, error: Exception | None = None) -> None:
+        if error is not None:
+            self._errors[step] = error
+        self._end_event(step).set()
+
+    def _end_event(self, step: int) -> asyncio.Event:
+        return self._end_events.setdefault(step, asyncio.Event())
+
+
+class _FakeWeightSync:
+    """Stands in for `WeightSyncManager`; a push/pull reaches the generators once awaited."""
+
+    def __init__(self) -> None:
+        self.generator_policy_version = 0
+        self._inflight_version: int | None = None
+
+    async def wait_prev_push(self) -> list[m.Metric]:
+        return []
+
+    async def wait_prev_pull(self) -> list[m.Metric]:
+        self._finish_inflight()
+        return []
+
+    def start_async_push_pull(self, *, version: int) -> None:
+        self._inflight_version = version
+
+    async def wait_inflight_push_pull(self) -> None:
+        # Other tasks run while the pull is in flight.
+        await asyncio.sleep(0)
+        self._finish_inflight()
+
+    def _finish_inflight(self) -> None:
+        if self._inflight_version is not None:
+            self.generator_policy_version = self._inflight_version
+            self._inflight_version = None
+
+
+def _rank_0_result(value: object) -> SimpleNamespace:
+    """Stands in for a Monarch ValueMesh; `Controller._get_rank_0_value` calls `.get(0)`."""
+    return SimpleNamespace(get=lambda rank: value)
+
+
+def _controller_for_trainer_loop(
+    validation: ValidationConfig, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Controller, _FakeValidation]:
+    """A `Controller` whose `_trainer_loop` runs on fakes: each step trains instantly."""
+
+    # The loop registers RDMA microbatches in a thread; run it inline so `_run_until`'s yields
+    # see each step finish.
+    async def to_thread(fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", to_thread)
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=AsyncLoopConfig(validation=validation)
+    )
+    controller.start_step = 0
+    controller._trainer_policy_version = 0
+    policy_versions = iter(range(1, 100))
+
+    async def optim_step(*, controller_state: dict, last_step: bool) -> SimpleNamespace:
+        return _rank_0_result(
+            SimpleNamespace(policy_version=next(policy_versions), metrics={})
+        )
+
+    controller.trainer = SimpleNamespace(
+        sync_log_step=SimpleNamespace(call=AsyncMock()),
+        forward_backward=SimpleNamespace(
+            call=AsyncMock(return_value=_rank_0_result({"loss/mean": 0.1}))
+        ),
+        optim_step=SimpleNamespace(call=optim_step),
+    )
+    controller.generator_router = SimpleNamespace(
+        sync_log_step=SimpleNamespace(call_one=AsyncMock())
+    )
+    controller._rollouter = SimpleNamespace(
+        sync_log_step=AsyncMock(),
+        acknowledge_training_sample_ids=Mock(),
+        state_dict=dict,
+    )
+    controller._weight_sync = _FakeWeightSync()
+    controller._group_buffer = SimpleNamespace(metrics=lambda: [])
+    controller.metrics_processor = Mock()
+    controller._validation_task = None
+    fake_validation = _FakeValidation()
+    controller.validate = fake_validation
+    return controller, fake_validation
+
+
+def _training_batch(step: int) -> SimpleNamespace:
+    """Stands in for the `TrainerStepBatch` that `step` trains on."""
+    return SimpleNamespace(
+        metrics=[],
+        min_policy_versions=[step - 1],
+        microbatches=[],
+        global_loss_token_counts=[1],
+        global_routing_token_counts=[],
+        group_ids=[step],
+    )
+
+
+def _logged_steps(controller: Controller, *, is_validation: bool) -> list[int]:
+    return [
+        call.kwargs["step"]
+        for call in controller.metrics_processor.log.call_args_list
+        if call.kwargs["is_validation"] == is_validation
+    ]
+
+
+async def _run_until(condition) -> None:
+    """Let other tasks run until `condition()` holds."""
+    for _ in range(100):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never held")
+
+
+def test_overlapped_validation_runs_beside_training(monkeypatch) -> None:
+    """Training keeps stepping while a pass runs; the pass is logged at the step it ends, and a
+    validation step that comes meanwhile starts the next pass once it ends."""
+    controller, validation = _controller_for_trainer_loop(
+        ValidationConfig(freq=2, overlap_training=True), monkeypatch
+    )
+
+    async def run() -> None:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        trainer = asyncio.create_task(
+            controller._trainer_loop(queue, num_training_steps=6)
+        )
+
+        async def train(step: int) -> None:
+            await queue.put(_training_batch(step))
+            await _run_until(
+                lambda: step in _logged_steps(controller, is_validation=False)
+            )
+
+        await train(1)
+        await train(2)
+        await _run_until(lambda: validation.started_steps == [2])
+        # The trainer waited for step 2's pull before starting the pass.
+        assert controller._weight_sync.generator_policy_version == 2
+
+        # Steps 3 and 4 train while the step-2 pass runs; step 4's pass waits for it.
+        await train(3)
+        await train(4)
+        assert validation.started_steps == [2]
+        assert _logged_steps(controller, is_validation=True) == []
+
+        validation.end(2)
+        await _run_until(lambda: controller._validation_task.done())
+        await train(5)
+        assert _logged_steps(controller, is_validation=True) == [5]
+        await _run_until(lambda: validation.started_steps == [2, 5])
+        assert controller._weight_sync.generator_policy_version == 5
+
+        await train(6)
+        await asyncio.wait_for(trainer, timeout=5)
+        # Step 6 is the last step: no pass starts there. run() awaits the running one.
+        assert validation.started_steps == [2, 5]
+        assert not controller._validation_task.done()
+        validation.end(5)
+        await controller._validation_task
+
+    asyncio.run(run())
+    # The pass logged at step 5 joins row 5: the commit that pushes row 5 comes after it.
+    calls = [
+        (name, kwargs.get("step"), kwargs.get("is_validation"))
+        for name, _, kwargs in controller.metrics_processor.mock_calls
+        if name in ("log", "commit")
+    ]
+    validation_log = calls.index(("log", 5, True))
+    assert ("commit", None, None) not in calls[
+        calls.index(("log", 5, False)) : validation_log
+    ]
+    assert calls[validation_log + 1][0] == "commit"
+
+
+def test_overlapped_validation_failure_stops_training(monkeypatch) -> None:
+    """A pass that raises stops training at the end of the next step."""
+    controller, validation = _controller_for_trainer_loop(
+        ValidationConfig(freq=1, overlap_training=True), monkeypatch
+    )
+
+    async def run() -> None:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        trainer = asyncio.create_task(
+            controller._trainer_loop(queue, num_training_steps=3)
+        )
+        await queue.put(_training_batch(1))
+        await _run_until(lambda: validation.started_steps == [1])
+        validation.end(1, error=RuntimeError("generator died"))
+        await queue.put(_training_batch(2))
+        with pytest.raises(RuntimeError, match="generator died"):
+            await asyncio.wait_for(trainer, timeout=5)
+
+    asyncio.run(run())
+
+
+def test_overlapped_validation_starts_no_pass_at_the_last_step(monkeypatch) -> None:
+    """A pass asked for while another runs does not start at the last step; the final pass
+    after training covers it. The last step leaves a finished pass for run() to log."""
+    controller, validation = _controller_for_trainer_loop(
+        ValidationConfig(freq=1, overlap_training=True), monkeypatch
+    )
+
+    async def run() -> None:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        trainer = asyncio.create_task(
+            controller._trainer_loop(queue, num_training_steps=3)
+        )
+        await queue.put(_training_batch(1))
+        await queue.put(_training_batch(2))
+        await _run_until(lambda: validation.started_steps == [1])
+        validation.end(1)
+        await _run_until(lambda: controller._validation_task.done())
+        await queue.put(_training_batch(3))
+        await asyncio.wait_for(trainer, timeout=5)
+
+    asyncio.run(run())
+    # Step 2 asked for a pass while step 1's ran; step 3 started none and left step 1's for run().
+    assert validation.started_steps == [1]
+    assert _logged_steps(controller, is_validation=True) == []
+    assert controller._validation_task.done()
+
+
+def test_validation_pauses_training_by_default(monkeypatch) -> None:
+    controller, validation = _controller_for_trainer_loop(
+        ValidationConfig(freq=2), monkeypatch
+    )
+
+    async def run() -> None:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        trainer = asyncio.create_task(
+            controller._trainer_loop(queue, num_training_steps=3)
+        )
+        await queue.put(_training_batch(1))
+        await queue.put(_training_batch(2))
+        await _run_until(lambda: validation.started_steps == [2])
+
+        await queue.put(_training_batch(3))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert _logged_steps(controller, is_validation=False) == [1, 2]
+
+        validation.end(2)
+        await asyncio.wait_for(trainer, timeout=5)
+        assert _logged_steps(controller, is_validation=False) == [1, 2, 3]
+        assert _logged_steps(controller, is_validation=True) == [2]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "pass_3_ends_in_training, logged_steps", [(True, [2, 3, 4]), (False, [2, 4, 5])]
+)
+def test_overlapped_validation_before_and_after_training(
+    pass_3_ends_in_training, logged_steps
+) -> None:
+    """The pre-training pass runs while training starts. A pass still running when training
+    ends is awaited and logged at the last step; the final pass then logs one step later."""
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=AsyncLoopConfig(
+            num_training_steps=4,
+            validation=ValidationConfig(overlap_training=True),
+        ),
+        trainer=SimpleNamespace(
+            training=SimpleNamespace(
+                num_tokens_per_microbatch_per_dp_rank=64, max_context_length=64
+            )
+        ),
+    )
+    controller.start_step = 0
+    controller.trainer = Mock()
+    controller.generator_router = Mock()
+    controller.trainer_dp_degree = 1
+    controller.tokenizer = SimpleNamespace(eos_id=0)
+    controller._sampling = SamplingConfig()
+    controller.metrics_processor = Mock()
+    controller._log_reward_delta = Mock()
+    controller._validation_task = None
+    validation = _FakeValidation()
+    controller.validate = validation
+
+    async def idle(*args, **kwargs) -> None:
+        await asyncio.Event().wait()
+
+    # Stands in for `_trainer_loop`'s overlap branch, which the tests above cover.
+    async def trainer_loop(queue, *, num_training_steps: int) -> None:
+        # Training starts while the pre-training pass runs.
+        assert validation.started_steps == [0]
+        assert not controller._validation_task.done()
+        validation.end(0)
+        await _run_until(lambda: controller._validation_task.done())
+        controller._log_finished_validation(step=2)
+        controller._start_validation(step=3)
+        await _run_until(lambda: validation.started_steps == [0, 3])
+        if pass_3_ends_in_training:
+            validation.end(3)
+            await _run_until(lambda: controller._validation_task.done())
+            controller._log_finished_validation(step=3)
+        else:
+            # Training ends with the step-3 pass still running.
+            asyncio.get_running_loop().call_later(0.05, validation.end, 3)
+
+    controller._data_input_loop = idle
+    controller._rollout_loop = idle
+    controller._batcher_loop = idle
+    controller._generator_loop = idle
+    controller._trainer_loop = trainer_loop
+    validation.end(4)
+    validation.end(5)
+
+    asyncio.run(asyncio.wait_for(controller.run(), timeout=5))
+
+    final_pass_step = logged_steps[-1]
+    assert validation.events == [
+        ("start", 0),
+        ("end", 0),
+        ("start", 3),
+        ("end", 3),
+        ("start", final_pass_step),
+        ("end", final_pass_step),
+    ]
+    assert _logged_steps(controller, is_validation=True) == logged_steps
+    # Only the post-training pass blocks.
+    assert validation.overlapped == {0: True, 3: True, final_pass_step: False}
+    controller._log_reward_delta.assert_called_once_with(
+        {"validation_reward/mean": 0.0},
+        {"validation_reward/mean": float(final_pass_step)},
+    )
+
+
+def test_close_cancels_a_running_pass_before_closing_the_rollouter() -> None:
+    """After a training crash, `close()` cancels the pass and waits for it, then closes the
+    rollouter the pass was using."""
+    controller = object.__new__(Controller)
+    controller.trainer = None
+    controller.generator_router = None
+    controller.metrics_processor = Mock()
+    controller._proc_meshes = []
+    validation = _FakeValidation()
+    controller.validate = validation
+    pass_done_at_rollouter_close: list[bool] = []
+
+    async def close_rollouter() -> None:
+        pass_done_at_rollouter_close.append(controller._validation_task.done())
+
+    controller._rollouter = SimpleNamespace(close=close_rollouter)
+
+    async def run() -> None:
+        controller._start_validation(step=0)
+        await _run_until(lambda: validation.started_steps == [0])
+        await asyncio.wait_for(controller.close(), timeout=5)
+
+    asyncio.run(run())
+    assert controller._validation_task.cancelled()
+    assert pass_done_at_rollouter_close == [True]
+
+
+@pytest.mark.parametrize(
+    "overlapped, key",
+    [
+        (False, "timing/validation/blocking"),
+        (True, "timing/validation/overlapped"),
+    ],
+)
+def test_validation_wall_time_says_whether_the_pass_blocked(overlapped, key) -> None:
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(validation=ValidationConfig(steps=1))
+    )
+    controller._rollouter = SimpleNamespace(
+        get_validation_samples=lambda steps: ["prompt"]
+    )
+    controller._sampling = SamplingConfig()
+    controller.rollout_recorder = Mock()
+
+    async def collect(*, samples, sampling, step):
+        return [], []
+
+    controller._collect_validation_rollouts = collect
+    metrics = asyncio.run(controller.validate(step=5, overlapped=overlapped))
+    assert [metric.key for metric in metrics] == [key]
