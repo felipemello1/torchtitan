@@ -52,7 +52,7 @@ def test_controller_config_maybe_log(tmp_path, caplog) -> None:
     assert saved_config["trainer"]["training"]["max_context_length"] == 128
 
 
-def test_setup_async_caps_max_num_seqs_at_1024(monkeypatch, caplog) -> None:
+def test_setup_async_caps_max_num_seqs_per_generator(monkeypatch, caplog) -> None:
     from torchtitan.rl import controller as controller_module
 
     class _StopAfterSizing(Exception):
@@ -93,7 +93,12 @@ def test_setup_async_caps_max_num_seqs_at_1024(monkeypatch, caplog) -> None:
                 )
             )
 
-    assert "max_num_seqs=1024 per generator (rollout_concurrency=4096" in caplog.text
+    # 256 groups x 16 rollouts on one generator -> 4096, capped.
+    assert (
+        f"max_num_seqs={controller_module.MAX_NUM_SEQS_PER_GENERATOR} per generator "
+        "(rollout_concurrency=4096" in caplog.text
+    )
+    assert controller_module.MAX_NUM_SEQS_PER_GENERATOR == 512
 
 
 def _training_sample(*, group_id: int, rollout_id: int) -> TrainingSample:
