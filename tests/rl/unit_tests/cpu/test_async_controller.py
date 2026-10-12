@@ -1120,6 +1120,7 @@ def _controller_for_trainer_loop(
         sync_log_step=AsyncMock(),
         acknowledge_training_sample_ids=Mock(),
         state_dict=dict,
+        training_data_metrics=list,
     )
     controller._weight_sync = _FakeWeightSync()
     controller._group_buffer = SimpleNamespace(
