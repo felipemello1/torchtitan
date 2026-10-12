@@ -368,7 +368,23 @@ def _engine_request(request_id: str, *, min_policy_version: int):
         routing_session_id="group=3/rollout=0",
     )
     request.min_policy_version = min_policy_version
+    request.priority = 3  # the group id
+    request.arrival_time = 1.5  # rank 0's clock at admission
     return request
+
+
+def test_admission_passes_rank0_priority_and_arrival_time(monkeypatch):
+    # Rank 0's priority (the group id, 3), not the pinned version (6), and rank 0's arrival_time stamp.
+    generator = _generator()
+    engine = cast(_FakeEngine, generator._engine)
+
+    _admit_through_engine_loop(
+        monkeypatch, generator, [_engine_request("r0", min_policy_version=6)]
+    )
+
+    _, kwargs = engine.add_requests[0]
+    assert kwargs["priority"] == 3
+    assert kwargs["arrival_time"] == 1.5
 
 
 def test_admission_salts_prompt_with_min_policy_version(monkeypatch):
@@ -658,7 +674,7 @@ def test_extra_vllm_engine_args_reach_engine_args(monkeypatch, tmp_path):
         ),
     )
     assert engine_kwargs["watermark"] == 0.03
-    assert engine_kwargs["scheduling_policy"] == "fcfs"
+    assert engine_kwargs["scheduling_policy"] == "priority"
 
 
 def test_kv_offload_sets_vllm_cpu_offload(monkeypatch, tmp_path):

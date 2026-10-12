@@ -79,6 +79,8 @@ def _bare_generator(
     )
     generator.policy_version = 0
     generator._group_min_policy_versions = {}
+    generator._validation_group_priorities = {}
+    generator._newest_training_group_id = -1
     generator._prefetched_model_state_dict = {}
     generator._session_kv = None
     # Engine-thread tests bind the queue once the engine thread's event loop exists.
@@ -484,6 +486,55 @@ def test_release_groups_drops_pins(runner) -> None:
     )
 
 
+def test_step_puts_an_old_groups_later_turn_ahead_of_a_new_groups_first_turn(
+    runner,
+) -> None:
+    # One policy version, so the version key would tie them and serve group 8's earlier arrival first.
+    generator = _bare_generator(event_loop=runner.get_loop())
+    new_turn_1 = _request("g8/turn1", group_id=8)
+    old_turn_2 = _request("g3/turn2", group_id=3)
+    for request in (_request("g3/turn1", group_id=3), new_turn_1, old_turn_2):
+        _admit(runner, generator, request)
+
+    # vLLM serves the lower priority first.
+    assert (old_turn_2.priority, new_turn_1.priority) == (3, 8)
+
+
+def test_step_gives_validation_the_newest_training_group_id(runner) -> None:
+    generator = _bare_generator(event_loop=runner.get_loop())
+    early_validation = _request("v2/turn1", group_id=-2)
+    validation_turn_1 = _request("v1/turn1", group_id=-1)
+    validation_turn_2 = _request("v1/turn2", group_id=-1)
+    for request in (
+        early_validation,
+        _request("g5/turn1", group_id=5),
+        _request("g2/turn1", group_id=2),
+        validation_turn_1,
+        _request("g9/turn1", group_id=9),
+        validation_turn_2,
+    ):
+        _admit(runner, generator, request)
+
+    # Before any training group: ahead of all of them.
+    assert early_validation.priority == -1
+    # The newest training id seen (5, not the later-arriving 2), kept for its next turn after group 9.
+    assert validation_turn_1.priority == validation_turn_2.priority == 5
+
+
+def test_release_groups_drops_validation_priorities(runner) -> None:
+    generator = _bare_generator(event_loop=runner.get_loop())
+    _admit(runner, generator, _request("g4/turn1", group_id=4))
+    _admit(runner, generator, _request("step=0/v1/turn1", group_id=-1))
+    _admit(runner, generator, _request("g9/turn1", group_id=9))
+
+    # Validation group ids are reused every pass: the next pass's group -1 starts after group 9.
+    runner.run(generator.release_groups([-1]))
+    next_pass = _request("step=5/v1/turn1", group_id=-1)
+    _admit(runner, generator, next_pass)
+
+    assert next_pass.priority == 9
+
+
 # --- engine thread ---
 
 
@@ -526,7 +577,7 @@ class _FakeEngine:
         self.running: list[str] = []
         self.threads: set[threading.Thread] = set()
 
-    def add_request(self, *, request_id, prompt, params):
+    def add_request(self, *, request_id, prompt, params, arrival_time, priority):
         self.threads.add(threading.current_thread())
         self.running.append(request_id)
 
@@ -545,10 +596,16 @@ class _RejectingEngine(_FakeEngine):
 
     max_prompt_len = 2
 
-    def add_request(self, *, request_id, prompt, params):
+    def add_request(self, *, request_id, prompt, params, arrival_time, priority):
         if len(prompt["prompt_token_ids"]) > self.max_prompt_len:
             raise ValueError(f"prompt of {request_id} is too long")
-        super().add_request(request_id=request_id, prompt=prompt, params=params)
+        super().add_request(
+            request_id=request_id,
+            prompt=prompt,
+            params=params,
+            arrival_time=arrival_time,
+            priority=priority,
+        )
 
 
 class _StuckEngine(_FakeEngine):
@@ -1058,6 +1115,8 @@ def test_follower_applies_broadcast_decisions_on_the_engine_thread(
 ) -> None:
     request = _request("r0")
     request.min_policy_version = 0  # rank 0 pins it on admission
+    request.arrival_time = 0.0  # and stamps it
+    request.priority = 0
     decisions = iter(
         [
             LoopDecision(action=LoopAction.STEP, requests_per_dp_rank=[[request]]),
