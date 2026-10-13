@@ -145,6 +145,10 @@ class TrainingSampleBuilder(Configurable):
         """Leave errored rollouts (sandbox, harness, timeout) out of training, and drop the group
         if fewer than 2 rollouts remain. Their reward is a fixed `error_reward`, not a task score."""
 
+        drop_zero_advantage_rollouts: bool = False
+        """Leave rollouts whose advantage is exactly 0 out of the batch. They add no gradient, only
+        loss tokens to the denominator; Prime-RL leaves them out of it (zero rl weight)."""
+
     def __init__(self, config: Config) -> None:
         self.config = config
 
@@ -229,7 +233,11 @@ class TrainingSampleBuilder(Configurable):
         branches_per_rollout: list[float] = []
         num_samples_dropped_no_valid_tokens = 0
         num_rollouts_dropped_empty_completion = 0
+        num_rollouts_dropped_zero_advantage = 0
         for rollout in rollouts:
+            if self.config.drop_zero_advantage_rollouts and rollout.advantage == 0.0:
+                num_rollouts_dropped_zero_advantage += 1
+                continue
             # A later turn with no completion (e.g. a request aborted before its first token): drop the
             # rollout, so `rollout_to_training_samples` doesn't raise and stop the run.
             if any(
@@ -257,6 +265,13 @@ class TrainingSampleBuilder(Configurable):
                 m.Metric(
                     "training_sample_builder/num_rollouts_dropped_empty_completion",
                     m.Sum(float(num_rollouts_dropped_empty_completion)),
+                )
+            )
+        if num_rollouts_dropped_zero_advantage:
+            metrics.append(
+                m.Metric(
+                    "training_sample_builder/num_rollouts_dropped_zero_advantage",
+                    m.Sum(float(num_rollouts_dropped_zero_advantage)),
                 )
             )
         if num_samples_dropped_no_valid_tokens:

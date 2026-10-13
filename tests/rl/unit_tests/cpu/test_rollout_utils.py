@@ -481,3 +481,23 @@ def test_topk_rows_follow_loss_tokens_across_turns() -> None:
         training_sample.topk_logprobs,
         torch.tensor([[-0.1, -2.0], [-0.2, -3.0], [-0.3, -1.5]]),
     )
+
+
+def test_build_from_group_drops_zero_advantage_rollouts() -> None:
+    builder = TrainingSampleBuilder.Config(drop_zero_advantage_rollouts=True).build()
+    rollouts = [
+        _sibling(0, reward=1.0, status=RolloutStatus.COMPLETED),
+        _sibling(1, reward=0.5, status=RolloutStatus.COMPLETED),
+        _sibling(2, reward=0.0, status=RolloutStatus.COMPLETED),
+    ]
+    for rollout, advantage in zip(rollouts, [0.5, 0.0, -0.5], strict=True):
+        rollout.advantage = advantage
+
+    group = builder.build_from_group(
+        rollout_group=RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+    )
+
+    assert [sample.rollout_id.rollout_id for sample in group.training_samples] == [0, 2]
+    metrics = {metric.key: metric.value for metric in group.metrics}
+    num_dropped = metrics["training_sample_builder/num_rollouts_dropped_zero_advantage"]
+    assert num_dropped.value == 1.0
