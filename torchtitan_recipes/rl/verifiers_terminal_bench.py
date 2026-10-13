@@ -680,8 +680,9 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
         # of that time: at 120 groups the run leased ~1,000 of 2,000 VMs. 360 groups (5,760
         # rollouts, ~3,110 VMs of demand), so the 3,000-VM pool, counted per rollout, binds instead
         # of the group permits: the env server runs at most sandbox_pool rollouts at once, and a
-        # finished rollout frees its VM for a queued one.
-        generation_capacity=360,
+        # finished rollout frees its VM for a queued one. Cut to 240 after the controller host
+        # (also trainer host 0) was OOM-killed at step 69 with ~290 groups in flight.
+        generation_capacity=240,
     )
     # Trainer ranks read each microbatch's tensors of 1 KiB or more as RDMA buffers. By value (the
     # default), every rank's call carries the whole batch: 93-100 s at step 3 of a router-replay run.
