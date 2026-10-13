@@ -12,7 +12,8 @@ Two buffers share one interface:
     RolloutGroupWorkBuffer          fixed `(target_offpolicy_steps + 1) * P` slots; optional FIFO window; never drops
     AdaptiveRolloutGroupWorkBuffer  slots from a quantile of the groups not ready at recent step starts, capped so
                                     the mean age stays under its `target_offpolicy_steps` (or `max_offpolicy_steps`);
-                                    takes the oldest finalized group; drops groups past `max_offpolicy_steps`
+                                    takes the oldest finalized group; drops groups past `max_offpolicy_steps`,
+                                    cancelling the ones still generating
 """
 
 import asyncio
@@ -62,6 +63,9 @@ class RolloutGroupWork:
     )  # set once FINALIZED
     policy_version_at_claim: int | None = field(default=None, init=False)
     """Generator policy version when generation started; only the adaptive buffer sets it, for its age drops."""
+    generation_task: asyncio.Task | None = field(default=None, init=False)
+    """Task generating this group, set by `track_generation`; the adaptive buffer cancels it once the group is
+    too old to ever train."""
     # TODO(async-rl): emit JSON lifecycle logging per RolloutGroupWork keyed by group_id:
     # admitted/claimed/finalized/batched/trained/dropped timestamps + policy version at admission and
     # at trainer consumption, for faithful end-to-end visibility.
@@ -170,16 +174,27 @@ class RolloutGroupWorkBuffer(Configurable):
                         return work
                 await self._condition.wait()
 
-    async def finalize_work(self, rollout_group: RolloutGroup) -> None:
-        """Rollout loop: store the produced RolloutGroup on its work entry (INFLIGHT -> FINALIZED) and wake the batcher."""
+    def track_generation(self, work: RolloutGroupWork, task: asyncio.Task) -> None:
+        """Rollout loop: record the task generating a claimed group, so the buffer can cancel it.
+
+        This buffer never cancels; the adaptive buffer cancels groups that became too old while generating.
+        """
+        work.generation_task = task
+
+    async def finalize_work(self, rollout_group: RolloutGroup) -> bool:
+        """Rollout loop: store the produced RolloutGroup on its work entry (INFLIGHT -> FINALIZED) and wake the batcher.
+
+        Returns False when the entry is gone (shutdown, or the adaptive buffer dropped it while it generated).
+        """
         async with self._condition:
             work = self._work_by_group_id.get(rollout_group.group_id)
             if work is None:
-                # run()'s shutdown called close(); drop the result.
-                return
+                # run()'s shutdown called close(), or the group was cancelled as too old; drop the result.
+                return False
             work.rollout_group = rollout_group
             work.state = _RolloutGroupWorkState.FINALIZED
             self._condition.notify_all()
+            return True
 
     @sl.log_trace_span("take_finalized")
     async def take_finalized(
@@ -324,9 +339,11 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
        blocks younger finished ones and keeps its slot until it finishes.
     3. Age. A finalized group that would be consumed more than `max_offpolicy_steps` versions after it was
        claimed is dropped (slot released at once, prompt not retried); with `max_offpolicy_steps=None` nothing is
-       dropped. The mean age is held under `target_offpolicy_steps` if set, else under `max_offpolicy_steps` if
-       set, by the demand ceiling, at the price of stalls when the workload needs more groups than the ceiling
-       allows. With neither, the demand follows the workload alone.
+       dropped. A group still generating is cancelled as soon as the batch being assembled makes it that old, since
+       it can never train: its `generation_task` is cancelled and its slot released at once. The mean age is held
+       under `target_offpolicy_steps` if set, else under `max_offpolicy_steps` if set, by the demand ceiling, at the
+       price of stalls when the workload needs more groups than the ceiling allows. With neither, the demand follows
+       the workload alone.
 
     Example:
         buffer = AdaptiveRolloutGroupWorkBuffer.Config(
@@ -340,6 +357,8 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         await buffer.finalize_work(RolloutGroup(group_id=0, rollouts=[...]))
         await buffer.take_finalized(consuming_policy_version=11)
         # -> slot released with reason "too_old"; selection skips to the next finalized group
+        # g1, also claimed at version 0, is still generating -> its generation task is cancelled, reason
+        # "cancelled_too_old"
 
     Args:
         num_prompts_per_train_step: Prompt groups per train step (`P`).
@@ -350,7 +369,8 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
     class Config(Configurable.Config):
         max_offpolicy_steps: int | None = 4
         """Bounds the age of EVERY trained group: a finalized group older than this at consumption is dropped
-        (prompt not retried). Without `target_offpolicy_steps`, also the mean age the demand ceiling holds under.
+        (prompt not retried), and a group still generating is cancelled once it is that old. Without
+        `target_offpolicy_steps`, also the mean age the demand ceiling holds under.
         None: nothing is dropped for age."""
 
         target_offpolicy_steps: int | None = None
@@ -497,7 +517,10 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         self._untrainable_since_step_start = 0
         self._dropped_since_step_start = 0
         self._dropped_too_old_since_flush = 0
+        self._cancelled_too_old_since_flush = 0
         self._dropped_group_ids: list[int] = []
+        # Highest version the batcher has assembled for; in-flight groups are checked when it moves.
+        self._consuming_policy_version = policy_version
 
     def _has_active_slot_available(self) -> bool:
         generating = sum(
@@ -552,13 +575,41 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         sl.log_trace_scalar({"rollout_buffer/released/too_old": 1.0})
         self._condition.notify_all()
 
+    def _cancel_too_old_inflight(self, *, consuming_policy_version: int) -> None:
+        """Cancel every in-flight group already past `max_offpolicy_steps` for the batch being assembled.
+
+        Batches train in version order, so such a group can never train: cancel its generation task (which stops
+        its episodes) and free its slot now instead of when its slowest rollout ends. It counts as a completed,
+        dropped group, as a finalized too-old drop does. Caller holds the condition.
+        """
+        for work in list(self._work_by_group_id.values()):
+            if (
+                work.state is not _RolloutGroupWorkState.INFLIGHT
+                or not self._is_too_old(
+                    work, consuming_policy_version=consuming_policy_version
+                )
+            ):
+                continue
+            if work.generation_task is not None:
+                work.generation_task.cancel()
+            del self._work_by_group_id[work.group_id]
+            self._dropped_group_ids.append(work.group_id)
+            self._active_rollout_groups -= 1
+            self._cancelled_too_old_since_flush += 1
+            self._completed_since_step_start += 1
+            self._dropped_since_step_start += 1
+            sl.log_trace_scalar({"rollout_buffer/released/cancelled_too_old": 1.0})
+            self._condition.notify_all()
+
     def pop_dropped_group_ids(self) -> list[int]:
         dropped_group_ids, self._dropped_group_ids = self._dropped_group_ids, []
         return dropped_group_ids
 
-    async def finalize_work(self, rollout_group: RolloutGroup) -> None:
-        await super().finalize_work(rollout_group)
-        self._completed_since_step_start += 1
+    async def finalize_work(self, rollout_group: RolloutGroup) -> bool:
+        stored = await super().finalize_work(rollout_group)
+        if stored:
+            self._completed_since_step_start += 1
+        return stored
 
     async def release_active_groups(self, count: int, *, reason: str) -> None:
         await super().release_active_groups(count, reason=reason)
@@ -582,6 +633,14 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         if consuming_policy_version is None:
             consuming_policy_version = self._trainer_policy_version
         async with self._condition:
+            if (
+                self._max_offpolicy_steps is not None
+                and consuming_policy_version > self._consuming_policy_version
+            ):
+                self._consuming_policy_version = consuming_policy_version
+                self._cancel_too_old_inflight(
+                    consuming_policy_version=consuming_policy_version
+                )
             while True:
                 if self._closed:
                     return None
@@ -688,6 +747,11 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
                 "rollout_buffer/dropped_too_old",
                 m.NoReduce(float(self._dropped_too_old_since_flush)),
             ),
+            # groups cancelled while generating, already too old to train
+            m.Metric(
+                "rollout_buffer/cancelled_too_old",
+                m.NoReduce(float(self._cancelled_too_old_since_flush)),
+            ),
             # 1 while the mean-age ceiling caps the demand, else 0
             m.Metric(
                 "rollout_buffer/demand_age_limited",
@@ -695,4 +759,5 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
             ),
         ]
         self._dropped_too_old_since_flush = 0
+        self._cancelled_too_old_since_flush = 0
         return out

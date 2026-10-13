@@ -1738,6 +1738,109 @@ def test_adaptive_buffer_drops_groups_past_max_offpolicy_steps() -> None:
     asyncio.run(run())
 
 
+def test_adaptive_buffer_cancels_generating_groups_past_max_offpolicy_steps() -> None:
+    async def run() -> None:
+        buffer = _adaptive_buffer(
+            num_prompts=1, max_offpolicy_steps=1, generation_capacity=4
+        )
+        for group_id in range(3):
+            await _admit(buffer, group_id)
+        works = [await buffer.claim_next() for _ in range(3)]  # g0..g2 under version 0
+        hung = asyncio.create_task(asyncio.sleep(3600))
+        buffer.track_generation(works[0], hung)
+
+        # Step 1 trains g2 at version 0; the pull of version 1 releases its slot
+        await _finalize(buffer, 2)
+        assert (await buffer.take_finalized(consuming_policy_version=0)).group_id == 2
+        await buffer.release_active_groups(1, reason="trained")
+
+        # The batch for version 1 makes g0/g1 1 old: still trainable, nothing cancelled
+        taker = asyncio.create_task(buffer.take_finalized(consuming_policy_version=1))
+        await asyncio.sleep(0)
+        assert not hung.cancelled()
+        await _finalize(buffer, 1)
+        assert (await taker).group_id == 1
+
+        # The batch for version 2 makes g0 2 old: it can never train, so it is cancelled mid-generation
+        taker = asyncio.create_task(buffer.take_finalized(consuming_policy_version=2))
+        with pytest.raises(asyncio.CancelledError):
+            await hung
+        metrics = {metric.key: metric.value.value for metric in buffer.metrics()}
+        assert metrics["rollout_buffer/cancelled_too_old"] == 1
+        assert metrics["rollout_buffer/num_groups_inflight"] == 0
+        assert buffer.pop_dropped_group_ids() == [0]
+        # A result arriving after the cancel is dropped
+        assert not await buffer.finalize_work(RolloutGroup(group_id=0, rollouts=[]))
+        # 3 admitted, 1 trained, 1 taken (held by the batcher), 1 cancelled -> 1 active
+        assert metrics["rollout_buffer/available_active_slots"] == (
+            metrics["rollout_buffer/demand_target_groups"] - 1
+        )
+        await buffer.close()
+        assert await taker is None
+
+    asyncio.run(run())
+
+
+def test_rollout_worker_survives_a_group_the_buffer_cancels() -> None:
+    async def run() -> None:
+        buffer = _adaptive_buffer(
+            num_prompts=1, max_offpolicy_steps=1, generation_capacity=4
+        )
+        cancelled_group_ids = []
+
+        async def run_group_rollouts(*, group_id: int, **kwargs) -> RolloutGroup:
+            if group_id == 0:  # a hung episode
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    cancelled_group_ids.append(group_id)
+                    raise
+            return _scored_group(group_id, [1.0, 0.0])
+
+        controller = object.__new__(Controller)
+        controller.config = SimpleNamespace(
+            async_loop=SimpleNamespace(num_samples_per_prompt=2)
+        )
+        controller._sampling = SamplingConfig(temperature=1.0)
+        release_groups = AsyncMock()
+        controller.generator_router = SimpleNamespace(
+            release_groups=SimpleNamespace(call_one=release_groups)
+        )
+        controller.rollout_recorder = SimpleNamespace(record=lambda **kwargs: None)
+        controller._rollouter = SimpleNamespace(
+            run_group_rollouts=run_group_rollouts,
+            record_group_outcome=lambda group: None,
+        )
+        workers = [
+            asyncio.create_task(
+                controller._rollout_loop(
+                    group_buffer=buffer,
+                    generate_fn=None,
+                    release_session_fn=None,
+                )
+            )
+            for _ in range(2)
+        ]
+        await _admit(buffer, 0)
+        await _admit(buffer, 1)
+        # g1 finishes and trains at version 0; g0 hangs
+        assert (await buffer.take_finalized(consuming_policy_version=0)).group_id == 1
+        await buffer.release_active_groups(1, reason="trained")
+
+        # The batch for version 2 cancels g0; its worker keeps serving the next group
+        taker = asyncio.create_task(buffer.take_finalized(consuming_policy_version=2))
+        await _admit(buffer, 2)
+        assert (await taker).group_id == 2
+        assert cancelled_group_ids == [0]
+        release_groups.assert_any_await([0])
+        assert not any(worker.done() for worker in workers)
+
+        await buffer.close()
+        await asyncio.gather(*workers)
+
+    asyncio.run(run())
+
+
 def test_adaptive_buffer_measures_the_shelf_and_moves_demand() -> None:
     async def run() -> None:
         # P=4: demand starts at three batches = 12; the shelf is what is finished and not held by the trainer.

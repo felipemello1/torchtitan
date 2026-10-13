@@ -1525,16 +1525,23 @@ class Controller(Configurable):
             if work is None:  # group_buffer closed/shutdown signal
                 logger.info("Buffer closed; rollout worker stopping")
                 return
+            # A task of its own, so the buffer can cancel this group (too old to train) without
+            # cancelling the worker.
+            generation_task = asyncio.create_task(
+                self._rollouter.run_group_rollouts(
+                    generate_fn=generate_fn,
+                    release_session_fn=release_session_fn,
+                    sample=work.sample,
+                    group_id=work.group_id,
+                    group_size=self.config.async_loop.num_samples_per_prompt,
+                    sampling=self._sampling,
+                ),
+                name=f"rollout_group_{work.group_id}",
+            )
+            group_buffer.track_generation(work, generation_task)
             try:
                 with sl.log_trace_span("rollout_group"):
-                    group = await self._rollouter.run_group_rollouts(
-                        generate_fn=generate_fn,
-                        release_session_fn=release_session_fn,
-                        sample=work.sample,
-                        group_id=work.group_id,
-                        group_size=self.config.async_loop.num_samples_per_prompt,
-                        sampling=self._sampling,
-                    )
+                    group = await generation_task
                 group.metrics = compute_rollout_metrics(
                     prefix="rollout", rollouts=group.rollouts
                 )
@@ -1545,6 +1552,16 @@ class Controller(Configurable):
                     is_validation=False,
                     rollout_groups=[group],
                 )
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise  # shutdown cancelled this worker
+                # The buffer cancelled the group: it became too old to train while generating.
+                logger.info(
+                    f"rollout group {work.group_id} cancelled: past max_offpolicy_steps"
+                )
+                await self.generator_router.release_groups.call_one([work.group_id])
+                del work
+                continue
             except Exception:
                 logger.exception(f"rollout group {work.group_id} failed; dropping")
                 group = RolloutGroup(
