@@ -11,8 +11,15 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+from torch._inductor.compile_fx import compile_fx
 
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
+
+# Inputs with more elements than this run their own compiled copy. Inductor tunes a
+# dynamic-shape kernel's launch config once, on its first input, and keeps it for all sizes.
+# Tuned on a decode-sized input, kernels ran 1.8-4x slower at T=64k (SwiGLU, gated RMSNorm,
+# GB300); tuned on a prefill-sized input, they matched the static kernel at T=34.
+_LARGE_INPUT_NUMEL = 1 << 22
 
 
 def apply_local_compile(regions: list[str]) -> None:
@@ -66,7 +73,11 @@ def local_compile(
                     "batch-invariant mode; remove it from local_compile_regions."
                 )
             if enabled:
-                fn = torch.compile(reference, fullgraph=True, **compile_kwargs)
+                small, large = (
+                    _compile_for_size(reference, name, size, compile_kwargs)
+                    for size in ("small", "large")
+                )
+                fn = functools.partial(_call_by_input_size, small, large)
             else:
                 fn = reference
 
@@ -78,6 +89,46 @@ def local_compile(
         return wrapped
 
     return decorate
+
+
+def _compile_for_size(
+    reference: Callable[..., Any], name: str, size: str, compile_kwargs: dict[str, Any]
+) -> Callable[..., Any]:
+    """Compile ``reference`` with its own Dynamo entries and its own Inductor cache entries.
+
+    Example:
+        >>> small = _compile_for_size(fn, "offset_rmsnorm", "small", {})
+    """
+    kwargs = dict(compile_kwargs)
+    if "backend" not in kwargs:
+        options = kwargs.pop("options", None)
+        tag = f"local_compile:{name}:{size}"
+
+        def backend(gm: torch.fx.GraphModule, example_inputs: list[Any]) -> Any:
+            # The two sizes trace identical graphs, so without the tag the FX graph cache
+            # would hand one size the other's kernels and their tuned launch configs.
+            with torch.compiler.config.patch(cache_key_tag=tag):
+                return compile_fx(gm, example_inputs, config_patches=options)
+
+        kwargs["backend"] = backend
+    return torch.compile(reference, fullgraph=True, isolate_recompiles=True, **kwargs)
+
+
+def _call_by_input_size(
+    small: Callable[..., Any], large: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    """Call ``large`` when a tensor argument has more than ``_LARGE_INPUT_NUMEL`` elements.
+
+    Example:
+        >>> _call_by_input_size(small, large, torch.empty(4096, 2048))  # runs ``large``
+    """
+    if torch.compiler.is_compiling():
+        # Called from another compiled region: trace into its graph without a size guard.
+        return small(*args, **kwargs)
+    for arg in (*args, *kwargs.values()):
+        if isinstance(arg, torch.Tensor) and arg.numel() > _LARGE_INPUT_NUMEL:
+            return large(*args, **kwargs)
+    return small(*args, **kwargs)
 
 
 __all__ = ["apply_local_compile", "local_compile"]
