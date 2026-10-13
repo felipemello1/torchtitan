@@ -22,6 +22,10 @@ RL_ENV_DEFAULTS: dict[str, str] = {
     "NCCL_DEBUG": "WARN",
 }
 
+RL_ROLE_ENV = "TORCHTITAN_RL_ROLE"
+"""Spawn-env variable naming a process's role: trainer, generator or env_server_worker.
+Children inherit it. Host-memory metrics group processes by it."""
+
 
 def apply_env_defaults() -> None:
     """Apply TorchTitan RL defaults without replacing existing values."""

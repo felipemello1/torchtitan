@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import subprocess
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -18,8 +19,12 @@ import pytest
 
 from torchtitan.observability.metrics import BaseLogger, TensorBoardLogger, WandBLogger
 
+from torchtitan.rl._runtime import RL_ROLE_ENV
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.observability.controller import compute_rollout_metrics
+from torchtitan.rl.observability.controller import (
+    compute_host_memory_metrics,
+    compute_rollout_metrics,
+)
 from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.types import RolloutTurnID
 
@@ -855,3 +860,23 @@ class TestIsValidationSwitch:
             is_validation=True,
         )
         assert [step for _, step in backend.calls] == [0, 1]
+
+
+def test_compute_host_memory_metrics_groups_processes_by_role() -> None:
+    # A child inherits this process's cgroup; tag it as a trainer.
+    sleeper = subprocess.Popen(
+        ["sleep", "60"], env={**os.environ, RL_ROLE_ENV: "trainer"}
+    )
+    try:
+        metrics = {
+            metric.key: metric.value.value for metric in compute_host_memory_metrics()
+        }
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+    if not metrics:
+        pytest.skip("needs cgroup v2")
+    assert metrics["host_memory/num_processes/controller"] == 1
+    assert metrics["host_memory/num_processes/trainer"] == 1
+    assert metrics["host_memory/rss_anon_gib/trainer"] > 0
+    assert metrics["host_memory/cgroup_memory_current_gib"] > 0

@@ -404,17 +404,19 @@ def test_shutdown_continues_after_generator_close_failure():
 
 
 class _FakeHostMesh:
-    """Records the CUDA_VISIBLE_DEVICES of each proc mesh spawned on it."""
+    """Records the CUDA_VISIBLE_DEVICES and role of each proc mesh spawned on it."""
 
     def __init__(self, num_hosts=1):
         self.num_hosts = num_hosts
         self.visible_devices = []
+        self.roles = []
 
     def __len__(self):
         return self.num_hosts
 
     def spawn_procs(self, *, per_host, bootstrap, bootstrap_command):
         self.visible_devices.append(bootstrap_command["CUDA_VISIBLE_DEVICES"])
+        self.roles.append(bootstrap_command[train.RL_ROLE_ENV])
 
 
 @pytest.fixture
@@ -446,6 +448,7 @@ def test_spawn_proc_mesh_gives_roles_sharing_a_host_mesh_disjoint_gpus(
 
     assert mesh_a.visible_devices == ["0,1", "2", "3"]
     assert mesh_b.visible_devices == ["0", "1", "2", "3"]
+    assert mesh_a.roles == ["trainer", "generator", "generator"]
 
 
 @pytest.mark.parametrize(

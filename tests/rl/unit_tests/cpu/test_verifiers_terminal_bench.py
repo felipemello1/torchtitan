@@ -193,11 +193,12 @@ def test_env_server_workers_skip_the_trainer_imports(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "__main__", sys.modules["__main__"])
     monkeypatch.setenv("no_proxy", "")
     monkeypatch.setenv("NO_PROXY", "")
-    # It also sets glibc defaults for the workers; drop them after the test.
+    # It also sets glibc defaults and the role for the workers; drop them after the test.
     for name in (
         "MALLOC_ARENA_MAX",
         "MALLOC_TRIM_THRESHOLD_",
         "MALLOC_MMAP_THRESHOLD_",
+        "TORCHTITAN_RL_ROLE",
     ):
         monkeypatch.setenv(name, "")
     config = _rollouter_config(TRAIN_DATASET, EVAL_DATASET).verifiers_env_server

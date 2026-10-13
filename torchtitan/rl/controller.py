@@ -123,6 +123,7 @@ from torchtitan.rl.distributed.weight_sync import WeightSyncManager
 from torchtitan.rl.generator import SamplingConfig, VLLMGenerator
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
+    compute_host_memory_metrics,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     compute_rollout_metrics,
@@ -1254,6 +1255,7 @@ class Controller(Configurable):
                             ),
                             time_metrics=time_metrics,
                         ),
+                        *compute_host_memory_metrics(),
                     ],
                 )
 
