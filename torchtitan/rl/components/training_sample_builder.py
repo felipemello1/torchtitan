@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from torchtitan.config import Configurable
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus
+from torchtitan.rl.rollout import Rollout, RolloutGroup
 from torchtitan.rl.rollout.types import RolloutTurnID
 
 
@@ -94,6 +94,10 @@ class TrainingSampleBuilder(Configurable):
         drop_zero_std_reward_groups: bool = True
         """Drop zero-reward-variance groups;"""
 
+        drop_errored_rollouts: bool = True
+        """Leave errored rollouts (sandbox, harness, timeout) out of training, and drop the group
+        if fewer than 2 rollouts remain. Their reward is a fixed `error_reward`, not a task score."""
+
     def __init__(self, config: Config) -> None:
         self.config = config
 
@@ -115,22 +119,30 @@ class TrainingSampleBuilder(Configurable):
                 group_id=rollout_group.group_id, training_samples=[], metrics=metrics
             )
 
-        # Timed out (usually slow infra, not the policy): drop just those rollouts.
-        # The advantage estimator already left them out of the group mean/std.
-        rollouts = [
-            rollout
-            for rollout in rollout_group.rollouts
-            if rollout.status is not RolloutStatus.ERROR_TIMEOUT
-        ]
-        if not rollouts:
-            metrics.append(
-                m.Metric(
-                    "training_sample_builder/num_groups_dropped_timed_out", m.Sum(1.0)
+        rollouts = rollout_group.rollouts
+        # Errored (sandbox, harness, timeout): train on the rest, if enough siblings remain to
+        # compare. The advantage estimator already left them out of the group mean/std.
+        if self.config.drop_errored_rollouts:
+            rollouts = [
+                rollout for rollout in rollouts if not rollout.status.is_error()
+            ]
+            num_errored = len(rollout_group.rollouts) - len(rollouts)
+            if num_errored:
+                metrics.append(
+                    m.Metric(
+                        "training_sample_builder/num_rollouts_dropped_errored",
+                        m.Sum(float(num_errored)),
+                    )
                 )
-            )
-            return TrainingSampleGroup(
-                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
-            )
+            if num_errored and len(rollouts) < 2:
+                metrics.append(
+                    m.Metric(
+                        "training_sample_builder/num_groups_dropped_errored", m.Sum(1.0)
+                    )
+                )
+                return TrainingSampleGroup(
+                    group_id=rollout_group.group_id, training_samples=[], metrics=metrics
+                )
 
         # Untrainable: any sibling with no completion tokens -> drop the whole group
         if any(
@@ -148,10 +160,7 @@ class TrainingSampleBuilder(Configurable):
 
         # Zero-std reward: no learning signal across siblings.
         rewards = [rollout.reward for rollout in rollouts]
-        # One survivor of a larger group has advantage 0.0, so it counts as zero-std too.
-        is_zero_std = (
-            len(rollout_group.rollouts) > 1 and statistics.pstdev(rewards) == 0.0
-        )
+        is_zero_std = len(rewards) > 1 and statistics.pstdev(rewards) == 0.0
         metrics.append(
             m.Metric(
                 "rollout_reward/group_zero_std_frac",

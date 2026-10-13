@@ -244,13 +244,14 @@ def test_group_filters_preserve_group_id_for_acknowledgement() -> None:
     filtered_groups = [failed, untrainable, zero_std, no_valid_tokens, all_timed_out]
     assert [group.group_id for group in filtered_groups] == [7, 8, 9, 10, 11]
     assert all(not group.training_samples for group in filtered_groups)
-    assert "training_sample_builder/num_groups_dropped_timed_out" in [
+    assert "training_sample_builder/num_groups_dropped_errored" in [
         metric.key for metric in all_timed_out.metrics
     ]
 
 
 _COMPLETED = RolloutStatus.COMPLETED
 _TIMEOUT = RolloutStatus.ERROR_TIMEOUT
+_ERROR = RolloutStatus.ERROR
 
 
 def _group(statuses: list[RolloutStatus], rewards: list[float]) -> RolloutGroup:
@@ -327,20 +328,10 @@ def test_timed_out_rollout_is_dropped_from_training_samples() -> None:
     ]
 
 
-@pytest.mark.parametrize(
-    "statuses, rewards",
-    [
-        # Kept rewards are [1.0, 1.0]: no learning signal once the timeout is left out.
-        ([_TIMEOUT, _COMPLETED, _COMPLETED], [0.0, 1.0, 1.0]),
-        # One survivor: its advantage is 0.0.
-        ([_TIMEOUT, _TIMEOUT, _COMPLETED], [0.0, 0.0, 1.0]),
-    ],
-)
-def test_zero_std_check_ignores_timed_out_rollouts(
-    statuses: list[RolloutStatus], rewards: list[float]
-) -> None:
+def test_zero_std_check_ignores_timed_out_rollouts() -> None:
     builder = TrainingSampleBuilder.Config().build()
-    group = _group(statuses, rewards=rewards)
+    # Kept rewards are [1.0, 1.0]: no learning signal once the timeout is left out.
+    group = _group([_TIMEOUT, _COMPLETED, _COMPLETED], rewards=[0.0, 1.0, 1.0])
     for rollout in group.rollouts:
         rollout.advantage = 0.0
 
@@ -350,6 +341,43 @@ def test_zero_std_check_ignores_timed_out_rollouts(
     assert "training_sample_builder/num_groups_dropped_zero_std" in [
         metric.key for metric in output.metrics
     ]
+
+
+def test_errored_rollout_is_left_out_like_a_timeout() -> None:
+    group = _group([_COMPLETED, _ERROR, _COMPLETED], rewards=[1.0, 0.0, 0.0])
+    for rollout, advantage in zip(
+        group.rollouts, AdvantageEstimator.Config().build()(group), strict=True
+    ):
+        rollout.advantage = advantage
+
+    output = TrainingSampleBuilder.Config().build().build_from_group(rollout_group=group)
+
+    assert [sample.advantage for sample in output.training_samples] == [
+        [0.0, 0.5],
+        [0.0, -0.5],
+    ]
+    assert "training_sample_builder/num_rollouts_dropped_errored" in [
+        metric.key for metric in output.metrics
+    ]
+
+
+def test_group_with_one_clean_rollout_is_dropped() -> None:
+    group = _group([_TIMEOUT, _ERROR, _COMPLETED], rewards=[0.0, 0.0, 1.0])
+    for rollout in group.rollouts:
+        rollout.advantage = 0.0
+
+    dropped = TrainingSampleBuilder.Config().build().build_from_group(rollout_group=group)
+    kept = (
+        TrainingSampleBuilder.Config(drop_errored_rollouts=False)
+        .build()
+        .build_from_group(rollout_group=group)
+    )
+
+    assert dropped.training_samples == []
+    assert "training_sample_builder/num_groups_dropped_errored" in [
+        metric.key for metric in dropped.metrics
+    ]
+    assert len(kept.training_samples) == 3
 
 
 def test_rollout_metrics_report_timeout_rate() -> None:
