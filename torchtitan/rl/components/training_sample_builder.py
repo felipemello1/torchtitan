@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+import torch
+
 from torchtitan.config import Configurable
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout, RolloutGroup
@@ -57,6 +59,14 @@ class TrainingSample:
     """[L] generator logprobs; 0.0 where loss_mask is False."""
     advantage: np.ndarray  # float32
     """[L] advantage on assistant tokens, 0.0 elsewhere."""
+    routed_expert_ids: np.ndarray | None = None
+    """[L - 1, num_layers, top_k] generator experts of the trainer inputs ``token_ids[:-1]``;
+    None without router replay."""
+    topk_token_ids: torch.Tensor | None = None
+    """[num_loss_tokens, k] generator top-k token ids, one row per True in loss_mask. None
+    unless `SamplingConfig.num_topk_logprobs` > 0."""
+    topk_logprobs: torch.Tensor | None = None
+    """[num_loss_tokens, k] generator logprobs of `topk_token_ids`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,16 +101,28 @@ class _SampleInProgress:
     loss_mask: list[np.ndarray] = field(default_factory=list)
     logprobs: list[np.ndarray] = field(default_factory=list)
     advantage: list[np.ndarray] = field(default_factory=list)
+    routed_expert_ids: list[np.ndarray] = field(default_factory=list)
+    topk_token_ids: list[torch.Tensor] = field(default_factory=list)
+    topk_logprobs: list[torch.Tensor] = field(default_factory=list)
 
     def to_training_sample(self) -> TrainingSample:
+        token_ids = np.concatenate(self.token_ids, dtype=np.int64)
+        routed_expert_ids = (
+            np.concatenate(self.routed_expert_ids) if self.routed_expert_ids else None
+        )
+        # One row per trainer input: token_ids[:-1].
+        assert routed_expert_ids is None or len(routed_expert_ids) == len(token_ids) - 1
         return TrainingSample(
             rollout_id=self.rollout_id,
             min_policy_version=self.min_policy_version,
             max_policy_version=self.max_policy_version,
-            token_ids=np.concatenate(self.token_ids, dtype=np.int64),
+            token_ids=token_ids,
             loss_mask=np.concatenate(self.loss_mask),
             logprobs=np.concatenate(self.logprobs, dtype=np.float32),
             advantage=np.concatenate(self.advantage),
+            routed_expert_ids=routed_expert_ids,
+            topk_token_ids=torch.cat(self.topk_token_ids) if self.topk_token_ids else None,
+            topk_logprobs=torch.cat(self.topk_logprobs) if self.topk_logprobs else None,
         )
 
 
@@ -118,6 +140,14 @@ class TrainingSampleBuilder(Configurable):
 
         drop_zero_std_reward_groups: bool = True
         """Drop zero-reward-variance groups;"""
+
+        drop_errored_rollouts: bool = True
+        """Leave errored rollouts (sandbox, harness, timeout) out of training, and drop the group
+        if fewer than 2 rollouts remain. Their reward is a fixed `error_reward`, not a task score."""
+
+        drop_zero_advantage_rollouts: bool = False
+        """Leave rollouts whose advantage is exactly 0 out of the batch. They add no gradient, only
+        loss tokens to the denominator; Prime-RL leaves them out of it (zero rl weight)."""
 
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -140,10 +170,34 @@ class TrainingSampleBuilder(Configurable):
                 group_id=rollout_group.group_id, training_samples=[], metrics=metrics
             )
 
+        rollouts = rollout_group.rollouts
+        # Errored: train on the rest, if enough siblings remain to compare.
+        if self.config.drop_errored_rollouts:
+            rollouts = [
+                rollout for rollout in rollouts if not rollout.status.is_error()
+            ]
+            num_errored = len(rollout_group.rollouts) - len(rollouts)
+            if num_errored:
+                metrics.append(
+                    m.Metric(
+                        "training_sample_builder/num_rollouts_dropped_errored",
+                        m.Sum(float(num_errored)),
+                    )
+                )
+            if num_errored and len(rollouts) < 2:
+                metrics.append(
+                    m.Metric(
+                        "training_sample_builder/num_groups_dropped_errored", m.Sum(1.0)
+                    )
+                )
+                return TrainingSampleGroup(
+                    group_id=rollout_group.group_id, training_samples=[], metrics=metrics
+                )
+
         # Untrainable: any sibling with no completion tokens -> drop the whole group
         if any(
             not any(len(turn.completion_token_ids) > 0 for turn in rollout.turns)
-            for rollout in rollout_group.rollouts
+            for rollout in rollouts
         ):
             metrics.append(
                 m.Metric(
@@ -155,7 +209,7 @@ class TrainingSampleBuilder(Configurable):
             )
 
         # Zero-std reward: no learning signal across siblings.
-        rewards = [rollout.reward for rollout in rollout_group.rollouts]
+        rewards = [rollout.reward for rollout in rollouts]
         is_zero_std = len(rewards) > 1 and statistics.pstdev(rewards) == 0.0
         metrics.append(
             m.Metric(
@@ -179,7 +233,11 @@ class TrainingSampleBuilder(Configurable):
         branches_per_rollout: list[float] = []
         num_samples_dropped_no_valid_tokens = 0
         num_rollouts_dropped_empty_completion = 0
-        for rollout in rollout_group.rollouts:
+        num_rollouts_dropped_zero_advantage = 0
+        for rollout in rollouts:
+            if self.config.drop_zero_advantage_rollouts and rollout.advantage == 0.0:
+                num_rollouts_dropped_zero_advantage += 1
+                continue
             # A later turn with no completion (e.g. a request aborted before its first token): drop the
             # rollout, so `rollout_to_training_samples` doesn't raise and stop the run.
             if any(
@@ -209,6 +267,13 @@ class TrainingSampleBuilder(Configurable):
                     m.Sum(float(num_rollouts_dropped_empty_completion)),
                 )
             )
+        if num_rollouts_dropped_zero_advantage:
+            metrics.append(
+                m.Metric(
+                    "training_sample_builder/num_rollouts_dropped_zero_advantage",
+                    m.Sum(float(num_rollouts_dropped_zero_advantage)),
+                )
+            )
         if num_samples_dropped_no_valid_tokens:
             metrics.append(
                 m.Metric(
@@ -225,7 +290,7 @@ class TrainingSampleBuilder(Configurable):
             training_sample.max_policy_version
             for training_sample in unfiltered_training_samples
         ]
-        advantages = [rollout.advantage for rollout in rollout_group.rollouts]
+        advantages = [rollout.advantage for rollout in rollouts]
         metrics += [
             m.Metric(
                 "training_sample_builder/num_training_samples",
@@ -328,6 +393,7 @@ class TrainingSampleBuilder(Configurable):
                 training_samples.append(sample_in_progress.to_training_sample())
                 sample_in_progress = None
 
+            starts_sample = sample_in_progress is None
             if sample_in_progress is None:
                 # Each turn appended to the last training_sample, so its token_ids are exactly the
                 # previous turn's prompt + completion.
@@ -392,13 +458,32 @@ class TrainingSampleBuilder(Configurable):
                 np.zeros(num_delta, dtype=np.float32),
                 np.full(num_completion, rollout_advantage, dtype=np.float32),
             ]
+            if rollout_turn.routed_expert_ids is not None:
+                # Like prompt_delta: a new sample first copies the shared prefix's rows, up to
+                # the prefix's last token, where this turn's rows start.
+                if starts_sample and prompt_prefix_len > 1:
+                    sample_in_progress.routed_expert_ids.append(
+                        training_samples[-1].routed_expert_ids[: prompt_prefix_len - 1]
+                    )
+                sample_in_progress.routed_expert_ids.append(
+                    rollout_turn.routed_expert_ids
+                )
             # Widen the segment's version span to include this turn (the min stays the opening turn's).
             sample_in_progress.max_policy_version = max(
                 sample_in_progress.max_policy_version, rollout_turn.max_policy_version
             )
+            if rollout_turn.completion_topk_token_ids is not None:
+                # One row per completion (loss) token; prompt and env-reply tokens get no rows.
+                sample_in_progress.topk_token_ids.append(
+                    rollout_turn.completion_topk_token_ids
+                )
+                sample_in_progress.topk_logprobs.append(
+                    rollout_turn.completion_topk_logprobs
+                )
 
             prev_len = rollout_turn.num_prompt_tokens + num_completion
 
         if sample_in_progress is not None:
             training_samples.append(sample_in_progress.to_training_sample())
         return training_samples
+

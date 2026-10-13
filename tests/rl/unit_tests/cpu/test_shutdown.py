@@ -6,8 +6,10 @@
 
 import asyncio
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
+import torchtitan.rl.controller as controller_module
 
 from torchtitan.config import OverrideConfig
 from torchtitan.rl import train
@@ -69,7 +71,9 @@ class _FakeConfig:
     trainer = _FakeTrainerConfig()
     # main() also reads config.generator.parallelism (same stubbing applies).
     generator = SimpleNamespace(
-        parallelism=None, cuda_graph=VLLMCudaGraphConfig(mode="NONE")
+        parallelism=None,
+        cuda_graph=VLLMCudaGraphConfig(mode="NONE"),
+        kv_offload_gib=0.0,
     )
     num_generators = 1
 
@@ -210,6 +214,102 @@ def test_main_passes_configured_num_generators(monkeypatch, stub_mesh_provisioni
         "generator_mesh_0",
         "generator_mesh_1",
     ]
+
+
+@pytest.mark.parametrize(
+    "offload_gib, generator_env",
+    [
+        (0.0, {}),
+        (
+            16.0,
+            {
+                "PYTORCH_ALLOC_CONF": "expandable_segments:False",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False,max_split_size_mb:512",
+                "PYTHONHASHSEED": "0",
+                # 2 one-proc generators on this host (the /dev/shm check)
+                "TORCHTITAN_GENERATOR_PROCS_ON_HOST": "2",
+            },
+        ),
+    ],
+)
+def test_main_launches_kv_offload_generators_without_expandable_segments(
+    monkeypatch, stub_mesh_provisioning, offload_gib, generator_env
+):
+    """Offload needs expandable_segments off (other allocator options stay), PYTHONHASHSEED=0, and
+    the generator procs on the host."""
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setenv(
+        "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:512"
+    )
+    spawn_kwargs = []
+    monkeypatch.setattr(
+        train,
+        "spawn_proc_mesh",
+        lambda *args, **kwargs: spawn_kwargs.append(kwargs)
+        or ("trainer_mesh", ["generator_mesh_0"]),
+    )
+    _FakeConfigLoader.config = _FakeConfig(
+        generator=SimpleNamespace(parallelism=None, kv_offload_gib=offload_gib),
+        num_generators=2,
+    )
+    _FakeController.instances = []
+    monkeypatch.setattr(train, "ConfigLoader", _FakeConfigLoader)
+
+    asyncio.run(train.main())
+
+    assert spawn_kwargs[0]["generator_env"] == generator_env
+
+
+@pytest.mark.parametrize(
+    "hold, offload_gib, forwarded",
+    [(False, 0.0, False), (True, 0.0, True), (False, 16.0, True)],
+)
+def test_router_forwards_session_releases_with_hold_or_kv_offload(
+    monkeypatch, hold, offload_gib, forwarded
+):
+    """A generator acts on a session's release when it holds session KV or offloads KV to CPU."""
+    spawn_kwargs = {}
+
+    class _Mesh:
+        def spawn(self, name, actor_cls, *args, **kwargs):
+            spawn_kwargs[name] = kwargs
+            return SimpleNamespace(name=name)
+
+    class _StopAfterSpawn(Exception):
+        pass
+
+    async def stop_after_spawn(**kwargs):
+        raise _StopAfterSpawn
+
+    async def no_elastic_env(mesh):
+        pass
+
+    rl_trainer: Any = _make_stub_rl_trainer()
+    rl_trainer.config.trainer = SimpleNamespace(
+        parallelism=SimpleNamespace(
+            data_parallel_shard_degree=1, data_parallel_replicate_degree=1
+        )
+    )
+    rl_trainer.config.generator_router = InterGeneratorRouter.Config()
+    rl_trainer.config.generator = VLLMGenerator.Config(
+        model=None, hold_session_kv=hold, kv_offload_gib=offload_gib
+    )
+    rl_trainer._rollouter = SimpleNamespace(
+        get_validation_samples=lambda steps: [], setup_async=stop_after_spawn
+    )
+    monkeypatch.setattr(
+        controller_module,
+        "this_host",
+        lambda: SimpleNamespace(spawn_procs=lambda **kwargs: _Mesh()),
+    )
+    monkeypatch.setattr(controller_module, "setup_torch_elastic_env", no_elastic_env)
+
+    with pytest.raises(_StopAfterSpawn):
+        asyncio.run(
+            rl_trainer.setup_async(trainer_mesh=_Mesh(), generator_meshes=[_Mesh()])
+        )
+
+    assert spawn_kwargs["generator_router"]["forward_session_releases"] is forwarded
 
 
 def test_main_shuts_down_after_train_failure(monkeypatch, stub_mesh_provisioning):

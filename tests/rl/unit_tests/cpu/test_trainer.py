@@ -8,11 +8,12 @@ import asyncio
 import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
 import torch
+from monarch.actor import Actor, ActorError, this_proc
 from torchstore import RankRole
 from torchtitan.components.data.types import (
     TrainingMicrobatch as CoreTrainingMicrobatch,
@@ -22,7 +23,11 @@ from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.observability.sdc_replayer import SDCReplayer
 from torchtitan.rl.components.batcher import TrainingMicrobatch
 from torchtitan.rl.components.checkpointer import MirroredState
-from torchtitan.rl.distributed.monarch_actors.trainer import TrainerActor
+from torchtitan.rl.distributed.monarch_actors.trainer import (
+    _TrainerActorEndpoints,
+    TrainerActor,
+)
+from torchtitan.rl.distributed.rdma_microbatch import MicrobatchStream, RDMAMicrobatch
 from torchtitan.rl.trainer import Trainer
 from torchtitan.trainer import Trainer as DatasetTrainer
 from torchtitan.training_engine import ForwardBackwardResult, TrainingEngine
@@ -108,9 +113,9 @@ def test_push_model_state_dict_reuses_final_dtype_cpu_staging_buffers() -> None:
         with patch(
             "torchtitan.rl.trainer.ts.put_state_dict", new_callable=AsyncMock
         ) as put_state_dict:
-            await trainer.push_model_state_dict()
+            await trainer.push_model_state_dict(on_published=lambda: None)
             trainer.model.weight.data.fill_(2.0)
-            await trainer.push_model_state_dict()
+            await trainer.push_model_state_dict(on_published=lambda: None)
 
         assert staging["weight"].data_ptr() == weight_data_ptr
         torch.testing.assert_close(
@@ -157,7 +162,7 @@ def test_push_model_state_dict_stages_on_dedicated_cuda_stream() -> None:
             new_callable=AsyncMock,
             side_effect=put_state_dict,
         ) as put:
-            await trainer.push_model_state_dict()
+            await trainer.push_model_state_dict(on_published=lambda: None)
 
         staging_complete.record.assert_called_once_with(
             trainer._staging_model_state_dict_stream
@@ -172,6 +177,92 @@ def test_push_model_state_dict_stages_on_dedicated_cuda_stream() -> None:
         assert worker_thread_ids[0] == worker_thread_ids[1]
         assert worker_thread_ids[0] != main_thread_id
         torch.testing.assert_close(trainer._staging_state_dict["weight"], source)
+
+    asyncio.run(run())
+
+
+def test_push_model_state_dict_calls_on_published_in_worker_thread_after_put() -> None:
+    async def run() -> None:
+        trainer = object.__new__(Trainer)
+        trainer._staging_state_dict = {"weight": torch.empty(4)}
+        trainer._staging_model_state_dict_stream = None
+        trainer.model = SimpleNamespace(state_dict=lambda: {"weight": torch.ones(4)})
+        events = []
+
+        async def put_state_dict(*args, **kwargs) -> None:
+            events.append(("put", threading.get_ident()))
+
+        with patch(
+            "torchtitan.rl.trainer.ts.put_state_dict",
+            new_callable=AsyncMock,
+            side_effect=put_state_dict,
+        ):
+            await trainer.push_model_state_dict(
+                on_published=lambda: events.append(
+                    ("on_published", threading.get_ident())
+                )
+            )
+
+        worker_thread_id = events[0][1]
+        assert worker_thread_id != threading.get_ident()
+        assert events == [("put", worker_thread_id), ("on_published", worker_thread_id)]
+
+    asyncio.run(run())
+
+
+_FORWARD_BACKWARD_MAY_RETURN = threading.Event()
+
+
+class _BlockingTrainer:
+    """Like `Trainer`: the push replies from a worker thread; forward_backward blocks the event loop."""
+
+    async def push_model_state_dict(self, on_published) -> None:
+        await asyncio.to_thread(on_published)
+
+    async def forward_backward(self, *args) -> dict[str, float]:
+        _FORWARD_BACKWARD_MAY_RETURN.wait()  # like `Trainer.forward_backward`, never awaits
+        return {}
+
+
+class _BlockingTrainerActor(Actor, _TrainerActorEndpoints, _BlockingTrainer):
+    pass
+
+
+class _FailingPushTrainer:
+    async def push_model_state_dict(self, on_published) -> None:
+        raise RuntimeError("put failed")
+
+
+class _FailingPushTrainerActor(Actor, _TrainerActorEndpoints, _FailingPushTrainer):
+    pass
+
+
+def test_trainer_actor_push_replies_during_forward_backward() -> None:
+    async def run() -> None:
+        _FORWARD_BACKWARD_MAY_RETURN.clear()
+        # In the test process, so forward_backward can wait on the test's threading.Event.
+        trainer = this_proc().spawn("trainer", _BlockingTrainerActor)
+        # Sent first, so the push enters its thread before forward_backward blocks the loop.
+        push = asyncio.ensure_future(trainer.push_model_state_dict.call())
+        forward_backward = asyncio.ensure_future(
+            trainer.forward_backward.call([], torch.zeros(1), torch.zeros(1))
+        )
+        try:
+            # forward_backward can't return yet, so the reply must come from the worker thread.
+            await asyncio.wait_for(push, timeout=10)
+        finally:
+            _FORWARD_BACKWARD_MAY_RETURN.set()
+        await forward_backward
+
+    asyncio.run(run())
+
+
+def test_trainer_actor_push_forwards_errors() -> None:
+    async def run() -> None:
+        trainer = this_proc().spawn("failing_trainer", _FailingPushTrainerActor)
+        # Reaches the caller as an ActorError, as from the other endpoints.
+        with pytest.raises(ActorError, match="put failed"):
+            await trainer.push_model_state_dict.call()
 
     asyncio.run(run())
 
@@ -268,6 +359,7 @@ def test_forward_backward_uses_global_token_count() -> None:
             return_value=ForwardBackwardResult(torch.tensor(1.0), [])
         ),
         _cuda_graph_per_accumulation_group_enabled=False,
+        _preprocess_groups_lazily=False,
         sdc_replayer=None,
     )
     microbatch_groups = [[object()], [object()], [object()]]
@@ -328,7 +420,8 @@ def test_get_controller_state_returns_restored_state() -> None:
     asyncio.run(run())
 
 
-def test_forward_backward_accumulates_microbatch_metrics() -> None:
+@pytest.mark.parametrize("rdma", [False, True])
+def test_forward_backward_accumulates_microbatch_metrics(rdma: bool) -> None:
     async def run() -> None:
         trainer = object.__new__(Trainer)
         engine = SimpleNamespace(
@@ -336,6 +429,7 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
             ntokens_seen=10,
             sdc_replayer=None,
             model_config=SimpleNamespace(mtp_layers=None),
+            device=torch.device("cpu"),
         )
         engine.forward_backward = MagicMock(
             return_value=ForwardBackwardResult(
@@ -354,7 +448,6 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
         )
         trainer.engine = engine
         trainer.config = Trainer.Config(model=MagicMock())
-        trainer.dp_rank = 0
         trainer._reduce_forward_backward_metrics = MagicMock(
             side_effect=lambda *, sum_reduced_metrics, max_reduced_metrics: {
                 key: float(value.item())
@@ -377,20 +470,36 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
             advantages=torch.tensor([1.0]),
         )
 
+        # This rank's column; with the RDMA fast path the trainer reads it.
+        microbatch = (
+            MagicMock(spec=RDMAMicrobatch, read=AsyncMock(return_value=batch))
+            if rdma
+            else batch
+        )
+
         result = await Trainer.forward_backward(
             trainer,
-            [[batch], [batch]],
+            [microbatch, microbatch],
             torch.tensor([3]),
             torch.tensor([2]),
         )
 
         engine.forward_backward.assert_called_once_with(
-            microbatch_groups=[[batch], [batch]],
+            microbatch_groups=ANY,
             global_loss_token_counts=torch.tensor([3]),
             global_routing_token_counts=torch.tensor([2]),
         )
-        assert trainer._step_num_tokens_per_dp_rank == 2
-        assert trainer._reduce_forward_backward_metrics.call_count == 2
+        # The RDMA fast path reads through the stream; by value, the column is passed as is.
+        groups = engine.forward_backward.call_args.kwargs["microbatch_groups"]
+        assert isinstance(groups, MicrobatchStream) == rdma
+        assert list(groups) == [[batch], [batch]]
+        assert trainer._step_num_tokens_per_dp_rank == (
+            2 * trainer.config.training.num_tokens_per_microbatch_per_dp_rank
+        )
+        if rdma:
+            # The read time is reported only when there was a read.
+            assert result.pop("timing/trainer/read_microbatches/max") >= 0
+        assert trainer._reduce_forward_backward_metrics.call_count == (3 if rdma else 2)
         assert result == {"loss/mean": 3.0, "loss/max": 4.0}
 
     asyncio.run(run())
@@ -473,7 +582,6 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
             "trainer/lr/AdamW/0": 0.25,
             "trainer/lr/AdamW/1": 0.125,
             "trainer/policy_version": 5.0,
-            "trainer/tokens_per_second": 10.0,
             "trainer/tflops": 2.0,
             "trainer/memory/max_active_gib": 3.0,
             "trainer/memory/max_active_percent": 4.0,

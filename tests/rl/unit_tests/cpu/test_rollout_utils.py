@@ -4,15 +4,17 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Unit tests for `TrainingSampleBuilder.rollout_to_training_samples` and `split_prompt`."""
+"""Unit tests for `TrainingSampleBuilder`, `split_prompt` and `AdvantageEstimator`."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
+import torch
 
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
+from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.types import RolloutTurnID, split_prompt
 
 _GROUP_ID = "step=1/group=0"
@@ -202,6 +204,36 @@ def test_rewrite_that_keeps_a_prefix_branches_then_continues() -> None:
     assert (second.min_policy_version, second.max_policy_version) == (1, 2)
 
 
+def test_routed_expert_ids_follow_the_trainer_inputs_across_turns_and_branches() -> None:
+    # The same turns as above. Each turn's generator rows are tagged turn * 100 + position;
+    # a turn keeps the rows from its prefix's last token on, like its prompt delta.
+    rollout = _scored_rollout(
+        [
+            _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=1),
+            _turn(prompt_token_ids=[1, 2, 7], completion_token_ids=[5], version=1),
+            _turn(
+                prompt_token_ids=[1, 2, 7, 5, 9], completion_token_ids=[6], version=2
+            ),
+        ],
+        reward=0.5,
+        advantage=0.1,
+    )
+    for turn_idx, rollout_turn in enumerate(rollout.turns):
+        # One completion token: prompt + completion - 1 rows.
+        num_rows = rollout_turn.num_prompt_tokens
+        rows = np.arange(num_rows).reshape(-1, 1, 1) + 100 * turn_idx
+        rollout_turn.routed_expert_ids = rows[
+            max(rollout_turn.prompt_prefix_len - 1, 0) :
+        ]
+
+    first, second = rollout_to_training_samples(rollout)
+
+    # [1, 2, 4] -> rows of inputs [1, 2]. [1, 2, 7, 5, 9, 6] -> rows of [1, 2, 7, 5, 9]: the branch
+    # copies the shared prefix's row from the first sample, then takes each turn's delta.
+    assert first.routed_expert_ids.flatten().tolist() == [0, 1]
+    assert second.routed_expert_ids.flatten().tolist() == [0, 101, 102, 203, 204]
+
+
 @pytest.mark.parametrize(
     "prompt_prefix_len, prompt_delta_token_ids",
     [
@@ -356,3 +388,116 @@ def test_group_filters_preserve_group_id_for_acknowledgement() -> None:
     filtered_groups = [failed, untrainable, zero_std, no_valid_tokens]
     assert [group.group_id for group in filtered_groups] == [7, 8, 9, 10]
     assert all(not group.training_samples for group in filtered_groups)
+
+
+def _sibling(rollout_id: int, *, reward: float, status: RolloutStatus) -> Rollout:
+    rollout = _scored_rollout(
+        [_turn(prompt_token_ids=[1], completion_token_ids=[2 + rollout_id], version=1)],
+        reward=reward,
+        advantage=0.0,
+    )
+    rollout.rollout_id = rollout_id
+    rollout.status = status
+    return rollout
+
+
+def test_advantage_baseline_skips_errored_rollouts() -> None:
+    rollouts = [
+        _sibling(0, reward=1.0, status=RolloutStatus.COMPLETED),
+        _sibling(1, reward=0.0, status=RolloutStatus.ERROR),
+        _sibling(2, reward=0.0, status=RolloutStatus.COMPLETED),
+    ]
+    estimator = AdvantageEstimator.Config().build()
+
+    advantages = estimator(RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts))
+
+    assert advantages == pytest.approx([0.5, -0.5, -0.5])
+    for rollout in rollouts:
+        rollout.status = RolloutStatus.ERROR
+    # Every rollout errored: fall back to the whole group.
+    assert estimator(
+        RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+    ) == pytest.approx([2 / 3, -1 / 3, -1 / 3])
+
+
+def test_build_from_group_drops_errored_rollouts() -> None:
+    builder = TrainingSampleBuilder.Config().build()
+    rollouts = [
+        _sibling(0, reward=1.0, status=RolloutStatus.COMPLETED),
+        _sibling(1, reward=0.0, status=RolloutStatus.ERROR),
+        _sibling(2, reward=0.0, status=RolloutStatus.TRUNCATED_MAX_TURNS),
+    ]
+
+    group = builder.build_from_group(
+        rollout_group=RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+    )
+
+    assert [sample.rollout_id.rollout_id for sample in group.training_samples] == [0, 2]
+    metrics = {metric.key: metric.value for metric in group.metrics}
+    assert metrics["training_sample_builder/num_rollouts_dropped_errored"].value == 1.0
+    assert "training_sample_builder/num_groups_dropped_errored" not in metrics
+
+
+def test_build_from_group_drops_a_group_with_fewer_than_two_clean_rollouts() -> None:
+    rollouts = [
+        _sibling(0, reward=1.0, status=RolloutStatus.COMPLETED),
+        _sibling(1, reward=0.0, status=RolloutStatus.ERROR),
+    ]
+    group = RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+
+    dropped = TrainingSampleBuilder.Config().build().build_from_group(rollout_group=group)
+    kept = (
+        TrainingSampleBuilder.Config(drop_errored_rollouts=False)
+        .build()
+        .build_from_group(rollout_group=group)
+    )
+
+    assert dropped.training_samples == []
+    assert {metric.key: metric.value for metric in dropped.metrics}[
+        "training_sample_builder/num_groups_dropped_errored"
+    ].value == 1.0
+    assert [sample.rollout_id.rollout_id for sample in kept.training_samples] == [0, 1]
+
+
+def test_topk_rows_follow_loss_tokens_across_turns() -> None:
+    first = _turn(prompt_token_ids=[1, 2], completion_token_ids=[4, 5], version=0)
+    first.completion_topk_token_ids = torch.tensor([[4, 9], [5, 8]], dtype=torch.int32)
+    first.completion_topk_logprobs = torch.tensor([[-0.1, -2.0], [-0.2, -3.0]])
+    second = _turn(
+        prompt_token_ids=[1, 2, 4, 5, 9], completion_token_ids=[7], version=0
+    )
+    second.completion_topk_token_ids = torch.tensor([[7, 3]], dtype=torch.int32)
+    second.completion_topk_logprobs = torch.tensor([[-0.3, -1.5]])
+
+    [training_sample] = rollout_to_training_samples(
+        _scored_rollout([first, second], reward=1.0, advantage=0.5)
+    )
+
+    # One row per loss token; the prompt and the env reply (token 9) get none.
+    assert training_sample.token_ids.tolist() == [1, 2, 4, 5, 9, 7]
+    assert training_sample.loss_mask.tolist() == [False, False, True, True, False, True]
+    assert training_sample.topk_token_ids.tolist() == [[4, 9], [5, 8], [7, 3]]
+    torch.testing.assert_close(
+        training_sample.topk_logprobs,
+        torch.tensor([[-0.1, -2.0], [-0.2, -3.0], [-0.3, -1.5]]),
+    )
+
+
+def test_build_from_group_drops_zero_advantage_rollouts() -> None:
+    builder = TrainingSampleBuilder.Config(drop_zero_advantage_rollouts=True).build()
+    rollouts = [
+        _sibling(0, reward=1.0, status=RolloutStatus.COMPLETED),
+        _sibling(1, reward=0.5, status=RolloutStatus.COMPLETED),
+        _sibling(2, reward=0.0, status=RolloutStatus.COMPLETED),
+    ]
+    for rollout, advantage in zip(rollouts, [0.5, 0.0, -0.5], strict=True):
+        rollout.advantage = advantage
+
+    group = builder.build_from_group(
+        rollout_group=RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+    )
+
+    assert [sample.rollout_id.rollout_id for sample in group.training_samples] == [0, 2]
+    metrics = {metric.key: metric.value for metric in group.metrics}
+    num_dropped = metrics["training_sample_builder/num_rollouts_dropped_zero_advantage"]
+    assert num_dropped.value == 1.0

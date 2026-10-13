@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 from dataclasses import dataclass, field, replace
 from typing import Any, TYPE_CHECKING
@@ -32,6 +33,7 @@ from torchtitan.rl.examples.verifiers.env_server import VerifiersEnvServer
 from torchtitan.rl.examples.verifiers.generation_server import (
     GenerationServer,
     GROUP_ID_SAMPLING_PARAM,
+    MAX_ROLLOUT_TOKENS_SAMPLING_PARAM,
     VerifiersGenerationMetadata,
 )
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
@@ -72,6 +74,42 @@ class RewardFromVerifiers(RewardFn):
         return 0.0
 
 
+@dataclass(kw_only=True, slots=True)
+class VerifiersValidationSet:
+    """An extra validation set with its own taskset, hence its own EnvServer (e.g. a benchmark
+    whose environment, images or grader differ from the training taskset's)."""
+
+    dataset: VerifiersTaskDataset.Config
+    """Verifiers taskset used for this set's validation samples."""
+
+    verifiers_env_server: VerifiersEnvServer.Config
+    """EnvServer for this set; its taskset is derived from `dataset`."""
+
+    max_rollout_tokens: int | None = None
+    """Context cap (prompt + output tokens) of this set's rollouts; None: the generation server's
+    `max_rollout_tokens`. A turn whose prompt reaches it stops the rollout as truncated."""
+
+    def __post_init__(self) -> None:
+        if self.max_rollout_tokens is not None and self.max_rollout_tokens <= 0:
+            raise ValueError("max_rollout_tokens must be positive")
+        configured_taskset = self.verifiers_env_server.environment.taskset
+        if configured_taskset not in (
+            VerifiersTasksetConfig(),
+            self.dataset.verifiers_taskset,
+        ):
+            raise ValueError(
+                "an extra validation set's verifiers_env_server.environment.taskset is derived "
+                "from its dataset.verifiers_taskset and must not configure a different taskset"
+            )
+        self.verifiers_env_server = replace(
+            self.verifiers_env_server,
+            environment=self.verifiers_env_server.environment.model_copy(
+                update={"taskset": self.dataset.verifiers_taskset}
+            ),
+            local_taskset_module=_local_taskset_module(self.dataset.verifiers_taskset),
+        )
+
+
 class VerifiersRollouter(Rollouter):
     """Adapt Verifiers execution to TitanRL's ``Rollouter`` contract.
 
@@ -93,6 +131,22 @@ class VerifiersRollouter(Rollouter):
 
         validation_dataset: VerifiersTaskDataset.Config
         """Verifiers taskset used for validation samples."""
+
+        max_rollout_tokens: int | None = None
+        """Context cap (prompt + output tokens) of training rollouts; None: the generation
+        server's `max_rollout_tokens`. A turn whose prompt reaches it stops the rollout as
+        truncated (graded, with the rubric's truncation penalty) instead of producing a sample the
+        batcher would drop as oversized."""
+
+        validation_max_rollout_tokens: int | None = None
+        """Context cap of the main validation set's rollouts; None: `max_rollout_tokens`."""
+
+        extra_validation_sets: dict[str, VerifiersValidationSet] = field(
+            default_factory=dict
+        )
+        """Named validation sets on their own EnvServers, run by `AsyncLoopConfig.extra_validations`
+        entries of the same name. Unlike `validation_dataset`, their taskset may differ from the
+        training one."""
 
         worker: RolloutWorker.Config | None = None
         """Inherited schema field; hidden because Verifiers replaces that path."""
@@ -150,6 +204,12 @@ class VerifiersRollouter(Rollouter):
                     self.training_dataloader.dataset.verifiers_taskset
                 ),
             )
+            for name, cap in (
+                ("max_rollout_tokens", self.max_rollout_tokens),
+                ("validation_max_rollout_tokens", self.validation_max_rollout_tokens),
+            ):
+                if cap is not None and cap <= 0:
+                    raise ValueError(f"{name} must be positive")
             if self.renderer_multiplex <= 0:
                 raise ValueError("renderer_multiplex must be positive")
             if self.connection_timeout_sec <= 0:
@@ -161,6 +221,11 @@ class VerifiersRollouter(Rollouter):
         self._rubric: Rubric = config.rubric.build()
         self._advantage_estimator: AdvantageEstimator = config.advantage.build()
         self._verifiers_env_server = config.verifiers_env_server.build()
+        self._extra_env_servers = {
+            name: validation_set.verifiers_env_server.build()
+            for name, validation_set in config.extra_validation_sets.items()
+        }
+        self._extra_env_clients: dict[str, VerifiersEnvClient] = {}
         self._generation_server: GenerationServer | None = None
         self._verifiers_env_client: VerifiersEnvClient | None = None
         self._verifiers_train_client_config: VerifiersTrainClientConfig | None = None
@@ -216,9 +281,22 @@ class VerifiersRollouter(Rollouter):
         self._generation_server = generation_server
         self._verifiers_env_client = verifiers_env_client
         self._verifiers_train_client_config = verifiers_train_client_config
+        # Extra validation sets: one EnvServer each, sharing the generation server.
+        for name, env_server in self._extra_env_servers.items():
+            address = await env_server.start()
+            client = VerifiersEnvClient(address)
+            self._extra_env_clients[name] = client
+            await client.wait_for_server_startup(
+                timeout=self._verifiers_config.connection_timeout_sec
+            )
 
     async def close(self) -> None:
-        """Close the Verifiers client, generation server, and environment server."""
+        """Close the Verifiers clients, generation server, and environment servers."""
+        extra_clients, self._extra_env_clients = self._extra_env_clients, {}
+        for client in extra_clients.values():
+            await client.close()
+        for env_server in self._extra_env_servers.values():
+            await env_server.close()
         try:
             if self._verifiers_env_client is not None:
                 await self._verifiers_env_client.close()
@@ -232,6 +310,26 @@ class VerifiersRollouter(Rollouter):
                 self._generation_server = None
                 await self._verifiers_env_server.close()
 
+    def get_validation_samples(
+        self, steps: int, validation_set: str | None = None
+    ) -> list[object]:
+        """Materialize one validation pass; an extra set's tasks are tagged with its name so they
+        run on its EnvServer."""
+        if validation_set is None:
+            return Rollouter.get_validation_samples(self, steps)
+        try:
+            dataset = self._verifiers_config.extra_validation_sets[validation_set].dataset
+        except KeyError:
+            raise ValueError(
+                f"unknown validation set {validation_set!r}; extra_validation_sets has "
+                f"{sorted(self._verifiers_config.extra_validation_sets)}"
+            ) from None
+        iterator = iter(dataset.build())
+        samples = (
+            list(iterator) if steps == -1 else list(itertools.islice(iterator, steps))
+        )
+        return [replace(sample, validation_set=validation_set) for sample in samples]
+
     async def run_group_rollouts(
         self,
         *,
@@ -243,14 +341,13 @@ class VerifiersRollouter(Rollouter):
         sampling: SamplingConfig,
     ) -> RolloutGroup:
         """Run sibling rollouts through Verifiers, then compute advantages."""
-        # TODO: release each rollout's session; until then `max_sessions` evicts them.
-        del release_session_fn
         if self._generation_server is None:
             raise RuntimeError("Verifiers rollouter is not initialized")
         self._generation_server.set_generate_fn(generate_fn)
-        rollouts = await asyncio.gather(
+        results = await asyncio.gather(
             *(
                 self._run_single_rollout(
+                    release_session_fn=release_session_fn,
                     sample=sample,
                     sampling=(
                         sampling
@@ -261,8 +358,14 @@ class VerifiersRollouter(Rollouter):
                     rollout_id=rollout_id,
                 )
                 for rollout_id in range(group_size)
-            )
+            ),
+            return_exceptions=True,
         )
+        # Raise only once every sibling finished: the caller releases the group right after.
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        rollouts = results
 
         outputs = await self._rubric.score_group(rollouts, sample)
         for rollout, output in zip(rollouts, outputs, strict=True):
@@ -275,15 +378,36 @@ class VerifiersRollouter(Rollouter):
             rollout.advantage = advantage
         return group
 
+    def _max_rollout_tokens_param(
+        self, sample: VerifiersTaskSample, group_id: int
+    ) -> dict[str, int]:
+        """The context cap to send with this rollout's generation requests, if any.
+
+        Example: training cap 65,536, an extra set "deepswe" at 131,072:
+            training sample (group 7)             -> {MAX_ROLLOUT_TOKENS_SAMPLING_PARAM: 65536}
+            main validation sample (group -3)     -> validation_max_rollout_tokens or 65536
+            "deepswe" sample                      -> {MAX_ROLLOUT_TOKENS_SAMPLING_PARAM: 131072}
+        """
+        config = self._verifiers_config
+        if sample.validation_set is not None:
+            cap = config.extra_validation_sets[sample.validation_set].max_rollout_tokens
+        elif group_id < 0 and config.validation_max_rollout_tokens is not None:
+            cap = config.validation_max_rollout_tokens
+        else:
+            cap = config.max_rollout_tokens
+        return {} if cap is None else {MAX_ROLLOUT_TOKENS_SAMPLING_PARAM: cap}
+
     async def _run_single_rollout(
         self,
         *,
+        release_session_fn: ReleaseSessionFn,
         sample: object,
         sampling: SamplingConfig,
         group_id: int,
         rollout_id: int,
     ) -> Rollout:
-        """Send one task to Verifiers and convert its trace to a rollout."""
+        """Send one task to Verifiers, release its routing sessions, and convert its trace to a
+        rollout."""
         if not isinstance(sample, VerifiersTaskSample):
             raise TypeError("Verifiers requires a VerifiersTaskSample")
         if (
@@ -296,7 +420,12 @@ class VerifiersRollouter(Rollouter):
         # One VerifiersEnvClient.run executes a complete rollout. The harness
         # owns the multi-turn model/tool loop and calls the generation server once per
         # generation; run returns only after the rollout stops.
-        verifiers_episode = await self._verifiers_env_client.run(
+        env_client = (
+            self._verifiers_env_client
+            if sample.validation_set is None
+            else self._extra_env_clients[sample.validation_set]
+        )
+        verifiers_episode = await env_client.run(
             task_data=sample.verifiers_task_data,
             client=self._verifiers_train_client_config,
             model=self._generation_server.model_id,
@@ -305,9 +434,20 @@ class VerifiersRollouter(Rollouter):
                 top_p=sampling.top_p,
                 max_tokens=sampling.max_tokens,
                 seed=sampling.seed,
+                num_topk_logprobs=sampling.num_topk_logprobs,
                 **{GROUP_ID_SAMPLING_PARAM: group_id},
+                **self._max_rollout_tokens_param(sample, group_id),
             ),
         )
+        # The rollout made its last call. Verifiers sent each trace's id as its X-Session-ID.
+        # TODO: sessions of attempts Verifiers retried (not in `traces`) wait for the group's
+        # release; the generation server could track each rollout's sessions.
+        for trace in verifiers_episode.traces:
+            try:
+                await release_session_fn(routing_session_id=trace.id)
+            except Exception:
+                # Not fatal: `max_sessions` evicts an unreleased session.
+                logger.exception("releasing routing session %s failed", trace.id)
         traces = [trace for trace in verifiers_episode.traces if trace.agent.trainable]
         if len(traces) != 1:
             raise ValueError(
@@ -324,9 +464,15 @@ class VerifiersRollouter(Rollouter):
             group_id=group_id,
             rollout_id=rollout_id,
         )
-        status = self.rollout_status(verifiers_episode=verifiers_episode, trace=trace)
+        status = self.rollout_status(
+            verifiers_episode=verifiers_episode,
+            trace=trace,
+            is_training=sample.validation_set is None and group_id >= 0,
+        )
         if not turns:
-            if trace.stop_condition == "context_length":
+            # Verifiers <= 0.3.1 stops an overlong prompt as context_length, later ones as
+            # max_input_tokens.
+            if trace.stop_condition in ("context_length", "max_input_tokens"):
                 # The harness builds the first prompt in the env server, so the dataset can't
                 # be filtered for it; flag it here as a data problem, not a policy one.
                 task = sample.verifiers_task_data.get(
@@ -341,9 +487,9 @@ class VerifiersRollouter(Rollouter):
                 )
             status = RolloutStatus.ERROR
         logs = verifiers_rollout_logs(verifiers_episode, trace)
-        if status == RolloutStatus.ERROR:
+        if status.is_error():
             log_failed_rollout(logs, group_id=group_id, rollout_id=rollout_id)
-        else:
+        if status != RolloutStatus.ERROR:
             turns[-1].env_rewards[VERIFIERS_REWARD_KEY] = trace.reward
         return Rollout(
             group_id=group_id,
@@ -354,7 +500,23 @@ class VerifiersRollouter(Rollouter):
         )
 
     @staticmethod
-    def rollout_status(*, verifiers_episode: Any, trace: Any) -> RolloutStatus:
+    def rollout_status(
+        *, verifiers_episode: Any, trace: Any, is_training: bool = True
+    ) -> RolloutStatus:
+        """Map how Verifiers ended a rollout to its status.
+
+        A stage deadline (setup, agent, finalize, scoring) flags `trace.is_timeout` but can leave
+        `ok` True, so a timed-out rollout would still be scored. Training marks it ERROR_TIMEOUT,
+        which stays out of the loss (usually slow infra or a stalled agent, not the policy);
+        validation keeps it as a scored outcome.
+
+        Example (ok, is_timeout, is_training -> status):
+            True,  True,  True  -> ERROR_TIMEOUT
+            True,  True,  False -> COMPLETED or TRUNCATED_*
+            False, False, any   -> ERROR
+        """
+        if is_training and trace.is_timeout:
+            return RolloutStatus.ERROR_TIMEOUT
         if not verifiers_episode.ok or not trace.ok:
             return RolloutStatus.ERROR
         if not trace.is_truncated:
@@ -384,7 +546,8 @@ class VerifiersRollouter(Rollouter):
         Verifiers does not return TorchTitan policy metadata, so every emitted
         turn receives the conservative min/max policy-version span accumulated
         by the generation server for the whole rollout. Generator metrics are
-        attached once to avoid double counting.
+        attached once to avoid double counting. A turn's top-k rows come from the
+        generation whose prompt length and completion tokens match its node.
         """
         if generation_metadata is None:
             if any(any(node.mask) for node in trace.nodes):
@@ -404,6 +567,10 @@ class VerifiersRollouter(Rollouter):
         for branch in trace.branches:
             token_ids = branch.token_ids
             logprobs = branch.logprobs
+            # [len(token_ids), num_layers, top_k] from the generation server; None without replay.
+            # TODO: Verifiers gives a continued turn's last token the row of the token before it,
+            # so 1 input per turn boundary replays its neighbor's experts (native: next prefill's row).
+            routed_expert_ids = branch.routed_experts
             branch_offset = 0
             reply_to: RolloutTurn | None = None
             for node in branch.nodes:
@@ -414,6 +581,24 @@ class VerifiersRollouter(Rollouter):
                         mask = [False] * len(mask)
                     else:
                         trained_nodes.add(index)
+                topk = None
+                if generation_metadata.topk_by_generation and any(mask):
+                    # The prompt this node's completion was sampled from ends at its first
+                    # sampled token.
+                    key = (
+                        branch_offset + node.mask.index(True),
+                        tuple(
+                            token_id
+                            for token_id, sampled in zip(node.token_ids, node.mask)
+                            if sampled
+                        ),
+                    )
+                    if key not in generation_metadata.topk_by_generation:
+                        raise ValueError(
+                            "Verifiers node has no generation with the same prompt length "
+                            "and completion tokens, so its top-k logprobs are unknown"
+                        )
+                    topk = generation_metadata.topk_by_generation[key]
                 for start, end in _trainable_token_spans(mask):
                     absolute_start = branch_offset + start
                     absolute_end = branch_offset + end
@@ -421,6 +606,8 @@ class VerifiersRollouter(Rollouter):
                         token_ids[:absolute_start], previous_token_ids
                     )
                     previous_token_ids = token_ids[:absolute_end]
+                    # Completion rows of this span: sampled tokens before `start` in the node.
+                    row = sum(node.mask[:start])
                     turns.append(
                         RolloutTurn(
                             rollout_id=RolloutTurnID(
@@ -435,6 +622,23 @@ class VerifiersRollouter(Rollouter):
                             ),
                             completion_logprobs=np.asarray(
                                 logprobs[absolute_start:absolute_end], dtype=np.float32
+                            ),
+                            routed_expert_ids=(
+                                None
+                                if routed_expert_ids is None
+                                else routed_expert_ids[
+                                    max(prompt_prefix_len - 1, 0) : absolute_end - 1
+                                ]
+                            ),
+                            completion_topk_token_ids=(
+                                None
+                                if topk is None
+                                else topk[0][row : row + end - start]
+                            ),
+                            completion_topk_logprobs=(
+                                None
+                                if topk is None
+                                else topk[1][row : row + end - start]
                             ),
                             min_policy_version=generation_metadata.min_policy_version,
                             max_policy_version=generation_metadata.max_policy_version,

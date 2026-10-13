@@ -46,3 +46,129 @@ def test_dapo_loss_matches_vllm_tempered_logprobs_bitwise() -> None:
     )
 
     assert metrics["bit_wise/logprob_diff/max"] == 0
+
+
+def test_dapo_logs_logprob_gap_metrics() -> None:
+    logits = torch.randn(4, 8)
+    labels = torch.tensor([1, 2, 3, 4])
+    trainer_logprobs = torch.log_softmax(logits, -1).gather(-1, labels[:, None])[:, 0]
+    # log p_trainer - log q_generator per token; the last token is not trained.
+    logprob_diffs = torch.tensor([0.1, -0.2, 1.0, 5.0])
+
+    _, metrics = DAPOLoss.Config().build()(
+        logits,
+        labels,
+        torch.tensor(3),
+        generator_logprobs=trainer_logprobs - logprob_diffs,
+        temperature=torch.ones(4),
+        advantages=torch.zeros(4),
+        loss_mask=torch.tensor([True, True, True, False]),
+    )
+
+    trained = logprob_diffs[:3]
+    torch.testing.assert_close(
+        metrics["bit_wise/logprob_diff_abs/mean"], trained.abs().mean()
+    )
+    torch.testing.assert_close(
+        metrics["bit_wise/kl_k3/mean"], (trained.exp() - 1 - trained).mean()
+    )
+    # Only the 1.0 diff is beyond ln(2).
+    torch.testing.assert_close(
+        metrics["bit_wise/ratio_beyond_2x/mean"], torch.tensor(1 / 3)
+    )
+
+
+def _prime_ipo_loss_sum(
+    trainer_logprobs: torch.Tensor,
+    inference_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    *,
+    eps: float,
+    max_importance_ratio: float,
+) -> torch.Tensor:
+    """Prime-RL's IPOLoss.loss (trainer/rl/loss.py) on already-masked tokens."""
+    log_importance_ratio = trainer_logprobs - inference_logprobs
+    larger = torch.maximum(trainer_logprobs, inference_logprobs)
+    smaller = torch.minimum(trainer_logprobs, inference_logprobs)
+    abs_probs_diff = torch.exp(larger) * -torch.expm1(smaller - larger)
+    keep = ~(abs_probs_diff > eps)
+    kept = log_importance_ratio[keep]
+    capped = kept.detach().clamp(max=kept.new_tensor(max_importance_ratio).log())
+    importance_ratio = torch.exp(capped + (kept - kept.detach()))
+    return (-advantages[keep] * importance_ratio).sum()
+
+
+def test_ipo_loss_matches_prime_rl_loss_and_gradient() -> None:
+    from torchtitan.rl.losses import IPOLoss
+
+    torch.manual_seed(0)
+    num_tokens, vocab = 256, 64
+    logits = (torch.randn(num_tokens, vocab) * 4).requires_grad_(True)
+    labels = torch.randint(0, vocab, (num_tokens,))
+    # The first 64 labels are each row's likeliest token, so moving q_y there crosses eps.
+    labels[:64] = logits[:64].argmax(-1)
+    with torch.no_grad():
+        exact = torch.log_softmax(logits, -1).gather(-1, labels[:, None])[:, 0]
+    generator_logprobs = exact + torch.randn(num_tokens) * 0.5
+    # Rare under the generator: dropped where p_y is large, a capped huge ratio elsewhere.
+    generator_logprobs[:8] = -30.0
+    generator_logprobs[64:72] = -30.0
+    advantages = torch.randn(num_tokens)
+    loss_mask = torch.rand(num_tokens) > 0.2
+    num_loss_tokens = int(loss_mask.sum())
+
+    loss, metrics = IPOLoss.Config(eps=0.3, max_importance_ratio=1e4).build()(
+        logits,
+        labels,
+        torch.tensor(num_loss_tokens),
+        generator_logprobs=generator_logprobs,
+        temperature=torch.ones(num_tokens),
+        advantages=advantages,
+        loss_mask=loss_mask,
+    )
+    (grad,) = torch.autograd.grad(loss, logits)
+
+    reference_logits = logits.detach().clone().requires_grad_(True)
+    trainer_logprobs = torch.log_softmax(reference_logits, -1).gather(
+        -1, labels[:, None]
+    )[:, 0]
+    reference_loss = (
+        _prime_ipo_loss_sum(
+            trainer_logprobs[loss_mask],
+            generator_logprobs[loss_mask],
+            advantages[loss_mask],
+            eps=0.3,
+            max_importance_ratio=1e4,
+        )
+        / num_loss_tokens
+    )
+    (reference_grad,) = torch.autograd.grad(reference_loss, reference_logits)
+
+    torch.testing.assert_close(loss, reference_loss)
+    torch.testing.assert_close(grad, reference_grad)
+    assert 0 < metrics["loss/ipo_dropped_frac"] < 1
+
+
+def test_ipo_loss_drops_tokens_outside_the_probability_trust_region() -> None:
+    from torchtitan.rl.losses import IPOLoss
+
+    # p_y = [0.5, 0.6, 0.2] under the trainer; q_y = [0.9, 0.5, 0.01] under the generator.
+    trainer_probs = torch.tensor([0.5, 0.6, 0.2])
+    logits = torch.stack(
+        [torch.stack([p.log(), (1 - p).log()]) for p in trainer_probs]
+    ).requires_grad_(True)
+    labels = torch.zeros(3, dtype=torch.long)
+
+    loss, metrics = IPOLoss.Config(eps=0.3).build()(
+        logits,
+        labels,
+        torch.tensor(3),
+        generator_logprobs=torch.tensor([0.9, 0.5, 0.01]).log(),
+        temperature=torch.ones(3),
+        advantages=torch.ones(3),
+        loss_mask=torch.ones(3, dtype=torch.bool),
+    )
+
+    # Token 0 (|0.5 - 0.9| = 0.4 > 0.3) is dropped but stays in the denominator.
+    torch.testing.assert_close(loss, -(0.6 / 0.5 + 0.2 / 0.01) / 3 * torch.ones(()))
+    torch.testing.assert_close(metrics["loss/ipo_dropped_frac"], torch.tensor(1 / 3))

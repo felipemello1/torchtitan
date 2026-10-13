@@ -25,6 +25,12 @@ class AdvantageEstimator(Configurable):
     ``denom = std(r) + eps`` when ``should_std_normalize`` (standard GRPO), else
     ``1.0`` (Dr.GRPO mean-baseline). The name is intentionally general — other
     advantage schemes can live here later.
+
+    The mean and std skip errored rollouts: an infrastructure failure scores a fixed
+    reward that says nothing about the task. If every rollout errored, all are used.
+
+    Example:
+        rewards [1, 0, 0 (errored), 1] -> mean 2/3 -> advantages [1/3, -2/3, -2/3, 1/3]
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -39,8 +45,15 @@ class AdvantageEstimator(Configurable):
     def __call__(self, group: RolloutGroup) -> list[float]:
         """Return per-rollout advantages, in group order."""
         rewards = [rollout.reward for rollout in group.rollouts]
-        group_mean = sum(rewards) / len(rewards)
+        baseline_rewards = [
+            rollout.reward
+            for rollout in group.rollouts
+            if not rollout.status.is_error()
+        ] or rewards
+        group_mean = sum(baseline_rewards) / len(baseline_rewards)
         denom = (
-            (statistics.pstdev(rewards) + 1e-6) if self.should_std_normalize else 1.0
+            (statistics.pstdev(baseline_rewards) + 1e-6)
+            if self.should_std_normalize
+            else 1.0
         )
         return [(reward - group_mean) / denom for reward in rewards]

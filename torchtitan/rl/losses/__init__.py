@@ -6,5 +6,7 @@
 
 from torchtitan.rl.losses.dapo import DAPOLoss
 from torchtitan.rl.losses.grpo import GRPOLoss
+from torchtitan.rl.losses.ipo import IPOLoss
+from torchtitan.rl.losses.score_centering import ScoreCenteringLoss
 
-__all__ = ["DAPOLoss", "GRPOLoss"]
+__all__ = ["DAPOLoss", "GRPOLoss", "IPOLoss", "ScoreCenteringLoss"]

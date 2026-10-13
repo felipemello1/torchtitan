@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -29,6 +30,7 @@ from torchtitan.observability.logging import init_logger
 from torchtitan.observability.metrics import compute_training_performance_metrics
 from torchtitan.rl.components.batcher import TrainingMicrobatch
 from torchtitan.rl.components.checkpointer import CONTROLLER_STATE_KEY, MirroredState
+from torchtitan.rl.distributed.rdma_microbatch import MicrobatchStream, RDMAMicrobatch
 from torchtitan.rl.observability.controller import combine_microbatch_metrics
 from torchtitan.tools import utils
 from torchtitan.training_engine import TrainingEngine
@@ -239,15 +241,16 @@ class Trainer(Configurable):
     @sl.log_trace_span("forward_backward")
     async def forward_backward(
         self,
-        training_data: list[list[TrainingMicrobatch]],
+        microbatches: list[TrainingMicrobatch] | list[RDMAMicrobatch],
         global_loss_token_counts: torch.Tensor,
         global_routing_token_counts: torch.Tensor,
     ) -> dict[str, float]:
         """Run one optimizer step's forward/backward microbatches.
 
         Args:
-            training_data: Microbatch-major grid with shape
-                ``[num_microbatches][dp_degree]``.
+            microbatches: This rank's microbatches, `[num_microbatches]`: one column of the
+                batcher's `[num_microbatches][dp_degree]` grid; `RDMAMicrobatch`es with the RDMA
+                fast path, read a few ahead of training.
             global_loss_token_counts: Per-objective loss-token counts across the
                 global batch.
             global_routing_token_counts: Per-depth non-padding routing-token
@@ -255,6 +258,12 @@ class Trainer(Configurable):
 
         Returns:
             dict[str, float]: Globally-reduced metrics.
+
+        Example:
+            # dp_degree=2, tp=2: ranks 0-1 share DP rank 0, ranks 2-3 share DP rank 1.
+            # grid = [[mb_00, mb_01], [mb_10, mb_11]]
+            # ranks 0 and 1 get microbatches = [mb_00, mb_10]
+            # ranks 2 and 3 get microbatches = [mb_01, mb_11]
         """
         logger.debug(
             f"{os.getpid()=} Trainer forward_backward "
@@ -262,13 +271,19 @@ class Trainer(Configurable):
         )
         engine = self.engine
         self._step_compute_start = time.perf_counter()
-        self._step_num_tokens_per_dp_rank = sum(
-            rank_batches[self.dp_rank].labels.numel() for rank_batches in training_data
+        # The batcher pads every microbatch to the same token count.
+        self._step_num_tokens_per_dp_rank = (
+            len(microbatches)
+            * self.config.training.num_tokens_per_microbatch_per_dp_rank
         )
+        uses_rdma = bool(microbatches) and isinstance(microbatches[0], RDMAMicrobatch)
+        microbatch_groups = [[microbatch] for microbatch in microbatches]
+        if uses_rdma:
+            # TODO: the cp * tp ranks of a DP replica read the same column. Read it once per replica
+            # and broadcast it, to cut the batcher's reads by cp * tp. Needs a per-replica group.
+            microbatch_groups = MicrobatchStream(microbatches)
         result = engine.forward_backward(
-            microbatch_groups=[
-                [rank_batches[self.dp_rank]] for rank_batches in training_data
-            ],
+            microbatch_groups=microbatch_groups,
             global_loss_token_counts=global_loss_token_counts,
             global_routing_token_counts=global_routing_token_counts,
         )
@@ -289,7 +304,21 @@ class Trainer(Configurable):
                 )
             )
 
-        return combine_microbatch_metrics(microbatch_metrics)
+        metrics = combine_microbatch_metrics(microbatch_metrics)
+        if uses_rdma:
+            # The slowest rank's total read time this step, hidden or not (max over the loss mesh).
+            read_microbatches_s = torch.tensor(
+                microbatch_groups.read_s, device=engine.device
+            )
+            metrics.update(
+                self._reduce_forward_backward_metrics(
+                    sum_reduced_metrics={},
+                    max_reduced_metrics={
+                        "timing/trainer/read_microbatches/max": read_microbatches_s
+                    },
+                )
+            )
+        return metrics
 
     @sl.log_trace_span("optim_step")
     async def optim_step(
@@ -335,7 +364,6 @@ class Trainer(Configurable):
                 "trainer/grad_norm/mean": float(grad_norm.item()),
                 **{f"trainer/{key}": value for key, value in lr_metrics.items()},
                 "trainer/policy_version": float(self.policy_version),
-                "trainer/tokens_per_second": performance["tokens_per_second"],
                 "trainer/tflops": performance["tflops"],
                 "trainer/memory/max_active_gib": device_mem_stats.max_active_gib,
                 "trainer/memory/max_active_percent": device_mem_stats.max_active_pct,
@@ -357,8 +385,13 @@ class Trainer(Configurable):
         )
 
     @sl.log_trace_span("push_model_state_dict")
-    async def push_model_state_dict(self) -> None:
-        """Publish a CPU snapshot of model weights for generators to pull."""
+    async def push_model_state_dict(self, on_published: Callable[[], None]) -> None:
+        """Publish a CPU snapshot of model weights for generators to pull.
+
+        Args:
+            on_published: Called in the worker thread right after the TorchStore put,
+                so it runs even while forward_backward blocks the event loop.
+        """
 
         model_state_dict = self.model.state_dict()
         # Today we copy the model into reusable pinned CPU buffers before calling
@@ -372,6 +405,7 @@ class Trainer(Configurable):
         await asyncio.to_thread(
             self._wait_for_staging_and_put_model_state_dict,
             staging_complete,
+            on_published=on_published,
         )
 
     @sl.log_trace_span("stage_model_state_dict")
@@ -399,7 +433,9 @@ class Trainer(Configurable):
         return staging_complete
 
     def _wait_for_staging_and_put_model_state_dict(
-        self, staging_complete: torch.Event | None
+        self,
+        staging_complete: torch.Event | None,
+        on_published: Callable[[], None],
     ) -> None:
         """Wait for staging and publish without blocking the actor event loop."""
         if staging_complete is not None:
@@ -411,6 +447,8 @@ class Trainer(Configurable):
                 direct_rdma=False,
             )
         )
+        # Keep this last: once it runs, the controller may run the optimizer step and the next push.
+        on_published()
 
     def _setup_staging_model_state_dict(self) -> dict[str, torch.Tensor]:
         """Allocate a final-dtype pinned CPU mirror of the model state dict."""

@@ -9,11 +9,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import numpy as np
 import pytest
+import torch
 
 pytest.importorskip("verifiers")
 
@@ -34,7 +37,6 @@ from torchtitan.rl.examples.verifiers.rollouter import (
 from torchtitan.rl.generator import SamplingConfig
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.types import Completion, RolloutStatus
-from verifiers.v1.errors import model_error, OverlongPromptError
 
 
 def test_trainable_token_spans() -> None:
@@ -60,6 +62,7 @@ def test_verifiers_trace_preserves_generation_metadata() -> None:
                 nodes=[node],
                 token_ids=[10, 11, 12, 13],
                 logprobs=[0.0, 0.0, -0.2, -0.3],
+                routed_experts=None,
             )
         ],
     )
@@ -109,6 +112,8 @@ def test_verifiers_multiturn_trace_matches_titanrl_rollout_structure() -> None:
                 nodes=[first_node, second_node],
                 token_ids=[10, 11, 12, 13],
                 logprobs=[0.0, -0.1, 0.0, -0.2],
+                # Row i holds the experts of position i.
+                routed_experts=np.arange(4).reshape(4, 1, 1),
             )
         ],
     )
@@ -131,6 +136,11 @@ def test_verifiers_multiturn_trace_matches_titanrl_rollout_structure() -> None:
     ]
     assert stored == [(0, [10]), (2, [12])]
     assert [turn.completion_token_ids.tolist() for turn in turns] == [[11], [13]]
+    # Like the prompt, a delta: turn 1's rows start at 11, which only its prefill ran.
+    assert [turn.routed_expert_ids.flatten().tolist() for turn in turns] == [
+        [0],
+        [1, 2],
+    ]
     assert [turn.completion_logprobs.tolist() for turn in turns] == [
         pytest.approx([-0.1]),
         pytest.approx([-0.2]),
@@ -156,11 +166,13 @@ def test_verifiers_second_branch_stores_its_prompt_as_a_delta_on_the_first() -> 
                 nodes=[shared, first_leaf],
                 token_ids=[10, 11, 12, 13],
                 logprobs=[0.0, -0.1, 0.0, -0.2],
+                routed_experts=None,
             ),
             SimpleNamespace(
                 nodes=[shared, second_leaf],
                 token_ids=[10, 11, 14, 15],
                 logprobs=[0.0, -0.1, 0.0, -0.3],
+                routed_experts=None,
             ),
         ],
     )
@@ -180,6 +192,85 @@ def test_verifiers_second_branch_stores_its_prompt_as_a_delta_on_the_first() -> 
     ]
     assert stored == [(0, [10]), (2, [12]), (2, [14])]
     assert [turn.completion_token_ids.tolist() for turn in turns] == [[11], [13], [15]]
+
+
+def _two_turn_trace():
+    from verifiers.v1.types import AssistantMessage as VerifiersAssistantMessage
+
+    first_node = SimpleNamespace(
+        token_ids=[10, 11],
+        mask=[False, True],
+        sampled=True,
+        message=VerifiersAssistantMessage(content="first"),
+    )
+    second_node = SimpleNamespace(
+        token_ids=[12, 13, 14],
+        mask=[False, True, True],
+        sampled=True,
+        message=VerifiersAssistantMessage(content="second"),
+    )
+    return SimpleNamespace(
+        nodes=[first_node, second_node],
+        branches=[
+            SimpleNamespace(
+                nodes=[first_node, second_node],
+                token_ids=[10, 11, 12, 13, 14],
+                logprobs=[0.0, -0.1, 0.0, -0.2, -0.3],
+                routed_experts=None,
+            )
+        ],
+    )
+
+
+def test_verifiers_trace_attaches_each_generations_topk_rows() -> None:
+    # Generations are keyed by (prompt length, completion tokens): prompts [10] and
+    # [10, 11, 12] sampled completions [11] and [13, 14].
+    topk_by_generation = {
+        (1, (11,)): (torch.tensor([[11, 7]]), torch.tensor([[-0.1, -2.0]])),
+        (3, (13, 14)): (
+            torch.tensor([[13, 8], [14, 9]]),
+            torch.tensor([[-0.2, -1.5], [-0.3, -1.2]]),
+        ),
+    }
+    turns = VerifiersRollouter.trace_to_rollout_turns(
+        trace=_two_turn_trace(),
+        generation_metadata=VerifiersGenerationMetadata(
+            min_policy_version=3,
+            max_policy_version=4,
+            metrics=[],
+            topk_by_generation=topk_by_generation,
+        ),
+        group_id=5,
+        rollout_id=2,
+    )
+
+    assert [turn.completion_token_ids.tolist() for turn in turns] == [[11], [13, 14]]
+    assert [turn.completion_topk_token_ids.tolist() for turn in turns] == [
+        [[11, 7]],
+        [[13, 8], [14, 9]],
+    ]
+    torch.testing.assert_close(
+        turns[1].completion_topk_logprobs, torch.tensor([[-0.2, -1.5], [-0.3, -1.2]])
+    )
+
+
+def test_verifiers_trace_rejects_a_node_without_its_topk_rows() -> None:
+    # Top-k was requested, but no generation produced the second node's tokens.
+    topk_by_generation = {
+        (1, (11,)): (torch.tensor([[11, 7]]), torch.tensor([[-0.1, -2.0]])),
+    }
+    with pytest.raises(ValueError, match="top-k logprobs are unknown"):
+        VerifiersRollouter.trace_to_rollout_turns(
+            trace=_two_turn_trace(),
+            generation_metadata=VerifiersGenerationMetadata(
+                min_policy_version=3,
+                max_policy_version=4,
+                metrics=[],
+                topk_by_generation=topk_by_generation,
+            ),
+            group_id=5,
+            rollout_id=2,
+        )
 
 
 def test_verifiers_trace_attaches_env_replies_to_the_preceding_turn() -> None:
@@ -214,6 +305,7 @@ def test_verifiers_trace_attaches_env_replies_to_the_preceding_turn() -> None:
                 nodes=branch_nodes,
                 token_ids=[0] * len(branch_nodes),
                 logprobs=[0.0] * len(branch_nodes),
+                routed_experts=None,
             )
             for branch_nodes in (
                 [task, first, out, second],
@@ -403,6 +495,60 @@ def test_generation_server_forwards_token_request() -> None:
     asyncio.run(run_test())
 
 
+def test_generation_server_records_topk_logprobs_per_generation() -> None:
+    async def run_test() -> None:
+        received = []
+
+        async def generate_fn(prompt_token_ids, *, request_id, group_id, **kwargs):
+            received.append(kwargs["sampling_config"])
+            return Completion(
+                min_policy_version=7,
+                max_policy_version=7,
+                request_id=request_id,
+                token_ids=[31, 32],
+                token_logprobs=[-0.1, -0.2],
+                topk_token_ids=torch.tensor([[31, 5], [32, 6]], dtype=torch.int32),
+                topk_logprobs=torch.tensor([[-0.1, -2.4], [-0.2, -1.9]]),
+                finish_reason="stop",
+            )
+
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+        try:
+            async with ClientSession() as session:
+                response = await session.post(
+                    f"http://{server.host}:{server.port}/inference/v1/generate",
+                    headers={"X-Session-ID": "group=1/rollout=2"},
+                    json={
+                        "token_ids": [10, 11],
+                        "sampling_params": {
+                            "temperature": 1.0,
+                            "max_tokens": 2,
+                            "torchtitan_group_id": 1,
+                            "stop_token_ids": [99],
+                            "num_topk_logprobs": 2,
+                        },
+                    },
+                )
+                assert response.status == 200
+            generation_metadata = server.pop_generation_metadata("group=1/rollout=2")
+        finally:
+            await server.close()
+
+        assert received[0].num_topk_logprobs == 2
+        [
+            (key, (topk_token_ids, topk_logprobs))
+        ] = generation_metadata.topk_by_generation.items()
+        assert key == (2, (31, 32))
+        assert topk_token_ids.tolist() == [[31, 5], [32, 6]]
+        torch.testing.assert_close(
+            topk_logprobs, torch.tensor([[-0.1, -2.4], [-0.2, -1.9]])
+        )
+
+    asyncio.run(run_test())
+
+
 def test_generation_server_rejects_aborted_generation() -> None:
     async def run_test() -> None:
         async def generate_fn(
@@ -433,6 +579,7 @@ def test_generation_server_rejects_aborted_generation() -> None:
                     json={
                         "token_ids": [10, 11],
                         "sampling_params": {
+                            "temperature": 1.0,
                             "torchtitan_group_id": 1,
                             "stop_token_ids": [99],
                         },
@@ -450,6 +597,57 @@ def test_generation_server_rejects_aborted_generation() -> None:
         assert generation_metadata is None
 
     asyncio.run(run_test())
+
+
+def test_generation_server_returns_routed_experts_from_the_prompt_start() -> None:
+    # Prompt [10, 11, 12] + completion [31, 32]: rows for positions 0..3.
+    routed_expert_ids = np.arange(4 * 2 * 2, dtype=np.uint8).reshape(4, 2, 2)
+
+    async def run_test() -> dict:
+        async def generate_fn(prompt_token_ids, *, request_id, **kwargs):
+            return Completion(
+                min_policy_version=0,
+                max_policy_version=0,
+                request_id=request_id,
+                token_ids=[31, 32],
+                token_logprobs=[-0.1, -0.2],
+                finish_reason="stop",
+                routed_expert_ids=routed_expert_ids,
+            )
+
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+        try:
+            async with ClientSession() as session:
+                response = await session.post(
+                    f"http://{server.host}:{server.port}/inference/v1/generate",
+                    headers={"X-Session-ID": "group=1/rollout=2"},
+                    json={
+                        "token_ids": [10, 11, 12],
+                        "sampling_params": {
+                            "temperature": 1.0,
+                            "max_tokens": 2,
+                            "torchtitan_group_id": 1,
+                            "stop_token_ids": [99],
+                            # The previous turn already returned positions 0 and 1.
+                            "routed_experts_prompt_start": 2,
+                        },
+                    },
+                )
+                assert response.status == 200
+                return await response.json()
+        finally:
+            await server.close()
+
+    payload = asyncio.run(run_test())["choices"][0]["routed_experts"]
+    assert (payload["shape"], payload["start"], payload["dtype"]) == (
+        [2, 2, 2],
+        2,
+        "uint8",
+    )
+    rows = np.frombuffer(base64.b64decode(payload["data"]), dtype=np.uint8)
+    assert rows.reshape(payload["shape"]).tolist() == routed_expert_ids[2:].tolist()
 
 
 def test_generation_server_requires_group_id() -> None:
@@ -498,6 +696,7 @@ def test_generation_server_rejects_prompt_without_room_for_output() -> None:
                         json={
                             "token_ids": [1] * num_tokens,
                             "sampling_params": {
+                                "temperature": 1.0,
                                 "torchtitan_group_id": 1,
                                 "stop_token_ids": [99],
                             },
@@ -510,8 +709,8 @@ def test_generation_server_rejects_prompt_without_room_for_output() -> None:
 
         assert prompt_lengths == [7]
         assert statuses == [500, 400, 400]
-        # Verifiers ends the rollout as context_length on OverlongPromptError.
-        assert isinstance(model_error(errors[1]), OverlongPromptError)
+        # vLLM's and the renderer's overlong-prompt wording, which Verifiers stops as truncated.
+        assert "exceeds maximum context length" in errors[1]
 
     asyncio.run(run_test())
 
@@ -525,6 +724,7 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
         agent=SimpleNamespace(trainable=True),
         ok=True,
         is_truncated=True,
+        is_timeout=False,
         stop_condition="context_length",
         errors=[],
         timing=SimpleNamespace(
@@ -537,6 +737,11 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
         branches=[],
     )
     rollouter = object.__new__(VerifiersRollouter)
+    rollouter._verifiers_config = SimpleNamespace(
+        max_rollout_tokens=None,
+        validation_max_rollout_tokens=None,
+        extra_validation_sets={},
+    )
     rollouter._generation_server = SimpleNamespace(
         model_id="model", pop_generation_metadata=lambda trace_id: None
     )
@@ -548,6 +753,7 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
     with caplog.at_level(logging.WARNING):
         rollout = asyncio.run(
             rollouter._run_single_rollout(
+                release_session_fn=AsyncMock(),
                 sample=VerifiersTaskSample(verifiers_task_data={"name": "huge-task"}),
                 sampling=SamplingConfig(),
                 group_id=1,
@@ -559,6 +765,206 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
     assert "first prompt of task huge-task does not fit" in caplog.text
 
 
+def test_rollout_releases_every_trace_session_even_if_one_release_fails(caplog) -> None:
+    """Each trace generated under its own id; another agent's trace has one too."""
+    span = SimpleNamespace(duration=0.0)
+    traces = [
+        SimpleNamespace(
+            id=trace_id,
+            task=SimpleNamespace(key="task"),
+            agent=SimpleNamespace(trainable=trainable),
+            ok=True,
+            is_truncated=False,
+            is_timeout=False,
+            stop_condition=None,
+            errors=[],
+            timing=SimpleNamespace(
+                setup=span,
+                agent=SimpleNamespace(duration=0.0, model=span, harness=span),
+                scoring=span,
+            ),
+            calls=[],
+            nodes=[],
+            branches=[],
+        )
+        for trace_id, trainable in [("opponent", False), ("policy", True)]
+    ]
+    rollouter = object.__new__(VerifiersRollouter)
+    rollouter._verifiers_config = SimpleNamespace(
+        max_rollout_tokens=None,
+        validation_max_rollout_tokens=None,
+        extra_validation_sets={},
+    )
+    rollouter._generation_server = SimpleNamespace(
+        model_id="model", pop_generation_metadata=lambda trace_id: None
+    )
+    rollouter._verifiers_env_client = SimpleNamespace(
+        run=AsyncMock(return_value=SimpleNamespace(ok=True, errors=[], traces=traces))
+    )
+    rollouter._verifiers_train_client_config = object()
+    release_session_fn = AsyncMock(side_effect=[RuntimeError("router down"), None])
+
+    with caplog.at_level(logging.ERROR):
+        rollout = asyncio.run(
+            rollouter._run_single_rollout(
+                release_session_fn=release_session_fn,
+                sample=VerifiersTaskSample(verifiers_task_data={"name": "task"}),
+                sampling=SamplingConfig(),
+                group_id=1,
+                rollout_id=0,
+            )
+        )
+
+    assert [call.kwargs for call in release_session_fn.call_args_list] == [
+        {"routing_session_id": "opponent"},
+        {"routing_session_id": "policy"},
+    ]
+    assert "releasing routing session opponent failed" in caplog.text
+    assert rollout.group_id == 1
+
+
+@pytest.mark.parametrize(
+    "ok, is_timeout, is_training, expected",
+    [
+        # Verifiers flags a stage deadline but can keep ok=True: train leaves it out.
+        (True, True, True, RolloutStatus.ERROR_TIMEOUT),
+        # Validation scores it like any other rollout.
+        (True, True, False, RolloutStatus.COMPLETED),
+        (False, True, False, RolloutStatus.ERROR),
+        (False, False, True, RolloutStatus.ERROR),
+        (True, False, True, RolloutStatus.COMPLETED),
+    ],
+)
+def test_rollout_status_leaves_training_timeouts_out(
+    ok: bool, is_timeout: bool, is_training: bool, expected: RolloutStatus
+) -> None:
+    trace = SimpleNamespace(
+        ok=ok, is_timeout=is_timeout, is_truncated=False, stop_condition="agent_timeout"
+    )
+
+    status = VerifiersRollouter.rollout_status(
+        verifiers_episode=SimpleNamespace(ok=True),
+        trace=trace,
+        is_training=is_training,
+    )
+
+    assert status is expected
+
+
+def test_a_failing_rollout_fails_its_group_only_after_every_sibling_finished() -> None:
+    """The caller releases the group once this raises; no sibling may still be generating."""
+
+    async def run_test() -> list[int]:
+        finished = []
+
+        async def run_single_rollout(*, rollout_id: int, **kwargs) -> None:
+            if rollout_id == 0:
+                raise RuntimeError("rollout 0 failed")
+            await asyncio.sleep(0.01)
+            finished.append(rollout_id)
+
+        rollouter = object.__new__(VerifiersRollouter)
+        rollouter._generation_server = SimpleNamespace(set_generate_fn=lambda fn: None)
+        rollouter._run_single_rollout = run_single_rollout
+        with pytest.raises(RuntimeError, match="rollout 0 failed"):
+            await rollouter.run_group_rollouts(
+                generate_fn=AsyncMock(),
+                release_session_fn=AsyncMock(),
+                sample=None,
+                group_id=1,
+                group_size=2,
+                sampling=SamplingConfig(),
+            )
+        return finished
+
+    assert asyncio.run(run_test()) == [1]
+
+
 def test_parse_sampling_config_requires_stop_token_ids() -> None:
     with pytest.raises(ValueError, match="stop_token_ids"):
         _parse_sampling_config({"temperature": 1.0})
+
+
+def test_parse_sampling_config_requires_temperature() -> None:
+    # A missing temperature must not silently fall back to SamplingConfig's default.
+    with pytest.raises(ValueError, match="must include temperature"):
+        _parse_sampling_config({"stop_token_ids": [1]})
+    assert _parse_sampling_config(
+        {"temperature": 0.0, "stop_token_ids": [1]}
+    ).temperature == 0.0
+
+
+def test_generation_server_enforces_each_request_context_cap() -> None:
+    """Server cap 131,072. A training request capped at 64 (the rollouter's per-source cap) with a
+    70-token prompt is rejected with vLLM's overlong-prompt wording (Verifiers stops it as
+    truncated); the same prompt without a request cap reaches the generator, and a capped request
+    has its `max_tokens` clamped to the room left."""
+
+    async def run_test() -> None:
+        calls = []
+
+        async def generate_fn(prompt_token_ids, **kwargs):
+            calls.append((len(prompt_token_ids), kwargs["sampling_config"].max_tokens))
+            raise RuntimeError("generator reached")
+
+        server = GenerationServer.Config(max_rollout_tokens=131072).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+
+        async def post(session, num_tokens, **extra):
+            response = await session.post(
+                f"http://{server.host}:{server.port}/inference/v1/generate",
+                headers={"X-Session-ID": "group=1/rollout=2"},
+                json={
+                    "token_ids": [1] * num_tokens,
+                    "sampling_params": {
+                        "temperature": 1.0,
+                        "max_tokens": 50,
+                        "torchtitan_group_id": 1,
+                        "stop_token_ids": [99],
+                        **extra,
+                    },
+                },
+            )
+            return response.status, (await response.json())["error"]
+
+        try:
+            async with ClientSession() as session:
+                over = await post(session, 70, torchtitan_max_rollout_tokens=64)
+                uncapped = await post(session, 70)
+                clamped = await post(session, 40, torchtitan_max_rollout_tokens=64)
+        finally:
+            await server.close()
+
+        assert over[0] == 400
+        assert "Prompt length (70) exceeds maximum context length (64)" in over[1]
+        assert uncapped[0] == 500  # reached the generator
+        assert clamped[0] == 500
+        assert calls == [(70, 50), (40, 24)]
+
+    asyncio.run(run_test())
+
+
+def test_rollouter_sends_each_sources_context_cap() -> None:
+    from torchtitan.rl.examples.verifiers.data import VerifiersTaskSample
+    from torchtitan.rl.examples.verifiers.generation_server import (
+        MAX_ROLLOUT_TOKENS_SAMPLING_PARAM,
+    )
+    from torchtitan.rl.examples.verifiers.rollouter import VerifiersRollouter
+
+    rollouter = object.__new__(VerifiersRollouter)
+    rollouter._verifiers_config = SimpleNamespace(
+        max_rollout_tokens=65536,
+        validation_max_rollout_tokens=None,
+        extra_validation_sets={
+            "deepswe": SimpleNamespace(max_rollout_tokens=131072)
+        },
+    )
+    train = VerifiersTaskSample(verifiers_task_data={})
+    deepswe = VerifiersTaskSample(verifiers_task_data={}, validation_set="deepswe")
+    key = MAX_ROLLOUT_TOKENS_SAMPLING_PARAM
+    assert rollouter._max_rollout_tokens_param(train, 7) == {key: 65536}
+    assert rollouter._max_rollout_tokens_param(train, -3) == {key: 65536}
+    assert rollouter._max_rollout_tokens_param(deepswe, -1_000_001) == {key: 131072}
+    rollouter._verifiers_config.max_rollout_tokens = None
+    assert rollouter._max_rollout_tokens_param(train, 7) == {}

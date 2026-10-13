@@ -23,6 +23,7 @@ from torchtitan.rl.distributed.routing.strategies import (
     StickySessionRoutingStrategy,
 )
 from torchtitan.rl.distributed.routing.types import RoutingCandidate, RoutingContext
+from torchtitan.rl.observability import metrics as m
 
 
 @dataclass(kw_only=True, slots=True)
@@ -82,8 +83,9 @@ class InterGeneratorRouter(Actor, Configurable):
         )
         """Routing strategy, selected by its config type. The default keeps a
         session's requests (one multi-turn rollout) on one generator, so each turn
-        reuses that generator's prefix KV; new sessions go to the least-loaded
-        generator. Other options: ``LeastLoadedRoutingStrategy.Config()``,
+        reuses that generator's prefix KV, unless that generator is overloaded
+        (``repin_load_ratio``); new sessions go to the least-loaded generator.
+        Other options: ``LeastLoadedRoutingStrategy.Config()``,
         ``RoundRobinRoutingStrategy.Config()``."""
 
         hot_swap: bool = True
@@ -102,6 +104,7 @@ class InterGeneratorRouter(Actor, Configurable):
         config: Config,
         *,
         generators: Sequence[Any],
+        forward_session_releases: bool = False,
     ):
         num_actors = math.prod(current_size().values())
         assert (
@@ -109,6 +112,9 @@ class InterGeneratorRouter(Actor, Configurable):
         ), f"InterGeneratorRouter must be a singleton, but its mesh holds {num_actors} actors"
 
         self._config = config
+        # Tell generators when a session ends, so they release its held KV (`hold_session_kv`)
+        # and its CPU-offloaded KV is evicted first (`kv_offload_gib`).
+        self._forward_session_releases = forward_session_releases
         self._generators = [
             _GeneratorHandle(
                 actor=generator,
@@ -123,6 +129,8 @@ class InterGeneratorRouter(Actor, Configurable):
             h.serving.set()
 
         self._strategy = config.strategy.build()
+        # `_strategy.num_repins` at the last `get_session_kv_metrics`.
+        self._num_repins_logged = 0
         self._serving = asyncio.Event()
         self._refresh_serving_status()
 
@@ -194,9 +202,13 @@ class InterGeneratorRouter(Actor, Configurable):
         finally:
             self._release(h, routing_ctx.estimated_cost)
 
-    def _release_session(self, session_id: str) -> None:
-        """Drop a session's affinity."""
+    async def _release_session(self, session_id: str) -> None:
+        """Drop a session's affinity, and tell its generator to release the session's held KV."""
+        pinned = self._strategy.pinned_candidate(RoutingContext(session_id=session_id))
         self._strategy.release_session(session_id)
+        # Without a pin (non-sticky routing), `release_groups` frees the held KV at group end.
+        if self._forward_session_releases and pinned is not None:
+            await pinned.rank0_actor.release_sessions.call_one([session_id])
 
     async def _fanout(
         self,
@@ -323,13 +335,34 @@ class InterGeneratorRouter(Actor, Configurable):
 
     @concurrent_endpoint
     async def release_session(self, routing_session_id: str) -> None:
-        """Forget a routing session after its rollout's last generation call."""
-        self._release_session(routing_session_id)
+        """Forget a routing session after its rollout's last generation call, and tell its
+        generator to release the session's held KV."""
+        await self._release_session(routing_session_id)
 
     @concurrent_endpoint
     async def release_groups(self, group_ids: list[int]) -> None:
         """Tell every generator that these rollout groups are finished."""
         await self._fanout("release_groups", group_ids)
+
+    @concurrent_endpoint
+    async def get_session_kv_metrics(self) -> list[m.Metric]:
+        """Every generator's session-KV metrics (from its rank 0) and the sessions re-pinned to
+        another generator, since the last call."""
+        return await self._get_session_kv_metrics()
+
+    async def _get_session_kv_metrics(self) -> list[m.Metric]:
+        per_generator = await asyncio.gather(
+            *(h.rank0_actor.get_session_kv_metrics.call_one() for h in self._generators)
+        )
+        num_repins = self._strategy.num_repins
+        repinned_sessions = num_repins - self._num_repins_logged
+        self._num_repins_logged = num_repins
+        return [
+            *(metric for metrics in per_generator for metric in metrics),
+            m.Metric(
+                "generator/session_kv/repinned_sessions", m.Sum(repinned_sessions)
+            ),
+        ]
 
     @concurrent_endpoint
     async def pull_model_state_dict(self, policy_version: int) -> None:

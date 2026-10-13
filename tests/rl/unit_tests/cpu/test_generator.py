@@ -16,6 +16,7 @@ The uneven-decode integration test requires four GPUs and a torchrun launcher.
 """
 
 import asyncio
+import bisect
 import concurrent.futures
 import gc
 import math
@@ -23,8 +24,9 @@ import os
 import shutil
 import tempfile
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast, NamedTuple
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -32,6 +34,7 @@ import torch
 import torch.distributed as dist
 
 import torchtitan.rl.generator as generator_module
+import vllm.distributed.parallel_state as vllm_parallel_state
 from torchstore import RankRole
 from torchtitan.components.optim import AdamW
 from torchtitan.config import CommConfig, DebugConfig
@@ -62,9 +65,13 @@ from torchtitan.rl.model.vllm_worker import (
 )
 from torchtitan.rl.observability import metrics as m
 from vllm import SamplingParams
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    OffloadingWorkerMetadata,
+)
 from vllm.exceptions import VLLMValidationError
 from vllm.logprobs import FlatLogprobs, Logprob
 from vllm.sampling_params import RequestOutputKind
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, KVConnectorOutput
 
 
 class _FakeRenderer:
@@ -101,7 +108,7 @@ class _FakeEngine:
         self.reset_prefix_cache_calls.append((args, kwargs))
 
 
-def _sample(*, token_ids=(10, 11), finish_reason="stop"):
+def _sample(*, token_ids=(10, 11), finish_reason="stop", routed_experts=None):
     # What vLLM returns with flat_logprobs=True and logprobs=0: one logprob (-0.1) per generated token.
     logprobs = FlatLogprobs()
     for tok in token_ids:
@@ -110,6 +117,7 @@ def _sample(*, token_ids=(10, 11), finish_reason="stop"):
         token_ids=list(token_ids),
         logprobs=logprobs,
         finish_reason=finish_reason,
+        routed_experts=routed_experts,
     )
 
 
@@ -137,6 +145,7 @@ def _generator():
     per-request helpers (`_build_sampling_params`) read."""
     generator = VLLMGenerator.__new__(VLLMGenerator)
     generator._engine = _FakeEngine()
+    generator._session_kv = None
     generator._rank = 0
     generator.policy_version = 7
     generator.config = SimpleNamespace(
@@ -145,6 +154,89 @@ def _generator():
         reset_kv_cache_on_weight_sync=False,
     )
     return generator
+
+
+def _session_kv_generator(*, hold: bool, offload: bool):
+    """A bare generator with a stub holder, as `get_session_kv_metrics` reads it."""
+    generator = _generator()
+    generator.config = SimpleNamespace(hold_session_kv=hold)
+    generator._session_kv = SimpleNamespace(
+        num_sessions=80,
+        num_held_blocks=900,
+        num_evicted=3,
+        num_stall_evicted=1,
+        gpu_hit_prefix_tokens=4000,
+        cpu_hit_prefix_tokens=1000,
+        recomputed_prefix_tokens=0,
+        cpu_used_fraction=lambda: 0.5,
+    )
+    generator._session_kv_totals = {}
+    generator._kv_offload_store_bytes = (
+        SimpleNamespace(store_bytes=10) if offload else None
+    )
+    kv_cache_manager = SimpleNamespace(usage=0.3)
+    generator._engine = SimpleNamespace(
+        engine_core=SimpleNamespace(
+            engine_core=SimpleNamespace(
+                scheduler=SimpleNamespace(kv_cache_manager=kv_cache_manager)
+            )
+        )
+    )
+    return generator
+
+
+def _session_kv_metrics(generator) -> dict[str, float]:
+    """Mean value per metric name (one generator, so mean == max)."""
+    metrics = asyncio.run(generator.get_session_kv_metrics())
+    return {
+        key.removeprefix("generator/session_kv/").removesuffix("/mean"): value
+        for key, value in m.MetricsProcessor._aggregate_metrics(metrics).items()
+        if key.endswith("/mean")
+    }
+
+
+def test_session_kv_metrics_are_levels_now_and_counts_since_the_last_call():
+    generator = _session_kv_generator(hold=True, offload=True)
+    first = _session_kv_metrics(generator)
+    holder = generator._session_kv
+    holder.num_sessions, holder.num_evicted = 78, 5
+    holder.recomputed_prefix_tokens = 528
+    generator._kv_offload_store_bytes.store_bytes = 25
+    second = _session_kv_metrics(generator)
+
+    assert first == {
+        "gpu_used_fraction": 0.3,
+        "held_sessions": 80,
+        "held_blocks": 900,
+        "cpu_used_fraction": 0.5,
+        "gpu_hit_prefix_tokens": 4000,
+        "cpu_hit_prefix_tokens": 1000,
+        "recomputed_prefix_tokens": 0,
+        "evicted_sessions": 3,
+        "stall_evicted_sessions": 1,
+        "cpu_store_bytes": 10,
+    }
+    assert second["held_sessions"] == 78
+    assert (second["evicted_sessions"], second["stall_evicted_sessions"]) == (2, 0)
+    assert (second["recomputed_prefix_tokens"], second["cpu_store_bytes"]) == (528, 15)
+    assert second["gpu_hit_prefix_tokens"] == 0
+
+
+def test_session_kv_metrics_follow_the_enabled_features():
+    without_offload = _session_kv_metrics(
+        _session_kv_generator(hold=True, offload=False)
+    )
+    without_hold = _session_kv_metrics(_session_kv_generator(hold=False, offload=True))
+    generator = _generator()
+
+    assert {"cpu_used_fraction", "cpu_store_bytes"}.isdisjoint(without_offload)
+    assert {
+        "held_sessions",
+        "held_blocks",
+        "evicted_sessions",
+        "stall_evicted_sessions",
+    }.isdisjoint(without_hold)
+    assert asyncio.run(generator.get_session_kv_metrics()) == []
 
 
 def test_initialize_torchstore_client_uses_requester_index():
@@ -234,6 +326,7 @@ def test_process_finished_requests_resolves_reply_with_completion():
         assert completion.request_id == "r0"
         assert completion.token_ids == [10, 11]
         assert completion.token_logprobs == [-0.1, -0.1]
+        assert completion.topk_token_ids is None
         assert completion.finish_reason == "length"
         assert completion.min_policy_version == 7  # min = version it was admitted under
         assert completion.max_policy_version == 8  # max = live version at finish
@@ -245,6 +338,45 @@ def test_process_finished_requests_resolves_reply_with_completion():
                 "generator/inflight_requests_at_completion/max"
             ]
             == 1
+        )
+
+    asyncio.run(main())
+
+
+def test_process_finished_requests_splits_topk_logprobs():
+    async def main():
+        dispatcher = _dispatcher()
+        reply = concurrent.futures.Future()
+        reply.set_running_or_notify_cancel()
+        generation = OutstandingGeneration(reply=reply, metrics_prefix="generator")
+        generation.min_policy_version = 7
+        dispatcher._rank0_outstanding_generations = {"r0": generation}
+        # vLLM's layout with logprobs=2: each position holds [sampled, top-1, top-2], and
+        # the sampled token repeats when it is also in the top-k.
+        logprobs = FlatLogprobs()
+        logprobs.append_fast(
+            [10, 10, 3], [-0.1, -0.1, -2.5], iter([1, 1, 2]), [None] * 3
+        )
+        logprobs.append_fast(
+            [11, 4, 11], [-0.7, -0.5, -0.7], iter([2, 1, 2]), [None] * 3
+        )
+        sample = SimpleNamespace(
+            token_ids=[10, 11],
+            logprobs=logprobs,
+            finish_reason="stop",
+            routed_experts=None,
+        )
+
+        dispatcher.process_finished_requests(
+            [_request_output(outputs=[sample])], policy_version=7
+        )
+
+        completion = await asyncio.wrap_future(reply)
+        assert completion.token_logprobs == [-0.1, -0.7]
+        assert completion.topk_token_ids.dtype == torch.int32
+        assert completion.topk_token_ids.tolist() == [[10, 3], [4, 11]]
+        torch.testing.assert_close(
+            completion.topk_logprobs, torch.tensor([[-0.1, -2.5], [-0.5, -0.7]])
         )
 
     asyncio.run(main())
@@ -312,6 +444,14 @@ def test_build_sampling_params_matches_contract():
     assert params.seed == 44
 
 
+def test_build_sampling_params_requests_topk_logprobs():
+    generator = _generator()
+    params = generator._build_sampling_params(
+        SamplingConfig(max_tokens=8, stop_token_ids=[99], num_topk_logprobs=32)
+    )
+    assert params.logprobs == 32
+
+
 def test_build_sampling_params_seed_defaults_to_none():
     generator = _generator()
     params = generator._build_sampling_params(
@@ -351,16 +491,33 @@ def _admit_through_engine_loop(monkeypatch, generator, requests):
     return rejected_requests
 
 
-def _engine_request(request_id: str, *, min_policy_version: int):
+def _engine_request(request_id: str, *, min_policy_version: int, group_id: int = 3):
     request = EngineRequest(
         request_id=request_id,
         prompt_token_ids=[1, 2],
         sampling=SamplingConfig(),
-        group_id=3,
+        group_id=group_id,
         routing_session_id="group=3/rollout=0",
+        arrival_time=1.5,
     )
     request.min_policy_version = min_policy_version
     return request
+
+
+def test_admission_passes_group_id_as_priority_and_arrival_time(monkeypatch):
+    # Priority is the group id (3), not the pinned version (6); every validation id shares -1.
+    generator = _generator()
+    engine = cast(_FakeEngine, generator._engine)
+    requests = [
+        _engine_request("train", min_policy_version=6, group_id=3),
+        _engine_request("val_1", min_policy_version=6, group_id=-1),
+        _engine_request("val_5", min_policy_version=6, group_id=-5),
+    ]
+
+    _admit_through_engine_loop(monkeypatch, generator, requests)
+
+    assert [kwargs["priority"] for _, kwargs in engine.add_requests] == [3, -1, -1]
+    assert [kwargs["arrival_time"] for _, kwargs in engine.add_requests] == [1.5] * 3
 
 
 def test_admission_salts_prompt_with_min_policy_version(monkeypatch):
@@ -570,6 +727,54 @@ def test_batch_invariant_requires_kv_cache_reset():
         )
 
 
+def test_kv_offload_rejects_kv_cache_reset_on_weight_sync():
+    with pytest.raises(ValueError, match="needs reset_kv_cache_on_weight_sync=False"):
+        VLLMGenerator.Config(
+            model=_MODEL_CONFIG,
+            parallelism=_PARALLELISM,
+            kv_offload_gib=16,
+            reset_kv_cache_on_weight_sync=True,
+        )
+
+
+def test_kv_offload_gib_rejects_negative_sizes():
+    with pytest.raises(ValueError, match="kv_offload_gib must be >= 0, got -1"):
+        VLLMGenerator.Config(
+            model=_MODEL_CONFIG, parallelism=_PARALLELISM, kv_offload_gib=-1
+        )
+
+
+@pytest.mark.parametrize(
+    "kv_offload_gib, generator_world_size, procs_on_host, raises",
+    [
+        (128, 1, "4", True),  # 4 one-proc generators: 512 GiB
+        (96, 1, "4", False),  # 384 GiB
+        (128, 8, "4", False),  # half of an 8-proc generator: 64 GiB
+        (512, 1, None, True),  # no launcher value: this generator alone
+    ],
+)
+def test_kv_offload_must_fit_in_dev_shm_with_the_hosts_other_generators(
+    monkeypatch, kv_offload_gib, generator_world_size, procs_on_host, raises
+):
+    monkeypatch.setattr(
+        generator_module.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=445 * (1 << 30)),
+    )
+    if procs_on_host is None:
+        monkeypatch.delenv(generator_module.GENERATOR_PROCS_ON_HOST_ENV, raising=False)
+    else:
+        monkeypatch.setenv(generator_module.GENERATOR_PROCS_ON_HOST_ENV, procs_on_host)
+    with (
+        pytest.raises(ValueError, match="but /dev/shm is 445 GiB: lower kv_offload_gib")
+        if raises
+        else nullcontext()
+    ):
+        generator_module._check_kv_offload_fits_in_dev_shm(
+            kv_offload_gib, generator_world_size
+        )
+
+
 def test_qwen36_27b_perf_config():
     from torchtitan_recipes.rl.alphabet_sort import rl_grpo_qwen3_6_27b_varlen_perf
 
@@ -611,6 +816,26 @@ def _build_engine_kwargs(monkeypatch, tmp_path, config: VLLMGenerator.Config) ->
     return engine_args.call_args.kwargs
 
 
+def test_kv_offload_checks_dev_shm_before_the_engine_build(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        generator_module.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=8 * (1 << 30)),
+    )
+    monkeypatch.setattr(generator_module, "EngineArgs", Mock())
+    monkeypatch.setattr(generator_module, "register_to_vllm", Mock())
+    monkeypatch.setattr(generator_module, "init_logger", Mock())
+    monkeypatch.setattr(generator_module, "sl", Mock())
+    with pytest.raises(ValueError, match="but /dev/shm is 8 GiB: lower kv_offload_gib"):
+        VLLMGenerator(
+            VLLMGenerator.Config(model=_MODEL_CONFIG, kv_offload_gib=16),
+            model_path="unused",
+            max_num_seqs=8,
+            output_dir=str(tmp_path),
+            rank=0,
+        )
+
+
 def test_extra_vllm_engine_args_reach_engine_args(monkeypatch, tmp_path):
     engine_kwargs = _build_engine_kwargs(
         monkeypatch,
@@ -620,7 +845,26 @@ def test_extra_vllm_engine_args_reach_engine_args(monkeypatch, tmp_path):
         ),
     )
     assert engine_kwargs["watermark"] == 0.03
-    assert engine_kwargs["scheduling_policy"] == "fcfs"
+    assert engine_kwargs["scheduling_policy"] == "priority"
+
+
+def test_kv_offload_sets_vllm_cpu_offload(monkeypatch, tmp_path):
+    engine_kwargs = _build_engine_kwargs(
+        monkeypatch,
+        tmp_path,
+        VLLMGenerator.Config(model=_MODEL_CONFIG, kv_offload_gib=16),
+    )
+    assert engine_kwargs["kv_offloading_size"] == 16
+    # vLLM adds cpu_bytes_to_use from kv_offloading_size when it builds its config.
+    assert engine_kwargs["kv_transfer_config"].kv_connector_extra_config == {
+        "offload_prompt_only": False,
+        "eviction_policy": "lru",
+    }
+
+    engine_kwargs = _build_engine_kwargs(
+        monkeypatch, tmp_path, VLLMGenerator.Config(model=_MODEL_CONFIG)
+    )
+    assert not engine_kwargs.keys() & {"kv_offloading_size", "kv_transfer_config"}
 
 
 @pytest.mark.parametrize(
@@ -634,6 +878,7 @@ def test_extra_vllm_engine_args_reach_engine_args(monkeypatch, tmp_path):
             r"use VLLMGenerator\.Config\.max_num_batched_tokens",
         ),
         ("seed", r"use VLLMGenerator\.Config\.debug\.seed"),
+        ("kv_offloading_size", r"use VLLMGenerator\.Config\.kv_offload_gib"),
     ],
 )
 def test_extra_vllm_engine_args_rejects_torchtitan_owned_keys(key, match):
@@ -641,6 +886,147 @@ def test_extra_vllm_engine_args_rejects_torchtitan_owned_keys(key, match):
     with pytest.raises(ValueError, match=match):
         add_extra_vllm_engine_args(engine_kwargs, {key: 1})
     assert engine_kwargs == {"scheduling_policy": "fcfs"}
+
+
+# --- CPU KV offload with several vLLM workers (_enable_multi_worker_kv_offload) ---
+
+
+class _ConnectorConfig(NamedTuple):
+    num_workers: int
+
+
+def _vllm_assign_request_id(request) -> None:
+    """Stands in for vLLM's InputProcessor.assign_request_id."""
+
+
+def _multi_worker_engine(
+    monkeypatch,
+    *,
+    tp_size: int,
+    peer_entry: Any = None,
+    hash_randomization: int = 0,
+    input_processor: Any = None,
+):
+    """A fake engine set up by `_enable_multi_worker_kv_offload` as TP rank 0 of DP=2 x TP.
+
+    `peer_entry(own_entry)` returns TP rank 1's part of each all-gather. Returns the engine, what
+    the scheduler's `update_from_output` received, and what this rank contributed to each gather.
+    """
+    received, gathers = [], []
+    connector_scheduler = SimpleNamespace(
+        config=_ConnectorConfig(num_workers=2 * tp_size), _job_counter=0
+    )
+    scheduler = SimpleNamespace(
+        connector=SimpleNamespace(connector_scheduler=connector_scheduler),
+        requests={},
+        update_from_output=lambda scheduler_output, output: received.append(output),
+    )
+    engine = SimpleNamespace(
+        engine_core=SimpleNamespace(engine_core=SimpleNamespace(scheduler=scheduler)),
+        input_processor=input_processor
+        or SimpleNamespace(assign_request_id=_vllm_assign_request_id),
+    )
+    tp_group = SimpleNamespace(world_size=tp_size, rank_in_group=0, cpu_group=None)
+    monkeypatch.setattr(vllm_parallel_state, "get_tp_group", lambda: tp_group)
+    flags = SimpleNamespace(hash_randomization=hash_randomization)
+    monkeypatch.setattr(generator_module, "sys", SimpleNamespace(flags=flags))
+
+    def all_gather_object(gathered, own_entry, group):
+        gathers.append(own_entry)
+        gathered[0], gathered[1] = own_entry, peer_entry(own_entry)
+
+    monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
+    generator_module._enable_multi_worker_kv_offload(cast(Any, engine))
+    return engine, received, gathers
+
+
+def _finished(job_id: int, request_id: str | None = None) -> KVConnectorOutput:
+    """One worker's finished transfers in a step: a load (of `request_id`) or a store."""
+    meta = OffloadingWorkerMetadata()
+    meta.mark_completed(job_id)
+    return KVConnectorOutput(
+        kv_connector_worker_meta=meta,
+        finished_recving={request_id} if request_id else None,
+    )
+
+
+def test_multi_worker_kv_offload_finishes_a_load_once_every_tp_rank_did(monkeypatch):
+    peer_outputs = iter([None, _finished(7, "r-0")])  # TP rank 1 finishes a step later
+    engine, received, _ = _multi_worker_engine(
+        monkeypatch, tp_size=2, peer_entry=lambda own: (own[0], next(peer_outputs))
+    )
+    scheduler = engine.engine_core.engine_core.scheduler
+    step = SimpleNamespace(num_scheduled_tokens={"r-0": 8})
+
+    own_output = replace(
+        EMPTY_MODEL_RUNNER_OUTPUT, kv_connector_output=_finished(7, "r-0")
+    )
+    scheduler.update_from_output(step, own_output)
+    scheduler.update_from_output(step, EMPTY_MODEL_RUNNER_OUTPUT)
+
+    # vLLM's connector adds up these counts and finishes job 7 at 2 of 2.
+    first, second = (output.kv_connector_output for output in received)
+    assert first.kv_connector_worker_meta.completed_jobs == {7: 1}
+    assert not first.finished_recving
+    assert second.kv_connector_worker_meta.completed_jobs == {7: 1}
+    assert second.finished_recving == {"r-0"}
+    # The second step's own output was vLLM's shared EMPTY_MODEL_RUNNER_OUTPUT.
+    assert EMPTY_MODEL_RUNNER_OUTPUT.kv_connector_output is None
+    # 4 (DP=2 x TP=2) before: each scheduler waits for its own TP group only.
+    assert scheduler.connector.connector_scheduler.config.num_workers == 2
+
+
+def test_multi_worker_kv_offload_raises_when_tp_ranks_diverge(monkeypatch):
+    peer = {"entry": None}
+    engine, _, gathers = _multi_worker_engine(
+        monkeypatch, tp_size=2, peer_entry=lambda own: peer["entry"] or own
+    )
+    update_from_output = engine.engine_core.engine_core.scheduler.update_from_output
+    # TP rank 1 schedules another request with the same token count.
+    update_from_output(
+        SimpleNamespace(num_scheduled_tokens={"r-1": 8}), EMPTY_MODEL_RUNNER_OUTPUT
+    )
+    peer["entry"] = gathers[-1]
+
+    with pytest.raises(RuntimeError, match="schedulers diverged"):
+        update_from_output(
+            SimpleNamespace(num_scheduled_tokens={"r-0": 8}), EMPTY_MODEL_RUNNER_OUTPUT
+        )
+
+
+def test_multi_worker_kv_offload_gives_every_tp_rank_the_same_request_ids(monkeypatch):
+    internal_ids = []
+    for _ in range(2):  # two TP ranks admit the same requests in the same order
+        engine, _, _ = _multi_worker_engine(monkeypatch, tp_size=2)
+        requests = [SimpleNamespace(request_id=request_id) for request_id in "aba"]
+        for request in requests:
+            engine.input_processor.assign_request_id(request)
+        internal_ids.append(
+            [(request.request_id, request.external_req_id) for request in requests]
+        )
+    assert (
+        internal_ids[0] == internal_ids[1] == [("a-0", "a"), ("b-1", "b"), ("a-2", "a")]
+    )
+
+
+def test_multi_worker_kv_offload_with_tp1_only_sets_the_expected_count(monkeypatch):
+    engine, _, _ = _multi_worker_engine(monkeypatch, tp_size=1)
+    connector_scheduler = (
+        engine.engine_core.engine_core.scheduler.connector.connector_scheduler
+    )
+    assert connector_scheduler.config.num_workers == 1  # 2 (DP=2) before
+    assert engine.input_processor.assign_request_id is _vllm_assign_request_id
+
+
+def test_multi_worker_kv_offload_needs_pythonhashseed_0(monkeypatch):
+    with pytest.raises(ValueError, match="needs PYTHONHASHSEED=0"):
+        _multi_worker_engine(monkeypatch, tp_size=2, hash_randomization=1)
+
+
+def test_multi_worker_kv_offload_needs_vllms_assign_request_id(monkeypatch):
+    """A vLLM that renamed it would keep random ids, and the first TP reload would hang."""
+    with pytest.raises(RuntimeError, match="no assign_request_id to replace"):
+        _multi_worker_engine(monkeypatch, tp_size=2, input_processor=SimpleNamespace())
 
 
 # --- CUDA graph config (VLLMCudaGraphConfig.get_vllm_compilation_config) ---
@@ -773,26 +1159,59 @@ def test_cuda_graph_full_mode_no_compile():
 
 
 def test_cuda_graph_decode_only_capture_sizes_cover_max_num_seqs():
-    # FULL_DECODE_ONLY only graphs decode, so capture up to max_num_seqs (plus
-    # max_num_seqs itself when not a power of 2).
+    # FULL_DECODE_ONLY only graphs decode, so capture up to max_num_seqs itself.
+    # Same sizes as the `_default_capture_sizes` docstring example.
     cfg = VLLMCudaGraphConfig(mode="FULL_DECODE_ONLY").get_vllm_compilation_config(
-        max_num_seqs=500,
+        max_num_seqs=300,
         expert_sequence_parallel_size=1,
         enable_sequence_parallel=False,
     )
-    assert cfg.cudagraph_capture_sizes == [1, 2, 4, 8, 16, 32, 64, 128, 256, 500]
+    assert cfg.cudagraph_capture_sizes == [
+        *[1, 2, 4],
+        *range(8, 256, 8),  # +8
+        *[256, 272, 288],  # +16
+        300,  # the cap
+    ]
 
 
-def test_cuda_graph_full_mode_extends_capture_sizes_to_chunk():
-    # FULL also graphs prefill, so sizes extend to the chunked-prefill chunk
-    # (max_num_batched_tokens, 2048) on top of max_num_seqs.
+@pytest.mark.parametrize("max_num_seqs", [1, 20, 128, 230, 256, 300, 500, 1024])
+def test_cuda_graph_decode_capture_sizes_are_dense(max_num_seqs):
+    cfg = VLLMCudaGraphConfig(mode="FULL_DECODE_ONLY").get_vllm_compilation_config(
+        max_num_seqs=max_num_seqs,
+        expert_sequence_parallel_size=1,
+        enable_sequence_parallel=False,
+    )
+    sizes = cfg.cudagraph_capture_sizes
+    assert sizes == sorted(set(sizes))
+    assert sizes[-1] == max_num_seqs
+    # Any batch pads by fewer than 8 rows up to 256, fewer than 16 above.
+    for batch in range(1, max_num_seqs + 1):
+        padding = sizes[bisect.bisect_left(sizes, batch)] - batch
+        assert padding < (8 if batch <= 256 else 16)
+
+
+def test_cuda_graph_full_mode_extends_capture_sizes_to_1024():
+    # FULL also graphs prefill: the ladder continues past max_num_seqs up to the
+    # chunked-prefill budget (max_num_batched_tokens, 2048 here), capped at 1024.
+    # vLLM's own defaults, so the sizes match a stock vLLM engine.
     cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
-        max_num_seqs=500,
+        max_num_seqs=230,
         expert_sequence_parallel_size=1,
         enable_sequence_parallel=False,
     )
-    assert cfg.cudagraph_capture_sizes[-1] == 2048
-    assert 500 in cfg.cudagraph_capture_sizes  # decode batch captured exactly
+    assert cfg.cudagraph_capture_sizes == [
+        *[1, 2, 4],
+        *range(8, 256, 8),
+        *range(256, 1025, 16),
+    ]
+    # A smaller budget caps the ladder; max_num_seqs stays covered.
+    small = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
+        max_num_seqs=600,
+        expert_sequence_parallel_size=1,
+        enable_sequence_parallel=False,
+        max_num_batched_tokens=512,
+    )
+    assert small.cudagraph_capture_sizes[-1] == 600
 
 
 def test_cuda_graph_rejects_nonpositive_max_num_seqs():

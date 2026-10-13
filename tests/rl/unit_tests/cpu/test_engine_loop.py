@@ -45,11 +45,14 @@ from torchtitan.rl.generator import (
     ModelStateDictPullMessage,
     RequestDispatcher,
     SamplingConfig,
+    SessionReleaseMessage,
     VLLMGenerator,
 )
 from vllm.logprobs import FlatLogprobs, Logprob
 
-_TIMEOUT_S = 5
+# Upper bound only: a pull's gc.collect() takes ~0.7 s in the full suite's heap, and a busy host
+# pushed it past 5 s once.
+_TIMEOUT_S = 30
 
 
 @pytest.fixture
@@ -77,6 +80,7 @@ def _bare_generator(
     generator.policy_version = 0
     generator._group_min_policy_versions = {}
     generator._prefetched_model_state_dict = {}
+    generator._session_kv = None
     # Engine-thread tests bind the queue once the engine thread's event loop exists.
     if event_loop is not None:
         generator._engine_loop_queue = EngineLoopQueue(event_loop)
@@ -111,6 +115,7 @@ def _request(
         sampling=SamplingConfig(),
         group_id=group_id,
         routing_session_id=routing_session_id or request_id,
+        arrival_time=0.0,
     )
 
 
@@ -392,7 +397,7 @@ def test_step_sticky_session_reuses_dp_rank(runner) -> None:
     generator = _bare_generator(
         event_loop=runner.get_loop(),
         dp_size=3,
-        dp_routing_strategy=StickySessionRoutingStrategy.Config(),
+        dp_routing_strategy=StickySessionRoutingStrategy.Config(repin_load_ratio=None),
     )
     pending_engine_requests: list[EngineRequest] = []
     first = _request("r0", routing_session_id="s0")
@@ -504,6 +509,7 @@ def _finished_output(request_id: str) -> SimpleNamespace:
                 token_ids=[7],
                 logprobs=logprobs,
                 finish_reason="stop",
+                routed_experts=None,
             )
         ],
     )
@@ -521,7 +527,7 @@ class _FakeEngine:
         self.running: list[str] = []
         self.threads: set[threading.Thread] = set()
 
-    def add_request(self, *, request_id, prompt, params):
+    def add_request(self, *, request_id, prompt, params, arrival_time, priority):
         self.threads.add(threading.current_thread())
         self.running.append(request_id)
 
@@ -540,10 +546,10 @@ class _RejectingEngine(_FakeEngine):
 
     max_prompt_len = 2
 
-    def add_request(self, *, request_id, prompt, params):
+    def add_request(self, *, request_id, prompt, **kwargs):
         if len(prompt["prompt_token_ids"]) > self.max_prompt_len:
             raise ValueError(f"prompt of {request_id} is too long")
-        super().add_request(request_id=request_id, prompt=prompt, params=params)
+        super().add_request(request_id=request_id, prompt=prompt, **kwargs)
 
 
 class _StuckEngine(_FakeEngine):
@@ -881,6 +887,8 @@ def test_crash_fails_outstanding_and_queued_calls_and_later_calls(
         failing_pull = asyncio.create_task(generator.pull_model_state_dict(3))
         assert await asyncio.to_thread(reading.wait, _TIMEOUT_S)
 
+        # A session release (no reply) queued ahead of the calls must not stop them from failing.
+        generator._engine_loop_queue.put(SessionReleaseMessage(session_ids=["s"]))
         queued = [
             _generate(generator, "r0"),
             asyncio.create_task(generator.pull_model_state_dict(4)),

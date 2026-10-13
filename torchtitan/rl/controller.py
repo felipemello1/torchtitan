@@ -25,7 +25,7 @@ _data_input_loop                                      _rollout_loop[N] (group wo
                         v                                                     | v
 RolloutGroupWorkBuffer
 +---------------------------------------------------------------------------------------------------------------------+
-| active slots = (target_offpolicy_steps + 1) * num_prompts_per_train_step                                                |
+| active slots = (target_offpolicy_steps + 1) * num_prompts_per_train_step, or the adaptive buffer's demand           |
 |                                                                                                                     |
 | caller            group_buffer call                                            state / active slot                  |
 | _data_input_loop  add_work(RolloutGroupWork)                                   WAITING; slot acquired               |
@@ -33,6 +33,7 @@ RolloutGroupWorkBuffer
 | _rollout_loop[N]  finalize_work(RolloutGroup)                                  INFLIGHT -> FINALIZED                |
 | _batcher_loop     RolloutGroup = take_finalized()                              FINALIZED -> taken (slot still held) |
 | _batcher_loop     release_active_groups(1, "untrainable_group")                slot released                        |
+| _trainer_loop     record_step_start(trainer_policy_version)                    adaptive: demand updated             |
 | _trainer_loop     release_active_groups(num_prompts_per_train_step, "trained")  slots released after weight pull     |
 +---------------------------------------------------------------------------------------------------------------------+
                                                   |
@@ -40,17 +41,16 @@ RolloutGroupWorkBuffer
                                                   v
 _batcher_loop
 +----------------------------------------------------------------------------------------+
-| training_sample_group = training_sample_builder.build_from_group(rollout_group=group)  |
+| batch, trainable = batcher.add_group.call_one(group)                                   |
 | if no trainable samples: group_buffer.release_active_groups(1, "untrainable_group")    |
-| batch, trainable = batcher.add_training_samples(training_sample_group)                  |
 | training_batch_queue.put(TrainerStepBatch)                                             |
 +-----------------------+------------------------------+---------------------------------+
                         |  ^                           |
           add group     |  | maybe_training_batch      | put batch
                         v  |                           v
-Batcher                                              training_batch_queue
+BatcherActor (own process)                           training_batch_queue
 +-------------------------------------------------+   +----------------------------------------------+
-| accumulated TrainingSampleGroups                |   | size 1; holds TrainerStepBatch | None        |
+| build_from_group -> add_training_samples        |   | size 1; holds TrainerStepBatch | None        |
 | pack at num_prompts_per_train_step               |   +---------------------+------------------------+
 +-------------------------------------------------+                         |
                                                                          | packed = training_batch_queue.get()
@@ -104,6 +104,7 @@ import torchstore as ts
 
 from monarch.actor import ProcMesh, this_host
 
+from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.renderer import RendererConfig
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import apply_overrides, Configurable, OverrideConfig
@@ -112,20 +113,29 @@ from torchtitan.rl.components.batcher import Batcher, TrainerStepBatch
 from torchtitan.rl.components.checkpointer import DATALOADER_STATE_KEY
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.components.work_buffer import (
+    AdaptiveRolloutGroupWorkBuffer,
+    DEFAULT_SEQS_PER_GENERATOR_DP_SHARD,
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
+from torchtitan.rl.distributed.monarch_actors.batcher import BatcherActor
 from torchtitan.rl.distributed.monarch_actors.generator import VLLMGeneratorActor
 from torchtitan.rl.distributed.monarch_actors.trainer import TrainerActor
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.distributed.torch_elastic import setup_torch_elastic_env
 from torchtitan.rl.distributed.weight_sync import WeightSyncManager
-from torchtitan.rl.generator import SamplingConfig, VLLMGenerator
+from torchtitan.rl.generator import (
+    EXTRA_VALIDATION_GROUP_ID_STRIDE,
+    SamplingConfig,
+    VLLMGenerator,
+)
+from torchtitan.rl.losses import ScoreCenteringLoss
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     compute_rollout_metrics,
+    GCTimer,
     MetricsTimer,
 )
 from torchtitan.rl.observability.rollout_recorder import RolloutSampleRecorder
@@ -137,19 +147,118 @@ from torchtitan.tools.garbage_collector import GarbageCollector
 
 logger = logging.getLogger(__name__)
 
+# Per-generator ceiling on vLLM's max_num_seqs. Decode CUDA graphs cover up to it
+# (`_default_capture_sizes`). Agent rollouts spend most of their time in tools, so a generator
+# rarely schedules more than a few dozen sequences at once even with hundreds in flight.
+# The adaptive buffer's capacity default without a target fills exactly this many per shard.
+MAX_NUM_SEQS_PER_GENERATOR = DEFAULT_SEQS_PER_GENERATOR_DP_SHARD
+
 
 @dataclass(kw_only=True, slots=True)
 class ValidationConfig:
-    """Held-out validation that runs at the start and end of training"""
+    """Held-out validation that runs before training, every `freq` steps, and after the last step.
 
-    # TODO: enable periodic validation with proper overlapping
+    Example, `freq=25`, `overlap_training=True`, 100 steps:
+        step 0:   pass 0 starts on policy 0; training starts at once.
+        step 7:   pass 0 ends and is logged at step 7; its slowest rollouts sampled up to policy 6.
+        step 25:  pass 25 starts on policy 25 or later. Had pass 0 still been running, pass 25 would
+                  start at the end of the step in which pass 0 ends.
+        step 100: a pass that ends in step 100, or is still running, is logged at step 100; the
+                  final pass then logs at step 101.
+    """
 
     steps: int = 20
     """Maximum prompts per pass. -1 consumes one finite source pass; 0 disables."""
 
+    freq: int | None = None
+    """Also validate after every `freq` train steps; None validates only before and after."""
+
+    overlap_training: bool = False
+    """False: training waits for each pass, so all its rollouts sample one policy.
+    True: the pre-training and periodic passes run beside training on the same generators, so a
+    rollout's later tokens can sample a newer policy (`validation/max_policy_version`). Keep False
+    for a clean pre-training score."""
+
+    temperature: float = 1.0
+    """Sampling temperature. 1.0 samples the model's distribution as is; 0.0 is greedy and needs
+    `num_samples_per_prompt=1`."""
+
+    num_samples_per_prompt: int = 1
+    """Sibling rollouts sampled per prompt. `validation_reward` averages all of them; set 4 for
+    lower-noise validation. With n > 1, `validation_reward/best_of_{n}` averages each prompt's
+    best reward."""
+
     def __post_init__(self) -> None:
         if self.steps < -1:
             raise ValueError("validation steps must be -1 or non-negative")
+        if self.freq is not None and self.freq <= 0:
+            raise ValueError(f"validation freq must be positive, got {self.freq}")
+        if self.temperature < 0:
+            raise ValueError(
+                f"validation temperature must be non-negative, got {self.temperature}"
+            )
+        if self.num_samples_per_prompt < 1:
+            raise ValueError(
+                "validation num_samples_per_prompt must be >= 1, got "
+                f"{self.num_samples_per_prompt}"
+            )
+        if self.temperature == 0 and self.num_samples_per_prompt > 1:
+            raise ValueError(
+                "greedy validation (temperature=0) repeats the same rollout; set "
+                f"num_samples_per_prompt=1, got {self.num_samples_per_prompt}"
+            )
+
+
+@dataclass(kw_only=True, slots=True)
+class ExtraValidationConfig:
+    """A named validation set beside `AsyncLoopConfig.validation`, e.g. a slow benchmark.
+
+    Its passes always overlap training, each set keeps at most one pass running, and passes of
+    different sets run concurrently. Unlike the main set it has no pre/post-training blocking pass:
+    a pass starts at the first step and then every `freq` steps; a pass still running when training
+    ends is awaited and logged at the last step. Its generator requests get the lowest vLLM priority
+    (`vllm_priority`), so a long pass never delays training rollouts. Its tasks come from the
+    rollouter's validation set of the same name. Metrics go under `validation/{name}/...`:
+
+        validation/{name}_reward/mean   mean reward over every sample (= pass@1 for 0/1 rewards)
+        validation/{name}/best_of_{k}   each prompt's best sample, averaged (k > 1)
+        validation/{name}/pass_at_{k}   same value, logged only with `binary_reward`
+    """
+
+    name: str
+    """Validation set name; the rollouter must have a validation set of this name."""
+
+    freq: int
+    """Start a pass every `freq` train steps (if the previous one has ended)."""
+
+    steps: int = -1
+    """Maximum prompts per pass; -1 runs the whole set."""
+
+    temperature: float = 1.0
+    """Sampling temperature."""
+
+    num_samples_per_prompt: int = 1
+    """Sibling rollouts sampled per prompt."""
+
+    binary_reward: bool = False
+    """Rewards are 0/1, so `best_of_k` is pass@k and is also logged as `pass_at_{k}`."""
+
+    def __post_init__(self) -> None:
+        if not self.name or "/" in self.name:
+            raise ValueError(f"extra validation name must be non-empty without '/', got {self.name!r}")
+        if self.freq <= 0:
+            raise ValueError(f"extra validation freq must be positive, got {self.freq}")
+        if self.steps == 0 or self.steps < -1:
+            raise ValueError("extra validation steps must be -1 or positive")
+        if self.temperature < 0:
+            raise ValueError("extra validation temperature must be non-negative")
+        if self.num_samples_per_prompt < 1:
+            raise ValueError("extra validation num_samples_per_prompt must be >= 1")
+        if self.temperature == 0 and self.num_samples_per_prompt > 1:
+            raise ValueError(
+                "greedy validation (temperature=0) repeats the same rollout; set "
+                "num_samples_per_prompt=1"
+            )
 
 
 @dataclass(kw_only=True, slots=True)
@@ -184,16 +293,39 @@ class AsyncLoopConfig(Configurable.Config):
     `target_offpolicy_steps + n`. A value of 1 is FIFO by batch. See
     ``torchtitan/rl/components/WINDOWED_FIFO.md``."""
 
-    group_buffer: RolloutGroupWorkBuffer.Config = field(
+    rdma_fast_path_threshold: int | None = None
+    """Trainer microbatches travel in Monarch RPC messages. With a value, tensors of at least that many
+    bytes go as Monarch RDMA buffers instead, and each trainer rank reads only its own microbatches:
+        None (default): no RDMA; every tensor in the message.
+        e.g. 1024: tensors of 1 KiB or more stay in the sender; token counts (8 B) and empty tensors
+            stay in the message.
+    Monarch uses ibverbs where the host has it, else TCP. A host that lists ibverbs devices it can't
+    use fails instead of falling back; MONARCH_RDMA_DISABLE_IBVERBS=1 forces TCP in every process,
+    weight sync included."""
+
+    group_buffer: RolloutGroupWorkBuffer.Config | AdaptiveRolloutGroupWorkBuffer.Config = field(
         default_factory=RolloutGroupWorkBuffer.Config
     )
+    """Which buffer paces generation:
+    - `RolloutGroupWorkBuffer` (default): `(target_offpolicy_steps + 1) * P` slots, windowed by
+      `windowed_fifo_batches`.
+    - `AdaptiveRolloutGroupWorkBuffer`: slots learned from the run, under its own age knobs. It ignores
+      `windowed_fifo_batches`, and `target_offpolicy_steps` only sets
+      `train_batch/pct_samples_over_target_age`."""
     training_sample_builder: TrainingSampleBuilder.Config = field(
         default_factory=TrainingSampleBuilder.Config
     )
     batcher: Batcher.Config = field(default_factory=Batcher.Config)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
 
+    extra_validations: list[ExtraValidationConfig] = field(default_factory=list)
+    """Named validation sets beside `validation`, each on its own schedule (see
+    `ExtraValidationConfig`)."""
+
     def __post_init__(self) -> None:
+        extra_names = [extra.name for extra in self.extra_validations]
+        if len(set(extra_names)) != len(extra_names):
+            raise ValueError(f"extra_validations names must be unique, got {extra_names}")
         if self.num_prompts_per_train_step < 1:
             raise ValueError(
                 "num_prompts_per_train_step must be >= 1, got "
@@ -206,6 +338,14 @@ class AsyncLoopConfig(Configurable.Config):
         if self.windowed_fifo_batches is not None and self.windowed_fifo_batches < 1:
             raise ValueError(
                 f"windowed_fifo_batches must be None or >= 1, got {self.windowed_fifo_batches}"
+            )
+        if (
+            self.rdma_fast_path_threshold is not None
+            and self.rdma_fast_path_threshold < 1
+        ):
+            raise ValueError(
+                "rdma_fast_path_threshold must be None or >= 1 (RDMABuffer rejects empty tensors), "
+                f"got {self.rdma_fast_path_threshold}"
             )
 
     @property
@@ -220,12 +360,40 @@ class AsyncLoopConfig(Configurable.Config):
         return self.windowed_fifo_batches * self.num_prompts_per_train_step
 
     @property
+    def max_concurrent_rollout_groups(self) -> int:
+        """Most groups generating at once: every active slot of the fixed buffer, or the adaptive
+        buffer's `generation_capacity`. Sizes the rollout workers and vLLM's `max_num_seqs`.
+        Raises if the adaptive default needs the generator layout (no `target_offpolicy_steps`);
+        the controller then uses `resolve_max_concurrent_rollout_groups`."""
+        return self.resolve_max_concurrent_rollout_groups()
+
+    def resolve_max_concurrent_rollout_groups(
+        self, num_generator_dp_shards: int | None = None
+    ) -> int:
+        """`max_concurrent_rollout_groups`, given the generator layout when the default needs it.
+
+        Example:
+            # adaptive buffer, no target, 24 generator DP shards, 16 samples per prompt
+            async_loop.resolve_max_concurrent_rollout_groups(num_generator_dp_shards=24)  # 768
+        """
+        if isinstance(self.group_buffer, AdaptiveRolloutGroupWorkBuffer.Config):
+            return self.group_buffer.resolve_generation_capacity(
+                self.num_prompts_per_train_step,
+                num_generator_dp_shards=num_generator_dp_shards,
+                num_samples_per_prompt=self.num_samples_per_prompt,
+            )
+        return self.max_active_rollout_groups
+
+    @property
     def max_offpolicy_steps(self) -> int | None:
         """Return the worst case consume-time offpolicy bound, or None without a window.
 
         For active buffer size `B`, window size `W`, and prompts per train step
         `P`, the bound is `(B + W - 2) // P`, which is `S + windowed_fifo_batches`.
+        The adaptive buffer drops groups past its own `max_offpolicy_steps` instead.
         """
+        if isinstance(self.group_buffer, AdaptiveRolloutGroupWorkBuffer.Config):
+            return self.group_buffer.max_offpolicy_steps
         if self.window_size is None:
             return None
         return (
@@ -364,6 +532,18 @@ class Controller(Configurable):
                         f"by sequence parallel degree ({sp_degree})."
                     )
 
+            loss_config = self.trainer.loss
+            if isinstance(loss_config, ChunkedLossWrapper.Config):
+                loss_config = loss_config.loss_fn
+            uses_score_centering = isinstance(loss_config, ScoreCenteringLoss.Config)
+            if uses_score_centering != (self.generator.sampling.num_topk_logprobs > 0):
+                raise ValueError(
+                    "ScoreCenteringLoss needs generator.sampling.num_topk_logprobs > 0, "
+                    "and other losses need 0 (they take no top-k inputs). Got "
+                    f"{type(loss_config).__qualname__} with num_topk_logprobs="
+                    f"{self.generator.sampling.num_topk_logprobs}."
+                )
+
             # TODO: add a check so that all seq_len related variables make sense
             # e.g. rollout max length cannot be larger than the model max_seq_len
             # or the packing len, etc.
@@ -414,7 +594,10 @@ class Controller(Configurable):
             apply_overrides(config.override, config)
         config.maybe_log()
         self.trainer: Trainer | None = None
+        # One trainer mesh slice per DP replica, in DP-rank order; set in setup_async.
+        self._trainer_dp_replicas = []
         self.generator_router: InterGeneratorRouter | None = None
+        self.batcher: BatcherActor | None = None
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
         self.start_step = 0
         self._proc_meshes = []
@@ -437,10 +620,24 @@ class Controller(Configurable):
         self.rollout_recorder = config.rollout_recorder.build(
             dump_dir=config.dump_folder
         )
+        # With `validation.overlap_training`: the pass running beside training.
+        self._validation_task: asyncio.Task[list[m.Metric]] | None = None
+        # Extra validation sets: the running pass of each, by name; and sets due to start one.
+        self._extra_validation_tasks: dict[str, asyncio.Task[list[m.Metric]]] = {}
+        self._extra_validation_requested: set[str] = set()
 
     async def close(self):
         """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
         logger.info("Closing: tearing down actors and process meshes.")
+
+        # Still running only if run() crashed; finish cancelling it before closing the rollouter it uses.
+        if self._validation_task is not None:
+            self._validation_task.cancel()
+            await asyncio.gather(self._validation_task, return_exceptions=True)
+        extra_tasks = list(self._extra_validation_tasks.values())
+        for task in extra_tasks:
+            task.cancel()
+        await asyncio.gather(*extra_tasks, return_exceptions=True)
 
         if self.trainer is not None:
             try:
@@ -557,19 +754,38 @@ class Controller(Configurable):
             trainer_mesh: ProcMesh the trainer actor is spawned on.
             generator_meshes: ProcMesh objects the generator actors are spawned on.
         """
-        # Peak concurrent rollout sequences (groups * num_samples_per_prompt, or the validation pass); sizes max_num_seqs below.
-        async_loop = self.config.async_loop
-        max_active_rollout_groups = async_loop.max_active_rollout_groups
-        num_validation_groups = len(
-            self._rollouter.get_validation_samples(async_loop.validation.steps)
-        )
-        rollout_concurrency = max(
-            max_active_rollout_groups * async_loop.num_samples_per_prompt,
-            num_validation_groups,
-        )
         config = self.config
         if not generator_meshes:
             raise ValueError("setup_async requires at least one generator mesh")
+        generator_dp_degree = max(config.generator.parallelism.data_parallel_degree, 1)
+        num_generator_dp_shards = len(generator_meshes) * generator_dp_degree
+
+        # Peak concurrent rollout sequences (groups * num_samples_per_prompt, or the validation pass);
+        # sizes max_num_seqs below. With periodic or overlapped validation, training rollouts keep
+        # generating during a pass, so the peak is the sum.
+        async_loop = self.config.async_loop
+        self._max_concurrent_rollout_groups = (
+            async_loop.resolve_max_concurrent_rollout_groups(num_generator_dp_shards)
+        )
+        num_training_rollouts = (
+            self._max_concurrent_rollout_groups * async_loop.num_samples_per_prompt
+        )
+        validation = async_loop.validation
+        num_validation_groups = (
+            len(self._rollouter.get_validation_samples(validation.steps))
+            * validation.num_samples_per_prompt
+        )
+        rollout_concurrency = (
+            num_training_rollouts + num_validation_groups
+            if validation.freq is not None or validation.overlap_training
+            else max(num_training_rollouts, num_validation_groups)
+        )
+        # Extra validation passes always overlap training (and each other).
+        rollout_concurrency += sum(
+            len(self._rollouter.get_validation_samples(extra.steps, extra.name))
+            * extra.num_samples_per_prompt
+            for extra in async_loop.extra_validations
+        )
 
         trainer_parallelism = config.trainer.parallelism
         dp_shard = max(trainer_parallelism.data_parallel_shard_degree, 1)
@@ -577,14 +793,12 @@ class Controller(Configurable):
             trainer_parallelism.data_parallel_replicate_degree * dp_shard
         )
 
-        generator_dp_degree = max(config.generator.parallelism.data_parallel_degree, 1)
-        num_generator_dp_shards = len(generator_meshes) * generator_dp_degree
-
         # Ceiling (not target) for the generator's max_num_seqs: the per-generator
         # upper bound on concurrently scheduled sequences. vLLM may admit fewer if KV
         # is tight; this also sets CUDA-graph capture sizes.
         max_num_seqs = min(
-            math.ceil(rollout_concurrency / num_generator_dp_shards), 512
+            math.ceil(rollout_concurrency / num_generator_dp_shards),
+            MAX_NUM_SEQS_PER_GENERATOR,
         )
 
         logger.info(
@@ -603,8 +817,16 @@ class Controller(Configurable):
             # controller's process so routing does not contend with the training
             # loop for the controller's GIL.
             router_mesh = this_host().spawn_procs(per_host={"cpus": 1})
+            # Same for the batcher: build + pack would contend for the controller's GIL.
+            # It drops its own buffers (release_oldest_batch): Monarch's drop must run on the owner's host.
+            batcher_mesh = this_host().spawn_procs(per_host={"cpus": 1})
             # Store proc meshes for cleanup
-            self._proc_meshes = [router_mesh, trainer_mesh, *generator_meshes]
+            self._proc_meshes = [
+                router_mesh,
+                batcher_mesh,
+                trainer_mesh,
+                *generator_meshes,
+            ]
 
             await setup_torch_elastic_env(trainer_mesh)
             for generator_mesh in generator_meshes:
@@ -641,6 +863,30 @@ class Controller(Configurable):
                 InterGeneratorRouter,
                 config.generator_router,
                 generators=generators,
+                forward_session_releases=(
+                    config.generator.hold_session_kv
+                    or config.generator.kv_offload_gib > 0
+                ),
+            )
+            self.batcher = batcher_mesh.spawn(
+                "batcher",
+                BatcherActor,
+                training_sample_builder_config=async_loop.training_sample_builder,
+                batcher_config=async_loop.batcher,
+                batcher_kwargs=dict(
+                    num_tokens_per_microbatch_per_dp_rank=(
+                        config.trainer.training.num_tokens_per_microbatch_per_dp_rank
+                    ),
+                    max_context_length=config.trainer.training.max_context_length,
+                    num_prompts_per_train_step=async_loop.num_prompts_per_train_step,
+                    dp_degree=self.trainer_dp_degree,
+                    pad_id=self.tokenizer.eos_id,
+                    temperature=self._sampling.temperature,
+                    num_topk_logprobs=self._sampling.num_topk_logprobs,
+                ),
+                rdma_fast_path_threshold=async_loop.rdma_fast_path_threshold,
+                output_dir=config.dump_folder,
+                enable_structured_logging=config.trainer.debug.enable_structured_logging,
             )
 
             await self._rollouter.setup_async(
@@ -670,6 +916,27 @@ class Controller(Configurable):
                     for requester_index, generator in enumerate(generators)
                 ),
             )
+
+        # Torch ranks follow this mesh's order and the trainer lays them out as
+        # (dp, cp, tp) with no PP, so a DP replica is cp * tp consecutive ranks.
+        trainer_by_dp_rank = self.trainer.flatten("rank").split(
+            rank=("dp", "cp_tp"), dp=self.trainer_dp_degree
+        )
+        self._trainer_dp_replicas = [
+            trainer_by_dp_rank.slice(dp=dp_rank)
+            for dp_rank in range(self.trainer_dp_degree)
+        ]
+        # Check that layout once: if it drifts, one TP group's ranks get different columns.
+        for dp_rank, trainer_dp_replica in enumerate(self._trainer_dp_replicas):
+            reported_dp_ranks = list(
+                (await trainer_dp_replica.get_dp_rank.call()).values()
+            )
+            if set(reported_dp_ranks) != {dp_rank}:
+                raise RuntimeError(
+                    f"Trainer ranks in DP replica {dp_rank} report DP ranks "
+                    f"{reported_dp_ranks}; the controller assumes the trainer orders "
+                    "ranks as (dp, cp, tp)."
+                )
 
         # Resume: __init__ ran CheckpointManager.load(); read back the restored
         # policy version and controller-owned data state.
@@ -705,14 +972,42 @@ class Controller(Configurable):
         with sl.log_trace_span("generator_pull_model_state_dict"):
             await self.generator_router.pull_model_state_dict.call_one(self.start_step)
 
-    # TODO: fold validation into a Validator(Configurable) the controller attaches, instead of 4 methods.
+    # TODO: fold validation into a Validator(Configurable) the controller attaches, instead of these methods.
     @sl.log_trace_span("_collect_validation_rollouts")
     async def _collect_validation_rollouts(
-        self, *, samples: list[object], sampling: SamplingConfig, step: int
+        self,
+        *,
+        samples: list[object],
+        sampling: SamplingConfig,
+        step: int,
+        extra: "ExtraValidationConfig | None" = None,
+        extra_index: int = 0,
     ) -> tuple[list[RolloutGroup], list[m.Metric]]:
-        """Sample held-out prompts, run each greedily (n=1) concurrently, and emit validation metrics."""
-        # TODO: group_size=1 (best-of-1) only. Support best-of-N.
-        generate = self._make_generate_fn(metrics_prefix="validation_generator")
+        """Run each held-out prompt `num_samples_per_prompt` times concurrently and emit validation metrics.
+
+        `extra` selects an extra validation set (`extra_index` is its position in
+        `extra_validations`): its own group-id range and metric prefix `validation/{name}`.
+
+        Example: 2 prompts x 2 samples with rewards [[1, 0], [0, 0]]:
+
+            validation_reward/_mean           0.25   # mean over all 4 rollouts
+            validation_reward/best_of_2/mean  0.5    # best rollout per prompt, averaged (n > 1 only)
+        """
+        if extra is None:
+            num_samples_per_prompt = (
+                self.config.async_loop.validation.num_samples_per_prompt
+            )
+            group_id_base = 0
+            prefix = "validation"
+            best_of_prefix = "validation_reward"
+            generator_prefix = "validation_generator"
+        else:
+            num_samples_per_prompt = extra.num_samples_per_prompt
+            group_id_base = -(extra_index + 1) * EXTRA_VALIDATION_GROUP_ID_STRIDE
+            prefix = best_of_prefix = f"validation/{extra.name}"
+            generator_prefix = f"validation_{extra.name}_generator"
+        group_ids = [group_id_base - (i + 1) for i in range(len(samples))]
+        generate = self._make_generate_fn(metrics_prefix=generator_prefix)
         release_session_fn = self._make_release_session_fn()
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
         group_results = await asyncio.gather(
@@ -723,71 +1018,117 @@ class Controller(Configurable):
                     sample=sample,
                     # Negative ids keep validation disjoint from training group ids, so their
                     # request_ids can't collide in the shared engine (e.g. post-validation).
-                    group_id=-(i + 1),
-                    group_size=1,
+                    group_id=group_id,
+                    group_size=num_samples_per_prompt,
                     sampling=sampling,
                 )
-                for i, sample in enumerate(samples)
+                for group_id, sample in zip(group_ids, samples, strict=True)
             ),
             return_exceptions=True,
         )
         # Validation group ids are reused every validation, so their cache salts must not outlive it.
-        await self.generator_router.release_groups.call_one(
-            [-(i + 1) for i in range(len(samples))]
-        )
+        await self.generator_router.release_groups.call_one(group_ids)
 
         # Keep the groups that succeeded; log + count the ones that raised.
         rollout_groups: list[RolloutGroup] = []
         num_failed_groups = 0
-        for i, result in enumerate(group_results):
+        for group_id, result in zip(group_ids, group_results, strict=True):
             if isinstance(result, BaseException):
                 logger.error(
-                    f"validation group {-(i + 1)} (step={step}) failed; dropping",
+                    f"{prefix} group {group_id} (step={step}) failed; dropping",
                     exc_info=(type(result), result, result.__traceback__),
                 )
                 num_failed_groups += 1
                 continue
             rollout_groups.append(result)
 
-        metrics = compute_rollout_metrics(
-            prefix="validation",
-            rollouts=[
-                rollout for group in rollout_groups for rollout in group.rollouts
-            ],
-        )
+        rollouts = [rollout for group in rollout_groups for rollout in group.rollouts]
+        metrics = compute_rollout_metrics(prefix=prefix, rollouts=rollouts)
         metrics.append(
-            m.Metric("validation/group_failures", m.Sum(float(num_failed_groups)))
+            m.Metric(f"{prefix}/group_failures", m.Sum(float(num_failed_groups)))
         )
+        # Policies the pass sampled. One, unless the pass overlaps training: then a weight sync
+        # during a rollout makes its later tokens sample a newer policy.
+        turns = [turn for rollout in rollouts for turn in rollout.turns]
+        is_mixed_policy = [
+            rollout.turns[-1].max_policy_version > rollout.turns[0].min_policy_version
+            for rollout in rollouts
+            if rollout.turns
+        ]
+        metrics += [
+            m.Metric(
+                f"{prefix}/min_policy_version",
+                m.Min.from_list([turn.min_policy_version for turn in turns]),
+            ),
+            m.Metric(
+                f"{prefix}/max_policy_version",
+                m.Max.from_list([turn.max_policy_version for turn in turns]),
+            ),
+            m.Metric(
+                f"{prefix}/mixed_policy_rollouts", m.Mean.from_list(is_mixed_policy)
+            ),
+        ]
+        if num_samples_per_prompt > 1:
+            # Equals pass@n when rewards are 0/1.
+            best_rewards = [
+                max(rollout.reward for rollout in group.rollouts)
+                for group in rollout_groups
+            ]
+            metrics.append(
+                m.Metric(
+                    f"{best_of_prefix}/best_of_{num_samples_per_prompt}",
+                    m.Mean.from_list(best_rewards),
+                )
+            )
+            if extra is not None and extra.binary_reward:
+                metrics.append(
+                    m.Metric(
+                        f"{prefix}/pass_at_{num_samples_per_prompt}",
+                        m.Mean.from_list(best_rewards),
+                    )
+                )
         return rollout_groups, metrics
 
     @sl.log_trace_span("validate")
-    async def validate(self, *, step: int) -> list[m.Metric]:
-        """Run greedy validation on held-out prompts.
+    async def validate(self, *, step: int, overlapped: bool = False) -> list[m.Metric]:
+        """Run validation on held-out prompts.
 
         Args:
             step: Training step this validation pass belongs to (0 for the
                 pre-training pass); tagged into logged rollout samples.
+            overlapped: The pass runs while training keeps stepping, so its wall time is
+                logged as `timing/validation/overlapped`, not `timing/validation/blocking`.
 
         Returns:
             Validation rollout metrics, generation metrics, and validation
             timing.
         """
-        # TODO: investigate using pass@k for validation.
         t_validate_start = time.perf_counter()
         steps = self.config.async_loop.validation.steps
         if steps == 0:  # skip validation (e.g. loss guard CI)
             return []
-        samples = self._rollouter.get_validation_samples(steps)
-        greedy = replace(self._sampling, temperature=0.0, top_p=1.0)
+        # In a thread: building the dataset would otherwise block the training loops.
+        samples = await asyncio.to_thread(self._rollouter.get_validation_samples, steps)
+        # Validation rollouts are never trained, so skip the top-k transport.
+        sampling = replace(
+            self._sampling,
+            temperature=self.config.async_loop.validation.temperature,
+            num_topk_logprobs=0,
+        )
 
         rollout_groups, validation_metrics = await self._collect_validation_rollouts(
-            samples=samples, sampling=greedy, step=step
+            samples=samples, sampling=sampling, step=step
         )
 
         self.rollout_recorder.record(is_validation=True, rollout_groups=rollout_groups)
 
         t_validate_s = time.perf_counter() - t_validate_start
-        validation_metrics.append(m.Metric("timing/validate", m.NoReduce(t_validate_s)))
+        timing_key = (
+            "timing/validation/overlapped"
+            if overlapped
+            else "timing/validation/blocking"
+        )
+        validation_metrics.append(m.Metric(timing_key, m.NoReduce(t_validate_s)))
         return validation_metrics
 
     async def run(self) -> None:
@@ -818,26 +1159,46 @@ class Controller(Configurable):
         )
 
         sl.log_trace_instant("validation_start")
-        pre_validation = await self._validate_and_log(step=self.start_step)
+        pre_validation_task: asyncio.Task[list[m.Metric]] | None = None
+        if async_loop.validation.overlap_training:
+            # Generators already hold policy `start_step` (setup_async), so training can start right away.
+            pre_validation_task = self._start_validation(step=self.start_step)
+            pre_validation = {}  # read from the task after training
+        else:
+            pre_validation = await self._validate_and_log(step=self.start_step)
+        # Extra validation sets start beside training from the first step.
+        for extra_index in range(len(async_loop.extra_validations)):
+            self._start_extra_validation(extra_index=extra_index, step=self.start_step)
         sl.log_trace_instant("training_start")
 
         # Trainer policy version, seeded from the resumed step; advances at each optimizer step.
         self._trainer_policy_version = self.start_step
 
-        # Depth (S + 1) * P targets the mean policy age; the window caps the max age.
-        max_active_rollout_groups = async_loop.max_active_rollout_groups
-        window_size = async_loop.window_size
-        logger.info(
-            f"max_active_rollout_groups={max_active_rollout_groups}, "
-            f"target_offpolicy_steps={async_loop.target_offpolicy_steps}, "
-            f"windowed_fifo_batches={async_loop.windowed_fifo_batches}, "
-            f"max_offpolicy_steps={async_loop.max_offpolicy_steps}"
-        )
+        if isinstance(async_loop.group_buffer, AdaptiveRolloutGroupWorkBuffer.Config):
+            logger.info(f"Adaptive rollout buffer: {async_loop.group_buffer}")
+            # The capacity resolved in setup_async, where the generator layout is known.
+            self._group_buffer = replace(
+                async_loop.group_buffer,
+                generation_capacity=self._max_concurrent_rollout_groups,
+            ).build(
+                num_prompts_per_train_step=async_loop.num_prompts_per_train_step,
+                policy_version=self.start_step,
+            )
+        else:
+            # Depth (S + 1) * P targets the mean policy age; the window caps the max age.
+            max_active_rollout_groups = async_loop.max_active_rollout_groups
+            window_size = async_loop.window_size
+            logger.info(
+                f"max_active_rollout_groups={max_active_rollout_groups}, "
+                f"target_offpolicy_steps={async_loop.target_offpolicy_steps}, "
+                f"windowed_fifo_batches={async_loop.windowed_fifo_batches}, "
+                f"max_offpolicy_steps={async_loop.max_offpolicy_steps}"
+            )
 
-        self._group_buffer = async_loop.group_buffer.build(
-            max_active_rollout_groups=max_active_rollout_groups,
-            window_size=window_size,
-        )
+            self._group_buffer = async_loop.group_buffer.build(
+                max_active_rollout_groups=max_active_rollout_groups,
+                window_size=window_size,
+            )
 
         # Overlaps each step's weight handoff (push -> pull -> buffer-slot release) with the next step's fwd/bwd
         self._weight_sync = WeightSyncManager(
@@ -845,21 +1206,6 @@ class Controller(Configurable):
             generator_router=self.generator_router,
             group_buffer=self._group_buffer,
             num_prompts_per_train_step=async_loop.num_prompts_per_train_step,
-        )
-
-        # training_sample_builder
-        training_sample_builder = async_loop.training_sample_builder.build()
-
-        # batcher
-        batcher = async_loop.batcher.build(
-            num_tokens_per_microbatch_per_dp_rank=(
-                self.config.trainer.training.num_tokens_per_microbatch_per_dp_rank
-            ),
-            max_context_length=self.config.trainer.training.max_context_length,
-            num_prompts_per_train_step=async_loop.num_prompts_per_train_step,
-            dp_degree=self.trainer_dp_degree,
-            pad_id=self.tokenizer.eos_id,
-            temperature=self._sampling.temperature,
         )
 
         # training_batch_queue
@@ -871,7 +1217,7 @@ class Controller(Configurable):
         generate_fn = self._make_generate_fn(metrics_prefix="generator")
         release_session_fn = self._make_release_session_fn()
 
-        # One rollout worker per active buffer slot: lets generation fill every active slot,
+        # One rollout worker per group that may generate at once: lets generation fill every active slot,
         # including the cold start (step 0 fills every active slot, not just num_prompts_per_train_step per wave).
         # TODO: support warm start
         rollout_tasks = [
@@ -883,7 +1229,7 @@ class Controller(Configurable):
                 ),
                 name=f"rollout_worker_{group_worker_id}",
             )
-            for group_worker_id in range(max_active_rollout_groups)
+            for group_worker_id in range(self._max_concurrent_rollout_groups)
         ]
 
         # data_input_loop
@@ -895,8 +1241,7 @@ class Controller(Configurable):
         batcher_task = asyncio.create_task(
             self._batcher_loop(
                 group_buffer=self._group_buffer,
-                training_sample_builder=training_sample_builder,
-                batcher=batcher,
+                batcher=self.batcher,
                 training_batch_queue=training_batch_queue,
             ),
             name="batcher",
@@ -949,8 +1294,37 @@ class Controller(Configurable):
                 *background_tasks, trainer_task, return_exceptions=True
             )
 
+        final_pass_step = num_training_steps
+        # Await, not cancel, a pass still running: the generators would keep serving its requests,
+        # and the final pass reuses their request ids.
+        if self._validation_task is not None:
+            logger.info(
+                f"Training done; waiting for {self._validation_task.get_name()} before the final pass"
+            )
+            await self._validation_task
+            self._log_finished_validation(step=num_training_steps)
+            # At the same step, W&B would keep only the final pass's values for keys both passes log.
+            final_pass_step += 1
+        # Await, not cancel, extra passes still running; they log at the last step (their keys
+        # differ from the main set's, so they can share its step).
+        if self._extra_validation_tasks:
+            logger.info(
+                "Training done; waiting for "
+                f"{sorted(task.get_name() for task in self._extra_validation_tasks.values())}"
+            )
+            await asyncio.gather(
+                *self._extra_validation_tasks.values(), return_exceptions=True
+            )
+            self._log_finished_extra_validations(step=num_training_steps, wait=True)
+        if pre_validation_task is not None:
+            pre_validation = m.MetricsProcessor._aggregate_metrics(
+                pre_validation_task.result()
+            )
+
         # Post-training validation (held-out eval after the final step).
-        post_validation = await self._validate_and_log(step=num_training_steps)
+        post_validation = await self._validate_and_log(step=final_pass_step)
+        # Push the last row now; close() would push it only after teardown.
+        self.metrics_processor.commit()
         self._log_reward_delta(pre_validation, post_validation)
 
     async def _generator_loop(self) -> None:
@@ -963,11 +1337,136 @@ class Controller(Configurable):
         self.metrics_processor.log(step=step, metrics=metrics, is_validation=True)
         return m.MetricsProcessor._aggregate_metrics(metrics)
 
+    def _start_validation(self, *, step: int) -> asyncio.Task[list[m.Metric]]:
+        """Start a validation pass beside training; `_log_finished_validation` logs it once it ends.
+
+        The caller makes sure the generators hold at least policy `step` and no pass is running.
+        """
+        # TODO: validation rollouts queue behind training rollouts for generator slots and
+        # env-server sandboxes, so a periodic pass can take longer than it would alone. Dispatching
+        # validation first needs a request priority in the env server and the generator router.
+        logger.info(f"Starting validation at step {step}, beside training")
+        self._validation_task = asyncio.create_task(
+            self.validate(step=step, overlapped=True),
+            name=f"validation_step_{step}",
+        )
+        return self._validation_task
+
+    def _log_finished_validation(self, *, step: int) -> None:
+        """If the pass started by `_start_validation` has ended, log it at `step`; re-raise its error.
+
+        Logged at the step it ends, not the one it started at: metric backends need steps that never go back.
+        """
+        task = self._validation_task
+        if task is None or not task.done():
+            return
+        metrics = task.result()
+        self._validation_task = None
+        logger.info(f"{task.get_name()} ended; logging it at step {step}")
+        self.metrics_processor.log(step=step, metrics=metrics, is_validation=True)
+
+    @sl.log_trace_span("validate_extra")
+    async def validate_extra(self, *, extra_index: int, step: int) -> list[m.Metric]:
+        """Run one pass of extra validation set `extra_validations[extra_index]` beside training.
+
+        Returns its rollout metrics (`validation/{name}/...`) and its wall time
+        (`timing/validation/{name}`).
+        """
+        extra = self.config.async_loop.extra_validations[extra_index]
+        t_start = time.perf_counter()
+        # In a thread: building the dataset would otherwise block the training loops.
+        samples = await asyncio.to_thread(
+            self._rollouter.get_validation_samples, extra.steps, extra.name
+        )
+        # Validation rollouts are never trained, so skip the top-k transport.
+        sampling = replace(
+            self._sampling, temperature=extra.temperature, num_topk_logprobs=0
+        )
+        rollout_groups, metrics = await self._collect_validation_rollouts(
+            samples=samples,
+            sampling=sampling,
+            step=step,
+            extra=extra,
+            extra_index=extra_index,
+        )
+        self.rollout_recorder.record(is_validation=True, rollout_groups=rollout_groups)
+        metrics.append(
+            m.Metric(
+                f"timing/validation/{extra.name}",
+                m.NoReduce(time.perf_counter() - t_start),
+            )
+        )
+        return metrics
+
+    def _start_extra_validation(self, *, extra_index: int, step: int) -> None:
+        """Start a pass of an extra validation set beside training; the caller makes sure none of
+        that set is running and the generators hold at least policy `step`."""
+        name = self.config.async_loop.extra_validations[extra_index].name
+        logger.info(f"Starting validation set {name!r} at step {step}, beside training")
+        self._extra_validation_tasks[name] = asyncio.create_task(
+            self.validate_extra(extra_index=extra_index, step=step),
+            name=f"validation_{name}_step_{step}",
+        )
+
+    def _log_finished_extra_validations(self, *, step: int, wait: bool = False) -> None:
+        """Log every extra validation pass that has ended (all of them with `wait`, which the
+        caller must have awaited) at `step`. A failed pass is logged as
+        `validation/{name}/pass_errors` and does not stop training; the set's next pass starts on
+        schedule."""
+        for name, task in list(self._extra_validation_tasks.items()):
+            if not task.done():
+                if wait:
+                    raise RuntimeError(f"{task.get_name()} has not ended")
+                continue
+            del self._extra_validation_tasks[name]
+            error = task.exception()
+            if error is not None:
+                logger.error(
+                    f"Validation set {name!r} failed ({task.get_name()}); training continues",
+                    exc_info=error,
+                )
+                metrics = [m.Metric(f"validation/{name}/pass_errors", m.Sum(1))]
+            else:
+                logger.info(f"{task.get_name()} ended; logging it at step {step}")
+                metrics = task.result()
+            self.metrics_processor.log(step=step, metrics=metrics, is_validation=True)
+
+    async def _step_extra_validations(
+        self, *, step: int, num_training_steps: int
+    ) -> None:
+        """At the end of train step `step`: log extra passes that ended, mark sets that are due,
+        and start each due set whose previous pass has ended."""
+        extras = self.config.async_loop.extra_validations
+        if not extras or step >= num_training_steps:
+            # run() awaits and logs passes still running at the end.
+            return
+        self._log_finished_extra_validations(step=step)
+        for extra in extras:
+            if step % extra.freq == 0:
+                self._extra_validation_requested.add(extra.name)
+        for extra_index, extra in enumerate(extras):
+            if (
+                extra.name in self._extra_validation_requested
+                and extra.name not in self._extra_validation_tasks
+            ):
+                # Wait only for this step's weight pull, so the pass starts on at least policy `step`.
+                await self._weight_sync.wait_inflight_push_pull()
+                self._start_extra_validation(extra_index=extra_index, step=step)
+                self._extra_validation_requested.discard(extra.name)
+
     def _log_reward_delta(self, pre: dict[str, float], post: dict[str, float]) -> None:
         """Console pre/post reward summary, visible without scrolling back through the loop."""
         reward_keys = sorted(key for key in set(pre) | set(post) if "reward" in key)
         logger.info("=" * 60)
         logger.info("Validation reward (pre / post):")
+        # With `overlap_training`, "pre" is the first pass, which ran beside training.
+        oldest_pre_policy = pre.get("validation/min_policy_version/min", 0)
+        newest_pre_policy = pre.get("validation/max_policy_version/max", 0)
+        if newest_pre_policy > oldest_pre_policy:
+            logger.info(
+                f"  pre sampled policies {oldest_pre_policy:.0f} to {newest_pre_policy:.0f}: "
+                "not a clean pre-training score"
+            )
         for key in reward_keys:
             logger.info(
                 f"  {key}:  {pre.get(key, float('nan')):+.3f}  /  {post.get(key, float('nan')):+.3f}"
@@ -1025,25 +1524,43 @@ class Controller(Configurable):
             if work is None:  # group_buffer closed/shutdown signal
                 logger.info("Buffer closed; rollout worker stopping")
                 return
+            # A task of its own, so the buffer can cancel this group (too old to train) without
+            # cancelling the worker.
+            generation_task = asyncio.create_task(
+                self._rollouter.run_group_rollouts(
+                    generate_fn=generate_fn,
+                    release_session_fn=release_session_fn,
+                    sample=work.sample,
+                    group_id=work.group_id,
+                    group_size=self.config.async_loop.num_samples_per_prompt,
+                    sampling=self._sampling,
+                ),
+                name=f"rollout_group_{work.group_id}",
+            )
+            group_buffer.track_generation(work, generation_task)
             try:
                 with sl.log_trace_span("rollout_group"):
-                    group = await self._rollouter.run_group_rollouts(
-                        generate_fn=generate_fn,
-                        release_session_fn=release_session_fn,
-                        sample=work.sample,
-                        group_id=work.group_id,
-                        group_size=self.config.async_loop.num_samples_per_prompt,
-                        sampling=self._sampling,
-                    )
+                    group = await generation_task
                 group.metrics = compute_rollout_metrics(
                     prefix="rollout", rollouts=group.rollouts
                 )
+                self._rollouter.record_group_outcome(group)
 
                 # save rollout for inspection
                 self.rollout_recorder.record(
                     is_validation=False,
                     rollout_groups=[group],
                 )
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise  # shutdown cancelled this worker
+                # The buffer cancelled the group: it became too old to train while generating.
+                logger.info(
+                    f"rollout group {work.group_id} cancelled: past max_offpolicy_steps"
+                )
+                await self.generator_router.release_groups.call_one([work.group_id])
+                del work
+                continue
             except Exception:
                 logger.exception(f"rollout group {work.group_id} failed; dropping")
                 group = RolloutGroup(
@@ -1062,11 +1579,10 @@ class Controller(Configurable):
         self,
         *,
         group_buffer: RolloutGroupWorkBuffer,
-        training_sample_builder: TrainingSampleBuilder,
-        batcher: Batcher,
+        batcher: BatcherActor,
         training_batch_queue: "asyncio.Queue[TrainerStepBatch | None]",
     ) -> None:
-        """Take finalized groups, build training_samples, accumulate them, and queue each ready training batch.
+        """Send finalized groups to the batcher actor and queue each training batch it returns.
 
         On a clean close/shutdown the group_buffer drains and returns None; we forward a `None` sentinel
         so the trainer stops.
@@ -1078,29 +1594,27 @@ class Controller(Configurable):
             waits for:    a free training_batch_queue slot (maxsize=1)
             unblocked by: _trainer_loop training_batch_queue.get()
         """
+        # Policy version that will train the batch being assembled: batches train in order, one per version.
+        consuming_policy_version = self.start_step
         while True:
-            rollout_group = await group_buffer.take_finalized()
+            rollout_group = await group_buffer.take_finalized(
+                consuming_policy_version=consuming_policy_version
+            )
             if rollout_group is None:  # closed and drained
                 logger.info("Buffer drained; batcher loop stopping")
                 break
-            # In a thread, so the event loop keeps running while the group's samples are built
-            with sl.log_trace_span("training_sample_builder"):
-                training_sample_group = await asyncio.to_thread(
-                    training_sample_builder.build_from_group,
-                    rollout_group=rollout_group,
-                )
-
             # We put a group in. We may get a batch back
             # if there are enough accumulated trainable groups to return one.
-            with sl.log_trace_span("batcher_pack"):
-                maybe_training_batch, group_is_trainable = await asyncio.to_thread(
-                    batcher.add_training_samples,
-                    training_sample_group=training_sample_group,
-                )
+            with sl.log_trace_span("batcher_add_group"):
+                (
+                    maybe_training_batch,
+                    group_is_trainable,
+                ) = await batcher.add_group.call_one(rollout_group=rollout_group)
             if not group_is_trainable:
                 await group_buffer.release_active_groups(1, reason="untrainable_group")
             if maybe_training_batch is not None:
                 await training_batch_queue.put(maybe_training_batch)
+                consuming_policy_version += 1
         await training_batch_queue.put(None)
         # TODO(async-rl): if finite datasets are supported, drain a final partial batch here.
 
@@ -1128,11 +1642,18 @@ class Controller(Configurable):
             waits for:    a TrainerStepBatch in the queue
             unblocked by: _batcher_loop training_batch_queue.put()
         """
+        # With `validation.overlap_training`: a pass is due, but waits for the running one to end.
+        validation_requested = False
+        gc_timer = GCTimer()
         for step in range(self.start_step + 1, num_training_steps + 1):
+            # Push the previous step; the last step stays open for post-training validation.
+            self.metrics_processor.commit()
             sl.set_step(step)  # propagate the step counter to the actors
             with sl.log_trace_span("sync_log_step"):
                 await self.trainer.sync_log_step.call(step)
                 await self.generator_router.sync_log_step.call_one(step)
+                # Not awaited: it would wait behind an in-flight add_group.
+                self.batcher.sync_log_step.broadcast(step)
                 await self._rollouter.sync_log_step(step)
             step_timer = MetricsTimer()
 
@@ -1140,6 +1661,10 @@ class Controller(Configurable):
                 sl.log_trace_span("train_step"),
                 step_timer.record("timing/step/total"),
             ):
+                # The adaptive buffer sizes its demand from what is ready at this moment.
+                await self._group_buffer.record_step_start(
+                    trainer_policy_version=self._trainer_policy_version
+                )
                 # Waits for a TrainerStepBatch to be ready (or None on shutdown).
                 with (
                     sl.log_trace_span("wait_for_training_batch"),
@@ -1169,13 +1694,29 @@ class Controller(Configurable):
                     sl.log_trace_span("forward_backward"),
                     step_timer.record("timing/step/forward_backward"),
                 ):
-                    fwd_bwd_metrics = self._get_rank_0_value(
-                        await self.trainer.forward_backward.call(
-                            packed.microbatches,
-                            packed.global_loss_token_counts,
-                            packed.global_routing_token_counts,
+                    # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks over
+                    # TCP). Send the RDMAMicrobatches to the trainer during the previous optim_step,
+                    # so each rank reads microbatch 0 then.
+                    try:
+                        # Each DP replica receives only its column of the grid.
+                        fwd_bwd_results = await asyncio.gather(
+                            *(
+                                trainer_dp_replica.forward_backward.call(
+                                    [row[dp_rank] for row in packed.microbatches],
+                                    packed.global_loss_token_counts,
+                                    packed.global_routing_token_counts,
+                                )
+                                for dp_rank, trainer_dp_replica in enumerate(
+                                    self._trainer_dp_replicas
+                                )
+                            )
                         )
-                    )
+                        fwd_bwd_metrics = self._get_rank_0_value(fwd_bwd_results[0])
+                    finally:
+                        if self.config.async_loop.rdma_fast_path_threshold is not None:
+                            # Every rank has read its column from the batcher, or the step failed.
+                            # Not awaited: it would wait behind an in-flight add_group.
+                            self.batcher.release_oldest_batch.broadcast()
 
                     if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
                         logger.error("Loss is NaN/Inf; training diverged")
@@ -1198,10 +1739,17 @@ class Controller(Configurable):
                     # doing it earlier could lose prompts if the process exits
                     # before the corresponding optimizer step is durable. The
                     # batcher includes every consumed group ID here, including
-                    # metric-only zero-std groups excluded from model inputs.
-                    self._rollouter.acknowledge_training_sample_ids(packed.group_ids)
+                    # metric-only zero-std groups excluded from model inputs, plus
+                    # the groups the buffer dropped as too old.
+                    # to_thread: both wait for an in-flight sample read; don't block the loop on it.
+                    await asyncio.to_thread(
+                        self._rollouter.acknowledge_training_sample_ids,
+                        [*packed.group_ids, *self._group_buffer.pop_dropped_group_ids()],
+                    )
                     controller_state = {
-                        DATALOADER_STATE_KEY: self._rollouter.state_dict()
+                        DATALOADER_STATE_KEY: await asyncio.to_thread(
+                            self._rollouter.state_dict
+                        )
                     }
                     optimizer_result = self._get_rank_0_value(
                         await self.trainer.optim_step.call(
@@ -1228,7 +1776,12 @@ class Controller(Configurable):
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.
             time_metrics = step_timer.flush()
+            # to_thread: the loader's metrics wait for an in-flight sample read; don't block the loop on it.
+            data_metrics = await asyncio.to_thread(self._rollouter.training_data_metrics)
             with sl.log_trace_span("metrics_log"):
+                session_kv_metrics = (
+                    await self.generator_router.get_session_kv_metrics.call_one()
+                )
                 self.metrics_processor.log(
                     step=step,
                     is_validation=False,
@@ -1243,19 +1796,60 @@ class Controller(Configurable):
                             for key, value in optimizer_result.metrics.items()
                         ],
                         *self._group_buffer.metrics(),
+                        *session_kv_metrics,
+                        *data_metrics,
                         *time_metrics,
+                        *gc_timer.flush(),
                         *policy_age_panel,
                         # Background push/pull work time; the trainer's wait for it is timing/step/blocking_*.
                         *push_metrics,
                         *pull_metrics,
                         *compute_perf_ratio_metrics(
-                            num_global_valid_tokens=int(
-                                packed.global_loss_token_counts[0]
+                            num_global_tokens=int(
+                                packed.global_routing_token_counts[0]
                             ),
                             time_metrics=time_metrics,
                         ),
                     ],
                 )
+
+            validation = self.config.async_loop.validation
+            is_validation_step = (
+                validation.freq is not None
+                and step % validation.freq == 0
+                and step < num_training_steps
+            )
+            if validation.overlap_training:
+                # Leave a pass that ends in the last step to run(), which logs it before the final pass.
+                if step < num_training_steps:
+                    self._log_finished_validation(step=step)
+                if is_validation_step:
+                    validation_requested = True
+                    if self._validation_task is not None:
+                        logger.info(
+                            f"Validation step {step}: {self._validation_task.get_name()} is still "
+                            "running; the next pass starts when it ends"
+                        )
+                # No pass starts at the last step: the final pass after training covers it.
+                if (
+                    validation_requested
+                    and self._validation_task is None
+                    and step < num_training_steps
+                ):
+                    # Wait only for this step's weight pull, so the pass starts on at least policy `step`.
+                    await self._weight_sync.wait_inflight_push_pull()
+                    self._start_validation(step=step)
+                    validation_requested = False
+            elif is_validation_step:
+                # Pause training until the pass ends. Only this loop syncs weights, so every
+                # validation rollout samples this step's policy; training rollouts keep generating.
+                await self._weight_sync.wait_inflight_push_pull()
+                await self._validate_and_log(step=step)
+            await self._step_extra_validations(
+                step=step, num_training_steps=num_training_steps
+            )
+
+        gc_timer.close()
 
         # Finish the last in-flight sync so generators hold the final weights for post-validation.
         await self._weight_sync.wait_inflight_push_pull()

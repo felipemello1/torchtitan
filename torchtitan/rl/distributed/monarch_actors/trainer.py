@@ -11,10 +11,11 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from monarch.actor import Actor, concurrent_endpoint
+from monarch.actor import Actor, ActorError, concurrent_endpoint, Port
 
 from torchtitan.rl.components.batcher import TrainingMicrobatch
 
+from torchtitan.rl.distributed.rdma_microbatch import RDMAMicrobatch
 from torchtitan.rl.trainer import OptimizerStepOutput, Trainer
 
 
@@ -26,6 +27,10 @@ class _TrainerActorEndpoints:
     @concurrent_endpoint
     async def get_policy_version(self) -> int:
         return super().policy_version
+
+    @concurrent_endpoint
+    async def get_dp_rank(self) -> int:
+        return self.dp_rank
 
     @concurrent_endpoint
     async def get_controller_state(self) -> dict[str, Any] | None:
@@ -42,12 +47,12 @@ class _TrainerActorEndpoints:
     @concurrent_endpoint
     async def forward_backward(
         self,
-        training_data: list[list[TrainingMicrobatch]],
+        microbatches: list[TrainingMicrobatch] | list[RDMAMicrobatch],
         global_loss_token_counts: torch.Tensor,
         global_routing_token_counts: torch.Tensor,
     ) -> dict[str, float]:
         return await super().forward_backward(
-            training_data,
+            microbatches,
             global_loss_token_counts,
             global_routing_token_counts,
         )
@@ -60,9 +65,31 @@ class _TrainerActorEndpoints:
             controller_state=controller_state, last_step=last_step
         )
 
-    @concurrent_endpoint
-    async def push_model_state_dict(self) -> None:
-        await super().push_model_state_dict()
+    @concurrent_endpoint(explicit_response_port=True)
+    async def push_model_state_dict(self, port: Port[None]) -> None:
+        """Reply as soon as TorchStore has the weights, so the generators can start pulling.
+
+        Without an explicit port, Monarch replies from the event loop, which forward_backward blocks:
+
+            event loop:     | next forward_backward ================ |
+            worker thread:  | copy + put |
+            reply:                       ^ this endpoint             ^ without an explicit port
+        """
+        replied = False
+
+        def reply() -> None:
+            nonlocal replied
+            port.send(None)
+            replied = True
+
+        try:
+            await super().push_model_state_dict(on_published=reply)
+        except BaseException as e:
+            if replied:
+                # The port takes one reply, so let Monarch fail the actor with this error.
+                raise
+            # We own the port, so we send every error, CancelledError included; else the caller waits forever.
+            port.exception(ActorError(e))
 
 
 class TrainerActor(Actor, _TrainerActorEndpoints, Trainer):
