@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
@@ -131,3 +132,25 @@ def test_load_state_dict_allocates_one_fsdp_group_at_a_time(
             assert param.equal(new_state_dict[name].to_local()), name
     finally:
         dist.destroy_process_group()
+
+
+def test_weight_caches_refresh_after_a_weight_load() -> None:
+    class WeightCache(nn.Module):
+        """Keeps a tensor derived from a weight, like the GDN adapter's fused weight."""
+
+        def __init__(self, source: torch.Tensor):
+            super().__init__()
+            self.sources = [source]  # not registered as this module's parameter
+            self.cache = source.detach() * 2
+
+        def refresh_weight_caches(self) -> None:
+            self.cache.copy_(self.sources[0] * 2)
+
+    model = nn.Linear(2, 2, bias=False)
+    model.cache = WeightCache(model.weight)
+    model.register_load_state_dict_post_hook(vllm_wrapper._refresh_weight_caches)
+    new_weight = torch.randn(2, 2)
+
+    model.load_state_dict({"weight": new_weight})
+
+    assert model.cache.cache.equal(new_weight * 2)
