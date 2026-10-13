@@ -261,6 +261,22 @@ def _sharded_param_storages(module: FSDPModule) -> Iterator[torch.Tensor]:
             yield sharded_data
 
 
+def _refresh_weight_caches(model: torch.nn.Module, incompatible_keys: Any) -> None:
+    """``load_state_dict`` post-hook: re-derive the weight caches of ``model``'s modules.
+
+    A module that keeps tensors derived from its weights across CUDA graph replays
+    (the GDN adapter's fused convolution weight) defines ``refresh_weight_caches``.
+
+    Example:
+        >>> model.register_load_state_dict_post_hook(_refresh_weight_caches)
+    """
+    del incompatible_keys
+    for module in model.modules():
+        refresh_weight_caches = getattr(module, "refresh_weight_caches", None)
+        if refresh_weight_caches is not None:
+            refresh_weight_caches()
+
+
 def _restore_sharded_params(module: FSDPModule) -> None:
     """Re-allocate the sharded buffers of `module`'s FSDP group so new weights can be copied in.
 
@@ -401,6 +417,9 @@ class VLLMModelWrapper(Module):
             cast(torch.device, vllm_config.device_config.device),
         )
         self._maybe_initial_load_weights()
+        # Any later load into self.model (the weight sync) re-derives the tensors that
+        # modules cache from their weights; CUDA graph replays read those caches.
+        self.model.register_load_state_dict_post_hook(_refresh_weight_caches)
 
         # Give each gpt-oss attention's vLLM backend its sink rescale.
         self._inject_attention_sinks()

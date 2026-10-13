@@ -448,5 +448,112 @@ def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
     torch.distributed.destroy_process_group()
 
 
+def test_cached_weights_follow_weight_sync() -> None:
+    """Graph replays read the cached fused weights; refresh_weight_caches() re-derives them."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens, heads, head_dim, width = 4, 16, 128, 4
+    channels = heads * head_dim
+    metadata = TorchTitanLinearAttentionMetadata(
+        execution_path=LinearAttentionExecutionPath.SINGLE_TOKEN,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=num_tokens,
+        num_decode_tokens=num_tokens,
+        num_spec_decodes=0,
+        num_spec_decode_tokens=0,
+        num_actual_tokens=num_tokens,
+        non_spec_query_start_loc=torch.arange(
+            num_tokens + 1, device=device, dtype=torch.int32
+        ),
+        non_spec_state_indices_tensor=torch.arange(
+            1, num_tokens + 1, device=device, dtype=torch.int32
+        ),
+        has_initial_state=torch.ones(num_tokens, device=device, dtype=torch.bool),
+    )
+    context = ForwardContext(
+        no_compile_layers={}, attn_metadata={"gdn": metadata}, slot_mapping={}
+    )
+
+    def make_layer():
+        layer = gdn.VLLMInnerGatedDeltaNet.__new__(gdn.VLLMInnerGatedDeltaNet)
+        torch.nn.Module.__init__(layer)
+        layer.prefix = "gdn"
+        layer.local_num_k_heads = layer.local_num_v_heads = heads
+        layer.head_k_dim = layer.head_v_dim = head_dim
+        layer.local_key_dim = channels
+        layer.conv_kernel_size = width
+        layer._weight_sources = layer._derived_weights = None
+        return layer
+
+    initial_states = (
+        torch.randn(8, width - 1, 3 * channels, device=device, dtype=torch.bfloat16),
+        torch.randn(8, heads, head_dim, head_dim, device=device),
+    )
+    query, key, value = torch.randn(
+        3, num_tokens, channels, device=device, dtype=torch.bfloat16
+    )
+    a, b = torch.randn(2, num_tokens, heads, device=device, dtype=torch.bfloat16)
+    conv_weights = [
+        torch.randn(channels, 1, width, device=device, dtype=torch.bfloat16)
+        for _ in range(3)
+    ]
+    A_log, dt_bias = torch.randn(2, heads, device=device, dtype=torch.bfloat16)
+
+    def run(layer):
+        layer.kv_cache = tuple(state.clone() for state in initial_states)
+        return layer(
+            query,
+            key,
+            value,
+            a,
+            b,
+            *conv_weights,
+            A_log,
+            dt_bias,
+            key_head_dim=head_dim,
+            value_head_dim=head_dim,
+            attention_metadata=None,
+        )
+
+    layer = make_layer()
+    with torch.inference_mode(), override_forward_context(context):
+        run(layer)
+        kv_cache = tuple(state.clone() for state in initial_states)
+        layer.kv_cache = kv_cache
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = layer(
+                query,
+                key,
+                value,
+                a,
+                b,
+                *conv_weights,
+                A_log,
+                dt_bias,
+                key_head_dim=head_dim,
+                value_head_dim=head_dim,
+                attention_metadata=None,
+            )
+
+        def replay():
+            for state, initial in zip(kv_cache, initial_states):
+                state.copy_(initial)
+            graph.replay()
+            return output.clone()
+
+        torch.testing.assert_close(replay(), run(make_layer()), rtol=0, atol=0)
+        # A weight sync copies new values into the same parameter storage.
+        for weight in (*conv_weights, A_log, dt_bias):
+            weight.copy_(torch.randn_like(weight))
+        expected = run(make_layer())
+        assert not torch.equal(replay(), expected)
+        layer.refresh_weight_caches()
+        torch.testing.assert_close(replay(), expected, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     run_engine(sys.argv[1], Path(sys.argv[2]), bool(int(sys.argv[3])))

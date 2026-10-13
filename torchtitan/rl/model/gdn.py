@@ -136,6 +136,48 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         if self.prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate GDN layer name: {self.prefix}")
         compilation_config.static_forward_context[self.prefix] = self
+        # Derived from the enclosing module's weights on the first forward and read by
+        # every graph replay: the fused convolution weight and the FP32 A_log and
+        # dt_bias. Weight loads update the parameters in place and then call
+        # refresh_weight_caches() (VLLMModelWrapper registers it as a post-hook).
+        self._weight_sources: tuple[torch.Tensor, ...] | None = None
+        self._derived_weights: tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor
+        ] | None = None
+
+    def refresh_weight_caches(self) -> None:
+        """Re-derive the cached weights in place from the current parameters.
+
+        CUDA graph replays read the cached tensors, not the parameters, so this
+        runs after every weight load.
+
+        Example:
+            >>> model.load_state_dict(new_weights)  # post-hook calls refresh_weight_caches()
+        """
+        if self._weight_sources is None or self._derived_weights is None:
+            return
+        for cached, fresh in zip(
+            self._derived_weights, self._derive_weights(*self._weight_sources)
+        ):
+            cached.copy_(fresh)
+
+    @staticmethod
+    def _derive_weights(
+        conv_q_weight_C1W: torch.Tensor,
+        conv_k_weight_C1W: torch.Tensor,
+        conv_v_weight_C1W: torch.Tensor,
+        A_log_H: torch.Tensor,
+        dt_bias_H: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the fused ``(C, W)`` convolution weight and the FP32 ``A_log`` and ``dt_bias``.
+
+        Example:
+            >>> conv_weight_CW, A_log_H, dt_bias_H = self._derive_weights(cq, ck, cv, A_log, dt_bias)
+        """
+        conv_weight_CW = torch.cat(
+            [conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W], dim=0
+        ).squeeze(1)
+        return conv_weight_CW, A_log_H.float(), dt_bias_H.float()
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return TorchTitanLinearAttentionBackend
@@ -376,10 +418,18 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         assert key_head_dim == self.head_k_dim
         assert value_head_dim == self.head_v_dim
         mixed_qkv_TC = torch.cat([query_TC, key_TC, value_TC], dim=-1)
-        conv_weight_CW = torch.cat(
-            [conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W],
-            dim=0,
-        ).squeeze(1)
+        # The weights only change at a weight sync, so derive them once instead of
+        # re-concatenating and re-casting them on every step (3 kernels per layer).
+        if self._derived_weights is None:
+            self._weight_sources = (
+                conv_q_weight_C1W,
+                conv_k_weight_C1W,
+                conv_v_weight_C1W,
+                A_log_H,
+                dt_bias_H,
+            )
+            self._derived_weights = self._derive_weights(*self._weight_sources)
+        conv_weight_CW, A_log_f32_H, dt_bias_f32_H = self._derived_weights
         assert conv_weight_CW.shape[-1] == self.conv_kernel_size
 
         num_tokens = mixed_qkv_TC.shape[0]
@@ -393,8 +443,8 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             b_TH,
             conv_weight_CW,
             None,
-            A_log_H,
-            dt_bias_H,
+            A_log_f32_H,
+            dt_bias_f32_H,
             output_THV,
         )
         return output_THV
