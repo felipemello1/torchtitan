@@ -474,6 +474,9 @@ def rl_dapo_qwen3_5_35b_a3b_base_intellect3_math_131k_tonight() -> Controller.Co
         thinking_budget=dataclasses.replace(
             worker.thinking_budget, max_thinking_tokens=max_response_tokens - 4096
         ),
+        # A forced answer scores 0, like a wrong one: at 0.5 the policy learned to think past the
+        # budget (forced closes 1% -> 20%, validation hard 0.36 -> 0.18 by step 90).
+        rubric=dataclasses.replace(worker.rubric, forced_answer_scale=0.0),
     )
     config.trainer = dataclasses.replace(
         config.trainer,
