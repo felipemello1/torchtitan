@@ -391,9 +391,9 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
         # The mean policy age of trained groups stays under 6 steps, every one under 10.
         target_offpolicy_steps=6,
         max_offpolicy_steps=10,
-        # Generate up to (6 + 1) batches at once from the first step, the most a mean age of 6
-        # allows; sizes vLLM's max_num_seqs.
-        generation_capacity=(6 + 1) * num_prompts_per_train_step,
+        # Host RAM on host 0 grows with the games in flight: 336 groups OOMed it at step 100
+        # (chess118gk). Also sizes vLLM's max_num_seqs.
+        generation_capacity=176,
         start_batches=6 + 1,
     )
     loop.target_offpolicy_steps = loop.group_buffer.target_offpolicy_steps
