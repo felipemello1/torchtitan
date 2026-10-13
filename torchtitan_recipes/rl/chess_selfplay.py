@@ -512,6 +512,9 @@ def rl_chess_qwen3_5_4b_base_gb300(
         start_batches=4 + 1,
     )
     loop.target_offpolicy_steps = loop.group_buffer.target_offpolicy_steps
+    # Validation samples at the training temperature: greedy decoding fell into reply loops far more
+    # often (58% force-closed vs 17% in training, chess118gn step ~146).
+    loop.validation.greedy = False
 
     # ======== Generators ========
     config.num_generators = 16
