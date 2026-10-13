@@ -297,6 +297,7 @@ class TokenChoiceTopKRouter(Module):
             gate_TE,
             expert_bias_E,
             padding_mask_T=padding_mask_T,
+            routed_expert_ids_TK=routed_expert_ids_TK,
             **router_kwargs,
         )
         # Keep the full routing map for dispatch, and build the masked view once
@@ -338,6 +339,7 @@ class TokenChoiceTopKRouter(Module):
         expert_bias_E: torch.Tensor | None,
         *,
         padding_mask_T: torch.Tensor | None,
+        routed_expert_ids_TK: torch.Tensor | None = None,
         **router_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Score the gate logits and pick experts: ``forward`` after the gate, without side effects.
