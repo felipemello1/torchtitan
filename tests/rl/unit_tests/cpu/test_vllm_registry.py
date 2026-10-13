@@ -72,6 +72,29 @@ def test_gdn_hybrid_model_registers_state_copy_funcs(monkeypatch):
     }
 
 
+def test_gdn_hybrid_model_makes_gdn_op_a_splitting_op(monkeypatch):
+    # vLLM reads its splitting ops when it builds the engine config, before the
+    # model is built, so registration must add the op.
+    from vllm.config import CompilationConfig
+
+    monkeypatch.setattr(CompilationConfig, "_attention_ops", [])
+    gdn_config = SimpleNamespace(
+        in_proj_q=SimpleNamespace(out_features=8),
+        in_proj_v=SimpleNamespace(out_features=12),
+        key_head_dim=4,
+        value_head_dim=6,
+        conv_kernel_size=4,
+    )
+    model_config = SimpleNamespace(layers=[SimpleNamespace(delta_net=gdn_config)])
+
+    class Model:
+        pass
+
+    gdn.maybe_configure_gdn_hybrid_model(Model, model_config)
+
+    assert CompilationConfig._attention_ops == ["torchtitan::vllm_gdn_forward"]
+
+
 def test_kda_hybrid_model_registers_state_copy_funcs(monkeypatch):
     copy_funcs = (object(), object())
 

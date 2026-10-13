@@ -48,7 +48,7 @@ from torchtitan.rl.model.linear_attention import (
     TorchTitanLinearAttentionMetadata,
     unique_state_shape,
 )
-from vllm.config import get_current_vllm_config
+from vllm.config import CompilationConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -573,24 +573,29 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
         conv_weight_CW, A_log_f32_H, dt_bias_f32_H = self._derived_weights
         assert conv_weight_CW.shape[-1] == self.conv_kernel_size
 
+        # Padded rows must remain defined across vLLM graph replays.
+        output_THV = mixed_qkv_TC.new_zeros(
+            mixed_qkv_TC.shape[0], self.local_num_v_heads, self.head_v_dim
+        )
         # Call the GDN step through a custom op so vLLM compile treats it as one
         # call. Tracing into `_forward` records the profiling run's missing-metadata
-        # early return and zeroes every GDN layer. Returning the output (instead of
-        # writing an argument) avoids a clone + copy-back per call.
-        return torch.ops.torchtitan.vllm_gdn_forward(
+        # early return and zeroes every GDN layer. vLLM splits its compiled graph at
+        # the op and runs it between piecewise CUDA graphs, so the op writes into
+        # `output_THV`, which a graph allocates at a stable address.
+        torch.ops.torchtitan.vllm_gdn_forward(
             mixed_qkv_TC,
             a_TH,
             b_TH,
             conv_weight_CW,
             A_log_f32_H,
             dt_bias_f32_H,
+            output_THV,
             self.prefix,
-            self.local_num_v_heads,
-            self.head_v_dim,
         )
+        return output_THV
 
 
-@torch.library.custom_op("torchtitan::vllm_gdn_forward", mutates_args=())
+@torch.library.custom_op("torchtitan::vllm_gdn_forward", mutates_args=("output",))
 def vllm_gdn_forward(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -598,23 +603,19 @@ def vllm_gdn_forward(
     conv_weight: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
+    output: torch.Tensor,
     layer_name: str,
-    num_v_heads: int,
-    head_v_dim: int,
-) -> torch.Tensor:
-    """Run layer ``layer_name``'s paged GDN step; looks the layer up at call time."""
-    # Padded rows must remain defined across vLLM graph replays.
-    output = mixed_qkv.new_zeros(mixed_qkv.shape[0], num_v_heads, head_v_dim)
+) -> None:
+    """Run layer ``layer_name``'s paged GDN step into ``output``; looks the layer up at call time."""
     layer = get_forward_context().no_compile_layers[layer_name]
     layer._forward(mixed_qkv, a, b, conv_weight, None, A_log, dt_bias, output)
-    return output
 
 
 @vllm_gdn_forward.register_fake
 def _vllm_gdn_forward_fake(
-    mixed_qkv, a, b, conv_weight, A_log, dt_bias, layer_name, num_v_heads, head_v_dim
-) -> torch.Tensor:
-    return mixed_qkv.new_empty(mixed_qkv.shape[0], num_v_heads, head_v_dim)
+    mixed_qkv, a, b, conv_weight, A_log, dt_bias, output, layer_name
+) -> None:
+    return None
 
 
 def maybe_configure_gdn_hybrid_model(
@@ -641,6 +642,11 @@ def maybe_configure_gdn_hybrid_model(
     )
     if state_shape is None:
         return
+    # Split vLLM's compiled graph at the GDN step, as vLLM does for its own GDN op
+    # (`vllm::qwen_gdn_attention_core`), so piecewise CUDA graphs can run prefill.
+    # vLLM reads this list when it builds the engine config, before the model is built.
+    if "torchtitan::vllm_gdn_forward" not in CompilationConfig._attention_ops:
+        CompilationConfig._attention_ops.append("torchtitan::vllm_gdn_forward")
     num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_size = state_shape
 
     def get_state_shape(vllm_config):

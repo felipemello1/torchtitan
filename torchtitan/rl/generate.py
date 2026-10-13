@@ -48,8 +48,8 @@ from torchtitan.rl.model.vllm_registry import (
     TORCHTITAN_CONFIG_FORMAT,
     TORCHTITAN_WORKER_CLS,
 )
-from torchtitan.tools import filesystem
 from torchtitan.rl.model.vllm_worker import use_v2_model_runner
+from torchtitan.tools import filesystem
 from torchtitan.tools.utils import has_cuda_capability
 
 
@@ -187,7 +187,7 @@ def generate() -> None:
         max_num_batched_tokens=gen_config.max_num_batched_tokens,
         expert_sequence_parallel_size=expert_sequence_parallel_size,
         enable_sequence_parallel=gen_config.parallelism.enable_sequence_parallel,
-        graph_prefill=not use_v2,
+        v2_model_runner=use_v2,
     )
     if vllm_compilation_config is not None:
         engine_kwargs["compilation_config"] = vllm_compilation_config
