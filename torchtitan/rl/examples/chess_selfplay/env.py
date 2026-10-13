@@ -66,13 +66,19 @@ class ChessPlayerEnv(MessageEnv):
     @dataclass(kw_only=True, slots=True)
     class Config(MessageEnv.Config):
         forced_close_text: str | None = None
-        """The thinking budget's close sentence. After thinking that ends with it, an illegal answer
-        plays the thinking's last box instead of forfeiting. None: an illegal answer forfeits."""
+        """The thinking budget's `close_text`. After thinking cut off by it, an illegal answer plays
+        the thinking's last box instead of forfeiting; the answer's tokens are still trained, on the
+        outcome of the box played. None: an illegal answer forfeits."""
 
     def __init__(self, config: Config, *, game: ChessGame, color: chess.Color) -> None:
         self._game = game
         self._color = color
-        self._forced_close_text = config.forced_close_text
+        # The parsed reasoning ends with the close text's sentence, before `</think>`.
+        self._forced_close_sentence = (
+            None
+            if config.forced_close_text is None
+            else config.forced_close_text.split("</think>")[0].strip()
+        )
 
     async def init(self) -> MessageEnvInitOutput:
         """Show the rules, the board, and the legal moves for this player's first move."""
@@ -114,13 +120,15 @@ class ChessPlayerEnv(MessageEnv):
         reasoning = completion_message.get("reasoning_content") or ""
         matches = [match for match in _BOXED_RE.findall(content) if match.strip()]
         index = 0 if reasoning else -1
-        # A force-closed answer is a fresh guess: if it is illegal, the thinking's last box stands in.
+        # Force-closed: the answer is a fresh guess, so if it is illegal, play the thinking's last box.
         fallback = None
-        if self._forced_close_text and reasoning.rstrip().endswith(
-            self._forced_close_text
+        if self._forced_close_sentence and reasoning.rstrip().endswith(
+            self._forced_close_sentence
         ):
-            thought = [match for match in _BOXED_RE.findall(reasoning) if match.strip()]
-            fallback = thought[-1] if thought else None
+            thinking_boxes = [
+                match for match in _BOXED_RE.findall(reasoning) if match.strip()
+            ]
+            fallback = thinking_boxes[-1] if thinking_boxes else None
         await self._game.play(
             self._color, matches[index] if matches else None, fallback_text=fallback
         )
@@ -179,6 +187,8 @@ class ChessGame:
         """Why the game ended, e.g. "checkmate", "max_plies", "illegal_move"; `None` while it runs."""
         self.forfeiter: chess.Color | None = None
         """The color that lost by forfeit (an illegal move or `forfeit`); `None` otherwise."""
+        self.num_fallback_moves = 0
+        """Moves played from `play`'s `fallback_text` because the answer's move was illegal."""
         self.checkmate_reward = checkmate_reward
         """The winner's training reward for a checkmate, at any length."""
         self.checkmated_reward = checkmated_reward
@@ -270,15 +280,16 @@ class ChessGame:
         *,
         fallback_text: str | None = None,
     ) -> None:
-        """Play `color`'s move, written as the prompt lists it (`Nf3`); if it is not legal, play
-        `fallback_text` instead; any other text forfeits. Does nothing once the game is over, e.g.
-        after the other player forfeited."""
+        """Play `color`'s move as the prompt lists it (`Nf3`), else `fallback_text` if that is legal;
+        anything else forfeits. Does nothing once the game is over, e.g. after the other player
+        forfeited."""
         async with self._turn_changed:
             if self.is_over:
                 return
             move = None if move_text is None else _parse_move(self.board, move_text)
             if move is None and fallback_text is not None:
                 move = _parse_move(self.board, fallback_text)
+                self.num_fallback_moves += move is not None
             if move is None:
                 self._forfeit(color, reason="illegal_move")
             else:
@@ -364,7 +375,7 @@ def _moves_by_piece(board: chess.Board, color: chess.Color, rng: random.Random) 
     without king captures, and without check marks when the side to move is in check (every move
     would read as check).
 
-    Compact JSON, one line: ~26% fewer tokens than indented JSON.
+    Compact JSON, one line: ~26% fewer Qwen3.5 tokens than indented JSON.
 
     Example:
 

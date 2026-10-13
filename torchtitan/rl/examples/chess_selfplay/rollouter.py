@@ -393,6 +393,7 @@ def _game_metrics(
         chess_games/plies_{self_play,vs_bot}        game length
         chess_games/max_plies_{self_play,vs_bot}    the games' ply cap
         chess_games/forfeits_per_reply_{self_play,vs_bot}
+        chess_games/fallback_moves_per_reply_{self_play,vs_bot}   illegal forced answers saved by the thinking's box
         chess_games/end_{self_play,vs_bot}/<end>    share of games ending in checkmate, draw,
                                                     ply_limit, illegal_move, reply_too_long, context_full, error
     """
@@ -435,6 +436,13 @@ def _game_metrics(
         m.Metric(
             f"{games_section}/forfeits_per_reply_{kind}",
             m.Mean(float(num_forfeiting_replies), count=float(num_replies)),
+        ),
+        m.Metric(
+            f"{games_section}/fallback_moves_per_reply_{kind}",
+            m.Mean(
+                float(sum(game.num_fallback_moves for game in games)),
+                count=float(num_replies),
+            ),
         ),
     ]
     losses = [loss for game_losses in losses_per_game for loss in game_losses]

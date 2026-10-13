@@ -43,6 +43,7 @@ from torchtitan.rl.observability.controller import compute_rollout_metrics
 from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.rubric import Rubric
+from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
 from torchtitan.rl.rollout.token_env import TokenEnv
 from torchtitan.rl.rollout.types import Completion, RolloutTurnID
 
@@ -494,7 +495,7 @@ def test_player_env_plays_the_first_box_after_thinking_else_the_last() -> None:
             )
         )
         # Thinking off or unclosed: the last box that isn't the copied prompt's empty one.
-        black_reply = "\\boxed{d5}? No, \\boxed{e5}\nThen reply with only your move inside \\boxed{}."
+        black_reply = "\\boxed{d5}? No, \\boxed{e5}\n...each, then reply with only your move inside \\boxed{}."
         asyncio.create_task(black.step({"role": "assistant", "content": black_reply}))
         await asyncio.wait_for(white_step, timeout=1)
         assert [move.uci() for move in game.board.move_stack] == ["e2e4", "e7e5"]
@@ -503,29 +504,39 @@ def test_player_env_plays_the_first_box_after_thinking_else_the_last() -> None:
 
 
 def test_player_env_plays_the_thinking_box_after_an_illegal_forced_answer() -> None:
-    close = "Considering the limited time, I answer now."
-    forced = {
-        "role": "assistant",
-        "reasoning_content": f"\\boxed{{e4}} is good. \\boxed{{e4}}.\n\n{close}",
-        "content": "\\boxed{e5}",
-    }
+    close_text = ThinkingBudget.Config(max_thinking_tokens=1).close_text
+    sentence = close_text.split("</think>")[0].strip()
 
-    async def run(config: ChessPlayerEnv.Config) -> chess.Board:
+    async def run(
+        config: ChessPlayerEnv.Config, reasoning: str, answer: str
+    ) -> ChessGame:
         game = _new_game()
         white = ChessPlayerEnv(config, game=game, color=chess.WHITE)
-        step = asyncio.create_task(white.step(forced))
+        reply = {"role": "assistant", "reasoning_content": reasoning, "content": answer}
+        step = asyncio.create_task(white.step(reply))
         await asyncio.sleep(0)
-        if not step.done():
-            await game.play(chess.BLACK, "e5")
+        await game.play(chess.BLACK, "e5")  # a no-op once White has forfeited
         await asyncio.wait_for(step, timeout=1)
         return game
 
-    # Force-closed: the illegal answer e5 falls back to the thinking's last box, e4.
-    game = asyncio.run(run(ChessPlayerEnv.Config(forced_close_text=close)))
-    assert [move.uci() for move in game.board.move_stack] == ["e2e4", "e7e5"]
-    # Without the close text, the same reply forfeits.
-    game = asyncio.run(run(ChessPlayerEnv.Config()))
-    assert game.end_reason == "illegal_move" and game.forfeiter == chess.WHITE
+    def first_move(game: ChessGame) -> str | None:
+        return game.board.move_stack[0].uci() if game.board.move_stack else None
+
+    config = ChessPlayerEnv.Config(forced_close_text=close_text)
+    cut_off = f"\\boxed{{d4}}? No, \\boxed{{e4}}.\n\n{sentence}"
+    # Force-closed, illegal answer e5: the thinking's last box, e4 (not d4), and it is counted.
+    game = asyncio.run(run(config, cut_off, "\\boxed{e5}"))
+    assert first_move(game) == "e2e4" and game.num_fallback_moves == 1
+    # Force-closed, legal answer: the answer stands.
+    game = asyncio.run(run(config, cut_off, "\\boxed{c4}"))
+    assert first_move(game) == "c2c4" and game.num_fallback_moves == 0
+    # Thinking closed by the model (no close sentence at the end), or no close text configured: forfeit.
+    for env_config, reasoning in [
+        (config, "\\boxed{e4}. Done."),
+        (ChessPlayerEnv.Config(), cut_off),
+    ]:
+        game = asyncio.run(run(env_config, reasoning, "\\boxed{e5}"))
+        assert game.end_reason == "illegal_move" and game.forfeiter == chess.WHITE
 
 
 def test_legal_moves_are_shuffled_per_game() -> None:

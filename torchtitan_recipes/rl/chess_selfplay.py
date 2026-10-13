@@ -217,6 +217,7 @@ def rl_chess_qwen3_5_4b_gb300(
     max_plies: int = 120,
     max_thinking_tokens: int = 1024,
     max_context_tokens: int = 131072,
+    max_answer_tokens: int = 512,
 ) -> Controller.Config:
     """Qwen3.5-4B (instruct) self-play with thinking on, on three GB300 hosts:
 
@@ -226,7 +227,7 @@ def rl_chess_qwen3_5_4b_gb300(
     A player keeps its own past thinking, so its history grows ~1.6k tokens a turn.
     """
     # room for the answer after the thinking ends, forced or not
-    max_response_tokens = max_thinking_tokens + 512
+    max_response_tokens = max_thinking_tokens + max_answer_tokens
     # ChunkedLossWrapper needs `max_context_tokens` divisible by its 16 chunks.
     config = rl_chess_qwen3_5_4b(
         max_plies=max_plies,
@@ -462,28 +463,27 @@ def rl_chess_qwen3_5_4b_base_gb300(
     max_context_tokens: int = 131072,
     num_prompts_per_train_step: int = 12,
 ) -> Controller.Config:
-    """Qwen3.5-4B-Base self-play from scratch on five GB300 hosts; games, thinking and validation as
-    in `rl_chess_qwen3_5_4b_gb300`, with a zero-sum mate (10 / -9) and no penalty for thinking:
+    """Qwen3.5-4B-Base self-play from scratch on five GB300 hosts; games and validation as in
+    `rl_chess_qwen3_5_4b_gb300`, with 2,048 thinking tokens, a zero-sum mate (10 / -9) and no penalty
+    for thinking:
 
         host 0:     the trainer, FSDP 4
         hosts 1-4:  sixteen TP1 generators; idle session KV goes to CPU
 
     Training games' ply cap grows from 60 at step 0 to `max_plies` at step 200; validation games
-    always play `max_plies`. A 90-ply game with every reply at the thinking cap holds ~111K tokens.
+    always play `max_plies`. A 90-ply game with every reply at the thinking cap holds ~111K tokens,
+    under the ~129K rollout budget.
     """
     config = rl_chess_qwen3_5_4b_gb300(
         max_plies=max_plies,
         max_thinking_tokens=max_thinking_tokens,
         max_context_tokens=max_context_tokens,
+        # After the thinking: the forced close and "\boxed{" (~28 tokens) then the move, or a
+        # self-closed answer's box and a short line, not 512 tokens of talk.
+        max_answer_tokens=128,
     )
     config.hf_assets_path = "torchtitan/rl/example_checkpoint/Qwen3.5-4B-Base"
     config.dump_folder = "outputs/rl/qwen3_5_4b_base_chess_gb300"
-    # After the thinking, room for the forced close's 30 tokens and a box, not for more talk.
-    max_response_tokens = max_thinking_tokens + 48
-    config.generator.sampling.max_tokens = max_response_tokens
-    config.rollouter.worker.token_env.max_rollout_tokens = (
-        max_context_tokens - max_response_tokens
-    )
 
     # ======== Rollouts ========
     config.rollouter.curriculum = ChessCurriculum.Config(
@@ -495,7 +495,7 @@ def rl_chess_qwen3_5_4b_base_gb300(
     # plays the thinking's last box.
     worker.rubric.reward_fns = [RewardChessScore.Config()]
     worker.message_env = ChessPlayerEnv.Config(
-        forced_close_text=worker.thinking_budget.close_text.split("</think>")[0].strip()
+        forced_close_text=worker.thinking_budget.close_text
     )
 
     # ======== Async loop ========
@@ -504,9 +504,10 @@ def rl_chess_qwen3_5_4b_base_gb300(
     # 12 positions x 8 games x 2 colors = 192 rollouts per step.
     loop.num_prompts_per_train_step = num_prompts_per_train_step
     loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
-        # The mean policy age of trained groups stays under 4 steps, every one under 8.
+        # The mean policy age of trained groups stays under 4 steps, every one under 10: the oldest
+        # run ~4 steps above the mean (chess118gm), and a tighter cap drops the longest games.
         target_offpolicy_steps=4,
-        max_offpolicy_steps=8,
+        max_offpolicy_steps=10,
         generation_capacity=(4 + 1) * num_prompts_per_train_step,
         start_batches=4 + 1,
     )
