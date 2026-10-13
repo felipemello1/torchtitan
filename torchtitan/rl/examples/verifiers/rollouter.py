@@ -319,10 +319,10 @@ class VerifiersRollouter(Rollouter):
             rollout_id=rollout_id,
         )
         status = self.rollout_status(verifiers_episode=verifiers_episode, trace=trace)
-        if not turns:
+        if not turns and status is not RolloutStatus.ERROR_TIMEOUT:
             status = RolloutStatus.ERROR
         logs = verifiers_rollout_logs(verifiers_episode, trace)
-        if status == RolloutStatus.ERROR:
+        if status.is_error():
             log_failed_rollout(logs, group_id=group_id, rollout_id=rollout_id)
         else:
             turns[-1].env_rewards[VERIFIERS_REWARD_KEY] = trace.reward
@@ -336,6 +336,35 @@ class VerifiersRollouter(Rollouter):
 
     @staticmethod
     def rollout_status(*, verifiers_episode: Any, trace: Any) -> RolloutStatus:
+        """Map how Verifiers 0.3.1 ended a rollout to its status. ERROR_TIMEOUT stays out of the loss.
+
+        Example (trace.ok, trace.last_error -> status):
+            False, HarnessError("agent timeout: ...")        -> ERROR_TIMEOUT
+            False, TaskError("scoring timed out")            -> ERROR_TIMEOUT  # after stop "agent_completed"
+            False, TaskError("scoring timed out")            -> ERROR  # truncated first: may be the agent's loop
+            False, HarnessError("harness 'x' exited 1: ...") -> ERROR  # usually the agent's own `pkill`/`exit`
+            False, None                                      -> ERROR  # `ok` defaults to False
+            True,  HarnessError("agent timeout: ...")        -> COMPLETED or TRUNCATED_*  # a retry succeeded
+        """
+        # TODO: Verifiers main flags setup, agent, finalize and scoring timeouts with
+        # `trace.is_timeout` and ok=True; check it here when the pin moves, or timeouts will
+        # train as completed rollouts. Main sets stop_condition to "scoring_timeout", so a
+        # scoring timeout after a truncation needs another way to stay ERROR.
+        # TODO: mask only agent timeouts spent mostly waiting on the model (`model_sec` /
+        # `agent_sec` in `verifiers_rollout_logs`), if policy-caused timeouts start to matter.
+        last_error = trace.last_error
+        if (
+            not trace.ok
+            and last_error is not None
+            and (
+                last_error.message.startswith("agent timeout")
+                or (
+                    last_error.message == "scoring timed out"
+                    and trace.stop_condition == "agent_completed"
+                )
+            )
+        ):
+            return RolloutStatus.ERROR_TIMEOUT
         if not verifiers_episode.ok or not trace.ok:
             return RolloutStatus.ERROR
         if not trace.is_truncated:

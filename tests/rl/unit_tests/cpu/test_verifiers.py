@@ -29,6 +29,7 @@ from torchtitan.rl.examples.verifiers.rollouter import (
     verifiers_rollout_logs,
     VerifiersRollouter,
 )
+from torchtitan.rl.rollout import RolloutStatus
 from torchtitan.rl.rollout.types import Completion
 from verifiers.v1.errors import model_error, OverlongPromptError
 
@@ -243,6 +244,63 @@ def test_verifiers_rollout_logs_keep_the_failure_reason(caplog) -> None:
         log_failed_rollout({**logs, "errors": []}, group_id=3, rollout_id=2)
     assert "error=HarnessError: agent timeout" in caplog.text
     assert "error=None: None" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "trace_ok, stop_condition, error_type, error_message, expected",
+    [
+        (
+            False,
+            "error",
+            "HarnessError",
+            "agent timeout: rollout exceeded its 7200s budget",
+            RolloutStatus.ERROR_TIMEOUT,
+        ),
+        (
+            False,
+            "agent_completed",
+            "TaskError",
+            "scoring timed out",
+            RolloutStatus.ERROR_TIMEOUT,
+        ),
+        (False, "max_turns", "TaskError", "scoring timed out", RolloutStatus.ERROR),
+        (
+            False,
+            "error",
+            "HarnessError",
+            "harness 'terminus-2' exited 1: RuntimeError: failed to send keys",
+            RolloutStatus.ERROR,
+        ),
+        (False, "error", None, None, RolloutStatus.ERROR),
+        # A retry that succeeded keeps the earlier attempt's timeout in its errors.
+        (
+            True,
+            "agent_completed",
+            "HarnessError",
+            "agent timeout: rollout exceeded its 7200s budget",
+            RolloutStatus.COMPLETED,
+        ),
+    ],
+)
+def test_rollout_status_maps_timeouts(
+    trace_ok, stop_condition, error_type, error_message, expected
+) -> None:
+    from verifiers.v1.trace import Error
+
+    last_error = (
+        None if error_message is None else Error(type=error_type, message=error_message)
+    )
+    trace = SimpleNamespace(
+        ok=trace_ok,
+        last_error=last_error,
+        is_truncated=stop_condition == "max_turns",
+        stop_condition=stop_condition,
+    )
+    status = VerifiersRollouter.rollout_status(
+        verifiers_episode=SimpleNamespace(ok=trace_ok), trace=trace
+    )
+
+    assert status is expected
 
 
 def test_generation_server_forwards_token_request() -> None:

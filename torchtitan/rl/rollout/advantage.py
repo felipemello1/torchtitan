@@ -37,10 +37,31 @@ class AdvantageEstimator(Configurable):
         self.should_std_normalize: bool = config.should_std_normalize
 
     def __call__(self, group: RolloutGroup) -> list[float]:
-        """Return per-rollout advantages, in group order."""
-        rewards = [rollout.reward for rollout in group.rollouts]
+        """Return per-rollout advantages, in group order. Errored rollouts (sandbox, harness,
+        timeout) are left out of the mean/std and get 0.0: their fixed `error_reward` says nothing
+        about the task. `TrainingSampleBuilder` drops them from the loss.
+
+        Example (Dr.GRPO):
+            status    [COMPLETED, COMPLETED, ERROR_TIMEOUT, COMPLETED]
+            reward    [1.0,       0.0,       0.0,           1.0]
+            mean over the 3 kept rewards = 2/3
+            advantage [1/3,       -2/3,      0.0,           1/3]
+            all errored -> all 0.0
+        """
+        rewards = [
+            rollout.reward
+            for rollout in group.rollouts
+            if not rollout.status.is_error()
+        ]
+        if not rewards:
+            return [0.0] * len(group.rollouts)
         group_mean = sum(rewards) / len(rewards)
         denom = (
             (statistics.pstdev(rewards) + 1e-6) if self.should_std_normalize else 1.0
         )
-        return [(reward - group_mean) / denom for reward in rewards]
+        return [
+            0.0
+            if rollout.status.is_error()
+            else (rollout.reward - group_mean) / denom
+            for rollout in group.rollouts
+        ]

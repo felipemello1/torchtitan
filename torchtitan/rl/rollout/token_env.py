@@ -91,7 +91,8 @@ class TokenEnv(Configurable):
 
         # TODO: its unclear if timeout should be on this layer or handled by the messageEnv
         step_timeout_s: float | None = 1800.0
-        """Wall-clock timeout for one `MessageEnv.step` call."""
+        """Wall-clock timeout for one `MessageEnv.step` call. A timeout ends the rollout as
+        `ERROR_TIMEOUT`, left out of the loss, so envs that run model code should time it out themselves."""
 
         max_num_turns: int | None = None
         """Cap on assistant turns. If the env would continue past this many turns,

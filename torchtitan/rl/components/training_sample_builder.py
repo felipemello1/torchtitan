@@ -94,6 +94,10 @@ class TrainingSampleBuilder(Configurable):
         drop_zero_std_reward_groups: bool = True
         """Drop zero-reward-variance groups;"""
 
+        drop_errored_rollouts: bool = True
+        """Leave errored rollouts (sandbox, harness, timeout) out of training, and drop the group
+        if fewer than 2 rollouts remain. Their reward is a fixed `error_reward`, not a task score."""
+
     def __init__(self, config: Config) -> None:
         self.config = config
 
@@ -115,10 +119,35 @@ class TrainingSampleBuilder(Configurable):
                 group_id=rollout_group.group_id, training_samples=[], metrics=metrics
             )
 
+        rollouts = rollout_group.rollouts
+        # Errored (sandbox, harness, timeout): train on the rest, if enough siblings remain to
+        # compare. The advantage estimator already left them out of the group mean/std.
+        if self.config.drop_errored_rollouts:
+            rollouts = [
+                rollout for rollout in rollouts if not rollout.status.is_error()
+            ]
+            num_errored = len(rollout_group.rollouts) - len(rollouts)
+            if num_errored:
+                metrics.append(
+                    m.Metric(
+                        "training_sample_builder/num_rollouts_dropped_errored",
+                        m.Sum(float(num_errored)),
+                    )
+                )
+            if num_errored and len(rollouts) < 2:
+                metrics.append(
+                    m.Metric(
+                        "training_sample_builder/num_groups_dropped_errored", m.Sum(1.0)
+                    )
+                )
+                return TrainingSampleGroup(
+                    group_id=rollout_group.group_id, training_samples=[], metrics=metrics
+                )
+
         # Untrainable: any sibling with no completion tokens -> drop the whole group
         if any(
             not any(turn.completion_token_ids for turn in rollout.turns)
-            for rollout in rollout_group.rollouts
+            for rollout in rollouts
         ):
             metrics.append(
                 m.Metric(
@@ -130,7 +159,7 @@ class TrainingSampleBuilder(Configurable):
             )
 
         # Zero-std reward: no learning signal across siblings.
-        rewards = [rollout.reward for rollout in rollout_group.rollouts]
+        rewards = [rollout.reward for rollout in rollouts]
         is_zero_std = len(rewards) > 1 and statistics.pstdev(rewards) == 0.0
         metrics.append(
             m.Metric(
@@ -153,7 +182,7 @@ class TrainingSampleBuilder(Configurable):
         unfiltered_training_samples: list[TrainingSample] = []
         branches_per_rollout: list[float] = []
         num_samples_dropped_no_valid_tokens = 0
-        for rollout in rollout_group.rollouts:
+        for rollout in rollouts:
             rollout_training_samples = self.rollout_to_training_samples(rollout)
             unfiltered_training_samples.extend(rollout_training_samples)
             kept = [
@@ -183,7 +212,7 @@ class TrainingSampleBuilder(Configurable):
             training_sample.max_policy_version
             for training_sample in unfiltered_training_samples
         ]
-        advantages = [rollout.advantage for rollout in rollout_group.rollouts]
+        advantages = [rollout.advantage for rollout in rollouts]
         metrics += [
             m.Metric(
                 "training_sample_builder/num_training_samples",
