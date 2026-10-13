@@ -366,6 +366,7 @@ class Qwen35Model(MultimodalModel):
                 "fp32_to_bf16_split",
                 "router",
                 "moe_aux_loss",
+                "moe_combine",
             ]
         )
 
