@@ -6,5 +6,6 @@
 
 from torchtitan.rl.losses.dapo import DAPOLoss
 from torchtitan.rl.losses.grpo import GRPOLoss
+from torchtitan.rl.losses.ipo import IPOLoss
 
-__all__ = ["DAPOLoss", "GRPOLoss"]
+__all__ = ["DAPOLoss", "GRPOLoss", "IPOLoss"]
