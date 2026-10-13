@@ -213,6 +213,7 @@ def test_forward_respects_prepared_extent_and_decode_padding(monkeypatch, decode
     layer = gdn.VLLMInnerGatedDeltaNet.__new__(gdn.VLLMInnerGatedDeltaNet)
     torch.nn.Module.__init__(layer)
     layer.prefix, layer.kv_cache = "gdn", (torch.empty(0), torch.empty(0))
+    layer.use_flashinfer_prefill = False
     extent = 4 if decode else 3
     metadata = TorchTitanLinearAttentionMetadata(
         execution_path=(

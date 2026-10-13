@@ -484,6 +484,9 @@ def test_cached_weights_follow_weight_sync() -> None:
         layer.local_key_dim = channels
         layer.conv_kernel_size = width
         layer._weight_sources = layer._derived_weights = None
+        layer.use_flashinfer_prefill = False
+        # The GDN step runs as a custom op that looks the layer up by name.
+        context.no_compile_layers[layer.prefix] = layer
         return layer
 
     initial_states = (
