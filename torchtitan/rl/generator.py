@@ -817,6 +817,12 @@ class VLLMGenerator(Configurable):
         ``Trainer.Config.dist_moe_runtime``: the generator plans scratch-only execution
         over its own, smaller, expert-parallel mesh."""
 
+        moe_kernel: Literal["torchtitan", "flashinfer"] = "torchtitan"
+        """Kernel for the stock routed experts. ``"flashinfer"`` runs dispatch, expert GEMMs and
+        combine in FlashInfer's TRT-LLM bf16 fused MoE (needs ``flashinfer`` and a single-rank expert
+        group); the router stays in TorchTitan. Its MoE output differs from TorchTitan's by about
+        bf16 rounding (relative L2 ~5e-3)."""
+
         model_dtype: str = "bfloat16"
         """Data type for model weights, passed directly to vLLM (auto, float16, bfloat16, float32)."""
 
@@ -934,6 +940,7 @@ class VLLMGenerator(Configurable):
             parallelism=config.parallelism,
             checkpointer_config=config.checkpointer,
             dist_moe_runtime=config.dist_moe_runtime,
+            moe_kernel=config.moe_kernel,
         )
 
         # Set vLLM environment variables from config before any vLLM initialization

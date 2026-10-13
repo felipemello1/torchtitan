@@ -38,8 +38,13 @@ from torchtitan.models.base.module import Module
 from torchtitan.models.common.attention import InnerAttention
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.dist_moe import DistMoeRoutedExperts, DistMoeRuntime
+from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
+from torchtitan.rl.model.flashinfer_moe import (
+    enable_flashinfer_routed_experts,
+    to_flashinfer_layout_,
+)
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import tensor_model_parallel_all_reduce
@@ -329,6 +334,7 @@ class VLLMModelWrapper(Module):
         vllm_config: VllmConfig,
         prefix: str = "",
         dist_moe_runtime: DistMoeRuntime.Config | None = None,
+        moe_kernel: str = "torchtitan",
     ):
         super().__init__()
 
@@ -401,6 +407,7 @@ class VLLMModelWrapper(Module):
             cast(torch.device, vllm_config.device_config.device),
         )
         self._maybe_initial_load_weights()
+        self._flashinfer_experts = self._maybe_enable_flashinfer_moe(moe_kernel)
 
         # Give each gpt-oss attention's vLLM backend its sink rescale.
         self._inject_attention_sinks()
@@ -473,7 +480,25 @@ class VLLMModelWrapper(Module):
         incompatible_keys = self.model.load_state_dict(state_dict, strict=True)
         for handle in handles:
             handle.remove()
+        if self._flashinfer_experts:
+            # The new expert weights arrive in TorchTitan's layout.
+            to_flashinfer_layout_(self._flashinfer_experts)
         return incompatible_keys
+
+    def _maybe_enable_flashinfer_moe(self, moe_kernel: str) -> list[RoutedExperts]:
+        """Route the stock routed experts through FlashInfer and convert their weights in place."""
+        if moe_kernel == "torchtitan":
+            return []
+        if moe_kernel != "flashinfer":
+            raise ValueError(f"moe_kernel must be 'torchtitan' or 'flashinfer', got {moe_kernel!r}")
+        ctx = self.parallelism_context
+        if ctx.tp_enabled or ctx.ep_enabled:
+            raise ValueError("moe_kernel='flashinfer' needs a single-rank expert group (TP=1, EP=1)")
+        experts = enable_flashinfer_routed_experts(self.model)
+        if not experts:
+            raise ValueError("moe_kernel='flashinfer' found no stock RoutedExperts in the model")
+        to_flashinfer_layout_(experts)
+        return experts
 
     def set_num_valid_tokens(self, num_valid_tokens: int) -> None:
         """Publish how many of this step's tokens are real, for the padding mask.

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import cast, Protocol
 
@@ -97,6 +97,11 @@ class RoutedExperts(Module):
             else None
         )
         self.token_dispatcher = config.token_dispatcher.build()
+        # An inference-only kernel for the whole routed computation, used when grad is off
+        # (e.g. the generator's FlashInfer MoE); None runs the TorchTitan path below.
+        self.inference_forward: (
+            Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None
+        ) = None
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         del buffer_device
@@ -123,6 +128,8 @@ class RoutedExperts(Module):
         # TODO(acisseJZhong): skip padding rows' dispatch, expert compute and
         # combine in the stock token dispatchers too, as Dist-MoE does.
         del padding_mask_T
+        if self.inference_forward is not None and not torch.is_grad_enabled():
+            return self.inference_forward(x_TD, topk_scores_TK, topk_expert_ids_TK)
         (
             routed_input_RD,
             num_global_tokens_per_local_expert_e,

@@ -130,6 +130,7 @@ def register_to_vllm(
     parallelism: InferenceParallelismConfig,
     checkpointer_config: CheckpointManager.Config | None,
     dist_moe_runtime: DistMoeRuntime.Config | None = None,
+    moe_kernel: str = "torchtitan",
 ) -> None:
     """Register the TorchTitan model class and the TorchTitan config parser with vLLM.
 
@@ -162,6 +163,7 @@ def register_to_vllm(
             weights arrive from TorchStore.
         dist_moe_runtime: ``DistMoeRuntime.Config(inference=True)`` for models
             with Dist-MoE routed experts; ``None`` otherwise.
+        moe_kernel: ``"flashinfer"`` runs the stock routed experts in FlashInfer's fused MoE.
     """
     has_gdn = any(
         getattr(layer, "delta_net", None) is not None for layer in model_config.layers
@@ -199,6 +201,7 @@ def register_to_vllm(
                 vllm_config=vllm_config,
                 prefix=prefix,
                 dist_moe_runtime=dist_moe_runtime,
+                moe_kernel=moe_kernel,
             )
 
     VLLMModelFromSpec.__name__ = VLLM_MODEL_NAME
