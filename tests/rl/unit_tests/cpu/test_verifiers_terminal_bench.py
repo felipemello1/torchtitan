@@ -179,8 +179,9 @@ print(type(load_harness(env_config.agent.harness)).__name__)
 
 
 def test_env_server_workers_skip_the_trainer_imports(monkeypatch) -> None:
-    """A pool worker loads the broker's ``__main__``, the pickled ``log_setup``
-    and the taskset module. None of them may import torch, vLLM or Monarch.
+    """A pool worker loads the broker's ``__main__``, runs the pickled ``log_setup``,
+    then imports the taskset module and the tokenizer. None of them may import torch,
+    vLLM or Monarch.
     """
     captured = {}
 
@@ -215,9 +216,11 @@ def test_env_server_workers_skip_the_trainer_imports(monkeypatch) -> None:
     assert not hasattr(captured["main"], "__file__")
     worker = f"""
 import pickle, sys
-pickle.loads({captured["log_setup"]!r})
+import verifiers.v1.serve.pool  # the worker's spawn target, unpickled before log_setup
+pickle.loads({captured["log_setup"]!r})()
 import {taskset.__name__}
-print([name for name in ("torch", "vllm", "monarch") if name in sys.modules])
+from transformers import AutoTokenizer
+print([name for name in ("torch", "vllm", "monarch") if sys.modules.get(name) is not None])
 """
     result = subprocess.run(
         [sys.executable, "-c", worker], capture_output=True, text=True, check=False
