@@ -37,8 +37,14 @@ class TestLocalTokenDispatcherInference(unittest.TestCase):
             (expert_rows_TKD * scores_TK.double()[..., None]).sum(1).bfloat16()
         )
         compiled = torch.compile(token_dispatcher._gather_weighted_sum, backend="eager")
-        with torch.no_grad(), patch.object(
-            token_dispatcher, "_gather_weighted_sum", compiled
+        with torch.no_grad(), patch.multiple(
+            token_dispatcher,
+            _sort_routes_and_gather=torch.compile(
+                token_dispatcher._sort_routes_and_gather, backend="eager"
+            ),
+            _gather_weighted_sum=torch.compile(
+                token_dispatcher._gather_weighted_sum, backend="eager"
+            ),
         ):
             actual_TD = self._dispatch_combine(x_TD, scores_TK, ids_TK, E)
         torch.testing.assert_close(actual_TD, expected_TD, rtol=0, atol=0)
@@ -54,6 +60,36 @@ class TestLocalTokenDispatcherInference(unittest.TestCase):
         with torch.no_grad():
             actual = self._dispatch_combine(x_TD, scores_TK, ids_TK, E)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_counting_sort_matches_stable_argsort(self):
+        sort_routes = token_dispatcher._sort_routes_and_gather
+        torch.manual_seed(0)
+        K, D, E = 4, 8, 5
+        for T in (37, 0):
+            x_TD = torch.randn(T, D)
+            scores_TK = torch.rand(T, K)
+            # Duplicate experts within a token, as router replay allows.
+            ids_TK = torch.randint(0, E, (T, K))
+            eager_outputs = sort_routes(x_TD, scores_TK, ids_TK, E)  # argsort
+            torch._dynamo.reset()
+            counting_outputs = torch.compile(sort_routes, backend="eager")(
+                x_TD, scores_TK, ids_TK, E
+            )
+            torch._dynamo.reset()
+            with patch.object(
+                token_dispatcher, "_MAX_COUNTING_SORT_ONE_HOT_ELEMENTS", -1
+            ):
+                argsort_outputs = torch.compile(sort_routes, backend="eager")(
+                    x_TD, scores_TK, ids_TK, E
+                )
+            torch._dynamo.reset()
+            for eager_t, counting_t, argsort_t in zip(
+                eager_outputs[:3], counting_outputs[:3], argsort_outputs[:3]
+            ):
+                self.assertTrue(torch.equal(counting_t, eager_t))
+                self.assertTrue(torch.equal(argsort_t, eager_t))
+            self.assertIsNone(eager_outputs[3])
+            self.assertTrue(torch.equal(counting_outputs[3], argsort_outputs[3]))
 
     def test_no_grad_dispatch_and_combine_with_zero_tokens(self):
         x_TD = torch.randn(0, 8)
