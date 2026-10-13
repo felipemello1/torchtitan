@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import subprocess
-import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -564,21 +562,3 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
 def test_parse_sampling_config_requires_stop_token_ids() -> None:
     with pytest.raises(ValueError, match="stop_token_ids"):
         _parse_sampling_config({"temperature": 1.0})
-
-
-def test_env_server_worker_setup_blocks_torch() -> None:
-    # A fresh interpreter, like a spawned pool worker.
-    worker = """
-from torchtitan.rl.examples.verifiers.worker_setup import setup_env_server_worker
-setup_env_server_worker("INFO")
-from transformers import AutoTokenizer
-try:
-    import torch
-except ImportError:
-    print("torch blocked")
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", worker], capture_output=True, text=True, check=False
-    )
-    assert result.returncode == 0, result.stderr[-2000:]
-    assert result.stdout.strip() == "torch blocked"

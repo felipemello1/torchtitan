@@ -43,8 +43,9 @@ def _run_env_server_process(
     no_proxy = ",".join(filter(None, (no_proxy, "127.0.0.1", "localhost")))
     os.environ["no_proxy"] = no_proxy
     os.environ["NO_PROXY"] = no_proxy
-    # Pool workers read these at exec. They render on threads and glibc keeps freed memory, so
-    # each stays at its peak. An 8-thread churn test: peak 504 -> 200 MB, idle 306 -> 38 MB.
+    # Pool workers read these at exec. They render on threads and, by default, stay at peak RSS.
+    # 8-thread churn test: RSS growth at peak 504 -> 200 MB, after the episodes end 306 -> 38 MB,
+    # for ~25% more CPU time (allocations >= 64 KB become mmap/munmap pairs).
     os.environ.setdefault("MALLOC_ARENA_MAX", "2")
     os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "0")
     os.environ.setdefault("MALLOC_MMAP_THRESHOLD_", "65536")
