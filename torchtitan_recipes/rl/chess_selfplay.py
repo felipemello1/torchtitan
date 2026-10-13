@@ -339,7 +339,7 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
     max_plies: int = 120,
     max_thinking_tokens: int = 1024,
     max_context_tokens: int = 131072,
-    num_prompts_per_train_step: int = 48,
+    num_prompts_per_train_step: int = 24,
 ) -> Controller.Config:
     """Qwen3.5-35B-A3B-Base self-play from scratch on five GB300 hosts; games, thinking and validation
     as in `rl_chess_qwen3_5_4b_gb300`, with a zero-sum mate (10 / -9):
@@ -384,8 +384,8 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
     # ======== Async loop ========
     loop = config.async_loop
     loop.num_training_steps = 1000
-    # 48 positions x 8 games x 2 colors = 768 rollouts per step: ~200 s of forward/backward at 66
-    # plies, growing with the ply cap. Sixteen generators keep the trainer busy up to ~640-token replies.
+    # 24 positions x 8 games x 2 colors = 384 rollouts per step. At 48 positions, host 0 ran out of RAM
+    # at step 100 (chess118gk): the buffer holds up to (6 + 1) batches of games.
     loop.num_prompts_per_train_step = num_prompts_per_train_step
     loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
         # The mean policy age of trained groups stays under 6 steps, every one under 10.
