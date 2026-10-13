@@ -42,6 +42,7 @@ from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.config.compilation import CompilationMode
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -294,6 +295,17 @@ def _restore_sharded_params(module: FSDPModule) -> None:
         alloc_storage(sharded_data)
 
 
+def _remove_fsdp_forward_hooks(module: FSDPModule) -> None:
+    """Remove the forward pre/post hooks of ``module``'s FSDP group (idempotent).
+
+    Example:
+        >>> _remove_fsdp_forward_hooks(model.layers["0"])  # forward now skips FSDP's unshard/reshard
+    """
+    state = module._get_fsdp_state()
+    state._pre_forward_hook_handle.remove()
+    state._post_forward_hook_handle.remove()
+
+
 def _unshard_and_free_sharded_params(module: FSDPModule) -> None:
     """Unshard `module`'s FSDP group into its unsharded buffers, then free its sharded ones.
 
@@ -443,6 +455,13 @@ class VLLMModelWrapper(Module):
         for module in self.model.modules():
             if isinstance(module, FSDPModule):
                 _unshard_and_free_sharded_params(module)
+        if vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
+            # vLLM compiles the forward with fullgraph=True and FSDP runs its forward hooks
+            # under torch._dynamo.disable. The parameters stay unsharded from here on (CUDA
+            # graph replays skip the hooks too), so the hooks have nothing left to do.
+            for module in self.model.modules():
+                if isinstance(module, FSDPModule):
+                    _remove_fsdp_forward_hooks(module)
 
     def load_state_dict(self, state_dict: Mapping[str, Any]):
         """Copy new weights into `self.model`, allocating about one FSDP group's sharded buffers at a time.
