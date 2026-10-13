@@ -428,8 +428,9 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300(
     generator.model = generator_model
     # Router replay: the trainer routes each token to the experts the generator picked.
     generator.return_routed_experts = True
-    # ScoreCenteringLoss's top-k: 32 matched the full vocabulary in arXiv 2609.20807.
-    generator.sampling.num_topk_logprobs = 32
+    # ScoreCenteringLoss's top-k: 32 matched the full vocabulary in arXiv 2609.20807; 16 halves the
+    # host RAM the top-k rows take, after host 0 ran out of RAM (chess118gk).
+    generator.sampling.num_topk_logprobs = 16
     # Admit a request only while 10% of KV blocks stay free. Below 15% free, release the sessions idle
     # longest; their KV stays in CPU memory.
     generator.extra_vllm_engine_args = {"watermark": 0.1}
