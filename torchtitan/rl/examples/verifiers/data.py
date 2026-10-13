@@ -87,11 +87,10 @@ class VerifiersTaskDataset(RLDataset):
                 f"Verifiers taskset {config.verifiers_taskset.id!r} is infinite; "
                 "num_tasks is required"
             )
-        verifiers_taskset = (
-            verifiers_taskset
-            if config.num_tasks is None
-            else verifiers_taskset.head(config.num_tasks)
-        )
+        if config.num_tasks is not None:
+            # Verifiers 0.3.2 names it `take`; newer releases `head`.
+            first_n = getattr(verifiers_taskset, "head", None) or verifiers_taskset.take
+            verifiers_taskset = first_n(config.num_tasks)
         if config.shuffle:
             verifiers_taskset = verifiers_taskset.shuffle(config.seed)
         tasks = list(verifiers_taskset)
