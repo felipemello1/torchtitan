@@ -199,7 +199,7 @@ def test_env_server_workers_skip_the_trainer_imports(monkeypatch) -> None:
         "MALLOC_ARENA_MAX",
         "MALLOC_TRIM_THRESHOLD_",
         "MALLOC_MMAP_THRESHOLD_",
-        "TORCHTITAN_RL_ROLE",
+        env_server.RL_ROLE_ENV,
     ):
         monkeypatch.setenv(name, "")
     config = _rollouter_config(TRAIN_DATASET, EVAL_DATASET).verifiers_env_server

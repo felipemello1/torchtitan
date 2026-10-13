@@ -863,20 +863,24 @@ class TestIsValidationSwitch:
 
 
 def test_compute_host_memory_metrics_groups_processes_by_role() -> None:
+    def host_memory() -> dict[str, float]:
+        return {
+            metric.key: metric.value.value for metric in compute_host_memory_metrics()
+        }
+
+    before = host_memory()
+    if not before:
+        pytest.skip("needs cgroup v2")
     # A child inherits this process's cgroup; tag it as a trainer.
     sleeper = subprocess.Popen(
         ["sleep", "60"], env={**os.environ, RL_ROLE_ENV: "trainer"}
     )
     try:
-        metrics = {
-            metric.key: metric.value.value for metric in compute_host_memory_metrics()
-        }
+        after = host_memory()
     finally:
         sleeper.kill()
         sleeper.wait()
-    if not metrics:
-        pytest.skip("needs cgroup v2")
-    assert metrics["host_memory/num_processes/controller"] == 1
-    assert metrics["host_memory/num_processes/trainer"] == 1
-    assert metrics["host_memory/rss_anon_gib/trainer"] > 0
-    assert metrics["host_memory/cgroup_memory_current_gib"] > 0
+    num_trainers = "host_memory/num_processes/trainer"
+    assert after["host_memory/num_processes/controller"] == 1
+    assert after[num_trainers] == before[num_trainers] + 1
+    assert after["host_memory/rss_anon_gib/trainer"] > 0

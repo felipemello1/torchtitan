@@ -50,6 +50,8 @@ def _run_env_server_process(
     os.environ.setdefault("MALLOC_ARENA_MAX", "2")
     os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "0")
     os.environ.setdefault("MALLOC_MMAP_THRESHOLD_", "65536")
+
+    # Tags the workers spawned below; /proc still shows this process's spawn env, without it.
     os.environ[RL_ROLE_ENV] = "env_server_worker"
 
     if local_taskset_module is not None:

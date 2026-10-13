@@ -308,16 +308,20 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
     return out
 
 
-def compute_host_memory_metrics() -> list[m.Metric]:
-    """Anonymous memory (``RssAnon``) per process role on this host, plus the cgroup total.
+_PROCESS_ROLES = ("controller", "trainer", "generator", "env_server_worker", "other")
 
+
+def compute_host_memory_metrics() -> list[m.Metric]:
+    """Anonymous memory (`RssAnon`) per process role on this host, plus the cgroup total.
+
+    `RssAnon` leaves out shared libraries, which summed RSS counts once per process.
     Scans every process in the controller's cgroup: trainer ranks need not be the
-    controller's descendants. A process's role is ``TORCHTITAN_RL_ROLE`` in its spawn env:
+    controller's descendants. A process's role is `TORCHTITAN_RL_ROLE` in its spawn env:
 
         controller           this process
         trainer, generator   Monarch procs and their children
-        env_server_worker    Verifiers pool workers and their children
-        other                the rest, e.g. the env-server process itself
+        env_server_worker    processes the env server spawns, and their children
+        other                the rest, e.g. Monarch host agents and the env server itself
 
     Example:
         compute_host_memory_metrics()
@@ -328,14 +332,14 @@ def compute_host_memory_metrics() -> list[m.Metric]:
     cgroup_dir = _cgroup_dir()
     if cgroup_dir is None:
         return []
-    rss_anon_kib: dict[str, int] = defaultdict(int)
-    num_processes: dict[str, int] = defaultdict(int)
+    rss_anon_kib = dict.fromkeys(_PROCESS_ROLES, 0)
+    num_processes = dict.fromkeys(_PROCESS_ROLES, 0)
     for pid in (cgroup_dir / "cgroup.procs").read_text().split():
-        # A process may exit after the cgroup listing.
+        # A process may exit after the cgroup listing, or be unreadable (hidepid).
         try:
             status = Path(f"/proc/{pid}/status").read_text()
             role = "controller" if int(pid) == os.getpid() else _process_role(pid)
-        except (FileNotFoundError, ProcessLookupError):
+        except OSError:
             continue
         # "RssAnon:   123456 kB"; a zombie has no such line.
         for line in status.splitlines():
@@ -366,7 +370,10 @@ def compute_host_memory_metrics() -> list[m.Metric]:
 
 @functools.cache
 def _cgroup_dir() -> Path | None:
-    """The controller's cgroup v2 directory, from the "0::<path>" line of /proc/self/cgroup."""
+    """The controller's cgroup v2 directory; cached, so a host without one warns once.
+
+    Example: "0::/user.slice/session-3.scope" -> /sys/fs/cgroup/user.slice/session-3.scope
+    """
     for line in Path("/proc/self/cgroup").read_text().splitlines():
         if line.startswith("0::"):
             cgroup_dir = Path("/sys/fs/cgroup") / line[3:].lstrip("/")
@@ -384,5 +391,6 @@ def _process_role(pid: str) -> str:
     prefix = f"{RL_ROLE_ENV}=".encode()
     for entry in environ.split(b"\0"):
         if entry.startswith(prefix):
-            return entry[len(prefix) :].decode()
+            role = entry[len(prefix) :].decode(errors="replace")
+            return role if role in _PROCESS_ROLES else "other"
     return "other"
