@@ -11,7 +11,6 @@ import concurrent.futures
 import enum
 import gc
 import logging
-import math
 import os
 import threading
 from collections.abc import Callable
@@ -200,6 +199,11 @@ def _prepare_generation_request_metrics(
 # is used instead (and also drives the vLLM engine).
 _DEFAULT_MAX_NUM_BATCHED_TOKENS = 2048
 
+# Largest auto-derived CUDA graph size for "FULL", as vLLM's own default on data center
+# Blackwell. Bigger prefill / mixed steps run without a graph instead of padding up to a
+# huge one; their launch overhead is small next to their compute.
+_MAX_DEFAULT_CAPTURE_SIZE = 1024
+
 
 @dataclass(kw_only=True, slots=True)
 class VLLMCudaGraphConfig:
@@ -224,11 +228,11 @@ class VLLMCudaGraphConfig:
     """
 
     capture_sizes: list[int] | None = None
-    """Explicit CUDA graph capture batch sizes. When ``None`` (default), sizes are
-    auto-derived: powers of 2 up to the cap, plus ``max_num_seqs`` and the cap as
-    exact sizes. When set, these sizes are deduped and sorted. When expert
-    sequence parallelism is enabled, capture sizes that are not multiples of
-    its degree are removed."""
+    """Explicit CUDA graph capture batch sizes. When ``None`` (default), vLLM's default
+    ladder is used (see ``_default_capture_sizes``), up to ``max_num_seqs``, and for
+    ``FULL`` up to ``max_num_batched_tokens`` capped at 1024. When set, these sizes are
+    deduped and sorted. When expert sequence parallelism is enabled, capture sizes that
+    are not multiples of its degree are removed."""
 
     # TODO: Validate CUDA graph capture with MoE / Expert Parallelism.
     # MoE routing produces dynamic shapes that may conflict with full
@@ -250,14 +254,14 @@ class VLLMCudaGraphConfig:
         """Build a vLLM ``CompilationConfig`` for the generator.
 
         When ``capture_sizes`` is set, those exact sizes are captured. Otherwise
-        sizes are auto-derived: powers of 2 up to the cap, plus ``max_num_seqs`` and
-        the cap itself as exact sizes so the largest capture size is always the cap
-        (even when it is not a power of 2). The cap is ``max_num_seqs`` for
+        sizes follow vLLM's default ladder, ``_default_capture_sizes(cap)``, whose
+        largest size is the cap. The cap is ``max_num_seqs`` for
         ``FULL_DECODE_ONLY`` (decode batch == num_seqs). ``FULL`` also graphs
         prefill, whose per-step token count is bounded by
         ``max_num_batched_tokens`` (the configured value, else
-        ``_DEFAULT_MAX_NUM_BATCHED_TOKENS``), so the cap extends to it -- otherwise
-        prefill chunks larger than the cap fall back to eager.
+        ``_DEFAULT_MAX_NUM_BATCHED_TOKENS``), so the cap extends to it, up to
+        ``_MAX_DEFAULT_CAPTURE_SIZE`` (1024) and never below ``max_num_seqs``. Larger
+        prefill chunks run without a graph rather than padded to a huge one.
 
         ``expert_sequence_parallel_size`` is the TP-axis shard count used by the
         internally sequence-sharded MoE path. A value greater than one removes
@@ -292,7 +296,9 @@ class VLLMCudaGraphConfig:
             _max_cuda_graph_capture_size = _DEFAULT_MAX_NUM_BATCHED_TOKENS
         cap = max_num_seqs
         if self.mode == "FULL":
-            cap = max(cap, _max_cuda_graph_capture_size)
+            cap = max(
+                cap, min(_max_cuda_graph_capture_size, _MAX_DEFAULT_CAPTURE_SIZE)
+            )
         if self.capture_sizes is not None:
             if not self.capture_sizes or any(s <= 0 for s in self.capture_sizes):
                 raise ValueError(
@@ -301,15 +307,7 @@ class VLLMCudaGraphConfig:
                 )
             sizes = sorted(set(self.capture_sizes))
         else:
-            sizes = [1 << i for i in range(int(math.log2(cap)) + 1)]
-            # Always include max_num_seqs (decode batch) and the cap (largest
-            # prefill chunk) as exact sizes so the largest capture size is the cap
-            # even when it is not a power of 2
-            if max_num_seqs not in sizes:
-                sizes.append(max_num_seqs)
-            if cap not in sizes:
-                sizes.append(cap)
-            sizes = sorted(sizes)
+            sizes = _default_capture_sizes(cap)
 
         if expert_sequence_parallel_size > 1:
             removed_sizes = [
@@ -340,6 +338,22 @@ class VLLMCudaGraphConfig:
                 sp_min_token_num=1 if enable_sequence_parallel else None,
             ),
         )
+
+
+def _default_capture_sizes(cap: int) -> list[int]:
+    """vLLM's default CUDA graph sizes up to ``cap``: 1, 2, 4, every 8 to 256, every 16 above.
+
+    A batch runs the smallest graph that fits it, padded to that size, so a dense ladder
+    at the low end matters: agent rollouts keep a generator at a few dozen sequences.
+
+    Example (cap=300, 38 sizes):
+        1 2 4
+        8 16 24 ... 248       +8
+        256 272 288           +16
+        300                   the cap itself
+    """
+    sizes = {1, 2, 4, *range(8, 256, 8), *range(256, cap + 1, 16), cap}
+    return sorted(size for size in sizes if size <= cap)
 
 
 @dataclass(kw_only=True, slots=True)
