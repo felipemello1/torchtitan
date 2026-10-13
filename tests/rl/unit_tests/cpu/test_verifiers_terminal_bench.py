@@ -668,7 +668,8 @@ def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) ->
     assert config.rollouter.training_dataloader.zero_spread_skip.min_mean_reward == 0.9
     assert config.generator.hold_session_kv
     assert not config.generator.reset_kv_cache_on_weight_sync
-    assert config.generator.kv_offload_gib == 96
+    assert config.generator.kv_offload_gib == 0
+    assert config.generator.sampling.max_tokens == 8192
 
     trainer = config.trainer
     (optimizer,) = trainer.optim.optimizer.optimizers
