@@ -24,4 +24,5 @@ def test_qwen35_architecture_enables_offset_rmsnorm_local_compile() -> None:
             "moe_combine",
             "expert_counts",
             "residual_norm",
+            "attention_output_gate",
         ]

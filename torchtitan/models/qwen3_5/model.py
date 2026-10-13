@@ -116,6 +116,64 @@ def _residual_add_norm(
     return x_TD, norm(x_TD)
 
 
+# Both functions round to the activation dtype where eager does, so compiled outputs and
+# gradients equal eager's bitwise.
+@local_compile(
+    "attention_output_gate",
+    batch_invariant=False,
+    options={"emulate_precision_casts": True},
+)
+def _gate_attention_output_forward(
+    out_THV: torch.Tensor, gate_THV: torch.Tensor
+) -> torch.Tensor:
+    """Return ``out * sigmoid(gate)`` flattened to ``(T, H * V)`` for ``wo``.
+
+    Example:
+        >>> _gate_attention_output_forward(torch.ones(2, 1, 3), torch.zeros(2, 1, 3))
+        tensor([[0.5000, 0.5000, 0.5000],
+                [0.5000, 0.5000, 0.5000]])
+    """
+    return (out_THV * torch.sigmoid(gate_THV)).reshape(out_THV.shape[0], -1)
+
+
+@local_compile(
+    "attention_output_gate",
+    batch_invariant=False,
+    options={"emulate_precision_casts": True},
+)
+def _gate_attention_output_backward(
+    grad_THV: torch.Tensor, out_THV: torch.Tensor, gate_THV: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the gradients of ``out * sigmoid(gate)`` w.r.t. ``out`` and ``gate``.
+
+    The gate gradient is ``(grad * out) * (1 - s) * s`` rounded per op, as aten's
+    BF16 ``sigmoid_backward`` computes it.
+
+    Example:
+        >>> ones, zeros = torch.ones(1, 1, 1), torch.zeros(1, 1, 1)
+        >>> _gate_attention_output_backward(ones, ones, zeros)
+        (tensor([[[0.5000]]]), tensor([[[0.2500]]]))
+    """
+    sigmoid_THV = torch.sigmoid(gate_THV)
+    return grad_THV * sigmoid_THV, grad_THV * out_THV * (1 - sigmoid_THV) * sigmoid_THV
+
+
+class _GateAttentionOutput(torch.autograd.Function):
+    """``out * sigmoid(gate)`` flattened, one compiled kernel each way (same in train and inference)."""
+
+    @staticmethod
+    def forward(ctx, out_THV: torch.Tensor, gate_THV: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(out_THV, gate_THV)
+        return _gate_attention_output_forward(out_THV, gate_THV)
+
+    @staticmethod
+    def backward(ctx, grad_TD: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        out_THV, gate_THV = ctx.saved_tensors
+        return _gate_attention_output_backward(
+            grad_TD.view(out_THV.shape), out_THV, gate_THV
+        )
+
+
 class Qwen35Attention(BaseAttention):
     """Full attention with output gating and partial RoPE for Qwen3.5.
 
@@ -177,8 +235,6 @@ class Qwen35Attention(BaseAttention):
         # at their common attention boundary.
         x_TD = maybe_gather_tp_input(self, x_TD)
 
-        num_tokens = x_TD.shape[0]
-
         # wq is 2x wider: produces query + gate
         xq_gate_THC = local_head_split(self.wq(x_TD), self.head_dim * 2, cp_shard_dim=0)
         xq_THK, gate_THV = xq_gate_THC.chunk(2, dim=-1)
@@ -208,11 +264,7 @@ class Qwen35Attention(BaseAttention):
         # The output gating reads the inner_attention and wq gate outputs with bare
         # ops.
         remat.recompute_needs_tensor(out_THV, gate_THV)
-        out_THV = out_THV.contiguous()
-
-        # Output gating
-        out_THV = out_THV * torch.sigmoid(gate_THV)
-        out_TD = out_THV.view(num_tokens, -1)
+        out_TD = _GateAttentionOutput.apply(out_THV, gate_THV)
         return self.wo(out_TD)
 
     # TODO: consider moving this to rope directly.
@@ -385,6 +437,7 @@ class Qwen35Model(MultimodalModel):
                 "moe_combine",
                 "expert_counts",
                 "residual_norm",
+                "attention_output_gate",
             ]
         )
 

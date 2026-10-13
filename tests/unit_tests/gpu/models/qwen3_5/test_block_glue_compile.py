@@ -81,6 +81,27 @@ class TestBlockGlueLocalCompile(unittest.TestCase):
             # One FP32 sum instead of two BF16 roundings: never less accurate.
             self.assertLessEqual(fus_err, sep_err * 1.01, name)
 
+    def test_attention_output_gate_matches_eager_in_training(self):
+        # Attention output and gate are strided halves of one projection, as in the model.
+        out0, gate0 = self.randn(4096, 4, 2 * 256).chunk(2, dim=-1)
+        grad = self.randn(4096, 4 * 256)
+
+        def run(regions: list[str] | None) -> list[torch.Tensor]:
+            out = out0.detach().clone().requires_grad_()
+            gate = gate0.detach().clone().requires_grad_()
+            if regions is None:  # the eager ops the model ran before the region
+                output = (out.contiguous() * torch.sigmoid(gate)).view(4096, -1)
+            else:
+                apply_local_compile(regions)
+                output = qwen3_5._GateAttentionOutput.apply(out, gate)
+            (output * grad).float().sum().backward()
+            return [output, out.grad, gate.grad]
+
+        expected = run(None)
+        for regions in ([], ["attention_output_gate"]):
+            for want, got in zip(expected, run(regions)):
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()
