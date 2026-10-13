@@ -973,7 +973,9 @@ class VLLMGenerator(Configurable):
         ), "Only varlen and flex attention backends are allowed."
 
         use_v2 = use_v2_model_runner(
-            config.parallelism, batch_invariant=config.debug.batch_invariant
+            config.parallelism,
+            batch_invariant=config.debug.batch_invariant,
+            dist_moe=config.dist_moe_runtime is not None,
         )
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if use_v2 else "0"
         set_batch_invariance(config.debug.batch_invariant)

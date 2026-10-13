@@ -133,7 +133,7 @@ class VLLMInnerGatedDeltaNet(Module, MambaBase):
             )
         self.cache_config.mamba_ssm_cache_dtype = "float32"
         # The V2 runner never captures packed GDN (see
-        # TorchTitanGDNAttentionMetadataBuilder.get_cudagraph_support), so its
+        # TorchTitanLinearAttentionMetadataBuilder.get_cudagraph_support), so its
         # prefill can use FlashInfer's Blackwell kernel, which requires head_dim 128.
         self.use_flashinfer_prefill = (
             vllm_config.use_v2_model_runner

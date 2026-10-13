@@ -133,7 +133,9 @@ def generate() -> None:
         raise ValueError("Only varlen and flex attention backends are supported.")
 
     use_v2 = use_v2_model_runner(
-        gen_config.parallelism, batch_invariant=gen_config.debug.batch_invariant
+        gen_config.parallelism,
+        batch_invariant=gen_config.debug.batch_invariant,
+        dist_moe=gen_config.dist_moe_runtime is not None,
     )
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if use_v2 else "0"
     set_batch_invariance(gen_config.debug.batch_invariant)

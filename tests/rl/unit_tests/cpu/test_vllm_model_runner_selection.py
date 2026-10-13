@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
-from torchtitan.rl.model.gdn_backend import TorchTitanGDNAttentionMetadataBuilder
+from torchtitan.rl.model.linear_attention import TorchTitanLinearAttentionMetadataBuilder
 from torchtitan.rl.model.vllm_worker import use_v2_model_runner
 from vllm.v1.attention.backend import AttentionCGSupport
 
@@ -48,7 +48,7 @@ def test_gdn_full_graphs_are_decode_only_on_v2_runner(use_v2, expected):
         ),
         use_v2_model_runner=use_v2,
     )
-    support = TorchTitanGDNAttentionMetadataBuilder.get_cudagraph_support(
+    support = TorchTitanLinearAttentionMetadataBuilder.get_cudagraph_support(
         vllm_config, kv_cache_spec=None
     )
     assert support == expected

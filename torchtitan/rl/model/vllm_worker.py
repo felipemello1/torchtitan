@@ -22,7 +22,10 @@ from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
 
 def use_v2_model_runner(
-    parallelism: InferenceParallelismConfig, *, batch_invariant: bool
+    parallelism: InferenceParallelismConfig,
+    *,
+    batch_invariant: bool,
+    dist_moe: bool = False,
 ) -> bool:
     """Whether vLLM's V2 model runner replaces ``TorchTitanGPUModelRunner`` (V1).
 
@@ -36,7 +39,9 @@ def use_v2_model_runner(
         parallelism.tensor_parallel_degree == 1
         and parallelism.data_parallel_degree == 1
     )
-    return single_gpu and not batch_invariant
+    # Dist-MoE reads each step's unpadded token count, which only the V1 runner
+    # publishes (TorchTitanGPUModelRunner._determine_batch_execution_and_padding).
+    return single_gpu and not batch_invariant and not dist_moe
 
 
 class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
