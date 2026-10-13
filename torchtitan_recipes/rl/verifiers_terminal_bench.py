@@ -622,7 +622,8 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     - lr 5e-6 with a 10-step warmup (was 1e-6, constant);
     - `ScoreCenteringLoss` with the generator's top-32 logprobs (was DAPO);
     - the adaptive rollout buffer, mean policy age <= 6 and max 10 (was a fixed 5-step buffer);
-    - no length reward, so all-pass and all-fail groups are dropped (was weight 0.1);
+    - no length reward, so all-pass groups are dropped (was weight 0.1); all-fail groups train
+      only on their share of malformed turns;
     - tasks whose group came back all pass are skipped in later epochs, then re-checked;
     - a 4,096-token thinking budget per turn (was 12,288);
     - each session's prefix stays held between its turns (no CPU KV offload);
@@ -695,10 +696,12 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     # length alone instead of being dropped.
     config.rollouter.rubric.length_reward_weight = 0.0
     # Training: full credit for a solve, else up to 0.5 for the tests that passed, minus 0.5 when
-    # truncated (the policy learned to loop with empty commands after solving). The zero-weight
-    # pass/fail fn keeps the pass rate in the metrics. Validation stays pass/fail.
+    # truncated (the policy learned to loop with empty commands after solving). An unsolved
+    # rollout also loses 0.2 x its share of malformed turns (they rose from 1% to 12% of turns by
+    # step 68); like a length reward, that breaks ties in all-fail groups, which then train. The
+    # zero-weight pass/fail fn keeps the pass rate in the metrics. Validation stays pass/fail.
     config.rollouter.rubric.reward_fns = [
-        RewardFromVerifiersPartialCredit.Config(weight=1.0),
+        RewardFromVerifiersPartialCredit.Config(weight=1.0, malformed_turn_penalty=0.2),
         RewardFromVerifiers.Config(weight=0.0),
     ]
     config.rollouter.rubric.truncation_penalty = 0.5

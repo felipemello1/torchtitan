@@ -953,9 +953,47 @@ def test_partial_credit_reward(verifiers_reward, passed_frac, expected) -> None:
         group_id=0,
         rollout_id=0,
         status=RolloutStatus.COMPLETED,
-        turns=[SimpleNamespace(env_rewards=env_rewards)],
+        turns=[SimpleNamespace(env_rewards=env_rewards, env_messages=[])],
     )
     reward_fn = RewardFromVerifiersPartialCredit.Config().build()
+    assert asyncio.run(reward_fn(rollout, None)) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "verifiers_reward, num_malformed_turns, expected",
+    [(1.0, 5, 1.0), (0.0, 0, 1 / 3), (0.0, 5, 1 / 3 - 0.2 * 5 / 20)],
+)
+def test_partial_credit_malformed_turn_penalty(
+    verifiers_reward, num_malformed_turns, expected
+) -> None:
+    """An unsolved rollout loses 0.2 x its share of malformed turns; a solve keeps 1.0."""
+    parse_error = {
+        "role": "user",
+        "content": "Previous response had parsing errors:\n...",
+    }
+    output = {"role": "user", "content": "New Terminal Output: ..."}
+    turns = [
+        SimpleNamespace(
+            env_rewards={},
+            env_messages=[parse_error if i < num_malformed_turns else output],
+        )
+        for i in range(19)
+    ]
+    turns.append(
+        SimpleNamespace(
+            env_rewards={
+                VERIFIERS_REWARD_KEY: verifiers_reward,
+                TESTS_PASSED_FRAC_KEY: 2 / 3,
+            },
+            env_messages=[],
+        )
+    )
+    rollout = Rollout(
+        group_id=0, rollout_id=0, status=RolloutStatus.COMPLETED, turns=turns
+    )
+    reward_fn = RewardFromVerifiersPartialCredit.Config(
+        malformed_turn_penalty=0.2
+    ).build()
     assert asyncio.run(reward_fn(rollout, None)) == pytest.approx(expected)
 
 
