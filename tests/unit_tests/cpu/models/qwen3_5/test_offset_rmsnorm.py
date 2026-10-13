@@ -22,5 +22,6 @@ def test_qwen35_architecture_enables_offset_rmsnorm_local_compile() -> None:
             "fp32_to_bf16_split",
             "router",
             "moe_aux_loss",
+            "moe_dispatch",
             "moe_combine",
         ]
