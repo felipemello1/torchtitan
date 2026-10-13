@@ -65,11 +65,14 @@ class ChessPlayerEnv(MessageEnv):
 
     @dataclass(kw_only=True, slots=True)
     class Config(MessageEnv.Config):
-        pass
+        forced_close_text: str | None = None
+        """The thinking budget's close sentence. After thinking that ends with it, an illegal answer
+        plays the thinking's last box instead of forfeiting. None: an illegal answer forfeits."""
 
     def __init__(self, config: Config, *, game: ChessGame, color: chess.Color) -> None:
         self._game = game
         self._color = color
+        self._forced_close_text = config.forced_close_text
 
     async def init(self) -> MessageEnvInitOutput:
         """Show the rules, the board, and the legal moves for this player's first move."""
@@ -82,13 +85,13 @@ class ChessPlayerEnv(MessageEnv):
             f"You are playing chess as {_COLOR_NAMES[self._color]}. Play to win.\n\n"
             "Each turn you see your pieces and your opponent's pieces, keyed by piece letter and "
             "square (Ke1 is a king on e1; P is a pawn), each with its legal moves. The current "
-            "positions and legal moves are already given: avoid restating them. Analyze which move "
-            "is best, then end your reply with that move, written exactly as listed, inside "
-            '\\boxed{}. For example, "Pe2": ["e4"] means \\boxed{e4}, not \\boxed{Pe4}; '
-            '"Bc8": ["Be6"] means \\boxed{Be6}, not \\boxed{e6} or \\boxed{be6}; '
-            '"Nb1": ["Nbd2"] means \\boxed{Nbd2}, not \\boxed{Nd2}; '
-            '"Ph7": ["h8=Q", "h8=N"] means \\boxed{h8=Q}, not \\boxed{h8}. An x marks a capture: '
-            '"Nf3": ["Nxe5"] means \\boxed{Nxe5}. Pick only from the moves listed under your '
+            "positions and legal moves are already given: avoid restating them. Think about which "
+            "move is best. Then close your thinking and reply with only that move inside \\boxed{}, "
+            'written exactly as listed, and nothing else. For example, "Pe2":["e4"] means '
+            '\\boxed{e4}, not \\boxed{Pe4}; "Bc8":["Be6"] means \\boxed{Be6}, not \\boxed{e6} or '
+            '\\boxed{be6}; "Nb1":["Nbd2"] means \\boxed{Nbd2}, not \\boxed{Nd2}; '
+            '"Ph7":["h8=Q","h8=N"] means \\boxed{h8=Q}, not \\boxed{h8}. An x marks a capture: '
+            '"Nf3":["Nxe5"] means \\boxed{Nxe5}. Pick only from the moves listed under your '
             "pieces this turn, not from an earlier turn's list or your opponent's list. An illegal "
             "or missing move loses the game.\n\n"
             f"Checkmating your opponent scores {self._game.checkmate_reward:g}{checkmated}. "
@@ -108,9 +111,19 @@ class ChessPlayerEnv(MessageEnv):
         # A reply can run on into the next turn, copying its prompt's empty \boxed{}: skip empty boxes,
         # and after closed thinking play the answer's first box (thinking off or unclosed: the last).
         content = completion_message.get("content") or ""
+        reasoning = completion_message.get("reasoning_content") or ""
         matches = [match for match in _BOXED_RE.findall(content) if match.strip()]
-        index = 0 if completion_message.get("reasoning_content") else -1
-        await self._game.play(self._color, matches[index] if matches else None)
+        index = 0 if reasoning else -1
+        # A force-closed answer is a fresh guess: if it is illegal, the thinking's last box stands in.
+        fallback = None
+        if self._forced_close_text and reasoning.rstrip().endswith(
+            self._forced_close_text
+        ):
+            thought = [match for match in _BOXED_RE.findall(reasoning) if match.strip()]
+            fallback = thought[-1] if thought else None
+        await self._game.play(
+            self._color, matches[index] if matches else None, fallback_text=fallback
+        )
         await self._game.wait_for_turn(self._color)
         if self._game.is_over:
             return MessageEnvStepOutput(
@@ -250,13 +263,22 @@ class ChessGame:
                 lambda: self.is_over or self.board.turn == color
             )
 
-    async def play(self, color: chess.Color, move_text: str | None) -> None:
-        """Play `color`'s move, written as the prompt lists it (`Nf3`); any other text forfeits.
-        Does nothing once the game is over, e.g. after the other player forfeited."""
+    async def play(
+        self,
+        color: chess.Color,
+        move_text: str | None,
+        *,
+        fallback_text: str | None = None,
+    ) -> None:
+        """Play `color`'s move, written as the prompt lists it (`Nf3`); if it is not legal, play
+        `fallback_text` instead; any other text forfeits. Does nothing once the game is over, e.g.
+        after the other player forfeited."""
         async with self._turn_changed:
             if self.is_over:
                 return
             move = None if move_text is None else _parse_move(self.board, move_text)
+            if move is None and fallback_text is not None:
+                move = _parse_move(self.board, fallback_text)
             if move is None:
                 self._forfeit(color, reason="illegal_move")
             else:
@@ -294,8 +316,9 @@ class ChessGame:
             lines += ["", f"{me} is in check."]
         lines += [
             "",
-            f"Your move as {me} (ply {self.num_plies + 1} of {self._max_plies}). Write your best "
-            "legal move inside \\boxed{}.",
+            f"Your move as {me} (ply {self.num_plies + 1} of {self._max_plies}). Think about your "
+            "best two or three moves and your opponent's best reply to each, then reply with only "
+            "your move inside \\boxed{}.",
         ]
         return "\n".join(lines)
 
@@ -341,14 +364,11 @@ def _moves_by_piece(board: chess.Board, color: chess.Color, rng: random.Random) 
     without king captures, and without check marks when the side to move is in check (every move
     would read as check).
 
+    Compact JSON, one line: ~26% fewer tokens than indented JSON.
+
     Example:
 
-        {
-          "Ke1": ["Ke2"],
-          "Qd1": ["Qh5", "Qe2", "Qg4", "Qf3"],
-          "Pd2": ["d4", "d3"],
-          ...
-        }
+        {"Ke1":["Ke2"],"Qd1":["Qh5","Qe2","Qg4","Qf3"],"Pd2":["d4","d3"],...}
     """
     to_move = color == board.turn
     strip_checks = not to_move and board.is_check()
@@ -367,14 +387,12 @@ def _moves_by_piece(board: chess.Board, color: chess.Color, rng: random.Random) 
         san = board.san(move)
         key = piece.symbol().upper() + chess.square_name(move.from_square)
         moves[key].append(san.rstrip("+#") if strip_checks else san)
-    rows = []
-    for key, listed in moves.items():
+    for listed in moves.values():
         if to_move:
             rng.shuffle(listed)
         else:
             listed.sort()
-        rows.append(f'  "{key}": {json.dumps(listed)}')
-    return "{\n" + ",\n".join(rows) + "\n}"
+    return json.dumps(moves, separators=(",", ":"))
 
 
 def material_score(board: chess.Board) -> float:

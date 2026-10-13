@@ -407,6 +407,7 @@ def test_elo_fit() -> None:
         "rl_chess_qwen3_5_35b_a3b_base_gb300",
         "rl_chess_qwen3_5_35b_a3b_base_gb300_lr2e6",
         "rl_chess_qwen3_5_35b_a3b_base_gb300_lr1e6",
+        "rl_chess_qwen3_5_4b_base_gb300",
     ],
 )
 def test_recipe_builds(recipe) -> None:
@@ -425,8 +426,11 @@ def test_player_env_shows_the_board_and_scores_the_end() -> None:
         init = await white.init()
         prompt = init.init_prompt_messages[0]["content"]
         assert "You are playing chess as White" in prompt
-        assert '"Pe2": [' in prompt and "Opponent pieces (Black)" in prompt
-        assert prompt.endswith("Write your best legal move inside \\boxed{}.")
+        assert '"Pe2":[' in prompt and "Opponent pieces (Black)" in prompt
+        assert "reply with only that move inside \\boxed{}" in prompt
+        assert prompt.endswith(
+            "your opponent's best reply to each, then reply with only your move inside \\boxed{}."
+        )
         # one right and one wrong way to write a move
         assert "means \\boxed{Nbd2}, not \\boxed{Nd2}" in prompt
         assert "means \\boxed{h8=Q}, not \\boxed{h8}" in prompt
@@ -490,14 +494,38 @@ def test_player_env_plays_the_first_box_after_thinking_else_the_last() -> None:
             )
         )
         # Thinking off or unclosed: the last box that isn't the copied prompt's empty one.
-        black_reply = (
-            "\\boxed{d5}? No, \\boxed{e5}\nWrite your best legal move inside \\boxed{}."
-        )
+        black_reply = "\\boxed{d5}? No, \\boxed{e5}\nThen reply with only your move inside \\boxed{}."
         asyncio.create_task(black.step({"role": "assistant", "content": black_reply}))
         await asyncio.wait_for(white_step, timeout=1)
         assert [move.uci() for move in game.board.move_stack] == ["e2e4", "e7e5"]
 
     asyncio.run(run())
+
+
+def test_player_env_plays_the_thinking_box_after_an_illegal_forced_answer() -> None:
+    close = "Considering the limited time, I answer now."
+    forced = {
+        "role": "assistant",
+        "reasoning_content": f"\\boxed{{e4}} is good. \\boxed{{e4}}.\n\n{close}",
+        "content": "\\boxed{e5}",
+    }
+
+    async def run(config: ChessPlayerEnv.Config) -> chess.Board:
+        game = _new_game()
+        white = ChessPlayerEnv(config, game=game, color=chess.WHITE)
+        step = asyncio.create_task(white.step(forced))
+        await asyncio.sleep(0)
+        if not step.done():
+            await game.play(chess.BLACK, "e5")
+        await asyncio.wait_for(step, timeout=1)
+        return game
+
+    # Force-closed: the illegal answer e5 falls back to the thinking's last box, e4.
+    game = asyncio.run(run(ChessPlayerEnv.Config(forced_close_text=close)))
+    assert [move.uci() for move in game.board.move_stack] == ["e2e4", "e7e5"]
+    # Without the close text, the same reply forfeits.
+    game = asyncio.run(run(ChessPlayerEnv.Config()))
+    assert game.end_reason == "illegal_move" and game.forfeiter == chess.WHITE
 
 
 def test_legal_moves_are_shuffled_per_game() -> None:

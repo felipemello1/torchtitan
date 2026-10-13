@@ -454,3 +454,72 @@ def rl_chess_qwen3_5_35b_a3b_base_gb300_lr1e6() -> Controller.Config:
     config = rl_chess_qwen3_5_35b_a3b_base_gb300()
     config.trainer.optim.optimizer.optimizers[0].lr = 1e-6
     return config
+
+
+def rl_chess_qwen3_5_4b_base_gb300(
+    max_plies: int = 90,
+    max_thinking_tokens: int = 2048,
+    max_context_tokens: int = 131072,
+    num_prompts_per_train_step: int = 12,
+) -> Controller.Config:
+    """Qwen3.5-4B-Base self-play from scratch on five GB300 hosts; games, thinking and validation as
+    in `rl_chess_qwen3_5_4b_gb300`, with a zero-sum mate (10 / -9) and no penalty for thinking:
+
+        host 0:     the trainer, FSDP 4
+        hosts 1-4:  sixteen TP1 generators; idle session KV goes to CPU
+
+    Training games' ply cap grows from 60 at step 0 to `max_plies` at step 200; validation games
+    always play `max_plies`. A 90-ply game with every reply at the thinking cap holds ~111K tokens.
+    """
+    config = rl_chess_qwen3_5_4b_gb300(
+        max_plies=max_plies,
+        max_thinking_tokens=max_thinking_tokens,
+        max_context_tokens=max_context_tokens,
+    )
+    config.hf_assets_path = "torchtitan/rl/example_checkpoint/Qwen3.5-4B-Base"
+    config.dump_folder = "outputs/rl/qwen3_5_4b_base_chess_gb300"
+    # After the thinking, room for the forced close's 30 tokens and a box, not for more talk.
+    max_response_tokens = max_thinking_tokens + 48
+    config.generator.sampling.max_tokens = max_response_tokens
+    config.rollouter.worker.token_env.max_rollout_tokens = (
+        max_context_tokens - max_response_tokens
+    )
+
+    # ======== Rollouts ========
+    config.rollouter.curriculum = ChessCurriculum.Config(
+        start_max_plies=60, end_max_plies=max_plies, max_plies_ramp_steps=200
+    )
+    worker = config.rollouter.worker
+    worker.checkmated_reward = 1.0 - worker.checkmate_reward
+    # No penalty for thinking: no forced-close cost in the reward, and a cut-off's illegal answer
+    # plays the thinking's last box.
+    worker.rubric.reward_fns = [RewardChessScore.Config()]
+    worker.message_env = ChessPlayerEnv.Config(
+        forced_close_text=worker.thinking_budget.close_text.split("</think>")[0].strip()
+    )
+
+    # ======== Async loop ========
+    loop = config.async_loop
+    loop.num_training_steps = 1000
+    # 12 positions x 8 games x 2 colors = 192 rollouts per step.
+    loop.num_prompts_per_train_step = num_prompts_per_train_step
+    loop.group_buffer = AdaptiveRolloutGroupWorkBuffer.Config(
+        # The mean policy age of trained groups stays under 4 steps, every one under 8.
+        target_offpolicy_steps=4,
+        max_offpolicy_steps=8,
+        generation_capacity=(4 + 1) * num_prompts_per_train_step,
+        start_batches=4 + 1,
+    )
+    loop.target_offpolicy_steps = loop.group_buffer.target_offpolicy_steps
+
+    # ======== Generators ========
+    config.num_generators = 16
+    generator = config.generator
+    # ScoreCenteringLoss's top-k: 32 matched the full vocabulary in arXiv 2609.20807.
+    generator.sampling.num_topk_logprobs = 32
+    # Admit a request only while 10% of KV blocks stay free. Below 15% free, release the sessions idle
+    # longest; their KV stays in CPU memory.
+    generator.extra_vllm_engine_args = {"watermark": 0.1}
+    generator.session_kv_free_floor = 0.15
+    generator.kv_offload_gib = 96.0
+    return config
