@@ -724,6 +724,7 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
         agent=SimpleNamespace(trainable=True),
         ok=True,
         is_truncated=True,
+        is_timeout=False,
         stop_condition="context_length",
         errors=[],
         timing=SimpleNamespace(
@@ -774,6 +775,7 @@ def test_rollout_releases_every_trace_session_even_if_one_release_fails(caplog) 
             agent=SimpleNamespace(trainable=trainable),
             ok=True,
             is_truncated=False,
+            is_timeout=False,
             stop_condition=None,
             errors=[],
             timing=SimpleNamespace(
@@ -819,6 +821,34 @@ def test_rollout_releases_every_trace_session_even_if_one_release_fails(caplog) 
     ]
     assert "releasing routing session opponent failed" in caplog.text
     assert rollout.group_id == 1
+
+
+@pytest.mark.parametrize(
+    "ok, is_timeout, is_training, expected",
+    [
+        # Verifiers flags a stage deadline but can keep ok=True: train leaves it out.
+        (True, True, True, RolloutStatus.ERROR_TIMEOUT),
+        # Validation scores it like any other rollout.
+        (True, True, False, RolloutStatus.COMPLETED),
+        (False, True, False, RolloutStatus.ERROR),
+        (False, False, True, RolloutStatus.ERROR),
+        (True, False, True, RolloutStatus.COMPLETED),
+    ],
+)
+def test_rollout_status_leaves_training_timeouts_out(
+    ok: bool, is_timeout: bool, is_training: bool, expected: RolloutStatus
+) -> None:
+    trace = SimpleNamespace(
+        ok=ok, is_timeout=is_timeout, is_truncated=False, stop_condition="agent_timeout"
+    )
+
+    status = VerifiersRollouter.rollout_status(
+        verifiers_episode=SimpleNamespace(ok=True),
+        trace=trace,
+        is_training=is_training,
+    )
+
+    assert status is expected
 
 
 def test_a_failing_rollout_fails_its_group_only_after_every_sibling_finished() -> None:

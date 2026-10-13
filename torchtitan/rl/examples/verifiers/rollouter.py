@@ -464,7 +464,11 @@ class VerifiersRollouter(Rollouter):
             group_id=group_id,
             rollout_id=rollout_id,
         )
-        status = self.rollout_status(verifiers_episode=verifiers_episode, trace=trace)
+        status = self.rollout_status(
+            verifiers_episode=verifiers_episode,
+            trace=trace,
+            is_training=sample.validation_set is None and group_id >= 0,
+        )
         if not turns:
             # Verifiers <= 0.3.1 stops an overlong prompt as context_length, later ones as
             # max_input_tokens.
@@ -483,9 +487,9 @@ class VerifiersRollouter(Rollouter):
                 )
             status = RolloutStatus.ERROR
         logs = verifiers_rollout_logs(verifiers_episode, trace)
-        if status == RolloutStatus.ERROR:
+        if status.is_error():
             log_failed_rollout(logs, group_id=group_id, rollout_id=rollout_id)
-        else:
+        if status != RolloutStatus.ERROR:
             turns[-1].env_rewards[VERIFIERS_REWARD_KEY] = trace.reward
         return Rollout(
             group_id=group_id,
@@ -496,7 +500,23 @@ class VerifiersRollouter(Rollouter):
         )
 
     @staticmethod
-    def rollout_status(*, verifiers_episode: Any, trace: Any) -> RolloutStatus:
+    def rollout_status(
+        *, verifiers_episode: Any, trace: Any, is_training: bool = True
+    ) -> RolloutStatus:
+        """Map how Verifiers ended a rollout to its status.
+
+        A stage deadline (setup, agent, finalize, scoring) flags `trace.is_timeout` but can leave
+        `ok` True, so a timed-out rollout would still be scored. Training marks it ERROR_TIMEOUT,
+        which stays out of the loss (usually slow infra or a stalled agent, not the policy);
+        validation keeps it as a scored outcome.
+
+        Example (ok, is_timeout, is_training -> status):
+            True,  True,  True  -> ERROR_TIMEOUT
+            True,  True,  False -> COMPLETED or TRUNCATED_*
+            False, False, any   -> ERROR
+        """
+        if is_training and trace.is_timeout:
+            return RolloutStatus.ERROR_TIMEOUT
         if not verifiers_episode.ok or not trace.ok:
             return RolloutStatus.ERROR
         if not trace.is_truncated:
