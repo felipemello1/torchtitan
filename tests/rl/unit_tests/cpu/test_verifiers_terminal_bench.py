@@ -194,7 +194,8 @@ def test_env_server_workers_skip_the_trainer_imports(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "__main__", sys.modules["__main__"])
     monkeypatch.setenv("no_proxy", "")
     monkeypatch.setenv("NO_PROXY", "")
-    # It also sets glibc defaults for the workers: start unset, restore after the test.
+    # It also sets glibc defaults for the workers. setenv records what to restore after the
+    # test; delenv starts the test without them.
     for name in ("MALLOC_ARENA_MAX", "MALLOC_MMAP_THRESHOLD_"):
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
