@@ -45,10 +45,9 @@ def _run_env_server_process(
     os.environ["no_proxy"] = no_proxy
     os.environ["NO_PROXY"] = no_proxy
     # Pool workers read these at exec. They render on threads and, by default, stay at peak RSS.
-    # 8-thread churn test: RSS growth at peak 504 -> 200 MB, after the episodes end 306 -> 38 MB,
+    # 8-thread churn test, RSS growth: peak ~500 -> ~210 MB, after episodes end 150-320 -> ~35 MB,
     # for ~25% more CPU time (allocations >= 64 KB become mmap/munmap pairs).
     os.environ.setdefault("MALLOC_ARENA_MAX", "2")
-    os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "0")
     os.environ.setdefault("MALLOC_MMAP_THRESHOLD_", "65536")
 
     # Tags the workers spawned below; /proc still shows this process's spawn env, without it.
