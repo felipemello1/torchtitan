@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Unit tests for `TrainingSampleBuilder.rollout_to_training_samples` and `split_prompt`."""
+"""Unit tests for `TrainingSampleBuilder`, `split_prompt` and `AdvantageEstimator`."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import torch
 
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
+from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.types import RolloutTurnID, split_prompt
 
 _GROUP_ID = "step=1/group=0"
@@ -387,6 +388,75 @@ def test_group_filters_preserve_group_id_for_acknowledgement() -> None:
     filtered_groups = [failed, untrainable, zero_std, no_valid_tokens]
     assert [group.group_id for group in filtered_groups] == [7, 8, 9, 10]
     assert all(not group.training_samples for group in filtered_groups)
+
+
+def _sibling(rollout_id: int, *, reward: float, status: RolloutStatus) -> Rollout:
+    rollout = _scored_rollout(
+        [_turn(prompt_token_ids=[1], completion_token_ids=[2 + rollout_id], version=1)],
+        reward=reward,
+        advantage=0.0,
+    )
+    rollout.rollout_id = rollout_id
+    rollout.status = status
+    return rollout
+
+
+def test_advantage_baseline_skips_errored_rollouts() -> None:
+    rollouts = [
+        _sibling(0, reward=1.0, status=RolloutStatus.COMPLETED),
+        _sibling(1, reward=0.0, status=RolloutStatus.ERROR),
+        _sibling(2, reward=0.0, status=RolloutStatus.COMPLETED),
+    ]
+    estimator = AdvantageEstimator.Config().build()
+
+    advantages = estimator(RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts))
+
+    assert advantages == pytest.approx([0.5, -0.5, -0.5])
+    for rollout in rollouts:
+        rollout.status = RolloutStatus.ERROR
+    # Every rollout errored: fall back to the whole group.
+    assert estimator(
+        RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+    ) == pytest.approx([2 / 3, -1 / 3, -1 / 3])
+
+
+def test_build_from_group_drops_errored_rollouts() -> None:
+    builder = TrainingSampleBuilder.Config().build()
+    rollouts = [
+        _sibling(0, reward=1.0, status=RolloutStatus.COMPLETED),
+        _sibling(1, reward=0.0, status=RolloutStatus.ERROR),
+        _sibling(2, reward=0.0, status=RolloutStatus.TRUNCATED_MAX_TURNS),
+    ]
+
+    group = builder.build_from_group(
+        rollout_group=RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+    )
+
+    assert [sample.rollout_id.rollout_id for sample in group.training_samples] == [0, 2]
+    metrics = {metric.key: metric.value for metric in group.metrics}
+    assert metrics["training_sample_builder/num_rollouts_dropped_errored"].value == 1.0
+    assert "training_sample_builder/num_groups_dropped_errored" not in metrics
+
+
+def test_build_from_group_drops_a_group_with_fewer_than_two_clean_rollouts() -> None:
+    rollouts = [
+        _sibling(0, reward=1.0, status=RolloutStatus.COMPLETED),
+        _sibling(1, reward=0.0, status=RolloutStatus.ERROR),
+    ]
+    group = RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+
+    dropped = TrainingSampleBuilder.Config().build().build_from_group(rollout_group=group)
+    kept = (
+        TrainingSampleBuilder.Config(drop_errored_rollouts=False)
+        .build()
+        .build_from_group(rollout_group=group)
+    )
+
+    assert dropped.training_samples == []
+    assert {metric.key: metric.value for metric in dropped.metrics}[
+        "training_sample_builder/num_groups_dropped_errored"
+    ].value == 1.0
+    assert [sample.rollout_id.rollout_id for sample in kept.training_samples] == [0, 1]
 
 
 def test_topk_rows_follow_loss_tokens_across_turns() -> None:
