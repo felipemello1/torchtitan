@@ -26,6 +26,7 @@ from verifiers.v1.serve import env_config_data, serve_env
 from verifiers.v1.utils.loaders import resolve_env_config
 
 from torchtitan.config import Configurable
+from torchtitan.rl._runtime import RL_ROLE_ENV
 from torchtitan.rl.examples.verifiers.data import register_local_taskset_alias
 from torchtitan.rl.examples.verifiers.worker_setup import setup_env_server_worker
 
@@ -48,6 +49,9 @@ def _run_env_server_process(
     # for ~25% more CPU time (allocations >= 64 KB become mmap/munmap pairs).
     os.environ.setdefault("MALLOC_ARENA_MAX", "2")
     os.environ.setdefault("MALLOC_MMAP_THRESHOLD_", "65536")
+
+    # Tags the workers spawned below. This process stays untagged: /proc shows its spawn env.
+    os.environ[RL_ROLE_ENV] = "env_server_worker"
 
     if local_taskset_module is not None:
         environment["taskset"]["id"] = register_local_taskset_alias(
