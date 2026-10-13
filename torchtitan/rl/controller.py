@@ -1229,6 +1229,8 @@ class Controller(Configurable):
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.
             time_metrics = step_timer.flush()
+            # Reads /proc for every process in the cgroup (~60 ms for 600): off the event loop.
+            host_memory_metrics = await asyncio.to_thread(compute_host_memory_metrics)
             with sl.log_trace_span("metrics_log"):
                 self.metrics_processor.log(
                     step=step,
@@ -1255,7 +1257,7 @@ class Controller(Configurable):
                             ),
                             time_metrics=time_metrics,
                         ),
-                        *compute_host_memory_metrics(),
+                        *host_memory_metrics,
                     ],
                 )
 

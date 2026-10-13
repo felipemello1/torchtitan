@@ -880,7 +880,7 @@ def test_compute_host_memory_metrics_groups_processes_by_role() -> None:
     finally:
         sleeper.kill()
         sleeper.wait()
-    num_trainers = "host_memory/num_processes/trainer"
+    trainer_count_key = "host_memory/num_processes/trainer"
     assert after["host_memory/num_processes/controller"] == 1
-    assert after[num_trainers] == before[num_trainers] + 1
+    assert after[trainer_count_key] == before[trainer_count_key] + 1
     assert after["host_memory/rss_anon_gib/trainer"] > 0
