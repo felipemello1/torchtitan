@@ -43,6 +43,15 @@ class TestBlockGlueLocalCompile(unittest.TestCase):
             torch.testing.assert_close(actual_x, expected_x, rtol=0, atol=0)
             torch.testing.assert_close(actual_norm, expected_norm, rtol=0, atol=0)
 
+    def test_attention_output_gate_matches_eager(self):
+        # Attention output and gate are strided halves of one projection, as in the model.
+        out, gate = self.randn(34, 4, 2 * 64).chunk(2, dim=-1)
+        with torch.no_grad():
+            expected = (out.contiguous() * torch.sigmoid(gate)).view(34, -1)
+            apply_local_compile(["attention_output_gate"])
+            output = qwen3_5._gate_attention_output(out, gate)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

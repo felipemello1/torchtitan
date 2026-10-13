@@ -113,6 +113,25 @@ def _residual_add_norm(
     return x_TD, norm(x_TD)
 
 
+@local_compile(
+    "attention_output_gate",
+    batch_invariant=False,
+    # Eager rounds the sigmoid to the activation dtype before the multiply.
+    options={"emulate_precision_casts": True},
+)
+def _gate_attention_output(
+    out_THV: torch.Tensor, gate_THV: torch.Tensor
+) -> torch.Tensor:
+    """Return ``out * sigmoid(gate)`` flattened to ``(T, H * V)`` for ``wo``.
+
+    Example:
+        >>> _gate_attention_output(torch.ones(2, 1, 3), torch.zeros(2, 1, 3))
+        tensor([[0.5000, 0.5000, 0.5000],
+                [0.5000, 0.5000, 0.5000]])
+    """
+    return (out_THV * torch.sigmoid(gate_THV)).reshape(out_THV.shape[0], -1)
+
+
 class Qwen35Attention(BaseAttention):
     """Full attention with output gating and partial RoPE for Qwen3.5.
 
@@ -174,8 +193,6 @@ class Qwen35Attention(BaseAttention):
         # at their common attention boundary.
         x_TD = maybe_gather_tp_input(self, x_TD)
 
-        num_tokens = x_TD.shape[0]
-
         # wq is 2x wider: produces query + gate
         xq_gate_THC = local_head_split(self.wq(x_TD), self.head_dim * 2, cp_shard_dim=0)
         xq_THK, gate_THV = xq_gate_THC.chunk(2, dim=-1)
@@ -205,11 +222,13 @@ class Qwen35Attention(BaseAttention):
         # The output gating reads the inner_attention and wq gate outputs with bare
         # ops.
         remat.recompute_needs_tensor(out_THV, gate_THV)
-        out_THV = out_THV.contiguous()
-
-        # Output gating
-        out_THV = out_THV * torch.sigmoid(gate_THV)
-        out_TD = out_THV.view(num_tokens, -1)
+        if torch.is_grad_enabled():
+            out_THV = out_THV.contiguous() * torch.sigmoid(gate_THV)
+            out_TD = out_THV.view(out_THV.shape[0], -1)
+        else:
+            # Inference (the generator): the gating and flatten in one region. The
+            # compiled backward rounds differently, so training keeps the eager ops.
+            out_TD = _gate_attention_output(out_THV, gate_THV)
         return self.wo(out_TD)
 
     # TODO: consider moving this to rope directly.
@@ -387,6 +406,7 @@ class Qwen35Model(MultimodalModel):
                 "moe_combine",
                 "expert_counts",
                 "residual_norm",
+                "attention_output_gate",
             ]
         )
 
