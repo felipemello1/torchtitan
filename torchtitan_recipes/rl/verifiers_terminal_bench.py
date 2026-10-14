@@ -622,8 +622,8 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     - lr 5e-6 with a 10-step warmup (was 1e-6, constant);
     - `ScoreCenteringLoss` with the generator's top-32 logprobs (was DAPO);
     - the adaptive rollout buffer, mean policy age <= 6 and max 10 (was a fixed 5-step buffer);
-    - no length reward, so all-pass groups are dropped (was weight 0.1); all-fail groups train
-      only on their share of malformed turns;
+    - no length reward, so all-pass groups are dropped (was weight 0.1), and groups with no solve
+      are dropped too, so partial credit and the malformed-turn penalty shape only groups with one;
     - tasks whose group came back all pass are skipped in later epochs, then re-checked;
     - a 4,096-token thinking budget per turn (was 12,288);
     - each session's prefix stays held between its turns (no CPU KV offload);
@@ -692,14 +692,18 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     # All-pass and all-fail groups (~45% of them in the last 1x2 run) carry no signal: drop each
     # and admit a new prompt in its slot.
     loop.training_sample_builder.drop_zero_std_reward_groups = True
+    # Train only groups that solved the task at least once. With the malformed-turn penalty, a 0/16
+    # group's rewards spread and it trained with no solve among its rollouts: failed rollouts learned
+    # to mark the task complete early, and entropy rose 0.14 -> 0.47.
+    loop.training_sample_builder.drop_unsolved_groups_by = "RewardFromVerifiers"
     # No length reward: it breaks reward ties, so all-pass and all-fail groups would train on
     # length alone instead of being dropped.
     config.rollouter.rubric.length_reward_weight = 0.0
     # Training: full credit for a solve, else up to 0.5 for the tests that passed, minus 0.5 when
     # truncated (the policy learned to loop with empty commands after solving). An unsolved
     # rollout also loses 0.2 x its share of malformed turns (they rose from 1% to 12% of turns by
-    # step 68); like a length reward, that breaks ties in all-fail groups, which then train. The
-    # zero-weight pass/fail fn keeps the pass rate in the metrics. Validation stays pass/fail.
+    # step 68). The zero-weight pass/fail fn feeds drop_unsolved_groups_by and the pass-rate
+    # metric. Validation stays pass/fail.
     config.rollouter.rubric.reward_fns = [
         RewardFromVerifiersPartialCredit.Config(weight=1.0, malformed_turn_penalty=0.2),
         RewardFromVerifiers.Config(weight=0.0),

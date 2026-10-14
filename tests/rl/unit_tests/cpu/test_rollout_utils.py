@@ -557,3 +557,36 @@ def test_task_zero_std_split_reads_the_graded_reward() -> None:
     assert aggregated[f"{prefix}/all_success/mean"] == pytest.approx(1 / 3)
     assert aggregated[f"{prefix}/all_failure/mean"] == pytest.approx(1 / 3)
     assert num_training_samples == [2, 2, 2]
+
+
+def test_drop_unsolved_groups_by_keeps_only_groups_with_a_solve() -> None:
+    # Partial credit spreads the unsolved group's rewards, so the zero-std drop keeps it.
+    builder = TrainingSampleBuilder.Config(
+        drop_unsolved_groups_by="RewardFromVerifiers"
+    ).build()
+    groups = [
+        # (reward, RewardFromVerifiers score)
+        [(0.1, 0.0), (0.2, 0.0)],  # no solve -> dropped
+        [(1.0, 1.0), (0.2, 0.0)],  # one solve -> trains
+    ]
+    metrics: list[m.Metric] = []
+    num_training_samples = []
+    for group_id, scores in enumerate(groups):
+        rollouts = [
+            _scored_rollout(
+                [_turn(prompt_token_ids=[1], completion_token_ids=[2], version=0)],
+                reward=reward,
+                advantage=0.0,
+            )
+            for reward, _ in scores
+        ]
+        for rollout, (_, solved) in zip(rollouts, scores, strict=True):
+            rollout.reward_breakdown = {"RewardFromVerifiers": solved}
+        output = builder.build_from_group(
+            rollout_group=RolloutGroup(group_id=group_id, rollouts=rollouts)
+        )
+        metrics += output.metrics
+        num_training_samples.append(len(output.training_samples))
+    aggregated = m.MetricsProcessor._aggregate_metrics(metrics)
+    assert num_training_samples == [0, 2]
+    assert aggregated["training_sample_builder/num_groups_dropped_unsolved/sum"] == 1.0

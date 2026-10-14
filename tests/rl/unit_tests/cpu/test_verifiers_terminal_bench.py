@@ -660,6 +660,9 @@ def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) ->
     assert loop.validation == ValidationConfig(steps=78, freq=10, overlap_training=True)
     assert loop.rdma_fast_path_threshold == 1024
     assert loop.training_sample_builder.drop_zero_std_reward_groups
+    assert loop.training_sample_builder.drop_unsolved_groups_by in {
+        fn._owner.__name__ for fn in config.rollouter.rubric.reward_fns
+    }
     assert config.rollouter.rubric.length_reward_weight == 0.0
     assert config.rollouter.thinking_budget.max_thinking_tokens == 4096
     # The env server runs the 3,000-VM pool; the 240 groups in flight queue for it per rollout.
