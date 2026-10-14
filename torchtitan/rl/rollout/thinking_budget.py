@@ -73,8 +73,16 @@ class ThinkingBudget(Configurable):
         Without it, a forced answer tends to keep reasoning until `max_tokens` cuts it."""
 
         answer_end_text: str | None = None
-        """After a forced close, end the turn at the first token containing this text, e.g. "}" after
-        `\\boxed{e4}`. Without it, a forced answer can keep talking until `max_tokens` cuts the turn."""
+        """After a forced close (or the model's own, with `answer_after_close`), end the turn at the first
+        token containing this text, e.g. "}" after `\\boxed{e4}`. Without it, a forced answer can keep
+        talking until `max_tokens` cuts the turn."""
+
+        answer_after_close: bool = False
+        """Treat the model's own `think_end_token` like a forced close: end the reply there, append "\\n\\n"
+        + `answer_prefix`, and stop at `answer_end_text`, so the answer is the box alone. The appended
+        tokens are loss-masked, so loss-mask checks of a forced answer (`Rollout.has_forced_answer`,
+        chess's `is_force_closed`) count these turns too.
+        Needs `answer_end_text`."""
 
         end_of_turn_token: str = "<|im_end|>"
         """The tokenizer's single end-of-turn token, appended untrained when `answer_end_text` stops
@@ -113,6 +121,15 @@ class ThinkingBudget(Configurable):
             self._end_of_turn_id = tokenizer.token_to_id(config.end_of_turn_token)
             if self._end_of_turn_id is None:
                 raise ValueError(f"{config.end_of_turn_token!r} must be one token")
+        if config.answer_after_close and config.answer_end_text is None:
+            raise ValueError(
+                "answer_after_close needs answer_end_text to end the answer"
+            )
+        self._answer_after_close = config.answer_after_close
+        # After the model's own close: the line break a forced close also ends with, then the prefix.
+        self._answer_ids = tokenizer.encode(
+            "\n\n" + config.answer_prefix, add_bos=False, add_eos=False
+        )
 
     def wrap(self, generate_fn: GenerateFn) -> GenerateFn:
         """Return a `GenerateFn` that applies the budget around `generate_fn`. Wrap once per rollout:
@@ -149,11 +166,24 @@ class ThinkingBudget(Configurable):
                 group_id=group_id,
                 routing_session_id=routing_session_id,
                 sampling_config=replace(
-                    sampling_config, max_tokens=max_thinking_tokens
+                    sampling_config,
+                    max_tokens=max_thinking_tokens,
+                    # stop at the model's own close, to append the answer prefix
+                    stop_token_ids=(
+                        (sampling_config.stop_token_ids or []) + [self._think_end_id]
+                        if self._answer_after_close
+                        else sampling_config.stop_token_ids
+                    ),
                 ),
             )
             if first is None:
                 return None
+            closed_by_model = (
+                self._answer_after_close
+                and first.finish_reason == "stop"
+                and first.token_ids[-1:] == [self._think_end_id]
+                and self._is_thinking(prompt_token_ids)
+            )
             # A reply that samples its stop token before </think> has not answered: with
             # `force_close_on_stop`, drop the stop token and force the close, as when the budget runs out.
             # TODO: the dropped stop token is never trained against; watch stopped_while_thinking_rate.
@@ -185,7 +215,7 @@ class ThinkingBudget(Configurable):
                 )
             # Done: the reply finished, or the context cut it ("length" below the budget, so a
             # second call would be rejected); end the turn as without a budget.
-            elif (
+            elif not closed_by_model and (
                 first.finish_reason != "length"
                 or len(first.token_ids) < max_thinking_tokens
             ):
@@ -200,9 +230,13 @@ class ThinkingBudget(Configurable):
                 )
                 return first
 
-            # Cut or stopped while thinking: force the close. Cut while answering: continue.
-            if self._is_thinking(prompt_token_ids + first.token_ids):
+            # Cut or stopped while thinking: force the close. Closed by the model: append the answer
+            # prefix. Cut while answering: continue.
+            force_closed = self._is_thinking(prompt_token_ids + first.token_ids)
+            if force_closed:
                 forced_ids = self._forced_ids
+            elif closed_by_model:
+                forced_ids = self._answer_ids
             else:
                 forced_ids = []
             answer_end_ids = sorted(self._answer_end_ids) if forced_ids else []
@@ -281,7 +315,7 @@ class ThinkingBudget(Configurable):
                     *second.metrics,
                     m.Metric(
                         "thinking_budget/forced_close_rate",
-                        m.Mean(float(bool(forced_ids))),
+                        m.Mean(float(force_closed)),
                     ),
                     m.Metric(
                         "thinking_budget/stopped_while_thinking_rate",

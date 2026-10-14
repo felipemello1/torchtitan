@@ -497,6 +497,9 @@ def rl_chess_qwen3_5_4b_base_gb300(
     worker.message_env = ChessPlayerEnv.Config(
         forced_close_text=worker.thinking_budget.close_text
     )
+    # After the model's own </think>, the answer is the box alone: unforced answers repeated
+    # "</think> \\boxed{X}" to the token cap and forfeited 10% of games (chess118go steps 170-179).
+    worker.thinking_budget.answer_after_close = True
 
     # ======== Async loop ========
     loop = config.async_loop

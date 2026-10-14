@@ -46,5 +46,5 @@ class RewardChessScore(RewardFn):
 
 def is_force_closed(turn: RolloutTurn) -> bool:
     """Whether the thinking budget force-closed this turn: it masks the tokens it forced out of the
-    loss, and no other path does."""
+    loss. With `ThinkingBudget.Config.answer_after_close`, turns the model closed itself count too."""
     return turn.completion_loss_mask is not None and not turn.completion_loss_mask.all()
