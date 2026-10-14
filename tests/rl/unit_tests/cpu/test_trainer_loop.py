@@ -105,6 +105,7 @@ def _controller(events: list[str], *, on_push=None, on_pull=None) -> Controller:
     controller._group_buffer = SimpleNamespace(
         metrics=lambda: [], release_active_groups=release_active_groups
     )
+    controller._garbage_collector = None
     controller.logged_metrics = []
     controller.metrics_processor = SimpleNamespace(
         log=lambda *, step, is_validation, metrics: controller.logged_metrics.append(
@@ -204,6 +205,27 @@ def test_push_and_pull_times_are_logged_one_step_late() -> None:
     # Step 2 logs step 1's push and pull, which have run by then.
     assert second[TRAINER_PUSH_KEY].value.value > 0.0
     assert second[GENERATOR_PULL_KEY].value.value > 0.0
+
+
+def test_garbage_collector_runs_after_each_step_metrics_log() -> None:
+    events: list[str] = []
+    controller = _controller([])
+    controller.metrics_processor = SimpleNamespace(
+        log=lambda *, step, is_validation, metrics: events.append(f"log {step}")
+    )
+    controller._garbage_collector = SimpleNamespace(
+        run=lambda step: events.append(f"gc {step}")
+    )
+    _run(controller, num_training_steps=2)
+
+    assert events == ["log 1", "gc 1", "log 2", "gc 2"]
+
+
+def test_controller_rss_is_logged() -> None:
+    controller = _controller([])
+    _run(controller, num_training_steps=1)
+
+    assert controller.logged_metrics[0]["controller/memory/rss_gib"].value.value > 0
 
 
 def test_push_failure_fails_the_loop() -> None:

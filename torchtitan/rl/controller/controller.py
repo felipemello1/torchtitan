@@ -308,6 +308,12 @@ class Controller(Configurable):
             default_factory=m.MetricsProcessor.Config
         )
 
+        garbage_collector: GarbageCollector.Config | None = None
+        """None: Python's automatic GC, whose full collections pause the event loop for seconds on a large heap.
+        Set: automatic GC off; `gc.collect(1)` every `gc_freq` steps (`debug` is unsupported). Objects alive
+        at a collect are never scanned again, so a cycle among them that dies later leaks; watch
+        `controller/memory/rss_gib`."""
+
         override: OverrideConfig = field(default_factory=OverrideConfig)
         """Registered overrides applied to this whole config tree, including the
         trainer and generator models, when the controller is constructed."""
@@ -809,6 +815,11 @@ class Controller(Configurable):
         GarbageCollector.freeze(
             "Full GC before freezing the controller's setup objects"
         )
+        self._garbage_collector = (
+            self.config.garbage_collector.build()
+            if self.config.garbage_collector is not None
+            else None
+        )
 
         async_loop = self.config.async_loop
         num_training_steps = async_loop.num_training_steps
@@ -1232,6 +1243,9 @@ class Controller(Configurable):
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.
             time_metrics = step_timer.flush()
+            # statm's 2nd field is the resident set size, in pages.
+            with open("/proc/self/statm") as file:
+                rss_bytes = int(file.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
             with sl.log_trace_span("metrics_log"):
                 self.metrics_processor.log(
                     step=step,
@@ -1264,8 +1278,13 @@ class Controller(Configurable):
                             ),
                             time_metrics=time_metrics,
                         ),
+                        m.Metric(
+                            "controller/memory/rss_gib", m.NoReduce(rss_bytes / 2**30)
+                        ),
                     ],
                 )
+            if self._garbage_collector is not None:
+                self._garbage_collector.run(step)
 
         # Finish the last push and pull so generators hold the final weights for post-validation.
         if push_task is not None:
