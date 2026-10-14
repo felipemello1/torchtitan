@@ -119,6 +119,15 @@ class TrainingSampleBuilder(Configurable):
         drop_zero_std_reward_groups: bool = True
         """Drop zero-reward-variance groups;"""
 
+        drop_unsolved_groups_by: str | None = None
+        """Drop a group where no rollout scores 1 on this 0/1 reward fn, named by class (weight 0
+        works: it reads the unweighted reward_breakdown). None: off. Runs after the zero-std drop.
+
+            drop_unsolved_groups_by="RewardFromVerifiers"
+            0/16 solved, rewards spread by partial credit -> dropped
+            1/16 solved                                   -> trains
+        """
+
     def __init__(self, config: Config) -> None:
         self.config = config
 
@@ -167,6 +176,20 @@ class TrainingSampleBuilder(Configurable):
             metrics.append(
                 m.Metric(
                     "training_sample_builder/num_groups_dropped_zero_std", m.Sum(1.0)
+                )
+            )
+            return TrainingSampleGroup(
+                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
+            )
+        solve_fn = self.config.drop_unsolved_groups_by
+        # A rollout short-circuited by truncation_reward/error_reward has no score: unsolved.
+        if solve_fn is not None and not any(
+            rollout.reward_breakdown.get(solve_fn, 0.0) >= 1.0
+            for rollout in rollout_group.rollouts
+        ):
+            metrics.append(
+                m.Metric(
+                    "training_sample_builder/num_groups_dropped_unsolved", m.Sum(1.0)
                 )
             )
             return TrainingSampleGroup(

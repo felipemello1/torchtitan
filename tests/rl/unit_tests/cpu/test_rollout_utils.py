@@ -356,3 +356,40 @@ def test_group_filters_preserve_group_id_for_acknowledgement() -> None:
     filtered_groups = [failed, untrainable, zero_std, no_valid_tokens]
     assert [group.group_id for group in filtered_groups] == [7, 8, 9, 10]
     assert all(not group.training_samples for group in filtered_groups)
+
+
+def test_drop_unsolved_groups_by_keeps_only_groups_with_a_solve() -> None:
+    # Partial credit spreads the unsolved group's rewards, so the zero-std drop keeps it.
+    builder = TrainingSampleBuilder.Config(
+        drop_unsolved_groups_by="RewardFromVerifiers"
+    ).build()
+    groups = [
+        # (reward, RewardFromVerifiers score)
+        [(0.1, 0.0), (0.2, 0.0)],  # no solve -> dropped
+        [(1.0, 1.0), (0.2, 0.0)],  # one solve -> trains
+    ]
+    num_training_samples = []
+    dropped = []
+    for group_id, scores in enumerate(groups):
+        rollouts = [
+            _scored_rollout(
+                [_turn(prompt_token_ids=[1], completion_token_ids=[2], version=0)],
+                reward=reward,
+                advantage=0.0,
+            )
+            for reward, _ in scores
+        ]
+        for rollout, (_, solved) in zip(rollouts, scores, strict=True):
+            rollout.reward_breakdown = {"RewardFromVerifiers": solved}
+        output = builder.build_from_group(
+            rollout_group=RolloutGroup(group_id=group_id, rollouts=rollouts)
+        )
+        num_training_samples.append(len(output.training_samples))
+        dropped.append(
+            any(
+                metric.key == "training_sample_builder/num_groups_dropped_unsolved"
+                for metric in output.metrics
+            )
+        )
+    assert num_training_samples == [0, 2]
+    assert dropped == [True, False]
