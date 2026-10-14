@@ -622,10 +622,12 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     - lr 5e-6 with a 10-step warmup (was 1e-6, constant);
     - `ScoreCenteringLoss` with the generator's top-32 logprobs (was DAPO);
     - the adaptive rollout buffer, mean policy age <= 6 and max 10 (was a fixed 5-step buffer);
-    - no length reward, so all-pass and all-fail groups are dropped (was weight 0.1);
+    - no length reward, so all-pass groups are dropped (was weight 0.1), and groups with no solve
+      are dropped too, so partial credit and the malformed-turn penalty shape only groups with one;
     - tasks whose group came back all pass are skipped in later epochs, then re-checked;
     - a 4,096-token thinking budget per turn (was 12,288);
-    - each session's prefix stays held between its turns, and idle sessions' KV spills to CPU;
+    - each session's prefix stays held between its turns (no CPU KV offload);
+    - 8,192 tokens per turn (was 16,384);
     - router replay (was off);
     - vLLM watermark 0.1 (was 0.03);
     - trainer microbatches as RDMA buffers (was in the Monarch message);
@@ -639,10 +641,6 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     num_samples_per_prompt = 16
     # Sandoq VMs the run holds; the groups in flight queue for them per rollout.
     sandbox_pool = 3000
-    # Host RAM per generator for vLLM's CPU KV offload. Four engines per host share its /dev/shm
-    # (DOME runs with --ipc=host; ~477 GB on a GB300 host). At 360 groups each engine holds ~190
-    # sessions and KV may near ~65%, where offload starts to load.
-    kv_offload_gib = 96
     target_offpolicy_steps = 6
     # The 78 Terminal-Bench 2.1 tasks that fit a small Sandoq VM, one greedy rollout each.
     num_validation_samples = 78
@@ -680,8 +678,9 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
         # of that time: at 120 groups the run leased ~1,000 of 2,000 VMs. 360 groups (5,760
         # rollouts, ~3,110 VMs of demand), so the 3,000-VM pool, counted per rollout, binds instead
         # of the group permits: the env server runs at most sandbox_pool rollouts at once, and a
-        # finished rollout frees its VM for a queued one.
-        generation_capacity=360,
+        # finished rollout frees its VM for a queued one. Cut to 240 after the controller host
+        # (also trainer host 0) was OOM-killed at step 69 with ~290 groups in flight.
+        generation_capacity=240,
     )
     # Trainer ranks read each microbatch's tensors of 1 KiB or more as RDMA buffers. By value (the
     # default), every rank's call carries the whole batch: 93-100 s at step 3 of a router-replay run.
@@ -693,14 +692,20 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     # All-pass and all-fail groups (~45% of them in the last 1x2 run) carry no signal: drop each
     # and admit a new prompt in its slot.
     loop.training_sample_builder.drop_zero_std_reward_groups = True
+    # Train only groups that solved the task at least once. With the malformed-turn penalty, a 0/16
+    # group's rewards spread and it trained with no solve among its rollouts: failed rollouts learned
+    # to mark the task complete early, and entropy rose 0.14 -> 0.47.
+    loop.training_sample_builder.drop_unsolved_groups_by = "RewardFromVerifiers"
     # No length reward: it breaks reward ties, so all-pass and all-fail groups would train on
     # length alone instead of being dropped.
     config.rollouter.rubric.length_reward_weight = 0.0
     # Training: full credit for a solve, else up to 0.5 for the tests that passed, minus 0.5 when
-    # truncated (the policy learned to loop with empty commands after solving). The zero-weight
-    # pass/fail fn keeps the pass rate in the metrics. Validation stays pass/fail.
+    # truncated (the policy learned to loop with empty commands after solving). An unsolved
+    # rollout also loses 0.2 x its share of malformed turns (they rose from 1% to 12% of turns by
+    # step 68). The zero-weight pass/fail fn feeds drop_unsolved_groups_by and the pass-rate
+    # metric. Validation stays pass/fail.
     config.rollouter.rubric.reward_fns = [
-        RewardFromVerifiersPartialCredit.Config(weight=1.0),
+        RewardFromVerifiersPartialCredit.Config(weight=1.0, malformed_turn_penalty=0.2),
         RewardFromVerifiers.Config(weight=0.0),
     ]
     config.rollouter.rubric.truncation_penalty = 0.5
@@ -708,7 +713,7 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
         reward_fns=[RewardFromVerifiers.Config(weight=1.0)], error_reward=0.0
     )
     # The last 1x2 run's budget: a turn still thinking after 4,096 tokens gets a forced end of
-    # thinking, which leaves the rest of its 16,384 tokens for the command.
+    # thinking, which leaves the rest of its 8,192 tokens for the command.
     config.rollouter.thinking_budget = ThinkingBudget.Config(max_thinking_tokens=4096)
     # A task whose 16 rollouts all pass is skipped in later epochs, then re-checked; all-fail tasks
     # keep coming back.
@@ -753,6 +758,9 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
     # k = 32 matched full-vocabulary score centering in every setting of the paper, whose default
     # is 128.
     generator.sampling.num_topk_logprobs = 32
+    # A turn that keeps writing actions after its first one runs to max_tokens and Terminus drops
+    # it (2.5% -> 11.5% of rollouts by step 119); 8,192 halves its cost. Answers' p99 is ~2.5K tokens.
+    generator.sampling.max_tokens = 8192
     # replace() re-runs VLLMGenerator.Config's checks (hold_session_kv needs no KV reset on sync).
     config.generator = dataclasses.replace(
         generator,
@@ -762,8 +770,8 @@ def rl_grpo_qwen3_5_35b_a3b_base_terminal_bench_1x2_tonight() -> Controller.Conf
         # Hold each session's prefix (attention + GDN state) between its turns. Before each step,
         # release the sessions idle longest until the watermark plus the step's growth stays free.
         hold_session_kv=True,
-        # A session whose KV left the GPU reloads its history from CPU instead of recomputing it.
-        kv_offload_gib=kv_offload_gib,
+        # No CPU KV offload: its 96 GiB per engine had 0 external prefix hits in the TB run, and
+        # its 384 GiB of /dev/shm per generator host preceded the OOM kill of generator host 1.
     )
     return config
 

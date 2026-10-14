@@ -655,20 +655,24 @@ def test_35b_sandoq_1x2_tonight_recipe_keeps_every_value_in_code(monkeypatch) ->
         target_offpolicy_steps=6,
         max_offpolicy_steps=10,
         start_batches=5,
-        generation_capacity=360,
+        generation_capacity=240,
     )
     assert loop.validation == ValidationConfig(steps=78, freq=10, overlap_training=True)
     assert loop.rdma_fast_path_threshold == 1024
     assert loop.training_sample_builder.drop_zero_std_reward_groups
+    assert loop.training_sample_builder.drop_unsolved_groups_by in {
+        fn._owner.__name__ for fn in config.rollouter.rubric.reward_fns
+    }
     assert config.rollouter.rubric.length_reward_weight == 0.0
     assert config.rollouter.thinking_budget.max_thinking_tokens == 4096
-    # The env server runs the 3,000-VM pool; the 360 groups in flight queue for it per rollout.
+    # The env server runs the 3,000-VM pool; the 240 groups in flight queue for it per rollout.
     serve = config.rollouter.verifiers_env_server.serve
     assert serve.pool.num_workers * serve.max_concurrent >= 3000
     assert config.rollouter.training_dataloader.zero_spread_skip.min_mean_reward == 0.9
     assert config.generator.hold_session_kv
     assert not config.generator.reset_kv_cache_on_weight_sync
-    assert config.generator.kv_offload_gib == 96
+    assert config.generator.kv_offload_gib == 0
+    assert config.generator.sampling.max_tokens == 8192
 
     trainer = config.trainer
     (optimizer,) = trainer.optim.optimizer.optimizers
