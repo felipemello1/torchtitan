@@ -74,7 +74,12 @@ class SigmoidGatedFeedForward(FeedForward):
         return sigmoid_gate(gate_out_T1, out_TD)
 
 
-@local_compile("shared_expert_gate", batch_invariant=True)
+# 2D tiling loads each token's gate once per row instead of once per masked element group.
+@local_compile(
+    "shared_expert_gate",
+    batch_invariant=True,
+    options={"triton.prefer_nd_tiling": True},
+)
 def sigmoid_gate(gate_T1: torch.Tensor, out_TD: torch.Tensor) -> torch.Tensor:
     """Scale each token's output by the sigmoid of its gate."""
     return torch.sigmoid(gate_T1) * out_TD

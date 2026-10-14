@@ -245,8 +245,14 @@ class LocalTokenDispatcher(Module):
 # sort (Qwen3.5-35B-A3B, E=256, GB300: faster up to 2048 tokens x top-8, slower at 4096).
 _MAX_COUNTING_SORT_ONE_HOT_ELEMENTS = 16384 * 256
 
+# Tile (T, D) kernels in 2D so per-token loads (route rows, scores) happen once per row.
+# Flattened to T * D with a dynamic T, the kernel keeps a bounds mask (Inductor drops it
+# only for sizes known to be multiples of 4096), and the masked per-token loads made the
+# combine 1.7x slower than its static-shape kernel (T=16384, GB300).
+_TILE_PER_TOKEN = {"triton.prefer_nd_tiling": True}
 
-@local_compile("moe_dispatch", batch_invariant=False)
+
+@local_compile("moe_dispatch", batch_invariant=False, options=_TILE_PER_TOKEN)
 def _sort_routes_and_gather(
     x_TD: torch.Tensor,
     topk_scores_TK: torch.Tensor,
@@ -338,7 +344,7 @@ def _sort_routes(
     return expert_sort_N, row_of_route_N
 
 
-@local_compile("moe_combine", batch_invariant=False)
+@local_compile("moe_combine", batch_invariant=False, options=_TILE_PER_TOKEN)
 def _gather_weighted_sum(
     routed_output_ND: torch.Tensor,
     row_of_route_N: torch.Tensor,
