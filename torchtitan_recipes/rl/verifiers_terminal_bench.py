@@ -396,9 +396,6 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
         generator=VLLMGenerator.Config(
             model=generator_model,
             model_dtype="bfloat16",
-            # FULL_DECODE_ONLY: FULL needs the TorchTitanCudagraphDispatcher fix for
-            # DP>1 (see its TODO).
-            cuda_graph=VLLMCudaGraphConfig(mode="FULL_DECODE_ONLY"),
             parallelism=generator_parallelism,
             checkpointer=None,
             sampling=SamplingConfig(
