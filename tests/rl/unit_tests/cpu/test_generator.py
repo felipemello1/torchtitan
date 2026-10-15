@@ -23,6 +23,7 @@ import os
 import shutil
 import tempfile
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
@@ -38,6 +39,7 @@ from torchtitan.config import CommConfig, DebugConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_remat import FullActivationRematConfig
 from torchtitan.models.common.attention import VarlenInnerAttention
+from torchtitan.models.common.dist_moe import DistMoeRuntime
 from torchtitan.rl.generator.generator import (
     _extract_request_metrics_inputs,
     _prepare_generation_request_metrics,
@@ -601,6 +603,43 @@ def test_session_kv_holder_rejects_kv_cache_reset_on_model_state_dict_load():
         )
 
 
+_FDO_CONFIG = VLLMGenerator.Config(
+    model=_MODEL_CONFIG, cuda_graph=VLLMCudaGraphConfig(mode="FULL_DECODE_ONLY")
+)
+
+
+def test_use_v2_model_runner_for_full_decode_only():
+    assert _FDO_CONFIG.use_v2_model_runner
+
+
+@pytest.mark.parametrize(
+    "v1_change",
+    [
+        {"cuda_graph": VLLMCudaGraphConfig(mode="FULL")},
+        {"cuda_graph": VLLMCudaGraphConfig(mode="NONE")},
+        {"parallelism": InferenceParallelismConfig(enable_sequence_parallel=True)},
+        {
+            "parallelism": InferenceParallelismConfig(
+                data_parallel_degree=2, expert_parallel_degree=2
+            )
+        },
+        {
+            "parallelism": InferenceParallelismConfig(
+                tensor_parallel_degree=2, expert_parallel_degree=2
+            )
+        },
+        {"dist_moe_runtime": DistMoeRuntime.Config(inference=True)},
+        {
+            "debug": DebugConfig(batch_invariant=True),
+            "reset_kv_cache_on_model_state_dict_load": True,
+        },
+    ],
+    ids=["full", "none", "sp", "dp_ep", "tp_ep", "dist_moe", "batch_invariant"],
+)
+def test_use_v2_model_runner_falls_back_to_v1(v1_change):
+    assert not replace(_FDO_CONFIG, **v1_change).use_v2_model_runner
+
+
 def test_qwen36_27b_perf_config():
     from torchtitan_recipes.rl.alphabet_sort import rl_grpo_qwen3_6_27b_varlen_perf
 
@@ -640,6 +679,12 @@ def _build_engine_kwargs(monkeypatch, tmp_path, config: VLLMGenerator.Config) ->
             rank=0,
         )
     return engine_args.call_args.kwargs
+
+
+def test_generator_sets_vllm_model_runner_env(monkeypatch, tmp_path):
+    # `_build_engine_kwargs` sets the env to "0" first, so "1" comes from the generator.
+    _build_engine_kwargs(monkeypatch, tmp_path, _FDO_CONFIG)
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"
 
 
 def test_extra_vllm_engine_args_reach_engine_args(monkeypatch, tmp_path):
