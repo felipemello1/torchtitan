@@ -327,9 +327,7 @@ def test_recipe_layouts_fit_the_model(
             generator.data_parallel_degree * generator.tensor_parallel_degree
         )
         assert num_experts % generator.expert_parallel_degree == 0
-        # The standard MoE dispatcher reads split sizes back to the host, which
-        # CUDA graph capture does not allow.
-        assert config.generator.cuda_graph.mode == "NONE"
+        assert config.generator.cuda_graph.mode == "FULL_DECODE_ONLY"
 
 
 @pytest.mark.parametrize(
