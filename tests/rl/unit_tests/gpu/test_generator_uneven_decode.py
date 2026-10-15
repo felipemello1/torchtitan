@@ -34,8 +34,17 @@ pytestmark = pytest.mark.multi_gpu
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_vllm_uneven_decode_tp_padding():
-    """Three decode tokens run through EP-internal TP sequence sharding."""
+@pytest.mark.parametrize(
+    "data_parallel_degree", [1, 2], ids=["dp1_tp4", "dp2_tp2_one_idle_rank"]
+)
+def test_vllm_uneven_decode_tp_padding(data_parallel_degree: int):
+    """Three decode tokens run through EP-internal TP sequence sharding.
+
+    With DP2 only DP rank 0 gets prompts. DP rank 1 runs vLLM's dummy batches,
+    whose MoE all-gather must match rank 0's DP-padded CUDA graph every step.
+    Run each case in its own torchrun launch, as CI does: vLLM keeps its process
+    groups across engines.
+    """
     world_size = (
         dist.get_world_size()
         if dist.is_initialized()
@@ -45,8 +54,8 @@ def test_vllm_uneven_decode_tp_padding():
         pytest.skip(f"requires exactly 4 GPUs, got {world_size}")
 
     config = rl_grpo_qwen3_moe_debug_varlen()
-    config.generator.parallelism.data_parallel_degree = 1
-    config.generator.parallelism.tensor_parallel_degree = 4
+    config.generator.parallelism.data_parallel_degree = data_parallel_degree
+    config.generator.parallelism.tensor_parallel_degree = 4 // data_parallel_degree
     config.generator.gpu_memory_limit = 0.5
 
     temporary_dump_folder = None
@@ -65,7 +74,10 @@ def test_vllm_uneven_decode_tp_padding():
 
     engine = build_inference_engine(config)
     try:
-        prompt_ids = _make_prompt_tokens(3, 100, engine.get_tokenizer())
+        dp_rank = dist.get_rank() // config.generator.parallelism.tensor_parallel_degree
+        prompt_ids = (
+            _make_prompt_tokens(3, 100, engine.get_tokenizer()) if dp_rank == 0 else []
+        )
         outputs = _run_engine(
             engine,
             "uneven_decode",

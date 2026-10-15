@@ -251,8 +251,7 @@ def rl_grpo_gpt_oss_debug_varlen_batch_invariant() -> Controller.Config:
             model=generator_model,
             model_dtype="bfloat16",
             parallelism=generator_parallelism,
-            # TODO: use FULL CUDA graphs once a CUDA-graph-compatible
-            # distributed MoE token dispatcher is enabled for GPT-OSS.
+            # Eager: the captured all-gather combine is not bitwise with the trainer's all-to-all.
             cuda_graph=VLLMCudaGraphConfig(mode="NONE"),
             checkpointer=None,
             sampling=SamplingConfig(
@@ -336,10 +335,6 @@ def rl_grpo_qwen3_moe_debug_varlen() -> Controller.Config:
         ),
         generator=VLLMGenerator.Config(
             model=generator_model,
-            # Disable torch.compile + CUDA graph capture: the EP all-to-all
-            # path issues an unpinned D2H copy of split sizes that the
-            # piecewise/full graph capture rejects.
-            cuda_graph=VLLMCudaGraphConfig(mode="NONE"),
             parallelism=generator_parallelism,
             checkpointer=None,
             sampling=SamplingConfig(
@@ -355,10 +350,8 @@ def rl_grpo_qwen3_moe_debug_deepep() -> Controller.Config:
     (8 GPUs: 4 gen + 4 train).
 
     Same EP/TP/DP layout as ``rl_grpo_qwen3_moe_debug_varlen`` (trainer FSDP=2/TP=2/EP=4,
-    generator DP=2/TP=2/EP=4), but the MoE uses the DeepEP v2 comm backend. Unlike the
-    standard all-to-all -- whose unpinned D2H split-size copy blocks CUDA graph capture, so
-    that config disables it -- DeepEP v2's inference dispatch is a static, host-sync-free
-    EXPAND layout, so this generator enables CUDA graph capture.
+    generator DP=2/TP=2/EP=4), but the MoE uses the DeepEP v2 comm backend, whose
+    inference dispatch is a static, host-sync-free EXPAND layout.
 
     Each role transforms its own model: the trainer keeps the compact, host-synced,
     backward-able DeepEP path, while the generator uses the CUDA-graph-compatible EXPAND
@@ -368,7 +361,6 @@ def rl_grpo_qwen3_moe_debug_deepep() -> Controller.Config:
     config.override = OverrideConfig(
         imports=["torchtitan_recipes.overrides.fused_swiglu.fused_swiglu"]
     )
-    config.generator.cuda_graph = VLLMCudaGraphConfig(mode="FULL")
     # vLLM's per-step token budget; it sizes the generator's DeepEP buffers.
     max_num_batched_tokens = 2048
     config.generator.max_num_batched_tokens = max_num_batched_tokens
@@ -496,6 +488,7 @@ def rl_grpo_qwen3_moe_debug_varlen_batch_invariant(
         generator=VLLMGenerator.Config(
             model=generator_model,
             model_dtype="bfloat16",
+            # Eager: the captured all-gather combine is not bitwise with the trainer's all-to-all.
             cuda_graph=VLLMCudaGraphConfig(mode="NONE"),
             parallelism=generator_parallelism,
             checkpointer=None,
@@ -834,8 +827,9 @@ def rl_grpo_moe_debug_tp4_ep4() -> Controller.Config:
     )
     for model_config in (config.trainer.model, config.generator.model):
         model_config.local_compile_regions = []
-    # TODO: use FULL CUDA graphs once GPT-OSS CI enables a
-    # CUDA-graph-compatible distributed MoE token dispatcher.
+    # TODO: FULL crashes in mixed prefill/decode capture for the GPT-OSS debug model
+    # (illegal memory access, also at TP1/EP1, so not the MoE dispatcher);
+    # FULL_DECODE_ONLY captures. Find the cause before enabling graphs.
     config.generator.cuda_graph.mode = "NONE"
     return _configure_ci(
         config,
@@ -957,9 +951,6 @@ def rl_grpo_moe_debug_dist_moe_tp2_ep4() -> Controller.Config:
     config.generator.dist_moe_runtime = DistMoeRuntime.Config(
         scratch_capacity_factor=4.0, inference=True
     )
-    # The standard MoE dispatcher cannot be captured in a CUDA graph; Dist-MoE can,
-    # prefill and decode steps alike.
-    config.generator.cuda_graph.mode = "FULL"
     config = _configure_ci(
         config,
         steps=3,

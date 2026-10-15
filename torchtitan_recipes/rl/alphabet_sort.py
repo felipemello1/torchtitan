@@ -378,8 +378,9 @@ def rl_grpo_gpt_oss_20b_varlen() -> Controller.Config:
             model=generator_model,
             model_dtype="bfloat16",
             parallelism=generator_parallelism,
-            # TODO: use FULL CUDA graphs once a CUDA-graph-compatible
-            # distributed MoE token dispatcher is enabled for GPT-OSS.
+            # TODO: FULL crashes in mixed prefill/decode capture for the GPT-OSS debug model
+            # (illegal memory access, also at TP1/EP1, so not the MoE dispatcher);
+            # FULL_DECODE_ONLY captures. Find the cause before enabling graphs.
             cuda_graph=VLLMCudaGraphConfig(mode="NONE"),
             checkpointer=None,
             sampling=SamplingConfig(
