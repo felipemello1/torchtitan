@@ -290,15 +290,6 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
     The trainer keeps fp32 master weights, the default. That is about 70 GB of
     model states per GPU across 8 GPUs before activations, so it needs GPUs with
     well over 80 GB of memory.
-
-    Generator CUDA graphs are off because of the standard all-to-all MoE token
-    dispatcher, not DistMoE. That dispatcher copies the split sizes to the host,
-    which CUDA graph capture does not allow
-    ("Cannot copy between CPU and CUDA tensors during CUDA graph capture"). Turn
-    capture back on together with a dispatcher that avoids the host read, such as
-    HybridEP with ``non_blocking_capacity_factor``.
-
-    TODO: migrate to DistMoE and capture generator CUDA graphs in ``FULL`` mode.
     """
     max_context_length = 65536
     max_output_tokens = 16384
@@ -405,7 +396,9 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
         generator=VLLMGenerator.Config(
             model=generator_model,
             model_dtype="bfloat16",
-            cuda_graph=VLLMCudaGraphConfig(mode="NONE"),
+            # FULL_DECODE_ONLY: FULL needs the TorchTitanCudagraphDispatcher fix for
+            # DP>1 (see its TODO).
+            cuda_graph=VLLMCudaGraphConfig(mode="FULL_DECODE_ONLY"),
             parallelism=generator_parallelism,
             checkpointer=None,
             sampling=SamplingConfig(

@@ -608,7 +608,6 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> Controller.Config:
         generator=VLLMGenerator.Config(
             model=generator_model,
             model_dtype="bfloat16",
-            cuda_graph=VLLMCudaGraphConfig(mode="NONE"),
             parallelism=generator_parallelism,
             checkpointer=None,
             sampling=SamplingConfig(
