@@ -313,14 +313,19 @@ def _sort_routes(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Return the stable expert sort of the flat routes and, compiled, each route's row.
 
-    compiled, N <= 2048:  pairwise rank: a route's row counts the routes with a smaller
-                          (expert, route) key; one kernel with the sort
+    compiled, N <= 2048:  pairwise rank (below), one kernel with the sort
     compiled, larger:     argsort(stable=True), same order, then its inverse
     eager:                argsort(stable=True); row None (eager combine scatters)
 
-    Example:
-        expert ids [2, 0, 0, 1] have keys [8, 1, 2, 7], so row_of_route_N = [3, 0, 1, 2]
-        and the sort is [1, 2, 3, 0].
+    Pairwise rank: give each route a unique key that orders routes by expert, then by
+    route index (key = expert_id * N + route). A route's row in the stable sort is the
+    number of routes with a smaller key.
+
+    Example (N = 4):
+        expert ids    [2, 0, 0, 1]
+        keys          [8, 1, 2, 7]   expert_id * 4 + route
+        row of route  [3, 0, 1, 2]   number of smaller keys
+        sort          [1, 2, 3, 0]   route at each row
     """
     expert_ids_N = topk_expert_ids_TK.reshape(-1)
     num_routes = expert_ids_N.numel()
@@ -328,6 +333,7 @@ def _sort_routes(
     compiling = torch.compiler.is_compiling()
     if compiling and num_routes <= _MAX_PAIRWISE_RANK_ROUTES:
         key_N = expert_ids_N * num_routes + routes_N
+        # (N, N) compare; row i counts the keys smaller than key i. Fuses to one kernel.
         row_of_route_N = (key_N[None, :] < key_N[:, None]).sum(dim=1)
         expert_sort_N = torch.empty_like(row_of_route_N)
         expert_sort_N[row_of_route_N] = routes_N
