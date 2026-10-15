@@ -262,7 +262,6 @@ def rl_grpo_qwen35_9b_terminal_bench() -> Controller.Config:
         generator=VLLMGenerator.Config(
             model=generator_model,
             model_dtype="bfloat16",
-            cuda_graph=VLLMCudaGraphConfig(mode="FULL_DECODE_ONLY"),
             parallelism=generator_parallelism,
             checkpointer=None,
             sampling=SamplingConfig(
