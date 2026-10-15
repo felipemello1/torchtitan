@@ -41,3 +41,7 @@ class RoutingContext:
     """Stable session key consumed only by sticky routing strategies; other
     strategies ignore it. ``None`` means the request is unpinned and uses fallback
     routing without session affinity."""
+
+    group_id: int | None = None
+    """Rollout group key consumed only by sticky routing with ``group_slack``; other
+    strategies ignore it. ``None`` means the request has no group."""

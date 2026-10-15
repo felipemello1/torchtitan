@@ -55,6 +55,7 @@ class _Actor:
         self.prefetch_model_state_dict = _Endpoint(wait=wait_prefetch)
         self.load_model_state_dict = _Endpoint(None, wait=wait_pull, raises=raises_pull)
         self.release_sessions = _Endpoint()
+        self.release_groups = _Endpoint()
 
     def flatten(self, *args, **kwargs):
         return self
@@ -287,6 +288,107 @@ def test_sticky_session_repins_off_an_overloaded_generator():
     asyncio.run(_run())
 
 
+def test_sticky_group_slack_places_siblings_on_their_group_generator():
+    async def _run():
+        actors = [_Actor(f"gen{i}", wait_generate=True) for i in range(2)]
+        router = _router(
+            actors, strategy=StickySessionRoutingStrategy.Config(group_slack=1)
+        )
+
+        def sibling(rollout_id):
+            # Through the endpoint body, so the group id comes from `generate`'s arguments.
+            call = router._generate(
+                [1, 2],
+                request_id=f"group=0/rollout={rollout_id}/turn=0",
+                group_id=0,
+                routing_session_id=f"group=0/rollout={rollout_id}",
+                sampling_config=None,
+                metrics_prefix="generator",
+            )
+            return asyncio.create_task(call)
+
+        turns = [sibling(0)]  # the first sibling makes gen0 the group's home
+        await asyncio.sleep(0)
+        router._set_serving(router._generators[0], serving=False)
+        # Home drains: skipped, even within slack (loads [1, 0]).
+        turns.append(sibling(1))
+        await asyncio.sleep(0)
+        router._set_serving(router._generators[0], serving=True)
+        turns.append(sibling(2))  # loads [1, 1]: joins home
+        turns.append(sibling(3))  # loads [2, 1]: joins home
+        turns.append(sibling(4))  # loads [3, 1]: 3 > 1 + 1, falls back
+        await asyncio.sleep(0)
+
+        actors[0].generate.release.set()
+        actors[1].generate.release.set()
+        assert await asyncio.gather(*turns) == ["gen0", "gen1", "gen0", "gen0", "gen1"]
+
+    asyncio.run(_run())
+
+
+def test_sticky_group_slack_ignores_requests_without_a_group():
+    async def _run():
+        actors = [_Actor("gen0"), _Actor("gen1")]
+        router = _router(
+            actors, strategy=StickySessionRoutingStrategy.Config(group_slack=4)
+        )
+        assert (
+            await router._route("generate", routing_ctx=RoutingContext(session_id="s0"))
+            == "gen0"
+        )
+        router._generators[0].reserved_load = 1
+
+        # Requests without a group share no home: the least loaded gets the next session.
+        assert (
+            await router._route("generate", routing_ctx=RoutingContext(session_id="s1"))
+            == "gen1"
+        )
+
+    asyncio.run(_run())
+
+
+def test_sticky_group_slack_repin_skips_overloaded_home():
+    async def _run():
+        actors = [_Actor("gen0"), _Actor("gen1")]
+        router = _router(
+            actors, strategy=StickySessionRoutingStrategy.Config(group_slack=10)
+        )
+        ctx = RoutingContext(session_id="group=0/rollout=0", group_id=0)
+        assert await router._route("generate", routing_ctx=ctx) == "gen0"
+
+        # gen0 (home and pin) is overloaded: 3 > 1.5 * mean 1.5. The re-pin leaves it,
+        # although home is within group_slack of the least loaded.
+        router._generators[0].reserved_load = 3
+        assert await router._route("generate", routing_ctx=ctx) == "gen1"
+
+    asyncio.run(_run())
+
+
+def test_sticky_group_slack_release_groups_forgets_home():
+    async def _run():
+        actors = [_Actor("gen0"), _Actor("gen1")]
+        router = _router(
+            actors, strategy=StickySessionRoutingStrategy.Config(group_slack=4)
+        )
+
+        def ctx(rollout_id):
+            # Validation reuses group ids (-1, -2, ...) in every validation run.
+            return RoutingContext(session_id=f"val/rollout={rollout_id}", group_id=-1)
+
+        assert await router._route("generate", routing_ctx=ctx(0)) == "gen0"
+        router._generators[0].reserved_load = 4
+
+        # gen0 is still home and within slack (4 <= 0 + 4) ...
+        assert await router._route("generate", routing_ctx=ctx(1)) == "gen0"
+        # ... until the group is released; then the least loaded gets the group's next session.
+        await router._release_groups([-1])
+        assert await router._route("generate", routing_ctx=ctx(2)) == "gen1"
+        # Every generator also hears about the release (it drops the group's cache salt).
+        assert all(a.release_groups.calls == [(([-1],), {})] for a in actors)
+
+    asyncio.run(_run())
+
+
 def test_sticky_session_can_use_round_robin_for_new_sessions():
     async def _run():
         actors = [_Actor("gen0"), _Actor("gen1")]
@@ -409,6 +511,11 @@ def test_session_release_reaches_only_its_pinned_generator():
 def test_sticky_session_rejects_non_positive_max_sessions():
     with pytest.raises(ValueError, match="max_sessions must be positive"):
         StickySessionRoutingStrategy.Config(max_sessions=0).build()
+
+
+def test_sticky_session_rejects_negative_group_slack():
+    with pytest.raises(ValueError, match="group_slack"):
+        StickySessionRoutingStrategy.Config(group_slack=-1)
 
 
 def test_sticky_session_rejects_repin_load_ratio_at_most_one():

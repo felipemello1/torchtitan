@@ -62,6 +62,10 @@ class RoutingStrategy(Configurable, ABC):
         """Forget a session that makes no more requests."""
         del session_id
 
+    def release_groups(self, group_ids: list[int]) -> None:
+        """Forget rollout groups that make no more requests."""
+        del group_ids
+
 
 class RoundRobinRoutingStrategy(RoutingStrategy):
     """Cycle over the candidates in order, ignoring load."""
@@ -144,7 +148,8 @@ class StickySessionRoutingStrategy(RoutingStrategy):
         fallback_strategy: RoutingStrategy.Config = field(
             default_factory=LeastLoadedRoutingStrategy.Config
         )
-        """Routing strategy used for new sessions and requests without a session."""
+        """Routing strategy used for new sessions that don't join their group's home
+        (`group_slack`), and for requests without a session."""
 
         repin_load_ratio: float | None = 1.5
         """Move a session off its pinned candidate once that candidate's in-flight load is above
@@ -158,6 +163,24 @@ class StickySessionRoutingStrategy(RoutingStrategy):
             loads [1, 0, 0, 0]  mean 0.25  1 > 0.375  moves, even at low load
         """
 
+        group_slack: int | None = None
+        """Keep a group's siblings together so they share their prompt's KV. None: off.
+
+        A new session joins its group's home, the generator the group's first session went to,
+        while home has at most `group_slack` more in-flight calls than the least loaded.
+        Higher keeps more of a group together; lower balances load better. With
+        `repin_load_ratio` set, a session can join a home that re-pins it on its next turn.
+
+        With 2, home first:
+
+            new session, loads [3, 2, 2]    3 <= 2 + 2   joins home
+            new session, loads [5, 2, 3]    5 >  2 + 2   fallback picks
+            re-pin off an overloaded pin                 fallback picks, never home
+
+        TODO: only `InterGeneratorRouter` passes group ids, so this has no effect across a
+        generator's DP ranks. That layer is untested and unmeasured (DP ranks step in lockstep).
+        """
+
         def __post_init__(self):
             if self.max_sessions <= 0:
                 raise ValueError(
@@ -167,12 +190,19 @@ class StickySessionRoutingStrategy(RoutingStrategy):
                 raise ValueError(
                     f"repin_load_ratio must be > 1 or None, got {self.repin_load_ratio}"
                 )
+            if self.group_slack is not None and self.group_slack < 0:
+                raise ValueError(
+                    f"group_slack must be >= 0 or None, got {self.group_slack}"
+                )
 
     def __init__(self, config: Config):
         self._max_sessions = config.max_sessions
         self._fallback_strategy = config.fallback_strategy.build()
         self._repin_load_ratio = config.repin_load_ratio
+        self._group_slack = config.group_slack
         self._sessions: OrderedDict[str, RoutingCandidate] = OrderedDict()
+        # group_id -> the candidate its first session went to (only with group_slack).
+        self._group_homes: dict[int, RoutingCandidate] = {}
 
     def choose(
         self,
@@ -182,7 +212,8 @@ class StickySessionRoutingStrategy(RoutingStrategy):
         """Return the session's assigned candidate, or assign a new one.
 
         - no ``session_id``: the fallback chooses; nothing is pinned.
-        - new session: the fallback chooses; the session is pinned there.
+        - new session: its group's home with ``group_slack``, else the fallback chooses; the
+          session is pinned there.
         - pinned session: reuse its candidate, unless that candidate is gone from
           ``candidates`` or overloaded (``repin_load_ratio``); then the fallback
           chooses and the session is re-pinned.
@@ -207,8 +238,24 @@ class StickySessionRoutingStrategy(RoutingStrategy):
                 self._sessions.move_to_end(routing_ctx.session_id)
                 return sticky_candidate
 
-        # New session, or the pinned candidate is gone or overloaded: (re)pin to the fallback's choice.
-        chosen = self._fallback_strategy.choose(routing_ctx, candidates)
+        # New session: join its group's home while home is within group_slack of the least loaded.
+        # A re-pin (pinned candidate gone or overloaded) skips home, so it can't land back on it.
+        home = None
+        if self._group_slack is not None and sticky_candidate is None:
+            home = self._group_homes.get(routing_ctx.group_id)
+        home_has_room = (
+            home is not None
+            and any(h is home for h in candidates)
+            and home.reserved_load
+            <= min(h.reserved_load for h in candidates) + self._group_slack
+        )
+        if home_has_room:
+            chosen = home
+        else:
+            # Consult the fallback only when its pick is used, so its tie-break tracks real placements.
+            chosen = self._fallback_strategy.choose(routing_ctx, candidates)
+            if self._group_slack is not None and routing_ctx.group_id is not None:
+                self._group_homes.setdefault(routing_ctx.group_id, chosen)
         self._sessions[routing_ctx.session_id] = chosen
         # End of the dict means it's the most-recently-used session.
         self._sessions.move_to_end(routing_ctx.session_id)
@@ -227,3 +274,8 @@ class StickySessionRoutingStrategy(RoutingStrategy):
     def release_session(self, session_id: str) -> None:
         """Drop the session's assignment."""
         self._sessions.pop(session_id, None)
+
+    def release_groups(self, group_ids: list[int]) -> None:
+        """Drop the groups' homes."""
+        for group_id in group_ids:
+            self._group_homes.pop(group_id, None)
