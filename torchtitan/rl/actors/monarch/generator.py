@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+from typing import Any, Literal
+
 from monarch.actor import Actor, Channel, concurrent_endpoint, context, current_rank
 
 from torchtitan.rl.generator.generator import SamplingConfig, VLLMGenerator
@@ -22,6 +24,7 @@ class _GeneratorActorEndpoints:
         model_path: str,
         max_num_seqs: int,
         output_dir: str,
+        prefill_decode_role: Literal["prefill", "decode"] | None = None,
     ) -> None:
         super().__init__(
             config,
@@ -31,6 +34,7 @@ class _GeneratorActorEndpoints:
             rank=current_rank().rank,
             generator_name=context().actor_instance.actor_id.actor_name,
             open_result_channel=Channel.open,
+            prefill_decode_role=prefill_decode_role,
         )
 
     @concurrent_endpoint
@@ -59,6 +63,8 @@ class _GeneratorActorEndpoints:
         routing_session_id: str,
         sampling_config: SamplingConfig | None = None,
         metrics_prefix: str = "generator",
+        kv_transfer_params: dict[str, Any] | None = None,
+        prefill_min_policy_version: int | None = None,
     ) -> Completion:
         return await super().generate(
             prompt_token_ids,
@@ -67,6 +73,8 @@ class _GeneratorActorEndpoints:
             routing_session_id=routing_session_id,
             sampling_config=sampling_config,
             metrics_prefix=metrics_prefix,
+            kv_transfer_params=kv_transfer_params,
+            prefill_min_policy_version=prefill_min_policy_version,
         )
 
     @concurrent_endpoint

@@ -79,6 +79,7 @@ def _bare_generator(
     generator._group_min_policy_versions = {}
     generator._prefetched_model_state_dict = {}
     generator._session_kv_holder = None
+    generator._prefill_decode_role = None
     # Engine-thread tests bind the queue once the engine thread's event loop exists.
     if event_loop is not None:
         generator._engine_loop_queue = EngineLoopQueue(event_loop)
@@ -481,6 +482,21 @@ def test_step_with_kv_reset_uses_current_version_without_pins(runner) -> None:
     assert generator._group_min_policy_versions == {}
 
 
+def test_step_takes_the_older_of_pin_and_prefill_min_policy_version(runner) -> None:
+    """A decode generator's request is as old as the KV it pulled: the min of its group's pin
+    and the version the prefill generator computed the KV under."""
+    generator = _bare_generator(event_loop=runner.get_loop())
+    generator.policy_version = 5
+    # The prefill generator is a version behind this one.
+    request = _request("t0", group_id=1)
+    request.prefill_min_policy_version = 4
+    assert _admit(runner, generator, request) == 4
+    # This generator lags the prefill generator: its own pin (5) is older than 6.
+    request = _request("t1", group_id=1)
+    request.prefill_min_policy_version = 6
+    assert _admit(runner, generator, request) == 5
+
+
 def test_release_groups_drops_pins(runner) -> None:
     generator = _bare_generator(event_loop=runner.get_loop())
     generator.policy_version = 3
@@ -508,6 +524,7 @@ def _finished_output(request_id: str) -> SimpleNamespace:
     return SimpleNamespace(
         request_id=request_id,
         num_cached_tokens=0,
+        kv_transfer_params=None,
         metrics=SimpleNamespace(
             first_token_latency=0.01,
             queued_ts=1.0,
@@ -584,6 +601,29 @@ class _HeldEngine(_FakeEngine):
             return super().step()
         self.step_hook()
         return []
+
+
+class _TransferHoldingEngine(_FakeEngine):
+    """A prefill engine whose scheduler holds each finished request's KV for `hold_steps` more
+    steps, as vLLM does until the decode generator's pull is done."""
+
+    def __init__(self, hold_steps: int):
+        super().__init__()
+        self.hold_steps, self.held_steps_left = hold_steps, 0
+        self.engine_core = SimpleNamespace(
+            engine_core=SimpleNamespace(
+                scheduler=SimpleNamespace(
+                    has_finished_requests=lambda: self.held_steps_left > 0
+                )
+            )
+        )
+
+    def step(self):
+        if self.running:
+            self.held_steps_left = self.hold_steps
+        elif self.held_steps_left:
+            self.held_steps_left -= 1
+        return super().step()
 
 
 class _StepGate:
@@ -716,6 +756,43 @@ def test_call_on_engine_thread_raises_any_failure_to_the_caller() -> None:
         with pytest.raises(SystemExit, match="build failed"):
             generator._call_on_engine_thread(fail)
     finally:
+        _stop_engine_thread(generator)
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_call_on_engine_thread_raises_when_the_kv_transfer_listener_dies() -> None:
+    """vLLM's listener failing to bind (port taken) raises instead of hanging the engine build.
+    Another thread dying doesn't, and the excepthook is restored afterwards."""
+    excepthook = threading.excepthook
+    release_build = threading.Event()
+
+    def build_engine(dying_thread_name: str) -> str:
+        def die():
+            raise OSError("Address already in use")
+
+        thread = threading.Thread(target=die, name=dying_thread_name)
+        thread.start()
+        thread.join()
+        # vLLM's init waits forever on a dead listener; give another thread's death the same
+        # window to (wrongly) fail the call.
+        listener = dying_thread_name == "nixl_handshake_listener"
+        release_build.wait(timeout=_TIMEOUT_S if listener else 0.2)
+        return "engine"
+
+    generator = _bare_generator()
+    generator._prefill_decode_role = "prefill"
+    _start_engine_thread(generator)
+    try:
+        assert (
+            generator._call_on_engine_thread(lambda: build_engine("other")) == "engine"
+        )
+        with pytest.raises(RuntimeError, match="listener died"):
+            generator._call_on_engine_thread(
+                lambda: build_engine("nixl_handshake_listener")
+            )
+        assert threading.excepthook is excepthook
+    finally:
+        release_build.set()
         _stop_engine_thread(generator)
 
 
@@ -982,6 +1059,25 @@ def test_generate_cancelled_after_admission_leaves_the_loop_running(
         completion = await asyncio.wait_for(_generate(generator, "r1"), _TIMEOUT_S)
         assert completion.request_id == "r1"
         assert generator._request_dispatcher._rank0_outstanding_generations == {}
+
+        await asyncio.wait_for(generator.close(), _TIMEOUT_S)
+
+    asyncio.run(run())
+
+
+def test_prefill_generator_steps_until_its_held_kv_is_freed(engine_thread) -> None:
+    """vLLM frees a pulled request's KV in an engine step, so an idle prefill generator keeps
+    stepping until nothing is held."""
+    engine = _TransferHoldingEngine(hold_steps=20)
+
+    async def run() -> None:
+        generator = engine_thread(engine)
+        generator._prefill_decode_role = "prefill"
+        await generator.start_engine_loop()
+        await asyncio.wait_for(_generate(generator, "r0"), _TIMEOUT_S)
+        async with asyncio.timeout(_TIMEOUT_S):
+            while engine.held_steps_left:
+                await asyncio.sleep(0.01)
 
         await asyncio.wait_for(generator.close(), _TIMEOUT_S)
 
