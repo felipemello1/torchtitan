@@ -785,6 +785,31 @@ class BatchWiseLoadBalanceLoss(AuxLoss):
             return self.inject(loss, carrier=carrier, denominator=denominator)
 
 
+_SIDE_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _shared_experts_side_stream() -> torch.cuda.Stream | None:
+    """Side stream for the shared experts, or None to run them inline.
+
+    Checked while a CUDA graph is captured: the graph records the two-stream schedule
+    once and every replay runs it, so all decode steps overlap, not just the first.
+    Only without grad (autograd and activation checkpointing would need the backward
+    on matching streams) and without EP (no collectives on the side stream). Eager
+    forwards keep one stream; the gain was measured only under CUDA graphs.
+    """
+    if (
+        torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or not torch.cuda.is_current_stream_capturing()
+        or spmd_sparse_mesh() is not None
+    ):
+        return None
+    device = torch.cuda.current_device()
+    if device not in _SIDE_STREAMS:
+        _SIDE_STREAMS[device] = torch.cuda.Stream(device)
+    return _SIDE_STREAMS[device]
+
+
 class MoE(Module):
     """Mixture of Experts layer.
 
@@ -893,6 +918,14 @@ class MoE(Module):
         )
         num_local_tokens_per_expert_E = routing_map_TE.sum(dim=0)
 
+        # Run the shared experts on a side stream so they overlap with the routed
+        # experts; the main stream waits for them before the final add.
+        side_stream = _shared_experts_side_stream() if self.shared_experts else None
+        if side_stream is not None:
+            side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side_stream):
+                shared_TD = self.shared_experts(x_TD)
+
         out_TD = self.routed_experts(
             routed_x_TD,
             topk_scores_TK,
@@ -902,7 +935,10 @@ class MoE(Module):
         )
         out_TD = self._maybe_zero_fill_routed_output_to_tp_partial(out_TD)
         if self.shared_experts is not None:
-            shared_TD = self.shared_experts(x_TD)
+            if side_stream is not None:
+                torch.cuda.current_stream().wait_stream(side_stream)
+            else:
+                shared_TD = self.shared_experts(x_TD)
             # Trailing add, always saved: it saves nothing for backward, so replay skips
             # it and its inputs need no persisting, matching checkpoint early stop.
             out_TD = remat.region(
