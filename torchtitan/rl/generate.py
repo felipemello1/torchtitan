@@ -111,6 +111,9 @@ def generate() -> None:
     max_num_seqs = args.max_num_seqs
     is_rank0 = os.environ.get("RANK", "0") == "0"
 
+    speculative_config = (
+        gen_config.extra_vllm_engine_args.get("speculative_config") or {}
+    )
     # Register TorchTitan model with vLLM before engine creation
     register_to_vllm(
         model_config,
@@ -182,6 +185,7 @@ def generate() -> None:
         max_num_batched_tokens=gen_config.max_num_batched_tokens,
         expert_sequence_parallel_size=expert_sequence_parallel_size,
         enable_sequence_parallel=gen_config.parallelism.enable_sequence_parallel,
+        num_speculative_tokens=speculative_config.get("num_speculative_tokens", 0),
     )
     if vllm_compilation_config is not None:
         engine_kwargs["compilation_config"] = vllm_compilation_config
