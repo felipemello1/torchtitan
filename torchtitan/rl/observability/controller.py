@@ -19,6 +19,7 @@ import random
 import time
 from collections import Counter, defaultdict
 
+from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.types import Rollout
 
@@ -101,6 +102,9 @@ class GCTimer:
         self._total_s[generation] += seconds
         self._max_s[generation] = max(self._max_s[generation], seconds)
         self._collected[generation] += info["collected"]
+        if seconds >= 0.1:
+            # Timestamped, to line pauses up with event-loop lag and request latency.
+            sl.log_trace_scalar({f"gc_gen{generation}_pause_ms": seconds * 1000})
 
     def flush(self) -> list[m.Metric]:
         """Return the GC metrics since the last flush, then reset."""

@@ -1829,6 +1829,12 @@ class Controller(Configurable):
                         *data_metrics,
                         *time_metrics,
                         *gc_timer.flush(),
+                        # GC probe: the Verifiers generation server's request latency.
+                        *(
+                            self._rollouter.generation_server_metrics()
+                            if hasattr(self._rollouter, "generation_server_metrics")
+                            else []
+                        ),
                         m.Metric(
                             "controller/memory/rss_gib", m.NoReduce(rss_bytes / 2**30)
                         ),

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import time
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -18,6 +19,7 @@ import torch
 from aiohttp import web
 
 from torchtitan.config import Configurable
+from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.types import GenerateFn
 
@@ -112,6 +114,36 @@ class GenerationServer(Configurable):
         self.bound_port: int | None = None
         self.request_counts: dict[str, int] = {}
         self.generation_metadata: dict[str, VerifiersGenerationMetadata] = {}
+        # Per finished request: (overhead_ms, handler_ms, generate_ms). Overhead is the
+        # controller-side generate time minus vLLM's arrival-to-last-token time.
+        self._request_stats: list[tuple[float, float, float]] = []
+
+    def drain_request_metrics(self) -> list[m.Metric]:
+        """Request latency since the last call, plus rollouts and their turns in flight."""
+        stats, self._request_stats = self._request_stats, []
+        metrics = [
+            m.Metric("genserver/sessions_in_flight", m.NoReduce(len(self.generation_metadata))),
+            m.Metric(
+                "genserver/turns_in_flight", m.NoReduce(sum(self.request_counts.values()))
+            ),
+            m.Metric("genserver/requests", m.NoReduce(len(stats))),
+        ]
+        if stats:
+            for index, name in enumerate(("overhead_ms", "handler_ms", "generate_ms")):
+                values = np.sort(np.array([row[index] for row in stats]))
+                metrics += [
+                    m.Metric(f"genserver/{name}/mean", m.NoReduce(float(values.mean()))),
+                    m.Metric(
+                        f"genserver/{name}/p50",
+                        m.NoReduce(float(values[len(values) // 2])),
+                    ),
+                    m.Metric(
+                        f"genserver/{name}/p99",
+                        m.NoReduce(float(values[int(len(values) * 0.99)])),
+                    ),
+                    m.Metric(f"genserver/{name}/max", m.NoReduce(float(values[-1]))),
+                ]
+        return metrics
 
     @property
     def port(self) -> int:
@@ -183,6 +215,7 @@ class GenerationServer(Configurable):
         return web.json_response({"object": "list", "data": [model]})
 
     async def _handle_generate_request(self, request: web.Request) -> web.Response:
+        handler_start = time.perf_counter()
         if self.generate_fn is None:
             return web.json_response(
                 {"error": "TorchTitan GenerateFn is not ready"}, status=503
@@ -246,6 +279,7 @@ class GenerationServer(Configurable):
         request_index = self.request_counts.get(session_id, 0)
         self.request_counts[session_id] = request_index + 1
         request_id = f"{session_id}/request={request_index}"
+        generate_start = time.perf_counter()
         try:
             completion = await self.generate_fn(
                 prompt_token_ids,
@@ -260,6 +294,7 @@ class GenerationServer(Configurable):
             logger.exception("TorchTitan generation failed for %s", request_id)
             return web.json_response({"error": str(error)}, status=500)
 
+        generate_ms = (time.perf_counter() - generate_start) * 1000
         if completion is None:
             return web.json_response(
                 {"error": f"generation returned no completion for {request_id}"},
@@ -307,7 +342,7 @@ class GenerationServer(Configurable):
             ),
             topk_by_generation=topk_by_generation,
         )
-        return web.json_response(
+        response = web.json_response(
             {
                 "request_id": completion.request_id,
                 "choices": [
@@ -344,6 +379,23 @@ class GenerationServer(Configurable):
                 "kv_transfer_params": None,
             }
         )
+        vllm_ms = sum(
+            metric.value.value
+            for metric in completion.metrics
+            if isinstance(metric.value, m.Mean)
+            and metric.key.endswith(("/time_to_first_token_ms", "/decode_time_ms"))
+        )
+        overhead_ms = generate_ms - vllm_ms
+        handler_ms = (time.perf_counter() - handler_start) * 1000
+        self._request_stats.append((overhead_ms, handler_ms, generate_ms))
+        if overhead_ms >= 200 or handler_ms - generate_ms >= 200:
+            sl.log_trace_scalar(
+                {
+                    "genserver_overhead_ms": overhead_ms,
+                    "genserver_handler_extra_ms": handler_ms - generate_ms,
+                }
+            )
+        return response
 
 
 def _routed_experts_payload(
