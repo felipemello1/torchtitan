@@ -519,7 +519,7 @@ class Controller(Configurable):
             routing_session_id: str | None = None,
             sampling_config: SamplingConfig | None = None,
         ) -> Completion | None:
-            return await generator_router.generate.call_one(
+            generate_call = generator_router.generate.call_one(
                 prompt_token_ids,
                 request_id=request_id,
                 group_id=group_id,
@@ -527,6 +527,13 @@ class Controller(Configurable):
                 sampling_config=sampling_config,
                 metrics_prefix=metrics_prefix,
             )
+            try:
+                return await generate_call
+            except asyncio.CancelledError:
+                # Cancelling this await doesn't cancel the remote call, so abort it to free its KV.
+                # Not awaited: `call_one` sends when called, and the cancellation shouldn't wait on it.
+                generator_router.abort_generation.call_one(request_id)
+                raise
 
         return generate
 

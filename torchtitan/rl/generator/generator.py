@@ -659,7 +659,10 @@ class RequestDispatcher:
             inflight_requests_at_completion = float(
                 len(self._rank0_outstanding_generations)
             )
-            generation = self._rank0_outstanding_generations.pop(request_id)
+            generation = self._rank0_outstanding_generations.pop(request_id, None)
+            if generation is None:
+                # Aborted while a peer DP rank was sending its completion; the abort answered it.
+                continue
 
             # Replace the placeholder min (the builder set min == max) with the true admitted
             # version stamped on the outstanding generation at admission.
@@ -684,12 +687,41 @@ class RequestDispatcher:
             if self._rank0_dp_router is not None:
                 self._rank0_dp_router.release(request_id)
 
+    def rank0_abort_generation(
+        self, request_id: str, *, policy_version: int, routed: bool
+    ) -> None:
+        """RANK 0: answer an aborted `generate` call with an empty "abort" `Completion`.
+
+        generation finished, or never seen   no-op
+        routed                               reply, then free its DP-rank reservation
+        not routed                           reply only (`release` raises on an id never reserved)
+        """
+        generation = self._rank0_outstanding_generations.pop(request_id, None)
+        if generation is None:
+            return
+        generation.reply.set_result(
+            Completion(
+                min_policy_version=policy_version,
+                max_policy_version=policy_version,
+                request_id=request_id,
+                token_ids=[],
+                token_logprobs=[],
+                finish_reason="abort",
+            )
+        )
+        if routed and self._rank0_dp_router is not None:
+            self._rank0_dp_router.release(request_id)
+
     def _rank0_fail_generations(
         self, rejected_requests: list[tuple[str, ValueError | VLLMClientError]]
     ) -> None:
         """RANK 0: fail the reply of each rejected request with its error."""
         for request_id, exc in rejected_requests:
-            self._rank0_outstanding_generations.pop(request_id).reply.set_exception(exc)
+            generation = self._rank0_outstanding_generations.pop(request_id, None)
+            if generation is None:
+                # Aborted while a peer DP rank was sending its rejection; the abort answered it.
+                continue
+            generation.reply.set_exception(exc)
             if self._rank0_dp_router is not None:
                 self._rank0_dp_router.release(request_id)
 
@@ -1402,6 +1434,9 @@ class VLLMGenerator(Configurable):
                     self._session_kv_holder.release(
                         decision.released_session_ids, decision.released_group_ids
                     )
+                # vLLM skips ids it doesn't hold (another DP rank's, or finished).
+                if decision.abort_request_ids:
+                    self._engine.abort_request(decision.abort_request_ids)
 
                 if decision.action is LoopAction.LOAD_MODEL_STATE_DICT:
                     await self._load_model_state_dict(decision.load_version)
@@ -1502,7 +1537,9 @@ class VLLMGenerator(Configurable):
         await asyncio.sleep(0)
         while not self._engine_loop_queue.empty():
             message = self._engine_loop_queue.get_nowait()
-            if isinstance(message, (CloseMessage, SessionReleaseMessage)):
+            if isinstance(
+                message, (CloseMessage, SessionReleaseMessage, GenerationAbortMessage)
+            ):
                 continue
             if message.reply.set_running_or_notify_cancel():
                 message.reply.set_exception(exc)
@@ -1540,6 +1577,7 @@ class VLLMGenerator(Configurable):
 
         released_session_ids: list[str] = []
         released_group_ids: list[int] = []
+        abort_request_ids: list[str] = []
         for message in messages:
             if isinstance(message, CloseMessage):
                 # Drops nothing: the queue rejects puts once closed, so the `CloseMessage` is the last message.
@@ -1547,6 +1585,21 @@ class VLLMGenerator(Configurable):
             if isinstance(message, SessionReleaseMessage):
                 released_session_ids.extend(message.session_ids)
                 released_group_ids.extend(message.group_ids)
+                continue
+            if isinstance(message, GenerationAbortMessage):
+                pending_ids = [
+                    request.request_id for request in pending_engine_requests
+                ]
+                # Still pending (same batch, or held back by a load): it never reached the engine.
+                unrouted = message.request_id in pending_ids
+                if unrouted:
+                    pending_engine_requests.pop(pending_ids.index(message.request_id))
+                self._request_dispatcher.rank0_abort_generation(
+                    message.request_id,
+                    policy_version=self.policy_version,
+                    routed=not unrouted,
+                )
+                abort_request_ids.append(message.request_id)
                 continue
             # Skip a call its caller already cancelled; once running, the reply ignores cancellation, so only
             # the engine loop resolves it.
@@ -1593,6 +1646,7 @@ class VLLMGenerator(Configurable):
             )
         decision.released_session_ids = released_session_ids
         decision.released_group_ids = released_group_ids
+        decision.abort_request_ids = abort_request_ids
         return decision
 
     def _build_sampling_params(self, sampling: SamplingConfig) -> SamplingParams:
@@ -1644,6 +1698,12 @@ class VLLMGenerator(Configurable):
             self._group_min_policy_versions.pop(group_id, None)
         if self._session_kv_holder is not None and self._rank == 0:
             self._engine_loop_queue.put(SessionReleaseMessage(group_ids=group_ids))
+
+    async def abort_generation(self, request_id: str) -> None:
+        """Stop one `generate` call so vLLM frees its KV. No-op if it already finished; raises once
+        the generator is closed (callers fire and forget, so the error is dropped)."""
+        if self._rank == 0:
+            self._engine_loop_queue.put(GenerationAbortMessage(request_id=request_id))
 
     async def release_sessions(self, session_ids: list[str]) -> None:
         """Release the held KV of sessions whose rollout ended (rank 0; a no-op without
@@ -1847,8 +1907,19 @@ class SessionReleaseMessage:
     group_ids: list[int] = field(default_factory=list)
 
 
+@dataclass(kw_only=True, slots=True)
+class GenerationAbortMessage:
+    """The `generate` call whose caller gave up; the engine loop aborts it; no reply."""
+
+    request_id: str
+
+
 EngineLoopMessage = (
-    GenerationMessage | ModelStateDictLoadMessage | CloseMessage | SessionReleaseMessage
+    GenerationMessage
+    | ModelStateDictLoadMessage
+    | CloseMessage
+    | SessionReleaseMessage
+    | GenerationAbortMessage
 )
 
 
@@ -1957,3 +2028,6 @@ class LoopDecision:
     released_session_ids: list[str] = field(default_factory=list)
     released_group_ids: list[int] = field(default_factory=list)
     # sessions (and groups) whose held KV every rank releases before acting (session_kv_holder)
+
+    abort_request_ids: list[str] = field(default_factory=list)
+    # requests every rank aborts in vLLM before acting
