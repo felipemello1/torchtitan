@@ -928,6 +928,7 @@ def _run_with_generator_watcher(watcher) -> None:
                 num_tokens_per_microbatch_per_dp_rank=8, max_context_length=8
             )
         ),
+        garbage_collector=None,
     )
     controller.start_step = 0
     controller._max_concurrent_rollout_groups = 1  # setup_async resolves this
@@ -1113,8 +1114,9 @@ def _controller_for_trainer_loop(
     """A `Controller` whose `_trainer_loop` runs on fakes: each step trains instantly."""
     controller = object.__new__(Controller)
     controller.config = SimpleNamespace(
-        async_loop=AsyncLoopConfig(validation=validation)
+        async_loop=AsyncLoopConfig(validation=validation), heap_census_every_n_steps=0
     )
+    controller._garbage_collector = None
     controller.start_step = 0
     controller._trainer_policy_version = 0
     policy_versions = iter(range(1, 100))
@@ -1345,6 +1347,8 @@ def test_overlapped_validation_before_and_after_training(
                 num_tokens_per_microbatch_per_dp_rank=64, max_context_length=64
             )
         ),
+        garbage_collector=None,
+        heap_census_every_n_steps=0,
     )
     controller.start_step = 0
     # setup_async resolves this

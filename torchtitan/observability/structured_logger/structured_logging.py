@@ -509,3 +509,32 @@ class log_trace_span:  # noqa: N801
                 return func(*args, **kwargs)
 
         return cast(F, sync_wrapper)
+
+
+async def log_event_loop_lag(
+    *, interval_s: float = 0.05, threshold_s: float = 0.2
+) -> None:
+    """Log an `event_loop_lag_ms` scalar when sync code blocks this event loop.
+
+    A task resumes only when the loop is free, so other spans on this loop that are open
+    during the `value` ms before the scalar may be inflated by up to that much. Blocks
+    shorter than `threshold_s` (even many in a row) and a block that never ends log nothing.
+    Runs until cancelled.
+
+    Args:
+        interval_s: Seconds between checks; `value` undercounts the block by up to this.
+        threshold_s: Smallest lag to log, in seconds.
+
+    Example::
+
+        lag_task = asyncio.create_task(log_event_loop_lag())
+        # another task calls time.sleep(2) inside an async def
+        # -> {"event_name": "event_loop_lag_ms", "value": 1970.4, ...}
+    """
+    loop = asyncio.get_running_loop()
+    while True:
+        due = loop.time() + interval_s
+        await asyncio.sleep(interval_s)
+        lag_s = loop.time() - due
+        if lag_s >= threshold_s:
+            log_trace_scalar({"event_loop_lag_ms": lag_s * 1000})

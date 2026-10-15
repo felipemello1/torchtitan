@@ -132,6 +132,7 @@ from torchtitan.rl.generator import (
 from torchtitan.rl.losses import ScoreCenteringLoss
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
+    append_heap_census,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     compute_rollout_metrics,
@@ -451,6 +452,22 @@ class Controller(Configurable):
             default_factory=RolloutSampleRecorder.Config
         )
         """JSONL recorder to save sampled rollouts to disk for further inspection and debugging."""
+
+        heap_census_every_n_steps: int = 0
+        """Every N train steps, append to `dump_folder/heap_census.jsonl` the objects a full GC
+        scans, counted by type; see `append_heap_census`. 0 disables."""
+
+        heap_census_referrer_types: int = 0
+        """On census steps divisible by `heap_census_referrer_every_n_steps`, also sample this many
+        top types and count their referrers (seconds per 1M objects: a long pause)."""
+
+        heap_census_referrer_every_n_steps: int = 10
+
+        garbage_collector: GarbageCollector.Config | None = None
+        """None: Python's automatic GC, whose full collections pause the event loop for seconds on a large heap.
+        Set: automatic GC off; `gc.collect(1)` every `gc_freq` steps (`debug` is unsupported). Objects alive
+        at a collect are never scanned again, so a cycle among them that dies later leaks; watch
+        `controller/memory/rss_gib`."""
 
         trainer: Trainer.Config
         """Trainer config. Controls the trainer model, optimizer, training, parallelism."""
@@ -1151,6 +1168,11 @@ class Controller(Configurable):
         GarbageCollector.freeze(
             "Full GC before freezing the controller's setup objects"
         )
+        self._garbage_collector = (
+            self.config.garbage_collector.build()
+            if self.config.garbage_collector is not None
+            else None
+        )
 
         async_loop = self.config.async_loop
         num_training_steps = async_loop.num_training_steps
@@ -1263,11 +1285,15 @@ class Controller(Configurable):
 
         # run everything until trainer finishes its number of steps
         # or some other loop breaks
+        event_loop_lag_task = asyncio.create_task(
+            sl.log_event_loop_lag(), name="event_loop_lag"
+        )
         background_tasks = [
             data_input_task,
             *rollout_tasks,
             batcher_task,
             generator_task,
+            event_loop_lag_task,
         ]
         try:
             done, _ = await asyncio.wait(
@@ -1778,6 +1804,9 @@ class Controller(Configurable):
             time_metrics = step_timer.flush()
             # to_thread: the loader's metrics wait for an in-flight sample read; don't block the loop on it.
             data_metrics = await asyncio.to_thread(self._rollouter.training_data_metrics)
+            # statm's 2nd field is the resident set size, in pages.
+            with open("/proc/self/statm") as file:
+                rss_bytes = int(file.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
             with sl.log_trace_span("metrics_log"):
                 session_kv_metrics = (
                     await self.generator_router.get_session_kv_metrics.call_one()
@@ -1800,6 +1829,9 @@ class Controller(Configurable):
                         *data_metrics,
                         *time_metrics,
                         *gc_timer.flush(),
+                        m.Metric(
+                            "controller/memory/rss_gib", m.NoReduce(rss_bytes / 2**30)
+                        ),
                         *policy_age_panel,
                         # Background push/pull work time; the trainer's wait for it is timing/step/blocking_*.
                         *push_metrics,
@@ -1812,6 +1844,20 @@ class Controller(Configurable):
                         ),
                     ],
                 )
+            if self._garbage_collector is not None:
+                self._garbage_collector.run(step)
+            heap_census_every_n_steps = self.config.heap_census_every_n_steps
+            if heap_census_every_n_steps and step % heap_census_every_n_steps == 0:
+                with sl.log_trace_span("heap_census"):
+                    append_heap_census(
+                        path=os.path.join(self.config.dump_folder, "heap_census.jsonl"),
+                        step=step,
+                        num_referrer_types=(
+                            self.config.heap_census_referrer_types
+                            if step % self.config.heap_census_referrer_every_n_steps == 0
+                            else 0
+                        ),
+                    )
 
             validation = self.config.async_loop.validation
             is_validation_step = (
