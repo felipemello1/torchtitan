@@ -245,6 +245,8 @@ def _argsort_expert_ids(expert_ids_N: torch.Tensor, num_experts: int) -> torch.T
     The CUDA radix sort makes one pass per key byte, so int64 ids take 8 passes and
     uint8 ids 1. Same order. GB300, 32,768 routes: 69 us as int64, 24 as uint8.
     """
+    # num_experts is a Python int fixed by the model config, so compile resolves this
+    # branch once: no graph break, and the same dtype in training and inference.
     if num_experts <= 256:
         expert_ids_N = expert_ids_N.to(torch.uint8)
     elif num_experts <= 2**15:
