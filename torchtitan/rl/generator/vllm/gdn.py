@@ -22,6 +22,7 @@ Decode and prefill update the paged convolution and SSM state pools directly.
 from dataclasses import dataclass
 
 import torch
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -195,6 +196,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         )
         return query, key, value
 
+    @eager_break_during_capture
     def _forward(
         self,
         mixed_qkv: torch.Tensor,
