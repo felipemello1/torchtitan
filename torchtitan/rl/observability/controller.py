@@ -174,6 +174,16 @@ def append_heap_census(
             for obj_type, count in type_counts.most_common(40)
         ],
     }
+    # A full GC visits every reference of every tracked object, untracked ints and strs too,
+    # so its cost follows references, not objects: a list of 7k ints is 1 object, 7k visits.
+    referents_by_type: Counter = Counter()
+    for obj in itertools.chain.from_iterable(generations):
+        referents_by_type[type(obj)] += len(gc.get_referents(obj))
+    record["total_referents"] = sum(referents_by_type.values())
+    record["top_types_by_referents"] = [
+        [f"{obj_type.__module__}.{obj_type.__qualname__}", count]
+        for obj_type, count in referents_by_type.most_common(30)
+    ]
     if num_referrer_types > 0:
         everything = list(itertools.chain.from_iterable(generations))
         rng = random.Random(step)
