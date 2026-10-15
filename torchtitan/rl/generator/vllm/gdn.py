@@ -7,7 +7,8 @@
 """vLLM paged-cache adapter for TorchTitan's Gated DeltaNet.
 
 The enclosing Qwen3.5 module owns all parameters. This adapter runs Attention
-Gym's paging-aware convolution and GDN kernels.
+Gym's paging-aware convolution and GDN kernels, or vLLM's GDN core with
+speculative decoding.
 
 Batch-invariant execution has two additional requirements:
 
@@ -20,8 +21,10 @@ Decode and prefill update the paged convolution and SSM state pools directly.
 """
 
 from dataclasses import dataclass
+from types import MethodType, SimpleNamespace
 
 import torch
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -32,6 +35,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
@@ -64,7 +68,8 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
     module owns only vLLM cache plumbing and kernel dispatch.
 
     The enclosing module and vLLM cache are both head-sharded under tensor
-    parallelism. Speculative decoding is not supported.
+    parallelism. With speculative decoding, vLLM's GDN core runs instead (see
+    ``__init__``).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -75,6 +80,9 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         head_k_dim: int
         head_v_dim: int
         conv_kernel_size: int = 4
+
+    # vLLM's GDN core, built in __init__ only with speculative decoding on.
+    _vllm_core: "_VLLMGDNCore | None" = None
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -87,10 +95,6 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         self.num_speculative_tokens = (
             speculative_config.num_speculative_tokens if speculative_config else 0
         )
-        # vLLM speculative decoding retains one state per draft position and
-        # commits the accepted state; Attention Gym currently mutates one slot.
-        if self.num_speculative_tokens != 0:
-            raise ValueError("Attention Gym GDN does not support speculative decoding.")
 
         self.num_k_heads = config.num_k_heads
         self.num_v_heads = config.num_v_heads
@@ -137,7 +141,13 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             raise ValueError(f"Duplicate GDN layer name: {self.prefix}")
         compilation_config.static_forward_context[self.prefix] = self
 
+        # Speculative decoding keeps one state per draft position and resumes from
+        # the last kept one; Attention Gym mutates one slot, so vLLM's core runs it.
+        self._vllm_core = _VLLMGDNCore(self) if self.num_speculative_tokens else None
+
     def get_attn_backend(self) -> type[AttentionBackend]:
+        if self._vllm_core is not None:
+            return GDNAttentionBackend
         return TorchTitanLinearAttentionBackend
 
     @property
@@ -207,6 +217,11 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         output: torch.Tensor,
     ) -> None:
         """Run convolution and recurrence against vLLM's paged state in place."""
+        if self._vllm_core is not None:
+            self._vllm_core.forward(
+                mixed_qkv, a, b, conv_weight, conv_bias, A_log, dt_bias, output
+            )
+            return
         assert (
             conv_bias is None
         ), "Attention Gym convolution kernels do not support bias"
@@ -398,6 +413,71 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             output_THV,
         )
         return output_THV
+
+
+class _VLLMGDNCore:
+    """Runs vLLM's GDN core on our layer's tensors, under the names it reads.
+
+    Name mapping::
+
+        ours                  vLLM's core reads
+        conv_weight (C, W) -> conv1d.weight (C, 1, W)
+        A_log, dt_bias     -> A_log, dt_bias in fp32
+        layer.kv_cache     -> kv_cache (vLLM binds it after __init__)
+    """
+
+    def __init__(self, layer: VLLMInnerGDN) -> None:
+        # Lazy import: a rename in vLLM's private GDN module breaks only spec-on engines.
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            ChunkGatedDeltaRule,
+            QwenGatedDeltaNetAttention,
+        )
+
+        for name in (
+            "_forward_core",
+            "_forward_core_decode_non_spec",
+            "_warmup_prefill_kernels",
+            "rearrange_mixed_qkv",
+        ):
+            method = getattr(QwenGatedDeltaNetAttention, name)
+            setattr(self, name, MethodType(method, self))
+        self.layer = layer
+        self.prefix = layer.prefix
+        self.get_state_dtype = layer.get_state_dtype
+        self.tp_size = layer.tensor_parallel_size
+        self.activation = "silu"
+        # Global head counts; vLLM's core divides by tp_size.
+        self.num_k_heads = layer.num_k_heads
+        self.num_v_heads = layer.num_v_heads
+        self.head_k_dim = layer.head_k_dim
+        self.head_v_dim = layer.head_v_dim
+        self.key_dim = layer.num_k_heads * layer.head_k_dim
+        self.value_dim = layer.num_v_heads * layer.head_v_dim
+        self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
+        self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
+        self.enable_packed_recurrent_decode = (
+            envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
+        )
+        self._prefill_kernels_warmed_up = False
+
+    def forward(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_weight: torch.Tensor,
+        conv_bias: torch.Tensor | None,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        self.kv_cache = self.layer.kv_cache
+        self.conv1d = SimpleNamespace(weight=conv_weight.unsqueeze(1), bias=conv_bias)
+        self.A_log = A_log.float()
+        self.dt_bias = dt_bias.float()
+        self._forward_core(
+            mixed_qkv, b=b.contiguous(), a=a.contiguous(), core_attn_out=output
+        )
 
 
 def maybe_configure_gdn_hybrid_model(

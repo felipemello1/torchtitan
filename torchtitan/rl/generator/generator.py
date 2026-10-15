@@ -232,7 +232,7 @@ class VLLMCudaGraphConfig:
 
     capture_sizes: list[int] | None = None
     """Explicit CUDA graph capture batch sizes. When ``None`` (default), sizes are
-    auto-derived: powers of 2 up to the cap, plus ``max_num_seqs`` and the cap as
+    auto-derived: powers of 2 up to the cap, plus the decode batch and the cap as
     exact sizes. When set, these sizes are deduped and sorted. When expert
     sequence parallelism is enabled, capture sizes that are not multiples of
     its degree are removed."""
@@ -253,14 +253,16 @@ class VLLMCudaGraphConfig:
         expert_sequence_parallel_size: int,
         enable_sequence_parallel: bool,
         max_num_batched_tokens: int | None = None,
+        num_speculative_tokens: int = 0,
     ) -> CompilationConfig:
         """Build a vLLM ``CompilationConfig`` for the generator.
 
         When ``capture_sizes`` is set, those exact sizes are captured. Otherwise
-        sizes are auto-derived: powers of 2 up to the cap, plus ``max_num_seqs`` and
+        sizes are auto-derived: powers of 2 up to the cap, plus the decode batch and
         the cap itself as exact sizes so the largest capture size is always the cap
-        (even when it is not a power of 2). The cap is ``max_num_seqs`` for
-        ``FULL_DECODE_ONLY`` (decode batch == num_seqs). ``FULL`` also graphs
+        (even when it is not a power of 2). The cap is the decode batch for
+        ``FULL_DECODE_ONLY``: ``max_num_seqs`` tokens, times ``k + 1`` with ``k``
+        speculative tokens (each sequence verifies ``k + 1``). ``FULL`` also graphs
         prefill, whose per-step token count is bounded by
         ``max_num_batched_tokens`` (the configured value, else
         ``_DEFAULT_MAX_NUM_BATCHED_TOKENS``), so the cap extends to it -- otherwise
@@ -297,7 +299,8 @@ class VLLMCudaGraphConfig:
             _max_cuda_graph_capture_size = max_num_batched_tokens
         else:
             _max_cuda_graph_capture_size = _DEFAULT_MAX_NUM_BATCHED_TOKENS
-        cap = max_num_seqs
+        decode_cap = max_num_seqs * (num_speculative_tokens + 1)
+        cap = decode_cap
         if self.mode == "FULL":
             cap = max(cap, _max_cuda_graph_capture_size)
         if self.capture_sizes is not None:
@@ -309,11 +312,11 @@ class VLLMCudaGraphConfig:
             sizes = sorted(set(self.capture_sizes))
         else:
             sizes = [1 << i for i in range(int(math.log2(cap)) + 1)]
-            # Always include max_num_seqs (decode batch) and the cap (largest
-            # prefill chunk) as exact sizes so the largest capture size is the cap
-            # even when it is not a power of 2
-            if max_num_seqs not in sizes:
-                sizes.append(max_num_seqs)
+            # Always include the decode batch and the cap (largest prefill chunk)
+            # as exact sizes so the largest capture size is the cap even when it
+            # is not a power of 2
+            if decode_cap not in sizes:
+                sizes.append(decode_cap)
             if cap not in sizes:
                 sizes.append(cap)
             sizes = sorted(sizes)
@@ -906,6 +909,29 @@ class VLLMGenerator(Configurable):
                     f"tensor_parallel_degree ({full_ep}) in the generator."
                 )
 
+            if spec := self.extra_vllm_engine_args.get("speculative_config"):
+                # Tested: MTP with standard rejection sampling, which keeps the target's
+                # distribution. k must be explicit: it sizes the CUDA graphs below.
+                if (
+                    spec.get("method") != "mtp"
+                    or "num_speculative_tokens" not in spec
+                    or spec.get("rejection_sample_method", "standard") != "standard"
+                ):
+                    raise ValueError(
+                        "speculative_config needs method='mtp', num_speculative_tokens "
+                        f"and rejection_sample_method='standard', got {spec}"
+                    )
+                # DP > 1 implies EP > 1 (checked above).
+                if (
+                    self.debug.batch_invariant
+                    or p.enable_sequence_parallel
+                    or p.expert_parallel_degree > 1
+                ):
+                    raise ValueError(
+                        "speculative_config is not supported with batch_invariant, "
+                        "sequence parallelism or expert parallelism"
+                    )
+
             if (
                 self.debug.batch_invariant
                 and not self.reset_kv_cache_on_model_state_dict_load
@@ -950,6 +976,9 @@ class VLLMGenerator(Configurable):
         self._dp_rank = self._rank // tp_degree
         self._tp_rank = self._rank % tp_degree
 
+        speculative_config = (
+            config.extra_vllm_engine_args.get("speculative_config") or {}
+        )
         # Register TorchTitan model + parser with vLLM
         register_to_vllm(
             model_config,
@@ -1053,6 +1082,7 @@ class VLLMGenerator(Configurable):
             max_num_batched_tokens=config.max_num_batched_tokens,
             expert_sequence_parallel_size=expert_sequence_parallel_size,
             enable_sequence_parallel=config.parallelism.enable_sequence_parallel,
+            num_speculative_tokens=speculative_config.get("num_speculative_tokens", 0),
         )
         if vllm_compilation_config is not None:
             engine_kwargs["compilation_config"] = vllm_compilation_config

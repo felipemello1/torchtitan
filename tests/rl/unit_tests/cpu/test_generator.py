@@ -589,6 +589,62 @@ def test_batch_invariant_requires_kv_cache_reset():
         )
 
 
+_MTP = {"speculative_config": {"method": "mtp", "num_speculative_tokens": 3}}
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(debug=DebugConfig(batch_invariant=True)),
+        dict(
+            parallelism=InferenceParallelismConfig(
+                tensor_parallel_degree=2, enable_sequence_parallel=True
+            )
+        ),
+        dict(
+            parallelism=InferenceParallelismConfig(
+                tensor_parallel_degree=2, expert_parallel_degree=2
+            )
+        ),
+    ],
+    ids=["batch_invariant", "sequence_parallel", "expert_parallel"],
+)
+def test_speculative_decoding_rejects_unsupported_settings(overrides):
+    config = {"model": _MODEL_CONFIG, "parallelism": _PARALLELISM, **overrides}
+    with pytest.raises(ValueError, match="speculative_config is not supported"):
+        VLLMGenerator.Config(extra_vllm_engine_args=_MTP, **config)
+
+
+@pytest.mark.parametrize(
+    "speculative_config",
+    [
+        {"method": "ngram", "num_speculative_tokens": 3},
+        {"method": "mtp"},
+        {
+            "method": "mtp",
+            "num_speculative_tokens": 3,
+            "rejection_sample_method": "synthetic",
+        },
+    ],
+    ids=["ngram", "no_k", "synthetic"],
+)
+def test_speculative_decoding_rejects_untested_configs(speculative_config):
+    with pytest.raises(ValueError, match="speculative_config needs"):
+        VLLMGenerator.Config(
+            model=_MODEL_CONFIG,
+            parallelism=_PARALLELISM,
+            extra_vllm_engine_args={"speculative_config": speculative_config},
+        )
+
+
+def test_speculative_decoding_allows_dense_tensor_parallelism():
+    VLLMGenerator.Config(
+        model=_MODEL_CONFIG,
+        parallelism=InferenceParallelismConfig(tensor_parallel_degree=2),
+        extra_vllm_engine_args=_MTP,
+    )
+
+
 def test_session_kv_holder_rejects_kv_cache_reset_on_model_state_dict_load():
     with pytest.raises(
         ValueError, match="needs reset_kv_cache_on_model_state_dict_load=False"
@@ -812,6 +868,17 @@ def test_cuda_graph_decode_only_capture_sizes_cover_max_num_seqs():
         enable_sequence_parallel=False,
     )
     assert cfg.cudagraph_capture_sizes == [1, 2, 4, 8, 16, 32, 64, 128, 256, 500]
+
+
+def test_cuda_graph_capture_sizes_cover_speculative_verify_batches():
+    # Each sequence verifies k + 1 tokens, so decode batches reach max_num_seqs * (k + 1).
+    cfg = VLLMCudaGraphConfig(mode="FULL_DECODE_ONLY").get_vllm_compilation_config(
+        max_num_seqs=100,
+        expert_sequence_parallel_size=1,
+        enable_sequence_parallel=False,
+        num_speculative_tokens=3,
+    )
+    assert cfg.cudagraph_capture_sizes == [1, 2, 4, 8, 16, 32, 64, 128, 256, 400]
 
 
 def test_cuda_graph_full_mode_extends_capture_sizes_to_chunk():
