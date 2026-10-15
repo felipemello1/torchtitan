@@ -43,7 +43,7 @@ class _Tiles:
 # Tiles tuned on GB300. Decode reads weights (16-row blocks, one program per tile; below
 # 32 rows only a few experts are active, so narrower w13 tiles give more programs);
 # prefill runs a persistent, warp-specialized loop.
-_SMALL_TILES = _Tiles(16, False, w13=(64, 256, 4, 4), w2=(128, 256, 3, 4))
+_SMALL_TILES = _Tiles(16, False, w13=(64, 128, 6, 4), w2=(128, 128, 4, 4))
 _SMALL_ROWS = 32
 _DECODE_TILES = _Tiles(16, False, w13=(128, 128, 4, 4), w2=(128, 256, 2, 4))
 _MID_TILES = _Tiles(64, True, w13=(128, 128, 4, 4), w2=(128, 128, 3, 4))
