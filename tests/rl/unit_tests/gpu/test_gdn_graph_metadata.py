@@ -9,7 +9,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from torchtitan.rl.generator.vllm import gdn
+from torchtitan.rl.generator.vllm import gdn, kda
 from torchtitan.rl.generator.vllm.linear_attention import (
     LinearAttentionExecutionPath,
     TorchTitanLinearAttentionMetadata,
@@ -266,5 +266,24 @@ def test_forward_respects_prepared_extent_and_decode_padding(monkeypatch, decode
                 match="Attention Gym convolution kernels do not support bias",
             ):
                 layer._forward(value, value, value, value, value, value, value, output)
+        # V2's warmup runs pass a dict without linear-attention layers.
+        context.attn_metadata = {"other": metadata}
+        untouched = torch.zeros(6, 1)
+        layer._forward(value, value, value, value, None, value, value, untouched)
+        assert not untouched.any()
     assert metadata.num_actual_tokens == 3
     assert torch.equal(output[:, 0], (torch.arange(6) < extent).float())
+
+
+def test_kda_forward_skips_dict_without_its_layer():
+    # V2's warmup runs pass a dict without linear-attention layers.
+    layer = kda.VLLMInnerKDA.__new__(kda.VLLMInnerKDA)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = "kda"
+    context = ForwardContext(
+        no_compile_layers={}, attn_metadata={"other": None}, slot_mapping={}
+    )
+    value, output = torch.ones(6, 1), torch.zeros(6, 1)
+    with override_forward_context(context):
+        layer._forward(value, value, value, value, value, value, output)
+    assert not output.any()

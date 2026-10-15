@@ -211,9 +211,9 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             conv_bias is None
         ), "Attention Gym convolution kernels do not support bias"
         attn_metadata = get_forward_context().attn_metadata
-        # vLLM's profiling/warmup runs have no attention metadata; leave the
-        # zero-filled output.
-        if attn_metadata is None:
+        # vLLM's profiling/warmup runs have no attention metadata, or (V2) a dict
+        # without linear-attention layers; leave the zero-filled output.
+        if attn_metadata is None or self.prefix not in attn_metadata:
             return
         assert isinstance(attn_metadata, dict)
         gdn_metadata = attn_metadata[self.prefix]

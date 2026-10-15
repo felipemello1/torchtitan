@@ -122,7 +122,7 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
 
 
 class TorchTitanGPUWorker(GPUWorker):
-    """V1 worker that constructs :class:`TorchTitanGPUModelRunner`."""
+    """Worker that builds :class:`TorchTitanGPUModelRunner` on V1; V2 uses vLLM's stock runner."""
 
     def _maybe_get_memory_pool_context(self, tag: str):
         # vLLM uses CuMem for model weights and the KV cache.
@@ -135,13 +135,9 @@ class TorchTitanGPUWorker(GPUWorker):
         return nullcontext()
 
     def init_device(self):
-        if self.use_v2_model_runner:
-            raise ValueError(
-                "TorchTitan's vLLM integration requires the V1 model runner"
-            )
-
         # GPUWorker imports its runner class inside init_device and provides no
         # runner factory. Scope the class substitution to that construction.
+        # V2 imports its runner from another module, so this only affects V1.
         original_runner_cls = vllm_gpu_model_runner.GPUModelRunner
         vllm_gpu_model_runner.GPUModelRunner = TorchTitanGPUModelRunner
         try:

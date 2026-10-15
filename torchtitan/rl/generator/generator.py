@@ -223,11 +223,13 @@ class VLLMCudaGraphConfig:
     mode: Literal["NONE", "FULL_DECODE_ONLY", "FULL"] = "FULL"
     """Which vLLM CUDA graph mode to capture:
 
-    - ``"NONE"``: disable compilation and CUDA graph capture.
+    - ``"NONE"``: disable compilation and CUDA graph capture. Runs on
+      TorchTitan's V1 runner.
     - ``"FULL_DECODE_ONLY"``: graph pure-decode batches; prefill / mixed
-      batches run eager. Cheap (no inductor compile).
+      batches run eager. Cheap (no inductor compile). Runs on vLLM's V2 runner
+      unless the engine needs V1 (``VLLMGenerator.Config.use_v2_model_runner``).
     - ``"FULL"`` (default): graph the whole forward, prefill included, attention
-      captured too.
+      captured too. Runs on TorchTitan's V1 runner.
     """
 
     capture_sizes: list[int] | None = None
@@ -915,6 +917,29 @@ class VLLMGenerator(Configurable):
                     "cached KV cannot cross a policy update"
                 )
 
+        @property
+        def use_v2_model_runner(self) -> bool:
+            """Whether the engine runs vLLM's V2 runner (True) or TorchTitan's V1 runner.
+
+            FULL, NONE                V1
+            FULL_DECODE_ONLY          V2, except with:
+                sequence parallelism  V1 pads token counts to a multiple of TP
+                expert parallelism    V1 pads token counts to a multiple of TP (TP>1), and
+                                      joins the DP sync on a step with no tokens (DP>1)
+                Dist-MoE              V1 passes the unpadded token count
+                batch-invariant mode  validated on V1 only
+            """
+            p = self.parallelism
+            needs_v1 = (
+                p.enable_sequence_parallel
+                # TODO: V2 skips the DP sync on a step where a rank with running requests
+                # schedules no tokens. Once vLLM joins the sync there, DP>1 at TP1 can use V2.
+                or p.expert_parallel_degree > 1
+                or self.dist_moe_runtime is not None
+                or self.debug.batch_invariant
+            )
+            return self.cuda_graph.mode == "FULL_DECODE_ONLY" and not needs_v1
+
     def __init__(
         self,
         config: Config,
@@ -967,7 +992,8 @@ class VLLMGenerator(Configurable):
             (VarlenInnerAttention.Config, FlexInnerAttention.Config),
         ), "Only varlen and flex attention backends are allowed."
 
-        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+        use_v2 = config.use_v2_model_runner
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if use_v2 else "0"
         set_batch_invariance(config.debug.batch_invariant)
         if config.debug.batch_invariant:
             # The vLLM v2 logprob Triton kernel bypasses the aten overrides above;

@@ -219,7 +219,7 @@ class VLLMInnerKDA(InnerAttention, MambaBase):
         output_THK: torch.Tensor,
     ) -> None:
         attn_metadata = get_forward_context().attn_metadata
-        if attn_metadata is None:
+        if attn_metadata is None or self.prefix not in attn_metadata:
             return
         assert isinstance(attn_metadata, dict)
         metadata = attn_metadata[self.prefix]
