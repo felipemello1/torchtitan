@@ -201,7 +201,7 @@ def _prepare_generation_request_metrics(
 
 # vLLM's default max_num_batched_tokens (vllm's per-step budget:
 # prefill + decode tokens summed over the batch). Used as the CUDA graph capture
-# cap for "FULL" (which graphs prefill / mixed batches, so capture sizes must
+# cap for "FULL" and "FULL_AND_PIECEWISE" (which graph prefill / mixed batches, so capture sizes must
 # reach the per-step budget or those batches fall back to eager) when
 # ``Config.max_num_batched_tokens`` is unset; when that field is set, its value
 # is used instead (and also drives the vLLM engine).
@@ -220,7 +220,7 @@ class VLLMCudaGraphConfig:
     ``FULL``, graphs the whole forward (prefill included).
     """
 
-    mode: Literal["NONE", "FULL_DECODE_ONLY", "FULL"] = "FULL"
+    mode: Literal["NONE", "FULL_DECODE_ONLY", "FULL", "FULL_AND_PIECEWISE"] = "FULL"
     """Which vLLM CUDA graph mode to capture:
 
     - ``"NONE"``: disable compilation and CUDA graph capture. Runs on
@@ -230,6 +230,11 @@ class VLLMCudaGraphConfig:
       unless the engine needs V1 (``VLLMGenerator.Config.use_v2_model_runner``).
     - ``"FULL"`` (default): graph the whole forward, prefill included, attention
       captured too. Runs on TorchTitan's V1 runner.
+    - ``"FULL_AND_PIECEWISE"``: FULL graphs for decode; prefill / mixed batches
+      replay piecewise graphs, with attention and linear attention eager between
+      them (vLLM breakable CUDA graphs, no compile). Runs on vLLM's V2 runner only.
+      Each eager layer costs host time, so a step with little GPU work is slower
+      than ``"FULL"``: 2k-token prefill, Qwen3.5-27B TP4 (H100), 124-140 vs 105 ms.
     """
 
     capture_sizes: list[int] | None = None
@@ -262,8 +267,8 @@ class VLLMCudaGraphConfig:
         sizes are auto-derived: powers of 2 up to the cap, plus ``max_num_seqs`` and
         the cap itself as exact sizes so the largest capture size is always the cap
         (even when it is not a power of 2). The cap is ``max_num_seqs`` for
-        ``FULL_DECODE_ONLY`` (decode batch == num_seqs). ``FULL`` also graphs
-        prefill, whose per-step token count is bounded by
+        ``FULL_DECODE_ONLY`` (decode batch == num_seqs). ``FULL`` and
+        ``FULL_AND_PIECEWISE`` also graph prefill, whose per-step token count is bounded by
         ``max_num_batched_tokens`` (the configured value, else
         ``_DEFAULT_MAX_NUM_BATCHED_TOKENS``), so the cap extends to it -- otherwise
         prefill chunks larger than the cap fall back to eager.
@@ -300,7 +305,7 @@ class VLLMCudaGraphConfig:
         else:
             _max_cuda_graph_capture_size = _DEFAULT_MAX_NUM_BATCHED_TOKENS
         cap = max_num_seqs
-        if self.mode == "FULL":
+        if self.mode in ("FULL", "FULL_AND_PIECEWISE"):
             cap = max(cap, _max_cuda_graph_capture_size)
         if self.capture_sizes is not None:
             if not self.capture_sizes or any(s <= 0 for s in self.capture_sizes):
@@ -916,12 +921,22 @@ class VLLMGenerator(Configurable):
                     "batch_invariant requires reset_kv_cache_on_model_state_dict_load=True so "
                     "cached KV cannot cross a policy update"
                 )
+            if (
+                self.cuda_graph.mode == "FULL_AND_PIECEWISE"
+                and not self.use_v2_model_runner
+            ):
+                raise ValueError(
+                    "cuda_graph.mode='FULL_AND_PIECEWISE' runs only on vLLM's V2 runner, which "
+                    "does not support sequence or expert parallelism, Dist-MoE or "
+                    "batch-invariant mode; use 'FULL' or 'FULL_DECODE_ONLY'"
+                )
 
         @property
         def use_v2_model_runner(self) -> bool:
             """Whether the engine runs vLLM's V2 runner (True) or TorchTitan's V1 runner.
 
             FULL, NONE                V1
+            FULL_AND_PIECEWISE        V2 (rejected with the settings below)
             FULL_DECODE_ONLY          V2, except with:
                 sequence parallelism  V1 pads token counts to a multiple of TP
                 expert parallelism    V1 pads token counts to a multiple of TP (TP>1), and
@@ -938,7 +953,10 @@ class VLLMGenerator(Configurable):
                 or self.dist_moe_runtime is not None
                 or self.debug.batch_invariant
             )
-            return self.cuda_graph.mode == "FULL_DECODE_ONLY" and not needs_v1
+            return (
+                self.cuda_graph.mode in ("FULL_DECODE_ONLY", "FULL_AND_PIECEWISE")
+                and not needs_v1
+            )
 
     def __init__(
         self,
@@ -974,6 +992,10 @@ class VLLMGenerator(Configurable):
         # TODO: revisit if PP/CP are added.
         self._dp_rank = self._rank // tp_degree
         self._tp_rank = self._rank % tp_degree
+
+        # register_to_vllm imports GDN/KDA, which read this env once, at import.
+        if config.cuda_graph.mode == "FULL_AND_PIECEWISE":
+            os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
 
         # Register TorchTitan model + parser with vLLM
         register_to_vllm(
@@ -1136,6 +1158,16 @@ class VLLMGenerator(Configurable):
                 self._call_on_engine_thread(torch.cuda.current_device)
             )
             logger.info("vLLM rollout engine initialized")
+            resolved_mode = self._engine.vllm_config.compilation_config.cudagraph_mode
+            if (
+                config.cuda_graph.mode == "FULL_AND_PIECEWISE"
+                and resolved_mode != CUDAGraphMode.FULL_AND_PIECEWISE
+            ):
+                raise RuntimeError(
+                    f"cuda_graph.mode='FULL_AND_PIECEWISE' resolved to {resolved_mode}: "
+                    "vLLM saw breakable CUDA graphs off, e.g. a second engine in this "
+                    "process reads vLLM's cached env"
+                )
 
         # The default PG was initialized during engine build. Confirm the configured
         # rank matches the torch-distributed global rank so the two views cannot

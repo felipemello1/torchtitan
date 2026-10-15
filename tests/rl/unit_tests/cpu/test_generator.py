@@ -21,6 +21,8 @@ import gc
 import math
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 from contextlib import nullcontext
 from dataclasses import replace
@@ -608,8 +610,10 @@ _FDO_CONFIG = VLLMGenerator.Config(
 )
 
 
-def test_use_v2_model_runner_for_full_decode_only():
-    assert _FDO_CONFIG.use_v2_model_runner
+@pytest.mark.parametrize("mode", ["FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"])
+def test_use_v2_model_runner_for_v2_modes(mode):
+    config = replace(_FDO_CONFIG, cuda_graph=VLLMCudaGraphConfig(mode=mode))
+    assert config.use_v2_model_runner
 
 
 @pytest.mark.parametrize(
@@ -640,6 +644,38 @@ def test_use_v2_model_runner_falls_back_to_v1(v1_change):
     assert not replace(_FDO_CONFIG, **v1_change).use_v2_model_runner
 
 
+def test_full_and_piecewise_rejects_settings_that_need_v1():
+    with pytest.raises(ValueError, match="runs only on vLLM's V2 runner"):
+        replace(
+            _FDO_CONFIG,
+            cuda_graph=VLLMCudaGraphConfig(mode="FULL_AND_PIECEWISE"),
+            parallelism=InferenceParallelismConfig(enable_sequence_parallel=True),
+        )
+
+
+def test_gdn_forward_is_a_break_point_with_breakable_graphs():
+    # The decorator binds when gdn.py imports, so check in a fresh process.
+    script = (
+        "from torchtitan.rl.generator.vllm.gdn import VLLMInnerGDN; "
+        "assert hasattr(VLLMInnerGDN._forward, '__wrapped__')"
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    env["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+    subprocess.run([sys.executable, "-c", script], check=True, env=env)
+
+
+def test_importing_the_generator_binds_no_break_points():
+    # GDN/KDA and vLLM's attention op read the breakable env once, at import.
+    script = (
+        "import sys; import torchtitan.rl.generate; "
+        "early = {'torchtitan.rl.generator.vllm.gdn', 'torchtitan.rl.generator.vllm.kda', "
+        "'vllm.model_executor.layers.attention.attention'} & set(sys.modules); "
+        "assert not early, early"
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    subprocess.run([sys.executable, "-c", script], check=True, env=env)
+
+
 def test_qwen36_27b_perf_config():
     from torchtitan_recipes.rl.alphabet_sort import rl_grpo_qwen3_6_27b_varlen_perf
 
@@ -661,15 +697,20 @@ def test_qwen36_27b_perf_config():
 # --- vLLM engine kwargs (what VLLMGenerator passes to EngineArgs) ---
 
 
-def _build_engine_kwargs(monkeypatch, tmp_path, config: VLLMGenerator.Config) -> dict:
+def _build_engine_kwargs(
+    monkeypatch, tmp_path, config: VLLMGenerator.Config, register_to_vllm=None
+) -> dict:
     """Run ``VLLMGenerator.__init__`` up to ``EngineArgs`` and return its kwargs."""
     # Raising stops __init__ right after it builds the engine kwargs.
     engine_args = Mock(side_effect=RuntimeError("stop before the engine build"))
     monkeypatch.setattr(generator_module, "EngineArgs", engine_args)
-    monkeypatch.setattr(generator_module, "register_to_vllm", Mock())
+    monkeypatch.setattr(
+        generator_module, "register_to_vllm", register_to_vllm or Mock()
+    )
     monkeypatch.setattr(generator_module, "init_logger", Mock())
     monkeypatch.setattr(generator_module, "sl", Mock())
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
     with pytest.raises(RuntimeError, match="stop before the engine build"):
         VLLMGenerator(
             config,
@@ -685,6 +726,25 @@ def test_generator_sets_vllm_model_runner_env(monkeypatch, tmp_path):
     # `_build_engine_kwargs` sets the env to "0" first, so "1" comes from the generator.
     _build_engine_kwargs(monkeypatch, tmp_path, _FDO_CONFIG)
     assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"), [("FULL_AND_PIECEWISE", "1"), ("FULL_DECODE_ONLY", "0")]
+)
+def test_breakable_env_is_set_before_register_to_vllm(
+    monkeypatch, tmp_path, mode, expected
+):
+    # register_to_vllm imports GDN/KDA, whose break points read the env at import.
+    env_at_register = []
+    _build_engine_kwargs(
+        monkeypatch,
+        tmp_path,
+        replace(_FDO_CONFIG, cuda_graph=VLLMCudaGraphConfig(mode=mode)),
+        register_to_vllm=lambda *args, **kwargs: env_at_register.append(
+            os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"]
+        ),
+    )
+    assert env_at_register == [expected]
 
 
 def test_extra_vllm_engine_args_reach_engine_args(monkeypatch, tmp_path):
@@ -859,10 +919,11 @@ def test_cuda_graph_decode_only_capture_sizes_cover_max_num_seqs():
     assert cfg.cudagraph_capture_sizes == [1, 2, 4, 8, 16, 32, 64, 128, 256, 500]
 
 
-def test_cuda_graph_full_mode_extends_capture_sizes_to_chunk():
-    # FULL also graphs prefill, so sizes extend to the chunked-prefill chunk
-    # (max_num_batched_tokens, 2048) on top of max_num_seqs.
-    cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
+@pytest.mark.parametrize("mode", ["FULL", "FULL_AND_PIECEWISE"])
+def test_cuda_graph_full_mode_extends_capture_sizes_to_chunk(mode):
+    # FULL and FULL_AND_PIECEWISE also graph prefill, so sizes extend to the
+    # chunked-prefill chunk (max_num_batched_tokens, 2048) on top of max_num_seqs.
+    cfg = VLLMCudaGraphConfig(mode=mode).get_vllm_compilation_config(
         max_num_seqs=500,
         expert_sequence_parallel_size=1,
         enable_sequence_parallel=False,
