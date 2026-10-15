@@ -11,9 +11,13 @@
 
 import contextlib
 import gc
+import itertools
+import json
 import logging
+import os
+import random
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.types import Rollout
@@ -124,6 +128,93 @@ class GCTimer:
 
     def close(self) -> None:
         gc.callbacks.remove(self._on_gc)
+
+
+def _type_name(obj: object) -> str:
+    obj_type = type(obj)
+    return f"{obj_type.__module__}.{obj_type.__qualname__}"
+
+
+def append_heap_census(
+    *, path: str, step: int, num_referrer_types: int = 0, num_samples: int = 200
+) -> None:
+    """Append one JSON line to `path` counting, by type, the objects a full GC scans: containers
+    and class instances, not str, bytes or numbers. The top types show what makes a full GC slow.
+
+    With `num_referrer_types` > 0, it also samples `num_samples` objects of each of the top
+    types and counts their referrers' types, two levels up, in two passes over the heap
+    (~1 s per pass per 1M objects).
+
+    Example:
+        append_heap_census(path="outputs/rl/heap_census.jsonl", step=20, num_referrer_types=3)
+        # appends:
+        # {"step": 20, "rss_gib": 31.2,
+        #  "objects_per_generation": [1520, 3100, 1371000],  # a full collection scans all 3
+        #  "frozen_objects": 1021000,                        # after gc.freeze(): never scanned
+        #  "top_types": [["builtins.dict", 412000], ["builtins.list", 160000], ...],  # top 40
+        #  "referrers": {"builtins.dict": [["builtins.list", 180], ...], ...},
+        #  "referrers_2": {"builtins.dict": [["mod.Rollout", 150], ...], ...},
+        #  "census_seconds": 0.25}
+    """
+    start = time.perf_counter()
+    gc_was_enabled = gc.isenabled()
+    gc.disable()  # a collection between the calls would list gen-0 survivors twice
+    generations = [gc.get_objects(generation=g) for g in range(3)]
+    type_counts = Counter(map(type, itertools.chain.from_iterable(generations)))
+    record: dict = {
+        "step": step,
+        "objects_per_generation": [len(objects) for objects in generations],
+        "frozen_objects": gc.get_freeze_count(),
+        "top_types": [
+            [f"{obj_type.__module__}.{obj_type.__qualname__}", count]
+            for obj_type, count in type_counts.most_common(40)
+        ],
+    }
+    if num_referrer_types > 0:
+        everything = list(itertools.chain.from_iterable(generations))
+        rng = random.Random(step)
+        # id -> sampled type name; level 1 = sampled objects, level 2 = their referrers.
+        sampled: dict[int, str] = {}
+        for obj_type, _ in type_counts.most_common(num_referrer_types):
+            candidates = [obj for obj in everything if type(obj) is obj_type]
+            for obj in rng.sample(candidates, min(num_samples, len(candidates))):
+                sampled[id(obj)] = _type_name(obj)
+            del candidates
+        level_2: dict[int, str] = {}
+        referrers: dict[str, Counter] = defaultdict(Counter)
+        for obj in everything:
+            for referent in gc.get_referents(obj):
+                sampled_type = sampled.get(id(referent))
+                if sampled_type is not None:
+                    referrers[sampled_type][_type_name(obj)] += 1
+                    level_2.setdefault(id(obj), sampled_type)
+        referrers_2: dict[str, Counter] = defaultdict(Counter)
+        for obj in everything:
+            for referent in gc.get_referents(obj):
+                sampled_type = level_2.get(id(referent))
+                if sampled_type is not None:
+                    referrers_2[sampled_type][_type_name(obj)] += 1
+        del everything
+        record["referrers"] = {
+            key: counts.most_common(10) for key, counts in referrers.items()
+        }
+        record["referrers_2"] = {
+            key: counts.most_common(10) for key, counts in referrers_2.items()
+        }
+    del generations
+    if gc_was_enabled:
+        gc.enable()
+    # statm's 2nd field is the resident set size, in pages.
+    with open("/proc/self/statm") as file:
+        rss_bytes = int(file.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    record["rss_gib"] = round(rss_bytes / 2**30, 2)
+    record["census_seconds"] = round(time.perf_counter() - start, 3)
+    with open(path, "a") as file:
+        file.write(json.dumps(record) + "\n")
+    logger.info(
+        f"Heap census at step {step}: {sum(record['objects_per_generation'])} tracked objects, "
+        f"{record['census_seconds']} s -> {path}"
+    )
 
 
 def combine_microbatch_metrics(
