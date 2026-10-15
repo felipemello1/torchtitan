@@ -203,6 +203,21 @@ class TestTritonTopKRouter(unittest.TestCase):
         self.assertTrue(torch.equal(f_routing_map, routing_map))
         torch.testing.assert_close(f_scores, scores, rtol=1e-6, atol=0)
 
+    def test_gate_gemv_matches_cublas(self):
+        cfg = make_router_config(
+            dim=_DIM,
+            num_experts=256,
+            gate_param_init={"weight": partial(init.trunc_normal_, std=0.02)},
+            score_func=Softmax.Config(),
+        )
+        with torch.device("cuda"):
+            gate = triton_topk_router(cfg).build().gate.bfloat16()
+        for num_tokens in (1, 8, 9):  # 9: the stock GEMM
+            x_TD = torch.randn(num_tokens, _DIM, device="cuda", dtype=torch.bfloat16)
+            with torch.no_grad():
+                expected = torch.mm(x_TD, gate.weight.T, out_dtype=torch.float32)
+                torch.testing.assert_close(gate(x_TD), expected, rtol=1e-5, atol=1e-5)
+
 
 if __name__ == "__main__":
     unittest.main()
