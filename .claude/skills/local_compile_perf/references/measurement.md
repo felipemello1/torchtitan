@@ -36,6 +36,8 @@ For a memory-bound op: ideal = (bytes of every input read once + every output wr
 | Another job hits mid-run | a run that started clean showed a 2x outlier wall; start/end `nvidia-smi` checks miss short jobs (one landed inside a timed loop) | poll `nvidia-smi` during the run; report the median of processes within ~1% of the best, with n shown |
 | A crashed run reusing the last result | the harness printed the previous RESULT line after a crash | write a FAILED marker per run |
 | Order effects | a variant always run second carried warm caches or a slower host | rotate order or use fresh processes |
+| Profiler before graph timing | a torch.profiler session slows every later CUDA-graph replay in the same process by ~0.3 µs per kernel; a 16-kernel A/B showed a false +18.5 µs/layer cost of dynamic shapes (real: ~2 µs) | time CUDA-graph replays before any profiler run, or profile in a separate process |
+| Shared Inductor cache dir | autotune picks (`.best_config`, keyed on kernel source + `cache_key_tag`) persist across processes and jobs on a node, so a bad pick sticks for later runs in the same power-of-2 size bucket | a fresh `TORCHINDUCTOR_CACHE_DIR` per benchmark call order |
 | Pooled batches | pooling a harness batch with a PR-tree batch hid a 1.4% vs 0.3% disagreement | report batches separately |
 | Timing a harness copy | the shipped code computed an extra in-graph inverse permutation (~18 µs) | time the code you ship |
 | World-1 smoke before a cluster job | a config check that fires only at EP > 1 killed every rank | build at the target world size first |

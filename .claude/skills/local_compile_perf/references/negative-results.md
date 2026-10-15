@@ -9,6 +9,9 @@ Check these before spending time on them; each was measured, not guessed. Each w
 - **Forcing unrolling via a big global threshold** (the first thing people try): has no effect on symbolic sizes.
 - **`assume_32bit_indexing` on large regions:** hard failure once T·N·D > int32.
 - **Coordinate descent on every region:** +2x cold compile and decode regressions; we kept it to the one region where it measured a clear gain, and turned it off in deterministic mode because its benchmark-picked configs can differ run to run.
+- **`TORCHINDUCTOR_ENABLE_PDL=1` on an MoE block:** bitwise, -1.8 µs at T=34 but +34 µs at T=4096 (632 -> 666 µs), in the generator's call order.
+- **Static-shape regions for decode:** vs dynamic in the generator's call order, ~2 µs on an MoE block at T=34 (270 vs 272 µs). A larger gap came from the profiler and call-order traps (measurement.md, deceiving-quirks.md).
+- **`triton.autotune_pointwise=False` against small-first tuning:** fixes 1D pointwise regions (SwiGLU 110 -> 64 µs at T=16k), but reductions ignore it and 2D-tiled regions lose 1.08-1.8x (combine 346 -> 634 µs at T=64k).
 - **Gathers instead of scatters, assumed to win compiled too:** EP permute/unpermute as gathers was 2.7x in eager. Compiled, the permute half still gained and the pair was a net win, but the unpermute half was 7% slower (Inductor's scatter was already fast and the in-graph inverse permutation cost ~18 µs). Measure each half compiled.
 - **A library's fused permute+dispatch:** bitwise but slower than separate kernels.
 - **Passing dense top-k ids instead of a routing map:** bitwise, not faster within one node (the win is a smaller allgather at large scale).
