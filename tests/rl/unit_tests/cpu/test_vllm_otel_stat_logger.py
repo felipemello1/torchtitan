@@ -144,6 +144,7 @@ def test_extract_step_stats_populated_converts_seconds_to_ms():
         num_running_reqs=4,
         num_waiting_reqs=2,
         prefix_cache_stats=SimpleNamespace(queries=10, hits=7),
+        spec_decoding_stats=None,
     )
     iteration = SimpleNamespace(
         num_generation_tokens=12,
@@ -181,6 +182,7 @@ def test_extract_step_stats_prefix_cache_none():
         num_running_reqs=1,
         num_waiting_reqs=0,
         prefix_cache_stats=None,
+        spec_decoding_stats=None,
     )
 
     step = _extract_step_stats(scheduler, None)
@@ -328,6 +330,7 @@ def test_jsonl_export_writes_recorded_metrics(
         num_running_reqs=4,
         num_waiting_reqs=2,
         prefix_cache_stats=SimpleNamespace(queries=10, hits=7),
+        spec_decoding_stats=None,
     )
     iteration = SimpleNamespace(
         num_generation_tokens=12,
@@ -381,6 +384,37 @@ def test_jsonl_export_writes_recorded_metrics(
     for name, (expected_count, expected_sum) in expected_histograms.items():
         assert metrics[name]["count"] == expected_count
         assert metrics[name]["sum"] == pytest.approx(expected_sum)
+
+
+def test_jsonl_export_writes_spec_decode_counters(
+    no_otel_env, monkeypatch, tmp_path, meter_providers
+):
+    monkeypatch.setenv("OTEL_METRICS_EXPORTER", "jsonl")
+    monkeypatch.setenv("VLLM_LOG_STATS_INTERVAL", "600")
+    log = VllmOtelStatLogger.Config().build(
+        vllm_config=_vllm_config(), context=_context(output_dir=str(tmp_path))
+    )
+    # 4 drafts, 8 accepted tokens: mean acceptance length 1 + 8 / 4 = 3.
+    scheduler = SimpleNamespace(
+        kv_cache_usage=0.5,
+        num_running_reqs=4,
+        num_waiting_reqs=0,
+        prefix_cache_stats=None,
+        spec_decoding_stats=SimpleNamespace(num_drafts=4, num_accepted_tokens=8),
+    )
+
+    log.record(scheduler, None)
+    meter_providers[0].force_flush(timeout_millis=1000)
+
+    rows = (tmp_path / "vllm_metrics" / "gen.rank0.jsonl").read_text().splitlines()
+    metrics = {
+        metric["name"]: metric["data"]["data_points"][0]["value"]
+        for metric in json.loads(rows[0])["resource_metrics"][0]["scope_metrics"][0][
+            "metrics"
+        ]
+    }
+    assert metrics["vllm.spec_decode_drafts"] == 4
+    assert metrics["vllm.spec_decode_accepted_tokens"] == 8
 
 
 def test_record_disables_on_instrument_failure(

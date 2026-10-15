@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -15,10 +16,16 @@ from torchtitan.models.common.attention import LinearAttention, VarlenInnerAtten
 from torchtitan.models.common.attention.gdn import GDN
 from torchtitan.models.common.attention.kda import KDA
 from torchtitan.models.qwen3_5 import build_model_config
+from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.vllm import gdn, kda
-from torchtitan.rl.generator.vllm.registry import model_config_to_hf_config_dict
+from torchtitan.rl.generator.vllm.registry import (
+    model_config_to_hf_config_dict,
+    register_to_vllm,
+    TORCHTITAN_CONFIG_FORMAT,
+)
 
 from transformers import GenerationConfig, PretrainedConfig
+from vllm.transformers_utils.config import get_config_parser
 
 
 def test_hf_config_adds_no_stop_token():
@@ -35,6 +42,47 @@ def test_hf_config_adds_no_stop_token():
         )
     )
     assert GenerationConfig.from_model_config(hf_config).eos_token_id is None
+
+
+@pytest.mark.parametrize("mtp", [False, True], ids=["spec-off", "mtp"])
+def test_config_parser_adds_mtp_checkpoint_fields(tmp_path, mtp):
+    from torchtitan.models.llama3 import build_model_config as build_llama3_config
+
+    model_config = build_llama3_config("debugmodel", parallelism=ParallelismConfig())
+    rope = {"rope_theta": 1e7, "mrope_section": [11, 11, 10], "mrope_interleaved": True}
+    text_config = {
+        "architectures": ["Qwen3_5ForCausalLM"],
+        "model_type": "qwen3_5_text",
+        "hidden_size": 1,
+        "mtp_num_hidden_layers": 1,
+        "rope_parameters": rope,
+    }
+    (tmp_path / "config.json").write_text(json.dumps({"text_config": text_config}))
+    register_to_vllm(
+        model_config,
+        parallelism=InferenceParallelismConfig(),
+        checkpointer_config=None,
+        mtp=mtp,
+    )
+
+    config_dict, _ = get_config_parser(TORCHTITAN_CONFIG_FORMAT).parse(
+        str(tmp_path), trust_remote_code=False
+    )
+
+    ours = model_config_to_hf_config_dict(model_config)
+    if not mtp:
+        assert config_dict == ours
+        return
+    # M-RoPE keys are dropped so vLLM feeds the target 1D positions.
+    rope_parameters = config_dict.pop("rope_parameters")
+    assert rope_parameters["rope_theta"] == 1e7
+    assert not any(key.startswith("mrope_") for key in rope_parameters)
+    # Our keys win, except model_type, which picks vLLM's MTP drafter.
+    assert config_dict == {
+        **ours,
+        "model_type": "qwen3_5_text",
+        "mtp_num_hidden_layers": 1,
+    }
 
 
 def test_hf_config_uses_full_attention_after_sliding_attention(monkeypatch):

@@ -710,6 +710,22 @@ def test_extra_vllm_engine_args_reach_engine_args(monkeypatch, tmp_path):
     assert engine_kwargs["scheduling_policy"] == "priority"
 
 
+def test_mtp_reaches_registration_and_capture_sizes(monkeypatch, tmp_path):
+    engine_kwargs = _build_engine_kwargs(
+        monkeypatch,
+        tmp_path,
+        VLLMGenerator.Config(
+            model=_MODEL_CONFIG,
+            cuda_graph=VLLMCudaGraphConfig(mode="FULL_DECODE_ONLY"),
+            extra_vllm_engine_args=_MTP,
+        ),
+    )
+    assert generator_module.register_to_vllm.call_args.kwargs["mtp"] is True
+    assert engine_kwargs["speculative_config"] == _MTP["speculative_config"]
+    # 8 sequences, each verifying k + 1 = 4 tokens.
+    assert engine_kwargs["compilation_config"].cudagraph_capture_sizes[-1] == 32
+
+
 @pytest.mark.parametrize(
     "key, match",
     [

@@ -26,6 +26,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -126,12 +127,30 @@ def model_config_to_hf_config_dict(cfg: Decoder.Config) -> dict[str, Any]:
     return hf
 
 
+def mtp_hf_text_fields(hf_dir: str) -> dict[str, Any]:
+    """A local Qwen3.5 checkpoint's HF text config, without M-RoPE keys.
+
+    vLLM builds the MTP drafter from the target's config (``mtp_num_hidden_layers``,
+    rope, MoE sizes). M-RoPE keys would make vLLM feed the target 3D positions;
+    for text-only tokens M-RoPE equals plain RoPE.
+    """
+    with open(os.path.join(hf_dir, "config.json")) as f:
+        text_config = json.load(f)["text_config"]
+    text_config["rope_parameters"] = {
+        k: v
+        for k, v in text_config["rope_parameters"].items()
+        if not k.startswith("mrope_")
+    }
+    return text_config
+
+
 def register_to_vllm(
     model_config: Decoder.Config,
     *,
     parallelism: InferenceParallelismConfig,
     checkpointer_config: CheckpointManager.Config | None,
     dist_moe_runtime: DistMoeRuntime.Config | None = None,
+    mtp: bool = False,
 ) -> None:
     """Register the TorchTitan model class and the TorchTitan config parser with vLLM.
 
@@ -164,6 +183,9 @@ def register_to_vllm(
             weights arrive from TorchStore.
         dist_moe_runtime: ``DistMoeRuntime.Config(inference=True)`` for models
             with Dist-MoE routed experts; ``None`` otherwise.
+        mtp: The engine runs MTP speculative decoding. The parsed config then also
+            carries the checkpoint's text fields (``mtp_hf_text_fields``) so vLLM
+            can build the MTP drafter; TorchTitan's own keys still win.
     """
     has_gdn = any(
         isinstance(layer.attention, GDN.Config) for layer in model_config.layers
@@ -231,6 +253,15 @@ def register_to_vllm(
             **kwargs,
         ):
             config_dict = model_config_to_hf_config_dict(model_config)
+            if mtp:
+                # ``model`` is the checkpoint dir. vLLM picks the MTP drafter from
+                # the checkpoint's model_type.
+                checkpoint_fields = mtp_hf_text_fields(model)
+                config_dict = {
+                    **checkpoint_fields,
+                    **config_dict,
+                    "model_type": checkpoint_fields["model_type"],
+                }
             return config_dict, PretrainedConfig.from_dict(config_dict)
 
     logger.info(

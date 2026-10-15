@@ -15,6 +15,7 @@ import copy
 import dataclasses
 from collections import defaultdict
 from collections.abc import Iterator, Mapping
+from types import SimpleNamespace
 from typing import Any, cast
 
 import spmd_types as spmd
@@ -423,6 +424,19 @@ class VLLMModelWrapper(Module):
         for module in self.model.modules():
             if isinstance(module, FSDPModule):
                 _unshard_and_free_sharded_params(module)
+
+        if vllm_config.speculative_config is not None:
+            # vLLM's MTP drafter calls target.model.embed_tokens(ids) and
+            # logits_processor(target.lm_head, h). Neither is a Module, so the
+            # state dict is unchanged. tp_size = 1: compute_logits already returns
+            # the full vocab, so vLLM skips its own gather.
+            self.model.embed_tokens = self.embed_input_ids
+            self.lm_head = SimpleNamespace(
+                tp_size=1,
+                quant_method=SimpleNamespace(
+                    apply=lambda _, h, bias=None: self.compute_logits(h)
+                ),
+            )
 
     def load_state_dict(self, state_dict: Mapping[str, Any]):
         """Copy new weights into `self.model`, allocating about one FSDP group's sharded buffers at a time.
