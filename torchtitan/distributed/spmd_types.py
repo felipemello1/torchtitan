@@ -35,6 +35,7 @@ __all__ = [
     "spmd_dense_sp_enabled",
     "spmd_mesh_group",
     "spmd_sparse_mesh",
+    "spmd_ep_mesh",
     "spmd_mesh_size",
     "spmd_distribute_tensor",
     "spmd_redistribute_per_axis",
@@ -66,6 +67,12 @@ def set_spmd_meshes(
     dense_sp_enabled: bool,
 ) -> None:
     """Register the SPMD meshes for dense and sparse runtime regions."""
+    if sparse_mesh is not spmd_sparse_mesh():
+        # Slice EP once per registered mesh: a slice costs ~140 us on the host, and the EP
+        # token dispatchers read it about 11 times per MoE layer.
+        with spmd.no_typecheck():
+            # weirdly, accessing ep PG hits DeviceMesh internals that expects type annotations
+            _MESH_TLS.ep_mesh = None if sparse_mesh is None else sparse_mesh["ep"]
     _MESH_TLS.dense_mesh = dense_mesh
     _MESH_TLS.sparse_mesh = sparse_mesh
     _MESH_TLS.dense_sp_enabled = dense_sp_enabled
@@ -81,6 +88,11 @@ def spmd_dense_mesh() -> DeviceMesh:
 def spmd_dense_sp_enabled() -> bool:
     """Return whether sequence parallelism is enabled in the dense region."""
     return getattr(_MESH_TLS, "dense_sp_enabled", False)
+
+
+def spmd_ep_mesh() -> DeviceMesh | None:
+    """Return the EP axis of the registered sparse SPMD mesh, if EP is enabled."""
+    return getattr(_MESH_TLS, "ep_mesh", None)
 
 
 def spmd_sparse_mesh() -> DeviceMesh | None:

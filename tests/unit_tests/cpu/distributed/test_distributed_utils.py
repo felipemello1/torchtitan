@@ -11,14 +11,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from torch.distributed.device_mesh import DeviceMesh
+import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor
+from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch.utils.checkpoint import checkpoint
 
 from torchtitan.config import CommConfig
 from torchtitan.distributed import DistributedTopology, utils as dist_utils
 from torchtitan.distributed.parallelism_context import ParallelismContext
-from torchtitan.distributed.spmd_types import set_spmd_meshes, spmd_dense_sp_enabled
+from torchtitan.distributed.spmd_types import (
+    set_spmd_meshes,
+    spmd_dense_sp_enabled,
+    spmd_ep_mesh,
+)
 from torchtitan.distributed.utils import get_local_tensor, init_distributed
 
 
@@ -329,6 +335,30 @@ def test_dense_sp_state_compiles_with_checkpoint() -> None:
         sparse_mesh=None,
         dense_sp_enabled=False,
     )
+
+
+def test_ep_mesh_is_sliced_once_per_registered_mesh() -> None:
+    dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=4)
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("efsdp", "ep"))
+        set_spmd_meshes(dense_mesh=mesh, sparse_mesh=mesh, dense_sp_enabled=False)
+        first = spmd_ep_mesh()
+        # Re-registering the same mesh (every activate_spmd) must not slice again.
+        set_spmd_meshes(dense_mesh=mesh, sparse_mesh=mesh, dense_sp_enabled=False)
+        assert spmd_ep_mesh() is first
+
+        # An equal mesh built again has its own process groups and gets its own slice.
+        mesh_again = init_device_mesh("cpu", (2, 2), mesh_dim_names=("efsdp", "ep"))
+        assert mesh_again == mesh
+        set_spmd_meshes(
+            dense_mesh=mesh_again, sparse_mesh=mesh_again, dense_sp_enabled=False
+        )
+        ep_group = spmd_ep_mesh().get_group()
+        assert ep_group is mesh_again["ep"].get_group()
+        assert ep_group is not mesh["ep"].get_group()
+    finally:
+        set_spmd_meshes(dense_mesh=mesh, sparse_mesh=None, dense_sp_enabled=False)
+        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("norm_type", [2.0, float("inf")])

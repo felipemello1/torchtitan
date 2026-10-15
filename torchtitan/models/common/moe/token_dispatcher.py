@@ -13,7 +13,7 @@ import torch_remat as remat
 from torch.distributed._functional_collectives import all_to_all_single
 from torch.distributed.tensor import DeviceMesh
 
-from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_sparse_mesh
+from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_ep_mesh
 from torchtitan.models.base.module import Module
 from torchtitan.ops.scatter_add import deterministic_scatter_add
 
@@ -196,10 +196,7 @@ class BaseEPTokenDispatcher(LocalTokenDispatcher, ABC):
     @property
     def ep_mesh(self) -> DeviceMesh | None:
         """Return the active one-dimensional EP mesh, if EP is enabled."""
-        with spmd.no_typecheck():
-            # weirdly, accessing ep PG hits DeviceMesh internals that expects type annotations
-            mesh = spmd_sparse_mesh()
-            return None if mesh is None else mesh["ep"]
+        return spmd_ep_mesh()
 
     def init_buffer(self) -> None:
         """Initialize backend communication buffers, if any."""
