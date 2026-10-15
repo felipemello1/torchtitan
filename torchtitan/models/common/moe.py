@@ -785,6 +785,28 @@ class BatchWiseLoadBalanceLoss(AuxLoss):
             return self.inject(loss, carrier=carrier, denominator=denominator)
 
 
+_SIDE_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _shared_experts_side_stream() -> torch.cuda.Stream | None:
+    """Side stream for the shared experts, or None to run them inline.
+
+    Only under CUDA graph capture, without grad and without EP (so no collectives
+    on the side stream). Training and eager forwards keep one stream.
+    """
+    if (
+        torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or not torch.cuda.is_current_stream_capturing()
+        or spmd_sparse_mesh() is not None
+    ):
+        return None
+    device = torch.cuda.current_device()
+    if device not in _SIDE_STREAMS:
+        _SIDE_STREAMS[device] = torch.cuda.Stream(device)
+    return _SIDE_STREAMS[device]
+
+
 class MoE(Module):
     """Mixture of Experts layer.
 
@@ -893,6 +915,14 @@ class MoE(Module):
         )
         num_local_tokens_per_expert_E = routing_map_TE.sum(dim=0)
 
+        # In CUDA graphs at inference (the generator's decode), the shared experts run
+        # on a side stream next to the routed experts, as vLLM does.
+        side_stream = _shared_experts_side_stream() if self.shared_experts else None
+        if side_stream is not None:
+            side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side_stream):
+                shared_TD = self.shared_experts(x_TD)
+
         out_TD = self.routed_experts(
             routed_x_TD,
             topk_scores_TK,
@@ -902,7 +932,10 @@ class MoE(Module):
         )
         out_TD = self._maybe_zero_fill_routed_output_to_tp_partial(out_TD)
         if self.shared_experts is not None:
-            shared_TD = self.shared_experts(x_TD)
+            if side_stream is not None:
+                torch.cuda.current_stream().wait_stream(side_stream)
+            else:
+                shared_TD = self.shared_experts(x_TD)
             # Trailing add, always saved: it saves nothing for backward, so replay skips
             # it and its inputs need no persisting, matching checkpoint early stop.
             out_TD = remat.region(
