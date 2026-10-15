@@ -178,6 +178,17 @@ def _spawn_proc_mesh(
     )
 
 
+def _make_generators_see_each_other(envs: list[dict[str, str]]) -> None:
+    """Let generators that share a host see each other's GPUs, so KV moves between them
+    over CUDA IPC. Own GPUs stay first, so each process still picks its GPU by local rank:
+
+        gen0 "2" -> "2,3,4"   gen1 "3" -> "3,2,4"   gen2 "4" -> "4,2,3"
+    """
+    gpus = [env["CUDA_VISIBLE_DEVICES"] for env in envs]
+    for i, env in enumerate(envs):
+        env["CUDA_VISIBLE_DEVICES"] = ",".join([gpus[i], *gpus[:i], *gpus[i + 1 :]])
+
+
 def _check_gpus_per_host(
     host_meshes: HostMeshes, trainer_world_size: int, per_generator_world_size: int
 ) -> None:
@@ -234,6 +245,7 @@ def spawn_proc_mesh(
     *,
     num_generators: int = 1,
     generator_env: dict[str, str] | None = None,
+    generators_see_each_other: bool = False,
 ) -> tuple[ProcMesh, list[ProcMesh]]:
     """Spawn the trainer and generator proc meshes.
 
@@ -246,6 +258,10 @@ def spawn_proc_mesh(
             both roles are spawned on ``this_host()`` by using non-overlapping
             GPU ranges.
         num_generators: Number of generator proc meshes to spawn.
+        generators_see_each_other: Single-node mode only (``host_meshes=None``): every
+            generator sees the other generators' GPUs (see ``_make_generators_see_each_other``).
+            With prefill generators, ``main`` sets it and turns off expandable segments
+            through ``generator_env``.
 
     Returns:
         The ``(trainer_mesh, generator_meshes)`` proc meshes.
@@ -258,6 +274,9 @@ def spawn_proc_mesh(
     )
 
     if host_meshes is not None:
+        # TODO: rewrite visibility per host mesh for multi-host prefill/decode.
+        if generators_see_each_other:
+            raise ValueError("generators_see_each_other needs host_meshes=None")
         trainer_host_mesh = host_meshes.trainer
         generator_host_meshes = host_meshes.generators
         gpus_per_node = host_meshes.gpus_per_node
@@ -304,17 +323,19 @@ def spawn_proc_mesh(
                 provisioner.allocate(trainer_world_size)
             ),
         )
+        generator_envs = [
+            provisioner.allocate(per_generator_world_size, extra_env=generator_env)
+            for _ in range(num_generators)
+        ]
+        if generators_see_each_other:
+            _make_generators_see_each_other(generator_envs)
         generator_meshes = [
             host_mesh.spawn_procs(
                 per_host={"gpus": per_generator_world_size},
                 bootstrap=_bootstrap_generator,
-                bootstrap_command=default_bootstrap_cmd().with_env(
-                    provisioner.allocate(
-                        per_generator_world_size, extra_env=generator_env
-                    )
-                ),
+                bootstrap_command=default_bootstrap_cmd().with_env(env),
             )
-            for _ in range(num_generators)
+            for env in generator_envs
         ]
 
     return trainer_mesh, generator_meshes
@@ -338,11 +359,21 @@ async def main():
         per_generator_world_size = _compute_generator_world_size(
             config.generator.parallelism
         )
+        generator_env = None
+        if config.num_prefill_generators:
+            # vLLM rejects KV transfer with expandable segments: they can remap the KV cache
+            # pages the transport registered. The trainer keeps them (see _env.py).
+            generator_env = {
+                "PYTORCH_ALLOC_CONF": "expandable_segments:False",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+            }
         trainer_mesh, generator_meshes = spawn_proc_mesh(
             trainer_world_size,
             per_generator_world_size,
             host_meshes=None,
             num_generators=config.num_generators,
+            generator_env=generator_env,
+            generators_see_each_other=config.num_prefill_generators > 0,
         )
         await rl_trainer.setup_async(
             trainer_mesh=trainer_mesh,

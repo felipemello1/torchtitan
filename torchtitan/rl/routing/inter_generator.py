@@ -47,6 +47,15 @@ class _GeneratorHandle(RoutingCandidate):
     """Set while routable; cleared while it drains for a model state dict load (hot_swap=False only)."""
 
 
+@dataclass(slots=True)
+class _Pool:
+    """Generators that serve one hop of a generation call, and the strategy that picks one."""
+
+    handles: list[_GeneratorHandle]
+    strategy: RoutingStrategy
+    """Each pool has its own instance: a sticky strategy pins a session to one of its handles."""
+
+
 class InterGeneratorRouter(Actor, Configurable):
     """Routes generation calls across generator meshes and pulls model's state dict.
 
@@ -103,6 +112,7 @@ class InterGeneratorRouter(Actor, Configurable):
         config: Config,
         *,
         generators: Sequence[Any],
+        prefill_generators: Sequence[Any] = (),
     ):
         num_actors = math.prod(current_size().values())
         assert (
@@ -110,32 +120,41 @@ class InterGeneratorRouter(Actor, Configurable):
         ), f"InterGeneratorRouter must be a singleton, but its mesh holds {num_actors} actors"
 
         self._config = config
+        # Every generator, so fan-out calls and model state dict pulls reach both pools.
         self._generators = [
             _GeneratorHandle(
                 actor=generator,
                 rank0_actor=generator.flatten("rank").slice(rank=0),
             )
-            for generator in generators
+            for generator in [*prefill_generators, *generators]
         ]
-        if not self._generators:
+        if not generators:
             raise ValueError("InterGeneratorRouter requires at least one generator")
         for h in self._generators:
             h.idle.set()
             h.serving.set()
 
-        self._strategy = config.strategy.build()
+        num_prefill = len(prefill_generators)
+        self._pool = _Pool(self._generators[num_prefill:], config.strategy.build())
+        # With prefill generators, a generation call takes two hops: a prefill generator computes
+        # the prompt's KV, then a decode generator from `_pool` pulls it and generates.
+        self._prefill_pool = (
+            _Pool(self._generators[:num_prefill], config.strategy.build())
+            if num_prefill
+            else None
+        )
         self._serving = asyncio.Event()
         self._refresh_serving_status()
 
-    def _candidates(self) -> list[_GeneratorHandle]:
-        """Return generator handles that are currently routable."""
+    def _candidates(self, pool: _Pool) -> list[_GeneratorHandle]:
+        """Return the pool's generator handles that are currently routable."""
 
-        return [h for h in self._generators if h.serving.is_set()]
+        return [h for h in pool.handles if h.serving.is_set()]
 
     def _refresh_serving_status(self) -> None:
         """Update whether any generator can serve; only changes while draining (i.e. hot-swap is off)."""
 
-        if self._candidates():
+        if self._candidates(self._pool):
             self._serving.set()
         else:
             self._serving.clear()
@@ -173,22 +192,26 @@ class InterGeneratorRouter(Actor, Configurable):
         method: str,
         *args,
         routing_ctx: RoutingContext,
+        pool: _Pool | None = None,
         **kwargs,
     ) -> Any:
         """Dispatch one call to a strategy-chosen serving generator's rank 0;
-        return its result.
+        return its result. ``pool`` defaults to the decode pool (every generator without
+        prefill generators).
         """
+        if pool is None:
+            pool = self._pool
         # TODO(pytorch/torchtitan#5253): drain inside the generator, so this wait goes away.
         # A turn pinned to a draining generator waits for it: all generators drain in the same
         # model state dict load (hot_swap=False), so re-pinning would pile those sessions onto whichever
         # serves first.
-        pinned = self._strategy.pinned_candidate(routing_ctx)
+        pinned = pool.strategy.pinned_candidate(routing_ctx)
         if pinned is not None:
             await pinned.serving.wait()
         await self._serving.wait()
-        candidates = self._candidates()
+        candidates = self._candidates(pool)
         assert candidates, "serving event was set with no serving generators"
-        h = self._strategy.choose(routing_ctx, candidates)
+        h = pool.strategy.choose(routing_ctx, candidates)
         self._reserve(h, routing_ctx.estimated_cost)
         try:
             return await getattr(h.rank0_actor, method).call_one(*args, **kwargs)
@@ -196,12 +219,18 @@ class InterGeneratorRouter(Actor, Configurable):
             self._release(h, routing_ctx.estimated_cost)
 
     async def _release_session(self, session_id: str) -> None:
-        """Drop a session's affinity, and tell its generator to release the session's held KV."""
-        pinned = self._strategy.pinned_candidate(RoutingContext(session_id=session_id))
-        self._strategy.release_session(session_id)
-        # Without a pin (non-sticky routing), `release_groups` frees the held KV at group end.
-        if pinned is not None:
-            await pinned.rank0_actor.release_sessions.call_one([session_id])
+        """Drop a session's affinity in each pool, and tell its generators to release the session's
+        held KV."""
+        for pool in (self._prefill_pool, self._pool):
+            if pool is None:
+                continue
+            pinned = pool.strategy.pinned_candidate(
+                RoutingContext(session_id=session_id)
+            )
+            pool.strategy.release_session(session_id)
+            # Without a pin (non-sticky routing), `release_groups` frees the held KV at group end.
+            if pinned is not None:
+                await pinned.rank0_actor.release_sessions.call_one([session_id])
 
     async def _fanout(
         self,
@@ -281,6 +310,47 @@ class InterGeneratorRouter(Actor, Configurable):
         #   big models / many generators, not at small scale.
         await asyncio.gather(*[_pull_one(h) for h in self._generators])
 
+    async def _prefill_then_decode(
+        self, prompt_token_ids: list[int], *, metrics_prefix: str, **kwargs
+    ) -> Any:
+        """Route one generation call through both pools, each sticky by session:
+
+        prefill generator: computes the prompt's KV  -> Completion.kv_transfer_params
+        decode generator:  pulls that KV, generates  -> the returned Completion
+        """
+        prefill = await self._route(
+            "generate",
+            prompt_token_ids,
+            metrics_prefix=f"{metrics_prefix}/prefill",
+            pool=self._prefill_pool,
+            **kwargs,
+        )
+        if prefill.kv_transfer_params is None:
+            raise RuntimeError(
+                f"{prefill.request_id}: the prefill generator returned no KV handle "
+                f"(finish_reason={prefill.finish_reason!r})"
+            )
+        completion = await self._route(
+            "generate",
+            prompt_token_ids,
+            metrics_prefix=metrics_prefix,
+            pool=self._pool,
+            kv_transfer_params=prefill.kv_transfer_params,
+            prefill_min_policy_version=prefill.min_policy_version,
+            **kwargs,
+        )
+        if completion.finish_reason == "error":
+            # vLLM ends a request whose KV pull failed with finish_reason="error" and no tokens.
+            raise RuntimeError(
+                f"{completion.request_id}: the decode generator failed the request, "
+                "e.g. its KV pull failed"
+            )
+        completion.max_policy_version = max(
+            completion.max_policy_version, prefill.max_policy_version
+        )
+        completion.metrics.extend(prefill.metrics)
+        return completion
+
     @concurrent_endpoint
     async def generate(
         self,
@@ -293,21 +363,25 @@ class InterGeneratorRouter(Actor, Configurable):
         metrics_prefix: str,
     ) -> Any:
         """Route one generation call to a generator and return its completion."""
-        return await self._route(
-            "generate",
-            prompt_token_ids,
+        kwargs = dict(
             request_id=request_id,
             group_id=group_id,
             # VLLMGenerator.generate also requires this field for its
             # intra-mesh DP routing.
             routing_session_id=routing_session_id,
             sampling_config=sampling_config,
-            metrics_prefix=metrics_prefix,
             # Load is measured as in-flight request count (one unit per call).
             routing_ctx=RoutingContext(
                 estimated_cost=1,
                 session_id=routing_session_id,
             ),
+        )
+        if self._prefill_pool is None:
+            return await self._route(
+                "generate", prompt_token_ids, metrics_prefix=metrics_prefix, **kwargs
+            )
+        return await self._prefill_then_decode(
+            prompt_token_ids, metrics_prefix=metrics_prefix, **kwargs
         )
 
     @concurrent_endpoint
@@ -329,7 +403,7 @@ class InterGeneratorRouter(Actor, Configurable):
     @concurrent_endpoint
     async def release_session(self, routing_session_id: str) -> None:
         """Forget a routing session after its rollout's last generation call, and tell its
-        generator to release the session's held KV."""
+        generators to release the session's held KV."""
         await self._release_session(routing_session_id)
 
     @concurrent_endpoint
