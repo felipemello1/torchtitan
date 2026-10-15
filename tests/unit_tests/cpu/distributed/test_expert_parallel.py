@@ -9,6 +9,7 @@ import unittest.mock
 
 import spmd_types as spmd
 import torch
+from torch.testing._internal.common_utils import DeterministicGuard
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.common.decoder_sharding import dense_param_placement
@@ -269,6 +270,96 @@ class TestPermute(unittest.TestCase):
             set(permuted_indices.tolist()),
             set(range(total)),
         )
+
+
+class TestAllGatherDispatch(unittest.TestCase):
+    """AllToAllTokenDispatcher's CUDA-graph path, with the EP collectives mocked.
+
+    Each mocked all-gather returns the tensors of every rank; each mocked
+    reduce-scatter returns this rank's partial sums unreduced.
+    """
+
+    num_experts = 4
+    ep_size = 2
+
+    def _run_rank(self, ep_rank, x_GD, scores_GK, expert_ids_GK, expert_weights_EDD):
+        """Dispatch, run this rank's experts with a grouped GEMM, combine; return partial sums."""
+        dispatcher = AllToAllTokenDispatcher.Config(
+            num_experts=self.num_experts, top_k=expert_ids_GK.shape[1]
+        ).build()
+        mock_mesh = unittest.mock.MagicMock()
+        mock_mesh.size.return_value = self.ep_size
+        mock_mesh.get_local_rank.return_value = ep_rank
+        num_tokens = x_GD.shape[0] // self.ep_size
+        local_slice = slice(ep_rank * num_tokens, (ep_rank + 1) * num_tokens)
+        num_local_experts = self.num_experts // self.ep_size
+        local_weights_eDD = expert_weights_EDD[
+            ep_rank * num_local_experts : (ep_rank + 1) * num_local_experts
+        ]
+        with (
+            unittest.mock.patch.object(
+                AllToAllTokenDispatcher,
+                "ep_mesh",
+                new_callable=unittest.mock.PropertyMock,
+                return_value=mock_mesh,
+            ),
+            unittest.mock.patch.object(
+                spmd, "all_gather", side_effect=[x_GD, scores_GK, expert_ids_GK]
+            ),
+            unittest.mock.patch.object(
+                spmd, "reduce_scatter", side_effect=lambda x, *args, **kwargs: x
+            ),
+        ):
+            (
+                routed_input_ND,
+                num_tokens_per_local_expert_e,
+                metadata,
+            ) = dispatcher._all_gather_dispatch(
+                x_GD[local_slice],
+                scores_GK[local_slice],
+                expert_ids_GK[local_slice],
+            )
+            routed_output_ND = torch._grouped_mm(
+                routed_input_ND,
+                local_weights_eDD,
+                offs=num_tokens_per_local_expert_e.cumsum(0, dtype=torch.int32),
+            )
+            return dispatcher.combine(routed_output_ND, metadata, x_GD[local_slice])
+
+    def test_uncomputed_rows_do_not_reach_the_output(self):
+        # Fill the grouped GEMM's uncomputed tail rows (other ranks' experts) with NaN.
+        with DeterministicGuard(True, fill_uninitialized_memory=True):
+            generator = torch.Generator().manual_seed(0)
+            dim = 8  # bf16 grouped-MM rows require a 16-byte stride
+            x_GD = torch.randn(6, dim, generator=generator).bfloat16()
+            scores_GK = torch.rand(6, 2, generator=generator)
+            expert_weights_EDD = torch.randn(
+                4, dim, dim, generator=generator
+            ).bfloat16()
+            routings = {
+                # Token 0 sends both picks to rank 0, token 3 both to rank 1.
+                "mixed": torch.tensor([[0, 1], [1, 2], [2, 3], [3, 2], [1, 3], [0, 2]]),
+                # Rank 1 computes no rows at all.
+                "all_on_rank_0": torch.tensor([[0, 1]] * 6),
+            }
+            for name, expert_ids_GK in routings.items():
+                with self.subTest(name):
+                    out_GD = sum(
+                        self._run_rank(
+                            ep_rank, x_GD, scores_GK, expert_ids_GK, expert_weights_EDD
+                        ).float()
+                        for ep_rank in range(self.ep_size)
+                    )
+                    expected_GD = torch.einsum(
+                        "gk,gd,gkde->ge",
+                        scores_GK,
+                        x_GD.float(),
+                        expert_weights_EDD.float()[expert_ids_GK],
+                    )
+                    self.assertTrue(torch.isfinite(out_GD).all())
+                    torch.testing.assert_close(
+                        out_GD, expected_GD, atol=5e-2, rtol=2e-2
+                    )
 
 
 if __name__ == "__main__":
