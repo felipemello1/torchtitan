@@ -132,6 +132,7 @@ def register_to_vllm(
     parallelism: InferenceParallelismConfig,
     checkpointer_config: CheckpointManager.Config | None,
     dist_moe_runtime: DistMoeRuntime.Config | None = None,
+    conv_state_dim_first: bool = False,
 ) -> None:
     """Register the TorchTitan model class and the TorchTitan config parser with vLLM.
 
@@ -164,6 +165,10 @@ def register_to_vllm(
             weights arrive from TorchStore.
         dist_moe_runtime: ``DistMoeRuntime.Config(inference=True)`` for models
             with Dist-MoE routed experts; ``None`` otherwise.
+        conv_state_dim_first: Allocate GDN conv state pages as ``[dim, state_len]``
+            (vLLM's DS layout, needed for KV transfer) instead of ``[state_len, dim]``
+            (SD). Valid only with equal TP on both engines and no speculative
+            decoding; see ``VLLMInnerGDN._forward``.
     """
     has_gdn = any(
         isinstance(layer.attention, GDN.Config) for layer in model_config.layers
@@ -172,9 +177,13 @@ def register_to_vllm(
         isinstance(layer.attention, KDA.Config) for layer in model_config.layers
     )
     if has_gdn or has_kda:
-        # Attention Gym's paged linear-attention kernels require channels to
-        # be contiguous in vLLM's convolution state cache.
-        os.environ["VLLM_SSM_CONV_STATE_LAYOUT"] = "SD"
+        if conv_state_dim_first and has_kda:
+            # TODO: give VLLMInnerKDA the same SD view as VLLMInnerGDN, then drop this check.
+            raise ValueError("conv_state_dim_first is not supported for KDA models")
+        # The GDN kernels read either layout as SD (see VLLMInnerGDN._forward).
+        os.environ["VLLM_SSM_CONV_STATE_LAYOUT"] = (
+            "DS" if conv_state_dim_first else "SD"
+        )
 
     from vllm.logger import init_logger
     from vllm.model_executor.models.registry import ModelRegistry

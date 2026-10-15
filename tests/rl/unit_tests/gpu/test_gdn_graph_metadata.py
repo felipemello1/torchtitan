@@ -208,11 +208,19 @@ def test_full_metadata_and_native_dispatch_variants():
     assert dispatcher.dispatch(2, uniform_decode=True)[0] == CUDAGraphMode.NONE
 
 
+@pytest.mark.parametrize("dim_first", [False, True], ids=["sd", "dim-first"])
 @pytest.mark.parametrize("decode", [False, True])
-def test_forward_respects_prepared_extent_and_decode_padding(monkeypatch, decode):
+def test_forward_respects_prepared_extent_and_decode_padding(
+    monkeypatch, decode, dim_first
+):
     layer = gdn.VLLMInnerGDN.__new__(gdn.VLLMInnerGDN)
     torch.nn.Module.__init__(layer)
-    layer.prefix, layer.kv_cache = "gdn", (torch.empty(0), torch.empty(0))
+    layer.prefix = "gdn"
+    layer._conv_state_dim_first = dim_first
+    # Two slots of dim=6, state_len=3, padded like vLLM's pages.
+    pool = torch.zeros(2, 6 * 3 + 5)
+    conv_shape = (6, 3) if dim_first else (3, 6)
+    layer.kv_cache = (pool[:, :18].view(2, *conv_shape), torch.empty(0))
     extent = 4 if decode else 3
     metadata = TorchTitanLinearAttentionMetadata(
         execution_path=(
@@ -238,8 +246,11 @@ def test_forward_respects_prepared_extent_and_decode_padding(monkeypatch, decode
     )
     monkeypatch.setattr(gdn, "is_in_batch_invariant_mode", lambda: True)
 
-    def convolution(x, *args, has_initial_state=None, **kwargs):
+    def convolution(x, weight, conv_state, *args, has_initial_state=None, **kwargs):
         assert has_initial_state is metadata.has_initial_state
+        # The kernels always get [slots, state_len, dim] with channel-contiguous rows.
+        assert conv_state.shape == (2, 3, 6) and conv_state.stride()[1:] == (6, 1)
+        assert conv_state.data_ptr() == pool.data_ptr()
         return x
 
     monkeypatch.setattr(gdn, "causal_conv1d_decode", convolution)

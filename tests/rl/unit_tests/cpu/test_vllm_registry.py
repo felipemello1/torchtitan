@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -16,7 +17,10 @@ from torchtitan.models.common.attention.gdn import GDN
 from torchtitan.models.common.attention.kda import KDA
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.generator.vllm import gdn, kda
-from torchtitan.rl.generator.vllm.registry import model_config_to_hf_config_dict
+from torchtitan.rl.generator.vllm.registry import (
+    model_config_to_hf_config_dict,
+    register_to_vllm,
+)
 
 from transformers import GenerationConfig, PretrainedConfig
 
@@ -213,3 +217,18 @@ def test_batch_invariant_kda_registers_attention_gym_replay_state(monkeypatch):
         temporal_copy,
         *(temporal_copy for _ in range(6)),
     )
+
+
+def test_kda_rejects_dim_first_conv_state(monkeypatch):
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "SD")
+    model_config = SimpleNamespace(
+        layers=[SimpleNamespace(attention=Mock(spec=KDA.Config))]
+    )
+    with pytest.raises(ValueError, match="KDA"):
+        register_to_vllm(
+            model_config,
+            parallelism=Mock(),
+            checkpointer_config=None,
+            conv_state_dim_first=True,
+        )
+    assert os.environ["VLLM_SSM_CONV_STATE_LAYOUT"] == "SD"

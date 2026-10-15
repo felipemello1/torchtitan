@@ -37,15 +37,20 @@ from vllm.forward_context import (
     get_forward_context,
     override_forward_context,
 )
+from vllm.v1.worker import mamba_utils
 
 MODEL_ENV = "TORCHTITAN_QWEN3_5_0_8B_HF_PATH"
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-@pytest.mark.parametrize(
-    "batch_invariant", [False, True], ids=["regular", "batch-invariant"]
-)
-def test_gdn_full_runner_matches_eager(tmp_path: Path, batch_invariant: bool) -> None:
+def _run_engine_in_subprocess(
+    tmp_path: Path,
+    mode: str,
+    batch_invariant: bool = False,
+    conv_state_dim_first: bool = False,
+    prefix_caching: bool = False,
+) -> dict:
+    """Run `run_engine` in a child interpreter and return its JSON result."""
     model = os.environ.get(MODEL_ENV)
     if not model:
         pytest.skip(f"set {MODEL_ENV} to a local Qwen3.5-0.8B checkpoint")
@@ -64,35 +69,46 @@ def test_gdn_full_runner_matches_eager(tmp_path: Path, batch_invariant: bool) ->
         "VLLM_DISABLE_REQUEST_ID_RANDOMIZATION": "1",
         "HF_HUB_OFFLINE": "1",
     }
-    results = []
-    for mode in ("eager", "full"):
-        output = tmp_path / f"{mode}.json"
-        command = [sys.executable]
-        command += "-m torch.distributed.run --standalone --nproc-per-node=1".split()
-        command += [
-            str(Path(__file__).resolve()),
-            mode,
-            str(output),
-            str(int(batch_invariant)),
-        ]
-        log_path = output.with_suffix(".log")
-        with log_path.open("w") as log:
-            completed = subprocess.run(
-                command,
-                check=False,
-                cwd=root,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-            )
-        if completed.returncode:
-            pytest.fail(
-                f"{mode} subprocess exited with {completed.returncode}:\n"
-                + "\n".join(log_path.read_text(errors="replace").splitlines()[-120:]),
-                pytrace=False,
-            )
-        results.append(json.loads(output.read_text()))
-    eager, full = results
+    output = tmp_path / (
+        f"{mode}_dim_first{int(conv_state_dim_first)}_prefix{int(prefix_caching)}.json"
+    )
+    command = [sys.executable]
+    command += "-m torch.distributed.run --standalone --nproc-per-node=1".split()
+    command += [
+        str(Path(__file__).resolve()),
+        mode,
+        str(output),
+        str(int(batch_invariant)),
+        str(int(conv_state_dim_first)),
+        str(int(prefix_caching)),
+    ]
+    log_path = output.with_suffix(".log")
+    with log_path.open("w") as log:
+        completed = subprocess.run(
+            command,
+            check=False,
+            cwd=root,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    if completed.returncode:
+        pytest.fail(
+            f"{mode} subprocess exited with {completed.returncode}:\n"
+            + "\n".join(log_path.read_text(errors="replace").splitlines()[-120:]),
+            pytrace=False,
+        )
+    return json.loads(output.read_text())
+
+
+@pytest.mark.parametrize(
+    "batch_invariant", [False, True], ids=["regular", "batch-invariant"]
+)
+def test_gdn_full_runner_matches_eager(tmp_path: Path, batch_invariant: bool) -> None:
+    eager, full = (
+        _run_engine_in_subprocess(tmp_path, mode, batch_invariant=batch_invariant)
+        for mode in ("eager", "full")
+    )
     # Real packed recurrence ran eagerly and was captured for FULL replay.
     assert [False, "PACKED"] in eager["recurrent_calls"]
     assert [True, "PACKED"] in full["recurrent_calls"]
@@ -149,6 +165,32 @@ def test_gdn_full_runner_matches_eager(tmp_path: Path, batch_invariant: bool) ->
 
 
 @pytest.mark.parametrize(
+    "prefix_caching", [False, True], ids=["full", "full-prefix-caching"]
+)
+def test_dim_first_conv_state_matches_sd(tmp_path: Path, prefix_caching: bool) -> None:
+    """Conv state stored dim-first (DS) and read as SD matches SD storage bitwise in:
+    - tokens and logprobs;
+    - running-slot states after every step;
+    - every state page after every wave.
+    With prefix caching, the second wave starts from states vLLM copies out of
+    cached pages."""
+    sd = _run_engine_in_subprocess(
+        tmp_path, "full", conv_state_dim_first=False, prefix_caching=prefix_caching
+    )
+    dim_first = _run_engine_in_subprocess(
+        tmp_path, "full", conv_state_dim_first=True, prefix_caching=prefix_caching
+    )
+    assert dim_first["conv_shape"] == sd["conv_shape"][::-1]
+    assert dim_first["outputs"] == sd["outputs"]
+    assert dim_first["states"] == sd["states"]
+    assert dim_first["pools"] == sd["pools"]
+    if prefix_caching:
+        # Every second-wave request started from at least two cached blocks.
+        assert min(dim_first["cached_tokens"].values()) >= 2 * dim_first["block_size"]
+        assert dim_first["copies"] > 0
+
+
+@pytest.mark.parametrize(
     "batch_invariant", [False, True], ids=["regular", "batch-invariant"]
 )
 def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -> None:
@@ -178,6 +220,7 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
     layer = gdn.VLLMInnerGDN.__new__(gdn.VLLMInnerGDN)
     torch.nn.Module.__init__(layer)
     layer.prefix = "gdn"
+    layer._conv_state_dim_first = False
     layer.local_num_k_heads = layer.local_num_v_heads = 16
     layer.head_k_dim = layer.head_v_dim = 128
     layer.local_key_dim = 2048
@@ -265,7 +308,13 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
                 assert torch.equal(actual[:, -128:], untouched[:, -128:])
 
 
-def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
+def run_engine(
+    mode: str,
+    output: Path,
+    batch_invariant: bool,
+    conv_state_dim_first: bool,
+    prefix_caching: bool,
+) -> None:
     assert int(os.environ["WORLD_SIZE"]) == 1
     # Eager runs the real token count, while FULL replay pads it up to a capture
     # size (e.g. 88 -> 128). cuBLAS may choose a different GEMM kernel for the
@@ -298,8 +347,12 @@ def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
 
     setattr(gdn, kernel_name, recurrent)
     model = os.environ[MODEL_ENV]
+    max_model_len = 2048 if prefix_caching else 256
     model_config = build_model_config(
-        "0.8B", seq_len=256, attn_backend="varlen", parallelism=ParallelismConfig()
+        "0.8B",
+        seq_len=max_model_len,
+        attn_backend="varlen",
+        parallelism=ParallelismConfig(),
     )
     model_config.local_compile_regions = []
     registry.register_to_vllm(
@@ -308,6 +361,7 @@ def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
         checkpointer_config=CheckpointManager.Config(
             initial_load_in_hf=True, initial_load_path=model
         ),
+        conv_state_dim_first=conv_state_dim_first,
     )
     engine = LLMEngine.from_engine_args(
         EngineArgs(
@@ -325,16 +379,18 @@ def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
                 "cudagraph_capture_sizes": [1, 2, 4, 64, 128],
                 "cudagraph_num_of_warmups": 1,
             },
-            max_model_len=256,
+            max_model_len=max_model_len,
             max_num_seqs=4,
-            max_num_batched_tokens=256,
+            max_num_batched_tokens=max_model_len,
             # PyTorch's FA2 paged-KV kernel on A10G requires 256-token pages.
             # Preserve 32 blocks so all four sequences can run concurrently.
             block_size=256,
             num_gpu_blocks_override=32,
             gpu_memory_utilization=0.25,
             enable_chunked_prefill=True,
-            enable_prefix_caching=False,
+            enable_prefix_caching=prefix_caching,
+            # Hash every block boundary, as VLLMGenerator does.
+            prefix_cache_retention_interval=None,
             async_scheduling=False,
             seed=42,
             disable_log_stats=True,
@@ -343,19 +399,30 @@ def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
     result = {
         "outputs": {},
         "states": [],
+        "pools": [],
         "dispatch": [],
         "recurrent_calls": recurrent_calls,
+        "copies": 0,
     }
+    layers = {}
 
     def instrument(worker):
         runner = worker.model_runner
         assert is_in_batch_invariant_mode() == batch_invariant
-        layers = {
-            name: layer
+        layers.update(
+            (name, layer)
             for name, layer in runner.compilation_config.static_forward_context.items()
             if isinstance(layer, gdn.VLLMInnerGDN)
-        }
+        )
         assert layers
+        result["conv_shape"] = list(next(iter(layers.values())).kv_cache[0].shape[1:])
+
+        # Count prefix-cache state copies between pages.
+        def copy_block(copy_bufs, original=mamba_utils.do_mamba_copy_block):
+            result["copies"] += copy_bufs.offset
+            return original(copy_bufs)
+
+        mamba_utils.do_mamba_copy_block = copy_block
         with torch.inference_mode():
             for layer in layers.values():
                 for state in layer.kv_cache:
@@ -424,11 +491,31 @@ def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
     base = engine.renderer.tokenizer.encode(
         "Explain physics.", add_special_tokens=False
     )
-    for wave, (lengths, initial_count) in enumerate(
-        (([11, 17, 23, 37], 4), ([129], 1), ([9, 13, 29, 41], 3), ([1], 1), ([1, 1], 1))
-    ):
+    block_size = engine.vllm_config.cache_config.block_size
+    if prefix_caching:
+        # Both waves share a prefix two blocks long, so the second wave starts from
+        # GDN states vLLM copies out of the first wave's cached pages.
+        prefix = (base * (2 * block_size + 7))[: 2 * block_size + 7]
+        waves = [
+            ([prefix + base[:1] * 3, prefix + base[1:2] * 5], 2),
+            ([prefix + base[2:3] * 4, prefix + base[:1] * 6], 2),
+        ]
+    else:
+        waves = [
+            ([(base * length)[:length] for length in lengths], initial_count)
+            for lengths, initial_count in (
+                ([11, 17, 23, 37], 4),
+                ([129], 1),
+                ([9, 13, 29, 41], 3),
+                ([1], 1),
+                ([1, 1], 1),
+            )
+        ]
+    result["block_size"] = block_size
+    result["cached_tokens"] = {}
+    for wave, (prompt_token_ids, initial_count) in enumerate(waves):
         prompts = engine.renderer.render_cmpl(
-            [{"prompt_token_ids": (base * length)[:length]} for length in lengths]
+            [{"prompt_token_ids": token_ids} for token_ids in prompt_token_ids]
         )
         for index, prompt in enumerate(prompts[:initial_count]):
             engine.add_request(f"{wave}-{index}", prompt, sampling)
@@ -443,12 +530,32 @@ def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
                     assert len(completion.token_ids) == 8
                     assert completion.logprobs is not None
                     result["outputs"][request.request_id] = asdict(completion)
+                    if wave:
+                        result["cached_tokens"][
+                            request.request_id
+                        ] = request.num_cached_tokens
             step += 1
-    assert len(result["outputs"]) == 12
+        # Every page, including cached pages no running request holds.
+        result["pools"].append(
+            [
+                hashlib.sha256(
+                    state.view(torch.uint8).cpu().numpy().tobytes()
+                ).hexdigest()
+                for layer in layers.values()
+                for state in layer.kv_cache
+            ]
+        )
+    assert len(result["outputs"]) == sum(len(prompts) for prompts, _ in waves)
     output.write_text(json.dumps(result, allow_nan=False))
     engine.model_executor.shutdown()
     torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
-    run_engine(sys.argv[1], Path(sys.argv[2]), bool(int(sys.argv[3])))
+    run_engine(
+        sys.argv[1],
+        Path(sys.argv[2]),
+        batch_invariant=bool(int(sys.argv[3])),
+        conv_state_dim_first=bool(int(sys.argv[4])),
+        prefix_caching=bool(int(sys.argv[5])),
+    )

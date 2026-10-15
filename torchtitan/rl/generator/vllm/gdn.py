@@ -113,11 +113,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         self.local_num_v_heads = self.num_v_heads // self.tensor_parallel_size
         self.local_key_dim = self.local_num_k_heads * self.head_k_dim
 
-        if is_conv_state_dim_first():
-            raise ValueError(
-                "Attention Gym GDN requires VLLM_SSM_CONV_STATE_LAYOUT=SD so "
-                "the paged convolution history has contiguous channels."
-            )
+        self._conv_state_dim_first = is_conv_state_dim_first()
 
         # Attention Gym's paged kernels mutate the SSM state pool directly and
         # require FP32 state in both regular and batch-invariant execution.
@@ -233,6 +229,19 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             and cu_seqlens is not None
             and has_initial_state is not None
         )
+
+        conv_state = self.kv_cache[0]
+        if self._conv_state_dim_first:
+            # Same memory, new shape; not a transpose. A page with dim=4, state_len=3:
+            #   DS [4, 3] (vLLM, KV transfer): [[0 1 2], [3 4 5], [6 7 8], [9 10 11]]
+            #   SD [3, 4] (our kernels):       [[0 1 2 3], [4 5 6 7], [8 9 10 11]]
+            # Safe while nothing else reads pages as DS: KV transfer at equal TP copies
+            # them whole and speculative decoding is rejected. self.kv_cache keeps
+            # vLLM's shape because vLLM's own state copies read it.
+            conv_state = conv_state.view(
+                conv_state.shape[0], conv_state.shape[2], conv_state.shape[1]
+            )
+
         # SP/model-input rounding need not pad attention metadata. FULL bucket
         # padding does: its prepared rows and captured slices stay fixed while
         # the builder restages slots and freshness, including null padding.
@@ -241,7 +250,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             conv_output = causal_conv1d_decode(
                 mixed_qkv[:num_decode_rows],
                 conv_weight,
-                self.kv_cache[0],
+                conv_state,
                 activation="silu",
                 state_indices=state_indices,
                 has_initial_state=has_initial_state,
@@ -276,7 +285,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         conv_output = paged_causal_conv1d(
             mixed_qkv[:num_actual_tokens].unsqueeze(0),
             conv_weight,
-            self.kv_cache[0],
+            conv_state,
             state_indices,
             activation="silu",
             cu_seqlens=cu_seqlens,
