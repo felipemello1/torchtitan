@@ -1688,12 +1688,24 @@ class VLLMGenerator(Configurable):
     @sl.log_trace_span("prefetch_model_state_dict")
     async def prefetch_model_state_dict(self) -> None:
         """Fetch weights into pinned CPU memory without interrupting generation."""
-        await ts.get_state_dict(
+        fetched_state_dict = await ts.get_state_dict(
             "model_state_dict",
             user_state_dict=self._prefetched_model_state_dict,
             strict=False,
             direct_rdma=False,
         )
+        # strict=False skips weights the trainer didn't publish; they would silently keep their old values.
+        # vLLM's attention scales exist only in the generator, so they are exempt.
+        unpublished = sorted(
+            key
+            for key in self._prefetched_model_state_dict
+            if ".vllm_attn." not in key and key not in fetched_state_dict
+        )
+        if unpublished:
+            raise RuntimeError(
+                f"The trainer did not publish {len(unpublished)} of the generator's weights "
+                f"(first 5: {unpublished[:5]}). Check that the trainer and generator model configs match."
+            )
 
     @sl.log_trace_span("load_model_state_dict_copy")
     async def _load_model_state_dict(self, version: int) -> None:
