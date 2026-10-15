@@ -366,6 +366,7 @@ class Qwen35Model(MultimodalModel):
                 "moe_aux_loss",
                 "moe_dispatch",
                 "moe_combine",
+                "moe_expert_counts",
             ]
         )
 

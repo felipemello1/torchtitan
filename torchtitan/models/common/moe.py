@@ -134,11 +134,7 @@ class RoutedExperts(Module):
             topk_expert_ids_TK,
             num_local_tokens_per_expert_E,
         )
-        offsets_E = torch.cumsum(
-            num_global_tokens_per_local_expert_e,
-            dim=0,
-            dtype=torch.int32,
-        )
+        offsets_E = _group_offsets(num_global_tokens_per_local_expert_e)
 
         with maybe_set_sparse_mesh():
             # w13 and w2 declare their own remat regions (<fqn>.grouped_mm).
@@ -167,6 +163,30 @@ class RoutedExperts(Module):
             x_TD,
         )
         return out_TD
+
+
+# Eager, the count is a bool->int64 copy plus a reduce, and the offsets an int32 copy
+# plus a two-kernel scan: 5 small launches per MoE layer. Compiled, each is one kernel.
+@local_compile("moe_expert_counts", batch_invariant=False)
+def _count_tokens_per_expert(routing_map_TE: torch.Tensor) -> torch.Tensor:
+    """Return the number of tokens routed to each expert, ``(E,)`` int64.
+
+    Example:
+        >>> _count_tokens_per_expert(torch.tensor([[True, False], [True, True]]))
+        tensor([2, 1])
+    """
+    return routing_map_TE.sum(dim=0)
+
+
+@local_compile("moe_expert_counts", batch_invariant=False)
+def _group_offsets(num_tokens_per_group_E: torch.Tensor) -> torch.Tensor:
+    """Return each group's exclusive row end for the grouped GEMMs, ``(E,)`` int32.
+
+    Example:
+        >>> _group_offsets(torch.tensor([2, 0, 3]))
+        tensor([2, 2, 5], dtype=torch.int32)
+    """
+    return torch.cumsum(num_tokens_per_group_E, dim=0, dtype=torch.int32)
 
 
 def _topk_ids_by_argmax(scores: torch.Tensor, k: int) -> torch.Tensor:
@@ -891,7 +911,7 @@ class MoE(Module):
             aux_loss_denominator=aux_loss_denominator,
             **router_kwargs,
         )
-        num_local_tokens_per_expert_E = routing_map_TE.sum(dim=0)
+        num_local_tokens_per_expert_E = _count_tokens_per_expert(routing_map_TE)
 
         out_TD = self.routed_experts(
             routed_x_TD,
