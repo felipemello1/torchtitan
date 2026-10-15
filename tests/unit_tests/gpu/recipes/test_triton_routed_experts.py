@@ -17,9 +17,14 @@ import torch
 from torch.nn import init
 
 from torchtitan.distributed.local_compile import apply_local_compile
-from torchtitan.models.common.config_utils import make_routed_experts_config
+from torchtitan.models.common.activation import Softmax
+from torchtitan.models.common.config_utils import (
+    make_routed_experts_config,
+    make_router_config,
+)
 from torchtitan_recipes.overrides.triton_routed_experts import (
     triton_routed_experts,
+    triton_topk_router,
 )
 
 _DIM, _HIDDEN, _E, _K = 1024, 256, 16, 4
@@ -170,6 +175,33 @@ class TestTritonRoutedExperts(unittest.TestCase):
         self.assertTrue(
             torch.equal(self.triton_experts(*routing), self.stock(*routing))
         )
+
+
+class TestTritonTopKRouter(unittest.TestCase):
+    def test_matches_stock_router_with_ties(self):
+        cfg = make_router_config(
+            dim=_DIM,
+            num_experts=256,
+            gate_param_init={"weight": partial(init.trunc_normal_, std=0.02)},
+            score_func=Softmax.Config(),
+            top_k=8,
+            route_norm=True,
+        )
+        with torch.device("cuda"):
+            stock, fused = cfg.build().eval(), triton_topk_router(cfg).build().eval()
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        # Integer logits: many exact ties, which must go to the lower expert id.
+        gate_TE = torch.randint(0, 6, (300, 256), device="cuda", generator=gen).float()
+        with torch.no_grad():
+            _, scores, ids, routing_map = stock._score_and_select_experts(
+                gate_TE, None, padding_mask_T=None
+            )
+            _, f_scores, f_ids, f_routing_map = fused._score_and_select_experts(
+                gate_TE, None, padding_mask_T=None
+            )
+        self.assertTrue(torch.equal(f_ids, ids))
+        self.assertTrue(torch.equal(f_routing_map, routing_map))
+        torch.testing.assert_close(f_scores, scores, rtol=1e-6, atol=0)
 
 
 if __name__ == "__main__":
