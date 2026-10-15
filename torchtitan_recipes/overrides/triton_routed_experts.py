@@ -56,6 +56,16 @@ _LARGE_ROWS_PER_EXPERT = 64
 _STOCK_ROWS_PER_EXPERT = 512
 
 
+# Triton 3.9's descriptor `.load()` drops the cache policy its IR op takes, so this calls the
+# private semantic API; replace it once `.load()` takes `eviction_policy`. With the decode
+# tiles each weight tile is read once, so it shouldn't evict activations from L2. Persistent
+# (prefill) tiles reuse weights, and below 32 rows the hint measured slower; both keep the default.
+@tl.core.builtin
+def _load_weights(desc, offsets, evict_first, _semantic=None):
+    policy = "evict_first" if tl.core._unwrap_if_constexpr(evict_first) else "evict_normal"
+    return _semantic.descriptor_load(desc, offsets, tl.core._CachePolicy("none", policy))
+
+
 @triton.jit
 def _grouped_gemm_kernel(
     a_ptr,
@@ -75,6 +85,7 @@ def _grouped_gemm_kernel(
     BLOCK_K: tl.constexpr,
     STAGES: tl.constexpr,
     PERSISTENT: tl.constexpr,
+    EVICT_W: tl.constexpr,
 ):
     """``out[row] = a[row] @ W[e].T`` for the rows of each expert ``e``.
 
@@ -132,10 +143,10 @@ def _grouped_gemm_kernel(
                 a = tl.load(a_ptrs, mask=valid[:, None], other=0.0)
                 a_ptrs += BLOCK_K
             if GATED:
-                w = w_desc.load([expert, 0, out0, k * BLOCK_K])
+                w = _load_weights(w_desc, [expert, 0, out0, k * BLOCK_K], EVICT_W)
                 w = w.reshape(BLOCK_N, BLOCK_K)
             else:
-                w = w_desc.load([expert * N_OUT + out0, k * BLOCK_K])
+                w = _load_weights(w_desc, [expert * N_OUT + out0, k * BLOCK_K], EVICT_W)
             acc = tl.dot(a, w.T, acc)
         if not PERSISTENT:
             tl.extra.cuda.gdc_launch_dependents()
@@ -183,7 +194,8 @@ def _launch_gemm(a, w, out, offsets_E, tiles, gated):
         a, a_desc, w_desc, out, offsets_E, num_experts, a.stride(0),
         E=triton.next_power_of_2(num_experts), KDIM=a.shape[1], N_OUT=n_out,
         GATED=gated, TMA_A=tma_a, BLOCK_M=tiles.block_m, BLOCK_N=block_n,
-        BLOCK_K=block_k, STAGES=stages, PERSISTENT=tiles.persistent, num_warps=warps,
+        BLOCK_K=block_k, STAGES=stages, PERSISTENT=tiles.persistent,
+        EVICT_W=tiles is _DECODE_TILES, num_warps=warps,
         launch_pdl=not gated,
     )  # fmt: skip
 
