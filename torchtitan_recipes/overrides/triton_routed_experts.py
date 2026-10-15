@@ -28,6 +28,7 @@ from triton.language.extra import libdevice
 from torchtitan.config import derive, override
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.models.common.activation import Softmax, SwiGLU
+from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
 from torchtitan.models.common.linear import GroupedLinear
 from torchtitan.models.common.moe import RoutedExperts, TokenChoiceTopKRouter
 from torchtitan.models.common.token_dispatcher import (
@@ -37,6 +38,7 @@ from torchtitan.models.common.token_dispatcher import (
 
 __all__ = [
     "TritonRoutedExperts",
+    "TritonGateLinear",
     "TritonTopKRouter",
     "triton_expert_mlp_op",
     "triton_routed_experts",
@@ -567,6 +569,47 @@ def _route_topk_kernel(
     tl.store(map_ptr + t * E + e, choice == float("-inf"))
 
 
+@triton.jit
+def _gate_gemv_kernel(
+    x_ptr, w_ptr, out_ptr, T, D, E, BLOCK_T: tl.constexpr, BLOCK_K: tl.constexpr
+):
+    """Program ``e``: fp32 ``out[:, e] = x @ w[e]`` over all of ``D`` (no split-K)."""
+    e = tl.program_id(0)
+    t = tl.arange(0, BLOCK_T)
+    acc = tl.zeros((BLOCK_T,), tl.float32)
+    for k0 in range(0, D, BLOCK_K):
+        k = k0 + tl.arange(0, BLOCK_K)
+        mask = (t[:, None] < T) & (k[None, :] < D)
+        x = tl.load(x_ptr + t[:, None] * D + k[None, :], mask=mask, other=0.0)
+        w = tl.load(w_ptr + e * D + k, mask=k < D, other=0.0)
+        acc += tl.sum(x.to(tl.float32) * w.to(tl.float32)[None, :], axis=1)
+    tl.store(out_ptr + t * E + e, acc, mask=t < T)
+
+
+class TritonGateLinear(HiMidLoLinear):
+    """Router gate: no-grad fp32 logits for <= 8 tokens in one Triton kernel.
+
+    cuBLAS runs a split-K GEMM plus a reduce there.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(HiMidLoLinear.Config):
+        pass
+
+    def _linear(self, input, weight, bias):
+        small = input.dim() == 2 and input.shape[0] <= 8
+        if torch.is_grad_enabled() or bias is not None or not small:
+            return super()._linear(input, weight, bias)
+        (num_tokens, dim), num_experts = input.shape, weight.shape[0]
+        out_TE = input.new_empty(num_tokens, num_experts, dtype=torch.float32)
+        _gate_gemv_kernel[(num_experts,)](
+            input.contiguous(), _local(weight).contiguous(), out_TE, num_tokens, dim,
+            num_experts,
+            BLOCK_T=8, BLOCK_K=min(triton.next_power_of_2(dim), 2048),
+        )  # fmt: skip
+        return out_TE
+
+
 class TritonTopKRouter(TokenChoiceTopKRouter):
     """``TokenChoiceTopKRouter`` with its no-grad softmax top-k as one Triton kernel."""
 
@@ -607,5 +650,6 @@ class TritonTopKRouter(TokenChoiceTopKRouter):
     description="Run the no-grad softmax top-k router as one Triton kernel.",
 )
 def triton_topk_router(cfg: TokenChoiceTopKRouter.Config) -> TritonTopKRouter.Config:
-    return derive(cfg, TritonTopKRouter.Config)
+    gate = derive(cfg.gate, TritonGateLinear.Config)
+    return derive(cfg, TritonTopKRouter.Config, gate=gate)
 
