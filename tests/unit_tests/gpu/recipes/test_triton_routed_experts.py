@@ -108,7 +108,7 @@ class TestTritonRoutedExperts(unittest.TestCase):
                 self.assertLess(_rel(triton_out, expected), 5e-3)
 
     def test_cuda_graph_replay_matches_eager_bitwise(self):
-        for num_tokens in (37, 1500):
+        for num_tokens in (8, 37, 1500):
             with self.subTest(num_tokens=num_tokens):
                 routing = _routing(num_tokens, seed=2)
                 with torch.no_grad():
@@ -148,6 +148,21 @@ class TestTritonRoutedExperts(unittest.TestCase):
                         self.assertEqual(actual.shape, (0, _DIM))
                         continue
                     expected = self.stock._expert_mlp(x_RD, offsets_E)
+                self.assertTrue(torch.equal(actual, expected))
+
+    def test_counts_left_to_the_kernels(self):
+        """On the EP=1 path the kernels count the ids themselves, so MoE skips the count."""
+        for num_tokens in (37, 1500):
+            with self.subTest(num_tokens=num_tokens):
+                x_TD, scores_TK, ids_TK, counts_E = _routing(num_tokens, seed=5)
+                routing_map_TE = torch.zeros(
+                    num_tokens, _E, dtype=torch.bool, device="cuda"
+                )
+                routing_map_TE.scatter_(1, ids_TK, True)
+                with torch.no_grad():
+                    self.assertIsNone(self.triton_experts.count_tokens(routing_map_TE))
+                    expected = self.triton_experts(x_TD, scores_TK, ids_TK, counts_E)
+                    actual = self.triton_experts(x_TD, scores_TK, ids_TK, None)
                 self.assertTrue(torch.equal(actual, expected))
 
     def test_grad_enabled_takes_stock_path(self):

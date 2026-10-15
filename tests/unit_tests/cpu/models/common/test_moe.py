@@ -50,6 +50,9 @@ class _PassthroughRoutedExperts(nn.Module):
         super().__init__()
         self.num_tokens_per_expert_E = None
 
+    def count_tokens(self, routing_map_TE):
+        return routing_map_TE.sum(dim=0)
+
     def forward(
         self,
         x_TD,
@@ -66,6 +69,9 @@ class _PassthroughRoutedExperts(nn.Module):
 class _RecordingRoutedExperts:
     def __init__(self) -> None:
         self.kwargs: dict | None = None
+
+    def count_tokens(self, routing_map_TE):
+        return routing_map_TE.sum(dim=0)
 
     def __call__(self, x_TD, scores_TK, expert_ids_TK, counts_E, **kwargs):
         self.kwargs = kwargs
