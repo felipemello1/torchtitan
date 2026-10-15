@@ -791,8 +791,11 @@ _SIDE_STREAMS: dict[int, torch.cuda.Stream] = {}
 def _shared_experts_side_stream() -> torch.cuda.Stream | None:
     """Side stream for the shared experts, or None to run them inline.
 
-    Only under CUDA graph capture, without grad and without EP (so no collectives
-    on the side stream). Training and eager forwards keep one stream.
+    Checked while a CUDA graph is captured: the graph records the two-stream schedule
+    once and every replay runs it, so all decode steps overlap, not just the first.
+    Only without grad (autograd and activation checkpointing would need the backward
+    on matching streams) and without EP (no collectives on the side stream). Eager
+    forwards keep one stream; the gain was measured only under CUDA graphs.
     """
     if (
         torch.is_grad_enabled()
@@ -915,8 +918,8 @@ class MoE(Module):
         )
         num_local_tokens_per_expert_E = routing_map_TE.sum(dim=0)
 
-        # In CUDA graphs at inference (the generator's decode), the shared experts run
-        # on a side stream next to the routed experts, as vLLM does.
+        # Run the shared experts on a side stream so they overlap with the routed
+        # experts; the main stream waits for them before the final add.
         side_stream = _shared_experts_side_stream() if self.shared_experts else None
         if side_stream is not None:
             side_stream.wait_stream(torch.cuda.current_stream())
