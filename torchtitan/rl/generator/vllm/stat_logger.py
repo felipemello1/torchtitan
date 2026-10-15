@@ -79,6 +79,8 @@ class _StepStats:
     ttft_ms: list[float] = field(default_factory=list)
     itl_ms: list[float] = field(default_factory=list)
     finished: list[_FinishedRequestStats] = field(default_factory=list)
+    spec_drafts: int = 0
+    spec_accepted_tokens: int = 0
 
 
 def _extract_step_stats(
@@ -91,6 +93,7 @@ def _extract_step_stats(
     num_waiting: int | None = None
     prefix_queries = 0
     prefix_hits = 0
+    spec = None
     if scheduler_stats is not None:
         kv_cache_usage = scheduler_stats.kv_cache_usage
         num_running = scheduler_stats.num_running_reqs
@@ -99,6 +102,7 @@ def _extract_step_stats(
         if prefix is not None:
             prefix_queries = prefix.queries
             prefix_hits = prefix.hits
+        spec = scheduler_stats.spec_decoding_stats
 
     gen_tokens = 0
     prompt_tokens = 0
@@ -136,6 +140,8 @@ def _extract_step_stats(
         ttft_ms=ttft_ms,
         itl_ms=itl_ms,
         finished=finished,
+        spec_drafts=spec.num_drafts if spec else 0,
+        spec_accepted_tokens=spec.num_accepted_tokens if spec else 0,
     )
 
 
@@ -299,6 +305,11 @@ class VllmOtelStatLogger(Configurable, StatLoggerBase):
         # Prefix-cache hit rate = rate(hits) / rate(queries) at query time.
         self._c_prefix_queries = meter.create_counter("vllm.prefix_cache_queries")
         self._c_prefix_hits = meter.create_counter("vllm.prefix_cache_hits")
+        # Mean acceptance length = 1 + rate(accepted_tokens) / rate(drafts).
+        self._c_spec_drafts = meter.create_counter("vllm.spec_decode_drafts")
+        self._c_spec_accepted = meter.create_counter(
+            "vllm.spec_decode_accepted_tokens", unit="token"
+        )
 
     def _create_histograms(self, meter: Meter) -> None:
         """Latency histograms; the backend computes percentiles (p50/p95/p99)."""
@@ -351,6 +362,9 @@ class VllmOtelStatLogger(Configurable, StatLoggerBase):
                 self._c_prefix_queries.add(step.prefix_queries)
             if step.prefix_hits:
                 self._c_prefix_hits.add(step.prefix_hits)
+            if step.spec_drafts:
+                self._c_spec_drafts.add(step.spec_drafts)
+                self._c_spec_accepted.add(step.spec_accepted_tokens)
 
             self._c_gen_tokens.add(step.num_generation_tokens)
             self._c_prompt_tokens.add(step.num_prompt_tokens)

@@ -843,7 +843,25 @@ class VLLMGenerator(Configurable):
         options without a dedicated field here (e.g. ``{"watermark": 0.03}``). vLLM
         validates them. Keys that TorchTitan sets itself, or derives from a field of
         this config (e.g. ``max_num_batched_tokens``), raise a ``ValueError``; see
-        ``add_extra_vllm_engine_args``."""
+        ``add_extra_vllm_engine_args``.
+
+        MTP speculative decoding (Qwen3.5, DP = EP = 1)::
+
+            {"speculative_config": {"method": "mtp", "num_speculative_tokens": 3,
+                                    "disable_eagle_block_drop": True}}
+
+        When to use it:
+
+        - model >= 4B (a 0.8B loses even at acceptance 2.5);
+        - spec-off peak ``vllm.kv_cache_usage`` <= ~0.7 (MTP holds 30% fewer
+          16K-token requests; shorter requests lose more);
+        - turn it on, then watch the logged mean acceptance length
+          (``vllm.spec_decode_*``); turn it off below ~2 (break-even 1.7-2.0).
+
+        With MTP on, GDN models run ``cuda_graph.mode="FULL"`` as
+        ``FULL_DECODE_ONLY``. ``disable_eagle_block_drop`` keeps prefix hits:
+        without it, vLLM drops the drafter's last cached block, and every KV group
+        loses that block too."""
 
         cuda_graph: VLLMCudaGraphConfig = field(default_factory=VLLMCudaGraphConfig)
         """CUDA graph capture settings for the vLLM engine."""
@@ -985,6 +1003,7 @@ class VLLMGenerator(Configurable):
             parallelism=config.parallelism,
             checkpointer_config=config.checkpointer,
             dist_moe_runtime=config.dist_moe_runtime,
+            mtp=speculative_config.get("method") == "mtp",
         )
 
         # Set vLLM environment variables from config before any vLLM initialization

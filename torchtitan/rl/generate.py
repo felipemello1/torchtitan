@@ -123,6 +123,7 @@ def generate() -> None:
             initial_load_path=model_path,
         ),
         dist_moe_runtime=gen_config.dist_moe_runtime,
+        mtp=speculative_config.get("method") == "mtp",
     )
     logger.info("Registered TorchTitan model with vLLM")
 
