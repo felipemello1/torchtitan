@@ -163,6 +163,10 @@ class DistMoeRoutedExperts(Module):
             )
         return postprocess
 
+    def count_tokens(self, routing_map_TE: torch.Tensor) -> torch.Tensor:
+        """Return the tokens routed to each expert, ``(E,)`` (see ``RoutedExperts.count_tokens``)."""
+        return routing_map_TE.sum(dim=0)
+
     def forward(
         self,
         x_TD: torch.Tensor,
