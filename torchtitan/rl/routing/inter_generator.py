@@ -203,6 +203,11 @@ class InterGeneratorRouter(Actor, Configurable):
         if pinned is not None:
             await pinned.rank0_actor.release_sessions.call_one([session_id])
 
+    async def _release_groups(self, group_ids: list[int]) -> None:
+        """Forget finished groups in the strategy (their homes), then tell every generator."""
+        self._strategy.release_groups(group_ids)
+        await self._fanout("release_groups", group_ids)
+
     async def _fanout(
         self,
         method: str,
@@ -281,8 +286,7 @@ class InterGeneratorRouter(Actor, Configurable):
         #   big models / many generators, not at small scale.
         await asyncio.gather(*[_pull_one(h) for h in self._generators])
 
-    @concurrent_endpoint
-    async def generate(
+    async def _generate(
         self,
         prompt_token_ids: list[int],
         *,
@@ -307,7 +311,29 @@ class InterGeneratorRouter(Actor, Configurable):
             routing_ctx=RoutingContext(
                 estimated_cost=1,
                 session_id=routing_session_id,
+                group_id=group_id,
             ),
+        )
+
+    @concurrent_endpoint
+    async def generate(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        request_id: str,
+        group_id: int,
+        routing_session_id: str | None,
+        sampling_config: Any | None,
+        metrics_prefix: str,
+    ) -> Any:
+        """Route one generation call to a generator and return its completion."""
+        return await self._generate(
+            prompt_token_ids,
+            request_id=request_id,
+            group_id=group_id,
+            routing_session_id=routing_session_id,
+            sampling_config=sampling_config,
+            metrics_prefix=metrics_prefix,
         )
 
     @concurrent_endpoint
@@ -335,7 +361,7 @@ class InterGeneratorRouter(Actor, Configurable):
     @concurrent_endpoint
     async def release_groups(self, group_ids: list[int]) -> None:
         """Tell every generator that these rollout groups are finished."""
-        await self._fanout("release_groups", group_ids)
+        await self._release_groups(group_ids)
 
     @concurrent_endpoint
     async def pull_model_state_dict(self, policy_version: int) -> None:
