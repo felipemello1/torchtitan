@@ -8,14 +8,19 @@
 the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID."""
 
 import asyncio
+import functools
 import json
 import logging
+import math
+from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import pytest
 import torch
+from torchtitan.rl.controller import controller as controller_module
 from torchtitan.rl.controller.controller import Controller
 from torchtitan.rl.controller.metrics import (
     compute_perf_ratio_metrics,
@@ -26,9 +31,12 @@ from torchtitan.rl.controller.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
+from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
+from torchtitan.rl.generator.vllm.session_kv_holder import VLLMSessionKVHolder
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.types import RolloutTurnID
+from torchtitan.rl.routing.inter_generator import InterGeneratorRouter
 
 from torchtitan.rl.trainer.batcher import Batcher
 from torchtitan.rl.trainer.training_sample_builder import (
@@ -53,6 +61,114 @@ def test_controller_config_maybe_log(tmp_path, caplog) -> None:
     with open(tmp_path / "config.json") as file:
         saved_config = json.load(file)
     assert saved_config["trainer"]["training"]["max_context_length"] == 128
+
+
+@pytest.mark.parametrize(
+    "num_prefill_generators, overrides, match",
+    [
+        (1, {}, None),
+        (2, {}, r"must be in \[0, num_generators\)"),
+        (
+            1,
+            {
+                "generator.parallelism": InferenceParallelismConfig(
+                    tensor_parallel_degree=2
+                )
+            },
+            "TP, DP and EP degrees of 1",
+        ),
+        (
+            1,
+            {"generator.reset_kv_cache_on_model_state_dict_load": True},
+            "reset_kv_cache_on_model_state_dict_load=False",
+        ),
+        (1, {"generator_router.hot_swap": False}, "hot_swap=True"),
+        (
+            1,
+            {"generator.session_kv_holder": VLLMSessionKVHolder.Config()},
+            "session_kv_holder=None",
+        ),
+    ],
+    ids=[
+        "supported",
+        "no-decode-generator",
+        "tp2",
+        "kv-reset",
+        "drain",
+        "session-kv",
+    ],
+)
+def test_prefill_generators_reject_untested_configs(
+    num_prefill_generators, overrides, match
+) -> None:
+    from torchtitan_recipes.tests.rl.alphabet_sort import rl_grpo_qwen3_5_debug_varlen
+
+    config = rl_grpo_qwen3_5_debug_varlen(seq_len=128)
+    config.generator.parallelism = InferenceParallelismConfig(tensor_parallel_degree=1)
+    for path, value in overrides.items():
+        *parents, name = path.split(".")
+        setattr(functools.reduce(getattr, parents, config), name, value)
+
+    with pytest.raises(ValueError, match=match) if match else nullcontext():
+        replace(config, num_generators=2, num_prefill_generators=num_prefill_generators)
+
+
+def test_setup_async_spawns_prefill_then_decode_generators(monkeypatch) -> None:
+    """The first meshes prefill, the rest decode; max_num_seqs counts decode generators only."""
+    from torchtitan_recipes.tests.rl.alphabet_sort import rl_grpo_qwen3_5_debug_varlen
+
+    config = rl_grpo_qwen3_5_debug_varlen(seq_len=128)
+    config.generator.parallelism = InferenceParallelismConfig(tensor_parallel_degree=1)
+    config = replace(config, num_generators=3, num_prefill_generators=1)
+
+    class RouterSpawnedError(Exception):
+        pass
+
+    class FakeMesh:
+        def __init__(self):
+            self.spawned = []
+
+        def spawn(self, name, actor_class, *args, **kwargs):
+            self.spawned.append((name, kwargs))
+            if actor_class is InterGeneratorRouter:
+                raise RouterSpawnedError
+            return name
+
+    host_mesh = FakeMesh()
+    monkeypatch.setattr(
+        controller_module,
+        "this_host",
+        lambda: SimpleNamespace(spawn_procs=lambda **kwargs: host_mesh),
+    )
+    monkeypatch.setattr(controller_module, "setup_torch_elastic_env", AsyncMock())
+    controller = Controller.__new__(Controller)
+    controller.config = config
+    controller._rollouter = SimpleNamespace(get_validation_samples=lambda steps: [])
+    generator_meshes = [FakeMesh() for _ in range(3)]
+
+    with pytest.raises(RouterSpawnedError):
+        asyncio.run(
+            controller.setup_async(
+                trainer_mesh=FakeMesh(), generator_meshes=generator_meshes
+            )
+        )
+
+    generators = [mesh.spawned[0] for mesh in generator_meshes]
+    assert [(name, kwargs["prefill_decode_role"]) for name, kwargs in generators] == [
+        ("prefill_generator_0", "prefill"),
+        ("decode_generator_1", "decode"),
+        ("decode_generator_2", "decode"),
+    ]
+    async_loop = config.async_loop
+    rollout_concurrency = (
+        async_loop.max_active_rollout_groups * async_loop.num_samples_per_prompt
+    )
+    assert generators[0][1]["max_num_seqs"] == min(
+        math.ceil(rollout_concurrency / 2), 512
+    )
+    (_, router_kwargs) = host_mesh.spawned[-1]
+    assert router_kwargs["prefill_generators"] == ["prefill_generator_0"]
+    assert router_kwargs["generators"] == ["decode_generator_1", "decode_generator_2"]
 
 
 def _training_sample(*, group_id: int, rollout_id: int) -> TrainingSample:

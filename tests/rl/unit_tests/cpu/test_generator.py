@@ -18,6 +18,7 @@ The uneven-decode integration test requires four GPUs and a torchrun launcher.
 import asyncio
 import concurrent.futures
 import gc
+import inspect
 import math
 import os
 import shutil
@@ -43,6 +44,7 @@ from torchtitan.rl.generator.generator import (
     _prepare_generation_request_metrics,
     _RejectedRequests,
     add_extra_vllm_engine_args,
+    add_kv_transfer_config,
     EngineRequest,
     LoopAction,
     LoopDecision,
@@ -115,11 +117,17 @@ def _sample(*, token_ids=(10, 11), finish_reason="stop"):
 
 
 def _request_output(
-    *, request_id="r0", outputs=None, num_generation_tokens=4, num_preemptions=0
+    *,
+    request_id="r0",
+    outputs=None,
+    num_generation_tokens=4,
+    num_preemptions=0,
+    kv_transfer_params=None,
 ):
     return SimpleNamespace(
         request_id=request_id,
         num_cached_tokens=0,
+        kv_transfer_params=kv_transfer_params,
         metrics=SimpleNamespace(
             first_token_latency=0.012,
             queued_ts=1.0,
@@ -139,6 +147,7 @@ def _generator():
     generator = VLLMGenerator.__new__(VLLMGenerator)
     generator._engine = _FakeEngine()
     generator._session_kv_holder = None
+    generator._prefill_decode_role = None
     generator._rank = 0
     generator.policy_version = 7
     generator.config = SimpleNamespace(
@@ -252,6 +261,24 @@ def test_process_finished_requests_resolves_reply_with_completion():
     asyncio.run(main())
 
 
+def test_prefill_completion_carries_the_kv_handle():
+    async def main():
+        dispatcher = _dispatcher()
+        reply = concurrent.futures.Future()
+        reply.set_running_or_notify_cancel()
+        generation = OutstandingGeneration(reply=reply, metrics_prefix="generator")
+        generation.min_policy_version = 7
+        dispatcher._rank0_outstanding_generations = {"r0": generation}
+        handle = {"do_remote_prefill": True, "remote_block_ids": [[3, 4]]}
+        dispatcher.process_finished_requests(
+            [_request_output(kv_transfer_params=handle)], policy_version=7
+        )
+        completion = await asyncio.wrap_future(reply)
+        assert completion.kv_transfer_params == handle
+
+    asyncio.run(main())
+
+
 def test_process_finished_requests_noop_on_nonzero_tp_rank():
     # tp_rank != 0 hold no finished outputs, so processing returns before building or sending.
     dispatcher = _dispatcher(rank=1, dp_degree=1, tp_degree=2)
@@ -312,6 +339,47 @@ def test_build_sampling_params_matches_contract():
     assert params.stop_token_ids == [99]
     assert params.ignore_eos
     assert params.seed == 44
+
+
+def test_prefill_generator_samples_one_token_and_keeps_the_kv():
+    generator = _generator()
+    generator._prefill_decode_role = "prefill"
+    params = generator._build_sampling_params(SamplingConfig(max_tokens=64))
+    assert params.max_tokens == 1
+    assert params.extra_args == {"kv_transfer_params": {"do_remote_decode": True}}
+
+
+@pytest.mark.parametrize(
+    "role, kv_role", [("prefill", "kv_producer"), ("decode", "kv_consumer")]
+)
+def test_kv_transfer_config_sets_the_role_and_listener_address(
+    monkeypatch, role, kv_role
+):
+    monkeypatch.delenv("VLLM_NIXL_SIDE_CHANNEL_HOST", raising=False)
+    monkeypatch.delenv("VLLM_NIXL_SIDE_CHANNEL_PORT", raising=False)
+    engine_kwargs = {}
+    add_kv_transfer_config(engine_kwargs, role)
+    assert engine_kwargs["kv_transfer_config"].kv_role == kv_role
+    assert os.environ["VLLM_NIXL_SIDE_CHANNEL_HOST"]
+    assert int(os.environ["VLLM_NIXL_SIDE_CHANNEL_PORT"]) > 0
+
+
+def test_kv_transfer_listener_thread_name_matches_vllm():
+    """The listener-death hook in `_call_on_engine_thread` matches vLLM's thread by name."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_scheduler
+
+    assert 'name="nixl_handshake_listener"' in inspect.getsource(base_scheduler)
+
+
+def test_decode_generator_passes_the_prefill_handle_to_vllm():
+    generator = _generator()
+    generator._prefill_decode_role = "decode"
+    handle = {"do_remote_prefill": True, "remote_block_ids": [[3, 4]]}
+    params = generator._build_sampling_params(
+        SamplingConfig(max_tokens=64), kv_transfer_params=handle
+    )
+    assert params.max_tokens == 64
+    assert params.extra_args == {"kv_transfer_params": handle}
 
 
 def test_build_sampling_params_seed_defaults_to_none():

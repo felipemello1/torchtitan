@@ -25,11 +25,12 @@ import torch.distributed as dist
 import torchstore as ts
 from torchstore import RankRole
 from vllm import EngineArgs, LLMEngine, SamplingParams
-from vllm.config import AttentionConfig, CompilationConfig
+from vllm.config import AttentionConfig, CompilationConfig, KVTransferConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode, PassConfig
 from vllm.exceptions import VLLMClientError
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
+from vllm.utils.network_utils import get_ip, get_open_port
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -64,6 +65,19 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 # TODO(async-rl): this file is large. Split a backend-agnostic BaseGenerator.
+
+
+def add_kv_transfer_config(
+    engine_kwargs: dict[str, Any], prefill_decode_role: Literal["prefill", "decode"]
+) -> None:
+    """Add vLLM's NIXL connector to ``engine_kwargs`` in place: a prefill generator produces KV,
+    a decode generator consumes it. Peers reach this engine's KV listener at this host and port."""
+    os.environ["VLLM_NIXL_SIDE_CHANNEL_HOST"] = get_ip()
+    os.environ["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(get_open_port())
+    engine_kwargs["kv_transfer_config"] = KVTransferConfig(
+        kv_connector="NixlConnector",
+        kv_role="kv_producer" if prefill_decode_role == "prefill" else "kv_consumer",
+    )
 
 
 def add_extra_vllm_engine_args(
@@ -635,6 +649,7 @@ class RequestDispatcher:
                         token_ids=list(completion_output.token_ids),
                         token_logprobs=token_logprobs,
                         finish_reason=completion_output.finish_reason,
+                        kv_transfer_params=request_output.kv_transfer_params,
                     ),
                     _extract_request_metrics_inputs(request_output),
                 )
@@ -925,6 +940,7 @@ class VLLMGenerator(Configurable):
         rank: int | None = None,
         generator_name: str = "generator",
         open_result_channel: Callable[[], tuple[Any, Any]] | None = None,
+        prefill_decode_role: Literal["prefill", "decode"] | None = None,
     ):
         init_logger()
         # TODO: Quiet torchstore's per-op transport-resolve INFO spam (very noisy in CI).
@@ -942,6 +958,9 @@ class VLLMGenerator(Configurable):
         self.model_config = model_config
 
         self._max_num_seqs = max_num_seqs
+        # With prefill/decode disaggregation, "prefill" generators only compute each prompt's KV and
+        # hand it to a "decode" generator, which generates. None: this generator does both.
+        self._prefill_decode_role = prefill_decode_role
 
         self._rank = rank if rank is not None else int(os.environ.get("RANK", "0"))
         self._dp_degree = config.parallelism.data_parallel_degree
@@ -956,6 +975,8 @@ class VLLMGenerator(Configurable):
             parallelism=config.parallelism,
             checkpointer_config=config.checkpointer,
             dist_moe_runtime=config.dist_moe_runtime,
+            # Transferring a hybrid model's KV needs the GDN conv state stored dim-first.
+            conv_state_dim_first=prefill_decode_role is not None,
         )
 
         # Set vLLM environment variables from config before any vLLM initialization
@@ -1058,6 +1079,8 @@ class VLLMGenerator(Configurable):
             engine_kwargs["compilation_config"] = vllm_compilation_config
         if config.debug.seed is not None:
             engine_kwargs["seed"] = config.debug.seed
+        if prefill_decode_role is not None:
+            add_kv_transfer_config(engine_kwargs, prefill_decode_role)
         add_extra_vllm_engine_args(engine_kwargs, config.extra_vllm_engine_args)
         engine_args = EngineArgs(**engine_kwargs)
 
@@ -1182,8 +1205,29 @@ class VLLMGenerator(Configurable):
 
     def _call_on_engine_thread(self, fn: Callable[[], _T]) -> _T:
         """Call `fn` on the engine thread, in the caller's contextvars, and block until it returns.
-        For setup in `__init__`, before the engine loop starts."""
+        For setup in `__init__`, before the engine loop starts. With a prefill/decode role, raises
+        RuntimeError if vLLM's KV transfer listener thread dies meanwhile."""
         result: concurrent.futures.Future[_T] = concurrent.futures.Future()
+        listener_died: concurrent.futures.Future[None] = concurrent.futures.Future()
+        previous_excepthook = threading.excepthook
+        if self._prefill_decode_role is not None:
+            # vLLM's KV transfer listener binds its port in its own thread, and engine init waits
+            # for it with no timeout. If the bind fails (e.g. the port was taken), raise here
+            # instead of hanging.
+            def listener_excepthook(args: threading.ExceptHookArgs) -> None:
+                previous_excepthook(args)
+                if (
+                    args.thread is not None
+                    and args.thread.name == "nixl_handshake_listener"
+                ):
+                    # The bind error names the address, e.g. "Address already in use (addr=...)".
+                    listener_died.set_exception(
+                        RuntimeError(
+                            f"vLLM's KV transfer listener died: {args.exc_value!r}"
+                        )
+                    )
+
+            threading.excepthook = listener_excepthook
 
         def call() -> None:
             # A plain callback rather than a task, which would re-raise a `SystemExit` out of
@@ -1195,7 +1239,16 @@ class VLLMGenerator(Configurable):
 
         # `call_soon_threadsafe` runs `call` in a copy of the caller's contextvars.
         self._engine_event_loop.call_soon_threadsafe(call)
-        return result.result()
+        try:
+            concurrent.futures.wait(
+                [result, listener_died],
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not result.done():
+                listener_died.result()
+            return result.result()
+        finally:
+            threading.excepthook = previous_excepthook
 
     @staticmethod
     def _set_determinism(debug: DebugConfig) -> None:
@@ -1272,6 +1325,8 @@ class VLLMGenerator(Configurable):
         routing_session_id: str,
         sampling_config: SamplingConfig | None = None,
         metrics_prefix: str = "generator",
+        kv_transfer_params: dict[str, Any] | None = None,
+        prefill_min_policy_version: int | None = None,
     ) -> Completion:
         """Generates one completion for one prompt.
 
@@ -1295,6 +1350,10 @@ class VLLMGenerator(Configurable):
             metrics_prefix: Namespace prepended to every metric key on the returned
                 `Completion` (default ``"generator"``). Callers that need to keep streams
                 separate, e.g. ``"validation/generator"``, can override it.
+            kv_transfer_params: Decode generators only: where the prompt's KV lives, from
+                the prefill generator's `Completion.kv_transfer_params`.
+            prefill_min_policy_version: Decode generators only: the oldest policy version the
+                prefill generator's KV can come from.
 
         Example:
 
@@ -1325,6 +1384,8 @@ class VLLMGenerator(Configurable):
                     group_id=group_id,
                     routing_session_id=routing_session_id,
                     arrival_time=time.time(),
+                    kv_transfer_params=kv_transfer_params,
+                    prefill_min_policy_version=prefill_min_policy_version,
                 ),
                 metrics_prefix=metrics_prefix,
                 reply=reply,
@@ -1451,7 +1512,9 @@ class VLLMGenerator(Configurable):
                             internal_request_id = self._engine.add_request(
                                 request_id=request.request_id,
                                 prompt=engine_input,
-                                params=self._build_sampling_params(request.sampling),
+                                params=self._build_sampling_params(
+                                    request.sampling, request.kv_transfer_params
+                                ),
                                 arrival_time=request.arrival_time,
                                 priority=max(request.group_id, -1),
                             )
@@ -1473,7 +1536,10 @@ class VLLMGenerator(Configurable):
                 # new requests and avoid a prefill in between every engine decode step, which is inefficient.
                 with sl.log_trace_span("vllm_engine_step_burst"):
                     for _ in range(self.config.max_engine_steps_between_decisions):
-                        if not self._engine.has_unfinished_requests():
+                        if not (
+                            self._engine.has_unfinished_requests()
+                            or self._holds_kv_for_transfer()
+                        ):
                             break
                         with torch.no_grad():
                             request_outputs = self._engine.step()
@@ -1483,6 +1549,8 @@ class VLLMGenerator(Configurable):
                             request_outputs, self.policy_version
                         )
                         await asyncio.sleep(0)  # let pending generate() calls enqueue
+                        if not self._engine.has_unfinished_requests():
+                            break  # only held KV is left: one step per decision
 
         except Exception as exc:
             logger.exception("engine loop crashed; failing all outstanding replies")
@@ -1525,6 +1593,10 @@ class VLLMGenerator(Configurable):
         # * If there are none, there is nothing to step, so we wait on the queue for the next decision.
         messages: list[EngineLoopMessage]
         if self._request_dispatcher.rank0_has_outstanding_generations():
+            messages = []
+        elif self._holds_kv_for_transfer():
+            # Only KV a decode generator has yet to pull is left: poll for it, don't spin.
+            await asyncio.sleep(0.005)
             messages = []
         else:
             if pending_engine_requests:
@@ -1583,6 +1655,11 @@ class VLLMGenerator(Configurable):
                             request.group_id, self.policy_version
                         )
                     )
+                if request.prefill_min_policy_version is not None:
+                    # KV pulled from a prefill generator can be as old as its minimum version.
+                    request.min_policy_version = min(
+                        request.min_policy_version, request.prefill_min_policy_version
+                    )
             requests_per_dp_rank = self._request_dispatcher.rank0_route(
                 pending_engine_requests
             )
@@ -1595,7 +1672,19 @@ class VLLMGenerator(Configurable):
         decision.released_group_ids = released_group_ids
         return decision
 
-    def _build_sampling_params(self, sampling: SamplingConfig) -> SamplingParams:
+    def _holds_kv_for_transfer(self) -> bool:
+        """Prefill generators only: whether finished requests still hold KV for a decode generator.
+        vLLM frees it in an engine step once the pull is done, so the loop keeps stepping."""
+        return (
+            self._prefill_decode_role == "prefill"
+            and self._engine.engine_core.engine_core.scheduler.has_finished_requests()
+        )
+
+    def _build_sampling_params(
+        self,
+        sampling: SamplingConfig,
+        kv_transfer_params: dict[str, Any] | None = None,
+    ) -> SamplingParams:
         """Translate a `SamplingConfig` into vLLM `SamplingParams` (n=1).
 
         ``seed`` and ``stop_token_ids`` are carried on the ``SamplingConfig``
@@ -1609,10 +1698,17 @@ class VLLMGenerator(Configurable):
         ``ignore_eos`` turns that off, so the renderer's ``stop_token_ids``
         (which include EOS) are the only stops.
         """
+        max_tokens, extra_args = sampling.max_tokens, None
+        if self._prefill_decode_role == "prefill":
+            # Only the prompt's KV is kept; the decode generator samples every output token.
+            max_tokens = 1
+            extra_args = {"kv_transfer_params": {"do_remote_decode": True}}
+        elif kv_transfer_params is not None:
+            extra_args = {"kv_transfer_params": kv_transfer_params}
         return SamplingParams(
             temperature=sampling.temperature,
             top_p=sampling.top_p,
-            max_tokens=sampling.max_tokens,
+            max_tokens=max_tokens,
             n=1,  # always expects a single sample per request. Caller can call N times.
             stop_token_ids=sampling.stop_token_ids,
             # Drops the generation config's eos ids, which vLLM merges into
@@ -1629,6 +1725,7 @@ class VLLMGenerator(Configurable):
             # TODO(async-rl): use RequestOutputKind.CUMULATIVE for exact per-token
             #   (start_token, version) boundaries; today we keep only the per-turn min/max.
             output_kind=RequestOutputKind.FINAL_ONLY,
+            extra_args=extra_args,
         )
 
     async def release_groups(self, group_ids: list[int]) -> None:
@@ -1798,10 +1895,14 @@ class EngineRequest:
     arrival_time: float
     """Rank 0's `time.time()` in `generate`; vLLM breaks priority ties by it and measures TTFT from it.
     All TP ranks pass this one value, so they order ties the same way even if their clocks differ."""
+    kv_transfer_params: dict[str, Any] | None = None
+    """Decode generators only: where the prompt's KV lives, from the prefill generator."""
+    prefill_min_policy_version: int | None = None
+    """Decode generators only: the oldest policy version the prefill generator's KV can come from."""
     min_policy_version: int = field(init=False)
     """Oldest policy version this request's KV can come from; rank 0 sets it at admission.
-    Without a KV reset on model state dict load it is the group's pinned version and salts the
-    prefix cache."""
+    Without a KV reset on model state dict load it is the group's pinned version (or the prefill
+    generator's, if older) and salts the prefix cache."""
 
 
 @dataclass(kw_only=True, slots=True)

@@ -81,6 +81,10 @@ class Completion:
     """Per-generation metrics measured by the generator (latencies); the
     controller attaches them to the rollout turn."""
 
+    kv_transfer_params: dict[str, Any] | None = None
+    """Set only by a prefill generator: where the prompt's KV lives, for the decode generator.
+    That completion's one token and its logprob are discarded."""
+
 
 class GenerateFn(Protocol):
     """Generate one model completion for a prompt.

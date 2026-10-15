@@ -8,6 +8,7 @@ import asyncio
 
 import pytest
 
+from torchtitan.rl.rollout.types import Completion
 from torchtitan.rl.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.routing.strategies import (
     LeastLoadedRoutingStrategy,
@@ -66,13 +67,16 @@ class _Actor:
         return 1
 
 
-def _router(actors, *, strategy=None, hot_swap=False) -> InterGeneratorRouter:
+def _router(
+    actors, *, strategy=None, hot_swap=False, prefill_actors=()
+) -> InterGeneratorRouter:
     return InterGeneratorRouter(
         InterGeneratorRouter.Config(
             strategy=strategy or LeastLoadedRoutingStrategy.Config(),
             hot_swap=hot_swap,
         ),
         generators=actors,
+        prefill_generators=prefill_actors,
     )
 
 
@@ -402,6 +406,132 @@ def test_session_release_reaches_only_its_pinned_generator():
 
         assert actors[0].release_sessions.calls == [((["s0"],), {})]
         assert actors[1].release_sessions.calls == []
+
+    asyncio.run(_run())
+
+
+def _completion(
+    metric, *, min_version, max_version, kv_transfer_params=None, finish_reason="stop"
+):
+    return Completion(
+        min_policy_version=min_version,
+        max_policy_version=max_version,
+        request_id="r0",
+        token_ids=[1],
+        token_logprobs=[-0.5],
+        finish_reason=finish_reason,
+        metrics=[metric],
+        kv_transfer_params=kv_transfer_params,
+    )
+
+
+def test_prefill_generator_hands_the_prompt_kv_to_a_decode_generator():
+    """The decode hop gets the prefill handle and version; the completion spans both hops."""
+
+    async def _run():
+        prefill, decode = _Actor("prefill"), _Actor("decode")
+        handle = {"remote_block_ids": [[3, 4]]}
+        prefill.generate.value = _completion(
+            "prefill metric", min_version=4, max_version=6, kv_transfer_params=handle
+        )
+        decode.generate.value = _completion(
+            "decode metric", min_version=4, max_version=5
+        )
+        router = _router([decode], prefill_actors=[prefill])
+
+        request = dict(request_id="r0", group_id=3, routing_session_id=None)
+        completion = await router._prefill_then_decode(
+            [7, 8], metrics_prefix="generator", routing_ctx=RoutingContext(), **request
+        )
+
+        assert prefill.generate.calls == [
+            (([7, 8],), {"metrics_prefix": "generator/prefill", **request})
+        ]
+        assert decode.generate.calls == [
+            (
+                ([7, 8],),
+                {
+                    "metrics_prefix": "generator",
+                    "kv_transfer_params": handle,
+                    "prefill_min_policy_version": 4,
+                    **request,
+                },
+            )
+        ]
+        assert completion.max_policy_version == 6
+        assert completion.metrics == ["decode metric", "prefill metric"]
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_params, decode_finish_reason, match",
+    [
+        (None, "stop", "returned no KV handle"),
+        ({"remote_block_ids": [[3]]}, "error", "KV pull failed"),
+    ],
+    ids=["no-kv-handle", "failed-pull"],
+)
+def test_prefill_then_decode_raises_instead_of_returning_an_empty_turn(
+    kv_transfer_params, decode_finish_reason, match
+):
+    async def _run():
+        prefill, decode = _Actor("prefill"), _Actor("decode")
+        prefill.generate.value = _completion(
+            "m", min_version=1, max_version=1, kv_transfer_params=kv_transfer_params
+        )
+        decode.generate.value = _completion(
+            "m", min_version=1, max_version=1, finish_reason=decode_finish_reason
+        )
+        router = _router([decode], prefill_actors=[prefill])
+        with pytest.raises(RuntimeError, match=match):
+            await router._prefill_then_decode(
+                [7], metrics_prefix="generator", routing_ctx=RoutingContext()
+            )
+
+    asyncio.run(_run())
+
+
+def test_prefill_and_decode_pools_each_pin_a_session_and_release_it():
+    """A session sticks to one prefill and one decode generator; release and pulls reach both."""
+
+    async def _run():
+        prefill = [_Actor("prefill0"), _Actor("prefill1")]
+        decode = [_Actor("decode0"), _Actor("decode1")]
+        for actor in prefill + decode:
+            actor.generate.value = _completion(
+                actor.generate.value,
+                min_version=1,
+                max_version=1,
+                kv_transfer_params={"remote_block_ids": [[3]]},
+            )
+        router = _router(
+            decode,
+            prefill_actors=prefill,
+            strategy=StickySessionRoutingStrategy.Config(),
+            hot_swap=True,
+        )
+        for _ in range(2):
+            await router._prefill_then_decode(
+                [7],
+                metrics_prefix="generator",
+                routing_ctx=RoutingContext(session_id="s0"),
+            )
+        assert [len(actor.generate.calls) for actor in prefill + decode] == [2, 0, 2, 0]
+
+        await router._release_session(session_id="s0")
+        assert [actor.release_sessions.calls for actor in prefill + decode] == [
+            [((["s0"],), {})],
+            [],
+            [((["s0"],), {})],
+            [],
+        ]
+
+        await router._pull_model_state_dict(policy_version=3)
+        assert all(
+            actor.load_model_state_dict.calls == [((3,), {})]
+            for actor in prefill + decode
+        )
 
     asyncio.run(_run())
 

@@ -76,6 +76,7 @@ class _FakeConfig:
         parallelism=None, cuda_graph=VLLMCudaGraphConfig(mode="NONE")
     )
     num_generators = 1
+    num_prefill_generators = 0
 
     @property
     def __class__(self):
@@ -179,13 +180,17 @@ def stub_mesh_provisioning(monkeypatch):
     monkeypatch.setattr(train, "_compute_trainer_world_size", lambda p: 1)
     monkeypatch.setattr(train, "_compute_generator_world_size", lambda p: 1)
 
+    calls = []
+
     def _spawn_proc_mesh(*args, num_generators=1, **kwargs):
+        calls.append(kwargs)
         return (
             "trainer_mesh",
             [f"generator_mesh_{idx}" for idx in range(num_generators)],
         )
 
     monkeypatch.setattr(train, "spawn_proc_mesh", _spawn_proc_mesh)
+    return calls
 
 
 def test_main_shuts_down_after_success(monkeypatch, stub_mesh_provisioning):
@@ -199,6 +204,23 @@ def test_main_shuts_down_after_success(monkeypatch, stub_mesh_provisioning):
     assert trainer.events == ["setup", "train", "close"]
     assert trainer.setup_trainer_mesh == "trainer_mesh"
     assert trainer.setup_generator_meshes == ["generator_mesh_0"]
+
+
+@pytest.mark.parametrize("num_prefill_generators", [0, 1])
+def test_main_launches_prefill_generators_with_kv_transfer_env(
+    monkeypatch, stub_mesh_provisioning, num_prefill_generators
+):
+    _FakeConfigLoader.config = _FakeConfig(
+        num_generators=2, num_prefill_generators=num_prefill_generators
+    )
+    _FakeController.instances = []
+    monkeypatch.setattr(train, "ConfigLoader", _FakeConfigLoader)
+
+    asyncio.run(train.main())
+
+    (kwargs,) = stub_mesh_provisioning
+    assert kwargs["generators_see_each_other"] is bool(num_prefill_generators)
+    assert (kwargs["generator_env"] is not None) == bool(num_prefill_generators)
 
 
 def test_main_passes_configured_num_generators(monkeypatch, stub_mesh_provisioning):
@@ -450,6 +472,33 @@ def test_spawn_proc_mesh_gives_roles_sharing_a_host_mesh_disjoint_gpus(
 
     assert mesh_a.visible_devices == ["0,1", "2", "3"]
     assert mesh_b.visible_devices == ["0", "1", "2", "3"]
+
+
+def test_spawn_proc_mesh_lets_generators_see_each_other(
+    bootstrap_cmd_returns_env, monkeypatch
+):
+    """Generators list each other's GPUs after their own; the trainer's stay hidden."""
+    mesh = _FakeHostMesh()
+    with pytest.raises(ValueError, match="needs host_meshes=None"):
+        train.spawn_proc_mesh(
+            trainer_world_size=1,
+            per_generator_world_size=1,
+            host_meshes=train.HostMeshes(
+                trainer=mesh, generators=[mesh, mesh], gpus_per_node=4
+            ),
+            num_generators=2,
+            generators_see_each_other=True,
+        )
+
+    single_host = _FakeHostMesh()
+    monkeypatch.setattr(train, "this_host", lambda: single_host)
+    train.spawn_proc_mesh(
+        trainer_world_size=1,
+        per_generator_world_size=1,
+        num_generators=3,
+        generators_see_each_other=True,
+    )
+    assert single_host.visible_devices == ["0", "1,2,3", "2,1,3", "3,1,2"]
 
 
 @pytest.mark.parametrize(
