@@ -29,6 +29,7 @@ from torchtitan.rl.examples.verifiers.data import (
     VerifiersTaskDataset,
     VerifiersTaskSample,
 )
+from torchtitan.rl.examples.verifiers.env_client import NumpyEnvClient
 from torchtitan.rl.examples.verifiers.env_server import VerifiersEnvServer
 from torchtitan.rl.examples.verifiers.generation_server import (
     GenerationServer,
@@ -258,7 +259,7 @@ class VerifiersRollouter(Rollouter):
         verifiers_env_client = None
         try:
             await generation_server.start()
-            verifiers_env_client = VerifiersEnvClient(verifiers_server_address)
+            verifiers_env_client = NumpyEnvClient(verifiers_server_address)
             await verifiers_env_client.wait_for_server_startup(
                 timeout=self._verifiers_config.connection_timeout_sec
             )
@@ -285,7 +286,7 @@ class VerifiersRollouter(Rollouter):
         # Extra validation sets: one EnvServer each, sharing the generation server.
         for name, env_server in self._extra_env_servers.items():
             address = await env_server.start()
-            client = VerifiersEnvClient(address)
+            client = NumpyEnvClient(address)
             self._extra_env_clients[name] = client
             await client.wait_for_server_startup(
                 timeout=self._verifiers_config.connection_timeout_sec
