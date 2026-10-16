@@ -228,7 +228,7 @@ def test_verifiers_rollouter_sends_muse_glimmer_renderer_config(monkeypatch) -> 
     )
     env_client = SimpleNamespace(wait_for_server_startup=AsyncMock(), close=AsyncMock())
     monkeypatch.setattr(
-        "torchtitan.rl.examples.verifiers.rollouter.VerifiersEnvClient",
+        "torchtitan.rl.examples.verifiers.rollouter.NumpyEnvClient",
         lambda _: env_client,
     )
 

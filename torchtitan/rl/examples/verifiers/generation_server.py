@@ -12,6 +12,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
+import numpy as np
 from aiohttp import web
 
 from torchtitan.config import Configurable
