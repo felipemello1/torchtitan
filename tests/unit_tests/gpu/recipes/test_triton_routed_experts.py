@@ -17,9 +17,14 @@ import torch
 from torch.nn import init
 
 from torchtitan.distributed.local_compile import apply_local_compile
-from torchtitan.models.common.config_utils import make_routed_experts_config
+from torchtitan.models.common.activation import Softmax
+from torchtitan.models.common.config_utils import (
+    make_routed_experts_config,
+    make_router_config,
+)
 from torchtitan_recipes.overrides.triton_routed_experts import (
     triton_routed_experts,
+    triton_topk_router,
 )
 
 _DIM, _HIDDEN, _E, _K = 1024, 256, 16, 4
@@ -87,7 +92,8 @@ def _rel(actual: torch.Tensor, expected: torch.Tensor) -> float:
 class TestTritonRoutedExperts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        apply_local_compile(["fused_binary_activation"])  # as the trainer runs it
+        # The trainer and the stock generator run these regions compiled.
+        apply_local_compile(["fused_binary_activation", "moe_dispatch", "moe_combine"])
         cls.stock, cls.triton_experts = _build_pair()
 
     def test_matches_fp64_at_least_as_well_as_stock(self):
@@ -108,7 +114,7 @@ class TestTritonRoutedExperts(unittest.TestCase):
                 self.assertLess(_rel(triton_out, expected), 5e-3)
 
     def test_cuda_graph_replay_matches_eager_bitwise(self):
-        for num_tokens in (37, 1500):
+        for num_tokens in (8, 37, 1500):
             with self.subTest(num_tokens=num_tokens):
                 routing = _routing(num_tokens, seed=2)
                 with torch.no_grad():
@@ -150,11 +156,100 @@ class TestTritonRoutedExperts(unittest.TestCase):
                     expected = self.stock._expert_mlp(x_RD, offsets_E)
                 self.assertTrue(torch.equal(actual, expected))
 
+    def test_routed_experts_match_stock_bitwise(self):
+        """The EP=1 path equals the stock compiled path bitwise at decode and prefill.
+
+        A Triton or Inductor change that alters either side's rounding fails here.
+        """
+        for num_tokens in (37, 1500):
+            with self.subTest(num_tokens=num_tokens):
+                routing = _routing(num_tokens, seed=6)
+                with torch.no_grad():
+                    actual = self.triton_experts(*routing)
+                    expected = self.stock(*routing)
+                self.assertTrue(torch.equal(actual, expected))
+
+    def test_counts_left_to_the_kernels(self):
+        """On the EP=1 path the kernels count the ids themselves, so MoE skips the count."""
+        for num_tokens in (37, 1500):
+            with self.subTest(num_tokens=num_tokens):
+                x_TD, scores_TK, ids_TK, counts_E = _routing(num_tokens, seed=5)
+                routing_map_TE = torch.zeros(
+                    num_tokens, _E, dtype=torch.bool, device="cuda"
+                )
+                routing_map_TE.scatter_(1, ids_TK, True)
+                with torch.no_grad():
+                    self.assertIsNone(self.triton_experts.count_tokens(routing_map_TE))
+                    expected = self.triton_experts(x_TD, scores_TK, ids_TK, counts_E)
+                    actual = self.triton_experts(x_TD, scores_TK, ids_TK, None)
+                self.assertTrue(torch.equal(actual, expected))
+
     def test_grad_enabled_takes_stock_path(self):
         routing = _routing(37, seed=4)
         self.assertTrue(
             torch.equal(self.triton_experts(*routing), self.stock(*routing))
         )
+
+
+class TestTritonTopKRouter(unittest.TestCase):
+    def test_matches_stock_router_with_ties(self):
+        cfg = make_router_config(
+            dim=_DIM,
+            num_experts=256,
+            gate_param_init={"weight": partial(init.trunc_normal_, std=0.02)},
+            score_func=Softmax.Config(),
+            top_k=8,
+            route_norm=True,
+        )
+        with torch.device("cuda"):
+            stock, fused = cfg.build().eval(), triton_topk_router(cfg).build().eval()
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        # Integer logits: many exact ties, which must go to the lower expert id.
+        gate_TE = torch.randint(0, 6, (300, 256), device="cuda", generator=gen).float()
+        with torch.no_grad():
+            _, scores, ids, routing_map = stock._score_and_select_experts(
+                gate_TE, None, padding_mask_T=None
+            )
+            _, f_scores, f_ids, f_routing_map = fused._score_and_select_experts(
+                gate_TE, None, padding_mask_T=None
+            )
+        self.assertTrue(torch.equal(f_ids, ids))
+        self.assertTrue(torch.equal(f_routing_map, routing_map))
+        torch.testing.assert_close(f_scores, scores, rtol=1e-6, atol=0)
+
+    def test_gate_gemv_matches_cublas(self):
+        cfg = make_router_config(
+            dim=_DIM,
+            num_experts=256,
+            gate_param_init={"weight": partial(init.trunc_normal_, std=0.02)},
+            score_func=Softmax.Config(),
+        )
+        with torch.device("cuda"):
+            gate = triton_topk_router(cfg).build().gate.bfloat16()
+        for num_tokens in (1, 8, 9):  # 9: the stock GEMM
+            x_TD = torch.randn(num_tokens, _DIM, device="cuda", dtype=torch.bfloat16)
+            with torch.no_grad():
+                expected = torch.mm(x_TD, gate.weight.T, out_dtype=torch.float32)
+                torch.testing.assert_close(gate(x_TD), expected, rtol=1e-5, atol=1e-5)
+
+    def test_match_trainer_bitwise(self):
+        """The opt-in GEMV equals cuBLAS bitwise at <= 8 rows, as the trainer runs it."""
+        cfg = make_router_config(
+            dim=_DIM,
+            num_experts=256,
+            gate_param_init={"weight": partial(init.trunc_normal_, std=0.02)},
+            score_func=Softmax.Config(),
+        )
+        with torch.device("cuda"):
+            router = triton_topk_router(cfg, match_trainer_bitwise=True).build()
+        gate = router.gate.bfloat16()
+        x_TD = torch.randn(2048, _DIM, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            expected = torch.mm(x_TD, gate.weight.T, out_dtype=torch.float32)
+            for num_tokens in (1, 8, 9):
+                self.assertTrue(
+                    torch.equal(gate(x_TD[:num_tokens]), expected[:num_tokens])
+                )
 
 
 if __name__ == "__main__":

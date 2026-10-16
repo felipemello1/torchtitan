@@ -6,17 +6,19 @@
 
 # pyrefly: ignore-errors
 
-"""Triton grouped GEMMs for the routed experts' no-grad expert MLP (generation).
+"""Triton grouped GEMMs for the routed experts' no-grad forward (generation).
 
-One kernel, launched for w13 (+ SwiGLU on the fp32 accumulators) and for w2, on the
-dispatcher's expert-sorted rows; dispatch and combine are unchanged. Forwards with grad,
-batch-invariant mode and quantized expert linears keep the stock path.
+One kernel, launched for w13 (+ SwiGLU on the fp32 accumulators) and for w2. With any
+dispatcher it runs on the expert-sorted rows; with all experts local (EP=1) it reads the
+routes directly, so dispatch and the scatter go away and one kernel sums each token's
+routes. Forwards with grad, batch-invariant mode and quantized expert linears keep the
+stock path.
 
 Example:
     >>> cfg = triton_routed_experts(moe_cfg.routed_experts)  # or the override import
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import triton
@@ -25,11 +27,26 @@ from triton.language.extra import libdevice
 
 from torchtitan.config import derive, override
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
-from torchtitan.models.common.activation import SwiGLU
-from torchtitan.models.common.linear import GroupedLinear
-from torchtitan.models.common.moe import RoutedExperts
+from torchtitan.models.common.activation import Softmax, SwiGLU
+from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
+from torchtitan.models.common.linear import GroupedLinear, Linear
+from torchtitan.models.common.moe import RoutedExperts, TokenChoiceTopKRouter
+from torchtitan.models.common.token_dispatcher import (
+    AllToAllTokenDispatcher,
+    LocalTokenDispatcher,
+)
 
-__all__ = ["TritonRoutedExperts", "triton_expert_mlp_op", "triton_routed_experts"]
+__all__ = [
+    "TritonRoutedExperts",
+    "TritonGateLinear",
+    "TritonSmallLinear",
+    "TritonTopKRouter",
+    "triton_expert_mlp_op",
+    "triton_routed_experts",
+    "triton_routed_experts_op",
+    "triton_shared_expert_linears",
+    "triton_topk_router",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,12 +85,97 @@ def _load_weights(desc, offsets, evict_first, _semantic=None):
 
 
 @triton.jit
+def _count_routes_kernel(ids_ptr, counts_ptr, N, E: tl.constexpr, BLOCK: tl.constexpr):
+    """Add this block's routes per expert to ``counts``: one atomic per expert per block."""
+    routes = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = routes < N
+    experts = tl.load(ids_ptr + routes, mask=valid, other=0).to(tl.int32)
+    block_counts = tl.histogram(experts, E, mask=valid)
+    tl.atomic_add(
+        counts_ptr + tl.arange(0, E), block_counts, mask=block_counts > 0, sem="relaxed"
+    )
+
+
+@triton.jit
+def _route_scan_kernel(
+    ids_ptr,
+    rows_ptr,
+    offsets_ptr,
+    N,
+    num_experts,
+    E: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Program ``e`` writes expert ``e``'s routes to its rows, in route order, and its end row."""
+    expert = tl.program_id(0)
+    e = tl.arange(0, E)
+    counts = tl.zeros((E,), dtype=tl.int32)
+    for start in range(0, N, BLOCK):
+        routes = start + tl.arange(0, BLOCK)
+        experts = tl.load(ids_ptr + routes, mask=routes < N, other=0).to(tl.int32)
+        counts += tl.histogram(experts, E, mask=routes < N)
+    row = tl.sum(tl.where(e < expert, counts, 0), axis=0)
+    tl.store(
+        offsets_ptr + expert, row + tl.sum(tl.where(e == expert, counts, 0), axis=0)
+    )
+    for start in range(0, N, BLOCK):
+        routes = start + tl.arange(0, BLOCK)
+        mine = (tl.load(ids_ptr + routes, mask=routes < N, other=-1) == expert).to(
+            tl.int32
+        )
+        tl.store(
+            rows_ptr + row + tl.cumsum(mine, axis=0) - mine, routes, mask=mine == 1
+        )
+        row += tl.sum(mine, axis=0)
+
+
+@triton.jit
+def _route_sorted_kernel(
+    ids_ptr, counts_ptr, fill_ptr, rows_ptr, offsets_ptr, N, num_experts,
+    E: tl.constexpr, BLOCK: tl.constexpr,
+):  # fmt: skip
+    """Give each route a row of its expert; rows of one expert end up in any order.
+
+    Each program sorts its BLOCK routes by expert, ranks them inside the block, and takes
+    one ``atomic_add`` per expert for the block's first row (one atomic per route contends
+    on the 256 counters). The order doesn't change any result: each GEMM output row depends
+    only on its own input row.
+    """
+    e = tl.arange(0, E)
+    counts = tl.load(counts_ptr + e, mask=e < num_experts, other=0).to(tl.int32)
+    row_end = tl.cumsum(counts, axis=0)
+    if tl.program_id(0) == 0:
+        tl.store(offsets_ptr + e, row_end, mask=e < num_experts)
+    i = tl.arange(0, BLOCK)
+    routes = tl.program_id(0) * BLOCK + i
+    # Padding routes get expert E, so they sort last and land in the unused bins >= E.
+    experts = tl.load(ids_ptr + routes, mask=routes < N, other=E).to(tl.int32)
+    sorted_keys = tl.sort((experts << 16) | i)
+    experts = sorted_keys >> 16
+    routes = tl.program_id(0) * BLOCK + (sorted_keys & 0xFFFF)
+    bins = tl.arange(0, 2 * E)
+    block_counts = tl.where(bins < E, tl.histogram(experts, 2 * E), 0)
+    block_start = tl.cumsum(block_counts, axis=0) - block_counts
+    block_row0 = tl.atomic_add(
+        fill_ptr + bins, block_counts, mask=block_counts > 0, sem="relaxed"
+    )
+    row = (
+        tl.gather(row_end - counts, tl.minimum(experts, E - 1), axis=0)
+        + tl.gather(block_row0, experts, axis=0)
+        + i
+        - tl.gather(block_start, experts, axis=0)
+    )
+    tl.store(rows_ptr + row, routes, mask=experts < E)
+
+
+@triton.jit
 def _grouped_gemm_kernel(
     a_ptr,
     a_desc,
     w_desc,
     out_ptr,
     offsets_ptr,
+    routes_ptr,
     num_experts,
     stride_a,
     E: tl.constexpr,
@@ -81,6 +183,8 @@ def _grouped_gemm_kernel(
     N_OUT: tl.constexpr,
     GATED: tl.constexpr,
     TMA_A: tl.constexpr,
+    ROUTES: tl.constexpr,
+    TOP_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -92,12 +196,13 @@ def _grouped_gemm_kernel(
 
     Each loop step computes one (block of BLOCK_M rows of one expert, N tile); it finds the
     block's expert from ``offsets``, so nothing writes a schedule.
-
     GATED (w13, weight (E, 2, F, D)): ``out = silu(a @ Wg.T) * (a @ Wu.T)``; a tile's gate
     and up rows load as one TMA box, so one MMA computes both.
     Else (w2, weight (E, D, F)): ``out = a @ W.T``.
     TMA_A: load a block's rows of ``a`` with one TMA box (rows past the expert are masked
     at the store); else with masked pointer loads.
+    ROUTES (EP=1): expert-sorted row ``i`` holds route ``routes[i] = token * TOP_K + k``;
+    w13 reads ``a`` (x) at the route's token, and w2 writes ``out`` (y) at the route.
     """
     BLOCK_OUT: tl.constexpr = BLOCK_N // 2 if GATED else BLOCK_N
     n_tiles: tl.constexpr = N_OUT // BLOCK_OUT
@@ -129,11 +234,19 @@ def _grouped_gemm_kernel(
         first_row += block_in_expert * BLOCK_M
         rows = first_row + tl.arange(0, BLOCK_M)
         valid = rows < tl.sum(tl.where(is_expert, row_end, 0), axis=0)
+        a_rows = rows
+        out_rows = rows
+        if ROUTES:
+            routes = tl.load(routes_ptr + rows, mask=valid, other=0)
+            if GATED:
+                a_rows = routes // TOP_K
+            else:
+                out_rows = routes
         # Main loop over K.
         out0 = (tile % n_tiles) * BLOCK_OUT
         a_ptrs = (
             a_ptr
-            + rows[:, None].to(tl.int64) * stride_a
+            + a_rows[:, None].to(tl.int64) * stride_a
             + tl.arange(0, BLOCK_K)[None, :]
         )
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -160,7 +273,7 @@ def _grouped_gemm_kernel(
             up = up.to(tl.bfloat16).to(tl.float32)
             acc = gate / (1.0 + libdevice.exp(-gate)) * up
         cols = out0 + tl.arange(0, BLOCK_OUT)
-        out_ptrs = out_ptr + rows[:, None].to(tl.int64) * N_OUT + cols[None, :]
+        out_ptrs = out_ptr + out_rows[:, None].to(tl.int64) * N_OUT + cols[None, :]
         tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=valid[:, None])
 
 
@@ -172,7 +285,7 @@ def _tiles(num_rows: int, num_experts: int) -> _Tiles:
     return _SMALL_TILES if num_rows < _SMALL_ROWS else _DECODE_TILES
 
 
-def _launch_gemm(a, w, out, offsets_E, tiles, gated):
+def _launch_gemm(a, w, out, offsets_E, tiles, gated, routes_N=None, top_k=None):
     from triton.tools.tensor_descriptor import TensorDescriptor
 
     num_experts, n_out = w.shape[0], out.shape[1]
@@ -196,9 +309,9 @@ def _launch_gemm(a, w, out, offsets_E, tiles, gated):
         max_blocks = num_rows // tiles.block_m + min(num_rows, num_experts)
         grid = max_blocks * (n_out // (block_n // 2 if gated else block_n))
     _grouped_gemm_kernel[(grid,)](
-        a, a_desc, w_desc, out, offsets_E, num_experts, a.stride(0),
+        a, a_desc, w_desc, out, offsets_E, routes_N, num_experts, a.stride(0),
         E=triton.next_power_of_2(num_experts), KDIM=a.shape[1], N_OUT=n_out,
-        GATED=gated, TMA_A=tma_a, BLOCK_M=tiles.block_m, BLOCK_N=block_n,
+        GATED=gated, TMA_A=tma_a, ROUTES=routes_N is not None, TOP_K=top_k, BLOCK_M=tiles.block_m, BLOCK_N=block_n,
         BLOCK_K=block_k, STAGES=stages, PERSISTENT=tiles.persistent,
         EVICT_W=tiles is not _SMALL_TILES and (gated or tiles is not _PREFILL_TILES),
         num_warps=warps,
@@ -239,6 +352,92 @@ def _(routed_input_RD, offsets_E, w13_E2FD, w2_EDF):
     return routed_input_RD.new_empty(routed_input_RD.shape[0], w2_EDF.shape[1])
 
 
+@triton.jit
+def _combine_kernel(
+    y_ptr, scores_ptr, out_ptr, D: tl.constexpr, K: tl.constexpr, BLOCK_D: tl.constexpr
+):
+    """``out[t] = sum_k score[t, k] * y[t * K + k]`` in fp32, one rounding."""
+    tl.extra.cuda.gdc_wait()  # y comes from the w2 kernel (programmatic dependent launch)
+    token = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    for k in tl.static_range(K):
+        score = tl.load(scores_ptr + token * K + k).to(tl.float32)
+        y = tl.load(y_ptr + (token * K + k).to(tl.int64) * D + cols).to(tl.float32)
+        # The trainer's compiled gather-sum rounds as y0*s0 + y1*s1, then one fma per
+        # route; the same order makes the outputs bitwise equal.
+        if k == 0:
+            acc = libdevice.mul_rn(y, score)
+        elif k == 1:
+            acc = libdevice.add_rn(acc, libdevice.mul_rn(y, score))
+        else:
+            acc = tl.fma(y, score, acc)
+    tl.store(out_ptr + token.to(tl.int64) * D + cols, acc.to(out_ptr.dtype.element_ty))
+
+
+@torch.library.custom_op("torchtitan::triton_routed_experts", mutates_args=())
+def triton_routed_experts_op(
+    x_TD: torch.Tensor,
+    topk_scores_TK: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
+    w13_E2FD: torch.Tensor,
+    w2_EDF: torch.Tensor,
+) -> torch.Tensor:
+    """EP=1 routed-experts output ``(T, D)``: each token's ``K`` routes, weighted by their scores.
+
+    Example:
+        >>> out_TD = triton_routed_experts_op(x_TD, scores_TK, ids_TK, w13, w2)
+    """
+    num_tokens, dim = x_TD.shape
+    top_k = topk_expert_ids_TK.shape[1]
+    num_experts, _, hidden, _ = w13_E2FD.shape
+    num_routes = num_tokens * top_k
+    ids_N = topk_expert_ids_TK.reshape(-1)
+    routes_N = x_TD.new_empty(num_routes, dtype=torch.int32)
+    offsets_E = x_TD.new_empty(num_experts, dtype=torch.int32)
+    experts_p2 = triton.next_power_of_2(num_experts)
+    tiles = _tiles(num_routes, num_experts)
+    h_NF = x_TD.new_empty(num_routes, hidden)
+    y_ND = x_TD.new_empty(num_routes, dim)
+    out_TD = torch.empty_like(x_TD)
+    block_d = 1024 if num_tokens >= 1024 and dim % 1024 == 0 else 256
+    if tiles.persistent:
+        # One zeroed buffer: the per-expert row counters, then the counts.
+        zeros = torch.zeros(3 * experts_p2, dtype=torch.int32, device=x_TD.device)
+        fill, counts_E = zeros[: 2 * experts_p2], zeros[2 * experts_p2 :]
+        _count_routes_kernel[(triton.cdiv(num_routes, 512),)](
+            ids_N, counts_E, num_routes, E=experts_p2, BLOCK=512
+        )
+        _route_sorted_kernel[(triton.cdiv(num_routes, 512),)](
+            ids_N, counts_E, fill, routes_N, offsets_E, num_routes,
+            num_experts, E=experts_p2, BLOCK=512,
+        )  # fmt: skip
+    else:
+        _route_scan_kernel[(num_experts,)](
+            ids_N, routes_N, offsets_E, num_routes, num_experts,
+            E=experts_p2, BLOCK=min(triton.next_power_of_2(num_routes), 2048),
+        )  # fmt: skip
+    _launch_gemm(
+        x_TD,
+        w13_E2FD,
+        h_NF,
+        offsets_E,
+        tiles,
+        gated=True,
+        routes_N=routes_N,
+        top_k=top_k,
+    )
+    _launch_gemm(h_NF, w2_EDF, y_ND, offsets_E, tiles, gated=False, routes_N=routes_N)
+    _combine_kernel[(num_tokens, dim // block_d)](
+        y_ND, topk_scores_TK, out_TD, D=dim, K=top_k, BLOCK_D=block_d, launch_pdl=True
+    )
+    return out_TD
+
+
+@triton_routed_experts_op.register_fake
+def _(x_TD, topk_scores_TK, topk_expert_ids_TK, w13_E2FD, w2_EDF):
+    return torch.empty_like(x_TD)
+
+
 def _local(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to_local() if hasattr(tensor, "to_local") else tensor
 
@@ -249,6 +448,65 @@ class TritonRoutedExperts(RoutedExperts):
     @dataclass(kw_only=True, slots=True)
     class Config(RoutedExperts.Config):
         pass
+
+    def forward(
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+        num_local_tokens_per_expert_E: torch.Tensor | None,
+        *,
+        padding_mask_T: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (
+            self._runs_ep1_path()
+            and x_TD.dtype == torch.bfloat16
+            and x_TD.shape[0] > 0
+            and x_TD.is_cuda
+            and x_TD.stride(-1) == 1
+        ):
+            # Padding rows are computed like real tokens, as on the stock path.
+            return triton_routed_experts_op(
+                x_TD,
+                topk_scores_TK,
+                topk_expert_ids_TK,
+                _local(self.w13.weight),
+                _local(self.w2.weight),
+            )
+        if num_local_tokens_per_expert_E is None:  # count_tokens left it to us
+            ids_N = topk_expert_ids_TK.reshape(-1)
+            num_local_tokens_per_expert_E = torch.zeros(
+                self.w13.weight.shape[0], dtype=torch.int64, device=ids_N.device
+            ).index_add_(0, ids_N, torch.ones_like(ids_N))
+        # Other dispatchers: their dispatch and combine around the Triton GEMMs.
+        return super().forward(
+            x_TD,
+            topk_scores_TK,
+            topk_expert_ids_TK,
+            num_local_tokens_per_expert_E,
+            padding_mask_T=padding_mask_T,
+        )
+
+    def count_tokens(self, routing_map_TE: torch.Tensor) -> torch.Tensor | None:
+        if self._runs_ep1_path():
+            return None  # the EP=1 kernels count the expert ids themselves
+        return super().count_tokens(routing_map_TE)
+
+    def _runs_ep1_path(self) -> bool:
+        return (
+            self._all_experts_local()
+            and self.output_postprocess is None
+            and self._can_run_triton(_local(self.w13.weight), _local(self.w2.weight))
+        )
+
+    def _all_experts_local(self) -> bool:
+        dispatcher = self.token_dispatcher
+        if type(dispatcher) is LocalTokenDispatcher:
+            return True
+        # Without an EP mesh, the all-to-all dispatcher only reorders tokens locally.
+        return type(dispatcher) is AllToAllTokenDispatcher and (
+            dispatcher.ep_mesh is None or dispatcher.ep_mesh.size() == 1
+        )
 
     def _expert_mlp(
         self, routed_input_RD: torch.Tensor, offsets_E: torch.Tensor
@@ -289,3 +547,202 @@ class TritonRoutedExperts(RoutedExperts):
 )
 def triton_routed_experts(cfg: RoutedExperts.Config) -> TritonRoutedExperts.Config:
     return derive(cfg, TritonRoutedExperts.Config)
+
+
+@triton.jit
+def _route_topk_kernel(
+    gate_ptr, bias_ptr, ids_ptr, scores_ptr, map_ptr, eps, scale,
+    E: tl.constexpr, K: tl.constexpr, HAS_BIAS: tl.constexpr, NORM: tl.constexpr,
+):  # fmt: skip
+    """Per token: softmax, top-K by argmax rounds (ties to the lower id), normalize."""
+    t = tl.program_id(0).to(tl.int64)
+    e = tl.arange(0, E)
+    k = tl.arange(0, K)
+    x = tl.load(gate_ptr + t * E + e)
+    p = libdevice.exp(x - tl.max(x, axis=0))
+    scores = p / tl.sum(p, axis=0)
+    choice = scores + tl.load(bias_ptr + e) if HAS_BIAS else scores
+    ids = tl.zeros((K,), tl.int32)
+    picked = tl.zeros((K,), tl.float32)
+    for i in tl.static_range(K):
+        top = tl.argmax(choice, axis=0, tie_break_left=True)
+        ids = tl.where(k == i, top, ids)
+        score = tl.sum(tl.where(e == top, scores, 0.0), axis=0)
+        picked = tl.where(k == i, score, picked)
+        choice = tl.where(e == top, float("-inf"), choice)
+    if NORM:
+        picked = picked / (tl.sum(picked, axis=0) + eps)
+    tl.store(ids_ptr + t * K + k, ids.to(tl.int64))
+    tl.store(scores_ptr + t * K + k, picked * scale)
+    tl.store(map_ptr + t * E + e, choice == float("-inf"))
+
+
+@triton.jit
+def _gate_gemv_kernel(
+    x_ptr, w_ptr, out_ptr, T, D, E, BLOCK_T: tl.constexpr, BLOCK_K: tl.constexpr
+):
+    """Program ``e``: fp32 ``out[:, e] = x @ w[e]`` over all of ``D`` (no split-K)."""
+    e = tl.program_id(0)
+    t = tl.arange(0, BLOCK_T)
+    acc = tl.zeros((BLOCK_T,), tl.float32)
+    for k0 in range(0, D, BLOCK_K):
+        k = k0 + tl.arange(0, BLOCK_K)
+        mask = (t[:, None] < T) & (k[None, :] < D)
+        x = tl.load(x_ptr + t[:, None] * D + k[None, :], mask=mask, other=0.0)
+        w = tl.load(w_ptr + e * D + k, mask=k < D, other=0.0)
+        acc += tl.sum(x.to(tl.float32) * w.to(tl.float32)[None, :], axis=1)
+    tl.store(out_ptr + t * E + e, acc, mask=t < T)
+
+
+@triton.jit
+def _dot_gemv_kernel(
+    x_ptr, w_ptr, out_ptr, T, D: tl.constexpr, N: tl.constexpr,
+    BLOCK_T: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    STAGES: tl.constexpr,
+):  # fmt: skip
+    """``out[:, n] = x @ w[n]`` for BLOCK_N columns per program: a tensor-core MMA over K
+    in order, so each row equals the trainer's cuBLAS GEMM bitwise at any M."""
+    cols = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    t = tl.arange(0, BLOCK_T)
+    acc = tl.zeros((BLOCK_T, BLOCK_N), tl.float32)
+    for k0 in tl.range(0, D, BLOCK_K, num_stages=STAGES):
+        k = k0 + tl.arange(0, BLOCK_K)
+        x = tl.load(x_ptr + t[:, None] * D + k[None, :], mask=t[:, None] < T, other=0.0)
+        acc = tl.dot(x, tl.load(w_ptr + cols[:, None] * D + k[None, :]).T, acc)
+    out_ptrs = out_ptr + t[:, None] * N + cols[None, :]
+    tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=t[:, None] < T)
+
+
+class _SmallRowsGemv:
+    """Linear mixin: no-grad, bias-free projections of <= ``max_rows`` rows in one
+    Triton kernel (cuBLAS runs split-K GEMMs plus reduces, or slow GEMMs, there).
+    Output is fp32 for HiMidLoLinear, else the input dtype.
+    ``match_trainer_bitwise``: a tensor-core GEMV that equals cuBLAS bitwise at any
+    batch size, as the trainer runs it (~1-2 µs slower); else a faster dot-product
+    GEMV that differs in fp32 summation order."""
+
+    max_rows = 8
+    match_trainer_bitwise = False
+
+    def _linear(self, input, weight, bias):
+        local_OD = _local(weight).reshape(-1, weight.shape[-1])
+        (num_out, dim), block_k = local_OD.shape, 512
+        bitwise = self.match_trainer_bitwise
+        if (
+            torch.is_grad_enabled()
+            or bias is not None
+            or input.dim() != 2
+            or input.shape[0] > self.max_rows
+            or (bitwise and (num_out % 16 or dim % block_k))
+        ):
+            return super()._linear(input, weight, bias)
+        dtype = torch.float32 if isinstance(self, HiMidLoLinear) else input.dtype
+        out = input.new_empty(input.shape[0], num_out, dtype=dtype)
+        input, local_OD = input.contiguous(), local_OD.contiguous()
+        if bitwise:
+            _dot_gemv_kernel[(num_out // 16,)](
+                input, local_OD, out, input.shape[0], D=dim, N=num_out, BLOCK_T=16,
+                BLOCK_N=16, BLOCK_K=block_k, STAGES=3, num_warps=2,
+            )  # fmt: skip
+        else:
+            _gate_gemv_kernel[(num_out,)](
+                input, local_OD, out, input.shape[0], dim, num_out,
+                BLOCK_T=triton.next_power_of_2(input.shape[0]),
+                BLOCK_K=min(triton.next_power_of_2(dim), 2048),
+            )  # fmt: skip
+        return out
+
+
+class TritonGateLinear(_SmallRowsGemv, HiMidLoLinear):
+    """Router gate with ``_SmallRowsGemv``."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(HiMidLoLinear.Config):
+        match_trainer_bitwise: bool = False
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.match_trainer_bitwise = config.match_trainer_bitwise
+
+
+class TritonSmallLinear(_SmallRowsGemv, Linear):
+    """Linear with ``_SmallRowsGemv`` (the shared experts' w13 and gate).
+
+    Above two rows, its programs crowd the routed experts' GEMMs running beside it.
+    """
+
+    max_rows = 2
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Linear.Config):
+        match_trainer_bitwise: bool = False
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.match_trainer_bitwise = config.match_trainer_bitwise
+
+
+class TritonTopKRouter(TokenChoiceTopKRouter):
+    """``TokenChoiceTopKRouter`` with its no-grad softmax top-k as one Triton kernel."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(TokenChoiceTopKRouter.Config):
+        pass
+
+    def _score_and_select_experts(
+        self, gate_TE, expert_bias_E, *, padding_mask_T, **kwargs
+    ):
+        num_tokens, num_experts = gate_TE.shape
+        if (
+            torch.is_grad_enabled()
+            or self.training
+            or type(self.score_func) is not Softmax
+            or not gate_TE.is_cuda
+            or num_experts & (num_experts - 1)
+        ):
+            return super()._score_and_select_experts(
+                gate_TE, expert_bias_E, padding_mask_T=padding_mask_T, **kwargs
+            )
+        ids_TK = gate_TE.new_empty(num_tokens, self.top_k, dtype=torch.int64)
+        scores_TK = gate_TE.new_empty(num_tokens, self.top_k)
+        map_TE = gate_TE.new_empty(num_tokens, num_experts, dtype=torch.bool)
+        _route_topk_kernel[(num_tokens,)](
+            gate_TE, gate_TE if expert_bias_E is None else expert_bias_E, ids_TK,
+            scores_TK, map_TE, self.route_norm_epsilon, self.route_scale, E=num_experts,
+            K=self.top_k, HAS_BIAS=expert_bias_E is not None, NORM=self.route_norm,
+            num_warps=1,
+        )  # fmt: skip
+        # The full scores are only read by the auxiliary loss, in training.
+        return None, scores_TK, ids_TK, map_TE
+
+
+@override(
+    target=TokenChoiceTopKRouter.Config,
+    exact=True,
+    description="Run the no-grad softmax top-k router as one Triton kernel.",
+)
+def triton_topk_router(
+    cfg: TokenChoiceTopKRouter.Config, *, match_trainer_bitwise: bool = False
+) -> TokenChoiceTopKRouter.Config:
+    """``match_trainer_bitwise``: keep the stock compiled router, whose reductions are
+    batch-invariant, so scores equal the trainer's bitwise (~1-5 µs slower at decode)."""
+    gate = derive(
+        cfg.gate, TritonGateLinear.Config, match_trainer_bitwise=match_trainer_bitwise
+    )
+    if match_trainer_bitwise:
+        return replace(cfg, gate=gate)
+    return derive(cfg, TritonTopKRouter.Config, gate=gate)
+
+
+@override(
+    target=Linear.Config,
+    fqns=["*shared_experts.w13", "*shared_experts.gate"],
+    exact=True,
+    description="Run the shared experts' no-grad w13 and gate at <= 2 tokens in Triton.",
+)
+def triton_shared_expert_linears(
+    cfg: Linear.Config, *, match_trainer_bitwise: bool = False
+) -> TritonSmallLinear.Config:
+    return derive(
+        cfg, TritonSmallLinear.Config, match_trainer_bitwise=match_trainer_bitwise
+    )
