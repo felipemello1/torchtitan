@@ -74,7 +74,9 @@ def _bare_generator(
     generator = object.__new__(VLLMGenerator)
     generator.config = SimpleNamespace(
         reset_kv_cache_on_model_state_dict_load=reset_kv_cache_on_model_state_dict_load,
+        http=None,
     )
+    generator._http_server = None
     generator.policy_version = 0
     generator._group_min_policy_versions = {}
     generator._prefetched_model_state_dict = {}
@@ -637,6 +639,7 @@ def engine_thread(monkeypatch):
             sampling=SamplingConfig(stop_token_ids=[]),
             max_engine_steps_between_decisions=16,
             reset_kv_cache_on_model_state_dict_load=False,
+            http=None,
         )
         generator.policy_version = 0
         generator._rank = 0

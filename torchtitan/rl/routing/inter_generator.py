@@ -316,6 +316,13 @@ class InterGeneratorRouter(Actor, Configurable):
         await self._fanout("start_engine_loop")
 
     @concurrent_endpoint
+    async def http_urls(self) -> list[str | None]:
+        """Each generator's HTTP server address (None where it serves no HTTP), in order."""
+        return await asyncio.gather(
+            *[h.rank0_actor.http_url.call_one() for h in self._generators]
+        )
+
+    @concurrent_endpoint
     async def wait_engine_loop(self) -> None:
         """Wait until every generator rank's engine loop exits; raise as soon as one crashes."""
         await self._wait_engine_loop()

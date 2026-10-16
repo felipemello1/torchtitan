@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import enum
+import functools
 import gc
 import logging
 import math
@@ -57,6 +58,7 @@ from torchtitan.rl.generator.vllm.stat_logger import (
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.types import Completion
 from torchtitan.rl.routing.intra_generator import IntraGeneratorRouter
+from torchtitan.rl.serving.http_server import VLLMHttpServer
 from torchtitan.tools.utils import has_cuda_capability
 
 logger = logging.getLogger(__name__)
@@ -878,6 +880,10 @@ class VLLMGenerator(Configurable):
         """Keep each multi-turn session's cached prefix on GPU between its turns (see
         `VLLMSessionKVHolder`). None: off."""
 
+        http: VLLMHttpServer.Config | None = None
+        """Serve this generator over vLLM's HTTP app on rank 0 (see `VLLMHttpServer`), for
+        external routers and debugging. Requests skip the router. None: off."""
+
         def __post_init__(self):
             if (
                 self.session_kv_holder is not None
@@ -977,6 +983,10 @@ class VLLMGenerator(Configurable):
         self._set_determinism(config.debug)
 
         self.model_path = model_path
+
+        if config.http is not None:
+            # vLLM caches its env at engine init; its token-in route reads this flag.
+            os.environ["VLLM_ENABLE_SCALE_OUT_ENDPOINTS"] = "1"
 
         # Build vLLM engine
         enable_ep = config.parallelism.expert_parallel_degree > 1
@@ -1178,6 +1188,9 @@ class VLLMGenerator(Configurable):
         # None until start_engine_loop starts it.
         self._engine_loop_future: concurrent.futures.Future[None] | None = None
 
+        # Rank 0's HTTP server when `config.http` is set; started with the engine loop.
+        self._http_server: VLLMHttpServer | None = None
+
         logger.info("Generator initialized with vLLM engine")
 
     def _call_on_engine_thread(self, fn: Callable[[], _T]) -> _T:
@@ -1233,11 +1246,39 @@ class VLLMGenerator(Configurable):
             )
 
     async def start_engine_loop(self) -> None:
-        """Start the background engine loop on every rank (one-time, idempotent)."""
+        """Start the background engine loop on every rank (one-time, idempotent), then rank 0's
+        HTTP server if `config.http` is set."""
         if self._engine_loop_future is None:
             self._engine_loop_future = asyncio.run_coroutine_threadsafe(
                 self._engine_loop(), self._engine_event_loop
             )
+        if (
+            self._rank == 0
+            and self.config.http is not None
+            and self._http_server is None
+        ):
+            http_server = self.config.http.build()
+            await http_server.start(
+                # The actor subclass makes `generate` an endpoint; serve the plain method.
+                # TODO: abort the engine request when this call is cancelled; until then the
+                # engine keeps decoding after a client disconnect.
+                generate_fn=functools.partial(VLLMGenerator.generate, self),
+                hf_assets_path=self.model_path,
+                max_model_len=self._engine.model_config.max_model_len,
+                stop_token_ids=self.config.sampling.stop_token_ids or [],
+                is_dead=self._engine_loop_dead,
+            )
+            self._http_server = http_server
+            logger.info("Generator HTTP server listening on %s", http_server.url)
+
+    async def http_url(self) -> str | None:
+        """Rank 0's HTTP server address, or None when `config.http` is off."""
+        return None if self._http_server is None else self._http_server.url
+
+    def _engine_loop_dead(self) -> bool:
+        """Whether this rank's engine loop has stopped serving (crashed or closed)."""
+        # Only the HTTP server calls this, and it starts after the loop future is set.
+        return self._engine_loop_queue.closed or self._engine_loop_future.done()
 
     async def wait_engine_loop(self) -> None:
         """Wait until this rank's engine loop exits, raising whatever crashed it.
@@ -1725,6 +1766,12 @@ class VLLMGenerator(Configurable):
         Rank 0 closes the queue: calls already queued stay ahead of the `CloseMessage` that makes
         the engine loop quit the while-loop, and later calls raise.
         """
+        if self._http_server is not None:
+            try:
+                await self._http_server.close()
+            except Exception:
+                logger.exception("HTTP server raised during shutdown")
+            self._http_server = None
         if self._rank == 0:
             self._engine_loop_queue.close(CloseMessage(), reason="generator is closed")
 
