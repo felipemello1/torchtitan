@@ -360,11 +360,17 @@ def _combine_kernel(
     tl.extra.cuda.gdc_wait()  # y comes from the w2 kernel (programmatic dependent launch)
     token = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
-    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
     for k in tl.static_range(K):
         score = tl.load(scores_ptr + token * K + k).to(tl.float32)
-        y = tl.load(y_ptr + (token * K + k).to(tl.int64) * D + cols)
-        acc += score * y.to(tl.float32)
+        y = tl.load(y_ptr + (token * K + k).to(tl.int64) * D + cols).to(tl.float32)
+        # The trainer's compiled gather-sum rounds as y0*s0 + y1*s1, then one fma per
+        # route; the same order makes the outputs bitwise equal.
+        if k == 0:
+            acc = libdevice.mul_rn(y, score)
+        elif k == 1:
+            acc = libdevice.add_rn(acc, libdevice.mul_rn(y, score))
+        else:
+            acc = tl.fma(y, score, acc)
     tl.store(out_ptr + token.to(tl.int64) * D + cols, acc.to(out_ptr.dtype.element_ty))
 
 
@@ -553,7 +559,7 @@ def _route_topk_kernel(
     e = tl.arange(0, E)
     k = tl.arange(0, K)
     x = tl.load(gate_ptr + t * E + e)
-    p = tl.exp(x - tl.max(x, axis=0))
+    p = libdevice.exp(x - tl.max(x, axis=0))
     scores = p / tl.sum(p, axis=0)
     choice = scores + tl.load(bias_ptr + e) if HAS_BIAS else scores
     ids = tl.zeros((K,), tl.int32)

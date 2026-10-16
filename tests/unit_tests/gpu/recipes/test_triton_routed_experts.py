@@ -92,7 +92,8 @@ def _rel(actual: torch.Tensor, expected: torch.Tensor) -> float:
 class TestTritonRoutedExperts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        apply_local_compile(["fused_binary_activation"])  # as the trainer runs it
+        # The trainer and the stock generator run these regions compiled.
+        apply_local_compile(["fused_binary_activation", "moe_dispatch", "moe_combine"])
         cls.stock, cls.triton_experts = _build_pair()
 
     def test_matches_fp64_at_least_as_well_as_stock(self):
@@ -153,6 +154,19 @@ class TestTritonRoutedExperts(unittest.TestCase):
                         self.assertEqual(actual.shape, (0, _DIM))
                         continue
                     expected = self.stock._expert_mlp(x_RD, offsets_E)
+                self.assertTrue(torch.equal(actual, expected))
+
+    def test_routed_experts_match_stock_bitwise(self):
+        """The EP=1 path equals the stock compiled path bitwise at decode and prefill.
+
+        A Triton or Inductor change that alters either side's rounding fails here.
+        """
+        for num_tokens in (37, 1500):
+            with self.subTest(num_tokens=num_tokens):
+                routing = _routing(num_tokens, seed=6)
+                with torch.no_grad():
+                    actual = self.triton_experts(*routing)
+                    expected = self.stock(*routing)
                 self.assertTrue(torch.equal(actual, expected))
 
     def test_counts_left_to_the_kernels(self):
