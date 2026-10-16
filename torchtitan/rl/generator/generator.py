@@ -26,7 +26,7 @@ import torchstore as ts
 from torchstore import RankRole
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, CompilationConfig
-from vllm.config.compilation import CompilationMode, CUDAGraphMode, PassConfig
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.exceptions import VLLMClientError
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
@@ -251,7 +251,6 @@ class VLLMCudaGraphConfig:
         *,
         max_num_seqs: int,
         expert_sequence_parallel_size: int,
-        enable_sequence_parallel: bool,
         max_num_batched_tokens: int | None = None,
     ) -> CompilationConfig:
         """Build a vLLM ``CompilationConfig`` for the generator.
@@ -271,9 +270,6 @@ class VLLMCudaGraphConfig:
         capture sizes that are not multiples of this count, preventing CUDA graph
         padding from producing a token count that cannot be evenly TP-sharded.
 
-        ``enable_sequence_parallel`` is forwarded to vLLM's sequence parallelism
-        pass. vLLM filters dense-SP CUDA graph sizes using its own TP size.
-
         All modes capture with ``mode=CompilationMode.NONE`` to avoid nesting
         vLLM's Inductor compile with TorchTitan local compile.
         """
@@ -281,10 +277,6 @@ class VLLMCudaGraphConfig:
             return CompilationConfig(
                 cudagraph_mode=CUDAGraphMode.NONE,
                 mode=CompilationMode.NONE,
-                pass_config=PassConfig(
-                    enable_sp=enable_sequence_parallel,
-                    sp_min_token_num=1 if enable_sequence_parallel else None,
-                ),
             )
         if max_num_seqs <= 0:
             raise ValueError(f"max_num_seqs must be positive, got {max_num_seqs}")
@@ -342,10 +334,6 @@ class VLLMCudaGraphConfig:
             cudagraph_mode=self.mode,
             mode=CompilationMode.NONE,
             cudagraph_capture_sizes=sizes,
-            pass_config=PassConfig(
-                enable_sp=enable_sequence_parallel,
-                sp_min_token_num=1 if enable_sequence_parallel else None,
-            ),
         )
 
 
@@ -1052,7 +1040,6 @@ class VLLMGenerator(Configurable):
             max_num_seqs=self._max_num_seqs,
             max_num_batched_tokens=config.max_num_batched_tokens,
             expert_sequence_parallel_size=expert_sequence_parallel_size,
-            enable_sequence_parallel=config.parallelism.enable_sequence_parallel,
         )
         if vllm_compilation_config is not None:
             engine_kwargs["compilation_config"] = vllm_compilation_config
