@@ -96,6 +96,8 @@ import time
 import warnings
 from dataclasses import dataclass, field, replace
 
+import numpy as np
+
 # PYTORCH_CUDA_ALLOC_CONF is set in torchtitan/rl/__init__.py (before torch is imported)
 # and in train.py; see the note there.
 import torch  # noqa: F401
@@ -512,15 +514,19 @@ class Controller(Configurable):
 
         @sl.log_trace_span("generate")
         async def generate(
-            prompt_token_ids: list[int],
+            prompt_token_ids: list[int] | np.ndarray,
             *,
             request_id: str,
             group_id: int,
             routing_session_id: str | None = None,
             sampling_config: SamplingConfig | None = None,
         ) -> Completion | None:
+            # A numpy prompt becomes a list only inside the call, which serializes it, so the
+            # list is not held (and walked by every GC) while the generation runs.
             return await generator_router.generate.call_one(
-                prompt_token_ids,
+                prompt_token_ids.tolist()
+                if isinstance(prompt_token_ids, np.ndarray)
+                else prompt_token_ids,
                 request_id=request_id,
                 group_id=group_id,
                 routing_session_id=routing_session_id,
