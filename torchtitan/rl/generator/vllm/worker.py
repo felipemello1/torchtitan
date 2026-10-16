@@ -64,16 +64,14 @@ class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         dispatch = super().dispatch
 
-        # TODO: linear attention with DP>1 under FULL asserts when another DP rank's step
-        # pads past the largest decode capture size: vLLM re-dispatches the decoding rank at
-        # that size with uniform_decode=True, and the decode-only keys have none. Fix:
-        # delegate only when num_tokens <= uniform_decode_query_len * max_num_seqs. The
-        # fall-through replays a mixed graph, so a decoding rank's numerics would depend on
-        # the other rank's batch.
+        # With DP>1, vLLM pads a decoding or idle rank to the busiest rank's token count.
+        # Past max_num_seqs no decode graph exists: replay the mixed-batch graph, which
+        # runs the decode tokens with prefill arithmetic.
         if (
             self.keys_initialized
             and self.cudagraph_mode == CUDAGraphMode.FULL
             and uniform_decode
+            and num_tokens <= self.vllm_config.scheduler_config.max_num_seqs
         ):
             dispatch = self.decode_dispatcher.dispatch
         return dispatch(

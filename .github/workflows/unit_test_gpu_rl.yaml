@@ -115,3 +115,5 @@ jobs:
           "tests/rl/unit_tests/gpu/test_generator_uneven_decode.py::test_vllm_uneven_decode_tp_padding[dp1_tp4]" -v
         torchrun --nproc-per-node=4 -m pytest \
           "tests/rl/unit_tests/gpu/test_generator_uneven_decode.py::test_vllm_uneven_decode_tp_padding[dp2_tp2_one_idle_rank]" -v
+        torchrun --nproc-per-node=4 -m pytest \
+          "tests/rl/unit_tests/gpu/test_generator_uneven_decode.py::test_vllm_uneven_decode_tp_padding[dp2_tp2_one_idle_rank_gdn]" -v
