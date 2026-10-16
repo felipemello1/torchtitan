@@ -2144,3 +2144,47 @@ def test_validation_config_rejects_bad_sampling() -> None:
         ValidationConfig(num_samples_per_prompt=0)
     with pytest.raises(ValueError, match="greedy"):
         ValidationConfig(temperature=0.0, num_samples_per_prompt=4)
+
+
+def test_trainer_loop_full_collect_every_n_steps() -> None:
+    """With the controller's GarbageCollector on, a full collection runs every
+    `full_gc_every_n_steps` steps and is logged with the next step's metrics."""
+    from torchtitan.tools.garbage_collector import GarbageCollector
+
+    controller, _ = _controller_for_trainer_loop(ValidationConfig())
+    controller.config.full_gc_every_n_steps = 2
+    gc_was_enabled = gc.isenabled()
+    controller._garbage_collector = GarbageCollector(GarbageCollector.Config(gc_freq=1))
+    controller._pending_full_gc_metrics = []
+
+    async def run() -> None:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        trainer = asyncio.create_task(
+            controller._trainer_loop(queue, num_training_steps=3)
+        )
+        for step in (1, 2, 3):
+            await queue.put(_training_batch(step))
+            await _run_until(
+                lambda: step in _logged_steps(controller, is_validation=False)
+            )
+        await asyncio.wait_for(trainer, timeout=5)
+
+    try:
+        asyncio.run(run())
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+    full_collect_keys = [
+        [
+            metric.key
+            for metric in call.kwargs["metrics"]
+            if metric.key.startswith("controller/gc/full_collect/")
+        ]
+        for call in controller.metrics_processor.log.call_args_list
+        if not call.kwargs["is_validation"]
+    ]
+    assert full_collect_keys == [
+        [],
+        [],
+        ["controller/gc/full_collect/seconds", "controller/gc/full_collect/collected"],
+    ]

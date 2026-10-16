@@ -93,6 +93,7 @@ import json
 import logging
 import math
 import os
+import gc
 import time
 import warnings
 from dataclasses import dataclass, field, replace
@@ -468,6 +469,11 @@ class Controller(Configurable):
         Set: automatic GC off; `gc.collect(1)` every `gc_freq` steps (`debug` is unsupported). Objects alive
         at a collect are never scanned again, so a cycle among them that dies later leaks; watch
         `controller/memory/rss_gib`."""
+
+        full_gc_every_n_steps: int = 0
+        """With `garbage_collector` set, also run a full `gc.collect()` every N steps (0: never), so
+        cycles that died after reaching the oldest generation are freed. Logged next step as
+        `controller/gc/full_collect/{seconds,collected}`."""
 
         trainer: Trainer.Config
         """Trainer config. Controls the trainer model, optimizer, training, parallelism."""
@@ -1168,6 +1174,7 @@ class Controller(Configurable):
         GarbageCollector.freeze(
             "Full GC before freezing the controller's setup objects"
         )
+        self._pending_full_gc_metrics: list[m.Metric] = []
         self._garbage_collector = (
             self.config.garbage_collector.build()
             if self.config.garbage_collector is not None
@@ -1644,6 +1651,11 @@ class Controller(Configurable):
         await training_batch_queue.put(None)
         # TODO(async-rl): if finite datasets are supported, drain a final partial batch here.
 
+    def _take_full_gc_metrics(self) -> list[m.Metric]:
+        metrics = getattr(self, "_pending_full_gc_metrics", [])
+        self._pending_full_gc_metrics = []
+        return metrics
+
     async def _trainer_loop(
         self,
         training_batch_queue: "asyncio.Queue[TrainerStepBatch | None]",
@@ -1829,6 +1841,7 @@ class Controller(Configurable):
                         *data_metrics,
                         *time_metrics,
                         *gc_timer.flush(),
+                        *self._take_full_gc_metrics(),
                         # GC probe: the Verifiers generation server's request latency.
                         *(
                             self._rollouter.generation_server_metrics()
@@ -1852,6 +1865,19 @@ class Controller(Configurable):
                 )
             if self._garbage_collector is not None:
                 self._garbage_collector.run(step)
+                full_every = self.config.full_gc_every_n_steps
+                if full_every and step % full_every == 0:
+                    with sl.log_trace_span("full_gc_collect"):
+                        start = time.perf_counter()
+                        collected = gc.collect()
+                        seconds = time.perf_counter() - start
+                    logger.info(
+                        f"[GC] full collection at step {step}: {seconds:.2f} s, {collected} objects freed"
+                    )
+                    self._pending_full_gc_metrics = [
+                        m.Metric("controller/gc/full_collect/seconds", m.NoReduce(seconds)),
+                        m.Metric("controller/gc/full_collect/collected", m.NoReduce(collected)),
+                    ]
             heap_census_every_n_steps = self.config.heap_census_every_n_steps
             if heap_census_every_n_steps and step % heap_census_every_n_steps == 0:
                 with sl.log_trace_span("heap_census"):
