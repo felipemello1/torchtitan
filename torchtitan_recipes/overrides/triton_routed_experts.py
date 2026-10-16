@@ -57,9 +57,9 @@ _STOCK_ROWS_PER_EXPERT = 512
 
 
 # Triton 3.9's descriptor `.load()` drops the cache policy its IR op takes, so this calls the
-# private semantic API; replace it once `.load()` takes `eviction_policy`. With the decode
-# tiles each weight tile is read once, so it shouldn't evict activations from L2. Persistent
-# (prefill) tiles reuse weights, and below 32 rows the hint measured slower; both keep the default.
+# private semantic API; replace it once `.load()` takes `eviction_policy`. Weights are
+# streamed once, so they shouldn't evict the reused activations from L2. Measured
+# exceptions keep the default: below 32 rows, and w2 with the 128-row prefill tiles.
 @tl.core.builtin
 def _load_weights(desc, offsets, evict_first, _semantic=None):
     policy = "evict_first" if tl.core._unwrap_if_constexpr(evict_first) else "evict_normal"
@@ -195,7 +195,8 @@ def _launch_gemm(a, w, out, offsets_E, tiles, gated):
         E=triton.next_power_of_2(num_experts), KDIM=a.shape[1], N_OUT=n_out,
         GATED=gated, TMA_A=tma_a, BLOCK_M=tiles.block_m, BLOCK_N=block_n,
         BLOCK_K=block_k, STAGES=stages, PERSISTENT=tiles.persistent,
-        EVICT_W=tiles is _DECODE_TILES, num_warps=warps,
+        EVICT_W=tiles is not _SMALL_TILES and (gated or tiles is not _PREFILL_TILES),
+        num_warps=warps,
         launch_pdl=not gated,
     )  # fmt: skip
 
