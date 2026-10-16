@@ -50,6 +50,10 @@ class _GeneratorActorEndpoints:
         await super().wait_engine_loop()
 
     @concurrent_endpoint
+    async def http_url(self) -> str | None:
+        return await super().http_url()
+
+    @concurrent_endpoint
     async def generate(
         self,
         prompt_token_ids: list[int],

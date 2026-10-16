@@ -646,7 +646,8 @@ class Controller(Configurable):
                 generator = generator_mesh.spawn(
                     actor_name,
                     VLLMGeneratorActor,
-                    config.generator,
+                    # With the renderer's stops, so HTTP requests that set none stop like rollouts.
+                    replace(config.generator, sampling=self._sampling),
                     model_path=config.hf_assets_path,
                     max_num_seqs=max_num_seqs,
                     output_dir=config.dump_folder,
@@ -756,6 +757,19 @@ class Controller(Configurable):
             await self.trainer.push_model_state_dict.call()
         with sl.log_trace_span("generator_pull_model_state_dict"):
             await self.generator_router.pull_model_state_dict.call_one(self.start_step)
+        http_urls = [
+            url for url in await self.generator_router.http_urls.call_one() if url
+        ]
+        if http_urls:
+            # One URL per generator with `http` set, written once they hold weights, for
+            # external routers and clients. Replaced atomically, so a poller never reads half.
+            endpoints_path = os.path.join(
+                self.config.dump_folder, "serving_endpoints.json"
+            )
+            with open(f"{endpoints_path}.tmp", "w") as file:
+                json.dump({"endpoints": http_urls}, file, indent=2)
+            os.replace(f"{endpoints_path}.tmp", endpoints_path)
+            logger.info(f"Generator HTTP endpoints: {http_urls} ({endpoints_path})")
 
     # TODO: fold validation into a Validator(Configurable) the controller attaches, instead of 4 methods.
     @sl.log_trace_span("_collect_validation_rollouts")
