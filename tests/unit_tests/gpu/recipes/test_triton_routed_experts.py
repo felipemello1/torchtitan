@@ -16,9 +16,9 @@ from functools import partial
 import torch
 from torch.nn import init
 
+from torchtitan.distributed.local_compile import apply_local_compile
 from torchtitan.models.common.config_utils import make_routed_experts_config
 from torchtitan_recipes.overrides.triton_routed_experts import (
-    triton_expert_mlp_op,
     triton_routed_experts,
 )
 
@@ -87,6 +87,7 @@ def _rel(actual: torch.Tensor, expected: torch.Tensor) -> float:
 class TestTritonRoutedExperts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        apply_local_compile(["fused_binary_activation"])  # as the trainer runs it
         cls.stock, cls.triton_experts = _build_pair()
 
     def test_matches_fp64_at_least_as_well_as_stock(self):
@@ -123,9 +124,13 @@ class TestTritonRoutedExperts(unittest.TestCase):
                 torch.cuda.synchronize()
                 self.assertTrue(torch.equal(graphed, eager))
 
-    def test_expert_sorted_rows_match_grouped_mm(self):
-        """Rows as any dispatcher returns them, including an expert-parallel rank with none."""
-        w13, w2 = self.stock.w13.weight, self.stock.w2.weight
+    def test_expert_sorted_rows_match_stock_bitwise(self):
+        """Rows as any dispatcher returns them, incl. an expert-parallel rank with none.
+
+        Bitwise equal to the stock path with its compiled SwiGLU region, at decode and
+        prefill row counts: the generator matches the trainer. A Triton or Inductor change
+        that alters either side's rounding fails here.
+        """
         for num_rows in (0, 40, 1500):
             with self.subTest(num_rows=num_rows):
                 gen = torch.Generator(device="cuda").manual_seed(num_rows)
@@ -138,18 +143,12 @@ class TestTritonRoutedExperts(unittest.TestCase):
                     num_rows, _DIM, device="cuda", dtype=torch.bfloat16, generator=gen
                 )
                 with torch.no_grad():
-                    actual = triton_expert_mlp_op(x_RD, offsets_E, w13, w2)
+                    actual = self.triton_experts._expert_mlp(x_RD, offsets_E)
                     if num_rows == 0:
                         self.assertEqual(actual.shape, (0, _DIM))
                         continue
-                    w13_EDN = w13.view(_E, 2 * _HIDDEN, _DIM).transpose(1, 2)
-                    gate_up = torch._grouped_mm(x_RD, w13_EDN, offs=offsets_E).float()
-                    hidden = torch.nn.functional.silu(gate_up[:, :_HIDDEN])
-                    hidden = (hidden * gate_up[:, _HIDDEN:]).bfloat16()
-                    expected = torch._grouped_mm(
-                        hidden, w2.transpose(1, 2), offs=offsets_E
-                    )
-                self.assertLess(_rel(actual, expected.double()), 1e-2)
+                    expected = self.stock._expert_mlp(x_RD, offsets_E)
+                self.assertTrue(torch.equal(actual, expected))
 
     def test_grad_enabled_takes_stock_path(self):
         routing = _routing(37, seed=4)

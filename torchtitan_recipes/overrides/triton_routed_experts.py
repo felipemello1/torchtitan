@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from torchtitan.config import derive, override
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
@@ -153,7 +154,11 @@ def _grouped_gemm_kernel(
         # Epilogue.
         if GATED:
             gate, up = acc.reshape(BLOCK_M, 2, BLOCK_OUT).permute(0, 2, 1).split()
-            acc = gate * tl.sigmoid(gate) * up
+            # The trainer's math, so outputs match it bitwise: its grouped GEMM rounds
+            # gate/up to bf16, then its compiled SwiGLU computes this in fp32.
+            gate = gate.to(tl.bfloat16).to(tl.float32)
+            up = up.to(tl.bfloat16).to(tl.float32)
+            acc = gate / (1.0 + libdevice.exp(-gate)) * up
         cols = out0 + tl.arange(0, BLOCK_OUT)
         out_ptrs = out_ptr + rows[:, None].to(tl.int64) * N_OUT + cols[None, :]
         tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=valid[:, None])
