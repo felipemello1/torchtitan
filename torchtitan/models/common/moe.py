@@ -347,7 +347,12 @@ class TokenChoiceTopKRouter(Module):
             routing_map_TE,
         )
 
-    @local_compile("moe_router_topk", batch_invariant=False)
+    # Inductor's batch_invariant option fixes each reduction's launch config, so a token's
+    # scores don't depend on the batch size: the generator at 1-34 tokens matches the
+    # trainer at 16k bitwise (otherwise the 1-token compile picks another config).
+    @local_compile(
+        "moe_router_topk", batch_invariant=False, options={"batch_invariant": True}
+    )
     def _score_and_select_experts(
         self,
         gate_TE: torch.Tensor,
