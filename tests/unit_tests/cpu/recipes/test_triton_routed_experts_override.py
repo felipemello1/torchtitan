@@ -82,7 +82,7 @@ class TestTritonRoutedExpertsOverride(unittest.TestCase):
         imports = [f"{name}.triton_shared_expert_linears"]
         apply_overrides(OverrideConfig(imports=imports), moe)
         self.assertIsInstance(moe.shared_experts.w13, TritonSmallLinear.Config)
-        self.assertIsInstance(moe.shared_experts.gate, TritonSmallLinear.Config)
+        self.assertNotIsInstance(moe.shared_experts.gate, TritonSmallLinear.Config)
         self.assertNotIsInstance(moe.shared_experts.w2, TritonSmallLinear.Config)
 
 
