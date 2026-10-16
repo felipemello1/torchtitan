@@ -63,7 +63,9 @@ from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.routing.strategies import LeastLoadedRoutingStrategy
 from vllm import SamplingParams
+from vllm.config import CUDAGraphMode
 from vllm.exceptions import VLLMValidationError
+from vllm.forward_context import BatchDescriptor
 from vllm.logprobs import FlatLogprobs, Logprob
 from vllm.sampling_params import RequestOutputKind
 
@@ -677,16 +679,13 @@ def test_extra_vllm_engine_args_rejects_torchtitan_owned_keys(key, match):
 # --- CUDA graph config (VLLMCudaGraphConfig.get_vllm_compilation_config) ---
 
 
-def test_cuda_graph_none_mode_preserves_sequence_parallel_config():
+def test_cuda_graph_none_mode_disables_cuda_graphs():
     compilation_config = VLLMCudaGraphConfig(mode="NONE").get_vllm_compilation_config(
         max_num_seqs=256,
         expert_sequence_parallel_size=1,
-        enable_sequence_parallel=True,
     )
 
     assert compilation_config.cudagraph_mode.name == "NONE"
-    assert compilation_config.pass_config.enable_sp
-    assert compilation_config.pass_config.sp_min_token_num == 1
 
 
 def test_expert_sequence_parallel_padding_filters_cuda_graph_sizes():
@@ -699,7 +698,6 @@ def test_expert_sequence_parallel_padding_filters_cuda_graph_sizes():
     ).get_vllm_compilation_config(
         max_num_seqs=8,
         expert_sequence_parallel_size=parallelism.expert_sequence_parallel_size,
-        enable_sequence_parallel=False,
     )
 
     assert cfg.cudagraph_capture_sizes == [4, 8]
@@ -709,7 +707,6 @@ def test_expert_sequence_parallel_padding_keeps_small_cuda_graph_batches():
     cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
         max_num_seqs=1,
         expert_sequence_parallel_size=8,
-        enable_sequence_parallel=False,
     )
 
     assert cfg.cudagraph_capture_sizes[0] == 8
@@ -723,7 +720,6 @@ def test_expert_sequence_parallel_padding_rejects_no_valid_cuda_graph_sizes():
         ).get_vllm_compilation_config(
             max_num_seqs=3,
             expert_sequence_parallel_size=4,
-            enable_sequence_parallel=False,
         )
 
 
@@ -737,32 +733,81 @@ def test_expert_sequence_parallel_padding_disabled_without_ep():
 
 
 @pytest.mark.parametrize(
-    ("enable_dense_sp", "enable_expert_sp", "expected_num_tokens"),
+    ("enable_expert_parallel", "vllm_output", "expected_output"),
     [
-        (False, True, 8),
-        (True, False, 8),
-        (False, False, 5),
+        # Eager, DP ranks ran 5 and 3 tokens: both round up to TP 4.
+        (
+            True,
+            (CUDAGraphMode.NONE, BatchDescriptor(num_tokens=5), [5, 3]),
+            (BatchDescriptor(num_tokens=8), [8, 4]),
+        ),
+        # Without EP, nothing is split over TP.
+        (
+            False,
+            (CUDAGraphMode.NONE, BatchDescriptor(num_tokens=5), [5, 3]),
+            (BatchDescriptor(num_tokens=5), [5, 3]),
+        ),
+        # DP 1: vLLM returns no per-rank counts.
+        (
+            True,
+            (CUDAGraphMode.NONE, BatchDescriptor(num_tokens=5), None),
+            (BatchDescriptor(num_tokens=8), None),
+        ),
+        # CUDA graph: the capture size is a TP multiple, so the descriptor passes through.
+        (
+            True,
+            (
+                CUDAGraphMode.FULL,
+                BatchDescriptor(num_tokens=8, num_reqs=8, uniform=True),
+                None,
+            ),
+            (BatchDescriptor(num_tokens=8, num_reqs=8, uniform=True), None),
+        ),
     ],
 )
-def test_sequence_parallel_padding_rounds_runner_tokens(
-    enable_dense_sp, enable_expert_sp, expected_num_tokens
+def test_expert_parallel_padding_rounds_eager_runner_tokens(
+    monkeypatch, enable_expert_parallel, vllm_output, expected_output
 ):
-    model_runner = SimpleNamespace(
-        compilation_config=SimpleNamespace(
-            pass_config=SimpleNamespace(enable_sp=enable_dense_sp)
-        ),
-        vllm_config=SimpleNamespace(
-            parallel_config=SimpleNamespace(
-                enable_expert_parallel=enable_expert_sp,
-                tensor_parallel_size=4,
-            ),
+    cudagraph_mode, vllm_batch_descriptor, vllm_num_tokens_across_dp = vllm_output
+    base_runner_cls = TorchTitanGPUModelRunner.__mro__[1]
+    monkeypatch.setattr(
+        base_runner_cls,
+        "_determine_batch_execution_and_padding",
+        lambda self, num_tokens, **kwargs: (
+            cudagraph_mode,
+            vllm_batch_descriptor,
+            False,
+            None
+            if vllm_num_tokens_across_dp is None
+            else torch.tensor(vllm_num_tokens_across_dp, dtype=torch.int32),
+            None,
         ),
     )
+    model_runner = object.__new__(TorchTitanGPUModelRunner)
+    model_runner.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=enable_expert_parallel,
+            tensor_parallel_size=4,
+        ),
+    )
+    model = Mock()
+    model_runner.get_model = lambda: model
 
-    assert (
-        TorchTitanGPUModelRunner._pad_for_sequence_parallelism(model_runner, 5)
-        == expected_num_tokens
-    )
+    (
+        _,
+        batch_descriptor,
+        _,
+        num_tokens_across_dp,
+        _,
+    ) = model_runner._determine_batch_execution_and_padding(num_tokens=5)
+
+    expected_batch_descriptor, expected_num_tokens_across_dp = expected_output
+    model.set_num_valid_tokens.assert_called_once_with(5)
+    assert batch_descriptor == expected_batch_descriptor
+    if expected_num_tokens_across_dp is None:
+        assert num_tokens_across_dp is None
+    else:
+        assert num_tokens_across_dp.tolist() == expected_num_tokens_across_dp
 
 
 def test_only_weights_use_cumem_allocator(monkeypatch):
@@ -786,7 +831,6 @@ def test_cuda_graph_default_mode_is_full():
     cfg = VLLMCudaGraphConfig().get_vllm_compilation_config(
         max_num_seqs=256,
         expert_sequence_parallel_size=1,
-        enable_sequence_parallel=False,
     )
     assert cfg.cudagraph_mode.name == "FULL"
     assert int(cfg.mode) == 0
@@ -797,7 +841,6 @@ def test_cuda_graph_full_mode_no_compile():
     cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
         max_num_seqs=256,
         expert_sequence_parallel_size=1,
-        enable_sequence_parallel=False,
     )
     assert cfg.cudagraph_mode.name == "FULL"
     assert int(cfg.mode) == 0
@@ -809,7 +852,6 @@ def test_cuda_graph_decode_only_capture_sizes_cover_max_num_seqs():
     cfg = VLLMCudaGraphConfig(mode="FULL_DECODE_ONLY").get_vllm_compilation_config(
         max_num_seqs=500,
         expert_sequence_parallel_size=1,
-        enable_sequence_parallel=False,
     )
     assert cfg.cudagraph_capture_sizes == [1, 2, 4, 8, 16, 32, 64, 128, 256, 500]
 
@@ -820,7 +862,6 @@ def test_cuda_graph_full_mode_extends_capture_sizes_to_chunk():
     cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
         max_num_seqs=500,
         expert_sequence_parallel_size=1,
-        enable_sequence_parallel=False,
     )
     assert cfg.cudagraph_capture_sizes[-1] == 2048
     assert 500 in cfg.cudagraph_capture_sizes  # decode batch captured exactly
@@ -831,28 +872,7 @@ def test_cuda_graph_rejects_nonpositive_max_num_seqs():
         VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
             max_num_seqs=0,
             expert_sequence_parallel_size=1,
-            enable_sequence_parallel=False,
         )
-
-
-def test_inference_parallelism_propagates_dense_sequence_parallelism():
-    parallelism = InferenceParallelismConfig(
-        tensor_parallel_degree=4,
-        enable_sequence_parallel=True,
-    )
-
-    assert parallelism.to_training().enable_sequence_parallel
-
-    compilation_config = VLLMCudaGraphConfig(
-        mode="FULL", capture_sizes=[1, 4, 5, 8]
-    ).get_vllm_compilation_config(
-        max_num_seqs=8,
-        expert_sequence_parallel_size=1,
-        enable_sequence_parallel=parallelism.enable_sequence_parallel,
-    )
-    assert compilation_config.cudagraph_capture_sizes == [1, 4, 5, 8]
-    assert compilation_config.pass_config.enable_sp
-    assert compilation_config.pass_config.sp_min_token_num == 1
 
 
 def test_inference_parallelism_disables_dense_sequence_parallelism():
