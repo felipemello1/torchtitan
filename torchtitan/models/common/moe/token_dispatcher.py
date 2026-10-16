@@ -595,6 +595,12 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
         assert self.ep_mesh is not None
         ep_rank = self.ep_mesh.get_local_rank()
         num_local_experts = self.num_experts // self.ep_mesh.size()
+        # The sort below uses int16 keys (ids <= num_local_experts).
+        if num_local_experts > torch.iinfo(torch.int16).max:
+            raise ValueError(
+                f"{num_local_experts} experts per EP rank do not fit the int16 sort keys; "
+                "raise the EP degree or run the generator without CUDA graphs"
+            )
         with maybe_set_sparse_mesh():
             gathered_x_GD, gathered_scores_GK, gathered_expert_ids_GK = (
                 spmd.all_gather(tensor, "ep", src=spmd.S(0), dst=spmd.R)
@@ -610,15 +616,26 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
             ~is_local_GK, num_local_experts
         )
         # Not _local_reorder: combine needs this order's inverse, which it does not return.
-        sorted_order_N = torch.argsort(local_expert_ids_GK.flatten(), stable=True)
+        # int16 keys sort faster than int64.
+        sorted_local_expert_ids_N, sorted_order_N = torch.sort(
+            local_expert_ids_GK.flatten().to(torch.int16), stable=True
+        )
         routed_input_ND = gathered_x_GD[sorted_order_N // self.top_k]
-        # A one-hot count, not bincount: bincount sizes its output on the host.
-        num_tokens_per_local_expert_e = (
-            local_expert_ids_GK.reshape(-1, 1)
-            == torch.arange(num_local_experts, device=x_TD.device)
-        ).sum(dim=0)
+        # Inverse of sorted_order_N by scatter, not a second sort (except under deterministic
+        # algorithms, where scatter_ sorts too): [2, 0, 1, 3] -> [1, 2, 0, 3].
+        sorted_positions_N = torch.empty_like(sorted_order_N).scatter_(
+            0, sorted_order_N, torch.arange(sorted_order_N.numel(), device=x_TD.device)
+        )
+        # Expert e's rows start at the first sorted id >= e and end at the first >= e + 1, so
+        # an empty expert counts 0. The extra last entry is where other ranks' picks start
+        # (bincount would size its output on the host).
+        first_row_per_expert = torch.searchsorted(
+            sorted_local_expert_ids_N,
+            torch.arange(num_local_experts + 1, dtype=torch.int16, device=x_TD.device),
+        )
+        num_tokens_per_local_expert_e = first_row_per_expert.diff()
         metadata = AllGatherDispatchMetadata(
-            sorted_positions_GK=torch.argsort(sorted_order_N).view_as(is_local_GK),
+            sorted_positions_GK=sorted_positions_N.view_as(is_local_GK),
             topk_scores_GK=gathered_scores_GK,
             is_local_GK=is_local_GK,
         )
@@ -769,21 +786,27 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
     ) -> torch.Tensor:
         """Reverse ``_all_gather_dispatch``: score, sum each token's local picks, reduce-scatter.
 
+        Inference only (``dispatch`` takes this path only without grad), so it scores the
+        gathered rows in place.
+
         Not a scatter-add: (EP-1)/EP of the rows belong to other ranks and would all be
         added into one extra row, which a deterministic scatter-add serializes (0.8 ms vs
         59 us per layer for this gather; 35B-A3B, 128 seqs per DP rank, EP4, H100).
         """
-        # Each gathered token's K picks, read at their sorted position.
-        rows_GKD = routed_output_ND[metadata.sorted_positions_GK]
+        # Each gathered token's K picks, read at their sorted position (a copy, so it is
+        # safe to overwrite).
+        scored_GKD = routed_output_ND[metadata.sorted_positions_GK]
         # Round each scored row to bf16 as the all-to-all combine does (top-2 stays
-        # bitwise), then sum in fp32 and round once after the reduce-scatter.
-        scored_GKD = (
-            rows_GKD * metadata.topk_scores_GK.unsqueeze(-1).to(torch.float32)
-        ).to(rows_GKD.dtype)
+        # bitwise), then sum in fp32 and round once after the reduce-scatter. bf16 *= fp32
+        # multiplies in fp32 and rounds once, with no fp32 temporary on CUDA.
+        scored_GKD.mul_(metadata.topk_scores_GK.unsqueeze(-1).to(torch.float32))
         # grouped_mm never computed other ranks' rows (garbage, maybe NaN): zero them.
         partial_out_GD = torch.where(
             metadata.is_local_GK.unsqueeze(-1), scored_GKD, 0
         ).sum(dim=1, dtype=torch.float32)
+        # TODO: compiled, this combine is 179 vs 628 us per layer at 4096 gathered tokens
+        # (H100) but not bitwise (2e-7). It first runs inside capture, where Dynamo refuses
+        # to compile ("cannot JIT compile during CUDA graph capture"): call it once before.
         with maybe_set_sparse_mesh():
             out_TD = spmd.reduce_scatter(
                 partial_out_GD, "ep", src=spmd.P, dst=spmd.S(0)
