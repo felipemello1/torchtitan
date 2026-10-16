@@ -418,6 +418,11 @@ class VLLMModelWrapper(Module):
                 self.model.state_dict(), pin_memory=True
             )
 
+        # vLLM drops to 1 CPU thread when warmup ends, and torch.compile guards the
+        # thread count, so warmup compiles would repeat. Do it now, after the copy
+        # above, which wants threads.
+        _torch_utils.set_torch_threads_for_runtime()
+
         # Unshard the model here so vLLM performs its GPU memory profiling
         # based on the model's actual representation used during forward
         for module in self.model.modules():
