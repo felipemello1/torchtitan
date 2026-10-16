@@ -19,7 +19,7 @@ from torch.nn.attention import (
 from torch.nn.attention.varlen import AuxRequest
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
-from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
+from vllm.v1.attention.backend import AttentionCGSupport, AttentionType, MultipleOf
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,
@@ -43,8 +43,28 @@ from torchtitan.tools.utils import get_cuda_flash_attention_impl
 logger = logging.getLogger(__name__)
 
 
+class _FA4PageSize:
+    """Ask vLLM for 128-token KV pages when FA4 runs the attention.
+
+    FA4 loads paged K/V with TMA only when a page holds exactly one 128-key block;
+    other page sizes take a slower gather path. vLLM picks 128 by itself only for
+    FA4's head-dim-256 kernel, so other head dims got vLLM's default of 16.
+    Muse Spark (head dim 64) on GB300, 16 -> 128-token pages: decode batch 256 x 32k
+    1478 -> 1246 us, prefill 2048 tokens on 32k cached 566 -> 515 us.
+    """
+
+    @classmethod
+    def get_supported_kernel_block_sizes(
+        cls, *args: Any, **kwargs: Any
+    ) -> list[int | MultipleOf]:
+        # *args: newer vLLM passes the layer's KV cache spec, older passes nothing.
+        if get_cuda_flash_attention_impl() == "FA4":
+            return [128]
+        return super().get_supported_kernel_block_sizes(*args, **kwargs)
+
+
 @register_backend(AttentionBackendEnum.CUSTOM)
-class TorchTitanVarlenInnerAttentionBackend(FlashAttentionBackend):
+class TorchTitanVarlenInnerAttentionBackend(_FA4PageSize, FlashAttentionBackend):
     """Custom vLLM attention backend using PyTorch's native FlashAttention kernel.
 
     This class is not directly referenced in user code. It is registered into
@@ -76,7 +96,9 @@ class TorchTitanVarlenInnerAttentionBackend(FlashAttentionBackend):
         return TorchTitanVarlenInnerAttentionMetadataBuilder
 
 
-class TorchTitanVarlenInnerAttentionDiffKVBackend(FlashAttentionDiffKVBackend):
+class TorchTitanVarlenInnerAttentionDiffKVBackend(
+    _FA4PageSize, FlashAttentionDiffKVBackend
+):
     """PyTorch varlen backend using vLLM's unequal K/V cache support."""
 
     @staticmethod
