@@ -605,7 +605,8 @@ class _SmallRowsGemv:
         out = input.new_empty(num_tokens, num_out, dtype=dtype)
         _gate_gemv_kernel[(num_out,)](
             input.contiguous(), weight, out, num_tokens, dim, num_out,
-            BLOCK_T=8, BLOCK_K=min(triton.next_power_of_2(dim), 2048),
+            BLOCK_T=triton.next_power_of_2(num_tokens),
+            BLOCK_K=min(triton.next_power_of_2(dim), 2048),
         )  # fmt: skip
         return out
 
@@ -621,10 +622,10 @@ class TritonGateLinear(_SmallRowsGemv, HiMidLoLinear):
 class TritonSmallLinear(_SmallRowsGemv, Linear):
     """Linear with ``_SmallRowsGemv`` (the shared experts' w13 and gate).
 
-    Above one row, its 1024 programs crowd the routed experts' GEMMs running beside it.
+    Above two rows, its 1024 programs crowd the routed experts' GEMMs running beside it.
     """
 
-    max_rows = 1
+    max_rows = 2
 
     @dataclass(kw_only=True, slots=True)
     class Config(Linear.Config):
@@ -680,7 +681,7 @@ def triton_topk_router(cfg: TokenChoiceTopKRouter.Config) -> TritonTopKRouter.Co
     target=Linear.Config,
     fqns=["*shared_experts.w13", "*shared_experts.gate"],
     exact=True,
-    description="Run the shared experts' no-grad w13 and gate at one token in Triton.",
+    description="Run the shared experts' no-grad w13 and gate at <= 2 tokens in Triton.",
 )
 def triton_shared_expert_linears(cfg: Linear.Config) -> TritonSmallLinear.Config:
     return derive(cfg, TritonSmallLinear.Config)
