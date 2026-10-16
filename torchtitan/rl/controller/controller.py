@@ -91,6 +91,7 @@ import asyncio
 import copy
 import json
 import logging
+import gc
 import math
 import os
 import time
@@ -307,6 +308,17 @@ class Controller(Configurable):
         metrics: m.MetricsProcessor.Config = field(
             default_factory=m.MetricsProcessor.Config
         )
+
+        manual_gc_every_n_steps: int = 0
+        """0: Python's automatic GC, whose full collections pause the event loop for seconds on a large heap.
+        N > 0: automatic GC off, and `gc.collect(1)` every N steps (from step 2) after metrics are logged.
+        Objects alive at a collect are never scanned again, so a cycle among them that dies later leaks until
+        a full collect (`full_gc_every_n_steps`); watch `controller/memory/rss_gib`."""
+
+        full_gc_every_n_steps: int = 0
+        """With `manual_gc_every_n_steps` set, also run a full `gc.collect()` every N steps (0: never). It frees
+        cycles that died after their first collect; its pause and freed objects are logged with the next step
+        as `controller/gc/full_collect/{seconds,collected}`."""
 
         override: OverrideConfig = field(default_factory=OverrideConfig)
         """Registered overrides applied to this whole config tree, including the
@@ -809,6 +821,16 @@ class Controller(Configurable):
         GarbageCollector.freeze(
             "Full GC before freezing the controller's setup objects"
         )
+        self._full_gc_metrics: list[m.Metric] = []
+        # Not `GarbageCollector.Config()`: its default `gc_freq` (50, the trainer's) would collect
+        # every 50 steps, leaving young objects to pile up between collects.
+        self._garbage_collector = (
+            GarbageCollector(
+                GarbageCollector.Config(gc_freq=self.config.manual_gc_every_n_steps)
+            )
+            if self.config.manual_gc_every_n_steps > 0
+            else None
+        )
 
         async_loop = self.config.async_loop
         num_training_steps = async_loop.num_training_steps
@@ -1232,6 +1254,9 @@ class Controller(Configurable):
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.
             time_metrics = step_timer.flush()
+            # statm's 2nd field is the resident set size, in pages.
+            with open("/proc/self/statm") as file:
+                rss_bytes = int(file.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
             with sl.log_trace_span("metrics_log"):
                 self.metrics_processor.log(
                     step=step,
@@ -1264,8 +1289,28 @@ class Controller(Configurable):
                             ),
                             time_metrics=time_metrics,
                         ),
+                        m.Metric(
+                            "controller/memory/rss_gib", m.NoReduce(rss_bytes / 2**30)
+                        ),
+                        *self._full_gc_metrics,
                     ],
                 )
+            self._full_gc_metrics = []
+            if self._garbage_collector is not None:
+                self._garbage_collector.run(step)
+                full_gc_every_n_steps = self.config.full_gc_every_n_steps
+                if full_gc_every_n_steps and step % full_gc_every_n_steps == 0:
+                    start = time.perf_counter()
+                    collected = gc.collect()
+                    self._full_gc_metrics = [
+                        m.Metric(
+                            "controller/gc/full_collect/seconds",
+                            m.NoReduce(time.perf_counter() - start),
+                        ),
+                        m.Metric(
+                            "controller/gc/full_collect/collected", m.NoReduce(collected)
+                        ),
+                    ]
 
         # Finish the last push and pull so generators hold the final weights for post-validation.
         if push_task is not None:

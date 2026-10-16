@@ -810,6 +810,7 @@ def _run_with_generator_watcher(watcher) -> None:
                 num_tokens_per_microbatch_per_dp_rank=8, max_context_length=8
             )
         ),
+        manual_gc_every_n_steps=0,
     )
     controller.start_step = 0
     controller.trainer = None
