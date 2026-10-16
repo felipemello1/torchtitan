@@ -81,6 +81,31 @@ class TestTokenChoiceRouterLocalCompile(unittest.TestCase):
         for actual, expected in zip(compiled, eager, strict=True):
             torch.testing.assert_close(actual, expected)
 
+    def test_scores_do_not_depend_on_batch_size(self):
+        """The generator (no grad, few tokens) matches the trainer's batch bitwise."""
+        torch.manual_seed(0)
+        config = TokenChoiceTopKRouter.Config(
+            num_experts=256,
+            gate=HiMidLoLinear.Config(in_features=DIM, out_features=256),
+            score_func=Softmax.Config(),
+            top_k=8,
+            route_norm=True,
+        )
+        with torch.device("cuda"):
+            router = config.build().eval()
+        apply_local_compile(["moe_router_topk"])
+        gate_TE = torch.randn(16384, 256, device="cuda")
+        with torch.no_grad():
+            outputs = {
+                n: router._score_and_select_experts(
+                    gate_TE[:n].contiguous(), None, padding_mask_T=None
+                )
+                for n in (16384, 14336, 34, 1)  # largest first, as the generator compiles
+            }
+        for n in (34, 1):
+            for actual, expected in zip(outputs[n][1:], outputs[16384][1:]):
+                self.assertTrue(torch.equal(actual, expected[:n]))
+
 
 if __name__ == "__main__":
     unittest.main()
