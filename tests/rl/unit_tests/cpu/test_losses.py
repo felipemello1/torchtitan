@@ -48,7 +48,7 @@ def test_dapo_loss_matches_vllm_tempered_logprobs_bitwise() -> None:
     assert metrics["bit_wise/logprob_diff/max"] == 0
 
 
-def _prime_ipo_loss_sum(
+def _reference_ipo_loss_sum(
     trainer_logprobs: torch.Tensor,
     inference_logprobs: torch.Tensor,
     advantages: torch.Tensor,
@@ -56,7 +56,7 @@ def _prime_ipo_loss_sum(
     eps: float,
     max_importance_ratio: float,
 ) -> torch.Tensor:
-    """Prime-RL's IPOLoss.loss (trainer/rl/loss.py) on already-masked tokens."""
+    """A plain reference IPO loss on already-masked tokens."""
     log_importance_ratio = trainer_logprobs - inference_logprobs
     larger = torch.maximum(trainer_logprobs, inference_logprobs)
     smaller = torch.minimum(trainer_logprobs, inference_logprobs)
@@ -68,7 +68,7 @@ def _prime_ipo_loss_sum(
     return (-advantages[keep] * importance_ratio).sum()
 
 
-def test_ipo_loss_matches_prime_rl_loss_and_gradient() -> None:
+def test_ipo_loss_matches_reference_loss_and_gradient() -> None:
     from torchtitan.rl.losses import IPOLoss
 
     torch.manual_seed(0)
@@ -103,7 +103,7 @@ def test_ipo_loss_matches_prime_rl_loss_and_gradient() -> None:
         -1, labels[:, None]
     )[:, 0]
     reference_loss = (
-        _prime_ipo_loss_sum(
+        _reference_ipo_loss_sum(
             trainer_logprobs[loss_mask],
             generator_logprobs[loss_mask],
             advantages[loss_mask],

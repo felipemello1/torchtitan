@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""IPO loss: policy gradient with an absolute-probability trust region (Prime-RL's default)."""
+"""IPO loss: policy gradient with an absolute-probability trust region."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from torchtitan.rl.losses.dapo import _MAX_LOG_RATIO, _normalize
 class IPOLoss(BaseLoss):
     """Policy gradient that drops tokens whose probability moved more than ``eps``.
 
-    Prime-RL's default RL loss. With ``r = p_y / q_y`` (trainer over generator probability of
+    With ``r = p_y / q_y`` (trainer over generator probability of
     the sampled token) and ``|p_y - q_y| <= eps`` selecting the kept tokens:
 
         w          = min(r, max_importance_ratio)    # value capped, gradient w * grad log p_y
@@ -110,7 +110,7 @@ class IPOLoss(BaseLoss):
                 max=math.log(self.max_importance_ratio)
             )
 
-        # Value min(r, cap); gradient (value) * grad log p, as Prime-RL's capped ratio.
+        # Value min(r, cap); gradient (value) * grad log p (a capped ratio).
         importance_weight = torch.exp(
             capped_log_ratio + (log_ratio - log_ratio.detach())
         )
@@ -121,7 +121,7 @@ class IPOLoss(BaseLoss):
 
         with torch.no_grad():
             masked_log_ratio = torch.where(effective_loss_mask, log_ratio, 0.0)
-            # k3 = r - 1 - log r, a nonnegative estimate of KL(q || p) (Prime-RL's mismatch KL).
+            # k3 = r - 1 - log r, a nonnegative estimate of KL(q || p) (the mismatch KL).
             clamped_log_ratio = masked_log_ratio.clamp(-_MAX_LOG_RATIO, _MAX_LOG_RATIO)
             kl_k3 = torch.expm1(clamped_log_ratio) - clamped_log_ratio
             metrics = {
@@ -130,7 +130,7 @@ class IPOLoss(BaseLoss):
                     torch.where(keep_mask, importance_weight, 0.0).sum(),
                     global_loss_token_counts,
                 ),
-                # Prime-RL's is_masked: share of loss tokens outside the trust region.
+                # is_masked: share of loss tokens outside the trust region.
                 "loss/ipo_dropped_frac": _normalize(
                     is_dropped.float().sum(), global_loss_token_counts
                 ),
