@@ -165,7 +165,7 @@ Use it when GC time is high (`perf/controller/gc_seconds`), agents' model calls 
 5. **GC time follows references, not object count.** 0.3M objects held 52-63M references, 98% of them in per-token Python lists of in-flight traces. Numpy arrays have one reference: the same trace replayed with numpy fields held 1.9M references instead of 37.9M.
 
 **Monarch tools** (`monarch/tools/SKILL.md`; not yet tried on our Slurm runs):
-- `breakpoint()` inside any actor opens a remote pdb (`_src/actor/bootstrap_main.py:66-68`); attach with `monarch debug` (`tools/cli.py:720`).
-- `monarch profile` collects a job-wide Perfetto trace of actor RPCs (`tools/cli.py:405`), useful for controller-to-generator call timing.
-- The mesh-admin server takes a py-spy dump of any proc by reference (`GET /v1/pyspy/{proc_ref}`, `monarch_dashboard/server/pyspy_client.py:7-13`), viewable in `monarch tui`. It needs mesh-admin and mTLS set up.
+- `breakpoint()` inside any actor opens a remote pdb (`monarch/_src/actor/bootstrap_main.py:66-68`); attach with `monarch debug` (`monarch/tools/cli.py:720`).
+- `monarch profile` collects a job-wide Perfetto trace of actor RPCs (`monarch/tools/cli.py:405`), useful for controller-to-generator call timing.
+- The mesh-admin server takes a py-spy dump of any proc by reference (`GET /v1/pyspy/{proc_ref}`, `monarch/monarch_dashboard/server/pyspy_client.py:7-13`), viewable in `monarch tui`. It needs mesh-admin and mTLS set up.
 - `monarch query` runs SQL over the job's telemetry, e.g. `SELECT * FROM actor_failures`.
