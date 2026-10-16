@@ -36,6 +36,7 @@ from torchtitan.rl.examples.verifiers.generation_server import (
     MAX_ROLLOUT_TOKENS_SAMPLING_PARAM,
     VerifiersGenerationMetadata,
 )
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 from torchtitan.rl.rollout.rubric import RewardFn, Rubric
@@ -289,6 +290,12 @@ class VerifiersRollouter(Rollouter):
             await client.wait_for_server_startup(
                 timeout=self._verifiers_config.connection_timeout_sec
             )
+
+    def generation_server_metrics(self) -> list[m.Metric]:
+        """The generation server's request latency and in-flight counts since the last call."""
+        if self._generation_server is None:
+            return []
+        return self._generation_server.drain_request_metrics()
 
     async def close(self) -> None:
         """Close the Verifiers clients, generation server, and environment servers."""
