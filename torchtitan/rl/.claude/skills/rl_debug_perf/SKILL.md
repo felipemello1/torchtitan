@@ -164,8 +164,13 @@ Use it when GC time is high (`perf/controller/gc_seconds`), agents' model calls 
 4. **What bad looked like** (35B SWE, 10 nodes): full GCs of 4.7-7.1 s every ~20 s, GC 18-27% of each step, the event loop blocked ≥0.2 s for 31% of wall time.
 5. **GC time follows references, not object count.** 0.3M objects held 52-63M references, 98% of them in per-token Python lists of in-flight traces. Numpy arrays have one reference: the same trace replayed with numpy fields held 1.9M references instead of 37.9M.
 
-**Monarch tools** (`monarch/tools/SKILL.md`; not yet tried on our Slurm runs):
-- `breakpoint()` inside any actor opens a remote pdb (`monarch/_src/actor/bootstrap_main.py:66-68`); attach with `monarch debug` (`monarch/tools/cli.py:720`).
-- `monarch profile` collects a job-wide Perfetto trace of actor RPCs (`monarch/tools/cli.py:405`), useful for controller-to-generator call timing.
-- The mesh-admin server takes a py-spy dump of any proc by reference (`GET /v1/pyspy/{proc_ref}`, `monarch/monarch_dashboard/server/pyspy_client.py:7-13`), viewable in `monarch tui`. It needs mesh-admin and mTLS set up.
-- `monarch query` runs SQL over the job's telemetry, e.g. `SELECT * FROM actor_failures`.
+**Monarch tools** (`monarch/tools/SKILL.md`). Tried on a 10-node Slurm run (Monarch 0.7):
+- Turn them on with `job.enable_telemetry()` before `job.apply()` (`monarch/_src/job/job.py:502`). It starts a telemetry sidecar on the client's node (~2% of a CPU, ~180 MB) and mesh admin (`Mesh admin server listening on http://<node0>:1729`).
+- Mesh admin speaks plain HTTP on Slurm (no mTLS). Bypass the cluster proxy:
+  `curl --noproxy '*' http://<node0>:1729/v1/tree` lists every proc and actor;
+  `curl --noproxy '*' http://<node0>:1729/v1/pyspy/<proc ref from the tree>` returns that proc's stacks as JSON. It only reaches Monarch procs (trainer, generators), not the controller (the root client): use py-spy by PID for that.
+- `monarch query` and `monarch profile` without a URL fail in batch jobs ("the active job is no longer running or healthy"): `.monarch/job_state.pkl` is the in-allocation `BatchJob`. Use the sidecar's API on node 0 instead. Find its port with `ss -ltnp` (pid of `_job_sidecar_worker`), then:
+  `curl -X POST http://127.0.0.1:<port>/api/query -d '{"sql": "SELECT COUNT(*) FROM actor_failures"}'`, or
+  `monarch profile http://127.0.0.1:<port> --time 20s` for a Perfetto trace of actor RPCs.
+  Useful tables: `messages`, `actor_failures`, `metric_sums` (mailbox posts, undeliverable messages) and `metric_gauges` (per-proc RSS).
+- `breakpoint()` inside an actor plus `monarch debug` works: `list`, `attach <actor> <rank>`, `p`, `c` (checked on a local proc mesh, `monarch/_src/actor/bootstrap_main.py:66-68`). The debug server runs in the client, so on Slurm run `monarch debug` on node 0. A breakpoint blocks that actor, so not on a live run.
