@@ -24,7 +24,7 @@ from torchtitan.models.common.config_utils import (
 )
 from torchtitan_recipes.overrides.triton_routed_experts import (
     triton_routed_experts,
-    triton_router_gate,
+    triton_topk_router,
 )
 
 _DIM, _HIDDEN, _E, _K = 1024, 256, 16, 4
@@ -191,21 +191,62 @@ class TestTritonRoutedExperts(unittest.TestCase):
         )
 
 
-class TestSmallRowsGemv(unittest.TestCase):
-    def test_bitwise_equal_to_cublas(self):
-        """At <= 8 rows the kernel equals cuBLAS bitwise, as the trainer runs it at any M."""
+class TestTritonTopKRouter(unittest.TestCase):
+    def test_matches_stock_router_with_ties(self):
         cfg = make_router_config(
             dim=_DIM,
             num_experts=256,
             gate_param_init={"weight": partial(init.trunc_normal_, std=0.02)},
             score_func=Softmax.Config(),
-        ).gate
+            top_k=8,
+            route_norm=True,
+        )
         with torch.device("cuda"):
-            gate = triton_router_gate(cfg).build().bfloat16()
+            stock, fused = cfg.build().eval(), triton_topk_router(cfg).build().eval()
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        # Integer logits: many exact ties, which must go to the lower expert id.
+        gate_TE = torch.randint(0, 6, (300, 256), device="cuda", generator=gen).float()
+        with torch.no_grad():
+            _, scores, ids, routing_map = stock._score_and_select_experts(
+                gate_TE, None, padding_mask_T=None
+            )
+            _, f_scores, f_ids, f_routing_map = fused._score_and_select_experts(
+                gate_TE, None, padding_mask_T=None
+            )
+        self.assertTrue(torch.equal(f_ids, ids))
+        self.assertTrue(torch.equal(f_routing_map, routing_map))
+        torch.testing.assert_close(f_scores, scores, rtol=1e-6, atol=0)
+
+    def test_gate_gemv_matches_cublas(self):
+        cfg = make_router_config(
+            dim=_DIM,
+            num_experts=256,
+            gate_param_init={"weight": partial(init.trunc_normal_, std=0.02)},
+            score_func=Softmax.Config(),
+        )
+        with torch.device("cuda"):
+            gate = triton_topk_router(cfg).build().gate.bfloat16()
+        for num_tokens in (1, 8, 9):  # 9: the stock GEMM
+            x_TD = torch.randn(num_tokens, _DIM, device="cuda", dtype=torch.bfloat16)
+            with torch.no_grad():
+                expected = torch.mm(x_TD, gate.weight.T, out_dtype=torch.float32)
+                torch.testing.assert_close(gate(x_TD), expected, rtol=1e-5, atol=1e-5)
+
+    def test_match_trainer_bitwise(self):
+        """The opt-in GEMV equals cuBLAS bitwise at <= 8 rows, as the trainer runs it."""
+        cfg = make_router_config(
+            dim=_DIM,
+            num_experts=256,
+            gate_param_init={"weight": partial(init.trunc_normal_, std=0.02)},
+            score_func=Softmax.Config(),
+        )
+        with torch.device("cuda"):
+            router = triton_topk_router(cfg, match_trainer_bitwise=True).build()
+        gate = router.gate.bfloat16()
         x_TD = torch.randn(2048, _DIM, device="cuda", dtype=torch.bfloat16)
         with torch.no_grad():
             expected = torch.mm(x_TD, gate.weight.T, out_dtype=torch.float32)
-            for num_tokens in (1, 8, 9):  # 9: the stock GEMM
+            for num_tokens in (1, 8, 9):
                 self.assertTrue(
                     torch.equal(gate(x_TD[:num_tokens]), expected[:num_tokens])
                 )

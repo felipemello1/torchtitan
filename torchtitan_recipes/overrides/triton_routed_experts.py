@@ -18,7 +18,7 @@ Example:
     >>> cfg = triton_routed_experts(moe_cfg.routed_experts)  # or the override import
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import triton
@@ -27,10 +27,10 @@ from triton.language.extra import libdevice
 
 from torchtitan.config import derive, override
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
-from torchtitan.models.common.activation import SwiGLU
+from torchtitan.models.common.activation import Softmax, SwiGLU
 from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
 from torchtitan.models.common.linear import GroupedLinear, Linear
-from torchtitan.models.common.moe import RoutedExperts
+from torchtitan.models.common.moe import RoutedExperts, TokenChoiceTopKRouter
 from torchtitan.models.common.token_dispatcher import (
     AllToAllTokenDispatcher,
     LocalTokenDispatcher,
@@ -40,11 +40,12 @@ __all__ = [
     "TritonRoutedExperts",
     "TritonGateLinear",
     "TritonSmallLinear",
+    "TritonTopKRouter",
     "triton_expert_mlp_op",
     "triton_routed_experts",
     "triton_routed_experts_op",
     "triton_shared_expert_linears",
-    "triton_router_gate",
+    "triton_topk_router",
 ]
 
 
@@ -549,7 +550,52 @@ def triton_routed_experts(cfg: RoutedExperts.Config) -> TritonRoutedExperts.Conf
 
 
 @triton.jit
+def _route_topk_kernel(
+    gate_ptr, bias_ptr, ids_ptr, scores_ptr, map_ptr, eps, scale,
+    E: tl.constexpr, K: tl.constexpr, HAS_BIAS: tl.constexpr, NORM: tl.constexpr,
+):  # fmt: skip
+    """Per token: softmax, top-K by argmax rounds (ties to the lower id), normalize."""
+    t = tl.program_id(0).to(tl.int64)
+    e = tl.arange(0, E)
+    k = tl.arange(0, K)
+    x = tl.load(gate_ptr + t * E + e)
+    p = libdevice.exp(x - tl.max(x, axis=0))
+    scores = p / tl.sum(p, axis=0)
+    choice = scores + tl.load(bias_ptr + e) if HAS_BIAS else scores
+    ids = tl.zeros((K,), tl.int32)
+    picked = tl.zeros((K,), tl.float32)
+    for i in tl.static_range(K):
+        top = tl.argmax(choice, axis=0, tie_break_left=True)
+        ids = tl.where(k == i, top, ids)
+        score = tl.sum(tl.where(e == top, scores, 0.0), axis=0)
+        picked = tl.where(k == i, score, picked)
+        choice = tl.where(e == top, float("-inf"), choice)
+    if NORM:
+        picked = picked / (tl.sum(picked, axis=0) + eps)
+    tl.store(ids_ptr + t * K + k, ids.to(tl.int64))
+    tl.store(scores_ptr + t * K + k, picked * scale)
+    tl.store(map_ptr + t * E + e, choice == float("-inf"))
+
+
+@triton.jit
 def _gate_gemv_kernel(
+    x_ptr, w_ptr, out_ptr, T, D, E, BLOCK_T: tl.constexpr, BLOCK_K: tl.constexpr
+):
+    """Program ``e``: fp32 ``out[:, e] = x @ w[e]`` over all of ``D`` (no split-K)."""
+    e = tl.program_id(0)
+    t = tl.arange(0, BLOCK_T)
+    acc = tl.zeros((BLOCK_T,), tl.float32)
+    for k0 in range(0, D, BLOCK_K):
+        k = k0 + tl.arange(0, BLOCK_K)
+        mask = (t[:, None] < T) & (k[None, :] < D)
+        x = tl.load(x_ptr + t[:, None] * D + k[None, :], mask=mask, other=0.0)
+        w = tl.load(w_ptr + e * D + k, mask=k < D, other=0.0)
+        acc += tl.sum(x.to(tl.float32) * w.to(tl.float32)[None, :], axis=1)
+    tl.store(out_ptr + t * E + e, acc, mask=t < T)
+
+
+@triton.jit
+def _dot_gemv_kernel(
     x_ptr, w_ptr, out_ptr, T, D: tl.constexpr, N: tl.constexpr,
     BLOCK_T: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     STAGES: tl.constexpr,
@@ -570,28 +616,40 @@ def _gate_gemv_kernel(
 class _SmallRowsGemv:
     """Linear mixin: no-grad, bias-free projections of <= ``max_rows`` rows in one
     Triton kernel (cuBLAS runs split-K GEMMs plus reduces, or slow GEMMs, there).
-    Output is fp32 for HiMidLoLinear, else the input dtype; bitwise equal to cuBLAS."""
+    Output is fp32 for HiMidLoLinear, else the input dtype.
+    ``match_trainer_bitwise``: a tensor-core GEMV that equals cuBLAS bitwise at any
+    batch size, as the trainer runs it (~1-2 µs slower); else a faster dot-product
+    GEMV that differs in fp32 summation order."""
 
     max_rows = 8
+    match_trainer_bitwise = False
 
     def _linear(self, input, weight, bias):
-        weight = _local(weight).reshape(-1, weight.shape[-1])
-        (num_out, dim), block_k = weight.shape, 512
+        local_OD = _local(weight).reshape(-1, weight.shape[-1])
+        (num_out, dim), block_k = local_OD.shape, 512
+        bitwise = self.match_trainer_bitwise
         if (
             torch.is_grad_enabled()
             or bias is not None
             or input.dim() != 2
             or input.shape[0] > self.max_rows
-            or num_out % 16
-            or dim % block_k
+            or (bitwise and (num_out % 16 or dim % block_k))
         ):
             return super()._linear(input, weight, bias)
         dtype = torch.float32 if isinstance(self, HiMidLoLinear) else input.dtype
         out = input.new_empty(input.shape[0], num_out, dtype=dtype)
-        _gate_gemv_kernel[(num_out // 16,)](
-            input.contiguous(), weight.contiguous(), out, input.shape[0], D=dim,
-            N=num_out, BLOCK_T=16, BLOCK_N=16, BLOCK_K=block_k, STAGES=3, num_warps=2,
-        )  # fmt: skip
+        input, local_OD = input.contiguous(), local_OD.contiguous()
+        if bitwise:
+            _dot_gemv_kernel[(num_out // 16,)](
+                input, local_OD, out, input.shape[0], D=dim, N=num_out, BLOCK_T=16,
+                BLOCK_N=16, BLOCK_K=block_k, STAGES=3, num_warps=2,
+            )  # fmt: skip
+        else:
+            _gate_gemv_kernel[(num_out,)](
+                input, local_OD, out, input.shape[0], dim, num_out,
+                BLOCK_T=triton.next_power_of_2(input.shape[0]),
+                BLOCK_K=min(triton.next_power_of_2(dim), 2048),
+            )  # fmt: skip
         return out
 
 
@@ -600,37 +658,91 @@ class TritonGateLinear(_SmallRowsGemv, HiMidLoLinear):
 
     @dataclass(kw_only=True, slots=True)
     class Config(HiMidLoLinear.Config):
-        pass
+        match_trainer_bitwise: bool = False
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.match_trainer_bitwise = config.match_trainer_bitwise
 
 
 class TritonSmallLinear(_SmallRowsGemv, Linear):
-    """Linear with ``_SmallRowsGemv`` (the shared experts' w13).
+    """Linear with ``_SmallRowsGemv`` (the shared experts' w13 and gate).
 
-    Above two rows, its 1024 programs crowd the routed experts' GEMMs running beside it.
+    Above two rows, its programs crowd the routed experts' GEMMs running beside it.
     """
 
     max_rows = 2
 
     @dataclass(kw_only=True, slots=True)
     class Config(Linear.Config):
+        match_trainer_bitwise: bool = False
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.match_trainer_bitwise = config.match_trainer_bitwise
+
+
+class TritonTopKRouter(TokenChoiceTopKRouter):
+    """``TokenChoiceTopKRouter`` with its no-grad softmax top-k as one Triton kernel."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(TokenChoiceTopKRouter.Config):
         pass
+
+    def _score_and_select_experts(
+        self, gate_TE, expert_bias_E, *, padding_mask_T, **kwargs
+    ):
+        num_tokens, num_experts = gate_TE.shape
+        if (
+            torch.is_grad_enabled()
+            or self.training
+            or type(self.score_func) is not Softmax
+            or not gate_TE.is_cuda
+            or num_experts & (num_experts - 1)
+        ):
+            return super()._score_and_select_experts(
+                gate_TE, expert_bias_E, padding_mask_T=padding_mask_T, **kwargs
+            )
+        ids_TK = gate_TE.new_empty(num_tokens, self.top_k, dtype=torch.int64)
+        scores_TK = gate_TE.new_empty(num_tokens, self.top_k)
+        map_TE = gate_TE.new_empty(num_tokens, num_experts, dtype=torch.bool)
+        _route_topk_kernel[(num_tokens,)](
+            gate_TE, gate_TE if expert_bias_E is None else expert_bias_E, ids_TK,
+            scores_TK, map_TE, self.route_norm_epsilon, self.route_scale, E=num_experts,
+            K=self.top_k, HAS_BIAS=expert_bias_E is not None, NORM=self.route_norm,
+            num_warps=1,
+        )  # fmt: skip
+        # The full scores are only read by the auxiliary loss, in training.
+        return None, scores_TK, ids_TK, map_TE
 
 
 @override(
-    target=HiMidLoLinear.Config,
-    fqns=["*router.gate"],
+    target=TokenChoiceTopKRouter.Config,
     exact=True,
-    description="Run the router gate's no-grad GEMM at <= 8 tokens in Triton.",
+    description="Run the no-grad softmax top-k router as one Triton kernel.",
 )
-def triton_router_gate(cfg: HiMidLoLinear.Config) -> TritonGateLinear.Config:
-    return derive(cfg, TritonGateLinear.Config)
+def triton_topk_router(
+    cfg: TokenChoiceTopKRouter.Config, *, match_trainer_bitwise: bool = False
+) -> TokenChoiceTopKRouter.Config:
+    """``match_trainer_bitwise``: keep the stock compiled router, whose reductions are
+    batch-invariant, so scores equal the trainer's bitwise (~1-5 µs slower at decode)."""
+    gate = derive(
+        cfg.gate, TritonGateLinear.Config, match_trainer_bitwise=match_trainer_bitwise
+    )
+    if match_trainer_bitwise:
+        return replace(cfg, gate=gate)
+    return derive(cfg, TritonTopKRouter.Config, gate=gate)
 
 
 @override(
     target=Linear.Config,
-    fqns=["*shared_experts.w13"],
+    fqns=["*shared_experts.w13", "*shared_experts.gate"],
     exact=True,
-    description="Run the shared experts' no-grad w13 at <= 2 tokens in Triton.",
+    description="Run the shared experts' no-grad w13 and gate at <= 2 tokens in Triton.",
 )
-def triton_shared_expert_linears(cfg: Linear.Config) -> TritonSmallLinear.Config:
-    return derive(cfg, TritonSmallLinear.Config)
+def triton_shared_expert_linears(
+    cfg: Linear.Config, *, match_trainer_bitwise: bool = False
+) -> TritonSmallLinear.Config:
+    return derive(
+        cfg, TritonSmallLinear.Config, match_trainer_bitwise=match_trainer_bitwise
+    )
