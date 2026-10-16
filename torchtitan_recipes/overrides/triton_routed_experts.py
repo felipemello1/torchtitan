@@ -408,7 +408,7 @@ def triton_routed_experts_op(
     else:
         _route_scan_kernel[(num_experts,)](
             ids_N, routes_N, offsets_E, num_routes, num_experts,
-            E=experts_p2, BLOCK=min(triton.next_power_of_2(num_routes), 1024),
+            E=experts_p2, BLOCK=min(triton.next_power_of_2(num_routes), 2048),
         )  # fmt: skip
     _launch_gemm(
         x_TD,
