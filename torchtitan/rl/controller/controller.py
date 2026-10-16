@@ -309,14 +309,14 @@ class Controller(Configurable):
             default_factory=m.MetricsProcessor.Config
         )
 
-        garbage_collector: GarbageCollector.Config | None = None
-        """None: Python's automatic GC, whose full collections pause the event loop for seconds on a large heap.
-        Set: automatic GC off; `gc.collect(1)` every `gc_freq` steps (`debug` is unsupported). Objects alive
-        at a collect are never scanned again, so a cycle among them that dies later leaks; watch
-        `controller/memory/rss_gib`."""
+        manual_gc_every_n_steps: int = 0
+        """0: Python's automatic GC, whose full collections pause the event loop for seconds on a large heap.
+        N > 0: automatic GC off, and `gc.collect(1)` every N steps (from step 2) after metrics are logged.
+        Objects alive at a collect are never scanned again, so a cycle among them that dies later leaks until
+        a full collect (`full_gc_every_n_steps`); watch `controller/memory/rss_gib`."""
 
         full_gc_every_n_steps: int = 0
-        """With `garbage_collector` set, also run a full `gc.collect()` every N steps (0: never). It frees
+        """With `manual_gc_every_n_steps` set, also run a full `gc.collect()` every N steps (0: never). It frees
         cycles that died after their first collect; its pause and freed objects are logged with the next step
         as `controller/gc/full_collect/{seconds,collected}`."""
 
@@ -822,9 +822,13 @@ class Controller(Configurable):
             "Full GC before freezing the controller's setup objects"
         )
         self._full_gc_metrics: list[m.Metric] = []
+        # Not `GarbageCollector.Config()`: its default `gc_freq` (50, the trainer's) would collect
+        # every 50 steps, leaving young objects to pile up between collects.
         self._garbage_collector = (
-            self.config.garbage_collector.build()
-            if self.config.garbage_collector is not None
+            GarbageCollector(
+                GarbageCollector.Config(gc_freq=self.config.manual_gc_every_n_steps)
+            )
+            if self.config.manual_gc_every_n_steps > 0
             else None
         )
 
