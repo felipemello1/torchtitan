@@ -478,6 +478,13 @@ class Controller(Configurable):
         cycles that died after reaching the oldest generation are freed. Logged next step as
         `controller/gc/full_collect/{seconds,collected}`."""
 
+        full_gc_every_seconds: float = 0
+        """Like `full_gc_every_n_steps`, by wall time: a full collect at the first step boundary at least
+        this many seconds after the previous one (0: never)."""
+
+        full_gc_at_steps: tuple[int, ...] = ()
+        """Extra full collects at these steps (e.g. to measure one in a short run)."""
+
         trainer: Trainer.Config
         """Trainer config. Controls the trainer model, optimizer, training, parallelism."""
 
@@ -1182,6 +1189,7 @@ class Controller(Configurable):
             "Full GC before freezing the controller's setup objects"
         )
         self._pending_full_gc_metrics: list[m.Metric] = []
+        self._last_full_gc = time.monotonic()
         self._garbage_collector = (
             self.config.garbage_collector.build()
             if self.config.garbage_collector is not None
@@ -1856,7 +1864,14 @@ class Controller(Configurable):
             if self._garbage_collector is not None:
                 self._garbage_collector.run(step)
                 full_every = self.config.full_gc_every_n_steps
-                if full_every and step % full_every == 0:
+                every_s = self.config.full_gc_every_seconds
+                now = time.monotonic()
+                if (
+                    (full_every and step % full_every == 0)
+                    or (every_s and now - self._last_full_gc >= every_s)
+                    or step in self.config.full_gc_at_steps
+                ):
+                    self._last_full_gc = now
                     with sl.log_trace_span("full_gc_collect"):
                         start = time.perf_counter()
                         collected = gc.collect()
