@@ -12,6 +12,7 @@ Start here:
 - The run hangs or crashes: section 5.
 - The run is slow: section 1, then section 3.
 - A reward change you don't trust: section 6.
+- The controller stalls (GC time high, agents' model calls lag): section 7.
 
 References: [worked_examples.md](references/worked_examples.md) (real runs), [rollout_inspection.md](references/rollout_inspection.md) (scripts), [metrics.md](references/metrics.md), [common_bugs.md](references/common_bugs.md).
 
@@ -142,3 +143,34 @@ Confirmation steps and fixes: [references/common_bugs.md](references/common_bugs
 - **Compare the same tasks.** `group_id` is the index in the dataset stream, so a same-seed relaunch gives each prompt the same `group_id`. Compare reward per group, e.g. after a speed-up.
 - **Eval offline on a fixed set.** Online validation runs only at the start and end (`ValidationConfig`). Evaluate saved checkpoints, k >= 4 samples per problem, as per-problem paired deltas against step 0.
 - **Eval at the training cap and with room to think.** After 50 capped steps, one 35B model gained 4.4 points at its 49K training cap but lost 10.6 on harder problems at 131K. Report finish rate and accuracy among finished separately.
+
+## 7. Profiling the controller
+
+Use it when GC time is high (`perf/controller/gc_seconds`), agents' model calls lag, or the run is slow and the trainer and engines both look idle. The controller is one Python process: the rollout loop, the Verifiers client and the aiohttp generation server all share its GIL. Any long pause stalls every agent's model call.
+
+1. **Find the controller PID** on node 0: it is the Python process running your launch entrypoint, not a Monarch worker (`bootstrap_main` / process allocator).
+   ```bash
+   srun --overlap --jobid <job> -w <node0> -N1 -n1 ps -eo pid,etime,rss,args | grep python
+   ```
+2. **Record 120 s in steady state** (after step 2), and use dumps for hangs:
+   ```bash
+   py-spy record --gil --idle --native -r 100 -d 120 --format speedscope -o controller.json -p <pid>
+   py-spy dump --native -p <pid>     # a few dumps ~7 s apart catch a GC pause or a hang
+   python scripts/speedscope_summary.py controller.json 100 120
+   ```
+   - `--gil` samples only the thread holding the GIL, so GIL held = samples / (rate x seconds). At 10 nodes it was 94%: the thread was saturated.
+   - Read the top inclusive frames and the frames that trigger GC. In that run, 78% of samples were generation-server request handling, and 61% of GC was triggered by building one dict per completion token.
+3. **Pair it with the metrics:** GC seconds and gen2 pauses per step (`perf/controller/gc_seconds`, `controller/gc/gen2/*`), event-loop lag (stalls ≥0.2 s), controller RSS and per-request latency in the generation server.
+4. **What bad looked like** (35B SWE, 10 nodes): full GCs of 4.7-7.1 s every ~20 s, GC 18-27% of each step, the event loop blocked ≥0.2 s for 31% of wall time.
+5. **GC time follows references, not object count.** 0.3M objects held 52-63M references, 98% of them in per-token Python lists of in-flight traces. Numpy arrays have one reference: the same trace replayed with numpy fields held 1.9M references instead of 37.9M.
+
+**Monarch tools** (`monarch/tools/SKILL.md`). Tried on a 10-node Slurm run (Monarch 0.7):
+- Turn them on with `job.enable_telemetry()` before `job.apply()` (`monarch/_src/job/job.py:502`). It starts a telemetry sidecar on the client's node (~2% of a CPU, ~180 MB) and mesh admin (`Mesh admin server listening on http://<node0>:1729`).
+- Mesh admin speaks plain HTTP on Slurm (no mTLS). Bypass the cluster proxy:
+  `curl --noproxy '*' http://<node0>:1729/v1/tree` lists every proc and actor;
+  `curl --noproxy '*' http://<node0>:1729/v1/pyspy/<proc ref from the tree>` returns that proc's stacks as JSON. It only reaches Monarch procs (trainer, generators), not the controller (the root client): use py-spy by PID for that.
+- `monarch query` and `monarch profile` without a URL fail in batch jobs ("the active job is no longer running or healthy"): `.monarch/job_state.pkl` is the in-allocation `BatchJob`. Use the sidecar's API on node 0 instead. Find its port with `ss -ltnp` (pid of `_job_sidecar_worker`), then:
+  `curl -X POST http://127.0.0.1:<port>/api/query -d '{"sql": "SELECT COUNT(*) FROM actor_failures"}'`, or
+  `monarch profile http://127.0.0.1:<port> --time 20s` for a Perfetto trace of actor RPCs.
+  Useful tables: `messages`, `actor_failures`, `metric_sums` (mailbox posts, undeliverable messages) and `metric_gauges` (per-proc RSS).
+- `breakpoint()` inside an actor plus `monarch debug` works: `list`, `attach <actor> <rank>`, `p`, `c` (checked on a local proc mesh, `monarch/_src/actor/bootstrap_main.py:66-68`). The debug server runs in the client, so on Slurm run `monarch debug` on node 0. A breakpoint blocks that actor, so not on a live run.
