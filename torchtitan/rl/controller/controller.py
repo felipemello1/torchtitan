@@ -91,6 +91,7 @@ import asyncio
 import copy
 import json
 import logging
+import gc
 import math
 import os
 import time
@@ -313,6 +314,11 @@ class Controller(Configurable):
         Set: automatic GC off; `gc.collect(1)` every `gc_freq` steps (`debug` is unsupported). Objects alive
         at a collect are never scanned again, so a cycle among them that dies later leaks; watch
         `controller/memory/rss_gib`."""
+
+        full_gc_every_n_steps: int = 0
+        """With `garbage_collector` set, also run a full `gc.collect()` every N steps (0: never). It frees
+        cycles that died after their first collect; its pause and freed objects are logged with the next step
+        as `controller/gc/full_collect/{seconds,collected}`."""
 
         override: OverrideConfig = field(default_factory=OverrideConfig)
         """Registered overrides applied to this whole config tree, including the
@@ -815,6 +821,7 @@ class Controller(Configurable):
         GarbageCollector.freeze(
             "Full GC before freezing the controller's setup objects"
         )
+        self._full_gc_metrics: list[m.Metric] = []
         self._garbage_collector = (
             self.config.garbage_collector.build()
             if self.config.garbage_collector is not None
@@ -1281,10 +1288,25 @@ class Controller(Configurable):
                         m.Metric(
                             "controller/memory/rss_gib", m.NoReduce(rss_bytes / 2**30)
                         ),
+                        *self._full_gc_metrics,
                     ],
                 )
+            self._full_gc_metrics = []
             if self._garbage_collector is not None:
                 self._garbage_collector.run(step)
+                full_gc_every_n_steps = self.config.full_gc_every_n_steps
+                if full_gc_every_n_steps and step % full_gc_every_n_steps == 0:
+                    start = time.perf_counter()
+                    collected = gc.collect()
+                    self._full_gc_metrics = [
+                        m.Metric(
+                            "controller/gc/full_collect/seconds",
+                            m.NoReduce(time.perf_counter() - start),
+                        ),
+                        m.Metric(
+                            "controller/gc/full_collect/collected", m.NoReduce(collected)
+                        ),
+                    ]
 
         # Finish the last push and pull so generators hold the final weights for post-validation.
         if push_task is not None:
