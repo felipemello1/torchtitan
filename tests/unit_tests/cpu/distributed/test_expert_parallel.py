@@ -361,6 +361,70 @@ class TestAllGatherDispatch(unittest.TestCase):
                         out_GD, expected_GD, atol=5e-2, rtol=2e-2
                     )
 
+    def test_dispatch_counts_and_rows_with_an_empty_expert(self):
+        # 3 local experts per rank, so the empty one below sits between two non-empty ones.
+        num_experts, top_k, ep_size, num_local_experts = 6, 3, 2, 3
+        x_GD = torch.arange(4, dtype=torch.float32).unsqueeze(1).repeat(1, 4)
+        # Rank 0's local expert 1 gets no tokens.
+        expert_ids_GK = torch.tensor([[0, 3, 4], [2, 5, 0], [3, 4, 5], [2, 0, 4]])
+        dispatcher = AllToAllTokenDispatcher.Config(
+            num_experts=num_experts, top_k=top_k
+        ).build()
+        mock_mesh = unittest.mock.MagicMock()
+        mock_mesh.size.return_value = ep_size
+        for ep_rank in range(ep_size):
+            mock_mesh.get_local_rank.return_value = ep_rank
+            with (
+                unittest.mock.patch.object(
+                    AllToAllTokenDispatcher,
+                    "ep_mesh",
+                    new_callable=unittest.mock.PropertyMock,
+                    return_value=mock_mesh,
+                ),
+                unittest.mock.patch.object(
+                    spmd,
+                    "all_gather",
+                    side_effect=[x_GD, torch.ones(4, top_k), expert_ids_GK],
+                ),
+            ):
+                routed_input_ND, counts_e, metadata = dispatcher._all_gather_dispatch(
+                    x_GD[:2], torch.ones(2, top_k), expert_ids_GK[:2]
+                )
+            local_ids_GK = expert_ids_GK - ep_rank * num_local_experts
+            expected_counts_e = torch.bincount(
+                local_ids_GK[(local_ids_GK >= 0) & (local_ids_GK < num_local_experts)],
+                minlength=num_local_experts,
+            )
+            self.assertEqual(counts_e.tolist(), expected_counts_e.tolist())
+            # Each local pick's row holds its token and sits among its expert's rows.
+            for gathered_token, pick in metadata.is_local_GK.nonzero().tolist():
+                row = metadata.sorted_positions_GK[gathered_token, pick]
+                expert = local_ids_GK[gathered_token, pick]
+                self.assertTrue(
+                    counts_e[:expert].sum() <= row < counts_e[: expert + 1].sum()
+                )
+                self.assertTrue(torch.equal(routed_input_ND[row], x_GD[gathered_token]))
+
+    def test_dispatch_rejects_more_local_experts_than_int16_keys_hold(self):
+        dispatcher = AllToAllTokenDispatcher.Config(
+            num_experts=2 * 32768, top_k=1
+        ).build()
+        mock_mesh = unittest.mock.MagicMock()
+        mock_mesh.size.return_value = 2
+        mock_mesh.get_local_rank.return_value = 0
+        with unittest.mock.patch.object(
+            AllToAllTokenDispatcher,
+            "ep_mesh",
+            new_callable=unittest.mock.PropertyMock,
+            return_value=mock_mesh,
+        ):
+            with self.assertRaisesRegex(ValueError, "int16"):
+                dispatcher._all_gather_dispatch(
+                    torch.zeros(1, 4),
+                    torch.ones(1, 1),
+                    torch.zeros(1, 1, dtype=torch.long),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
