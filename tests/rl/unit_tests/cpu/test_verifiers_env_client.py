@@ -4,14 +4,17 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import hashlib
+import inspect
 import random
 
 import numpy as np
 import pytest
 
-pytest.importorskip("verifiers")
+pytest.importorskip("verifiers.v1.serve.delta")  # verifiers >= 0.3.2 streams traces
 
 from torchtitan.rl.examples.verifiers.env_client import NumpyEpisodeAssembly
+from verifiers.v1.serve.client import EnvClient
 from verifiers.v1.serve.delta import EpisodeAssembly, pack, unpack, TraceSummary
 
 
@@ -71,3 +74,18 @@ def test_numpy_assembly_finishes_to_the_same_record() -> None:
             assert all(type(v) is int for v in node["token_ids"])
             assert all(type(v) is bool for v in node["mask"] + node["is_content"])
             assert all(type(v) is float for v in node["logprobs"])
+
+
+# sha256 of `inspect.getsource(EnvClient.run)` in verifiers 0.3.2 to 0.4.0, which
+# `NumpyEnvClient.run` copies.
+_ENV_CLIENT_RUN_SHA256_PREFIX = "ac2fa8410a4e28af"
+
+
+def test_env_client_run_is_the_copied_version() -> None:
+    source = inspect.getsource(EnvClient.run)
+    digest = hashlib.sha256(source.encode()).hexdigest()[:16]
+    assert digest == _ENV_CLIENT_RUN_SHA256_PREFIX, (
+        "verifiers' EnvClient.run changed. NumpyEnvClient.run "
+        "(torchtitan/rl/examples/verifiers/env_client.py) is a copy of it with the assembly class "
+        "swapped: re-check the copy against the new source, then update this hash."
+    )
