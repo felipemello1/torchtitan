@@ -19,7 +19,11 @@ from torchtitan.models.common.config_utils import (
     make_router_config,
 )
 from torchtitan.models.common.moe import RoutedExperts
-from torchtitan_recipes.overrides.triton_routed_experts import TritonRoutedExperts
+from torchtitan.models.qwen3_5.flavors import _shared_experts_config
+from torchtitan_recipes.overrides.triton_routed_experts import (
+    TritonRoutedExperts,
+    TritonSmallLinear,
+)
 
 _TRITON_ROUTED_EXPERTS = (
     "torchtitan_recipes.overrides.triton_routed_experts.triton_routed_experts"
@@ -57,6 +61,29 @@ class TestTritonRoutedExpertsOverride(unittest.TestCase):
         )
         apply_overrides(OverrideConfig(imports=[_TRITON_ROUTED_EXPERTS]), moe)
         self.assertIsInstance(moe.routed_experts, TritonRoutedExperts.Config)
+
+    def test_shared_expert_linears_override(self):
+        moe = make_moe_config(
+            num_experts=4,
+            router=make_router_config(
+                dim=16,
+                num_experts=4,
+                gate_param_init={"weight": partial(init.trunc_normal_, std=0.02)},
+                score_func=Sigmoid.Config(),
+                top_k=2,
+            ),
+            routed_experts=_routed_experts_config(),
+            shared_experts=_shared_experts_config(
+                dim=16, hidden_dim=32, layer_id=0, enable_sp=False
+            ),
+            enable_sp=False,
+        )
+        name = "torchtitan_recipes.overrides.triton_routed_experts"
+        imports = [f"{name}.triton_shared_expert_linears"]
+        apply_overrides(OverrideConfig(imports=imports), moe)
+        self.assertIsInstance(moe.shared_experts.w13, TritonSmallLinear.Config)
+        self.assertIsInstance(moe.shared_experts.gate, TritonSmallLinear.Config)
+        self.assertNotIsInstance(moe.shared_experts.w2, TritonSmallLinear.Config)
 
 
 if __name__ == "__main__":

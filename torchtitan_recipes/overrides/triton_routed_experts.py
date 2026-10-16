@@ -29,7 +29,7 @@ from torchtitan.config import derive, override
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.models.common.activation import Softmax, SwiGLU
 from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
-from torchtitan.models.common.linear import GroupedLinear
+from torchtitan.models.common.linear import GroupedLinear, Linear
 from torchtitan.models.common.moe import RoutedExperts, TokenChoiceTopKRouter
 from torchtitan.models.common.token_dispatcher import (
     AllToAllTokenDispatcher,
@@ -39,10 +39,12 @@ from torchtitan.models.common.token_dispatcher import (
 __all__ = [
     "TritonRoutedExperts",
     "TritonGateLinear",
+    "TritonSmallLinear",
     "TritonTopKRouter",
     "triton_expert_mlp_op",
     "triton_routed_experts",
     "triton_routed_experts_op",
+    "triton_shared_expert_linears",
     "triton_topk_router",
 ]
 
@@ -586,28 +588,47 @@ def _gate_gemv_kernel(
     tl.store(out_ptr + t * E + e, acc, mask=t < T)
 
 
-class TritonGateLinear(HiMidLoLinear):
-    """Router gate: no-grad fp32 logits for <= 8 tokens in one Triton kernel.
+class _SmallRowsGemv:
+    """Linear mixin: no-grad, bias-free projections of <= ``max_rows`` rows in one
+    Triton kernel (cuBLAS runs split-K GEMMs plus reduces, or slow GEMMs, there).
+    Output is fp32 for HiMidLoLinear, else the input dtype."""
 
-    cuBLAS runs a split-K GEMM plus a reduce there.
-    """
+    max_rows = 8
+
+    def _linear(self, input, weight, bias):
+        small = input.dim() == 2 and input.shape[0] <= self.max_rows
+        if torch.is_grad_enabled() or bias is not None or not small:
+            return super()._linear(input, weight, bias)
+        weight = _local(weight).reshape(-1, weight.shape[-1]).contiguous()
+        (num_tokens, dim), num_out = input.shape, weight.shape[0]
+        dtype = torch.float32 if isinstance(self, HiMidLoLinear) else input.dtype
+        out = input.new_empty(num_tokens, num_out, dtype=dtype)
+        _gate_gemv_kernel[(num_out,)](
+            input.contiguous(), weight, out, num_tokens, dim, num_out,
+            BLOCK_T=8, BLOCK_K=min(triton.next_power_of_2(dim), 2048),
+        )  # fmt: skip
+        return out
+
+
+class TritonGateLinear(_SmallRowsGemv, HiMidLoLinear):
+    """Router gate with ``_SmallRowsGemv``."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(HiMidLoLinear.Config):
         pass
 
-    def _linear(self, input, weight, bias):
-        small = input.dim() == 2 and input.shape[0] <= 8
-        if torch.is_grad_enabled() or bias is not None or not small:
-            return super()._linear(input, weight, bias)
-        (num_tokens, dim), num_experts = input.shape, weight.shape[0]
-        out_TE = input.new_empty(num_tokens, num_experts, dtype=torch.float32)
-        _gate_gemv_kernel[(num_experts,)](
-            input.contiguous(), _local(weight).contiguous(), out_TE, num_tokens, dim,
-            num_experts,
-            BLOCK_T=8, BLOCK_K=min(triton.next_power_of_2(dim), 2048),
-        )  # fmt: skip
-        return out_TE
+
+class TritonSmallLinear(_SmallRowsGemv, Linear):
+    """Linear with ``_SmallRowsGemv`` (the shared experts' w13 and gate).
+
+    Above one row, its 1024 programs crowd the routed experts' GEMMs running beside it.
+    """
+
+    max_rows = 1
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Linear.Config):
+        pass
 
 
 class TritonTopKRouter(TokenChoiceTopKRouter):
@@ -653,3 +674,13 @@ def triton_topk_router(cfg: TokenChoiceTopKRouter.Config) -> TritonTopKRouter.Co
     gate = derive(cfg.gate, TritonGateLinear.Config)
     return derive(cfg, TritonTopKRouter.Config, gate=gate)
 
+
+
+@override(
+    target=Linear.Config,
+    fqns=["*shared_experts.w13", "*shared_experts.gate"],
+    exact=True,
+    description="Run the shared experts' no-grad w13 and gate at one token in Triton.",
+)
+def triton_shared_expert_linears(cfg: Linear.Config) -> TritonSmallLinear.Config:
+    return derive(cfg, TritonSmallLinear.Config)
