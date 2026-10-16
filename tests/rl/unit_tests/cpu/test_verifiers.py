@@ -475,7 +475,7 @@ def test_generation_server_forwards_token_request() -> None:
             "group=1/rollout=2/request=0",
             "group=1/rollout=2/request=1",
         ]
-        assert all(request["prompt_token_ids"] == [10, 11] for request in received)
+        assert all(list(request["prompt_token_ids"]) == [10, 11] for request in received)
         assert all(request["group_id"] == 1 for request in received)
         assert all(
             request["routing_session_id"] == "group=1/rollout=2" for request in received
