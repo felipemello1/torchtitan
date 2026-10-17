@@ -422,10 +422,8 @@ def _routed_experts_payload(
 
 def _validate_token_ids(value: object, *, field_name: str) -> list[int]:
     """Validate an untyped JSON value as integer token IDs and return a copy."""
-    if not isinstance(value, list) or any(
-        isinstance(token_id, bool) or not isinstance(token_id, int)
-        for token_id in value
-    ):
+    # One C-level pass over the types: JSON ints are exactly `int`; `bool` is its own type.
+    if not isinstance(value, list) or not set(map(type, value)) <= {int}:
         raise ValueError(f"{field_name} must be a list of integer token IDs")
     return list(value)
 

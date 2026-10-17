@@ -25,6 +25,7 @@ from aiohttp import ClientSession
 from torchtitan.rl.examples.verifiers.data import VerifiersTaskSample
 from torchtitan.rl.examples.verifiers.generation_server import (
     _parse_sampling_config,
+    _validate_token_ids,
     GenerationServer,
     VerifiersGenerationMetadata,
 )
@@ -393,6 +394,16 @@ def test_verifiers_rollout_logs_keep_the_failure_reason(caplog) -> None:
         log_failed_rollout({**logs, "errors": []}, group_id=3, rollout_id=2)
     assert "error=HarnessError: agent timeout" in caplog.text
     assert "error=None: None" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "value", [[1, True], [1, 2.0], [1, "2"], [1, None], (1, 2), None]
+)
+def test_validate_token_ids_rejects_non_int_tokens(value) -> None:
+    with pytest.raises(
+        ValueError, match="token_ids must be a list of integer token IDs"
+    ):
+        _validate_token_ids(value, field_name="token_ids")
 
 
 def test_generation_server_forwards_token_request() -> None:
