@@ -11,9 +11,12 @@
 
 import contextlib
 import gc
+import itertools
+import json
 import logging
+import os
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.types import Rollout
@@ -124,6 +127,54 @@ class GCTimer:
 
     def close(self) -> None:
         gc.callbacks.remove(self._on_gc)
+
+
+def append_heap_census(*, path: str, step: int) -> None:
+    """Append one JSON line to `path` counting, by type, the objects a full GC scans: containers
+    and class instances, not str, bytes or numbers. The top types show what makes a full GC slow.
+
+    Example:
+        append_heap_census(path="outputs/rl/heap_census.jsonl", step=20)
+        # appends:
+        # {"step": 20, "rss_gib": 31.2,
+        #  "objects_per_generation": [1520, 3100, 1371000],  # a full collection scans all 3
+        #  "frozen_objects": 1021000,                        # after gc.freeze(): never scanned
+        #  "top_types": [["builtins.dict", 412000], ["builtins.list", 160000], ...],  # top 40
+        #  "census_seconds": 0.25}
+    """
+    start = time.perf_counter()
+    gc_was_enabled = gc.isenabled()
+    gc.disable()  # a collection between the calls would list gen-0 survivors twice
+    generations = [gc.get_objects(generation=g) for g in range(3)]
+    if gc_was_enabled:
+        gc.enable()
+    type_counts = Counter(map(type, itertools.chain.from_iterable(generations)))
+    object_counts = [len(objects) for objects in generations]
+    # gc.get_objects() lists this frame too, and this frame holds the lists: a cycle that would keep
+    # every object alive now until the next full collect, even after the program drops them.
+    for objects in generations:
+        objects.clear()
+    del generations
+    # statm's 2nd field is the resident set size, in pages.
+    with open("/proc/self/statm") as file:
+        rss_bytes = int(file.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    record = {
+        "step": step,
+        "rss_gib": round(rss_bytes / 2**30, 2),
+        "objects_per_generation": object_counts,
+        "frozen_objects": gc.get_freeze_count(),
+        "top_types": [
+            [f"{obj_type.__module__}.{obj_type.__qualname__}", count]
+            for obj_type, count in type_counts.most_common(40)
+        ],
+        "census_seconds": round(time.perf_counter() - start, 3),
+    }
+    with open(path, "a") as file:
+        file.write(json.dumps(record) + "\n")
+    logger.info(
+        f"Heap census at step {step}: {sum(record['objects_per_generation'])} tracked objects, "
+        f"{record['census_seconds']} s -> {path}"
+    )
 
 
 def combine_microbatch_metrics(

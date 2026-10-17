@@ -8,6 +8,7 @@
 the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID."""
 
 import asyncio
+import dataclasses
 import gc
 import json
 import logging
@@ -26,6 +27,7 @@ from torchtitan.rl.components.work_buffer import (
 )
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
+    append_heap_census,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     GCTimer,
@@ -51,6 +53,15 @@ def test_controller_config_maybe_log(tmp_path, caplog) -> None:
     with open(tmp_path / "config.json") as file:
         saved_config = json.load(file)
     assert saved_config["trainer"]["training"]["max_context_length"] == 128
+
+
+def test_controller_config_heap_census_off_by_default() -> None:
+    from torchtitan_recipes.tests.rl.alphabet_sort import rl_grpo_qwen3_5_debug_varlen
+
+    config = rl_grpo_qwen3_5_debug_varlen()
+    assert config.heap_census_every_n_steps == 0
+    with pytest.raises(ValueError, match="heap_census_every_n_steps"):
+        dataclasses.replace(config, heap_census_every_n_steps=-1)
 
 
 def _training_sample(*, group_id: int, rollout_id: int) -> TrainingSample:
@@ -605,6 +616,27 @@ def test_gc_timer_times_collections_per_generation() -> None:
     assert all(metric.value.value == 0.0 for metric in gc_timer.flush())
 
 
+def test_append_heap_census_counts_tracked_objects_by_type(tmp_path) -> None:
+    class Probe:
+        pass
+
+    probes = [Probe() for _ in range(100_000)]
+    path = str(tmp_path / "heap_census.jsonl")
+    append_heap_census(path=path, step=3)
+    append_heap_census(path=path, step=6)
+    with open(path) as file:
+        censuses = [json.loads(line) for line in file]
+
+    assert [census["step"] for census in censuses] == [3, 6]
+    census = censuses[0]
+    top_types = dict(census["top_types"])
+    assert len(top_types) == 40
+    assert top_types[f"{Probe.__module__}.{Probe.__qualname__}"] == len(probes)
+    assert sum(census["objects_per_generation"]) > len(probes)
+    assert census["rss_gib"] > 0.0
+    assert census["census_seconds"] >= 0.0
+
+
 def test_metrics_timer_flush_drains() -> None:
     timer = MetricsTimer()
     with timer.record("timing/x"):
@@ -805,3 +837,18 @@ def test_no_window_takes_oldest_ready_group_past_a_stuck_head() -> None:
         assert taker.result().group_id == 6
 
     asyncio.run(run())
+
+
+def test_heap_census_does_not_keep_objects_alive(tmp_path) -> None:
+    """Objects the program drops after a census are freed by refcount, not left to cyclic GC."""
+    gc.collect()
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        held = [[i] for i in range(10_000)]
+        append_heap_census(path=str(tmp_path / "heap_census.jsonl"), step=1)
+        del held
+        assert gc.collect() < 100
+    finally:
+        if gc_was_enabled:
+            gc.enable()
