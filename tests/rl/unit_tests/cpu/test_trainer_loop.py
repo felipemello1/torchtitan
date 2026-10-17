@@ -220,3 +220,26 @@ def test_push_failure_fails_the_loop() -> None:
     controller = _controller([], on_push=failing_push)
     with pytest.raises(RuntimeError, match="push failed"):
         _run(controller, num_training_steps=2)
+
+
+def test_sync_log_step_calls_run_concurrently_before_the_step() -> None:
+    events: list[str] = []
+    controller = _controller(events)
+    released = asyncio.Event()
+
+    async def trainer_sync(step):
+        events.append(f"trainer sync {step} start")
+        # Returns only once the router call has started; awaited one after the other, it times out.
+        await asyncio.wait_for(released.wait(), timeout=5)
+        events.append(f"trainer sync {step} end")
+
+    async def router_sync(step):
+        events.append(f"router sync {step}")
+        released.set()
+
+    controller.trainer.sync_log_step = _Endpoint(trainer_sync)
+    controller.generator_router.sync_log_step = _Endpoint(router_sync)
+    _run(controller, num_training_steps=1)
+
+    assert events[:3] == ["trainer sync 1 start", "router sync 1", "trainer sync 1 end"]
+    assert events[3] == "fwd_bwd 1"
