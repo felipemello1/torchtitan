@@ -30,7 +30,12 @@ from torchtitan.observability.logging import init_logger
 from torchtitan.observability.metrics import compute_training_performance_metrics
 from torchtitan.rl.components.batcher import TrainingMicrobatch
 from torchtitan.rl.components.checkpointer import CONTROLLER_STATE_KEY, MirroredState
-from torchtitan.rl.distributed.rdma_microbatch import MicrobatchStream, RDMAMicrobatch
+from torchtitan.rl.distributed.rdma_microbatch import (
+    as_tensor,
+    InlineTensor,
+    MicrobatchStream,
+    RDMAMicrobatch,
+)
 from torchtitan.rl.observability.controller import combine_microbatch_metrics
 from torchtitan.tools import utils
 from torchtitan.training_engine import TrainingEngine
@@ -242,8 +247,8 @@ class Trainer(Configurable):
     async def forward_backward(
         self,
         microbatches: list[TrainingMicrobatch] | list[RDMAMicrobatch],
-        global_loss_token_counts: torch.Tensor,
-        global_routing_token_counts: torch.Tensor,
+        global_loss_token_counts: torch.Tensor | InlineTensor,
+        global_routing_token_counts: torch.Tensor | InlineTensor,
     ) -> dict[str, float]:
         """Run one optimizer step's forward/backward microbatches.
 
@@ -252,9 +257,9 @@ class Trainer(Configurable):
                 batcher's `[num_microbatches][dp_degree]` grid; `RDMAMicrobatch`es with the RDMA
                 fast path, read a few ahead of training.
             global_loss_token_counts: Per-objective loss-token counts across the
-                global batch.
+                global batch; an `InlineTensor` with the RDMA fast path.
             global_routing_token_counts: Per-depth non-padding routing-token
-                counts across the global batch.
+                counts across the global batch; an `InlineTensor` with the RDMA fast path.
 
         Returns:
             dict[str, float]: Globally-reduced metrics.
@@ -277,6 +282,8 @@ class Trainer(Configurable):
             * self.config.training.num_tokens_per_microbatch_per_dp_rank
         )
         uses_rdma = bool(microbatches) and isinstance(microbatches[0], RDMAMicrobatch)
+        global_loss_token_counts = as_tensor(global_loss_token_counts)
+        global_routing_token_counts = as_tensor(global_routing_token_counts)
         microbatch_groups = [[microbatch] for microbatch in microbatches]
         if uses_rdma:
             # TODO: the cp * tp ranks of a DP replica read the same column. Read it once per replica

@@ -29,7 +29,7 @@ from torchtitan.rl.components.training_sample_builder import (
 from torchtitan.rl.observability import metrics as m
 
 if TYPE_CHECKING:
-    from torchtitan.rl.distributed.rdma_microbatch import RDMAMicrobatch
+    from torchtitan.rl.distributed.rdma_microbatch import InlineTensor, RDMAMicrobatch
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +108,9 @@ class TrainerStepBatch:
 
     # [num_microbatches][dp_degree]; RDMAMicrobatches once BatcherActor registers them
     microbatches: list[list[TrainingMicrobatch]] | list[list["RDMAMicrobatch"]]
-    global_loss_token_counts: torch.Tensor
-    global_routing_token_counts: torch.Tensor
+    # InlineTensors once BatcherActor registers the microbatches
+    global_loss_token_counts: "torch.Tensor | InlineTensor"
+    global_routing_token_counts: "torch.Tensor | InlineTensor"
     metrics: list[m.Metric]
     group_ids: list[int]
     """Every consumed rollout group, including metric-only groups."""

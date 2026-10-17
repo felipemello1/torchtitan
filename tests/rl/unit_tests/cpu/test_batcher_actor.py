@@ -17,7 +17,7 @@ from monarch.actor import ActorError, this_host
 from torchtitan.rl.components.batcher import Batcher
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.distributed.monarch_actors.batcher import BatcherActor
-from torchtitan.rl.distributed.rdma_microbatch import _TensorRef
+from torchtitan.rl.distributed.rdma_microbatch import _TensorRef, as_tensor, InlineTensor
 from torchtitan.rl.rollout.types import (
     Rollout,
     RolloutGroup,
@@ -137,18 +137,28 @@ def test_batcher_actor_returns_the_in_process_batch(tmp_path, monkeypatch) -> No
     ]
     batch_b = results[4][0]
     assert [results[2][0].group_ids, batch_b.group_ids] == [[0, 1, 2], [3, 4]]
-    # int64 fields (2 KiB) cross processes by ref; the token counts go by value.
+    # int64 fields (2 KiB) cross processes by ref; the token counts go by value, as numpy.
     assert isinstance(batch_b.microbatches[0][0].fields["input"], _TensorRef)
     assert isinstance(
-        batch_b.microbatches[0][0].fields["loss_token_counts"], torch.Tensor
+        batch_b.microbatches[0][0].fields["loss_token_counts"], InlineTensor
     )
+    assert isinstance(batch_b.global_loss_token_counts, InlineTensor)
 
     def comparable(batch) -> dict:
         # assert_close can't compare metric objects; every other field must match exactly.
         return dataclasses.asdict(dataclasses.replace(batch, metrics=[]))
 
     torch.testing.assert_close(
-        comparable(dataclasses.replace(batch_b, microbatches=microbatches_b)),
+        comparable(
+            dataclasses.replace(
+                batch_b,
+                microbatches=microbatches_b,
+                global_loss_token_counts=as_tensor(batch_b.global_loss_token_counts),
+                global_routing_token_counts=as_tensor(
+                    batch_b.global_routing_token_counts
+                ),
+            )
+        ),
         comparable(expected[4][0]),
         rtol=0,
         atol=0,

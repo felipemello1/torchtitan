@@ -121,6 +121,7 @@ from torchtitan.rl.components.work_buffer import (
 from torchtitan.rl.distributed.monarch_actors.batcher import BatcherActor
 from torchtitan.rl.distributed.monarch_actors.generator import VLLMGeneratorActor
 from torchtitan.rl.distributed.monarch_actors.trainer import TrainerActor
+from torchtitan.rl.distributed.rdma_microbatch import as_tensor
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.distributed.torch_elastic import setup_torch_elastic_env
 from torchtitan.rl.distributed.weight_sync import WeightSyncManager
@@ -1790,7 +1791,7 @@ class Controller(Configurable):
                         *pull_metrics,
                         *compute_perf_ratio_metrics(
                             num_global_tokens=int(
-                                packed.global_routing_token_counts[0]
+                                as_tensor(packed.global_routing_token_counts)[0]
                             ),
                             time_metrics=time_metrics,
                         ),

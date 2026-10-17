@@ -21,6 +21,7 @@ from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
+import numpy as np
 import torch
 from monarch.rdma import RDMAAction, RDMABuffer
 from torch.utils import _pytree as pytree
@@ -43,7 +44,8 @@ class RDMAMicrobatch:
 
     fields: dict[str, Any]
     """The microbatch's fields: tensors of at least `min_bytes` (also inside `model_kwargs`) as
-    `_TensorRef`s, the rest by value. Tensors inside a container that pytree can't flatten also go by value."""
+    `_TensorRef`s, smaller ones as `InlineTensor`s, the rest by value. Tensors inside a container
+    that pytree can't flatten go by value."""
 
     @classmethod
     def register(
@@ -53,15 +55,12 @@ class RDMAMicrobatch:
             field.name: getattr(microbatch, field.name)
             for field in dataclasses.fields(microbatch)
         }
-        return cls(
-            fields=pytree.tree_map_only(
-                lambda leaf: (
-                    isinstance(leaf, torch.Tensor) and leaf.nbytes >= min_bytes
-                ),
-                _TensorRef.register,
-                fields,
-            )
-        )
+        def by_size(tensor: torch.Tensor) -> _TensorRef | InlineTensor:
+            if tensor.nbytes >= min_bytes:
+                return _TensorRef.register(tensor)
+            return InlineTensor.wrap(tensor)
+
+        return cls(fields=pytree.tree_map_only(torch.Tensor, by_size, fields))
 
     async def read(self) -> TrainingMicrobatch:
         action = RDMAAction()
@@ -74,6 +73,9 @@ class RDMAMicrobatch:
             return tensor
 
         microbatch_fields = pytree.tree_map_only(_TensorRef, queue_read, self.fields)
+        microbatch_fields = pytree.tree_map_only(
+            InlineTensor, InlineTensor.unwrap, microbatch_fields
+        )
         await action.submit()
         return TrainingMicrobatch(**microbatch_fields)
 
@@ -103,6 +105,39 @@ class _TensorRef:
             shape=tensor.shape,
             dtype=tensor.dtype,
         )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class InlineTensor:
+    """A small CPU tensor sent by value as numpy bytes, rebuilt bit for bit by `unwrap`.
+
+    Unpickling a torch tensor goes through `torch.load`, which defines a new class on every call;
+    each one waits in a reference cycle for the next full GC. Unpickling numpy creates none.
+
+    Example:
+        InlineTensor.wrap(torch.tensor([3, 4])).unwrap()  # tensor([3, 4])
+    """
+
+    data: np.ndarray
+    """The tensor's bytes, as uint8."""
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+    @classmethod
+    def wrap(cls, tensor: torch.Tensor) -> InlineTensor:
+        data = tensor.contiguous().view(-1).view(torch.uint8).numpy()
+        return cls(data=data, shape=tuple(tensor.shape), dtype=tensor.dtype)
+
+    def unwrap(self) -> torch.Tensor:
+        tensor = torch.empty(self.shape, dtype=self.dtype)
+        # copy(): unpickled numpy arrays are read-only, and torch.from_numpy warns on those.
+        tensor.view(-1).view(torch.uint8).copy_(torch.from_numpy(self.data.copy()))
+        return tensor
+
+
+def as_tensor(value: torch.Tensor | InlineTensor) -> torch.Tensor:
+    """`value` as a tensor, unwrapping an `InlineTensor`."""
+    return value.unwrap() if isinstance(value, InlineTensor) else value
 
 
 # Reads queued behind the one the engine waits on. A rank holds at most 4 microbatches on
