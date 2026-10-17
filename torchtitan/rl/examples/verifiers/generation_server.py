@@ -12,6 +12,8 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
+import msgspec
+
 from aiohttp import web
 
 from torchtitan.config import Configurable
@@ -175,7 +177,8 @@ class GenerationServer(Configurable):
             )
 
         try:
-            body = await request.json()
+            # Same types as `request.json()` (dict, list, int, float, str), parsed ~2x faster.
+            body = msgspec.json.decode(await request.read())
             prompt_token_ids = _validate_token_ids(
                 body.get("token_ids"), field_name="token_ids"
             )
@@ -199,7 +202,7 @@ class GenerationServer(Configurable):
             sampling = _parse_sampling_config(sampling_params)
             if body.get("features") is not None:
                 raise ValueError("multimodal features are not supported")
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError, msgspec.DecodeError) as error:
             return web.json_response({"error": str(error)}, status=400)
 
         request_index = self.request_counts.get(session_id, 0)
