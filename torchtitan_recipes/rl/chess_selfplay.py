@@ -122,6 +122,9 @@ def rl_chess_qwen3_5_4b_base(
         answer_end_text="}",
         # A reply that stops inside thinking plays the box it wrote.
         force_close_on_stop=False,
+        # After the model's own </think>, the answer is the box alone: without it, answers repeated
+        # "</think> \boxed{X}" to the token cap and forfeited up to 15% of games.
+        answer_after_close=True,
     )
     return Controller.Config(
         hf_assets_path="./assets/hf/Qwen3.5-4B-Base",
