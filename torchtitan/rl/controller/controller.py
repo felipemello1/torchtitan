@@ -113,6 +113,7 @@ from torchtitan.rl.actors.monarch.generator import VLLMGeneratorActor
 from torchtitan.rl.actors.monarch.torch_elastic import setup_torch_elastic_env
 from torchtitan.rl.actors.monarch.trainer import TrainerActor
 from torchtitan.rl.controller.metrics import (
+    collect_and_explain_garbage,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     compute_rollout_metrics,
@@ -320,6 +321,11 @@ class Controller(Configurable):
         this many seconds after the previous one (0: never). It frees cycles that died after their first collect;
         its pause and freed objects are logged with the next step as `controller/gc/full_collect/{seconds,collected}`.
         With a large `manual_gc_every_n_steps` this is "GC off, one full collect per hour" (`3600`)."""
+
+        explain_full_gc: bool = False
+        """Debug: each full collect keeps its garbage once and appends to `dump_folder/gc_garbage.jsonl`
+        the garbage's top types and the chains of objects that closed its cycles (see
+        `collect_and_explain_garbage`). Adds seconds to the collect on a large heap."""
 
         override: OverrideConfig = field(default_factory=OverrideConfig)
         """Registered overrides applied to this whole config tree, including the
@@ -1302,7 +1308,14 @@ class Controller(Configurable):
                 ):
                     self._last_full_gc = time.monotonic()
                     start = time.perf_counter()
-                    collected = gc.collect()
+                    collected = (
+                        collect_and_explain_garbage(
+                            path=os.path.join(self.config.dump_folder, "gc_garbage.jsonl"),
+                            step=step,
+                        )
+                        if self.config.explain_full_gc
+                        else gc.collect()
+                    )
                     self._full_gc_metrics = [
                         m.Metric(
                             "controller/gc/full_collect/seconds",

@@ -10,9 +10,12 @@
 # but components/ may not be the right home either.
 
 import contextlib
+import gc
+import json
 import logging
 import time
-from collections import defaultdict
+import types
+from collections import Counter, defaultdict
 
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.types import Rollout
@@ -302,3 +305,78 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
         )
     )
     return out
+
+
+def _describe(obj: object) -> str:
+    """A short label for one object in a garbage chain: its type, plus where frames and functions live."""
+    name = f"{type(obj).__module__}.{type(obj).__qualname__}"
+    if isinstance(obj, types.FrameType):
+        return f"{name} {obj.f_code.co_name} ({obj.f_code.co_filename}:{obj.f_lineno})"
+    if isinstance(obj, types.FunctionType):
+        code = obj.__code__
+        return f"{name} {obj.__qualname__} ({code.co_filename}:{code.co_firstlineno})"
+    if isinstance(obj, dict):
+        return f"{name} keys={list(obj)[:6]}"
+    if isinstance(obj, (list, tuple)):
+        return f"{name} len={len(obj)}"
+    return name
+
+
+def collect_and_explain_garbage(*, path: str, step: int, num_samples: int = 3) -> int:
+    """Run a full collection that keeps its garbage (`gc.DEBUG_SAVEALL`), append one JSON line to
+    `path` naming what the cycles were, then free them. Returns the number of objects collected.
+
+    The line holds the garbage counted by type, and for a few objects of each of the 3 most common
+    types, the chain of garbage objects referring to it, walked back until it closes a cycle.
+
+    Example:
+        collect_and_explain_garbage(path="gc_garbage.jsonl", step=8)
+        # {"step": 8, "collected": 407126, "top_types": [["builtins.dict", 121815], ...],
+        #  "chains": [["...RolloutTurn", "builtins.list len=7", "...Rollout", ...,
+        #              "builtins.frame census (metrics.py:150)", "cycle -> 4"], ...]}
+    """
+    gc.set_debug(gc.DEBUG_SAVEALL)
+    try:
+        collected = gc.collect()
+    finally:
+        gc.set_debug(0)
+    garbage, gc.garbage[:] = gc.garbage[:], []
+    in_garbage = {id(obj) for obj in garbage}
+    referrers: dict[int, list[object]] = defaultdict(list)
+    for obj in garbage:
+        for referent in gc.get_referents(obj):
+            if id(referent) in in_garbage:
+                referrers[id(referent)].append(obj)
+    type_counts = Counter(type(obj) for obj in garbage)
+    chains = []
+    obj = current = None
+    for obj_type, _ in type_counts.most_common(3):
+        for obj in [o for o in garbage if type(o) is obj_type][:num_samples]:
+            chain: list[str] = []
+            seen: dict[int, int] = {}
+            current = obj
+            while id(current) not in seen and len(chain) < 40:
+                seen[id(current)] = len(chain)
+                chain.append(_describe(current))
+                holders = referrers.get(id(current))
+                if not holders:
+                    break
+                current = holders[0]
+            if id(current) in seen:
+                chain.append(f"cycle -> {seen[id(current)]}")
+            chains.append(chain)
+    record = {
+        "step": step,
+        "collected": collected,
+        "top_types": [
+            [f"{t.__module__}.{t.__qualname__}", count]
+            for t, count in type_counts.most_common(30)
+        ],
+        "chains": chains,
+    }
+    # The saved garbage holds its own cycles; drop our references and free them for real.
+    del garbage, in_garbage, referrers, obj, current
+    gc.collect()
+    with open(path, "a") as file:
+        file.write(json.dumps(record) + "\n")
+    return collected
