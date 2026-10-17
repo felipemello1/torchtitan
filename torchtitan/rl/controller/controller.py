@@ -1157,11 +1157,15 @@ class Controller(Configurable):
         for step in range(self.start_step + 1, num_training_steps + 1):
             sl.set_step(step)  # propagate the step counter to the actors
             with sl.log_trace_span("sync_log_step"):
-                await self.trainer.sync_log_step.call(step)
-                await self.generator_router.sync_log_step.call_one(step)
                 # Not awaited: it would wait behind an in-flight add_group.
                 self.batcher.sync_log_step.broadcast(step)
-                await self._rollouter.sync_log_step(step)
+                # Concurrent, and still awaited before the step's work, so each actor has set this
+                # step before the controller sends it anything for the step.
+                await asyncio.gather(
+                    self.trainer.sync_log_step.call(step),
+                    self.generator_router.sync_log_step.call_one(step),
+                    self._rollouter.sync_log_step(step),
+                )
             step_timer = MetricsTimer()
 
             with (
