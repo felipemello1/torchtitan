@@ -11,7 +11,6 @@ from enum import StrEnum
 from typing import Any, Protocol, TYPE_CHECKING
 
 import numpy as np
-import torch
 from renderers import Message
 
 from torchtitan.rl.observability import metrics as m
@@ -75,10 +74,10 @@ class Completion:
     ordered completions or map by id."""
     token_ids: list[int]
     token_logprobs: list[float]
-    topk_token_ids: torch.Tensor | None = None
+    topk_token_ids: np.ndarray | None = None
     """[num_tokens, k] int32 ids of the generator's k most likely tokens at each position;
     None unless `SamplingConfig.num_topk_logprobs` > 0."""
-    topk_logprobs: torch.Tensor | None = None
+    topk_logprobs: np.ndarray | None = None
     """[num_tokens, k] float32 generator logprobs of `topk_token_ids`."""
     finish_reason: str | None = None
     """vLLM `CompletionOutput.finish_reason` ("stop" | "length" | "abort")"""
@@ -215,10 +214,10 @@ class RolloutTurn:
         this turn       p0 p1 c0 c1 e0 | c2    prompt_prefix_len=4 -> rows r3 r4 (r3: c1)
     """
 
-    completion_topk_token_ids: torch.Tensor | None = None  # [num_completion_tokens, k]
+    completion_topk_token_ids: np.ndarray | None = None  # [num_completion_tokens, k]
     """The generator's top-k token ids at each completion position (`Completion.topk_token_ids`)."""
 
-    completion_topk_logprobs: torch.Tensor | None = None  # [num_completion_tokens, k]
+    completion_topk_logprobs: np.ndarray | None = None  # [num_completion_tokens, k]
     """The generator's logprobs of `completion_topk_token_ids`."""
 
     # Filtering

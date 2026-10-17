@@ -102,8 +102,8 @@ class _SampleInProgress:
     logprobs: list[np.ndarray] = field(default_factory=list)
     advantage: list[np.ndarray] = field(default_factory=list)
     routed_expert_ids: list[np.ndarray] = field(default_factory=list)
-    topk_token_ids: list[torch.Tensor] = field(default_factory=list)
-    topk_logprobs: list[torch.Tensor] = field(default_factory=list)
+    topk_token_ids: list[np.ndarray] = field(default_factory=list)
+    topk_logprobs: list[np.ndarray] = field(default_factory=list)
 
     def to_training_sample(self) -> TrainingSample:
         token_ids = np.concatenate(self.token_ids, dtype=np.int64)
@@ -121,8 +121,16 @@ class _SampleInProgress:
             logprobs=np.concatenate(self.logprobs, dtype=np.float32),
             advantage=np.concatenate(self.advantage),
             routed_expert_ids=routed_expert_ids,
-            topk_token_ids=torch.cat(self.topk_token_ids) if self.topk_token_ids else None,
-            topk_logprobs=torch.cat(self.topk_logprobs) if self.topk_logprobs else None,
+            topk_token_ids=(
+                torch.from_numpy(np.concatenate(self.topk_token_ids))
+                if self.topk_token_ids
+                else None
+            ),
+            topk_logprobs=(
+                torch.from_numpy(np.concatenate(self.topk_logprobs))
+                if self.topk_logprobs
+                else None
+            ),
         )
 
 
