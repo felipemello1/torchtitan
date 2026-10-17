@@ -56,12 +56,14 @@ from torchtitan.models.common.activation import ClampedSwiGLU
 from torchtitan.models.common.attention import (
     FlexInnerAttention,
     SlidingWindowFlexInnerAttention,
+    VarlenInnerAttention,
 )
 from torchtitan.models.common.attention.cp_attention import (
     AllGatherKVFlexInnerAttention,
     AllGatherKVSlidingWindowFlexInnerAttention,
     UlyssesFlexInnerAttention,
     UlyssesSlidingWindowFlexInnerAttention,
+    UlyssesVarlenInnerAttention,
 )
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.common.moe import (
@@ -104,6 +106,7 @@ def _muse_spark_context_parallel_transform() -> ContextParallelTransform:
         inner_attention_map={
             FlexInnerAttention: UlyssesFlexInnerAttention,
             SlidingWindowFlexInnerAttention: (UlyssesSlidingWindowFlexInnerAttention),
+            VarlenInnerAttention: UlyssesVarlenInnerAttention,
         },
     )
 
@@ -321,6 +324,7 @@ def _muse_spark_816b_a42b(
     seq_len: int | None = None,
     *,
     parallelism: ParallelismConfig | None = None,
+    attn_backend: str = "varlen",
 ) -> Trainer.Config:
     """Configure full-parameter text continuation from the Muse Spark Open checkpoint.
 
@@ -329,6 +333,10 @@ def _muse_spark_816b_a42b(
     ``checkpointer.initial_load_path`` to an absolute path in the recipe.
     Use a fresh checkpoint folder; native DCP checkpoints cannot be resumed
     by this backend.
+
+    Attention defaults to varlen, 1.3-2.4x faster than flex per 4-layer
+    window/global cycle on GB300; CP uses Ulysses. Pass ``attn_backend="flex"``
+    for KV all-gather CP, needed when CP exceeds the KV heads left per TP rank.
     """
     if parallelism is None:
         parallelism = ParallelismConfig(
@@ -344,7 +352,7 @@ def _muse_spark_816b_a42b(
         parallelism=parallelism,
         seq_len=seq_len,
         moe_comm_backend="standard",
-        attn_backend="flex",
+        attn_backend=attn_backend,
     )
     if parallelism.context_parallel_degree > 1:
         transform_model_config_(
@@ -484,7 +492,8 @@ def _muse_spark_816b_dist_moe_bf16_spmd(
     # path while exposing TP communication. Keep MXFP8 coverage in the debug
     # recipe until those two execution paths exist.
     config = _with_dist_moe(
-        _muse_spark_816b_a42b(seq_len=seq_len),
+        # Flex for KV all-gather CP, which varlen lacks; see the CP transform below.
+        _muse_spark_816b_a42b(seq_len=seq_len, attn_backend="flex"),
         expert_precision="bf16",
         activation_slot_capacity_factor=1.0,
         scratch_capacity_factor=32.0,
