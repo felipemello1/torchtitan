@@ -15,7 +15,7 @@ from monarch.actor import Actor, ActorError, concurrent_endpoint, Port
 
 from torchtitan.rl.components.batcher import TrainingMicrobatch
 
-from torchtitan.rl.distributed.rdma_microbatch import RDMAMicrobatch
+from torchtitan.rl.distributed.rdma_microbatch import InlineTensor, RDMAMicrobatch
 from torchtitan.rl.trainer import OptimizerStepOutput, Trainer
 
 
@@ -48,8 +48,8 @@ class _TrainerActorEndpoints:
     async def forward_backward(
         self,
         microbatches: list[TrainingMicrobatch] | list[RDMAMicrobatch],
-        global_loss_token_counts: torch.Tensor,
-        global_routing_token_counts: torch.Tensor,
+        global_loss_token_counts: torch.Tensor | InlineTensor,
+        global_routing_token_counts: torch.Tensor | InlineTensor,
     ) -> dict[str, float]:
         return await super().forward_backward(
             microbatches,
