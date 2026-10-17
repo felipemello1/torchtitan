@@ -249,8 +249,9 @@ def test_verifiers_trace_attaches_each_generations_topk_rows() -> None:
         [[11, 7]],
         [[13, 8], [14, 9]],
     ]
-    torch.testing.assert_close(
-        turns[1].completion_topk_logprobs, torch.tensor([[-0.2, -1.5], [-0.3, -1.2]])
+    np.testing.assert_allclose(
+        turns[1].completion_topk_logprobs,
+        np.array([[-0.2, -1.5], [-0.3, -1.2]], dtype=np.float32),
     )
 
 
@@ -507,8 +508,8 @@ def test_generation_server_records_topk_logprobs_per_generation() -> None:
                 request_id=request_id,
                 token_ids=[31, 32],
                 token_logprobs=[-0.1, -0.2],
-                topk_token_ids=torch.tensor([[31, 5], [32, 6]], dtype=torch.int32),
-                topk_logprobs=torch.tensor([[-0.1, -2.4], [-0.2, -1.9]]),
+                topk_token_ids=np.array([[31, 5], [32, 6]], dtype=np.int32),
+                topk_logprobs=np.array([[-0.1, -2.4], [-0.2, -1.9]], dtype=np.float32),
                 finish_reason="stop",
             )
 
@@ -542,8 +543,8 @@ def test_generation_server_records_topk_logprobs_per_generation() -> None:
         ] = generation_metadata.topk_by_generation.items()
         assert key == (2, (31, 32))
         assert topk_token_ids.tolist() == [[31, 5], [32, 6]]
-        torch.testing.assert_close(
-            topk_logprobs, torch.tensor([[-0.1, -2.4], [-0.2, -1.9]])
+        np.testing.assert_array_equal(
+            topk_logprobs, np.array([[-0.1, -2.4], [-0.2, -1.9]], dtype=np.float32)
         )
 
     asyncio.run(run_test())
