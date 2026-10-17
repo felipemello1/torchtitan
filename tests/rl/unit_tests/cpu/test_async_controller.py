@@ -925,6 +925,7 @@ def _run_with_generator_watcher(watcher) -> None:
             )
         ),
         garbage_collector=None,
+        loop_stall_watchdog_s=0,
     )
     controller.start_step = 0
     controller._max_concurrent_rollout_groups = 1  # setup_async resolves this
@@ -1337,6 +1338,7 @@ def test_overlapped_validation_before_and_after_training(
         ),
         garbage_collector=None,
         heap_census_every_n_steps=0,
+        loop_stall_watchdog_s=0,
     )
     controller.start_step = 0
     # setup_async resolves this

@@ -142,6 +142,7 @@ from torchtitan.rl.observability.controller import (
     GCTimer,
     MetricsTimer,
 )
+from torchtitan.rl.observability.loop_stall_watchdog import LoopStallWatchdog
 from torchtitan.rl.observability.rollout_recorder import RolloutSampleRecorder
 from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.rollouter import Rollouter
@@ -484,6 +485,14 @@ class Controller(Configurable):
 
         full_gc_at_steps: tuple[int, ...] = ()
         """Extra full collects at these steps (e.g. to measure one in a short run)."""
+
+        full_gc_rss_gib: float = 0
+        """With `garbage_collector` set, also run a full collect at a step boundary when controller RSS is
+        at least this many GiB (0: never), at most once per step."""
+
+        loop_stall_watchdog_s: float = 0
+        """When > 0, log the controller loop thread's stack to `dump_folder/loop_stalls.jsonl` whenever its
+        event loop is blocked this many seconds; see `LoopStallWatchdog`. 0 disables."""
 
         trainer: Trainer.Config
         """Trainer config. Controls the trainer model, optimizer, training, parallelism."""
@@ -1310,7 +1319,17 @@ class Controller(Configurable):
         event_loop_lag_task = asyncio.create_task(
             sl.log_event_loop_lag(), name="event_loop_lag"
         )
+        watchdog_tasks = []
+        if self.config.loop_stall_watchdog_s > 0:
+            watchdog = LoopStallWatchdog(
+                path=os.path.join(self.config.dump_folder, "loop_stalls.jsonl"),
+                threshold_s=self.config.loop_stall_watchdog_s,
+            )
+            watchdog_tasks.append(
+                asyncio.create_task(watchdog.heartbeat(), name="loop_stall_watchdog")
+            )
         background_tasks = [
+            *watchdog_tasks,
             data_input_task,
             *rollout_tasks,
             batcher_task,
@@ -1686,11 +1705,15 @@ class Controller(Configurable):
             self.metrics_processor.commit()
             sl.set_step(step)  # propagate the step counter to the actors
             with sl.log_trace_span("sync_log_step"):
-                await self.trainer.sync_log_step.call(step)
-                await self.generator_router.sync_log_step.call_one(step)
                 # Not awaited: it would wait behind an in-flight add_group.
                 self.batcher.sync_log_step.broadcast(step)
-                await self._rollouter.sync_log_step(step)
+                # Concurrently, still a barrier: every receiver has its step set before this step's
+                # calls, since Monarch delivers one sender's messages to an actor in order.
+                await asyncio.gather(
+                    self.trainer.sync_log_step.call(step),
+                    self.generator_router.sync_log_step.call_one(step),
+                    self._rollouter.sync_log_step(step),
+                )
             step_timer = MetricsTimer()
 
             with (
@@ -1870,6 +1893,10 @@ class Controller(Configurable):
                     (full_every and step % full_every == 0)
                     or (every_s and now - self._last_full_gc >= every_s)
                     or step in self.config.full_gc_at_steps
+                    or (
+                        self.config.full_gc_rss_gib
+                        and rss_bytes / 2**30 >= self.config.full_gc_rss_gib
+                    )
                 ):
                     self._last_full_gc = now
                     with sl.log_trace_span("full_gc_collect"):
