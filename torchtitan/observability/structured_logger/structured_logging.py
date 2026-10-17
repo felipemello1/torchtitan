@@ -13,11 +13,13 @@ the ``TITAN_STRUCT_LOGGER_HANDLERS`` env var.
 
 import asyncio
 import enum
+import faulthandler
 import functools
 import importlib
 import inspect
 import logging
 import os
+import time
 from collections.abc import Callable
 from timeit import default_timer as timer
 from typing import Any, cast, TypeVar
@@ -512,7 +514,11 @@ class log_trace_span:  # noqa: N801
 
 
 async def log_event_loop_lag(
-    *, interval_s: float = 0.05, threshold_s: float = 0.2
+    *,
+    interval_s: float = 0.05,
+    threshold_s: float = 0.2,
+    dump_path: str | None = None,
+    dump_threshold_s: float = 1.0,
 ) -> None:
     """Log an `event_loop_lag_ms` scalar when sync code blocks this event loop.
 
@@ -521,20 +527,40 @@ async def log_event_loop_lag(
     shorter than `threshold_s` (even many in a row) and a block that never ends log nothing.
     Runs until cancelled.
 
+    With `dump_path`, each check also re-arms `faulthandler.dump_traceback_later(dump_threshold_s)`:
+    a block that long gets every thread's stack written to `dump_path` by faulthandler's own
+    thread, mid-way through the block, even inside a C call that holds the GIL. When the loop
+    resumes, a `# loop stall ended at <unix time>, <seconds> s` line follows the dump.
+    faulthandler keeps one such timer per process, so nothing else may use it meanwhile.
+
     Args:
         interval_s: Seconds between checks; `value` undercounts the block by up to this.
         threshold_s: Smallest lag to log, in seconds.
+        dump_path: File to append stack dumps to; None dumps nothing.
+        dump_threshold_s: Block length that triggers a stack dump, in seconds.
 
     Example::
 
-        lag_task = asyncio.create_task(log_event_loop_lag())
+        lag_task = asyncio.create_task(log_event_loop_lag(dump_path="loop_stalls.txt"))
         # another task calls time.sleep(2) inside an async def
         # -> {"event_name": "event_loop_lag_ms", "value": 1970.4, ...}
+        # -> loop_stalls.txt: "Timeout (0:00:01)!\nThread 0x... File ... in <blocking frame>"
     """
     loop = asyncio.get_running_loop()
-    while True:
-        due = loop.time() + interval_s
-        await asyncio.sleep(interval_s)
-        lag_s = loop.time() - due
-        if lag_s >= threshold_s:
-            log_trace_scalar({"event_loop_lag_ms": lag_s * 1000})
+    dump_file = open(dump_path, "a") if dump_path is not None else None
+    try:
+        while True:
+            if dump_file is not None:
+                faulthandler.dump_traceback_later(dump_threshold_s, file=dump_file)
+            due = loop.time() + interval_s
+            await asyncio.sleep(interval_s)
+            lag_s = loop.time() - due
+            if lag_s >= threshold_s:
+                log_trace_scalar({"event_loop_lag_ms": lag_s * 1000})
+            if dump_file is not None and lag_s >= dump_threshold_s:
+                dump_file.write(f"# loop stall ended at {time.time():.1f}, {lag_s:.2f} s\n")
+                dump_file.flush()
+    finally:
+        if dump_file is not None:
+            faulthandler.cancel_dump_traceback_later()
+            dump_file.close()
