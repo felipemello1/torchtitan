@@ -152,23 +152,33 @@ class TrainingSampleBuilder(Configurable):
     def __init__(self, config: Config) -> None:
         self.config = config
 
-    def build_from_group(self, *, rollout_group: RolloutGroup) -> TrainingSampleGroup:
-        """Apply data-validity filters and convert surviving rollouts to training_samples.
+    def rollouts_left_out(self, rollout_group: RolloutGroup) -> list[Rollout]:
+        """The rollouts `build_from_group` makes no training samples from, by the same filters.
 
         Example:
-            # rollouts=[] from a failed generation
-            build_from_group(rollout_group=failed_group)
-            # -> TrainingSampleGroup(group_id=..., training_samples=[], metrics=[failure_metric])
+            rewards [1.0, 1.0, 1.0, 1.0], drop_zero_std_reward_groups=True
+            rollouts_left_out(group)  # -> all 4 rollouts
         """
-        metrics: list[m.Metric] = list(rollout_group.metrics)
+        _, trained_rollouts, _ = self._filter(rollout_group)
+        trained_ids = {id(rollout) for rollout in trained_rollouts}
+        return [
+            rollout for rollout in rollout_group.rollouts if id(rollout) not in trained_ids
+        ]
 
+    def _filter(
+        self, rollout_group: RolloutGroup
+    ) -> tuple[list[Rollout] | None, list[Rollout], list[m.Metric]]:
+        """The group's data-validity filters: `(rollouts, trained_rollouts, metrics)`.
+
+        `rollouts` are the siblings after the errored-rollout filter, or None when the whole group is
+        dropped. `trained_rollouts` are those that become training samples.
+        """
+        metrics: list[m.Metric] = []
         # TODO(async-rl): generalize these group-level filters into an ordered, user-pluggable filter
         # list (e.g. drop groups with all-0 / all-1 advantage), run in sequence on each RolloutGroup.
         # Failed generation: empty group carrying its failure metric.
         if not rollout_group.rollouts:
-            return TrainingSampleGroup(
-                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
-            )
+            return None, [], metrics
 
         rollouts = rollout_group.rollouts
         # Errored: train on the rest, if enough siblings remain to compare.
@@ -190,9 +200,7 @@ class TrainingSampleBuilder(Configurable):
                         "training_sample_builder/num_groups_dropped_errored", m.Sum(1.0)
                     )
                 )
-                return TrainingSampleGroup(
-                    group_id=rollout_group.group_id, training_samples=[], metrics=metrics
-                )
+                return None, [], metrics
 
         # Untrainable: any sibling with no completion tokens -> drop the whole group
         if any(
@@ -204,9 +212,7 @@ class TrainingSampleBuilder(Configurable):
                     "training_sample_builder/num_groups_dropped_untrainable", m.Sum(1.0)
                 )
             )
-            return TrainingSampleGroup(
-                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
-            )
+            return None, [], metrics
 
         # Zero-std reward: no learning signal across siblings.
         rewards = [rollout.reward for rollout in rollouts]
@@ -223,15 +229,9 @@ class TrainingSampleBuilder(Configurable):
                     "training_sample_builder/num_groups_dropped_zero_std", m.Sum(1.0)
                 )
             )
-            return TrainingSampleGroup(
-                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
-            )
+            return None, [], metrics
 
-        # One rollout may branch into multiple trainable training_samples.
-        training_samples: list[TrainingSample] = []
-        unfiltered_training_samples: list[TrainingSample] = []
-        branches_per_rollout: list[float] = []
-        num_samples_dropped_no_valid_tokens = 0
+        trained_rollouts: list[Rollout] = []
         num_rollouts_dropped_empty_completion = 0
         num_rollouts_dropped_zero_advantage = 0
         for rollout in rollouts:
@@ -246,20 +246,7 @@ class TrainingSampleBuilder(Configurable):
             ):
                 num_rollouts_dropped_empty_completion += 1
                 continue
-
-            rollout_training_samples = self.rollout_to_training_samples(rollout)
-            unfiltered_training_samples.extend(rollout_training_samples)
-            kept = [
-                training_sample
-                for training_sample in rollout_training_samples
-                if _has_valid_loss_token(training_sample)
-            ]
-            num_samples_dropped_no_valid_tokens += len(rollout_training_samples) - len(
-                kept
-            )
-            training_samples.extend(kept)
-            branches_per_rollout.append(float(len(rollout_training_samples)))
-
+            trained_rollouts.append(rollout)
         if num_rollouts_dropped_empty_completion:
             metrics.append(
                 m.Metric(
@@ -274,6 +261,43 @@ class TrainingSampleBuilder(Configurable):
                     m.Sum(float(num_rollouts_dropped_zero_advantage)),
                 )
             )
+        return rollouts, trained_rollouts, metrics
+
+    def build_from_group(self, *, rollout_group: RolloutGroup) -> TrainingSampleGroup:
+        """Apply data-validity filters and convert surviving rollouts to training_samples.
+
+        Example:
+            # rollouts=[] from a failed generation
+            build_from_group(rollout_group=failed_group)
+            # -> TrainingSampleGroup(group_id=..., training_samples=[], metrics=[failure_metric])
+        """
+        metrics: list[m.Metric] = list(rollout_group.metrics)
+        rollouts, trained_rollouts, filter_metrics = self._filter(rollout_group)
+        metrics += filter_metrics
+        if rollouts is None:
+            return TrainingSampleGroup(
+                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
+            )
+
+        # One rollout may branch into multiple trainable training_samples.
+        training_samples: list[TrainingSample] = []
+        unfiltered_training_samples: list[TrainingSample] = []
+        branches_per_rollout: list[float] = []
+        num_samples_dropped_no_valid_tokens = 0
+        for rollout in trained_rollouts:
+            rollout_training_samples = self.rollout_to_training_samples(rollout)
+            unfiltered_training_samples.extend(rollout_training_samples)
+            kept = [
+                training_sample
+                for training_sample in rollout_training_samples
+                if _has_valid_loss_token(training_sample)
+            ]
+            num_samples_dropped_no_valid_tokens += len(rollout_training_samples) - len(
+                kept
+            )
+            training_samples.extend(kept)
+            branches_per_rollout.append(float(len(rollout_training_samples)))
+
         if num_samples_dropped_no_valid_tokens:
             metrics.append(
                 m.Metric(

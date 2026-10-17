@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import random
+
 import numpy as np
 import pytest
 import torch
@@ -501,3 +503,85 @@ def test_build_from_group_drops_zero_advantage_rollouts() -> None:
     metrics = {metric.key: metric.value for metric in group.metrics}
     num_dropped = metrics["training_sample_builder/num_rollouts_dropped_zero_advantage"]
     assert num_dropped.value == 1.0
+
+
+def _with_routed_experts(rollout: Rollout) -> Rollout:
+    # One row per trainer input of the single turn: prompt [1] + completion [x] -> 1 row.
+    rollout.turns[0].routed_expert_ids = np.full((1, 2, 1), rollout.rollout_id, dtype=np.uint8)
+    return rollout
+
+
+@pytest.mark.parametrize(
+    "rewards, advantages, statuses",
+    [
+        # zero-std group: all left out
+        ([1.0, 1.0, 1.0], [0.0, 0.0, 0.0], ["completed"] * 3),
+        # mixed: zero-advantage and errored rollouts left out
+        ([1.0, 0.5, 0.0, 0.0], [0.5, 0.0, -0.5, -0.5], ["completed", "completed", "completed", "error"]),
+    ],
+)
+def test_rollouts_left_out_get_no_training_samples(rewards, advantages, statuses) -> None:
+    """Every rollout `rollouts_left_out` names is one `build_from_group` drops, so stripping its
+    routed expert ids leaves the training samples bitwise the same."""
+    builder = TrainingSampleBuilder.Config(drop_zero_advantage_rollouts=True).build()
+
+    def group() -> RolloutGroup:
+        rollouts = []
+        for rollout_id, (reward, advantage, status) in enumerate(
+            zip(rewards, advantages, statuses, strict=True)
+        ):
+            rollout = _with_routed_experts(
+                _sibling(rollout_id, reward=reward, status=RolloutStatus(status))
+            )
+            rollout.advantage = advantage
+            rollouts.append(rollout)
+        return RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+
+    reference = builder.build_from_group(rollout_group=group())
+    stripped_group = group()
+    left_out = builder.rollouts_left_out(stripped_group)
+    assert left_out  # each case leaves some out
+    for rollout in left_out:
+        for rollout_turn in rollout.turns:
+            rollout_turn.routed_expert_ids = None
+    stripped = builder.build_from_group(rollout_group=stripped_group)
+
+    left_out_ids = {rollout.rollout_id for rollout in left_out}
+    assert not left_out_ids & {s.rollout_id.rollout_id for s in reference.training_samples}
+    assert len(stripped.training_samples) == len(reference.training_samples)
+    for got, want in zip(stripped.training_samples, reference.training_samples, strict=True):
+        assert got.rollout_id == want.rollout_id
+        assert np.array_equal(got.token_ids, want.token_ids)
+        assert np.array_equal(got.routed_expert_ids, want.routed_expert_ids)
+
+
+def test_rollouts_left_out_matches_build_from_group_on_random_groups() -> None:
+    """Over random groups and configs: no rollout `rollouts_left_out` names gets a training sample,
+    and every rollout that gets none is named (or produced only samples with no valid loss token)."""
+    rng = random.Random(0)
+    statuses = [RolloutStatus.COMPLETED, RolloutStatus.TRUNCATED_LENGTH, RolloutStatus.ERROR]
+    for _ in range(500):
+        builder = TrainingSampleBuilder.Config(
+            drop_errored_rollouts=rng.random() < 0.5,
+            drop_zero_std_reward_groups=rng.random() < 0.5,
+            drop_zero_advantage_rollouts=rng.random() < 0.5,
+        ).build()
+        rollouts = []
+        for rollout_id in range(rng.randint(1, 4)):
+            rollout = _sibling(
+                rollout_id, reward=rng.choice([0.0, 0.5, 1.0]), status=rng.choice(statuses)
+            )
+            rollout.advantage = rng.choice([0.0, 0.5, -0.5])
+            if rng.random() < 0.1:  # no completion at all: the group is untrainable
+                rollout.turns[0].completion_token_ids = np.array([], dtype=np.int32)
+                rollout.turns[0].completion_logprobs = np.array([], dtype=np.float32)
+            rollouts.append(rollout)
+        group = RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+
+        left_out = {rollout.rollout_id for rollout in builder.rollouts_left_out(group)}
+        sampled = {
+            sample.rollout_id.rollout_id
+            for sample in builder.build_from_group(rollout_group=group).training_samples
+        }
+        assert not left_out & sampled
+        assert left_out | sampled == {rollout.rollout_id for rollout in rollouts}
