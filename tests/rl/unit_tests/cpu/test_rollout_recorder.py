@@ -13,7 +13,6 @@ import json
 
 import numpy as np
 import pytest
-import torch
 
 from torchtitan.rl.observability.rollout_recorder import (
     KeepExtremeRewardsFilter,
@@ -235,8 +234,8 @@ def test_none_policy_version_and_completion_message(tmp_path) -> None:
 def test_encode_turn_covers_all_rollout_turn_fields(tmp_path) -> None:
     recorder = _recorder(tmp_path, log_tensors=True, log_logprobs=True)
     turn = _turn(completion_logprobs=[-0.5, -1.5])
-    turn.completion_topk_token_ids = torch.tensor([[4, 9], [5, 8]], dtype=torch.int32)
-    turn.completion_topk_logprobs = torch.tensor([[-0.5, -2.0], [-1.5, -3.0]])
+    turn.completion_topk_token_ids = np.array([[4, 9], [5, 8]], dtype=np.int32)
+    turn.completion_topk_logprobs = np.array([[-0.5, -2.0], [-1.5, -3.0]], dtype=np.float32)
     encoded = recorder._encode_turn(turn)
 
     # rollout_id is flattened to turn_id; metrics and routed_expert_ids are not logged.
