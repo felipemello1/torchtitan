@@ -9,6 +9,8 @@
 # TODO(async-rl): revisit this module's path/name — not observability/metrics (that is public API),
 # but components/ may not be the right home either.
 
+import asyncio
+import concurrent.futures
 import contextlib
 import gc
 import itertools
@@ -491,9 +493,31 @@ def _describe(obj: object) -> str:
         return f"{name} {obj.__func__.__qualname__}"
     if isinstance(obj, dict):
         return f"{name} keys={list(obj)[:6]}"
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        items = list(obj)[:4]
+        return f"{name} len={len(obj)} [{', '.join(_describe_short(x) for x in items)}]"
+    if isinstance(obj, asyncio.Future):
+        coro = getattr(obj, "get_coro", lambda: None)()
+        where = getattr(coro, "__qualname__", "") if coro is not None else ""
+        return f"{name} {where} done={obj.done()}"
+    if isinstance(obj, concurrent.futures.Future):
+        return f"{name} done={obj.done()} callbacks={len(obj._done_callbacks)}"
+    if type(obj).__name__ == "cell":
+        try:
+            return f"{name} -> {_describe_short(obj.cell_contents)}"
+        except ValueError:
+            return f"{name} (empty)"
     if isinstance(obj, BaseException):
         return f"{name} {str(obj)[:120]!r}"
     return name
+
+
+def _describe_short(obj: object) -> str:
+    if isinstance(obj, types.FunctionType):
+        return f"function {obj.__qualname__}"
+    if isinstance(obj, types.MethodType):
+        return f"method {obj.__func__.__qualname__}"
+    return _type_name(obj)
 
 
 def collect_and_explain_garbage(
@@ -540,11 +564,28 @@ def collect_and_explain_garbage(
                 if not holders:
                     chain.append("(no garbage referrer)")
                     break
+                if len(holders) > 1:
+                    chain.append(
+                        f"(also held by: {', '.join(_describe(h)[:80] for h in holders[1:4])})"
+                    )
                 current = holders[0]
             chains[wanted].append(chain)
+    # Who holds each sampled gather future and its callbacks: the objects closing the cycle.
+    holders_of: dict[str, list[list[str]]] = {}
+    for wanted in ("_GatheringFuture", "function"):
+        found = [
+            obj
+            for obj in garbage
+            if type(obj).__name__ == wanted
+            and (wanted != "function" or obj.__qualname__ == "gather.<locals>._done_callback")
+        ][:num_samples]
+        holders_of[wanted] = [
+            [_describe(holder) for holder in referrers.get(id(obj), [])][:8] for obj in found
+        ]
     record = {
         "step": step,
         "collected": collected,
+        "holders_of": holders_of,
         "top_types": [
             [name, count]
             for name, count in Counter(map(_type_name, garbage)).most_common(40)
@@ -552,7 +593,10 @@ def collect_and_explain_garbage(
         "chains": chains,
         "seconds": round(time.perf_counter() - start, 2),
     }
-    del garbage, garbage_ids, referrers
+    del garbage, garbage_ids, referrers, found
+    # DEBUG_SAVEALL kept the garbage alive; free it now.
+    collected_again = gc.collect()
+    record["freed_after_explain"] = collected_again
     with open(path, "a") as file:
         file.write(json.dumps(record) + "\n")
     logger.info(f"Garbage at step {step}: {collected} objects; explained in {path}")
