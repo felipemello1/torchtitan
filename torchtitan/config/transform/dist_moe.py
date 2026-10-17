@@ -41,11 +41,21 @@ def _replace_routed_experts(
                 "Dist-MoE requires an unmodified RoutedExperts.Config source; "
                 f"got {type(source).__qualname__} at {fqn!r}"
             )
-        if (
-            type(source.w13) is not GroupedLinear.Config
-            or type(source.w2) is not GroupedLinear.Config
-        ):
-            raise TypeError("Dist-MoE requires stock GroupedLinear W13/W2 projections")
+        for projection in (source.w13, source.w2):
+            # Only an owner that defines the hook itself qualifies: a subclass
+            # (e.g. a quantized wrapper) may change what the projection computes.
+            has_bias = "to_dist_moe_bias" in vars(projection._owner)
+            if type(projection) is not GroupedLinear.Config and not has_bias:
+                raise TypeError(
+                    "Dist-MoE requires stock GroupedLinear W13/W2 projections "
+                    "or ones that define to_dist_moe_bias()"
+                )
+            # TODO: add expert biases to the MXFP8 kernels (W2 in the shared combine
+            # scatter epilogue, W13 in the fused SwiGLU-quantize kernel).
+            if has_bias and replacement_type is MXFP8DistMoeRoutedExperts:
+                raise TypeError(
+                    f"Dist-MoE adds expert biases only in BF16; {fqn!r} has them"
+                )
         if isinstance(source.activation_fn, SwiGLU.Config):
             activation = "swiglu"
             swiglu_alpha = None

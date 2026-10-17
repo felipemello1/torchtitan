@@ -27,6 +27,7 @@ from torchtitan.distributed.spmd_types import (  # noqa: E402
     set_spmd_meshes,
 )
 from torchtitan.models.base.module import Module  # noqa: E402
+from torchtitan.models.common.activation import ClampedSwiGLU  # noqa: E402
 from torchtitan.models.common.dist_moe import (  # noqa: E402
     DistMoeRoutedExperts,
     DistMoeRuntime,
@@ -36,6 +37,7 @@ from torchtitan.models.common.moe import RoutedExperts  # noqa: E402
 from torchtitan.models.common.moe.token_dispatcher import (  # noqa: E402
     AllToAllTokenDispatcher,
 )
+from torchtitan.models.gpt_oss.moe import GptOssGroupedLinear  # noqa: E402
 from torchtitan_recipes.overrides.fused_swiglu import FusedSwiGLU  # noqa: E402
 
 
@@ -54,6 +56,8 @@ def _stock_routed_experts(
     num_experts: int,
     w13_E2FD: torch.Tensor,
     w2_EDF: torch.Tensor,
+    linear_config: type[GroupedLinear.Config] = GroupedLinear.Config,
+    activation_fn: Module.Config | None = None,
 ) -> RoutedExperts:
     """Build the production stock expert path with rank-local weights.
 
@@ -64,7 +68,7 @@ def _stock_routed_experts(
     experts = RoutedExperts.__new__(RoutedExperts)
     Module.__init__(experts)
     experts.w13 = (
-        GroupedLinear.Config(
+        linear_config(
             group_size=_E_LOCAL,
             in_features=_D,
             out_features=_F,
@@ -74,7 +78,7 @@ def _stock_routed_experts(
         .to(device=w13_E2FD.device, dtype=torch.bfloat16)
     )
     experts.w2 = (
-        GroupedLinear.Config(
+        linear_config(
             group_size=_E_LOCAL,
             in_features=_F,
             out_features=_D,
@@ -85,7 +89,7 @@ def _stock_routed_experts(
     with torch.no_grad():
         experts.w13.weight.copy_(w13_E2FD)
         experts.w2.weight.copy_(w2_EDF)
-    experts.activation_fn = FusedSwiGLU.Config().build()
+    experts.activation_fn = (activation_fn or FusedSwiGLU.Config()).build()
     experts.output_postprocess = None
     experts.token_dispatcher = AllToAllTokenDispatcher.Config(
         num_experts=num_experts,
@@ -265,6 +269,121 @@ class TestDistMoeNumerics(DTensorTestBase):
                     rtol=_TOL,
                     atol=_TOL,
                 )
+
+    @with_comms
+    def test_bf16_inference_matches_stock_gpt_oss_experts(self) -> None:
+        """GPT-OSS biases and clamped SwiGLU match the stock module in EP2 inference."""
+        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+            self.skipTest("Dist-MoE requires an SM100 or SM103 GPU")
+
+        num_experts = _E_LOCAL * self.world_size
+        device = torch.device(self.device_type, self.rank)
+        mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+        )
+        set_spmd_meshes(dense_mesh=mesh, sparse_mesh=mesh, dense_sp_enabled=False)
+        generator = torch.Generator(device=device).manual_seed(1234)
+
+        def randn(*shape: int, std: float) -> torch.Tensor:
+            return std * torch.randn(
+                *shape, device=device, dtype=torch.bfloat16, generator=generator
+            )
+
+        # Every rank draws the global tensors in the same order, then keeps its experts.
+        experts = slice(self.rank * _E_LOCAL, (self.rank + 1) * _E_LOCAL)
+        w13_E2FD = randn(num_experts, 2, _F, _D, std=0.05)[experts]
+        w2_EDF = randn(num_experts, _D, _F, std=0.05)[experts]
+        b13_E2F = randn(num_experts, 2, _F, std=0.5)[experts]
+        b2_ED = randn(num_experts, _D, std=0.5)[experts]
+        x_TD = randn(self.world_size, _T, _D, std=1.0)[self.rank]
+        topk_scores_TK = torch.rand(_T, _K, device=device, generator=generator)
+        topk_scores_TK /= topk_scores_TK.sum(dim=-1, keepdim=True)
+        topk_expert_ids_TK = (
+            torch.rand(_T, num_experts, device=device, generator=generator)
+            .topk(_K, dim=-1)
+            .indices
+        )
+        num_local_tokens_per_expert_E = torch.bincount(
+            topk_expert_ids_TK.flatten(), minlength=num_experts
+        )
+        activation_fn = ClampedSwiGLU.Config()
+
+        stock = _stock_routed_experts(
+            num_experts=num_experts,
+            w13_E2FD=w13_E2FD,
+            w2_EDF=w2_EDF,
+            linear_config=GptOssGroupedLinear.Config,
+            activation_fn=activation_fn,
+        )
+        with torch.no_grad():
+            stock.w13.bias.copy_(b13_E2F)
+            stock.w2.bias.copy_(b2_ED)
+        with torch.inference_mode(), set_current_spmd_mesh(mesh):
+            stock_out_TD = stock(
+                x_TD, topk_scores_TK, topk_expert_ids_TK, num_local_tokens_per_expert_E
+            )
+
+        config = dist_moe.Config(
+            max_num_local_input_tokens=_T,
+            hidden_dim=_D,
+            intermediate_dim=_F,
+            top_k=_K,
+            num_experts=num_experts,
+            max_moe_layers_per_activation_slot=1,
+            device_scratch_capacity_factor=float(self.world_size),
+            inference=True,
+            activation="swiglu_clamped",
+            swiglu_alpha=activation_fn.swiglu_alpha,
+            swiglu_limit=activation_fn.swiglu_limit,
+        )
+        context = dist_moe.create_context(
+            group=torch.distributed.group.WORLD, config=config, device=device
+        )
+        try:
+            annex = (
+                DistMoeRoutedExperts.Config(
+                    w13=GptOssGroupedLinear.Config(
+                        group_size=_E_LOCAL,
+                        in_features=_D,
+                        out_features=_F,
+                        num_linears=2,
+                    ),
+                    w2=GptOssGroupedLinear.Config(
+                        group_size=_E_LOCAL,
+                        in_features=_F,
+                        out_features=_D,
+                    ),
+                    top_k=_K,
+                    inplace_wgrad_accum=False,
+                    activation="swiglu_clamped",
+                    swiglu_alpha=activation_fn.swiglu_alpha,
+                    swiglu_limit=activation_fn.swiglu_limit,
+                )
+                .build()
+                .to(device=device, dtype=torch.bfloat16)
+                .requires_grad_(False)
+            )
+            with torch.no_grad():
+                for name in ("w13.weight", "w13.bias", "w2.weight", "w2.bias"):
+                    annex.get_parameter(name).copy_(stock.get_parameter(name))
+            runtime = cast(DistMoeRuntime, object.__new__(DistMoeRuntime))
+            runtime.config = DistMoeRuntime.Config(inference=True)
+            runtime.context = context
+            runtime._num_local_input_tokens_per_call = None
+            annex._runtime = runtime
+            with torch.inference_mode():
+                annex_out_TD = annex(
+                    x_TD,
+                    topk_scores_TK,
+                    topk_expert_ids_TK,
+                    num_local_tokens_per_expert_E,
+                )
+        finally:
+            context.close()
+
+        # Stock ClampedSwiGLU rounds each op to BF16 and Dist-MoE rounds once,
+        # so outputs differ by about one BF16 ulp (measured rel L2 5e-3).
+        torch.testing.assert_close(annex_out_TD, stock_out_TD, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

@@ -61,7 +61,10 @@ class DistMoeRoutedExperts(Module):
 
         Args:
             w13: Grouped gate/up projection with stored shape ``(E, 2, F, D)``.
-            w2: Grouped down projection with stored shape ``(E, D, F)``.
+                A projection that defines ``to_dist_moe_bias()`` has that
+                ``(E, 2F)`` bias added (BF16 inference only).
+            w2: Grouped down projection with stored shape ``(E, D, F)``, with
+                an optional ``(E, D)`` bias via ``to_dist_moe_bias()``.
             top_k: Number of experts selected for each local input token.
             output_postprocess: Optional module translated into the annex's
                 typed or eager post-expert processing policy.
@@ -157,6 +160,14 @@ class DistMoeRoutedExperts(Module):
         w13_EFD = w13_E2FD.flatten(1, 2)
         return w13_EFD, w2_EDF
 
+    def _bias_operands(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return the W13 ``[E, 2F]`` and W2 ``[E, D]`` biases; ``None`` without one."""
+        w13_bias_EF, w2_bias_ED = (
+            proj.to_dist_moe_bias() if hasattr(proj, "to_dist_moe_bias") else None
+            for proj in (self.w13, self.w2)
+        )
+        return w13_bias_EF, w2_bias_ED
+
     def _output_postprocess(
         self,
     ) -> dist_moe.RMSNormPostprocess | Callable[[torch.Tensor], torch.Tensor] | None:
@@ -232,9 +243,12 @@ class DistMoeRoutedExperts(Module):
                 topk_expert_ids_TK, (0, 0, 0, num_padded_tokens), value=-1
             )
         w13_operand, w2_operand = self._weight_operands()
+        w13_bias_EF, w2_bias_ED = self._bias_operands()
         postprocess = self._output_postprocess()
         execution_options = dist_moe.ExecutionOptions(
             inplace_wgrad_accum=self.inplace_wgrad_accum,
+            w13_bias_EF=w13_bias_EF,
+            w2_bias_ED=w2_bias_ED,
             experts_output_postprocess=postprocess,
             # -1 routes come from the padding mask (rows inside the call) and
             # from the pad above (rows appended up to the call size). A Python

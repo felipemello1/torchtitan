@@ -41,10 +41,12 @@ from torchtitan.models.common.dist_moe import (
     MXFP8DistMoeRoutedExperts,
 )
 from torchtitan.models.common.dist_moe.runtime import _DistMoeForwardContext
-from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.linear import GroupedLinear, Linear
 from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.models.common.moe.token_dispatcher import HybridEPTokenDispatcher
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.gpt_oss.flavors import _make_gptoss_experts_config
+from torchtitan.models.gpt_oss.moe import GptOssGroupedLinear
 from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
 from torchtitan.training_engine import TrainingEngine
 from torchtitan_recipes.tests.models.deepseek_v3 import deepseek_v3_debugmodel
@@ -725,6 +727,72 @@ def test_eager_postprocess_callback_preserves_module_hooks_and_gradients() -> No
         pytest.raises(TypeError, match="RMSNormPostprocess or callable"),
     ):
         module._output_postprocess()
+
+
+def _gpt_oss_experts_config() -> RoutedExperts.Config:
+    return _make_gptoss_experts_config(
+        dim=32, hidden_dim=64, num_experts=4, layer_id=0, top_k=2, enable_ep=False
+    )
+
+
+def test_forward_passes_projection_biases_as_local_expert_rows() -> None:
+    """Biased projections keep their parameters and reach the annex as [E, O]."""
+    module = cast(
+        DistMoeRoutedExperts,
+        DistMoeTransform().transform(_gpt_oss_experts_config()).build(),
+    )
+    module._runtime = _runtime()
+    assert list(dict(module.named_parameters())) == [
+        "w13.weight",
+        "w13.bias",
+        "w2.weight",
+        "w2.bias",
+    ]
+
+    _, execute = _run_forward_with_padding(module, num_tokens=2, padding_mask_T=None)
+
+    options = execute.call_args.kwargs["options"]
+    assert options.w13_bias_EF.shape == (4, 128)
+    assert options.w13_bias_EF.data_ptr() == module.w13.bias.data_ptr()
+    assert options.w2_bias_ED.shape == (4, 32)
+    assert options.w2_bias_ED.data_ptr() == module.w2.bias.data_ptr()
+
+
+class _HooklessGroupedLinear(GroupedLinear):
+    @dataclass(kw_only=True, slots=True)
+    class Config(GroupedLinear.Config):
+        pass
+
+
+class _WrappedGptOssGroupedLinear(GptOssGroupedLinear):
+    @dataclass(kw_only=True, slots=True)
+    class Config(GptOssGroupedLinear.Config):
+        pass
+
+
+@pytest.mark.parametrize(
+    "linear", [_HooklessGroupedLinear, _WrappedGptOssGroupedLinear]
+)
+def test_transform_rejects_projections_without_their_own_bias_hook(
+    linear: type[GroupedLinear],
+) -> None:
+    """Only a stock projection or one that defines to_dist_moe_bias() itself passes.
+
+    A subclass of a hooked owner (a quantized wrapper, say) may change what the
+    projection computes, so it is rejected like any other specialized linear.
+    """
+    source = _gpt_oss_experts_config()
+    source.w13 = linear.Config(
+        group_size=4, in_features=32, out_features=64, num_linears=2
+    )
+    with pytest.raises(TypeError, match="define to_dist_moe_bias"):
+        DistMoeTransform().transform(source)
+
+
+def test_mxfp8_transform_rejects_projection_biases() -> None:
+    """MXFP8 Dist-MoE fails at transform time on biased projections."""
+    with pytest.raises(TypeError, match="expert biases only in BF16"):
+        DistMoeTransform(expert_precision="mxfp8").transform(_gpt_oss_experts_config())
 
 
 def _run_forward_with_padding(

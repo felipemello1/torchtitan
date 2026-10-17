@@ -58,3 +58,11 @@ class GptOssGroupedLinear(GroupedLinear):
         bias_RO: torch.Tensor,
     ) -> torch.Tensor:
         return output_RO + bias_RO.to(output_RO.dtype)
+
+    def to_dist_moe_bias(self) -> torch.Tensor:
+        """Per-expert bias ``[E, O]`` that Dist-MoE adds to this projection's output.
+
+        For W13, ``(E, 2, F)`` flattens to ``[gate | up]``, the row order of the
+        ``(E, 2, F, D)`` weight.
+        """
+        return self.bias.flatten(1)
