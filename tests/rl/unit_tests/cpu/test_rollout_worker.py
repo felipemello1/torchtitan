@@ -11,7 +11,7 @@ import random
 from types import SimpleNamespace
 
 from renderers import ParsedResponse, Qwen3RendererConfig
-import torch
+import numpy as np
 
 from torchtitan.components.renderer import from_renderers
 
@@ -112,8 +112,8 @@ class _GenerateFn:
             request_id=kwargs["request_id"],
             token_ids=[4],
             token_logprobs=[-0.5],
-            topk_token_ids=torch.tensor([[4, 9]], dtype=torch.int32),
-            topk_logprobs=torch.tensor([[-0.5, -1.5]]),
+            topk_token_ids=np.array([[4, 9]], dtype=np.int32),
+            topk_logprobs=np.array([[-0.5, -1.5]], dtype=np.float32),
             finish_reason="stop",
         )
 

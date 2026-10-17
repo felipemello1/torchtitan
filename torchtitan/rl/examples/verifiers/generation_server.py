@@ -15,7 +15,6 @@ import time
 from dataclasses import dataclass, field, replace
 
 import numpy as np
-import torch
 from aiohttp import web
 
 from torchtitan.config import Configurable
@@ -58,7 +57,7 @@ class VerifiersGenerationMetadata:
     """Metrics from every generation in the rollout, merged with `m.fold`."""
 
     topk_by_generation: dict[
-        tuple[int, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]
+        tuple[int, tuple[int, ...]], tuple[np.ndarray, np.ndarray]
     ] = field(default_factory=dict)
     """The generator's top-k ids and logprobs `[num_completion_tokens, k]` per generation,
     keyed by `(len(prompt_token_ids), completion_token_ids)`; empty unless
@@ -66,7 +65,7 @@ class VerifiersGenerationMetadata:
 
     Example:
 
-        {(2, (12, 13)): (tensor([[12, 5], [13, 6]]), tensor([[-0.1, -2.4], [-0.2, -1.9]]))}
+        {(2, (12, 13)): (array([[12, 5], [13, 6]]), array([[-0.1, -2.4], [-0.2, -1.9]]))}
     """
 
 

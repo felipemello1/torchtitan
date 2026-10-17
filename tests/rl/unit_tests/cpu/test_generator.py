@@ -21,6 +21,7 @@ import concurrent.futures
 import gc
 import math
 import os
+import pickle
 import shutil
 import tempfile
 from contextlib import nullcontext
@@ -30,6 +31,7 @@ from typing import Any, cast, NamedTuple
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -373,11 +375,25 @@ def test_process_finished_requests_splits_topk_logprobs():
 
         completion = await asyncio.wrap_future(reply)
         assert completion.token_logprobs == [-0.1, -0.7]
-        assert completion.topk_token_ids.dtype == torch.int32
+        assert completion.topk_token_ids.dtype == np.int32
         assert completion.topk_token_ids.tolist() == [[10, 3], [4, 11]]
-        torch.testing.assert_close(
-            completion.topk_logprobs, torch.tensor([[-0.1, -2.5], [-0.5, -0.7]])
+        # Bitwise what torch.tensor() of the same floats gives (float32).
+        assert np.array_equal(
+            completion.topk_logprobs,
+            torch.tensor([[-0.1, -2.5], [-0.5, -0.7]]).numpy(),
         )
+        assert completion.topk_logprobs.dtype == np.float32
+        # numpy unpickles without creating classes; a tensor creates one per unpickle (torch.load).
+        blob = pickle.dumps(completion)
+        def num_types() -> int:
+            return sum(isinstance(obj, type) for obj in gc.get_objects())
+
+        pickle.loads(blob)  # imports anything unpickling needs
+        num_types()  # the isinstance checks can trigger lazy imports too
+        before = num_types()
+        for _ in range(10):
+            pickle.loads(blob)
+        assert num_types() == before
 
     asyncio.run(main())
 

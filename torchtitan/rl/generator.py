@@ -22,6 +22,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal, TypeVar
 
 import cloudpickle
+import numpy as np
 import torch
 import torch.distributed as dist
 import torchstore as ts
@@ -777,12 +778,12 @@ class RequestDispatcher:
                 # logprobs=k > 0: each token holds k + 1 entries, [sampled, top-1, ..., top-k].
                 # k is per request (validation asks for 0), so read it from the layout.
                 row_width = len(token_logprobs) // num_tokens
-                topk_token_ids = torch.tensor(
-                    flat_logprobs.token_ids, dtype=torch.int32
-                )
-                topk_logprobs = torch.tensor(token_logprobs)
-                topk_token_ids = topk_token_ids.view(-1, row_width)[:, 1:].contiguous()
-                topk_logprobs = topk_logprobs.view(-1, row_width)[:, 1:].contiguous()
+                # numpy, not torch: every tensor in a Monarch reply is unpickled through torch.load,
+                # which creates a class per call and leaves cyclic garbage in the controller.
+                topk_token_ids = np.asarray(flat_logprobs.token_ids, dtype=np.int32)
+                topk_logprobs = np.asarray(token_logprobs, dtype=np.float32)
+                topk_token_ids = topk_token_ids.reshape(-1, row_width)[:, 1:].copy()
+                topk_logprobs = topk_logprobs.reshape(-1, row_width)[:, 1:].copy()
                 token_logprobs = token_logprobs[::row_width]
 
             completions.append(
