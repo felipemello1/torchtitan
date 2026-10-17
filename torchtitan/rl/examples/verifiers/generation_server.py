@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import time
 from dataclasses import dataclass, field, replace
@@ -347,7 +348,12 @@ class GenerationServer(Configurable):
             ),
             topk_by_generation=topk_by_generation,
         )
-        response = web.json_response(
+        routed_experts_rows = (
+            None
+            if completion.routed_expert_ids is None
+            else completion.routed_expert_ids[routed_experts_prompt_start:]
+        )
+        response = _json_response(
             {
                 "request_id": completion.request_id,
                 "choices": [
@@ -373,7 +379,7 @@ class GenerationServer(Configurable):
                             if completion.routed_expert_ids is None
                             else {
                                 "routed_experts": _routed_experts_payload(
-                                    completion.routed_expert_ids,
+                                    routed_experts_rows,
                                     start=routed_experts_prompt_start,
                                 )
                             }
@@ -382,7 +388,8 @@ class GenerationServer(Configurable):
                 ],
                 "prompt_logprobs": None,
                 "kv_transfer_params": None,
-            }
+            },
+            routed_experts_rows,
         )
         vllm_ms = sum(
             metric.value.value
@@ -403,23 +410,34 @@ class GenerationServer(Configurable):
         return response
 
 
-def _routed_experts_payload(
-    routed_expert_ids: np.ndarray, *, start: int
-) -> dict[str, object]:
-    """Verifiers' ``routed_experts`` field: the rows from position ``start`` on.
+_ROUTED_EXPERTS_DATA = "__routed_experts_data__"
+"""Placeholder for the base64 routed-experts rows; `_json_response` splices the bytes in."""
 
-    Example:
 
-        _routed_experts_payload(routed_expert_ids, start=3)  # uint8 [6, 48, 8]
-        # -> {"data": <base64 of rows 3..5>, "shape": [3, 48, 8], "start": 3, "dtype": "uint8"}
-    """
-    rows = routed_expert_ids[start:]
+def _routed_experts_payload(rows: np.ndarray, *, start: int) -> dict[str, object]:
+    """Verifiers' ``routed_experts`` field for ``rows`` (positions ``start`` on), data left as a
+    placeholder for `_json_response`."""
     return {
-        "data": base64.b64encode(rows.tobytes()).decode("ascii"),
+        "data": _ROUTED_EXPERTS_DATA,
         "shape": list(rows.shape),
         "start": start,
         "dtype": str(rows.dtype),
     }
+
+
+def _json_response(
+    data: dict[str, object], routed_experts_rows: np.ndarray | None
+) -> web.Response:
+    """``web.json_response(data)``, with the routed-experts rows' base64 spliced in as bytes
+    (byte-identical to putting the base64 string through ``json.dumps``)."""
+    if routed_experts_rows is None:
+        return web.json_response(data)
+    head, placeholder, tail = json.dumps(data).rpartition(f'"{_ROUTED_EXPERTS_DATA}"')
+    if not placeholder:
+        raise RuntimeError("the routed_experts placeholder is missing from the response")
+    rows = np.ascontiguousarray(routed_experts_rows)
+    body = b"".join((head.encode(), b'"', base64.b64encode(rows), b'"', tail.encode()))
+    return web.Response(body=body, content_type="application/json", charset="utf-8")
 
 
 def _validate_token_ids(value: object, *, field_name: str) -> list[int]:
