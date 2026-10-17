@@ -219,6 +219,7 @@ def append_heap_census(
                 sampled_type = level_2.get(id(referent))
                 if sampled_type is not None:
                     referrers_2[sampled_type][_type_name(obj)] += 1
+        everything.clear()  # it holds this frame too (see below)
         del everything
         record["referrers"] = {
             key: counts.most_common(10) for key, counts in referrers.items()
@@ -226,6 +227,10 @@ def append_heap_census(
         record["referrers_2"] = {
             key: counts.most_common(10) for key, counts in referrers_2.items()
         }
+    # gc.get_objects() lists this function's own frame, and the frame holds these lists: a cycle
+    # that would keep every object alive at census time until the next full collect. Empty them.
+    for objects in generations:
+        objects.clear()
     del generations
     if gc_was_enabled:
         gc.enable()
