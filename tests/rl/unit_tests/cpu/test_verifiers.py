@@ -687,6 +687,25 @@ def test_generation_server_requires_group_id() -> None:
     asyncio.run(run_test())
 
 
+def test_generation_server_rejects_malformed_json() -> None:
+    async def run_test() -> int:
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.set_generate_fn(AsyncMock())
+        await server.start()
+        try:
+            async with ClientSession() as session:
+                response = await session.post(
+                    f"http://{server.host}:{server.port}/inference/v1/generate",
+                    headers={"X-Session-ID": "group=1/rollout=2"},
+                    data=b'{"token_ids": [10,',
+                )
+                return response.status
+        finally:
+            await server.close()
+
+    assert asyncio.run(run_test()) == 400
+
+
 def test_generation_server_rejects_prompt_without_room_for_output() -> None:
     async def run_test() -> None:
         prompt_lengths = []
