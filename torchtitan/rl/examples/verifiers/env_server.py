@@ -24,10 +24,10 @@ from verifiers.v1.configs.serve import (
 )
 from verifiers.v1.serve import env_config_data, serve_env
 from verifiers.v1.utils.loaders import resolve_env_config
-from verifiers.v1.utils.logging import setup_logging
 
 from torchtitan.config import Configurable
 from torchtitan.rl.examples.verifiers.data import register_local_taskset_alias
+from torchtitan.rl.examples.verifiers.worker_setup import setup_env_server_worker
 
 
 def _run_env_server_process(
@@ -43,6 +43,11 @@ def _run_env_server_process(
     no_proxy = ",".join(filter(None, (no_proxy, "127.0.0.1", "localhost")))
     os.environ["no_proxy"] = no_proxy
     os.environ["NO_PROXY"] = no_proxy
+    # Pool workers read these at exec. They render on threads and, by default, stay at peak RSS.
+    # 8-thread churn test, RSS growth: peak ~500 -> ~210 MB, after episodes end 150-310 -> ~35 MB,
+    # for ~25% more CPU time (allocations >= 64 KB become mmap/munmap pairs).
+    os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+    os.environ.setdefault("MALLOC_MMAP_THRESHOLD_", "65536")
 
     if local_taskset_module is not None:
         environment["taskset"]["id"] = register_local_taskset_alias(
@@ -58,7 +63,7 @@ def _run_env_server_process(
         address_queue=address_queue,
         death_pipe=death_pipe,
         # Workers unpickle this by importing its module, so that module must not import torch.
-        log_setup=functools.partial(setup_logging, "INFO"),
+        log_setup=functools.partial(setup_env_server_worker, "INFO"),
         config_data=env_config_data(env_config),
         max_concurrent=serve.max_concurrent,
     )

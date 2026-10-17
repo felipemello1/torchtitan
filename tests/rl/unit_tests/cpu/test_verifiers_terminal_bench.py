@@ -179,8 +179,9 @@ print(type(load_harness(env_config.agent.harness)).__name__)
 
 
 def test_env_server_workers_skip_the_trainer_imports(monkeypatch) -> None:
-    """A pool worker loads the broker's ``__main__``, the pickled ``log_setup``
-    and the taskset module. None of them may import torch, vLLM or Monarch.
+    """A pool worker loads the broker's ``__main__``, runs the pickled ``log_setup``,
+    then imports the taskset module and the tokenizer. None of them may import torch,
+    vLLM or Monarch.
     """
     captured = {}
 
@@ -193,6 +194,11 @@ def test_env_server_workers_skip_the_trainer_imports(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "__main__", sys.modules["__main__"])
     monkeypatch.setenv("no_proxy", "")
     monkeypatch.setenv("NO_PROXY", "")
+    # It also sets glibc defaults for the workers. setenv records what to restore after the
+    # test; delenv starts the test without them.
+    for name in ("MALLOC_ARENA_MAX", "MALLOC_MMAP_THRESHOLD_"):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
     config = _rollouter_config(TRAIN_DATASET, EVAL_DATASET).verifiers_env_server
     env_server._run_env_server_process(
         environment=env_config_data(config.environment),
@@ -207,9 +213,11 @@ def test_env_server_workers_skip_the_trainer_imports(monkeypatch) -> None:
     assert not hasattr(captured["main"], "__file__")
     worker = f"""
 import pickle, sys
-pickle.loads({captured["log_setup"]!r})
+import verifiers.v1.serve.pool  # the worker's spawn target, unpickled before log_setup
+pickle.loads({captured["log_setup"]!r})()
 import {taskset.__name__}
-print([name for name in ("torch", "vllm", "monarch") if name in sys.modules])
+from transformers import AutoTokenizer
+print([name for name in ("torch", "vllm", "monarch") if sys.modules.get(name) is not None])
 """
     result = subprocess.run(
         [sys.executable, "-c", worker], capture_output=True, text=True, check=False
