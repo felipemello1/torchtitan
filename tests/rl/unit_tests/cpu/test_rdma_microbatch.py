@@ -9,6 +9,8 @@
 import asyncio
 import contextvars
 import dataclasses
+import gc
+import pickle
 import threading
 import time
 from types import SimpleNamespace
@@ -21,6 +23,7 @@ from torchtitan.rl.distributed import rdma_microbatch
 from torchtitan.rl.distributed.rdma_microbatch import (
     _NUM_MICROBATCHES_READ_AHEAD,
     _TensorRef,
+    InlineTensor,
     MicrobatchStream,
     RDMAMicrobatch,
 )
@@ -99,12 +102,42 @@ def test_rdma_microbatch_round_trips_every_field_and_drops_its_buffers(
     for leaf, rdma_leaf, read_leaf in zip(
         leaves, rdma_leaves, read_leaves, strict=True
     ):
-        assert isinstance(rdma_leaf, _TensorRef) == (leaf.nbytes >= min_bytes)
+        expected_type = _TensorRef if leaf.nbytes >= min_bytes else InlineTensor
+        assert isinstance(rdma_leaf, expected_type)
         assert torch.equal(leaf, read_leaf) and leaf.dtype == read_leaf.dtype
 
     asyncio.run(registered.drop())
     tensor_refs = [leaf for leaf in rdma_leaves if isinstance(leaf, _TensorRef)]
     assert tensor_refs and all(tensor_ref.buffer.dropped for tensor_ref in tensor_refs)
+
+
+def test_inline_tensor_unpickles_bit_for_bit_without_cyclic_garbage() -> None:
+    tensors = [
+        torch.tensor(2),
+        torch.tensor([2, 2]),
+        torch.arange(6, dtype=torch.bfloat16).view(2, 3),
+        torch.tensor([True, False]),
+        torch.zeros(0, 4),
+    ]
+
+    def cyclic_garbage_per_unpickle(payload: bytes) -> int:
+        pickle.loads(payload)
+        gc.collect()
+        gc.disable()
+        try:
+            for _ in range(10):
+                pickle.loads(payload)
+            return gc.collect()
+        finally:
+            gc.enable()
+
+    # Unpickling a torch tensor goes through torch.load, which leaves a class in a cycle per call.
+    assert cyclic_garbage_per_unpickle(pickle.dumps(tensors)) > 0
+    payload = pickle.dumps([InlineTensor.wrap(tensor) for tensor in tensors])
+    assert cyclic_garbage_per_unpickle(payload) == 0
+    for tensor, inline in zip(tensors, pickle.loads(payload), strict=True):
+        rebuilt = inline.unwrap()
+        assert rebuilt.dtype == tensor.dtype and torch.equal(rebuilt, tensor)
 
 
 def _fake_rdma_microbatch(index: int, started: list[int]) -> SimpleNamespace:

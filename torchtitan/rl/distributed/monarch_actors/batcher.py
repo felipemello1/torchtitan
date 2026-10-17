@@ -21,6 +21,7 @@ from torchtitan.rl.components.batcher import Batcher, TrainerStepBatch
 from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder
 from torchtitan.rl.distributed.rdma_microbatch import (
     create_cuda_context_to_silence_monarch_log,
+    InlineTensor,
     RDMAMicrobatch,
 )
 from torchtitan.rl.rollout.types import RolloutGroup
@@ -121,7 +122,14 @@ class BatcherActor(Actor):
             ]
         self._batches_being_read.append(rdma_microbatches)
         return (
-            dataclasses.replace(batch, microbatches=rdma_microbatches),
+            dataclasses.replace(
+                batch,
+                microbatches=rdma_microbatches,
+                global_loss_token_counts=InlineTensor.wrap(batch.global_loss_token_counts),
+                global_routing_token_counts=InlineTensor.wrap(
+                    batch.global_routing_token_counts
+                ),
+            ),
             group_is_trainable,
         )
 
