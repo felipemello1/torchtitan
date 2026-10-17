@@ -22,10 +22,12 @@ from torchtitan.rl.trainer.training_sample_builder import TrainingSampleBuilder
 
 THINK, END_THINK, END_OF_TURN, BRACE, BRACE_DOT = 1, 2, 3, 4, 5
 FORCED = [90, 91, 92]
+PREFIX = [80, 81]
 
 
 class _Tokenizer:
-    """`<think>` and `</think>` are one token each; the forced text encodes to `FORCED`."""
+    """`<think>` and `</think>` are one token each; the forced text encodes to `FORCED`, and the
+    answer prefix after the model's own close ("\\n\\n" + `answer_prefix`) to `PREFIX`."""
 
     def token_to_id(self, token: str) -> int | None:
         return {"<think>": THINK, "</think>": END_THINK, "<|im_end|>": END_OF_TURN}.get(
@@ -33,7 +35,11 @@ class _Tokenizer:
         )
 
     def encode(self, text: str, *, add_bos: bool, add_eos: bool) -> list[int]:
-        return list(FORCED)
+        return (
+            list(PREFIX)
+            if text.startswith("\n\n") and "</think>" not in text
+            else list(FORCED)
+        )
 
     def get_vocab_size(self) -> int:
         return 100
@@ -157,6 +163,53 @@ def test_forced_answer_ends_the_turn_at_its_closing_brace() -> None:
     assert completion.finish_reason == "stop"
     # the thinking call does not stop at braces
     assert generate.calls[0]["sampling_config"].stop_token_ids is None
+
+
+def test_answer_after_close_appends_the_prefix_and_stops_at_the_brace() -> None:
+    # The model closes its own thinking at 3 tokens; the answer stops at its closing brace.
+    thinking = _completion([10, 11, END_THINK], finish_reason="stop")
+    answer = _completion([20, BRACE], finish_reason="stop")
+    generate = _ScriptedGenerate(thinking, answer)
+    budget = ThinkingBudget(
+        ThinkingBudget.Config(
+            max_thinking_tokens=4, answer_end_text="}", answer_after_close=True
+        ),
+        tokenizer=_Tokenizer(),
+    )
+    completion = _run(budget, generate, [THINK])
+
+    assert generate.calls[0]["sampling_config"].stop_token_ids == [END_THINK]
+    answer_call = generate.calls[1]
+    assert answer_call["prompt_token_ids"] == [THINK, 10, 11, END_THINK, *PREFIX]
+    assert answer_call["sampling_config"].stop_token_ids == [BRACE, BRACE_DOT]
+    assert answer_call["sampling_config"].max_tokens == 12 - 3 - len(PREFIX) - 1
+    assert completion.token_ids == [10, 11, END_THINK, *PREFIX, 20, BRACE, END_OF_TURN]
+    assert completion.loss_mask == [True] * 3 + [False] * 2 + [True] * 2 + [False]
+    assert all(math.isnan(lp) for lp in completion.token_logprobs[3:5])
+    assert _forced_close_rate(completion) == 0.0
+
+
+def test_answer_after_close_only_stops_at_a_close_when_thinking_is_open() -> None:
+    # The prompt closed thinking (thinking off): a stray </think> in the answer doesn't end the turn.
+    reply = _completion([10, END_THINK, 11], finish_reason="stop")
+    generate = _ScriptedGenerate(reply)
+    budget = ThinkingBudget(
+        ThinkingBudget.Config(
+            max_thinking_tokens=4, answer_end_text="}", answer_after_close=True
+        ),
+        tokenizer=_Tokenizer(),
+    )
+    completion = _run(budget, generate, [THINK, 6, END_THINK])
+    assert generate.calls[0]["sampling_config"].stop_token_ids is None
+    assert completion is reply
+
+
+def test_answer_after_close_needs_an_answer_end() -> None:
+    with pytest.raises(ValueError, match="answer_end_text"):
+        ThinkingBudget(
+            ThinkingBudget.Config(max_thinking_tokens=4, answer_after_close=True),
+            tokenizer=_Tokenizer(),
+        )
 
 
 def test_reply_that_stops_while_thinking_gets_a_forced_close() -> None:

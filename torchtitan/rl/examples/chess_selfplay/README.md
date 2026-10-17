@@ -79,6 +79,7 @@ thinking_budget = ThinkingBudget.Config(
     answer_prefix="\\boxed{",
     answer_end_text="}",
     force_close_on_stop=False,
+    answer_after_close=True,
 )
 message_env = ChessPlayerEnv.Config(forced_close_text=thinking_budget.close_text)
 ```
@@ -88,6 +89,7 @@ message_env = ChessPlayerEnv.Config(forced_close_text=thinking_budget.close_text
 3. The forced tokens are masked out of the loss, and the reward doesn't charge for them.
 4. After a forced close, an illegal answer plays the thinking's last `\boxed{}` instead of forfeiting (`chess_games/fallback_moves_per_reply_*` counts these).
 5. With `force_close_on_stop=False`, a reply that ends its turn before `</think>` is returned as is, and the env reads the box it wrote.
+6. With `answer_after_close=True`, a reply that closes its own thinking also gets `\boxed{` appended (loss-masked), and its answer stops at the brace.
 
 Each turn's `max_tokens` is the thinking budget plus 128 answer tokens. A player keeps its own past thinking, never the opponent's, so a 90-ply game with every reply at the cap holds ~111k tokens of context.
 
@@ -144,7 +146,7 @@ python -m torchtitan.rl.train \
 
 ## Results
 
-None yet for this recipe. A 5-host GB300 run of the same model, prompt, rewards, thinking budget and ply schedule (16 generators, a loss that isn't on main yet (score centering) instead of DAPO, validation every 5 steps at temperature 1.0) gave:
+None yet for this recipe. A 5-host GB300 run of the same model, prompt, rewards, thinking budget (without `answer_after_close`) and ply schedule (16 generators, a loss that isn't on main yet (score centering) instead of DAPO, validation every 5 steps at temperature 1.0) gave:
 
 ```text
 illegal-move game endings   99.5% at step 0 -> 2-4% at steps 190-220 -> 12-14% after step ~250 (a thinking-loop phase)
