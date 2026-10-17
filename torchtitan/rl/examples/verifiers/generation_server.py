@@ -347,7 +347,8 @@ def _json_response(
     if routed_experts_rows is None:
         return web.json_response(data)
     head, placeholder, tail = json.dumps(data).rpartition(f'"{_ROUTED_EXPERTS_DATA}"')
-    assert placeholder, "the routed_experts placeholder is missing from the response"
+    if not placeholder:
+        raise RuntimeError("the routed_experts placeholder is missing from the response")
     rows = np.ascontiguousarray(routed_experts_rows)
     body = b"".join((head.encode(), b'"', base64.b64encode(rows), b'"', tail.encode()))
     return web.Response(body=body, content_type="application/json", charset="utf-8")
