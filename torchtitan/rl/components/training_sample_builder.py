@@ -152,6 +152,33 @@ class TrainingSampleBuilder(Configurable):
     def __init__(self, config: Config) -> None:
         self.config = config
 
+    def rollouts_left_out(self, rollout_group: RolloutGroup) -> list[Rollout]:
+        """Rollouts `build_from_group` leaves out of training whatever their turns hold: errored ones,
+        every rollout of a zero-reward-std group, and zero-advantage ones, as configured. A subset of
+        what it drops, so a caller may skip their turn payloads.
+
+        Example:
+            rewards [1.0, 1.0, 1.0, 1.0], drop_zero_std_reward_groups=True
+            rollouts_left_out(group)  # -> all 4 rollouts
+        """
+        rollouts = rollout_group.rollouts
+        rewards = [rollout.reward for rollout in rollouts]
+        # Equal over all rollouts stays equal over the non-errored ones; fewer than 2 of those
+        # drops the group too.
+        if (
+            self.config.drop_zero_std_reward_groups
+            and None not in rewards
+            and len(rewards) > 1
+            and statistics.pstdev(rewards) == 0.0
+        ):
+            return list(rollouts)
+        return [
+            rollout
+            for rollout in rollouts
+            if (self.config.drop_errored_rollouts and rollout.status.is_error())
+            or (self.config.drop_zero_advantage_rollouts and rollout.advantage == 0.0)
+        ]
+
     def build_from_group(self, *, rollout_group: RolloutGroup) -> TrainingSampleGroup:
         """Apply data-validity filters and convert surviving rollouts to training_samples.
 
