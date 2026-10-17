@@ -924,6 +924,7 @@ def _run_with_generator_watcher(watcher) -> None:
                 num_tokens_per_microbatch_per_dp_rank=8, max_context_length=8
             )
         ),
+        loop_stall_watchdog_s=0,
     )
     controller.start_step = 0
     controller._max_concurrent_rollout_groups = 1  # setup_async resolves this

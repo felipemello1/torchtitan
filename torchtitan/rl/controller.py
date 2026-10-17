@@ -138,6 +138,7 @@ from torchtitan.rl.observability.controller import (
     GCTimer,
     MetricsTimer,
 )
+from torchtitan.rl.observability.loop_stall_watchdog import watch_loop_stalls
 from torchtitan.rl.observability.rollout_recorder import RolloutSampleRecorder
 from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.rollouter import Rollouter
@@ -452,6 +453,10 @@ class Controller(Configurable):
             default_factory=RolloutSampleRecorder.Config
         )
         """JSONL recorder to save sampled rollouts to disk for further inspection and debugging."""
+
+        loop_stall_watchdog_s: float = 0
+        """When > 0, dump every thread's stack to `dump_folder/loop_stalls.txt` whenever the
+        controller's event loop is blocked this many seconds; see `watch_loop_stalls`. 0 disables."""
 
         trainer: Trainer.Config
         """Trainer config. Controls the trainer model, optimizer, training, parallelism."""
@@ -1270,6 +1275,16 @@ class Controller(Configurable):
             batcher_task,
             generator_task,
         ]
+        if self.config.loop_stall_watchdog_s > 0:
+            background_tasks.append(
+                asyncio.create_task(
+                    watch_loop_stalls(
+                        path=os.path.join(self.config.dump_folder, "loop_stalls.txt"),
+                        threshold_s=self.config.loop_stall_watchdog_s,
+                    ),
+                    name="loop_stall_watchdog",
+                )
+            )
         try:
             done, _ = await asyncio.wait(
                 [trainer_task, *background_tasks], return_when=asyncio.FIRST_COMPLETED
