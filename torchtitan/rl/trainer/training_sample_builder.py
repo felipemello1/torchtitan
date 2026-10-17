@@ -163,7 +163,17 @@ class TrainingSampleBuilder(Configurable):
                 m.Mean(1.0 if is_zero_std else 0.0),
             )
         )
-        if self.config.drop_zero_std_reward_groups and is_zero_std:
+        # A turn with its own advantage (e.g. a forfeit's penalty) still trains in a tied group.
+        has_turn_advantages = any(
+            turn.advantage is not None
+            for rollout in rollout_group.rollouts
+            for turn in rollout.turns
+        )
+        if (
+            self.config.drop_zero_std_reward_groups
+            and is_zero_std
+            and not has_turn_advantages
+        ):
             metrics.append(
                 m.Metric(
                     "training_sample_builder/num_groups_dropped_zero_std", m.Sum(1.0)
@@ -376,6 +386,11 @@ class TrainingSampleBuilder(Configurable):
             # Append this turn's chunks: prompt delta (untrained) + completion (trained).
             num_delta = len(prompt_delta)
             num_completion = len(rollout_turn.completion_token_ids)
+            turn_advantage = (
+                rollout_advantage
+                if rollout_turn.advantage is None
+                else rollout_turn.advantage
+            )
             sample_in_progress.token_ids += [
                 prompt_delta,
                 rollout_turn.completion_token_ids,
@@ -394,7 +409,7 @@ class TrainingSampleBuilder(Configurable):
             ]
             sample_in_progress.advantage += [
                 np.zeros(num_delta, dtype=np.float32),
-                np.full(num_completion, rollout_advantage, dtype=np.float32),
+                np.full(num_completion, turn_advantage, dtype=np.float32),
             ]
             # Widen the segment's version span to include this turn (the min stays the opening turn's).
             sample_in_progress.max_policy_version = max(
