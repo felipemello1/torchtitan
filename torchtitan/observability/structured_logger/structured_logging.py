@@ -547,20 +547,28 @@ async def log_event_loop_lag(
         # -> loop_stalls.txt: "Timeout (0:00:01)!\nThread 0x... File ... in <blocking frame>"
     """
     loop = asyncio.get_running_loop()
-    dump_file = open(dump_path, "a") if dump_path is not None else None
+    # One unbuffered O_APPEND fd: faulthandler's thread writes dumps straight to it, and each footer is
+    # a single os.write, so the two never interleave through a shared Python buffer.
+    dump_fd = (
+        os.open(dump_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        if dump_path is not None
+        else None
+    )
     try:
         while True:
-            if dump_file is not None:
-                faulthandler.dump_traceback_later(dump_threshold_s, file=dump_file)
+            if dump_fd is not None:
+                faulthandler.dump_traceback_later(dump_threshold_s, file=dump_fd)
             due = loop.time() + interval_s
             await asyncio.sleep(interval_s)
             lag_s = loop.time() - due
             if lag_s >= threshold_s:
                 log_trace_scalar({"event_loop_lag_ms": lag_s * 1000})
-            if dump_file is not None and lag_s >= dump_threshold_s:
-                dump_file.write(f"# loop stall ended at {time.time():.1f}, {lag_s:.2f} s\n")
-                dump_file.flush()
+            if dump_fd is not None and lag_s >= dump_threshold_s:
+                os.write(
+                    dump_fd,
+                    f"# loop stall ended at {time.time():.1f}, {lag_s:.2f} s\n".encode(),
+                )
     finally:
-        if dump_file is not None:
+        if dump_fd is not None:
             faulthandler.cancel_dump_traceback_later()
-            dump_file.close()
+            os.close(dump_fd)
