@@ -2047,3 +2047,18 @@ def test_validation_config_rejects_bad_sampling() -> None:
         ValidationConfig(num_samples_per_prompt=0)
     with pytest.raises(ValueError, match="greedy"):
         ValidationConfig(temperature=0.0, num_samples_per_prompt=4)
+
+
+def test_heap_census_does_not_keep_objects_alive(tmp_path) -> None:
+    """Objects the program drops after a census are freed by refcount, not left to cyclic GC."""
+    gc.collect()
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        held = [[i] for i in range(10_000)]
+        append_heap_census(path=str(tmp_path / "heap_census.jsonl"), step=1)
+        del held
+        assert gc.collect() < 100
+    finally:
+        if gc_was_enabled:
+            gc.enable()
