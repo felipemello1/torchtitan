@@ -24,6 +24,7 @@ from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.data import RLDataLoader, RLDataset
 from torchtitan.rl.rollout.message_env import MessageEnv
 from torchtitan.rl.rollout.rubric import Rubric, RubricOutput
+from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
 from torchtitan.rl.rollout.token_env import TokenEnv
 from torchtitan.rl.rollout.types import (
     GenerateFn,
@@ -266,12 +267,17 @@ class RolloutWorker(Configurable):
         """Post-scoring advantage estimator. Default = Dr.GRPO (mean-baseline only);
         set `AdvantageEstimator.Config(should_std_normalize=True)` for standard GRPO."""
 
+        thinking_budget: ThinkingBudget.Config | None = None
+        """Caps thinking per turn by forcing its end; None leaves replies to `max_tokens`."""
+
     def __init__(self, config: Config) -> None:
         self.rubric: Rubric = config.rubric.build()
         self._message_env_config = config.message_env
         self._token_env_config = config.token_env
+        self._thinking_budget_config = config.thinking_budget
         self.advantage_estimator: AdvantageEstimator = config.advantage.build()
         self._renderer: Renderer
+        self._thinking_budget: ThinkingBudget | None = None
 
     async def setup_async(
         self,
@@ -283,6 +289,10 @@ class RolloutWorker(Configurable):
         """Build runtime dependencies after the worker actor is spawned."""
         tokenizer = tokenizer_config.build(tokenizer_path=hf_assets_path)
         self._renderer = renderer_config.build(tokenizer=tokenizer)
+        if self._thinking_budget_config is not None:
+            self._thinking_budget = self._thinking_budget_config.build(
+                tokenizer=tokenizer
+            )
 
     def make_env_group(
         self,
@@ -432,6 +442,14 @@ class RolloutWorker(Configurable):
         Returns:
             One unscored `Rollout`; `run_group` fills its reward later.
         """
+        if self._thinking_budget is not None:
+            # Validation groups (negative ids) log apart, as validation's generator metrics do.
+            generate_fn = self._thinking_budget.wrap(
+                generate_fn,
+                metrics_prefix=(
+                    "validation_thinking_budget" if group_id < 0 else "thinking_budget"
+                ),
+            )
         # Per-sample sticky key: a sample's turns reuse one generator's prefix cache.
         routing_session_id = RolloutTurnID(
             group_id=group_id, rollout_id=rollout_id, turn_id=0
@@ -471,6 +489,11 @@ class RolloutWorker(Configurable):
                         ),
                         completion_logprobs=np.asarray(
                             completion.token_logprobs, dtype=np.float32
+                        ),
+                        completion_loss_mask=(
+                            None
+                            if completion.loss_mask is None
+                            else np.asarray(completion.loss_mask, dtype=bool)
                         ),
                         completion_message=next_env_step.completion_message,
                         env_messages=next_env_step.env_messages,
