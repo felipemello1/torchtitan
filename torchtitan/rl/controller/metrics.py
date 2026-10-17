@@ -149,13 +149,19 @@ def append_heap_census(*, path: str, step: int) -> None:
     if gc_was_enabled:
         gc.enable()
     type_counts = Counter(map(type, itertools.chain.from_iterable(generations)))
+    object_counts = [len(objects) for objects in generations]
+    # gc.get_objects() lists this frame too, and this frame holds the lists: a cycle that would keep
+    # every object alive now until the next full collect, even after the program drops them.
+    for objects in generations:
+        objects.clear()
+    del generations
     # statm's 2nd field is the resident set size, in pages.
     with open("/proc/self/statm") as file:
         rss_bytes = int(file.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
     record = {
         "step": step,
         "rss_gib": round(rss_bytes / 2**30, 2),
-        "objects_per_generation": [len(objects) for objects in generations],
+        "objects_per_generation": object_counts,
         "frozen_objects": gc.get_freeze_count(),
         "top_types": [
             [f"{obj_type.__module__}.{obj_type.__qualname__}", count]
