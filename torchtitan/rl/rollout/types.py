@@ -91,7 +91,7 @@ class GenerateFn(Protocol):
 
     async def __call__(
         self,
-        prompt_token_ids: list[int],
+        prompt_token_ids: list[int] | np.ndarray,
         *,
         request_id: str,
         group_id: int,
@@ -101,7 +101,9 @@ class GenerateFn(Protocol):
         """Run one generation.
 
         Args:
-            prompt_token_ids: The tokenized prompt to generate from.
+            prompt_token_ids: The tokenized prompt to generate from; a 1-D int array is accepted
+                too (e.g. a prompt held for the whole generation, which a list would make every
+                GC visit token by token).
             request_id: Unique per call; identifies the exact turn (e.g. ".../turn=2") in logs.
             group_id: Rollout group this call belongs to. Calls of one group share a prefix
                 cache namespace, so siblings and later turns can reuse the group's KV.
