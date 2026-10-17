@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import random
+
 import numpy as np
 import pytest
 import torch
@@ -551,3 +553,35 @@ def test_rollouts_left_out_get_no_training_samples(rewards, advantages, statuses
         assert got.rollout_id == want.rollout_id
         assert np.array_equal(got.token_ids, want.token_ids)
         assert np.array_equal(got.routed_expert_ids, want.routed_expert_ids)
+
+
+def test_rollouts_left_out_matches_build_from_group_on_random_groups() -> None:
+    """Over random groups and configs: no rollout `rollouts_left_out` names gets a training sample,
+    and every rollout that gets none is named (or produced only samples with no valid loss token)."""
+    rng = random.Random(0)
+    statuses = [RolloutStatus.COMPLETED, RolloutStatus.TRUNCATED_LENGTH, RolloutStatus.ERROR]
+    for _ in range(500):
+        builder = TrainingSampleBuilder.Config(
+            drop_errored_rollouts=rng.random() < 0.5,
+            drop_zero_std_reward_groups=rng.random() < 0.5,
+            drop_zero_advantage_rollouts=rng.random() < 0.5,
+        ).build()
+        rollouts = []
+        for rollout_id in range(rng.randint(1, 4)):
+            rollout = _sibling(
+                rollout_id, reward=rng.choice([0.0, 0.5, 1.0]), status=rng.choice(statuses)
+            )
+            rollout.advantage = rng.choice([0.0, 0.5, -0.5])
+            if rng.random() < 0.1:  # no completion at all: the group is untrainable
+                rollout.turns[0].completion_token_ids = np.array([], dtype=np.int32)
+                rollout.turns[0].completion_logprobs = np.array([], dtype=np.float32)
+            rollouts.append(rollout)
+        group = RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+
+        left_out = {rollout.rollout_id for rollout in builder.rollouts_left_out(group)}
+        sampled = {
+            sample.rollout_id.rollout_id
+            for sample in builder.build_from_group(rollout_group=group).training_samples
+        }
+        assert not left_out & sampled
+        assert left_out | sampled == {rollout.rollout_id for rollout in rollouts}
