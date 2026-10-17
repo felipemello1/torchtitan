@@ -14,6 +14,7 @@ import logging
 import time
 from dataclasses import dataclass, field, replace
 
+import msgspec
 import numpy as np
 from aiohttp import web
 
@@ -226,7 +227,8 @@ class GenerationServer(Configurable):
             )
 
         try:
-            body = await request.json()
+            # Same types as `request.json()` (dict, list, int, float, str), parsed ~2x faster.
+            body = msgspec.json.decode(await request.read())
             # numpy: the request is held for its whole generation, and a full GC visits every
             # element of a list (a 30k-token prompt: 30k references, twice with the body).
             prompt_token_ids = np.asarray(
@@ -275,7 +277,7 @@ class GenerationServer(Configurable):
                 sampling = replace(sampling, max_tokens=room)
             if body.get("features") is not None:
                 raise ValueError("multimodal features are not supported")
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError, msgspec.DecodeError) as error:
             return web.json_response({"error": str(error)}, status=400)
         del body
 
