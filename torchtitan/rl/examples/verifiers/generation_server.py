@@ -12,6 +12,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
+import numpy as np
 from aiohttp import web
 
 from torchtitan.config import Configurable
@@ -176,8 +177,11 @@ class GenerationServer(Configurable):
 
         try:
             body = await request.json()
-            prompt_token_ids = _validate_token_ids(
-                body.get("token_ids"), field_name="token_ids"
+            # numpy: the request is held for its whole generation, and a full GC visits every
+            # element of a list (a 30k-token prompt: 30k references, twice with the body).
+            prompt_token_ids = np.asarray(
+                _validate_token_ids(body.get("token_ids"), field_name="token_ids"),
+                dtype=np.int64,
             )
             # vLLM needs room for one output token. Verifiers reads this wording as an
             # overlong prompt and ends the rollout as context_length.
@@ -201,6 +205,7 @@ class GenerationServer(Configurable):
                 raise ValueError("multimodal features are not supported")
         except (TypeError, ValueError) as error:
             return web.json_response({"error": str(error)}, status=400)
+        del body
 
         request_index = self.request_counts.get(session_id, 0)
         self.request_counts[session_id] = request_index + 1
