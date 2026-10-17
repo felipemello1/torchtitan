@@ -823,7 +823,6 @@ class Controller(Configurable):
             "Full GC before freezing the controller's setup objects"
         )
         self._full_gc_metrics: list[m.Metric] = []
-        self._last_full_gc = time.monotonic()
         # Not `GarbageCollector.Config()`: its default `gc_freq` (50, the trainer's) would collect
         # every 50 steps, leaving young objects to pile up between collects.
         self._garbage_collector = (
@@ -1153,6 +1152,8 @@ class Controller(Configurable):
         # The previous step's push and pull, each returning its wall time; None before the first.
         push_task: asyncio.Task[float] | None = None
         pull_task: asyncio.Task[float] | None = None
+        # The full-collect interval counts from the first step, not from setup and pre-validation.
+        self._last_full_gc = time.monotonic()
         for step in range(self.start_step + 1, num_training_steps + 1):
             sl.set_step(step)  # propagate the step counter to the actors
             with sl.log_trace_span("sync_log_step"):

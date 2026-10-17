@@ -235,15 +235,19 @@ def test_push_failure_fails_the_loop() -> None:
         _run(controller, num_training_steps=2)
 
 
-def test_full_collect_every_seconds_runs_once_the_interval_passed() -> None:
-    controller = _controller([])
-    controller.config.full_gc_every_seconds = 3600
-    controller._garbage_collector = SimpleNamespace(run=lambda step: None)
-    controller._last_full_gc = time.monotonic() - 3601  # the hour is up at the first step
-    _run(controller, num_training_steps=3)
+def test_full_collect_every_seconds_counts_from_the_first_step() -> None:
+    def full_collects(every_s: float) -> list[bool]:
+        controller = _controller([])
+        controller.config.full_gc_every_seconds = every_s
+        controller._garbage_collector = SimpleNamespace(run=lambda step: None)
+        controller._last_full_gc = 0.0  # setup ran long ago; the loop restarts the clock
+        _run(controller, num_training_steps=3)
+        # A collect is logged with the step after it.
+        return [
+            "controller/gc/full_collect/seconds" in metrics
+            for metrics in controller.logged_metrics
+        ]
 
-    full_collects = [
-        "controller/gc/full_collect/seconds" in metrics
-        for metrics in controller.logged_metrics
-    ]
-    assert full_collects == [False, True, False]  # logged with the step after the collect
+    assert full_collects(3600) == [False, False, False]
+    assert full_collects(1e-9) == [False, True, True]
+
