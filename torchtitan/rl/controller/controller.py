@@ -91,6 +91,7 @@ import asyncio
 import copy
 import json
 import logging
+import gc
 import math
 import os
 import time
@@ -307,6 +308,18 @@ class Controller(Configurable):
         metrics: m.MetricsProcessor.Config = field(
             default_factory=m.MetricsProcessor.Config
         )
+
+        manual_gc_every_n_steps: int = 0
+        """0: Python's automatic GC, whose full collections pause the event loop for seconds on a large heap.
+        N > 0: automatic GC off, and `gc.collect(1)` every N steps (from step 2) after metrics are logged.
+        Objects alive at a collect are never scanned again, so a cycle among them that dies later leaks until
+        a full collect (`full_gc_every_seconds`); watch the controller's host memory."""
+
+        full_gc_every_seconds: float = 0
+        """With `manual_gc_every_n_steps` set, also run a full `gc.collect()` at the first step boundary at least
+        this many seconds after the previous one (0: never). It frees cycles that died after their first collect;
+        its pause and freed objects are logged with the next step as `controller/gc/full_collect/{seconds,collected}`.
+        With a large `manual_gc_every_n_steps` this is "GC off, one full collect per hour" (`3600`)."""
 
         override: OverrideConfig = field(default_factory=OverrideConfig)
         """Registered overrides applied to this whole config tree, including the
@@ -809,6 +822,16 @@ class Controller(Configurable):
         GarbageCollector.freeze(
             "Full GC before freezing the controller's setup objects"
         )
+        self._full_gc_metrics: list[m.Metric] = []
+        # Not `GarbageCollector.Config()`: its default `gc_freq` (50, the trainer's) would collect
+        # every 50 steps, leaving young objects to pile up between collects.
+        self._garbage_collector = (
+            GarbageCollector(
+                GarbageCollector.Config(gc_freq=self.config.manual_gc_every_n_steps)
+            )
+            if self.config.manual_gc_every_n_steps > 0
+            else None
+        )
 
         async_loop = self.config.async_loop
         num_training_steps = async_loop.num_training_steps
@@ -1129,6 +1152,8 @@ class Controller(Configurable):
         # The previous step's push and pull, each returning its wall time; None before the first.
         push_task: asyncio.Task[float] | None = None
         pull_task: asyncio.Task[float] | None = None
+        # The full-collect interval counts from the first step, not from setup and pre-validation.
+        self._last_full_gc = time.monotonic()
         for step in range(self.start_step + 1, num_training_steps + 1):
             sl.set_step(step)  # propagate the step counter to the actors
             with sl.log_trace_span("sync_log_step"):
@@ -1264,8 +1289,29 @@ class Controller(Configurable):
                             ),
                             time_metrics=time_metrics,
                         ),
+                        *self._full_gc_metrics,
                     ],
                 )
+            self._full_gc_metrics = []
+            if self._garbage_collector is not None:
+                self._garbage_collector.run(step)
+                full_gc_every_seconds = self.config.full_gc_every_seconds
+                if (
+                    full_gc_every_seconds
+                    and time.monotonic() - self._last_full_gc >= full_gc_every_seconds
+                ):
+                    self._last_full_gc = time.monotonic()
+                    start = time.perf_counter()
+                    collected = gc.collect()
+                    self._full_gc_metrics = [
+                        m.Metric(
+                            "controller/gc/full_collect/seconds",
+                            m.NoReduce(time.perf_counter() - start),
+                        ),
+                        m.Metric(
+                            "controller/gc/full_collect/collected", m.NoReduce(collected)
+                        ),
+                    ]
 
         # Finish the last push and pull so generators hold the final weights for post-validation.
         if push_task is not None:

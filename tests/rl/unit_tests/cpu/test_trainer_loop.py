@@ -12,6 +12,7 @@ the ordering that makes the overlap safe.
 """
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -80,7 +81,8 @@ def _controller(events: list[str], *, on_push=None, on_pull=None) -> Controller:
             target_offpolicy_steps=1,
             max_offpolicy_steps=None,
             num_prompts_per_train_step=5,
-        )
+        ),
+        full_gc_every_seconds=0,
     )
     controller.start_step = 0
     controller._trainer_policy_version = 0
@@ -105,6 +107,9 @@ def _controller(events: list[str], *, on_push=None, on_pull=None) -> Controller:
     controller._group_buffer = SimpleNamespace(
         metrics=lambda: [], release_active_groups=release_active_groups
     )
+    controller._garbage_collector = None
+    controller._full_gc_metrics = []
+    controller._last_full_gc = 0.0
     controller.logged_metrics = []
     controller.metrics_processor = SimpleNamespace(
         log=lambda *, step, is_validation, metrics: controller.logged_metrics.append(
@@ -206,6 +211,21 @@ def test_push_and_pull_times_are_logged_one_step_late() -> None:
     assert second[GENERATOR_PULL_KEY].value.value > 0.0
 
 
+def test_garbage_collector_runs_after_each_step_metrics_log() -> None:
+    events: list[str] = []
+    controller = _controller([])
+    controller.metrics_processor = SimpleNamespace(
+        log=lambda *, step, is_validation, metrics: events.append(f"log {step}")
+    )
+    controller._garbage_collector = SimpleNamespace(
+        run=lambda step: events.append(f"gc {step}")
+    )
+    _run(controller, num_training_steps=2)
+
+    assert events == ["log 1", "gc 1", "log 2", "gc 2"]
+
+
+
 def test_push_failure_fails_the_loop() -> None:
     async def failing_push():
         raise RuntimeError("push failed")
@@ -213,3 +233,21 @@ def test_push_failure_fails_the_loop() -> None:
     controller = _controller([], on_push=failing_push)
     with pytest.raises(RuntimeError, match="push failed"):
         _run(controller, num_training_steps=2)
+
+
+def test_full_collect_every_seconds_counts_from_the_first_step() -> None:
+    def full_collects(every_s: float) -> list[bool]:
+        controller = _controller([])
+        controller.config.full_gc_every_seconds = every_s
+        controller._garbage_collector = SimpleNamespace(run=lambda step: None)
+        controller._last_full_gc = 0.0  # setup ran long ago; the loop restarts the clock
+        _run(controller, num_training_steps=3)
+        # A collect is logged with the step after it.
+        return [
+            "controller/gc/full_collect/seconds" in metrics
+            for metrics in controller.logged_metrics
+        ]
+
+    assert full_collects(3600) == [False, False, False]
+    assert full_collects(1e-9) == [False, True, True]
+
