@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 from dataclasses import dataclass, field, replace
 
+import msgspec
 import numpy as np
-import torch
 from aiohttp import web
 
 from torchtitan.config import Configurable
@@ -56,7 +57,7 @@ class VerifiersGenerationMetadata:
     """Metrics from every generation in the rollout, merged with `m.fold`."""
 
     topk_by_generation: dict[
-        tuple[int, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]
+        tuple[int, tuple[int, ...]], tuple[np.ndarray, np.ndarray]
     ] = field(default_factory=dict)
     """The generator's top-k ids and logprobs `[num_completion_tokens, k]` per generation,
     keyed by `(len(prompt_token_ids), completion_token_ids)`; empty unless
@@ -64,7 +65,7 @@ class VerifiersGenerationMetadata:
 
     Example:
 
-        {(2, (12, 13)): (tensor([[12, 5], [13, 6]]), tensor([[-0.1, -2.4], [-0.2, -1.9]]))}
+        {(2, (12, 13)): (array([[12, 5], [13, 6]]), array([[-0.1, -2.4], [-0.2, -1.9]]))}
     """
 
 
@@ -194,7 +195,8 @@ class GenerationServer(Configurable):
             )
 
         try:
-            body = await request.json()
+            # Same types as `request.json()` (dict, list, int, float, str), parsed ~2x faster.
+            body = msgspec.json.decode(await request.read())
             prompt_token_ids = _validate_token_ids(
                 body.get("token_ids"), field_name="token_ids"
             )
@@ -240,7 +242,7 @@ class GenerationServer(Configurable):
                 sampling = replace(sampling, max_tokens=room)
             if body.get("features") is not None:
                 raise ValueError("multimodal features are not supported")
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError, msgspec.DecodeError) as error:
             return web.json_response({"error": str(error)}, status=400)
 
         request_index = self.request_counts.get(session_id, 0)
@@ -307,7 +309,12 @@ class GenerationServer(Configurable):
             ),
             topk_by_generation=topk_by_generation,
         )
-        return web.json_response(
+        routed_experts_rows = (
+            None
+            if completion.routed_expert_ids is None
+            else completion.routed_expert_ids[routed_experts_prompt_start:]
+        )
+        return _json_response(
             {
                 "request_id": completion.request_id,
                 "choices": [
@@ -330,10 +337,10 @@ class GenerationServer(Configurable):
                         "finish_reason": completion.finish_reason,
                         **(
                             {}
-                            if completion.routed_expert_ids is None
+                            if routed_experts_rows is None
                             else {
                                 "routed_experts": _routed_experts_payload(
-                                    completion.routed_expert_ids,
+                                    routed_experts_rows,
                                     start=routed_experts_prompt_start,
                                 )
                             }
@@ -342,35 +349,59 @@ class GenerationServer(Configurable):
                 ],
                 "prompt_logprobs": None,
                 "kv_transfer_params": None,
-            }
+            },
+            routed_experts_rows,
         )
 
 
-def _routed_experts_payload(
-    routed_expert_ids: np.ndarray, *, start: int
-) -> dict[str, object]:
-    """Verifiers' ``routed_experts`` field: the rows from position ``start`` on.
+_ROUTED_EXPERTS_DATA = "__routed_experts_data__"
+"""Placeholder for the base64 routed-experts rows; `_json_response` splices the bytes in."""
+
+
+def _routed_experts_payload(rows: np.ndarray, *, start: int) -> dict[str, object]:
+    """Verifiers' ``routed_experts`` field for ``rows`` (positions ``start`` on), data left as a
+    placeholder for `_json_response`.
 
     Example:
 
-        _routed_experts_payload(routed_expert_ids, start=3)  # uint8 [6, 48, 8]
-        # -> {"data": <base64 of rows 3..5>, "shape": [3, 48, 8], "start": 3, "dtype": "uint8"}
+        _routed_experts_payload(routed_expert_ids[3:], start=3)  # uint8 [3, 48, 8]
+        # -> {"data": _ROUTED_EXPERTS_DATA, "shape": [3, 48, 8], "start": 3, "dtype": "uint8"}
     """
-    rows = routed_expert_ids[start:]
     return {
-        "data": base64.b64encode(rows.tobytes()).decode("ascii"),
+        "data": _ROUTED_EXPERTS_DATA,
         "shape": list(rows.shape),
         "start": start,
         "dtype": str(rows.dtype),
     }
 
 
+def _json_response(
+    data: dict[str, object], routed_experts_rows: np.ndarray | None
+) -> web.Response:
+    """``web.json_response(data)``, with the routed-experts rows' base64 spliced in as bytes.
+
+    The body is byte-identical to putting the base64 string through ``json.dumps``, which
+    scans and copies it (~33 MB at a 64k-token context; base64 needs no JSON escaping).
+
+    Example:
+
+        _json_response({"routed_experts": _routed_experts_payload(rows, start=0)}, rows)
+        # body: b'{"routed_experts": {"data": "<base64 of rows>", "shape": ...}}'
+    """
+    if routed_experts_rows is None:
+        return web.json_response(data)
+    head, placeholder, tail = json.dumps(data).rpartition(f'"{_ROUTED_EXPERTS_DATA}"')
+    if not placeholder:
+        raise RuntimeError("the routed_experts placeholder is missing from the response")
+    rows = np.ascontiguousarray(routed_experts_rows)
+    body = b"".join((head.encode(), b'"', base64.b64encode(rows), b'"', tail.encode()))
+    return web.Response(body=body, content_type="application/json", charset="utf-8")
+
+
 def _validate_token_ids(value: object, *, field_name: str) -> list[int]:
     """Validate an untyped JSON value as integer token IDs and return a copy."""
-    if not isinstance(value, list) or any(
-        isinstance(token_id, bool) or not isinstance(token_id, int)
-        for token_id in value
-    ):
+    # One C-level pass over the types: JSON ints are exactly `int`; `bool` is its own type.
+    if not isinstance(value, list) or not set(map(type, value)) <= {int}:
         raise ValueError(f"{field_name} must be a list of integer token IDs")
     return list(value)
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -24,7 +25,10 @@ from aiohttp import ClientSession
 
 from torchtitan.rl.examples.verifiers.data import VerifiersTaskSample
 from torchtitan.rl.examples.verifiers.generation_server import (
+    _json_response,
     _parse_sampling_config,
+    _routed_experts_payload,
+    _validate_token_ids,
     GenerationServer,
     VerifiersGenerationMetadata,
 )
@@ -249,8 +253,9 @@ def test_verifiers_trace_attaches_each_generations_topk_rows() -> None:
         [[11, 7]],
         [[13, 8], [14, 9]],
     ]
-    torch.testing.assert_close(
-        turns[1].completion_topk_logprobs, torch.tensor([[-0.2, -1.5], [-0.3, -1.2]])
+    np.testing.assert_allclose(
+        turns[1].completion_topk_logprobs,
+        np.array([[-0.2, -1.5], [-0.3, -1.2]], dtype=np.float32),
     )
 
 
@@ -394,6 +399,16 @@ def test_verifiers_rollout_logs_keep_the_failure_reason(caplog) -> None:
     assert "error=None: None" in caplog.text
 
 
+@pytest.mark.parametrize(
+    "value", [[1, True], [1, 2.0], [1, "2"], [1, None], (1, 2), None]
+)
+def test_validate_token_ids_rejects_non_int_tokens(value) -> None:
+    with pytest.raises(
+        ValueError, match="token_ids must be a list of integer token IDs"
+    ):
+        _validate_token_ids(value, field_name="token_ids")
+
+
 def test_generation_server_forwards_token_request() -> None:
     async def run_test() -> None:
         received = []
@@ -507,8 +522,8 @@ def test_generation_server_records_topk_logprobs_per_generation() -> None:
                 request_id=request_id,
                 token_ids=[31, 32],
                 token_logprobs=[-0.1, -0.2],
-                topk_token_ids=torch.tensor([[31, 5], [32, 6]], dtype=torch.int32),
-                topk_logprobs=torch.tensor([[-0.1, -2.4], [-0.2, -1.9]]),
+                topk_token_ids=np.array([[31, 5], [32, 6]], dtype=np.int32),
+                topk_logprobs=np.array([[-0.1, -2.4], [-0.2, -1.9]], dtype=np.float32),
                 finish_reason="stop",
             )
 
@@ -542,8 +557,8 @@ def test_generation_server_records_topk_logprobs_per_generation() -> None:
         ] = generation_metadata.topk_by_generation.items()
         assert key == (2, (31, 32))
         assert topk_token_ids.tolist() == [[31, 5], [32, 6]]
-        torch.testing.assert_close(
-            topk_logprobs, torch.tensor([[-0.1, -2.4], [-0.2, -1.9]])
+        np.testing.assert_array_equal(
+            topk_logprobs, np.array([[-0.1, -2.4], [-0.2, -1.9]], dtype=np.float32)
         )
 
     asyncio.run(run_test())
@@ -650,6 +665,25 @@ def test_generation_server_returns_routed_experts_from_the_prompt_start() -> Non
     assert rows.reshape(payload["shape"]).tolist() == routed_expert_ids[2:].tolist()
 
 
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16])
+def test_routed_experts_response_body_matches_json_dumps(dtype) -> None:
+    rows = np.arange(5 * 3 * 2, dtype=dtype).reshape(5, 3, 2)[2:]
+    data = {"choices": [{"routed_experts": _routed_experts_payload(rows, start=2)}]}
+    expected = {
+        "choices": [
+            {
+                "routed_experts": {
+                    "data": base64.b64encode(rows.tobytes()).decode("ascii"),
+                    "shape": [3, 3, 2],
+                    "start": 2,
+                    "dtype": str(rows.dtype),
+                }
+            }
+        ]
+    }
+    assert _json_response(data, rows).body == json.dumps(expected).encode()
+
+
 def test_generation_server_requires_group_id() -> None:
     async def run_test() -> None:
         async def generate_fn(*args, **kwargs):
@@ -673,6 +707,25 @@ def test_generation_server_requires_group_id() -> None:
         assert "torchtitan_group_id" in payload["error"]
 
     asyncio.run(run_test())
+
+
+def test_generation_server_rejects_malformed_json() -> None:
+    async def run_test() -> int:
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.set_generate_fn(AsyncMock())
+        await server.start()
+        try:
+            async with ClientSession() as session:
+                response = await session.post(
+                    f"http://{server.host}:{server.port}/inference/v1/generate",
+                    headers={"X-Session-ID": "group=1/rollout=2"},
+                    data=b'{"token_ids": [10,',
+                )
+                return response.status
+        finally:
+            await server.close()
+
+    assert asyncio.run(run_test()) == 400
 
 
 def test_generation_server_rejects_prompt_without_room_for_output() -> None:

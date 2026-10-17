@@ -391,13 +391,13 @@ def test_group_filters_preserve_group_id_for_acknowledgement() -> None:
 
 def test_topk_rows_follow_loss_tokens_across_turns() -> None:
     first = _turn(prompt_token_ids=[1, 2], completion_token_ids=[4, 5], version=0)
-    first.completion_topk_token_ids = torch.tensor([[4, 9], [5, 8]], dtype=torch.int32)
-    first.completion_topk_logprobs = torch.tensor([[-0.1, -2.0], [-0.2, -3.0]])
+    first.completion_topk_token_ids = np.array([[4, 9], [5, 8]], dtype=np.int32)
+    first.completion_topk_logprobs = np.array([[-0.1, -2.0], [-0.2, -3.0]], dtype=np.float32)
     second = _turn(
         prompt_token_ids=[1, 2, 4, 5, 9], completion_token_ids=[7], version=0
     )
-    second.completion_topk_token_ids = torch.tensor([[7, 3]], dtype=torch.int32)
-    second.completion_topk_logprobs = torch.tensor([[-0.3, -1.5]])
+    second.completion_topk_token_ids = np.array([[7, 3]], dtype=np.int32)
+    second.completion_topk_logprobs = np.array([[-0.3, -1.5]], dtype=np.float32)
 
     [training_sample] = rollout_to_training_samples(
         _scored_rollout([first, second], reward=1.0, advantage=0.5)

@@ -132,12 +132,14 @@ from torchtitan.rl.generator import (
 from torchtitan.rl.losses import ScoreCenteringLoss
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
+    append_heap_census,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     compute_rollout_metrics,
     GCTimer,
     MetricsTimer,
 )
+from torchtitan.rl.observability.loop_stall_watchdog import watch_loop_stalls
 from torchtitan.rl.observability.rollout_recorder import RolloutSampleRecorder
 from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.rollouter import Rollouter
@@ -453,6 +455,15 @@ class Controller(Configurable):
         )
         """JSONL recorder to save sampled rollouts to disk for further inspection and debugging."""
 
+        loop_stall_watchdog_s: float = 0
+        """When > 0, dump every thread's stack to `dump_folder/loop_stalls.txt` whenever the
+        controller's event loop is blocked this many seconds; see `watch_loop_stalls`. 0 disables."""
+
+        heap_census_every_n_steps: int = 0
+        """Every N train steps, append to `dump_folder/heap_census.jsonl` the objects a full GC
+        scans, counted by type; see `append_heap_census`. 0 disables.
+        Each census pauses the controller ~0.25 s at 1.5M objects (a full GC there: ~0.65 s)."""
+
         trainer: Trainer.Config
         """Trainer config. Controls the trainer model, optimizer, training, parallelism."""
 
@@ -509,6 +520,11 @@ class Controller(Configurable):
             if self.num_generators < 1:
                 raise ValueError(
                     f"num_generators must be at least 1, got {self.num_generators}"
+                )
+            if self.heap_census_every_n_steps < 0:
+                raise ValueError(
+                    "heap_census_every_n_steps must be >= 0 (0 disables), got "
+                    f"{self.heap_census_every_n_steps}"
                 )
             if self.generator.checkpointer is not None:
                 raise ValueError(
@@ -1270,6 +1286,16 @@ class Controller(Configurable):
             batcher_task,
             generator_task,
         ]
+        if self.config.loop_stall_watchdog_s > 0:
+            background_tasks.append(
+                asyncio.create_task(
+                    watch_loop_stalls(
+                        path=os.path.join(self.config.dump_folder, "loop_stalls.txt"),
+                        threshold_s=self.config.loop_stall_watchdog_s,
+                    ),
+                    name="loop_stall_watchdog",
+                )
+            )
         try:
             done, _ = await asyncio.wait(
                 [trainer_task, *background_tasks], return_when=asyncio.FIRST_COMPLETED
@@ -1634,11 +1660,15 @@ class Controller(Configurable):
             self.metrics_processor.commit()
             sl.set_step(step)  # propagate the step counter to the actors
             with sl.log_trace_span("sync_log_step"):
-                await self.trainer.sync_log_step.call(step)
-                await self.generator_router.sync_log_step.call_one(step)
                 # Not awaited: it would wait behind an in-flight add_group.
                 self.batcher.sync_log_step.broadcast(step)
-                await self._rollouter.sync_log_step(step)
+                # Concurrent, and still awaited before the step's work, so each actor has set this
+                # step before the controller sends it anything for the step.
+                await asyncio.gather(
+                    self.trainer.sync_log_step.call(step),
+                    self.generator_router.sync_log_step.call_one(step),
+                    self._rollouter.sync_log_step(step),
+                )
             step_timer = MetricsTimer()
 
             with (
@@ -1833,6 +1863,13 @@ class Controller(Configurable):
                 step=step, num_training_steps=num_training_steps
             )
 
+            heap_census_every_n_steps = self.config.heap_census_every_n_steps
+            if heap_census_every_n_steps and step % heap_census_every_n_steps == 0:
+                with sl.log_trace_span("heap_census"):
+                    append_heap_census(
+                        path=os.path.join(self.config.dump_folder, "heap_census.jsonl"),
+                        step=step,
+                    )
         gc_timer.close()
 
         # Finish the last in-flight sync so generators hold the final weights for post-validation.
