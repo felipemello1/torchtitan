@@ -62,6 +62,7 @@ See docstrings for full args:
 - `sl.log_trace_span(event_type, description=None, *, stacklevel=2)` -- context manager / decorator; emits `_start` / `_end` / optional `_error` records.
 - `sl.log_trace_instant(event_type, *, stacklevel=2)` -- point-in-time marker (no duration).
 - `sl.log_trace_scalar(scalars, *, stacklevel=2)` -- emit `metric_value` records from a `{name: number}` dict.
+- `sl.log_event_loop_lag(*, interval_s=0.05, threshold_s=0.2)` -- run as an asyncio task; emits an `event_loop_lag_ms` scalar when sync code blocks the event loop.
 - `sl.set_step(step, *, relative_step=None)` -- stamp subsequent records with a step; clears previous step's tags.
 - `sl.add_step_tag(tag)` / `sl.clear_step_tags()` -- annotate the current step (e.g. `"gc"`, `"eval"`). `clear_step_tags` is called at `set_step`.
 - `TITAN_STRUCT_LOGGER_HANDLERS` -- Define handlers at the env level

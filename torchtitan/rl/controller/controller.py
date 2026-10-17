@@ -279,6 +279,10 @@ class Controller(Configurable):
         )
         """JSONL recorder to save sampled rollouts to disk for further inspection and debugging."""
 
+        loop_stall_dump_s: float = 0
+        """When > 0, dump every thread's stack to `dump_folder/loop_stalls.txt` whenever the
+        controller's event loop is blocked this many seconds; see `log_event_loop_lag`. 0 disables."""
+
         trainer: Trainer.Config
         """Trainer config. Controls the trainer model, optimizer, training, parallelism."""
 
@@ -942,11 +946,23 @@ class Controller(Configurable):
 
         # run everything until trainer finishes its number of steps
         # or some other loop breaks
+        event_loop_lag_task = asyncio.create_task(
+            sl.log_event_loop_lag(
+                dump_path=(
+                    os.path.join(self.config.dump_folder, "loop_stalls.txt")
+                    if self.config.loop_stall_dump_s > 0
+                    else None
+                ),
+                dump_threshold_s=self.config.loop_stall_dump_s,
+            ),
+            name="event_loop_lag",
+        )
         background_tasks = [
             data_input_task,
             *rollout_tasks,
             batcher_task,
             generator_task,
+            event_loop_lag_task,
         ]
         try:
             done, _ = await asyncio.wait(
