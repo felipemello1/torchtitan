@@ -12,6 +12,7 @@ the ordering that makes the overlap safe.
 """
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -82,6 +83,7 @@ def _controller(events: list[str], *, on_push=None, on_pull=None) -> Controller:
             num_prompts_per_train_step=5,
         ),
         full_gc_every_n_steps=0,
+        full_gc_every_seconds=0,
     )
     controller.start_step = 0
     controller._trainer_policy_version = 0
@@ -108,6 +110,7 @@ def _controller(events: list[str], *, on_push=None, on_pull=None) -> Controller:
     )
     controller._garbage_collector = None
     controller._full_gc_metrics = []
+    controller._last_full_gc = 0.0
     controller.logged_metrics = []
     controller.metrics_processor = SimpleNamespace(
         log=lambda *, step, is_validation, metrics: controller.logged_metrics.append(
@@ -248,3 +251,17 @@ def test_full_collect_every_n_steps_is_logged_with_the_next_step() -> None:
         [],
         ["controller/gc/full_collect/collected", "controller/gc/full_collect/seconds"],
     ]
+
+
+def test_full_collect_every_seconds_runs_once_the_interval_passed() -> None:
+    controller = _controller([])
+    controller.config.full_gc_every_seconds = 3600
+    controller._garbage_collector = SimpleNamespace(run=lambda step: None)
+    controller._last_full_gc = time.monotonic() - 3601  # the hour is up at the first step
+    _run(controller, num_training_steps=3)
+
+    full_collects = [
+        "controller/gc/full_collect/seconds" in metrics
+        for metrics in controller.logged_metrics
+    ]
+    assert full_collects == [False, True, False]  # logged with the step after the collect

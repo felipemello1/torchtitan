@@ -320,6 +320,11 @@ class Controller(Configurable):
         cycles that died after their first collect; its pause and freed objects are logged with the next step
         as `controller/gc/full_collect/{seconds,collected}`."""
 
+        full_gc_every_seconds: float = 0
+        """Like `full_gc_every_n_steps`, by wall time: a full collect at the first step boundary at least this
+        many seconds after the previous one (0: never). With a large `manual_gc_every_n_steps`, this is "GC off,
+        full collect hourly" (`3600`)."""
+
         override: OverrideConfig = field(default_factory=OverrideConfig)
         """Registered overrides applied to this whole config tree, including the
         trainer and generator models, when the controller is constructed."""
@@ -822,6 +827,7 @@ class Controller(Configurable):
             "Full GC before freezing the controller's setup objects"
         )
         self._full_gc_metrics: list[m.Metric] = []
+        self._last_full_gc = time.monotonic()
         # Not `GarbageCollector.Config()`: its default `gc_freq` (50, the trainer's) would collect
         # every 50 steps, leaving young objects to pile up between collects.
         self._garbage_collector = (
@@ -1293,7 +1299,12 @@ class Controller(Configurable):
             if self._garbage_collector is not None:
                 self._garbage_collector.run(step)
                 full_gc_every_n_steps = self.config.full_gc_every_n_steps
-                if full_gc_every_n_steps and step % full_gc_every_n_steps == 0:
+                full_gc_every_seconds = self.config.full_gc_every_seconds
+                if (full_gc_every_n_steps and step % full_gc_every_n_steps == 0) or (
+                    full_gc_every_seconds
+                    and time.monotonic() - self._last_full_gc >= full_gc_every_seconds
+                ):
+                    self._last_full_gc = time.monotonic()
                     start = time.perf_counter()
                     collected = gc.collect()
                     self._full_gc_metrics = [
