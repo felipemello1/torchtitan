@@ -1634,11 +1634,15 @@ class Controller(Configurable):
             self.metrics_processor.commit()
             sl.set_step(step)  # propagate the step counter to the actors
             with sl.log_trace_span("sync_log_step"):
-                await self.trainer.sync_log_step.call(step)
-                await self.generator_router.sync_log_step.call_one(step)
                 # Not awaited: it would wait behind an in-flight add_group.
                 self.batcher.sync_log_step.broadcast(step)
-                await self._rollouter.sync_log_step(step)
+                # Concurrent, and still awaited: Monarch delivers one sender's messages to an actor
+                # in order, so each actor sets this step before any later message from the controller.
+                await asyncio.gather(
+                    self.trainer.sync_log_step.call(step),
+                    self.generator_router.sync_log_step.call_one(step),
+                    self._rollouter.sync_log_step(step),
+                )
             step_timer = MetricsTimer()
 
             with (
