@@ -356,3 +356,42 @@ def test_group_filters_preserve_group_id_for_acknowledgement() -> None:
     filtered_groups = [failed, untrainable, zero_std, no_valid_tokens]
     assert [group.group_id for group in filtered_groups] == [7, 8, 9, 10]
     assert all(not group.training_samples for group in filtered_groups)
+
+
+def test_dropping_messages_leaves_training_samples_and_metrics_unchanged() -> None:
+    """Everything the controller and the batcher compute after recording is the same without the
+    messages: rollout metrics, and the training samples (bitwise)."""
+    from torchtitan.rl.controller.metrics import compute_rollout_metrics
+
+    def group() -> RolloutGroup:
+        rollouts = []
+        for rollout_id, (reward, advantage) in enumerate([(1.0, 0.5), (0.0, -0.5)]):
+            first = _turn(prompt_token_ids=[1, 2], completion_token_ids=[3, 4], version=1)
+            second = _turn(prompt_token_ids=[1, 2, 3, 4, 5], completion_token_ids=[6], version=2)
+            first.prompt_messages = [{"role": "user", "content": "q"}]
+            first.env_messages = [{"role": "tool", "content": "out"}]
+            first.env_rewards = {"verifiers": reward}
+            rollout = _scored_rollout([first, second], reward=reward, advantage=advantage)
+            rollout.rollout_id = rollout_id
+            rollouts.append(rollout)
+        return RolloutGroup(group_id=_GROUP_ID, rollouts=rollouts)
+
+    builder = TrainingSampleBuilder.Config().build()
+    kept, dropped = group(), group()
+    for rollout in dropped.rollouts:
+        for rollout_turn in rollout.turns:
+            rollout_turn.drop_messages()
+    assert dropped.rollouts[0].turns[0].completion_message is None
+
+    def metric_values(group: RolloutGroup) -> list:
+        return [(metric.key, repr(metric.value)) for metric in compute_rollout_metrics("rollout", group.rollouts)]
+
+    assert metric_values(dropped) == metric_values(kept)
+    want = builder.build_from_group(rollout_group=kept).training_samples
+    got = builder.build_from_group(rollout_group=dropped).training_samples
+    assert len(got) == len(want) > 0
+    for got_sample, want_sample in zip(got, want, strict=True):
+        assert np.array_equal(got_sample.token_ids, want_sample.token_ids)
+        assert np.array_equal(got_sample.loss_mask, want_sample.loss_mask)
+        assert np.array_equal(got_sample.logprobs, want_sample.logprobs)
+        assert np.array_equal(got_sample.advantage, want_sample.advantage)

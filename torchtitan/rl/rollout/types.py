@@ -220,6 +220,22 @@ class RolloutTurn:
     metrics: list[m.Metric] = field(default_factory=list)
     """Per-turn metrics produced during rollouts"""
 
+    def drop_messages(self) -> None:
+        """Release the logging and rubric fields once the rubric scored the rollout and the
+        recorder wrote it: `prompt_messages`, `completion_message`, `env_messages`, `env_rewards`.
+
+        Training samples are built from the token arrays only. A held turn otherwise keeps its
+        message dicts and lists alive until training, and every full GC walks them.
+
+        Example:
+            rollout_turn.drop_messages()
+            rollout_turn.completion_message  # -> None
+        """
+        self.prompt_messages = []
+        self.completion_message = None
+        self.env_messages = []
+        self.env_rewards = {}
+
     @property
     def num_prompt_tokens(self) -> int:
         """Length of the full prompt this turn generated from."""
