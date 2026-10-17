@@ -261,6 +261,21 @@ def _sharded_param_storages(module: FSDPModule) -> Iterator[torch.Tensor]:
             yield sharded_data
 
 
+def _modules_in_fsdp_group(module: FSDPModule) -> Iterator[torch.nn.Module]:
+    """Yield every module of ``module``'s FSDP group and their descendants.
+
+    Starts from all modules sharing the group (e.g. ``[tok_embeddings, norm,
+    lm_head]``) and stops at nested FSDP modules, which unshard themselves.
+    """
+    pending = list(module._get_fsdp_state()._modules)
+    while pending:
+        submodule = pending.pop()
+        yield submodule
+        pending.extend(
+            child for child in submodule.children() if not isinstance(child, FSDPModule)
+        )
+
+
 def _restore_sharded_params(module: FSDPModule) -> None:
     """Re-allocate the sharded buffers of `module`'s FSDP group so new weights can be copied in.
 
@@ -278,21 +293,34 @@ def _restore_sharded_params(module: FSDPModule) -> None:
         alloc_storage(sharded_data)
 
 
-def _unshard_and_free_sharded_params(module: FSDPModule) -> None:
+def _unshard_and_free_sharded_params(
+    module: FSDPModule, *, block_major_weights: bool = False
+) -> None:
     """Unshard `module`'s FSDP group into its unsharded buffers, then free its sharded ones.
 
         before:  sharded: new weights   unsharded: old weights
         after:   sharded: freed         unsharded: new weights (what CUDA graphs read)
 
     The unshard is explicit because CUDA graph replays skip FSDP's forward pre-hook.
+    With `block_major_weights`, the group's Dist-MoE expert weights are then
+    re-laid out. A group that was already unsharded is skipped: `unshard()` is a
+    no-op there, its weights are already block-major, and a second relayout
+    would permute them again.
     """
     from torch.distributed.fsdp._fully_shard._fsdp_param import free_storage
 
+    unshard_wrote_weights = not all(
+        group.is_unsharded for group in module._get_fsdp_state()._fsdp_param_groups
+    )
     with torch.inference_mode():
         module.unshard()
         # TODO: replace this with FSDPModule._free_sharded_params()
         for sharded_data in _sharded_param_storages(module):
             free_storage(sharded_data)
+        if block_major_weights and unshard_wrote_weights:
+            for submodule in _modules_in_fsdp_group(module):
+                if isinstance(submodule, DistMoeRoutedExperts):
+                    submodule.relayout_weights_to_block_major()
 
 
 @support_torch_compile(
@@ -423,7 +451,9 @@ class VLLMModelWrapper(Module):
         # based on the model's actual representation used during forward
         for module in self.model.modules():
             if isinstance(module, FSDPModule):
-                _unshard_and_free_sharded_params(module)
+                _unshard_and_free_sharded_params(
+                    module, block_major_weights=self._block_major_weights
+                )
 
     def load_state_dict(self, state_dict: Mapping[str, Any]):
         """Copy new weights into `self.model`, allocating about one FSDP group's sharded buffers at a time.
@@ -467,7 +497,9 @@ class VLLMModelWrapper(Module):
             )
             handles.append(
                 modules[-1].register_load_state_dict_post_hook(
-                    lambda module, *args: _unshard_and_free_sharded_params(module)
+                    lambda module, *args: _unshard_and_free_sharded_params(
+                        module, block_major_weights=self._block_major_weights
+                    )
                 )
             )
         incompatible_keys = self.model.load_state_dict(state_dict, strict=True)
@@ -526,6 +558,8 @@ class VLLMModelWrapper(Module):
         """
         self._dist_moe_runtime = None
         self._num_valid_tokens: torch.Tensor | None = None
+        # Whether each weight load re-lays out the expert weights for Dist-MoE.
+        self._block_major_weights = False
         if not any(
             isinstance(module, DistMoeRoutedExperts) for module in self.model.modules()
         ):
@@ -560,6 +594,7 @@ class VLLMModelWrapper(Module):
             num_tokens_per_microbatch_per_dp_rank=max_num_batched_tokens,
             pp_schedule=None,
         )
+        self._block_major_weights = runtime_config.block_major_weights
         # The runner writes each step's real token count here before the forward
         # runs, and forward builds the padding mask from it on the device, so
         # CUDA-graph replay sees the current count. The address must stay fixed

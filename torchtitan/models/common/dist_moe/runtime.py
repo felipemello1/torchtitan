@@ -208,6 +208,11 @@ class DistMoeRuntime(Configurable):
                 planning with no saved activations, and a per-step row count
                 instead of the planned maximum. The activation-slot controls
                 must stay ``None``; ``dist_moe`` rejects them for inference.
+            block_major_weights: Have Dist-MoE read routed-expert W13/W2 in its
+                block-major layout, which streams faster. Inference only: the
+                generator re-lays out the weights after every load
+                (``DistMoeRoutedExperts.relayout_weights_to_block_major``);
+                ``dist_moe`` rejects it otherwise.
         """
 
         activation_slot_bytes: int | None = None
@@ -216,6 +221,7 @@ class DistMoeRuntime(Configurable):
         vmm_capacity_factor: float | None = None
         pp_activation_slot_policy: PPActivationSlotPolicy = "stage_microbatch"
         inference: bool = False
+        block_major_weights: bool = False
 
         def __post_init__(self) -> None:
             if (
@@ -446,6 +452,10 @@ class DistMoeRuntime(Configurable):
                 "swiglu_alpha": module.swiglu_alpha,
                 "swiglu_limit": module.swiglu_limit,
             }
+        # Passed only when set, so a dist_moe without the option still works.
+        layout_options = (
+            {"block_major_weights": True} if self.config.block_major_weights else {}
+        )
         return dist_moe.Config(
             max_num_local_input_tokens=max_num_local_input_tokens,
             hidden_dim=module.hidden_dim,
@@ -466,6 +476,7 @@ class DistMoeRuntime(Configurable):
             wgrad_dtype=wgrad_dtype,
             inference=self.config.inference,
             **activation_options,
+            **layout_options,
         )
 
     def _bf16_grouped_gemm_preset(self, module: DistMoeRoutedExperts) -> str | None:

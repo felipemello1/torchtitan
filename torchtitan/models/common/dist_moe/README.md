@@ -292,6 +292,10 @@ The RL vLLM generator owns an inference runtime
 vLLM's per-step token budget. vLLM pads every step at the end (TP rounding,
 CUDA-graph size, DP maximum); the runner publishes the unpadded count and the
 model passes a `padding_mask` down to the routed experts.
+With `block_major_weights=True` the generator keeps expert W13/W2 in Dist-MoE's
+faster block-major layout: after every unshard that writes them (the initial
+load and each weight sync) it rewrites them in place with
+`dist_moe.relayout_to_block_major`.
 
 ## Padding Rows
 

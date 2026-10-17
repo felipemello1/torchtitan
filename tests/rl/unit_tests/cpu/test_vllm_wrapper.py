@@ -14,6 +14,8 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule, fully_shard
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.common.attention import InnerAttention
+from torchtitan.models.common.dist_moe import DistMoeRoutedExperts
+from torchtitan.models.common.linear import GroupedLinear
 from torchtitan.models.deepseek_v3 import build_model_config as build_deepseek_config
 from torchtitan.models.kimi_k3 import build_model_config as build_kimi_config
 from torchtitan.models.qwen3 import build_model_config as build_qwen3_config
@@ -137,8 +139,9 @@ class _Wrapper:
 
     load_state_dict = VLLMModelWrapper.load_state_dict
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, block_major_weights: bool = False):
         self.model = model
+        self._block_major_weights = block_major_weights
 
 
 def test_load_state_dict_allocates_one_fsdp_group_at_a_time(
@@ -211,5 +214,77 @@ def test_load_state_dict_allocates_one_fsdp_group_at_a_time(
         )
         for name, param in model.named_parameters(remove_duplicate=False):
             assert param.equal(new_state_dict[name].to_local()), name
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("shared_group", [False, True])
+def test_unshard_relayouts_dist_moe_experts_once(tmp_path, shared_group: bool) -> None:
+    """Every unshard that writes new expert weights re-lays them out; a no-op unshard does not.
+
+    Covers the initial unshard and a weight sync through `load_state_dict`, each
+    leaving block-major experts, and a repeated unshard leaving them unchanged,
+    with one FSDP group per block or one group shared by both blocks.
+    """
+    dist_moe = pytest.importorskip("dist_moe")
+
+    def block_major(weight: torch.Tensor) -> torch.Tensor:
+        weight_ENK = weight.reshape(weight.shape[0], -1, weight.shape[-1]).clone()
+        dist_moe.relayout_to_block_major(weight_ENK)
+        return weight_ENK.view(weight.shape)
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'store'}", rank=0, world_size=1
+    )
+    try:
+        model = nn.Module()
+        model.tok_embeddings = nn.Embedding(32, 64)
+        model.layers = nn.ModuleList()
+        for _ in range(2):
+            block = nn.Module()
+            block.routed_experts = DistMoeRoutedExperts.Config(
+                w13=GroupedLinear.Config(
+                    group_size=2, in_features=64, out_features=128, num_linears=2
+                ),
+                w2=GroupedLinear.Config(group_size=2, in_features=128, out_features=64),
+                top_k=1,
+            ).build()
+            model.layers.append(block)
+        with torch.no_grad():
+            for param in model.parameters():
+                param.copy_(torch.randn_like(param))
+        mesh = init_device_mesh("cpu", (1,))
+        if shared_group:
+            fully_shard(list(model.layers), mesh=mesh)
+        else:
+            for block in model.layers:
+                fully_shard(block, mesh=mesh)
+        fully_shard(model, mesh=mesh)
+        model.set_keep_unsharded_storage(True)
+        expert_names = [
+            name for name, _ in model.named_parameters() if "routed_experts" in name
+        ]
+
+        def assert_block_major(state_dict) -> None:
+            params = dict(model.named_parameters())
+            for name in expert_names:
+                expected = block_major(state_dict[name].to_local())
+                assert params[name].equal(expected), name
+
+        initial = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        for module in model.modules():  # as after the initial load
+            if isinstance(module, FSDPModule):
+                model_wrapper._unshard_and_free_sharded_params(
+                    module, block_major_weights=True
+                )
+        assert_block_major(initial)
+        model_wrapper._unshard_and_free_sharded_params(
+            model.layers[0], block_major_weights=True
+        )
+        assert_block_major(initial)
+
+        new_state_dict = {k: v + 1.0 for k, v in initial.items()}
+        _Wrapper(model, block_major_weights=True).load_state_dict(new_state_dict)
+        assert_block_major(new_state_dict)
     finally:
         dist.destroy_process_group()
