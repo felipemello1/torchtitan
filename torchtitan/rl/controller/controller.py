@@ -313,7 +313,7 @@ class Controller(Configurable):
         """0: Python's automatic GC, whose full collections pause the event loop for seconds on a large heap.
         N > 0: automatic GC off, and `gc.collect(1)` every N steps (from step 2) after metrics are logged.
         Objects alive at a collect are never scanned again, so a cycle among them that dies later leaks until
-        a full collect (`full_gc_every_n_steps`); watch `controller/memory/rss_gib`."""
+        a full collect (`full_gc_every_n_steps`); watch the controller's host memory."""
 
         full_gc_every_n_steps: int = 0
         """With `manual_gc_every_n_steps` set, also run a full `gc.collect()` every N steps (0: never). It frees
@@ -1254,9 +1254,6 @@ class Controller(Configurable):
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.
             time_metrics = step_timer.flush()
-            # statm's 2nd field is the resident set size, in pages.
-            with open("/proc/self/statm") as file:
-                rss_bytes = int(file.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
             with sl.log_trace_span("metrics_log"):
                 self.metrics_processor.log(
                     step=step,
@@ -1288,9 +1285,6 @@ class Controller(Configurable):
                                 packed.global_loss_token_counts[0]
                             ),
                             time_metrics=time_metrics,
-                        ),
-                        m.Metric(
-                            "controller/memory/rss_gib", m.NoReduce(rss_bytes / 2**30)
                         ),
                         *self._full_gc_metrics,
                     ],

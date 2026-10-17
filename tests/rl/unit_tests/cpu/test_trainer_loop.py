@@ -223,12 +223,6 @@ def test_garbage_collector_runs_after_each_step_metrics_log() -> None:
     assert events == ["log 1", "gc 1", "log 2", "gc 2"]
 
 
-def test_controller_rss_is_logged() -> None:
-    controller = _controller([])
-    _run(controller, num_training_steps=1)
-
-    assert controller.logged_metrics[0]["controller/memory/rss_gib"].value.value > 0
-
 
 def test_push_failure_fails_the_loop() -> None:
     async def failing_push():
