@@ -15,12 +15,15 @@ from renderers import ParsedResponse, Qwen3RendererConfig
 from torchtitan.components.renderer import from_renderers
 
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
+from torchtitan.rl.controller.metrics import compute_rollout_metrics
 
 from torchtitan.rl.generator.generator import SamplingConfig
+from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout import RolloutStatus
 from torchtitan.rl.rollout.message_env import MessageEnvInitOutput, MessageEnvStepOutput
 from torchtitan.rl.rollout.rollouter import RolloutWorker
 from torchtitan.rl.rollout.rubric import RubricOutput
+from torchtitan.rl.rollout.thinking_budget import ThinkingBudget
 from torchtitan.rl.rollout.token_env import TokenEnv, TokenEnvOutput
 from torchtitan.rl.rollout.types import Completion
 from torchtitan.rl.trainer.training_sample_builder import TrainingSampleBuilder
@@ -127,6 +130,7 @@ def test_worker_executes_group_without_actor_mesh() -> None:
             message_env=_MessageEnvConfig(),
             token_env=token_env_config,
             advantage=_Config(_AdvantageEstimator()),
+            thinking_budget=None,
         )
         worker = _CustomWorker(worker_config)
         released = []
@@ -249,6 +253,7 @@ def test_delta_prompts_rebuild_the_full_prompt_samples() -> None:
             message_env=None,
             token_env=None,
             advantage=_Config(None),
+            thinking_budget=None,
         )
     )
     builder = TrainingSampleBuilder.Config().build()
@@ -300,5 +305,95 @@ def test_delta_prompts_rebuild_the_full_prompt_samples() -> None:
             assert [
                 (s.rollout_id.turn_id, s.token_ids.tolist()) for s in samples
             ] == expected
+
+    asyncio.run(run())
+
+
+class _ThinkingTokenizer:
+    """`<think>` is token 2, so `_TokenEnv`'s prompt [1, 2] opens thinking; the forced text is [90, 91]."""
+
+    def token_to_id(self, token: str) -> int | None:
+        return {"<think>": 2, "</think>": 3}.get(token)
+
+    def encode(self, text: str, *, add_bos: bool, add_eos: bool) -> list[int]:
+        return [90, 91]
+
+
+class _ThinkingGenerateFn:
+    """Thinks until each turn's first call is cut; the forced answer call stops."""
+
+    def __init__(self) -> None:
+        self.max_tokens: dict[str, int] = {}
+
+    async def __call__(self, prompt_token_ids, **kwargs) -> Completion:
+        max_tokens = kwargs["sampling_config"].max_tokens
+        self.max_tokens[kwargs["request_id"]] = max_tokens
+        is_answer = kwargs["request_id"].endswith("/answer")
+        token_ids = [6] if is_answer else [5] * max_tokens
+        return Completion(
+            min_policy_version=3,
+            max_policy_version=3,
+            request_id=kwargs["request_id"],
+            token_ids=token_ids,
+            token_logprobs=[-0.5] * len(token_ids),
+            finish_reason="stop" if is_answer else "length",
+        )
+
+
+def test_worker_applies_the_thinking_budget() -> None:
+    async def run() -> None:
+        worker = RolloutWorker(
+            SimpleNamespace(
+                rubric=_Config(_Rubric()),
+                message_env=_MessageEnvConfig(),
+                token_env=_TokenEnvConfig(),
+                advantage=_Config(_AdvantageEstimator()),
+                thinking_budget=ThinkingBudget.Config(max_thinking_tokens=4),
+            )
+        )
+        await worker.setup_async(
+            tokenizer_config=_Config(_ThinkingTokenizer()),
+            renderer_config=_Config(object()),
+            hf_assets_path="unused",
+        )
+
+        async def release_session_fn(**kwargs) -> None:
+            pass
+
+        # A training group (id 7) and a validation group (negative id) log under different names.
+        for group_id, prefix, metrics_prefix in [
+            (7, "rollout", "thinking_budget"),
+            (-1, "validation", "validation_thinking_budget"),
+        ]:
+            generate_fn = _ThinkingGenerateFn()
+            group = await worker.run_group(
+                generate_fn=generate_fn,
+                release_session_fn=release_session_fn,
+                sample="sample",
+                group_id=group_id,
+                group_size=2,
+                sampling=SamplingConfig(max_tokens=12),
+            )
+
+            # each answer call gets the rest of the turn: 12 - 4 thinking - 2 forced
+            assert generate_fn.max_tokens == {
+                f"group={group_id}/rollout=0/turn=0": 4,
+                f"group={group_id}/rollout=0/turn=0/answer": 6,
+                f"group={group_id}/rollout=1/turn=0": 4,
+                f"group={group_id}/rollout=1/turn=0/answer": 6,
+            }
+            # the forced tokens reach the rollout turn, masked out of the loss
+            for rollout in group.rollouts:
+                (turn,) = rollout.turns
+                assert turn.completion_token_ids.tolist() == [5] * 4 + [90, 91, 6]
+                loss_mask = turn.completion_loss_mask.tolist()
+                assert loss_mask == [True] * 4 + [False, False, True]
+            reduced = MetricsProcessor._aggregate_metrics(
+                compute_rollout_metrics(prefix=prefix, rollouts=group.rollouts)
+            )
+            assert {k: v for k, v in reduced.items() if "thinking_budget/" in k} == {
+                f"{metrics_prefix}/forced_close_rate/mean": 1.0,
+                f"{metrics_prefix}/stopped_while_thinking_rate/mean": 0.0,
+            }
 
     asyncio.run(run())

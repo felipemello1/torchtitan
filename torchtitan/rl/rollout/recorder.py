@@ -164,6 +164,11 @@ class RolloutSampleRecorder(Configurable):
             encoded["prompt_prefix_len"] = turn.prompt_prefix_len
             encoded["prompt_delta_token_ids"] = turn.prompt_delta_token_ids.tolist()
             encoded["completion_token_ids"] = turn.completion_token_ids.tolist()
+            encoded["completion_loss_mask"] = (
+                None
+                if turn.completion_loss_mask is None
+                else turn.completion_loss_mask.tolist()
+            )
         if self._log_logprobs:
             encoded["completion_logprobs"] = turn.completion_logprobs.tolist()
         return encoded

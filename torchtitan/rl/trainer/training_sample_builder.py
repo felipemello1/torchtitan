@@ -54,7 +54,7 @@ class TrainingSample:
     loss_mask: np.ndarray  # bool
     """[L] True on assistant tokens to train."""
     logprobs: np.ndarray  # float32
-    """[L] generator logprobs; 0.0 where loss_mask is False."""
+    """[L] generator logprobs; 0.0 on prompt and env tokens, NaN on tokens the rollout appended."""
     advantage: np.ndarray  # float32
     """[L] advantage on assistant tokens, 0.0 elsewhere."""
 
@@ -382,7 +382,11 @@ class TrainingSampleBuilder(Configurable):
             ]
             sample_in_progress.loss_mask += [
                 np.zeros(num_delta, dtype=bool),
-                np.ones(num_completion, dtype=bool),
+                (
+                    np.ones(num_completion, dtype=bool)
+                    if rollout_turn.completion_loss_mask is None
+                    else rollout_turn.completion_loss_mask
+                ),
             ]
             sample_in_progress.logprobs += [
                 np.zeros(num_delta, dtype=np.float32),
