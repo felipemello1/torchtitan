@@ -313,17 +313,13 @@ class Controller(Configurable):
         """0: Python's automatic GC, whose full collections pause the event loop for seconds on a large heap.
         N > 0: automatic GC off, and `gc.collect(1)` every N steps (from step 2) after metrics are logged.
         Objects alive at a collect are never scanned again, so a cycle among them that dies later leaks until
-        a full collect (`full_gc_every_n_steps`); watch the controller's host memory."""
-
-        full_gc_every_n_steps: int = 0
-        """With `manual_gc_every_n_steps` set, also run a full `gc.collect()` every N steps (0: never). It frees
-        cycles that died after their first collect; its pause and freed objects are logged with the next step
-        as `controller/gc/full_collect/{seconds,collected}`."""
+        a full collect (`full_gc_every_seconds`); watch the controller's host memory."""
 
         full_gc_every_seconds: float = 0
-        """Like `full_gc_every_n_steps`, by wall time: a full collect at the first step boundary at least this
-        many seconds after the previous one (0: never). With a large `manual_gc_every_n_steps`, this is "GC off,
-        full collect hourly" (`3600`)."""
+        """With `manual_gc_every_n_steps` set, also run a full `gc.collect()` at the first step boundary at least
+        this many seconds after the previous one (0: never). It frees cycles that died after their first collect;
+        its pause and freed objects are logged with the next step as `controller/gc/full_collect/{seconds,collected}`.
+        With a large `manual_gc_every_n_steps` this is "GC off, one full collect per hour" (`3600`)."""
 
         override: OverrideConfig = field(default_factory=OverrideConfig)
         """Registered overrides applied to this whole config tree, including the
@@ -1298,9 +1294,8 @@ class Controller(Configurable):
             self._full_gc_metrics = []
             if self._garbage_collector is not None:
                 self._garbage_collector.run(step)
-                full_gc_every_n_steps = self.config.full_gc_every_n_steps
                 full_gc_every_seconds = self.config.full_gc_every_seconds
-                if (full_gc_every_n_steps and step % full_gc_every_n_steps == 0) or (
+                if (
                     full_gc_every_seconds
                     and time.monotonic() - self._last_full_gc >= full_gc_every_seconds
                 ):
