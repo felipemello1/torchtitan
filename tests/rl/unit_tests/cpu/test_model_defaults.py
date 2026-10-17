@@ -28,8 +28,8 @@ _RECIPE_MODULES = [
     for module in pkgutil.iter_modules(package.__path__)
     if module.name != "model_configs"
 ]
-# Reward packages that some recipe modules import (dapo_math, the verifiers recipes).
-_OPTIONAL_PACKAGES = {"math_verify", "verifiers"}
+# Packages that some recipe modules import (dapo_math, the verifiers recipes, chess_selfplay).
+_OPTIONAL_PACKAGES = {"chess", "math_verify", "verifiers"}
 # Recipes that need an optional package: torchao nightly (MXFP8) and dist_moe.
 _OPTIONAL_PACKAGE_RECIPES = {
     "rl_grpo_qwen3_0_6b_varlen_mxfp8",
