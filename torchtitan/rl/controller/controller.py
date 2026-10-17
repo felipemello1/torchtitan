@@ -1159,8 +1159,8 @@ class Controller(Configurable):
             with sl.log_trace_span("sync_log_step"):
                 # Not awaited: it would wait behind an in-flight add_group.
                 self.batcher.sync_log_step.broadcast(step)
-                # Concurrent, and still awaited: Monarch delivers one sender's messages to an actor
-                # in order, so each actor sets this step before any later message from the controller.
+                # Concurrent, and still awaited before the step's work, so each actor has set this
+                # step before the controller sends it anything for the step.
                 await asyncio.gather(
                     self.trainer.sync_log_step.call(step),
                     self.generator_router.sync_log_step.call_one(step),
