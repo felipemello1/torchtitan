@@ -136,6 +136,7 @@ from torchtitan.rl.losses import ScoreCenteringLoss
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     append_heap_census,
+    collect_and_explain_garbage,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     compute_rollout_metrics,
@@ -485,6 +486,10 @@ class Controller(Configurable):
 
         full_gc_at_steps: tuple[int, ...] = ()
         """Extra full collects at these steps (e.g. to measure one in a short run)."""
+
+        explain_garbage_at_full_gc: bool = False
+        """Debug: each full collect keeps its garbage once and writes `dump_folder/garbage.jsonl`, naming the
+        reference cycles (see `collect_and_explain_garbage`)."""
 
         full_gc_rss_gib: float = 0
         """With `garbage_collector` set, also run a full collect at a step boundary when controller RSS is
@@ -1903,7 +1908,22 @@ class Controller(Configurable):
                     self._last_full_gc = now
                     with sl.log_trace_span("full_gc_collect"):
                         start = time.perf_counter()
-                        collected = gc.collect()
+                        collected = (
+                            collect_and_explain_garbage(
+                                path=os.path.join(self.config.dump_folder, "garbage.jsonl"),
+                                step=step,
+                                sample_types=(
+                                    "RolloutTurn",
+                                    "Rollout",
+                                    "RolloutGroup",
+                                    "memoryview",
+                                    "dict",
+                                    "list",
+                                ),
+                            )
+                            if self.config.explain_garbage_at_full_gc
+                            else gc.collect()
+                        )
                         seconds = time.perf_counter() - start
                     logger.info(
                         f"[GC] full collection at step {step}: {seconds:.2f} s, {collected} objects freed"

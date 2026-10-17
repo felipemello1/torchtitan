@@ -17,6 +17,7 @@ import logging
 import os
 import random
 import time
+import types
 from collections import Counter, defaultdict
 
 from torchtitan.observability import structured_logger as sl
@@ -473,3 +474,86 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
         )
     )
     return out
+
+
+def _describe(obj: object) -> str:
+    """A short label for one object in a garbage chain: its type, plus where code objects live."""
+    name = _type_name(obj)
+    if isinstance(obj, types.FrameType):
+        code = obj.f_code
+        return f"{name} {code.co_name} ({code.co_filename}:{obj.f_lineno})"
+    if isinstance(obj, types.FunctionType):
+        code = obj.__code__
+        return f"{name} {obj.__qualname__} ({code.co_filename}:{code.co_firstlineno})"
+    if isinstance(obj, types.CoroutineType):
+        return f"{name} {obj.__qualname__}"
+    if isinstance(obj, types.MethodType):
+        return f"{name} {obj.__func__.__qualname__}"
+    if isinstance(obj, dict):
+        return f"{name} keys={list(obj)[:6]}"
+    if isinstance(obj, BaseException):
+        return f"{name} {str(obj)[:120]!r}"
+    return name
+
+
+def collect_and_explain_garbage(
+    *, path: str, step: int, sample_types: tuple[str, ...], num_samples: int = 5
+) -> int:
+    """Run a full collection that keeps its garbage (`gc.DEBUG_SAVEALL`), and append one JSON line to
+    `path` that names the reference cycles: garbage counted by type, and for a few garbage objects of
+    each `sample_types` type, the chain of garbage objects that refer to it, walked back until it
+    closes a cycle. Clears `gc.garbage` afterwards. Returns the number of objects collected.
+
+    Example:
+        collect_and_explain_garbage(path="garbage.jsonl", step=8, sample_types=("RolloutTurn",))
+        # {"step": 8, "collected": 1096819, "top_types": [["builtins.dict", 412000], ...],
+        #  "chains": {"RolloutTurn": [["...RolloutTurn", "builtins.list", "...Rollout", ...,
+        #                              "builtins.frame _run (events.py:88)", "cycle -> 3"]]}}
+    """
+    start = time.perf_counter()
+    gc.set_debug(gc.DEBUG_SAVEALL)
+    try:
+        collected = gc.collect()
+    finally:
+        gc.set_debug(0)
+    garbage = gc.garbage[:]
+    gc.garbage.clear()
+    garbage_ids = {id(obj): obj for obj in garbage}
+    referrers: dict[int, list[object]] = defaultdict(list)
+    for obj in garbage:
+        for referent in gc.get_referents(obj):
+            if id(referent) in garbage_ids:
+                referrers[id(referent)].append(obj)
+    chains: dict[str, list[list[str]]] = {}
+    for wanted in sample_types:
+        samples = [obj for obj in garbage if type(obj).__qualname__ == wanted][:num_samples]
+        chains[wanted] = []
+        for obj in samples:
+            chain, seen, current = [], {}, obj
+            for _ in range(40):
+                if id(current) in seen:
+                    chain.append(f"cycle -> {seen[id(current)]}")
+                    break
+                seen[id(current)] = len(chain)
+                chain.append(_describe(current))
+                holders = referrers.get(id(current))
+                if not holders:
+                    chain.append("(no garbage referrer)")
+                    break
+                current = holders[0]
+            chains[wanted].append(chain)
+    record = {
+        "step": step,
+        "collected": collected,
+        "top_types": [
+            [name, count]
+            for name, count in Counter(map(_type_name, garbage)).most_common(40)
+        ],
+        "chains": chains,
+        "seconds": round(time.perf_counter() - start, 2),
+    }
+    del garbage, garbage_ids, referrers
+    with open(path, "a") as file:
+        file.write(json.dumps(record) + "\n")
+    logger.info(f"Garbage at step {step}: {collected} objects; explained in {path}")
+    return collected
