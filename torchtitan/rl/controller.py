@@ -142,7 +142,7 @@ from torchtitan.rl.observability.controller import (
     GCTimer,
     MetricsTimer,
 )
-from torchtitan.rl.observability.loop_stall_watchdog import LoopStallWatchdog
+from torchtitan.rl.observability.loop_stall_watchdog import watch_loop_stalls
 from torchtitan.rl.observability.rollout_recorder import RolloutSampleRecorder
 from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.rollouter import Rollouter
@@ -491,8 +491,8 @@ class Controller(Configurable):
         at least this many GiB (0: never), at most once per step."""
 
         loop_stall_watchdog_s: float = 0
-        """When > 0, log the controller loop thread's stack to `dump_folder/loop_stalls.jsonl` whenever its
-        event loop is blocked this many seconds; see `LoopStallWatchdog`. 0 disables."""
+        """When > 0, dump every thread's stack to `dump_folder/loop_stalls.txt` whenever the controller's
+        event loop is blocked this many seconds; see `watch_loop_stalls`. 0 disables."""
 
         trainer: Trainer.Config
         """Trainer config. Controls the trainer model, optimizer, training, parallelism."""
@@ -1321,12 +1321,14 @@ class Controller(Configurable):
         )
         watchdog_tasks = []
         if self.config.loop_stall_watchdog_s > 0:
-            watchdog = LoopStallWatchdog(
-                path=os.path.join(self.config.dump_folder, "loop_stalls.jsonl"),
-                threshold_s=self.config.loop_stall_watchdog_s,
-            )
             watchdog_tasks.append(
-                asyncio.create_task(watchdog.heartbeat(), name="loop_stall_watchdog")
+                asyncio.create_task(
+                    watch_loop_stalls(
+                        path=os.path.join(self.config.dump_folder, "loop_stalls.txt"),
+                        threshold_s=self.config.loop_stall_watchdog_s,
+                    ),
+                    name="loop_stall_watchdog",
+                )
             )
         background_tasks = [
             *watchdog_tasks,
