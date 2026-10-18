@@ -17,16 +17,35 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
+import spmd_types as spmd
+
 import torch
 import torch.nn.functional as F
 import torch_remat as remat
 
+from torchtitan.distributed.local_compile import local_compile
 from torchtitan.models.base.module import Module
 
 from torchtitan.models.common.linear import GroupedLinear
 
 from . import _dist_moe as dist_moe
 from .runtime import DistMoeRuntime
+
+
+# dynamic=True: one graph for any token count. The generator's eager warmup
+# compiles it before CUDA graph capture, which cannot compile.
+@local_compile("dist_moe_mask_padded_routes", batch_invariant=True, dynamic=True)
+def _mask_padded_routes(
+    topk_expert_ids_TK: torch.Tensor,
+    topk_scores_TK: torch.Tensor,
+    padding_mask_T: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route padded rows to expert ``-1`` with score ``0``; one kernel when compiled."""
+    padding_mask_TK = padding_mask_T.unsqueeze(-1)
+    return (
+        topk_expert_ids_TK.masked_fill(padding_mask_TK, -1),
+        topk_scores_TK.masked_fill(padding_mask_TK, 0.0),
+    )
 
 
 class DistMoeRoutedExperts(Module):
@@ -163,12 +182,19 @@ class DistMoeRoutedExperts(Module):
             )
         return postprocess
 
+    def count_tokens(self, routing_map_TE: torch.Tensor) -> torch.Tensor | None:
+        """Skip the count: ``forward`` builds its dispatch from the expert ids."""
+        if spmd.is_type_checking():
+            # The typechecker rejects ``None`` where a tensor input is declared.
+            return routing_map_TE.sum(dim=0)
+        return None
+
     def forward(
         self,
         x_TD: torch.Tensor,
         topk_scores_TK: torch.Tensor,
         topk_expert_ids_TK: torch.Tensor,
-        num_local_tokens_per_expert_E: torch.Tensor,
+        num_local_tokens_per_expert_E: torch.Tensor | None,
         *,
         padding_mask_T: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -178,9 +204,7 @@ class DistMoeRoutedExperts(Module):
             x_TD: Local input tokens with model dimension ``D``.
             topk_scores_TK: Selected routing weights for ``K`` experts.
             topk_expert_ids_TK: Selected global expert IDs.
-            num_local_tokens_per_expert_E: Router statistics retained by the
-                surrounding MoE module; Dist-MoE derives dispatch metadata from
-                the selected IDs.
+            num_local_tokens_per_expert_E: Unused; see ``count_tokens``.
             padding_mask_T: Optional bool ``(T,)``, true for rows the caller
                 padded. Their routes get expert ID ``-1`` and score ``0``, which
                 Dist-MoE never dispatches, and their output rows are zero.
@@ -193,9 +217,9 @@ class DistMoeRoutedExperts(Module):
         if runtime is None:
             raise RuntimeError("Dist-MoE context is not initialized")
         if padding_mask_T is not None:
-            padding_mask_TK = padding_mask_T.unsqueeze(-1)
-            topk_expert_ids_TK = topk_expert_ids_TK.masked_fill(padding_mask_TK, -1)
-            topk_scores_TK = topk_scores_TK.masked_fill(padding_mask_TK, 0.0)
+            topk_expert_ids_TK, topk_scores_TK = _mask_padded_routes(
+                topk_expert_ids_TK, topk_scores_TK, padding_mask_T
+            )
         # Every EP rank must pass the annex the same row count, and local batches
         # can differ across ranks. Pad to the call's count with rows routed to
         # expert -1, then slice the output.
