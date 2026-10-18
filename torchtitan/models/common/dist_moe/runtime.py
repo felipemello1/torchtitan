@@ -472,6 +472,8 @@ class DistMoeRuntime(Configurable):
         # keep row-major weights.
         # TODO: resolve interleaved_gate_up to False for experts with a W13 bias
         # (GPT-OSS); dist_moe rejects the pair at the first forward.
+        # Every local module must resolve the same pair: __init__ compares the
+        # configs, which carry it.
         self.block_major_weights = (
             self.config.inference
             and self.config.block_major_weights

@@ -58,10 +58,10 @@ def _parameter_initializers() -> dict[str, Any]:
     }
 
 
-def _stock_config(*, dim: int = 32) -> RoutedExperts.Config:
+def _stock_config(*, dim: int = 32, hidden_dim: int = 64) -> RoutedExperts.Config:
     return make_routed_experts_config(
         dim=dim,
-        hidden_dim=64,
+        hidden_dim=hidden_dim,
         num_experts=4,
         top_k=2,
         param_init=_parameter_initializers(),
@@ -637,12 +637,12 @@ _LORA_EXPERTS = [
 @pytest.mark.parametrize(
     ("inference", "layout_flags", "transforms", "intermediate_dim", "expected"),
     [
-        (True, {}, _BF16_EXPERTS, 64, (True, True)),
-        (True, {"interleaved_gate_up": False}, _BF16_EXPERTS, 64, (True, False)),
-        (True, {"block_major_weights": False}, _BF16_EXPERTS, 64, (False, False)),
-        (False, {}, _BF16_EXPERTS, 64, (False, False)),
-        (True, {}, _MXFP8_EXPERTS, 64, (False, False)),
-        (True, {}, _LORA_EXPERTS, 64, (False, False)),
+        (True, {}, _BF16_EXPERTS, 128, (True, True)),
+        (True, {"interleaved_gate_up": False}, _BF16_EXPERTS, 128, (True, False)),
+        (True, {"block_major_weights": False}, _BF16_EXPERTS, 128, (False, False)),
+        (False, {}, _BF16_EXPERTS, 128, (False, False)),
+        (True, {}, _MXFP8_EXPERTS, 128, (False, False)),
+        (True, {}, _LORA_EXPERTS, 128, (False, False)),
         (True, {}, _BF16_EXPERTS, 96, (False, False)),
     ],
     ids=[
@@ -666,7 +666,7 @@ def test_runtime_resolves_the_inference_weight_layout(
 
     The experts then relayout to that resolved layout, not to the requested one.
     """
-    config = _stock_config(dim=128)
+    config = _stock_config(dim=128, hidden_dim=128)
     for transform in transforms:
         config = transform.transform(config)
     module = cast(DistMoeRoutedExperts, config.build())

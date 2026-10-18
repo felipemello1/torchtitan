@@ -159,6 +159,7 @@ class DistMoeRoutedExperts(Module):
         if not runtime.block_major_weights:
             return
         # Passed only when on, so a dist_moe without the option still works.
+        # TODO: pass it directly once dist_moe main has it.
         w13_options = (
             {"interleave_gate_up": True} if runtime.interleaved_gate_up else {}
         )
