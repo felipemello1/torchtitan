@@ -49,9 +49,13 @@ class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
             self.decode_dispatcher.initialize_cudagraph_keys(
                 CUDAGraphMode.FULL_DECODE_ONLY, uniform_decode_query_len
             )
+            self.max_decode_tokens = 0
             for mode, descriptors in self.decode_dispatcher.get_capture_descs():
                 for descriptor in descriptors:
                     self.add_cudagraph_key(mode, descriptor)
+                    self.max_decode_tokens = max(
+                        self.max_decode_tokens, descriptor.num_tokens
+                    )
 
     def dispatch(
         self,
@@ -67,11 +71,11 @@ class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
             self.keys_initialized
             and self.cudagraph_mode == CUDAGraphMode.FULL
             and uniform_decode
-            # DP padding can lift a decode batch to a prefilling peer's size,
-            # past the largest decode graph; that batch replays a packed graph.
-            and num_tokens
-            <= self.uniform_decode_query_len
-            * self.vllm_config.scheduler_config.max_num_seqs
+            # A decode batch with no decode graph replays a packed graph instead
+            # of running eager: DP pads it to a prefilling peer's size, or its
+            # size falls between capture sizes. Eager on one DP replica makes
+            # every replica run that step eager.
+            and num_tokens <= self.max_decode_tokens
         ):
             dispatch = self.decode_dispatcher.dispatch
         return dispatch(

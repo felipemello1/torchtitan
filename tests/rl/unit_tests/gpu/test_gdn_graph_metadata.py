@@ -70,20 +70,53 @@ def test_gdn_supports_eager_and_full_decode_only_modes(graph_mode):
     assert (decode_mode, prefill_mode) == (expected_decode, CUDAGraphMode.NONE)
 
 
-@pytest.mark.parametrize("batch_invariant", [False, True])
-def test_dp_graphs_packed_batches_unless_batch_invariant(monkeypatch, batch_invariant):
+@pytest.mark.parametrize(
+    "data_parallel_size,batch_invariant,expected",
+    [
+        (2, False, AttentionCGSupport.ALWAYS),
+        (2, True, AttentionCGSupport.UNIFORM_BATCH),
+        (1, True, AttentionCGSupport.ALWAYS),
+    ],
+)
+def test_dp_support_level(monkeypatch, data_parallel_size, batch_invariant, expected):
     config = VllmConfig()
-    config.parallel_config.data_parallel_size = 2
+    config.parallel_config.data_parallel_size = data_parallel_size
     monkeypatch.setattr(
         linear_attention, "is_in_batch_invariant_mode", lambda: batch_invariant
     )
     support = TorchTitanLinearAttentionMetadataBuilder.get_cudagraph_support(
         config, None
     )
-    assert support == (
-        AttentionCGSupport.UNIFORM_BATCH
-        if batch_invariant
-        else AttentionCGSupport.ALWAYS
+    assert support == expected
+
+
+def test_decode_batches_without_decode_graph_replay_packed_graph():
+    config = VllmConfig()
+    config.compilation_config = CompilationConfig(
+        mode=CompilationMode.NONE,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        cudagraph_capture_sizes=[1, 2, 8],
+        max_cudagraph_capture_size=8,
+        cudagraph_num_of_warmups=1,
+    )
+    config.scheduler_config = SchedulerConfig(
+        max_model_len=16,
+        max_num_seqs=4,
+        max_num_batched_tokens=8,
+        is_encoder_decoder=False,
+    )
+    dispatcher = TorchTitanCudagraphDispatcher(config)
+    dispatcher.initialize_cudagraph_keys(CUDAGraphMode.FULL)
+    packed = dispatcher.dispatch(8)
+    assert packed[0] == CUDAGraphMode.FULL and not packed[1].uniform
+    # 2 decodes still replay their decode graph.
+    assert dispatcher.dispatch(2, uniform_decode=True)[1].uniform
+    # 3 decodes fall between capture sizes 2 and 8.
+    assert dispatcher.dispatch(3, uniform_decode=True) == packed
+    # DP pads 2 decodes to a prefilling peer's 8 tokens.
+    assert (
+        dispatcher.dispatch(8, uniform_decode=True, valid_modes={CUDAGraphMode.FULL})
+        == packed
     )
 
 
@@ -116,10 +149,6 @@ def test_full_metadata_and_native_dispatch_variants():
                 descriptor.num_tokens, uniform_decode=descriptor.uniform
             ) == (mode, descriptor)
     assert dispatcher.dispatch(9)[0] == CUDAGraphMode.NONE
-    # DP padding lifts a decode batch past the largest decode graph (max_num_seqs=2).
-    assert dispatcher.dispatch(
-        4, uniform_decode=True, valid_modes={CUDAGraphMode.FULL}
-    ) == dispatcher.dispatch(4)
     assert (
         dispatcher.dispatch(2, uniform_decode=True, valid_modes={CUDAGraphMode.NONE})[0]
         == CUDAGraphMode.NONE
