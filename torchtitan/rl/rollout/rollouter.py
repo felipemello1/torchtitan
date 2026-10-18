@@ -223,14 +223,25 @@ class Rollouter(Configurable):
 
         # `choose` (see ActorSystem's call convention) sends the call to the `run_group`
         # endpoint of one worker in the pool.
-        return await self._worker_actors.run_group.choose(
-            generate_fn=generate_fn,
-            release_session_fn=release_session_fn,
-            sample=sample,
-            group_id=group_id,
-            group_size=group_size,
-            sampling=sampling,
-        )
+        try:
+            return await self._worker_actors.run_group.choose(
+                generate_fn=generate_fn,
+                release_session_fn=release_session_fn,
+                sample=sample,
+                group_id=group_id,
+                group_size=group_size,
+                sampling=sampling,
+            )
+        except asyncio.CancelledError:
+            # Monarch runs a call to completion even when its caller is cancelled, so stop the
+            # group on its worker (see `RolloutWorkerActor.cancel_group`).
+            try:
+                await self._worker_actors.cancel_group.call(group_id)
+            except Exception:
+                logger.exception(
+                    "cancel_group(%d) failed; the group may keep running", group_id
+                )
+            raise
 
     def state_dict(self) -> dict[str, object]:
         """Return the checkpoint state of the training input iterator."""
@@ -261,11 +272,18 @@ class RolloutWorker(Configurable):
         """Post-scoring advantage estimator. Default = Dr.GRPO (mean-baseline only);
         set `AdvantageEstimator.Config(should_std_normalize=True)` for standard GRPO."""
 
+        rollout_timeout_s: float | None = None
+        """Wall-clock limit of one rollout (env init and every turn, not `score_group`): a
+        liveness guard against a hung env or generator. Past it the rollout ends as ERROR_TIMEOUT
+        and its in-flight generation is aborted. Set it well above the p99 rollout time: a cut
+        biases toward short rollouts. None means no limit."""
+
     def __init__(self, config: Config) -> None:
         self.rubric: Rubric = config.rubric.build()
         self._message_env_config = config.message_env
         self._token_env_config = config.token_env
         self.advantage_estimator: AdvantageEstimator = config.advantage.build()
+        self._rollout_timeout_s = config.rollout_timeout_s
         self._renderer: Renderer
 
     async def setup_async(
@@ -361,8 +379,9 @@ class RolloutWorker(Configurable):
         # TODO(perf): siblings in a group share the first-turn prompt; tokenize it once per group and
         # reuse across the group_size rollouts (truest spot is the worker's first-turn render).
         try:
-            # produce the rollouts
-            rollouts = await asyncio.gather(
+            # produce the rollouts. A cancel cancels every sibling, and with return_exceptions the
+            # gather still waits for each one's `finally` (session release) before it raises.
+            results = await asyncio.gather(
                 *(
                     self._run_single_rollout(
                         generate_fn=generate_fn,
@@ -379,11 +398,18 @@ class RolloutWorker(Configurable):
                         rollout_id=sample_idx,
                     )
                     for sample_idx, env in enumerate(envs)
-                )
+                ),
+                return_exceptions=True,
             )
         finally:
             # close the envs
             await asyncio.gather(*(env.close() for env in envs), return_exceptions=True)
+        # Raise only after every sibling finished, as the Verifiers rollouter does: the caller
+        # releases the group next.
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        rollouts = results
 
         # score
         outputs = await self.score_group(rollouts, sample)
@@ -433,67 +459,81 @@ class RolloutWorker(Configurable):
         ).to_string(include_turn=False)
         turns: list[RolloutTurn] = []
         status = RolloutStatus.ERROR
+        timeout = asyncio.timeout(self._rollout_timeout_s)
         try:
-            env_step = await env.init()
-            while not env_step.status.is_terminal():
-                turn_rollout_id = RolloutTurnID(
-                    group_id=group_id,
-                    rollout_id=rollout_id,
-                    turn_id=len(turns),
-                )
-
-                # generator call
-                completion = await generate_fn(
-                    prompt_token_ids=env_step.next_prompt_token_ids,
-                    request_id=turn_rollout_id.to_string(),
-                    group_id=group_id,
-                    routing_session_id=routing_session_id,
-                    sampling_config=sampling,
-                )
-
-                # env call
-                next_env_step = await env.step(completion)
-
-                # this turn from a token and message perspective
-                turns.append(
-                    RolloutTurn(
-                        rollout_id=turn_rollout_id,
-                        prompt_prefix_len=env_step.next_prompt_prefix_len,
-                        prompt_delta_token_ids=env_step.next_prompt_delta_token_ids,
-                        prompt_messages=env_step.next_prompt_messages or [],
-                        completion_token_ids=np.asarray(
-                            completion.token_ids, dtype=np.int32
-                        ),
-                        completion_logprobs=np.asarray(
-                            completion.token_logprobs, dtype=np.float32
-                        ),
-                        completion_message=next_env_step.completion_message,
-                        env_messages=next_env_step.env_messages,
-                        env_rewards=next_env_step.env_rewards,
-                        min_policy_version=completion.min_policy_version,
-                        max_policy_version=completion.max_policy_version,
-                        metrics=completion.metrics,
+            async with timeout:
+                env_step = await env.init()
+                while not env_step.status.is_terminal():
+                    turn_rollout_id = RolloutTurnID(
+                        group_id=group_id,
+                        rollout_id=rollout_id,
+                        turn_id=len(turns),
                     )
-                )
 
-                # holds the input for next generation call
-                env_step = next_env_step
+                    # generator call
+                    completion = await generate_fn(
+                        prompt_token_ids=env_step.next_prompt_token_ids,
+                        request_id=turn_rollout_id.to_string(),
+                        group_id=group_id,
+                        routing_session_id=routing_session_id,
+                        sampling_config=sampling,
+                    )
+
+                    # env call
+                    next_env_step = await env.step(completion)
+
+                    # this turn from a token and message perspective
+                    turns.append(
+                        RolloutTurn(
+                            rollout_id=turn_rollout_id,
+                            prompt_prefix_len=env_step.next_prompt_prefix_len,
+                            prompt_delta_token_ids=env_step.next_prompt_delta_token_ids,
+                            prompt_messages=env_step.next_prompt_messages or [],
+                            completion_token_ids=np.asarray(
+                                completion.token_ids, dtype=np.int32
+                            ),
+                            completion_logprobs=np.asarray(
+                                completion.token_logprobs, dtype=np.float32
+                            ),
+                            completion_message=next_env_step.completion_message,
+                            env_messages=next_env_step.env_messages,
+                            env_rewards=next_env_step.env_rewards,
+                            min_policy_version=completion.min_policy_version,
+                            max_policy_version=completion.max_policy_version,
+                            metrics=completion.metrics,
+                        )
+                    )
+
+                    # holds the input for next generation call
+                    env_step = next_env_step
 
             status = env_step.status
         except Exception:
-            logger.exception(
-                "rollout %s/rollout=%d failed after %d turn(s); marking ERROR",
-                group_id,
-                rollout_id,
-                len(turns),
-            )
-            status = RolloutStatus.ERROR
-
-        try:
-            await release_session_fn(routing_session_id=routing_session_id)
-        except Exception:
-            # Not fatal: `max_sessions` evicts an unreleased session.
-            logger.exception("releasing routing session %s failed", routing_session_id)
+            if timeout.expired():
+                logger.warning(
+                    "rollout %s/rollout=%d timed out after %d turn(s); marking ERROR_TIMEOUT",
+                    group_id,
+                    rollout_id,
+                    len(turns),
+                )
+                status = RolloutStatus.ERROR_TIMEOUT
+            else:
+                logger.exception(
+                    "rollout %s/rollout=%d failed after %d turn(s); marking ERROR",
+                    group_id,
+                    rollout_id,
+                    len(turns),
+                )
+                status = RolloutStatus.ERROR
+        finally:
+            # Also on a cancel, so a cancelled rollout releases its session like a failed one.
+            try:
+                await release_session_fn(routing_session_id=routing_session_id)
+            except Exception:
+                # Not fatal: `max_sessions` evicts an unreleased session.
+                logger.exception(
+                    "releasing routing session %s failed", routing_session_id
+                )
         return Rollout(
             group_id=group_id,
             rollout_id=rollout_id,
