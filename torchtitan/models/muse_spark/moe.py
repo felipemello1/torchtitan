@@ -14,6 +14,7 @@ from torchtitan.models.common.activation import UnaryActivationFn
 from torchtitan.models.common.dist_moe import DistMoeRoutedExperts
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.moe.moe import _shared_experts_side_stream
 from torchtitan.models.common.moe.token_dispatcher import (
     AllToAllTokenDispatcher,
     LocalTokenDispatcher,
@@ -107,6 +108,14 @@ class MuseSparkMoE(MoE):
         x_TD, padding_mask_T = self._maybe_shard_routed_branch_inputs_across_tp(
             x_TD, padding_mask_T
         )
+        # The pooler and pre-expert norm read only x_TD and run no collective (replicated
+        # weights), so under graph capture they run on a side stream beside the router.
+        side_stream = _shared_experts_side_stream() if x_TD.is_cuda else None
+        expert_input_TC = None
+        if side_stream is not None:
+            side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side_stream):
+                expert_input_TC = self._pool_expert_input(x_TD)
         (topk_scores_TK, topk_expert_ids_TK, routing_map_TE,) = remat.region(
             self.router,
             self.remat_region_name("router"),
@@ -121,12 +130,10 @@ class MuseSparkMoE(MoE):
         remat.recompute_needs_tensor(routing_map_TE)
         num_local_tokens_per_expert_E = routing_map_TE.sum(dim=0)
 
-        expert_input_TC = self.pooler(x_TD)
-        expert_input_TC = remat.region(
-            self.pre_expert_norm,
-            self.remat_region_name("pre_expert_norm"),
-            recompute=self.remat_should_recompute("pre_expert_norm"),
-        )(expert_input_TC)
+        if side_stream is not None:
+            torch.cuda.current_stream().wait_stream(side_stream)
+        else:
+            expert_input_TC = self._pool_expert_input(x_TD)
         # Local token dispatch indexes these inputs outside a remat region.
         remat.recompute_needs_tensor(
             expert_input_TC, topk_scores_TK, topk_expert_ids_TK
@@ -142,6 +149,14 @@ class MuseSparkMoE(MoE):
         # Replicated unpooler weights produce a token shard, not a row-linear partial.
         output_TD = self._maybe_zero_fill_routed_output_to_tp_partial(output_TD)
         return self._maybe_all_reduce_moe_output_across_tp(output_TD)
+
+    def _pool_expert_input(self, x_TD: torch.Tensor) -> torch.Tensor:
+        """Pooler then pre-expert norm: ``(T, D)`` -> ``(T, C)``."""
+        return remat.region(
+            self.pre_expert_norm,
+            self.remat_region_name("pre_expert_norm"),
+            recompute=self.remat_should_recompute("pre_expert_norm"),
+        )(self.pooler(x_TD))
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         super()._init_self_buffers(buffer_device=buffer_device)
