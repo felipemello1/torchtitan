@@ -208,11 +208,16 @@ class DistMoeRuntime(Configurable):
                 planning with no saved activations, and a per-step row count
                 instead of the planned maximum. The activation-slot controls
                 must stay ``None``; ``dist_moe`` rejects them for inference.
-            block_major_weights: Have Dist-MoE read routed-expert W13/W2 in its
-                block-major layout, which streams faster. Inference only: the
+            block_major_weights: Have inference read routed-expert W13/W2 in
+                Dist-MoE's block-major layout, which streams faster; the
                 generator re-lays out the weights after every load
-                (``DistMoeRoutedExperts.relayout_weights_to_block_major``);
-                ``dist_moe`` rejects it otherwise.
+                (``DistMoeRoutedExperts.relayout_weights_to_block_major``).
+                Training ignores it, and experts ``dist_moe`` can't read that
+                way (MXFP8, or ``intermediate_dim`` not a multiple of 64) keep
+                the plain layout.
+            interleaved_gate_up: With block-major weights, also interleave W13's
+                gate and up rows in groups of 16, so the dispatch GEMM writes the
+                SwiGLU output itself, bitwise equal to the separate SwiGLU kernel.
         """
 
         activation_slot_bytes: int | None = None
@@ -221,7 +226,8 @@ class DistMoeRuntime(Configurable):
         vmm_capacity_factor: float | None = None
         pp_activation_slot_policy: PPActivationSlotPolicy = "stage_microbatch"
         inference: bool = False
-        block_major_weights: bool = False
+        block_major_weights: bool = True
+        interleaved_gate_up: bool = True
 
         def __post_init__(self) -> None:
             if (
@@ -452,10 +458,22 @@ class DistMoeRuntime(Configurable):
                 "swiglu_alpha": module.swiglu_alpha,
                 "swiglu_limit": module.swiglu_limit,
             }
-        # Passed only when set, so a dist_moe without the option still works.
-        layout_options = (
-            {"block_major_weights": True} if self.config.block_major_weights else {}
-        )
+        # Inference reads block-major weights with W13's gate/up rows
+        # interleaved, unless dist_moe can't read these experts that way (64 is
+        # its block width). Training passes neither, so a dist_moe without the
+        # options still trains.
+        # TODO: a W13 bias (GPT-OSS) also needs interleaved_gate_up off.
+        layout_options: dict[str, bool] = {}
+        if (
+            self.config.inference
+            and self.config.block_major_weights
+            and module.block_scaled_config is None
+            and module.intermediate_dim % 64 == 0
+        ):
+            layout_options = {
+                "block_major_weights": True,
+                "interleaved_gate_up": self.config.interleaved_gate_up,
+            }
         return dist_moe.Config(
             max_num_local_input_tokens=max_num_local_input_tokens,
             hidden_dim=module.hidden_dim,

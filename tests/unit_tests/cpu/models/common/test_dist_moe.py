@@ -626,6 +626,47 @@ def test_runtime_passes_inference_to_annex() -> None:
     assert context_config.device_scratch_capacity_factor == 4.0
 
 
+@pytest.mark.parametrize(
+    ("inference", "layout_flags", "experts", "expected"),
+    [
+        (True, {}, "bf16", (True, True)),
+        (True, {"interleaved_gate_up": False}, "bf16", (True, False)),
+        (True, {"block_major_weights": False}, "bf16", (False, False)),
+        (False, {}, "bf16", (False, False)),
+        (True, {}, "mxfp8", (False, False)),
+        (True, {}, "intermediate_dim_96", (False, False)),
+    ],
+)
+def test_runtime_resolves_the_inference_weight_layout(
+    inference: bool,
+    layout_flags: dict[str, bool],
+    experts: str,
+    expected: tuple[bool, bool],
+) -> None:
+    """Inference defaults to block-major weights with interleaved W13, when dist_moe can read them."""
+    precision = "mxfp8" if experts == "mxfp8" else "bf16"
+    module = cast(
+        DistMoeRoutedExperts,
+        DistMoeTransform(expert_precision=precision)
+        .transform(_stock_config(dim=64))
+        .build(),
+    )
+    if experts == "intermediate_dim_96":
+        module.intermediate_dim = 96
+    runtime = _runtime()
+    runtime.config = DistMoeRuntime.Config(inference=inference, **layout_flags)
+
+    context_config = runtime._resolve_context_config(
+        module,
+        max_num_local_input_tokens=128,
+        max_live_activation_slots=1,
+        max_moe_layers_per_activation_slot=3,
+    )
+
+    layout = (context_config.block_major_weights, context_config.interleaved_gate_up)
+    assert layout == expected
+
+
 def test_mxfp8_transform_is_independent_and_uses_prepared_weights() -> None:
     """MXFP8 transforms stock experts directly and installs prepared weights."""
     transformed = DistMoeTransform(expert_precision="mxfp8").transform(_stock_config())

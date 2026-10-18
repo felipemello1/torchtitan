@@ -145,14 +145,20 @@ class DistMoeRoutedExperts(Module):
         """Leave communication and activation storage to the shared runtime."""
         del buffer_device
 
-    def relayout_weights_to_block_major(self) -> None:
+    def relayout_weights_to_block_major(
+        self, *, interleave_gate_up: bool = False
+    ) -> None:
         """Rewrite the stored W13 and W2 in place in Dist-MoE's block-major layout.
 
         Uses ``dist_moe.relayout_to_block_major``. Shapes are unchanged, so after
         this only Dist-MoE may read the weights; call it once per load that
         writes row-major weights, since a second call permutes them again.
+        ``interleave_gate_up`` also interleaves W13's gate and up rows, for
+        ``DistMoeRuntime.Config.interleaved_gate_up``.
         """
-        dist_moe.relayout_to_block_major(self.w13.weight.flatten(1, 2))
+        dist_moe.relayout_to_block_major(
+            self.w13.weight.flatten(1, 2), interleave_gate_up=interleave_gate_up
+        )
         dist_moe.relayout_to_block_major(self.w2.weight)
 
     def _weight_operands(

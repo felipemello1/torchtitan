@@ -294,7 +294,10 @@ def _restore_sharded_params(module: FSDPModule) -> None:
 
 
 def _unshard_and_free_sharded_params(
-    module: FSDPModule, *, block_major_weights: bool = False
+    module: FSDPModule,
+    *,
+    block_major_weights: bool = False,
+    interleaved_gate_up: bool = False,
 ) -> None:
     """Unshard `module`'s FSDP group into its unsharded buffers, then free its sharded ones.
 
@@ -305,7 +308,8 @@ def _unshard_and_free_sharded_params(
     With `block_major_weights`, the group's Dist-MoE expert weights are then
     re-laid out. A group that was already unsharded is skipped: `unshard()` is a
     no-op there, its weights are already block-major, and a second relayout
-    would permute them again.
+    would permute them again. `interleaved_gate_up` also interleaves W13's
+    gate/up rows in that relayout.
     """
     from torch.distributed.fsdp._fully_shard._fsdp_param import free_storage
 
@@ -320,7 +324,9 @@ def _unshard_and_free_sharded_params(
         if block_major_weights and unshard_wrote_weights:
             for submodule in _modules_in_fsdp_group(module):
                 if isinstance(submodule, DistMoeRoutedExperts):
-                    submodule.relayout_weights_to_block_major()
+                    submodule.relayout_weights_to_block_major(
+                        interleave_gate_up=interleaved_gate_up
+                    )
 
 
 @support_torch_compile(
@@ -452,7 +458,9 @@ class VLLMModelWrapper(Module):
         for module in self.model.modules():
             if isinstance(module, FSDPModule):
                 _unshard_and_free_sharded_params(
-                    module, block_major_weights=self._block_major_weights
+                    module,
+                    block_major_weights=self._block_major_weights,
+                    interleaved_gate_up=self._interleaved_gate_up,
                 )
 
     def load_state_dict(self, state_dict: Mapping[str, Any]):
@@ -498,7 +506,9 @@ class VLLMModelWrapper(Module):
             handles.append(
                 modules[-1].register_load_state_dict_post_hook(
                     lambda module, *args: _unshard_and_free_sharded_params(
-                        module, block_major_weights=self._block_major_weights
+                        module,
+                        block_major_weights=self._block_major_weights,
+                        interleaved_gate_up=self._interleaved_gate_up,
                     )
                 )
             )
@@ -560,6 +570,7 @@ class VLLMModelWrapper(Module):
         self._num_valid_tokens: torch.Tensor | None = None
         # Whether each weight load re-lays out the expert weights for Dist-MoE.
         self._block_major_weights = False
+        self._interleaved_gate_up = False
         if not any(
             isinstance(module, DistMoeRoutedExperts) for module in self.model.modules()
         ):
@@ -594,7 +605,10 @@ class VLLMModelWrapper(Module):
             num_tokens_per_microbatch_per_dp_rank=max_num_batched_tokens,
             pp_schedule=None,
         )
-        self._block_major_weights = runtime_config.block_major_weights
+        # The runtime turns these off for experts dist_moe can't read that way.
+        context_config = self._dist_moe_runtime.context.config
+        self._block_major_weights = context_config.block_major_weights
+        self._interleaved_gate_up = context_config.interleaved_gate_up
         # The runner writes each step's real token count here before the forward
         # runs, and forward builds the padding mask from it on the device, so
         # CUDA-graph replay sees the current count. The address must stay fixed
