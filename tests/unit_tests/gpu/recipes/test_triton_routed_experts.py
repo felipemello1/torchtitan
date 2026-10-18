@@ -239,13 +239,27 @@ class TestTritonRoutedExperts(unittest.TestCase):
                         torch.Tensor, "new_empty", nan_new_empty
                     ):
                         actual = triton_routed_experts_op(
-                            x_TD, scores_TK, ids_TK, local_w13, local_w2, rank, ep
+                            x_TD,
+                            scores_TK,
+                            ids_TK,
+                            local_w13,
+                            local_w2,
+                            ep_rank=rank,
+                            ep_size=ep,
                         )
                         # The other id style: local ids, -1 for other ranks' routes.
                         local_ids = torch.where(mine_TK, ids_TK - first, -1)
                         with_local_ids = triton_routed_experts_op(
-                            x_TD, scores_TK, local_ids, local_w13, local_w2, 0, ep
+                            x_TD,
+                            scores_TK,
+                            local_ids,
+                            local_w13,
+                            local_w2,
+                            ep_rank=0,
+                            ep_size=ep,
                         )
+                        # Fewer rows than at EP > 1, so maybe another tile class: GEMM rows are
+                        # bitwise the same for every class (test_expert_sorted_rows_match_stock_bitwise).
                         expected = triton_routed_experts_op(
                             x_TD[real_T],
                             torch.where(mine_TK, scores_TK, 0.0)[real_T],

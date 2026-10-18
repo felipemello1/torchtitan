@@ -171,7 +171,7 @@ def _route_sorted_kernel(
         tl.store(offsets_ptr + e, row_end, mask=e < num_experts)
     i = tl.arange(0, BLOCK)
     routes = tl.program_id(0) * BLOCK + i
-    # Padding routes get expert E, so they sort last and land in the unused bins >= E.
+    # Padding and other ranks' routes get expert E: they sort last, into the unused bins >= E.
     if SKIP:  # skipped routes too
         experts = tl.load(ids_ptr + routes, mask=routes < N, other=-1).to(tl.int32)
         experts = _local_expert_ids(experts, first_expert, num_experts)
@@ -388,7 +388,7 @@ def _combine_kernel(
     """``out[t] = sum_k score[t, k] * y[t * K + k]`` in fp32, one rounding.
 
     SKIP (EP > 1): a route to another rank's expert or padding adds nothing; its y row was never
-    written, and its score is another rank's (or NaN on a padding row), so neither is read.
+    written, and its score is another rank's (or NaN on a padding row), so neither is used.
     """
     tl.extra.cuda.gdc_wait()  # y comes from the w2 kernel (programmatic dependent launch)
     token = tl.program_id(0)
@@ -426,8 +426,8 @@ def triton_routed_experts_op(
 ) -> torch.Tensor:
     """Routed-experts output ``(T, D)``: each token's ``K`` routes, weighted by their scores.
 
-    With ``ep_size > 1`` this rank holds experts ``[ep_rank * E, (ep_rank + 1) * E)`` of the
-    global ids; routes to other experts, or -1, add nothing.
+    With ``ep_size > 1`` this rank holds ``E = w13_E2FD.shape[0]`` experts, global ids
+    ``[ep_rank * E, (ep_rank + 1) * E)``; routes to other experts, or -1, add nothing.
 
     Example:
         >>> out_TD = triton_routed_experts_op(x_TD, scores_TK, ids_TK, w13, w2)
