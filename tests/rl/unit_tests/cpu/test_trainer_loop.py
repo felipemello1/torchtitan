@@ -83,6 +83,7 @@ def _controller(events: list[str], *, on_push=None, on_pull=None) -> Controller:
             num_prompts_per_train_step=5,
         ),
         full_gc_every_seconds=0,
+        explain_full_gc=False,
     )
     controller.start_step = 0
     controller._trainer_policy_version = 0
@@ -251,3 +252,40 @@ def test_full_collect_every_seconds_counts_from_the_first_step() -> None:
     assert full_collects(3600) == [False, False, False]
     assert full_collects(1e-9) == [False, True, True]
 
+
+def test_collect_and_explain_garbage_names_the_cycle(tmp_path, monkeypatch) -> None:
+    import gc
+    import json
+    from torchtitan.rl.controller.metrics import collect_and_explain_garbage
+
+    class Payload:
+        pass
+
+    def leak() -> None:
+        payload = [Payload() for _ in range(3)]
+        try:
+            raise ValueError("boom")
+        except ValueError as error:
+            kept = error  # exception -> traceback -> this frame -> kept: a cycle holding `payload`
+
+    gc.collect()
+    # The function collects twice: once keeping the garbage to explain it, then to free it. The second
+    # must free everything the first found, while the function still runs (automatic GC is off).
+    counts: list[int] = []
+    collect = gc.collect
+    monkeypatch.setattr(gc, "collect", lambda: counts.append(collect()) or counts[-1])
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(5):
+            leak()
+        path = tmp_path / "gc_garbage.jsonl"
+        collected = collect_and_explain_garbage(path=str(path), step=1)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+    assert len(counts) == 2 and counts[1] >= counts[0] == collected
+    record = json.loads(path.read_text())
+    assert collected > 0
+    assert any("leak" in link for chain in record["chains"] for link in chain)
