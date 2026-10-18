@@ -214,11 +214,21 @@ class DistMoeRuntime(Configurable):
                 every load (``DistMoeRoutedExperts.relayout_weights_for_context``).
                 MXFP8 and LoRA experts and an ``intermediate_dim`` that isn't a
                 multiple of 64 keep row-major weights.
-            interleaved_gate_up: With block-major weights, also interleave W13's
-                gate and up rows in groups of 16, so the dispatch GEMM writes the
-                SwiGLU output itself, bitwise equal to the separate SwiGLU kernel.
-                Slower at some small shapes; see
-                ``dist_moe.Config.interleaved_gate_up``.
+            interleaved_gate_up: Inference only (training ignores it): also
+                interleave W13's gate and up rows in groups of 16 in the
+                block-major weights, so the dispatch GEMM writes the SwiGLU
+                output itself, bitwise equal to the separate SwiGLU kernel.
+                ``None`` turns it on when ``intermediate_dim >= 2048``
+                (measured at EP 4 on GB300):
+
+                - F 2048 and 4096: faster at every size measured, by 6.6-74 us
+                  per MoE layer.
+                - F 512: 0.5-1.8 us faster at decode, 10-12 us slower at 512-1024
+                  tokens per GPU.
+                - F 768-1536 (Qwen3 MoE): not measured; keeps the separate kernel.
+
+                ``True`` forces it on and raises if the experts can't have
+                block-major weights; ``False`` keeps W13's row order.
         """
 
         activation_slot_bytes: int | None = None
@@ -228,7 +238,7 @@ class DistMoeRuntime(Configurable):
         pp_activation_slot_policy: PPActivationSlotPolicy = "stage_microbatch"
         inference: bool = False
         block_major_weights: bool = True
-        interleaved_gate_up: bool = True
+        interleaved_gate_up: bool | None = None
 
         def __post_init__(self) -> None:
             if (
@@ -465,13 +475,13 @@ class DistMoeRuntime(Configurable):
                 "swiglu_alpha": module.swiglu_alpha,
                 "swiglu_limit": module.swiglu_limit,
             }
-        # Inference reads block-major weights (W13's gate/up rows interleaved if
-        # interleaved_gate_up). Training, experts that don't hand dist_moe their
-        # stored weights (MXFP8's prepared operands, LoRA's W + B @ A) and an
-        # intermediate_dim that isn't a multiple of 64 (dist_moe's block width)
-        # keep row-major weights.
-        # TODO: resolve interleaved_gate_up to False for experts with a W13 bias
-        # (GPT-OSS); dist_moe rejects the pair at the first forward.
+        # Inference reads block-major weights. Training, experts that don't hand
+        # dist_moe their stored weights (MXFP8's prepared operands, LoRA's
+        # W + B @ A) and an intermediate_dim that isn't a multiple of 64
+        # (dist_moe's block width) keep row-major weights.
+        # TODO: a W13 bias (GPT-OSS) can't interleave either: resolve None to
+        # off and raise on True for it; dist_moe rejects the pair at the first
+        # forward.
         # Every local module must resolve the same pair: __init__ compares the
         # configs, which carry it.
         self.block_major_weights = (
@@ -480,9 +490,24 @@ class DistMoeRuntime(Configurable):
             and type(module)._weight_operands is DistMoeRoutedExperts._weight_operands
             and module.intermediate_dim % 64 == 0
         )
-        self.interleaved_gate_up = (
-            self.block_major_weights and self.config.interleaved_gate_up
-        )
+        interleaved_gate_up = self.config.interleaved_gate_up
+        if interleaved_gate_up is None:
+            # Config.interleaved_gate_up gives the measurements behind 2048.
+            interleaved_gate_up = module.intermediate_dim >= 2048
+        elif (
+            interleaved_gate_up
+            and self.config.inference
+            and not self.block_major_weights
+        ):
+            raise ValueError(
+                "interleaved_gate_up=True needs block-major expert weights: "
+                "block_major_weights=True and BF16 experts without LoRA whose "
+                "intermediate_dim is a multiple of 64; got "
+                f"{type(module).__name__} with intermediate_dim="
+                f"{module.intermediate_dim} and block_major_weights="
+                f"{self.config.block_major_weights}"
+            )
+        self.interleaved_gate_up = self.block_major_weights and interleaved_gate_up
         # Passed only when on, so a dist_moe without the options still works.
         # TODO: pass both directly once dist_moe main has them.
         layout_options: dict[str, bool] = {}

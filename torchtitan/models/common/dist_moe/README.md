@@ -297,8 +297,9 @@ fastest, and rewrites them in place with `dist_moe.relayout_to_block_major`
 after every unshard that writes them (the initial load and each weight sync):
 
 - block-major (`block_major_weights`);
-- W13's gate and up rows interleaved, so the dispatch GEMM computes SwiGLU
-  itself (`interleaved_gate_up`).
+- from `intermediate_dim` 2048 up, W13's gate and up rows interleaved, so the
+  dispatch GEMM computes SwiGLU itself (`interleaved_gate_up`; `True` or
+  `False` overrides the size rule).
 
 Training, MXFP8 and LoRA experts, and an `intermediate_dim` that isn't a
 multiple of 64 keep row-major weights.
