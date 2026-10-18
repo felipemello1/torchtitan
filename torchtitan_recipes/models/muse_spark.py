@@ -334,9 +334,8 @@ def _muse_spark_816b_a42b(
     Use a fresh checkpoint folder; native DCP checkpoints cannot be resumed
     by this backend.
 
-    Attention defaults to varlen, 1.3-2.4x faster than flex per 4-layer
-    window/global cycle on GB300; CP uses Ulysses. Pass ``attn_backend="flex"``
-    for KV all-gather CP, needed when CP exceeds the KV heads left per TP rank.
+    Attention defaults to varlen (Ulysses under CP). Pass `attn_backend="flex"`
+    when CP is larger than the KV heads per TP rank: only flex has KV all-gather CP.
     """
     if parallelism is None:
         parallelism = ParallelismConfig(
@@ -850,7 +849,4 @@ def muse_spark_816b_a42b_ultradata_lora_sft_cp16_128k() -> Trainer.Config:
             _ultradata_lora_sft_transform(),
         ],
     )
-    for _, inner_attention, _, _ in config.model.traverse(FlexInnerAttention.Config):
-        inner_attention.kernel_options = {"BACKEND": "FLASH"}
-        inner_attention.block_size = 256
     return config
