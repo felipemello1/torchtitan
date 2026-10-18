@@ -111,7 +111,7 @@ class RoutedExperts(Module):
         *,
         padding_mask_T: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Dispatch tokens to experts, compute, combine, and scatter_add.
+        """Dispatch tokens to experts, compute, and combine each token's routes.
 
         When parallelized, ``local_spmd`` (from ``sharding_config``) establishes
         the local SPMD types for the forward body.
@@ -143,10 +143,7 @@ class RoutedExperts(Module):
             # w13 and w2 declare their own remat regions (<fqn>.grouped_mm).
             # The bf16 cast reads the dispatched tokens with bare ops.
             remat.recompute_needs_tensor(routed_input_RD)
-            gate_up_R2F = self.w13(routed_input_RD.bfloat16(), offsets_E)
-            remat.recompute_needs_tensor(gate_up_R2F)
-            hidden_RF = self.activation_fn(gate_up_R2F, offsets=offsets_E)
-            routed_output_RD = self.w2(hidden_RF, offsets_E)
+            routed_output_RD = self._expert_mlp(routed_input_RD, offsets_E)
             # A real dtype cast and the output postprocess read the w2 output with
             # bare ops, so pin it only then. In the common bf16 case without a
             # postprocess, type_as is a no-op and the w2 output goes straight to
@@ -166,6 +163,27 @@ class RoutedExperts(Module):
             x_TD,
         )
         return out_TD
+
+    def count_tokens(self, routing_map_TE: torch.Tensor) -> torch.Tensor | None:
+        """Return the tokens routed to each expert, ``(E,)``, for ``forward``.
+
+        Subclasses whose ``forward`` counts them from the expert ids return ``None``.
+        """
+        return routing_map_TE.sum(dim=0)
+
+    def _expert_mlp(
+        self, routed_input_RD: torch.Tensor, offsets_E: torch.Tensor
+    ) -> torch.Tensor:
+        """Run w13, the activation and w2 over the dispatcher's expert-sorted rows.
+
+        Args:
+            routed_input_RD: rows grouped by expert, as the token dispatcher returns them.
+            offsets_E: end row of each expert's group (the grouped GEMMs' ``offs``).
+        """
+        gate_up_R2F = self.w13(routed_input_RD.bfloat16(), offsets_E)
+        remat.recompute_needs_tensor(gate_up_R2F)
+        hidden_RF = self.activation_fn(gate_up_R2F, offsets=offsets_E)
+        return self.w2(hidden_RF, offsets_E)
 
 
 def _topk_ids_by_argmax(scores: torch.Tensor, k: int) -> torch.Tensor:
@@ -801,7 +819,8 @@ class MoE(Module):
           to expert-owning ranks.
        b. expert computation (W13, activation, and W2 on local tensors)
        c. combine (TokenDispatcher) — reverse the dispatch reordering.
-          - LocalTokenDispatcher (no EP): scatter_add only.
+          - LocalTokenDispatcher (no EP): gather-sum when its regions are
+            compiled, else scatter_add.
           - AllToAll: all-to-all communication, then scatter_add.
           - DeepEP: combine_tokens followed by backend synchronization.
           - HybridEP: synchronous combine_tokens.
@@ -895,7 +914,7 @@ class MoE(Module):
             aux_loss_denominator=aux_loss_denominator,
             **router_kwargs,
         )
-        num_local_tokens_per_expert_E = routing_map_TE.sum(dim=0)
+        num_local_tokens_per_expert_E = self.routed_experts.count_tokens(routing_map_TE)
 
         out_TD = self.routed_experts(
             routed_x_TD,
