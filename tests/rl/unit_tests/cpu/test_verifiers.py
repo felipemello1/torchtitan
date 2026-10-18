@@ -31,6 +31,7 @@ from torchtitan.rl.examples.verifiers.rollouter import (
     log_failed_rollout,
     verifiers_rollout_logs,
     VerifiersRollouter,
+    VerifiersRolloutWorker,
 )
 from torchtitan.rl.generator.generator import SamplingConfig
 from torchtitan.rl.observability import metrics as m
@@ -222,26 +223,22 @@ def test_verifiers_rollouter_sends_muse_glimmer_renderer_config(monkeypatch) -> 
         close=AsyncMock(),
         base_url="http://127.0.0.1:2",
     )
-    env_server = SimpleNamespace(
-        start=AsyncMock(return_value="http://127.0.0.1:1"),
-        close=AsyncMock(),
-    )
     env_client = SimpleNamespace(wait_for_server_startup=AsyncMock(), close=AsyncMock())
     monkeypatch.setattr(
         "torchtitan.rl.examples.verifiers.rollouter.VerifiersEnvClient",
         lambda _: env_client,
     )
 
-    rollouter = object.__new__(VerifiersRollouter)
-    rollouter._verifiers_config = SimpleNamespace(
+    worker = object.__new__(VerifiersRolloutWorker)
+    worker._config = SimpleNamespace(
         generation_server=SimpleNamespace(build=lambda: generation_server),
         connection_timeout_sec=5.0,
         renderer_multiplex=8,
+        env_server_address="http://127.0.0.1:1",
     )
-    rollouter._verifiers_env_server = env_server
-    rollouter._generation_server = None
-    rollouter._verifiers_env_client = None
-    rollouter._verifiers_train_client_config = None
+    worker._generation_server = None
+    worker._verifiers_env_client = None
+    worker._verifiers_train_client_config = None
     renderers_config = CustomRendererConfig(
         import_path="torchtitan.models.muse_glimmer.renderer.MuseGlimmerRenderer",
         reasoning_strength="low",
@@ -249,18 +246,91 @@ def test_verifiers_rollouter_sends_muse_glimmer_renderer_config(monkeypatch) -> 
     config = from_renderers(renderers_config)
 
     asyncio.run(
-        rollouter.setup_async(
+        worker.setup_async(
             tokenizer_config=cast(HuggingFaceTokenizer.Config, None),
             renderer_config=config,
             hf_assets_path="muse-checkpoint",
         )
     )
 
-    sent = rollouter._verifiers_train_client_config
+    sent = worker._verifiers_train_client_config
     assert sent is not None
     assert sent.renderer == renderers_config
     assert sent.renderer_model_name == "muse-checkpoint"
-    asyncio.run(rollouter.close())
+    asyncio.run(worker.close())
+
+
+def test_verifiers_rollouter_runs_groups_in_rollout_processes(monkeypatch) -> None:
+    """With `worker_pool_size`, workers are spawned on the controller host and
+    groups go to them, so the controller process starts no generation server."""
+    from renderers import CustomRendererConfig
+    from torchtitan.components.renderer import from_renderers
+    from torchtitan.components.tokenizer import HuggingFaceTokenizer
+    from torchtitan.rl.actors.monarch.rollout_worker import RolloutWorkerActor
+
+    from tests.rl.unit_tests.cpu.test_rollouter_pool import (
+        _ControllerHost,
+        _WorkerActorMesh,
+        _WorkerMesh,
+    )
+
+    worker_mesh = _WorkerMesh(_WorkerActorMesh())
+    host = _ControllerHost(worker_mesh)
+    monkeypatch.setattr("torchtitan.rl.rollout.rollouter.this_host", lambda: host)
+    env_server = SimpleNamespace(
+        start=AsyncMock(return_value="tcp://127.0.0.1:1"), close=AsyncMock()
+    )
+    rollouter = object.__new__(VerifiersRollouter)
+    rollouter._config = rollouter._verifiers_config = SimpleNamespace(
+        rubric="rubric",
+        advantage="advantage",
+        generation_server="generation_server",
+        renderer_multiplex=8,
+        connection_timeout_sec=5.0,
+        worker=None,
+        worker_pool_size=2,
+        num_threads_per_worker=3,
+    )
+    rollouter._verifiers_env_server = env_server
+    rollouter._worker = None
+    rollouter._worker_actors = None
+    rollouter._worker_mesh = None
+    renderer_config = from_renderers(
+        CustomRendererConfig(
+            import_path="torchtitan.models.muse_glimmer.renderer.MuseGlimmerRenderer"
+        )
+    )
+
+    async def run() -> None:
+        await rollouter.setup_async(
+            tokenizer_config=cast(HuggingFaceTokenizer.Config, None),
+            renderer_config=renderer_config,
+            hf_assets_path="checkpoint",
+        )
+        assert host.spawn_kwargs == {"per_host": {"cpus": 2}}
+        args, kwargs = worker_mesh.spawn_args
+        assert args[1] is RolloutWorkerActor
+        assert kwargs["num_threads"] == 3
+        assert kwargs["worker_config"].env_server_address == "tcp://127.0.0.1:1"
+
+        actor_mesh = worker_mesh.actor_mesh
+        actor_mesh.run_group.release.set()
+        group = await rollouter.run_group_rollouts(
+            generate_fn=AsyncMock(),
+            release_session_fn=AsyncMock(),
+            sample="sample",
+            group_id=7,
+            group_size=2,
+            sampling=SamplingConfig(),
+        )
+        assert group.group_id == 7
+        assert actor_mesh.run_group.calls[0]["group_id"] == 7
+
+        await rollouter.close()
+        assert worker_mesh.stopped
+        env_server.close.assert_awaited_once()
+
+    asyncio.run(run())
 
 
 def test_trainable_token_spans() -> None:
@@ -762,18 +832,18 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
         nodes=[],
         branches=[],
     )
-    rollouter = object.__new__(VerifiersRollouter)
-    rollouter._generation_server = SimpleNamespace(
+    worker = object.__new__(VerifiersRolloutWorker)
+    worker._generation_server = SimpleNamespace(
         model_id="model", pop_generation_metadata=lambda trace_id: None
     )
-    rollouter._verifiers_env_client = SimpleNamespace(
+    worker._verifiers_env_client = SimpleNamespace(
         run=AsyncMock(return_value=SimpleNamespace(ok=True, errors=[], traces=[trace]))
     )
-    rollouter._verifiers_train_client_config = object()
+    worker._verifiers_train_client_config = object()
 
     with caplog.at_level(logging.WARNING):
         rollout = asyncio.run(
-            rollouter._run_single_rollout(
+            worker._run_single_rollout(
                 sample=VerifiersTaskSample(verifiers_task_data={"name": "huge-task"}),
                 sampling=SamplingConfig(),
                 group_id=1,
