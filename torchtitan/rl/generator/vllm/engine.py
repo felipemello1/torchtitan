@@ -392,6 +392,20 @@ class VLLMEngine(GenerationEngine):
                 rejected_requests.append((request.request_id, exc))
         return rejected_requests
 
+    def abort_requests(self, request_ids: list[str]) -> list[str]:
+        """Abort the requests among ``request_ids`` this replica is running and free their KV;
+        return their ids."""
+        # vLLM maps each external id to its internal ones and drops the entry when the request
+        # finishes, so the map says which ids still run here (vLLM internals; recheck on a vLLM
+        # upgrade). The sync engine emits no output for an aborted request.
+        external_req_ids = self._engine.output_processor.external_req_ids
+        running = [i for i in request_ids if i in external_req_ids]
+        # One id per call: vLLM frees a call's requests in set order of internal ids, which carry a
+        # random per-process suffix, and every TP rank must free blocks in the same order.
+        for request_id in running:
+            self._engine.abort_request([request_id])
+        return running
+
     def has_unfinished_requests(self) -> bool:
         """Whether any admitted request is still running."""
         return self._engine.has_unfinished_requests()
