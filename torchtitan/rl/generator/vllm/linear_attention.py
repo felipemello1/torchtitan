@@ -31,6 +31,8 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
+from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
+
 
 class LinearAttentionExecutionPath(Enum):
     SINGLE_TOKEN = auto()
@@ -73,7 +75,10 @@ class TorchTitanLinearAttentionMetadataBuilder(
     ) -> AttentionCGSupport:
         parallel = vllm_config.parallel_config
         if (
-            parallel.data_parallel_size != 1
+            # At DP > 1, a decode-only replica is padded to a prefilling peer's
+            # size and replays the packed graph instead of the decode graph.
+            # Batch-invariant runs keep the decode path.
+            (parallel.data_parallel_size != 1 and is_in_batch_invariant_mode())
             or parallel.use_ubatching
             or parallel.enable_dbo
         ):

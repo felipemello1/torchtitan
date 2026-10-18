@@ -67,6 +67,11 @@ class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
             self.keys_initialized
             and self.cudagraph_mode == CUDAGraphMode.FULL
             and uniform_decode
+            # DP padding can lift a decode batch to a prefilling peer's size,
+            # past the largest decode graph; that batch replays a packed graph.
+            and num_tokens
+            <= self.uniform_decode_query_len
+            * self.vllm_config.scheduler_config.max_num_seqs
         ):
             dispatch = self.decode_dispatcher.dispatch
         return dispatch(

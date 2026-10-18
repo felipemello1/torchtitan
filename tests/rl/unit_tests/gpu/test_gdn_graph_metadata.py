@@ -9,7 +9,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from torchtitan.rl.generator.vllm import gdn
+from torchtitan.rl.generator.vllm import gdn, linear_attention
 from torchtitan.rl.generator.vllm.linear_attention import (
     LinearAttentionExecutionPath,
     TorchTitanLinearAttentionMetadata,
@@ -24,7 +24,7 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.forward_context import ForwardContext, override_forward_context
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -70,6 +70,23 @@ def test_gdn_supports_eager_and_full_decode_only_modes(graph_mode):
     assert (decode_mode, prefill_mode) == (expected_decode, CUDAGraphMode.NONE)
 
 
+@pytest.mark.parametrize("batch_invariant", [False, True])
+def test_dp_graphs_packed_batches_unless_batch_invariant(monkeypatch, batch_invariant):
+    config = VllmConfig()
+    config.parallel_config.data_parallel_size = 2
+    monkeypatch.setattr(
+        linear_attention, "is_in_batch_invariant_mode", lambda: batch_invariant
+    )
+    support = TorchTitanLinearAttentionMetadataBuilder.get_cudagraph_support(
+        config, None
+    )
+    assert support == (
+        AttentionCGSupport.UNIFORM_BATCH
+        if batch_invariant
+        else AttentionCGSupport.ALWAYS
+    )
+
+
 def test_full_metadata_and_native_dispatch_variants():
     config = VllmConfig()
     config.compilation_config = CompilationConfig(
@@ -99,6 +116,10 @@ def test_full_metadata_and_native_dispatch_variants():
                 descriptor.num_tokens, uniform_decode=descriptor.uniform
             ) == (mode, descriptor)
     assert dispatcher.dispatch(9)[0] == CUDAGraphMode.NONE
+    # DP padding lifts a decode batch past the largest decode graph (max_num_seqs=2).
+    assert dispatcher.dispatch(
+        4, uniform_decode=True, valid_modes={CUDAGraphMode.FULL}
+    ) == dispatcher.dispatch(4)
     assert (
         dispatcher.dispatch(2, uniform_decode=True, valid_modes={CUDAGraphMode.NONE})[0]
         == CUDAGraphMode.NONE
