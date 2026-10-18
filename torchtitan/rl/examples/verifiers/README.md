@@ -28,12 +28,14 @@ package and dependencies: [`dapo_math/`](./dapo_math) (single-turn math) and
    a separate local process on the TitanRL controller host. The configured
    Verifiers runtime is independent: for example, `SubprocessConfig` or
    `DockerConfig` for the agent.
-3. [`generation_server.py`](../../generator/generation_server.py) exposes TitanRL's `GenerateFn` through the
-   HTTP token-generation protocol expected by Verifiers. It also retains the
-   policy-version span and metrics that are absent from Verifiers traces.
-4. `rollouter.py` sends samples to Verifiers and converts the
-   returned trace graph into TitanRL `RolloutTurn` objects. TitanRL then applies
-   its rubric and advantage estimator normally.
+3. Each generator serves the HTTP token-generation protocol expected by Verifiers
+   ([`GenerationServer`](../../generator/generation_server.py)), so agents call
+   generators directly. It also retains the policy-version span and metrics that
+   are absent from Verifiers traces.
+4. `rollouter.py` picks a generator for each rollout, points the rollout's agent
+   at it, sends samples to Verifiers and converts the returned trace graph into
+   TitanRL `RolloutTurn` objects. TitanRL then applies its rubric and advantage
+   estimator normally.
 
 The training dataset is the single source of the environment taskset config.
 `VerifiersRollouter.Config` copies it into the environment-server config, so an
@@ -41,8 +43,8 @@ experiment must not configure the same taskset a second time.
 
 For CPU-heavy environments, increase the Verifiers worker-pool size first. A
 future implementation could instead place the environment server in a Monarch
-actor. That would require routable ZMQ and generation-server addresses plus
-actor-owned startup and shutdown; the current integration does not provide
+actor. That would require routable ZMQ addresses plus actor-owned startup and
+shutdown; the current integration does not provide
 that placement mode.
 
 ## Add an experiment
@@ -53,7 +55,6 @@ Create one package per task, with its own dependency list:
 verifiers/
   data.py
   env_server.py
-  generation_server.py
   rollouter.py
   my_task/
     __init__.py
