@@ -159,8 +159,12 @@ class Rollouter(Configurable):
         tokenizer_config: HuggingFaceTokenizer.Config,
         renderer_config: RendererConfig,
         hf_assets_path: str,
+        worker_config: RolloutWorker.Config | None = None,
     ) -> None:
-        """Spawn and initialize the owned worker proc mesh and actor pool."""
+        """Spawn and initialize the owned worker proc mesh and actor pool.
+
+        `worker_config` replaces `Config.worker`, for a subclass whose worker config
+        exists only at setup (e.g. it needs a server address)."""
         # Import lazily to avoid a circular dependency through Rollouter.Config.
         from torchtitan.rl.actors.monarch.rollout_worker import RolloutWorkerActor
 
@@ -173,7 +177,7 @@ class Rollouter(Configurable):
         self._worker_actors = self._worker_mesh.spawn(
             "rollout_worker",
             RolloutWorkerActor,
-            worker_config=self._config.worker,
+            worker_config=worker_config or self._config.worker,
             num_threads=self._config.num_threads_per_worker,
         )
         await self._worker_actors.setup_async.call(

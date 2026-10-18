@@ -261,7 +261,7 @@ def test_verifiers_rollouter_sends_muse_glimmer_renderer_config(monkeypatch) -> 
 
 
 def test_verifiers_rollouter_runs_groups_in_rollout_processes(monkeypatch) -> None:
-    """With `num_rollout_processes`, workers are spawned on the controller host and
+    """With `worker_pool_size`, workers are spawned on the controller host and
     groups go to them, so the controller process starts no generation server."""
     from renderers import CustomRendererConfig
     from torchtitan.components.renderer import from_renderers
@@ -276,9 +276,7 @@ def test_verifiers_rollouter_runs_groups_in_rollout_processes(monkeypatch) -> No
 
     worker_mesh = _WorkerMesh(_WorkerActorMesh())
     host = _ControllerHost(worker_mesh)
-    monkeypatch.setattr(
-        "torchtitan.rl.examples.verifiers.rollouter.this_host", lambda: host
-    )
+    monkeypatch.setattr("torchtitan.rl.rollout.rollouter.this_host", lambda: host)
     env_server = SimpleNamespace(
         start=AsyncMock(return_value="tcp://127.0.0.1:1"), close=AsyncMock()
     )
@@ -289,7 +287,8 @@ def test_verifiers_rollouter_runs_groups_in_rollout_processes(monkeypatch) -> No
         generation_server="generation_server",
         renderer_multiplex=8,
         connection_timeout_sec=5.0,
-        num_rollout_processes=2,
+        worker=None,
+        worker_pool_size=2,
         num_threads_per_worker=3,
     )
     rollouter._verifiers_env_server = env_server

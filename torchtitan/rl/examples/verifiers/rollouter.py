@@ -14,7 +14,6 @@ from dataclasses import dataclass, field, replace
 from typing import Any, TYPE_CHECKING
 
 import numpy as np
-from monarch.actor import this_host
 from verifiers.v1.configs.client import TrainClientConfig as VerifiersTrainClientConfig
 from verifiers.v1.configs.taskset import TasksetConfig as VerifiersTasksetConfig
 from verifiers.v1.dialects.chat import message_to_wire
@@ -83,7 +82,7 @@ class VerifiersRollouter(Rollouter):
     ``GenerationServer``, which forwards Verifiers model requests to TitanRL's
     controller-provided ``GenerateFn``. A ``VerifiersRolloutWorker`` owns that
     server; it runs in the controller process, or in rollout processes
-    (``num_rollout_processes``).
+    (``worker_pool_size``).
 
     TitanRL still owns dataset and group scheduling, generator routing, policy
     metadata, conversion to ``RolloutTurn``, reward and advantage assignment,
@@ -101,19 +100,16 @@ class VerifiersRollouter(Rollouter):
         worker: RolloutWorker.Config | None = None
         """Inherited schema field; hidden because Verifiers replaces that path."""
 
-        worker_pool_size: int = 1
-        """Unused; see ``num_rollout_processes``."""
-
-        num_threads_per_worker: int = 1
-        """Thread pool size of each rollout process (``num_rollout_processes > 0``)."""
-
-        num_rollout_processes: int = 0
+        worker_pool_size: int = 0
         """Processes that run rollout groups. 0 runs them in the controller process.
 
         N > 0 spawns N processes on the controller host, each with its own
         generation server and Verifiers client. Agents' model calls, their
         request parsing and the trace conversion then run there instead of on
         the controller's event loop and GIL. Groups go to a random process."""
+
+        num_threads_per_worker: int = 1
+        """Thread pool size of each rollout process (``worker_pool_size > 0``)."""
 
         verifiers_env_server: VerifiersEnvServer.Config
         """Environment server spawned and owned by this rollouter."""
@@ -140,7 +136,11 @@ class VerifiersRollouter(Rollouter):
         """Maximum time to wait for the Verifiers server to become healthy."""
 
         def __post_init__(self) -> None:
-            Rollouter.Config.__post_init__(self)
+            # Not Rollouter.Config.__post_init__: it rejects worker_pool_size=0.
+            if self.worker_pool_size < 0:
+                raise ValueError("worker_pool_size must be non-negative")
+            if self.num_threads_per_worker < 1:
+                raise ValueError("num_threads_per_worker must be at least 1")
             configured_taskset = self.verifiers_env_server.environment.taskset
             if configured_taskset not in (
                 VerifiersTasksetConfig(),
@@ -166,9 +166,7 @@ class VerifiersRollouter(Rollouter):
                 raise ValueError("renderer_multiplex must be positive")
             if self.connection_timeout_sec <= 0:
                 raise ValueError("connection_timeout_sec must be positive")
-            if self.num_rollout_processes < 0:
-                raise ValueError("num_rollout_processes must be non-negative")
-            if self.num_rollout_processes > 0 and self.generation_server.port != 0:
+            if self.worker_pool_size > 0 and self.generation_server.port != 0:
                 raise ValueError(
                     "rollout processes each start a generation server, so "
                     "generation_server.port must be 0 (an ephemeral port)"
@@ -206,7 +204,7 @@ class VerifiersRollouter(Rollouter):
             env_server_address=await self._verifiers_env_server.start(),
         )
         try:
-            if config.num_rollout_processes == 0:
+            if config.worker_pool_size == 0:
                 worker = worker_config.build()
                 await worker.setup_async(
                     tokenizer_config=tokenizer_config,
@@ -215,24 +213,11 @@ class VerifiersRollouter(Rollouter):
                 )
                 self._worker = worker
             else:
-                # Import lazily to avoid a circular dependency through Rollouter.Config.
-                from torchtitan.rl.actors.monarch.rollout_worker import (
-                    RolloutWorkerActor,
-                )
-
-                self._worker_mesh = this_host().spawn_procs(
-                    per_host={"cpus": config.num_rollout_processes}
-                )
-                self._worker_actors = self._worker_mesh.spawn(
-                    "verifiers_rollout_worker",
-                    RolloutWorkerActor,
-                    worker_config=worker_config,
-                    num_threads=config.num_threads_per_worker,
-                )
-                await self._worker_actors.setup_async.call(
+                await super().setup_async(
                     tokenizer_config=tokenizer_config,
                     renderer_config=renderer_config,
                     hf_assets_path=hf_assets_path,
+                    worker_config=worker_config,
                 )
         except BaseException:
             await self.close()
@@ -384,7 +369,7 @@ class VerifiersRolloutWorker(Configurable):
     """Runs Verifiers rollout groups through one generation server and one env client.
 
     `VerifiersRollouter` builds one in the controller process, or one per rollout
-    process (`num_rollout_processes`). Each owns the HTTP bridge that agents'
+    process (`worker_pool_size`). Each owns the HTTP bridge that agents'
     model calls go through, so those calls and the trace conversion run in the
     process that owns the worker.
     """
