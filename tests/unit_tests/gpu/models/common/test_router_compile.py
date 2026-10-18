@@ -10,7 +10,7 @@ import torch
 
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.local_compile import apply_local_compile
-from torchtitan.models import kimi_k2_7
+from torchtitan.models import kimi_k2_7, muse_spark
 from torchtitan.models.common.activation import Softmax
 from torchtitan.models.common.linear.hi_mid_lo_linear import HiMidLoLinear
 from torchtitan.models.common.moe import BatchWiseLoadBalanceLoss, TokenChoiceTopKRouter
@@ -34,6 +34,9 @@ def _flavor_router(model_config) -> TokenChoiceTopKRouter:
 FLAVOR_ROUTERS = {
     "Kimi-K2.5": lambda: _flavor_router(
         kimi_k2_7.build_model_config("Kimi-K2.5", parallelism=ParallelismConfig())
+    ),
+    "Muse Spark 816B-A42B": lambda: _flavor_router(
+        muse_spark.build_model_config("816B-A42B")
     ),
 }
 
