@@ -318,6 +318,12 @@ def test_bf16_transform_preserves_parameter_layout() -> None:
         torch.testing.assert_close(value, stock.state_dict()[key], rtol=0, atol=0)
 
 
+def test_count_tokens_skips_the_unused_count() -> None:
+    """Dist-MoE derives dispatch from the expert ids, so MoE skips the count."""
+    module = DistMoeTransform().transform(_stock_config()).build()
+    assert module.count_tokens(torch.ones(3, 4, dtype=torch.bool)) is None
+
+
 @pytest.mark.parametrize("expert_precision", ["bf16", "mxfp8"])
 def test_transform_propagates_clamped_swiglu_to_annex_config(
     expert_precision: Literal["bf16", "mxfp8"],
