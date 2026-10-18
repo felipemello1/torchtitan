@@ -322,6 +322,45 @@ def _describe(obj: object) -> str:
     return name
 
 
+def _explain_garbage(garbage: list[object], num_samples: int) -> dict[str, list]:
+    """Count `garbage` by type, and for `num_samples` objects of each of the 3 most common types,
+    walk back through the garbage objects referring to it until the walk closes a cycle."""
+    in_garbage = {id(obj) for obj in garbage}
+    referrers: dict[int, list[object]] = defaultdict(list)
+    for obj in garbage:
+        for referent in gc.get_referents(obj):
+            if id(referent) in in_garbage:
+                referrers[id(referent)].append(obj)
+
+    def chain_to_cycle(obj: object) -> list[str]:
+        # Walk back through garbage referrers until an object repeats (the cycle) or none is left.
+        chain: list[str] = []
+        seen: dict[int, int] = {}
+        while id(obj) not in seen and len(chain) < 40:
+            seen[id(obj)] = len(chain)
+            chain.append(_describe(obj))
+            holders = referrers.get(id(obj))
+            if not holders:
+                return chain
+            obj = holders[0]
+        if id(obj) in seen:
+            chain.append(f"cycle -> {seen[id(obj)]}")
+        return chain
+
+    type_counts = Counter(type(obj) for obj in garbage)
+    return {
+        "top_types": [
+            [f"{t.__module__}.{t.__qualname__}", count]
+            for t, count in type_counts.most_common(30)
+        ],
+        "chains": [
+            chain_to_cycle(obj)
+            for obj_type, _ in type_counts.most_common(3)
+            for obj in [o for o in garbage if type(o) is obj_type][:num_samples]
+        ],
+    }
+
+
 def collect_and_explain_garbage(*, path: str, step: int, num_samples: int = 3) -> int:
     """Run a full collection that keeps its garbage (`gc.DEBUG_SAVEALL`), append one JSON line to
     `path` naming what the cycles were, then free them. Returns the number of objects collected.
@@ -341,41 +380,10 @@ def collect_and_explain_garbage(*, path: str, step: int, num_samples: int = 3) -
     finally:
         gc.set_debug(0)
     garbage, gc.garbage[:] = gc.garbage[:], []
-    in_garbage = {id(obj) for obj in garbage}
-    referrers: dict[int, list[object]] = defaultdict(list)
-    for obj in garbage:
-        for referent in gc.get_referents(obj):
-            if id(referent) in in_garbage:
-                referrers[id(referent)].append(obj)
-    type_counts = Counter(type(obj) for obj in garbage)
-    chains = []
-    obj = current = None
-    for obj_type, _ in type_counts.most_common(3):
-        for obj in [o for o in garbage if type(o) is obj_type][:num_samples]:
-            chain: list[str] = []
-            seen: dict[int, int] = {}
-            current = obj
-            while id(current) not in seen and len(chain) < 40:
-                seen[id(current)] = len(chain)
-                chain.append(_describe(current))
-                holders = referrers.get(id(current))
-                if not holders:
-                    break
-                current = holders[0]
-            if id(current) in seen:
-                chain.append(f"cycle -> {seen[id(current)]}")
-            chains.append(chain)
-    record = {
-        "step": step,
-        "collected": collected,
-        "top_types": [
-            [f"{t.__module__}.{t.__qualname__}", count]
-            for t, count in type_counts.most_common(30)
-        ],
-        "chains": chains,
-    }
-    # The saved garbage holds its own cycles; drop our references and free them for real.
-    del garbage, in_garbage, referrers, obj, current
+    record = {"step": step, "collected": collected, **_explain_garbage(garbage, num_samples)}
+    # The saved garbage holds its own cycles; drop our reference and free them for real. The
+    # references `_explain_garbage` held into the garbage went away with its frame.
+    del garbage
     gc.collect()
     with open(path, "a") as file:
         file.write(json.dumps(record) + "\n")
