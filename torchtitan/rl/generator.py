@@ -1342,6 +1342,7 @@ class VLLMGenerator(Configurable):
         # Re-apply the state dict to run that module's merge hook. Other params,
         # including native QKVLinear.wqkv, share storage with model_sd.
         model.model.load_state_dict(model_sd, strict=False)
+        model.copy_gdn_gate_params()
         self.policy_version = version
         if self.config.reset_prefix_cache_on_weight_sync:
             # TODO(async-rl): consider a `flush_kv_cache_every_n_steps` flag to force-flush every N steps

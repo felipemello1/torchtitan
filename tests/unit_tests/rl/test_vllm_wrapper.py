@@ -193,3 +193,40 @@ def test_hf_adapter_restores_local_shards(tmp_path: Path) -> None:
         nprocs=2,
         join=True,
     )
+
+
+def test_copy_gdn_gate_params_refreshes_every_layer_in_place():
+    """Decode CUDA graphs capture the fp32 copies, so weight loads must refresh them in place."""
+    from torchtitan.rl.model.gdn import VLLMInnerGatedDeltaNet
+
+    model = torch.nn.ModuleList()
+    for _ in range(2):
+        block = torch.nn.Module()
+        block.A_log = torch.nn.Parameter(torch.randn(4, dtype=torch.bfloat16))
+        block.dt_bias = torch.nn.Parameter(torch.randn(4, dtype=torch.bfloat16))
+        inner = VLLMInnerGatedDeltaNet.__new__(VLLMInnerGatedDeltaNet)
+        torch.nn.Module.__init__(inner)
+        inner.A_log_fp32 = inner.dt_bias_fp32 = None
+        block.inner_gated_delta_net = inner
+        model.append(block)
+    wrapper = VLLMModelWrapper.__new__(VLLMModelWrapper)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.model = model
+
+    wrapper.copy_gdn_gate_params()
+    copies = [
+        (b.inner_gated_delta_net.A_log_fp32, b.inner_gated_delta_net.dt_bias_fp32)
+        for b in model
+    ]
+    with torch.no_grad():
+        for block in model:
+            block.A_log.add_(1.0)
+            block.dt_bias.add_(1.0)
+    wrapper.copy_gdn_gate_params()
+
+    for block, (A_log_fp32, dt_bias_fp32) in zip(model, copies):
+        inner = block.inner_gated_delta_net
+        assert inner.A_log_fp32 is A_log_fp32 and inner.dt_bias_fp32 is dt_bias_fp32
+        assert A_log_fp32.dtype == torch.float32
+        torch.testing.assert_close(A_log_fp32, block.A_log.float(), rtol=0, atol=0)
+        torch.testing.assert_close(dt_bias_fp32, block.dt_bias.float(), rtol=0, atol=0)

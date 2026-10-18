@@ -384,31 +384,25 @@ def _set_deltanet_sharding(
     )
 
     # The inner GDN is the local SPMD boundary for the head-parallel
-    # convolution and recurrence. cu_seqlens_host is keyword-only host metadata
-    # and intentionally remains outside the local SPMD positional placements.
+    # convolution and recurrence. Its [q|k|v] input and conv weight are the
+    # rank-local concatenations [q_r|k_r|v_r] and [conv_q_r|conv_k_r|conv_v_r].
+    # cu_seqlens_host is keyword-only host metadata and intentionally remains
+    # outside the local SPMD positional placements.
     deltanet_cfg.inner_gated_delta_net.sharding_config = ShardingConfig(
         in_src_shardings={
-            "query_TC": projected_placement,
-            "key_TC": projected_placement,
-            "value_TC": projected_placement,
+            "mixed_qkv_TC": projected_placement,
             "a_TH": projected_placement,
             "b_TH": projected_placement,
-            "conv_q_weight_C1W": parameter_placement,
-            "conv_k_weight_C1W": parameter_placement,
-            "conv_v_weight_C1W": parameter_placement,
+            "conv_weight_C1W": parameter_placement,
             "A_log_H": parameter_placement,
             "dt_bias_H": parameter_placement,
             "cu_seqlens": cu_seqlens_placement,
         },
         in_dst_shardings={
-            "query_TC": projected_placement,
-            "key_TC": projected_placement,
-            "value_TC": projected_placement,
+            "mixed_qkv_TC": projected_placement,
             "a_TH": projected_placement,
             "b_TH": projected_placement,
-            "conv_q_weight_C1W": parameter_placement,
-            "conv_k_weight_C1W": parameter_placement,
-            "conv_v_weight_C1W": parameter_placement,
+            "conv_weight_C1W": parameter_placement,
             "A_log_H": parameter_placement,
             "dt_bias_H": parameter_placement,
             "cu_seqlens": cu_seqlens_placement,
