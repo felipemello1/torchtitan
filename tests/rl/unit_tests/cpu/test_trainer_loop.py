@@ -253,7 +253,6 @@ def test_full_collect_every_seconds_counts_from_the_first_step() -> None:
     assert full_collects(1e-9) == [False, True, True]
 
 
-
 def test_collect_and_explain_garbage_names_the_cycle(tmp_path, monkeypatch) -> None:
     import gc
     import json
