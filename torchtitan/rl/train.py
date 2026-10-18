@@ -24,7 +24,7 @@ Set ``hf_assets_path`` in ``my_rl_configs.py`` to the model checkpoint path.
 """
 
 # Apply process env defaults (e.g. the CUDA allocator config) before anything
-# imports torch; spawned procs re-apply them in their bootstrap.
+# imports torch or monarch; spawned procs re-apply them in their bootstrap.
 from torchtitan.rl._env import apply_env_defaults
 
 apply_env_defaults()

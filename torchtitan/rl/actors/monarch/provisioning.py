@@ -73,7 +73,7 @@ class PerHostProvisioner:
     On the same host, the trainer and generator run on separate GPU
     meshes (e.g. GPUs 0-3 for training, GPUs 4-7 for generation). Each
     call to `allocate(n)` reserves the next *n* GPUs and returns the launch
-    env (`CUDA_VISIBLE_DEVICES` plus any `extra_env`) for those GPUs. The
+    env (`CUDA_VISIBLE_DEVICES`, `MALLOC_ARENA_MAX`, `extra_env`) for those GPUs. The
     returned env vars are applied to the spawned process via ``bootstrap_command``.
     """
 
@@ -96,7 +96,12 @@ class PerHostProvisioner:
         gpu_ids = list(range(self.next_gpu, self.next_gpu + num_gpus))
         self.next_gpu += num_gpus
 
-        env = {"CUDA_VISIBLE_DEVICES": ",".join(str(g) for g in gpu_ids)}
+        # Trainer and generator procs get 8 malloc arenas, not the controller's 16 (see
+        # RL_ENV_DEFAULTS). Set here because a proc on another host doesn't inherit our env.
+        env = {
+            "CUDA_VISIBLE_DEVICES": ",".join(str(g) for g in gpu_ids),
+            "MALLOC_ARENA_MAX": "8",
+        }
         if extra_env:
             env.update(extra_env)
         return env
