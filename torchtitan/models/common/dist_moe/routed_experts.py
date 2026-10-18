@@ -145,20 +145,24 @@ class DistMoeRoutedExperts(Module):
         """Leave communication and activation storage to the shared runtime."""
         del buffer_device
 
-    def relayout_weights_to_block_major(
-        self, *, interleave_gate_up: bool = False
-    ) -> None:
-        """Rewrite the stored W13 and W2 in place in Dist-MoE's block-major layout.
+    def relayout_weights_for_context(self) -> None:
+        """Rewrite the stored W13 and W2 in place in the layout this module's context reads.
 
-        Uses ``dist_moe.relayout_to_block_major``. Shapes are unchanged, so after
+        A no-op for row-major weights; otherwise uses
+        ``dist_moe.relayout_to_block_major``. Shapes are unchanged, so after
         this only Dist-MoE may read the weights; call it once per load that
         writes row-major weights, since a second call permutes them again.
-        ``interleave_gate_up`` also interleaves W13's gate and up rows, for
-        ``DistMoeRuntime.Config.interleaved_gate_up``.
         """
-        dist_moe.relayout_to_block_major(
-            self.w13.weight.flatten(1, 2), interleave_gate_up=interleave_gate_up
+        runtime = self._runtime
+        if runtime is None:
+            raise RuntimeError("Dist-MoE context is not initialized")
+        if not runtime.block_major_weights:
+            return
+        # Passed only when on, so a dist_moe without the option still works.
+        w13_options = (
+            {"interleave_gate_up": True} if runtime.interleaved_gate_up else {}
         )
+        dist_moe.relayout_to_block_major(self.w13.weight.flatten(1, 2), **w13_options)
         dist_moe.relayout_to_block_major(self.w2.weight)
 
     def _weight_operands(

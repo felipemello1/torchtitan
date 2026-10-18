@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -139,15 +140,8 @@ class _Wrapper:
 
     load_state_dict = VLLMModelWrapper.load_state_dict
 
-    def __init__(
-        self,
-        model: nn.Module,
-        block_major_weights: bool = False,
-        interleaved_gate_up: bool = False,
-    ):
+    def __init__(self, model: nn.Module):
         self.model = model
-        self._block_major_weights = block_major_weights
-        self._interleaved_gate_up = interleaved_gate_up
 
 
 def test_load_state_dict_allocates_one_fsdp_group_at_a_time(
@@ -237,10 +231,10 @@ def test_unshard_relayouts_dist_moe_experts_once(
     or without W13's gate/up rows interleaved.
     """
     dist_moe = pytest.importorskip("dist_moe")
-    layout_flags = {
-        "block_major_weights": True,
-        "interleaved_gate_up": interleaved_gate_up,
-    }
+    # Stand-in for the runtime's resolved layout, which the experts read.
+    runtime = SimpleNamespace(
+        block_major_weights=True, interleaved_gate_up=interleaved_gate_up
+    )
 
     def block_major(weight: torch.Tensor, interleave_gate_up: bool) -> torch.Tensor:
         weight_ENK = weight.reshape(weight.shape[0], -1, weight.shape[-1]).clone()
@@ -265,6 +259,7 @@ def test_unshard_relayouts_dist_moe_experts_once(
                 w2=GroupedLinear.Config(group_size=2, in_features=128, out_features=64),
                 top_k=1,
             ).build()
+            block.routed_experts._runtime = runtime
             model.layers.append(block)
         with torch.no_grad():
             for param in model.parameters():
@@ -291,13 +286,13 @@ def test_unshard_relayouts_dist_moe_experts_once(
         initial = {k: v.detach().clone() for k, v in model.state_dict().items()}
         for module in model.modules():  # as after the initial load
             if isinstance(module, FSDPModule):
-                model_wrapper._unshard_and_free_sharded_params(module, **layout_flags)
+                model_wrapper._unshard_and_free_sharded_params(module)
         assert_block_major(initial)
-        model_wrapper._unshard_and_free_sharded_params(model.layers[0], **layout_flags)
+        model_wrapper._unshard_and_free_sharded_params(model.layers[0])
         assert_block_major(initial)
 
         new_state_dict = {k: v + 1.0 for k, v in initial.items()}
-        _Wrapper(model, **layout_flags).load_state_dict(new_state_dict)
+        _Wrapper(model).load_state_dict(new_state_dict)
         assert_block_major(new_state_dict)
     finally:
         dist.destroy_process_group()

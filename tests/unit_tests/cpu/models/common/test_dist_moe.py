@@ -626,33 +626,54 @@ def test_runtime_passes_inference_to_annex() -> None:
     assert context_config.device_scratch_capacity_factor == 4.0
 
 
+_BF16_EXPERTS = [DistMoeTransform()]
+_MXFP8_EXPERTS = [DistMoeTransform(expert_precision="mxfp8")]
+_LORA_EXPERTS = [
+    DistMoeTransform(inplace_wgrad_accum=False),
+    LoRATransform(rank=8, alpha=16.0),
+]
+
+
 @pytest.mark.parametrize(
-    ("inference", "layout_flags", "experts", "expected"),
+    ("inference", "layout_flags", "transforms", "intermediate_dim", "expected"),
     [
-        (True, {}, "bf16", (True, True)),
-        (True, {"interleaved_gate_up": False}, "bf16", (True, False)),
-        (True, {"block_major_weights": False}, "bf16", (False, False)),
-        (False, {}, "bf16", (False, False)),
-        (True, {}, "mxfp8", (False, False)),
-        (True, {}, "intermediate_dim_96", (False, False)),
+        (True, {}, _BF16_EXPERTS, 64, (True, True)),
+        (True, {"interleaved_gate_up": False}, _BF16_EXPERTS, 64, (True, False)),
+        (True, {"block_major_weights": False}, _BF16_EXPERTS, 64, (False, False)),
+        (False, {}, _BF16_EXPERTS, 64, (False, False)),
+        (True, {}, _MXFP8_EXPERTS, 64, (False, False)),
+        (True, {}, _LORA_EXPERTS, 64, (False, False)),
+        (True, {}, _BF16_EXPERTS, 96, (False, False)),
+    ],
+    ids=[
+        "default",
+        "no_interleave",
+        "no_block_major",
+        "training",
+        "mxfp8",
+        "lora",
+        "intermediate_dim_96",
     ],
 )
 def test_runtime_resolves_the_inference_weight_layout(
     inference: bool,
     layout_flags: dict[str, bool],
-    experts: str,
+    transforms: list[Any],
+    intermediate_dim: int,
     expected: tuple[bool, bool],
 ) -> None:
-    """Inference defaults to block-major weights with interleaved W13, when dist_moe can read them."""
-    precision = "mxfp8" if experts == "mxfp8" else "bf16"
-    module = cast(
-        DistMoeRoutedExperts,
-        DistMoeTransform(expert_precision=precision)
-        .transform(_stock_config(dim=64))
-        .build(),
-    )
-    if experts == "intermediate_dim_96":
-        module.intermediate_dim = 96
+    """Inference defaults to block-major weights with interleaved W13 when dist_moe can read them.
+
+    The experts then relayout to that resolved layout, not to the requested one.
+    """
+    config = _stock_config(dim=128)
+    for transform in transforms:
+        config = transform.transform(config)
+    module = cast(DistMoeRoutedExperts, config.build())
+    with torch.no_grad():
+        for weight in (module.w13.weight, module.w2.weight):
+            weight.copy_(torch.randn_like(weight))
+    module.intermediate_dim = intermediate_dim
     runtime = _runtime()
     runtime.config = DistMoeRuntime.Config(inference=inference, **layout_flags)
 
@@ -663,8 +684,24 @@ def test_runtime_resolves_the_inference_weight_layout(
         max_moe_layers_per_activation_slot=3,
     )
 
-    layout = (context_config.block_major_weights, context_config.interleaved_gate_up)
+    layout = (runtime.block_major_weights, runtime.interleaved_gate_up)
     assert layout == expected
+    assert (
+        context_config.block_major_weights,
+        context_config.interleaved_gate_up,
+    ) == layout
+
+    w13_EFD = module.w13.weight.detach().flatten(1, 2).clone()
+    w2_EDF = module.w2.weight.detach().clone()
+    if runtime.block_major_weights:
+        dist_moe.relayout_to_block_major(
+            w13_EFD, interleave_gate_up=runtime.interleaved_gate_up
+        )
+        dist_moe.relayout_to_block_major(w2_EDF)
+    module._runtime = runtime
+    module.relayout_weights_for_context()
+    assert torch.equal(module.w13.weight.flatten(1, 2), w13_EFD)
+    assert torch.equal(module.w2.weight, w2_EDF)
 
 
 def test_mxfp8_transform_is_independent_and_uses_prepared_weights() -> None:

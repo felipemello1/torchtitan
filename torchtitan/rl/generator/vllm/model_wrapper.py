@@ -293,23 +293,17 @@ def _restore_sharded_params(module: FSDPModule) -> None:
         alloc_storage(sharded_data)
 
 
-def _unshard_and_free_sharded_params(
-    module: FSDPModule,
-    *,
-    block_major_weights: bool = False,
-    interleaved_gate_up: bool = False,
-) -> None:
+def _unshard_and_free_sharded_params(module: FSDPModule) -> None:
     """Unshard `module`'s FSDP group into its unsharded buffers, then free its sharded ones.
 
         before:  sharded: new weights   unsharded: old weights
         after:   sharded: freed         unsharded: new weights (what CUDA graphs read)
 
     The unshard is explicit because CUDA graph replays skip FSDP's forward pre-hook.
-    With `block_major_weights`, the group's Dist-MoE expert weights are then
-    re-laid out. A group that was already unsharded is skipped: `unshard()` is a
-    no-op there, its weights are already block-major, and a second relayout
-    would permute them again. `interleaved_gate_up` also interleaves W13's
-    gate/up rows in that relayout.
+    The group's Dist-MoE experts then re-lay out their weights for their context.
+    A group that was already unsharded is skipped: `unshard()` is a no-op there,
+    its weights are already in that layout, and a second relayout would permute
+    them again.
     """
     from torch.distributed.fsdp._fully_shard._fsdp_param import free_storage
 
@@ -321,12 +315,10 @@ def _unshard_and_free_sharded_params(
         # TODO: replace this with FSDPModule._free_sharded_params()
         for sharded_data in _sharded_param_storages(module):
             free_storage(sharded_data)
-        if block_major_weights and unshard_wrote_weights:
+        if unshard_wrote_weights:
             for submodule in _modules_in_fsdp_group(module):
                 if isinstance(submodule, DistMoeRoutedExperts):
-                    submodule.relayout_weights_to_block_major(
-                        interleave_gate_up=interleaved_gate_up
-                    )
+                    submodule.relayout_weights_for_context()
 
 
 @support_torch_compile(
@@ -457,11 +449,7 @@ class VLLMModelWrapper(Module):
         # based on the model's actual representation used during forward
         for module in self.model.modules():
             if isinstance(module, FSDPModule):
-                _unshard_and_free_sharded_params(
-                    module,
-                    block_major_weights=self._block_major_weights,
-                    interleaved_gate_up=self._interleaved_gate_up,
-                )
+                _unshard_and_free_sharded_params(module)
 
     def load_state_dict(self, state_dict: Mapping[str, Any]):
         """Copy new weights into `self.model`, allocating about one FSDP group's sharded buffers at a time.
@@ -505,11 +493,7 @@ class VLLMModelWrapper(Module):
             )
             handles.append(
                 modules[-1].register_load_state_dict_post_hook(
-                    lambda module, *args: _unshard_and_free_sharded_params(
-                        module,
-                        block_major_weights=self._block_major_weights,
-                        interleaved_gate_up=self._interleaved_gate_up,
-                    )
+                    lambda module, *args: _unshard_and_free_sharded_params(module)
                 )
             )
         incompatible_keys = self.model.load_state_dict(state_dict, strict=True)
@@ -568,9 +552,6 @@ class VLLMModelWrapper(Module):
         """
         self._dist_moe_runtime = None
         self._num_valid_tokens: torch.Tensor | None = None
-        # Whether each weight load re-lays out the expert weights for Dist-MoE.
-        self._block_major_weights = False
-        self._interleaved_gate_up = False
         if not any(
             isinstance(module, DistMoeRoutedExperts) for module in self.model.modules()
         ):
@@ -605,10 +586,11 @@ class VLLMModelWrapper(Module):
             num_tokens_per_microbatch_per_dp_rank=max_num_batched_tokens,
             pp_schedule=None,
         )
-        # The runtime turns these off for experts dist_moe can't read that way.
-        context_config = self._dist_moe_runtime.context.config
-        self._block_major_weights = context_config.block_major_weights
-        self._interleaved_gate_up = context_config.interleaved_gate_up
+        logger.info(
+            "Dist-MoE expert weights: block_major_weights=%s, interleaved_gate_up=%s",
+            self._dist_moe_runtime.block_major_weights,
+            self._dist_moe_runtime.interleaved_gate_up,
+        )
         # The runner writes each step's real token count here before the forward
         # runs, and forward builds the padding mask from it on the device, so
         # CUDA-graph replay sees the current count. The address must stay fixed

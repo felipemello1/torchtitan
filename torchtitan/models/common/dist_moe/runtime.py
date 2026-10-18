@@ -208,16 +208,17 @@ class DistMoeRuntime(Configurable):
                 planning with no saved activations, and a per-step row count
                 instead of the planned maximum. The activation-slot controls
                 must stay ``None``; ``dist_moe`` rejects them for inference.
-            block_major_weights: Have inference read routed-expert W13/W2 in
-                Dist-MoE's block-major layout, which streams faster; the
-                generator re-lays out the weights after every load
-                (``DistMoeRoutedExperts.relayout_weights_to_block_major``).
-                Training ignores it, and experts ``dist_moe`` can't read that
-                way (MXFP8, or ``intermediate_dim`` not a multiple of 64) keep
-                the plain layout.
+            block_major_weights: Inference only (training ignores it): store
+                routed-expert W13/W2 in Dist-MoE's block-major layout, which
+                streams faster. The generator re-lays out the weights after
+                every load (``DistMoeRoutedExperts.relayout_weights_for_context``).
+                MXFP8 and LoRA experts and an ``intermediate_dim`` that isn't a
+                multiple of 64 keep row-major weights.
             interleaved_gate_up: With block-major weights, also interleave W13's
                 gate and up rows in groups of 16, so the dispatch GEMM writes the
                 SwiGLU output itself, bitwise equal to the separate SwiGLU kernel.
+                Slower at some small shapes; see
+                ``dist_moe.Config.interleaved_gate_up``.
         """
 
         activation_slot_bytes: int | None = None
@@ -442,7 +443,13 @@ class DistMoeRuntime(Configurable):
         max_moe_layers_per_activation_slot: int,
         wgrad_dtype: torch.dtype | None = None,
     ) -> dist_moe.Config:
-        """Build the annex context configuration for one local expert module."""
+        """Build the annex context configuration for one local expert module.
+
+        Also records the weight layout dist_moe reads in ``block_major_weights``
+        and ``interleaved_gate_up``, which can be narrower than ``self.config``'s.
+        """
+        from .routed_experts import DistMoeRoutedExperts
+
         vmm = (
             None
             if self.config.vmm_capacity_factor is None
@@ -458,22 +465,29 @@ class DistMoeRuntime(Configurable):
                 "swiglu_alpha": module.swiglu_alpha,
                 "swiglu_limit": module.swiglu_limit,
             }
-        # Inference reads block-major weights with W13's gate/up rows
-        # interleaved, unless dist_moe can't read these experts that way (64 is
-        # its block width). Training passes neither, so a dist_moe without the
-        # options still trains.
-        # TODO: a W13 bias (GPT-OSS) also needs interleaved_gate_up off.
-        layout_options: dict[str, bool] = {}
-        if (
+        # Inference reads block-major weights (W13's gate/up rows interleaved if
+        # interleaved_gate_up). Training, experts that don't hand dist_moe their
+        # stored weights (MXFP8's prepared operands, LoRA's W + B @ A) and an
+        # intermediate_dim that isn't a multiple of 64 (dist_moe's block width)
+        # keep row-major weights.
+        # TODO: resolve interleaved_gate_up to False for experts with a W13 bias
+        # (GPT-OSS); dist_moe rejects the pair at the first forward.
+        self.block_major_weights = (
             self.config.inference
             and self.config.block_major_weights
-            and module.block_scaled_config is None
+            and type(module)._weight_operands is DistMoeRoutedExperts._weight_operands
             and module.intermediate_dim % 64 == 0
-        ):
-            layout_options = {
-                "block_major_weights": True,
-                "interleaved_gate_up": self.config.interleaved_gate_up,
-            }
+        )
+        self.interleaved_gate_up = (
+            self.block_major_weights and self.config.interleaved_gate_up
+        )
+        # Passed only when on, so a dist_moe without the options still works.
+        # TODO: pass both directly once dist_moe main has them.
+        layout_options: dict[str, bool] = {}
+        if self.block_major_weights:
+            layout_options["block_major_weights"] = True
+        if self.interleaved_gate_up:
+            layout_options["interleaved_gate_up"] = True
         return dist_moe.Config(
             max_num_local_input_tokens=max_num_local_input_tokens,
             hidden_dim=module.hidden_dim,
