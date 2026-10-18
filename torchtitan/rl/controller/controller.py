@@ -1069,7 +1069,8 @@ class Controller(Configurable):
                     rollout_groups=[group],
                 )
                 # Scored and recorded: nothing downstream reads the messages, so the held group
-                # doesn't keep them (most of the controller's GC-tracked objects).
+                # doesn't keep them (~42% of the controller's GC-tracked objects in the 10-node
+                # census).
                 for rollout in group.rollouts:
                     for rollout_turn in rollout.turns:
                         rollout_turn.drop_messages()
