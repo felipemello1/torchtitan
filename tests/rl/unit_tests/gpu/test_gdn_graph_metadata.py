@@ -9,7 +9,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from torchtitan.rl.generator.vllm import gdn, linear_attention
+from torchtitan.rl.generator.vllm import gdn, linear_attention, worker
 from torchtitan.rl.generator.vllm.linear_attention import (
     LinearAttentionExecutionPath,
     TorchTitanLinearAttentionMetadata,
@@ -90,7 +90,7 @@ def test_dp_support_level(monkeypatch, data_parallel_size, batch_invariant, expe
     assert support == expected
 
 
-def test_decode_batches_without_decode_graph_replay_packed_graph():
+def test_decode_batches_without_decode_graph_replay_packed_graph(monkeypatch):
     config = VllmConfig()
     config.compilation_config = CompilationConfig(
         mode=CompilationMode.NONE,
@@ -109,8 +109,6 @@ def test_decode_batches_without_decode_graph_replay_packed_graph():
     dispatcher.initialize_cudagraph_keys(CUDAGraphMode.FULL)
     packed = dispatcher.dispatch(8)
     assert packed[0] == CUDAGraphMode.FULL and not packed[1].uniform
-    # 2 decodes still replay their decode graph.
-    assert dispatcher.dispatch(2, uniform_decode=True)[1].uniform
     # 3 decodes fall between capture sizes 2 and 8.
     assert dispatcher.dispatch(3, uniform_decode=True) == packed
     # DP pads 2 decodes to a prefilling peer's 8 tokens.
@@ -118,6 +116,9 @@ def test_decode_batches_without_decode_graph_replay_packed_graph():
         dispatcher.dispatch(8, uniform_decode=True, valid_modes={CUDAGraphMode.FULL})
         == packed
     )
+    # Batch-invariant runs keep gap batches eager on the decode kernels.
+    monkeypatch.setattr(worker, "is_in_batch_invariant_mode", lambda: True)
+    assert dispatcher.dispatch(3, uniform_decode=True)[0] == CUDAGraphMode.NONE
 
 
 def test_full_metadata_and_native_dispatch_variants():

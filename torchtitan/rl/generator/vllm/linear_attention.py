@@ -75,10 +75,11 @@ class TorchTitanLinearAttentionMetadataBuilder(
     ) -> AttentionCGSupport:
         parallel = vllm_config.parallel_config
         if (
-            # TODO: batch-invariant runs keep decode-only graphs at DP > 1. A
-            # decode-only replica padded to a prefilling peer's size replays the
-            # packed graph, whose decode tokens don't match the decode kernels
-            # bitwise. DP = 1 mixed prefill + decode steps share this gap.
+            # TODO: drop once packed GDN kernels with initial state match the decode
+            # kernels bitwise; until then batch-invariant runs keep eager prefill at
+            # DP > 1 (a padded decode replica would replay the packed graph). Drop
+            # the batch-invariant clause in TorchTitanCudagraphDispatcher.dispatch
+            # with it, or padded decode replicas fail.
             (parallel.data_parallel_size != 1 and is_in_batch_invariant_mode())
             or parallel.use_ubatching
             or parallel.enable_dbo
