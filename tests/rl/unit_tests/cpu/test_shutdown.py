@@ -461,6 +461,15 @@ def test_spawn_proc_mesh_checks_gpus_per_host_before_spawning(
     assert all(mesh.visible_devices == [] for mesh in meshes.values())
 
 
+def test_per_host_provisioner_puts_malloc_arena_max_in_launch_env(monkeypatch):
+    """Trainer and generator procs get 8 arenas from the launch env, not the controller's 16."""
+    monkeypatch.setenv("MALLOC_ARENA_MAX", "16")
+
+    env = provisioning.PerHostProvisioner(total_gpus=8).allocate(2)
+
+    assert env == {"CUDA_VISIBLE_DEVICES": "0,1", "MALLOC_ARENA_MAX": "8"}
+
+
 def test_monarch_actor_system_provisions_every_role_before_spawning(monkeypatch):
     """`provision` spawns the GPU meshes on the launcher's hosts, then the router's and
     the batcher's procs, then sets up torch elastic on each GPU mesh, before any actor
