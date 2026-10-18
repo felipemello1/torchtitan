@@ -218,14 +218,17 @@ class DistMoeRuntime(Configurable):
                 interleave W13's gate and up rows in groups of 16 in the
                 block-major weights, so the dispatch GEMM writes the SwiGLU
                 output itself, bitwise equal to the separate SwiGLU kernel.
-                ``None`` turns it on when ``intermediate_dim >= 2048``
-                (measured at EP 4 on GB300):
+                ``None`` turns it on only in the region of the measured
+                winners: ``hidden_dim`` (D) >= 4096 and ``intermediate_dim`` (F)
+                >= 2048. Measured at EP 4 on GB300 with E experts, us per MoE
+                layer:
 
-                - F 2048 and 4096: faster at every size measured, by 6.6-74 us
-                  per MoE layer.
-                - F 512: 0.5-1.8 us faster at decode, 10-12 us slower at 512-1024
-                  tokens per GPU.
-                - F 768-1536 (Qwen3 MoE): not measured; keeps the separate kernel.
+                - E384 D7168 F2048 and E256 D4096 F4096: faster at every size
+                  measured, by 6.6-69.
+                - E256 D2048 F512: 0.5-1.8 faster at decode, 10-12 slower at
+                  512-1024 tokens per GPU.
+                - Smaller D or F is not measured (D and F were never varied
+                  separately) and defaults off; set ``True`` to opt in.
 
                 ``True`` forces it on and raises if the experts can't have
                 block-major weights; ``False`` keeps W13's row order.
@@ -492,8 +495,10 @@ class DistMoeRuntime(Configurable):
         )
         interleaved_gate_up = self.config.interleaved_gate_up
         if interleaved_gate_up is None:
-            # Config.interleaved_gate_up gives the measurements behind 2048.
-            interleaved_gate_up = module.intermediate_dim >= 2048
+            # Only in the region of the measured winners (see the Config).
+            interleaved_gate_up = (
+                module.hidden_dim >= 4096 and module.intermediate_dim >= 2048
+            )
         elif (
             interleaved_gate_up
             and self.config.inference

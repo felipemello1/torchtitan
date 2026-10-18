@@ -626,18 +626,19 @@ def test_runtime_passes_inference_to_annex() -> None:
     assert context_config.device_scratch_capacity_factor == 4.0
 
 
-_BF16_EXPERTS = [DistMoeTransform()]
-_MXFP8_EXPERTS = [DistMoeTransform(expert_precision="mxfp8")]
-_LORA_EXPERTS = [
+_BF16 = [DistMoeTransform()]
+_MXFP8 = [DistMoeTransform(expert_precision="mxfp8")]
+_LORA = [
     DistMoeTransform(inplace_wgrad_accum=False),
     LoRATransform(rank=8, alpha=16.0),
 ]
 
 
 def _build_experts(
-    transforms: list[Any], intermediate_dim: int
+    transforms: list[Any], hidden_dim: int, intermediate_dim: int
 ) -> DistMoeRoutedExperts:
-    config = _stock_config(dim=128, hidden_dim=intermediate_dim)
+    # make_routed_experts_config calls D `dim` and F `hidden_dim`.
+    config = _stock_config(dim=hidden_dim, hidden_dim=intermediate_dim)
     for transform in transforms:
         config = transform.transform(config)
     return cast(DistMoeRoutedExperts, config.build())
@@ -653,21 +654,23 @@ def _resolve(runtime: DistMoeRuntime, module: DistMoeRoutedExperts) -> Any:
 
 
 @pytest.mark.parametrize(
-    ("inference", "layout_flags", "transforms", "intermediate_dim", "expected"),
+    ("inference", "layout_flags", "transforms", "dims", "expected"),
     [
-        (True, {}, _BF16_EXPERTS, 2048, (True, True)),
-        (True, {}, _BF16_EXPERTS, 512, (True, False)),
-        (True, {"interleaved_gate_up": True}, _BF16_EXPERTS, 512, (True, True)),
-        (True, {"interleaved_gate_up": False}, _BF16_EXPERTS, 2048, (True, False)),
-        (True, {"block_major_weights": False}, _BF16_EXPERTS, 2048, (False, False)),
-        (False, {}, _BF16_EXPERTS, 2048, (False, False)),
-        (True, {}, _MXFP8_EXPERTS, 2048, (False, False)),
-        (True, {}, _LORA_EXPERTS, 2048, (False, False)),
-        (True, {}, _BF16_EXPERTS, 96, (False, False)),
+        (True, {}, _BF16, (4096, 2048), (True, True)),
+        (True, {}, _BF16, (4096, 1536), (True, False)),
+        (True, {}, _BF16, (2048, 2048), (True, False)),
+        (True, {"interleaved_gate_up": True}, _BF16, (128, 512), (True, True)),
+        (True, {"interleaved_gate_up": False}, _BF16, (4096, 2048), (True, False)),
+        (True, {"block_major_weights": False}, _BF16, (128, 512), (False, False)),
+        (False, {"interleaved_gate_up": True}, _BF16, (128, 512), (False, False)),
+        (True, {}, _MXFP8, (128, 512), (False, False)),
+        (True, {}, _LORA, (128, 512), (False, False)),
+        (True, {}, _BF16, (128, 96), (False, False)),
     ],
     ids=[
-        "auto_intermediate_dim_2048",
-        "auto_intermediate_dim_512",
+        "auto_d4096_f2048",
+        "auto_d4096_f1536",
+        "auto_d2048_f2048",
         "forced_on",
         "forced_off",
         "no_block_major",
@@ -681,14 +684,15 @@ def test_runtime_resolves_the_inference_weight_layout(
     inference: bool,
     layout_flags: dict[str, bool],
     transforms: list[Any],
-    intermediate_dim: int,
+    dims: tuple[int, int],
     expected: tuple[bool, bool],
 ) -> None:
-    """Inference defaults to block-major weights when dist_moe can read them, with W13 interleaved from F 2048.
+    """Inference defaults to block-major weights when dist_moe can read them, interleaving W13 from D 4096 and F 2048.
 
-    The experts then relayout to that resolved layout, not to the requested one.
+    ``dims`` is (``hidden_dim`` D, ``intermediate_dim`` F). The experts then
+    relayout to the resolved layout, not to the requested one.
     """
-    module = _build_experts(transforms, intermediate_dim)
+    module = _build_experts(transforms, *dims)
     with torch.no_grad():
         for weight in (module.w13.weight, module.w2.weight):
             weight.copy_(torch.randn_like(weight))
@@ -720,10 +724,10 @@ def test_runtime_resolves_the_inference_weight_layout(
 @pytest.mark.parametrize(
     ("layout_flags", "transforms", "intermediate_dim"),
     [
-        ({"block_major_weights": False}, _BF16_EXPERTS, 2048),
-        ({}, _MXFP8_EXPERTS, 2048),
-        ({}, _LORA_EXPERTS, 2048),
-        ({}, _BF16_EXPERTS, 96),
+        ({"block_major_weights": False}, _BF16, 2048),
+        ({}, _MXFP8, 2048),
+        ({}, _LORA, 2048),
+        ({}, _BF16, 96),
     ],
     ids=["no_block_major", "mxfp8", "lora", "intermediate_dim_96"],
 )
@@ -738,7 +742,7 @@ def test_runtime_rejects_forced_interleave_without_block_major_weights(
         inference=True, interleaved_gate_up=True, **layout_flags
     )
     with pytest.raises(ValueError, match="interleaved_gate_up=True needs block-major"):
-        _resolve(runtime, _build_experts(transforms, intermediate_dim))
+        _resolve(runtime, _build_experts(transforms, 128, intermediate_dim))
 
 
 def test_mxfp8_transform_is_independent_and_uses_prepared_weights() -> None:
