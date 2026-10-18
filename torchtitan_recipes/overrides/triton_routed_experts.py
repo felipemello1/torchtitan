@@ -85,11 +85,27 @@ def _load_weights(desc, offsets, evict_first, _semantic=None):
 
 
 @triton.jit
-def _count_routes_kernel(ids_ptr, counts_ptr, N, E: tl.constexpr, BLOCK: tl.constexpr):
+def _local_expert_ids(experts, first_expert, num_experts):
+    """Global expert ids -> this rank's ids, -1 for other ranks' experts and padding.
+
+    Example (rank 1 of 4, 64 experts each): [3, 70, 127, 128, -1] -> [-1, 6, 63, -1, -1]
+    """
+    local = experts - first_expert
+    return tl.where((local >= 0) & (local < num_experts), local, -1)
+
+
+@triton.jit
+def _count_routes_kernel(
+    ids_ptr, counts_ptr, N, first_expert, num_experts,
+    E: tl.constexpr, BLOCK: tl.constexpr, SKIP: tl.constexpr,
+):  # fmt: skip
     """Add this block's routes per expert to ``counts``: one atomic per expert per block."""
     routes = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     valid = routes < N
     experts = tl.load(ids_ptr + routes, mask=valid, other=0).to(tl.int32)
+    if SKIP:
+        experts = _local_expert_ids(experts, first_expert, num_experts)
+        valid = valid & (experts >= 0)
     block_counts = tl.histogram(experts, E, mask=valid)
     tl.atomic_add(
         counts_ptr + tl.arange(0, E), block_counts, mask=block_counts > 0, sem="relaxed"
@@ -102,9 +118,11 @@ def _route_scan_kernel(
     rows_ptr,
     offsets_ptr,
     N,
+    first_expert,
     num_experts,
     E: tl.constexpr,
     BLOCK: tl.constexpr,
+    SKIP: tl.constexpr,
 ):
     """Program ``e`` writes expert ``e``'s routes to its rows, in route order, and its end row."""
     expert = tl.program_id(0)
@@ -112,17 +130,22 @@ def _route_scan_kernel(
     counts = tl.zeros((E,), dtype=tl.int32)
     for start in range(0, N, BLOCK):
         routes = start + tl.arange(0, BLOCK)
-        experts = tl.load(ids_ptr + routes, mask=routes < N, other=0).to(tl.int32)
-        counts += tl.histogram(experts, E, mask=routes < N)
+        valid = routes < N
+        experts = tl.load(ids_ptr + routes, mask=valid, other=0).to(tl.int32)
+        if SKIP:
+            experts = _local_expert_ids(experts, first_expert, num_experts)
+            valid = valid & (experts >= 0)
+        counts += tl.histogram(experts, E, mask=valid)
     row = tl.sum(tl.where(e < expert, counts, 0), axis=0)
     tl.store(
         offsets_ptr + expert, row + tl.sum(tl.where(e == expert, counts, 0), axis=0)
     )
     for start in range(0, N, BLOCK):
         routes = start + tl.arange(0, BLOCK)
-        mine = (tl.load(ids_ptr + routes, mask=routes < N, other=-1) == expert).to(
-            tl.int32
-        )
+        experts = tl.load(ids_ptr + routes, mask=routes < N, other=-1)
+        if SKIP:
+            experts = _local_expert_ids(experts.to(tl.int32), first_expert, num_experts)
+        mine = (experts == expert).to(tl.int32)
         tl.store(
             rows_ptr + row + tl.cumsum(mine, axis=0) - mine, routes, mask=mine == 1
         )
@@ -131,8 +154,8 @@ def _route_scan_kernel(
 
 @triton.jit
 def _route_sorted_kernel(
-    ids_ptr, counts_ptr, fill_ptr, rows_ptr, offsets_ptr, N, num_experts,
-    E: tl.constexpr, BLOCK: tl.constexpr,
+    ids_ptr, counts_ptr, fill_ptr, rows_ptr, offsets_ptr, N, first_expert, num_experts,
+    E: tl.constexpr, BLOCK: tl.constexpr, SKIP: tl.constexpr,
 ):  # fmt: skip
     """Give each route a row of its expert; rows of one expert end up in any order.
 
@@ -149,7 +172,12 @@ def _route_sorted_kernel(
     i = tl.arange(0, BLOCK)
     routes = tl.program_id(0) * BLOCK + i
     # Padding routes get expert E, so they sort last and land in the unused bins >= E.
-    experts = tl.load(ids_ptr + routes, mask=routes < N, other=E).to(tl.int32)
+    if SKIP:  # skipped routes too
+        experts = tl.load(ids_ptr + routes, mask=routes < N, other=-1).to(tl.int32)
+        experts = _local_expert_ids(experts, first_expert, num_experts)
+        experts = tl.where(experts < 0, E, experts)
+    else:
+        experts = tl.load(ids_ptr + routes, mask=routes < N, other=E).to(tl.int32)
     sorted_keys = tl.sort((experts << 16) | i)
     experts = sorted_keys >> 16
     routes = tl.program_id(0) * BLOCK + (sorted_keys & 0xFFFF)
@@ -201,7 +229,7 @@ def _grouped_gemm_kernel(
     Else (w2, weight (E, D, F)): ``out = a @ W.T``.
     TMA_A: load a block's rows of ``a`` with one TMA box (rows past the expert are masked
     at the store); else with masked pointer loads.
-    ROUTES (EP=1): expert-sorted row ``i`` holds route ``routes[i] = token * TOP_K + k``;
+    ROUTES (no dispatcher): expert-sorted row ``i`` holds route ``routes[i] = token * TOP_K + k``;
     w13 reads ``a`` (x) at the route's token, and w2 writes ``out`` (y) at the route.
     """
     BLOCK_OUT: tl.constexpr = BLOCK_N // 2 if GATED else BLOCK_N
@@ -354,17 +382,29 @@ def _(routed_input_RD, offsets_E, w13_E2FD, w2_EDF):
 
 @triton.jit
 def _combine_kernel(
-    y_ptr, scores_ptr, out_ptr, D: tl.constexpr, K: tl.constexpr, BLOCK_D: tl.constexpr
-):
-    """``out[t] = sum_k score[t, k] * y[t * K + k]`` in fp32, one rounding."""
+    y_ptr, scores_ptr, ids_ptr, out_ptr, first_expert, num_experts,
+    D: tl.constexpr, K: tl.constexpr, BLOCK_D: tl.constexpr, SKIP: tl.constexpr,
+):  # fmt: skip
+    """``out[t] = sum_k score[t, k] * y[t * K + k]`` in fp32, one rounding.
+
+    SKIP (EP > 1): a route to another rank's expert or padding adds nothing; its y row was never
+    written, and its score is another rank's (or NaN on a padding row), so neither is read.
+    """
     tl.extra.cuda.gdc_wait()  # y comes from the w2 kernel (programmatic dependent launch)
     token = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
     for k in tl.static_range(K):
         score = tl.load(scores_ptr + token * K + k).to(tl.float32)
-        y = tl.load(y_ptr + (token * K + k).to(tl.int64) * D + cols).to(tl.float32)
+        y_ptrs = y_ptr + (token * K + k).to(tl.int64) * D + cols
+        if SKIP:
+            expert = tl.load(ids_ptr + token * K + k).to(tl.int32)
+            is_local = _local_expert_ids(expert, first_expert, num_experts) >= 0
+            score = tl.where(is_local, score, 0.0)
+            y = tl.load(y_ptrs, mask=is_local, other=0.0).to(tl.float32)
+        else:
+            y = tl.load(y_ptrs).to(tl.float32)
         # The trainer's compiled gather-sum rounds as y0*s0 + y1*s1, then one fma per
-        # route; the same order makes the outputs bitwise equal.
+        # route; the same order makes the outputs bitwise equal (at EP = 1).
         if k == 0:
             acc = libdevice.mul_rn(y, score)
         elif k == 1:
@@ -381,11 +421,19 @@ def triton_routed_experts_op(
     topk_expert_ids_TK: torch.Tensor,
     w13_E2FD: torch.Tensor,
     w2_EDF: torch.Tensor,
+    ep_rank: int = 0,
+    ep_size: int = 1,
 ) -> torch.Tensor:
-    """EP=1 routed-experts output ``(T, D)``: each token's ``K`` routes, weighted by their scores.
+    """Routed-experts output ``(T, D)``: each token's ``K`` routes, weighted by their scores.
+
+    With ``ep_size > 1`` this rank holds experts ``[ep_rank * E, (ep_rank + 1) * E)`` of the
+    global ids; routes to other experts, or -1, add nothing.
 
     Example:
         >>> out_TD = triton_routed_experts_op(x_TD, scores_TK, ids_TK, w13, w2)
+        >>> part_TD = triton_routed_experts_op(  # experts 64-127 of 256
+        ...     x_TD, scores_TK, ids_TK, w13, w2, ep_rank=1, ep_size=4
+        ... )
     """
     num_tokens, dim = x_TD.shape
     top_k = topk_expert_ids_TK.shape[1]
@@ -395,7 +443,9 @@ def triton_routed_experts_op(
     routes_N = x_TD.new_empty(num_routes, dtype=torch.int32)
     offsets_E = x_TD.new_empty(num_experts, dtype=torch.int32)
     experts_p2 = triton.next_power_of_2(num_experts)
-    tiles = _tiles(num_routes, num_experts)
+    skip, first_expert = ep_size > 1, ep_rank * num_experts
+    # About 1 / ep_size of the routes are local; their exact count is only on the device.
+    tiles = _tiles(num_routes // ep_size, num_experts)
     h_NF = x_TD.new_empty(num_routes, hidden)
     y_ND = x_TD.new_empty(num_routes, dim)
     out_TD = torch.empty_like(x_TD)
@@ -405,16 +455,17 @@ def triton_routed_experts_op(
         zeros = torch.zeros(3 * experts_p2, dtype=torch.int32, device=x_TD.device)
         fill, counts_E = zeros[: 2 * experts_p2], zeros[2 * experts_p2 :]
         _count_routes_kernel[(triton.cdiv(num_routes, 512),)](
-            ids_N, counts_E, num_routes, E=experts_p2, BLOCK=512
-        )
+            ids_N, counts_E, num_routes, first_expert, num_experts,
+            E=experts_p2, BLOCK=512, SKIP=skip,
+        )  # fmt: skip
         _route_sorted_kernel[(triton.cdiv(num_routes, 512),)](
-            ids_N, counts_E, fill, routes_N, offsets_E, num_routes,
-            num_experts, E=experts_p2, BLOCK=512,
+            ids_N, counts_E, fill, routes_N, offsets_E, num_routes, first_expert,
+            num_experts, E=experts_p2, BLOCK=512, SKIP=skip,
         )  # fmt: skip
     else:
         _route_scan_kernel[(num_experts,)](
-            ids_N, routes_N, offsets_E, num_routes, num_experts,
-            E=experts_p2, BLOCK=min(triton.next_power_of_2(num_routes), 2048),
+            ids_N, routes_N, offsets_E, num_routes, first_expert, num_experts,
+            E=experts_p2, BLOCK=min(triton.next_power_of_2(num_routes), 2048), SKIP=skip,
         )  # fmt: skip
     _launch_gemm(
         x_TD,
@@ -428,13 +479,14 @@ def triton_routed_experts_op(
     )
     _launch_gemm(h_NF, w2_EDF, y_ND, offsets_E, tiles, gated=False, routes_N=routes_N)
     _combine_kernel[(num_tokens, dim // block_d)](
-        y_ND, topk_scores_TK, out_TD, D=dim, K=top_k, BLOCK_D=block_d, launch_pdl=True
-    )
+        y_ND, topk_scores_TK, ids_N, out_TD, first_expert, num_experts,
+        D=dim, K=top_k, BLOCK_D=block_d, SKIP=skip, launch_pdl=True,
+    )  # fmt: skip
     return out_TD
 
 
 @triton_routed_experts_op.register_fake
-def _(x_TD, topk_scores_TK, topk_expert_ids_TK, w13_E2FD, w2_EDF):
+def _(x_TD, topk_scores_TK, topk_expert_ids_TK, w13_E2FD, w2_EDF, ep_rank=0, ep_size=1):
     return torch.empty_like(x_TD)
 
 
