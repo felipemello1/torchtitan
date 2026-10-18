@@ -75,11 +75,12 @@ class TorchTitanLinearAttentionMetadataBuilder(
     ) -> AttentionCGSupport:
         parallel = vllm_config.parallel_config
         if (
-            # TODO: drop once packed GDN kernels with initial state match the decode
-            # kernels bitwise; until then batch-invariant runs keep eager prefill at
-            # DP > 1 (a padded decode replica would replay the packed graph). Drop
-            # the batch-invariant clause in TorchTitanCudagraphDispatcher.dispatch
-            # with it, or padded decode replicas fail.
+            # TODO: drop once packed GDN/KDA kernels with initial state match the
+            # decode kernels bitwise; until then batch-invariant runs keep eager
+            # prefill at DP > 1 (a padded decode replica would replay the packed
+            # graph). Drop the batch-invariant clause in
+            # TorchTitanCudagraphDispatcher.dispatch with it, or padded decode
+            # replicas fail.
             (parallel.data_parallel_size != 1 and is_in_batch_invariant_mode())
             or parallel.use_ubatching
             or parallel.enable_dbo

@@ -74,7 +74,7 @@ class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
             and uniform_decode
             # Decode batches above the largest decode graph replay a packed graph:
             # - DP padded the batch to a prefilling peer's size, where vLLM allows only
-            #   FULL and fails with "No matching cudagraph found".
+            #   FULL, and the decode dispatcher fails "No matching cudagraph found".
             # - Capture sizes skip max_num_seqs; eager here makes all DP replicas eager.
             # Batch-invariant runs keep them eager on the decode kernels (see the TODO
             # in linear_attention.py).
