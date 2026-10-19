@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from torchtitan.components.loss import ChunkedLossWrapper
+from torchtitan.rl.trainer.losses.dapo import DAPOLoss
 from torchtitan.rl.trainer.losses.score_centering import ScoreCenteringLoss
 
 
@@ -219,29 +220,31 @@ def test_score_centering_through_chunked_loss_wrapper_matches_unchunked() -> Non
     torch.testing.assert_close(lm_head.weight.grad, ref_weight_grad)
 
 
-def test_score_centering_logs_the_shared_policy_metrics() -> None:
-    # The monitor's KL guard reads bit_wise/kl_k3; every RL loss logs it through policy_metrics.
+def test_score_centering_logs_the_same_policy_metrics_as_dapo() -> None:
     torch.manual_seed(0)
-    num_tokens, vocab_size, num_topk = 8, 16, 4
+    num_tokens, vocab_size = 8, 16
     logits = torch.randn(num_tokens, vocab_size)
     labels = torch.randint(0, vocab_size, (num_tokens,))
     generator_log_softmax = torch.log_softmax(
         logits + 0.1 * torch.randn(num_tokens, vocab_size), dim=-1
     )
-    loss_inputs = _loss_inputs(logits, labels, generator_log_softmax, num_topk)
+    loss_inputs = _loss_inputs(logits, labels, generator_log_softmax, num_topk=4)
 
     _, metrics = ScoreCenteringLoss.Config().build()(
         logits, labels, torch.tensor(num_tokens), **loss_inputs
     )
+    _, dapo_metrics = DAPOLoss.Config().build()(
+        logits,
+        labels,
+        torch.tensor(num_tokens),
+        **{
+            key: loss_inputs[key]
+            for key in ("generator_logprobs", "temperature", "advantages", "loss_mask")
+        },
+    )
 
-    log_ratio = (
-        torch.log_softmax(logits, dim=-1).gather(-1, labels[:, None])[:, 0]
-        - loss_inputs["generator_logprobs"]
-    )
+    shared_keys = dapo_metrics.keys() - {"loss/mean", "loss/ratio_clipped_frac"}
     torch.testing.assert_close(
-        metrics["bit_wise/kl_k3/mean"], (torch.expm1(log_ratio) - log_ratio).mean()
+        {key: metrics[key] for key in shared_keys},
+        {key: dapo_metrics[key] for key in shared_keys},
     )
-    torch.testing.assert_close(
-        metrics["bit_wise/logprob_diff_abs/mean"], log_ratio.abs().mean()
-    )
-    assert "bit_wise/ratio_beyond_2x/mean" in metrics

@@ -181,7 +181,6 @@ class ScoreCenteringLoss(BaseLoss):
                 loss_metric_sums["loss/ratio_truncated_frac"] = (
                     ((ratio > self.max_ratio) & effective_loss_mask).float().sum()
                 )
-        # The metrics every RL loss logs (logprob diff, KL k3, entropy, ...), as DAPOLoss does.
         tokens = ScoredTokens(
             generator_logprobs=generator_logprobs,
             advantages=advantages,
@@ -191,10 +190,9 @@ class ScoreCenteringLoss(BaseLoss):
             log_ratio=masked_log_ratio,
             ratio=ratio,
         )
-        metrics = policy_metrics(
+        return loss, policy_metrics(
             tokens,
             loss_metric_sums,
             loss=loss,
             global_loss_token_counts=global_loss_token_counts,
         )
-        return loss, metrics
