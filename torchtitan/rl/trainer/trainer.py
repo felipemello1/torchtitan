@@ -24,6 +24,7 @@ from torchtitan.config.validation import validate_model_training_config
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.models.base.model import BaseModel
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
+from torchtitan.models.common.moe import collect_routing_mismatch_metrics
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.observability.metrics import compute_training_performance_metrics
@@ -88,6 +89,10 @@ class Trainer(Configurable):
 
         model: BaseModel.Config
         """Trainer model config, built for ``parallelism``."""
+
+        log_routing_mismatch_per_layer: bool = False
+        """With router replay, also log each MoE layer's `moe_routing/set_mismatch_frac/layer_<i>`
+        (the aggregate keys are always logged)."""
 
     def __init__(
         self,
@@ -427,6 +432,11 @@ class Trainer(Configurable):
                 ),
                 "trainer/memory/num_ooms": float(device_mem_stats.num_ooms),
                 **collect_aux_loss_metrics(engine.parallelism_context),
+                **collect_routing_mismatch_metrics(
+                    engine.model_parts,
+                    engine.parallelism_context,
+                    per_layer=self.config.log_routing_mismatch_per_layer,
+                ),
                 **(
                     {"trainer/mfu_percent": performance["mfu_percent"]}
                     if "mfu_percent" in performance

@@ -467,6 +467,7 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
                 dp_shard=1,
                 get_optional_mesh=lambda _: None,
             ),
+            model_parts=[],  # no MoE routers: no routing-mismatch metrics
             num_completed_steps=4,
             ntokens_seen=12,
             has_quantization=False,
@@ -481,6 +482,7 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
             torch.tensor(2.0),
         )[1]
         trainer.engine = engine
+        trainer.config = SimpleNamespace(log_routing_mismatch_per_layer=False)
         trainer._resume_state = MirroredState()
         trainer.gpu_peak_flops = 1000
         trainer._step_compute_start = 0.0
