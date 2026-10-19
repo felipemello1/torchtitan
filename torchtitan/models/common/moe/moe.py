@@ -222,9 +222,8 @@ class TokenChoiceTopKRouter(Module):
             torch.zeros(config.num_experts, dtype=torch.float32),
             persistent=False,
         )
-        # [real tokens, tokens whose top-k set differs, differing experts] between this router's
-        # own top-k and the replayed ``routed_expert_ids_TK``, summed until
-        # ``collect_routing_mismatch_metrics`` reads them.
+        # ``_count_routing_mismatch``'s counts, summed until ``collect_routing_mismatch_metrics``
+        # reads them.
         self.register_buffer(
             "routing_mismatch_counts",
             torch.zeros(3, dtype=torch.float32),
