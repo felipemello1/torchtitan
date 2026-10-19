@@ -40,7 +40,10 @@ from torchtitan.models.common.dist_moe import (
     DistMoeRuntime,
     MXFP8DistMoeRoutedExperts,
 )
-from torchtitan.models.common.dist_moe.routed_experts import _BlockMajorWeight
+from torchtitan.models.common.dist_moe.routed_experts import (
+    _BlockMajorWeight,
+    _InterleavedBlockMajorWeight,
+)
 from torchtitan.models.common.dist_moe.runtime import _DistMoeForwardContext
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import RoutedExperts
@@ -646,36 +649,49 @@ def _experts_config(
 
 
 @pytest.mark.parametrize(
-    ("block_major_weights", "transforms", "intermediate_dim", "expected"),
+    ("layout_flags", "transforms", "dims", "expected"),
     [
-        (True, _BF16, 128, True),
-        (False, _BF16, 128, False),
-        (True, _MXFP8, 128, False),
-        (True, _LORA, 128, False),
-        (True, _BF16, 96, False),
+        ({}, _BF16, (4096, 2048), (True, True)),
+        ({}, _BF16, (4096, 1536), (True, False)),
+        ({}, _BF16, (2048, 2048), (True, False)),
+        ({"interleaved_gate_up": True}, _BF16, (128, 512), (True, True)),
+        ({"interleaved_gate_up": False}, _BF16, (4096, 2048), (True, False)),
+        ({"block_major_weights": False}, _BF16, (128, 512), (False, False)),
+        ({}, _MXFP8, (128, 512), (False, False)),
+        ({}, _LORA, (128, 512), (False, False)),
+        ({}, _BF16, (128, 96), (False, False)),
     ],
-    ids=["bf16", "off", "mxfp8", "lora", "intermediate_dim_96"],
+    ids=[
+        "auto_d4096_f2048",
+        "auto_d4096_f1536",
+        "auto_d2048_f2048",
+        "forced_on",
+        "forced_off",
+        "no_block_major",
+        "mxfp8",
+        "lora",
+        "intermediate_dim_96",
+    ],
 )
-def test_runtime_resolves_block_major_weights(
-    block_major_weights: bool,
+def test_runtime_resolves_the_inference_weight_layout(
+    layout_flags: dict[str, bool],
     transforms: list[Any],
-    intermediate_dim: int,
-    expected: bool,
+    dims: tuple[int, int],
+    expected: tuple[bool, bool],
 ) -> None:
-    """Inference experts get block-major weights only when dist_moe reads their stored weights.
+    """Inference defaults to block-major weights when dist_moe can read them, interleaving W13 from D 4096 and F 2048.
 
-    Experts built with the result wrap their weights for it and pass it to their
-    context.
+    ``dims`` is (``hidden_dim`` D, ``intermediate_dim`` F). Experts built with
+    the resolved layout wrap their weights for it and pass it to their context.
     """
-    experts = _experts_config(transforms, 128, intermediate_dim)
+    experts = _experts_config(transforms, *dims)
     runtime = _runtime()
-    runtime.config = DistMoeRuntime.Config(
-        inference=True, block_major_weights=block_major_weights
-    )
+    runtime.config = DistMoeRuntime.Config(inference=True, **layout_flags)
 
-    experts.block_major_weights = runtime.config.resolve_block_major_weights(experts)
+    layout = runtime.config.resolve_weight_layout(experts)
 
-    assert experts.block_major_weights == expected
+    assert layout == expected
+    experts.block_major_weights, experts.interleaved_gate_up = layout
     module = experts.build()
     context_config = runtime._resolve_context_config(
         module,
@@ -683,12 +699,23 @@ def test_runtime_resolves_block_major_weights(
         max_live_activation_slots=1,
         max_moe_layers_per_activation_slot=3,
     )
-    assert context_config.block_major_weights == expected
-    if expected:
-        assert isinstance(module.w13.weight, _BlockMajorWeight)
+    assert (
+        context_config.block_major_weights,
+        context_config.interleaved_gate_up,
+    ) == layout
+    if layout[0]:
         assert isinstance(module.w2.weight, _BlockMajorWeight)
+        assert isinstance(module.w13.weight, _BlockMajorWeight)
+        assert isinstance(module.w13.weight, _InterleavedBlockMajorWeight) == layout[1]
         with pytest.raises(RuntimeError, match="built by FSDP's unshard"):
             module._weight_operands()
+
+
+def test_runtime_rejects_forced_interleave_without_block_major_weights() -> None:
+    """``interleaved_gate_up=True`` raises instead of falling back to row-major W13."""
+    config = DistMoeRuntime.Config(inference=True, interleaved_gate_up=True)
+    with pytest.raises(ValueError, match="interleaved_gate_up=True needs block-major"):
+        config.resolve_weight_layout(_experts_config(_MXFP8, 128, 2048))
 
 
 def test_mxfp8_transform_is_independent_and_uses_prepared_weights() -> None:

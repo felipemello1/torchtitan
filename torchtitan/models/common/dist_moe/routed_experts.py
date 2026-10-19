@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import ClassVar, Literal
 
 import spmd_types as spmd
 import torch
@@ -68,6 +68,8 @@ class _BlockMajorWeight(_ShardedFSDPTensor):
     is already unsharded gathers nothing and does not call this.
     """
 
+    interleaved_gate_up: ClassVar[bool] = False
+
     def _build_operands(
         self,
         logical_tensor: torch.Tensor,
@@ -78,8 +80,16 @@ class _BlockMajorWeight(_ShardedFSDPTensor):
         if out is None:
             out = _BlockMajorOperands(torch.empty_like(weight_ENK))
         out.weight.copy_(weight_ENK)
-        dist_moe.relayout_to_block_major(out.weight)
+        dist_moe.relayout_to_block_major(
+            out.weight, interleave_gate_up=self.interleaved_gate_up
+        )
         return out
+
+
+class _InterleavedBlockMajorWeight(_BlockMajorWeight):
+    """W13 with gate and up rows interleaved, so the dispatch GEMM writes SwiGLU."""
+
+    interleaved_gate_up: ClassVar[bool] = True
 
 
 class DistMoeRoutedExperts(Module):
@@ -115,6 +125,9 @@ class DistMoeRoutedExperts(Module):
             block_major_weights: Hand Dist-MoE a block-major copy of W13/W2.
                 Inference only; set by the vLLM generator from
                 ``DistMoeRuntime.Config``.
+            interleaved_gate_up: Also interleave W13's gate and up rows in that
+                copy, so the dispatch GEMM writes the SwiGLU output. Needs
+                ``block_major_weights``; set by the vLLM generator.
         """
 
         w13: GroupedLinear.Config
@@ -127,6 +140,7 @@ class DistMoeRoutedExperts(Module):
         swiglu_alpha: float | None = None
         swiglu_limit: float | None = None
         block_major_weights: bool = False
+        interleaved_gate_up: bool = False
 
         def __post_init__(self) -> None:
             """Validate expert dimensions consumed by the annex kernels."""
@@ -180,6 +194,7 @@ class DistMoeRoutedExperts(Module):
         self.swiglu_alpha = config.swiglu_alpha
         self.swiglu_limit = config.swiglu_limit
         self.block_major_weights = config.block_major_weights
+        self.interleaved_gate_up = config.interleaved_gate_up
         self._runtime: DistMoeRuntime | None = None
         if self.block_major_weights:
             self._wrap_block_major_weights()
@@ -190,12 +205,17 @@ class DistMoeRoutedExperts(Module):
 
     def _wrap_block_major_weights(self) -> None:
         """Wrap W13/W2 in the FSDP weight class that builds the block-major copy."""
-        for proj in (self.w13, self.w2):
-            if isinstance(proj.weight, _BlockMajorWeight):
+        w13_cls = (
+            _InterleavedBlockMajorWeight
+            if self.interleaved_gate_up
+            else _BlockMajorWeight
+        )
+        for proj, wrapper_cls in ((self.w13, w13_cls), (self.w2, _BlockMajorWeight)):
+            if isinstance(proj.weight, wrapper_cls):
                 continue
             weight = proj.weight
             wrapped_weight = torch.nn.Parameter(
-                _BlockMajorWeight(weight.data), requires_grad=weight.requires_grad
+                wrapper_cls(weight.data), requires_grad=weight.requires_grad
             )
             spmd.assert_type_like(wrapped_weight, weight)
             proj.weight = wrapped_weight
