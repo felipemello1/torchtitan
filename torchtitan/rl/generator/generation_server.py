@@ -118,6 +118,8 @@ class GenerationServer:
         self.generation_metadata: dict[str, VerifiersGenerationMetadata] = {}
         # Group id -> the sessions with folded metadata, so `drop_generation_metadata` can free them.
         self._group_sessions: dict[int, set[str]] = {}
+        # This process's (the engine's) GC time, attached to each completion's metrics; set by `start`.
+        self._gc_timer: m.GCTimer | None = None
 
     @property
     def port(self) -> int:
@@ -148,6 +150,7 @@ class GenerationServer:
         await web.SockSite(runner, sock, backlog=4096).start()
         self.runner = runner
         self.bound_port = int(sock.getsockname()[1])
+        self._gc_timer = m.GCTimer("generator")
         # Every in-flight call holds a connection, so a low open-file limit caps concurrency.
         logger.info(
             "Generation server listening on %s (open-file limit %d)",
@@ -159,6 +162,7 @@ class GenerationServer:
         runner = self.runner
         if runner is not None:
             await runner.cleanup()
+            self._gc_timer.close()
         self.runner = None
         self.bound_port = None
         self.generation_metadata.clear()
@@ -287,6 +291,10 @@ class GenerationServer:
                 {"error": "completion token IDs and logprobs have different lengths"},
                 status=500,
             )
+        # Validation (negative group ids) logs at the same W&B step under these keys: leave this
+        # process's GC time for the next training completion.
+        if group_id >= 0:
+            completion.metrics = [*completion.metrics, *self._gc_timer.flush()]
         if response_format == TORCHTITAN_RESPONSE_FORMAT:
             return web.json_response(completion_to_response(completion))
         if completion.finish_reason not in ("stop", "length"):

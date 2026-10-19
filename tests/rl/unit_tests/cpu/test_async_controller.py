@@ -593,13 +593,17 @@ def test_compute_perf_ratio_metrics_reads_flushed_means() -> None:
     ratios = {
         metric.key: metric.value.value
         for metric in compute_perf_ratio_metrics(
-            num_global_valid_tokens=100, time_metrics=time_metrics
+            num_global_valid_tokens=100,
+            num_global_tokens=400,
+            time_metrics=time_metrics,
         )
     }
     assert ratios == pytest.approx(
         {
             "perf/trainer/tokens_per_second_full_step": 5.0,
             "perf/trainer/tokens_per_second_forward_backward": 12.5,
+            "perf/trainer/all_tokens_per_second_full_step": 20.0,
+            "perf/trainer/all_tokens_per_second_forward_backward": 50.0,
             # One ratio per timing/step/<phase>; unaccounted is the rest of the step.
             "perf/trainer/step_time_ratio/metrics_log": 0.05,
             "perf/trainer/step_time_ratio/sync_log_step": 0.05,
@@ -620,15 +624,23 @@ def test_compute_perf_ratio_metrics_skips_missing_spans() -> None:
     keys = {
         metric.key
         for metric in compute_perf_ratio_metrics(
-            num_global_valid_tokens=100, time_metrics=time_metrics
+            num_global_valid_tokens=100,
+            num_global_tokens=400,
+            time_metrics=time_metrics,
         )
     }
-    assert keys == {"perf/trainer/tokens_per_second_full_step"}
+    assert keys == {
+        "perf/trainer/tokens_per_second_full_step",
+        "perf/trainer/all_tokens_per_second_full_step",
+    }
 
 
 def test_compute_perf_ratio_metrics_returns_empty_without_total() -> None:
     assert (
-        compute_perf_ratio_metrics(num_global_valid_tokens=100, time_metrics=[]) == []
+        compute_perf_ratio_metrics(
+            num_global_valid_tokens=100, num_global_tokens=400, time_metrics=[]
+        )
+        == []
     )
 
 
@@ -1644,7 +1656,7 @@ def _training_batch(step: int) -> SimpleNamespace:
         min_policy_versions=[step - 1],
         microbatch_groups=[],
         global_loss_token_counts=[1],
-        global_routing_token_counts=None,
+        global_routing_token_counts=[1],
         group_ids=[step],
     )
 
