@@ -8,11 +8,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import logging
 import math
 import os
 import subprocess
+import time
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -903,3 +905,18 @@ def test_gc_timer_times_collections() -> None:
     assert values[m.Sum] == values[m.Max] > 0.0
     gc.collect(0)  # after close(): not timed, and the flush above reset the totals
     assert all(metric.value.value == 0.0 for metric in gc_timer.flush())
+
+
+def test_event_loop_lag_records_a_blocking_call() -> None:
+    async def run() -> list[m.Metric]:
+        lag = m.EventLoopLag("controller", interval_s=0.01, threshold_s=0.05)
+        await asyncio.sleep(0.02)  # let the lag task start its first check
+        time.sleep(0.3)  # blocks the loop
+        await asyncio.sleep(0.05)  # the lag task wakes late and records it
+        metrics = lag.flush()
+        lag.close()
+        return metrics
+
+    values = {type(metric.value): metric.value.value for metric in asyncio.run(run())}
+    assert values[m.Max] >= 250.0
+    assert values[m.Sum] >= values[m.Max]
