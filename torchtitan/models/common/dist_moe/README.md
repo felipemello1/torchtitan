@@ -293,6 +293,17 @@ vLLM's per-step token budget. vLLM pads every step at the end (TP rounding,
 CUDA-graph size, DP maximum); the runner publishes the unpadded count and the
 model passes a `padding_mask` down to the routed experts.
 
+With `block_major_weights=True` the generator hands Dist-MoE a copy of expert
+W13/W2 that it reads faster:
+
+- block-major (`block_major_weights`).
+
+FSDP's post-all-gather hook copies the gathered weights into the same tensor
+and rewrites it in place with `dist_moe.relayout_to_block_major` on every
+unshard that gathers new weights (the initial load and each weight sync), so
+CUDA graphs keep reading one address. Training, MXFP8 and LoRA experts, and an
+`intermediate_dim` that isn't a multiple of 64 keep row-major weights.
+
 ## Padding Rows
 
 Rows marked in `padding_mask` get expert ID `-1` and score zero, in training and

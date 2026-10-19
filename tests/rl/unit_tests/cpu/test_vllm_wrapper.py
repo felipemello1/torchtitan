@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 import importlib
 
 import pytest
@@ -13,7 +14,11 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule, fully_shard
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config.transform import LoRATransform
+from torchtitan.config.transform.dist_moe import DistMoeTransform
 from torchtitan.models.common.attention import InnerAttention
+from torchtitan.models.common.dist_moe import DistMoeRoutedExperts, DistMoeRuntime
+from torchtitan.models.common.linear import GroupedLinear
 from torchtitan.models.deepseek_v3 import build_model_config as build_deepseek_config
 from torchtitan.models.kimi_k3 import build_model_config as build_kimi_config
 from torchtitan.models.qwen3 import build_model_config as build_qwen3_config
@@ -213,3 +218,83 @@ def test_load_state_dict_allocates_one_fsdp_group_at_a_time(
             assert param.equal(new_state_dict[name].to_local()), name
     finally:
         dist.destroy_process_group()
+
+
+def test_unshard_hands_dist_moe_block_major_copy_of_loaded_weights(tmp_path) -> None:
+    """Each unshard that gathers new expert weights rebuilds Dist-MoE's block-major copy in place.
+
+    Covers the initial unshard and a weight sync through `load_state_dict` that
+    replaces every weight with new random values, so a stale W13 or W2 fails.
+    The copy keeps its address, which CUDA graphs read.
+    """
+    dist_moe = pytest.importorskip("dist_moe")
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'store'}", rank=0, world_size=1
+    )
+    try:
+        model = nn.Module()
+        model.layers = nn.ModuleList([nn.Module()])
+        model.layers[0].routed_experts = DistMoeRoutedExperts.Config(
+            w13=GroupedLinear.Config(
+                group_size=2, in_features=128, out_features=128, num_linears=2
+            ),
+            w2=GroupedLinear.Config(group_size=2, in_features=128, out_features=128),
+            top_k=1,
+            block_major_weights=True,
+        ).build()
+        initial = {}
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                initial[name] = torch.randn(param.shape)
+                param.copy_(initial[name])
+        mesh = init_device_mesh("cpu", (1,))
+        fully_shard(model.layers[0], mesh=mesh)
+        fully_shard(model, mesh=mesh)
+        model.set_keep_unsharded_storage(True)
+
+        def expert_operands() -> dict[str, torch.Tensor]:
+            return {
+                name: param.operands.weight
+                for name, param in model.named_parameters()
+                if "routed_experts" in name
+            }
+
+        def assert_block_major(weights: dict[str, torch.Tensor]) -> None:
+            for name, operand in expert_operands().items():
+                expected = weights[name].flatten(1, -2).clone()
+                dist_moe.relayout_to_block_major(expected)
+                assert operand.equal(expected), name
+
+        for module in model.modules():  # as after the initial load
+            if isinstance(module, FSDPModule):
+                model_wrapper._unshard_and_free_sharded_params(module)
+        assert_block_major(initial)
+        addresses = {name: t.data_ptr() for name, t in expert_operands().items()}
+
+        new_state_dict = {
+            k: torch.randn_like(v.detach()) for k, v in model.state_dict().items()
+        }
+        _Wrapper(model).load_state_dict(new_state_dict)
+        assert_block_major({k: v.to_local() for k, v in new_state_dict.items()})
+        assert {
+            name: t.data_ptr() for name, t in expert_operands().items()
+        } == addresses
+    finally:
+        dist.destroy_process_group()
+
+
+def test_generator_gives_every_dist_moe_expert_one_layout() -> None:
+    """The vLLM wrapper sets the resolved layout; LoRA on one layer keeps all row-major."""
+    config = DistMoeTransform(inplace_wgrad_accum=False).transform(
+        build_qwen3_config("debugmodel_moe", parallelism=ParallelismConfig())
+    )
+    first = next(fqn for fqn, *_ in config.traverse(DistMoeRoutedExperts.Config))
+    lora_config = LoRATransform(
+        rank=8, alpha=16.0, target_modules=[f"{first}.w2"]
+    ).transform(copy.deepcopy(config))
+    runtime_config = DistMoeRuntime.Config(inference=True, block_major_weights=True)
+    for model_config, expected in ((config, True), (lora_config, False)):
+        model_wrapper._set_dist_moe_weight_layout(model_config, runtime_config)
+        experts = model_config.traverse(DistMoeRoutedExperts.Config)
+        assert {cfg.block_major_weights for _, cfg, _, _ in experts} == {expected}

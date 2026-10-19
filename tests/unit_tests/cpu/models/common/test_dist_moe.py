@@ -40,6 +40,7 @@ from torchtitan.models.common.dist_moe import (
     DistMoeRuntime,
     MXFP8DistMoeRoutedExperts,
 )
+from torchtitan.models.common.dist_moe.routed_experts import _BlockMajorWeight
 from torchtitan.models.common.dist_moe.runtime import _DistMoeForwardContext
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import RoutedExperts
@@ -58,10 +59,10 @@ def _parameter_initializers() -> dict[str, Any]:
     }
 
 
-def _stock_config(*, dim: int = 32) -> RoutedExperts.Config:
+def _stock_config(*, dim: int = 32, hidden_dim: int = 64) -> RoutedExperts.Config:
     return make_routed_experts_config(
         dim=dim,
-        hidden_dim=64,
+        hidden_dim=hidden_dim,
         num_experts=4,
         top_k=2,
         param_init=_parameter_initializers(),
@@ -624,6 +625,70 @@ def test_runtime_passes_inference_to_annex() -> None:
 
     assert context_config.inference
     assert context_config.device_scratch_capacity_factor == 4.0
+
+
+_BF16 = [DistMoeTransform()]
+_MXFP8 = [DistMoeTransform(expert_precision="mxfp8")]
+_LORA = [
+    DistMoeTransform(inplace_wgrad_accum=False),
+    LoRATransform(rank=8, alpha=16.0),
+]
+
+
+def _experts_config(
+    transforms: list[Any], hidden_dim: int, intermediate_dim: int
+) -> DistMoeRoutedExperts.Config:
+    # make_routed_experts_config calls D `dim` and F `hidden_dim`.
+    config = _stock_config(dim=hidden_dim, hidden_dim=intermediate_dim)
+    for transform in transforms:
+        config = transform.transform(config)
+    return cast(DistMoeRoutedExperts.Config, config)
+
+
+@pytest.mark.parametrize(
+    ("block_major_weights", "transforms", "intermediate_dim", "expected"),
+    [
+        (True, _BF16, 128, True),
+        (False, _BF16, 128, False),
+        (True, _MXFP8, 128, False),
+        (True, _LORA, 128, False),
+        (True, _BF16, 96, False),
+    ],
+    ids=["bf16", "off", "mxfp8", "lora", "intermediate_dim_96"],
+)
+def test_runtime_resolves_block_major_weights(
+    block_major_weights: bool,
+    transforms: list[Any],
+    intermediate_dim: int,
+    expected: bool,
+) -> None:
+    """Inference experts get block-major weights only when dist_moe reads their stored weights.
+
+    Experts built with the result wrap their weights for it and pass it to their
+    context.
+    """
+    experts = _experts_config(transforms, 128, intermediate_dim)
+    runtime = _runtime()
+    runtime.config = DistMoeRuntime.Config(
+        inference=True, block_major_weights=block_major_weights
+    )
+
+    experts.block_major_weights = runtime.config.resolve_block_major_weights(experts)
+
+    assert experts.block_major_weights == expected
+    module = experts.build()
+    context_config = runtime._resolve_context_config(
+        module,
+        max_num_local_input_tokens=128,
+        max_live_activation_slots=1,
+        max_moe_layers_per_activation_slot=3,
+    )
+    assert context_config.block_major_weights == expected
+    if expected:
+        assert isinstance(module.w13.weight, _BlockMajorWeight)
+        assert isinstance(module.w2.weight, _BlockMajorWeight)
+        with pytest.raises(RuntimeError, match="built by FSDP's unshard"):
+            module._weight_operands()
 
 
 def test_mxfp8_transform_is_independent_and_uses_prepared_weights() -> None:
