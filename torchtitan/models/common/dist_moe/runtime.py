@@ -22,7 +22,7 @@ import math
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Literal, TYPE_CHECKING
+from typing import cast, Literal, TYPE_CHECKING
 
 import torch
 from torch.distributed.pipelining import (
@@ -208,10 +208,10 @@ class DistMoeRuntime(Configurable):
                 planning with no saved activations, and a per-step row count
                 instead of the planned maximum. The activation-slot controls
                 must stay ``None``; ``dist_moe`` rejects them for inference.
-            block_major_weights: Inference only (training ignores it): store
-                routed-expert W13/W2 in Dist-MoE's block-major layout, which
-                streams faster. The generator re-lays out the weights after
-                every load (``DistMoeRoutedExperts.relayout_weights_for_context``).
+            block_major_weights: Inference only (training ignores it): hand
+                Dist-MoE a block-major copy of routed-expert W13/W2, which
+                streams faster. FSDP builds it on every unshard that gathers
+                new weights (the initial load and each weight sync).
                 MXFP8 and LoRA experts and an ``intermediate_dim`` that isn't a
                 multiple of 64 keep row-major weights.
             interleaved_gate_up: Inference only (training ignores it): also
@@ -288,6 +288,44 @@ class DistMoeRuntime(Configurable):
                 "microbatch",
             ):
                 raise ValueError("unsupported PP activation-slot policy")
+
+        def resolve_weight_layout(
+            self, experts: DistMoeRoutedExperts.Config
+        ) -> tuple[bool, bool]:
+            """Return the ``(block_major_weights, interleaved_gate_up)`` pair for inference experts.
+
+            Experts that don't hand dist_moe their stored weights (MXFP8's
+            prepared operands, LoRA's W + B @ A) and an ``intermediate_dim``
+            that isn't a multiple of 64 (dist_moe's block width) keep
+            row-major weights.
+            """
+            from .routed_experts import DistMoeRoutedExperts
+
+            # TODO: a W13 bias (GPT-OSS) can't interleave either: resolve None
+            # to off and raise on True for it; dist_moe rejects the pair at the
+            # first forward.
+            hidden_dim = experts.w13.in_features
+            intermediate_dim = experts.w2.in_features
+            owner = cast(type[DistMoeRoutedExperts], experts._owner)
+            block_major_weights = (
+                self.block_major_weights
+                and owner._weight_operands is DistMoeRoutedExperts._weight_operands
+                and intermediate_dim % 64 == 0
+            )
+            interleaved_gate_up = self.interleaved_gate_up
+            if interleaved_gate_up is None:
+                # Only in the region of the measured winners (see the Config).
+                interleaved_gate_up = hidden_dim >= 4096 and intermediate_dim >= 2048
+            elif interleaved_gate_up and not block_major_weights:
+                raise ValueError(
+                    "interleaved_gate_up=True needs block-major expert weights: "
+                    "block_major_weights=True and BF16 experts without LoRA whose "
+                    "intermediate_dim is a multiple of 64; got "
+                    f"{type(experts).__qualname__} with intermediate_dim="
+                    f"{intermediate_dim} and block_major_weights="
+                    f"{self.block_major_weights}"
+                )
+            return block_major_weights, block_major_weights and interleaved_gate_up
 
     def __init__(
         self,
@@ -456,13 +494,7 @@ class DistMoeRuntime(Configurable):
         max_moe_layers_per_activation_slot: int,
         wgrad_dtype: torch.dtype | None = None,
     ) -> dist_moe.Config:
-        """Build the annex context configuration for one local expert module.
-
-        Also records the weight layout dist_moe reads in ``block_major_weights``
-        and ``interleaved_gate_up``, which can be narrower than ``self.config``'s.
-        """
-        from .routed_experts import DistMoeRoutedExperts
-
+        """Build the annex context configuration for one local expert module."""
         vmm = (
             None
             if self.config.vmm_capacity_factor is None
@@ -478,47 +510,16 @@ class DistMoeRuntime(Configurable):
                 "swiglu_alpha": module.swiglu_alpha,
                 "swiglu_limit": module.swiglu_limit,
             }
-        # Inference reads block-major weights. Training, experts that don't hand
-        # dist_moe their stored weights (MXFP8's prepared operands, LoRA's
-        # W + B @ A) and an intermediate_dim that isn't a multiple of 64
-        # (dist_moe's block width) keep row-major weights.
-        # TODO: a W13 bias (GPT-OSS) can't interleave either: resolve None to
-        # off and raise on True for it; dist_moe rejects the pair at the first
-        # forward.
-        # Every local module must resolve the same pair: __init__ compares the
-        # configs, which carry it.
-        self.block_major_weights = (
-            self.config.inference
-            and self.config.block_major_weights
-            and type(module)._weight_operands is DistMoeRoutedExperts._weight_operands
-            and module.intermediate_dim % 64 == 0
-        )
-        interleaved_gate_up = self.config.interleaved_gate_up
-        if interleaved_gate_up is None:
-            # Only in the region of the measured winners (see the Config).
-            interleaved_gate_up = (
-                module.hidden_dim >= 4096 and module.intermediate_dim >= 2048
-            )
-        elif (
-            interleaved_gate_up
-            and self.config.inference
-            and not self.block_major_weights
-        ):
-            raise ValueError(
-                "interleaved_gate_up=True needs block-major expert weights: "
-                "block_major_weights=True and BF16 experts without LoRA whose "
-                "intermediate_dim is a multiple of 64; got "
-                f"{type(module).__name__} with intermediate_dim="
-                f"{module.intermediate_dim} and block_major_weights="
-                f"{self.config.block_major_weights}"
-            )
-        self.interleaved_gate_up = self.block_major_weights and interleaved_gate_up
+        # The vLLM generator sets the module's layout from
+        # Config.resolve_weight_layout before FSDP wraps the weights. Every
+        # local module must have the same pair: __init__ compares the configs,
+        # which carry it.
         # Passed only when on, so a dist_moe without the options still works.
         # TODO: pass both directly once dist_moe main has them.
         layout_options: dict[str, bool] = {}
-        if self.block_major_weights:
+        if module.block_major_weights:
             layout_options["block_major_weights"] = True
-        if self.interleaved_gate_up:
+        if module.interleaved_gate_up:
             layout_options["interleaved_gate_up"] = True
         return dist_moe.Config(
             max_num_local_input_tokens=max_num_local_input_tokens,

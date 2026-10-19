@@ -15,16 +15,22 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import ClassVar, Literal
 
+import spmd_types as spmd
 import torch
 import torch.nn.functional as F
 import torch_remat as remat
 
 from torchtitan.distributed.local_compile import local_compile
+from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.base.module import Module
 
 from torchtitan.models.common.linear import GroupedLinear
+from torchtitan.quantization._fsdp_tensor import (
+    _ShardedFSDPTensor,
+    _UnshardedFSDPTensor,
+)
 
 from . import _dist_moe as dist_moe
 from .runtime import DistMoeRuntime
@@ -44,6 +50,45 @@ def _mask_padded_routes(
         topk_expert_ids_TK.masked_fill(padding_mask_TK, -1),
         topk_scores_TK.masked_fill(padding_mask_TK, 0.0),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _BlockMajorOperands:
+    """Dist-MoE's block-major ``[E, N, K]`` copy of one expert weight."""
+
+    weight: torch.Tensor
+
+
+class _BlockMajorWeight(_ShardedFSDPTensor):
+    """W13 or W2 whose FSDP unshard writes Dist-MoE's block-major copy.
+
+    The copy is rebuilt from the freshly gathered row-major weight on every
+    unshard that gathers (the initial load and each weight sync) into the same
+    tensor, so CUDA graphs keep reading one address. An unshard of a group that
+    is already unsharded gathers nothing and does not call this.
+    """
+
+    interleave_gate_up: ClassVar[bool] = False
+
+    def _build_operands(
+        self,
+        logical_tensor: torch.Tensor,
+        out: _BlockMajorOperands | None = None,
+    ) -> _BlockMajorOperands:
+        # W2 [E, D, F] is unchanged; W13 [E, 2, F, D] becomes [E, 2F, D].
+        weight_ENK = logical_tensor.flatten(1, -2)
+        if out is None:
+            out = _BlockMajorOperands(torch.empty_like(weight_ENK))
+        dist_moe.relayout_to_block_major(
+            weight_ENK, interleave_gate_up=self.interleave_gate_up, out=out.weight
+        )
+        return out
+
+
+class _InterleavedBlockMajorWeight(_BlockMajorWeight):
+    """W13 with gate and up rows interleaved, so the dispatch GEMM writes SwiGLU."""
+
+    interleave_gate_up: ClassVar[bool] = True
 
 
 class DistMoeRoutedExperts(Module):
@@ -76,6 +121,13 @@ class DistMoeRoutedExperts(Module):
                 SwiGLU; otherwise ``None``.
             swiglu_limit: Gate and up-projection bound when ``activation`` is
                 clamped SwiGLU; otherwise ``None``.
+            block_major_weights: Hand Dist-MoE a block-major copy of W13/W2,
+                which streams faster. FSDP builds it on every unshard that
+                gathers new weights. Inference only; the vLLM generator sets it
+                from ``DistMoeRuntime.Config``.
+            interleaved_gate_up: Also interleave W13's gate and up rows in that
+                copy, so the dispatch GEMM writes the SwiGLU output. Needs
+                ``block_major_weights``; set by the vLLM generator.
         """
 
         w13: GroupedLinear.Config
@@ -87,6 +139,8 @@ class DistMoeRoutedExperts(Module):
         activation: Literal["swiglu", "swiglu_clamped"] = "swiglu"
         swiglu_alpha: float | None = None
         swiglu_limit: float | None = None
+        block_major_weights: bool = False
+        interleaved_gate_up: bool = False
 
         def __post_init__(self) -> None:
             """Validate expert dimensions consumed by the annex kernels."""
@@ -139,32 +193,39 @@ class DistMoeRoutedExperts(Module):
         self.activation = config.activation
         self.swiglu_alpha = config.swiglu_alpha
         self.swiglu_limit = config.swiglu_limit
+        self.block_major_weights = config.block_major_weights
+        self.interleaved_gate_up = config.interleaved_gate_up
         self._runtime: DistMoeRuntime | None = None
+        if self.block_major_weights:
+            self._wrap_block_major_weights()
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         """Leave communication and activation storage to the shared runtime."""
         del buffer_device
 
-    def relayout_weights_for_context(self) -> None:
-        """Rewrite the stored W13 and W2 in place in the layout this module's context reads.
-
-        A no-op for row-major weights; otherwise uses
-        ``dist_moe.relayout_to_block_major``. Shapes are unchanged, so after
-        this only Dist-MoE may read the weights; call it once per load that
-        writes row-major weights, since a second call permutes them again.
-        """
-        runtime = self._runtime
-        if runtime is None:
-            raise RuntimeError("Dist-MoE context is not initialized")
-        if not runtime.block_major_weights:
-            return
-        # Passed only when on, so a dist_moe without the option still works.
-        # TODO: pass it directly once dist_moe main has it.
-        w13_options = (
-            {"interleave_gate_up": True} if runtime.interleaved_gate_up else {}
+    def _wrap_block_major_weights(self) -> None:
+        """Make W13/W2 FSDP extension tensors whose unshard builds the block-major copy."""
+        w13_cls = (
+            _InterleavedBlockMajorWeight
+            if self.interleaved_gate_up
+            else _BlockMajorWeight
         )
-        dist_moe.relayout_to_block_major(self.w13.weight.flatten(1, 2), **w13_options)
-        dist_moe.relayout_to_block_major(self.w2.weight)
+        for proj, wrapper_cls in ((self.w13, w13_cls), (self.w2, _BlockMajorWeight)):
+            if isinstance(proj.weight, wrapper_cls):
+                continue
+            weight = proj.weight
+            wrapped_weight = torch.nn.Parameter(
+                wrapper_cls(weight.data), requires_grad=weight.requires_grad
+            )
+            spmd.assert_type_like(wrapped_weight, weight)
+            proj.weight = wrapped_weight
+
+    def _parallelize(self, parallelism_context: ParallelismContext) -> None:
+        # spmd_types returns a plain tensor when EP/TP shards a weight. Wrap it
+        # again before fully_shard() consumes it.
+        super()._parallelize(parallelism_context)
+        if self.block_major_weights:
+            self._wrap_block_major_weights()
 
     def _weight_operands(
         self,
@@ -175,8 +236,16 @@ class DistMoeRoutedExperts(Module):
         """Return W13 and W2 operands for the annex invocation."""
         w13_E2FD = self.w13.weight
         w2_EDF = self.w2.weight
-        w13_EFD = w13_E2FD.flatten(1, 2)
-        return w13_EFD, w2_EDF
+        if not self.block_major_weights:
+            return w13_E2FD.flatten(1, 2), w2_EDF
+        if not isinstance(w13_E2FD, _UnshardedFSDPTensor) or not isinstance(
+            w2_EDF, _UnshardedFSDPTensor
+        ):
+            raise RuntimeError(
+                "Block-major Dist-MoE weights are built by FSDP's unshard; "
+                "unshard the experts' FSDP group before the forward"
+            )
+        return w13_E2FD.operands.weight, w2_EDF.operands.weight
 
     def _output_postprocess(
         self,

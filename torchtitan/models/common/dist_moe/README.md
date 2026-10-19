@@ -292,9 +292,11 @@ The RL vLLM generator owns an inference runtime
 vLLM's per-step token budget. vLLM pads every step at the end (TP rounding,
 CUDA-graph size, DP maximum); the runner publishes the unpadded count and the
 model passes a `padding_mask` down to the routed experts.
-By default the generator stores expert W13/W2 in the layout Dist-MoE reads
-fastest, and rewrites them in place with `dist_moe.relayout_to_block_major`
-after every unshard that writes them (the initial load and each weight sync):
+By default the generator hands Dist-MoE a copy of expert W13/W2 in the layout
+it reads fastest. FSDP's post-all-gather hook rebuilds the copy in place with
+`dist_moe.relayout_to_block_major(..., out=)` on every unshard that gathers new
+weights (the initial load and each weight sync), so CUDA graphs keep reading
+one address:
 
 - block-major (`block_major_weights`);
 - for experts with `hidden_dim` >= 4096 and `intermediate_dim` >= 2048, W13's

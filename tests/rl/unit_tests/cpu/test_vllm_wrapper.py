@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import importlib
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -219,29 +218,16 @@ def test_load_state_dict_allocates_one_fsdp_group_at_a_time(
 
 
 @pytest.mark.parametrize("interleaved_gate_up", [False, True])
-@pytest.mark.parametrize("shared_group", [False, True])
-def test_unshard_relayouts_dist_moe_experts_once(
-    tmp_path, shared_group: bool, interleaved_gate_up: bool
+def test_unshard_hands_dist_moe_block_major_copy_of_loaded_weights(
+    tmp_path, interleaved_gate_up: bool
 ) -> None:
-    """Every unshard that writes new expert weights re-lays them out; a no-op unshard does not.
+    """Each unshard that gathers new expert weights rebuilds Dist-MoE's block-major copy in place.
 
-    Covers the initial unshard and a weight sync through `load_state_dict`, each
-    leaving block-major experts, and a repeated unshard leaving them unchanged,
-    with one FSDP group per block or one group shared by both blocks, and with
-    or without W13's gate/up rows interleaved.
+    Covers the initial unshard and a weight sync through `load_state_dict` that
+    replaces every weight with new random values, so a stale W13 or W2 fails.
+    The copy keeps its address, which CUDA graphs read.
     """
     dist_moe = pytest.importorskip("dist_moe")
-    # Stand-in for the runtime's resolved layout, which the experts read.
-    runtime = SimpleNamespace(
-        block_major_weights=True, interleaved_gate_up=interleaved_gate_up
-    )
-
-    def block_major(weight: torch.Tensor, interleave_gate_up: bool) -> torch.Tensor:
-        weight_ENK = weight.reshape(weight.shape[0], -1, weight.shape[-1]).clone()
-        dist_moe.relayout_to_block_major(
-            weight_ENK, interleave_gate_up=interleave_gate_up
-        )
-        return weight_ENK.view(weight.shape)
 
     dist.init_process_group(
         "gloo", init_method=f"file://{tmp_path / 'store'}", rank=0, world_size=1
@@ -254,45 +240,58 @@ def test_unshard_relayouts_dist_moe_experts_once(
             block = nn.Module()
             block.routed_experts = DistMoeRoutedExperts.Config(
                 w13=GroupedLinear.Config(
-                    group_size=2, in_features=64, out_features=128, num_linears=2
+                    group_size=2, in_features=128, out_features=128, num_linears=2
                 ),
-                w2=GroupedLinear.Config(group_size=2, in_features=128, out_features=64),
+                w2=GroupedLinear.Config(
+                    group_size=2, in_features=128, out_features=128
+                ),
                 top_k=1,
+                block_major_weights=True,
+                interleaved_gate_up=interleaved_gate_up,
             ).build()
-            block.routed_experts._runtime = runtime
             model.layers.append(block)
+        initial = {}
         with torch.no_grad():
-            for param in model.parameters():
-                param.copy_(torch.randn_like(param))
+            for name, param in model.named_parameters():
+                initial[name] = torch.randn(param.shape)
+                param.copy_(initial[name])
         mesh = init_device_mesh("cpu", (1,))
-        if shared_group:
-            fully_shard(list(model.layers), mesh=mesh)
-        else:
-            for block in model.layers:
-                fully_shard(block, mesh=mesh)
+        for block in model.layers:
+            fully_shard(block, mesh=mesh)
         fully_shard(model, mesh=mesh)
         model.set_keep_unsharded_storage(True)
-        expert_names = [
-            name for name, _ in model.named_parameters() if "routed_experts" in name
-        ]
 
-        def assert_block_major(state_dict) -> None:
-            params = dict(model.named_parameters())
-            for name in expert_names:
-                interleave = interleaved_gate_up and ".w13." in name
-                expected = block_major(state_dict[name].to_local(), interleave)
-                assert params[name].equal(expected), name
+        def expert_operands() -> dict[str, torch.Tensor]:
+            return {
+                name: param.operands.weight
+                for name, param in model.named_parameters()
+                if "routed_experts" in name
+            }
 
-        initial = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        def assert_block_major(weights: dict[str, torch.Tensor]) -> None:
+            for name, operand in expert_operands().items():
+                weight_ENK = weights[name].flatten(1, -2)
+                expected = torch.empty_like(weight_ENK)
+                dist_moe.relayout_to_block_major(
+                    weight_ENK,
+                    interleave_gate_up=interleaved_gate_up and ".w13." in name,
+                    out=expected,
+                )
+                assert operand.equal(expected), name
+
         for module in model.modules():  # as after the initial load
             if isinstance(module, FSDPModule):
                 model_wrapper._unshard_and_free_sharded_params(module)
         assert_block_major(initial)
-        model_wrapper._unshard_and_free_sharded_params(model.layers[0])
-        assert_block_major(initial)
+        addresses = {name: t.data_ptr() for name, t in expert_operands().items()}
 
-        new_state_dict = {k: v + 1.0 for k, v in initial.items()}
+        new_state_dict = {
+            k: torch.randn_like(v.detach()) for k, v in model.state_dict().items()
+        }
         _Wrapper(model).load_state_dict(new_state_dict)
-        assert_block_major(new_state_dict)
+        assert_block_major({k: v.to_local() for k, v in new_state_dict.items()})
+        assert {
+            name: t.data_ptr() for name, t in expert_operands().items()
+        } == addresses
     finally:
         dist.destroy_process_group()

@@ -146,6 +146,28 @@ def _replace_vllm_layer_configs(model_config):
     return dataclasses.replace(model_config, layers=new_layers)
 
 
+def _set_dist_moe_weight_layout(
+    model_config, runtime_config: DistMoeRuntime.Config
+) -> None:
+    """Set each Dist-MoE expert config's weight layout from the runtime config.
+
+    Runs before ``build()``: block-major experts make W13/W2 FSDP extension
+    tensors whose unshard builds the block-major copy, and ``fully_shard``
+    reads the weight type.
+    """
+    layouts = set()
+    for _, experts, _, _ in model_config.traverse(DistMoeRoutedExperts.Config):
+        layout = runtime_config.resolve_weight_layout(experts)
+        experts.block_major_weights, experts.interleaved_gate_up = layout
+        layouts.add(layout)
+    for block_major_weights, interleaved_gate_up in sorted(layouts):
+        logger.info(
+            "Dist-MoE expert weights: block_major_weights=%s, interleaved_gate_up=%s",
+            block_major_weights,
+            interleaved_gate_up,
+        )
+
+
 # NOTE: Monkeypatch vLLM's weak_ref_tensor to handle DTensor
 # This is because piecewise CUDA-graph capture calls weak_ref_tensor()
 # on every subgraphoutput (see vllm/compilation/cuda_graph.py).
@@ -261,21 +283,6 @@ def _sharded_param_storages(module: FSDPModule) -> Iterator[torch.Tensor]:
             yield sharded_data
 
 
-def _modules_in_fsdp_group(module: FSDPModule) -> Iterator[torch.nn.Module]:
-    """Yield every module of ``module``'s FSDP group and their descendants.
-
-    Starts from all modules sharing the group (e.g. ``[tok_embeddings, norm,
-    lm_head]``) and stops at nested FSDP modules, which unshard themselves.
-    """
-    pending = list(module._get_fsdp_state()._modules)
-    while pending:
-        submodule = pending.pop()
-        yield submodule
-        pending.extend(
-            child for child in submodule.children() if not isinstance(child, FSDPModule)
-        )
-
-
 def _restore_sharded_params(module: FSDPModule) -> None:
     """Re-allocate the sharded buffers of `module`'s FSDP group so new weights can be copied in.
 
@@ -300,25 +307,14 @@ def _unshard_and_free_sharded_params(module: FSDPModule) -> None:
         after:   sharded: freed         unsharded: new weights (what CUDA graphs read)
 
     The unshard is explicit because CUDA graph replays skip FSDP's forward pre-hook.
-    The group's Dist-MoE experts then re-lay out their weights for their context.
-    A group that was already unsharded is skipped: `unshard()` is a no-op there,
-    its weights are already in that layout, and a second relayout would permute
-    them again.
     """
     from torch.distributed.fsdp._fully_shard._fsdp_param import free_storage
 
-    unshard_wrote_weights = not all(
-        group.is_unsharded for group in module._get_fsdp_state()._fsdp_param_groups
-    )
     with torch.inference_mode():
         module.unshard()
         # TODO: replace this with FSDPModule._free_sharded_params()
         for sharded_data in _sharded_param_storages(module):
             free_storage(sharded_data)
-        if unshard_wrote_weights:
-            for submodule in _modules_in_fsdp_group(module):
-                if isinstance(submodule, DistMoeRoutedExperts):
-                    submodule.relayout_weights_for_context()
 
 
 @support_torch_compile(
@@ -365,6 +361,8 @@ class VLLMModelWrapper(Module):
         training_parallelism = parallelism.to_training()
         model_config = copy.deepcopy(model_config)
         self.config = _replace_vllm_layer_configs(model_config)
+        if dist_moe_runtime is not None and dist_moe_runtime.inference:
+            _set_dist_moe_weight_layout(self.config, dist_moe_runtime)
 
         # Build ParallelismContext from the translated ParallelismConfig so TP/EP
         # sharding sees the same mesh shape as vLLM. The DP axis is represented
@@ -585,11 +583,6 @@ class VLLMModelWrapper(Module):
             device=device,
             num_tokens_per_microbatch_per_dp_rank=max_num_batched_tokens,
             pp_schedule=None,
-        )
-        logger.info(
-            "Dist-MoE expert weights: block_major_weights=%s, interleaved_gate_up=%s",
-            self._dist_moe_runtime.block_major_weights,
-            self._dist_moe_runtime.interleaved_gate_up,
         )
         # The runner writes each step's real token count here before the forward
         # runs, and forward builds the padding mask from it on the device, so
