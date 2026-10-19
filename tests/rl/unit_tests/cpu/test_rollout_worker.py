@@ -577,6 +577,6 @@ def test_gather_rollouts_times_the_group_and_its_straggler() -> None:
 
     assert results[:2] == [0.05, 0.01] and isinstance(results[2], ValueError)
     values = m.MetricsProcessor._aggregate_metrics(metrics)
-    assert values["rollout/group_wall_s/max"] >= 0.05
+    assert values["rollout/group_wall_seconds/max"] >= 0.05
     # The last sibling ended ~0.05 s after the first (the one that raised at once).
-    assert values["rollout/group_straggler_wait_s/max"] >= 0.04
+    assert values["rollout/group_straggler_wait_seconds/max"] >= 0.04

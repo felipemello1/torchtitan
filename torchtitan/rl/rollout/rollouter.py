@@ -688,7 +688,7 @@ async def gather_rollouts(
     Example (16 siblings; the first ends 120 s after the start, the last at 900 s):
 
         results, metrics = await gather_rollouts(coroutines)
-        # metrics: rollout/group_wall_s 900, rollout/group_straggler_wait_s 780 (Mean and Max each)
+        # metrics: rollout/group_wall_seconds 900, rollout/group_straggler_wait_seconds 780 (Mean and Max each)
     """
     start = time.perf_counter()
     finish_times: list[float] = []
@@ -703,8 +703,8 @@ async def gather_rollouts(
         *(timed(rollout) for rollout in rollouts), return_exceptions=True
     )
     durations = {
-        "rollout/group_wall_s": max(finish_times) - start,
-        "rollout/group_straggler_wait_s": max(finish_times) - min(finish_times),
+        "rollout/group_wall_seconds": max(finish_times) - start,
+        "rollout/group_straggler_wait_seconds": max(finish_times) - min(finish_times),
     }
     return results, [
         m.Metric(key, metric_type(value))
