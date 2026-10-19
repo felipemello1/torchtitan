@@ -162,15 +162,30 @@ class TrainingSampleBuilder(Configurable):
         self.config = config
         self.replay_routed_experts = replay_routed_experts
 
-    def build_from_group(self, *, rollout_group: RolloutGroup) -> TrainingSampleGroup:
-        """Apply data-validity filters and convert surviving rollouts to training_samples.
+    def rollouts_left_out(self, rollout_group: RolloutGroup) -> list[Rollout]:
+        """The rollouts `build_from_group` makes no training samples from, by the same filters.
 
         Example:
-            # rollouts=[] from a failed generation
-            build_from_group(rollout_group=failed_group)
-            # -> TrainingSampleGroup(group_id=..., training_samples=[], metrics=[failure_metric])
+            rewards [1.0, 1.0, 1.0, 1.0], drop_zero_std_reward_groups=True
+            rollouts_left_out(group)  # -> all 4 rollouts
         """
-        metrics: list[m.Metric] = list(rollout_group.metrics)
+        _, trained_rollouts, _ = self._filter(rollout_group)
+        trained_ids = {id(rollout) for rollout in trained_rollouts}
+        return [
+            rollout
+            for rollout in rollout_group.rollouts
+            if id(rollout) not in trained_ids
+        ]
+
+    def _filter(
+        self, rollout_group: RolloutGroup
+    ) -> tuple[list[Rollout] | None, list[Rollout], list[m.Metric]]:
+        """The group's data-validity filters: `(rollouts, trained_rollouts, metrics)`.
+
+        `rollouts` are the scored siblings, or None when the whole group is dropped.
+        `trained_rollouts` are those that become training samples.
+        """
+        metrics: list[m.Metric] = []
         # A rollout with reward None wasn't scored (see `BaseRolloutWorker.make_scored_group`): skip
         # it, not its group. A group left with 10 of 16 trains those 10, centered on their 10 rewards.
         rollouts = [
@@ -181,9 +196,7 @@ class TrainingSampleBuilder(Configurable):
         # list (e.g. drop groups with all-0 / all-1 advantage), run in sequence on each RolloutGroup.
         # Failed generation, or no rollout scored: no samples, only the metrics.
         if not rollouts:
-            return TrainingSampleGroup(
-                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
-            )
+            return None, [], metrics
 
         # Untrainable: any sibling with no completion tokens -> drop the whole group
         if any(
@@ -195,28 +208,7 @@ class TrainingSampleBuilder(Configurable):
                     "training_sample_builder/num_groups_dropped_untrainable", m.Sum(1.0)
                 )
             )
-            return TrainingSampleGroup(
-                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
-            )
-
-        # Router replay: a turn without routed expert ids (Verifiers drops a branch's rows when one
-        # node lacks them) would crash packing, or train on the trainer's own routing.
-        if self.replay_routed_experts and any(
-            turn.routed_expert_ids is None for rollout in rollouts for turn in rollout.turns
-        ):
-            logger.warning(
-                "Dropped group %s: a turn has no routed expert ids, which router replay needs.",
-                rollout_group.group_id,
-            )
-            metrics.append(
-                m.Metric(
-                    "training_sample_builder/num_groups_dropped_no_routed_expert_ids",
-                    m.Sum(1.0),
-                )
-            )
-            return TrainingSampleGroup(
-                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
-            )
+            return None, [], metrics
 
         # Zero-std reward: no learning signal across siblings. A group of N > 1 left with one scored
         # rollout counts too: its advantage is 0.
@@ -236,15 +228,9 @@ class TrainingSampleBuilder(Configurable):
                     "training_sample_builder/num_groups_dropped_zero_std", m.Sum(1.0)
                 )
             )
-            return TrainingSampleGroup(
-                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
-            )
+            return None, [], metrics
 
-        # One rollout may branch into multiple trainable training_samples.
-        training_samples: list[TrainingSample] = []
-        unfiltered_training_samples: list[TrainingSample] = []
-        branches_per_rollout: list[float] = []
-        num_samples_dropped_no_valid_tokens = 0
+        trained_rollouts: list[Rollout] = []
         num_rollouts_dropped_empty_completion = 0
         for rollout in rollouts:
             # A later turn with no completion (e.g. a generate fn that returned no tokens): drop the
@@ -255,7 +241,60 @@ class TrainingSampleBuilder(Configurable):
             ):
                 num_rollouts_dropped_empty_completion += 1
                 continue
+            trained_rollouts.append(rollout)
+        if num_rollouts_dropped_empty_completion:
+            metrics.append(
+                m.Metric(
+                    "training_sample_builder/num_rollouts_dropped_empty_completion",
+                    m.Sum(float(num_rollouts_dropped_empty_completion)),
+                )
+            )
+        return rollouts, trained_rollouts, metrics
 
+    def build_from_group(self, *, rollout_group: RolloutGroup) -> TrainingSampleGroup:
+        """Apply data-validity filters and convert surviving rollouts to training_samples.
+
+        Example:
+            # rollouts=[] from a failed generation
+            build_from_group(rollout_group=failed_group)
+            # -> TrainingSampleGroup(group_id=..., training_samples=[], metrics=[failure_metric])
+        """
+        metrics: list[m.Metric] = list(rollout_group.metrics)
+        rollouts, trained_rollouts, filter_metrics = self._filter(rollout_group)
+        metrics += filter_metrics
+        if rollouts is None:
+            return TrainingSampleGroup(
+                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
+            )
+
+        # Router replay: a trained turn without routed expert ids (Verifiers drops a branch's rows
+        # when one node lacks them) would crash packing, or train on the trainer's own routing.
+        # Only trained rollouts count: the controller strips the ids of the rest (`rollouts_left_out`).
+        if self.replay_routed_experts and any(
+            turn.routed_expert_ids is None
+            for rollout in trained_rollouts
+            for turn in rollout.turns
+        ):
+            logger.warning(
+                "Dropped group %s: a turn has no routed expert ids, which router replay needs.",
+                rollout_group.group_id,
+            )
+            metrics.append(
+                m.Metric(
+                    "training_sample_builder/num_groups_dropped_no_routed_expert_ids",
+                    m.Sum(1.0),
+                )
+            )
+            return TrainingSampleGroup(
+                group_id=rollout_group.group_id, training_samples=[], metrics=metrics
+            )
+
+        # One rollout may branch into multiple trainable training_samples.
+        training_samples: list[TrainingSample] = []
+        unfiltered_training_samples: list[TrainingSample] = []
+        branches_per_rollout: list[float] = []
+        num_samples_dropped_no_valid_tokens = 0
+        for rollout in trained_rollouts:
             rollout_training_samples = self.rollout_to_training_samples(rollout)
             unfiltered_training_samples.extend(rollout_training_samples)
             kept = [
@@ -269,13 +308,6 @@ class TrainingSampleBuilder(Configurable):
             training_samples.extend(kept)
             branches_per_rollout.append(float(len(rollout_training_samples)))
 
-        if num_rollouts_dropped_empty_completion:
-            metrics.append(
-                m.Metric(
-                    "training_sample_builder/num_rollouts_dropped_empty_completion",
-                    m.Sum(float(num_rollouts_dropped_empty_completion)),
-                )
-            )
         if num_samples_dropped_no_valid_tokens:
             metrics.append(
                 m.Metric(
