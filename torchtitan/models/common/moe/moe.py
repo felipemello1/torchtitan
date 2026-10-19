@@ -232,9 +232,8 @@ class TokenChoiceTopKRouter(Module):
             torch.zeros(config.num_experts, dtype=torch.float32),
             persistent=False,
         )
-        # [real tokens, tokens whose top-k set differs, differing experts] between this router's
-        # own top-k and the replayed ``routed_expert_ids_TK``, summed until
-        # ``collect_routing_mismatch_metrics`` reads them.
+        # ``_count_routing_mismatch``'s counts, summed until ``collect_routing_mismatch_metrics``
+        # reads them.
         self.register_buffer(
             "routing_mismatch_counts",
             torch.zeros(3, dtype=torch.float32),
@@ -398,9 +397,8 @@ class TokenChoiceTopKRouter(Module):
             topk_expert_ids_TK: Expert indices ``(T, K)``.
             routing_map_TE: One-hot boolean routing map ``(T, E)``; ``None`` with
                 ``mask_padded_routes``.
-            routing_mismatch_counts: With ``routed_expert_ids_TK``, ``(3,)``: real tokens,
-                tokens whose own top-k set differs from the replayed one, differing experts
-                (``forward`` adds them to ``routing_mismatch_counts``); else ``None``.
+            routing_mismatch_counts: ``_count_routing_mismatch``'s ``(3,)`` counts with
+                ``routed_expert_ids_TK``; else ``None``.
         """
         scores_TE = self.score_func(gate_TE)
         topk_expert_ids_TK = remat.region(
