@@ -37,7 +37,7 @@ class _BatcherActorEndpoints:
         output_dir: str,
         enable_structured_logging: bool,
         vision_processor: VisionProcessor.Config | None = None,
-        replay_routed_experts: bool,
+        replay_routed_experts: bool = False,
     ) -> None:
         init_logger()
         sl.init_structured_logger(

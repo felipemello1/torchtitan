@@ -535,6 +535,7 @@ def _two_turn_trace():
                 nodes=[first_node, second_node],
                 token_ids=np.array([10, 11, 12, 13, 14], dtype=np.int32),
                 logprobs=[0.0, -0.1, 0.0, -0.2, -0.3],
+                routed_experts=None,
             )
         ],
     )
