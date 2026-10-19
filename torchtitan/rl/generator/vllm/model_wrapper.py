@@ -159,19 +159,19 @@ def _set_dist_moe_weight_layout(
         for _, experts, _, _ in model_config.traverse(DistMoeRoutedExperts.Config)
     ]
     layouts = {
-        runtime_config.resolve_block_major_weights(experts)
-        for experts in experts_configs
+        runtime_config.resolve_weight_layout(experts) for experts in experts_configs
     }
     # One Dist-MoE context serves every local layer, so they need one layout.
     # A mix (e.g. LoRA on some experts only) keeps row-major weights everywhere.
-    block_major_weights = layouts == {True}
+    layout = next(iter(layouts)) if len(layouts) == 1 else (False, False)
     logger.info(
-        "Dist-MoE expert weights: block_major_weights=%s (layers resolved %s)",
-        block_major_weights,
+        "Dist-MoE expert weights: (block_major_weights, interleaved_gate_up)=%s "
+        "(layers resolved %s)",
+        layout,
         sorted(layouts),
     )
     for experts in experts_configs:
-        experts.block_major_weights = block_major_weights
+        experts.block_major_weights, experts.interleaved_gate_up = layout
 
 
 # NOTE: Monkeypatch vLLM's weak_ref_tensor to handle DTensor

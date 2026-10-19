@@ -293,10 +293,13 @@ vLLM's per-step token budget. vLLM pads every step at the end (TP rounding,
 CUDA-graph size, DP maximum); the runner publishes the unpadded count and the
 model passes a `padding_mask` down to the routed experts.
 
-With `block_major_weights=True` the generator hands Dist-MoE a copy of expert
-W13/W2 that it reads faster:
+By default the generator hands Dist-MoE a copy of expert W13/W2 that it reads
+faster:
 
-- block-major (`block_major_weights`).
+- block-major (`block_major_weights`);
+- for experts with `hidden_dim` >= 4096 and `intermediate_dim` >= 2048, also
+  W13's gate and up rows interleaved, so the dispatch GEMM computes SwiGLU itself
+  (`interleaved_gate_up`; `True` or `False` overrides the size rule).
 
 FSDP's post-all-gather hook copies the gathered weights into the same tensor
 and rewrites it in place with `dist_moe.relayout_to_block_major` on every

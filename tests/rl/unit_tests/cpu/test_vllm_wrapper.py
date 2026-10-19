@@ -220,7 +220,10 @@ def test_load_state_dict_allocates_one_fsdp_group_at_a_time(
         dist.destroy_process_group()
 
 
-def test_unshard_hands_dist_moe_block_major_copy_of_loaded_weights(tmp_path) -> None:
+@pytest.mark.parametrize("interleaved_gate_up", [False, True])
+def test_unshard_hands_dist_moe_block_major_copy_of_loaded_weights(
+    tmp_path, interleaved_gate_up: bool
+) -> None:
     """Each unshard that gathers new expert weights rebuilds Dist-MoE's block-major copy in place.
 
     Covers the initial unshard and a weight sync through `load_state_dict` that
@@ -242,6 +245,7 @@ def test_unshard_hands_dist_moe_block_major_copy_of_loaded_weights(tmp_path) -> 
             w2=GroupedLinear.Config(group_size=2, in_features=128, out_features=128),
             top_k=1,
             block_major_weights=True,
+            interleaved_gate_up=interleaved_gate_up,
         ).build()
         initial = {}
         with torch.no_grad():
@@ -263,7 +267,9 @@ def test_unshard_hands_dist_moe_block_major_copy_of_loaded_weights(tmp_path) -> 
         def assert_block_major(weights: dict[str, torch.Tensor]) -> None:
             for name, operand in expert_operands().items():
                 expected = weights[name].flatten(1, -2).clone()
-                dist_moe.relayout_to_block_major(expected)
+                dist_moe.relayout_to_block_major(
+                    expected, interleave_gate_up=interleaved_gate_up and ".w13." in name
+                )
                 assert operand.equal(expected), name
 
         for module in model.modules():  # as after the initial load
@@ -293,8 +299,14 @@ def test_generator_gives_every_dist_moe_expert_one_layout() -> None:
     lora_config = LoRATransform(
         rank=8, alpha=16.0, target_modules=[f"{first}.w2"]
     ).transform(copy.deepcopy(config))
-    runtime_config = DistMoeRuntime.Config(inference=True, block_major_weights=True)
-    for model_config, expected in ((config, True), (lora_config, False)):
+    runtime_config = DistMoeRuntime.Config(inference=True)
+    for model_config, expected in (
+        (config, (True, False)),
+        (lora_config, (False, False)),
+    ):
         model_wrapper._set_dist_moe_weight_layout(model_config, runtime_config)
         experts = model_config.traverse(DistMoeRoutedExperts.Config)
-        assert {cfg.block_major_weights for _, cfg, _, _ in experts} == {expected}
+        layouts = {
+            (c.block_major_weights, c.interleaved_gate_up) for _, c, _, _ in experts
+        }
+        assert layouts == {expected}
