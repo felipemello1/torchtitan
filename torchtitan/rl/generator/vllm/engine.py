@@ -16,6 +16,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig
@@ -79,6 +80,7 @@ def add_extra_vllm_engine_args(
     # only when their field is set must be listed, since engine_kwargs may lack them.
     config_field_by_engine_arg = {
         "max_num_batched_tokens": "Generator.Config.max_num_batched_tokens",
+        "max_logprobs": "Generator.Config.sampling.num_topk_logprobs",
         "compilation_config": "VLLMEngine.Config.cuda_graph",
         "seed": "Generator.Config.debug.seed",
         "watermark": "VLLMEngine.Config.watermark",
@@ -153,6 +155,7 @@ class VLLMEngine(GenerationEngine):
         precision: PrecisionConfig,
         gpu_memory_limit: float,
         max_num_batched_tokens: int | None,
+        num_topk_logprobs: int,
         checkpointer: CheckpointManager.Config | None,
         dist_moe_runtime: DistMoeRuntime.Config | None,
         debug: DebugConfig,
@@ -200,6 +203,7 @@ class VLLMEngine(GenerationEngine):
             param_dtype=precision.param_dtype,
             gpu_memory_limit=gpu_memory_limit,
             max_num_batched_tokens=max_num_batched_tokens,
+            num_topk_logprobs=num_topk_logprobs,
             seed=debug.seed,
             serves_images=vision_processor is not None,
         )
@@ -269,6 +273,7 @@ class VLLMEngine(GenerationEngine):
         param_dtype: str,
         gpu_memory_limit: float,
         max_num_batched_tokens: int | None,
+        num_topk_logprobs: int,
         seed: int | None,
         serves_images: bool,
     ) -> EngineArgs:
@@ -316,6 +321,8 @@ class VLLMEngine(GenerationEngine):
         # Return logprobs of the distribution vLLM samples from (after temperature). vLLM's default
         # returns the raw model's logprobs, before temperature.
         engine_kwargs["logprobs_mode"] = "processed_logprobs"
+        if num_topk_logprobs > 0:
+            engine_kwargs["max_logprobs"] = num_topk_logprobs
         engine_kwargs["max_num_seqs"] = max_num_seqs
         if max_num_batched_tokens is not None:
             engine_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
@@ -579,7 +586,8 @@ def _build_sampling_params(sampling: SamplingConfig) -> SamplingParams:
         # stop_token_ids even with skip_tokenizer_init.
         ignore_eos=True,
         seed=sampling.seed,
-        logprobs=0,  # return only the sampled token's logprob (for the GRPO ratio)
+        # The sampled token's logprob (for the GRPO ratio), plus the top-k if requested.
+        logprobs=sampling.num_topk_logprobs,
         # Token ids in, token ids and logprob floats out: stops are token ids and nothing reads
         # text, so skip vLLM's per-token detokenization and per-token logprob dicts.
         detokenize=False,
@@ -603,14 +611,31 @@ def _finished_request(request_output: RequestOutput) -> FinishedRequest:
         )
 
     # flat_logprobs=True: vLLM returns logprobs as plain lists instead of one dict per token.
-    # logprobs=0 keeps only the sampled token, so `.logprobs` has exactly one float per generated token.
+    # logprobs=0 (num_topk_logprobs=0) keeps only the sampled token: one float per generated token.
     completion_output = request_output.outputs[0]
+    flat_logprobs = completion_output.logprobs
+    token_logprobs = list(flat_logprobs.logprobs)
+    topk_token_ids = topk_logprobs = None
+    num_tokens = len(completion_output.token_ids)
+    if len(token_logprobs) > num_tokens:
+        # logprobs=k > 0: each token holds k + 1 entries, [sampled, top-1, ..., top-k].
+        # k is per request (validation asks for 0), so read it from the layout.
+        row_width = len(token_logprobs) // num_tokens
+        topk_token_ids = np.asarray(flat_logprobs.token_ids, dtype=np.int32).reshape(
+            num_tokens, row_width
+        )[:, 1:]
+        topk_logprobs = np.asarray(token_logprobs, dtype=np.float32).reshape(
+            num_tokens, row_width
+        )[:, 1:]
+        token_logprobs = token_logprobs[::row_width]
     return FinishedRequest(
         request_id=request_output.request_id,
         token_ids=list(completion_output.token_ids),
-        token_logprobs=list(completion_output.logprobs.logprobs),
+        token_logprobs=token_logprobs,
         finish_reason=completion_output.finish_reason,
         metrics_inputs=_extract_request_metrics_inputs(request_output),
+        topk_token_ids=topk_token_ids,
+        topk_logprobs=topk_logprobs,
     )
 
 

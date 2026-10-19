@@ -374,6 +374,7 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
                     top_p=sampling.top_p,
                     max_tokens=sampling.max_tokens,
                     seed=sampling.seed,
+                    num_topk_logprobs=sampling.num_topk_logprobs,
                     **{GROUP_ID_SAMPLING_PARAM: group_id},
                 ),
             ),
@@ -531,6 +532,8 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
 
         A node shared by several branches is emitted once. Every turn gets the rollout-wide
         min/max policy version from the generation server; generator metrics go on turn 0 only.
+        A turn's top-k rows come from the generation whose prompt length and completion tokens
+        match its node.
         """
         if generation_metadata is None:
             if any(any(node.mask) for node in trace.nodes):
@@ -561,9 +564,29 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
                         mask = [False] * len(mask)
                     else:
                         trained_nodes.add(index)
+                topk = None
+                if generation_metadata.topk_by_generation and any(mask):
+                    # The prompt this node's completion was sampled from ends at its first
+                    # sampled token.
+                    key = (
+                        branch_offset + list(node.mask).index(True),
+                        tuple(
+                            token_id
+                            for token_id, sampled in zip(node.token_ids, node.mask)
+                            if sampled
+                        ),
+                    )
+                    if key not in generation_metadata.topk_by_generation:
+                        raise ValueError(
+                            "Verifiers node has no generation with the same prompt length "
+                            "and completion tokens, so its top-k logprobs are unknown"
+                        )
+                    topk = generation_metadata.topk_by_generation[key]
                 for start, end in _trainable_token_spans(mask):
                     absolute_start = branch_offset + start
                     absolute_end = branch_offset + end
+                    # Completion rows of this span: sampled tokens before `start` in the node.
+                    row = sum(node.mask[:start])
                     prompt_prefix_len, prompt_delta_token_ids = split_prompt(
                         Prompt(token_ids=token_ids[:absolute_start]),
                         previous=Prompt(token_ids=previous_token_ids),
@@ -583,6 +606,16 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
                             ),
                             completion_logprobs=np.asarray(
                                 logprobs[absolute_start:absolute_end], dtype=np.float32
+                            ),
+                            completion_topk_token_ids=(
+                                None
+                                if topk is None
+                                else topk[0][row : row + end - start]
+                            ),
+                            completion_topk_logprobs=(
+                                None
+                                if topk is None
+                                else topk[1][row : row + end - start]
                             ),
                             min_policy_version=generation_metadata.min_policy_version,
                             max_policy_version=generation_metadata.max_policy_version,
