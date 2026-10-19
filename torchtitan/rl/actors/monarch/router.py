@@ -16,6 +16,7 @@ from monarch.actor import Actor, concurrent_endpoint, current_size
 
 from torchtitan.rl.actors.system import ServiceHandle
 from torchtitan.rl.generator.generation_server import VerifiersGenerationMetadata
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.routing.inter_generator import (
     GeneratorEndpoint,
     InterGeneratorRouter,
@@ -74,7 +75,7 @@ class _InterGeneratorRouterActorEndpoints:
         await super().release_groups(group_ids)
 
     @concurrent_endpoint
-    async def get_session_kv_metrics(self) -> list[Any]:
+    async def get_session_kv_metrics(self) -> list[m.Metric]:
         return await super().get_session_kv_metrics()
 
     @concurrent_endpoint
