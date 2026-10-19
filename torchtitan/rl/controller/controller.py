@@ -1420,7 +1420,7 @@ class Controller(Configurable):
                         group_size=self.config.async_loop.num_samples_per_prompt,
                         sampling=self._sampling,
                     )
-                # Extend: the group arrives with its rollout worker's GC metrics.
+                # Extend: the group arrives with its rollout worker's metrics.
                 group.metrics += compute_rollout_metrics(
                     prefix="rollout", rollouts=group.rollouts
                 )
@@ -1534,7 +1534,7 @@ class Controller(Configurable):
         push_task: asyncio.Task[float] | None = None
         pull_task: asyncio.Task[float] | None = None
         step_timer = MetricsTimer()
-        gc_timer = m.GCTimer("controller", per_generation=True)
+        gc_timer = m.GCTimer("controller")
         step_start = time.perf_counter()
         # With `validation.overlap_training`: a pass is due, but waits for the running one to end.
         validation_requested = False

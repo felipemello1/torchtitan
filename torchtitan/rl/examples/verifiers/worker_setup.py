@@ -63,8 +63,8 @@ def _log_gc_time(*, pause_s: float = 0.5, summary_every_s: float = 600.0) -> Non
 
     Env-server processes have no metrics channel to W&B (Verifiers drops extra fields), so their
     GC time goes to the job's stderr (print: `setup_logging` routes only Verifiers' loggers), e.g.
-        env-server pid 4242: GC gen 2 paused 0.81 s (collected 1032)
-        env-server pid 4242: GC 3.2 s in 1840 collections over the last 600 s
+        env-server worker pid 4242: GC gen 2 paused 0.81 s (collected 1032)
+        env-server worker pid 4242: GC 3.2 s in 1840 collections over the last 600 s
     """
     start = time.perf_counter()
     total_s, count, window_start = 0.0, 0, time.monotonic()
@@ -80,7 +80,7 @@ def _log_gc_time(*, pause_s: float = 0.5, summary_every_s: float = 600.0) -> Non
         pid = os.getpid()
         if seconds > pause_s:
             print(
-                f"env-server pid {pid}: GC gen {info['generation']} paused {seconds:.2f} s "
+                f"env-server worker pid {pid}: GC gen {info['generation']} paused {seconds:.2f} s "
                 f"(collected {info['collected']})",
                 file=sys.stderr,
                 flush=True,
@@ -88,7 +88,7 @@ def _log_gc_time(*, pause_s: float = 0.5, summary_every_s: float = 600.0) -> Non
         window_s = time.monotonic() - window_start
         if window_s >= summary_every_s:
             print(
-                f"env-server pid {pid}: GC {total_s:.1f} s in {count} collections over "
+                f"env-server worker pid {pid}: GC {total_s:.1f} s in {count} collections over "
                 f"the last {window_s:.0f} s",
                 file=sys.stderr,
                 flush=True,

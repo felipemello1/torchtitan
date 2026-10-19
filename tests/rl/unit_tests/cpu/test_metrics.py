@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import math
 import os
@@ -888,3 +889,17 @@ def test_compute_host_memory_metrics_groups_processes_by_role() -> None:
     assert after["host_memory/num_processes/controller"] == 1
     assert after[trainer_count_key] == before[trainer_count_key] + 1
     assert after["host_memory/rss_anon_gib/trainer"] > 0
+
+
+def test_gc_timer_times_collections() -> None:
+    gc_timer = m.GCTimer("controller")
+    gc.disable()  # only the collection below runs
+    try:
+        gc.collect(2)
+        values = {type(metric.value): metric.value.value for metric in gc_timer.flush()}
+    finally:
+        gc_timer.close()
+        gc.enable()
+    assert values[m.Sum] == values[m.Max] > 0.0
+    gc.collect(0)  # after close(): not timed, and the flush above reset the totals
+    assert all(metric.value.value == 0.0 for metric in gc_timer.flush())

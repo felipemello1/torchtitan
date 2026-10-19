@@ -118,8 +118,8 @@ class GenerationServer:
         self.generation_metadata: dict[str, VerifiersGenerationMetadata] = {}
         # Group id -> the sessions with folded metadata, so `drop_generation_metadata` can free them.
         self._group_sessions: dict[int, set[str]] = {}
-        # This process (the engine's) GC time, attached to each completion's metrics.
-        self._gc_timer = m.GCTimer("generator")
+        # This process's (the engine's) GC time, attached to each completion's metrics; set by `start`.
+        self._gc_timer: m.GCTimer | None = None
 
     @property
     def port(self) -> int:
@@ -150,6 +150,7 @@ class GenerationServer:
         await web.SockSite(runner, sock, backlog=4096).start()
         self.runner = runner
         self.bound_port = int(sock.getsockname()[1])
+        self._gc_timer = m.GCTimer("generator")
         # Every in-flight call holds a connection, so a low open-file limit caps concurrency.
         logger.info(
             "Generation server listening on %s (open-file limit %d)",
@@ -161,7 +162,7 @@ class GenerationServer:
         runner = self.runner
         if runner is not None:
             await runner.cleanup()
-        self._gc_timer.close()
+            self._gc_timer.close()
         self.runner = None
         self.bound_port = None
         self.generation_metadata.clear()
