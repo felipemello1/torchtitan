@@ -146,6 +146,34 @@ def _replace_vllm_layer_configs(model_config):
     return dataclasses.replace(model_config, layers=new_layers)
 
 
+def _set_dist_moe_weight_layout(
+    model_config, runtime_config: DistMoeRuntime.Config
+) -> None:
+    """Set every Dist-MoE expert config's weight layout from the runtime config.
+
+    Runs before ``build()``, since the layout picks the class of W13/W2 that
+    ``fully_shard`` wraps.
+    """
+    experts_configs = [
+        experts
+        for _, experts, _, _ in model_config.traverse(DistMoeRoutedExperts.Config)
+    ]
+    layouts = {
+        runtime_config.resolve_block_major_weights(experts)
+        for experts in experts_configs
+    }
+    # One Dist-MoE context serves every local layer, so they need one layout.
+    # A mix (e.g. LoRA on some experts only) keeps row-major weights everywhere.
+    block_major_weights = layouts == {True}
+    logger.info(
+        "Dist-MoE expert weights: block_major_weights=%s (layers resolved %s)",
+        block_major_weights,
+        sorted(layouts),
+    )
+    for experts in experts_configs:
+        experts.block_major_weights = block_major_weights
+
+
 # NOTE: Monkeypatch vLLM's weak_ref_tensor to handle DTensor
 # This is because piecewise CUDA-graph capture calls weak_ref_tensor()
 # on every subgraphoutput (see vllm/compilation/cuda_graph.py).
@@ -339,6 +367,8 @@ class VLLMModelWrapper(Module):
         training_parallelism = parallelism.to_training()
         model_config = copy.deepcopy(model_config)
         self.config = _replace_vllm_layer_configs(model_config)
+        if dist_moe_runtime is not None and dist_moe_runtime.inference:
+            _set_dist_moe_weight_layout(self.config, dist_moe_runtime)
 
         # Build ParallelismContext from the translated ParallelismConfig so TP/EP
         # sharding sees the same mesh shape as vLLM. The DP axis is represented

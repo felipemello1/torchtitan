@@ -22,7 +22,7 @@ import math
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Literal, TYPE_CHECKING
+from typing import cast, Literal, TYPE_CHECKING
 
 import torch
 from torch.distributed.pipelining import (
@@ -208,6 +208,11 @@ class DistMoeRuntime(Configurable):
                 planning with no saved activations, and a per-step row count
                 instead of the planned maximum. The activation-slot controls
                 must stay ``None``; ``dist_moe`` rejects them for inference.
+            block_major_weights: Inference only (training ignores it): hand
+                Dist-MoE a block-major copy of routed-expert W13/W2, which
+                streams faster. MXFP8 and LoRA experts and an
+                ``intermediate_dim`` that isn't a multiple of 64 keep row-major
+                weights.
         """
 
         activation_slot_bytes: int | None = None
@@ -216,6 +221,7 @@ class DistMoeRuntime(Configurable):
         vmm_capacity_factor: float | None = None
         pp_activation_slot_policy: PPActivationSlotPolicy = "stage_microbatch"
         inference: bool = False
+        block_major_weights: bool = False
 
         def __post_init__(self) -> None:
             if (
@@ -262,6 +268,25 @@ class DistMoeRuntime(Configurable):
                 "microbatch",
             ):
                 raise ValueError("unsupported PP activation-slot policy")
+
+        def resolve_block_major_weights(
+            self, experts: DistMoeRoutedExperts.Config
+        ) -> bool:
+            """Return whether these inference experts hand dist_moe block-major weights.
+
+            Experts that don't hand dist_moe their stored weights (MXFP8's
+            prepared operands, LoRA's W + B @ A) and an ``intermediate_dim``
+            that isn't a multiple of 64 (dist_moe's block width) keep
+            row-major weights.
+            """
+            from .routed_experts import DistMoeRoutedExperts
+
+            owner = cast(type[DistMoeRoutedExperts], experts._owner)
+            return (
+                self.block_major_weights
+                and owner._weight_operands is DistMoeRoutedExperts._weight_operands
+                and experts.w2.in_features % 64 == 0
+            )
 
     def __init__(
         self,
@@ -446,6 +471,10 @@ class DistMoeRuntime(Configurable):
                 "swiglu_alpha": module.swiglu_alpha,
                 "swiglu_limit": module.swiglu_limit,
             }
+        # Passed only when set, so a dist_moe without the option still works.
+        layout_options = (
+            {"block_major_weights": True} if module.block_major_weights else {}
+        )
         return dist_moe.Config(
             max_num_local_input_tokens=max_num_local_input_tokens,
             hidden_dim=module.hidden_dim,
@@ -466,6 +495,7 @@ class DistMoeRuntime(Configurable):
             wgrad_dtype=wgrad_dtype,
             inference=self.config.inference,
             **activation_options,
+            **layout_options,
         )
 
     def _bf16_grouped_gemm_preset(self, module: DistMoeRoutedExperts) -> str | None:
