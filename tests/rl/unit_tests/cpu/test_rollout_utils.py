@@ -240,7 +240,7 @@ def test_a_sample_with_generator_handles_instead_of_rows_raises() -> None:
     rollout_turn = _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=1)
     rollout_turn.routed_expert_ids = np.zeros((2, 4), np.uint8)
     rollout = _scored_rollout([rollout_turn], reward=1.0, advantage=0.5)
-    with pytest.raises(ValueError, match="generator handles"):
+    with pytest.raises(RuntimeError, match="generator handles"):
         rollout_to_training_samples(rollout)
 
 

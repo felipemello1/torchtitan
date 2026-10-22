@@ -31,8 +31,6 @@ SESSION_ID_HEADER = "X-Session-ID"
 
 # Stands in for the logprobs content list; the handler splices the real list in.
 _LOGPROBS_CONTENT_PLACEHOLDER = "<logprobs content>"
-# Stands in for the routed-experts base64; the handler splices the bytes in.
-_ROUTED_EXPERTS_PLACEHOLDER = "<routed experts data>"
 
 GROUP_ID_SAMPLING_PARAM = "torchtitan_group_id"
 """Sampling parameter carrying a request's rollout group id.
@@ -219,11 +217,13 @@ class GenerationServer:
         """Drop the folded metadata and the rows of every session of these finished groups,
         including sessions nobody popped (e.g. a retried Verifiers trace).
 
-        A completion that lands after its group's release, e.g. a sibling's call still in the
-        engine when the group was cancelled:
+        A training group's call after its release, e.g. from an agent of a cancelled group, keeps
+        nothing, or nothing would free it (ids never repeat in a run):
 
-            training group     keeps nothing, or nothing would free it (ids never repeat in a run)
-            validation group   kept: the next pass reuses the negative id, and its release frees it
+            arrives after the release      409 without generating
+            in the engine at the release   409 after generating, counted in released_group_completions
+
+        Validation groups are not remembered: the next pass reuses their negative ids.
         """
         for group_id in group_ids:
             if group_id >= 0:
@@ -232,7 +232,7 @@ class GenerationServer:
                 self.generation_metadata.pop(session_id, None)
                 self.session_stores.pop(session_id, None)
 
-    def session_store_metrics(self) -> list[m.Metric]:
+    def routed_experts_metrics(self) -> list[m.Metric]:
         """The rows the session stores hold now, and the completions of released groups since
         the last call. Levels get Mean and Max over generators, counts a Sum."""
         stores = self.session_stores.values()
@@ -331,6 +331,10 @@ class GenerationServer:
             return web.json_response({"error": str(error)}, status=400)
         # Keep only the prompt alive while the engine generates, not the whole parsed body.
         del body
+        if group_id in self._released_groups:
+            return web.json_response(
+                {"error": f"rollout group {group_id} was released"}, status=409
+            )
 
         # The counter keeps every id unique, even when a client sends the same id twice.
         request_id = (
@@ -446,7 +450,7 @@ class GenerationServer:
                             if handles is None
                             else {
                                 "routed_experts": {
-                                    "data": _ROUTED_EXPERTS_PLACEHOLDER,
+                                    "data": base64.b64encode(handles).decode(),
                                     "shape": list(handles.shape),
                                     "start": routed_experts_prompt_start,
                                     "dtype": str(handles.dtype),
@@ -465,23 +469,7 @@ class GenerationServer:
             json.dumps(_LOGPROBS_CONTENT_PLACEHOLDER)
         )
         response_text = f"{head}[{logprobs_content}]{tail}"
-        if handles is None:
-            return web.Response(text=response_text, content_type="application/json")
-        # Base64 needs no JSON escaping: splice it in as bytes instead of json.dumps scanning
-        # and copying it.
-        head, _, tail = response_text.rpartition(
-            json.dumps(_ROUTED_EXPERTS_PLACEHOLDER)
-        )
-        body = b"".join(
-            (
-                head.encode(),
-                b'"',
-                base64.b64encode(handles),
-                b'"',
-                tail.encode(),
-            )
-        )
-        return web.Response(body=body, content_type="application/json", charset="utf-8")
+        return web.Response(text=response_text, content_type="application/json")
 
     def _store_routed_experts(self, session_id: str, rows: np.ndarray) -> np.ndarray:
         """Append a completion's rows `[num_rows, num_layers, top_k]` to its session's store and
@@ -511,8 +499,8 @@ class GenerationServer:
         """
         session_id = request.headers.get(SESSION_ID_HEADER)
         row_ids = np.frombuffer(await request.read(), dtype="<u4")
-        # Taken on this loop. The snapshot's first `num_rows` rows never change: a later append
-        # writes past them or into a new buffer, so the thread below reads stable rows.
+        # Read on the event loop: an append writes past a store's `num_rows` rows or into a new
+        # buffer, so the thread below reads rows that never change.
         store = self.session_stores.get(session_id)
         if store is None:
             return web.json_response(
@@ -533,7 +521,7 @@ class GenerationServer:
             np.save(npy, store.rows[row_ids])
             return npy.getvalue()
 
-        # A thread: gathering a mean rollout's ~38 MB would stall every generate call on this loop.
+        # Off the event loop: gathering a rollout's rows (tens of MB) would stall every generate call.
         body = await asyncio.to_thread(rows_to_npy)
         return web.Response(body=body, content_type="application/octet-stream")
 

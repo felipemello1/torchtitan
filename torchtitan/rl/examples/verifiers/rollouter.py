@@ -461,19 +461,14 @@ class VerifiersRolloutWorker(RolloutWorker):
             trained, both fetch attempts failed          None: the batcher drops the group, counted
             left out (ERROR_SYSTEM, zero-std, ...)       None
         """
-        rollouts_with_handles = [
-            rollout
-            for rollout in group.rollouts
-            if any(turn.routed_expert_ids is not None for turn in rollout.turns)
-        ]
-        if not rollouts_with_handles:  # no router replay, or validation
-            return []
         left_out = {
             id(rollout)
             for rollout in self._training_sample_builder.rollouts_left_out(group)
         }
         rollouts_to_fetch = []
-        for rollout in rollouts_with_handles:
+        for rollout in group.rollouts:
+            if all(turn.routed_expert_ids is None for turn in rollout.turns):
+                continue  # no router replay, or validation
             if id(rollout) in left_out:
                 for rollout_turn in rollout.turns:
                     rollout_turn.routed_expert_ids = None
@@ -482,8 +477,8 @@ class VerifiersRolloutWorker(RolloutWorker):
         if not rollouts_to_fetch:
             return []
 
-        async def fetch(rollout: Rollout) -> int:
-            """Fetch one rollout's rows; return how many attempts failed (2: it gets None)."""
+        async def fetch(rollout: Rollout) -> bool:
+            """Swap one rollout's handles for rows; after a second failure, set them to None."""
             turns = [
                 turn for turn in rollout.turns if turn.routed_expert_ids is not None
             ]
@@ -508,22 +503,16 @@ class VerifiersRolloutWorker(RolloutWorker):
                     turns, np.split(rows, turn_ends[:-1]), strict=True
                 ):
                     rollout_turn.routed_expert_ids = turn_rows
-                return attempt
+                return True
             for rollout_turn in turns:
                 rollout_turn.routed_expert_ids = None
-            return 2
+            return False
 
-        failed_attempts = await asyncio.gather(*map(fetch, rollouts_to_fetch))
+        fetched = await asyncio.gather(*map(fetch, rollouts_to_fetch))
         return [
-            m.Metric("rollout/routed_experts/fetches", m.Sum(len(rollouts_to_fetch))),
             m.Metric(
-                "rollout/routed_experts/fetch_retries",
-                m.Sum(sum(num > 0 for num in failed_attempts)),
-            ),
-            m.Metric(
-                "rollout/routed_experts/fetch_failures",
-                m.Sum(sum(num == 2 for num in failed_attempts)),
-            ),
+                "rollout/routed_experts/fetch_failures", m.Sum(fetched.count(False))
+            )
         ]
 
     async def _run_single_rollout(

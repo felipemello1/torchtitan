@@ -252,8 +252,8 @@ class Rollouter(Configurable):
     ) -> None:
         """Spawn the rollout worker pool through `actor_system` and initialize it.
         `worker_config` replaces `Config.worker`, for a worker config known only at setup.
-        `training_sample_builder` is the batcher's, which tells which rollouts train; unused here
-        (`VerifiersRollouter` fetches router-replay rows for those rollouts only)."""
+        `training_sample_builder`: the batcher's filters, for a subclass that needs to know which
+        rollouts train."""
         del training_sample_builder
         if self._worker_actors is not None:
             raise RuntimeError("rollout worker pool is already initialized")

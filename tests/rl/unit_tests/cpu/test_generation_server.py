@@ -154,12 +154,6 @@ def _reply_routed_experts(raw: bytes) -> dict | None:
     return payload
 
 
-async def _generate_four_rows(prompt_token_ids, **kwargs) -> Completion:
-    return _completion(
-        kwargs["request_id"], routed_expert_ids=np.zeros((4, 2, 2), np.uint8)
-    )
-
-
 async def _post_raw(server: GenerationServer, body: dict, session_id: str) -> bytes:
     async with ClientSession() as session:
         async with session.post(
@@ -215,28 +209,38 @@ def test_verifiers_response_returns_handles_to_rows_the_server_holds() -> None:
     asyncio.run(run())
 
 
-def test_a_released_group_keeps_nothing_from_a_late_completion() -> None:
+def test_a_released_group_keeps_nothing_from_a_late_call() -> None:
     async def run() -> None:
-        async with _Server(_generate_four_rows) as server:
+        generated_sessions = []
+
+        async def generate(prompt_token_ids, **kwargs) -> Completion:
+            generated_sessions.append(kwargs["routing_session_id"])
+            if kwargs["routing_session_id"] == "trace-b":
+                # trace-b's call is in the engine when its group is released.
+                server.release_groups([2, -1])
+            return _completion(
+                kwargs["request_id"], routed_expert_ids=np.zeros((4, 2, 2), np.uint8)
+            )
+
+        async with _Server(generate) as server:
             assert (await _post(server, _body(group_id=2), "trace-a"))[0] == 200
             assert (await _post(server, _body(group_id=-1), "validation"))[0] == 200
             levels = m.MetricsProcessor._aggregate_metrics(
-                server.session_store_metrics()
+                server.routed_experts_metrics()
             )
             assert levels["generator/routed_experts/held_rows/max"] == 4
 
-            server.release_groups([2, -1])
+            assert (await _post(server, _body(group_id=2), "trace-b"))[0] == 409
             assert server.generation_metadata == {} and server.session_stores == {}
-            # trace-b's first call was still in the engine at the release.
-            status, _ = await _post(server, _body(group_id=2), "trace-b")
-            assert status == 409
-            assert server.generation_metadata == {} and server.session_stores == {}
+            # A call that arrives after the release gets its 409 without generating.
+            assert (await _post(server, _body(group_id=2), "trace-c"))[0] == 409
+            assert generated_sessions == ["trace-a", "validation", "trace-b"]
             # Validation reuses its group ids every pass, so the next pass keeps its metadata.
             assert (await _post(server, _body(group_id=-1), "validation"))[0] == 200
             assert set(server.generation_metadata) == {"validation"}
 
             metrics = m.MetricsProcessor._aggregate_metrics(
-                server.session_store_metrics()
+                server.routed_experts_metrics()
             )
             assert metrics["generator/released_group_completions/sum"] == 1
             assert metrics["generator/routed_experts/held_rows/max"] == 0
@@ -245,13 +249,20 @@ def test_a_released_group_keeps_nothing_from_a_late_completion() -> None:
 
 
 @pytest.mark.parametrize(
-    "session_id, row_id, status", [("unknown", 0, 404), ("trace-a", 4, 400)]
+    "session_id, row_id, status", [("unknown", 0, 404), ("trace-a", 5, 400)]
 )
 def test_fetch_rejects_an_unknown_session_and_a_handle_past_its_rows(
     session_id, row_id, status
 ) -> None:
+    # 4 rows, then 1: the buffer grows to 6, so handle 5 is inside it but past the 5 rows.
+    replies = iter([np.zeros((4, 2, 2), np.uint8), np.zeros((1, 2, 2), np.uint8)])
+
+    async def generate(prompt_token_ids, **kwargs) -> Completion:
+        return _completion(kwargs["request_id"], routed_expert_ids=next(replies))
+
     async def run() -> None:
-        async with _Server(_generate_four_rows) as server:
+        async with _Server(generate) as server:
+            await _post(server, _body(), "trace-a")
             await _post(server, _body(), "trace-a")
             handles = np.array([row_id], dtype="<u4").view(np.uint8).reshape(1, 4)
             with pytest.raises(RuntimeError, match=f"with {status}:"):

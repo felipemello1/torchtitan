@@ -459,14 +459,13 @@ class Generator(Configurable):
         return self._generation_server.pop_generation_metadata(session_ids)
 
     async def get_session_kv_metrics(self) -> list[m.Metric]:
-        """This replica's session-KV metrics, and on rank 0 its HTTP server's session stores
-        (levels now, counts since the last call); [] on TP ranks > 0, whose holders mirror TP
-        rank 0's."""
+        """This replica's session-KV and router-replay row metrics (levels now, counts since the
+        last call); [] on TP ranks > 0, whose holders mirror TP rank 0's."""
         if self._tp_rank != 0:
             return []
         metrics = self._engine_loop.session_kv_metrics()
         if self._generation_server is not None:
-            metrics += self._generation_server.session_store_metrics()
+            metrics += self._generation_server.routed_experts_metrics()
         return metrics
 
     async def initialize_torchstore_client(self, requester_index: int) -> None:

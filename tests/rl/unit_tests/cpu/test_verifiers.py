@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import gc
 import inspect
 import logging
@@ -1367,6 +1368,7 @@ def test_a_rollout_that_raises_is_kept_but_left_out_of_the_advantage(
     monkeypatch.setattr(VerifiersRolloutWorker, "score_group", score_group)
     worker = object.__new__(VerifiersRolloutWorker)
     worker.advantage_estimator = AdvantageEstimator.Config().build()
+    worker._training_sample_builder = TrainingSampleBuilder.Config().build()
 
     group = asyncio.run(
         worker.run_group(
@@ -1610,6 +1612,7 @@ def test_group_logs_the_share_of_each_stop_condition(monkeypatch) -> None:
     monkeypatch.setattr(VerifiersRolloutWorker, "score_group", score_group)
     worker = object.__new__(VerifiersRolloutWorker)
     worker.advantage_estimator = AdvantageEstimator.Config().build()
+    worker._training_sample_builder = TrainingSampleBuilder.Config().build()
 
     group = asyncio.run(
         worker.run_group(
@@ -1643,13 +1646,11 @@ def test_group_logs_the_share_of_each_stop_condition(monkeypatch) -> None:
 def test_rows_fetched_by_handle_are_todays_routed_expert_ids_bitwise() -> None:
     """Commit one rollout's turns twice through Verifiers' graph and delta stream: once with the
     rows the generation server used to send, once with the handles it sends now. Fetching rows by
-    handle gives the same bytes per node, per branch and per training turn.
+    handle gives the same bytes per training turn.
 
     Two branches share the system node, like a compaction. Bridged turns repair the previous
     turn's placeholder row over the stream; unbridged ones also return the prefix's rows.
     """
-    import base64
-
     import verifiers.v1 as vf
     from renderers.client import parse_generate_response
     from verifiers.v1 import graph
@@ -1721,7 +1722,7 @@ def test_rows_fetched_by_handle_are_todays_routed_expert_ids_bitwise() -> None:
             routed_expert_ids=sent_rows[-1],
         )
 
-    async def run() -> tuple[dict[str, Rollout], list[m.Metric]]:
+    async def run() -> dict[str, Rollout]:
         traces = {
             name: vf.Trace(
                 agent=vf.AgentInfo(config=vf.AgentConfig()),
@@ -1809,16 +1810,6 @@ def test_rows_fetched_by_handle_are_todays_routed_expert_ids_bitwise() -> None:
                 wire_traces[name] = WireEpisode.model_validate(record).traces[0]
             assert any(b"routing_repairs" in frame for frame in frames["handles"])
 
-            store = server.session_stores[session_id]
-            for rows_part, handles_part in [
-                *zip(wire_traces["rows"].nodes, wire_traces["handles"].nodes),
-                *zip(wire_traces["rows"].branches, wire_traces["handles"].branches),
-            ]:
-                row_ids = handles_part.routed_experts.view("<u4").ravel()
-                assert (
-                    store.rows[row_ids].tobytes() == rows_part.routed_experts.tobytes()
-                )
-
             # The training turns: today's slices of the rows vs the worker's fetch by handle.
             metadata = VerifiersGenerationMetadata(
                 min_policy_version=1, max_policy_version=1, metrics=[]
@@ -1840,16 +1831,16 @@ def test_rows_fetched_by_handle_are_todays_routed_expert_ids_bitwise() -> None:
             }
             worker = object.__new__(VerifiersRolloutWorker)
             worker._training_sample_builder = TrainingSampleBuilder.Config().build()
-            metrics = await worker._fetch_routed_expert_ids(
+            await worker._fetch_routed_expert_ids(
                 RolloutGroup(group_id=7, rollouts=[rollouts["handles"]]),
                 generator_client=GeneratorClient(router=None),
                 generator_sessions={0: (server.url, session_id)},
             )
         finally:
             await server.close()
-        return rollouts, metrics
+        return rollouts
 
-    rollouts, metrics = asyncio.run(run())
+    rollouts = asyncio.run(run())
 
     assert len(rollouts["rows"].turns) == len(turns)
     for rows_turn, fetched_turn in zip(
@@ -1858,25 +1849,20 @@ def test_rows_fetched_by_handle_are_todays_routed_expert_ids_bitwise() -> None:
         rows, fetched = rows_turn.routed_expert_ids, fetched_turn.routed_expert_ids
         assert (fetched.dtype, fetched.shape) == (rows.dtype, rows.shape)
         assert fetched.tobytes() == rows.tobytes()
-    assert m.MetricsProcessor._aggregate_metrics(metrics) == {
-        "rollout/routed_experts/fetches/sum": 1.0,
-        "rollout/routed_experts/fetch_retries/sum": 0.0,
-        "rollout/routed_experts/fetch_failures/sum": 0.0,
-    }
 
 
 @pytest.mark.parametrize(
-    "rewards, failed_attempts, fetched, fetch_metrics",
+    "rewards, failed_attempts, fetched, num_fetch_failures",
     [
         # Rollout 1's fetch fails twice: it gets None, so the batcher drops the group, counted.
-        ([0.0, 1.0], [0, 2], [True, False], (2, 1, 1)),
-        ([0.0, 1.0], [0, 1], [True, True], (2, 1, 0)),
+        ([0.0, 1.0], [0, 2], [True, False], 1),
+        ([0.0, 1.0], [0, 1], [True, True], 0),
         # Zero reward spread: the batcher trains neither rollout, so neither fetches.
         ([1.0, 1.0], [0, 0], [False, False], None),
     ],
 )
 def test_only_trained_rollouts_swap_their_handles_for_rows(
-    monkeypatch, rewards, failed_attempts, fetched, fetch_metrics
+    monkeypatch, rewards, failed_attempts, fetched, num_fetch_failures
 ) -> None:
     """Rollouts 0 and 1 carry handles to rows 0-2 and 3-4 of their sessions; rollout 2 raised.
     No rollout leaves the worker with handles."""
@@ -1958,17 +1944,7 @@ def test_only_trained_rollouts_swap_their_handles_for_rows(
         else:
             assert turn_rows == [None, None]
     assert group.rollouts[2].status is RolloutStatus.ERROR_SYSTEM
-    metrics = {
-        key: value
-        for key, value in m.MetricsProcessor._aggregate_metrics(group.metrics).items()
-        if key.startswith("rollout/routed_experts/")
-    }
-    if fetch_metrics is None:
-        assert metrics == {}
-    else:
-        assert metrics == {
-            f"rollout/routed_experts/{key}/sum": float(value)
-            for key, value in zip(
-                ("fetches", "fetch_retries", "fetch_failures"), fetch_metrics
-            )
-        }
+    metrics = m.MetricsProcessor._aggregate_metrics(group.metrics)
+    assert (
+        metrics.get("rollout/routed_experts/fetch_failures/sum") == num_fetch_failures
+    )
