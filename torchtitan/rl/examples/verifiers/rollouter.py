@@ -551,10 +551,10 @@ class VerifiersRolloutWorker(RolloutWorker):
         if not verifiers_episode.ok or not trace.ok:
             # Verifiers records a failure as data instead of raising; the first error
             # stopped the rollout.
-            #   generator 4xx (e.g. a prompt past the context)    -> ERROR, the policy's
-            #   HarnessError after the first turn (agent's exit)  -> ERROR, the policy's
-            #   HarnessError before the first turn                -> ERROR_SYSTEM
-            #   anything else (sandbox, env, tool, 5xx, untyped)  -> ERROR_SYSTEM
+            #   generator 4xx (e.g. a prompt past the context)     -> ERROR, the policy's
+            #   HarnessError after the first turn (agent's exit)   -> ERROR, the policy's
+            #   HarnessError before the first turn                 -> ERROR_SYSTEM
+            #   any other error (sandbox, env, tool, 5xx, untyped) -> ERROR_SYSTEM
             errors = trace.errors or verifiers_episode.errors
             if not errors:
                 return RolloutStatus.ERROR
