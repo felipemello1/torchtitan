@@ -461,6 +461,12 @@ class VerifiersRolloutWorker(RolloutWorker):
             trained, both fetch attempts failed          None: the batcher drops the group, counted
             left out (ERROR_SYSTEM, zero-std, ...)       None
         """
+        if all(
+            turn.routed_expert_ids is None
+            for rollout in group.rollouts
+            for turn in rollout.turns
+        ):
+            return []  # no router replay, or validation
         left_out = {
             id(rollout)
             for rollout in self._training_sample_builder.rollouts_left_out(group)
@@ -468,7 +474,7 @@ class VerifiersRolloutWorker(RolloutWorker):
         rollouts_to_fetch = []
         for rollout in group.rollouts:
             if all(turn.routed_expert_ids is None for turn in rollout.turns):
-                continue  # no router replay, or validation
+                continue  # failed before its first generate call
             if id(rollout) in left_out:
                 for rollout_turn in rollout.turns:
                     rollout_turn.routed_expert_ids = None
