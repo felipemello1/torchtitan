@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class MetricsTimer:
-    """Times named code spans; flush() drains each span's total seconds into a Mean metric, then resets.
+    """Times named code spans; flush() drains them into Mean metrics, then resets.
 
     Example:
         metric_timer = MetricsTimer()
@@ -31,7 +31,7 @@ class MetricsTimer:
                     ...
         time_metrics = metric_timer.flush()
         # -> [Metric("timing/step/total", Mean(...)),
-        #     Metric("timing/step/forward_backward", Mean(...))]   # total over num_microbatches
+        #     Metric("timing/step/forward_backward", Mean(...))]   # mean over num_microbatches
     """
 
     def __init__(self) -> None:
@@ -48,12 +48,34 @@ class MetricsTimer:
             self.durations[key].append(time.perf_counter() - start)
 
     def flush(self) -> list[m.Metric]:
-        """Return one Mean metric per recorded span holding its total seconds, then reset so the
-        timer can be reused. A span recorded several times in one step, like the wait for each
-        streamed batch, logs the step's total."""
+        """Return one Mean metric per recorded span, then reset so the timer can be reused."""
         durations = self.durations
         self.durations = defaultdict(list)
-        return [m.Metric(key, m.Mean(sum(values))) for key, values in durations.items()]
+        return [
+            m.Metric(key, m.Mean.from_list(values)) for key, values in durations.items()
+        ]
+
+
+def forward_backward_wait_and_busy_seconds(
+    step_start_s: float, calls: list[tuple[float, float]]
+) -> tuple[float, float]:
+    """The trainer's total wait for batches and its total forward/backward time in one step, from each
+    forward_backward call's (sent, finished) times. The trainer runs its calls in order, so a call sent
+    while the previous one runs starts when that one finishes.
+
+    Example:
+        # Each call takes 3 s. Batch 2 is sent at t=1, while call 1 runs; batch 3 at t=10.
+        forward_backward_wait_and_busy_seconds(0.0, [(0.0, 3.0), (1.0, 6.0), (10.0, 13.0)])
+        # -> (4.0, 9.0): waits 0 + 0 + 4, forward/backward 3 + 3 + 3
+    """
+    wait_s = busy_s = 0.0
+    previous_end_s = step_start_s
+    for sent_s, finished_s in calls:
+        start_s = max(sent_s, previous_end_s)
+        wait_s += start_s - previous_end_s
+        busy_s += finished_s - start_s
+        previous_end_s = finished_s
+    return wait_s, busy_s
 
 
 _SUMMED_METRIC_SUFFIXES = ("/mean", "_mean", "/frac", "_frac")
@@ -105,7 +127,7 @@ def compute_perf_ratio_metrics(
 ) -> list[m.Metric]:
     """Trainer-side timing ratios from the flushed step timers. A ratio is emitted only if every span
     it needs was recorded this step (no fallback zeros)."""
-    # MetricsTimer.flush stores each span's total seconds this step in `.value`.
+    # Each span is recorded once/step; Mean.from_list stores the summed seconds in `.value`.
     # Front-load each span's seconds into a short name (None if it was not recorded this step).
     seconds = {
         metric.key: metric.value.value

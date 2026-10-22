@@ -85,6 +85,9 @@ _trainer_loop
   consumes: a TrainerStepBatch (training_batch_queue.get)
     waits for:    a TrainerStepBatch in the queue
     unblocked by: _batcher_loop training_batch_queue.put()
+  produces: forward_backward calls to the trainer, sent without waiting for earlier ones
+    waits for:    fewer than _MAX_IN_FLIGHT_FORWARD_BACKWARD_CALLS calls in flight
+    unblocked by: the trainer finishing its oldest call
 """
 
 import asyncio
@@ -95,6 +98,7 @@ import math
 import os
 import time
 import warnings
+from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -113,6 +117,7 @@ from torchtitan.rl.controller.metrics import (
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     compute_rollout_metrics,
+    forward_backward_wait_and_busy_seconds,
     MetricsTimer,
 )
 from torchtitan.rl.controller.work_buffer import (
@@ -133,6 +138,12 @@ from torchtitan.rl.trainer.trainer import Trainer
 from torchtitan.tools.garbage_collector import GarbageCollector
 
 logger = logging.getLogger(__name__)
+
+# How many forward_backward calls the controller sends before the oldest one returns. One runs while
+# up to two wait in the trainer's mailbox with their microbatches already delivered (RDMA microbatches
+# are read when their call starts), so the trainer starts each call as soon as the previous one ends.
+# Two would hide the round trip; the third is slack for calls shorter than one round trip.
+_MAX_IN_FLIGHT_FORWARD_BACKWARD_CALLS = 3
 
 
 @dataclass(kw_only=True, slots=True)
@@ -847,8 +858,6 @@ class Controller(Configurable):
 
         # training_batch_queue. Streaming puts several batches per step; a full queue would block
         # _batcher_loop, which also releases the slots of untrainable groups.
-        # TODO: with streaming and off-policy steps, the batcher can pack a few steps ahead. Merge
-        # queued batches of one step into one forward_backward call if trainer-bound runs need it.
         training_batch_queue: asyncio.Queue[TrainerStepBatch | None] = asyncio.Queue(
             maxsize=0 if async_loop.batcher.stream_microbatches else 1
         )
@@ -1093,6 +1102,10 @@ class Controller(Configurable):
             Batcher:  [batch 1]       [batch 2]             [batch 3, ends_step]
             Trainer:      [fwd/bwd 1]     [fwd/bwd 2]            [fwd/bwd 3] [optimizer]
 
+        Each batch is sent as soon as it arrives, without waiting for the previous call to return (up to
+        3 calls in flight). The trainer runs its calls in order, so a batch that arrives during fwd/bwd 1
+        starts right after it. A failed call stops the step at once.
+
         The push and pull of policy N overlap forward/backward N+1:
 
             Trainer:    forward/backward N
@@ -1134,85 +1147,106 @@ class Controller(Configurable):
                 step_timer.record("timing/step/total"),
             ):
                 # One batch per step, or several with streaming; the step's last batch has ends_step=True.
-                # The step timer sums each span's records, so the wait is the step's total wait.
+                step_start_s = time.perf_counter()
                 step_batches: list[TrainerStepBatch] = []
-                batch_fwd_bwd_metrics: list[dict[str, float]] = []
-                while not step_batches or not step_batches[-1].ends_step:
-                    # Waits for a TrainerStepBatch to be ready (or None on shutdown).
-                    with (
-                        sl.log_trace_span("wait_for_training_batch"),
-                        step_timer.record("timing/step/wait_for_training_batch"),
-                    ):
-                        packed = await training_batch_queue.get()
-                    if packed is None:
-                        break
-                    if packed.ends_step:
-                        # Policy age is computed HERE, at consumption time, against the live trainer version, so
-                        # it is faithful to what this step trains on -- not the version when the batch was packed.
-                        # The step's last batch holds every sample's version.
-                        policy_age_panel = compute_policy_age_metrics(
-                            trainer_policy_version=self._trainer_policy_version,
-                            min_policy_versions=packed.min_policy_versions,
-                            target_offpolicy_steps=(
-                                self.config.async_loop.target_offpolicy_steps
-                            ),
-                            max_offpolicy_steps=self.config.async_loop.max_offpolicy_steps,
-                        )
+                # Per forward_backward call: the task that waits for its result, and the time it was sent.
+                forward_backward_tasks: list[
+                    asyncio.Task[tuple[dict[str, float], float]]
+                ] = []
+                sent_times_s: list[float] = []
+                # A failed call cancels the wait for the next batch and the other calls, then raises.
+                async with asyncio.TaskGroup() as forward_backward_calls:
+                    while not step_batches or not step_batches[-1].ends_step:
+                        # The controller's wait for the next TrainerStepBatch (or None on shutdown). The
+                        # trainer may still be computing meanwhile; its own wait is computed below.
+                        with sl.log_trace_span("wait_for_training_batch"):
+                            packed = await training_batch_queue.get()
+                        if packed is None:
+                            break
+                        if packed.ends_step:
+                            # Policy age is computed HERE, at consumption time, against the live trainer version, so
+                            # it is faithful to what this step trains on -- not the version when the batch was packed.
+                            # The step's last batch holds every sample's version.
+                            policy_age_panel = compute_policy_age_metrics(
+                                trainer_policy_version=self._trainer_policy_version,
+                                min_policy_versions=packed.min_policy_versions,
+                                target_offpolicy_steps=(
+                                    self.config.async_loop.target_offpolicy_steps
+                                ),
+                                max_offpolicy_steps=self.config.async_loop.max_offpolicy_steps,
+                            )
 
-                    # Streamed losses are sums: optim_step gets the step's loss-token count instead.
-                    loss_token_counts, routing_token_counts = (
-                        (None, None)
-                        if stream_microbatches
-                        else (
-                            packed.global_loss_token_counts,
-                            packed.global_routing_token_counts,
+                        # Streamed losses are sums: optim_step gets the step's loss-token count instead.
+                        loss_token_counts, routing_token_counts = (
+                            (None, None)
+                            if stream_microbatches
+                            else (
+                                packed.global_loss_token_counts,
+                                packed.global_routing_token_counts,
+                            )
                         )
-                    )
-                    with (
-                        sl.log_trace_span("forward_backward"),
-                        step_timer.record("timing/step/forward_backward"),
-                    ):
-                        # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks over TCP).
-                        # Sending the RDMAMicrobatches during the previous optim_step would hide it.
-                        try:
-                            # Send each DP rank only its column of the grid.
-                            fwd_bwd_results = await asyncio.gather(
-                                *(
-                                    trainer_at_dp_rank.forward_backward.call(
-                                        [
-                                            [row[dp_rank] for row in group]
-                                            for group in packed.microbatch_groups
-                                        ],
-                                        loss_token_counts,
-                                        routing_token_counts,
-                                        ends_step=packed.ends_step,
-                                    )
-                                    for dp_rank, trainer_at_dp_rank in enumerate(
-                                        self.trainer.by_dp_rank
-                                    )
-                                )
+                        if (
+                            len(forward_backward_tasks)
+                            >= _MAX_IN_FLIGHT_FORWARD_BACKWARD_CALLS
+                        ):
+                            # Calls finish in order, so this is the oldest call that may still run.
+                            # asyncio.wait returns without raising, so the group raises a failed call once.
+                            await asyncio.wait(
+                                [
+                                    forward_backward_tasks[
+                                        -_MAX_IN_FLIGHT_FORWARD_BACKWARD_CALLS
+                                    ]
+                                ]
                             )
-                            # Under PP, only trainer ranks holding the last stage
-                            # compute the loss; the others return None.
-                            batch_fwd_bwd_metrics.append(
-                                next(
-                                    rank_metrics
-                                    for rank_metrics in fwd_bwd_results[0].values()
-                                    if rank_metrics is not None
-                                )
+                        # TODO: a queued call starts reading its RDMAMicrobatches only when it starts running
+                        # (~0.5 GB/s per rank, 4 ranks over TCP). Start the first read when the call arrives.
+                        sent_times_s.append(time.perf_counter())
+                        forward_backward_tasks.append(
+                            forward_backward_calls.create_task(
+                                self._wait_for_forward_backward(
+                                    # `.call` sends now, so each rank gets its calls in order.
+                                    # Send each DP rank only its column of the grid.
+                                    [
+                                        trainer_at_dp_rank.forward_backward.call(
+                                            [
+                                                [row[dp_rank] for row in group]
+                                                for group in packed.microbatch_groups
+                                            ],
+                                            loss_token_counts,
+                                            routing_token_counts,
+                                            ends_step=packed.ends_step,
+                                        )
+                                        for dp_rank, trainer_at_dp_rank in enumerate(
+                                            self.trainer.by_dp_rank
+                                        )
+                                    ]
+                                ),
+                                # One trace track per in-flight slot.
+                                name=f"forward_backward_{len(forward_backward_tasks) % _MAX_IN_FLIGHT_FORWARD_BACKWARD_CALLS}",
                             )
-                        finally:
-                            # With RDMA, every rank has read its column (or the step failed).
-                            # Not awaited: it would wait behind an in-flight add_group.
-                            self.batcher.maybe_release_oldest_batch.broadcast()
-                    step_batches.append(packed)
-                    # TODO: send the next batch while the trainer computes this one, to hide the
-                    # RPC between them.
+                        )
+                        step_batches.append(packed)
+                    # Leaving the group waits for every call, also when the batcher closed mid-step.
 
                 if packed is None:
                     logger.info("Batcher closed and drained; stopping training")
                     break
 
+                forward_backward_results = [
+                    task.result() for task in forward_backward_tasks
+                ]
+                wait_s, forward_backward_s = forward_backward_wait_and_busy_seconds(
+                    step_start_s,
+                    [
+                        (sent_s, finished_s)
+                        for sent_s, (_, finished_s) in zip(
+                            sent_times_s, forward_backward_results, strict=True
+                        )
+                    ],
+                )
+                batch_fwd_bwd_metrics = [
+                    metrics for metrics, _ in forward_backward_results
+                ]
                 step_loss_token_counts = sum(
                     batch.global_loss_token_counts for batch in step_batches
                 )
@@ -1278,7 +1312,12 @@ class Controller(Configurable):
 
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.
-            time_metrics = step_timer.flush()
+            time_metrics = [
+                *step_timer.flush(),
+                # The trainer's wait for batches and its forward/backward time this step.
+                m.Metric("timing/step/wait_for_training_batch", m.Mean(wait_s)),
+                m.Metric("timing/step/forward_backward", m.Mean(forward_backward_s)),
+            ]
             with sl.log_trace_span("metrics_log"):
                 self.metrics_processor.log(
                     step=step,
@@ -1316,6 +1355,27 @@ class Controller(Configurable):
         if push_task is not None:
             await push_task
             await pull_task
+
+    async def _wait_for_forward_backward(
+        self, results_by_dp_rank: list[Awaitable[Any]]
+    ) -> tuple[dict[str, float], float]:
+        """Wait for one batch's forward_backward calls, one per DP rank. Returns the loss metrics and
+        the time the calls finished."""
+        with sl.log_trace_span("forward_backward"):
+            try:
+                fwd_bwd_results = await asyncio.gather(*results_by_dp_rank)
+            finally:
+                # With RDMA, every rank has read its column (or the step failed).
+                # Not awaited: it would wait behind an in-flight add_group.
+                self.batcher.maybe_release_oldest_batch.broadcast()
+        finished_s = time.perf_counter()
+        # Under PP, only trainer ranks holding the last stage compute the loss; the others return None.
+        metrics = next(
+            rank_metrics
+            for rank_metrics in fwd_bwd_results[0].values()
+            if rank_metrics is not None
+        )
+        return metrics, finished_s
 
     async def _push_model_state_dict(self) -> float:
         """Push the trainer's model state dict to TorchStore; returns its wall time in seconds."""

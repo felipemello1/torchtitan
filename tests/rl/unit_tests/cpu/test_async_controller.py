@@ -23,6 +23,7 @@ from torchtitan.rl.controller.metrics import (
     combine_microbatch_metrics,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
+    forward_backward_wait_and_busy_seconds,
     MetricsTimer,
 )
 from torchtitan.rl.controller.work_buffer import (
@@ -694,18 +695,13 @@ def test_metrics_timer_flush_drains() -> None:
     assert timer.flush() == []  # drained on the second read
 
 
-def test_metrics_timer_logs_the_total_of_repeated_spans() -> None:
-    timer = MetricsTimer()
-    with patch(
-        "torchtitan.rl.controller.metrics.time.perf_counter",
-        side_effect=[0.0, 1.0, 5.0, 7.0],
-    ):
-        # e.g. the wait for each streamed batch of one step
-        for _ in range(2):
-            with timer.record("timing/step/wait_for_training_batch"):
-                pass
-    [metric] = timer.flush()
-    assert m.Mean.reduce([metric.value]) == {"mean": 3.0}
+def test_forward_backward_wait_and_busy_seconds_follow_the_trainer() -> None:
+    # Each call takes 3 s. Batch 2 is sent at t=1, while call 1 runs, so it waits 0 s; batch 3 at t=10.
+    assert forward_backward_wait_and_busy_seconds(
+        0.0, [(0.0, 3.0), (1.0, 6.0), (10.0, 13.0)]
+    ) == (4.0, 9.0)
+    # One call per step: the wait for the batch, then the call.
+    assert forward_backward_wait_and_busy_seconds(0.0, [(2.0, 5.0)]) == (2.0, 3.0)
 
 
 def test_combine_microbatch_metrics_divides_streamed_sums_by_the_step_count() -> None:

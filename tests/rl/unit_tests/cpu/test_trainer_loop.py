@@ -313,3 +313,103 @@ def test_nan_loss_mid_step_skips_the_optimizer_step() -> None:
     asyncio.run(controller._trainer_loop(queue, num_training_steps=1))
 
     assert events == ["fwd_bwd", "fwd_bwd"]
+
+
+def test_batches_are_sent_before_earlier_calls_return() -> None:
+    events: list[str] = []
+    controller = _controller(events, stream_microbatches=True)
+    calls: list[asyncio.Task] = []
+    num_finished = 0
+    num_in_flight_at_send: list[int] = []
+
+    def forward_backward_call(*args, ends_step):
+        # Like the trainer actor: the call is sent at once, and calls run one after another.
+        async def run(previous: asyncio.Task | None):
+            nonlocal num_finished
+            if previous is not None:
+                await previous
+            for _ in range(3):
+                await asyncio.sleep(0)
+            num_finished += 1
+            events.append(f"finish {index}")
+            return _RankValues({"loss/mean": 1.0})
+
+        index = len(calls)
+        num_in_flight_at_send.append(index + 1 - num_finished)
+        events.append(f"send {index}")
+        calls.append(asyncio.ensure_future(run(calls[-1] if calls else None)))
+        return calls[-1]
+
+    controller.trainer.by_dp_rank[0].forward_backward = SimpleNamespace(
+        call=forward_backward_call
+    )
+    controller.batcher.maybe_release_oldest_batch = SimpleNamespace(
+        broadcast=lambda: events.append("release")
+    )
+    queue: asyncio.Queue = asyncio.Queue()
+    for ends_step in (False, False, False, False, True):
+        queue.put_nowait(_batch(ends_step=ends_step))
+
+    asyncio.run(controller._trainer_loop(queue, num_training_steps=1))
+
+    # The first three batches are all sent before the first call returns; the fourth waits for it.
+    assert events[:4] == ["send 0", "send 1", "send 2", "finish 0"]
+    assert num_in_flight_at_send == [1, 2, 3, 3, 3]
+    # A batch's RDMA buffers are released only after its call returned.
+    releases = [i for i, event in enumerate(events) if event == "release"]
+    assert len(releases) == 5
+    for index, release in enumerate(releases):
+        assert events.index(f"finish {index}") < release
+    assert events.index("finish 4") < events.index("optim 1")
+
+
+def test_step_times_are_the_trainers_wait_and_forward_backward() -> None:
+    controller = _controller([], stream_microbatches=True)
+
+    async def forward_backward(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        return _RankValues({"loss/mean": 1.0})
+
+    controller.trainer.by_dp_rank[0].forward_backward = _Endpoint(forward_backward)
+
+    async def run() -> None:
+        queue: asyncio.Queue = asyncio.Queue()
+        queue.put_nowait(_batch(ends_step=False))
+        loop = asyncio.create_task(
+            controller._trainer_loop(queue, num_training_steps=1)
+        )
+        # The trainer computes 0.05 s, then waits ~0.45 s for the step's last batch.
+        await asyncio.sleep(0.5)
+        queue.put_nowait(_batch())
+        await loop
+
+    asyncio.run(run())
+
+    [metrics] = controller.logged_metrics
+    wait_s = metrics["timing/step/wait_for_training_batch"].value.value
+    forward_backward_s = metrics["timing/step/forward_backward"].value.value
+    assert 0.09 <= forward_backward_s < 0.3
+    assert wait_s >= 0.4
+
+
+def test_forward_backward_failure_stops_the_step_at_once() -> None:
+    async def failing_forward_backward(*args, **kwargs):
+        raise RuntimeError("forward_backward failed")
+
+    events: list[str] = []
+    controller = _controller(events, stream_microbatches=True)
+    controller.trainer.by_dp_rank[0].forward_backward = _Endpoint(
+        failing_forward_backward
+    )
+    queue: asyncio.Queue = asyncio.Queue()
+    # The step's other batches are still generating: the loop must not wait for them.
+    queue.put_nowait(_batch(ends_step=False))
+
+    with pytest.raises(ExceptionGroup) as raised:
+        asyncio.run(
+            asyncio.wait_for(
+                controller._trainer_loop(queue, num_training_steps=1), timeout=5
+            )
+        )
+    assert "forward_backward failed" in str(raised.value.exceptions[0])
+    assert "optim 1" not in events
