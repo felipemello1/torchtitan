@@ -72,7 +72,7 @@ class TrainingMicrobatch(TokenizedTrainingMicrobatch):
 
 @dataclass(frozen=True, slots=True)
 class TrainerStepBatch:
-    """Packed microbatches for one optimizer step.
+    """Packed microbatches for one optimizer step, or for part of one with `stream_microbatches`.
 
     Example:
         # 5 training samples, effective length 5 each; 2 rows/rank, dp_degree=1
@@ -91,13 +91,17 @@ class TrainerStepBatch:
     microbatch_groups: (
         list[list[list[TrainingMicrobatch]]] | list[list[list[RDMAMicrobatch]]]
     )
+    # Counts over this batch's microbatches.
     global_loss_token_counts: torch.Tensor
     global_routing_token_counts: torch.Tensor
+    # The step's metrics, group ids and policy versions; empty on a streamed step's earlier batches.
     metrics: list[m.Metric]
     group_ids: list[int]
     """Every consumed rollout group, including metric-only groups."""
-    # one per packed training_sample; trainer computes policy_age at consume time
+    # one per training_sample of the step; trainer computes policy_age at consume time
     min_policy_versions: list[int]
+    ends_step: bool = True
+    """False on a streamed step's earlier batches; True on the step's last batch."""
 
 
 _MAX_CONSECUTIVE_UNTRAINABLE_BATCHES = 10
@@ -189,6 +193,13 @@ class Batcher(Configurable):
         # pending is None; batch.microbatch_groups: [num_groups][1][2 ranks];
         # each TrainingMicrobatch.input: [256 tokens]
 
+    With `stream_microbatches`, a group can also return the step's microbatches that are ready:
+
+        batcher = Batcher.Config(stream_microbatches=True).build(..., num_prompts_per_train_step=3)
+        batcher.add_training_samples(training_sample_group=group0)  # -> (TrainerStepBatch(ends_step=False), True)
+        batcher.add_training_samples(training_sample_group=group1)  # -> (None, True): nothing ready yet
+        batcher.add_training_samples(training_sample_group=group2)  # -> (TrainerStepBatch(ends_step=True), True)
+
     With `rdma_min_tensor_bytes` set, it returns `RDMAMicrobatch`es registered with
     `register_rdma_microbatch`, the actor system's RDMA registration (e.g.
     `MonarchRDMAMicrobatch.register`), which is then required.
@@ -216,6 +227,14 @@ class Batcher(Configurable):
         The Monarch actor system uses ibverbs where the host has it, else TCP; a host that lists unusable
         ibverbs devices fails instead. MONARCH_RDMA_DISABLE_IBVERBS=1 forces TCP in every process, weight sync
         included."""
+        stream_microbatches: bool = False
+        """When the trainer gets the step's microbatches:
+            False: once, after all `num_prompts_per_train_step` groups are packed. Each loss divides by the
+                step's loss-token count.
+            True: after each group, every microbatch that is ready; the step's last batch has the rest. Each
+                loss returns a sum, and the trainer divides the gradients by the step's count before clipping.
+                Needs: CUDA graphs off, no SDC replay, no deferred FSDP reduction, no MoE auxiliary loss, no MTP.
+        """
         training_sample_builder: TrainingSampleBuilder.Config = field(
             default_factory=TrainingSampleBuilder.Config
         )
@@ -278,6 +297,10 @@ class Batcher(Configurable):
         self._num_pp_microbatches = num_pp_microbatches
         self._groups_for_next_batch: list[TrainingSampleGroup] = []
         self._num_consecutive_zero_output_groups = 0
+        self._stream_microbatches = config.stream_microbatches
+        # Streaming: this step's samples that no batch has sent yet, and the microbatches sent so far.
+        self._unsent_training_samples: list[TrainingSample] = []
+        self._num_microbatches_sent = 0
         self._rdma_min_tensor_bytes = config.rdma_min_tensor_bytes
         self._register_rdma_microbatch = register_rdma_microbatch
         # Batches that trainer ranks may still read, oldest first; each buffer keeps its tensor alive until drop().
@@ -387,12 +410,19 @@ class Batcher(Configurable):
         # leave its dataloader entry pending forever.
         self._groups_for_next_batch.append(training_sample_group)
         self._record_untrainable_groups(group_is_trainable=group_is_trainable)
+        if self._stream_microbatches:
+            self._unsent_training_samples.extend(training_sample_group.training_samples)
         num_trainable_groups = sum(
             bool(group.training_samples) for group in self._groups_for_next_batch
         )
-        if num_trainable_groups < self._num_prompts_per_train_step:
-            return None, group_is_trainable  # accumulate until one full batch is ready
-        batch = self._pack_one_training_batch()
+        if num_trainable_groups >= self._num_prompts_per_train_step:
+            batch = self._pack_one_training_batch()
+        elif self._stream_microbatches:
+            batch = self._pack_ready_microbatches()
+        else:
+            batch = None  # accumulate until one full batch is ready
+        if batch is None:
+            return None, group_is_trainable
         if self._rdma_min_tensor_bytes is None:
             return batch, group_is_trainable
         assert self._register_rdma_microbatch is not None
@@ -440,17 +470,66 @@ class Batcher(Configurable):
             )
         )
 
-    def _pack_one_training_batch(self) -> TrainerStepBatch:
-        """Pack the oldest accumulated groups (up to `num_prompts_per_train_step` trainable groups) into one batch."""
-        (
-            training_samples,
-            metrics,
-            num_rollout_groups,
-            num_metric_only_groups,
-            group_ids,
-        ) = self._take_groups()
+    def _pack_ready_microbatches(self) -> TrainerStepBatch | None:
+        """Streaming: pack the step's unsent samples with first-fit decreasing (FFD), and send every
+        full microbatch group of bins except FFD's last bins.
+
+        A microbatch group has `num_pp_microbatches * dp_degree` bins. Cases with dp_degree=1, no PP
+        and 10 tokens per bin, by unsent sample lengths:
+            [6, 5, 4, 3] -> bins [6+4] [5+3] -> send [6+4]; 5 and 3 stay unsent
+            [5, 3, 2]    -> bins [5+3+2]     -> send nothing: later samples can fill the last bin
+            [6, 5, 5]    -> bins [6] [5+5]   -> send [6]; both 5s stay unsent
+            []           -> no bins          -> send nothing (e.g. the step's first group was untrainable)
+        """
+        bins = self._first_fit_decreasing(self._unsent_training_samples)
+        num_bins_per_microbatch_group = self._num_pp_microbatches * self._dp_degree
+        # Keep FFD's last bins unsent: later samples can fill them, which saves padding.
+        num_ready_bins = (
+            (len(bins) - 1)
+            // num_bins_per_microbatch_group
+            * num_bins_per_microbatch_group
+        )
+        if num_ready_bins <= 0:
+            return None
+        # FFD over the samples of FFD's first bins rebuilds the same bins, so the packer below makes
+        # exactly `num_ready_bins` bins, with no extra padding.
+        ready_training_samples = [
+            sample for bin_ in bins[:num_ready_bins] for sample in bin_
+        ]
+        self._unsent_training_samples = [
+            sample for bin_ in bins[num_ready_bins:] for sample in bin_
+        ]
+        return self._pack_one_training_batch(
+            streamed_training_samples=ready_training_samples
+        )
+
+    def _pack_one_training_batch(
+        self, *, streamed_training_samples: list[TrainingSample] | None = None
+    ) -> TrainerStepBatch:
+        """Pack one training batch:
+        streamed_training_samples=None: the step's last batch. Takes the oldest accumulated groups (up to
+            `num_prompts_per_train_step` trainable groups), packs every sample no earlier batch sent, and
+            carries the step's metrics, group ids and policy versions.
+        streamed_training_samples=[...]: a streamed step's earlier batch, with only these samples.
+        """
+        if streamed_training_samples is None:
+            (
+                training_samples,
+                metrics,
+                num_rollout_groups,
+                num_metric_only_groups,
+                group_ids,
+            ) = self._take_groups()
+            # With streaming, the step's earlier batches sent the other samples.
+            samples_to_pack = (
+                self._unsent_training_samples
+                if self._stream_microbatches
+                else training_samples
+            )
+        else:
+            samples_to_pack = streamed_training_samples
         assignments = self._assign_training_samples_to_microbatches(
-            training_samples, num_pp_microbatches=self._num_pp_microbatches
+            samples_to_pack, num_pp_microbatches=self._num_pp_microbatches
         )
         microbatches = [
             [self._pack_training_samples(samples) for samples in rank_assignments]
@@ -472,18 +551,40 @@ class Batcher(Configurable):
                 global_routing_token_counts.add_(microbatch.routing_token_counts)
         assert global_loss_token_counts is not None
         assert global_routing_token_counts is not None
-        num_global_loss_tokens = int(global_loss_token_counts.reshape(-1)[0].item())
-        num_response_tokens = sum(
-            int(microbatch.loss_mask.sum().item())
-            for rank_microbatches in microbatches
-            for microbatch in rank_microbatches
-        )
         num_pp_microbatches = self._num_pp_microbatches
+        microbatch_groups = [
+            microbatches[start : start + num_pp_microbatches]
+            for start in range(0, len(microbatches), num_pp_microbatches)
+        ]
+        if streamed_training_samples is not None:
+            self._num_microbatches_sent += len(assignments)
+            return TrainerStepBatch(
+                microbatch_groups=microbatch_groups,
+                global_loss_token_counts=global_loss_token_counts,
+                global_routing_token_counts=global_routing_token_counts,
+                metrics=[],
+                group_ids=[],
+                min_policy_versions=[],
+                ends_step=False,
+            )
+
+        num_microbatches = self._num_microbatches_sent + len(assignments)
+        self._unsent_training_samples = []
+        self._num_microbatches_sent = 0
+        # Response tokens, and those with a finite generator logprob (the loss tokens), over the step.
+        num_response_tokens = sum(
+            int(np.count_nonzero(sample.loss_mask[1:])) for sample in training_samples
+        )
+        num_global_loss_tokens = sum(
+            int(
+                np.count_nonzero(
+                    sample.loss_mask[1:] & np.isfinite(sample.logprobs[1:])
+                )
+            )
+            for sample in training_samples
+        )
         return TrainerStepBatch(
-            microbatch_groups=[
-                microbatches[start : start + num_pp_microbatches]
-                for start in range(0, len(microbatches), num_pp_microbatches)
-            ],
+            microbatch_groups=microbatch_groups,
             global_loss_token_counts=global_loss_token_counts,
             global_routing_token_counts=global_routing_token_counts,
             metrics=[
@@ -498,7 +599,7 @@ class Batcher(Configurable):
                     ),
                 ),
                 *self._packing_metrics(
-                    assignments,
+                    num_microbatches,
                     training_samples,
                     num_rollout_groups,
                     num_metric_only_groups,
@@ -578,38 +679,13 @@ class Batcher(Configurable):
         ``[G * M][D]``; the trainer runs each M consecutive microbatches as
         one pipeline step.
         """
-        num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
-
         # Step 1: find the bin count with FFD, retaining its fallback packing.
         ordered_samples = sorted(
             training_samples,
             key=self.num_tokens_to_pack,
             reverse=True,
         )
-        ffd_bins: list[list[TrainingSample]] = []
-        ffd_bin_num_tokens: list[int] = []
-
-        for training_sample in ordered_samples:
-            num_tokens = self.num_tokens_to_pack(training_sample)
-            destination = next(
-                (
-                    index
-                    for index, bin_ in enumerate(ffd_bins)
-                    if ffd_bin_num_tokens[index] + num_tokens <= num_tokens_per_rank
-                    and (
-                        self._max_num_documents is None
-                        or len(bin_) < self._max_num_documents
-                    )
-                ),
-                None,
-            )
-            if destination is None:
-                ffd_bins.append([])
-                ffd_bin_num_tokens.append(0)
-                destination = len(ffd_bins) - 1
-
-            ffd_bins[destination].append(training_sample)
-            ffd_bin_num_tokens[destination] += num_tokens
+        ffd_bins = self._first_fit_decreasing(ordered_samples)
 
         # Step 2: make the [G][M][D] grid rectangular.
         num_bins_per_step = num_pp_microbatches * self._dp_degree
@@ -640,6 +716,42 @@ class Batcher(Configurable):
             [bins[sorted_bin_indices[index]] for index in rank_indices]
             for rank_indices in bin_indices_by_rank
         ]
+
+    def _first_fit_decreasing(
+        self, training_samples: list[TrainingSample]
+    ) -> list[list[TrainingSample]]:
+        """Put each sample, longest first, in the first bin with room for its tokens and documents."""
+        num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
+        ordered_samples = sorted(
+            training_samples,
+            key=self.num_tokens_to_pack,
+            reverse=True,
+        )
+        ffd_bins: list[list[TrainingSample]] = []
+        ffd_bin_num_tokens: list[int] = []
+
+        for training_sample in ordered_samples:
+            num_tokens = self.num_tokens_to_pack(training_sample)
+            destination = next(
+                (
+                    index
+                    for index, bin_ in enumerate(ffd_bins)
+                    if ffd_bin_num_tokens[index] + num_tokens <= num_tokens_per_rank
+                    and (
+                        self._max_num_documents is None
+                        or len(bin_) < self._max_num_documents
+                    )
+                ),
+                None,
+            )
+            if destination is None:
+                ffd_bins.append([])
+                ffd_bin_num_tokens.append(0)
+                destination = len(ffd_bins) - 1
+
+            ffd_bins[destination].append(training_sample)
+            ffd_bin_num_tokens[destination] += num_tokens
+        return ffd_bins
 
     def _attention_workload(self, training_samples: list[TrainingSample]) -> int:
         """Estimate document and tail-padding attention as squared lengths.
@@ -921,14 +1033,14 @@ class Batcher(Configurable):
 
     def _packing_metrics(
         self,
-        assignments: list[list[list[TrainingSample]]],
+        num_microbatches: int,
         training_samples: list[TrainingSample],
         num_rollout_groups: int,
         num_metric_only_groups: int,
     ) -> list[m.Metric]:
         """Per-training-batch packing + count metrics. (policy age is logged at trainer consume time.)"""
         padding_frac = self._padding_fraction(
-            num_microbatches=len(assignments),
+            num_microbatches=num_microbatches,
             training_samples=training_samples,
         )
         return [
@@ -938,7 +1050,7 @@ class Batcher(Configurable):
             ),
             m.Metric(
                 "train_batch/num_microbatches",
-                m.NoReduce(float(len(assignments))),
+                m.NoReduce(float(num_microbatches)),
             ),
             m.Metric(
                 "train_batch/num_rollout_groups", m.NoReduce(float(num_rollout_groups))

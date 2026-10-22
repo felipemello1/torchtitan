@@ -49,14 +49,15 @@ _batcher_loop
                         v  |                           v
 Batcher (own process)                                training_batch_queue
 +-------------------------------------------------+   +----------------------------------------------+
-| build_from_group -> add_training_samples        |   | size 1; holds TrainerStepBatch | None        |
-| pack at num_prompts_per_train_step               |   +---------------------+------------------------+
-+-------------------------------------------------+                         |
+| build_from_group -> add_training_samples        |   | size 1 (unbounded with stream_microbatches); |
+| pack at num_prompts_per_train_step               |   | holds TrainerStepBatch | None                |
++-------------------------------------------------+   +---------------------+------------------------+
+                                                                         |
                                                                          | packed = training_batch_queue.get()
                                                                          v
 _trainer_loop
 +----------------------------------------------------------------------------------------------------------+
-| train batch -> optim -> push/pull weights -> buffer.release_active_groups(num_prompts_per_train_step)     |
+| train batches -> optim -> push/pull weights -> buffer.release_active_groups(num_prompts_per_train_step)   |
 +----------------------------------------------------------------------------------------------------------+
 
 Backpressure (each loop: what it consumes/produces, and what gates each side):
@@ -78,7 +79,7 @@ _batcher_loop
     waits for:    a group inside the window becoming FINALIZED (any group when windowed_fifo_batches is None)
     unblocked by: _rollout_loop[N] group_buffer.finalize_work()
   produces: TrainerStepBatch (training_batch_queue.put)
-    waits for:    a free training_batch_queue slot (maxsize=1)
+    waits for:    a free training_batch_queue slot (maxsize=1; never with stream_microbatches)
     unblocked by: _trainer_loop training_batch_queue.get()
 _trainer_loop
   consumes: a TrainerStepBatch (training_batch_queue.get)
@@ -104,9 +105,11 @@ import torch  # noqa: F401
 from torchtitan.components.renderer import RendererConfig
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import apply_overrides, Configurable, OverrideConfig
+from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.actors.system import ActorSystem, TrainerHandle
 from torchtitan.rl.controller.metrics import (
+    combine_microbatch_metrics,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
     compute_rollout_metrics,
@@ -369,6 +372,17 @@ class Controller(Configurable):
                     "trainer.training.preprocess_microbatch_groups_lazily=True: trainer "
                     "ranks read all microbatches before forward/backward, with no overlap.",
                     stacklevel=2,
+                )
+            # TODO: support them. An auxiliary loss divides by the step's routed-token count, and MTP
+            # by one loss-token count per depth, both before forward/backward.
+            if self.async_loop.batcher.stream_microbatches and (
+                next(self.trainer.model.traverse(AuxLoss.Config), None) is not None
+                or self.async_loop.batcher.num_mtp_layers > 0
+            ):
+                raise ValueError(
+                    "async_loop.batcher.stream_microbatches does not support MoE auxiliary "
+                    "losses or MTP yet: they need step-wide token counts before forward/backward, "
+                    "and a streamed batch trains before the step's other samples exist."
                 )
             # TODO: read RDMA microbatches in pipeline-step groups.
             if (
@@ -831,9 +845,12 @@ class Controller(Configurable):
             window_size=window_size,
         )
 
-        # training_batch_queue
+        # training_batch_queue. Streaming puts several batches per step; a full queue would block
+        # _batcher_loop, which also releases the slots of untrainable groups.
+        # TODO: with streaming and off-policy steps, the batcher can pack a few steps ahead. Merge
+        # queued batches of one step into one forward_backward call if trainer-bound runs need it.
         training_batch_queue: asyncio.Queue[TrainerStepBatch | None] = asyncio.Queue(
-            maxsize=1
+            maxsize=0 if async_loop.batcher.stream_microbatches else 1
         )
 
         # rollout_loop
@@ -1036,7 +1053,7 @@ class Controller(Configurable):
             waits for:    a group inside the window becoming FINALIZED (any group when windowed_fifo_batches is None)
             unblocked by: _rollout_loop[N] group_buffer.finalize_work()
         produces: TrainerStepBatch (training_batch_queue.put)
-            waits for:    a free training_batch_queue slot (maxsize=1)
+            waits for:    a free training_batch_queue slot (maxsize=1; never with stream_microbatches)
             unblocked by: _trainer_loop training_batch_queue.get()
         """
         while True:
@@ -1066,8 +1083,15 @@ class Controller(Configurable):
         *,
         num_training_steps: int,
     ) -> None:
-        """Run num_training_steps optimizer steps: train one packed batch, push the trainer's model
-        state dict, then pull it into the generators, log metrics.
+        """Run num_training_steps optimizer steps: train the step's packed batches, push the trainer's
+        model state dict, then pull it into the generators, log metrics.
+
+        A step has one batch, or several with `stream_microbatches`: forward/backward starts on the
+        first batch while later groups are still generating, and the losses are sums until the
+        optimizer step divides the gradients by the step's loss-token count.
+
+            Batcher:  [batch 1]       [batch 2]             [batch 3, ends_step]
+            Trainer:      [fwd/bwd 1]     [fwd/bwd 2]            [fwd/bwd 3] [optimizer]
 
         The push and pull of policy N overlap forward/backward N+1:
 
@@ -1091,6 +1115,7 @@ class Controller(Configurable):
             waits for:    a TrainerStepBatch in the queue
             unblocked by: _batcher_loop training_batch_queue.put()
         """
+        stream_microbatches = self.config.async_loop.batcher.stream_microbatches
         # The previous step's push and pull, each returning its wall time; None before the first.
         push_task: asyncio.Task[float] | None = None
         pull_task: asyncio.Task[float] | None = None
@@ -1108,69 +1133,98 @@ class Controller(Configurable):
                 sl.log_trace_span("train_step"),
                 step_timer.record("timing/step/total"),
             ):
-                # Waits for a TrainerStepBatch to be ready (or None on shutdown).
-                with (
-                    sl.log_trace_span("wait_for_training_batch"),
-                    step_timer.record("timing/step/wait_for_training_batch"),
-                ):
-                    packed = await training_batch_queue.get()
+                # One batch per step, or several with streaming; the step's last batch has ends_step=True.
+                # The step timer sums each span's records, so the wait is the step's total wait.
+                step_batches: list[TrainerStepBatch] = []
+                batch_fwd_bwd_metrics: list[dict[str, float]] = []
+                while not step_batches or not step_batches[-1].ends_step:
+                    # Waits for a TrainerStepBatch to be ready (or None on shutdown).
+                    with (
+                        sl.log_trace_span("wait_for_training_batch"),
+                        step_timer.record("timing/step/wait_for_training_batch"),
+                    ):
+                        packed = await training_batch_queue.get()
+                    if packed is None:
+                        break
+                    if packed.ends_step:
+                        # Policy age is computed HERE, at consumption time, against the live trainer version, so
+                        # it is faithful to what this step trains on -- not the version when the batch was packed.
+                        # The step's last batch holds every sample's version.
+                        policy_age_panel = compute_policy_age_metrics(
+                            trainer_policy_version=self._trainer_policy_version,
+                            min_policy_versions=packed.min_policy_versions,
+                            target_offpolicy_steps=(
+                                self.config.async_loop.target_offpolicy_steps
+                            ),
+                            max_offpolicy_steps=self.config.async_loop.max_offpolicy_steps,
+                        )
+
+                    # Streamed losses are sums: optim_step gets the step's loss-token count instead.
+                    loss_token_counts, routing_token_counts = (
+                        (None, None)
+                        if stream_microbatches
+                        else (
+                            packed.global_loss_token_counts,
+                            packed.global_routing_token_counts,
+                        )
+                    )
+                    with (
+                        sl.log_trace_span("forward_backward"),
+                        step_timer.record("timing/step/forward_backward"),
+                    ):
+                        # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks over TCP).
+                        # Sending the RDMAMicrobatches during the previous optim_step would hide it.
+                        try:
+                            # Send each DP rank only its column of the grid.
+                            fwd_bwd_results = await asyncio.gather(
+                                *(
+                                    trainer_at_dp_rank.forward_backward.call(
+                                        [
+                                            [row[dp_rank] for row in group]
+                                            for group in packed.microbatch_groups
+                                        ],
+                                        loss_token_counts,
+                                        routing_token_counts,
+                                        ends_step=packed.ends_step,
+                                    )
+                                    for dp_rank, trainer_at_dp_rank in enumerate(
+                                        self.trainer.by_dp_rank
+                                    )
+                                )
+                            )
+                            # Under PP, only trainer ranks holding the last stage
+                            # compute the loss; the others return None.
+                            batch_fwd_bwd_metrics.append(
+                                next(
+                                    rank_metrics
+                                    for rank_metrics in fwd_bwd_results[0].values()
+                                    if rank_metrics is not None
+                                )
+                            )
+                        finally:
+                            # With RDMA, every rank has read its column (or the step failed).
+                            # Not awaited: it would wait behind an in-flight add_group.
+                            self.batcher.maybe_release_oldest_batch.broadcast()
+                    step_batches.append(packed)
+                    # TODO: send the next batch while the trainer computes this one, to hide the
+                    # RPC between them.
 
                 if packed is None:
                     logger.info("Batcher closed and drained; stopping training")
                     break
 
-                # Policy age is computed HERE, at consumption time, against the live trainer version, so it is
-                # faithful to what this step trains on -- not the version when the batch was packed.
-                policy_age_panel = compute_policy_age_metrics(
-                    trainer_policy_version=self._trainer_policy_version,
-                    min_policy_versions=packed.min_policy_versions,
-                    target_offpolicy_steps=(
-                        self.config.async_loop.target_offpolicy_steps
-                    ),
-                    max_offpolicy_steps=self.config.async_loop.max_offpolicy_steps,
+                step_loss_token_counts = sum(
+                    batch.global_loss_token_counts for batch in step_batches
                 )
-
-                # TODO(async): can't stream microbatches (interleave pack->train) -- the loss is normalized by
-                #   global counts over ALL microbatches, needed before any fwd/bwd. To
-                #   support streaming, accumulate raw loss/token counts across microbatches and scale before optimizer.
-                with (
-                    sl.log_trace_span("forward_backward"),
-                    step_timer.record("timing/step/forward_backward"),
-                ):
-                    # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks over TCP).
-                    # Sending the RDMAMicrobatches during the previous optim_step would hide it.
-                    try:
-                        # Send each DP rank only its column of the grid.
-                        fwd_bwd_results = await asyncio.gather(
-                            *(
-                                trainer_at_dp_rank.forward_backward.call(
-                                    [
-                                        [row[dp_rank] for row in group]
-                                        for group in packed.microbatch_groups
-                                    ],
-                                    packed.global_loss_token_counts,
-                                    packed.global_routing_token_counts,
-                                )
-                                for dp_rank, trainer_at_dp_rank in enumerate(
-                                    self.trainer.by_dp_rank
-                                )
-                            )
-                        )
-                        # Under PP, only trainer ranks holding the last stage
-                        # compute the loss; the others return None.
-                        fwd_bwd_metrics = next(
-                            rank_metrics
-                            for rank_metrics in fwd_bwd_results[0].values()
-                            if rank_metrics is not None
-                        )
-                    finally:
-                        # With RDMA, every rank has read its column (or the step failed).
-                        # Not awaited: it would wait behind an in-flight add_group.
-                        self.batcher.maybe_release_oldest_batch.broadcast()
-
-                    if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
-                        logger.error("Loss is NaN/Inf; training diverged")
-                        break
+                fwd_bwd_metrics = combine_microbatch_metrics(
+                    batch_fwd_bwd_metrics,
+                    num_global_loss_tokens=(
+                        int(step_loss_token_counts[0]) if stream_microbatches else None
+                    ),
+                )
+                if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
+                    logger.error("Loss is NaN/Inf; training diverged")
+                    break
 
                 # Await the trainer model state dict push before the optimizer mutates the weights.
                 with (
@@ -1198,6 +1252,9 @@ class Controller(Configurable):
                         await self.trainer.all_ranks.optim_step.call(
                             controller_state=controller_state,
                             last_step=(step == num_training_steps),
+                            global_loss_token_counts=(
+                                step_loss_token_counts if stream_microbatches else None
+                            ),
                         )
                     )
                 self._trainer_policy_version = optimizer_result.policy_version
@@ -1249,9 +1306,7 @@ class Controller(Configurable):
                             m.NoReduce(pull_s),
                         ),
                         *compute_perf_ratio_metrics(
-                            num_global_valid_tokens=int(
-                                packed.global_loss_token_counts[0]
-                            ),
+                            num_global_valid_tokens=int(step_loss_token_counts[0]),
                             time_metrics=time_metrics,
                         ),
                     ],

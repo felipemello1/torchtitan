@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class MetricsTimer:
-    """Times named code spans; flush() drains them into Mean metrics, then resets.
+    """Times named code spans; flush() drains each span's total seconds into a Mean metric, then resets.
 
     Example:
         metric_timer = MetricsTimer()
@@ -31,7 +31,7 @@ class MetricsTimer:
                     ...
         time_metrics = metric_timer.flush()
         # -> [Metric("timing/step/total", Mean(...)),
-        #     Metric("timing/step/forward_backward", Mean(...))]   # mean over num_microbatches
+        #     Metric("timing/step/forward_backward", Mean(...))]   # total over num_microbatches
     """
 
     def __init__(self) -> None:
@@ -48,20 +48,28 @@ class MetricsTimer:
             self.durations[key].append(time.perf_counter() - start)
 
     def flush(self) -> list[m.Metric]:
-        """Return one Mean metric per recorded span, then reset so the timer can be reused."""
+        """Return one Mean metric per recorded span holding its total seconds, then reset so the
+        timer can be reused. A span recorded several times in one step, like the wait for each
+        streamed batch, logs the step's total."""
         durations = self.durations
         self.durations = defaultdict(list)
-        return [
-            m.Metric(key, m.Mean.from_list(values)) for key, values in durations.items()
-        ]
+        return [m.Metric(key, m.Mean(sum(values))) for key, values in durations.items()]
+
+
+_SUMMED_METRIC_SUFFIXES = ("/mean", "_mean", "/frac", "_frac")
 
 
 def combine_microbatch_metrics(
     microbatch_metrics: list[dict[str, float]],
+    *,
+    num_global_loss_tokens: int | None = None,
 ) -> dict[str, float]:
     """Combine per-microbatch loss metrics over the grad-accumulation: mean/frac keys are pre-normalized
     by num_global_valid_tokens so summing them reconstructs the global value. For keys ending in "max",
     the max value is taken.
+
+    Streamed microbatches return unnormalized sums; `num_global_loss_tokens` then divides the summed
+    mean/frac keys.
 
     Example:
         # already normalized by num_global_valid_tokens
@@ -69,6 +77,11 @@ def combine_microbatch_metrics(
                                     {"loss/ratio_clipped_frac": 0.2, "x/max": 5.0}])
         # output
         # -> {"loss/ratio_clipped_frac": 0.3, "x/max": 5.0}
+
+        # streamed: token sums over a step with 10 loss tokens
+        combine_microbatch_metrics([{"loss/ratio_clipped_frac": 1.0}, {"loss/ratio_clipped_frac": 2.0}],
+                                   num_global_loss_tokens=10)
+        # -> {"loss/ratio_clipped_frac": 0.3}
     """
     combined: dict[str, float] = {}
     for microbatch in microbatch_metrics:
@@ -77,8 +90,13 @@ def combine_microbatch_metrics(
                 combined[key] = value
             elif key.endswith("/max"):
                 combined[key] = max(combined[key], value)
-            elif key.endswith(("/mean", "_mean", "/frac", "_frac")):
+            elif key.endswith(_SUMMED_METRIC_SUFFIXES):
                 combined[key] += value
+    if num_global_loss_tokens is not None:
+        for key in combined:
+            if key.endswith(_SUMMED_METRIC_SUFFIXES):
+                # A step with no loss tokens has all-zero sums; dividing by 1 keeps them zero.
+                combined[key] /= max(num_global_loss_tokens, 1)
     return combined
 
 
@@ -87,7 +105,7 @@ def compute_perf_ratio_metrics(
 ) -> list[m.Metric]:
     """Trainer-side timing ratios from the flushed step timers. A ratio is emitted only if every span
     it needs was recorded this step (no fallback zeros)."""
-    # Each span is recorded once/step; Mean.from_list stores the summed seconds in `.value`.
+    # MetricsTimer.flush stores each span's total seconds this step in `.value`.
     # Front-load each span's seconds into a short name (None if it was not recorded this step).
     seconds = {
         metric.key: metric.value.value
