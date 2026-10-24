@@ -226,12 +226,13 @@ def _stream_groups(groups: list[TrainingSampleGroup], *, stream: bool, dp_degree
 def test_streaming_batcher_sends_each_sample_once_and_ends_the_step_last(
     dp_degree: int,
 ) -> None:
-    # Untrainable groups first and mid-step; samples pack 3 to 9 tokens each.
+    # Untrainable groups first and mid-step; samples pack 1 to 9 tokens each. Groups 1 and 3 each
+    # complete a microbatch group whose bins are full (10 tokens), so they stream.
     groups = [
         _untrainable_group(0),
         _variable_length_group(1, token_lengths=[7, 6, 5, 4, 7, 6]),
         _untrainable_group(2),
-        _variable_length_group(3, token_lengths=[10, 9, 3]),
+        _variable_length_group(3, token_lengths=[10, 9, 3, 2]),
         _variable_length_group(4, token_lengths=[8, 5, 4, 4]),
     ]
     streamed = _stream_groups(groups, stream=True, dp_degree=dp_degree)
@@ -250,8 +251,8 @@ def test_streaming_batcher_sends_each_sample_once_and_ends_the_step_last(
         )
     last = streamed[-1]
     assert last.group_ids == whole_step.group_ids == [0, 1, 2, 3, 4]
-    assert len(last.min_policy_versions) == 13
-    assert _metric_value(last, "train_batch/num_training_samples") == 13
+    assert len(last.min_policy_versions) == 14
+    assert _metric_value(last, "train_batch/num_training_samples") == 14
 
     # Every batch holds whole rows of one microbatch per DP rank, and every token is sent once.
     microbatches = [
@@ -269,7 +270,7 @@ def test_streaming_batcher_sends_each_sample_once_and_ends_the_step_last(
     )
     num_sample_tokens = sum(int((~mb.padding_mask).sum()) for mb in microbatches)
     assert num_sample_tokens == sum(
-        length - 1 for length in [7, 6, 5, 4, 7, 6, 10, 9, 3, 8, 5, 4, 4]
+        length - 1 for length in [7, 6, 5, 4, 7, 6, 10, 9, 3, 2, 8, 5, 4, 4]
     )
     assert sum(batch.global_loss_token_counts for batch in streamed).tolist() == (
         whole_step.global_loss_token_counts.tolist()
@@ -1000,12 +1001,13 @@ def test_streaming_batcher_loop_queues_one_step_the_trainer_has_not_started() ->
         async def release_active_groups(self, count, *, reason):
             raise AssertionError("every group is trainable")
 
-    async def add_group(*, rollout_group):
+    async def add_group(*, rollout_group, num_queued_microbatch_groups):
         # 2 groups per step; each group streams one batch, the second ends the step.
         return SimpleNamespace(ends_step=rollout_group.group_id % 2 == 1), True
 
     buffer = _Buffer()
     controller = SimpleNamespace(
+        config=SimpleNamespace(async_loop=SimpleNamespace(batcher=Batcher.Config())),
         start_step=5,
         _group_buffer=buffer,
         batcher=SimpleNamespace(add_group=SimpleNamespace(call_one=add_group)),
@@ -1032,5 +1034,112 @@ def test_streaming_batcher_loop_queues_one_step_the_trainer_has_not_started() ->
         await step_starts.mark_started(6)
         await batcher
         assert queue.qsize() == 7  # three steps of two batches, and the None sentinel
+
+    asyncio.run(run())
+
+
+def test_streaming_batcher_loop_packs_when_the_trainer_falls_below_its_queue_target() -> None:
+    """Each group goes with the trainer's queued microbatch groups; a finished batch that leaves the
+    trainer below `stream_queued_microbatches` makes the loop ask the batcher for microbatches before
+    the next group arrives, and each queued batch counts its microbatch groups."""
+    calls = []
+    next_group = asyncio.Event()
+
+    class _Buffer:
+        def __init__(self) -> None:
+            self.num_taken = 0
+
+        async def take_finalized(self):
+            if self.num_taken == 2:
+                await next_group.wait()
+            if self.num_taken == 3:
+                return None
+            self.num_taken += 1
+            return RolloutGroup(group_id=self.num_taken - 1, rollouts=[])
+
+    def _streamed(num_microbatch_groups: int, *, ends_step: bool = False):
+        return SimpleNamespace(
+            microbatch_groups=[[[None]]] * num_microbatch_groups, ends_step=ends_step
+        )
+
+    async def add_group(*, rollout_group, num_queued_microbatch_groups):
+        calls.append(
+            ("add_group", rollout_group.group_id, num_queued_microbatch_groups)
+        )
+        # Group 0 fills the trainer's 3; group 1 adds samples but the trainer has enough; group 2
+        # ends the step.
+        return {
+            0: _streamed(3),
+            1: None,
+            2: _streamed(1, ends_step=True),
+        }[rollout_group.group_id], True
+
+    async def pack_ready_microbatches(*, num_queued_microbatch_groups):
+        calls.append(("pack_ready", num_queued_microbatch_groups))
+        return _streamed(3 - num_queued_microbatch_groups)
+
+    controller = SimpleNamespace(
+        config=SimpleNamespace(
+            async_loop=SimpleNamespace(
+                batcher=Batcher.Config(
+                    stream_microbatches=True, stream_queued_microbatches=3
+                )
+            ),
+        ),
+        start_step=5,
+        _group_buffer=_Buffer(),
+        batcher=SimpleNamespace(
+            add_group=SimpleNamespace(call_one=add_group),
+            pack_ready_microbatches=SimpleNamespace(call_one=pack_ready_microbatches),
+        ),
+    )
+
+    async def run() -> None:
+        queue: asyncio.Queue = asyncio.Queue()
+        queued = controller_module._QueuedMicrobatchGroups()
+        batcher = asyncio.create_task(
+            Controller._batcher_loop(
+                controller, training_batch_queue=queue, queued_microbatch_groups=queued
+            )
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert calls == [("add_group", 0, 0), ("add_group", 1, 3)]
+        assert queued.count == 3
+        # The trainer finishes group 0's batch: no group arrives, but the loop packs the missing 3.
+        queued.remove(3)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert calls[2:] == [("pack_ready", 0)]
+        assert queued.count == 3
+        next_group.set()
+        await batcher
+        assert calls[3:] == [("add_group", 2, 3)]
+        assert queued.count == 4
+        assert queue.qsize() == 4  # three batches and the None sentinel
+
+    asyncio.run(run())
+
+
+def test_queued_microbatch_groups_wake_only_on_progress_below_the_target() -> None:
+    async def run() -> None:
+        queued = controller_module._QueuedMicrobatchGroups()
+        queued.add(4)
+        waiter = asyncio.create_task(
+            queued.wait_for_trainer_progress(queued.num_finished, below=3)
+        )
+        queued.remove(1)  # 3 left: not below the target
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        queued.remove(1)
+        await asyncio.wait_for(waiter, timeout=1)
+        assert queued.count == 2
+        # Below the target but nothing finished since the snapshot: keep waiting.
+        waiter = asyncio.create_task(
+            queued.wait_for_trainer_progress(queued.num_finished, below=3)
+        )
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        waiter.cancel()
 
     asyncio.run(run())
