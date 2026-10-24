@@ -887,3 +887,22 @@ def test_streaming_packs_only_the_microbatch_groups_the_trainer_is_missing() -> 
 def test_stream_queued_microbatches_must_be_positive() -> None:
     with pytest.raises(ValueError, match="stream_queued_microbatches must be >= 1"):
         Batcher.Config(stream_microbatches=True, stream_queued_microbatches=0)
+
+
+def test_streaming_sends_bins_at_their_document_limit() -> None:
+    # Two documents per bin: four 1-token samples fill both bins' document limits, though not their
+    # tokens, so they stream.
+    batcher = _streaming_batcher(
+        num_tokens_per_microbatch=10,
+        max_context_length=10,
+        num_groups=2,
+        dp_degree=2,
+        max_num_documents=2,
+    )
+    streamed_rows, last_rows = _record_streamed_step(
+        batcher, [[_SizedSample(1) for _ in range(4)], [_SizedSample(5)]]
+    )
+    assert [[len(bin_) for bin_ in row] for row in streamed_rows] == [[2, 2]]
+    assert sorted(s.num_tokens for row in last_rows for bin_ in row for s in bin_) == [
+        5
+    ]

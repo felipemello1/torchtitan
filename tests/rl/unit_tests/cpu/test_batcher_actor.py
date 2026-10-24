@@ -167,3 +167,91 @@ def test_batcher_actor_returns_the_in_process_batch(tmp_path, monkeypatch) -> No
             torch.testing.assert_close(
                 comparable(batch), comparable(expected_batch), rtol=0, atol=0
             )
+
+
+def test_streaming_batcher_actor_packs_on_add_group_and_on_request(tmp_path) -> None:
+    """With streaming, `add_group` packs through a method that the actor's `pack_ready_microbatches`
+    endpoint does not shadow, and the endpoint packs on request: the same batches as in process."""
+    # Each sample packs 4 tokens, so a group's 4 samples fill one 16-token bin.
+    kwargs = dict(
+        num_tokens_per_microbatch_per_dp_rank=16,
+        max_context_length=16,
+        num_prompts_per_train_step=3,
+        dp_degree=1,
+        pad_id=0,
+        temperature=1.0,
+    )
+    config = Batcher.Config(stream_microbatches=True)
+    groups = [_group(group_id, [0.0, 1.0, 0.0, 1.0]) for group_id in range(3)]
+
+    def calls(batcher_call, pack_call):
+        # The trainer has nothing queued, then 3 (enough), then asks once its queue is empty.
+        return [
+            batcher_call(groups[0], 0),
+            batcher_call(groups[1], 3),
+            (pack_call(0), True),
+            batcher_call(groups[2], 1),
+        ]
+
+    batcher = config.build(**kwargs)
+    expected = calls(
+        lambda group, num_queued: batcher.add_group(
+            rollout_group=group, num_queued_microbatch_groups=num_queued
+        ),
+        lambda num_queued: batcher.pack_ready_microbatches(
+            num_queued_microbatch_groups=num_queued
+        ),
+    )
+
+    async def run() -> list:
+        mesh = this_host().spawn_procs(per_host={"cpus": 1})
+        try:
+            actor = mesh.spawn(
+                "batcher",
+                BatcherActor,
+                config,
+                **kwargs,
+                output_dir=str(tmp_path),
+                enable_structured_logging=False,
+            )
+            return [
+                await actor.add_group.call_one(
+                    rollout_group=groups[0], num_queued_microbatch_groups=0
+                ),
+                await actor.add_group.call_one(
+                    rollout_group=groups[1], num_queued_microbatch_groups=3
+                ),
+                (
+                    await actor.pack_ready_microbatches.call_one(
+                        num_queued_microbatch_groups=0
+                    ),
+                    True,
+                ),
+                await actor.add_group.call_one(
+                    rollout_group=groups[2], num_queued_microbatch_groups=1
+                ),
+            ]
+        finally:
+            await mesh.stop()
+
+    results = asyncio.run(run())
+
+    assert [None if batch is None else batch.ends_step for batch, _ in expected] == [
+        False,
+        None,
+        False,
+        True,
+    ]
+
+    def comparable(batch) -> dict:
+        return dataclasses.asdict(dataclasses.replace(batch, metrics=[]))
+
+    for (batch, trainable), (expected_batch, expected_trainable) in zip(
+        results, expected, strict=True
+    ):
+        assert trainable == expected_trainable
+        assert (batch is None) == (expected_batch is None)
+        if expected_batch is not None:
+            torch.testing.assert_close(
+                comparable(batch), comparable(expected_batch), rtol=0, atol=0
+            )

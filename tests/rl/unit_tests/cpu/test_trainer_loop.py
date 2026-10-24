@@ -380,7 +380,7 @@ def test_streamed_steps_mark_their_start_and_log_the_step_routing_tokens() -> No
 
 
 def test_streamed_batches_leave_the_queued_count_when_trained() -> None:
-    """Each finished forward_backward call removes its batch's microbatch groups, so the batcher loop
+    """Each finished forward_backward call finishes its batch in the queued count, so the batcher loop
     sees the trainer's queue shrink."""
     controller = _controller([], stream_microbatches=True)
     queued = controller_module._QueuedMicrobatchGroups()
@@ -398,6 +398,25 @@ def test_streamed_batches_leave_the_queued_count_when_trained() -> None:
     )
 
     assert (queued.count, queued.num_finished) == (0, 2)
+
+
+def test_failed_forward_backward_still_finishes_its_batch_in_the_queued_count() -> None:
+    controller = _controller([], stream_microbatches=True)
+    queued = controller_module._QueuedMicrobatchGroups()
+    queued.add(1)
+    queued.add(2)
+
+    async def failed_call():
+        raise RuntimeError("forward_backward failed")
+
+    with pytest.raises(RuntimeError, match="forward_backward failed"):
+        asyncio.run(
+            controller._wait_for_forward_backward(
+                [failed_call()], queued_microbatch_groups=queued
+            )
+        )
+    # The 2-group batch now runs, so none are queued behind it.
+    assert (queued.count, queued.num_finished) == (0, 1)
 
 
 def test_one_batch_step_passes_counts_to_forward_backward() -> None:
