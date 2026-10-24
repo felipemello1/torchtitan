@@ -47,6 +47,7 @@ from torchtitan.observability.metrics import (
 )
 from torchtitan.observability.profiler import Profiler
 from torchtitan.observability.sdc_replayer import SDCReplayer
+from torchtitan.observability.thread_probe import ThreadProbe
 from torchtitan.quantization.utils import has_quantization
 from torchtitan.tools import utils
 from torchtitan.tools.garbage_collector import GarbageCollector
@@ -737,11 +738,16 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         prepared_microbatches: list[tuple[Any, ...]] = []
         for microbatch in microbatch_group:
             with (
-                sl.log_trace_span("preprocess_inputs"),
+                sl.log_trace_span("preprocess_inputs") as span,
                 self.parallelism_context.activate_spmd(),
             ):
+                # Splits the span: H2D vs model preprocess (varlen metadata may sync), CPU vs wait.
+                probe = ThreadProbe(self.device)
+                input_dict = microbatch.to_input_dict(self.device, non_blocking=True)
+                probe.mark("to_device_ms")
+                probe.gpu_idle("gpu_idle_after_to_device")
                 inputs, labels, model_kwargs = self.model_parts[0].preprocess_inputs(
-                    microbatch.to_input_dict(self.device, non_blocking=True),
+                    input_dict,
                     parallelism_context=self.parallelism_context,
                     parallelism=self.config.parallelism,
                     max_num_documents=self.max_num_documents,
@@ -749,18 +755,15 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                     global_routing_token_counts=global_routing_token_counts,
                     **self.preprocess_inputs_kwargs,
                 )
+                probe.mark("model_preprocess_ms")
+                span.context = probe.finish()
             self.ntokens_seen += (
                 self.config.training.num_tokens_per_microbatch_per_dp_rank
                 // self.parallelism_context.cp
             )
-            prepared_microbatches.append(
-                (
-                    inputs,
-                    labels,
-                    model_kwargs,
-                    microbatch.to_loss_kwargs(self.device, non_blocking=True),
-                )
-            )
+            with sl.log_trace_span("preprocess_loss_kwargs"):
+                loss_kwargs = microbatch.to_loss_kwargs(self.device, non_blocking=True)
+            prepared_microbatches.append((inputs, labels, model_kwargs, loss_kwargs))
 
         if not self.parallelism_context.pp_enabled:
             assert len(prepared_microbatches) == 1

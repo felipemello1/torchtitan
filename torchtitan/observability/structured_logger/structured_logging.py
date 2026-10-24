@@ -164,9 +164,11 @@ def event_extra(
     value: float | int | None = None,
     task_name: str | None = None,
     log_type: LogType = LogType.EVENT,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the extra dict for a structured JSONL event record."""
     return {
+        str(ExtraFields.CONTEXT): context,
         str(ExtraFields.LOG_TYPE): str(log_type),
         str(ExtraFields.LOG_TYPE_NAME): str(event_type),
         str(ExtraFields.EVENT_NAME): event_name,
@@ -370,7 +372,8 @@ class log_trace_span:  # noqa: N801
     and stamps it on both records. Analysis pairs ``_start`` / ``_end``
     via a LIFO stack on ``(source, task_name)``, so nested spans in one
     task pair correctly. The ``_end`` record's ``value`` is the elapsed
-    wall-time in ms.
+    wall-time in ms. A dict assigned to ``context`` inside the block is
+    added to the ``_end`` record as its ``context`` field.
 
     On exception, emits an extra ``_error`` record (with exception type
     and message), then the normal ``_end`` -- so every ``_start`` has a
@@ -382,6 +385,11 @@ class log_trace_span:  # noqa: N801
         with log_trace_span("fwd_bwd"):
             loss = model(batch)
             loss.backward()
+
+        # extra fields on the _end record
+        with log_trace_span("preprocess") as span:
+            ...
+            span.context = {"to_device_ms": 1.5}
 
         # decorator of sync or async function
         @log_trace_span("rl_rollout")
@@ -408,6 +416,7 @@ class log_trace_span:  # noqa: N801
         self.stacklevel = stacklevel
         self.start_time: float = 0.0
         self._task_name: str | None = None
+        self.context: dict[str, Any] | None = None
         self.start_type_name = self.base_name + "_start"
         self.end_type_name = self.base_name + "_end"
 
@@ -471,6 +480,7 @@ class log_trace_span:  # noqa: N801
                 value=delta_ms,
                 step=step,
                 task_name=self._task_name,
+                context=self.context,
             ),
             stacklevel=self.stacklevel,
         )

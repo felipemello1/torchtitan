@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
+import os
 import subprocess
 import sys
 import weakref
@@ -15,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torchtitan.training_engine as training_engine_module
 from torchtitan.components.data.types import (
     TokenizedTrainingMicrobatch,
     TrainingMicrobatch,
@@ -352,6 +354,77 @@ def test_preprocess_microbatch_groups_prepares_structured_pp_inputs(
         assert isinstance(microbatch, _DictTrainingMicrobatch)
         assert microbatch.to_input_dict_calls == [(trainer.device, True)]
         assert microbatch.to_loss_kwargs_calls == [(trainer.device, True)]
+
+
+def test_preprocess_inputs_end_splits_the_span(monkeypatch) -> None:
+    """preprocess_inputs_end carries sub-span walls and thread CPU / runqueue wait; the loss
+    kwargs get their own span."""
+    spans = []
+
+    class _Span:
+        def __init__(self, name):
+            self.name, self.context = name, None
+            spans.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+    monkeypatch.setattr(training_engine_module.sl, "log_trace_span", _Span)
+
+    class _FakeModel:
+        def preprocess_inputs(self, input_dict, **kwargs):
+            return input_dict["input"], input_dict["labels"], {}
+
+    trainer = cast(
+        TrainingEngine,
+        SimpleNamespace(
+            model_parts=[_FakeModel()],
+            parallelism_context=SimpleNamespace(
+                pp_enabled=False, cp=1, activate_spmd=contextlib.nullcontext
+            ),
+            max_num_documents=None,
+            preprocess_inputs_kwargs={},
+            config=SimpleNamespace(
+                parallelism=None,
+                training=SimpleNamespace(
+                    max_context_length=8, num_tokens_per_microbatch_per_dp_rank=1
+                ),
+            ),
+            ntokens_seen=0,
+            device=torch.device("cpu"),
+        ),
+    )
+    microbatch = _dict_microbatch(
+        {"input": torch.tensor([1]), "labels": torch.tensor([2])},
+        {"advantages": torch.tensor([0.5])},
+    )
+    TrainingEngine._preprocess_microbatch_group(
+        trainer, [microbatch], global_routing_token_counts=torch.tensor([1])
+    )
+
+    assert [span.name for span in spans] == [
+        "preprocess_inputs",
+        "preprocess_loss_kwargs",
+    ]
+    context = spans[0].context
+    assert set(context) == {
+        "gpu_idle_at_start",
+        "to_device_ms",
+        "gpu_idle_after_to_device",
+        "model_preprocess_ms",
+        "thread_cpu_ms",
+        "sched_wait_ms",
+    }
+    # Off CUDA there is no stream to query.
+    assert context["gpu_idle_at_start"] is None
+    assert context["gpu_idle_after_to_device"] is None
+    assert context["to_device_ms"] >= 0 and context["model_preprocess_ms"] >= 0
+    assert context["thread_cpu_ms"] >= 0
+    if os.path.exists("/proc/thread-self/schedstat"):
+        assert context["sched_wait_ms"] >= 0
 
 
 def test_pp_forward_backward_copies_global_counts_and_nests_metrics() -> None:

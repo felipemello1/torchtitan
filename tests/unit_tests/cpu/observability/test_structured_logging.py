@@ -980,6 +980,15 @@ class TestLogTraceSpan:
         assert lines[0].get("event_name") is None
         assert lines[1].get("event_name") is None
 
+    def test_context_lands_on_end_record(self, tmp_path, structured_logger_fixture):
+        init_structured_logger(rank=0, source="trainer", output_dir=str(tmp_path))
+        with log_trace_span("preprocess_inputs") as span:
+            span.context = {"to_device_ms": 1.5, "gpu_idle_at_start": None}
+
+        start, end = _read_trace_lines(tmp_path)
+        assert "context" not in start
+        assert end["context"] == {"to_device_ms": 1.5, "gpu_idle_at_start": None}
+
     def test_event_type_required(self):
         """event_type is required — cannot be omitted."""
         with pytest.raises(TypeError):
