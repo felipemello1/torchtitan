@@ -49,8 +49,8 @@ _batcher_loop
                         v  |                           v
 Batcher (own process)                                training_batch_queue
 +-------------------------------------------------+   +----------------------------------------------+
-| build_from_group -> add_training_samples        |   | size 1 (unbounded with stream_microbatches); |
-| pack at num_prompts_per_train_step               |   | holds TrainerStepBatch | None                |
+| build_from_group -> add_training_samples        |   | size 1 (stream_microbatches: one step the    |
+| pack at num_prompts_per_train_step               |   | trainer hasn't started); TrainerStepBatch    |
 +-------------------------------------------------+   +---------------------+------------------------+
                                                                          |
                                                                          | packed = training_batch_queue.get()
@@ -79,7 +79,8 @@ _batcher_loop
     waits for:    a group inside the window becoming FINALIZED (any group when windowed_fifo_batches is None)
     unblocked by: _rollout_loop[N] group_buffer.finalize_work()
   produces: TrainerStepBatch (training_batch_queue.put)
-    waits for:    a free training_batch_queue slot (maxsize=1; never with stream_microbatches)
+    waits for:    a free training_batch_queue slot (maxsize=1); with stream_microbatches, the trainer
+                  starting the previous step
     unblocked by: _trainer_loop training_batch_queue.get()
 _trainer_loop
   consumes: a TrainerStepBatch (training_batch_queue.get)
@@ -144,6 +145,36 @@ logger = logging.getLogger(__name__)
 # are read when their call starts), so the trainer starts each call as soon as the previous one ends.
 # Two would hide the round trip; the third is slack for calls shorter than one round trip.
 _MAX_IN_FLIGHT_FORWARD_BACKWARD_CALLS = 3
+
+
+class _TrainerStepStarts:
+    """The latest policy version whose step the trainer has started, i.e. taken its first batch.
+
+    With streamed microbatches the training batch queue is unbounded, since a step puts several
+    batches. `_batcher_loop` queues a batch of version v only once the trainer started version
+    v - 1, so the queue holds at most one step the trainer has not started, as maxsize=1 keeps
+    without streaming. Otherwise a trainer-bound run would pack every finalized group into batches
+    (and their RDMA buffers) many steps ahead.
+
+    Example (trainer started version 4):
+        await step_starts.wait_until_started(4)   # returns: a batch of version 5 can be queued
+        await step_starts.wait_until_started(5)   # waits: a batch of version 6 waits for step 5
+    """
+
+    def __init__(self, policy_version: int) -> None:
+        self._started_policy_version = policy_version - 1
+        self._condition = asyncio.Condition()
+
+    async def wait_until_started(self, policy_version: int) -> None:
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: self._started_policy_version >= policy_version
+            )
+
+    async def mark_started(self, policy_version: int) -> None:
+        async with self._condition:
+            self._started_policy_version = policy_version
+            self._condition.notify_all()
 
 
 @dataclass(kw_only=True, slots=True)
@@ -856,10 +887,15 @@ class Controller(Configurable):
             window_size=window_size,
         )
 
-        # training_batch_queue. Streaming puts several batches per step; a full queue would block
-        # _batcher_loop, which also releases the slots of untrainable groups.
+        # training_batch_queue. Streaming puts several batches per step, so `step_starts` bounds it
+        # by steps instead: at most one step the trainer has not started waits in it.
         training_batch_queue: asyncio.Queue[TrainerStepBatch | None] = asyncio.Queue(
             maxsize=0 if async_loop.batcher.stream_microbatches else 1
+        )
+        step_starts = (
+            _TrainerStepStarts(self.start_step)
+            if async_loop.batcher.stream_microbatches
+            else None
         )
 
         # rollout_loop
@@ -888,14 +924,18 @@ class Controller(Configurable):
 
         # training_sample_batcher_loop
         batcher_task = asyncio.create_task(
-            self._batcher_loop(training_batch_queue=training_batch_queue),
+            self._batcher_loop(
+                training_batch_queue=training_batch_queue, step_starts=step_starts
+            ),
             name="batcher",
         )
 
         # trainer_loop
         trainer_task = asyncio.create_task(
             self._trainer_loop(
-                training_batch_queue, num_training_steps=num_training_steps
+                training_batch_queue,
+                num_training_steps=num_training_steps,
+                step_starts=step_starts,
             ),
             name="trainer",
         )
@@ -1052,6 +1092,7 @@ class Controller(Configurable):
         self,
         *,
         training_batch_queue: "asyncio.Queue[TrainerStepBatch | None]",
+        step_starts: _TrainerStepStarts | None = None,
     ) -> None:
         """Send finalized groups to the batcher actor and queue each training batch it returns.
 
@@ -1062,9 +1103,12 @@ class Controller(Configurable):
             waits for:    a group inside the window becoming FINALIZED (any group when windowed_fifo_batches is None)
             unblocked by: _rollout_loop[N] group_buffer.finalize_work()
         produces: TrainerStepBatch (training_batch_queue.put)
-            waits for:    a free training_batch_queue slot (maxsize=1; never with stream_microbatches)
+            waits for:    a free training_batch_queue slot (maxsize=1); with stream_microbatches, the
+                          trainer starting the previous step (step_starts)
             unblocked by: _trainer_loop training_batch_queue.get()
         """
+        # Policy version that will train the batch being assembled: steps train in order, one per version.
+        consuming_policy_version = self.start_step
         while True:
             rollout_group = await self._group_buffer.take_finalized()
             if rollout_group is None:  # closed and drained
@@ -1082,7 +1126,11 @@ class Controller(Configurable):
                     1, reason="untrainable_group"
                 )
             if maybe_training_batch is not None:
+                if step_starts is not None:
+                    await step_starts.wait_until_started(consuming_policy_version - 1)
                 await training_batch_queue.put(maybe_training_batch)
+                if maybe_training_batch.ends_step:
+                    consuming_policy_version += 1
         await training_batch_queue.put(None)
         # TODO(async-rl): if finite datasets are supported, drain a final partial batch here.
 
@@ -1091,6 +1139,7 @@ class Controller(Configurable):
         training_batch_queue: "asyncio.Queue[TrainerStepBatch | None]",
         *,
         num_training_steps: int,
+        step_starts: _TrainerStepStarts | None = None,
     ) -> None:
         """Run num_training_steps optimizer steps: train the step's packed batches, push the trainer's
         model state dict, then pull it into the generators, log metrics.
@@ -1163,6 +1212,9 @@ class Controller(Configurable):
                             packed = await training_batch_queue.get()
                         if packed is None:
                             break
+                        if step_starts is not None and not step_batches:
+                            # The batcher loop may now queue the next step's batches.
+                            await step_starts.mark_started(self._trainer_policy_version)
                         if packed.ends_step:
                             # Policy age is computed HERE, at consumption time, against the live trainer version, so
                             # it is faithful to what this step trains on -- not the version when the batch was packed.

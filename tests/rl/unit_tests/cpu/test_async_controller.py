@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 import torch
 from torchtitan.models.common.moe.moe import MicrobatchWiseLoadBalanceLoss, MoE
+from torchtitan.rl.controller import controller as controller_module
 from torchtitan.rl.controller.controller import Controller
 from torchtitan.rl.controller.metrics import (
     combine_microbatch_metrics,
@@ -978,3 +979,58 @@ def test_run_fails_when_the_engine_loops_exit_mid_run() -> None:
         RuntimeError, match="generator_wait_engine_loop exited unexpectedly"
     ):
         _run_with_generator_watcher(exited)
+
+
+def test_streaming_batcher_loop_queues_one_step_the_trainer_has_not_started() -> None:
+    """With streaming the queue is unbounded, so the batcher loop waits to queue a batch of
+    version v until the trainer started version v - 1: as maxsize=1 without streaming, at most one
+    step the trainer has not started waits in the queue."""
+    num_groups = 6
+
+    class _Buffer:
+        def __init__(self) -> None:
+            self.num_taken = 0
+
+        async def take_finalized(self):
+            if self.num_taken == num_groups:
+                return None
+            self.num_taken += 1
+            return RolloutGroup(group_id=self.num_taken - 1, rollouts=[])
+
+        async def release_active_groups(self, count, *, reason):
+            raise AssertionError("every group is trainable")
+
+    async def add_group(*, rollout_group):
+        # 2 groups per step; each group streams one batch, the second ends the step.
+        return SimpleNamespace(ends_step=rollout_group.group_id % 2 == 1), True
+
+    buffer = _Buffer()
+    controller = SimpleNamespace(
+        start_step=5,
+        _group_buffer=buffer,
+        batcher=SimpleNamespace(add_group=SimpleNamespace(call_one=add_group)),
+    )
+
+    async def run() -> None:
+        queue: asyncio.Queue = asyncio.Queue()
+        step_starts = controller_module._TrainerStepStarts(5)
+        batcher = asyncio.create_task(
+            Controller._batcher_loop(
+                controller, training_batch_queue=queue, step_starts=step_starts
+            )
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+        # Version 5's two batches are queued; version 6's first batch waits for step 5 to start.
+        assert queue.qsize() == 2
+        assert buffer.num_taken == 3
+        await step_starts.mark_started(5)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert queue.qsize() == 4
+        assert buffer.num_taken == 5
+        await step_starts.mark_started(6)
+        await batcher
+        assert queue.qsize() == 7  # three steps of two batches, and the None sentinel
+
+    asyncio.run(run())
