@@ -22,12 +22,13 @@ from torchtitan.rl.generator.http_client import GeneratorClient
 
 from torchtitan.rl.generator.types import SamplingConfig
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.rollout import RolloutGroup, RolloutStatus
+from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.message_env import MessageEnvInitOutput, MessageEnvStepOutput
 from torchtitan.rl.rollout.rollouter import (
     gather_rollouts,
     Rollouter,
+    RolloutProgress,
     RolloutWorker,
     StragglerCut,
 )
@@ -657,6 +658,10 @@ def test_cut_stragglers_cuts_the_unfinished_rollout_and_the_rest_train() -> None
     *trained, cut = group.rollouts
     assert cut.status is RolloutStatus.ERROR_SYSTEM
     assert cut.logs["straggler_cut"] == "grace"
+    # Cut while waiting for its first completion
+    assert cut.logs["elapsed_s"] >= 0
+    assert (cut.logs["num_turns"], cut.logs["completion_tokens"]) == (0, 0)
+    assert cut.logs["min_policy_version"] is None
     assert (cut.reward, cut.advantage) == (None, None)
     # `_Rubric` rewards rollout_id + 1, so 1, 2 and 3, centered on their mean 2.
     assert [rollout.advantage for rollout in trained] == [-1.0, 0.0, 1.0]
@@ -699,7 +704,61 @@ def test_cut_stragglers_cuts_nothing_when_the_straggler_finishes_first() -> None
             RolloutStatus.COMPLETED
         ] * 4
         assert not any(
-            metric.key.startswith("rollout/stragglers_cut") for metric in group.metrics
+            metric.key.startswith(("rollout/stragglers_cut", "rollout/straggler_cut"))
+            for metric in group.metrics
         )
 
     asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+
+def test_gather_rollouts_logs_a_cut_rollouts_progress() -> None:
+    async def run() -> tuple[list, list[m.Metric]]:
+        progress = [RolloutProgress(), RolloutProgress()]
+        straggler_cut = StragglerCut(max_stragglers=1)
+
+        async def finishes() -> Rollout:
+            return Rollout(group_id=7, rollout_id=0, status=RolloutStatus.COMPLETED)
+
+        async def hangs_after_two_turns() -> Rollout:
+            for version, num_tokens in ((5, 3), (6, 2)):
+                progress[1].add_turn(
+                    Completion(
+                        min_policy_version=version,
+                        max_policy_version=version,
+                        request_id="r",
+                        token_ids=[1] * num_tokens,
+                        token_logprobs=[-0.5] * num_tokens,
+                        finish_reason="stop",
+                    )
+                )
+            await asyncio.Event().wait()
+            raise AssertionError("not reached")
+
+        group = asyncio.create_task(
+            gather_rollouts(
+                [finishes(), hangs_after_two_turns()],
+                group_id=7,
+                straggler_cut=straggler_cut,
+                progress=progress,
+            )
+        )
+        assert await straggler_cut.gate_reached is True
+        await asyncio.sleep(0.01)
+        straggler_cut.request("cap")
+        return await group
+
+    (_, cut), metrics = asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+    assert cut.status is RolloutStatus.ERROR_SYSTEM
+    assert cut.logs["straggler_cut"] == "cap"
+    assert cut.logs["elapsed_s"] >= 0.01
+    assert {key: cut.logs[key] for key in RolloutProgress.__dataclass_fields__} == {
+        "num_turns": 2,
+        "completion_tokens": 5,
+        "min_policy_version": 5,
+        "max_policy_version": 6,
+    }
+    values = m.MetricsProcessor._aggregate_metrics(metrics)
+    assert values["rollout/straggler_cut/num_turns/mean"] == 2
+    assert values["rollout/straggler_cut/completion_tokens/max"] == 5
+    assert values["rollout/straggler_cut/elapsed_s/max"] >= 0.01
