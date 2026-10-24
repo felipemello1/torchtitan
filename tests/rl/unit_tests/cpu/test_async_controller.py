@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 import torch
 from torchtitan.models.common.moe.moe import MicrobatchWiseLoadBalanceLoss, MoE
+from torchtitan.rl.controller import controller as controller_module
 from torchtitan.rl.controller.adaptive_demand import (
     estimate_next_unavailable_upper_bound,
     mean_age_ceiling,
@@ -1840,6 +1841,67 @@ def test_batcher_passes_the_version_that_trains_each_group(
     assert queue.qsize() == (5 if stream_microbatches else 3)
 
 
+def test_streaming_batcher_loop_queues_one_step_the_trainer_has_not_started() -> None:
+    """With streaming the queue is unbounded, so the batcher loop waits to queue a batch of
+    version v until the trainer started version v - 1: as maxsize=1 without streaming, at most one
+    step the trainer has not started waits in the queue."""
+    num_groups = 6
+
+    class _Buffer:
+        def __init__(self) -> None:
+            self.num_taken = 0
+
+        async def take_finalized(self, *, consuming_policy_version):
+            if self.num_taken == num_groups:
+                return None
+            self.num_taken += 1
+            return RolloutGroup(group_id=self.num_taken - 1, rollouts=[])
+
+        async def release_active_groups(self, count, *, reason):
+            raise AssertionError("every group is trainable")
+
+    async def add_group(*, rollout_group):
+        # 2 groups per step; each group streams one batch, the second ends the step.
+        return SimpleNamespace(ends_step=rollout_group.group_id % 2 == 1), True
+
+    buffer = _Buffer()
+    controller = SimpleNamespace(
+        config=SimpleNamespace(
+            async_loop=SimpleNamespace(batcher=Batcher.Config()),
+            generator=SimpleNamespace(
+                engine=SimpleNamespace(return_routed_experts=False)
+            ),
+        ),
+        start_step=5,
+        _group_buffer=buffer,
+        batcher=SimpleNamespace(add_group=SimpleNamespace(call_one=add_group)),
+    )
+
+    async def run() -> None:
+        queue: asyncio.Queue = asyncio.Queue()
+        step_starts = controller_module._TrainerStepStarts(5)
+        batcher = asyncio.create_task(
+            Controller._batcher_loop(
+                controller, training_batch_queue=queue, step_starts=step_starts
+            )
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+        # Version 5's two batches are queued; version 6's first batch waits for step 5 to start.
+        assert queue.qsize() == 2
+        assert buffer.num_taken == 3
+        await step_starts.mark_started(5)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert queue.qsize() == 4
+        assert buffer.num_taken == 5
+        await step_starts.mark_started(6)
+        await batcher
+        assert queue.qsize() == 7  # three steps of two batches, and the None sentinel
+
+    asyncio.run(run())
+
+
 def test_generation_capacity_default_follows_target_offpolicy_steps() -> None:
     config = AdaptiveRolloutGroupWorkBuffer.Config(
         max_offpolicy_steps=10, target_offpolicy_steps=6
@@ -2588,7 +2650,7 @@ def test_overlapped_validation_before_and_after_training(
     controller, validation = _controller_for_run()
 
     # Stands in for `_trainer_loop`'s overlap branch, which the tests above cover.
-    async def trainer_loop(queue, *, num_training_steps: int) -> None:
+    async def trainer_loop(queue, *, num_training_steps: int, step_starts=None) -> None:
         # Training starts while the pre-training pass runs.
         assert validation.started_steps == [0]
         assert not controller._validation_task.done()
@@ -2634,7 +2696,7 @@ def test_overlapped_validation_failures_do_not_fail_the_run() -> None:
     `validation/pass_failures` at the last step, and the final pass still runs one step later."""
     controller, validation = _controller_for_run()
 
-    async def trainer_loop(queue, *, num_training_steps: int) -> None:
+    async def trainer_loop(queue, *, num_training_steps: int, step_starts=None) -> None:
         validation.end(0, error=RuntimeError("sandbox died"))
         await _run_until(lambda: controller._validation_task.done())
         controller._log_finished_validation(step=2)

@@ -352,6 +352,33 @@ def test_streamed_step_trains_each_batch_then_divides_by_the_step_count() -> Non
     assert controller.logged_metrics[0]["loss/mean"].value.value == 0.25
 
 
+def test_streamed_steps_mark_their_start_and_log_the_step_routing_tokens() -> None:
+    """The trainer marks each step's start once, at its first batch, so the batcher loop may queue
+    the next step; the all-token throughput counts every batch of the step."""
+    controller = _controller([], stream_microbatches=True)
+    queue: asyncio.Queue = asyncio.Queue()
+    for _ in range(2):
+        queue.put_nowait(_batch(num_loss_tokens=3, ends_step=False))
+        queue.put_nowait(_batch(num_loss_tokens=5))
+    marked: list[int] = []
+
+    class _StepStarts:
+        async def mark_started(self, policy_version: int) -> None:
+            marked.append(policy_version)
+
+    asyncio.run(
+        controller._trainer_loop(queue, num_training_steps=2, step_starts=_StepStarts())
+    )
+
+    assert marked == [0, 1]
+    for metrics in controller.logged_metrics:
+        # Fake batches count as many routing tokens as loss tokens: 3 + 5 per step.
+        total = metrics["timing/step/total"].value.value
+        assert metrics[
+            "perf/trainer/all_tokens_per_second_full_step"
+        ].value.value == pytest.approx(8 / total)
+
+
 def test_one_batch_step_passes_counts_to_forward_backward() -> None:
     events: list[str] = []
     controller = _controller(events)
