@@ -8,6 +8,7 @@
 the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID."""
 
 import asyncio
+import dataclasses
 import json
 import logging
 from types import SimpleNamespace
@@ -16,10 +17,14 @@ from unittest.mock import AsyncMock, patch
 import numpy as np
 import pytest
 import torch
+from torchtitan.models.common.moe.moe import MicrobatchWiseLoadBalanceLoss, MoE
+from torchtitan.rl.controller import controller as controller_module
 from torchtitan.rl.controller.controller import Controller
 from torchtitan.rl.controller.metrics import (
+    combine_microbatch_metrics,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
+    forward_backward_wait_and_busy_seconds,
     MetricsTimer,
 )
 from torchtitan.rl.controller.work_buffer import (
@@ -53,6 +58,26 @@ def test_controller_config_maybe_log(tmp_path, caplog) -> None:
     with open(tmp_path / "config.json") as file:
         saved_config = json.load(file)
     assert saved_config["trainer"]["training"]["max_context_length"] == 128
+
+
+@pytest.mark.parametrize("unsupported", [None, "aux_loss", "mtp"])
+def test_stream_microbatches_rejects_aux_loss_and_mtp(unsupported: str | None) -> None:
+    from torchtitan_recipes.tests.rl.alphabet_sort import rl_grpo_qwen3_moe_debug_varlen
+
+    config = rl_grpo_qwen3_moe_debug_varlen()
+    batcher = dataclasses.replace(config.async_loop.batcher, stream_microbatches=True)
+    if unsupported == "aux_loss":
+        _, moe, _, _ = next(config.trainer.model.traverse(MoE.Config))
+        moe.router.aux_loss = MicrobatchWiseLoadBalanceLoss.Config(coeff=0.01)
+    if unsupported == "mtp":
+        batcher = dataclasses.replace(batcher, num_mtp_layers=1)
+    config.async_loop = dataclasses.replace(config.async_loop, batcher=batcher)
+
+    if unsupported is None:
+        dataclasses.replace(config)
+        return
+    with pytest.raises(ValueError, match="stream_microbatches does not support"):
+        dataclasses.replace(config)
 
 
 def _training_sample(*, group_id: int, rollout_id: int) -> TrainingSample:
@@ -177,6 +202,83 @@ def test_batcher_carries_metric_only_groups_until_trainable_batch() -> None:
     assert batch.global_loss_token_counts[0] > 0
     assert batch.global_routing_token_counts.shape == (1,)
     assert batch.group_ids == [0, 1]
+
+
+def _stream_groups(groups: list[TrainingSampleGroup], *, stream: bool, dp_degree: int):
+    """Add `groups` one at a time to a 10-token-per-microbatch batcher; return its batches."""
+    batcher = Batcher.Config(stream_microbatches=stream).build(
+        num_tokens_per_microbatch_per_dp_rank=10,
+        max_context_length=10,
+        num_prompts_per_train_step=3,
+        dp_degree=dp_degree,
+        pad_id=0,
+        temperature=1.0,
+    )
+    batches = []
+    for group in groups:
+        batch, _ = batcher.add_training_samples(training_sample_group=group)
+        if batch is not None:
+            batches.append(batch)
+    return batches
+
+
+@pytest.mark.parametrize("dp_degree", [1, 2])
+def test_streaming_batcher_sends_each_sample_once_and_ends_the_step_last(
+    dp_degree: int,
+) -> None:
+    # Untrainable groups first and mid-step; samples pack 1 to 9 tokens each. Groups 1 and 3 each
+    # complete a microbatch group whose bins are full (10 tokens), so they stream.
+    groups = [
+        _untrainable_group(0),
+        _variable_length_group(1, token_lengths=[7, 6, 5, 4, 7, 6]),
+        _untrainable_group(2),
+        _variable_length_group(3, token_lengths=[10, 9, 3, 2]),
+        _variable_length_group(4, token_lengths=[8, 5, 4, 4]),
+    ]
+    streamed = _stream_groups(groups, stream=True, dp_degree=dp_degree)
+    [whole_step] = _stream_groups(groups, stream=False, dp_degree=dp_degree)
+
+    # Earlier batches stream out; only the step's last batch ends it and carries the step's fields.
+    assert len(streamed) > 1
+    assert [batch.ends_step for batch in streamed] == [False] * (len(streamed) - 1) + [
+        True
+    ]
+    for batch in streamed[:-1]:
+        assert (batch.metrics, batch.group_ids, batch.min_policy_versions) == (
+            [],
+            [],
+            [],
+        )
+    last = streamed[-1]
+    assert last.group_ids == whole_step.group_ids == [0, 1, 2, 3, 4]
+    assert len(last.min_policy_versions) == 14
+    assert _metric_value(last, "train_batch/num_training_samples") == 14
+
+    # Every batch holds whole rows of one microbatch per DP rank, and every token is sent once.
+    microbatches = [
+        microbatch
+        for batch in streamed
+        for group in batch.microbatch_groups
+        for row in group
+        for microbatch in row
+    ]
+    assert all(
+        len(row) == dp_degree
+        for batch in streamed
+        for group in batch.microbatch_groups
+        for row in group
+    )
+    num_sample_tokens = sum(int((~mb.padding_mask).sum()) for mb in microbatches)
+    assert num_sample_tokens == sum(
+        length - 1 for length in [7, 6, 5, 4, 7, 6, 10, 9, 3, 2, 8, 5, 4, 4]
+    )
+    assert sum(batch.global_loss_token_counts for batch in streamed).tolist() == (
+        whole_step.global_loss_token_counts.tolist()
+    )
+    assert (
+        _metric_value(last, "train_batch/num_microbatches")
+        == len(microbatches) / dp_degree
+    )
 
 
 def test_batcher_prepares_per_depth_mtp_token_counts() -> None:
@@ -595,6 +697,30 @@ def test_metrics_timer_flush_drains() -> None:
     assert timer.flush() == []  # drained on the second read
 
 
+def test_forward_backward_wait_and_busy_seconds_follow_the_trainer() -> None:
+    # Each call takes 3 s. Batch 2 is sent at t=1, while call 1 runs, so it waits 0 s; batch 3 at t=10.
+    assert forward_backward_wait_and_busy_seconds(
+        0.0, [(0.0, 3.0), (1.0, 6.0), (10.0, 13.0)]
+    ) == (4.0, 9.0)
+    # One call per step: the wait for the batch, then the call.
+    assert forward_backward_wait_and_busy_seconds(0.0, [(2.0, 5.0)]) == (2.0, 3.0)
+
+
+def test_combine_microbatch_metrics_divides_streamed_sums_by_the_step_count() -> None:
+    combined = combine_microbatch_metrics(
+        [
+            {"loss/mean": 1.0, "loss/ratio_clipped_frac": 2.0, "x/max": 2.0},
+            {"loss/mean": 3.0, "loss/ratio_clipped_frac": 1.0, "x/max": 5.0},
+        ],
+        num_global_loss_tokens=4,
+    )
+    assert combined == {"loss/mean": 1.0, "loss/ratio_clipped_frac": 0.75, "x/max": 5.0}
+    # A step with no loss tokens logs zeros.
+    assert combine_microbatch_metrics(
+        [{"loss/mean": 0.0}], num_global_loss_tokens=0
+    ) == {"loss/mean": 0.0}
+
+
 def test_rollout_id_to_string_is_callable_and_uses_int_group_id() -> None:
     rollout_id = RolloutTurnID(group_id=5, rollout_id=2, turn_id=0)
     assert rollout_id.to_string() == "group=5/rollout=2/turn=0"
@@ -808,6 +934,7 @@ def _run_with_generator_watcher(watcher) -> None:
             group_buffer=SimpleNamespace(
                 build=lambda **kwargs: SimpleNamespace(close=AsyncMock())
             ),
+            batcher=SimpleNamespace(stream_microbatches=False),
         ),
         trainer=SimpleNamespace(
             training=SimpleNamespace(
@@ -853,3 +980,228 @@ def test_run_fails_when_the_engine_loops_exit_mid_run() -> None:
         RuntimeError, match="generator_wait_engine_loop exited unexpectedly"
     ):
         _run_with_generator_watcher(exited)
+
+
+def test_streaming_batcher_loop_queues_one_step_the_trainer_has_not_started() -> None:
+    """With streaming the queue is unbounded, so the batcher loop waits to queue a batch of
+    version v until the trainer started version v - 1: as maxsize=1 without streaming, at most one
+    step the trainer has not started waits in the queue."""
+    num_groups = 6
+
+    class _Buffer:
+        def __init__(self) -> None:
+            self.num_taken = 0
+
+        async def take_finalized(self):
+            if self.num_taken == num_groups:
+                return None
+            self.num_taken += 1
+            return RolloutGroup(group_id=self.num_taken - 1, rollouts=[])
+
+        async def release_active_groups(self, count, *, reason):
+            raise AssertionError("every group is trainable")
+
+    async def add_group(*, rollout_group, num_queued_microbatch_groups):
+        # 2 groups per step; each group streams one batch, the second ends the step.
+        return SimpleNamespace(ends_step=rollout_group.group_id % 2 == 1), True
+
+    buffer = _Buffer()
+    controller = SimpleNamespace(
+        config=SimpleNamespace(async_loop=SimpleNamespace(batcher=Batcher.Config())),
+        start_step=5,
+        _group_buffer=buffer,
+        batcher=SimpleNamespace(add_group=SimpleNamespace(call_one=add_group)),
+    )
+
+    async def run() -> None:
+        queue: asyncio.Queue = asyncio.Queue()
+        step_starts = controller_module._TrainerStepStarts(5)
+        batcher = asyncio.create_task(
+            Controller._batcher_loop(
+                controller, training_batch_queue=queue, step_starts=step_starts
+            )
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+        # Version 5's two batches are queued; version 6's first batch waits for step 5 to start.
+        assert queue.qsize() == 2
+        assert buffer.num_taken == 3
+        await step_starts.mark_started(5)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert queue.qsize() == 4
+        assert buffer.num_taken == 5
+        await step_starts.mark_started(6)
+        await batcher
+        assert queue.qsize() == 7  # three steps of two batches, and the None sentinel
+
+    asyncio.run(run())
+
+
+def _streaming_batcher_loop_controller(buffer, *, add_group, pack_ready_microbatches):
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            async_loop=SimpleNamespace(
+                batcher=Batcher.Config(
+                    stream_microbatches=True, stream_queued_microbatches=3
+                )
+            ),
+        ),
+        start_step=5,
+        _group_buffer=buffer,
+        batcher=SimpleNamespace(
+            add_group=SimpleNamespace(call_one=add_group),
+            pack_ready_microbatches=SimpleNamespace(call_one=pack_ready_microbatches),
+        ),
+    )
+
+
+class _GatedBuffer:
+    """Hands out `num_groups` groups, then None; waits on `gate` before the group at `gate_at`."""
+
+    def __init__(self, *, num_groups: int, gate_at: int) -> None:
+        self.num_taken = 0
+        self.num_groups = num_groups
+        self.gate_at = gate_at
+        self.gate = asyncio.Event()
+
+    async def take_finalized(self):
+        if self.num_taken == self.gate_at:
+            await self.gate.wait()
+        if self.num_taken == self.num_groups:
+            return None
+        self.num_taken += 1
+        return RolloutGroup(group_id=self.num_taken - 1, rollouts=[])
+
+
+def _streamed_batch(num_microbatch_groups: int, *, ends_step: bool = False):
+    return SimpleNamespace(
+        microbatch_groups=[[[None]]] * num_microbatch_groups, ends_step=ends_step
+    )
+
+
+def test_streaming_batcher_loop_packs_when_the_trainer_falls_below_its_queue_target() -> None:
+    """Each group goes with the microbatch groups queued behind the trainer's running batch; a
+    finished batch that leaves fewer than `stream_queued_microbatches` makes the loop ask the batcher
+    for microbatches before the next group arrives."""
+    calls = []
+    buffer = _GatedBuffer(num_groups=4, gate_at=3)
+
+    async def add_group(*, rollout_group, num_queued_microbatch_groups):
+        calls.append(
+            ("add_group", rollout_group.group_id, num_queued_microbatch_groups)
+        )
+        # Group 0 starts the trainer; group 1 queues 3 behind it; group 2 adds samples but the trainer
+        # has enough; group 3 ends the step.
+        return {
+            0: _streamed_batch(1),
+            1: _streamed_batch(3),
+            2: None,
+            3: _streamed_batch(1, ends_step=True),
+        }[rollout_group.group_id], True
+
+    async def pack_ready_microbatches(*, num_queued_microbatch_groups):
+        calls.append(("pack_ready", num_queued_microbatch_groups))
+        return _streamed_batch(3 - num_queued_microbatch_groups)
+
+    controller = _streaming_batcher_loop_controller(
+        buffer, add_group=add_group, pack_ready_microbatches=pack_ready_microbatches
+    )
+
+    async def run() -> None:
+        queue: asyncio.Queue = asyncio.Queue()
+        queued = controller_module._QueuedMicrobatchGroups()
+        batcher = asyncio.create_task(
+            Controller._batcher_loop(
+                controller, training_batch_queue=queue, queued_microbatch_groups=queued
+            )
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert calls == [("add_group", 0, 0), ("add_group", 1, 0), ("add_group", 2, 3)]
+        assert queued.count == 3
+        # The first batch finishes and the 3-group batch starts: none are left behind it, so the loop
+        # packs 3 without waiting for a group.
+        queued.finish_oldest()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert calls[3:] == [("pack_ready", 0)]
+        assert queued.count == 3
+        buffer.gate.set()
+        await batcher
+        assert calls[4:] == [("add_group", 3, 3)]
+        assert queued.count == 4
+        assert queue.qsize() == 5  # four batches and the None sentinel
+
+    asyncio.run(run())
+
+
+def test_streaming_batcher_loop_counts_a_batch_that_finishes_during_a_pack() -> None:
+    """A batch that finishes while `pack_ready_microbatches` runs still wakes the loop."""
+    calls = []
+    buffer = _GatedBuffer(num_groups=1, gate_at=1)
+    queued = controller_module._QueuedMicrobatchGroups()
+
+    async def add_group(*, rollout_group, num_queued_microbatch_groups):
+        calls.append(("add_group", num_queued_microbatch_groups))
+        return _streamed_batch(3), True
+
+    async def pack_ready_microbatches(*, num_queued_microbatch_groups):
+        calls.append(("pack_ready", num_queued_microbatch_groups))
+        if len(calls) == 2:
+            # The trainer finishes its running batch during this call.
+            queued.finish_oldest()
+            return _streamed_batch(1)
+        return None
+
+    controller = _streaming_batcher_loop_controller(
+        buffer, add_group=add_group, pack_ready_microbatches=pack_ready_microbatches
+    )
+
+    async def run() -> None:
+        queue: asyncio.Queue = asyncio.Queue()
+        batcher = asyncio.create_task(
+            Controller._batcher_loop(
+                controller, training_batch_queue=queue, queued_microbatch_groups=queued
+            )
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+        # Group 0's 3-group batch runs. Queue a 2-group batch behind it, then finish the 3-group one:
+        # the loop packs, and the 2-group batch finishes during that pack. The finish wakes the loop
+        # again, so it packs once more instead of waiting for the next group.
+        queued.add(2)
+        queued.finish_oldest()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert calls == [("add_group", 0), ("pack_ready", 0), ("pack_ready", 0)]
+        batcher.cancel()
+
+    asyncio.run(run())
+
+
+def test_queued_microbatch_groups_count_the_batches_behind_the_running_one() -> None:
+    async def run() -> None:
+        queued = controller_module._QueuedMicrobatchGroups()
+        queued.add(3)
+        assert queued.count == 0  # the trainer runs it
+        queued.add(2)
+        queued.add(2)
+        assert queued.count == 4
+        waiter = asyncio.create_task(
+            queued.wait_for_trainer_progress(queued.num_finished, below=3)
+        )
+        queued.finish_oldest()  # a 2-group batch runs, 2 queued: below the target
+        await asyncio.wait_for(waiter, timeout=1)
+        assert queued.count == 2
+        # Below the target but nothing finished since the snapshot: keep waiting.
+        waiter = asyncio.create_task(
+            queued.wait_for_trainer_progress(queued.num_finished, below=2)
+        )
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        queued.finish_oldest()
+        await asyncio.wait_for(waiter, timeout=1)
+        assert queued.count == 0
+
+    asyncio.run(run())

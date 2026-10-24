@@ -19,6 +19,7 @@ from torchtitan_recipes.tests.rl.alphabet_sort import (
     rl_grpo_cp2_fsdp2_gen_tp2,
     rl_grpo_fsdp2_gen_tp2_compile,
     rl_grpo_fsdp2_gen_tp2_no_compile,
+    rl_grpo_fsdp2_gen_tp2_stream_microbatches,
     rl_grpo_kimi_k3_debug_batch_invariant,
     rl_grpo_moe_debug_dist_moe_tp2_ep4,
     rl_grpo_moe_debug_tp4_ep4,
@@ -48,6 +49,12 @@ def build_rl_test_list() -> list[IntegrationTestDefinition]:
             configs=[rl_grpo_fsdp2_gen_tp2_no_compile],
             test_descr="RL GRPO trainer FSDP=2 + gen TP=2 no compile",
             test_name="rl_grpo_fsdp2_gen_tp2_no_compile",
+            ngpu=8,
+        ),
+        _rl_test(
+            configs=[rl_grpo_fsdp2_gen_tp2_stream_microbatches],
+            test_descr="RL GRPO trainer FSDP=2 + gen TP=2, streamed microbatches",
+            test_name="rl_grpo_fsdp2_gen_tp2_stream_microbatches",
             ngpu=8,
         ),
         _rl_test(

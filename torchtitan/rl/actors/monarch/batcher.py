@@ -58,11 +58,23 @@ class _BatcherActorEndpoints:
 
     @endpoint
     async def add_group(
-        self, *, rollout_group: RolloutGroup
+        self, *, rollout_group: RolloutGroup, num_queued_microbatch_groups: int = 0
     ) -> tuple[TrainerStepBatch | None, bool]:
         """Plain `@endpoint`, not `@concurrent_endpoint`: calls run one at a time, so groups reach the
         stateful batcher in arrival order. `async` because Monarch rejects mixing sync and async endpoints."""
-        return super().add_group(rollout_group=rollout_group)
+        return super().add_group(
+            rollout_group=rollout_group,
+            num_queued_microbatch_groups=num_queued_microbatch_groups,
+        )
+
+    @endpoint
+    async def pack_ready_microbatches(
+        self, *, num_queued_microbatch_groups: int
+    ) -> TrainerStepBatch | None:
+        """Plain `@endpoint` like `add_group`, so it runs between groups, never during one."""
+        return super().pack_ready_microbatches(
+            num_queued_microbatch_groups=num_queued_microbatch_groups
+        )
 
     @endpoint
     async def maybe_release_oldest_batch(self) -> None:
