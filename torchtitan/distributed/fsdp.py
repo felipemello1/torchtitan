@@ -72,6 +72,7 @@ def linear_param_shard_placements(
     module: nn.Module,
     *,
     include_unstacked_grouped: bool = False,
+    shard_size: int | None = None,
 ) -> dict[nn.Parameter, Shard]:
     """Shard linear parameters along their matrix-row dimension.
 
@@ -85,6 +86,10 @@ def linear_param_shard_placements(
         include_unstacked_grouped: Also return ordinary ``[E, F, D]`` grouped
             weights. This is used when the expert dimension is too small for
             the E/FSDP mesh and expert weights must shard their matrix rows.
+        shard_size: FSDP shard degree. FSDP can't shard a dim other than 0
+            unevenly, so a parameter whose matrix rows this doesn't divide
+            (e.g. 512 rows over 12 ranks) is left out and keeps FSDP's default
+            ``Shard(0)``, which pads uneven shards.
     """
     placements: dict[nn.Parameter, Shard] = {}
     for child in module.modules():
@@ -94,10 +99,24 @@ def linear_param_shard_placements(
         elif not isinstance(child, nn.Linear) or getattr(child, "num_linears", 1) == 1:
             continue
         weight = cast(nn.Parameter, child.weight)
+        if shard_size is not None and weight.size(-2) % shard_size != 0:
+            continue
         placements[weight] = Shard(weight.ndim - 2)
         if (bias := getattr(child, "bias", None)) is not None:
             placements[bias] = Shard(bias.ndim - 1)
     return placements
+
+
+def _dense_shard_size(dp_mesh: DeviceMesh) -> int | None:
+    """Degree FSDP shards dense parameters over: ``dp_shard``, times ``cp`` when
+    the mesh has it (see ``resolve_fsdp_mesh``). None for a mesh without names."""
+    names = dp_mesh.mesh_dim_names or ()
+    if "dp_shard" not in names:
+        return None
+    size = dp_mesh["dp_shard"].size()
+    if "cp" in names:
+        size *= dp_mesh["cp"].size()
+    return size
 
 
 def resolve_fsdp_mesh(
@@ -360,7 +379,10 @@ def apply_fsdp_to_decoder(
     for layer_id, transformer_block in model.layers.items():
         # A stacked Linear keeps W1/W3 separate from the matrix-row dimension.
         # Shard matrix rows so every rank retains both projections.
-        stacked_param_placements = linear_param_shard_placements(transformer_block)
+        # Rows FSDP's shard degree doesn't divide stay on Shard(0).
+        stacked_param_placements = linear_param_shard_placements(
+            transformer_block, shard_size=_dense_shard_size(dp_mesh)
+        )
         # NOTE: In an MoE layer, we use shard_placement_fn to apply different
         # FSDP mesh and shard placement to different parameters:
         # - When EP > 1: routed-expert parameters use edp_mesh, while other
