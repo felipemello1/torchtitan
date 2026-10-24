@@ -6,6 +6,7 @@
 
 """CPU tests for fixed-bin LPT packing and its FFD fallback."""
 
+import asyncio
 import copy
 import random
 import weakref
@@ -483,3 +484,119 @@ def test_packing_releases_each_microbatchs_samples_once_packed() -> None:
     assert num_alive_before_each_pack == [num_samples - n for n in num_packed_before]
     assert all(ref() is None for ref in token_refs)
     assert batch.min_policy_versions == [0] * num_samples
+
+
+def _replay_groups() -> list[TrainingSampleGroup]:
+    """Three groups whose samples carry router-replay rows equal to their input tokens; every
+    input token is distinct across samples."""
+    groups = []
+    for group_id, lengths in enumerate([[9, 5, 3, 7], [8, 6, 2], [4, 9, 1, 6]]):
+        samples = _make_samples(lengths)
+        for index, sample in enumerate(samples):
+            first_token = 100 * (4 * group_id + index) + 1
+            sample.token_ids = first_token + np.arange(len(sample.token_ids))
+            rows = sample.token_ids[:-1].astype(np.uint16)
+            sample.routed_expert_ids = rows.reshape(-1, 1, 1)
+        groups.append(
+            TrainingSampleGroup(group_id=group_id, training_samples=samples, metrics=[])
+        )
+    return groups
+
+
+def _replay_batcher(*, stream_microbatches: bool, register_rdma_microbatch=None):
+    return Batcher.Config(
+        stream_microbatches=stream_microbatches,
+        rdma_min_tensor_bytes=None if register_rdma_microbatch is None else 1,
+    ).build(
+        num_tokens_per_microbatch_per_dp_rank=10,
+        max_context_length=10,
+        num_prompts_per_train_step=3,
+        dp_degree=2,
+        pad_id=0,
+        temperature=1.0,
+        register_rdma_microbatch=register_rdma_microbatch,
+        replay_routed_experts=True,
+    )
+
+
+def _add_groups(batcher: Batcher, groups: list[TrainingSampleGroup]) -> list:
+    batches = []
+    for group in groups:
+        batch, _ = batcher.add_training_samples(training_sample_group=group)
+        if batch is not None:
+            batches.append(batch)
+    return batches
+
+
+def test_streamed_microbatches_carry_each_tokens_router_replay_row() -> None:
+    """Router replay with streamed microbatches: each early batch's rows follow its own tokens,
+    and the step's batches together send every token's row once, as the whole step does."""
+    streamed = _add_groups(_replay_batcher(stream_microbatches=True), _replay_groups())
+    [whole_step] = _add_groups(
+        _replay_batcher(stream_microbatches=False), _replay_groups()
+    )
+    assert len(streamed) > 1 and not streamed[0].ends_step
+
+    def token_rows(batches) -> list[int]:
+        rows = []
+        for batch in batches:
+            for group in batch.microbatch_groups:
+                for row in group:
+                    for microbatch in row:
+                        routed = microbatch.model_kwargs["routed_expert_ids"].flatten()
+                        real = ~microbatch.padding_mask
+                        assert torch.equal(routed[real], microbatch.input[real].short())
+                        assert not routed[~real].any()
+                        rows += routed[real].tolist()
+        return rows
+
+    streamed_rows = token_rows(streamed)
+    assert len(streamed_rows) == len(set(streamed_rows))
+    assert sorted(streamed_rows) == sorted(token_rows([whole_step]))
+
+
+def test_streamed_batches_register_rdma_microbatches_per_batch() -> None:
+    """Each streamed batch registers its own RDMA batch: batch indices count the batches in
+    training order (what the trainer checks), microbatch indices restart per batch, and releases
+    drop the oldest batch first."""
+    registered = []
+    dropped = []
+
+    class _FakeRDMAMicrobatch:
+        def __init__(self, microbatch, *, batch_index, dp_rank, microbatch_index):
+            self.identity = (batch_index, dp_rank, microbatch_index)
+
+        async def drop(self) -> None:
+            dropped.append(self.identity)
+
+    def register(microbatch, *, min_bytes, batch_index, dp_rank, microbatch_index):
+        registered.append((batch_index, dp_rank, microbatch_index))
+        return _FakeRDMAMicrobatch(
+            microbatch,
+            batch_index=batch_index,
+            dp_rank=dp_rank,
+            microbatch_index=microbatch_index,
+        )
+
+    batcher = _replay_batcher(
+        stream_microbatches=True, register_rdma_microbatch=register
+    )
+    batches = _add_groups(batcher, _replay_groups())
+    assert len(batches) > 1
+    expected = []
+    for batch_index, batch in enumerate(batches):
+        rows = [row for group in batch.microbatch_groups for row in group]
+        expected += [
+            (batch_index, dp_rank, microbatch_index)
+            for microbatch_index, row in enumerate(rows)
+            for dp_rank in range(len(row))
+        ]
+        assert [[microbatch.identity for microbatch in row] for row in rows] == [
+            [(batch_index, dp_rank, index) for dp_rank in range(2)]
+            for index in range(len(rows))
+        ]
+    assert registered == expected
+
+    for _ in batches:
+        asyncio.run(batcher.maybe_release_oldest_batch())
+    assert dropped == expected

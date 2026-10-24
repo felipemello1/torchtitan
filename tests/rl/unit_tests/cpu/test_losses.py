@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from torchtitan.components.loss import ChunkedLossWrapper, compute_logprobs
+from torchtitan.rl.controller.metrics import combine_microbatch_metrics
 from torchtitan.rl.trainer.losses import DAPOLoss, DPPOLoss
 from torchtitan.rl.trainer.losses.common import normalize
 
@@ -326,3 +327,90 @@ def test_dppo_symmetric_gradient_matches_reference() -> None:
     # Only the gradients match: this loss reports -A * w * log p, the reference -A * w.
     torch.testing.assert_close(grad, reference_grad)
     assert 0 < metrics["loss/trust_region_dropped_frac"] < 1
+
+
+@pytest.mark.parametrize("num_chunks", [None, 2], ids=["unchunked", "chunked"])
+@pytest.mark.parametrize(
+    "loss_config",
+    [
+        DAPOLoss.Config(),
+        DPPOLoss.Config(divergence_threshold=0.2, max_ratio=2.0),
+        DPPOLoss.Config(divergence_threshold=0.2, max_ratio=2.0, symmetric=True),
+    ],
+    ids=["dapo", "dppo", "dppo_symmetric"],
+)
+def test_summed_losses_divided_once_match_divided_losses(
+    loss_config, num_chunks
+) -> None:
+    """Streamed microbatches: each loss returns its sum (global_loss_token_counts=None), the
+    gradients are divided by the step's loss-token count N once, and the controller divides the
+    summed mean/frac metrics by N. Loss, gradients and every metric match dividing each microbatch
+    by N, including DPPO's trust-region and truncation fractions."""
+    torch.manual_seed(0)
+    num_microbatches, num_tokens, dim, vocab_size = 3, 16, 8, 32
+    lm_head = nn.Linear(dim, vocab_size, bias=False)
+    hidden = 3 * torch.randn(num_microbatches, num_tokens, dim)
+    with torch.no_grad():
+        logits = lm_head(hidden)
+        labels = logits.argmax(-1)
+        trainer_logprobs = compute_logprobs(
+            logits.flatten(0, 1), labels.flatten(), vocab_parallel_group=None
+        ).view(num_microbatches, num_tokens)
+    # A large mismatch, so DAPO clips and DPPO drops and truncates some tokens.
+    generator_logprobs = (
+        trainer_logprobs + 2 * torch.randn(num_microbatches, num_tokens)
+    ).clamp(max=0)
+    generator_logprobs[0, 3] = float("nan")
+    generator_logprobs[1, 4] = float("-inf")
+    loss_mask = torch.rand(num_microbatches, num_tokens) > 0.2
+    # A microbatch with fewer loss tokens weighs less: per-microbatch means would differ.
+    loss_mask[2, 4:] = False
+    advantages = torch.randn(num_microbatches, num_tokens)
+    num_loss_tokens = (loss_mask & torch.isfinite(generator_logprobs)).sum()
+
+    if num_chunks is None:
+        loss_fn = loss_config.build()
+    else:
+        loss_fn = ChunkedLossWrapper.Config(
+            num_chunks=num_chunks, loss_fn=loss_config
+        ).build()
+        loss_fn.set_lm_head(lm_head)
+
+    def run(global_loss_token_counts):
+        lm_head.weight.grad = None
+        total_loss = torch.zeros(())
+        metrics = []
+        for index in range(num_microbatches):
+            inputs = hidden[index].clone().requires_grad_()
+            pred = inputs if num_chunks is not None else lm_head(inputs)
+            loss, microbatch_metrics = loss_fn(
+                pred,
+                labels[index],
+                global_loss_token_counts,
+                generator_logprobs=generator_logprobs[index],
+                temperature=torch.ones(num_tokens),
+                advantages=advantages[index],
+                loss_mask=loss_mask[index],
+            )
+            loss.backward()
+            total_loss += loss.detach()
+            metrics.append(
+                {key: float(value) for key, value in microbatch_metrics.items()}
+            )
+        return total_loss, lm_head.weight.grad.clone(), metrics
+
+    ref_loss, ref_grad, ref_metrics = run(num_loss_tokens)
+    summed_loss, summed_grad, summed_metrics = run(None)
+
+    torch.testing.assert_close(summed_loss / num_loss_tokens, ref_loss)
+    torch.testing.assert_close(summed_grad / num_loss_tokens, ref_grad)
+    expected = combine_microbatch_metrics(ref_metrics)
+    streamed = combine_microbatch_metrics(
+        summed_metrics, num_global_loss_tokens=int(num_loss_tokens)
+    )
+    assert streamed.keys() == expected.keys()
+    for key in expected:
+        torch.testing.assert_close(streamed[key], expected[key], msg=key)
+    if isinstance(loss_config, DPPOLoss.Config):
+        assert 0 < expected["loss/trust_region_dropped_frac"] < 1
+        assert 0 < expected["loss/ratio_truncated_frac"] < 1
