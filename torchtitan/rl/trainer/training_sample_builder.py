@@ -22,6 +22,13 @@ from torchtitan.rl.rollout.types import RolloutStatus, RolloutTurnID
 
 logger = logging.getLogger(__name__)
 
+# `Rollout.logs` counts of why a rollout forked into more samples (the Verifiers worker's `_fork_counts`).
+FORK_COUNT_KEYS = (
+    "num_compactions",
+    "num_resent_assistant_messages",
+    "num_resampled_prompts",
+)
+
 
 @dataclass(kw_only=True, slots=True)
 class TrainingSample:
@@ -315,6 +322,11 @@ class TrainingSampleBuilder(Configurable):
                 )
             )
 
+        fork_counts = {
+            key: [float(r.logs[key]) for r in trained_rollouts if key in r.logs]
+            for key in FORK_COUNT_KEYS
+        }
+        fork_counts = {key: values for key, values in fork_counts.items() if values}
         min_policy_versions = [
             training_sample.min_policy_version
             for training_sample in unfiltered_training_samples
@@ -335,6 +347,15 @@ class TrainingSampleBuilder(Configurable):
             ),
             m.Metric(
                 "rollout/branches_per_rollout", m.Max.from_list(branches_per_rollout)
+            ),
+            # The fork counts over the same rollouts as branches_per_rollout: the worker's
+            # rollout/<key> also averages the groups dropped here (e.g. zero-std).
+            *(
+                m.Metric(
+                    f"training_sample_builder/{key}", metric_type.from_list(values)
+                )
+                for key, values in fork_counts.items()
+                for metric_type in (m.Mean, m.Max)
             ),
             m.Metric(
                 "rollout/min_policy_version", m.Min.from_list(min_policy_versions)
