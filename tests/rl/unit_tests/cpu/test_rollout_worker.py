@@ -22,10 +22,16 @@ from torchtitan.rl.generator.http_client import GeneratorClient
 
 from torchtitan.rl.generator.types import SamplingConfig
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.rollout import RolloutGroup, RolloutStatus
+from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.message_env import MessageEnvInitOutput, MessageEnvStepOutput
-from torchtitan.rl.rollout.rollouter import gather_rollouts, RolloutWorker
+from torchtitan.rl.rollout.rollouter import (
+    gather_rollouts,
+    Rollouter,
+    RolloutProgress,
+    RolloutWorker,
+    StragglerCut,
+)
 from torchtitan.rl.rollout.rubric import RubricOutput
 from torchtitan.rl.rollout.token_env import TokenEnv, TokenEnvOutput
 from torchtitan.rl.rollout.types import Completion
@@ -572,7 +578,7 @@ def test_gather_rollouts_times_the_group_and_its_straggler() -> None:
         raise ValueError("env crashed")
 
     results, metrics = asyncio.run(
-        gather_rollouts([rollout(0.05), rollout(0.01), fails()])
+        gather_rollouts([rollout(0.05), rollout(0.01), fails()], group_id=7)
     )
 
     assert results[:2] == [0.05, 0.01] and isinstance(results[2], ValueError)
@@ -580,3 +586,179 @@ def test_gather_rollouts_times_the_group_and_its_straggler() -> None:
     assert values["rollout/group_wall_s/max"] >= 0.05
     # The last sibling ended ~0.05 s after the first (the one that raised at once).
     assert values["rollout/group_straggler_wait_s/max"] >= 0.04
+
+
+async def _start_group_with_unfinished_rollouts(
+    num_unfinished: int,
+) -> tuple[asyncio.Task, StragglerCut, list[str], asyncio.Event]:
+    """Start a group of 4 whose last `num_unfinished` rollouts wait for the returned event; return
+    once the others ended. The group may cut 1 straggler."""
+    group_size = 4
+    hanging = {
+        f"group=7/rollout={rollout_id}"
+        for rollout_id in range(group_size - num_unfinished, group_size)
+    }
+    released = []
+    finish = asyncio.Event()
+
+    async def generate_fn(prompt_token_ids, **kwargs) -> Completion:
+        if kwargs["routing_session_id"] in hanging:
+            await finish.wait()
+        return await _GenerateFn()(prompt_token_ids, **kwargs)
+
+    async def release_session_fn(*, routing_session_id: str) -> None:
+        released.append(routing_session_id)
+
+    worker = RolloutWorker(
+        SimpleNamespace(
+            rubric=_Config(_Rubric()),
+            message_env=_MessageEnvConfig(),
+            token_env=_TokenEnvConfig(),
+            advantage=AdvantageEstimator.Config(),
+            rollout_timeout_s=None,
+        )
+    )
+    await worker.setup_async(
+        tokenizer_config=HuggingFaceTokenizer.Config(),
+        renderer_config=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
+        hf_assets_path="tests/assets/tokenizer",
+    )
+    straggler_cut = StragglerCut(max_stragglers=1)
+    group = asyncio.create_task(
+        worker.run_group(
+            generate_fn=generate_fn,
+            release_session_fn=release_session_fn,
+            sample="sample",
+            group_id=7,
+            group_size=group_size,
+            sampling=SamplingConfig(),
+            straggler_cut=straggler_cut,
+        )
+    )
+    while len(released) < group_size - num_unfinished:
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)  # the last finished rollout's done callback
+    return group, straggler_cut, released, finish
+
+
+def test_cut_stragglers_cuts_the_unfinished_rollout_and_the_rest_train() -> None:
+    async def run() -> RolloutGroup:
+        group, straggler_cut, released, _ = await _start_group_with_unfinished_rollouts(
+            1
+        )
+        assert straggler_cut.gate_reached.result() is True
+        straggler_cut.request("grace")
+        # The group returns at once instead of raising the cut rollout's CancelledError.
+        group = await group
+        assert sorted(released) == [f"group=7/rollout={i}" for i in range(4)]
+        return group
+
+    group = asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+    *trained, cut = group.rollouts
+    assert cut.status is RolloutStatus.ERROR_SYSTEM
+    assert cut.logs["straggler_cut"] == "grace"
+    # Cut while waiting for its first completion
+    assert cut.logs["elapsed_s"] >= 0
+    assert (cut.logs["num_turns"], cut.logs["completion_tokens"]) == (0, 0)
+    assert cut.logs["min_policy_version"] is None
+    assert (cut.reward, cut.advantage) == (None, None)
+    # `_Rubric` rewards rollout_id + 1, so 1, 2 and 3, centered on their mean 2.
+    assert [rollout.advantage for rollout in trained] == [-1.0, 0.0, 1.0]
+    values = m.MetricsProcessor._aggregate_metrics(group.metrics)
+    assert values["rollout/stragglers_cut/grace/sum"] == 1
+    # The 3 that finished are not a fair sample of the task: the group records no outcome.
+    rollouter = object.__new__(Rollouter)
+    rollouter._group_outcomes = {}
+    rollouter.record_group_outcome(group)
+    assert rollouter._group_outcomes == {}
+
+
+def test_cut_stragglers_cuts_nothing_when_more_than_max_stragglers_are_unfinished() -> None:
+    async def run() -> None:
+        group, straggler_cut, _, _ = await _start_group_with_unfinished_rollouts(2)
+        # Gate never reached: a request (the cap) cuts nothing
+        assert not straggler_cut.gate_reached.done()
+        straggler_cut.request("cap")
+        await asyncio.sleep(0.1)
+        # Both keep running; the group's own cancel (too old, or shutdown) still raises.
+        assert not group.done()
+        group.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await group
+        # Cancelled siblings don't reach the gate
+        assert not straggler_cut.gate_reached.done()
+
+    asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+
+def test_cut_stragglers_cuts_nothing_when_the_straggler_finishes_first() -> None:
+    async def run() -> None:
+        group, straggler_cut, _, finish = await _start_group_with_unfinished_rollouts(1)
+        assert straggler_cut.gate_reached.result() is True
+        # The 4th finishes inside the grace: the group trains whole, and a later request does nothing
+        finish.set()
+        group = await group
+        straggler_cut.request("grace")
+        assert [rollout.status for rollout in group.rollouts] == [
+            RolloutStatus.COMPLETED
+        ] * 4
+        assert not any(
+            metric.key.startswith(("rollout/stragglers_cut", "rollout/straggler_cut"))
+            for metric in group.metrics
+        )
+
+    asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+
+def test_gather_rollouts_logs_a_cut_rollouts_progress() -> None:
+    async def run() -> tuple[list, list[m.Metric]]:
+        progress = [RolloutProgress(), RolloutProgress()]
+        straggler_cut = StragglerCut(max_stragglers=1)
+
+        async def finishes() -> Rollout:
+            return Rollout(group_id=7, rollout_id=0, status=RolloutStatus.COMPLETED)
+
+        async def hangs_after_two_turns() -> Rollout:
+            for version, num_tokens in ((5, 3), (6, 2)):
+                progress[1].add_turn(
+                    Completion(
+                        min_policy_version=version,
+                        max_policy_version=version,
+                        request_id="r",
+                        token_ids=[1] * num_tokens,
+                        token_logprobs=[-0.5] * num_tokens,
+                        finish_reason="stop",
+                    )
+                )
+            await asyncio.Event().wait()
+            raise AssertionError("not reached")
+
+        group = asyncio.create_task(
+            gather_rollouts(
+                [finishes(), hangs_after_two_turns()],
+                group_id=7,
+                straggler_cut=straggler_cut,
+                progress=progress,
+            )
+        )
+        assert await straggler_cut.gate_reached is True
+        await asyncio.sleep(0.01)
+        straggler_cut.request("cap")
+        return await group
+
+    (_, cut), metrics = asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+    assert cut.status is RolloutStatus.ERROR_SYSTEM
+    assert cut.logs["straggler_cut"] == "cap"
+    assert cut.logs["elapsed_s"] >= 0.01
+    assert {key: cut.logs[key] for key in RolloutProgress.__dataclass_fields__} == {
+        "num_turns": 2,
+        "completion_tokens": 5,
+        "min_policy_version": 5,
+        "max_policy_version": 6,
+    }
+    values = m.MetricsProcessor._aggregate_metrics(metrics)
+    assert values["rollout/straggler_cut/num_turns/mean"] == 2
+    assert values["rollout/straggler_cut/completion_tokens/max"] == 5
+    assert values["rollout/straggler_cut/elapsed_s/max"] >= 0.01

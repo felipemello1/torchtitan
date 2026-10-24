@@ -44,7 +44,7 @@ from torchtitan.rl.generator.http_client import GeneratorClient
 from torchtitan.rl.generator.types import SamplingConfig
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
-from torchtitan.rl.rollout.rollouter import Rollouter
+from torchtitan.rl.rollout.rollouter import Rollouter, StragglerCut
 from torchtitan.rl.rollout.rubric import RubricOutput
 from torchtitan.rl.rollout.types import (
     Completion,
@@ -1421,6 +1421,69 @@ def test_a_rollout_that_raises_is_kept_but_left_out_of_the_advantage(
     assert [rollout.advantage for rollout in scored] == advantages
 
 
+def test_cut_stragglers_cuts_the_unfinished_rollout_and_the_rest_train(
+    monkeypatch,
+) -> None:
+    released = []
+
+    async def run_single_rollout(self, *, group_id, rollout_id, **kwargs):
+        try:
+            if rollout_id == 3:
+                await asyncio.Event().wait()
+            return Rollout(
+                group_id=group_id,
+                rollout_id=rollout_id,
+                status=RolloutStatus.COMPLETED,
+                logs={"stop_condition": "agent_completed"},
+            )
+        finally:
+            released.append(rollout_id)
+
+    async def score_group(self, rollouts, sample):
+        return [
+            RubricOutput(reward=float(rollout.rollout_id), reward_breakdown={})
+            for rollout in rollouts
+        ]
+
+    monkeypatch.setattr(
+        VerifiersRolloutWorker, "_run_single_rollout", run_single_rollout
+    )
+    monkeypatch.setattr(VerifiersRolloutWorker, "score_group", score_group)
+    worker = object.__new__(VerifiersRolloutWorker)
+    worker.advantage_estimator = AdvantageEstimator.Config().build()
+
+    async def run():
+        straggler_cut = StragglerCut(max_stragglers=1)
+        group = asyncio.create_task(
+            worker.run_group(
+                generate_fn=GeneratorClient(router=None),
+                release_session_fn=None,
+                sample=None,
+                group_id=1,
+                group_size=4,
+                sampling=SamplingConfig(),
+                straggler_cut=straggler_cut,
+            )
+        )
+        while len(released) < 3:
+            await asyncio.sleep(0)
+        straggler_cut.request("cap_minus_1")
+        return await group
+
+    group = asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+    *trained, cut = group.rollouts
+    assert cut.status is RolloutStatus.ERROR_SYSTEM
+    assert cut.logs["straggler_cut"] == "cap_minus_1"
+    assert (cut.reward, cut.advantage) == (None, None)
+    assert [rollout.advantage for rollout in trained] == [-1.0, 0.0, 1.0]
+    assert sorted(released) == [0, 1, 2, 3]
+    values = m.MetricsProcessor._aggregate_metrics(group.metrics)
+    assert values["rollout/stragglers_cut/cap_minus_1/sum"] == 1
+    # The cut rollout has no stop condition: it counts as "other"
+    assert values["rollout/stop/other/mean"] == 0.25
+
+
 def test_cancelled_run_group_waits_for_every_sibling_release() -> None:
     """A cancelled group returns only after each sibling gave its lease back with
     `release_rollout(session_ids=[])`: no sibling's lease outlives `cancel_group`."""
@@ -1520,6 +1583,7 @@ def test_rollout_logs_why_its_trace_forked() -> None:
     assert _fork_counts(trace) == {
         "num_compactions": 1,
         "num_resent_assistant_messages": 1,
+        "num_resampled_prompts": 0,
     }
 
 
@@ -1592,6 +1656,31 @@ def test_a_midnight_fork_is_not_a_compaction() -> None:
     )
 
     assert _fork_counts(trace)["num_compactions"] == 0
+
+
+def test_a_prompt_sampled_again_counts_as_resampled() -> None:
+    """The agent re-sent a prompt it had a completion for (twice), and each was sampled again."""
+    from verifiers.v1.types import (
+        AssistantMessage as VerifiersAssistantMessage,
+        UserMessage as VerifiersUserMessage,
+    )
+
+    trace = _trace_of(
+        (None, _system("Tue 20"), False),
+        (0, VerifiersUserMessage(content="fix it"), False),
+        (1, VerifiersAssistantMessage(content="first try"), True),
+        (1, VerifiersAssistantMessage(content="second try"), True),
+        (3, VerifiersUserMessage(content="tool output"), False),
+        (4, VerifiersAssistantMessage(content="a"), True),
+        (4, VerifiersAssistantMessage(content="b"), True),
+        (4, VerifiersAssistantMessage(content="c"), True),
+    )
+
+    assert _fork_counts(trace) == {
+        "num_compactions": 0,
+        "num_resent_assistant_messages": 0,
+        "num_resampled_prompts": 3,
+    }
 
 
 def test_a_summary_after_a_midnight_fork_counts_once() -> None:

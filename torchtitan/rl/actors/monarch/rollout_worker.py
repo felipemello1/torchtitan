@@ -18,7 +18,7 @@ from torchtitan.components.renderer import RendererConfig
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.rollout.rollouter import RolloutWorker
+from torchtitan.rl.rollout.rollouter import RolloutWorker, StragglerCut
 from torchtitan.rl.rollout.types import RolloutGroup
 
 
@@ -44,6 +44,8 @@ class RolloutWorkerActor(Actor):
         self._loop_lag = m.EventLoopLag("rollout_worker")
         # group id -> the `run_group` call running it here, for `cancel_group`.
         self._group_tasks: dict[int, asyncio.Task] = {}
+        # group id -> its straggler cut, for `wait_for_straggler_gate` and `cut_stragglers`.
+        self._straggler_cuts: dict[int, StragglerCut] = {}
 
     @concurrent_endpoint
     async def setup_async(
@@ -69,9 +71,19 @@ class RolloutWorkerActor(Actor):
         group_id: int,
         group_size: int,
         sampling: Any,
+        max_stragglers: int | None = None,
     ) -> RolloutGroup:
+        """Run one group on this worker. With `max_stragglers`, the worker's `run_group` gets a
+        `StragglerCut` that `wait_for_straggler_gate` and `cut_stragglers` reach; without, the
+        call it got before the cut existed."""
         task = asyncio.current_task()
         self._group_tasks[group_id] = task
+        extra_kwargs = {}
+        straggler_cut = None
+        if max_stragglers is not None:
+            straggler_cut = StragglerCut(max_stragglers)
+            self._straggler_cuts[group_id] = straggler_cut
+            extra_kwargs["straggler_cut"] = straggler_cut
         try:
             group = await self._worker.run_group(
                 generate_fn=generate_fn,
@@ -80,6 +92,7 @@ class RolloutWorkerActor(Actor):
                 group_id=group_id,
                 group_size=group_size,
                 sampling=sampling,
+                **extra_kwargs,
             )
             # This process's GC time and event-loop lag since the last finished training group;
             # summed over a step's groups. Validation (negative group ids) ignores group metrics,
@@ -92,6 +105,10 @@ class RolloutWorkerActor(Actor):
             # don't drop a newer call's entry.
             if self._group_tasks.get(group_id) is task:
                 del self._group_tasks[group_id]
+            if straggler_cut is not None:
+                straggler_cut.close()
+                if self._straggler_cuts.get(group_id) is straggler_cut:
+                    del self._straggler_cuts[group_id]
 
     @concurrent_endpoint
     async def cancel_group(self, group_id: int) -> None:
@@ -104,6 +121,24 @@ class RolloutWorkerActor(Actor):
         if task is not None:
             task.cancel()
             await asyncio.wait([task])
+
+    @concurrent_endpoint
+    async def wait_for_straggler_gate(self, group_id: int) -> bool:
+        """If this worker runs the group, wait until at most its `max_stragglers` rollouts are
+        unfinished (True) or it ended (False). False at once on the other workers."""
+        straggler_cut = self._straggler_cuts.get(group_id)
+        if straggler_cut is None:
+            return False
+        return await asyncio.shield(straggler_cut.gate_reached)
+
+    @concurrent_endpoint
+    async def cut_stragglers(self, group_id: int, reason: str) -> None:
+        """Cut this group's unfinished rollouts if this worker runs it and at most its
+        `max_stragglers` are left (see `gather_rollouts`). Unlike `cancel_group`, it returns without
+        waiting for them."""
+        straggler_cut = self._straggler_cuts.get(group_id)
+        if straggler_cut is not None:
+            straggler_cut.request(reason)
 
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:

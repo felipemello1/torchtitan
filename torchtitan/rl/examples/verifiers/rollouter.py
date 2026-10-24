@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import itertools
 import logging
 import re
@@ -50,6 +51,7 @@ from torchtitan.rl.rollout.rollouter import (
     Rollouter,
     rollouts_from_gather,
     RolloutWorker,
+    StragglerCut,
 )
 from torchtitan.rl.rollout.rubric import RewardFn, Rubric
 from torchtitan.rl.rollout.types import (
@@ -62,7 +64,10 @@ from torchtitan.rl.rollout.types import (
     RolloutTurnID,
     split_prompt,
 )
-from torchtitan.rl.trainer.training_sample_builder import TrainingSampleBuilder
+from torchtitan.rl.trainer.training_sample_builder import (
+    FORK_COUNT_KEYS,
+    TrainingSampleBuilder,
+)
 
 if TYPE_CHECKING:
     from torchtitan.rl.actors.system import ActorSystem
@@ -376,6 +381,7 @@ class VerifiersRolloutWorker(RolloutWorker):
         group_id: int,
         group_size: int,
         sampling: SamplingConfig,
+        straggler_cut: StragglerCut | None = None,
     ) -> RolloutGroup:
         """Run sibling rollouts through Verifiers, then compute advantages."""
         # Each rollout releases its own generator sessions; see `_run_single_rollout`.
@@ -389,7 +395,7 @@ class VerifiersRolloutWorker(RolloutWorker):
         generator_sessions: dict[int, tuple[str, str]] = {}
         # A cancel cancels every sibling, and with return_exceptions the gather still waits for each
         # one's lease release before it raises: the caller releases the group next.
-        results, group_metrics = await gather_rollouts(
+        sibling_rollouts = (
             self._run_single_rollout(
                 generator_client=generate_fn,
                 sample=sample,
@@ -403,6 +409,9 @@ class VerifiersRolloutWorker(RolloutWorker):
                 generator_sessions=generator_sessions,
             )
             for rollout_id in range(group_size)
+        )
+        results, group_metrics = await gather_rollouts(
+            sibling_rollouts, group_id=group_id, straggler_cut=straggler_cut
         )
         rollouts = rollouts_from_gather(results, group_id=group_id)
 
@@ -426,7 +435,9 @@ class VerifiersRolloutWorker(RolloutWorker):
             generator_client=generate_fn,
             generator_sessions=generator_sessions,
         )
-        for key in ("num_compactions", "num_resent_assistant_messages"):
+        # Over every rollout; `TrainingSampleBuilder` logs them over the trained ones only, as
+        # rollout/branches_per_rollout (training_sample_builder/<key>).
+        for key in FORK_COUNT_KEYS:
             values = [float(r.logs[key]) for r in rollouts if key in r.logs]
             if values:
                 group_metrics += [
@@ -852,6 +863,8 @@ def _fork_counts(trace: Any) -> dict[str, int]:
     - num_resent_assistant_messages: assistant messages re-sent in a form the graph did not match to
       the sampled turn beside them; each adds one branch. The copies a summary request re-carries
       under its own root are not counted.
+    - num_resampled_prompts: prompts sampled again, i.e. (sampled children - 1) per node: the agent
+      re-sent a prompt it already had a completion for (e.g. a client retry), and each adds a branch.
 
     Example: two summary requests, then a midnight fork whose later turns continue the conversation
     -> num_compactions = 2.
@@ -875,7 +888,9 @@ def _fork_counts(trace: Any) -> dict[str, int]:
         and index != 0
         and _without_date(node.message) == main_message
     }
-    parents_of_sampled = {node.parent for node in nodes if node.sampled}
+    sampled_children = collections.Counter(
+        node.parent for node in nodes if node.sampled
+    )
     return {
         "num_compactions": sum(
             node.sampled
@@ -888,9 +903,10 @@ def _fork_counts(trace: Any) -> dict[str, int]:
             not node.sampled
             and node.message.role == "assistant"
             and node.parent is not None
-            and node.parent in parents_of_sampled
+            and node.parent in sampled_children
             for node in nodes
         ),
+        "num_resampled_prompts": sum(count - 1 for count in sampled_children.values()),
     }
 
 
