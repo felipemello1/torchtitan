@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import torch
@@ -20,6 +21,12 @@ from torchtitan.rl.trainer.trainer import OptimizerStepOutput, Trainer
 
 
 class _TrainerActorEndpoints:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # The controller sends forward_backward calls without waiting for earlier ones, and a concurrent
+        # endpoint only starts queued calls in order. The lock runs them one at a time, in that order.
+        self._forward_backward_lock = asyncio.Lock()
+
     @concurrent_endpoint
     async def initialize_torchstore_client(self) -> None:
         await super().initialize_torchstore_client()
@@ -50,20 +57,29 @@ class _TrainerActorEndpoints:
         microbatch_groups: (
             list[list[TrainingMicrobatch]] | list[list[RDMAMicrobatch]]
         ),
-        global_loss_token_counts: torch.Tensor,
-        global_routing_token_counts: torch.Tensor,
+        global_loss_token_counts: torch.Tensor | None,
+        global_routing_token_counts: torch.Tensor | None,
+        ends_step: bool = True,
     ) -> dict[str, float] | None:
-        return await super().forward_backward(
-            microbatch_groups,
-            global_loss_token_counts,
-            global_routing_token_counts,
-        )
+        async with self._forward_backward_lock:
+            return await super().forward_backward(
+                microbatch_groups,
+                global_loss_token_counts,
+                global_routing_token_counts,
+                ends_step=ends_step,
+            )
 
     @concurrent_endpoint
     async def optim_step(
-        self, *, controller_state: dict[str, Any]
+        self,
+        *,
+        controller_state: dict[str, Any],
+        global_loss_token_counts: torch.Tensor | None = None,
     ) -> OptimizerStepOutput:
-        return await super().optim_step(controller_state=controller_state)
+        return await super().optim_step(
+            controller_state=controller_state,
+            global_loss_token_counts=global_loss_token_counts,
+        )
 
     @concurrent_endpoint
     async def save_checkpoint(self, *, last_step: bool) -> None:

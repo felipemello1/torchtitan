@@ -8,6 +8,7 @@
 the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID."""
 
 import asyncio
+import dataclasses
 import gc
 import json
 import logging
@@ -18,6 +19,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import numpy as np
 import pytest
 import torch
+from torchtitan.models.common.moe.moe import MicrobatchWiseLoadBalanceLoss, MoE
 from torchtitan.rl.controller.adaptive_demand import (
     estimate_next_unavailable_upper_bound,
     mean_age_ceiling,
@@ -31,8 +33,10 @@ from torchtitan.rl.controller.controller import (
     ValidationConfig,
 )
 from torchtitan.rl.controller.metrics import (
+    combine_microbatch_metrics,
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
+    forward_backward_wait_and_busy_seconds,
     MetricsTimer,
 )
 from torchtitan.rl.controller.work_buffer import (
@@ -75,6 +79,26 @@ def test_controller_config_maybe_log(tmp_path, caplog) -> None:
     with open(tmp_path / "config.json") as file:
         saved_config = json.load(file)
     assert saved_config["trainer"]["training"]["max_context_length"] == 128
+
+
+@pytest.mark.parametrize("unsupported", [None, "aux_loss", "mtp"])
+def test_stream_microbatches_rejects_aux_loss_and_mtp(unsupported: str | None) -> None:
+    from torchtitan_recipes.tests.rl.alphabet_sort import rl_grpo_qwen3_moe_debug_varlen
+
+    config = rl_grpo_qwen3_moe_debug_varlen()
+    batcher = dataclasses.replace(config.async_loop.batcher, stream_microbatches=True)
+    if unsupported == "aux_loss":
+        _, moe, _, _ = next(config.trainer.model.traverse(MoE.Config))
+        moe.router.aux_loss = MicrobatchWiseLoadBalanceLoss.Config(coeff=0.01)
+    if unsupported == "mtp":
+        batcher = dataclasses.replace(batcher, num_mtp_layers=1)
+    config.async_loop = dataclasses.replace(config.async_loop, batcher=batcher)
+
+    if unsupported is None:
+        dataclasses.replace(config)
+        return
+    with pytest.raises(ValueError, match="stream_microbatches does not support"):
+        dataclasses.replace(config)
 
 
 def _training_sample(*, group_id: int, rollout_id: int) -> TrainingSample:
@@ -199,6 +223,82 @@ def test_batcher_carries_metric_only_groups_until_trainable_batch() -> None:
     assert batch.global_loss_token_counts[0] > 0
     assert batch.global_routing_token_counts.shape == (1,)
     assert batch.group_ids == [0, 1]
+
+
+def _stream_groups(groups: list[TrainingSampleGroup], *, stream: bool, dp_degree: int):
+    """Add `groups` one at a time to a 10-token-per-microbatch batcher; return its batches."""
+    batcher = Batcher.Config(stream_microbatches=stream).build(
+        num_tokens_per_microbatch_per_dp_rank=10,
+        max_context_length=10,
+        num_prompts_per_train_step=3,
+        dp_degree=dp_degree,
+        pad_id=0,
+        temperature=1.0,
+    )
+    batches = []
+    for group in groups:
+        batch, _ = batcher.add_training_samples(training_sample_group=group)
+        if batch is not None:
+            batches.append(batch)
+    return batches
+
+
+@pytest.mark.parametrize("dp_degree", [1, 2])
+def test_streaming_batcher_sends_each_sample_once_and_ends_the_step_last(
+    dp_degree: int,
+) -> None:
+    # Untrainable groups first and mid-step; samples pack 3 to 9 tokens each.
+    groups = [
+        _untrainable_group(0),
+        _variable_length_group(1, token_lengths=[7, 6, 5, 4, 7, 6]),
+        _untrainable_group(2),
+        _variable_length_group(3, token_lengths=[10, 9, 3]),
+        _variable_length_group(4, token_lengths=[8, 5, 4, 4]),
+    ]
+    streamed = _stream_groups(groups, stream=True, dp_degree=dp_degree)
+    [whole_step] = _stream_groups(groups, stream=False, dp_degree=dp_degree)
+
+    # Earlier batches stream out; only the step's last batch ends it and carries the step's fields.
+    assert len(streamed) > 1
+    assert [batch.ends_step for batch in streamed] == [False] * (len(streamed) - 1) + [
+        True
+    ]
+    for batch in streamed[:-1]:
+        assert (batch.metrics, batch.group_ids, batch.min_policy_versions) == (
+            [],
+            [],
+            [],
+        )
+    last = streamed[-1]
+    assert last.group_ids == whole_step.group_ids == [0, 1, 2, 3, 4]
+    assert len(last.min_policy_versions) == 13
+    assert _metric_value(last, "train_batch/num_training_samples") == 13
+
+    # Every batch holds whole rows of one microbatch per DP rank, and every token is sent once.
+    microbatches = [
+        microbatch
+        for batch in streamed
+        for group in batch.microbatch_groups
+        for row in group
+        for microbatch in row
+    ]
+    assert all(
+        len(row) == dp_degree
+        for batch in streamed
+        for group in batch.microbatch_groups
+        for row in group
+    )
+    num_sample_tokens = sum(int((~mb.padding_mask).sum()) for mb in microbatches)
+    assert num_sample_tokens == sum(
+        length - 1 for length in [7, 6, 5, 4, 7, 6, 10, 9, 3, 8, 5, 4, 4]
+    )
+    assert sum(batch.global_loss_token_counts for batch in streamed).tolist() == (
+        whole_step.global_loss_token_counts.tolist()
+    )
+    assert (
+        _metric_value(last, "train_batch/num_microbatches")
+        == len(microbatches) / dp_degree
+    )
 
 
 def test_batcher_prepares_per_depth_mtp_token_counts() -> None:
@@ -673,6 +773,30 @@ def test_metrics_timer_flush_drains() -> None:
     assert timer.flush() == []  # drained on the second read
 
 
+def test_forward_backward_wait_and_busy_seconds_follow_the_trainer() -> None:
+    # Each call takes 3 s. Batch 2 is sent at t=1, while call 1 runs, so it waits 0 s; batch 3 at t=10.
+    assert forward_backward_wait_and_busy_seconds(
+        0.0, [(0.0, 3.0), (1.0, 6.0), (10.0, 13.0)]
+    ) == (4.0, 9.0)
+    # One call per step: the wait for the batch, then the call.
+    assert forward_backward_wait_and_busy_seconds(0.0, [(2.0, 5.0)]) == (2.0, 3.0)
+
+
+def test_combine_microbatch_metrics_divides_streamed_sums_by_the_step_count() -> None:
+    combined = combine_microbatch_metrics(
+        [
+            {"loss/mean": 1.0, "loss/ratio_clipped_frac": 2.0, "x/max": 2.0},
+            {"loss/mean": 3.0, "loss/ratio_clipped_frac": 1.0, "x/max": 5.0},
+        ],
+        num_global_loss_tokens=4,
+    )
+    assert combined == {"loss/mean": 1.0, "loss/ratio_clipped_frac": 0.75, "x/max": 5.0}
+    # A step with no loss tokens logs zeros.
+    assert combine_microbatch_metrics(
+        [{"loss/mean": 0.0}], num_global_loss_tokens=0
+    ) == {"loss/mean": 0.0}
+
+
 def test_rollout_id_to_string_is_callable_and_uses_int_group_id() -> None:
     rollout_id = RolloutTurnID(group_id=5, rollout_id=2, turn_id=0)
     assert rollout_id.to_string() == "group=5/rollout=2/turn=0"
@@ -923,6 +1047,7 @@ def _run_with_generator_watcher(watcher) -> None:
             ),
             validation=ValidationConfig(),
             extra_validations=[],
+            batcher=SimpleNamespace(stream_microbatches=False),
         ),
         trainer=SimpleNamespace(
             training=SimpleNamespace(
@@ -1663,8 +1788,12 @@ def test_adaptive_buffer_admits_a_granted_slot_after_the_demand_drops() -> None:
     asyncio.run(run())
 
 
-def test_batcher_passes_the_version_that_trains_each_group() -> None:
-    """Batches train in order, one per version, so the batch a group joins sets its consuming version."""
+@pytest.mark.parametrize("stream_microbatches", [False, True])
+def test_batcher_passes_the_version_that_trains_each_group(
+    stream_microbatches: bool,
+) -> None:
+    """Batches train in order, one step per version, so the step a group joins sets its consuming version.
+    A streamed step's earlier batches (ends_step=False) train with the version of its last batch."""
     # Groups 0, 2, 3, 4 are trainable; group 1 is not and joins no batch's count.
     trainable = {0: True, 1: False, 2: True, 3: True, 4: True}
     consuming_policy_versions = []
@@ -1687,7 +1816,10 @@ def test_batcher_passes_the_version_that_trains_each_group() -> None:
         if not trainable[rollout_group.group_id]:
             return None, False
         trainable_seen.append(rollout_group.group_id)
-        return ("batch" if len(trainable_seen) % 2 == 0 else None), True
+        if len(trainable_seen) % 2 == 0:
+            return SimpleNamespace(ends_step=True), True
+        # Streaming: the step's first group already fills a microbatch and sends it.
+        return (SimpleNamespace(ends_step=False) if stream_microbatches else None), True
 
     controller = SimpleNamespace(
         config=SimpleNamespace(
@@ -1704,7 +1836,8 @@ def test_batcher_passes_the_version_that_trains_each_group() -> None:
     asyncio.run(Controller._batcher_loop(controller, training_batch_queue=queue))
     # [0, 1, 2] trains at version 5, [3, 4] at 6; the last call returns None
     assert consuming_policy_versions == [5, 5, 5, 6, 6, 7]
-    assert queue.qsize() == 3  # two batches and the None sentinel
+    # two steps' last batches, their earlier batches when streaming, and the None sentinel
+    assert queue.qsize() == (5 if stream_microbatches else 3)
 
 
 def test_generation_capacity_default_follows_target_offpolicy_steps() -> None:
@@ -2207,9 +2340,10 @@ def _training_batch(step: int) -> SimpleNamespace:
         metrics=[],
         min_policy_versions=[step - 1],
         microbatch_groups=[],
-        global_loss_token_counts=[1],
-        global_routing_token_counts=[1],
+        global_loss_token_counts=torch.tensor([1]),
+        global_routing_token_counts=torch.tensor([1]),
         group_ids=[step],
+        ends_step=True,
     )
 
 

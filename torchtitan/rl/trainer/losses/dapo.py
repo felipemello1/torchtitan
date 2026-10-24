@@ -62,7 +62,8 @@ class DAPOLoss(BaseLoss):
             logits: [T, V] current-policy output.
             labels: [T] pre-shifted target token ids.
             global_loss_token_counts: total response tokens with finite generator logprobs
-                across all microbatches and DP ranks; the loss denominator.
+                across all microbatches and DP ranks; the loss denominator. None: the loss and
+                the mean/frac metrics are sums, and the trainer divides the gradients later.
             **loss_inputs: the [T] tensors `score_tokens` takes (generator logprobs,
                 temperature, loss mask, advantages).
 

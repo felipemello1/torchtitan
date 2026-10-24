@@ -422,7 +422,7 @@ def test_packed_batch_equals_packing_each_assigned_microbatch() -> None:
         for row in assignments
     ]
     expected_packing_metrics = batcher._packing_metrics(
-        assignments, sample_copies, len(_GROUP_LENGTHS), 0
+        len(assignments), sample_copies, len(_GROUP_LENGTHS), 0
     )
     expected_microbatches = [mb for row in expected for mb in row]
     expected_loss_counts = sum(mb.loss_token_counts for mb in expected_microbatches)

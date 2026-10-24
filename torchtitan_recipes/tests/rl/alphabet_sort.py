@@ -800,6 +800,14 @@ def rl_grpo_fsdp2_gen_tp2_no_compile() -> Controller.Config:
     )
 
 
+def rl_grpo_fsdp2_gen_tp2_stream_microbatches() -> Controller.Config:
+    config = rl_grpo_fsdp2_gen_tp2_no_compile()
+    config.async_loop.batcher.stream_microbatches = True
+    # Smaller microbatches, so a step streams several batches.
+    config.trainer.training.num_tokens_per_microbatch_per_dp_rank = 1024
+    return config
+
+
 def rl_grpo_fsdp2_gen_tp2_compile() -> Controller.Config:
     config = rl_grpo_qwen3_0_6b_varlen(seq_len=1024)
     config.num_generators = 3
