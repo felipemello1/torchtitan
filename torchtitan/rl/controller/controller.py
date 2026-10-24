@@ -102,6 +102,7 @@ import math
 import os
 import time
 import warnings
+from collections import deque
 from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -181,32 +182,44 @@ class _TrainerStepStarts:
 
 
 class _QueuedMicrobatchGroups:
-    """Streaming: the microbatch groups sent to the trainer and not yet trained.
+    """Streaming: the microbatch groups sent to the trainer that it has not started yet.
 
-    `_batcher_loop` adds a batch's groups when it queues the batch; `_trainer_loop` removes them when
-    the batch's forward_backward calls finish, which also wakes `wait_for_trainer_progress`, so the
-    batcher loop can pack more microbatches without waiting for the next rollout group.
+    `_batcher_loop` adds a batch's groups when it queues the batch; `_trainer_loop` calls `finish_oldest`
+    when a batch's forward_backward calls finish (or fail), which also wakes `wait_for_trainer_progress`,
+    so the batcher loop can pack more microbatches without waiting for the next rollout group.
+
+    The trainer runs calls in order, so the oldest unfinished batch is the one running and does not
+    count: after a 3-group call starts, the batcher packs up to `stream_queued_microbatches` groups to run
+    behind it, instead of waiting for the whole call to end.
 
     Example:
         queued = _QueuedMicrobatchGroups()
+        queued.add(3)                    # queued.count == 0: that batch runs
         queued.add(2)                    # queued.count == 2
         num_finished = queued.num_finished
-        queued.remove(1)                 # queued.count == 1; num_finished advanced
+        queued.finish_oldest()           # queued.count == 0: the 2-group batch runs
         await queued.wait_for_trainer_progress(num_finished, below=3)  # returns at once
     """
 
     def __init__(self) -> None:
-        self.count = 0
+        # Microbatch groups per sent and unfinished batch, oldest (running) first.
+        self._num_groups_by_batch: deque[int] = deque()
         # Batches the trainer has finished, so a waiter can tell whether one finished since it looked.
         self.num_finished = 0
         self._changed = asyncio.Event()
 
-    def add(self, num_microbatch_groups: int) -> None:
-        self.count += num_microbatch_groups
+    @property
+    def count(self) -> int:
+        return sum(self._num_groups_by_batch) - (
+            self._num_groups_by_batch[0] if self._num_groups_by_batch else 0
+        )
 
-    def remove(self, num_microbatch_groups: int) -> None:
-        """Synchronous, so a cancelled forward_backward wait still removes its groups."""
-        self.count -= num_microbatch_groups
+    def add(self, num_microbatch_groups: int) -> None:
+        self._num_groups_by_batch.append(num_microbatch_groups)
+
+    def finish_oldest(self) -> None:
+        """Synchronous, so a cancelled forward_backward wait still finishes its batch."""
+        self._num_groups_by_batch.popleft()
         self.num_finished += 1
         self._changed.set()
 
@@ -1198,8 +1211,14 @@ class Controller(Configurable):
                     )
                     if not take_task.done():
                         # The trainer finished a batch and is short of microbatches: pack them from
-                        # the samples that arrived while it had enough.
-                        trainer_progress_task = None
+                        # the samples that arrived while it had enough. Watch for the next finish from
+                        # now, so a batch that finishes during the pack or the step gate still counts.
+                        trainer_progress_task = asyncio.create_task(
+                            queued_microbatch_groups.wait_for_trainer_progress(
+                                queued_microbatch_groups.num_finished,
+                                below=stream_queued_microbatches,
+                            )
+                        )
                         with sl.log_trace_span("batcher_pack_ready_microbatches"):
                             maybe_training_batch = await self.batcher.pack_ready_microbatches.call_one(
                                 num_queued_microbatch_groups=queued_microbatch_groups.count
@@ -1379,7 +1398,6 @@ class Controller(Configurable):
                                         )
                                     ],
                                     queued_microbatch_groups=queued_microbatch_groups,
-                                    num_microbatch_groups=len(packed.microbatch_groups),
                                 ),
                                 # One trace track per in-flight slot.
                                 name=f"forward_backward_{len(forward_backward_tasks) % _MAX_IN_FLIGHT_FORWARD_BACKWARD_CALLS}",
@@ -1521,11 +1539,10 @@ class Controller(Configurable):
         results_by_dp_rank: list[Awaitable[Any]],
         *,
         queued_microbatch_groups: _QueuedMicrobatchGroups | None = None,
-        num_microbatch_groups: int = 0,
     ) -> tuple[dict[str, float], float]:
         """Wait for one batch's forward_backward calls, one per DP rank. Returns the loss metrics and
-        the time the calls finished. With streaming, then removes the batch's `num_microbatch_groups`
-        from `queued_microbatch_groups`."""
+        the time the calls finished. With streaming, then finishes the oldest batch in
+        `queued_microbatch_groups`, also when the calls fail."""
         with sl.log_trace_span("forward_backward"):
             try:
                 fwd_bwd_results = await asyncio.gather(*results_by_dp_rank)
@@ -1534,7 +1551,7 @@ class Controller(Configurable):
                 # Not awaited: it would wait behind an in-flight add_group.
                 self.batcher.maybe_release_oldest_batch.broadcast()
                 if queued_microbatch_groups is not None:
-                    queued_microbatch_groups.remove(num_microbatch_groups)
+                    queued_microbatch_groups.finish_oldest()
         finished_s = time.perf_counter()
         # Under PP, only trainer ranks holding the last stage compute the loss; the others return None.
         metrics = next(

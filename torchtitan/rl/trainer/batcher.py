@@ -251,7 +251,7 @@ class Batcher(Configurable):
         """
         stream_queued_microbatches: int = 3
         """With `stream_microbatches`: how many microbatch groups (one microbatch per DP rank; under PP,
-        `num_pp_microbatches` of them) to keep sent to the trainer and not yet trained. While the trainer has
+        `num_pp_microbatches` of them) to keep sent to the trainer and not yet started. While the trainer has
         this many, the batcher keeps the step's new samples unsent: packing from more samples balances the
         DP ranks' attention work better. When it has fewer, the batcher packs the missing microbatch
         groups from every unsent sample, as soon as it can fill their bins. With 8.5 s microbatches, 3 is
@@ -397,7 +397,7 @@ class Batcher(Configurable):
         Args:
             training_sample_group: One rollout group's trainable samples plus rollout metrics.
             num_queued_microbatch_groups: With `stream_microbatches`, the microbatch groups sent to the
-                trainer and not yet trained; see `pack_ready_microbatches`.
+                trainer and not yet started; see `pack_ready_microbatches`.
 
         Example:
             batcher = Batcher.Config().build(
@@ -452,7 +452,7 @@ class Batcher(Configurable):
             batch = self._pack_one_training_batch()
         elif self._stream_microbatches:
             return (
-                self.pack_ready_microbatches(
+                self._pack_requested_microbatches(
                     num_queued_microbatch_groups=num_queued_microbatch_groups
                 ),
                 group_is_trainable,
@@ -468,7 +468,7 @@ class Batcher(Configurable):
     ) -> TrainerStepBatch | None:
         """Streaming: pack the microbatch groups the trainer is missing from the step's unsent samples.
 
-        The trainer should have `stream_queued_microbatches` groups sent and not yet trained; this packs
+        The trainer should have `stream_queued_microbatches` groups sent and not yet started; this packs
         up to the missing number, fewer (or none) if the unsent samples can't fill their bins (see
         `_pack_ready_microbatches`). `add_training_samples` calls it after each group but the step's
         last; the controller also calls it when the trainer finishes a batch, so a trainer that drained
@@ -478,6 +478,16 @@ class Batcher(Configurable):
             pack_ready_microbatches(num_queued_microbatch_groups=3)  # -> None
             pack_ready_microbatches(num_queued_microbatch_groups=1)  # -> TrainerStepBatch, 2 groups
         """
+        return self._pack_requested_microbatches(
+            num_queued_microbatch_groups=num_queued_microbatch_groups
+        )
+
+    def _pack_requested_microbatches(
+        self, *, num_queued_microbatch_groups: int
+    ) -> TrainerStepBatch | None:
+        """`pack_ready_microbatches`, under a name no actor endpoint shadows: in `BatcherActor` the
+        `pack_ready_microbatches` endpoint comes first in the MRO, so `self.pack_ready_microbatches` is the
+        endpoint, not this method."""
         assert self._stream_microbatches
         batch = self._pack_ready_microbatches(
             max_num_microbatch_groups=self._stream_queued_microbatches
@@ -562,16 +572,20 @@ class Batcher(Configurable):
         min_bin_num_tokens = (
             _STREAMED_MIN_BIN_FILL * self._num_rows_per_microbatch * self.seq_len
         )
-        num_unsent_tokens = sum(
-            map(self.num_tokens_to_pack, self._unsent_training_samples)
-        )
-        num_microbatch_groups = min(
-            max_num_microbatch_groups,
-            int(
-                num_unsent_tokens
-                // (num_bins_per_microbatch_group * min_bin_num_tokens)
-            ),
-        )
+        num_microbatch_groups = max_num_microbatch_groups
+        if self._max_num_documents is None:
+            # Skip packing tries that can't fill their bins' tokens. With a document limit, a bin at the
+            # limit counts as full whatever its tokens, so no token bound applies.
+            num_unsent_tokens = sum(
+                map(self.num_tokens_to_pack, self._unsent_training_samples)
+            )
+            num_microbatch_groups = min(
+                num_microbatch_groups,
+                int(
+                    num_unsent_tokens
+                    // (num_bins_per_microbatch_group * min_bin_num_tokens)
+                ),
+            )
         for num_groups in range(num_microbatch_groups, 0, -1):
             bins, unplaced_training_samples = self._pack_streamed_bins(
                 self._unsent_training_samples,
