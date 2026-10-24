@@ -88,6 +88,33 @@ def test_stacked_linear_shard_placements_use_num_linears() -> None:
     }
 
 
+def test_stacked_linear_rows_not_divisible_by_shard_size_keep_shard0() -> None:
+    """512 rows over 12 ranks: FSDP can't shard dim 1 unevenly, so the stacked
+    weight keeps FSDP's default Shard(0), which fully_shard pads."""
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+    from torch.testing._internal.distributed.fake_pg import FakeStore
+
+    def build() -> nn.Module:
+        with torch.device("meta"):
+            return Linear.Config(in_features=8, out_features=512, num_linears=2).build()
+
+    assert linear_param_shard_placements(build(), shard_size=16) != {}
+    module = build()
+    placements = linear_param_shard_placements(module, shard_size=12)
+    assert placements == {}
+
+    dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=12)
+    try:
+        mesh = init_device_mesh("cpu", (12,), mesh_dim_names=("dp_shard",))
+        fully_shard(module, mesh=mesh, shard_placement_fn=placements.get)
+        assert module.weight.placements == (Shard(0),)
+        assert module.weight.to_local().shape == (1, 512, 8)
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.mark.parametrize(
     ("scope", "dense_enabled", "sparse_enabled"),
     [
