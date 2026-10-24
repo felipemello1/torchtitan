@@ -13,6 +13,7 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
+from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.types import RolloutTurnID, split_prompt
 
@@ -391,6 +392,40 @@ def test_build_from_group_skips_an_error_system_rollout_but_trains_its_siblings(
     )
 
     assert [sample.rollout_id.rollout_id for sample in group.training_samples] == [1, 2]
+
+
+def test_build_from_group_logs_fork_counts_over_trained_rollouts_only() -> None:
+    # The ERROR_SYSTEM rollout's count is left out, as from rollout/branches_per_rollout.
+    failed = Rollout(
+        group_id=_GROUP_ID,
+        rollout_id=0,
+        status=RolloutStatus.ERROR_SYSTEM,
+        logs={"num_compactions": 10},
+    )
+    trained = []
+    for rollout_id, num_compactions in [(1, 1), (2, 3)]:
+        rollout = _scored_rollout(
+            [_turn(prompt_token_ids=[1, 2], completion_token_ids=[5], version=1)],
+            reward=float(rollout_id),
+            advantage=rollout_id - 1.5,
+        )
+        rollout.rollout_id = rollout_id
+        rollout.logs = {"num_compactions": num_compactions}
+        trained.append(rollout)
+
+    group = (
+        TrainingSampleBuilder.Config()
+        .build()
+        .build_from_group(
+            rollout_group=RolloutGroup(group_id=_GROUP_ID, rollouts=[failed, *trained])
+        )
+    )
+
+    values = MetricsProcessor._aggregate_metrics(group.metrics)
+    assert values["training_sample_builder/num_compactions/mean"] == 2.0
+    assert values["training_sample_builder/num_compactions/max"] == 3.0
+    # A counter no rollout logged is not logged
+    assert not any("num_resampled_prompts" in key for key in values)
 
 
 def test_build_from_group_drops_a_group_left_with_one_rollout() -> None:

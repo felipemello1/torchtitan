@@ -1583,6 +1583,7 @@ def test_rollout_logs_why_its_trace_forked() -> None:
     assert _fork_counts(trace) == {
         "num_compactions": 1,
         "num_resent_assistant_messages": 1,
+        "num_resampled_prompts": 0,
     }
 
 
@@ -1655,6 +1656,31 @@ def test_a_midnight_fork_is_not_a_compaction() -> None:
     )
 
     assert _fork_counts(trace)["num_compactions"] == 0
+
+
+def test_a_prompt_sampled_again_counts_as_resampled() -> None:
+    """The agent re-sent a prompt it had a completion for (twice), and each was sampled again."""
+    from verifiers.v1.types import (
+        AssistantMessage as VerifiersAssistantMessage,
+        UserMessage as VerifiersUserMessage,
+    )
+
+    trace = _trace_of(
+        (None, _system("Tue 20"), False),
+        (0, VerifiersUserMessage(content="fix it"), False),
+        (1, VerifiersAssistantMessage(content="first try"), True),
+        (1, VerifiersAssistantMessage(content="second try"), True),
+        (3, VerifiersUserMessage(content="tool output"), False),
+        (4, VerifiersAssistantMessage(content="a"), True),
+        (4, VerifiersAssistantMessage(content="b"), True),
+        (4, VerifiersAssistantMessage(content="c"), True),
+    )
+
+    assert _fork_counts(trace) == {
+        "num_compactions": 0,
+        "num_resent_assistant_messages": 0,
+        "num_resampled_prompts": 3,
+    }
 
 
 def test_a_summary_after_a_midnight_fork_counts_once() -> None:
