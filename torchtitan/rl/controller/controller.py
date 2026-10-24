@@ -85,6 +85,9 @@ _batcher_loop
     waits for:    a free training_batch_queue slot (maxsize=1); with stream_microbatches, the trainer
                   starting the previous step
     unblocked by: _trainer_loop training_batch_queue.get()
+  with stream_microbatches, also asks the batcher for microbatches (batcher.pack_ready_microbatches)
+    waits for:    the trainer finishing a batch with fewer than stream_queued_microbatches queued
+    unblocked by: _trainer_loop's forward_backward calls finishing (queued_microbatch_groups)
 _trainer_loop
   consumes: a TrainerStepBatch (training_batch_queue.get)
     waits for:    a TrainerStepBatch in the queue
@@ -189,6 +192,44 @@ class _TrainerStepStarts:
         async with self._condition:
             self._started_policy_version = policy_version
             self._condition.notify_all()
+
+
+class _QueuedMicrobatchGroups:
+    """Streaming: the microbatch groups sent to the trainer and not yet trained.
+
+    `_batcher_loop` adds a batch's groups when it queues the batch; `_trainer_loop` removes them when
+    the batch's forward_backward calls finish, which also wakes `wait_for_trainer_progress`, so the
+    batcher loop can pack more microbatches without waiting for the next rollout group.
+
+    Example:
+        queued = _QueuedMicrobatchGroups()
+        queued.add(2)                    # queued.count == 2
+        num_finished = queued.num_finished
+        queued.remove(1)                 # queued.count == 1; num_finished advanced
+        await queued.wait_for_trainer_progress(num_finished, below=3)  # returns at once
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+        # Batches the trainer has finished, so a waiter can tell whether one finished since it looked.
+        self.num_finished = 0
+        self._changed = asyncio.Event()
+
+    def add(self, num_microbatch_groups: int) -> None:
+        self.count += num_microbatch_groups
+
+    def remove(self, num_microbatch_groups: int) -> None:
+        """Synchronous, so a cancelled forward_backward wait still removes its groups."""
+        self.count -= num_microbatch_groups
+        self.num_finished += 1
+        self._changed.set()
+
+    async def wait_for_trainer_progress(self, num_finished: int, *, below: int) -> None:
+        """Wait until a batch finished after `num_finished` and fewer than `below` groups are queued.
+        One waiter at a time (the batcher loop): waiting clears the shared event."""
+        while not (self.num_finished > num_finished and self.count < below):
+            self._changed.clear()
+            await self._changed.wait()
 
 
 @dataclass(kw_only=True, slots=True)
@@ -1187,6 +1228,11 @@ class Controller(Configurable):
             if async_loop.batcher.stream_microbatches
             else None
         )
+        queued_microbatch_groups = (
+            _QueuedMicrobatchGroups()
+            if async_loop.batcher.stream_microbatches
+            else None
+        )
 
         # rollout_loop
         client = GeneratorClient(router=self.generator_router)
@@ -1214,7 +1260,9 @@ class Controller(Configurable):
         # training_sample_batcher_loop
         batcher_task = asyncio.create_task(
             self._batcher_loop(
-                training_batch_queue=training_batch_queue, step_starts=step_starts
+                training_batch_queue=training_batch_queue,
+                step_starts=step_starts,
+                queued_microbatch_groups=queued_microbatch_groups,
             ),
             name="batcher",
         )
@@ -1225,6 +1273,7 @@ class Controller(Configurable):
                 training_batch_queue,
                 num_training_steps=num_training_steps,
                 step_starts=step_starts,
+                queued_microbatch_groups=queued_microbatch_groups,
             ),
             name="trainer",
         )
@@ -1585,11 +1634,17 @@ class Controller(Configurable):
         *,
         training_batch_queue: "asyncio.Queue[TrainerStepBatch | None]",
         step_starts: _TrainerStepStarts | None = None,
+        queued_microbatch_groups: _QueuedMicrobatchGroups | None = None,
     ) -> None:
         """Send finalized groups to the batcher actor and queue each training batch it returns.
 
         On a clean close/shutdown the group_buffer drains and returns None; we forward a `None` sentinel
         so the trainer stops.
+
+        With `stream_microbatches` (`queued_microbatch_groups` set), each group goes with the number of
+        microbatch groups the trainer has queued, and when the trainer finishes a batch and has fewer than
+        `stream_queued_microbatches` queued, the loop asks the batcher for more
+        (`pack_ready_microbatches`) without waiting for the next group.
 
         consumes: the oldest FINALIZED group inside the window (group_buffer.take_finalized)
             waits for:    a group inside the window becoming FINALIZED (any group when windowed_fifo_batches is None)
@@ -1604,37 +1659,89 @@ class Controller(Configurable):
         # Same filters as the batcher's builder: tells which rollouts it will leave out.
         sample_builder = self.config.async_loop.batcher.training_sample_builder.build()
         replay_routed_experts = self.config.generator.engine.return_routed_experts
-        while True:
-            rollout_group = await self._group_buffer.take_finalized(
-                consuming_policy_version=consuming_policy_version
-            )
-            if rollout_group is None:  # closed and drained
-                logger.info("Buffer drained; batcher loop stopping")
-                break
-            if replay_routed_experts:
-                # The batcher won't train these rollouts, so don't send their router-replay expert
-                # ids: ~320 bytes per token, most of a group's message.
-                for rollout in sample_builder.rollouts_left_out(rollout_group):
-                    for rollout_turn in rollout.turns:
-                        rollout_turn.routed_expert_ids = None
-            # We put a group in. We may get a batch back
-            # if there are enough accumulated trainable groups to return one.
-            with sl.log_trace_span("batcher_add_group"):
-                (
-                    maybe_training_batch,
-                    group_is_trainable,
-                ) = await self.batcher.add_group.call_one(rollout_group=rollout_group)
-            if not group_is_trainable:
-                await self._group_buffer.release_active_groups(
-                    1, reason="untrainable_group"
-                )
-            if maybe_training_batch is not None:
-                if step_starts is not None:
-                    await step_starts.wait_until_started(consuming_policy_version - 1)
-                await training_batch_queue.put(maybe_training_batch)
-                # A streamed step's earlier batches train with the same policy as its last batch.
-                if maybe_training_batch.ends_step:
-                    consuming_policy_version += 1
+        stream_queued_microbatches = (
+            self.config.async_loop.batcher.stream_queued_microbatches
+        )
+
+        async def queue_training_batch(training_batch: TrainerStepBatch) -> None:
+            nonlocal consuming_policy_version
+            if step_starts is not None:
+                await step_starts.wait_until_started(consuming_policy_version - 1)
+            if queued_microbatch_groups is not None:
+                queued_microbatch_groups.add(len(training_batch.microbatch_groups))
+            await training_batch_queue.put(training_batch)
+            # A streamed step's earlier batches train with the same policy as its last batch.
+            if training_batch.ends_step:
+                consuming_policy_version += 1
+
+        take_task: asyncio.Task[RolloutGroup | None] | None = None
+        trainer_progress_task: asyncio.Task[None] | None = None
+        try:
+            while True:
+                if take_task is None:
+                    take_task = asyncio.create_task(
+                        self._group_buffer.take_finalized(
+                            consuming_policy_version=consuming_policy_version
+                        )
+                    )
+                if queued_microbatch_groups is not None:
+                    if trainer_progress_task is None:
+                        trainer_progress_task = asyncio.create_task(
+                            queued_microbatch_groups.wait_for_trainer_progress(
+                                queued_microbatch_groups.num_finished,
+                                below=stream_queued_microbatches,
+                            )
+                        )
+                    await asyncio.wait(
+                        [take_task, trainer_progress_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not take_task.done():
+                        # The trainer finished a batch and is short of microbatches: pack them from
+                        # the samples that arrived while it had enough.
+                        trainer_progress_task = None
+                        with sl.log_trace_span("batcher_pack_ready_microbatches"):
+                            maybe_training_batch = await self.batcher.pack_ready_microbatches.call_one(
+                                num_queued_microbatch_groups=queued_microbatch_groups.count
+                            )
+                        if maybe_training_batch is not None:
+                            await queue_training_batch(maybe_training_batch)
+                        continue
+                rollout_group = await take_task
+                take_task = None
+                if rollout_group is None:  # closed and drained
+                    logger.info("Buffer drained; batcher loop stopping")
+                    break
+                if replay_routed_experts:
+                    # The batcher won't train these rollouts, so don't send their router-replay expert
+                    # ids: ~320 bytes per token, most of a group's message.
+                    for rollout in sample_builder.rollouts_left_out(rollout_group):
+                        for rollout_turn in rollout.turns:
+                            rollout_turn.routed_expert_ids = None
+                # We put a group in. We may get a batch back
+                # if there are enough accumulated trainable groups to return one.
+                with sl.log_trace_span("batcher_add_group"):
+                    (
+                        maybe_training_batch,
+                        group_is_trainable,
+                    ) = await self.batcher.add_group.call_one(
+                        rollout_group=rollout_group,
+                        num_queued_microbatch_groups=(
+                            0
+                            if queued_microbatch_groups is None
+                            else queued_microbatch_groups.count
+                        ),
+                    )
+                if not group_is_trainable:
+                    await self._group_buffer.release_active_groups(
+                        1, reason="untrainable_group"
+                    )
+                if maybe_training_batch is not None:
+                    await queue_training_batch(maybe_training_batch)
+        finally:
+            for task in (take_task, trainer_progress_task):
+                if task is not None:
+                    task.cancel()
         await training_batch_queue.put(None)
         # TODO(async-rl): if finite datasets are supported, drain a final partial batch here.
 
@@ -1644,6 +1751,7 @@ class Controller(Configurable):
         *,
         num_training_steps: int,
         step_starts: _TrainerStepStarts | None = None,
+        queued_microbatch_groups: _QueuedMicrobatchGroups | None = None,
     ) -> None:
         """Run num_training_steps optimizer steps: train the step's packed batches, push the trainer's
         model state dict, then pull it into the generators, log metrics.
@@ -1786,7 +1894,9 @@ class Controller(Configurable):
                                         for dp_rank, trainer_at_dp_rank in enumerate(
                                             self.trainer.by_dp_rank
                                         )
-                                    ]
+                                    ],
+                                    queued_microbatch_groups=queued_microbatch_groups,
+                                    num_microbatch_groups=len(packed.microbatch_groups),
                                 ),
                                 # One trace track per in-flight slot.
                                 name=f"forward_backward_{len(forward_backward_tasks) % _MAX_IN_FLIGHT_FORWARD_BACKWARD_CALLS}",
@@ -2012,10 +2122,15 @@ class Controller(Configurable):
             await pull_task
 
     async def _wait_for_forward_backward(
-        self, results_by_dp_rank: list[Awaitable[Any]]
+        self,
+        results_by_dp_rank: list[Awaitable[Any]],
+        *,
+        queued_microbatch_groups: _QueuedMicrobatchGroups | None = None,
+        num_microbatch_groups: int = 0,
     ) -> tuple[dict[str, float], float]:
         """Wait for one batch's forward_backward calls, one per DP rank. Returns the loss metrics and
-        the time the calls finished."""
+        the time the calls finished. With streaming, then removes the batch's `num_microbatch_groups`
+        from `queued_microbatch_groups`."""
         with sl.log_trace_span("forward_backward"):
             try:
                 fwd_bwd_results = await asyncio.gather(*results_by_dp_rank)
@@ -2023,6 +2138,8 @@ class Controller(Configurable):
                 # With RDMA, every rank has read its column (or the step failed).
                 # Not awaited: it would wait behind an in-flight add_group.
                 self.batcher.maybe_release_oldest_batch.broadcast()
+                if queued_microbatch_groups is not None:
+                    queued_microbatch_groups.remove(num_microbatch_groups)
         finished_s = time.perf_counter()
         # Under PP, only trainer ranks holding the last stage compute the loss; the others return None.
         metrics = next(

@@ -69,25 +69,44 @@ class _BatcherActorEndpoints:
 
     @endpoint
     async def add_group(
-        self, *, rollout_group: RolloutGroup
+        self, *, rollout_group: RolloutGroup, num_queued_microbatch_groups: int = 0
     ) -> tuple[TrainerStepBatch | None, bool]:
         """Plain `@endpoint`, not `@concurrent_endpoint`: calls run one at a time, so groups reach the
         stateful batcher in arrival order. `async` because Monarch rejects mixing sync and async endpoints."""
-        batch, has_samples = super().add_group(rollout_group=rollout_group)
-        if batch is not None:
-            # This process's GC time and event-loop lag since the previous batch, and its memory
-            # (mostly the batches it holds), logged with the step it trains. The controller's
-            # `host_memory/*` scan sees only its own host, and the batcher may run on another.
-            batch = dataclasses.replace(
-                batch,
-                metrics=[
-                    *batch.metrics,
-                    *self._gc_timer.flush(),
-                    *self._loop_lag.flush(),
-                    m.Metric("perf/batcher/rss_anon_gib", m.NoReduce(_rss_anon_gib())),
-                ],
+        batch, has_samples = super().add_group(
+            rollout_group=rollout_group,
+            num_queued_microbatch_groups=num_queued_microbatch_groups,
+        )
+        return self._add_process_metrics(batch), has_samples
+
+    @endpoint
+    async def pack_ready_microbatches(
+        self, *, num_queued_microbatch_groups: int
+    ) -> TrainerStepBatch | None:
+        """Plain `@endpoint` like `add_group`, so it runs between groups, never during one."""
+        return self._add_process_metrics(
+            super().pack_ready_microbatches(
+                num_queued_microbatch_groups=num_queued_microbatch_groups
             )
-        return batch, has_samples
+        )
+
+    def _add_process_metrics(
+        self, batch: TrainerStepBatch | None
+    ) -> TrainerStepBatch | None:
+        """This process's GC time and event-loop lag since the previous batch, and its memory (mostly
+        the batches it holds), logged with the step it trains. The controller's `host_memory/*` scan
+        sees only its own host, and the batcher may run on another."""
+        if batch is None:
+            return None
+        return dataclasses.replace(
+            batch,
+            metrics=[
+                *batch.metrics,
+                *self._gc_timer.flush(),
+                *self._loop_lag.flush(),
+                m.Metric("perf/batcher/rss_anon_gib", m.NoReduce(_rss_anon_gib())),
+            ],
+        )
 
     @endpoint
     async def maybe_release_oldest_batch(self) -> None:

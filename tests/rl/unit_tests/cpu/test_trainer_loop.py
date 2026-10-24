@@ -379,6 +379,27 @@ def test_streamed_steps_mark_their_start_and_log_the_step_routing_tokens() -> No
         ].value.value == pytest.approx(8 / total)
 
 
+def test_streamed_batches_leave_the_queued_count_when_trained() -> None:
+    """Each finished forward_backward call removes its batch's microbatch groups, so the batcher loop
+    sees the trainer's queue shrink."""
+    controller = _controller([], stream_microbatches=True)
+    queued = controller_module._QueuedMicrobatchGroups()
+    queue: asyncio.Queue = asyncio.Queue()
+    for num_groups, ends_step in ((2, False), (1, True)):
+        batch = _batch(ends_step=ends_step)
+        batch.microbatch_groups = [[[None]]] * num_groups
+        queued.add(num_groups)
+        queue.put_nowait(batch)
+
+    asyncio.run(
+        controller._trainer_loop(
+            queue, num_training_steps=1, queued_microbatch_groups=queued
+        )
+    )
+
+    assert (queued.count, queued.num_finished) == (0, 2)
+
+
 def test_one_batch_step_passes_counts_to_forward_backward() -> None:
     events: list[str] = []
     controller = _controller(events)
