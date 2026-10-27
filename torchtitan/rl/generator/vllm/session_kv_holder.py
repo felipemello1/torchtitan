@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +16,27 @@ from typing import Any
 from vllm.utils.math_utils import cdiv
 
 from torchtitan.config import Configurable
+
+
+@dataclass(kw_only=True, slots=True)
+class StepKVUsage:
+    """Fractions of vLLM's KV pool, recorded after each engine step (see
+    `VLLMSessionKVHolder.pop_step_kv_usage`).
+
+    - used: vLLM's ``kv_cache_usage``.
+    - idle-held: held only for sessions with no running request (their next turn waits on a tool,
+      the env, or vLLM's queue).
+    - running: used - idle-held, so running requests and their sessions' holds.
+    """
+
+    num_steps: int = 0
+    used_fraction_sum: float = 0.0
+    used_fraction_max: float = 0.0
+    idle_held_fraction_sum: float = 0.0
+    idle_held_fraction_max: float = 0.0
+    # The last step's split, kept across `pop_step_kv_usage` calls.
+    idle_held_fraction: float = 0.0
+    running_fraction: float = 0.0
 
 
 class VLLMSessionKVHolder(Configurable):
@@ -45,7 +67,8 @@ class VLLMSessionKVHolder(Configurable):
         floor = free_floor_blocks
             + num_kv_cache_groups x len(running)  # a block each at a block boundary
 
-    - Held blocks count as used in vLLM's ``kv_cache_usage``.
+    - Held blocks count as used in vLLM's ``kv_cache_usage``. After each step the holder also counts
+      the "idle-held" ones: held for sessions with no running request, and used by nothing else.
     - Every mutating method runs on every rank's engine thread in the same order, so the TP ranks'
       schedulers stay identical.
 
@@ -100,6 +123,15 @@ class VLLMSessionKVHolder(Configurable):
         # Each tracked request's vLLM prefill stats (its hits at the first schedule), taken at
         # `track`: vLLM detaches them at the first output, before `after_step` runs.
         self._prefill_stats: dict[str, Any] = {}
+        # Sessions with a request in vLLM's running queue, as of the latest `after_step`.
+        self._running_sessions: set[str] = set()
+        # The holds of sessions not in `_running_sessions`, per block: block id -> [block, number of
+        # these holds that contain it]. GRPO siblings' holds share their prompt blocks.
+        self._idle_hold_refs: dict[int, list[Any]] = {}
+        # KV pool fractions over the steps since the last `pop_step_kv_usage`, which another thread
+        # calls: the lock keeps a step from landing between its read and its reset.
+        self._step_kv_usage_lock = threading.Lock()
+        self._step_kv_usage = StepKVUsage()
         # Plain ints, so other threads (e.g. a logging endpoint) can read them safely.
         self.num_sessions = 0
         self.num_evicted = 0
@@ -117,7 +149,20 @@ class VLLMSessionKVHolder(Configurable):
 
     def after_step(self) -> None:
         """After each engine step: hold the prefix of requests whose prefill finished, mark sessions
-        whose request left, and release held sessions (idle first) so the next step has room."""
+        whose request left, record KV usage, and release held sessions (idle first) so the next step
+        has room."""
+        scheduler = self._scheduler
+        running_sessions = {
+            self._live[request.request_id][0]
+            for request in scheduler.running
+            if request.request_id in self._live
+        }
+        for session_id in self._running_sessions - running_sessions:
+            self._count_idle_hold(session_id, 1)
+        for session_id in running_sessions - self._running_sessions:
+            self._count_idle_hold(session_id, -1)
+        self._running_sessions = running_sessions
+
         for internal_id, (session_id, group_id, held) in list(self._live.items()):
             request = self._scheduler.requests.get(internal_id)
             if request is None:  # finished or aborted: the session is idle from now on
@@ -135,9 +180,11 @@ class VLLMSessionKVHolder(Configurable):
                 self._hashed_sessions.setdefault(group_id, set()).add(session_id)
                 self._hold(request, session_id, group_id)
 
+        # Before any release below, so the step max sees the peak this step reached.
+        self._record_kv_usage()
+
         # Nothing runs and requests wait: with an empty batch vLLM skips the watermark, so it refused
         # the head for lack of blocks (or the batch just drained: one cheap extra release).
-        scheduler = self._scheduler
         if not scheduler.running and (scheduler.waiting or scheduler.skipped_waiting):
             free_before = self._block_pool.get_num_free_blocks()
             for session_id in list(self._held):
@@ -160,19 +207,15 @@ class VLLMSessionKVHolder(Configurable):
           and the extra copy of a block that `_hold` may take. Skipping them under heavy pressure
           makes vLLM preempt running requests instead.
         """
-        running = self._scheduler.running
         # GRPO siblings decode in lockstep, so all running requests can cross a boundary together.
-        floor = self.free_floor_blocks + self._num_kv_cache_groups * len(running)
+        floor = self.free_floor_blocks + self._num_kv_cache_groups * len(
+            self._scheduler.running
+        )
         if self._block_pool.get_num_free_blocks() >= floor:
             return
-        running_sessions = {
-            self._live[request.request_id][0]
-            for request in running
-            if request.request_id in self._live
-        }
         # False (no running request) sorts before True, and sorted() is stable: sessions with no
         # running request go first, then running ones, each part in `_held` order.
-        for session_id in sorted(self._held, key=running_sessions.__contains__):
+        for session_id in sorted(self._held, key=self._running_sessions.__contains__):
             if self._block_pool.get_num_free_blocks() >= floor:
                 return
             self._release(session_id)
@@ -210,11 +253,15 @@ class VLLMSessionKVHolder(Configurable):
         self._block_pool.touch(blocks)
         self._release(session_id)
         self._held[session_id] = blocks
+        if session_id not in self._running_sessions:
+            self._count_idle_hold(session_id, 1)
         self._session_groups[session_id] = group_id
         self._group_sessions.setdefault(group_id, set()).add(session_id)
         self.num_sessions += 1
 
     def _release(self, session_id: str) -> None:
+        if session_id not in self._running_sessions:
+            self._count_idle_hold(session_id, -1)
         blocks = self._held.pop(session_id, None)
         group_id = self._session_groups.pop(session_id, None)
         if group_id is not None:
@@ -222,6 +269,55 @@ class VLLMSessionKVHolder(Configurable):
         if blocks is not None:
             self.num_sessions -= 1
             self._block_pool.free_blocks(reversed(blocks))
+
+    def _count_idle_hold(self, session_id: str, delta: int) -> None:
+        """Add (1) or remove (-1) this session's hold, if any, in `_idle_hold_refs`."""
+        for block in self._held.get(session_id, ()):
+            entry = self._idle_hold_refs.setdefault(block.block_id, [block, 0])
+            entry[1] += delta
+            if entry[1] == 0:
+                del self._idle_hold_refs[block.block_id]
+
+    def _record_kv_usage(self) -> None:
+        """Add this step's used and idle-held fractions of the KV pool to the step stats.
+
+        A block is idle-held when idle sessions' holds are all its references: its ``ref_cnt``
+        equals the number of those holds that contain it, so no request and no running session's
+        hold uses it. The pass costs one comparison per block in `_idle_hold_refs` (at most the pool).
+        """
+        num_idle_held_blocks = sum(
+            1
+            for block, num_holds in self._idle_hold_refs.values()
+            if block.ref_cnt == num_holds
+        )
+        # vLLM's `BlockPool.get_usage`: used blocks over every block but the null block. One pool
+        # backs every KV cache group, so each block counts once.
+        num_blocks = self._block_pool.num_gpu_blocks - 1
+        num_used_blocks = num_blocks - self._block_pool.get_num_free_blocks()
+        used_fraction = self._block_pool.get_usage()
+        idle_held_fraction = num_idle_held_blocks / num_blocks
+        running_fraction = (num_used_blocks - num_idle_held_blocks) / num_blocks
+        with self._step_kv_usage_lock:
+            usage = self._step_kv_usage
+            usage.num_steps += 1
+            usage.used_fraction_sum += used_fraction
+            usage.used_fraction_max = max(usage.used_fraction_max, used_fraction)
+            usage.idle_held_fraction = idle_held_fraction
+            usage.idle_held_fraction_sum += idle_held_fraction
+            usage.idle_held_fraction_max = max(
+                usage.idle_held_fraction_max, idle_held_fraction
+            )
+            usage.running_fraction = running_fraction
+
+    def pop_step_kv_usage(self) -> StepKVUsage:
+        """The KV pool fractions over the steps since the last call, and the last step's split."""
+        with self._step_kv_usage_lock:
+            usage = self._step_kv_usage
+            self._step_kv_usage = StepKVUsage(
+                idle_held_fraction=usage.idle_held_fraction,
+                running_fraction=usage.running_fraction,
+            )
+        return usage
 
     def _count_prefix_tokens(
         self, request: Any, previous_hashes: list[bytes], prefill_stats: Any
