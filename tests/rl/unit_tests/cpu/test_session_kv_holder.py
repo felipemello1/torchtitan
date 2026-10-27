@@ -7,12 +7,16 @@
 """VLLMSessionKVHolder on vLLM's real KV cache manager: 1 attention group + 3 Mamba "align"
 groups, 16-token blocks standing in for Qwen3.5's 1,152."""
 
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from torchtitan.rl.generator.vllm.session_kv_holder import VLLMSessionKVHolder
+from torchtitan.rl.generator.vllm.session_kv_holder import (
+    StepKVUsage,
+    VLLMSessionKVHolder,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -402,18 +406,124 @@ def test_a_waiting_turn_gets_room_when_held_sessions_fill_the_pool(manager, queu
         pytest.fail("held sessions stalled the engine: the waiting turn never fit")
 
 
-def test_engine_session_kv_counts_are_deltas_since_the_last_call():
-    """Counts (e.g. evictions) cover the time since the previous call; levels are read as is."""
+POOL = 79  # vLLM's usage denominator: the 80 blocks but the null block
+
+
+def _assert_hold_refs_match_held(holder) -> None:
+    """`_hold_refs` counts, per block, the holds in `_held` that contain it."""
+    expected = Counter(
+        block.block_id for blocks in holder._held.values() for block in blocks
+    )
+    assert {block_id: n for block_id, (_, n) in holder._hold_refs.items()} == expected
+
+
+def _step_held_only(holder) -> float:
+    """Run one `after_step` and return its held-only fraction."""
+    holder.pop_step_kv_usage()
+    holder.after_step()
+    return holder.pop_step_kv_usage().held_only_fraction_sum
+
+
+def test_held_only_counts_sibling_prompt_blocks_once(manager):
+    """GRPO siblings' holds share the prompt's 6 blocks (3 attention + 3 GDN states)."""
+    requests = {}
+    holder = _holder(manager, requests)
+    prompt = list(range(50))
+    _finished_turn(manager, holder, requests, "s0", prompt + [1])
+    _finished_turn(manager, holder, requests, "s1", prompt + [2])
+    assert _step_held_only(holder) == 6 / POOL
+    _assert_hold_refs_match_held(holder)
+
+
+def test_blocks_a_running_request_uses_are_not_held_only(manager):
+    requests, running = {}, []
+    holder = _holder(manager, requests, running=running)
+    busy = _request("busy", list(range(50)))
+    requests["busy"] = busy
+    running.append(busy)
+    holder.track("busy", session_id="busy", group_id=0)
+    _prefill(manager, busy)
+    # The request still uses every held block, prompt-end GDN states included.
+    assert _step_held_only(holder) == 0
+    # One decode step: the 3 prompt-end GDN states leave the request; only the hold keeps them.
+    _schedule(manager, busy, 1, sample=8)
+    assert _step_held_only(holder) == 3 / POOL
+
+    running.clear()
+    del requests["busy"]
+    manager.free(busy)
+    assert _step_held_only(holder) == 6 / POOL
+    _assert_hold_refs_match_held(holder)
+
+
+def test_release_keeps_hold_counts_exact(manager):
+    requests = {}
+    holder = _holder(manager, requests)
+    prompt = list(range(50))
+    for session in ("s0", "s1"):
+        _finished_turn(manager, holder, requests, session, prompt + [1])
+    _finished_turn(manager, holder, requests, "other", list(range(500, 550)))
+
+    holder.release(session_ids=["s0"])
+    _assert_hold_refs_match_held(holder)
+    # s1 still holds the shared prompt blocks.
+    assert _step_held_only(holder) == 12 / POOL
+    holder.release(group_ids=[0])
+    assert holder._hold_refs == {}
+    assert _step_held_only(holder) == 0
+
+
+def test_step_max_sees_the_level_before_the_releases_of_the_same_step(manager):
+    requests = {}
+    holder = _holder(manager, requests)
+    _finished_turn(manager, holder, requests, "old", list(range(50)))
+    _finished_turn(manager, holder, requests, "new", list(range(500, 550)))
+    holder.pop_step_kv_usage()
+
+    holder.free_floor_blocks = manager.block_pool.get_num_free_blocks() + 1
+    holder.after_step()
+    assert list(holder._held) == ["new"]
+    assert holder.pop_step_kv_usage().held_only_fraction_max == 12 / POOL
+    _assert_hold_refs_match_held(holder)
+
+
+def test_step_max_keeps_the_peak_between_two_pops_and_then_resets(manager):
+    requests = {}
+    holder = _holder(manager, requests)
+    for i in range(3):
+        _finished_turn(
+            manager, holder, requests, f"s{i}", [1000 * i + j for j in range(50)]
+        )
+    holder.release(session_ids=["s0", "s1", "s2"])
+    holder.after_step()
+
+    usage = holder.pop_step_kv_usage()
+    # The peak: 3 sessions x 6 held blocks; the last step: nothing held.
+    assert usage.held_only_fraction_max == 18 / POOL
+    assert usage.used_fraction_max >= 18 / POOL
+    holder.after_step()
+    usage = holder.pop_step_kv_usage()
+    assert usage.num_steps == 1
+    assert usage.held_only_fraction_max == usage.used_fraction_max == 0
+
+
+def test_engine_session_kv_metrics_cover_the_time_since_the_last_call():
+    """Counts (e.g. evictions) and step levels cover the time since the previous call."""
     from types import SimpleNamespace
 
     from torchtitan.rl.generator.vllm.engine import VLLMEngine
 
+    step_usages = [
+        StepKVUsage(num_steps=2, used_fraction_sum=1.2, used_fraction_max=0.9),
+        StepKVUsage(),  # no engine step since the last call
+    ]
     holder = SimpleNamespace(
         num_sessions=80,
         num_evicted=3,
         num_stall_evicted=0,
         gpu_hit_prefix_tokens=0,
         recomputed_prefix_tokens=0,
+        pop_step_kv_usage=lambda: step_usages.pop(0),
     )
     engine = object.__new__(VLLMEngine)
     engine._session_kv_holder = holder
@@ -423,10 +533,17 @@ def test_engine_session_kv_counts_are_deltas_since_the_last_call():
         engine_core=SimpleNamespace(engine_core=SimpleNamespace(scheduler=scheduler))
     )
 
-    def evicted(metrics):
-        [metric] = [x for x in metrics if x.key == "generator/session_kv/evicted_sessions"]
-        return metric.value.value
+    def values(metrics, name):
+        return [
+            x.value.value for x in metrics if x.key == f"generator/session_kv/{name}"
+        ]
 
-    assert evicted(engine.session_kv_metrics()) == 3
+    metrics = engine.session_kv_metrics()
+    assert values(metrics, "evicted_sessions") == [3]
+    # Mean and Max over replicas, each from this replica's value over its engine steps.
+    assert values(metrics, "gpu_used_fraction_step_mean") == [0.6, 0.6]
+    assert values(metrics, "gpu_used_fraction_step_max") == [0.9, 0.9]
     holder.num_evicted = 5
-    assert evicted(engine.session_kv_metrics()) == 2
+    metrics = engine.session_kv_metrics()
+    assert values(metrics, "evicted_sessions") == [2]
+    assert values(metrics, "gpu_used_fraction_step_max") == []

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +16,17 @@ from typing import Any
 from vllm.utils.math_utils import cdiv
 
 from torchtitan.config import Configurable
+
+
+@dataclass(kw_only=True, slots=True)
+class StepKVUsage:
+    """KV pool fractions summed and maxed over the engine steps since the last `pop_step_kv_usage`."""
+
+    num_steps: int = 0
+    used_fraction_sum: float = 0.0
+    used_fraction_max: float = 0.0
+    held_only_fraction_sum: float = 0.0
+    held_only_fraction_max: float = 0.0
 
 
 class VLLMSessionKVHolder(Configurable):
@@ -45,7 +57,8 @@ class VLLMSessionKVHolder(Configurable):
         floor = free_floor_blocks
             + num_kv_cache_groups x len(running)  # a block each at a block boundary
 
-    - Held blocks count as used in vLLM's ``kv_cache_usage``.
+    - Held blocks count as used in vLLM's ``kv_cache_usage``. After each step the holder also counts
+      the "held-only" ones, which no request uses: releasing every hold would free them.
     - Every mutating method runs on every rank's engine thread in the same order, so the TP ranks'
       schedulers stay identical.
 
@@ -100,6 +113,13 @@ class VLLMSessionKVHolder(Configurable):
         # Each tracked request's vLLM prefill stats (its hits at the first schedule), taken at
         # `track`: vLLM detaches them at the first output, before `after_step` runs.
         self._prefill_stats: dict[str, Any] = {}
+        # Holds per held block: block id -> [block, number of holds containing it]. GRPO siblings'
+        # holds share their prompt blocks.
+        self._hold_refs: dict[int, list[Any]] = {}
+        # KV pool fractions over the steps since the last `pop_step_kv_usage`, which another thread
+        # calls: the lock keeps a step from landing between its read and its reset.
+        self._step_kv_usage_lock = threading.Lock()
+        self._step_kv_usage = StepKVUsage()
         # Plain ints, so other threads (e.g. a logging endpoint) can read them safely.
         self.num_sessions = 0
         self.num_evicted = 0
@@ -117,7 +137,8 @@ class VLLMSessionKVHolder(Configurable):
 
     def after_step(self) -> None:
         """After each engine step: hold the prefix of requests whose prefill finished, mark sessions
-        whose request left, and release held sessions (idle first) so the next step has room."""
+        whose request left, record KV usage, and release held sessions (idle first) so the next step
+        has room."""
         for internal_id, (session_id, group_id, held) in list(self._live.items()):
             request = self._scheduler.requests.get(internal_id)
             if request is None:  # finished or aborted: the session is idle from now on
@@ -134,6 +155,9 @@ class VLLMSessionKVHolder(Configurable):
                 self._session_hashes[session_id] = request.block_hashes
                 self._hashed_sessions.setdefault(group_id, set()).add(session_id)
                 self._hold(request, session_id, group_id)
+
+        # The level after the step (finished requests already freed), before the releases below.
+        self._record_kv_usage()
 
         # Nothing runs and requests wait: with an empty batch vLLM skips the watermark, so it refused
         # the head for lack of blocks (or the batch just drained: one cheap extra release).
@@ -210,6 +234,7 @@ class VLLMSessionKVHolder(Configurable):
         self._block_pool.touch(blocks)
         self._release(session_id)
         self._held[session_id] = blocks
+        self._count_hold(session_id, blocks, 1)
         self._session_groups[session_id] = group_id
         self._group_sessions.setdefault(group_id, set()).add(session_id)
         self.num_sessions += 1
@@ -222,6 +247,52 @@ class VLLMSessionKVHolder(Configurable):
         if blocks is not None:
             self.num_sessions -= 1
             self._block_pool.free_blocks(reversed(blocks))
+            self._count_hold(session_id, blocks, -1)
+
+    def _count_hold(self, session_id: str, blocks: list[Any], delta: int) -> None:
+        """Add (1) or remove (-1) this session's hold of ``blocks`` in `_hold_refs`."""
+        for block in blocks:
+            entry = self._hold_refs.setdefault(block.block_id, [block, 0])
+            entry[1] += delta
+            if entry[1] < 0:
+                raise RuntimeError(
+                    f"session {session_id} released block {block.block_id} more often than "
+                    "it was held"
+                )
+            if entry[1] == 0:
+                del self._hold_refs[block.block_id]
+
+    def _record_kv_usage(self) -> None:
+        """Add this step's used and held-only fractions of the KV pool to the step stats.
+
+        A block is held-only when holds are its only references: ``ref_cnt`` equals the holds that
+        contain it. A lower bound when anything else (a KV connector, offload) also references blocks.
+        """
+        num_held_only_blocks = sum(
+            1
+            for block, num_holds in self._hold_refs.values()
+            if block.ref_cnt == num_holds
+        )
+        # vLLM's `BlockPool.get_usage` denominator: every block but the null block. One pool backs
+        # every KV cache group, so each block counts once.
+        num_blocks = self._block_pool.num_gpu_blocks - 1
+        held_only_fraction = num_held_only_blocks / num_blocks if num_blocks else 0.0
+        used_fraction = self._block_pool.get_usage()
+        with self._step_kv_usage_lock:
+            usage = self._step_kv_usage
+            usage.num_steps += 1
+            usage.used_fraction_sum += used_fraction
+            usage.used_fraction_max = max(usage.used_fraction_max, used_fraction)
+            usage.held_only_fraction_sum += held_only_fraction
+            usage.held_only_fraction_max = max(
+                usage.held_only_fraction_max, held_only_fraction
+            )
+
+    def pop_step_kv_usage(self) -> StepKVUsage:
+        """The KV pool fractions over the engine steps since the last call."""
+        with self._step_kv_usage_lock:
+            usage, self._step_kv_usage = self._step_kv_usage, StepKVUsage()
+        return usage
 
     def _count_prefix_tokens(
         self, request: Any, previous_hashes: list[bytes], prefill_stats: Any
