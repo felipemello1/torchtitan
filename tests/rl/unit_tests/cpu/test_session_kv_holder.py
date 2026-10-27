@@ -7,6 +7,7 @@
 """VLLMSessionKVHolder on vLLM's real KV cache manager: 1 attention group + 3 Mamba "align"
 groups, 16-token blocks standing in for Qwen3.5's 1,152."""
 
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -408,19 +409,33 @@ def test_a_waiting_turn_gets_room_when_held_sessions_fill_the_pool(manager, queu
 POOL = 79  # vLLM's usage denominator: the 80 blocks but the null block
 
 
-def test_idle_held_counts_sibling_prompt_blocks_once(manager):
+def _assert_hold_refs_match_held(holder) -> None:
+    """`_hold_refs` counts, per block, the holds in `_held` that contain it."""
+    expected = Counter(
+        block.block_id for blocks in holder._held.values() for block in blocks
+    )
+    assert {block_id: n for block_id, (_, n) in holder._hold_refs.items()} == expected
+
+
+def _step_held_only(holder) -> float:
+    """Run one `after_step` and return its held-only fraction."""
+    holder.pop_step_kv_usage()
+    holder.after_step()
+    return holder.pop_step_kv_usage().held_only_fraction_sum
+
+
+def test_held_only_counts_sibling_prompt_blocks_once(manager):
     """GRPO siblings' holds share the prompt's 6 blocks (3 attention + 3 GDN states)."""
     requests = {}
     holder = _holder(manager, requests)
     prompt = list(range(50))
     _finished_turn(manager, holder, requests, "s0", prompt + [1])
     _finished_turn(manager, holder, requests, "s1", prompt + [2])
-    usage = holder.pop_step_kv_usage()
-    assert usage.idle_held_fraction == 6 / POOL
-    assert usage.running_fraction == 0
+    assert _step_held_only(holder) == 6 / POOL
+    _assert_hold_refs_match_held(holder)
 
 
-def test_a_session_with_a_running_request_is_not_idle(manager):
+def test_blocks_a_running_request_uses_are_not_held_only(manager):
     requests, running = {}, []
     holder = _holder(manager, requests, running=running)
     busy = _request("busy", list(range(50)))
@@ -428,17 +443,48 @@ def test_a_session_with_a_running_request_is_not_idle(manager):
     running.append(busy)
     holder.track("busy", session_id="busy", group_id=0)
     _prefill(manager, busy)
-    holder.after_step()
-    # The request uses the attention blocks; its prompt-end GDN states have only the hold.
-    usage = holder.pop_step_kv_usage()
-    assert usage.idle_held_fraction == 0
-    assert usage.running_fraction == pytest.approx(manager.usage)
+    # The request still uses every held block, prompt-end GDN states included.
+    assert _step_held_only(holder) == 0
+    # One decode step: the 3 prompt-end GDN states leave the request; only the hold keeps them.
+    _schedule(manager, busy, 1, sample=8)
+    assert _step_held_only(holder) == 3 / POOL
 
     running.clear()
     del requests["busy"]
     manager.free(busy)
+    assert _step_held_only(holder) == 6 / POOL
+    _assert_hold_refs_match_held(holder)
+
+
+def test_release_keeps_hold_counts_exact(manager):
+    requests = {}
+    holder = _holder(manager, requests)
+    prompt = list(range(50))
+    for session in ("s0", "s1"):
+        _finished_turn(manager, holder, requests, session, prompt + [1])
+    _finished_turn(manager, holder, requests, "other", list(range(500, 550)))
+
+    holder.release(session_ids=["s0"])
+    _assert_hold_refs_match_held(holder)
+    # s1 still holds the shared prompt blocks.
+    assert _step_held_only(holder) == 12 / POOL
+    holder.release(group_ids=[0])
+    assert holder._hold_refs == {}
+    assert _step_held_only(holder) == 0
+
+
+def test_step_max_sees_the_level_before_the_releases_of_the_same_step(manager):
+    requests = {}
+    holder = _holder(manager, requests)
+    _finished_turn(manager, holder, requests, "old", list(range(50)))
+    _finished_turn(manager, holder, requests, "new", list(range(500, 550)))
+    holder.pop_step_kv_usage()
+
+    holder.free_floor_blocks = manager.block_pool.get_num_free_blocks() + 1
     holder.after_step()
-    assert holder.pop_step_kv_usage().idle_held_fraction == 6 / POOL
+    assert list(holder._held) == ["new"]
+    assert holder.pop_step_kv_usage().held_only_fraction_max == 12 / POOL
+    _assert_hold_refs_match_held(holder)
 
 
 def test_step_max_keeps_the_peak_between_two_pops_and_then_resets(manager):
@@ -453,16 +499,15 @@ def test_step_max_keeps_the_peak_between_two_pops_and_then_resets(manager):
 
     usage = holder.pop_step_kv_usage()
     # The peak: 3 sessions x 6 held blocks; the last step: nothing held.
-    assert usage.idle_held_fraction_max == 18 / POOL
+    assert usage.held_only_fraction_max == 18 / POOL
     assert usage.used_fraction_max >= 18 / POOL
-    assert usage.idle_held_fraction == 0
     holder.after_step()
     usage = holder.pop_step_kv_usage()
     assert usage.num_steps == 1
-    assert usage.idle_held_fraction_max == usage.used_fraction_max == 0
+    assert usage.held_only_fraction_max == usage.used_fraction_max == 0
 
 
-def test_engine_session_kv_counts_and_step_levels_cover_the_time_since_the_last_call():
+def test_engine_session_kv_metrics_cover_the_time_since_the_last_call():
     """Counts (e.g. evictions) and step levels cover the time since the previous call."""
     from types import SimpleNamespace
 

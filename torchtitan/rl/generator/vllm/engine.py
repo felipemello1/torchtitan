@@ -460,8 +460,9 @@ class VLLMEngine(GenerationEngine):
             call 2: holder.num_evicted 5, num_sessions 78  ->  evicted_sessions 2, held_sessions 78
 
         Levels get Mean and Max over replicas (the typical and the fullest one), counts a Sum. The
-        ``_step_max`` and ``_step_mean`` levels cover the engine steps since the last call, so they
-        see the peaks that evictions cut, which ``gpu_used_fraction`` (read now) misses.
+        ``_step_max`` and ``_step_mean`` levels cover the engine steps since the last call (each read
+        after the step, before the holder's releases), so they see the levels that evictions cut,
+        which ``gpu_used_fraction`` (read now) misses.
         """
         holder = self._session_kv_holder
         if holder is None:
@@ -471,17 +472,14 @@ class VLLMEngine(GenerationEngine):
         levels = {
             "gpu_used_fraction": scheduler.kv_cache_manager.usage,
             "held_sessions": holder.num_sessions,
-            # As of the last engine step; they add up to that step's gpu_used_fraction.
-            "gpu_idle_held_fraction": step_usage.idle_held_fraction,
-            "gpu_running_fraction": step_usage.running_fraction,
         }
         if step_usage.num_steps > 0:
             levels |= {
                 "gpu_used_fraction_step_max": step_usage.used_fraction_max,
                 "gpu_used_fraction_step_mean": step_usage.used_fraction_sum
                 / step_usage.num_steps,
-                "gpu_idle_held_fraction_step_max": step_usage.idle_held_fraction_max,
-                "gpu_idle_held_fraction_step_mean": step_usage.idle_held_fraction_sum
+                "gpu_held_only_fraction_step_max": step_usage.held_only_fraction_max,
+                "gpu_held_only_fraction_step_mean": step_usage.held_only_fraction_sum
                 / step_usage.num_steps,
             }
         totals = {
