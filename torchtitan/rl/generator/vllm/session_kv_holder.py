@@ -234,7 +234,7 @@ class VLLMSessionKVHolder(Configurable):
         self._block_pool.touch(blocks)
         self._release(session_id)
         self._held[session_id] = blocks
-        self._count_hold(blocks, 1)
+        self._count_hold(session_id, blocks, 1)
         self._session_groups[session_id] = group_id
         self._group_sessions.setdefault(group_id, set()).add(session_id)
         self.num_sessions += 1
@@ -247,16 +247,17 @@ class VLLMSessionKVHolder(Configurable):
         if blocks is not None:
             self.num_sessions -= 1
             self._block_pool.free_blocks(reversed(blocks))
-            self._count_hold(blocks, -1)
+            self._count_hold(session_id, blocks, -1)
 
-    def _count_hold(self, blocks: list[Any], delta: int) -> None:
-        """Add (1) or remove (-1) one hold of ``blocks`` in `_hold_refs`."""
+    def _count_hold(self, session_id: str, blocks: list[Any], delta: int) -> None:
+        """Add (1) or remove (-1) this session's hold of ``blocks`` in `_hold_refs`."""
         for block in blocks:
             entry = self._hold_refs.setdefault(block.block_id, [block, 0])
             entry[1] += delta
             if entry[1] < 0:
                 raise RuntimeError(
-                    f"block {block.block_id} released more often than held"
+                    f"session {session_id} released block {block.block_id} more often than "
+                    "it was held"
                 )
             if entry[1] == 0:
                 del self._hold_refs[block.block_id]
