@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -58,6 +59,7 @@ from torchtitan.rl.generator.vllm.engine import (
 from torchtitan.rl.generator.vllm.registry import register_to_vllm
 from torchtitan.rl.generator.vllm.session_kv_holder import VLLMSessionKVHolder
 from torchtitan.rl.generator.vllm.worker import (
+    group_rows_by_prompt,
     TorchTitanGPUModelRunner,
     TorchTitanGPUWorker,
 )
@@ -815,6 +817,61 @@ def test_sequence_parallel_padding_rounds_runner_tokens(
         TorchTitanGPUModelRunner._pad_for_sequence_parallelism(model_runner, 5)
         == expected_num_tokens
     )
+
+
+class _FakeInputBatch:
+    """Rows of vLLM's persistent batch, 16-token blocks: block 0 holds a system prompt every request
+    shares, block 1 the end of the request's prompt; prompts are 33 tokens (``None``: 16 tokens)."""
+
+    def __init__(self, prompt_blocks: list[int | None]):
+        self.req_ids = [f"r{i}" for i in range(len(prompt_blocks))]
+        self.num_prompt_tokens = np.array(
+            [16 if b is None else 33 for b in prompt_blocks]
+        )
+        table = [
+            [7, -1 if b is None else b, 100 + i] for i, b in enumerate(prompt_blocks)
+        ]
+        self.block_table = SimpleNamespace(
+            block_size=16, block_table=SimpleNamespace(np=np.array(table))
+        )
+        self.swaps = 0
+
+    def swap_states(self, i: int, j: int) -> None:
+        table = self.block_table.block_table.np
+        self.req_ids[i], self.req_ids[j] = self.req_ids[j], self.req_ids[i]
+        self.num_prompt_tokens[[i, j]] = self.num_prompt_tokens[[j, i]]
+        table[[i, j]] = table[[j, i]]
+        self.swaps += 1
+
+
+@pytest.mark.parametrize(
+    ("prompt_blocks", "num_rows", "max_swaps"),
+    [
+        ([1, 1, 2, 1, 3, 2, 3, 2], 8, 2),  # the docstring example
+        ([1, 2, 3] * 8, 24, 24),  # every group fully scattered
+        # 16 groups x 16 rows; row 0 finished and vLLM moved the last row (group 15) into it
+        ([15] + [g for g in range(16) for _ in range(16)][1:-1], 255, 16),
+        ([1, 2, 1, 2, 3, 1], 4, 1),  # rows past num_rows stay
+        ([1, 1, 2, 2, 3], 5, 0),  # already grouped
+        ([1, 2, 3, 4], 4, 0),  # nothing shared beyond the system prompt
+        ([None, 1, None, 1], 4, 1),  # short prompts share nothing
+    ],
+)
+def test_group_rows_by_prompt(prompt_blocks, num_rows, max_swaps):
+    batch = _FakeInputBatch(prompt_blocks)
+    table = batch.block_table.block_table.np
+    rows_before = {r: row.tolist() for r, row in zip(batch.req_ids, table)}
+
+    group_rows_by_prompt(batch, block_table=batch.block_table, num_rows=num_rows)
+
+    keys = [table[i, 1] if table[i, 1] >= 0 else f"short{i}" for i in range(num_rows)]
+    runs = [k for i, k in enumerate(keys) if i == 0 or k != keys[i - 1]]
+    untouched = [f"r{i}" for i in range(num_rows, len(prompt_blocks))]
+    rows_after = {r: row.tolist() for r, row in zip(batch.req_ids, table)}
+    assert len(runs) == len(set(keys))
+    assert batch.req_ids[num_rows:] == untouched
+    assert rows_after == rows_before  # each request kept its whole row
+    assert batch.swaps <= max_swaps
 
 
 def test_only_weights_use_cumem_allocator(monkeypatch):
