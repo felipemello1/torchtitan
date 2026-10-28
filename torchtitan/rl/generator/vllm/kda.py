@@ -7,7 +7,6 @@
 from dataclasses import dataclass
 
 import torch
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -103,6 +102,9 @@ class VLLMInnerKDA(InnerAttention, MambaBase):
         self.conv_kernel_size = config.conv_kernel_size
         self.lower_bound = config.lower_bound
         self.use_chunk_replay = is_in_batch_invariant_mode()
+        # The enclosing KDA's q/k/v conv weights fused into one [C, W] tensor, so no step
+        # concatenates them; see `refresh_conv_weight`.
+        self.conv_weight_CW: torch.Tensor | None = None
 
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -183,31 +185,21 @@ class VLLMInnerKDA(InnerAttention, MambaBase):
         the module this replaces. vLLM derives its own offsets from the per-layer
         metadata, so the caller's attention metadata is unused.
         """
-        del attention_metadata
-
+        # The conv weights are read from their fused copy, `conv_weight_CW`.
+        del attention_metadata, conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W
+        assert (
+            self.conv_weight_CW is not None
+        ), "call `refresh_conv_weight` after loading weights"
         mixed_qkv_TC = torch.cat((query_TC, key_TC, value_TC), dim=-1)
-        # vLLM's conv kernels take (channels, width); Conv1d stores (C, 1, W).
-        conv_weight_CW = torch.cat(
-            (conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W),
-            dim=0,
-        ).squeeze(1)
-        output_THK = mixed_qkv_TC.new_zeros(
-            mixed_qkv_TC.shape[0],
-            self.local_num_heads,
-            self.head_dim,
-        )
-        self._forward(
+        return self._forward(
             mixed_qkv_TC,
             raw_gate_THK,
             raw_beta_TH,
-            conv_weight_CW,
+            self.conv_weight_CW,
             A_log_H,
             dt_bias_HK,
-            output_THK,
         )
-        return output_THK
 
-    @eager_break_during_capture
     def _forward(
         self,
         mixed_qkv_TC: torch.Tensor,
@@ -216,18 +208,24 @@ class VLLMInnerKDA(InnerAttention, MambaBase):
         conv_weight_CW: torch.Tensor,
         A_log_H: torch.Tensor,
         dt_bias_HK: torch.Tensor,
-        output_THK: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
+        """Advance vLLM's paged conv and recurrent state in place and return the output.
+
+        Returns the ``[tokens, heads, head_dim]`` output, zero on rows no sequence owns
+        so padded rows stay defined across graph replays.
+        """
+        num_tokens = mixed_qkv_TC.shape[0]
+        output_shape = (num_tokens, self.local_num_heads, self.head_dim)
         attn_metadata = get_forward_context().attn_metadata
         if attn_metadata is None:
-            return
+            return mixed_qkv_TC.new_zeros(output_shape)
         assert isinstance(attn_metadata, dict)
         metadata = attn_metadata[self.prefix]
         assert isinstance(metadata, TorchTitanLinearAttentionMetadata)
 
         num_actual_tokens = metadata.num_actual_tokens
         if num_actual_tokens == 0:
-            return
+            return mixed_qkv_TC.new_zeros(output_shape)
         state_indices = metadata.non_spec_state_indices_tensor
         cu_seqlens = metadata.non_spec_query_start_loc
         has_initial_state = metadata.has_initial_state
@@ -237,10 +235,10 @@ class VLLMInnerKDA(InnerAttention, MambaBase):
             and has_initial_state is not None
         )
         conv_state, recurrent_state, *replay_state = self.kv_cache
-        gate_args = (A_log_H.float(), dt_bias_HK.float())
 
         if metadata.execution_path is LinearAttentionExecutionPath.SINGLE_TOKEN:
             num_decode_rows = state_indices.numel()
+            output_THK = mixed_qkv_TC.new_empty(output_shape)
             convolved_BC = causal_conv1d_decode(
                 mixed_qkv_TC[:num_decode_rows],
                 conv_weight_CW,
@@ -254,14 +252,17 @@ class VLLMInnerKDA(InnerAttention, MambaBase):
                     convolved_BC,
                     raw_gate_THK[:num_decode_rows].unsqueeze(0),
                     raw_beta_TH[:num_decode_rows].unsqueeze(0),
-                    *gate_args,
+                    A_log_H,
+                    dt_bias_HK,
                     recurrent_state,
                     state_indices,
                     has_initial_state=has_initial_state,
                     lower_bound=self.lower_bound,
                     out=output_THK[:num_decode_rows].unsqueeze(0),
                 )
-                return
+                # Rows past the decode batch must stay defined across graph replays.
+                output_THK[num_decode_rows:].zero_()
+                return output_THK
             query_B1HK, key_B1HK, value_B1HK = (
                 tensor.reshape(-1, 1, self.local_num_heads, self.head_dim)
                 for tensor in convolved_BC.chunk(3, dim=-1)
@@ -272,7 +273,8 @@ class VLLMInnerKDA(InnerAttention, MambaBase):
                 value_B1HK,
                 bound_gate(
                     raw_gate_THK[:num_decode_rows].unsqueeze(1),
-                    *gate_args,
+                    A_log_H.float(),
+                    dt_bias_HK.float(),
                     lower_bound=self.lower_bound,
                 ),
                 raw_beta_TH[:num_decode_rows].unsqueeze(1).float().sigmoid(),
@@ -282,7 +284,8 @@ class VLLMInnerKDA(InnerAttention, MambaBase):
                 replay_state=tuple(replay_state),
             )
             output_THK[:num_decode_rows].copy_(output_B1HK[:, 0])
-            return
+            output_THK[num_decode_rows:].zero_()
+            return output_THK
 
         convolved_1TC = paged_causal_conv1d(
             mixed_qkv_TC[:num_actual_tokens].unsqueeze(0),
@@ -303,7 +306,8 @@ class VLLMInnerKDA(InnerAttention, MambaBase):
             value_1THK,
             bound_gate(
                 raw_gate_THK[:num_actual_tokens].unsqueeze(0),
-                *gate_args,
+                A_log_H.float(),
+                dt_bias_HK.float(),
                 lower_bound=self.lower_bound,
             ),
             raw_beta_TH[:num_actual_tokens].unsqueeze(0).float().sigmoid(),
@@ -314,7 +318,34 @@ class VLLMInnerKDA(InnerAttention, MambaBase):
             replay_state=tuple(replay_state) if self.use_chunk_replay else None,
             kernel_options=chunk_kernel_options(query_1THK),
         )
-        output_THK[:num_actual_tokens].copy_(output_1THK[0])
+        output_THK = output_1THK[0]
+        # FULL graphs pad the metadata to every row; eager SP/model-input rounding may not.
+        if num_actual_tokens < num_tokens:
+            padding = output_THK.new_zeros(
+                num_tokens - num_actual_tokens, *output_THK.shape[1:]
+            )
+            output_THK = torch.cat([output_THK, padding])
+        return output_THK
+
+    @torch.no_grad()
+    def refresh_conv_weight(
+        self,
+        conv_q_weight_C1W: torch.Tensor,
+        conv_k_weight_C1W: torch.Tensor,
+        conv_v_weight_C1W: torch.Tensor,
+    ) -> None:
+        """Refresh `conv_weight_CW` from the enclosing KDA's conv weights after a weight load.
+
+        Updates in place after the first call: CUDA graphs capture its address.
+        """
+        conv_weight_CW = torch.cat(
+            [conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W]
+        ).squeeze(1)
+        assert conv_weight_CW.shape[-1] == self.conv_kernel_size
+        if self.conv_weight_CW is None:
+            self.conv_weight_CW = conv_weight_CW
+        else:
+            self.conv_weight_CW.copy_(conv_weight_CW)
 
 
 def maybe_configure_kda_hybrid_model(
