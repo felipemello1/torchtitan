@@ -35,6 +35,23 @@ class LinearAttentionExecutionPath(Enum):
 
 
 @dataclass(kw_only=True)
+class PackedDecodeSplit:
+    """A packed step's 1-token (decode) requests take the decode kernel, the rest the chunk kernel.
+
+    vLLM puts decode requests first. Example, 2 decode requests then a 3-token prefill,
+    slots 5, 7, 9, capacity 4:
+
+        decode_state_indices     [5, 7, 0, 0]        null past the decode requests
+        prefill_query_start_loc  [0, 2, 2, 5, 5, 5]  decode tokens as one sequence
+        prefill_state_indices    [0, 0, 9, 0, 0]     ... with the null slot
+    """
+
+    decode_state_indices: torch.Tensor  # [capacity]
+    prefill_query_start_loc: torch.Tensor  # [capacity + 2]
+    prefill_state_indices: torch.Tensor  # [capacity + 1]
+
+
+@dataclass(kw_only=True)
 class TorchTitanLinearAttentionMetadata(GDNAttentionMetadata):
     """vLLM's GDN metadata, which vLLM also uses for KDA, plus the execution path."""
 
@@ -42,6 +59,8 @@ class TorchTitanLinearAttentionMetadata(GDNAttentionMetadata):
     # Block-table column of each request's running state, ``[num_reqs, 1]``; the same
     # in every group, so ``update_block_table`` reuses it.
     state_block_column: torch.Tensor
+    # Packed steps only: which rows the decode kernel and the chunk kernel take.
+    decode_split: PackedDecodeSplit | None = None
 
 
 class TorchTitanLinearAttentionBackend(AttentionBackend):
@@ -121,6 +140,9 @@ class TorchTitanLinearAttentionMetadataBuilder(
         self.decode_query_start_loc = torch.arange(
             self.num_reqs_capacity + 1, device=device, dtype=torch.int32
         )
+        self.decode_state_indices = torch.zeros_like(self.state_indices)
+        self.prefill_state_indices = torch.zeros_like(self.state_indices)
+        self.prefill_query_start_loc = torch.zeros_like(self.query_start_loc)
 
     def build(
         self,
@@ -173,6 +195,16 @@ class TorchTitanLinearAttentionMetadataBuilder(
         # If every request is processing one token, use the single-token
         # (decode-style) path.
         single_token = m.max_query_len == 1
+        decode_split = None
+        if not single_token:
+            # The chunk kernel sees the decode tokens as one sequence: [0, num_decode_tokens).
+            torch.clamp(
+                self.query_start_loc,
+                min=num_decode_tokens,
+                out=self.prefill_query_start_loc,
+            )
+            self.prefill_query_start_loc[0] = 0
+            decode_split = self._stage_decode_split(num_decode_tokens, capacity)
         return TorchTitanLinearAttentionMetadata(
             execution_path=(
                 LinearAttentionExecutionPath.SINGLE_TOKEN
@@ -203,6 +235,21 @@ class TorchTitanLinearAttentionMetadataBuilder(
                 else self.has_initial_state[: capacity + 1]
             ),
             state_block_column=state_block_column,
+            decode_split=decode_split,
+        )
+
+    def _stage_decode_split(
+        self, num_decode_tokens: int, capacity: int
+    ) -> PackedDecodeSplit:
+        """Split this group's slots between the decode and chunk kernels."""
+        self.decode_state_indices.copy_(self.state_indices)
+        self.decode_state_indices[num_decode_tokens:].zero_()
+        self.prefill_state_indices.copy_(self.state_indices)
+        self.prefill_state_indices[:num_decode_tokens].zero_()
+        return PackedDecodeSplit(
+            decode_state_indices=self.decode_state_indices[:capacity],
+            prefill_query_start_loc=self.prefill_query_start_loc[: capacity + 2],
+            prefill_state_indices=self.prefill_state_indices[: capacity + 1],
         )
 
     def update_block_table(
@@ -224,14 +271,22 @@ class TorchTitanLinearAttentionMetadataBuilder(
         # Single-token metadata runs eager or replays decode graphs, both reading the
         # static decode offsets, so only the packed path copies the query offsets.
         query_start_loc = self.decode_query_start_loc[: extent + 1]
+        decode_split = None
         if metadata.execution_path is LinearAttentionExecutionPath.PACKED:
             query_start_loc = self.query_start_loc[: extent + 1]
             query_start_loc.copy_(metadata.non_spec_query_start_loc)
+            self.prefill_query_start_loc[: extent + 1].copy_(
+                metadata.decode_split.prefill_query_start_loc
+            )
+            decode_split = self._stage_decode_split(
+                metadata.num_decode_tokens, extent - 1
+            )
         return replace(
             metadata,
             non_spec_query_start_loc=query_start_loc,
             non_spec_state_indices_tensor=self.state_indices[:extent],
             has_initial_state=self.has_initial_state[:extent],
+            decode_split=decode_split,
         )
 
     def _stage_state_indices(

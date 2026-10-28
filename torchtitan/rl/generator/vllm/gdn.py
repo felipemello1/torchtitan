@@ -282,6 +282,36 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             cu_seqlens=cu_seqlens,
             has_initial_state=has_initial_state,
         ).squeeze(0)
+        if is_in_batch_invariant_mode():
+            self._forward_gdn(
+                conv_output,
+                a[:num_actual_tokens],
+                b[:num_actual_tokens],
+                A_log,
+                dt_bias,
+                output[:num_actual_tokens],
+                cu_seqlens,
+                state_indices,
+                has_initial_state,
+            )
+            return
+        # Decode requests take the decode kernel; the chunk kernel sees their tokens as
+        # one null-slot sequence (see PackedDecodeSplit).
+        split = gdn_metadata.decode_split
+        decode_state_indices = split.decode_state_indices
+        num_decode_rows = decode_state_indices.numel()
+        recurrent_gdn_decode(
+            conv_output[:num_decode_rows],
+            a[:num_decode_rows].unsqueeze(0),
+            b[:num_decode_rows].unsqueeze(0),
+            A_log.float(),
+            dt_bias.float(),
+            self.kv_cache[1],
+            decode_state_indices,
+            has_initial_state=has_initial_state[:num_decode_rows],
+            scale=self.head_k_dim**-0.5,
+            out=output[:num_decode_rows].unsqueeze(0),
+        )
         self._forward_gdn(
             conv_output,
             a[:num_actual_tokens],
@@ -289,9 +319,10 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             A_log,
             dt_bias,
             output[:num_actual_tokens],
-            cu_seqlens,
-            state_indices,
+            split.prefill_query_start_loc,
+            split.prefill_state_indices,
             has_initial_state,
+            accumulate=True,
         )
 
     def _forward_gdn(
@@ -305,10 +336,12 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         cu_seqlens: torch.Tensor,
         all_slots: torch.Tensor,
         has_initial_state: torch.Tensor,
+        accumulate: bool = False,
     ) -> None:
         """Map each cu_seqlens interval to its paged SSM slot in all_slots.
 
         Null slots skip state writes and produce zero output for padding.
+        ``accumulate`` adds the result to ``output`` instead of copying it.
         """
         query, key, value = self._split_qkv(conv_output)
         # Keep the existing FP32 arithmetic while reusing the GDN gate contract.
@@ -352,7 +385,12 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                 scale=self.head_k_dim**-0.5,
                 kernel_options=chunk_kernel_options(query),
             )
-        output.copy_(recurrent_output[0].to(output.dtype))
+        if accumulate:
+            # The decode kernel wrote the decode rows and zeroed the others, and the chunk
+            # kernel's null-slot sequence (the decode tokens) is zero: the sum keeps both.
+            output.add_(recurrent_output[0].to(output.dtype))
+        else:
+            output.copy_(recurrent_output[0].to(output.dtype))
 
     def forward(
         self,

@@ -30,13 +30,18 @@ from torchtitan.rl.generator.vllm.batch_invariance import (
 from torchtitan.rl.generator.vllm.linear_attention import (
     LinearAttentionExecutionPath,
     TorchTitanLinearAttentionMetadata,
+    TorchTitanLinearAttentionMetadataBuilder,
 )
 from vllm import EngineArgs, LLMEngine, SamplingParams
+from vllm.config import SchedulerConfig, VllmConfig
 from vllm.forward_context import (
     ForwardContext,
     get_forward_context,
     override_forward_context,
 )
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.kv_cache_interface import MambaSpec
 
 MODEL_ENV = "TORCHTITAN_QWEN3_5_0_8B_HF_PATH"
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -453,3 +458,77 @@ def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
 
 if __name__ == "__main__":
     run_engine(sys.argv[1], Path(sys.argv[2]), bool(int(sys.argv[3])))
+
+
+def test_packed_decode_routing_matches_recurrence(monkeypatch) -> None:
+    """A mixed step's decode rows (decode kernel) and prefill rows (chunk kernel) match the
+    batch-invariant path, which runs the plain recurrence over the same packed batch."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    # Qwen3.5-0.8B's local TP=1 shapes: 3 resumed decode requests, then a fresh 61-token prefill.
+    num_decodes, prefill = 3, 61
+    num_tokens = num_decodes + prefill
+    offsets = torch.tensor([0, 1, 2, 3, num_tokens], dtype=torch.int32)
+    config = VllmConfig()
+    config.scheduler_config = SchedulerConfig(
+        max_model_len=128,
+        max_num_seqs=8,
+        max_num_batched_tokens=num_tokens,
+        is_encoder_decoder=False,
+    )
+    config.cache_config.mamba_cache_mode = "none"
+    spec = MambaSpec(
+        block_size=128,
+        shapes=((3, 6144), (16, 128, 128)),
+        dtypes=(torch.bfloat16, torch.float32),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+    )
+    metadata = TorchTitanLinearAttentionMetadataBuilder(spec, [], config, device).build(
+        0,
+        CommonAttentionMetadata(
+            query_start_loc=offsets.to(device),
+            query_start_loc_cpu=offsets,
+            seq_lens=torch.tensor(
+                [40, 40, 40, prefill], device=device, dtype=torch.int32
+            ),
+            num_reqs=4,
+            num_actual_tokens=num_tokens,
+            max_query_len=prefill,
+            max_seq_len=prefill,
+            block_table_tensor=torch.tensor(
+                [[1], [2], [3], [4]], device=device, dtype=torch.int32
+            ),
+            slot_mapping=torch.zeros(num_tokens, device=device, dtype=torch.int64),
+        ),
+    )
+    assert metadata.num_decodes == num_decodes
+    layer = gdn.VLLMInnerGDN.__new__(gdn.VLLMInnerGDN)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = "gdn"
+    layer.local_num_k_heads = layer.local_num_v_heads = 16
+    layer.head_k_dim = layer.head_v_dim = 128
+    layer.local_key_dim = 2048
+    pools = (
+        (torch.randn(5, 3, 6144, device=device) * 0.5).bfloat16(),
+        torch.randn(5, 16, 128, 128, device=device) * 0.05,
+    )
+    inputs = torch.randn(num_tokens, 6144, device=device, dtype=torch.bfloat16)
+    weight = (torch.randn(6144, 4, device=device) / 2).bfloat16()
+    a, b = torch.randn(2, num_tokens, 16, device=device, dtype=torch.bfloat16)
+    A_log = torch.log1p(torch.rand(16, device=device) * 15)
+    dt_bias = torch.full((16,), -3.0, device=device)
+    context = ForwardContext(
+        no_compile_layers={}, attn_metadata={"gdn": metadata}, slot_mapping={}
+    )
+
+    def run(batch_invariant: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        monkeypatch.setattr(gdn, "is_in_batch_invariant_mode", lambda: batch_invariant)
+        layer.kv_cache = tuple(pool.clone() for pool in pools)
+        output = torch.zeros(num_tokens, 16, 128, device=device, dtype=torch.bfloat16)
+        with torch.inference_mode(), override_forward_context(context):
+            layer._forward(inputs, a, b, weight, None, A_log, dt_bias, output)
+        return output.float(), layer.kv_cache[1][1:]
+
+    (routed, routed_state), (reference, reference_state) = run(False), run(True)
+    for got, want in ((routed, reference), (routed_state, reference_state)):
+        assert ((got - want).norm() / want.norm()).item() < 1e-2
