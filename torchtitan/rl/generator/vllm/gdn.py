@@ -97,6 +97,9 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         self.head_k_dim = config.head_k_dim
         self.head_v_dim = config.head_v_dim
         self.conv_kernel_size = config.conv_kernel_size
+        # The enclosing GDN's q/k/v conv weights fused into one [C, W] tensor, so no step
+        # concatenates them; see `refresh_conv_weight`.
+        self.conv_weight_CW: torch.Tensor | None = None
 
         # vLLM's state-shape calculator takes global head counts, while the
         # computation and allocated cache use local head counts.
@@ -306,6 +309,26 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             output = torch.cat([output, padding])
         return output
 
+    @torch.no_grad()
+    def refresh_conv_weight(
+        self,
+        conv_q_weight_C1W: torch.Tensor,
+        conv_k_weight_C1W: torch.Tensor,
+        conv_v_weight_C1W: torch.Tensor,
+    ) -> None:
+        """Refresh `conv_weight_CW` from the enclosing GDN's conv weights after a weight load.
+
+        Updates in place after the first call: CUDA graphs capture its address.
+        """
+        conv_weight_CW = torch.cat(
+            [conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W]
+        ).squeeze(1)
+        assert conv_weight_CW.shape[-1] == self.conv_kernel_size
+        if self.conv_weight_CW is None:
+            self.conv_weight_CW = conv_weight_CW
+        else:
+            self.conv_weight_CW.copy_(conv_weight_CW)
+
     def _forward_gdn(
         self,
         conv_output: torch.Tensor,
@@ -383,21 +406,20 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         attention_metadata: LinearAttentionMetadata | None,
     ) -> torch.Tensor:
         """Run the flattened vLLM cache operation on rank-local tensors."""
-        del attention_metadata
+        # The conv weights are read from their fused copy, `conv_weight_CW`.
+        del attention_metadata, conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W
         assert key_head_dim == self.head_k_dim
         assert value_head_dim == self.head_v_dim
+        assert (
+            self.conv_weight_CW is not None
+        ), "call `refresh_conv_weight` after loading weights"
         mixed_qkv_TC = torch.cat([query_TC, key_TC, value_TC], dim=-1)
-        conv_weight_CW = torch.cat(
-            [conv_q_weight_C1W, conv_k_weight_C1W, conv_v_weight_C1W],
-            dim=0,
-        ).squeeze(1)
-        assert conv_weight_CW.shape[-1] == self.conv_kernel_size
 
         return self._forward(
             mixed_qkv_TC,
             a_TH,
             b_TH,
-            conv_weight_CW,
+            self.conv_weight_CW,
             None,
             A_log_H,
             dt_bias_H,
