@@ -488,8 +488,8 @@ def test_packing_releases_each_microbatchs_samples_once_packed() -> None:
 
 
 def _replay_groups() -> list[TrainingSampleGroup]:
-    """Three groups whose samples carry router-replay rows equal to their input tokens; every
-    input token is distinct across samples."""
+    """Three groups whose samples carry router-replay rows equal to their input tokens, and
+    top-k rows equal to their labels; every input token is distinct across samples."""
     groups = []
     # The first group fills a full microbatch group ([9+1] [7+3]), so it streams.
     for group_id, lengths in enumerate([[9, 5, 3, 7, 1], [8, 6, 2], [4, 9, 1, 6]]):
@@ -499,13 +499,17 @@ def _replay_groups() -> list[TrainingSampleGroup]:
             sample.token_ids = first_token + np.arange(len(sample.token_ids))
             rows = sample.token_ids[:-1].astype(np.uint16)
             sample.routed_expert_ids = rows.reshape(-1, 1, 1)
+            sample.topk_token_ids = sample.token_ids[1:, None].astype(np.int32)
+            sample.topk_logprobs = np.zeros(sample.topk_token_ids.shape, np.float32)
         groups.append(
             TrainingSampleGroup(group_id=group_id, training_samples=samples, metrics=[])
         )
     return groups
 
 
-def _replay_batcher(*, stream_microbatches: bool, register_rdma_microbatch=None):
+def _replay_batcher(
+    *, stream_microbatches: bool, register_rdma_microbatch=None, num_topk_logprobs=0
+):
     return Batcher.Config(
         stream_microbatches=stream_microbatches,
         rdma_min_tensor_bytes=None if register_rdma_microbatch is None else 1,
@@ -518,6 +522,7 @@ def _replay_batcher(*, stream_microbatches: bool, register_rdma_microbatch=None)
         temperature=1.0,
         register_rdma_microbatch=register_rdma_microbatch,
         replay_routed_experts=True,
+        num_topk_logprobs=num_topk_logprobs,
     )
 
 
@@ -555,6 +560,25 @@ def test_streamed_microbatches_carry_each_tokens_router_replay_row() -> None:
     streamed_rows = token_rows(streamed)
     assert len(streamed_rows) == len(set(streamed_rows))
     assert sorted(streamed_rows) == sorted(token_rows([whole_step]))
+
+
+@pytest.mark.parametrize("stream_microbatches", [True, False])
+def test_microbatches_carry_each_loss_tokens_topk_row(stream_microbatches) -> None:
+    """Score centering's top-k rows land on their own loss tokens, streamed or not."""
+    batcher = _replay_batcher(
+        stream_microbatches=stream_microbatches, num_topk_logprobs=1
+    )
+    for batch in _add_groups(batcher, _replay_groups()):
+        for group in batch.microbatch_groups:
+            for row in group:
+                for microbatch in row:
+                    loss_kwargs = microbatch.to_loss_kwargs("cpu")
+                    topk = loss_kwargs["generator_topk_token_ids"][:, 0]
+                    loss_mask = loss_kwargs["loss_mask"]
+                    assert torch.equal(
+                        topk[loss_mask], microbatch.labels[loss_mask].int()
+                    )
+                    assert not topk[~loss_mask].any()
 
 
 def test_streamed_batches_register_rdma_microbatches_per_batch() -> None:
