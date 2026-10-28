@@ -878,6 +878,30 @@ def test_cuda_graph_full_mode_extends_capture_sizes_to_chunk():
     assert 500 in cfg.cudagraph_capture_sizes  # decode batch captured exactly
 
 
+@pytest.mark.parametrize(
+    "max_num_seqs, max_num_batched_tokens", [(256, None), (64, 8192), (512, 32768)]
+)
+def test_cuda_graph_full_mode_capture_sizes_pad_at_most_one_eighth_above_1024(
+    max_num_seqs, max_num_batched_tokens
+):
+    # A step replays the smallest captured size that holds it. With powers of 2 a
+    # Qwen3.5 mixed step (3 whole 512-token prompts + decodes, ~1.6k tokens) ran the
+    # 2048 graph; above 1024 the grid now pads at most 1/8 (8 sizes per doubling).
+    cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+        expert_sequence_parallel_size=1,
+        enable_sequence_parallel=False,
+    )
+    sizes = cfg.cudagraph_capture_sizes
+    assert sizes[-1] == (max_num_batched_tokens or 2048)
+    assert [s for s in sizes if s <= 1024] == sorted(
+        {1 << i for i in range(11)} | {max_num_seqs}
+    )
+    assert all(b - a <= a / 8 for a, b in zip(sizes, sizes[1:]) if a >= 1024)
+    assert min(size for size in sizes if size >= 1536 + 61) == 1664
+
+
 def test_cuda_graph_rejects_nonpositive_max_num_seqs():
     with pytest.raises(ValueError, match="max_num_seqs must be positive"):
         VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
