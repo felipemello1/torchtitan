@@ -387,6 +387,9 @@ class SparseIndexerLoss(AuxLoss):
         gather_TK = compressed_gather_indices(
             topk_indices_TK, cu_seqlens, self.compress_ratio
         )
+        # bf16 products are exact in fp32 and the GEMM accumulates in fp32 on tensor
+        # cores: the teacher target matches the fp32 einsum to ~5e-7 rel L2.
+        bf16_gemm = q_THD.is_cuda and q_THD.dtype == cmp_k_SD.dtype == torch.bfloat16
         targets = []
         # Bound gathered keys and fp32 logits by chunk_size, not context length.
         with torch.autocast(device_type=q_THD.device.type, enabled=False):
@@ -395,11 +398,17 @@ class SparseIndexerLoss(AuxLoss):
                 valid_TK = topk_indices_TK[start:stop] >= 0
                 if padding_mask_T is not None:
                     valid_TK = valid_TK & ~padding_mask_T[start:stop, None]
-                keys_TKD = cmp_k_SD[gather_TK[start:stop]].float()
-                logits_THK = (
-                    torch.einsum("thd,tkd->thk", q_THD[start:stop].float(), keys_TKD)
-                    * self.softmax_scale
-                )
+                q_chunk_THD = q_THD[start:stop]
+                keys_TKD = cmp_k_SD[gather_TK[start:stop]]
+                if bf16_gemm:
+                    logits_THK = torch.bmm(
+                        q_chunk_THD, keys_TKD.transpose(1, 2), out_dtype=torch.float32
+                    )
+                else:
+                    logits_THK = torch.einsum(
+                        "thd,tkd->thk", q_chunk_THD.float(), keys_TKD.float()
+                    )
+                logits_THK = logits_THK * self.softmax_scale
                 # The main kernel includes window, compressed slots and sink.
                 logits_THK = logits_THK - attn_lse_TH[start:stop, :, None].float()
                 logits_THK = logits_THK.masked_fill(~valid_TK[:, None], -torch.inf)

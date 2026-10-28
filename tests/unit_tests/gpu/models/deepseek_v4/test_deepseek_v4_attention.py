@@ -10,15 +10,18 @@ masked attention, on CPU (reference impl) and CUDA (fused impl). Kernel
 numerics are tested in Attention Gym.
 """
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
+from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.deepseek_v4.attention import (
     CompressedSparseAttention,
     HeavilyCompressedAttention,
     SlidingWindowAttention,
 )
-from torchtitan.models.deepseek_v4.compressor import Indexer
+from torchtitan.models.deepseek_v4.compressor import Indexer, SparseIndexerLoss
 
 SEQLEN, N_HEADS, HEAD_DIM, WINDOW, SCALE, TOPK = 32, 4, 8, 6, 0.1234, 5
 
@@ -166,3 +169,27 @@ def test_indexer_select_score_grads_cuda():
     # atomic backward, 1x4096's 1024 rows the two-pass one: both sum in fp32.
     for actual, ref in zip(grads, ref_grads):
         assert (actual.float() - ref).norm() / ref.norm() < 1e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_indexer_loss_teacher_bf16_matches_fp32_cuda():
+    """The teacher on bf16 CUDA inputs (bf16 GEMM, fp32 output) vs the same values
+    in fp32, on a causal top-k selection with -1 slots."""
+    seqlen, heads, dim, ratio, topk = 512, 8, 64, 4, 32
+    g = torch.Generator().manual_seed(0)
+    q = torch.randn(seqlen, heads, dim, generator=g).cuda().bfloat16()
+    cmp_k = torch.randn(seqlen // ratio, dim, generator=g).cuda().bfloat16()
+    lse = torch.randn(seqlen, heads, generator=g).cuda() + 4.0
+    slots = torch.arange(topk, device="cuda")
+    limit = (torch.arange(seqlen, device="cuda") + 1) // ratio
+    indices = torch.where(slots < limit[:, None], slots, -1).int()
+    with patch.dict(AuxLoss._group_counts, clear=True):
+        loss = SparseIndexerLoss.Config(
+            coeff=0.01, softmax_scale=dim**-0.5, num_heads=heads
+        ).build()
+    with patch("torch.bmm", wraps=torch.bmm) as bmm:
+        actual = loss._teacher(q, cmp_k, indices, lse, None)
+    assert bmm.called  # the bf16 GEMM path ran
+    expected = loss._teacher(q.float(), cmp_k.float(), indices, lse, None)
+    # GB300: max abs diff 4.8e-7. Logits rounded to bf16 give 1.4e-2 (CPU check).
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
