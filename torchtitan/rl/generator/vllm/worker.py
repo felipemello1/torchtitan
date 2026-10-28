@@ -177,8 +177,9 @@ def group_rows_by_prompt(
       Prompts that share only a system prompt get different keys; a prompt of at most
       one cache block shares nothing.
     - Layout: one segment per group, in the order of the groups' median rows.
-    - Moves: rows already in their segment stay; the others swap into its other slots
-      with vLLM's ``swap_states``, so a step that refilled a few rows moves a few rows.
+    - Moves: rows already in their segment stay; the others swap, with vLLM's
+      ``swap_states``, into their segment's slots that hold other groups' rows, so a
+      step that refilled a few rows moves a few rows.
 
     Args:
         batch: vLLM's persistent batch.
@@ -191,8 +192,10 @@ def group_rows_by_prompt(
     """
     if num_rows < 2:
         return
-    # Older vLLM nightlies store kernel blocks in this table, blocks_per_kv_block per
-    # prefix-cache block (Qwen3.5: 128-token FA4 blocks, 640+ token cache blocks).
+    # vLLM nightlies (up to at least 1.0.0.dev20261028) store kernel blocks in this
+    # table, blocks_per_kv_block per prefix-cache block (Qwen3.5: 128-token FA4
+    # blocks, 640+ token cache blocks); vLLM main stores cache blocks and has no
+    # blocks_per_kv_block. TODO: key on block_size alone once the nightly does too.
     blocks_per_cache_block = getattr(block_table, "blocks_per_kv_block", 1)
     cache_block_size = block_table.block_size * blocks_per_cache_block
     num_cached_blocks = (batch.num_prompt_tokens[:num_rows] - 1) // cache_block_size
