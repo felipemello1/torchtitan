@@ -465,3 +465,11 @@ def test_packed_forward_routes_decode_rows(monkeypatch, capturing):
     with override_forward_context(context):
         layer._forward(mixed, ab, ab, torch.ones(3, 4), None, ab[0], ab[0], output)
     assert output.flatten().tolist() == [1, 1, 2, 2, 2, 0]
+    if not capturing:
+        # No decode requests: eager skips the decode kernel, which rejects 0 rows.
+        context.attn_metadata = {"gdn": replace(metadata, num_decodes=0)}
+        monkeypatch.setattr(gdn, "recurrent_gdn_decode", lambda *a, **k: pytest.fail())
+        output.zero_()
+        with override_forward_context(context):
+            layer._forward(mixed, ab, ab, torch.ones(3, 4), None, ab[0], ab[0], output)
+        assert output.flatten().tolist() == [0, 0, 2, 2, 2, 0]

@@ -299,6 +299,8 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         # one null-slot sequence (the metadata builder's `_stage_decode_split`).
         decode_state_indices = gdn_metadata.decode_state_indices
         # A captured graph replays with any decode count, so capture runs every row.
+        # vLLM's warmup at packed sizes has no decode requests, so capture is this
+        # kernel's first launch there: fine while it has no autotuner.
         num_decode_rows = (
             decode_state_indices.numel()
             if torch.cuda.is_current_stream_capturing()
@@ -306,7 +308,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         )
         if num_decode_rows:
             # TODO: Attention Gym's decode kernel launches programs for null rows
-            # (16-52 us over 256 rows); a capped grid looping over rows makes them cheap.
+            # (14-52 us over 256 rows); a capped grid looping over rows makes them cheap.
             recurrent_gdn_decode(
                 conv_output[:num_decode_rows],
                 a[:num_decode_rows].unsqueeze(0),
