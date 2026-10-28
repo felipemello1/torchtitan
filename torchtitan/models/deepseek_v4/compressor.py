@@ -316,10 +316,18 @@ class Indexer(Module):
             return topk_indices, None
         valid_TK = topk_indices >= 0
         gather_indices_TK = compressed_gather_indices(topk_indices, cu_seqlens, ratio)
+        # compressed_gather_indices points every invalid slot at row 0. Their grads
+        # are zero, but the embedding backward sums each row's reads serially (one
+        # 4096-token document at top-k 512: 525k reads of row 0). Slot i reads
+        # row i % S instead.
+        spread_TK = torch.arange(
+            gather_indices_TK.numel(), device=gather_indices_TK.device
+        ).view_as(gather_indices_TK) % idx_k.size(0)
+        gather_indices_TK = torch.where(valid_TK, gather_indices_TK, spread_TK)
 
         # Same gather as idx_k[gather_indices_TK], with an fp32 backward: indexing's
-        # backward adds each row's duplicates one by one in bf16, and every invalid
-        # slot reads row 0 (GB300, one 4096-token document: 840 -> 8 ms fwd+bwd).
+        # backward adds each row's duplicates one by one in bf16 (GB300, one
+        # 4096-token document, before the spread: 840 -> 8 ms fwd+bwd).
         selected_TKD = F.embedding(gather_indices_TK, idx_k)
         logits_THK = torch.einsum("thd,tkd->thk", idx_q, selected_TKD)
         topk_scores = (logits_THK.relu() * idx_w.unsqueeze(-1)).sum(dim=1)
