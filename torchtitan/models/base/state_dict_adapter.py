@@ -16,7 +16,7 @@ from typing import Any
 import torch
 from torch.distributed.checkpoint import HuggingFaceStorageReader
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from .model import BaseModel
@@ -152,6 +152,10 @@ class StateDictAdapter(BaseStateDictAdapter):
         self._qkv_linear_sharding: dict[
             str, tuple[DeviceMesh, tuple[Placement, ...]]
         ] = {}
+        # Same for stacked linears that FSDP shards along the stacked dim.
+        self._stacked_linear_sharding: dict[
+            str, tuple[DeviceMesh, tuple[Placement, ...]]
+        ] = {}
         if hf_assets_path:
             mapping_path = os.path.join(hf_assets_path, "model.safetensors.index.json")
             try:
@@ -198,11 +202,30 @@ class StateDictAdapter(BaseStateDictAdapter):
         fused_key: str,
         logical_keys: tuple[str, ...],
         dim: int,
+        sharding: dict[str, tuple[DeviceMesh, tuple[Placement, ...]]] | None = None,
     ) -> None:
-        """Expose a native stacked parameter as logical projection views."""
+        """Expose a native stacked parameter as logical projection views.
+
+        A DTensor sharded along ``dim`` (FSDP's default Shard(0) when its degree doesn't
+        divide the matrix rows) can't be unbound, so that mesh dim is replicated first and
+        its placements are saved in ``sharding`` for ``_stack_logical_linears``.
+        """
         if fused_key not in state_dict:
             return
-        projections = state_dict.pop(fused_key).unbind(dim)
+        tensor = state_dict.pop(fused_key)
+        if isinstance(tensor, DTensor) and any(
+            isinstance(p, Shard) and p.dim == dim for p in tensor.placements
+        ):
+            if sharding is not None:
+                sharding[fused_key] = (tensor.device_mesh, tensor.placements)
+            tensor = tensor.redistribute(
+                tensor.device_mesh,
+                [
+                    Replicate() if isinstance(p, Shard) and p.dim == dim else p
+                    for p in tensor.placements
+                ],
+            )
+        projections = tensor.unbind(dim)
         assert len(projections) == len(logical_keys)
         state_dict.update(zip(logical_keys, projections, strict=True))
 
@@ -213,13 +236,20 @@ class StateDictAdapter(BaseStateDictAdapter):
         fused_key: str,
         logical_keys: tuple[str, ...],
         dim: int,
+        sharding: dict[str, tuple[DeviceMesh, tuple[Placement, ...]]] | None = None,
     ) -> None:
-        """Stack logical projection parameters into one native parameter."""
+        """Stack logical projection parameters into one native parameter.
+
+        Restores the placements ``_split_stacked_linear`` saved in ``sharding``, if any.
+        """
         if not all(key in state_dict for key in logical_keys):
             return
-        state_dict[fused_key] = torch.stack(
-            [state_dict.pop(key) for key in logical_keys], dim=dim
-        )
+        fused = torch.stack([state_dict.pop(key) for key in logical_keys], dim=dim)
+        if sharding is not None and fused_key in sharding:
+            assert isinstance(fused, DTensor)
+            mesh, placements = sharding[fused_key]
+            fused = fused.redistribute(mesh, placements)
+        state_dict[fused_key] = fused
 
     def _split_qkv_linear(
         self,
@@ -341,6 +371,7 @@ class StateDictAdapter(BaseStateDictAdapter):
                         f"{prefix}w3.{name}",
                     ),
                     dim=0,
+                    sharding=self._stacked_linear_sharding,
                 )
 
         for fqn, config, _parent, _ in self.model_config.traverse(QKVLinear.Config):
@@ -403,6 +434,7 @@ class StateDictAdapter(BaseStateDictAdapter):
                         f"{prefix}w3.{name}",
                     ),
                     dim=0,
+                    sharding=self._stacked_linear_sharding,
                 )
 
         for fqn, config, _parent, _ in self.model_config.traverse(QKVLinear.Config):
