@@ -574,9 +574,9 @@ class VLLMModelWrapper(Module):
             (), torch.iinfo(torch.int32).max, dtype=torch.int32, device=device
         )
 
-    # TODO: followup with potentially adding extra kwarg ``sinks`` to vLLM attn
     def _inject_attention_sinks(self) -> None:
-        """Give each gpt-oss attention's vLLM backend its sink-rescale hook."""
+        """Give each gpt-oss attention's vLLM backend its sinks: FA4 runs them in the
+        kernel; other kernels use the sink-rescale hook."""
         from torchtitan.models.gpt_oss.model import (
             apply_attention_sink_rescale,
             GptOssAttention,
@@ -585,9 +585,11 @@ class VLLMModelWrapper(Module):
         for module in self.model.modules():
             if not isinstance(module, GptOssAttention):
                 continue
+            impl = module.inner_attention.vllm_attn.impl
             # Read sinks per call: FSDP swaps the parameter between its sharded
             # and unsharded tensors and frees the sharded storage after unsharding.
-            module.inner_attention.vllm_attn.impl.out_transform = (
+            impl.learnable_sink = lambda attention=module: attention.sinks
+            impl.out_transform = (
                 lambda out, lse, attention=module: apply_attention_sink_rescale(
                     out, lse, attention.sinks
                 )

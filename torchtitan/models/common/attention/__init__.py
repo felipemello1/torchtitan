@@ -8,6 +8,7 @@ from collections.abc import Mapping
 
 from . import attention as _attention, mla as _mla
 from .attention import (  # noqa: F401
+    apply_attention_sink_rescale,
     Attention,
     create_attention_mask,
     create_varlen_metadata_for_document,
@@ -24,6 +25,7 @@ from .attention import (  # noqa: F401
     QKVLinear,
     SlidingWindowFlexInnerAttention,
     SlidingWindowVarlenInnerAttention,
+    varlen_attn_with_sink,
     VarlenAttentionMetadata,
     VarlenInnerAttention,
 )

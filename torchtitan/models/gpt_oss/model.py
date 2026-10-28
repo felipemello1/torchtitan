@@ -18,7 +18,8 @@ from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_remat import ActivationRematConfig
 from torchtitan.distributed.parallelism_context import ParallelismContext
-from torchtitan.models.common.attention import (
+from torchtitan.models.common.attention import (  # noqa: F401
+    apply_attention_sink_rescale,
     Attention,
     FlexAttentionMetadata,
     InnerAttention,
@@ -37,15 +38,6 @@ from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.rope import RoPE
 
 from .state_dict_adapter import GptOssStateDictAdapter
-
-
-def apply_attention_sink_rescale(
-    out: torch.Tensor, lse: torch.Tensor, sinks: torch.Tensor
-) -> torch.Tensor:
-    """Rescale attention output by the learned per-head sink term."""
-    sinks = sinks.view(*([1] * (lse.ndim - 1)), -1)
-    sink_scale = torch.sigmoid(lse - sinks).unsqueeze(-1)
-    return out * sink_scale.to(out.dtype)
 
 
 class GptOssAttention(Attention):
@@ -116,6 +108,11 @@ class GptOssAttention(Attention):
 
         q, k = self.rope(q, k, positions)
 
+        # Varlen runs the sink inside the kernel (FA4); other kernels rescale through the LSE.
+        if isinstance(self.inner_attention, VarlenInnerAttention):
+            sink_kwargs = {"learnable_sink": self.sinks}
+        else:
+            sink_kwargs = {"out_transform": self._apply_sinks}
         output = remat.region(
             self.inner_attention,
             self.remat_region_name("inner_attention"),
@@ -127,7 +124,7 @@ class GptOssAttention(Attention):
             attention_metadata=attention_metadata,
             scale=self.softmax_scale,
             enable_gqa=self.enable_gqa,
-            out_transform=self._apply_sinks,
+            **sink_kwargs,
         )
 
         # The reshape below copies the inner_attention output with bare ops.

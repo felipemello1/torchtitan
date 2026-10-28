@@ -105,6 +105,9 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         # optional post-attention epilogue transform (out, lse) -> out
         # set by VLLMModelWrapper in vllm_wrapper.py
         self.out_transform = None
+        # optional () -> per-head sink logits [H] (gpt-oss), run inside FA4's softmax;
+        # set by VLLMModelWrapper. Without FA4 it falls back to the out_transform rescale.
+        self.learnable_sink = None
 
         self.enable_gqa = self.num_heads > self.num_kv_heads
 
@@ -248,6 +251,17 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         if fa_impl in (None, "FA2") or is_in_batch_invariant_mode():
             extra_kwargs["num_splits"] = 1
 
+        if self.learnable_sink is not None and fa_impl == "FA4":
+            return self._forward_fa4_with_sink(
+                query,
+                key_cache,
+                value_cache,
+                output,
+                attn_metadata,
+                sliding_window_size,
+                extra_kwargs.get("num_splits"),
+            )
+
         if self.enable_gqa:
             extra_kwargs["enable_gqa"] = True
 
@@ -275,6 +289,46 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         out, lse = result
         out = self.out_transform(out, lse.transpose(0, 1))
         output[:num_actual_tokens].copy_(out)
+        return output[:num_actual_tokens]
+
+    def _forward_fa4_with_sink(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        sliding_window_size: tuple[int, int],
+        num_splits: int | None,
+    ) -> torch.Tensor:
+        """Paged FA4 attention with the sink logit in the softmax, written into ``output``.
+
+        Mirrors the kwargs torch's FA4 wrapper passes for varlen_attn_out (torch's varlen API
+        has no sink input), plus ``learnable_sink``.
+        """
+        from flash_attn.cute.interface import _flash_attn_fwd
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        left, right = sliding_window_size
+        if num_splits is None:
+            num_splits = 1 if torch.are_deterministic_algorithms_enabled() else 0
+        _flash_attn_fwd(
+            query[:num_actual_tokens],
+            key_cache,
+            value_cache,
+            softmax_scale=self.scale,
+            causal=(left, right) == (-1, 0),
+            window_size_left=None if left < 0 else left,
+            window_size_right=None if right < 0 else right,
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            max_seqlen_q=attn_metadata.max_query_len,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            seqused_k=attn_metadata.seq_lens,
+            page_table=attn_metadata.block_table,
+            learnable_sink=self.learnable_sink(),
+            num_splits=num_splits,
+            out=output[:num_actual_tokens],
+        )
         return output[:num_actual_tokens]
 
 
