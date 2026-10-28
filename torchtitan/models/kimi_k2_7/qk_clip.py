@@ -27,7 +27,6 @@ from torchtitan.models.common.attention import (
     MLAAttention,
     VarlenAttentionMetadata,
 )
-from torchtitan.models.common.attention.cp_mla import UlyssesMLAAttention
 from torchtitan.models.deepseek_v3.attention import DeepSeekMLAAttention
 
 # Shape suffixes:
@@ -309,6 +308,9 @@ def qk_clip(
     ]
     num_heads_per_layer = [logits.numel() for logits in layer_max_logits_H]
     max_logits_H = torch.cat(layer_max_logits_H)
+    # TODO: the loss mesh includes CP. Ulysses CP splits heads across CP ranks, so
+    # this MAX would mix different heads: reduce per head first once Kimi K2.x
+    # supports CP (KimiK25Model.parallelize rejects it today).
     if reduction_mesh.size() > 1:
         dist.all_reduce(
             max_logits_H,
@@ -334,18 +336,6 @@ def register_qk_clip_hook(
     parallelism_context: ParallelismContext,
 ) -> None:
     """Apply QK clipping after each ordinary optimizer step."""
-    for model_part in model_parts:
-        for module in model_part.modules():
-            # Ulysses gives each CP rank different heads, but qk_clip MAX-reduces head
-            # maxima over CP ranks as if every rank held the same heads.
-            if isinstance(module, UlyssesMLAAttention) and isinstance(
-                module.inner_attention, _QKClipAttention
-            ):
-                raise ValueError(
-                    "Kimi QK clipping with context parallelism requires "
-                    "attn_backend='flex': varlen runs Ulysses CP, which splits "
-                    "attention heads across CP ranks."
-                )
     reduction_mesh = parallelism_context.get_mesh("loss")
 
     def _qk_clip_hook(

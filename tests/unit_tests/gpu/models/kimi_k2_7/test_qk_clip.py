@@ -28,7 +28,6 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 from torchtitan.components.optim import AdamW, OptimizersContainer
 from torchtitan.distributed import ParallelismContext
 from torchtitan.models.common.attention import FlexInnerAttention, MLAAttention
-from torchtitan.models.common.attention.cp_mla import UlyssesMLAAttention
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.deepseek_v3.attention import DeepSeekMLAAttention
 
@@ -174,18 +173,6 @@ class QKClipTest(unittest.TestCase):
             [model],
             reduction_mesh=reduction_mesh,
         )
-
-    def test_hook_rejects_ulysses_context_parallel(self) -> None:
-        ulysses = UlyssesMLAAttention.__new__(UlyssesMLAAttention)
-        nn.Module.__init__(ulysses)
-        ulysses.inner_attention = _qk_clip_config().build()
-
-        with self.assertRaisesRegex(ValueError, "context parallelism"):
-            register_qk_clip_hook(
-                cast(OptimizersContainer, None),
-                [ulysses],
-                cast(ParallelismContext, None),
-            )
 
     def test_qk_clip_collects_varlen_maxima(self) -> None:
         attention = DeepSeekMLAAttention.__new__(DeepSeekMLAAttention)
