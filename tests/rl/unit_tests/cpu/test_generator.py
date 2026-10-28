@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -58,6 +59,7 @@ from torchtitan.rl.generator.vllm.engine import (
 from torchtitan.rl.generator.vllm.registry import register_to_vllm
 from torchtitan.rl.generator.vllm.session_kv_holder import VLLMSessionKVHolder
 from torchtitan.rl.generator.vllm.worker import (
+    group_rows_by_prompt,
     TorchTitanGPUModelRunner,
     TorchTitanGPUWorker,
 )
@@ -68,6 +70,7 @@ from vllm import SamplingParams
 from vllm.exceptions import VLLMValidationError
 from vllm.logprobs import FlatLogprobs, Logprob
 from vllm.sampling_params import RequestOutputKind
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 
 class _FakeRenderer:
@@ -815,6 +818,123 @@ def test_sequence_parallel_padding_rounds_runner_tokens(
         TorchTitanGPUModelRunner._pad_for_sequence_parallelism(model_runner, 5)
         == expected_num_tokens
     )
+
+
+class _FakeInputBatch:
+    """vLLM's persistent batch, reduced to what row reordering reads and swaps.
+
+    Two block tables, as in Qwen3.5: a linear-attention state table (one private block
+    per row), then the full-attention table, whose row i is [7, key, 100 + i, 200 + i]:
+    block 0 is a system prompt every request shares, block 1 ends the request's prompt
+    (rows of one group share it), the rest is private. ``blocks_per_kv_block=2`` is an
+    older vLLM's table: 16-token kernel blocks, 32-token prefix-cache blocks. A ``None``
+    prompt block: a 16-token prompt.
+    """
+
+    def __init__(self, prompt_blocks, *, blocks_per_kv_block=None, computed=None):
+        long_prompt = 33 if blocks_per_kv_block is None else 50  # key = column 1
+        self.req_ids = [f"r{i}" for i in range(len(prompt_blocks))]
+        self.num_reqs = len(prompt_blocks)
+        self.num_prompt_tokens = np.array(
+            [16 if b is None else long_prompt for b in prompt_blocks]
+        )
+        self.num_computed_tokens_cpu = np.array(
+            self.num_prompt_tokens if computed is None else computed
+        )
+        rows = [[7, b, 100 + i, 200 + i] for i, b in enumerate(prompt_blocks)]
+        state = [[300 + i] for i in range(self.num_reqs)]
+        self.block_table = [
+            SimpleNamespace(block_size=16, block_table=SimpleNamespace(np=np.array(t)))
+            for t in (state, rows)
+        ]
+        if blocks_per_kv_block is not None:
+            self.block_table[1].blocks_per_kv_block = blocks_per_kv_block
+        self.swaps = 0
+
+    def swap_states(self, i: int, j: int) -> None:
+        self.req_ids[i], self.req_ids[j] = self.req_ids[j], self.req_ids[i]
+        for array in (
+            self.num_prompt_tokens,
+            self.num_computed_tokens_cpu,
+            *(table.block_table.np for table in self.block_table),
+        ):
+            array[[i, j]] = array[[j, i]]
+        self.swaps += 1
+
+    def rows(self) -> dict[str, list[int]]:
+        state, table = (t.block_table.np for t in self.block_table)
+        return {
+            r: state[i].tolist() + table[i].tolist() for i, r in enumerate(self.req_ids)
+        }
+
+    def keys(self, num_rows: int) -> list:
+        table = self.block_table[1].block_table.np
+        return [
+            table[i, 1] if self.num_prompt_tokens[i] > 16 else self.req_ids[i]
+            for i in range(num_rows)
+        ]
+
+
+def _is_grouped(keys: list) -> bool:
+    runs = [k for i, k in enumerate(keys) if i == 0 or k != keys[i - 1]]
+    return len(runs) == len(set(keys))
+
+
+@pytest.mark.parametrize("blocks_per_kv_block", [None, 2])
+@pytest.mark.parametrize(
+    ("prompt_blocks", "num_rows", "max_swaps"),
+    [
+        ([1, 1, 2, 1, 3, 2, 3, 2], 8, 2),  # the docstring example
+        ([1, 2, 3] * 8, 24, 24),  # every group fully scattered
+        # 16 groups x 16 rows; row 0 finished, vLLM moved the last row (group 15) in
+        ([15] + [g for g in range(16) for _ in range(16)][1:-1], 255, 16),
+        ([1, 2, 1, 2, 3, 1], 4, 1),  # rows past num_rows stay
+        ([1, 1, 2, 2, 3], 5, 0),  # already grouped
+        ([1, 2, 3, 4], 4, 0),  # nothing shared beyond the system prompt
+        ([None, 1, None, 1], 4, 1),  # short prompts share nothing
+    ],
+)
+def test_group_rows_by_prompt(prompt_blocks, num_rows, max_swaps, blocks_per_kv_block):
+    batch = _FakeInputBatch(prompt_blocks, blocks_per_kv_block=blocks_per_kv_block)
+    rows_before = batch.rows()
+
+    group_rows_by_prompt(batch, block_table=batch.block_table[1], num_rows=num_rows)
+
+    assert _is_grouped(batch.keys(num_rows))
+    assert batch.req_ids[num_rows:] == [
+        f"r{i}" for i in range(num_rows, batch.num_reqs)
+    ]
+    assert batch.rows() == rows_before  # each request kept its whole row
+    assert batch.swaps <= max_swaps
+
+
+@pytest.mark.parametrize("reorder_batch_threshold", [None, 1])
+def test_may_reorder_batch_groups_decode_rows(reorder_batch_threshold):
+    # Decodes of groups 1 and 2, interleaved after vLLM's reorder, plus a group-1
+    # request still prefilling its prompt one token at a time (r2) and a prefill (r5).
+    batch = _FakeInputBatch(
+        [1, 1, 1, 1, 2, 3, 2, 2], computed=[33, 40, 20, 35, 33, 0, 36, 34]
+    )
+    runner = object.__new__(TorchTitanGPUModelRunner)
+    runner.input_batch = batch
+    runner.reorder_batch_threshold = reorder_batch_threshold
+    runner.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=object()),  # linear-attention state
+            SimpleNamespace(kv_cache_spec=object.__new__(FullAttentionSpec)),
+        ]
+    )
+    scheduled = {r: 40 if r == "r5" else 1 for r in batch.req_ids}
+    rows_before = batch.rows()
+
+    runner._may_reorder_batch(SimpleNamespace(num_scheduled_tokens=scheduled))
+
+    assert batch.rows() == rows_before
+    if reorder_batch_threshold is None:
+        assert _is_grouped(batch.keys(8))
+    else:  # vLLM's regions stay: the 6 decodes, the prompt-chunk row, the prefill
+        assert batch.req_ids[6:] == ["r2", "r5"]
+        assert _is_grouped(batch.keys(6))
 
 
 def test_only_weights_use_cumem_allocator(monkeypatch):

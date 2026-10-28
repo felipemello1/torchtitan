@@ -6,15 +6,21 @@
 
 """TorchTitan-owned vLLM worker and model runner customizations."""
 
+import functools
 from collections.abc import Set
 from contextlib import nullcontext
 
+import numpy as np
 from vllm.config import CUDAGraphMode, get_layers_from_vllm_config
 from vllm.forward_context import BatchDescriptor
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.utils.math_utils import round_up
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.worker import gpu_model_runner as vllm_gpu_model_runner
+from vllm.v1.worker.block_table import BlockTable
+from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
@@ -110,6 +116,43 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
             num_tokens, *args, **kwargs
         )
 
+    def _may_reorder_batch(self, scheduler_output: SchedulerOutput) -> None:
+        """vLLM's reorder, then requests that share a cached prompt in adjacent rows
+        (only the leading decode rows when vLLM puts decodes first)."""
+        super()._may_reorder_batch(scheduler_output)
+        if self._full_attention_kv_cache_group is None:
+            return
+        batch = self.input_batch
+        num_rows = batch.num_reqs
+        if self.reorder_batch_threshold is not None:
+            # vLLM's decode test; its reorder put these rows first.
+            scheduled = np.array(
+                [scheduler_output.num_scheduled_tokens[r] for r in batch.req_ids]
+            )
+            is_decode = (scheduled <= self.reorder_batch_threshold) & (
+                batch.num_computed_tokens_cpu[:num_rows]
+                >= batch.num_prompt_tokens[:num_rows]
+            )
+            num_rows = int(is_decode.sum())
+        group_rows_by_prompt(
+            batch,
+            block_table=batch.block_table[self._full_attention_kv_cache_group],
+            num_rows=num_rows,
+        )
+
+    @functools.cached_property
+    def _full_attention_kv_cache_group(self) -> int | None:
+        """Index of the first full-attention KV cache group, whose blocks identify the
+        prompt (None: no such group, rows keep vLLM's order)."""
+        return next(
+            (
+                i
+                for i, group in enumerate(self.kv_cache_config.kv_cache_groups)
+                if isinstance(group.kv_cache_spec, FullAttentionSpec)
+            ),
+            None,
+        )
+
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         enable_dense_sp = self.compilation_config.pass_config.enable_sp and tp_size > 1
@@ -119,6 +162,77 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
         if enable_dense_sp or enable_expert_sp:
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
+
+
+def group_rows_by_prompt(
+    batch: InputBatch, *, block_table: BlockTable, num_rows: int
+) -> None:
+    """Swap rows of vLLM's persistent batch so requests that share a cached prompt (the
+    samples of one GRPO group) sit in adjacent rows.
+
+    vLLM refills finished rows with other requests, so a group's samples drift apart;
+    decode attention reads rows in order, so adjacent samples find the prompt in L2.
+    - Key: the prompt's last cached block, the last whole prefix-cache block before the
+      prompt's final token (vLLM recomputes that token, so every sample hits the block).
+      Prompts that share only a system prompt get different keys; a prompt of at most
+      one cache block shares nothing.
+    - Layout: one segment per group, in the order of the groups' median rows.
+    - Moves: rows already in their segment stay; the others swap, with vLLM's
+      ``swap_states``, into their segment's slots that hold other groups' rows, so a
+      step that refilled a few rows moves a few rows.
+
+    Args:
+        batch: vLLM's persistent batch.
+        block_table: the block table of the full-attention KV cache group.
+        num_rows: rows ``[0, num_rows)`` are grouped; later rows stay.
+
+    Example (letters = key of each row):
+        before   A A B A C B C B
+        after    A A A B B B C C     (2 swaps: rows 2 <-> 3, 4 <-> 7)
+    """
+    if num_rows < 2:
+        return
+    # vLLM nightlies (up to at least 1.0.0.dev20261028) store kernel blocks in this
+    # table, blocks_per_kv_block per prefix-cache block (Qwen3.5: 128-token FA4
+    # blocks, 640+ token cache blocks); vLLM main stores cache blocks and has no
+    # blocks_per_kv_block. TODO: key on block_size alone once the nightly does too.
+    blocks_per_cache_block = getattr(block_table, "blocks_per_kv_block", 1)
+    cache_block_size = block_table.block_size * blocks_per_cache_block
+    num_cached_blocks = (batch.num_prompt_tokens[:num_rows] - 1) // cache_block_size
+    last_cached_block = num_cached_blocks * blocks_per_cache_block - 1
+    rows = np.arange(num_rows)
+    key = np.where(
+        last_cached_block >= 0,
+        block_table.block_table.np[rows, np.maximum(last_cached_block, 0)],
+        -1 - rows,  # unique: shares nothing
+    )
+    run_starts = np.flatnonzero(key[1:] != key[:-1]) + 1
+    run_keys = key[np.concatenate(([0], run_starts))].tolist()
+    if len(set(run_keys)) == len(run_keys):
+        return  # every group is contiguous
+
+    # One segment per group, ordered by the groups' median rows: a row vLLM moved
+    # doesn't drag its group's segment.
+    _, group, size = np.unique(key, return_inverse=True, return_counts=True)
+    rows_by_group = np.lexsort((rows, group))
+    median_row = rows_by_group[np.cumsum(size) - size + size // 2]
+    segment_order = np.argsort(median_row, kind="stable")
+    segment_rank = np.argsort(segment_order)
+    slot_group = np.repeat(segment_order, size[segment_order])
+
+    # Rows outside their segment take its misplaced slots in slot order, and the
+    # permutation is applied one cycle at a time, both as in vLLM's
+    # reorder_batch_to_split_decodes_and_prefills.
+    misplaced = np.flatnonzero(slot_group != group)
+    src_rows = misplaced[np.argsort(segment_rank[group[misplaced]], kind="stable")]
+    dest = dict(zip(src_rows.tolist(), misplaced.tolist()))
+    for src in list(dest):
+        dst = dest[src]
+        while src != dst:
+            batch.swap_states(src, dst)
+            next_dst = dest[dst]
+            dest[dst] = dst
+            dst = next_dst
 
 
 class TorchTitanGPUWorker(GPUWorker):
