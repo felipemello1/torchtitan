@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import fields, is_dataclass, replace
+from dataclasses import fields, replace
 
 import pytest
 import torch
@@ -12,7 +12,6 @@ import torch
 from torchtitan.rl.generator.vllm import gdn
 from torchtitan.rl.generator.vllm.linear_attention import (
     LinearAttentionExecutionPath,
-    PackedDecodeSplit,
     TorchTitanLinearAttentionMetadata,
     TorchTitanLinearAttentionMetadataBuilder,
 )
@@ -134,6 +133,8 @@ def test_full_metadata_and_native_dispatch_variants():
     assert captured.num_decode_tokens == 4 and captured.num_prefill_tokens == 0
     assert captured.has_initial_state is not None
     assert not captured.non_spec_state_indices_tensor.any()
+    assert not captured.decode_state_indices.any()
+    assert not captured.prefill_state_indices.any()
     assert captured.spec_sequence_masks is None and captured.chunk_indices is None
     assert common.block_table_tensor.tolist() == [[1], [2]]
     actual = builder.build(0, common)
@@ -255,7 +256,14 @@ def test_update_block_table_matches_build(single_token, mode):
     other_table = torch.tensor([[3, 7], [4, 8]], dtype=torch.int32)
     captured = other.build_for_cudagraph_capture(common)
     # Stale values from an earlier step, so every copy and zeroing is checked.
-    for buffer in (other.query_start_loc, other.state_indices, other.has_initial_state):
+    for buffer in (
+        other.query_start_loc,
+        other.state_indices,
+        other.has_initial_state,
+        other.decode_state_indices,
+        other.prefill_query_start_loc,
+        other.prefill_state_indices,
+    ):
         buffer.fill_(True if buffer.dtype == torch.bool else -1)
 
     updated = other.update_block_table(
@@ -266,37 +274,30 @@ def test_update_block_table_matches_build(single_token, mode):
     assert expected.non_spec_state_indices_tensor.tolist()[:2] == (
         [7, 4] if mode == "align" else [3, 4]
     )
-    _assert_same_fields(updated, expected)
+    for field in fields(expected):
+        want, got = getattr(expected, field.name), getattr(updated, field.name)
+        if isinstance(want, torch.Tensor):
+            assert torch.equal(got, want), field.name
+        else:
+            assert got == want, field.name
     # The graph captured this builder's buffers, not the first group's.
-    for name in (
+    names = (
         "non_spec_query_start_loc",
         "non_spec_state_indices_tensor",
         "has_initial_state",
-    ):
-        assert getattr(updated, name).data_ptr() == getattr(captured, name).data_ptr()
+    )
     if not single_token:
-        for field in fields(captured.decode_split):
-            name = field.name
-            assert (
-                getattr(updated.decode_split, name).data_ptr()
-                == getattr(captured.decode_split, name).data_ptr()
-            )
-
-
-def _assert_same_fields(got, want, prefix=""):
-    for field in fields(want):
-        name = prefix + field.name
-        a, b = getattr(got, field.name), getattr(want, field.name)
-        if isinstance(b, torch.Tensor):
-            assert torch.equal(a, b), name
-        elif is_dataclass(b):
-            _assert_same_fields(a, b, name + ".")
-        else:
-            assert a == b, name
+        names += (
+            "decode_state_indices",
+            "prefill_query_start_loc",
+            "prefill_state_indices",
+        )
+    for name in names:
+        assert getattr(updated, name).data_ptr() == getattr(captured, name).data_ptr()
 
 
 def test_packed_metadata_splits_decode_requests():
-    """PackedDecodeSplit's docstring example: 2 decode requests, then a 3-token prefill."""
+    """`_stage_decode_split`'s docstring example: 2 decode requests, then a 3-token prefill."""
     config = VllmConfig()
     config.compilation_config = CompilationConfig(
         mode=CompilationMode.NONE,
@@ -337,11 +338,10 @@ def test_packed_metadata_splits_decode_requests():
         ),
     )
 
-    split = metadata.decode_split
     assert metadata.num_decodes == 2 and metadata.num_decode_tokens == 2
-    assert split.decode_state_indices.tolist() == [5, 7, 0, 0]
-    assert split.prefill_query_start_loc.tolist() == [0, 2, 2, 5, 5, 5]
-    assert split.prefill_state_indices.tolist() == [0, 0, 9, 0, 0]
+    assert metadata.decode_state_indices.tolist() == [5, 7, 0, 0]
+    assert metadata.prefill_query_start_loc.tolist() == [0, 2, 2, 5, 5, 5]
+    assert metadata.prefill_state_indices.tolist() == [0, 0, 9, 0, 0]
 
 
 @pytest.mark.parametrize("decode", [False, True])
@@ -407,19 +407,18 @@ def test_forward_respects_prepared_extent_and_decode_padding(monkeypatch, decode
     assert torch.equal(output[:, 0], (torch.arange(6) < extent).float())
 
 
-def test_packed_forward_routes_decode_rows(monkeypatch):
-    """Decode rows take the decode kernel, prefill rows the chunk kernel; the add keeps both."""
+@pytest.mark.parametrize("capturing", [False, True])
+def test_packed_forward_routes_decode_rows(monkeypatch, capturing):
+    """Decode rows take the decode kernel, prefill rows the chunk kernel; the add keeps both.
+
+    Graph capture runs the decode kernel on every row; eager steps on the decode requests.
+    """
     layer = gdn.VLLMInnerGDN.__new__(gdn.VLLMInnerGDN)
     torch.nn.Module.__init__(layer)
     layer.prefix, layer.kv_cache = "gdn", (torch.empty(0), torch.empty(0))
     layer.local_num_k_heads = layer.local_num_v_heads = 1
     layer.head_k_dim = layer.head_v_dim = layer.local_key_dim = 1
-    # PackedDecodeSplit's example: 2 decode requests, then a 3-token prefill; 6 input rows.
-    split = PackedDecodeSplit(
-        decode_state_indices=torch.tensor([5, 7, 0, 0]),
-        prefill_query_start_loc=torch.tensor([0, 2, 2, 5, 5, 5]),
-        prefill_state_indices=torch.tensor([0, 0, 9, 0, 0]),
-    )
+    # `_stage_decode_split`'s example: 2 decode requests, then a 3-token prefill; 6 rows.
     metadata = TorchTitanLinearAttentionMetadata(
         execution_path=LinearAttentionExecutionPath.PACKED,
         num_prefills=1,
@@ -433,20 +432,25 @@ def test_packed_forward_routes_decode_rows(monkeypatch):
         non_spec_state_indices_tensor=torch.tensor([5, 7, 9, 0, 0]),
         has_initial_state=torch.tensor([True, True, False, False, False]),
         state_block_column=torch.zeros(3, 1, dtype=torch.long),
-        decode_split=split,
+        decode_state_indices=torch.tensor([5, 7, 0, 0]),
+        prefill_query_start_loc=torch.tensor([0, 2, 2, 5, 5, 5]),
+        prefill_state_indices=torch.tensor([0, 0, 9, 0, 0]),
     )
     monkeypatch.setattr(gdn, "is_in_batch_invariant_mode", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     monkeypatch.setattr(gdn, "paged_causal_conv1d", lambda x, *args, **kwargs: x)
     monkeypatch.setattr(gdn, "gate_transform", lambda a, *args, **kwargs: a)
     monkeypatch.setattr(gdn, "l2norm", lambda x, **kwargs: x)
 
     def decode(conv, a, b, A_log, dt_bias, ssm, slots, *, out, **kwargs):
-        assert slots is split.decode_state_indices and conv.shape[0] == 4
+        rows = 4 if capturing else 2
+        assert conv.shape[0] == rows
+        assert slots.tolist() == metadata.decode_state_indices[:rows].tolist()
         out.copy_((slots > 0).float()[None, :, None, None])  # inactive rows are zero
 
     def chunk(q, k, v, decay, beta, ssm, slots, *, cu_seqlens, **kwargs):
-        assert cu_seqlens is split.prefill_query_start_loc
-        assert slots is split.prefill_state_indices
+        assert cu_seqlens is metadata.prefill_query_start_loc
+        assert slots is metadata.prefill_state_indices
         tokens = torch.arange(q.shape[1])
         # The null-slot sequence (the decode tokens, [0, 2)) is zero.
         return torch.where(tokens >= 2, 2.0, 0.0)[None, :, None, None]

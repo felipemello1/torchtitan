@@ -296,22 +296,31 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             )
             return
         # Decode requests take the decode kernel; the chunk kernel sees their tokens as
-        # one null-slot sequence (see PackedDecodeSplit).
-        split = gdn_metadata.decode_split
-        decode_state_indices = split.decode_state_indices
-        num_decode_rows = decode_state_indices.numel()
-        recurrent_gdn_decode(
-            conv_output[:num_decode_rows],
-            a[:num_decode_rows].unsqueeze(0),
-            b[:num_decode_rows].unsqueeze(0),
-            A_log.float(),
-            dt_bias.float(),
-            self.kv_cache[1],
-            decode_state_indices,
-            has_initial_state=has_initial_state[:num_decode_rows],
-            scale=self.head_k_dim**-0.5,
-            out=output[:num_decode_rows].unsqueeze(0),
+        # one null-slot sequence (the metadata builder's `_stage_decode_split`).
+        decode_state_indices = gdn_metadata.decode_state_indices
+        # A captured graph replays with any decode count, so capture runs every row.
+        num_decode_rows = (
+            decode_state_indices.numel()
+            if torch.cuda.is_current_stream_capturing()
+            else gdn_metadata.num_decodes
         )
+        if num_decode_rows:
+            # TODO: Attention Gym's decode kernel launches programs for null rows
+            # (16-52 us over 256 rows); a capped grid looping over rows makes them cheap.
+            recurrent_gdn_decode(
+                conv_output[:num_decode_rows],
+                a[:num_decode_rows].unsqueeze(0),
+                b[:num_decode_rows].unsqueeze(0),
+                A_log.float(),
+                dt_bias.float(),
+                self.kv_cache[1],
+                decode_state_indices[:num_decode_rows],
+                has_initial_state=has_initial_state[:num_decode_rows],
+                scale=self.head_k_dim**-0.5,
+                out=output[:num_decode_rows].unsqueeze(0),
+            )
+        # Adding keeps each row's one kernel result: both kernels give null slots zero
+        # output (Attention Gym's paged GDN contract), and `forward` zeroes `output`.
         self._forward_gdn(
             conv_output,
             a[:num_actual_tokens],
@@ -319,8 +328,8 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             A_log,
             dt_bias,
             output[:num_actual_tokens],
-            split.prefill_query_start_loc,
-            split.prefill_state_indices,
+            gdn_metadata.prefill_query_start_loc,
+            gdn_metadata.prefill_state_indices,
             has_initial_state,
             accumulate=True,
         )
@@ -386,8 +395,6 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                 kernel_options=chunk_kernel_options(query),
             )
         if accumulate:
-            # The decode kernel wrote the decode rows and zeroed the others, and the chunk
-            # kernel's null-slot sequence (the decode tokens) is zero: the sum keeps both.
             output.add_(recurrent_output[0].to(output.dtype))
         else:
             output.copy_(recurrent_output[0].to(output.dtype))
