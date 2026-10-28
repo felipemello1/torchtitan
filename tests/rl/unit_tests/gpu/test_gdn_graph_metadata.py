@@ -255,10 +255,11 @@ def test_forward_respects_prepared_extent_and_decode_padding(monkeypatch, decode
     context = ForwardContext(
         no_compile_layers={}, attn_metadata={"gdn": metadata}, slot_mapping={}
     )
-    value, output = torch.ones(6, 1), torch.zeros(6, 1)
+    # NaN catches a row that is neither written nor zeroed.
+    value, output = torch.ones(6, 1), torch.full((6, 1), float("nan"))
     with override_forward_context(context):
         layer._forward(value, value, value, value, None, value, value, output)
-        # Reject bias even in profiling and empty-batch early returns.
+        # Profiling and empty-batch early returns reject bias and zero the output.
         for attn_metadata in (None, {"gdn": replace(metadata, num_actual_tokens=0)}):
             context.attn_metadata = attn_metadata
             with pytest.raises(
@@ -266,5 +267,8 @@ def test_forward_respects_prepared_extent_and_decode_padding(monkeypatch, decode
                 match="Attention Gym convolution kernels do not support bias",
             ):
                 layer._forward(value, value, value, value, value, value, value, output)
+            early = torch.full((6, 1), float("nan"))
+            layer._forward(value, value, value, value, None, value, value, early)
+            assert torch.equal(early, torch.zeros(6, 1))
     assert metadata.num_actual_tokens == 3
     assert torch.equal(output[:, 0], (torch.arange(6) < extent).float())

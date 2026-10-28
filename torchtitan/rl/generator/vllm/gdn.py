@@ -211,9 +211,9 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             conv_bias is None
         ), "Attention Gym convolution kernels do not support bias"
         attn_metadata = get_forward_context().attn_metadata
-        # vLLM's profiling/warmup runs have no attention metadata; leave the
-        # zero-filled output.
+        # vLLM's profiling/warmup runs have no attention metadata.
         if attn_metadata is None:
+            output.zero_()
             return
         assert isinstance(attn_metadata, dict)
         gdn_metadata = attn_metadata[self.prefix]
@@ -224,6 +224,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
 
         num_actual_tokens = gdn_metadata.num_actual_tokens
         if num_actual_tokens == 0:
+            output.zero_()
             return
         state_indices = gdn_metadata.non_spec_state_indices_tensor
         cu_seqlens = gdn_metadata.non_spec_query_start_loc
@@ -271,6 +272,8 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                     state_indices,
                     has_initial_state,
                 )
+            # Rows past the decode batch must stay defined across graph replays.
+            output[num_decode_rows:].zero_()
             return
 
         conv_output = paged_causal_conv1d(
@@ -293,6 +296,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             state_indices,
             has_initial_state,
         )
+        output[num_actual_tokens:].zero_()
 
     def _forward_gdn(
         self,
@@ -383,8 +387,8 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         assert conv_weight_CW.shape[-1] == self.conv_kernel_size
 
         num_tokens = mixed_qkv_TC.shape[0]
-        # Padded rows must remain defined across vLLM graph replays.
-        output_THV = mixed_qkv_TC.new_zeros(
+        # `_forward` writes every row, zeroing rows past the actual tokens.
+        output_THV = mixed_qkv_TC.new_empty(
             num_tokens, self.local_num_v_heads, self.head_v_dim
         )
         self._forward(
