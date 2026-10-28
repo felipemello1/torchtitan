@@ -18,7 +18,7 @@ from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_remat import ActivationRematConfig
 from torchtitan.distributed.parallelism_context import ParallelismContext
-from torchtitan.models.common.attention import (  # noqa: F401
+from torchtitan.models.common.attention import (
     apply_attention_sink_rescale,
     Attention,
     FlexAttentionMetadata,
@@ -108,7 +108,7 @@ class GptOssAttention(Attention):
 
         q, k = self.rope(q, k, positions)
 
-        # Varlen runs the sink inside the kernel (FA4); other kernels rescale through the LSE.
+        # VarlenInnerAttention runs the sink inside FA4 when it can; flex rescales through its LSE.
         if isinstance(self.inner_attention, VarlenInnerAttention):
             sink_kwargs = {"learnable_sink": self.sinks}
         else:

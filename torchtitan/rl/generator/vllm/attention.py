@@ -106,8 +106,8 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         # set by VLLMModelWrapper in vllm_wrapper.py
         self.out_transform = None
         # optional () -> per-head sink logits [H] (gpt-oss), run inside FA4's softmax;
-        # set by VLLMModelWrapper. Without FA4 it falls back to the out_transform rescale.
-        self.learnable_sink = None
+        # set by VLLMModelWrapper. Without FA4, out_transform rescales instead.
+        self.get_learnable_sink = None
 
         self.enable_gqa = self.num_heads > self.num_kv_heads
 
@@ -251,7 +251,7 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         if fa_impl in (None, "FA2") or is_in_batch_invariant_mode():
             extra_kwargs["num_splits"] = 1
 
-        if self.learnable_sink is not None and fa_impl == "FA4":
+        if self.get_learnable_sink is not None and fa_impl == "FA4":
             return self._forward_fa4_with_sink(
                 query,
                 key_cache,
@@ -301,10 +301,10 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         sliding_window_size: tuple[int, int],
         num_splits: int | None,
     ) -> torch.Tensor:
-        """Paged FA4 attention with the sink logit in the softmax, written into ``output``.
+        """Paged FA4 attention with the sink logit in the softmax, written into `output`.
 
-        Mirrors the kwargs torch's FA4 wrapper passes for varlen_attn_out (torch's varlen API
-        has no sink input), plus ``learnable_sink``.
+        Passes the kwargs torch's FA4 wrapper passes for `varlen_attn_out`, plus
+        `learnable_sink`, which torch's varlen API doesn't take.
         """
         from flash_attn.cute.interface import _flash_attn_fwd
 
@@ -325,7 +325,7 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             max_seqlen_k=attn_metadata.max_seq_len,
             seqused_k=attn_metadata.seq_lens,
             page_table=attn_metadata.block_table,
-            learnable_sink=self.learnable_sink(),
+            learnable_sink=self.get_learnable_sink(),
             num_splits=num_splits,
             out=output[:num_actual_tokens],
         )

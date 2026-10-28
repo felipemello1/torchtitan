@@ -575,8 +575,10 @@ class VLLMModelWrapper(Module):
         )
 
     def _inject_attention_sinks(self) -> None:
-        """Give each gpt-oss attention's vLLM backend its sinks: FA4 runs them in the
-        kernel; other kernels use the sink-rescale hook."""
+        """Give each gpt-oss attention's vLLM backend its sinks:
+        - FA4: `get_learnable_sink`, run inside the kernel's softmax;
+        - other kernels: `out_transform`, the rescale through the LSE.
+        """
         from torchtitan.models.gpt_oss.model import (
             apply_attention_sink_rescale,
             GptOssAttention,
@@ -588,7 +590,7 @@ class VLLMModelWrapper(Module):
             impl = module.inner_attention.vllm_attn.impl
             # Read sinks per call: FSDP swaps the parameter between its sharded
             # and unsharded tensors and frees the sharded storage after unsharding.
-            impl.learnable_sink = lambda attention=module: attention.sinks
+            impl.get_learnable_sink = lambda attention=module: attention.sinks
             impl.out_transform = (
                 lambda out, lse, attention=module: apply_attention_sink_rescale(
                     out, lse, attention.sinks

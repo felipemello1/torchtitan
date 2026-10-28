@@ -436,9 +436,10 @@ class TestPackedVarlenInnerAttention(unittest.TestCase):
         metadata = create_varlen_metadata_for_document(torch.tensor([0, 1, 0, 1, 2]))
         inner_attention = VarlenInnerAttention.Config().build()
 
-        with patch(
-            "torchtitan.models.common.attention.attention._varlen_attn",
-            return_value=(q_THK, lse_HT),
+        module = "torchtitan.models.common.attention.attention"
+        with (
+            patch(f"{module}.current_flash_attention_impl", return_value=None),
+            patch(f"{module}._varlen_attn", return_value=(q_THK, lse_HT)),
         ):
             out_THV = inner_attention(
                 q_THK,

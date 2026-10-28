@@ -397,8 +397,10 @@ class VarlenInnerAttention(InnerAttention):
         learnable_sink: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """``learnable_sink``: per-head sink logits (gpt-oss), shape ``[H]``; each query's
-        softmax gets one extra logit that takes probability mass but has no value."""
+        """
+        Args:
+            learnable_sink: per-head sink logits `[H]` (gpt-oss), see `varlen_attn_with_sink`.
+        """
         assert isinstance(
             attention_metadata, VarlenAttentionMetadata
         ), f"attention_metadata must be instance of VarlenAttentionMetadata but got {type(attention_metadata)}"
@@ -436,8 +438,8 @@ class VarlenInnerAttention(InnerAttention):
             attn_dtype = torch.bfloat16
 
         if learnable_sink is not None:
-            # FA4 is called directly (not a torch op), so traced and compiled graphs
-            # keep the LSE rescale below.
+            # flash_attn_varlen_func is not a torch op, so torch.compile and make_fx
+            # can't trace it: traced graphs keep the LSE rescale below.
             tracing = torch.compiler.is_compiling() or get_proxy_mode() is not None
             if fa_impl == "FA4" and not tracing:
                 return varlen_attn_with_sink(
@@ -790,7 +792,11 @@ def varlen_attn_with_lse(*args, **kwargs):
 def apply_attention_sink_rescale(
     out: torch.Tensor, lse: torch.Tensor, sinks: torch.Tensor
 ) -> torch.Tensor:
-    """Rescale attention output by the learned per-head sink term."""
+    """Rescale attention output by the learned per-head sink term.
+
+    Example:
+        out [T, H, D], lse [T, H], sinks [H] -> out * sigmoid(lse - sinks)[..., None]
+    """
     sinks = sinks.view(*([1] * (lse.ndim - 1)), -1)
     sink_scale = torch.sigmoid(lse - sinks).unsqueeze(-1)
     return out * sink_scale.to(out.dtype)
@@ -811,24 +817,32 @@ def varlen_attn_with_sink(
     learnable_sink: torch.Tensor,
     num_splits: int | None = None,
 ) -> torch.Tensor:
-    """FA4 varlen attention with a learned per-head sink logit in the softmax.
+    """FA4 varlen attention with a learned per-head sink logit in each query's softmax.
 
-    Same result as ``apply_attention_sink_rescale`` on the LSE, without the LSE round
-    trip and its elementwise kernels. Calls FA4 directly: torch's ``varlen_attn`` has
-    no sink input.
+    For query t of head h (the sink logit has no value; it only takes probability mass):
+        p = softmax([s_0, ..., s_t, learnable_sink[h]]),  s_j = scale * q_t . k_j
+        out[t, h] = p_0 * v_0 + ... + p_t * v_t
 
-    TODO: switch to ``varlen_attn`` once it accepts a sink.
+    Why not `apply_attention_sink_rescale` (`out * sigmoid(lse - sink)` after varlen)?
+    It adds elementwise kernels, and its q/k grads miss the sink term: varlen's LSE is
+    not differentiable.
+
+    TODO: call torch's `varlen_attn` once it takes a sink (it doesn't today).
 
     Example:
-        out_THV = varlen_attn_with_sink(q_THK, k_THK, v_THV, cu_seq, cu_seq, 4096, 4096,
-                                        scale=None, window_size=(-1, 0), learnable_sink=sinks_H)
+        # 2 documents, of 3 and 5 tokens
+        cu_seq = torch.tensor([0, 3, 8], dtype=torch.int32, device="cuda")
+        out_THV = varlen_attn_with_sink(
+            q_THK, k_THK, v_THV, cu_seq_q=cu_seq, cu_seq_k=cu_seq, max_q=5, max_k=5,
+            scale=None, window_size=(-1, 0), learnable_sink=sinks_H,
+        )
     """
     from flash_attn.cute import flash_attn_varlen_func
 
     left, right = window_size
     deterministic = torch.are_deterministic_algorithms_enabled()
     if num_splits is None:
-        # torch's FA4 wrapper: FA4's split heuristic unless deterministic.
+        # As torch's FA4 wrapper: one split when deterministic, else FA4's heuristic (0).
         num_splits = 1 if deterministic else 0
     out, _ = flash_attn_varlen_func(
         query,
