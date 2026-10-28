@@ -401,6 +401,10 @@ class VLLMModelWrapper(Module):
             # spmd context.
             with self.parallelism_context.activate_spmd():
                 self.model.init_weights(buffer_device=None)
+        # The generator runs no backward. Code that checks requires_grad, not grad mode,
+        # would treat it as training: the inference Dist-MoE context rejects such
+        # operands, and FA4 writes an LSE for a sink that requires grad.
+        self.model.requires_grad_(False)
         self._initialize_dist_moe_runtime(
             dist_moe_runtime,
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -554,11 +558,6 @@ class VLLMModelWrapper(Module):
                 "backward, so a training context's activation slots would reserve "
                 "memory it can never use."
             )
-        # An inference context rejects any operand carrying requires_grad, and
-        # it tests the attribute rather than whether grad is enabled.
-        for module in self.model.modules():
-            if isinstance(module, DistMoeRoutedExperts):
-                module.requires_grad_(False)
         self._dist_moe_runtime = runtime_config.build(
             model_parts=[self.model],
             parallelism_context=self.parallelism_context,

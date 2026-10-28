@@ -180,7 +180,8 @@ def test_paged_sink_attention_matches_varlen(window_size, num_splits, decode):
         torch.randn(64, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
         for _ in range(2)
     )
-    # A parameter, as the generator passes it: FA4 then also writes the LSE.
+    # The trainer passes the sink parameter; the frozen generator's sink has no grad,
+    # so FA4 skips the LSE there.
     sinks = torch.randn(num_heads, device="cuda", dtype=torch.bfloat16).requires_grad_()
     # Decode: one query per sequence, its last token, against all of its keys.
     cu_seq_q, max_q = cu_seq, 40
@@ -197,11 +198,11 @@ def test_paged_sink_attention_matches_varlen(window_size, num_splits, decode):
         torch.cat((to_pages(k), to_pages(v)), dim=-1).transpose(1, 2).contiguous()
     )
     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
-    kwargs = dict(
-        scale=None, window_size=window_size, learnable_sink=sinks, num_splits=num_splits
-    )
+    kwargs = dict(scale=None, window_size=window_size, num_splits=num_splits)
     with torch.no_grad():
-        expected = varlen_attn_with_sink(q, k, v, cu_seq_q, cu_seq, max_q, 40, **kwargs)
+        expected = varlen_attn_with_sink(
+            q, k, v, cu_seq_q, cu_seq, max_q, 40, learnable_sink=sinks, **kwargs
+        )
         actual = varlen_attn_out_with_sink(
             torch.empty_like(q),
             q,
@@ -212,6 +213,7 @@ def test_paged_sink_attention_matches_varlen(window_size, num_splits, decode):
             40,
             seqused_k=torch.tensor([40, 24], device="cuda", dtype=torch.int32),
             block_table=block_table,
+            learnable_sink=sinks.detach(),
             **kwargs,
         )
     if num_splits == 1:
