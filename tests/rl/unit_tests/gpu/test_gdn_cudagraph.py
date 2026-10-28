@@ -196,7 +196,8 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
     inputs = torch.randn(4, 6144, device=device, dtype=torch.bfloat16)
     weight = torch.randn(6144, 4, device=device, dtype=torch.bfloat16)
     a, b = torch.randn(2, 4, 16, device=device)
-    A_log, bias = torch.randn(2, 16, device=device)
+    # bf16, as the generator holds them: the decode kernel takes them without a cast.
+    A_log, bias = torch.randn(2, 16, device=device).bfloat16()
 
     def forward():
         return layer._forward(inputs, a, b, weight, None, A_log, bias)
