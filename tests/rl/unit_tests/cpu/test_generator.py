@@ -878,28 +878,34 @@ def test_cuda_graph_full_mode_extends_capture_sizes_to_chunk():
     assert 500 in cfg.cudagraph_capture_sizes  # decode batch captured exactly
 
 
-@pytest.mark.parametrize(
-    "max_num_seqs, max_num_batched_tokens", [(256, None), (64, 8192), (512, 32768)]
-)
-def test_cuda_graph_full_mode_capture_sizes_pad_at_most_one_eighth_above_1024(
-    max_num_seqs, max_num_batched_tokens
-):
-    # A step replays the smallest captured size that holds it. With powers of 2 a
-    # Qwen3.5 mixed step (3 whole 512-token prompts + decodes, ~1.6k tokens) ran the
-    # 2048 graph; above 1024 the grid now pads at most 1/8 (8 sizes per doubling).
+def test_cuda_graph_full_mode_capture_sizes_8_per_doubling_above_1024():
+    # Above 1024 tokens a step pads at most 1/8: every 128 to 2048, every 256 above.
     cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
-        max_num_seqs=max_num_seqs,
-        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=256,
+        max_num_batched_tokens=3000,
         expert_sequence_parallel_size=1,
         enable_sequence_parallel=False,
     )
     sizes = cfg.cudagraph_capture_sizes
-    assert sizes[-1] == (max_num_batched_tokens or 2048)
-    assert [s for s in sizes if s <= 1024] == sorted(
-        {1 << i for i in range(11)} | {max_num_seqs}
+    assert sizes == (
+        [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+        + [1152, 1280, 1408, 1536, 1664, 1792, 1920, 2048]
+        + [2304, 2560, 2816, 3000]
     )
-    assert all(b - a <= a / 8 for a, b in zip(sizes, sizes[1:]) if a >= 1024)
-    assert min(size for size in sizes if size >= 1536 + 61) == 1664
+    # A Qwen3.5 mixed step: 3 whole 512-token prompts + 61 decodes.
+    qwen35_mixed_step_tokens = 3 * 512 + 61
+    assert min(size for size in sizes if size >= qwen35_mixed_step_tokens) == 1664
+
+
+def test_expert_sequence_parallel_rejects_no_decode_cuda_graph_sizes():
+    # Degree 3 keeps only multiples of 384 (1152, 1536, 1920): a decode batch of
+    # at most 256 tokens would always replay a mixed-step graph.
+    with pytest.raises(ValueError, match="No CUDA graph capture sizes"):
+        VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
+            max_num_seqs=256,
+            expert_sequence_parallel_size=3,
+            enable_sequence_parallel=False,
+        )
 
 
 def test_cuda_graph_rejects_nonpositive_max_num_seqs():
