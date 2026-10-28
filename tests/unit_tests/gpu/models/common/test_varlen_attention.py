@@ -105,7 +105,7 @@ def test_learnable_sink_matches_fp32_reference(sliding_window_size):
     """FA4's in-kernel sink: output and q/k/v/sink grads match an fp32 softmax with the sink logit.
 
     The LSE rescale it replaces gets no gradient through torch's LSE (non-differentiable), so at
-    these shapes its q/k grads are off by 9-21% rel L2 (fp64); the kernel path is off by ~2e-3.
+    these shapes its q/k grads are off by 12-13% rel L2; the kernel path is off by ~2e-3.
     """
     torch.manual_seed(42)
     config = (
@@ -162,10 +162,12 @@ def test_learnable_sink_matches_fp32_reference(sliding_window_size):
         assert relative_error.item() < 1e-2, relative_error.item()
 
 
+@pytest.mark.parametrize("decode", [False, True])
 @pytest.mark.parametrize("num_splits", [None, 1])
 @pytest.mark.parametrize("window_size", [(-1, 0), (7, 0)])
-def test_paged_sink_attention_matches_varlen(window_size, num_splits):
+def test_paged_sink_attention_matches_varlen(window_size, num_splits, decode):
     """The generator's paged sink call matches the trainer's: bitwise with one split."""
+    pytest.importorskip("flash_attn.cute")
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("in-kernel sinks run on FA4 (SM100)")
     torch.manual_seed(42)
@@ -178,7 +180,13 @@ def test_paged_sink_attention_matches_varlen(window_size, num_splits):
         torch.randn(64, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
         for _ in range(2)
     )
-    sinks = torch.randn(num_heads, device="cuda", dtype=torch.bfloat16)
+    # A parameter, as the generator passes it: FA4 then also writes the LSE.
+    sinks = torch.randn(num_heads, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    # Decode: one query per sequence, its last token, against all of its keys.
+    cu_seq_q, max_q = cu_seq, 40
+    if decode:
+        cu_seq_q, max_q = torch.arange(3, device="cuda", dtype=torch.int32), 1
+        q = q[cu_seq[1:] - 1]
 
     def to_pages(x):
         padded = [F.pad(x[:40], (0, 0, 0, 0, 0, 8)), F.pad(x[40:], (0, 0, 0, 0, 0, 8))]
@@ -193,14 +201,14 @@ def test_paged_sink_attention_matches_varlen(window_size, num_splits):
         scale=None, window_size=window_size, learnable_sink=sinks, num_splits=num_splits
     )
     with torch.no_grad():
-        expected = varlen_attn_with_sink(q, k, v, cu_seq, cu_seq, 40, 40, **kwargs)
+        expected = varlen_attn_with_sink(q, k, v, cu_seq_q, cu_seq, max_q, 40, **kwargs)
         actual = varlen_attn_out_with_sink(
             torch.empty_like(q),
             q,
             key_cache,
             value_cache,
-            cu_seq,
-            40,
+            cu_seq_q,
+            max_q,
             40,
             seqused_k=torch.tensor([40, 24], device="cuda", dtype=torch.int32),
             block_table=block_table,

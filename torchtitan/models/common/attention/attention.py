@@ -879,7 +879,7 @@ def varlen_attn_out_with_sink(
     Example:
         # 2 sequences decoding one token each; sequence 0 has 300 keys, sequence 1 has 17
         varlen_attn_out_with_sink(
-            out_THV, q_THK, key_cache, value_cache, cu_seq_q=cu_seq_q, max_q=1, max_k=65536,
+            out_THV, q_THK, key_cache, value_cache, cu_seq_q=cu_seq_q, max_q=1, max_k=300,
             seqused_k=torch.tensor([300, 17], dtype=torch.int32, device="cuda"),
             block_table=block_table, scale=None, window_size=(-1, 0), learnable_sink=sinks_H,
         )
@@ -915,12 +915,12 @@ def _fa4_mask_and_num_splits(
     """FA4's `causal`, window and `num_splits` arguments, set as torch's FA4 wrapper sets them.
 
     Example (SM100, not deterministic):
-        window_size (-1, 0),  num_splits None -> (True, None, None, 0)   # 0: FA4 picks
+        window_size (-1, 0),  num_splits None -> (True, None, 0, 0)   # 0: FA4 picks
         window_size (127, 0), num_splits 1    -> (False, 127, 0, 1)
         any window, on SM120                  -> num_splits 1 (split-KV is SM100-only)
     """
     left, right = window_size
-    if torch.cuda.get_device_capability(device)[0] != 10:
+    if _cuda_major(device.index) != 10:
         num_splits = 1
     elif num_splits is None:
         num_splits = 1 if torch.are_deterministic_algorithms_enabled() else 0
@@ -930,6 +930,12 @@ def _fa4_mask_and_num_splits(
         None if right < 0 else right,
         num_splits,
     )
+
+
+# Cached: the generator calls this per layer in eager mode, where host time counts.
+@functools.cache
+def _cuda_major(device_index: int | None) -> int:
+    return torch.cuda.get_device_capability(device_index)[0]
 
 
 def local_head_split(
