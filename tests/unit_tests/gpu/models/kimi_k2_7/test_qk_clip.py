@@ -6,6 +6,7 @@
 
 # @lint-ignore-every CITRINE
 
+import importlib.util
 import unittest
 from types import SimpleNamespace
 from typing import cast
@@ -33,6 +34,7 @@ from torchtitan.models.deepseek_v3.attention import DeepSeekMLAAttention
 from torchtitan.models.kimi_k2_7.qk_clip import (
     qk_clip,
     QKClipFlexInnerAttention,
+    QKClipVarlenInnerAttention,
     register_qk_clip_hook,
 )
 
@@ -171,6 +173,26 @@ class QKClipTest(unittest.TestCase):
             [model],
             reduction_mesh=reduction_mesh,
         )
+
+    def test_qk_clip_collects_varlen_maxima(self) -> None:
+        attention = DeepSeekMLAAttention.__new__(DeepSeekMLAAttention)
+        nn.Module.__init__(attention)
+        attention.inner_attention = _qk_clip_mla_attention()
+        # Skip __init__'s cudnn-frontend check: this test runs no attention kernel.
+        inner = QKClipVarlenInnerAttention.__new__(QKClipVarlenInnerAttention)
+        nn.Module.__init__(inner)
+        inner.max_attention_logits_H = [torch.tensor([50.0, 400.0])]
+        attention.inner_attention.inner_attention = inner
+        model = nn.Module()
+        model.add_module("attention", attention)
+        reduction_mesh = cast(DeviceMesh, SimpleNamespace(size=lambda: 1))
+
+        with patch("torchtitan.models.kimi_k2_7.qk_clip._clip_mla_weights") as clip:
+            qk_clip([model], reduction_mesh=reduction_mesh)
+
+        clip.assert_called_once()
+        torch.testing.assert_close(clip.call_args.args[1], torch.tensor([1.0, 0.25]))
+        self.assertFalse(inner.max_attention_logits_H)
 
 
 @pytest.mark.multi_gpu
@@ -344,3 +366,138 @@ class QKClipDistributedTest(DTensorTestBase):
         # One packed MAX all-reduce covers every layer and head; the 8 weights
         # this model clips must add nothing on top of it.
         self.assertEqual(total, 1, f"expected one collective, got {collectives}")
+
+
+def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    diff = actual.float() - expected.float()
+    return (diff.norm() / expected.float().norm()).item()
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available()
+    and torch.version.hip is None
+    and torch.cuda.get_device_capability() >= (10, 0)
+    and importlib.util.find_spec("cudnn") is not None
+    and importlib.util.find_spec("cudnn.flex_attention") is not None,
+    "cudnn-frontend interval-mask attention needs SM100+ and nvidia-cudnn-frontend>=1.31",
+)
+class QKClipVarlenInnerAttentionTest(unittest.TestCase):
+    """QKClipVarlenInnerAttention against QKClipFlexInnerAttention at MLA head dims."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+        # Two packed documents and 128 padding tokens; MLA head dims (192 query/key,
+        # 128 value).
+        self.positions = torch.cat(
+            [torch.arange(384), torch.arange(512), torch.arange(128)]
+        ).cuda()
+        self.padding_mask = self.positions.new_zeros(1024, dtype=torch.bool)
+        self.padding_mask[896:] = True
+        num_tokens, num_heads = self.positions.numel(), 4
+        self.scale = 192**-0.5
+        self.q = torch.randn(
+            num_tokens, num_heads, 192, device="cuda", dtype=torch.bfloat16
+        )
+        self.k = torch.randn(
+            num_tokens, num_heads, 192, device="cuda", dtype=torch.bfloat16
+        )
+        # A strided value, as materialize_mla_kv returns it.
+        self.v = torch.randn(
+            num_tokens, num_heads, 256, device="cuda", dtype=torch.bfloat16
+        )[..., 128:]
+        self.grad_out = torch.randn(
+            num_tokens, num_heads, 128, device="cuda", dtype=torch.bfloat16
+        )
+
+    def _run(self, attention: nn.Module, metadata) -> tuple[torch.Tensor, ...]:
+        q, k, v = (t.detach().requires_grad_() for t in (self.q, self.k, self.v))
+        out = attention(q, k, v, attention_metadata=metadata, scale=self.scale)
+        out.backward(self.grad_out)
+        assert q.grad is not None and k.grad is not None and v.grad is not None
+        return out, q.grad, k.grad, v.grad
+
+    def test_matches_flex_qk_clip(self) -> None:
+        # Masked (query, key) pairs with a ~900 logit: a later key in the same
+        # document, and the previous document's last key. Visible logits stay below ~30.
+        for query, key in ((0, 1), (384, 383)):
+            self.q[query] = 8.0
+            self.k[key] = 8.0
+        flex = QKClipFlexInnerAttention.Config().build().train()
+        expected = self._run(
+            flex, FlexInnerAttention.Config().build_attention_metadata(self.positions)
+        )
+        metadata_config = QKClipVarlenInnerAttention.Config()
+        for name, metadata in (
+            ("packed", metadata_config.build_attention_metadata(self.positions)),
+            (
+                "fixed slots",
+                metadata_config.build_attention_metadata(
+                    self.positions,
+                    padding_mask=self.padding_mask,
+                    max_num_documents=4,
+                    max_context_length=1024,
+                ),
+            ),
+        ):
+            with self.subTest(name):
+                varlen = QKClipVarlenInnerAttention.Config().build().train()
+                actual = self._run(varlen, metadata)
+                # Both are bf16 kernels; each is ~2e-3 from fp32.
+                for tensor_name, a, e in zip(
+                    ("out", "dq", "dk", "dv"), actual, expected, strict=True
+                ):
+                    self.assertLess(_rel_l2(a, e), 1e-2, tensor_name)
+                torch.testing.assert_close(
+                    varlen.max_attention_logits_H[0],
+                    flex.max_attention_logits_H[0],
+                    atol=1e-4,
+                    rtol=1e-4,
+                )
+                self.assertLess(varlen.max_attention_logits_H[0].max().item(), 100.0)
+
+    def test_layers_share_one_mask_plan_per_microbatch(self) -> None:
+        from cudnn import flex_attention
+
+        # Two microbatches with the same token count and different documents.
+        microbatch_positions = (
+            self.positions,
+            torch.cat([torch.arange(512), torch.arange(512)]).cuda(),
+        )
+        layers = [QKClipVarlenInnerAttention.Config().build().train() for _ in range(3)]
+        with patch.object(
+            flex_attention,
+            "create_mask_plan",
+            wraps=flex_attention.create_mask_plan,
+        ) as create_mask_plan:
+            for positions in microbatch_positions:
+                metadata = QKClipVarlenInnerAttention.Config().build_attention_metadata(
+                    positions
+                )
+                for layer in layers:
+                    self._run(layer, metadata)
+        self.assertEqual(create_mask_plan.call_count, 2)
+
+    def test_records_training_maxima_once(self) -> None:
+        attention = QKClipVarlenInnerAttention.Config().build()
+        metadata = QKClipVarlenInnerAttention.Config().build_attention_metadata(
+            self.positions
+        )
+        attention.eval()
+        with torch.no_grad():
+            attention(
+                self.q, self.k, self.v, attention_metadata=metadata, scale=self.scale
+            )
+        self.assertFalse(attention.max_attention_logits_H)
+
+        attention.train()
+        q = self.q.detach().requires_grad_()
+
+        def forward(q: torch.Tensor) -> torch.Tensor:
+            # A dense output gradient: cudnn-frontend's backward rejects the expanded one of .sum().
+            out = attention(
+                q, self.k, self.v, attention_metadata=metadata, scale=self.scale
+            )
+            return (out * self.grad_out).sum()
+
+        remat.checkpoint(region_name="attention")(forward)(q).backward()
+        self.assertEqual(len(attention.max_attention_logits_H), 1)

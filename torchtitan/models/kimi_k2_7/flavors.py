@@ -52,7 +52,7 @@ from torchtitan.models.common.vision_encoder_sharding import (
 )
 from torchtitan.models.deepseek_v3.flavors import build_mla_moe_layers
 from .model import KimiK25Model
-from .qk_clip import QKClipFlexInnerAttention
+from .qk_clip import QKClipFlexInnerAttention, QKClipVarlenInnerAttention
 from .sharding import (
     moonvit_encoder_sharding_config,
     moonvit_projector_sharding_config,
@@ -257,10 +257,14 @@ def _vision_encoder_config(
 
 def _qk_clip_attention_config(
     attn_backend: str,
-) -> QKClipFlexInnerAttention.Config:
-    if attn_backend != "flex":
-        raise ValueError("Kimi QK clipping requires the FlexInnerAttention backend.")
-    return QKClipFlexInnerAttention.Config()
+) -> QKClipFlexInnerAttention.Config | QKClipVarlenInnerAttention.Config:
+    if attn_backend == "flex":
+        return QKClipFlexInnerAttention.Config()
+    if attn_backend == "varlen":
+        return QKClipVarlenInnerAttention.Config()
+    raise ValueError(
+        f"Kimi QK clipping supports the flex and varlen backends, got {attn_backend!r}."
+    )
 
 
 def _build_kimi_layers(**kwargs) -> list[TransformerBlock.Config]:
