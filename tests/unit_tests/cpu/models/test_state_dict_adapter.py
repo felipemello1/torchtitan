@@ -261,6 +261,49 @@ class Llama3FusedLinearStateDictAdapterTest(unittest.TestCase):
         model.load_state_dict(restored, strict=True)
 
 
+class Llama3FusedLinearShardedStackedDimTest(DTensorTestBase):
+    @property
+    def world_size(self) -> int:
+        return 3
+
+    @with_comms
+    def test_hf_roundtrip_of_w13_sharded_along_its_stacked_dim(self) -> None:
+        """FSDP keeps Shard(0) on a w13 whose rows its degree doesn't divide, so the
+        stacked dim (w1 | w3) is the sharded one and to_hf can't unbind it in place."""
+        build_config, max_context_length = LLAMA3_MODEL_FLAVORS["debugmodel"]
+        config = build_config(
+            attn_backend="flex",
+            seq_len=max_context_length,
+            parallelism=ParallelismConfig(),
+        )
+        mesh = init_device_mesh(
+            self.device_type,
+            (self.world_size,),
+            mesh_dim_names=("dp_shard",),
+        )
+        w13_key = "layers.0.feed_forward.w13.weight"
+        full_w13 = torch.arange(
+            2 * 4 * 3, dtype=torch.float32, device=self.device_type
+        ).reshape(2, 4, 3)
+        adapter = Llama3StateDictAdapter(config, hf_assets_path=None)
+
+        hf_state_dict = adapter.to_hf(
+            {w13_key: distribute_tensor(full_w13, mesh, (Shard(0),))}
+        )
+        for hf_key, expected in (
+            ("model.layers.0.mlp.gate_proj.weight", full_w13[0]),
+            ("model.layers.0.mlp.up_proj.weight", full_w13[1]),
+        ):
+            torch.testing.assert_close(
+                hf_state_dict[hf_key].full_tensor(), expected, rtol=0, atol=0
+            )
+
+        restored_w13 = adapter.from_hf(hf_state_dict)[w13_key]
+        self.assertIsInstance(restored_w13, DTensor)
+        self.assertEqual(restored_w13.placements, (Shard(0),))
+        torch.testing.assert_close(restored_w13.full_tensor(), full_w13, rtol=0, atol=0)
+
+
 class Qwen3StateDictAdapterTest(unittest.TestCase):
     def test_hf_roundtrip_preserves_tied_embedding_shape(self) -> None:
         build_config, max_context_length = QWEN3_MODEL_FLAVORS["debugmodel"]
