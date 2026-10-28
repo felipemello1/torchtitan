@@ -42,6 +42,10 @@ update from the Kimi K2 technical report. They record the maximum attention
 score for each MLA head, reduce those maxima across data- and context-parallel
 ranks, and clip the Q/K projection weights after each optimizer step.
 The update currently uses the report values `threshold=100.0` and `alpha=0.5`.
+Recipes record the maxima with FlexAttention (`attn_backend="flex"`).
+`attn_backend="varlen"` records them with cudnn-frontend's interval-mask
+attention instead: it needs `nvidia-cudnn-frontend>=1.31`, is tested on
+Blackwell (SM100) only, and does not support context parallelism.
 
 ## Supported Parallelisms
 

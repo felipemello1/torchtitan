@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import importlib.util
 from dataclasses import dataclass
 from typing import Any, cast, ClassVar
 
@@ -15,6 +16,7 @@ import torch_remat as remat
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.nn.attention.flex_attention import AuxRequest
+from torch.utils.weak import WeakTensorKeyDictionary
 
 from torchtitan.components.optim import OptimizersContainer
 from torchtitan.distributed import ParallelismContext
@@ -25,6 +27,7 @@ from torchtitan.models.common.attention import (
     MLAAttention,
     VarlenAttentionMetadata,
 )
+from torchtitan.models.common.attention.cp_mla import UlyssesMLAAttention
 from torchtitan.models.deepseek_v3.attention import DeepSeekMLAAttention
 
 # Shape suffixes:
@@ -56,13 +59,12 @@ class QKClipFlexInnerAttention(FlexInnerAttention):
 
 
 class QKClipVarlenInnerAttention(InnerAttention):
-    """Varlen attention that records the maximum score for each query head.
+    """Document-causal varlen attention that records the maximum score for each query head.
 
-    torch's ``varlen_attn`` cannot return the maximum score, so this runs cuDNN's
-    interval-mask attention (``cudnn.flex_attention``, cudnn-frontend >= 1.31), which
-    returns it per head. On GB300 at MLA's head dims (192/128) its forward+backward is
-    2.5-3.9x faster than ``QKClipFlexInnerAttention`` and within 0-25% of cuDNN varlen.
-    cuDNN's backward needs a dense output gradient (an expanded one raises).
+    torch's ``varlen_attn`` returns only the LSE, so this calls cudnn-frontend's
+    interval-mask attention (``cudnn.flex_attention``, >= 1.31), JIT-compiled CuTe DSL
+    kernels that also return the maximum. Their backward needs a dense output gradient
+    (an expanded one raises).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -87,11 +89,23 @@ class QKClipVarlenInnerAttention(InnerAttention):
                 max_context_length=max_context_length,
             )
 
-    # Every layer of a microbatch shares one mask plan: building one costs ~1-2 ms of host time.
-    _mask_plan_cache: ClassVar[tuple[tuple, Any] | None] = None
+    # One mask plan per microbatch, shared by every layer: a build costs 1-2 ms of host
+    # time and a blocking device-to-host copy. Keyed by the metadata's ``cu_seq_q``, so
+    # a plan is freed together with its microbatch's metadata.
+    _mask_plans: ClassVar[WeakTensorKeyDictionary] = WeakTensorKeyDictionary()
 
     def __init__(self, config: Config) -> None:
         super().__init__()
+        try:
+            found = importlib.util.find_spec("cudnn.flex_attention") is not None
+        except ModuleNotFoundError:  # Parent package `cudnn` missing.
+            found = False
+        if not found:
+            raise ValueError(
+                "Kimi QK clipping on the varlen backend needs nvidia-cudnn-frontend>=1.31, "
+                "but 'cudnn.flex_attention' is not installed. Install it or select "
+                "attn_backend='flex'."
+            )
         self.max_attention_logits_H: list[torch.Tensor] = []
 
     @classmethod
@@ -105,25 +119,19 @@ class QKClipVarlenInnerAttention(InnerAttention):
         """Build (or reuse) the document-causal mask plan for this microbatch."""
         from cudnn.flex_attention import create_mask_plan
 
+        cu_seq = attention_metadata.cu_seq_q
         needs_backward = torch.is_grad_enabled() and any(
             t.requires_grad for t in (q_THK, k_THK, v_THV)
         )
-        key = (
-            attention_metadata.cu_seq_q,
-            q_THK.shape,
-            k_THK.shape,
-            v_THV.shape,
-            q_THK.dtype,
-            needs_backward,
-        )
-        cached = cls._mask_plan_cache
-        if cached is not None and cached[0][0] is key[0] and cached[0][1:] == key[1:]:
+        key = (q_THK.shape, k_THK.shape, v_THV.shape, q_THK.dtype, needs_backward)
+        cached = cls._mask_plans.get(cu_seq)
+        if cached is not None and cached[0] == key:
             return cached[1]
-        # Each query sees keys [0, position + 1) of its own document.
-        cu_seq = attention_metadata.cu_seq_q
+        # Each query sees keys up to itself within its own document, given as the end of
+        # that range per query: cu_seq [0, 3, 5] -> visible_end [1, 2, 3, 1, 2].
         token_T = torch.arange(q_THK.shape[0], device=q_THK.device, dtype=torch.int32)
         doc_start_T = cu_seq[torch.searchsorted(cu_seq, token_T, right=True) - 1]
-        visible_end_11T = (token_T - doc_start_T + 1).view(1, 1, -1).contiguous()
+        visible_end_11T = (token_T - doc_start_T + 1).view(1, 1, -1)
         plan = create_mask_plan(
             visible_end_11T,
             q_THK,
@@ -135,7 +143,7 @@ class QKClipVarlenInnerAttention(InnerAttention):
             max_seqlen_k=attention_metadata.max_k,
             build_backward=needs_backward,
         )
-        cls._mask_plan_cache = (key, plan)
+        cls._mask_plans[cu_seq] = (key, plan)
         return plan
 
     def forward(
@@ -150,15 +158,16 @@ class QKClipVarlenInnerAttention(InnerAttention):
     ) -> torch.Tensor:
         from cudnn.flex_attention import flex_attn_func
 
-        if attention_metadata.window_size != (-1, 0):
-            raise ValueError(
-                f"{type(self).__name__} supports causal attention only, "
-                f"got window_size={attention_metadata.window_size}."
+        if kwargs:
+            # e.g. out_transform: this kernel has no output epilogue to apply it in.
+            raise TypeError(
+                f"{type(self).__name__} got unsupported arguments: {sorted(kwargs)}"
             )
-        plan = self._mask_plan(q_THK, k_THK, v_THV, attention_metadata)
-        # Like FlexInnerAttention.compiled_flex_attn: the kernel runs outside SPMD
-        # typechecking and the output takes the query's type.
+
+        # Like FlexInnerAttention.compiled_flex_attn: the plan build and the kernel run
+        # outside SPMD typechecking, and the output takes the query's type.
         with spmd.no_typecheck():
+            plan = self._mask_plan(q_THK, k_THK, v_THV, attention_metadata)
             out_THV, max_logit_H = flex_attn_func(
                 q_THK,
                 k_THK,
@@ -176,6 +185,10 @@ class QKClipVarlenInnerAttention(InnerAttention):
             # Same per-head maximum of the scaled logits as QKClipFlexInnerAttention.
             self.max_attention_logits_H.append(max_logit_H)
         return out_THV
+
+
+# Inner attentions that record per-head maximum logits for QK clipping.
+_QKClipAttention = QKClipFlexInnerAttention | QKClipVarlenInnerAttention
 
 
 def _validate_head_sharding(weight: DTensor) -> None:
@@ -206,11 +219,6 @@ def _replicated_scales(scales_H: torch.Tensor, weight: DTensor) -> DTensor:
         tuple(Replicate() for _ in weight.placements),
         run_check=False,
     )
-
-
-# Inner attentions that record per-head maximum logits for QK clipping.
-_QK_CLIP_ATTENTIONS = (QKClipFlexInnerAttention, QKClipVarlenInnerAttention)
-_QKClipAttention = QKClipFlexInnerAttention | QKClipVarlenInnerAttention
 
 
 @torch.no_grad()
@@ -285,7 +293,7 @@ def qk_clip(
         for module in model_part.modules()
         if isinstance(module, DeepSeekMLAAttention)
         and isinstance(module.inner_attention, MLAAttention)
-        and isinstance(module.inner_attention.inner_attention, _QK_CLIP_ATTENTIONS)
+        and isinstance(module.inner_attention.inner_attention, _QKClipAttention)
     ]
     if not attention_layers:
         return
@@ -326,6 +334,18 @@ def register_qk_clip_hook(
     parallelism_context: ParallelismContext,
 ) -> None:
     """Apply QK clipping after each ordinary optimizer step."""
+    for model_part in model_parts:
+        for module in model_part.modules():
+            # Ulysses gives each CP rank different heads, but qk_clip MAX-reduces head
+            # maxima over CP ranks as if every rank held the same heads.
+            if isinstance(module, UlyssesMLAAttention) and isinstance(
+                module.inner_attention, _QKClipAttention
+            ):
+                raise ValueError(
+                    "Kimi QK clipping with context parallelism requires "
+                    "attn_backend='flex': varlen runs Ulysses CP, which splits "
+                    "attention heads across CP ranks."
+                )
     reduction_mesh = parallelism_context.get_mesh("loss")
 
     def _qk_clip_hook(
