@@ -67,6 +67,7 @@ def _trace(*responses: list[str] | None) -> Trace:
 
 def test_repeated_tool_calls_fires_at_five_identical_responses() -> None:
     assert not repeated_tool_calls(_trace(["ls"], *[["pytest -x"]] * 4))
+    assert not repeated_tool_calls(_trace(*[["pytest -x"]] * 4))
     assert repeated_tool_calls(_trace(["ls"], *[["pytest -x"]] * 5))
     # The whole response's calls must match, not just one of them.
     assert not repeated_tool_calls(_trace(*[["pytest -x"]] * 4, ["pytest -x", "ls"]))
