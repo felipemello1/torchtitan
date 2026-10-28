@@ -25,7 +25,6 @@ from .attention import (  # noqa: F401
     QKVLinear,
     SlidingWindowFlexInnerAttention,
     SlidingWindowVarlenInnerAttention,
-    varlen_attn_with_sink,
     VarlenAttentionMetadata,
     VarlenInnerAttention,
 )

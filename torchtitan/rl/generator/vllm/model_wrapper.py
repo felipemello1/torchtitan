@@ -579,10 +579,8 @@ class VLLMModelWrapper(Module):
         - FA4: `get_learnable_sink`, run inside the kernel's softmax;
         - other kernels: `out_transform`, the rescale through the LSE.
         """
-        from torchtitan.models.gpt_oss.model import (
-            apply_attention_sink_rescale,
-            GptOssAttention,
-        )
+        from torchtitan.models.common.attention import apply_attention_sink_rescale
+        from torchtitan.models.gpt_oss.model import GptOssAttention
 
         for module in self.model.modules():
             if not isinstance(module, GptOssAttention):

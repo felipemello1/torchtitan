@@ -36,6 +36,7 @@ from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.models.base.module import Module
 from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.attention import InnerAttention
+from torchtitan.models.common.attention.attention import varlen_attn_out_with_sink
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.observability.logging import warn_once
 from torchtitan.tools.utils import get_cuda_flash_attention_impl
@@ -252,14 +253,20 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             extra_kwargs["num_splits"] = 1
 
         if self.get_learnable_sink is not None and fa_impl == "FA4":
-            return self._forward_fa4_with_sink(
-                query,
+            return varlen_attn_out_with_sink(
+                output[:num_actual_tokens],
+                query[:num_actual_tokens],
                 key_cache,
                 value_cache,
-                output,
-                attn_metadata,
-                sliding_window_size,
-                extra_kwargs.get("num_splits"),
+                cu_seqlens_q,
+                max_seqlen_q,
+                max_seqlen_k,
+                seqused_k=seqused_k,
+                block_table=block_table,
+                scale=self.scale,
+                window_size=sliding_window_size,
+                learnable_sink=self.get_learnable_sink(),
+                num_splits=extra_kwargs.get("num_splits"),
             )
 
         if self.enable_gqa:
@@ -289,46 +296,6 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         out, lse = result
         out = self.out_transform(out, lse.transpose(0, 1))
         output[:num_actual_tokens].copy_(out)
-        return output[:num_actual_tokens]
-
-    def _forward_fa4_with_sink(
-        self,
-        query: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        output: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
-        sliding_window_size: tuple[int, int],
-        num_splits: int | None,
-    ) -> torch.Tensor:
-        """Paged FA4 attention with the sink logit in the softmax, written into `output`.
-
-        Passes the kwargs torch's FA4 wrapper passes for `varlen_attn_out`, plus
-        `learnable_sink`, which torch's varlen API doesn't take.
-        """
-        from flash_attn.cute.interface import _flash_attn_fwd
-
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        left, right = sliding_window_size
-        if num_splits is None:
-            num_splits = 1 if torch.are_deterministic_algorithms_enabled() else 0
-        _flash_attn_fwd(
-            query[:num_actual_tokens],
-            key_cache,
-            value_cache,
-            softmax_scale=self.scale,
-            causal=(left, right) == (-1, 0),
-            window_size_left=None if left < 0 else left,
-            window_size_right=None if right < 0 else right,
-            cu_seqlens_q=attn_metadata.query_start_loc,
-            max_seqlen_q=attn_metadata.max_query_len,
-            max_seqlen_k=attn_metadata.max_seq_len,
-            seqused_k=attn_metadata.seq_lens,
-            page_table=attn_metadata.block_table,
-            learnable_sink=self.get_learnable_sink(),
-            num_splits=num_splits,
-            out=output[:num_actual_tokens],
-        )
         return output[:num_actual_tokens]
 
 

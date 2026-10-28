@@ -13,7 +13,6 @@
 #   K = query/key head dimension, V = value head dimension.
 
 import functools
-import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, NamedTuple, TYPE_CHECKING, TypeAlias
@@ -21,7 +20,6 @@ from typing import Any, ClassVar, NamedTuple, TYPE_CHECKING, TypeAlias
 import spmd_types as spmd
 import torch
 import torch_remat as remat
-from torch.fx.experimental.proxy_tensor import get_proxy_mode
 from torch.nn.attention import (
     activate_flash_attention_impl,
     current_flash_attention_impl,
@@ -49,13 +47,10 @@ from torchtitan.models.base.module import Module
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
-from torchtitan.observability.logging import warn_once
 from torchtitan.tools.utils import round_up
 
 if TYPE_CHECKING:
     from . import AttentionMetadata
-
-logger = logging.getLogger(__name__)
 
 __all__ = [
     "Attention",
@@ -77,7 +72,6 @@ __all__ = [
     "get_fixed_block_mask_mod",
     "get_sliding_window_mask_mod",
     "local_head_split",
-    "varlen_attn_with_sink",
 ]
 
 
@@ -400,12 +394,13 @@ class VarlenInnerAttention(InnerAttention):
         """
         Args:
             learnable_sink: per-head sink logits `[H]` (gpt-oss), see `varlen_attn_with_sink`.
+                eager, FA4, FLASH_ATTENTION in `sdpa_backends`: inside FA4's softmax, exact grads
+                otherwise (FA2/FA3, cuDNN only, compile, make_fx): `out * sigmoid(lse - sink)`
+                    after varlen; q/k grads miss the sink term
         """
         assert isinstance(
             attention_metadata, VarlenAttentionMetadata
         ), f"attention_metadata must be instance of VarlenAttentionMetadata but got {type(attention_metadata)}"
-        if learnable_sink is not None and out_transform is not None:
-            raise ValueError("learnable_sink and out_transform cannot be combined.")
 
         cu_seq_q = attention_metadata.cu_seq_q
         cu_seq_k = attention_metadata.cu_seq_k
@@ -440,8 +435,14 @@ class VarlenInnerAttention(InnerAttention):
         if learnable_sink is not None:
             # flash_attn_varlen_func is not a torch op, so torch.compile and make_fx
             # can't trace it: traced graphs keep the LSE rescale below.
-            tracing = torch.compiler.is_compiling() or get_proxy_mode() is not None
-            if fa_impl == "FA4" and not tracing:
+            tracing = (
+                torch.compiler.is_compiling() or torch.compiler._is_non_strict_tracing()
+            )
+            if (
+                fa_impl == "FA4"
+                and SDPBackend.FLASH_ATTENTION in self.sdpa_backends
+                and not tracing
+            ):
                 return varlen_attn_with_sink(
                     q_THK.to(attn_dtype),
                     k_THK.to(attn_dtype),
@@ -455,13 +456,7 @@ class VarlenInnerAttention(InnerAttention):
                     learnable_sink=learnable_sink,
                     num_splits=varlen_kwargs.get("num_splits"),
                 ).to(q_THK.dtype)
-            # Without FA4, rescale the output by the sink term through the LSE.
-            if torch.is_grad_enabled() and q_THK.requires_grad:
-                warn_once(
-                    logger,
-                    "learnable_sink without FA4: varlen's LSE is not differentiable, "
-                    "so q/k gradients miss the sink term.",
-                )
+            # TODO: q/k grads miss the sink term here: varlen's LSE is not differentiable.
             out_transform = functools.partial(
                 apply_attention_sink_rescale, sinks=learnable_sink
             )
@@ -839,11 +834,9 @@ def varlen_attn_with_sink(
     """
     from flash_attn.cute import flash_attn_varlen_func
 
-    left, right = window_size
-    deterministic = torch.are_deterministic_algorithms_enabled()
-    if num_splits is None:
-        # As torch's FA4 wrapper: one split when deterministic, else FA4's heuristic (0).
-        num_splits = 1 if deterministic else 0
+    causal, left, right, num_splits = _fa4_mask_and_num_splits(
+        query.device, window_size, num_splits
+    )
     out, _ = flash_attn_varlen_func(
         query,
         key,
@@ -853,13 +846,90 @@ def varlen_attn_with_sink(
         max_seqlen_q=max_q,
         max_seqlen_k=max_k,
         softmax_scale=scale,
-        causal=(left, right) == (-1, 0),
-        window_size=(None if left < 0 else left, None if right < 0 else right),
+        causal=causal,
+        window_size=(left, right),
         learnable_sink=learnable_sink,
         num_splits=num_splits,
-        deterministic=deterministic,
+        deterministic=torch.are_deterministic_algorithms_enabled(),
     )
     return out
+
+
+def varlen_attn_out_with_sink(
+    out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    cu_seq_q: torch.Tensor,
+    max_q: int,
+    max_k: int,
+    *,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+    scale: float | None,
+    window_size: tuple[int, int],
+    learnable_sink: torch.Tensor,
+    num_splits: int | None = None,
+) -> torch.Tensor:
+    """Forward-only `varlen_attn_with_sink` on a paged KV cache, written into `out`.
+
+    Takes torch's `varlen_attn_out` arguments plus `learnable_sink`; the vLLM generator
+    calls it so its sink math matches the trainer's.
+
+    Example:
+        # 2 sequences decoding one token each; sequence 0 has 300 keys, sequence 1 has 17
+        varlen_attn_out_with_sink(
+            out_THV, q_THK, key_cache, value_cache, cu_seq_q=cu_seq_q, max_q=1, max_k=65536,
+            seqused_k=torch.tensor([300, 17], dtype=torch.int32, device="cuda"),
+            block_table=block_table, scale=None, window_size=(-1, 0), learnable_sink=sinks_H,
+        )
+    """
+    from flash_attn.cute.interface import _flash_attn_fwd
+
+    causal, left, right, num_splits = _fa4_mask_and_num_splits(
+        query.device, window_size, num_splits
+    )
+    _flash_attn_fwd(
+        query,
+        key_cache,
+        value_cache,
+        softmax_scale=scale,
+        causal=causal,
+        window_size_left=left,
+        window_size_right=right,
+        cu_seqlens_q=cu_seq_q,
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        seqused_k=seqused_k.contiguous(),
+        page_table=block_table,
+        learnable_sink=learnable_sink,
+        num_splits=num_splits,
+        out=out,
+    )
+    return out
+
+
+def _fa4_mask_and_num_splits(
+    device: torch.device, window_size: tuple[int, int], num_splits: int | None
+) -> tuple[bool, int | None, int | None, int]:
+    """FA4's `causal`, window and `num_splits` arguments, set as torch's FA4 wrapper sets them.
+
+    Example (SM100, not deterministic):
+        window_size (-1, 0),  num_splits None -> (True, None, None, 0)   # 0: FA4 picks
+        window_size (127, 0), num_splits 1    -> (False, 127, 0, 1)
+        any window, on SM120                  -> num_splits 1 (split-KV is SM100-only)
+    """
+    left, right = window_size
+    if torch.cuda.get_device_capability(device)[0] != 10:
+        num_splits = 1
+    elif num_splits is None:
+        num_splits = 1 if torch.are_deterministic_algorithms_enabled() else 0
+    return (
+        (left, right) == (-1, 0),
+        None if left < 0 else left,
+        None if right < 0 else right,
+        num_splits,
+    )
 
 
 def local_head_split(
