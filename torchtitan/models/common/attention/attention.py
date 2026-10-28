@@ -41,7 +41,7 @@ from torch.nn.attention.varlen import (
 )
 
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
-from torchtitan.distributed.local_compile import compile
+from torchtitan.distributed.local_compile import compile, local_compile
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.models.base.module import Module
 from torchtitan.models.common.linear import Linear
@@ -153,21 +153,23 @@ class QKVLinear(Module):
 
     @spmd.local_map(
         out_types=(
-            (
-                {"dp": spmd.V, "cp": spmd.V, "tp": spmd.V},
-                spmd.PartitionSpec(("dp", "cp"), "tp", None),
-            ),
+            {"dp": spmd.V, "cp": spmd.V, "tp": spmd.V},
+            spmd.PartitionSpec(("dp", "cp"), "tp", None, None),
         )
-        * 3
     )
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Fused QKV: single matmul, then reshape and split along R dim.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the fused output as ``[T, n_kv_heads, R, head_dim]``. ``split_heads`` copies
+        q/k/v out of it; a compiled consumer can fuse those copies into its own reads.
+
+        Example::
+
+            xq_THK, xk_THK, xv_THV = QKVLinear.split_heads(qkv_linear(x_TD))
+        """
+        # Fused QKV: single matmul, then reshape to expose the R dim.
         # [T, n_kv_heads * R * head_dim] -> [T, n_kv_heads, R, head_dim]
         # Use -1 for n_kv_heads so TP sharding is handled automatically.
         qkv = self.wqkv(x)
-        # The split below copies the wqkv projection output with bare ops.
+        # split_heads copies the wqkv projection output with bare ops.
         remat.recompute_needs_tensor(qkv)
         num_tokens = qkv.shape[0]
         with spmd.local():  # TODO(pianpwk): same QKV:S(1) unflatten case handled by even sharding
@@ -178,16 +180,37 @@ class QKVLinear(Module):
                     spmd.V,
                     spmd.PartitionSpec(("dp", "cp"), "tp", None, None),
                 )
+        return qkv
 
-        local_num_tokens = qkv.shape[0]
-        xq, xk, xv = torch.split(qkv, [self.heads_per_kv, 1, 1], dim=-2)
+    @staticmethod
+    @spmd.local_map(
+        out_types=(
+            (
+                {"dp": spmd.V, "cp": spmd.V, "tp": spmd.V},
+                spmd.PartitionSpec(("dp", "cp"), "tp", None),
+            ),
+        )
+        * 3
+    )
+    def split_heads(
+        qkv: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split ``forward``'s output along R into contiguous ``[T, heads, head_dim]`` q/k/v.
+
+        Example::
+
+            xq_THK, xk_THK, xv_THV = QKVLinear.split_heads(qkv_linear(x_TD))
+        """
+        num_tokens, head_dim = qkv.shape[0], qkv.shape[-1]
+        # R = heads_per_kv q heads, then k, then v.
+        xq, xk, xv = torch.split(qkv, [qkv.shape[-2] - 2, 1, 1], dim=-2)
         # split leaves xk/xv as strided views into the fused buffer; vLLM
         # attention/KV-cache kernels read raw memory assuming a contiguous
         # head-major layout, so materialize all three contiguously here.
         return (
-            xq.reshape(local_num_tokens, -1, self.head_dim).contiguous(),
-            xk.reshape(local_num_tokens, -1, self.head_dim).contiguous(),
-            xv.reshape(local_num_tokens, -1, self.head_dim).contiguous(),
+            xq.reshape(num_tokens, -1, head_dim).contiguous(),
+            xk.reshape(num_tokens, -1, head_dim).contiguous(),
+            xv.reshape(num_tokens, -1, head_dim).contiguous(),
         )
 
 
@@ -261,20 +284,8 @@ class GQAttention(Attention):
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # The projection's linear declares its own remat regions.
-        xq_THK, xk_THK, xv_THV = self.qkv_linear(x_TD)
-
-        # Optional QK normalization (before RoPE, per Qwen3)
-        if self.q_norm is not None or self.k_norm is not None:
-            assert self.q_norm is not None and self.k_norm is not None
-            remat.recompute_needs_tensor(xq_THK)
-            xq_THK = self.q_norm(xq_THK)
-            remat.recompute_needs_tensor(xk_THK)
-            xk_THK = self.k_norm(xk_THK)
-
-        # Apply rotary embeddings
-        if self.rope is not None:
-            remat.recompute_needs_tensor(xq_THK, xk_THK)
-            xq_THK, xk_THK = self.rope(xq_THK, xk_THK, positions)
+        qkv = self.qkv_linear(x_TD)
+        xq_THK, xk_THK, xv_THV = self._prepare_qkv(qkv, positions)
 
         out_THV = remat.region(
             self.inner_attention,
@@ -292,6 +303,39 @@ class GQAttention(Attention):
         out_THV = out_THV.contiguous()
         out_TD = out_THV.view(out_THV.shape[0], -1)
         return self.wo(out_TD)
+
+    # Compiled, the head copies fuse into the q/k norm and RoPE reads. emulate_precision_casts
+    # rounds the normed q/k to bf16 before RoPE, as the separate modules do; without it Inductor
+    # keeps them in fp32, and the train and no_grad graphs can round differently.
+    # No pointwise autotuning, as in ComplexRoPE.forward: RoPE is inlined here.
+    # Limit 16: RoPE and NoPE layers (iRoPE) share this region, 8 graphs each.
+    @local_compile(
+        "qkv_norm_rope",
+        batch_invariant=False,
+        recompile_limit=16,
+        options={
+            "emulate_precision_casts": True,
+            "triton.autotune_pointwise": False,
+        },
+    )
+    def _prepare_qkv(
+        self, qkv: torch.Tensor, positions: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return q/k/v as attention reads them, from ``QKVLinear``'s fused output: split heads,
+        then the optional q/k norms (before RoPE, per Qwen3) and RoPE."""
+        xq_THK, xk_THK, xv_THV = QKVLinear.split_heads(qkv)
+
+        if self.q_norm is not None or self.k_norm is not None:
+            assert self.q_norm is not None and self.k_norm is not None
+            remat.recompute_needs_tensor(xq_THK)
+            xq_THK = self.q_norm(xq_THK)
+            remat.recompute_needs_tensor(xk_THK)
+            xk_THK = self.k_norm(xk_THK)
+
+        if self.rope is not None:
+            remat.recompute_needs_tensor(xq_THK, xk_THK)
+            xq_THK, xk_THK = self.rope(xq_THK, xk_THK, positions)
+        return xq_THK, xk_THK, xv_THV
 
 
 class VarlenAttentionMetadata(NamedTuple):

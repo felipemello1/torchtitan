@@ -63,4 +63,8 @@ def build_rl_model_configs(
         cast(Decoder.Config, transform_model_config_(model_config, transforms))
         for model_config in model_configs
     )
+    # Generator only: GQAttention's head copies + q/k norms + RoPE in one compiled region,
+    # 2-3x faster per decode step. Training keeps the eager norm kernel, which is faster with a
+    # backward. Batch-invariant recipes clear the regions afterwards.
+    generator_model.local_compile.regions.append("qkv_norm_rope")
     return trainer_model, generator_model

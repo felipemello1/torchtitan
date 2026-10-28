@@ -351,14 +351,14 @@ class TestAsyncQKVNumerics(DTensorTestBase):
             dtype=torch.bfloat16,
             requires_grad=True,
         )
-        expected = stock(x_TD)
+        expected = QKVLinear.split_heads(stock(x_TD))
         torch.stack([output.sum() for output in expected]).sum().backward()
 
         x_local_TD = x_TD.detach().chunk(R, 0)[self.rank].contiguous().requires_grad_()
         mesh = parallelism_context.spmd_dense_mesh()
         with set_current_spmd_mesh(mesh), typecheck(local=False):
             spmd.assert_type(x_local_TD, input_layout)
-            actual = async_qkv(x_local_TD)
+            actual = QKVLinear.split_heads(async_qkv(x_local_TD))
             torch.stack([output.sum() for output in actual]).sum().backward()
 
         for actual_projection, expected_projection in zip(actual, expected):

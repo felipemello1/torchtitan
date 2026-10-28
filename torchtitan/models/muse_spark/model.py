@@ -28,6 +28,7 @@ from torchtitan.models.common.attention import (
     AttentionMetadataMap,
     FlexAttentionMetadata,
     GQAttention,
+    QKVLinear,
     VarlenAttentionMetadata,
 )
 from torchtitan.models.common.aux_loss import AuxLoss
@@ -119,7 +120,7 @@ class MuseSparkAttention(GQAttention):
         attention_metadata: FlexAttentionMetadata | VarlenAttentionMetadata | None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        query_TNH, key_TKH, value_TKH = self.qkv_linear(x_TD)
+        query_TNH, key_TKH, value_TKH = QKVLinear.split_heads(self.qkv_linear(x_TD))
         output_gate_TO = None
         if self.output_gate is not None:
             output_gate_TO = self.output_gate(x_TD)
