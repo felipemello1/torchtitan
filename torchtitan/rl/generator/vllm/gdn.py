@@ -204,17 +204,21 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         conv_bias: torch.Tensor | None,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        """Run convolution and recurrence against vLLM's paged state in place."""
+    ) -> torch.Tensor:
+        """Run convolution and recurrence against vLLM's paged state in place.
+
+        Returns the ``[tokens, heads, head_v_dim]`` output, zero on rows no sequence owns
+        so padded rows stay defined across graph replays.
+        """
         assert (
             conv_bias is None
         ), "Attention Gym convolution kernels do not support bias"
+        num_tokens = mixed_qkv.shape[0]
+        output_shape = (num_tokens, self.local_num_v_heads, self.head_v_dim)
         attn_metadata = get_forward_context().attn_metadata
         # vLLM's profiling/warmup runs have no attention metadata.
         if attn_metadata is None:
-            output.zero_()
-            return
+            return mixed_qkv.new_zeros(output_shape)
         assert isinstance(attn_metadata, dict)
         gdn_metadata = attn_metadata[self.prefix]
         assert isinstance(gdn_metadata, TorchTitanLinearAttentionMetadata)
@@ -224,8 +228,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
 
         num_actual_tokens = gdn_metadata.num_actual_tokens
         if num_actual_tokens == 0:
-            output.zero_()
-            return
+            return mixed_qkv.new_zeros(output_shape)
         state_indices = gdn_metadata.non_spec_state_indices_tensor
         cu_seqlens = gdn_metadata.non_spec_query_start_loc
         has_initial_state = gdn_metadata.has_initial_state
@@ -239,6 +242,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         # the builder restages slots and freshness, including null padding.
         if gdn_metadata.execution_path is LinearAttentionExecutionPath.SINGLE_TOKEN:
             num_decode_rows = state_indices.numel()
+            output = mixed_qkv.new_empty(output_shape)
             conv_output = causal_conv1d_decode(
                 mixed_qkv[:num_decode_rows],
                 conv_weight,
@@ -261,20 +265,19 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                     out=output[:num_decode_rows].unsqueeze(0),
                 )
             else:
-                self._forward_gdn(
+                output[:num_decode_rows] = self._forward_gdn(
                     conv_output,
                     a[:num_decode_rows],
                     b[:num_decode_rows],
                     A_log,
                     dt_bias,
-                    output[:num_decode_rows],
                     cu_seqlens,
                     state_indices,
                     has_initial_state,
                 )
             # Rows past the decode batch must stay defined across graph replays.
             output[num_decode_rows:].zero_()
-            return
+            return output
 
         conv_output = paged_causal_conv1d(
             mixed_qkv[:num_actual_tokens].unsqueeze(0),
@@ -285,18 +288,23 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             cu_seqlens=cu_seqlens,
             has_initial_state=has_initial_state,
         ).squeeze(0)
-        self._forward_gdn(
+        output = self._forward_gdn(
             conv_output,
             a[:num_actual_tokens],
             b[:num_actual_tokens],
             A_log,
             dt_bias,
-            output[:num_actual_tokens],
             cu_seqlens,
             state_indices,
             has_initial_state,
         )
-        output[num_actual_tokens:].zero_()
+        # FULL graphs pad the metadata to every row; eager SP/model-input rounding may not.
+        if num_actual_tokens < num_tokens:
+            padding = output.new_zeros(
+                num_tokens - num_actual_tokens, *output.shape[1:]
+            )
+            output = torch.cat([output, padding])
+        return output
 
     def _forward_gdn(
         self,
@@ -305,11 +313,10 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         b: torch.Tensor,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
-        output: torch.Tensor,
         cu_seqlens: torch.Tensor,
         all_slots: torch.Tensor,
         has_initial_state: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
         """Map each cu_seqlens interval to its paged SSM slot in all_slots.
 
         Null slots skip state writes and produce zero output for padding.
@@ -356,7 +363,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                 scale=self.head_k_dim**-0.5,
                 kernel_options=chunk_kernel_options(query),
             )
-        output.copy_(recurrent_output[0].to(output.dtype))
+        return recurrent_output[0]
 
     def forward(
         self,
@@ -386,12 +393,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         ).squeeze(1)
         assert conv_weight_CW.shape[-1] == self.conv_kernel_size
 
-        num_tokens = mixed_qkv_TC.shape[0]
-        # `_forward` writes every row, zeroing rows past the actual tokens.
-        output_THV = mixed_qkv_TC.new_empty(
-            num_tokens, self.local_num_v_heads, self.head_v_dim
-        )
-        self._forward(
+        return self._forward(
             mixed_qkv_TC,
             a_TH,
             b_TH,
@@ -399,9 +401,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             None,
             A_log_H,
             dt_bias_H,
-            output_THV,
         )
-        return output_THV
 
 
 def maybe_configure_gdn_hybrid_model(
