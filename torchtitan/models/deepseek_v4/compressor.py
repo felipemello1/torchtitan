@@ -317,7 +317,10 @@ class Indexer(Module):
         valid_TK = topk_indices >= 0
         gather_indices_TK = compressed_gather_indices(topk_indices, cu_seqlens, ratio)
 
-        selected_TKD = idx_k[gather_indices_TK]
+        # Same gather as idx_k[gather_indices_TK], with an fp32 backward: indexing's
+        # backward adds each row's duplicates one by one in bf16, and every invalid
+        # slot reads row 0 (GB300, one 4096-token document: 840 -> 8 ms fwd+bwd).
+        selected_TKD = F.embedding(gather_indices_TK, idx_k)
         logits_THK = torch.einsum("thd,tkd->thk", idx_q, selected_TKD)
         topk_scores = (logits_THK.relu() * idx_w.unsqueeze(-1)).sum(dim=1)
         topk_scores = topk_scores.masked_fill(~valid_TK, -torch.inf)

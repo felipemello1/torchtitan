@@ -55,6 +55,32 @@ class TestIndexerSelect(unittest.TestCase):
         expected_scores = expected_scores.masked_fill(selected < 0, -torch.inf)
         torch.testing.assert_close(selected_scores, expected_scores)
 
+    def test_indexer_select_score_grads_match_full_scores(self):
+        seqlen, ratio, topk = 256, 4, 32
+        g = torch.Generator().manual_seed(12)
+        idx_q = torch.randn(seqlen, 8, 32, generator=g, requires_grad=True)
+        idx_k = torch.randn(seqlen // ratio, 32, generator=g, requires_grad=True)
+        idx_w = torch.randn(seqlen, 8, generator=g, requires_grad=True)
+        selected, selected_scores = Indexer.select(
+            idx_q, idx_k, idx_w, max_seqlen=seqlen, ratio=ratio, topk=topk
+        )
+        # Early rows have fewer candidates than topk: their -1 slots read row 0
+        # of idx_k, which other rows also select. The upstream grad reaches every
+        # slot, so only select's own -inf mask keeps the -1 slots out.
+        valid = selected >= 0
+        self.assertFalse(valid.all())
+        scores = torch.einsum("shd,td->sht", idx_q, idx_k).relu()
+        scores = (scores * idx_w.unsqueeze(-1)).sum(dim=1)
+        expected = scores.gather(1, selected.long().clamp_min(0))
+
+        inputs = (idx_q, idx_k, idx_w)
+        grad = torch.randn(selected.shape, generator=g)
+        actual_grads = torch.autograd.grad(selected_scores, inputs, grad)
+        expected_grads = torch.autograd.grad(expected[valid], inputs, grad[valid])
+        # fp32 sums in a different order: compare at 1e-4.
+        for actual, reference in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual, reference, atol=1e-4, rtol=1e-4)
+
 
 class TestDSVPackedDocuments(unittest.TestCase):
     def setUp(self):
