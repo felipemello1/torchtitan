@@ -137,3 +137,32 @@ def test_matches_dense_masked_attention(cls, ratio, device, dtype, tol):
     torch.testing.assert_close(out.cpu().double(), ref, **tol)
     for grad, ref_grad in zip(grads, ref_grads, strict=True):
         torch.testing.assert_close(grad.cpu().double(), ref_grad, **tol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_indexer_select_score_grads_cuda():
+    """The indexer loss's score grads on CUDA (bf16) vs fp32 on the same selection.
+    One 1024-token document at top-k 256: each key is picked ~500 times."""
+    seqlen, ratio, topk = 1024, 4, 256
+    g = torch.Generator().manual_seed(0)
+    idx_q = torch.randn(seqlen, 64, 128, generator=g)
+    idx_k = torch.randn(seqlen // ratio, 128, generator=g)
+    idx_w = 0.01 * torch.randn(seqlen, 64, generator=g)
+    inputs = [t.cuda().bfloat16().requires_grad_() for t in (idx_q, idx_k, idx_w)]
+    selected, scores = Indexer.select(
+        *inputs, max_seqlen=seqlen, ratio=ratio, topk=topk
+    )
+    grad = torch.randn(selected.shape, generator=g).cuda()
+    grads = torch.autograd.grad(scores, inputs, grad.bfloat16())
+
+    ref_inputs = [t.detach().float().requires_grad_() for t in inputs]
+    q, k, w = ref_inputs
+    ref_scores = (torch.einsum("thd,sd->tsh", q, k).relu() * w.unsqueeze(1)).sum(-1)
+    expected = ref_scores.gather(1, selected.long().clamp_min(0))
+    valid = selected >= 0
+    ref_grads = torch.autograd.grad(expected[valid], ref_inputs, grad[valid])
+    # GB300: 2.9e-3 / 3.3e-3 / 3.3e-3. Indexing's backward, which rounds each
+    # pick to bf16, gives 3.1e-2 for idx_k. This 256-row pool runs embedding's
+    # atomic backward, 1x4096's 1024 rows the two-pass one: both sum in fp32.
+    for actual, ref in zip(grads, ref_grads):
+        assert (actual.float() - ref).norm() / ref.norm() < 1e-2
