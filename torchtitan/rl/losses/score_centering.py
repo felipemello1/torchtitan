@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -33,8 +34,14 @@ class ScoreCenteringLoss(BaseLoss):
     Each weight sync feeds the drift back into the generator, so it compounds. Score
     centering subtracts the expected score `sum_v q_v grad log p_v` from each token's score,
     which cancels the drift. The sum runs over the generator's top-k tokens `H`; outside `H`,
-    `q` is modeled as `p` rescaled to the generator's tail mass (Eq. 7-12). With
-    `w(r) = min(r, max_ratio)`, or `w(r) = 1` if `max_ratio` is None:
+    `q` is modeled as `p` rescaled to the generator's tail mass (Eq. 7-12). The token weight
+    `w(r)` is one of:
+
+        max_ratio=C            w(r) = min(r, C)                    truncated IS
+        ratio_band=(lo, hi)    w(r) = r if lo <= r <= hi else 0    masked IS
+        neither                w(r) = 1                            SC alone
+
+    and enters as:
 
         rho        = (1 - sum_H q) / (1 - sum_H p)
         alpha      = rho * w(1 / rho)                    # weight of the modeled tail
@@ -42,7 +49,9 @@ class ScoreCenteringLoss(BaseLoss):
                            - sum_H detach(q_v * w(p_v / q_v) - alpha * p_v) * log p_v)
         loss       = sum(token_loss) / global_loss_token_counts
 
-    When `p == q`, every weight is 1 and the correction is 0: plain REINFORCE.
+    When `p == q`, every weight is 1 and the correction is 0: plain REINFORCE. With
+    `ratio_band`, `q_v * w(p_v / q_v) = p_v` inside the band, so the correction is 0 unless a
+    top-k entry or the tail leaves it: it cancels the bias of the masked probability mass.
 
     Example (one position, k=2, max_ratio=None):
 
@@ -59,11 +68,39 @@ class ScoreCenteringLoss(BaseLoss):
         TIS+SC). None weights every token by 1 (SC alone). The paper finds both alike under
         quantization, and the cap clearly better under large staleness."""
 
+        ratio_band: tuple[float, float] | None = None
+        """Masked IS: absolute bounds `(lo, hi)` on the ratio `r = p / q` (unlike
+        `DAPOLoss.ratio_clip_*`, which are offsets from 1). A token with `lo <= r <= hi` is
+        weighted by `r`, otherwise by 0; the same rule masks each top-k entry and the modeled
+        tail, whose ratio is `(1 - sum_H p) / (1 - sum_H q)`. Requires `max_ratio=None`, and
+        `lo <= 1 <= hi` so a generator that matches the trainer stays plain REINFORCE.
+        Example: `(0.2, 5.0)`."""
+
         global_vocab_size: int | None = None
         """Full vocabulary size; required when TP shards the vocabulary."""
 
+        def __post_init__(self) -> None:
+            if self.ratio_band is None:
+                return
+            if self.max_ratio is not None:
+                raise ValueError(
+                    "ScoreCenteringLoss: set max_ratio=None to use ratio_band "
+                    f"(got max_ratio={self.max_ratio}, ratio_band={self.ratio_band})."
+                )
+            low, high = self.ratio_band
+            if not 0 < low <= 1 <= high:
+                raise ValueError(
+                    "ScoreCenteringLoss: ratio_band=(lo, hi) needs 0 < lo <= 1 <= hi, "
+                    f"got {self.ratio_band}."
+                )
+
     def __init__(self, config: Config) -> None:
         self.max_ratio = config.max_ratio
+        self.log_ratio_band = (
+            None
+            if config.ratio_band is None
+            else (math.log(config.ratio_band[0]), math.log(config.ratio_band[1]))
+        )
         self.global_vocab_size = config.global_vocab_size
 
     def __call__(
@@ -133,7 +170,25 @@ class ScoreCenteringLoss(BaseLoss):
             rho = (1 - generator_head_mass).clamp_min(_MIN_TAIL_MASS) / (
                 1 - trainer_head_mass
             ).clamp_min(_MIN_TAIL_MASS)
-            if self.max_ratio is None:
+            if self.log_ratio_band is not None:
+                log_low, log_high = self.log_ratio_band
+                token_in_band = (masked_log_ratio >= log_low) & (
+                    masked_log_ratio <= log_high
+                )
+                token_weight = torch.where(token_in_band, ratio, 0.0)
+                # q * w(p / q) = p inside the band and 0 outside, without dividing by q.
+                head_log_ratio = trainer_topk_logprobs - generator_topk_logprobs
+                weighted_generator_topk_probs = torch.where(
+                    (head_log_ratio >= log_low) & (head_log_ratio <= log_high),
+                    trainer_topk_probs,
+                    0.0,
+                )
+                # rho * w(1 / rho): 1 if the tail ratio p_tail / q_tail = 1 / rho is in the band.
+                tail_log_ratio = -rho.log()
+                alpha = ((tail_log_ratio >= log_low) & (tail_log_ratio <= log_high)).to(
+                    rho.dtype
+                )
+            elif self.max_ratio is None:
                 token_weight = torch.ones_like(ratio)
                 weighted_generator_topk_probs = generator_topk_probs
                 alpha = rho
@@ -160,6 +215,13 @@ class ScoreCenteringLoss(BaseLoss):
         )
 
         with torch.no_grad():
+            # Gradient of the correction w.r.t. the logits, before the advantage.
+            coefficient_sum = coefficients.sum(-1)
+            head_logit_grad = (
+                coefficients - trainer_topk_probs * coefficient_sum[:, None]
+            )
+            tail_logit_grad = (1 - trainer_head_mass).clamp_min(0) * coefficient_sum
+            logit_correction_l1 = head_logit_grad.abs().sum(-1) + tail_logit_grad.abs()
             metrics = {
                 "loss/mean": loss.detach(),
                 "loss/ratio_mean": _normalize(
@@ -189,11 +251,26 @@ class ScoreCenteringLoss(BaseLoss):
                     global_loss_token_counts,
                 ),
                 # sum_H |q * w - alpha * p|: 0 when trainer and generator agree, and with
-                # max_ratio whenever no head or tail ratio is truncated.
+                # max_ratio or ratio_band whenever no head or tail ratio is truncated or masked.
                 "score_centering/coefficient_l1/mean": _normalize(
                     coefficients.abs().sum(-1).sum(), global_loss_token_counts
                 ),
+                # L1 norm of the correction's logit gradient: sum_H |c - p * sum_H c| +
+                # (1 - sum_H p) * |sum_H c|. Unlike coefficient_l1, it stays ~0 when an
+                # all-or-none tail flips at a near-deterministic position.
+                "score_centering/logit_correction_l1/mean": _normalize(
+                    logit_correction_l1.sum(), global_loss_token_counts
+                ),
             }
+            if self.log_ratio_band is not None:
+                metrics["loss/ratio_masked_frac"] = _normalize(
+                    (~token_in_band & effective_loss_mask).float().sum(),
+                    global_loss_token_counts,
+                )
+                metrics["score_centering/tail_masked_frac"] = _normalize(
+                    ((alpha == 0) & effective_loss_mask).float().sum(),
+                    global_loss_token_counts,
+                )
             if self.max_ratio is not None:
                 metrics["loss/ratio_truncated_frac"] = _normalize(
                     ((ratio > self.max_ratio) & effective_loss_mask).float().sum(),
