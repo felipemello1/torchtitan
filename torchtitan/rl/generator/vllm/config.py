@@ -47,8 +47,8 @@ class VLLMCudaGraphConfig:
     - ``"FULL_DECODE_ONLY"``: graph pure-decode batches; prefill / mixed
       batches run eager. Cheap (no inductor compile).
     - ``"FULL"`` (default): graph the whole forward, prefill included, attention
-      captured too. MLA models capture prefill / mixed batches piecewise, with
-      attention eager (see ``get_vllm_compilation_config``).
+      captured too. Compressed-MLA models (vLLM's MLA backends) graph prefill /
+      mixed batches piecewise, with attention eager.
     """
 
     capture_sizes: list[int] | None = None
@@ -96,14 +96,12 @@ class VLLMCudaGraphConfig:
         ``enable_sequence_parallel`` is forwarded to vLLM's sequence parallelism
         pass. vLLM filters dense-SP CUDA graph sizes using its own TP size.
 
-        ``piecewise_prefill`` is for attention backends that graph only uniform
-        decode batches (vLLM's MLA backends). vLLM would turn ``FULL`` into
-        ``FULL_DECODE_ONLY`` for them and run every prefill / mixed batch eager.
-        With it, ``FULL`` asks for ``FULL_AND_PIECEWISE`` instead: decode keeps
-        full graphs, and prefill / mixed batches replay vLLM's breakable graphs,
-        with only the attention call eager. Breakable graphs need
-        ``VLLM_USE_BREAKABLE_CUDAGRAPH=1``, which ``register_to_vllm`` sets for
-        these models; without it vLLM falls back to ``FULL_DECODE_ONLY``.
+        ``piecewise_prefill`` turns ``FULL`` into ``FULL_AND_PIECEWISE`` for vLLM's
+        MLA backends, which graph only uniform decode batches (plain ``FULL``
+        becomes ``FULL_DECODE_ONLY``, with prefill / mixed batches eager). Those
+        batches then replay breakable graphs around eager attention. That needs
+        ``VLLM_USE_BREAKABLE_CUDAGRAPH=1`` (set by ``register_to_vllm``); without
+        it vLLM falls back to ``FULL_DECODE_ONLY``.
 
         All modes capture with ``mode=CompilationMode.NONE`` to avoid nesting
         vLLM's Inductor compile with TorchTitan local compile.

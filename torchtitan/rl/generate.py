@@ -117,6 +117,8 @@ def generate() -> None:
     max_num_seqs = args.max_num_seqs
     is_rank0 = os.environ.get("RANK", "0") == "0"
 
+    # Before register_to_vllm, which picks the MLA cache layout from it.
+    set_batch_invariance(gen_config.debug.batch_invariant)
     # Register TorchTitan model with vLLM before engine creation
     register_to_vllm(
         model_config,
@@ -130,7 +132,6 @@ def generate() -> None:
     logger.info("Registered TorchTitan model with vLLM")
 
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-    set_batch_invariance(gen_config.debug.batch_invariant)
     enable_ep = gen_config.parallelism.expert_parallel_degree > 1
 
     logger.debug("Initializing vLLM LLMEngine with TorchTitan model")

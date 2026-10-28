@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Any, TYPE_CHECKING
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -241,11 +242,16 @@ def register_to_vllm(
         os.environ["VLLM_SSM_CONV_STATE_LAYOUT"] = "SD"
     attention = model_config.first_full_attention
     if attention is not None and uses_compressed_mla_cache(attention.inner_attention):
-        # vLLM's MLA backends graph only uniform decode batches; breakable graphs
-        # let prefill and mixed batches replay graphs around the eager attention
-        # call (VLLMCudaGraphConfig.get_vllm_compilation_config). vLLM reads this
-        # when it imports its attention layers, which happens at model build.
-        os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+        # vLLM's MLA attention reads this once, at import (model build); see
+        # VLLMCudaGraphConfig.get_vllm_compilation_config.
+        if "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ:
+            if "vllm.model_executor.layers.attention.mla_attention" in sys.modules:
+                raise RuntimeError(
+                    "vLLM's MLA attention was imported before register_to_vllm, so "
+                    "prefill CUDA graphs would capture attention. Import vLLM's "
+                    "attention layers later, or set VLLM_USE_BREAKABLE_CUDAGRAPH first."
+                )
+            os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
 
     from vllm.model_executor.models.registry import ModelRegistry
 
