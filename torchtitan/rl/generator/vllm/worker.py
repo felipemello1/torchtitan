@@ -9,30 +9,32 @@
 from collections.abc import Set
 from contextlib import nullcontext
 
-from vllm.config import CUDAGraphMode, get_layers_from_vllm_config
+from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
-from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.utils.math_utils import round_up
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.worker import gpu_model_runner as vllm_gpu_model_runner
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
-from torchtitan.rl.generator.vllm.linear_attention import (
-    TorchTitanLinearAttentionBackend,
-)
-
 
 class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
-    """Keep native FULL descriptors distinct for packed linear attention and fused decode.
+    """Give decode batches their own FULL-graph keys, apart from prefill and mixed batches.
 
-    Currently installed only for TorchTitan's Attention Gym linear attention
-    backends (GDN/KDA).
-    vLLM at c6fa1f0 erases the uniform-decode discriminator in FULL mode:
-    four one-token decodes collide with one four-token prefill. Attention Gym's
-    different numerical paths need distinct keys. Delegate decode keys to the
-    native FULL_DECODE_ONLY dispatcher until upstream supports FULL decode
-    specialization; native capture, replay and graph ownership stay intact.
+    vLLM at af4db2a erases the uniform-decode discriminator in FULL mode:
+    four one-token decodes collide with one four-token prefill, and the shared
+    graph is captured as the mixed batch, with ``max_query_len = num_tokens``.
+    Decode needs its own key for two reasons:
+      - Attention Gym linear attention (GDN/KDA) takes a different numerical path.
+      - Softmax attention reads ``max_query_len`` on the host, and the graph
+        freezes it at capture. FA4 sizes its grid from it: with ``num_tokens``
+        instead of 1, decode takes 1.3-2.0x longer from 32 sequences at head
+        dim 64 and from 64 at head dim 128 (GB300, 16-token pages).
+    Delegate decode keys to the native FULL_DECODE_ONLY dispatcher until upstream
+    supports FULL decode specialization; native capture, replay and graph
+    ownership stay intact. Decode keys stop at ``max_num_seqs``; a larger decode
+    batch (e.g. padded by DP sync to another rank's mixed batch) replays the
+    mixed graph, as in stock FULL mode.
     The single-token key also covers fresh requests: initialization is GPU mask
     data, not another dispatch key or a reason to switch to packed arithmetic.
 
@@ -62,14 +64,25 @@ class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
         valid_modes: Set[CUDAGraphMode] | None = None,
         invalid_modes: Set[CUDAGraphMode] | None = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
-        dispatch = super().dispatch
         if (
             self.keys_initialized
             and self.cudagraph_mode == CUDAGraphMode.FULL
             and uniform_decode
         ):
-            dispatch = self.decode_dispatcher.dispatch
-        return dispatch(
+            # Ask without valid_modes: when only FULL is allowed (DP re-dispatch) and no
+            # decode key fits, vLLM's dispatcher asserts instead of returning NONE.
+            mode, descriptor = self.decode_dispatcher.dispatch(
+                num_tokens,
+                uniform_decode=True,
+                has_lora=has_lora,
+                num_active_loras=num_active_loras,
+                invalid_modes=invalid_modes,
+            )
+            if mode == CUDAGraphMode.FULL and (
+                valid_modes is None or mode in valid_modes
+            ):
+                return mode, descriptor
+        return super().dispatch(
             num_tokens,
             uniform_decode,
             has_lora,
@@ -80,18 +93,12 @@ class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
 
 
 class TorchTitanGPUModelRunner(GPUModelRunner):
-    """V1 runner with sequence-parallel padding and linear attention (GDN/KDA) decode specialization."""
+    """V1 runner with sequence-parallel padding and FULL-graph decode specialization."""
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)
-        if any(
-            layer.get_attn_backend() is TorchTitanLinearAttentionBackend
-            for layer in get_layers_from_vllm_config(
-                self.vllm_config, MambaBase
-            ).values()
-        ):
-            assert not self.cudagraph_dispatcher.keys_initialized
-            self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)
+        assert not self.cudagraph_dispatcher.keys_initialized
+        self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)
 
     def _determine_batch_execution_and_padding(self, num_tokens: int, *args, **kwargs):
         """Tell the model how many of this step's tokens are real, before padding.

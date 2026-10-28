@@ -58,6 +58,7 @@ from torchtitan.rl.generator.vllm.engine import (
 from torchtitan.rl.generator.vllm.registry import register_to_vllm
 from torchtitan.rl.generator.vllm.session_kv_holder import VLLMSessionKVHolder
 from torchtitan.rl.generator.vllm.worker import (
+    TorchTitanCudagraphDispatcher,
     TorchTitanGPUModelRunner,
     TorchTitanGPUWorker,
 )
@@ -65,6 +66,13 @@ from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.routing.strategies import LeastLoadedRoutingStrategy
 from vllm import SamplingParams
+from vllm.config import (
+    CompilationConfig,
+    CompilationMode,
+    CUDAGraphMode,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.exceptions import VLLMValidationError
 from vllm.logprobs import FlatLogprobs, Logprob
 from vllm.sampling_params import RequestOutputKind
@@ -815,6 +823,35 @@ def test_sequence_parallel_padding_rounds_runner_tokens(
         TorchTitanGPUModelRunner._pad_for_sequence_parallelism(model_runner, 5)
         == expected_num_tokens
     )
+
+
+def test_full_mode_decode_past_decode_keys_replays_the_mixed_graph():
+    config = VllmConfig()
+    config.compilation_config = CompilationConfig(
+        mode=CompilationMode.NONE,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        cudagraph_capture_sizes=[1, 2, 4, 8, 16],
+        max_cudagraph_capture_size=16,
+    )
+    config.scheduler_config = SchedulerConfig(
+        max_model_len=64,
+        max_num_seqs=4,
+        max_num_batched_tokens=16,
+        is_encoder_decoder=False,
+    )
+    dispatcher = TorchTitanCudagraphDispatcher(config)
+    dispatcher.initialize_cudagraph_keys(CUDAGraphMode.FULL)
+
+    mode, descriptor = dispatcher.dispatch(2, uniform_decode=True)
+    assert mode == CUDAGraphMode.FULL and descriptor.uniform
+    # DP sync pads a decode-only rank to another rank's 16-token mixed batch,
+    # past the decode keys (max_num_seqs = 4), and allows only FULL.
+    mode, descriptor = dispatcher.dispatch(
+        16, uniform_decode=True, valid_modes={CUDAGraphMode.FULL}
+    )
+    assert mode == CUDAGraphMode.FULL and not descriptor.uniform
+    mode, descriptor = dispatcher.dispatch(8, uniform_decode=True)
+    assert mode == CUDAGraphMode.FULL and not descriptor.uniform
 
 
 def test_only_weights_use_cumem_allocator(monkeypatch):
