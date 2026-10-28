@@ -1113,7 +1113,9 @@ def test_rollout_whose_first_model_call_failed_has_no_turns(
 def test_rollout_status_maps_timeouts_to_error_timeout(
     ok: bool, is_timeout: bool, episode_is_timeout: bool, expected: RolloutStatus
 ) -> None:
-    trace = SimpleNamespace(ok=ok, is_timeout=is_timeout, is_truncated=False, errors=[])
+    trace = SimpleNamespace(
+        ok=ok, is_timeout=is_timeout, is_truncated=False, stop_condition=None, errors=[]
+    )
     episode = SimpleNamespace(
         ok=not episode_is_timeout, is_timeout=episode_is_timeout, errors=[]
     )
@@ -1759,6 +1761,8 @@ def test_group_logs_the_share_of_each_stop_condition(monkeypatch) -> None:
         "rollout/stop/sandbox_error/mean": 0.0,
         "rollout/stop/harness_error/mean": 0.0,
         "rollout/stop/agentstalled_error/mean": 0.0,
+        "rollout/stop/repeated_tool_calls/mean": 0.0,
+        "rollout/stop/repeated_call_in_turn/mean": 0.0,
         "rollout/stop/other/mean": 0.4,
     }
 

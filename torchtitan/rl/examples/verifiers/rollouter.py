@@ -35,6 +35,7 @@ from torchtitan.rl.examples.verifiers.data import (
     VerifiersTaskSample,
 )
 from torchtitan.rl.examples.verifiers.env_server import VerifiersEnvServer
+from torchtitan.rl.examples.verifiers.stops import REPETITION_STOPS
 from torchtitan.rl.generator.generation_server import (
     GenerationServer,
     GROUP_ID_SAMPLING_PARAM,
@@ -681,6 +682,9 @@ class VerifiersRolloutWorker(RolloutWorker):
             return (
                 RolloutStatus.ERROR if is_policy_error else RolloutStatus.ERROR_SYSTEM
             )
+        # Verifiers' `is_truncated` leaves out custom @stop hooks.
+        if trace.stop_condition in REPETITION_STOPS:
+            return RolloutStatus.TRUNCATED_REPETITION
         if not trace.is_truncated:
             return RolloutStatus.COMPLETED
         if trace.stop_condition == "max_turns":
@@ -830,6 +834,7 @@ _STOP_CONDITION_BUCKETS = (
     "sandbox_error",
     "harness_error",
     "agentstalled_error",
+    *REPETITION_STOPS,
 )
 
 # OpenCode's system prompt carries the sandbox's date ("Today's date: Tue Oct 20 2026"). A rollout in
