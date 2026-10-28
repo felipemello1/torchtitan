@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -236,12 +237,14 @@ def test_compressed_mla_configures_vllm_native_mla(monkeypatch):
         assert hf[name] == getattr(mla_attention, name)
 
     monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "SD")
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")  # restored after the test
     monkeypatch.delitem(
         MODEL_ARCH_CONFIG_CONVERTORS, registry.TORCHTITAN_MODEL_TYPE, raising=False
     )
     registry.register_to_vllm(
         config, parallelism=InferenceParallelismConfig(), checkpointer_config=None
     )
+    assert os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "1"
     hf_config = PretrainedConfig.from_dict(hf)
     assert MODEL_ARCH_CONFIG_CONVERTORS[hf_config.model_type](
         hf_config, hf_config

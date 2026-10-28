@@ -239,6 +239,13 @@ def register_to_vllm(
         # Attention Gym's paged linear-attention kernels require channels to
         # be contiguous in vLLM's convolution state cache.
         os.environ["VLLM_SSM_CONV_STATE_LAYOUT"] = "SD"
+    attention = model_config.first_full_attention
+    if attention is not None and uses_compressed_mla_cache(attention.inner_attention):
+        # vLLM's MLA backends graph only uniform decode batches; breakable graphs
+        # let prefill and mixed batches replay graphs around the eager attention
+        # call (VLLMCudaGraphConfig.get_vllm_compilation_config). vLLM reads this
+        # when it imports its attention layers, which happens at model build.
+        os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
 
     from vllm.model_executor.models.registry import ModelRegistry
 

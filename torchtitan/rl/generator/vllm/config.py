@@ -47,7 +47,8 @@ class VLLMCudaGraphConfig:
     - ``"FULL_DECODE_ONLY"``: graph pure-decode batches; prefill / mixed
       batches run eager. Cheap (no inductor compile).
     - ``"FULL"`` (default): graph the whole forward, prefill included, attention
-      captured too.
+      captured too. MLA models capture prefill / mixed batches piecewise, with
+      attention eager (see ``get_vllm_compilation_config``).
     """
 
     capture_sizes: list[int] | None = None
@@ -73,6 +74,7 @@ class VLLMCudaGraphConfig:
         expert_sequence_parallel_size: int,
         enable_sequence_parallel: bool,
         max_num_batched_tokens: int | None = None,
+        piecewise_prefill: bool = False,
     ) -> CompilationConfig:
         """Build a vLLM ``CompilationConfig`` for the generator.
 
@@ -93,6 +95,15 @@ class VLLMCudaGraphConfig:
 
         ``enable_sequence_parallel`` is forwarded to vLLM's sequence parallelism
         pass. vLLM filters dense-SP CUDA graph sizes using its own TP size.
+
+        ``piecewise_prefill`` is for attention backends that graph only uniform
+        decode batches (vLLM's MLA backends). vLLM would turn ``FULL`` into
+        ``FULL_DECODE_ONLY`` for them and run every prefill / mixed batch eager.
+        With it, ``FULL`` asks for ``FULL_AND_PIECEWISE`` instead: decode keeps
+        full graphs, and prefill / mixed batches replay vLLM's breakable graphs,
+        with only the attention call eager. Breakable graphs need
+        ``VLLM_USE_BREAKABLE_CUDAGRAPH=1``, which ``register_to_vllm`` sets for
+        these models; without it vLLM falls back to ``FULL_DECODE_ONLY``.
 
         All modes capture with ``mode=CompilationMode.NONE`` to avoid nesting
         vLLM's Inductor compile with TorchTitan local compile.
@@ -158,8 +169,11 @@ class VLLMCudaGraphConfig:
                     f"expert_sequence_parallel_size {expert_sequence_parallel_size}"
                 )
 
+        cudagraph_mode = self.mode
+        if self.mode == "FULL" and piecewise_prefill:
+            cudagraph_mode = "FULL_AND_PIECEWISE"
         return CompilationConfig(
-            cudagraph_mode=self.mode,
+            cudagraph_mode=cudagraph_mode,
             mode=CompilationMode.NONE,
             cudagraph_capture_sizes=sizes,
             pass_config=PassConfig(

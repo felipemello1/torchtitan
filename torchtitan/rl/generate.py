@@ -45,6 +45,7 @@ from torchtitan.rl.generator.vllm.registry import (
     register_to_vllm,
     TORCHTITAN_CONFIG_FORMAT,
     TORCHTITAN_WORKER_CLS,
+    uses_compressed_mla_cache,
     vllm_attention_backend,
 )
 from torchtitan.tools import filesystem
@@ -174,6 +175,9 @@ def generate() -> None:
         max_num_batched_tokens=gen_config.max_num_batched_tokens,
         expert_sequence_parallel_size=expert_sequence_parallel_size,
         enable_sequence_parallel=gen_config.parallelism.enable_sequence_parallel,
+        piecewise_prefill=uses_compressed_mla_cache(
+            model_config.first_full_attention.inner_attention
+        ),
     )
     if vllm_compilation_config is not None:
         engine_kwargs["compilation_config"] = vllm_compilation_config

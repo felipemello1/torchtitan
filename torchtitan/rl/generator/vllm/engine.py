@@ -40,6 +40,7 @@ from torchtitan.rl.generator.vllm.registry import (
     register_to_vllm,
     TORCHTITAN_CONFIG_FORMAT,
     TORCHTITAN_WORKER_CLS,
+    uses_compressed_mla_cache,
     vllm_attention_backend,
 )
 from torchtitan.rl.generator.vllm.session_kv_holder import VLLMSessionKVHolder
@@ -287,6 +288,9 @@ class VLLMEngine(GenerationEngine):
             max_num_batched_tokens=max_num_batched_tokens,
             expert_sequence_parallel_size=parallelism.expert_sequence_parallel_size,
             enable_sequence_parallel=parallelism.enable_sequence_parallel,
+            piecewise_prefill=uses_compressed_mla_cache(
+                model.first_full_attention.inner_attention
+            ),
         )
         if vllm_compilation_config is not None:
             engine_kwargs["compilation_config"] = vllm_compilation_config

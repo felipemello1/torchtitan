@@ -855,6 +855,24 @@ def test_cuda_graph_full_mode_no_compile():
     assert int(cfg.mode) == 0
 
 
+def test_cuda_graph_full_mode_graphs_mla_prefill_piecewise():
+    # vLLM's MLA backends graph only uniform decode batches: plain FULL resolves
+    # to FULL_DECODE_ONLY, which runs every prefill / mixed batch eager.
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
+        max_num_seqs=64,
+        expert_sequence_parallel_size=1,
+        enable_sequence_parallel=False,
+        piecewise_prefill=True,
+    )
+    mode = cfg.resolve_cudagraph_mode_and_sizes(
+        AttentionCGSupport.UNIFORM_BATCH, "FlashInferMLABackend"
+    )
+    assert mode.name == "FULL_AND_PIECEWISE"
+    assert cfg.cudagraph_capture_sizes[-1] == 2048  # prefill-sized batches graphed
+
+
 def test_cuda_graph_decode_only_capture_sizes_cover_max_num_seqs():
     # FULL_DECODE_ONLY only graphs decode, so capture up to max_num_seqs (plus
     # max_num_seqs itself when not a power of 2).
