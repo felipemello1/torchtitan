@@ -47,7 +47,8 @@ class VLLMCudaGraphConfig:
     - ``"FULL_DECODE_ONLY"``: graph pure-decode batches; prefill / mixed
       batches run eager. Cheap (no inductor compile).
     - ``"FULL"`` (default): graph the whole forward, prefill included, attention
-      captured too.
+      captured too. Compressed-MLA models (vLLM's MLA backends) graph prefill /
+      mixed batches piecewise, with attention eager.
     """
 
     capture_sizes: list[int] | None = None
@@ -73,6 +74,7 @@ class VLLMCudaGraphConfig:
         expert_sequence_parallel_size: int,
         enable_sequence_parallel: bool,
         max_num_batched_tokens: int | None = None,
+        piecewise_prefill: bool = False,
     ) -> CompilationConfig:
         """Build a vLLM ``CompilationConfig`` for the generator.
 
@@ -93,6 +95,13 @@ class VLLMCudaGraphConfig:
 
         ``enable_sequence_parallel`` is forwarded to vLLM's sequence parallelism
         pass. vLLM filters dense-SP CUDA graph sizes using its own TP size.
+
+        ``piecewise_prefill`` turns ``FULL`` into ``FULL_AND_PIECEWISE`` for vLLM's
+        MLA backends, which graph only uniform decode batches (plain ``FULL``
+        becomes ``FULL_DECODE_ONLY``, with prefill / mixed batches eager). Those
+        batches then replay breakable graphs around eager attention. That needs
+        ``VLLM_USE_BREAKABLE_CUDAGRAPH=1`` (set by ``register_to_vllm``); without
+        it vLLM falls back to ``FULL_DECODE_ONLY``.
 
         All modes capture with ``mode=CompilationMode.NONE`` to avoid nesting
         vLLM's Inductor compile with TorchTitan local compile.
@@ -158,8 +167,11 @@ class VLLMCudaGraphConfig:
                     f"expert_sequence_parallel_size {expert_sequence_parallel_size}"
                 )
 
+        cudagraph_mode = self.mode
+        if self.mode == "FULL" and piecewise_prefill:
+            cudagraph_mode = "FULL_AND_PIECEWISE"
         return CompilationConfig(
-            cudagraph_mode=self.mode,
+            cudagraph_mode=cudagraph_mode,
             mode=CompilationMode.NONE,
             cudagraph_capture_sizes=sizes,
             pass_config=PassConfig(

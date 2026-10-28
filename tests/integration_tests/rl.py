@@ -124,7 +124,7 @@ def build_h100_rl_test_list() -> list[IntegrationTestDefinition]:
         ),
         _rl_test(
             configs=[rl_grpo_deepseek_v3_debug],
-            test_descr="RL GRPO DeepSeek V3 compressed MLA cache + decode CUDA graphs",
+            test_descr="RL GRPO DeepSeek V3 compressed MLA cache + CUDA graphs",
             test_name="rl_grpo_deepseek_v3_debug",
             ngpu=4,
         ),

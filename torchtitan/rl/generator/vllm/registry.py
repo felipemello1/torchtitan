@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Any, TYPE_CHECKING
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -239,6 +240,18 @@ def register_to_vllm(
         # Attention Gym's paged linear-attention kernels require channels to
         # be contiguous in vLLM's convolution state cache.
         os.environ["VLLM_SSM_CONV_STATE_LAYOUT"] = "SD"
+    attention = model_config.first_full_attention
+    if attention is not None and uses_compressed_mla_cache(attention.inner_attention):
+        # vLLM's MLA attention (and the KDA adapter, imported below) read this
+        # once, at import; see VLLMCudaGraphConfig.get_vllm_compilation_config.
+        if "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ:
+            if "vllm.model_executor.layers.attention.mla_attention" in sys.modules:
+                raise RuntimeError(
+                    "vLLM's MLA attention was imported before register_to_vllm, so "
+                    "prefill CUDA graphs would capture attention. Import vLLM's "
+                    "attention layers later, or set VLLM_USE_BREAKABLE_CUDAGRAPH first."
+                )
+            os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
 
     from vllm.model_executor.models.registry import ModelRegistry
 

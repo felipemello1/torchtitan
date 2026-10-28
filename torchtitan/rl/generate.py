@@ -45,6 +45,7 @@ from torchtitan.rl.generator.vllm.registry import (
     register_to_vllm,
     TORCHTITAN_CONFIG_FORMAT,
     TORCHTITAN_WORKER_CLS,
+    uses_compressed_mla_cache,
     vllm_attention_backend,
 )
 from torchtitan.tools import filesystem
@@ -116,6 +117,8 @@ def generate() -> None:
     max_num_seqs = args.max_num_seqs
     is_rank0 = os.environ.get("RANK", "0") == "0"
 
+    # Before register_to_vllm, which picks the MLA cache layout from it.
+    set_batch_invariance(gen_config.debug.batch_invariant)
     # Register TorchTitan model with vLLM before engine creation
     register_to_vllm(
         model_config,
@@ -129,7 +132,6 @@ def generate() -> None:
     logger.info("Registered TorchTitan model with vLLM")
 
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-    set_batch_invariance(gen_config.debug.batch_invariant)
     enable_ep = gen_config.parallelism.expert_parallel_degree > 1
 
     logger.debug("Initializing vLLM LLMEngine with TorchTitan model")
@@ -174,6 +176,9 @@ def generate() -> None:
         max_num_batched_tokens=gen_config.max_num_batched_tokens,
         expert_sequence_parallel_size=expert_sequence_parallel_size,
         enable_sequence_parallel=gen_config.parallelism.enable_sequence_parallel,
+        piecewise_prefill=uses_compressed_mla_cache(
+            model_config.first_full_attention.inner_attention
+        ),
     )
     if vllm_compilation_config is not None:
         engine_kwargs["compilation_config"] = vllm_compilation_config

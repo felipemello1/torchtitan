@@ -766,7 +766,7 @@ def rl_grpo_deepseek_v3_debug_varlen(*, seq_len: int = 2048) -> Controller.Confi
     """Random-init DeepSeek V3 GRPO whose generator caches compressed MLA latents.
 
     Without batch invariance, the generator uses vLLM's native MLA and captures
-    decode CUDA graphs.
+    CUDA graphs (prefill / mixed batches piecewise).
     """
     trainer_parallelism = ParallelismConfig(data_parallel_shard_degree=2)
     generator_parallelism = InferenceParallelismConfig(
@@ -824,9 +824,7 @@ def rl_grpo_deepseek_v3_debug_varlen(*, seq_len: int = 2048) -> Controller.Confi
         ),
         generator=Generator.Config(
             model=generator_model,
-            engine=VLLMEngine.Config(
-                cuda_graph=VLLMCudaGraphConfig(mode="FULL_DECODE_ONLY")
-            ),
+            engine=VLLMEngine.Config(cuda_graph=VLLMCudaGraphConfig(mode="FULL")),
             parallelism=generator_parallelism,
             checkpointer=None,
             sampling=SamplingConfig(

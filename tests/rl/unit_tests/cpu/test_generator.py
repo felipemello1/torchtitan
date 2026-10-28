@@ -855,6 +855,38 @@ def test_cuda_graph_full_mode_no_compile():
     assert int(cfg.mode) == 0
 
 
+@pytest.mark.parametrize(
+    "piecewise_prefill, breakable, expected",
+    [
+        (False, True, "FULL_DECODE_ONLY"),
+        (True, False, "FULL_DECODE_ONLY"),  # VLLM_USE_BREAKABLE_CUDAGRAPH unset
+        (True, True, "FULL_AND_PIECEWISE"),
+    ],
+)
+def test_cuda_graph_full_mode_graphs_mla_prefill_piecewise(
+    piecewise_prefill, breakable, expected
+):
+    # vLLM's MLA backends graph only uniform decode batches. vLLM resolves the
+    # mode twice: in VllmConfig (needs breakable graphs), then in the runner.
+    from vllm.config import VllmConfig
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
+        max_num_seqs=64,
+        expert_sequence_parallel_size=1,
+        enable_sequence_parallel=False,
+        piecewise_prefill=piecewise_prefill,
+    )
+    VllmConfig._normalize_piecewise_cudagraph_mode(
+        SimpleNamespace(compilation_config=cfg), breakable_cudagraph_enabled=breakable
+    )
+    mode = cfg.resolve_cudagraph_mode_and_sizes(
+        AttentionCGSupport.UNIFORM_BATCH, "FlashInferMLABackend"
+    )
+    assert mode.name == expected
+    assert cfg.cudagraph_capture_sizes[-1] == 2048
+
+
 def test_cuda_graph_decode_only_capture_sizes_cover_max_num_seqs():
     # FULL_DECODE_ONLY only graphs decode, so capture up to max_num_seqs (plus
     # max_num_seqs itself when not a power of 2).

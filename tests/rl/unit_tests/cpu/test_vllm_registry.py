@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -236,13 +238,28 @@ def test_compressed_mla_configures_vllm_native_mla(monkeypatch):
         assert hf[name] == getattr(mla_attention, name)
 
     monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "SD")
+    # Unset for the test. setenv first: delenv(raising=False) on an absent var
+    # records nothing, so register_to_vllm's "1" would leak to later tests.
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH")
+    mla_module = "vllm.model_executor.layers.attention.mla_attention"
+    monkeypatch.delitem(sys.modules, mla_module, raising=False)
     monkeypatch.delitem(
         MODEL_ARCH_CONFIG_CONVERTORS, registry.TORCHTITAN_MODEL_TYPE, raising=False
     )
     registry.register_to_vllm(
         config, parallelism=InferenceParallelismConfig(), checkpointer_config=None
     )
+    assert os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "1"
     hf_config = PretrainedConfig.from_dict(hf)
     assert MODEL_ARCH_CONFIG_CONVERTORS[hf_config.model_type](
         hf_config, hf_config
     ).is_deepseek_mla()
+
+    # vLLM's MLA attention imported first: prefill graphs would capture attention.
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH")
+    monkeypatch.setitem(sys.modules, mla_module, SimpleNamespace())
+    with pytest.raises(RuntimeError, match="imported before register_to_vllm"):
+        registry.register_to_vllm(
+            config, parallelism=InferenceParallelismConfig(), checkpointer_config=None
+        )
