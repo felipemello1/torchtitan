@@ -36,6 +36,7 @@ from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.models.base.module import Module
 from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.attention import InnerAttention
+from torchtitan.models.common.attention.attention import varlen_attn_out_with_sink
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.observability.logging import warn_once
 from torchtitan.tools.utils import get_cuda_flash_attention_impl
@@ -105,6 +106,9 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         # optional post-attention epilogue transform (out, lse) -> out
         # set by VLLMModelWrapper in vllm_wrapper.py
         self.out_transform = None
+        # optional () -> per-head sink logits [H] (gpt-oss), run inside FA4's softmax;
+        # set by VLLMModelWrapper. Without FA4, out_transform rescales instead.
+        self.get_learnable_sink = None
 
         self.enable_gqa = self.num_heads > self.num_kv_heads
 
@@ -247,6 +251,23 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         # num_splits=1 in batch-invariant mode (determinism).
         if fa_impl in (None, "FA2") or is_in_batch_invariant_mode():
             extra_kwargs["num_splits"] = 1
+
+        if self.get_learnable_sink is not None and fa_impl == "FA4":
+            return varlen_attn_out_with_sink(
+                output[:num_actual_tokens],
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                cu_seqlens_q,
+                max_seqlen_q,
+                max_seqlen_k,
+                seqused_k=seqused_k,
+                block_table=block_table,
+                scale=self.scale,
+                window_size=sliding_window_size,
+                learnable_sink=self.get_learnable_sink(),
+                num_splits=extra_kwargs.get("num_splits"),
+            )
 
         if self.enable_gqa:
             extra_kwargs["enable_gqa"] = True

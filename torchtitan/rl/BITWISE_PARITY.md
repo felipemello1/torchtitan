@@ -74,10 +74,11 @@ back to the trainer's ops:
   - *GPT-OSS* (varlen + per-layer sliding window + attention sinks): the same
     `CUSTOM` varlen path and `num_splits=1` as Varlen, with the sliding-window
     size baked into each layer's `VarlenInnerAttention` config (identical on both
-    sides). The attention sinks are a post-softmax rescale
-    (`apply_attention_sink_rescale`, `sigmoid(lse - sinks)`); the vLLM wrapper's
-    `_inject_attention_sinks` installs that same rescale as the generator
-    attention's `out_transform`, so the sink math matches the trainer.
+    sides). With FA4, both sides add the sinks inside the kernel's softmax
+    (`learnable_sink`): the trainer through `varlen_attn_with_sink`, the generator
+    through the hook the vLLM wrapper's `_inject_attention_sinks` installs. Without
+    FA4, both apply the same post-softmax rescale (`apply_attention_sink_rescale`,
+    `sigmoid(lse - sinks)`).
 - **`force_logprobs_fn_for_batch_invariance`:** vLLM's v2 GPU sampler computes
   per-token logprobs with a fused Triton kernel that inlines
   `log(softmax(logits))` and never calls PyTorch ops. Replaced with the trainer's

@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
-from torch.nn.attention import sdpa_kernel, SDPBackend
+from torch.nn.attention import current_flash_attention_impl, sdpa_kernel, SDPBackend
 from torch.testing._internal.common_utils import DeterministicGuard
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
@@ -29,6 +29,10 @@ from torchtitan.models.common.attention import (
     SlidingWindowVarlenInnerAttention,
     VarlenAttentionMetadata,
     VarlenInnerAttention,
+)
+from torchtitan.models.common.attention.attention import (
+    varlen_attn_out_with_sink,
+    varlen_attn_with_sink,
 )
 from torchtitan.models.common.attention.cp_attention import UlyssesVarlenInnerAttention
 
@@ -94,6 +98,128 @@ def test_forward_backward_precision(dtype, upcast_qk, window_size):
     for result, reference in zip((actual, *actual_grads), (expected, *expected_grads)):
         relative_error = (result.double() - reference).norm() / reference.norm()
         assert relative_error.item() < tolerance
+
+
+@pytest.mark.parametrize("sliding_window_size", [None, 8])
+def test_learnable_sink_matches_fp32_reference(sliding_window_size):
+    """FA4's in-kernel sink: output and q/k/v/sink grads match an fp32 softmax with the sink logit.
+
+    The LSE rescale it replaces gets no gradient through torch's LSE (non-differentiable), so at
+    these shapes its q/k grads are off by 12-13% rel L2; the kernel path is off by ~2e-3.
+    """
+    torch.manual_seed(42)
+    config = (
+        VarlenInnerAttention.Config()
+        if sliding_window_size is None
+        else SlidingWindowVarlenInnerAttention.Config(
+            sliding_window_size=sliding_window_size
+        )
+    )
+    # build() activates FA4 on SM100+
+    attention = config.build()
+    if current_flash_attention_impl() != "FA4":
+        pytest.skip("in-kernel sinks need FA4 (SM100+)")
+    doc_len, num_docs, num_heads, num_kv_heads, head_dim = 32, 2, 8, 2, 64
+    metadata = config.build_attention_metadata(
+        torch.arange(doc_len, device="cuda").repeat(num_docs)
+    )
+    q = torch.randn(64, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k, v = (
+        torch.randn(64, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        for _ in range(2)
+    )
+    sinks = torch.randn(num_heads, device="cuda", dtype=torch.bfloat16)
+    grad_output = torch.randn_like(q)
+
+    def reference(q, k, v, sinks):
+        q, k, v = (
+            t.unflatten(0, (num_docs, doc_len)).transpose(1, 2) for t in (q, k, v)
+        )
+        k, v = (t.repeat_interleave(num_heads // num_kv_heads, dim=1) for t in (k, v))
+        scores = q @ k.transpose(-1, -2) * head_dim**-0.5
+        pos = torch.arange(doc_len, device="cuda")
+        visible = pos[:, None] >= pos[None, :]
+        if sliding_window_size is not None:
+            visible &= pos[:, None] - pos[None, :] < sliding_window_size
+        scores = scores.masked_fill(~visible, float("-inf"))
+        sink = sinks.view(1, -1, 1, 1).expand(num_docs, -1, doc_len, 1)
+        probs = torch.cat([scores, sink], dim=-1).softmax(-1)[..., :-1]
+        return (probs @ v).transpose(1, 2).flatten(0, 1)
+
+    inputs = [t.clone().requires_grad_() for t in (q, k, v, sinks)]
+    out = attention(
+        *inputs[:3],
+        attention_metadata=metadata,
+        enable_gqa=True,
+        learnable_sink=inputs[3],
+    )
+    grads = torch.autograd.grad(out, inputs, grad_output)
+    ref_inputs = [t.float().requires_grad_() for t in (q, k, v, sinks)]
+    ref_out = reference(*ref_inputs)
+    ref_grads = torch.autograd.grad(ref_out, ref_inputs, grad_output.float())
+    for actual, expected in zip((out, *grads), (ref_out, *ref_grads)):
+        relative_error = (actual.float() - expected).norm() / expected.norm()
+        assert relative_error.item() < 1e-2, relative_error.item()
+
+
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("num_splits", [None, 1])
+@pytest.mark.parametrize("window_size", [(-1, 0), (7, 0)])
+def test_paged_sink_attention_matches_varlen(window_size, num_splits, decode):
+    """The generator's paged sink call matches the trainer's: bitwise with one split."""
+    pytest.importorskip("flash_attn.cute")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("in-kernel sinks run on FA4 (SM100)")
+    torch.manual_seed(42)
+    page_size, num_heads, num_kv_heads, head_dim = 16, 8, 2, 64
+    # Sequence 0: tokens 0-39 on pages 0-2; sequence 1: tokens 40-63 on pages 3-4.
+    cu_seq = torch.tensor([0, 40, 64], device="cuda", dtype=torch.int32)
+    block_table = torch.tensor([[0, 1, 2], [3, 4, 0]], device="cuda", dtype=torch.int32)
+    q = torch.randn(64, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k, v = (
+        torch.randn(64, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        for _ in range(2)
+    )
+    # The trainer passes the sink parameter; the frozen generator's sink has no grad,
+    # so FA4 skips the LSE there.
+    sinks = torch.randn(num_heads, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    # Decode: one query per sequence, its last token, against all of its keys.
+    cu_seq_q, max_q = cu_seq, 40
+    if decode:
+        cu_seq_q, max_q = torch.arange(3, device="cuda", dtype=torch.int32), 1
+        q = q[cu_seq[1:] - 1]
+
+    def to_pages(x):
+        padded = [F.pad(x[:40], (0, 0, 0, 0, 0, 8)), F.pad(x[40:], (0, 0, 0, 0, 0, 8))]
+        return torch.cat(padded).view(-1, page_size, num_kv_heads, head_dim)
+
+    # The generator's cache: K and V packed in the last dim, [pages, kv_heads, page, 2 * D].
+    kv_cache = (
+        torch.cat((to_pages(k), to_pages(v)), dim=-1).transpose(1, 2).contiguous()
+    )
+    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+    kwargs = dict(scale=None, window_size=window_size, num_splits=num_splits)
+    with torch.no_grad():
+        expected = varlen_attn_with_sink(
+            q, k, v, cu_seq_q, cu_seq, max_q, 40, learnable_sink=sinks, **kwargs
+        )
+        actual = varlen_attn_out_with_sink(
+            torch.empty_like(q),
+            q,
+            key_cache,
+            value_cache,
+            cu_seq_q,
+            max_q,
+            40,
+            seqused_k=torch.tensor([40, 24], device="cuda", dtype=torch.int32),
+            block_table=block_table,
+            learnable_sink=sinks.detach(),
+            **kwargs,
+        )
+    if num_splits == 1:
+        assert torch.equal(actual, expected)
+    else:
+        torch.testing.assert_close(actual, expected)
 
 
 def test_fp32_fallback_matches_legacy_forward_backward():

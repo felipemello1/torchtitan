@@ -27,6 +27,7 @@ from torchtitan.config.transform.base import convert_config_type
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import _per_axis_types
 from torchtitan.models.common.attention import (
+    apply_attention_sink_rescale,
     create_varlen_metadata_for_document,
     GQAttention,
     QKVLinear,
@@ -426,6 +427,30 @@ class TestPackedVarlenInnerAttention(unittest.TestCase):
             )
 
         self.assertEqual(out_THV.shape, q_THK.shape)
+
+    def test_learnable_sink_without_fa4_rescales_through_lse(self):
+        num_tokens, num_heads, head_dim = 5, 2, 4
+        q_THK = torch.randn(num_tokens, num_heads, head_dim)
+        lse_HT = torch.randn(num_heads, num_tokens)
+        sinks_H = torch.randn(num_heads)
+        metadata = create_varlen_metadata_for_document(torch.tensor([0, 1, 0, 1, 2]))
+        inner_attention = VarlenInnerAttention.Config().build()
+
+        module = "torchtitan.models.common.attention.attention"
+        with (
+            patch(f"{module}.current_flash_attention_impl", return_value=None),
+            patch(f"{module}._varlen_attn", return_value=(q_THK, lse_HT)),
+        ):
+            out_THV = inner_attention(
+                q_THK,
+                q_THK,
+                q_THK,
+                attention_metadata=metadata,
+                learnable_sink=sinks_H,
+            )
+
+        expected = apply_attention_sink_rescale(q_THK, lse_HT.T, sinks_H)
+        torch.testing.assert_close(out_THV, expected)
 
     def test_llama_decoder_preserves_td_shape(self):
         from torchtitan.models.llama3 import MODEL_FLAVORS

@@ -401,6 +401,10 @@ class VLLMModelWrapper(Module):
             # spmd context.
             with self.parallelism_context.activate_spmd():
                 self.model.init_weights(buffer_device=None)
+        # The generator runs no backward. Code that checks requires_grad, not grad mode,
+        # would treat it as training: the inference Dist-MoE context rejects such
+        # operands, and FA4 writes an LSE for a sink that requires grad.
+        self.model.requires_grad_(False)
         self._initialize_dist_moe_runtime(
             dist_moe_runtime,
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -554,11 +558,6 @@ class VLLMModelWrapper(Module):
                 "backward, so a training context's activation slots would reserve "
                 "memory it can never use."
             )
-        # An inference context rejects any operand carrying requires_grad, and
-        # it tests the attribute rather than whether grad is enabled.
-        for module in self.model.modules():
-            if isinstance(module, DistMoeRoutedExperts):
-                module.requires_grad_(False)
         self._dist_moe_runtime = runtime_config.build(
             model_parts=[self.model],
             parallelism_context=self.parallelism_context,
@@ -574,20 +573,22 @@ class VLLMModelWrapper(Module):
             (), torch.iinfo(torch.int32).max, dtype=torch.int32, device=device
         )
 
-    # TODO: followup with potentially adding extra kwarg ``sinks`` to vLLM attn
     def _inject_attention_sinks(self) -> None:
-        """Give each gpt-oss attention's vLLM backend its sink-rescale hook."""
-        from torchtitan.models.gpt_oss.model import (
-            apply_attention_sink_rescale,
-            GptOssAttention,
-        )
+        """Give each gpt-oss attention's vLLM backend its sinks:
+        - FA4: `get_learnable_sink`, run inside the kernel's softmax;
+        - other kernels: `out_transform`, the rescale through the LSE.
+        """
+        from torchtitan.models.common.attention import apply_attention_sink_rescale
+        from torchtitan.models.gpt_oss.model import GptOssAttention
 
         for module in self.model.modules():
             if not isinstance(module, GptOssAttention):
                 continue
+            impl = module.inner_attention.vllm_attn.impl
             # Read sinks per call: FSDP swaps the parameter between its sharded
             # and unsharded tensors and frees the sharded storage after unsharding.
-            module.inner_attention.vllm_attn.impl.out_transform = (
+            impl.get_learnable_sink = lambda attention=module: attention.sinks
+            impl.out_transform = (
                 lambda out, lse, attention=module: apply_attention_sink_rescale(
                     out, lse, attention.sinks
                 )
