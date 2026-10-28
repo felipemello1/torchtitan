@@ -64,6 +64,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 VERIFIERS_REWARD_KEY = "verifiers_reward"
+# vLLM, the renderer and the generation server all word a prompt past the context this way.
+_CONTEXT_OVERFLOW_TEXT = "maximum context length"
 
 
 class RewardFromVerifiers(RewardFn):
@@ -357,13 +359,18 @@ class VerifiersRollouter(Rollouter):
             group_id=group_id,
             rollout_id=rollout_id,
         )
-        status = self.rollout_status(verifiers_episode=verifiers_episode, trace=trace)
-        if not turns and status is not RolloutStatus.ERROR_SYSTEM:
-            # Verifiers records an overlong first prompt as a failed model call; vLLM, the
-            # renderer and the generation server all word it "maximum context length".
+        status = self.rollout_status(
+            verifiers_episode=verifiers_episode,
+            trace=trace,
+            # The controller numbers validation groups -1, -2, ...
+            is_validation=group_id < 0,
+        )
+        if not turns:
+            # No trainable turn, so however the rollout ended, it isn't the policy's doing.
+            status = RolloutStatus.ERROR_SYSTEM
+            # Verifiers records an overlong first prompt as a failed model call.
             first_prompt_too_long = any(
-                call.error is not None
-                and "maximum context length" in call.error.message
+                call.error is not None and _CONTEXT_OVERFLOW_TEXT in call.error.message
                 for call in trace.calls
             )
             if first_prompt_too_long:
@@ -374,12 +381,11 @@ class VerifiersRollouter(Rollouter):
                 )
                 logger.warning(
                     "rollout group=%d/rollout=%d: the first prompt%s does not fit the "
-                    "context; marking ERROR",
+                    "context; marking ERROR_SYSTEM",
                     group_id,
                     rollout_id,
                     "" if task is None else f" of task {task}",
                 )
-            status = RolloutStatus.ERROR
         logs = verifiers_rollout_logs(verifiers_episode, trace)
         if status.is_error():
             log_failed_rollout(logs, group_id=group_id, rollout_id=rollout_id)
@@ -394,27 +400,45 @@ class VerifiersRollouter(Rollouter):
         )
 
     @staticmethod
-    def rollout_status(*, verifiers_episode: Any, trace: Any) -> RolloutStatus:
+    def rollout_status(
+        *, verifiers_episode: Any, trace: Any, is_validation: bool
+    ) -> RolloutStatus:
         # Verifiers flags an expired deadline with is_timeout: a stage's on its trace (which can keep
-        # ok=True), the whole episode's on the episode.
+        # ok=True), the whole episode's on the episode. A slow sandbox, grader or generator can
+        # expire any deadline, so only validation scores a timeout.
         if trace.is_timeout or verifiers_episode.is_timeout:
-            return RolloutStatus.ERROR_TIMEOUT
+            return (
+                RolloutStatus.ERROR_TIMEOUT
+                if is_validation
+                else RolloutStatus.ERROR_SYSTEM
+            )
         if not verifiers_episode.ok or not trace.ok:
             # Verifiers records a failure as data instead of raising; the first error stopped the
-            # rollout. Only a generator 4xx (e.g. a prompt past the context) or the agent's own
-            # exit after the policy's first turn is the policy's doing. Any other error (a sandbox,
-            # env or tool failure, a generator 5xx or failed connection, a harness that failed
-            # before the first turn) makes the rollout ERROR_SYSTEM.
+            # rollout. Only a failure after the policy's first turn can be the policy's doing:
+            #   HarnessError that stopped the trace ("harness_error"): the harness failed
+            #     mid-rollout, in practice the agent process exiting                 -> ERROR
+            #   ProviderError 400 "maximum context length": it outgrew the context   -> ERROR
+            #   any other generator error (a bad request, an unreachable server)     -> ERROR_SYSTEM
+            #   any other error (e.g. a harness @metric after the agent finished, a
+            #     sandbox, env, tool or task-code error), or none recorded           -> ERROR_SYSTEM
             errors = trace.errors or verifiers_episode.errors
             if not errors:
-                return RolloutStatus.ERROR
+                return RolloutStatus.ERROR_SYSTEM
+            # Assumes no AgentConfig.retries: those put earlier attempts' errors first.
             error = errors[0]
-            is_policy_error = (
-                error.type == VerifiersHarnessError.__name__ and trace.num_turns > 0
-            ) or (
-                error.type == VerifiersProviderError.__name__
-                and error.status_code is not None
-                and error.status_code < 500
+            # Verifiers records only the class name, so a HarnessError subclass is ERROR_SYSTEM.
+            # A trace keeps its first stop condition: after the agent stopped, a HarnessError
+            # doesn't change it to "harness_error".
+            is_policy_error = trace.num_turns > 0 and (
+                (
+                    error.type == VerifiersHarnessError.__name__
+                    and trace.stop_condition == "harness_error"
+                )
+                or (
+                    error.type == VerifiersProviderError.__name__
+                    and error.status_code == 400
+                    and _CONTEXT_OVERFLOW_TEXT in error.message
+                )
             )
             return (
                 RolloutStatus.ERROR if is_policy_error else RolloutStatus.ERROR_SYSTEM

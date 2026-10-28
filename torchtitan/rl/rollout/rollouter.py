@@ -237,7 +237,8 @@ class Rollouter(Configurable):
             release_session_fn: Async callable each rollout calls after its last turn, to
                 release its routing session.
             sample: Dataset sample shared by the group.
-            group_id: Stable group id; siblings share it for advantage centering.
+            group_id: Stable group id; siblings share it for advantage centering. Negative for
+                validation.
             group_size: Number of sibling rollouts.
             sampling: Sampling config for every generate call in the group.
 

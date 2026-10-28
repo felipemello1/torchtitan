@@ -29,6 +29,7 @@ from torchtitan.rl.examples.verifiers.generation_server import (
     VerifiersGenerationMetadata,
 )
 from torchtitan.rl.examples.verifiers.rollouter import (
+    _CONTEXT_OVERFLOW_TEXT,
     _trainable_token_spans,
     log_failed_rollout,
     VERIFIERS_REWARD_KEY,
@@ -42,15 +43,29 @@ from torchtitan.rl.rollout.rubric import RubricOutput
 from torchtitan.rl.rollout.types import Completion, Rollout, RolloutStatus
 
 
-def _recorded_error(error_type: str, status_code: int | None = None) -> SimpleNamespace:
+# The renderer's wording for a prompt past the context; Verifiers records it as a ProviderError 400.
+_OVERFLOW_MESSAGE = "Prompt length (9) exceeds maximum context length (8)."
+# The generation server's wording for the same, as the OpenAI client relays its 400.
+_SERVER_OVERFLOW_MESSAGE = (
+    "Error code: 400 - {'error': \"This model's maximum context length is 8 tokens, and the "
+    'prompt has 8 tokens, leaving no room for an output token"}'
+)
+
+
+def _recorded_error(
+    error_type: str, status_code: int | None = None, message: str | None = None
+) -> SimpleNamespace:
     """An error as Verifiers records it on a trace or an episode (`verifiers.v1.trace.Error`)."""
     fields = {
         "type": error_type,
-        "message": f"{error_type} happened",
+        "message": message or f"{error_type} happened",
         "status_code": status_code,
         "traceback": None,
     }
     return SimpleNamespace(**fields, model_dump=lambda mode: fields)
+
+
+_OVERFLOW_400 = _recorded_error("ProviderError", 400, _OVERFLOW_MESSAGE)
 
 
 def test_train_client_config_carries_an_in_tree_renderer() -> None:
@@ -795,7 +810,7 @@ def test_generation_server_rejects_prompt_without_room_for_output() -> None:
         assert prompt_lengths == [7]
         assert statuses == [500, 400, 400]
         # vLLM's own wording, which Verifiers matches as a context overflow.
-        assert "maximum context length" in errors[1]
+        assert _CONTEXT_OVERFLOW_TEXT in errors[1]
 
     asyncio.run(run_test())
 
@@ -823,27 +838,31 @@ def test_validate_token_ids(token_ids, accepted) -> None:
 
 
 @pytest.mark.parametrize(
-    "trace_ok, trace_errors, expected",
+    "trace_errors, call_error_message",
     [
-        # The prompt is past the context: the data's problem, flagged and kept as ERROR.
-        (True, [], RolloutStatus.ERROR),
-        # The generator unreachable: not the policy's doing, so its group still trains.
-        (False, [_recorded_error("ProviderError", 503)], RolloutStatus.ERROR_SYSTEM),
+        # The prompt is past the context and the harness ended cleanly: the data's problem, flagged.
+        ([], _OVERFLOW_MESSAGE),
+        # The same, recorded as the generator's 400.
+        ([_OVERFLOW_400], _OVERFLOW_MESSAGE),
+        # The generator unreachable.
+        ([_recorded_error("ProviderError", 503)], "Connection error."),
     ],
 )
 def test_rollout_whose_first_model_call_failed_has_no_turns(
-    caplog, trace_ok, trace_errors, expected
+    caplog, trace_errors, call_error_message
 ) -> None:
+    """No trainable turn, so its siblings still train (ERROR_SYSTEM)."""
     span = SimpleNamespace(duration=0.0)
     trace = SimpleNamespace(
         id="trace",
         task=SimpleNamespace(key="huge-task"),
         agent=SimpleNamespace(trainable=True),
-        ok=trace_ok,
+        ok=not trace_errors,
         is_truncated=False,
         is_timeout=False,
         stop_condition="agent_completed",
         errors=trace_errors,
+        num_turns=0,
         timing=SimpleNamespace(
             setup=span,
             agent=SimpleNamespace(duration=0.0, model=span, harness=span),
@@ -851,10 +870,7 @@ def test_rollout_whose_first_model_call_failed_has_no_turns(
         ),
         calls=[
             SimpleNamespace(
-                time=span,
-                error=SimpleNamespace(
-                    message="Prompt length (9) exceeds maximum context length (8)."
-                ),
+                time=span, error=SimpleNamespace(message=call_error_message)
             )
         ],
         nodes=[],
@@ -884,33 +900,44 @@ def test_rollout_whose_first_model_call_failed_has_no_turns(
             )
         )
 
-    assert rollout.status is expected and rollout.turns == []
+    assert rollout.status is RolloutStatus.ERROR_SYSTEM and rollout.turns == []
     is_flagged = "first prompt of task huge-task does not fit" in caplog.text
-    assert is_flagged == (expected is RolloutStatus.ERROR)
+    assert is_flagged == (call_error_message == _OVERFLOW_MESSAGE)
 
 
 @pytest.mark.parametrize(
-    "ok, is_timeout, episode_is_timeout, expected",
+    "ok, is_timeout, episode_is_timeout, training, validation",
     [
-        (True, True, False, RolloutStatus.ERROR_TIMEOUT),
-        (False, True, False, RolloutStatus.ERROR_TIMEOUT),
+        # A stage's deadline (setup, agent, finalize, scoring) on the trace.
+        (True, True, False, RolloutStatus.ERROR_SYSTEM, RolloutStatus.ERROR_TIMEOUT),
+        (False, True, False, RolloutStatus.ERROR_SYSTEM, RolloutStatus.ERROR_TIMEOUT),
         # The episode's own deadline flags the episode and leaves it not ok.
-        (True, False, True, RolloutStatus.ERROR_TIMEOUT),
-        (False, False, False, RolloutStatus.ERROR),
-        (True, False, False, RolloutStatus.COMPLETED),
+        (True, False, True, RolloutStatus.ERROR_SYSTEM, RolloutStatus.ERROR_TIMEOUT),
+        # Not ok, with no error recorded to say why.
+        (False, False, False, RolloutStatus.ERROR_SYSTEM, RolloutStatus.ERROR_SYSTEM),
+        (True, False, False, RolloutStatus.COMPLETED, RolloutStatus.COMPLETED),
     ],
 )
-def test_rollout_status_maps_timeouts_to_error_timeout(
-    ok: bool, is_timeout: bool, episode_is_timeout: bool, expected: RolloutStatus
+def test_rollout_status_scores_timeouts_only_in_validation(
+    ok: bool,
+    is_timeout: bool,
+    episode_is_timeout: bool,
+    training: RolloutStatus,
+    validation: RolloutStatus,
 ) -> None:
     trace = SimpleNamespace(ok=ok, is_timeout=is_timeout, is_truncated=False, errors=[])
     episode = SimpleNamespace(
         ok=not episode_is_timeout, is_timeout=episode_is_timeout, errors=[]
     )
 
-    status = VerifiersRollouter.rollout_status(verifiers_episode=episode, trace=trace)
+    statuses = [
+        VerifiersRollouter.rollout_status(
+            verifiers_episode=episode, trace=trace, is_validation=is_validation
+        )
+        for is_validation in (False, True)
+    ]
 
-    assert status is expected
+    assert statuses == [training, validation]
 
 
 @pytest.mark.parametrize(
@@ -923,20 +950,31 @@ def test_rollout_status_maps_timeouts_to_error_timeout(
         ([_recorded_error("RuntimeError")], [], 1, RolloutStatus.ERROR_SYSTEM),
         # The env's own `run()` raised: recorded on the episode, not the trace.
         ([], [_recorded_error("EnvError")], 1, RolloutStatus.ERROR_SYSTEM),
-        # A prompt past the context, or the agent's own exit: the policy's doing.
-        ([_recorded_error("ProviderError", 400)], [], 1, RolloutStatus.ERROR),
-        ([_recorded_error("HarnessError")], [], 1, RolloutStatus.ERROR),
-        # A generator 4xx stays ERROR even before the first turn.
-        ([_recorded_error("ProviderError", 400)], [], 0, RolloutStatus.ERROR),
-        # The harness failed before the policy's first turn: the policy never ran.
-        ([_recorded_error("HarnessError")], [], 0, RolloutStatus.ERROR_SYSTEM),
-        # The first error stopped the rollout; a later teardown error doesn't change it.
+        # The agent outgrew the context (the renderer's or the generation server's 400), or the
+        # harness failed: the policy's doing.
+        ([_OVERFLOW_400], [], 1, RolloutStatus.ERROR),
         (
-            [_recorded_error("ProviderError", 400), _recorded_error("SandboxError")],
+            [_recorded_error("ProviderError", 400, _SERVER_OVERFLOW_MESSAGE)],
             [],
             1,
             RolloutStatus.ERROR,
         ),
+        ([_recorded_error("HarnessError")], [], 1, RolloutStatus.ERROR),
+        # Any other generator error is the request's or the server's, even a 500 naming the context.
+        ([_recorded_error("ProviderError", 400)], [], 1, RolloutStatus.ERROR_SYSTEM),
+        (
+            [_recorded_error("ProviderError", 500, _OVERFLOW_MESSAGE)],
+            [],
+            1,
+            RolloutStatus.ERROR_SYSTEM,
+        ),
+        # A HarnessError subclass: Verifiers records only its own class name.
+        ([_recorded_error("StalledHarnessError")], [], 1, RolloutStatus.ERROR_SYSTEM),
+        # Before the policy's first turn, nothing is the policy's doing.
+        ([_OVERFLOW_400], [], 0, RolloutStatus.ERROR_SYSTEM),
+        ([_recorded_error("HarnessError")], [], 0, RolloutStatus.ERROR_SYSTEM),
+        # The first error stopped the rollout; a later teardown error doesn't change it.
+        ([_OVERFLOW_400, _recorded_error("SandboxError")], [], 1, RolloutStatus.ERROR),
     ],
 )
 def test_rollout_status_maps_recorded_infra_errors_to_error_system(
@@ -948,10 +986,58 @@ def test_rollout_status_maps_recorded_infra_errors_to_error_system(
         is_truncated=False,
         errors=trace_errors,
         num_turns=num_turns,
+        # Left by a HarnessError that stopped the trace; only a HarnessError reads it.
+        stop_condition="harness_error",
     )
     episode = SimpleNamespace(ok=False, is_timeout=False, errors=episode_errors)
 
-    status = VerifiersRollouter.rollout_status(verifiers_episode=episode, trace=trace)
+    statuses = [
+        VerifiersRollouter.rollout_status(
+            verifiers_episode=episode, trace=trace, is_validation=is_validation
+        )
+        for is_validation in (False, True)
+    ]
+
+    assert statuses == [expected, expected]
+
+
+@pytest.mark.parametrize(
+    "stopped_by, expected",
+    [
+        # The agent process exited: its HarnessError stopped the trace ("harness_error").
+        (None, RolloutStatus.ERROR),
+        # A harness @metric raised after the agent completed or hit max_turns: the trace keeps
+        # its first stop condition.
+        ("agent_completed", RolloutStatus.ERROR_SYSTEM),
+        ("max_turns", RolloutStatus.ERROR_SYSTEM),
+    ],
+)
+def test_a_harness_error_is_the_policys_only_if_it_stopped_the_trace(
+    stopped_by: str | None, expected: RolloutStatus
+) -> None:
+    from verifiers.v1.episode import WireEpisode
+    from verifiers.v1.errors import HarnessError
+    from verifiers.v1.trace import WireTrace
+
+    task = {"type": "swe", "data": {}}
+    # One sampled turn, then the HarnessError recorded as Verifiers records it.
+    trace = WireTrace.model_validate(
+        {
+            "task": task,
+            "agent": {"config": {}},
+            "nodes": [
+                {"message": {"role": "assistant", "content": "done"}, "sampled": True}
+            ],
+        }
+    )
+    if stopped_by is not None:
+        trace.stop(stopped_by)
+    trace.record_error(HarnessError("harness 'agent' failed"))
+    episode = WireEpisode.model_validate({"task": task, "ok": False, "traces": [trace]})
+
+    status = VerifiersRollouter.rollout_status(
+        verifiers_episode=episode, trace=trace, is_validation=False
+    )
 
     assert status is expected
 
@@ -974,12 +1060,27 @@ def test_a_harness_that_fails_before_the_first_turn_is_error_system() -> None:
     )
     episode = WireEpisode.model_validate({"task": task, "ok": False, "traces": [trace]})
 
-    status = VerifiersRollouter.rollout_status(verifiers_episode=episode, trace=trace)
+    status = VerifiersRollouter.rollout_status(
+        verifiers_episode=episode, trace=trace, is_validation=False
+    )
 
     assert status is RolloutStatus.ERROR_SYSTEM
 
 
-def test_timed_out_rollout_is_logged_and_keeps_no_reward(caplog) -> None:
+@pytest.mark.parametrize(
+    "group_id, has_turn, expected",
+    [
+        # Training, from group 0: a deadline can expire on our side (a slow sandbox, grader or
+        # generator).
+        (0, True, RolloutStatus.ERROR_SYSTEM),
+        # Validation (negative group ids) keeps scoring it, unless no turn was trainable.
+        (-1, True, RolloutStatus.ERROR_TIMEOUT),
+        (-1, False, RolloutStatus.ERROR_SYSTEM),
+    ],
+)
+def test_timed_out_rollout_is_logged_and_keeps_no_reward(
+    caplog, group_id: int, has_turn: bool, expected: RolloutStatus
+) -> None:
     from verifiers.v1.types import AssistantMessage as VerifiersAssistantMessage
 
     # The agent stage timed out, but Verifiers kept ok=True and still graded the reply.
@@ -989,6 +1090,7 @@ def test_timed_out_rollout_is_logged_and_keeps_no_reward(caplog) -> None:
         sampled=True,
         message=VerifiersAssistantMessage(content="answer"),
     )
+    branch = SimpleNamespace(nodes=[node], token_ids=[10, 11], logprobs=[0.0, -0.1])
     span = SimpleNamespace(duration=0.0)
     trace = SimpleNamespace(
         id="trace",
@@ -1006,10 +1108,8 @@ def test_timed_out_rollout_is_logged_and_keeps_no_reward(caplog) -> None:
             scoring=span,
         ),
         calls=[],
-        nodes=[node],
-        branches=[
-            SimpleNamespace(nodes=[node], token_ids=[10, 11], logprobs=[0.0, -0.1])
-        ],
+        nodes=[node] if has_turn else [],
+        branches=[branch] if has_turn else [],
     )
     rollouter = object.__new__(VerifiersRollouter)
     rollouter._generation_server = SimpleNamespace(
@@ -1033,14 +1133,14 @@ def test_timed_out_rollout_is_logged_and_keeps_no_reward(caplog) -> None:
                 release_session_fn=AsyncMock(),
                 sample=VerifiersTaskSample(verifiers_task_data={"name": "slow-task"}),
                 sampling=SamplingConfig(),
-                group_id=1,
+                group_id=group_id,
                 rollout_id=2,
             )
         )
 
-    assert rollout.status is RolloutStatus.ERROR_TIMEOUT
+    assert rollout.status is expected and bool(rollout.turns) == has_turn
     assert "Verifiers rollout failed: trace=trace" in caplog.text
-    assert VERIFIERS_REWARD_KEY not in rollout.turns[-1].env_rewards
+    assert all(VERIFIERS_REWARD_KEY not in turn.env_rewards for turn in rollout.turns)
 
 
 def test_rollout_releases_every_trace_session_even_if_one_release_fails(caplog) -> None:
