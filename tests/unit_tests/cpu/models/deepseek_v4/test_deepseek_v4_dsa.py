@@ -64,9 +64,9 @@ class TestIndexerSelect(unittest.TestCase):
         selected, selected_scores = Indexer.select(
             idx_q, idx_k, idx_w, max_seqlen=seqlen, ratio=ratio, topk=topk
         )
-        # Early rows have fewer candidates than topk: their -1 slots read row 0
-        # of idx_k, which other rows also select. The upstream grad reaches every
-        # slot, so only select's own -inf mask keeps the -1 slots out.
+        # Early rows have fewer candidates than topk: their -1 slots read idx_k rows
+        # that other rows also select. The upstream grad reaches every slot, so only
+        # select's own -inf mask keeps the -1 slots out.
         valid = selected >= 0
         self.assertFalse(valid.all())
         scores = torch.einsum("shd,td->sht", idx_q, idx_k).relu()
