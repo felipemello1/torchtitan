@@ -568,6 +568,27 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
             model, x_TD, positions, attention_metadata
         )
 
+    def test_single_document_keeps_varlen_convolution(self):
+        """One document with offsets runs the Attention Gym convolution, not F.conv1d."""
+        torch.manual_seed(42)
+        model = self._make_deltanet()
+        x_TD = torch.randn(6, 4)
+        metadata = LinearAttentionMetadata(
+            varlen=create_varlen_metadata_for_document(
+                torch.arange(6, dtype=torch.int32)
+            ),
+            num_conv_history_tokens=model.conv_q.weight.shape[-1] - 1,
+        )
+
+        with mock.patch(
+            "torchtitan.models.common.attention.gdn._causal_conv1d_varlen",
+            side_effect=_reference_causal_conv1d_varlen,
+        ) as convolution:
+            actual = model(x_TD, metadata)
+
+        self.assertEqual(convolution.call_count, 3)
+        self.assertTrue(torch.equal(actual, model(x_TD)))
+
     def test_get_attention_metadata_pairs_flex_mask_with_deltanet_offsets(self):
         """Qwen35Model groups each metadata value by its attention backend."""
         from torch.nn.attention.flex_attention import BlockMask

@@ -366,26 +366,24 @@ class InnerGDN(InnerAttention):
     ) -> torch.Tensor:
         """Run the stages shared by local and context-parallel GDN."""
         num_tokens = query_TC.shape[0]
-        use_varlen_kernels = cu_seqlens is not None and (
-            cu_seqlens.numel() > 2 or is_in_batch_invariant_mode()
-        )
-        convolution_offsets = cu_seqlens if use_varlen_kernels else None
+        # Pass offsets even for one document: without them short_convolution falls back to
+        # F.conv1d, 8-12x slower at 16k tokens.
         xq_THK = self.short_convolution(
             query_TC,
             conv_q_weight_C1W,
-            cu_seqlens=convolution_offsets,
+            cu_seqlens=cu_seqlens,
             routing=routing,
         ).reshape(num_tokens, -1, key_head_dim)
         xk_THK = self.short_convolution(
             key_TC,
             conv_k_weight_C1W,
-            cu_seqlens=convolution_offsets,
+            cu_seqlens=cu_seqlens,
             routing=routing,
         ).reshape(num_tokens, -1, key_head_dim)
         xv_THV = self.short_convolution(
             value_TC,
             conv_v_weight_C1W,
-            cu_seqlens=convolution_offsets,
+            cu_seqlens=cu_seqlens,
             routing=routing,
         ).reshape(num_tokens, -1, value_head_dim)
         g_TH = -torch.exp(A_log_H.float()) * F.softplus(a_TH.float() + dt_bias_H)
@@ -396,7 +394,7 @@ class InnerGDN(InnerAttention):
             xv_THV,
             g_TH,
             beta_TH,
-            cu_seqlens=cu_seqlens if use_varlen_kernels else None,
+            cu_seqlens=cu_seqlens,
             routing=routing,
         )
 
