@@ -430,7 +430,7 @@ class VLLMModelWrapper(Module):
         for module in self.model.modules():
             if isinstance(module, FSDPModule):
                 _unshard_and_free_sharded_params(module)
-        self._refresh_gdn_conv_weights()
+        self._refresh_conv_weights()
 
     def load_state_dict(self, state_dict: Mapping[str, Any]):
         """Copy new weights into `self.model`, allocating about one FSDP group's sharded buffers at a time.
@@ -480,15 +480,19 @@ class VLLMModelWrapper(Module):
         incompatible_keys = self.model.load_state_dict(state_dict, strict=True)
         for handle in handles:
             handle.remove()
-        self._refresh_gdn_conv_weights()
+        self._refresh_conv_weights()
         return incompatible_keys
 
-    def _refresh_gdn_conv_weights(self) -> None:
-        """Refresh every GDN layer's fused conv weight; call after each weight load."""
+    def _refresh_conv_weights(self) -> None:
+        """Refresh every GDN and KDA layer's fused conv weight; call after each weight load."""
         for module in self.model.modules():
             if isinstance(module, GDN):
                 module.inner_attention.refresh_conv_weight(
                     module.conv_q.weight, module.conv_k.weight, module.conv_v.weight
+                )
+            elif isinstance(module, KDA):
+                module.inner_attention.refresh_conv_weight(
+                    module.q_conv.weight, module.k_conv.weight, module.v_conv.weight
                 )
 
     def set_num_valid_tokens(self, num_valid_tokens: int) -> None:

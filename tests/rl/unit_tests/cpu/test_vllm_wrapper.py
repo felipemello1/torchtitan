@@ -17,6 +17,7 @@ from torch.distributed.fsdp import FSDPModule, fully_shard
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.common.attention import InnerAttention, MLAAttention
 from torchtitan.models.common.attention.gdn import GDN
+from torchtitan.models.common.attention.kda import KDA
 from torchtitan.models.deepseek_v3 import build_model_config as build_deepseek_config
 from torchtitan.models.kimi_k2_7 import build_model_config as build_kimi_k2_7_config
 from torchtitan.models.kimi_k3 import build_model_config as build_kimi_k3_config
@@ -25,6 +26,7 @@ from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.generator.vllm import model_wrapper
 from torchtitan.rl.generator.vllm.attention import VLLMInnerAttention
 from torchtitan.rl.generator.vllm.gdn import VLLMInnerGDN
+from torchtitan.rl.generator.vllm.kda import VLLMInnerKDA
 from torchtitan.rl.generator.vllm.model_wrapper import (
     _replace_vllm_layer_configs,
     VLLMModelWrapper,
@@ -150,7 +152,7 @@ class _Wrapper:
     """Stand-in `self` for VLLMModelWrapper's real model state dict load methods (no vLLM)."""
 
     load_state_dict = VLLMModelWrapper.load_state_dict
-    _refresh_gdn_conv_weights = VLLMModelWrapper._refresh_gdn_conv_weights
+    _refresh_conv_weights = VLLMModelWrapper._refresh_conv_weights
 
     def __init__(self, model: nn.Module):
         self.model = model
@@ -230,26 +232,36 @@ def test_load_state_dict_allocates_one_fsdp_group_at_a_time(
         dist.destroy_process_group()
 
 
-def test_load_state_dict_refreshes_fused_gdn_conv_weight_in_place() -> None:
+@pytest.mark.parametrize(
+    ("layer_cls", "inner_cls", "conv_names"),
+    [
+        pytest.param(GDN, VLLMInnerGDN, ("conv_q", "conv_k", "conv_v"), id="gdn"),
+        pytest.param(KDA, VLLMInnerKDA, ("q_conv", "k_conv", "v_conv"), id="kda"),
+    ],
+)
+def test_load_state_dict_refreshes_fused_conv_weight_in_place(
+    layer_cls, inner_cls, conv_names
+) -> None:
     """CUDA graphs capture the fused conv weight, so every weight load refreshes it in place."""
-    gdn = GDN.__new__(GDN)
-    nn.Module.__init__(gdn)
-    for name in ("conv_q", "conv_k", "conv_v"):
+    layer = layer_cls.__new__(layer_cls)
+    nn.Module.__init__(layer)
+    for name in conv_names:
         conv = nn.Module()
         conv.weight = nn.Parameter(torch.randn(8, 1, 4, dtype=torch.bfloat16))
-        setattr(gdn, name, conv)
-    gdn.inner_attention = VLLMInnerGDN.__new__(VLLMInnerGDN)
-    nn.Module.__init__(gdn.inner_attention)
-    gdn.inner_attention.conv_weight_CW, gdn.inner_attention.conv_kernel_size = None, 4
-    wrapper = _Wrapper(nn.ModuleList([gdn]))
+        setattr(layer, name, conv)
+    layer.inner_attention = inner_cls.__new__(inner_cls)
+    nn.Module.__init__(layer.inner_attention)
+    layer.inner_attention.conv_weight_CW = None
+    layer.inner_attention.conv_kernel_size = 4
+    wrapper = _Wrapper(nn.ModuleList([layer]))
     pushed = {k: v + 1.0 for k, v in wrapper.model.state_dict().items()}
-    wrapper._refresh_gdn_conv_weights()  # as after the initial load
-    fused = gdn.inner_attention.conv_weight_CW
+    wrapper._refresh_conv_weights()  # as after the initial load
+    fused = layer.inner_attention.conv_weight_CW
 
     wrapper.load_state_dict(pushed)
 
-    assert gdn.inner_attention.conv_weight_CW is fused
-    conv_weights = [gdn.conv_q.weight, gdn.conv_k.weight, gdn.conv_v.weight]
+    assert layer.inner_attention.conv_weight_CW is fused
+    conv_weights = [getattr(layer, name).weight for name in conv_names]
     assert torch.equal(fused, torch.cat(conv_weights).squeeze(1))
 
 
