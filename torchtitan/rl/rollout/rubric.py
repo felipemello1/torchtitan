@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import math
 from dataclasses import dataclass, field
 
 from torchtitan.config import Configurable
@@ -76,7 +77,8 @@ class Rubric(Configurable):
 
     Setting `truncation_reward` / `error_reward` short-circuits the reward fns for
     rollouts whose status is truncated / errored. `truncation_penalty` instead keeps the
-    reward fns' partial credit on a truncated rollout and adds the penalty to it.
+    reward fns' partial credit on a truncated rollout and adds the penalty to it in
+    `score_group` (optionally only in groups whose scores differ).
 
     Example:
         rubric = Rubric.Config(
@@ -99,6 +101,12 @@ class Rubric(Configurable):
         tokens or context length, e.g. -0.2: it keeps its partial credit but scores below the
         same rollout finished. Needs `truncation_reward=None`."""
 
+        truncation_penalty_needs_spread: bool = False
+        """If True, `truncation_penalty` is added only in groups of 2+ rollouts whose rewards
+        before the penalty are not all equal. A group that ties without it (e.g. every rollout
+        fails, some truncated) then keeps zero spread and trains nothing; its truncated rollouts
+        record `truncation_penalty: 0.0`. NaN rewards are ignored when checking for a tie."""
+
         error_reward: float | None = None
         """Reward for a errored rollout. If set, the reward fns are SKIPPED and this fixed
         reward is used. If None, the reward fns run on the errored rollout."""
@@ -112,6 +120,8 @@ class Rubric(Configurable):
                 "set truncation_reward (a fixed score) or truncation_penalty (added to the "
                 "reward fns' score), not both"
             )
+        if config.truncation_penalty_needs_spread and config.truncation_penalty is None:
+            raise ValueError("truncation_penalty_needs_spread needs truncation_penalty")
         self._config = config
         self._reward_fns = [rwd_cfg.build() for rwd_cfg in config.reward_fns]
 
@@ -166,10 +176,6 @@ class Rubric(Configurable):
             reward_breakdown[type(fn).__name__] = r
             total_reward += (fn.weight / self._weight_sum) * r
 
-        if cfg.truncation_penalty is not None and rollout.status.is_truncated():
-            reward_breakdown["truncation_penalty"] = cfg.truncation_penalty
-            total_reward += cfg.truncation_penalty
-
         return RubricOutput(reward=total_reward, reward_breakdown=reward_breakdown)
 
     @sl.log_trace_span("score_group")
@@ -190,6 +196,37 @@ class Rubric(Configurable):
         Returns:
             One `RubricOutput` per rollout, in input order.
         """
-        return await asyncio.gather(
+        outputs = await asyncio.gather(
             *(self._score_single_rollout(r, env_input) for r in rollouts)
         )
+        return self._add_truncation_penalty(rollouts, outputs)
+
+    def _add_truncation_penalty(
+        self, rollouts: list[Rollout], outputs: list[RubricOutput]
+    ) -> list[RubricOutput]:
+        """Add `truncation_penalty` to each truncated rollout's score, or 0.0 to all of them
+        when `truncation_penalty_needs_spread` is set and the group's scores tie.
+
+        Example:
+            needs_spread, scores [0, 0, 0 (truncated)] -> [0, 0, 0], truncation_penalty 0.0
+            needs_spread, scores [1, 0, 0 (truncated)] -> [1, 0, -0.2]
+        """
+        penalty = self._config.truncation_penalty
+        if penalty is None:
+            return outputs
+        if self._config.truncation_penalty_needs_spread and len(outputs) >= 2:
+            scores = {o.reward for o in outputs if not math.isnan(o.reward)}
+            if len(scores) <= 1:
+                penalty = 0.0
+        return [
+            RubricOutput(
+                reward=output.reward + penalty,
+                reward_breakdown={
+                    **output.reward_breakdown,
+                    "truncation_penalty": penalty,
+                },
+            )
+            if rollout.status.is_truncated()
+            else output
+            for rollout, output in zip(rollouts, outputs, strict=True)
+        ]
