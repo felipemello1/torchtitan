@@ -172,7 +172,7 @@ class TestKernelSelection(unittest.TestCase):
     def test_mla_builders_set_projection_and_backend_sharding(self):
         for model, backends in (
             ("deepseek_v3", ("flex", "varlen")),
-            ("kimi_k2_7", ("flex",)),  # QK clipping requires FlexAttention.
+            ("kimi_k2_7", ("flex", "varlen")),
             ("kimi_k3", ("flex", "varlen")),
         ):
             build_model_config = importlib.import_module(
