@@ -16,6 +16,7 @@ The uneven-decode integration test requires four GPUs and a torchrun launcher.
 
 import asyncio
 import concurrent.futures
+import functools
 import gc
 import math
 import os
@@ -897,15 +898,33 @@ def test_cuda_graph_full_mode_capture_sizes_8_per_doubling_above_1024():
     assert min(size for size in sizes if size >= qwen35_mixed_step_tokens) == 1664
 
 
-def test_expert_sequence_parallel_rejects_no_decode_cuda_graph_sizes():
-    # Degree 3 keeps only multiples of 384 (1152, 1536, 1920): a decode batch of
-    # at most 256 tokens would always replay a mixed-step graph.
-    with pytest.raises(ValueError, match="No CUDA graph capture sizes"):
-        VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(
-            max_num_seqs=256,
-            expert_sequence_parallel_size=3,
-            enable_sequence_parallel=False,
-        )
+@pytest.mark.parametrize("max_num_seqs, rejects", [(256, True), (1150, False)])
+def test_expert_sequence_parallel_needs_a_decode_cuda_graph_size(max_num_seqs, rejects):
+    # Degree 3 keeps only multiples of 384 (1152, 1536, 1920) of the auto sizes. A
+    # decode batch of 256 would always replay a mixed-step graph; one of 1150 pads to
+    # 1152 = 1150 + 3 - 1, the largest size still below max_num_seqs + degree.
+    get_config = functools.partial(
+        VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config,
+        max_num_seqs=max_num_seqs,
+        expert_sequence_parallel_size=3,
+        enable_sequence_parallel=False,
+    )
+    if rejects:
+        with pytest.raises(ValueError, match="No CUDA graph capture sizes"):
+            get_config()
+    else:
+        assert get_config().cudagraph_capture_sizes[0] == 1152
+
+
+def test_expert_sequence_parallel_keeps_explicit_capture_sizes_above_max_num_seqs():
+    cfg = VLLMCudaGraphConfig(
+        mode="FULL", capture_sizes=[512, 1024, 2048]
+    ).get_vllm_compilation_config(
+        max_num_seqs=256,
+        expert_sequence_parallel_size=4,
+        enable_sequence_parallel=False,
+    )
+    assert cfg.cudagraph_capture_sizes == [512, 1024, 2048]
 
 
 def test_cuda_graph_rejects_nonpositive_max_num_seqs():

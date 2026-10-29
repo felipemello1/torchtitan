@@ -53,9 +53,9 @@ class VLLMCudaGraphConfig:
     """Explicit CUDA graph capture batch sizes. When ``None`` (default), sizes are
     auto-derived: powers of 2 up to 1024, then 8 sizes per doubling up to the cap
     (every 128 tokens to 2048, every 256 to 4096, ...), so a step above 1024 tokens
-    pads at most 1/8, plus ``max_num_seqs`` and the cap as exact sizes. When set, these sizes are deduped and sorted. When expert
-    sequence parallelism is enabled, capture sizes that are not multiples of
-    its degree are removed."""
+    pads at most 1/8, plus ``max_num_seqs`` and the cap as exact sizes. When set,
+    these sizes are deduped and sorted. When expert sequence parallelism is
+    enabled, capture sizes that are not multiples of its degree are removed."""
 
     # TODO: Validate CUDA graph capture with MoE / Expert Parallelism.
     # MoE routing produces dynamic shapes that may conflict with full
@@ -158,13 +158,17 @@ class VLLMCudaGraphConfig:
             sizes = [
                 size for size in sizes if size % expert_sequence_parallel_size == 0
             ]
-            # A decode batch is padded to a multiple of the degree, so it needs a
-            # size below max_num_seqs + degree; otherwise every decode step would
-            # replay a mixed-step graph (e.g. degree 3 keeps only 1152, 1536, ...).
-            if not sizes or sizes[0] >= max_num_seqs + expert_sequence_parallel_size:
+            # Auto sizes above 1024 are multiples of 128, so a degree of 3 or 6 can
+            # keep only those (1152, 1536, ...), and every decode step would replay
+            # a mixed-step graph. A decode batch is padded to a multiple of the
+            # degree, so it needs a size below max_num_seqs + degree.
+            if not sizes or (
+                self.capture_sizes is None
+                and sizes[0] >= max_num_seqs + expert_sequence_parallel_size
+            ):
                 raise ValueError(
-                    "No CUDA graph capture sizes up to max_num_seqs "
-                    f"{max_num_seqs} are divisible by "
+                    "No CUDA graph capture sizes for a decode batch of up to "
+                    f"max_num_seqs {max_num_seqs} are divisible by "
                     f"expert_sequence_parallel_size {expert_sequence_parallel_size}"
                 )
 
