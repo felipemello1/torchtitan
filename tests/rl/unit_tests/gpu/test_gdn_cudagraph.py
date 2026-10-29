@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn.functional as F
 from batch_invariant_ops import enable_batch_invariant_mode
 from torchtitan.components.checkpointer import CheckpointManager
 
@@ -263,6 +264,54 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
                 unused = [slot for slot in range(6) if slot not in slots]
                 assert torch.equal(actual[unused], untouched[unused])
                 assert torch.equal(actual[:, -128:], untouched[:, -128:])
+
+
+def test_packed_gate_matches_trainer_expression(monkeypatch) -> None:
+    """The packed path's fused gate has the bits of the trainer's FP32 expression, on every
+    bf16 gate value."""
+    device, heads = torch.device("cuda"), 48
+    values = torch.arange(-(2**15), 2**15, dtype=torch.int16).view(torch.bfloat16)
+    a = values[values.isfinite()].to(device)[:, None].expand(-1, heads).contiguous()
+    num_tokens = a.shape[0]
+    # Trained Qwen3.5-27B / 35B-A3B reach A_log [-5.6, 4.9], dt_bias [-8.9, 19.3].
+    A_log = torch.linspace(-8, 6, heads, device=device).bfloat16()
+    dt_bias = torch.linspace(-14, 20, heads, device=device).bfloat16()
+    layer = gdn.VLLMInnerGDN.__new__(gdn.VLLMInnerGDN)
+    torch.nn.Module.__init__(layer)
+    layer.local_num_k_heads = layer.local_num_v_heads = heads
+    layer.head_k_dim = layer.head_v_dim = 1
+    layer.local_key_dim = heads
+    layer.kv_cache = (None, None)
+    decays = []
+
+    def chunk(query, key, value, decay, *args, **kwargs):
+        decays.append(decay)
+        return torch.zeros_like(value)
+
+    monkeypatch.setattr(gdn, "is_in_batch_invariant_mode", lambda: False)
+    monkeypatch.setattr(gdn, "l2norm", lambda x, **kwargs: x)
+    monkeypatch.setattr(gdn, "chunk_kernel_options", lambda query: None)
+    monkeypatch.setattr(gdn, "paged_chunk_gdn", chunk)
+    conv_output = torch.zeros(num_tokens, 3 * heads, device=device)
+    output = torch.empty(num_tokens, heads, 1, device=device)
+    with torch.inference_mode():
+        layer._forward_gdn(
+            conv_output,
+            a,
+            torch.zeros_like(a),
+            A_log,
+            dt_bias,
+            output,
+            None,
+            None,
+            None,
+        )
+        # The trainer's gate (torchtitan/models/common/attention/gdn.py).
+        trainer = -torch.exp(A_log.float()) * F.softplus(a.float() + dt_bias)
+    # Bit patterns, so fastmath=True (off by up to ~4e-6) fails here.
+    assert torch.equal(
+        decays[0].view(torch.int32), trainer.unsqueeze(0).view(torch.int32)
+    )
 
 
 def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
