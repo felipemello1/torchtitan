@@ -27,6 +27,7 @@ if TYPE_CHECKING:
         context_parallel_conv_history,
         ContextParallelRouting,
     )
+    from attn_gym.linear.gdn import prepare_gdn_inputs
     from attn_gym.linear.gdn.context_parallel import context_parallel_gdn
     from attn_gym.linear.gdn.impl.cudnn import ChunkGdnCudnnPacked
     from attn_gym.linear.gdn.ops import _ChunkGDN
@@ -79,6 +80,7 @@ __all__ = [
     "paged_causal_conv1d",
     "paged_chunk_gdn",
     "paged_chunk_kda",
+    "prepare_gdn_inputs",
     "recurrent_gdn",
     "recurrent_gdn_decode",
     "recurrent_kda_decode",
@@ -115,6 +117,7 @@ _EXPORTS = {
     "paged_causal_conv1d": "attn_gym.linear.short_conv",
     "paged_chunk_gdn": "attn_gym.linear",
     "paged_chunk_kda": "attn_gym.linear.kda",
+    "prepare_gdn_inputs": "attn_gym.linear.gdn",
     "recurrent_gdn": "attn_gym.linear",
     "recurrent_gdn_decode": "attn_gym.linear",
     "recurrent_kda_decode": "attn_gym.linear.kda",
