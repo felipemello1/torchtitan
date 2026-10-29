@@ -222,7 +222,12 @@ def test_full_metadata_and_native_dispatch_variants():
     assert decode_metadata.non_spec_query_start_loc.tolist() == [0, 1, 2]
     assert decode_metadata.non_spec_state_indices_tensor.tolist() == [1, 0]
     single_token = replace(common, max_query_len=1, num_actual_tokens=2)
+    # A dummy run builds through here and may replay the mixed graph at this size
+    # (one token, 2 <= max_num_seqs), so the packed offsets must end at 2, not a stale 4.
+    builder.build(0, common)
     decode_capture = builder.build_for_cudagraph_capture(single_token)
+    assert builder.query_start_loc.tolist() == [0, 1, 2, 2]
+    assert builder.prefill_query_start_loc.tolist() == [0, 2, 2, 2]
     assert not decode_capture.has_initial_state.any()
     actual = builder.build(0, single_token)
     assert actual.execution_path is LinearAttentionExecutionPath.SINGLE_TOKEN
