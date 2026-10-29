@@ -28,14 +28,19 @@ from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.types import Rollout, RolloutGroup, RolloutStatus
 
 
-def _group(group_id: int, rewards: list[float]) -> RolloutGroup:
+def _group(group_id: int, rewards: list[float | None]) -> RolloutGroup:
+    """A reward of None makes an unscored ERROR_SYSTEM rollout."""
     return RolloutGroup(
         group_id=group_id,
         rollouts=[
             Rollout(
                 group_id=group_id,
                 rollout_id=rollout_id,
-                status=RolloutStatus.COMPLETED,
+                status=(
+                    RolloutStatus.ERROR_SYSTEM
+                    if reward is None
+                    else RolloutStatus.COMPLETED
+                ),
                 reward=reward,
             )
             for rollout_id, reward in enumerate(rewards)
@@ -71,7 +76,7 @@ def test_vllm_priority_puts_extra_validation_after_training() -> None:
     assert background > vllm_priority(10**9)
 
 
-def _controller(extra: ExtraValidationConfig, rewards: list[list[float]]):
+def _controller(extra: ExtraValidationConfig, rewards: list[list[float | None]]):
     controller = object.__new__(Controller)
     controller.config = SimpleNamespace(
         async_loop=SimpleNamespace(
@@ -132,6 +137,16 @@ def test_extra_validation_without_binary_reward_logs_only_best_of() -> None:
     )
     assert aggregated["validation/swe/best_of_2/mean"] == 0.75
     assert not any("pass_at" in key for key in aggregated)
+
+
+def test_extra_validation_best_of_skips_unscored_rollouts() -> None:
+    """best_of_n takes each task's best scored rollout; a task with none scored is left out."""
+    extra = ExtraValidationConfig(name="deepswe", freq=20, num_samples_per_prompt=3)
+    controller = _controller(extra, [[None, 1.0, 0.0], [None, None, None]])
+    aggregated = m.MetricsProcessor._aggregate_metrics(
+        asyncio.run(controller.validate_extra(extra_index=0, step=1))
+    )
+    assert aggregated["validation/deepswe/best_of_3/mean"] == 1.0
 
 
 def test_extra_validations_start_every_freq_steps_one_pass_at_a_time() -> None:
