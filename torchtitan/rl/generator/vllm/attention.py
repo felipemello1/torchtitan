@@ -6,7 +6,7 @@
 
 import itertools
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, ClassVar
 
 import spmd_types as spmd
@@ -17,6 +17,7 @@ from torch.nn.attention import (
     current_flash_attention_impl,
 )
 from torch.nn.attention.varlen import AuxRequest
+from vllm._custom_ops import reshape_and_cache_flash
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
@@ -31,6 +32,7 @@ from vllm.v1.attention.backends.flash_attn_diffkv import (
     FlashAttentionDiffKVImpl,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.models.base.module import Module
@@ -74,6 +76,27 @@ class TorchTitanVarlenInnerAttentionBackend(FlashAttentionBackend):
             _cudagraph_support = AttentionCGSupport.ALWAYS
 
         return TorchTitanVarlenInnerAttentionMetadataBuilder
+
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        # K and V in separate head slots, [K heads | V heads] per block, instead
+        # of vLLM's default K|V packed per token and head. With LBHNC below, each
+        # slot's page is one contiguous [block_size, head_size] run (TRT-LLM's
+        # decode cache order): FA4 decode is 3.3-3.5% faster at 8k context (hd256).
+        if spec.head_size != spec.head_size_v:
+            raise ValueError(
+                f"head slots need equal K/V head sizes, got {spec.head_size} "
+                f"and {spec.head_size_v}"
+            )
+        return replace(
+            spec,
+            num_head_slots=2 * spec.num_kv_heads,
+            state_content_bytes=spec.head_size * spec.dtype.itemsize,
+        )
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.LBHNC,)
 
 
 class TorchTitanVarlenInnerAttentionDiffKVBackend(FlashAttentionDiffKVBackend):
@@ -147,8 +170,9 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             query: shape = [num_tokens, num_heads, head_size]
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
-            kv_cache: shape is ``[num_blocks, num_kv_heads, block_size,
-                2 * head_size]``, with K and V packed in the last dimension.
+            kv_cache: shape is ``[num_blocks, 2 * num_kv_heads, block_size,
+                head_size]``, K heads then V heads (``customize_spec``). DiffKV
+                keeps vLLM's packed cache, see its ``_kv_cache_views``.
             attn_metadata: Metadata for attention.
         Returns:
             shape = [num_tokens, num_heads * head_size]
@@ -192,10 +216,7 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             AttentionType.ENCODER,
         ), "Encoder-only attention not supported yet."
 
-        # vLLM #44455 packs K and V into the content dimension for full-attention
-        # layers, including those in hybrid models. Restore the layout expected by
-        # varlen attention before splitting them.
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        key_cache, value_cache = self._kv_cache_views(kv_cache)
 
         assert not self.kv_cache_dtype.startswith(
             "fp8"
@@ -277,9 +298,42 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         output[:num_actual_tokens].copy_(out)
         return output[:num_actual_tokens]
 
+    def _kv_cache_views(
+        self, kv_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(B, 2 * H, N, D) -> K and V views (B, N, H, D), the layout varlen reads."""
+        key_cache, value_cache = kv_cache.split(self.num_kv_heads, dim=1)
+        return key_cache.transpose(1, 2), value_cache.transpose(1, 2)
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        key_cache, value_cache = self._kv_cache_views(kv_cache)
+        reshape_and_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
+        )
+
 
 class TorchTitanVarlenInnerAttentionDiffKVImpl(TorchTitanVarlenInnerAttentionImpl):
     """PyTorch varlen implementation using vLLM's unequal K/V cache writer."""
+
+    def _kv_cache_views(
+        self, kv_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(B, H, N, Dk + Dv) -> K (B, N, H, Dk), V (B, N, H, Dv); vLLM packs K|V."""
+        return kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
 
     def do_kv_cache_update(
         self,
