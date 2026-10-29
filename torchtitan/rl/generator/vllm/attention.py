@@ -83,7 +83,11 @@ class TorchTitanVarlenInnerAttentionBackend(FlashAttentionBackend):
         # of vLLM's default K|V packed per token and head. With LBHNC below, each
         # slot's page is one contiguous [block_size, head_size] run (TRT-LLM's
         # decode cache order): FA4 decode is 3.3-3.5% faster at 8k context (hd256).
-        assert spec.head_size == spec.head_size_v, "head slots need equal K/V sizes"
+        if spec.head_size != spec.head_size_v:
+            raise ValueError(
+                f"head slots need equal K/V head sizes, got {spec.head_size} "
+                f"and {spec.head_size_v}"
+            )
         return replace(
             spec,
             num_head_slots=2 * spec.num_kv_heads,
