@@ -42,6 +42,8 @@ def build_rl_model_configs(
         freeze_moe_routing  frozen router gate and expert bias, no aux loss
                             (FreezeMoERoutingTransform), so trainer and generator
                             expert choices don't drift apart
+    Generator only: the ``qkv_norm_rope`` local_compile region; remove it from
+    ``config.generator.model.local_compile.regions`` to opt out.
     Per-role transforms go through ``apply_transforms(config.generator, ...)``.
     """
     if fp32_lm_head:
@@ -63,4 +65,8 @@ def build_rl_model_configs(
         cast(Decoder.Config, transform_model_config_(model_config, transforms))
         for model_config in model_configs
     )
+    # Generator only: GQAttention's head copies, q/k norms and RoPE in one compiled region
+    # (prologue 2-3x faster, Qwen3-8B decode step 3-5% faster). With a backward the eager
+    # norm is faster, so the trainer keeps it. Batch-invariant recipes clear the regions afterwards.
+    generator_model.local_compile.regions.append("qkv_norm_rope")
     return trainer_model, generator_model
