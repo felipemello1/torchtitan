@@ -273,16 +273,16 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                 )
             return
 
-        conv_output = paged_causal_conv1d(
-            mixed_qkv[:num_actual_tokens].unsqueeze(0),
-            conv_weight,
-            self.kv_cache[0],
-            state_indices,
-            activation="silu",
-            cu_seqlens=cu_seqlens,
-            has_initial_state=has_initial_state,
-        ).squeeze(0)
         if is_in_batch_invariant_mode():
+            conv_output = paged_causal_conv1d(
+                mixed_qkv[:num_actual_tokens].unsqueeze(0),
+                conv_weight,
+                self.kv_cache[0],
+                state_indices,
+                activation="silu",
+                cu_seqlens=cu_seqlens,
+                has_initial_state=has_initial_state,
+            ).squeeze(0)
             self._forward_gdn(
                 conv_output,
                 a[:num_actual_tokens],
@@ -295,8 +295,9 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                 has_initial_state,
             )
             return
-        # Decode requests take the decode kernel; the chunk kernel sees their tokens as
-        # one null-slot sequence (the metadata builder's `_stage_decode_split`).
+        # Decode requests take the decode kernels. The paged convolution and the chunk
+        # kernel, which both cost per sequence, see their tokens as one null-slot sequence
+        # (the metadata builder's `_stage_decode_split`).
         decode_state_indices = gdn_metadata.decode_state_indices
         # A captured graph replays with any decode count, so capture runs every row.
         # vLLM's warmup at packed sizes has no decode requests, so capture is this
@@ -306,11 +307,30 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             if torch.cuda.is_current_stream_capturing()
             else gdn_metadata.num_decodes
         )
+        conv_output = paged_causal_conv1d(
+            mixed_qkv[:num_actual_tokens].unsqueeze(0),
+            conv_weight,
+            self.kv_cache[0],
+            gdn_metadata.prefill_state_indices,
+            activation="silu",
+            cu_seqlens=gdn_metadata.prefill_query_start_loc,
+            has_initial_state=has_initial_state,
+        ).squeeze(0)
         if num_decode_rows:
+            # The chunk kernel gives the decode rows zero output, so only the decode
+            # recurrence reads their convolution.
+            decode_conv_output = causal_conv1d_decode(
+                mixed_qkv[:num_decode_rows],
+                conv_weight,
+                self.kv_cache[0],
+                activation="silu",
+                state_indices=decode_state_indices[:num_decode_rows],
+                has_initial_state=has_initial_state[:num_decode_rows],
+            )
             # TODO: Attention Gym's decode kernel launches programs for null rows
             # (14-52 us over 256 rows); a capped grid looping over rows makes them cheap.
             recurrent_gdn_decode(
-                conv_output[:num_decode_rows],
+                decode_conv_output,
                 a[:num_decode_rows].unsqueeze(0),
                 b[:num_decode_rows].unsqueeze(0),
                 A_log.float(),

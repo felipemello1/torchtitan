@@ -461,8 +461,8 @@ if __name__ == "__main__":
 
 
 def test_packed_decode_routing_matches_recurrence(monkeypatch) -> None:
-    """A mixed step's decode rows (decode kernel) and prefill rows (chunk kernel) match the
-    batch-invariant path, which runs the plain recurrence over the same packed batch."""
+    """A mixed step's decode rows (decode kernels) and prefill rows (paged conv, chunk kernel)
+    match the batch-invariant path: one paged conv and the plain recurrence over the batch."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     # Qwen3.5-0.8B's local TP=1 shapes: 3 resumed decode requests, then a fresh 61-token prefill.
@@ -521,14 +521,17 @@ def test_packed_decode_routing_matches_recurrence(monkeypatch) -> None:
         no_compile_layers={}, attn_metadata={"gdn": metadata}, slot_mapping={}
     )
 
-    def run(batch_invariant: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    def run(batch_invariant: bool) -> tuple[torch.Tensor, ...]:
         monkeypatch.setattr(gdn, "is_in_batch_invariant_mode", lambda: batch_invariant)
         layer.kv_cache = tuple(pool.clone() for pool in pools)
         output = torch.zeros(num_tokens, 16, 128, device=device, dtype=torch.bfloat16)
         with torch.inference_mode(), override_forward_context(context):
             layer._forward(inputs, a, b, weight, None, A_log, dt_bias, output)
-        return output.float(), layer.kv_cache[1][1:]
+        return output.float(), layer.kv_cache[1][1:], layer.kv_cache[0]
 
-    (routed, routed_state), (reference, reference_state) = run(False), run(True)
+    routed, routed_state, routed_conv = run(False)
+    reference, reference_state, reference_conv = run(True)
     for got, want in ((routed, reference), (routed_state, reference_state)):
         assert ((got - want).norm() / want.norm()).item() < 1e-2
+    # Both convolution kernels store the raw inputs, so the history matches exactly.
+    assert torch.equal(routed_conv, reference_conv)

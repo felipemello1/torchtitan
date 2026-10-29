@@ -42,8 +42,9 @@ class TorchTitanLinearAttentionMetadata(GDNAttentionMetadata):
     # Block-table column of each request's running state, ``[num_reqs, 1]``; the same
     # in every group, so ``update_block_table`` reuses it.
     state_block_column: torch.Tensor
-    # Packed steps only: the decode requests' slots for the decode kernel; the chunk
-    # kernel reads the inherited prefill_* fields (see `_stage_decode_split`).
+    # Packed steps only: the decode requests' slots for the decode kernels; the paged
+    # convolution and the chunk kernel read the inherited prefill_* fields (see
+    # `_stage_decode_split`).
     decode_state_indices: torch.Tensor | None = None
 
 
@@ -218,11 +219,11 @@ class TorchTitanLinearAttentionMetadataBuilder(
     def _stage_decode_split(
         self, num_decodes: int, capacity: int
     ) -> dict[str, torch.Tensor]:
-        """Stage the slots and offsets that send decode requests to the decode kernel.
+        """Stage the slots and offsets that send decode requests to the decode kernels.
 
-        vLLM puts decode requests (one token each) first. The chunk kernel sees their
-        tokens as one sequence with the null slot. Example, 2 decode requests then a
-        3-token prefill, slots 5, 7, 9, capacity 4:
+        vLLM puts decode requests (one token each) first. The paged convolution and the
+        chunk kernel see their tokens as one sequence with the null slot. Example, 2
+        decode requests then a 3-token prefill, slots 5, 7, 9, capacity 4:
 
             decode_state_indices     [5, 7, 0, 0]        null past the decode requests
             prefill_query_start_loc  [0, 2, 2, 5, 5, 5]  decode tokens as one sequence
