@@ -241,13 +241,21 @@ def test_load_state_dict_refreshes_fused_gdn_weights_in_place(tmp_path) -> None:
             nn.Module.__init__(gdn)
             for name, rows in zip("qkvzab", (8, 8, 16, 16, 2, 2)):
                 projection = nn.Module()
-                projection.weight = nn.Parameter(torch.randn(rows, 4))
+                projection.weight = nn.Parameter(
+                    torch.randn(rows, 4, dtype=torch.bfloat16)
+                )
                 setattr(gdn, f"in_proj_{name}", projection)
             for name, rows in zip("qkv", (8, 8, 16)):
                 conv = nn.Module()
-                conv.weight = nn.Parameter(torch.randn(rows, 1, 4))
+                conv.weight = nn.Parameter(
+                    torch.randn(rows, 1, 4, dtype=torch.bfloat16)
+                )
                 setattr(gdn, f"conv_{name}", conv)
+            # bf16 like the generator's, so the float32 copies are new tensors.
+            gdn.A_log = nn.Parameter(torch.randn(2, dtype=torch.bfloat16))
+            gdn.dt_bias = nn.Parameter(torch.randn(2, dtype=torch.bfloat16))
             gdn.input_weight_CD = gdn.conv_weight_CW = None
+            gdn.A_log_fp32_H = gdn.dt_bias_fp32_H = None
             model.layers.append(gdn)
         model.norm = nn.LayerNorm(4)
         mesh = init_device_mesh("cpu", (1,))
@@ -259,18 +267,22 @@ def test_load_state_dict_refreshes_fused_gdn_weights_in_place(tmp_path) -> None:
         for module in model.modules():  # as after the initial load
             if isinstance(module, FSDPModule):
                 model_wrapper._unshard_and_free_sharded_params(module)
+        fused_names = (
+            "input_weight_CD",
+            "conv_weight_CW",
+            "A_log_fp32_H",
+            "dt_bias_fp32_H",
+        )
         data_ptrs = [
-            (gdn.input_weight_CD.data_ptr(), gdn.conv_weight_CW.data_ptr())
+            {name: getattr(gdn, name).data_ptr() for name in fused_names}
             for gdn in model.layers
         ]
 
         _Wrapper(model).load_state_dict(pushed)
 
         for i, gdn in enumerate(model.layers):
-            assert (
-                gdn.input_weight_CD.data_ptr(),
-                gdn.conv_weight_CW.data_ptr(),
-            ) == data_ptrs[i]
+            for name in fused_names:
+                assert getattr(gdn, name).data_ptr() == data_ptrs[i][name], name
             projections = [
                 pushed[f"layers.{i}.in_proj_{name}.weight"].to_local()
                 for name in "qkvzab"
@@ -280,6 +292,9 @@ def test_load_state_dict_refreshes_fused_gdn_weights_in_place(tmp_path) -> None:
                 pushed[f"layers.{i}.conv_{name}.weight"].to_local() for name in "qkv"
             ]
             assert torch.equal(gdn.conv_weight_CW, torch.cat(convs).squeeze(1))
+            for name in ("A_log", "dt_bias"):
+                expected = pushed[f"layers.{i}.{name}"].to_local().float()
+                assert torch.equal(getattr(gdn, f"{name}_fp32_H"), expected), name
             for name in "qkvzab":
                 weight = getattr(gdn, f"in_proj_{name}").weight
                 assert weight.untyped_storage().size() == 0, name

@@ -473,10 +473,11 @@ class VLLMGDN(GDN):
 
     Parameters and state-dict keys are ``GDN``'s, so weight loads and syncs are
     unchanged. After each load of its FSDP group, ``refresh_fused_weights`` copies
-    each rank's local shards into two fused tensors that every step reads:
+    each rank's local shards into the tensors that every step reads:
 
         input_weight_CD = [in_proj_q | in_proj_k | in_proj_v | in_proj_z | in_proj_a | in_proj_b]
         conv_weight_CW  = [conv_q | conv_k | conv_v]
+        A_log_fp32_H, dt_bias_fp32_H = float32 A_log, dt_bias (the GDN kernels read float32)
 
     Why copies: FSDP owns each parameter's storage, and the generator's model is
     FSDP-wrapped, so the parameters can't be views of one buffer. To hold one copy,
@@ -501,6 +502,8 @@ class VLLMGDN(GDN):
             )
         self.input_weight_CD: torch.Tensor | None = None
         self.conv_weight_CW: torch.Tensor | None = None
+        self.A_log_fp32_H: torch.Tensor | None = None
+        self.dt_bias_fp32_H: torch.Tensor | None = None
 
     def _input_projections(self) -> tuple[Linear, ...]:
         return (
@@ -524,12 +527,18 @@ class VLLMGDN(GDN):
         conv_weight_CW = torch.cat(
             [self.conv_q.weight, self.conv_k.weight, self.conv_v.weight]
         ).squeeze(1)
+        A_log_fp32_H = self.A_log.float()
+        dt_bias_fp32_H = self.dt_bias.float()
         if self.input_weight_CD is None or self.conv_weight_CW is None:
             self.input_weight_CD = input_weight_CD
             self.conv_weight_CW = conv_weight_CW
+            self.A_log_fp32_H = A_log_fp32_H
+            self.dt_bias_fp32_H = dt_bias_fp32_H
         else:
             self.input_weight_CD.copy_(input_weight_CD)
             self.conv_weight_CW.copy_(conv_weight_CW)
+            self.A_log_fp32_H.copy_(A_log_fp32_H)
+            self.dt_bias_fp32_H.copy_(dt_bias_fp32_H)
         for projection in self._input_projections():
             free_storage(projection.weight)
 
@@ -542,7 +551,11 @@ class VLLMGDN(GDN):
         del attention_metadata
         x_TD = maybe_gather_tp_input(self, x_TD)
         output_THV, gate_THV = self.inner_attention(
-            x_TD, self.input_weight_CD, self.conv_weight_CW, self.A_log, self.dt_bias
+            x_TD,
+            self.input_weight_CD,
+            self.conv_weight_CW,
+            self.A_log_fp32_H,
+            self.dt_bias_fp32_H,
         )
         output_THV = self.norm(output_THV, gate_THV)
         return self.out_proj(output_THV.reshape(x_TD.shape[0], -1))
