@@ -409,9 +409,9 @@ def test_forward_respects_prepared_extent_and_decode_padding(monkeypatch, decode
 
 @pytest.mark.parametrize("capturing", [False, True])
 def test_packed_forward_routes_decode_rows(monkeypatch, capturing):
-    """Decode rows take the decode kernel, prefill rows the chunk kernel; the add keeps both.
+    """Decode rows take the decode kernels, prefill rows the paged conv and chunk kernel.
 
-    Graph capture runs the decode kernel on every row; eager steps on the decode requests.
+    Graph capture runs the decode kernels on every row; eager steps on the decode requests.
     """
     layer = gdn.VLLMInnerGDN.__new__(gdn.VLLMInnerGDN)
     torch.nn.Module.__init__(layer)
@@ -438,38 +438,53 @@ def test_packed_forward_routes_decode_rows(monkeypatch, capturing):
     )
     monkeypatch.setattr(gdn, "is_in_batch_invariant_mode", lambda: False)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
-    monkeypatch.setattr(gdn, "paged_causal_conv1d", lambda x, *args, **kwargs: x)
     monkeypatch.setattr(gdn, "gate_transform", lambda a, *args, **kwargs: a)
     monkeypatch.setattr(gdn, "l2norm", lambda x, **kwargs: x)
+    rows = 4 if capturing else 2
+    # Token i carries the value i + 1 in its q, k and v channels.
+    mixed = torch.arange(1.0, 7.0)[:, None].expand(6, 3).contiguous()
+    ab = torch.ones(6, 1)
+
+    def paged_conv(x, weight, state, slots, *, cu_seqlens, **kwargs):
+        assert cu_seqlens is metadata.prefill_query_start_loc
+        assert slots is metadata.prefill_state_indices
+        # The null-slot sequence (the decode tokens, [0, 2)) is zero.
+        return torch.where(torch.arange(x.shape[1])[None, :, None] >= 2, x, 0.0)
+
+    def decode_conv(x, weight, state, *, state_indices, **kwargs):
+        assert x.shape[0] == rows
+        assert state_indices.tolist() == metadata.decode_state_indices[:rows].tolist()
+        return x * (state_indices > 0)[:, None]  # inactive rows are zero
 
     def decode(conv, a, b, A_log, dt_bias, ssm, slots, *, out, **kwargs):
-        rows = 4 if capturing else 2
         assert conv.shape[0] == rows
         assert slots.tolist() == metadata.decode_state_indices[:rows].tolist()
-        out.copy_((slots > 0).float()[None, :, None, None])  # inactive rows are zero
+        out.copy_((conv[:, 2:] * (slots > 0)[:, None]).view(1, rows, 1, 1))  # v
 
     def chunk(q, k, v, decay, beta, ssm, slots, *, cu_seqlens, **kwargs):
         assert cu_seqlens is metadata.prefill_query_start_loc
         assert slots is metadata.prefill_state_indices
-        tokens = torch.arange(q.shape[1])
-        # The null-slot sequence (the decode tokens, [0, 2)) is zero.
-        return torch.where(tokens >= 2, 2.0, 0.0)[None, :, None, None]
+        tokens = torch.arange(q.shape[1])[None, :, None, None]
+        return torch.where(tokens >= 2, 2 * v, 0.0)  # null-slot sequence: zero
 
+    monkeypatch.setattr(gdn, "paged_causal_conv1d", paged_conv)
+    monkeypatch.setattr(gdn, "causal_conv1d_decode", decode_conv)
     monkeypatch.setattr(gdn, "recurrent_gdn_decode", decode)
     monkeypatch.setattr(gdn, "paged_chunk_gdn", chunk)
     context = ForwardContext(
         no_compile_layers={}, attn_metadata={"gdn": metadata}, slot_mapping={}
     )
-    mixed, ab = torch.ones(6, 3), torch.ones(6, 1)
     output = torch.zeros(6, 1, 1)
     with override_forward_context(context):
         layer._forward(mixed, ab, ab, torch.ones(3, 4), None, ab[0], ab[0], output)
-    assert output.flatten().tolist() == [1, 1, 2, 2, 2, 0]
+    # decode rows: v; prefill rows: 2 v; past the 5 real tokens: zero
+    assert output.flatten().tolist() == [1, 2, 6, 8, 10, 0]
     if not capturing:
-        # No decode requests: eager skips the decode kernel, which rejects 0 rows.
+        # No decode requests: eager skips both decode kernels, which reject 0 rows.
         context.attn_metadata = {"gdn": replace(metadata, num_decodes=0)}
+        monkeypatch.setattr(gdn, "causal_conv1d_decode", lambda *a, **k: pytest.fail())
         monkeypatch.setattr(gdn, "recurrent_gdn_decode", lambda *a, **k: pytest.fail())
         output.zero_()
         with override_forward_context(context):
             layer._forward(mixed, ab, ab, torch.ones(3, 4), None, ab[0], ab[0], output)
-        assert output.flatten().tolist() == [0, 0, 2, 2, 2, 0]
+        assert output.flatten().tolist() == [0, 0, 6, 8, 10, 0]

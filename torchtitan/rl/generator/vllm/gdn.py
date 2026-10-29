@@ -273,16 +273,16 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                 )
             return
 
-        conv_output = paged_causal_conv1d(
-            mixed_qkv[:num_actual_tokens].unsqueeze(0),
-            conv_weight,
-            self.kv_cache[0],
-            state_indices,
-            activation="silu",
-            cu_seqlens=cu_seqlens,
-            has_initial_state=has_initial_state,
-        ).squeeze(0)
         if is_in_batch_invariant_mode():
+            conv_output = paged_causal_conv1d(
+                mixed_qkv[:num_actual_tokens].unsqueeze(0),
+                conv_weight,
+                self.kv_cache[0],
+                state_indices,
+                activation="silu",
+                cu_seqlens=cu_seqlens,
+                has_initial_state=has_initial_state,
+            ).squeeze(0)
             self._forward_gdn(
                 conv_output,
                 a[:num_actual_tokens],
@@ -295,22 +295,35 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                 has_initial_state,
             )
             return
-        # Decode requests take the decode kernel; the chunk kernel sees their tokens as
-        # one null-slot sequence (the metadata builder's `_stage_decode_split`).
+        # Decode requests take the decode kernels. The paged convolution and the chunk
+        # kernel, which both slow down on one-token sequences, see their tokens as one
+        # null-slot sequence (the metadata builder's `_stage_decode_split`).
         decode_state_indices = gdn_metadata.decode_state_indices
         # A captured graph replays with any decode count, so capture runs every row.
-        # vLLM's warmup at packed sizes has no decode requests, so capture is this
-        # kernel's first launch there: fine while it has no autotuner.
+        # vLLM's warmup at packed sizes has no decode requests, so capture is these
+        # kernels' first launch there (it can include the convolution's CuTe DSL
+        # compile): fine while they have no autotuner.
         num_decode_rows = (
             decode_state_indices.numel()
             if torch.cuda.is_current_stream_capturing()
             else gdn_metadata.num_decodes
         )
         if num_decode_rows:
-            # TODO: Attention Gym's decode kernel launches programs for null rows
-            # (14-52 us over 256 rows); a capped grid looping over rows makes them cheap.
+            # TODO: both decode kernels launch programs for null rows (over 256 rows:
+            # recurrence 14-52 us, convolution 4-5 us); a capped grid looping over rows
+            # makes them cheap.
+            # The chunk kernel gives the decode rows zero output, so only the decode
+            # recurrence reads their convolution.
+            decode_conv_output = causal_conv1d_decode(
+                mixed_qkv[:num_decode_rows],
+                conv_weight,
+                self.kv_cache[0],
+                activation="silu",
+                state_indices=decode_state_indices[:num_decode_rows],
+                has_initial_state=has_initial_state[:num_decode_rows],
+            )
             recurrent_gdn_decode(
-                conv_output[:num_decode_rows],
+                decode_conv_output,
                 a[:num_decode_rows].unsqueeze(0),
                 b[:num_decode_rows].unsqueeze(0),
                 A_log.float(),
@@ -321,8 +334,18 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                 scale=self.head_k_dim**-0.5,
                 out=output[:num_decode_rows].unsqueeze(0),
             )
-        # Adding keeps each row's one kernel result: both kernels give null slots zero
-        # output (Attention Gym's paged GDN contract), and `forward` zeroes `output`.
+        conv_output = paged_causal_conv1d(
+            mixed_qkv[:num_actual_tokens].unsqueeze(0),
+            conv_weight,
+            self.kv_cache[0],
+            gdn_metadata.prefill_state_indices,
+            activation="silu",
+            cu_seqlens=gdn_metadata.prefill_query_start_loc,
+            has_initial_state=has_initial_state,
+        ).squeeze(0)
+        # Adding keeps each row's one kernel result: the recurrence and chunk kernels give
+        # null slots zero output (Attention Gym's paged GDN contract), and `forward`
+        # zeroes `output`.
         self._forward_gdn(
             conv_output,
             a[:num_actual_tokens],
