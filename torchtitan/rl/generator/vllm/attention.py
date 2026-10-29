@@ -82,7 +82,8 @@ class TorchTitanVarlenInnerAttentionBackend(FlashAttentionBackend):
         # K and V in separate head slots, [K heads | V heads] per block, instead
         # of vLLM's default K|V packed per token and head. With LBHNC below, each
         # slot's page is one contiguous [block_size, head_size] run (TRT-LLM's
-        # decode cache): FA4 decode reads it ~4% faster at 8k context (hd256).
+        # decode cache order): FA4 decode is 3.3-3.5% faster at 8k context (hd256).
+        assert spec.head_size == spec.head_size_v, "head slots need equal K/V sizes"
         return replace(
             spec,
             num_head_slots=2 * spec.num_kv_heads,
@@ -166,7 +167,8 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
             kv_cache: shape is ``[num_blocks, 2 * num_kv_heads, block_size,
-                head_size]``, K heads then V heads (``customize_spec``).
+                head_size]``, K heads then V heads (``customize_spec``). DiffKV
+                keeps vLLM's packed cache, see its ``_kv_cache_views``.
             attn_metadata: Metadata for attention.
         Returns:
             shape = [num_tokens, num_heads * head_size]
@@ -326,7 +328,7 @@ class TorchTitanVarlenInnerAttentionDiffKVImpl(TorchTitanVarlenInnerAttentionImp
     def _kv_cache_views(
         self, kv_cache: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # vLLM #44455 packs K and V into the content dimension.
+        """(B, H, N, Dk + Dv) -> K (B, N, H, Dk), V (B, N, H, Dv); vLLM packs K|V."""
         return kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
 
     def do_kv_cache_update(
