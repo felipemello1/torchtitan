@@ -40,10 +40,9 @@ from torchtitan.models.common.attention.gdn import GDN
 from torchtitan.models.common.attention.linear_attention import chunk_kernel_options
 from torchtitan.models.common.attn_gym import (
     causal_conv1d_decode,
-    gate_transform,
-    l2norm,
     paged_causal_conv1d,
     paged_chunk_gdn,
+    prepare_gdn_inputs,
     recurrent_gdn,
     recurrent_gdn_decode,
 )
@@ -175,18 +174,17 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
     def _split_qkv(
         self, mixed_qkv: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Split local fused channels and add a singleton batch dim."""
+        """Split local fused channels and add a singleton batch dim.
+
+        q and k stay row-strided views, which ``prepare_gdn_inputs`` reads in place.
+        """
         num_tokens = mixed_qkv.shape[0]
         local_key_dim = self.local_key_dim
-        query = (
-            mixed_qkv[:, :local_key_dim]
-            .contiguous()
-            .view(1, num_tokens, self.local_num_k_heads, self.head_k_dim)
+        query = mixed_qkv[:, :local_key_dim].view(
+            1, num_tokens, self.local_num_k_heads, self.head_k_dim
         )
-        key = (
-            mixed_qkv[:, local_key_dim : 2 * local_key_dim]
-            .contiguous()
-            .view(1, num_tokens, self.local_num_k_heads, self.head_k_dim)
+        key = mixed_qkv[:, local_key_dim : 2 * local_key_dim].view(
+            1, num_tokens, self.local_num_k_heads, self.head_k_dim
         )
         value = (
             mixed_qkv[:, 2 * local_key_dim :]
@@ -311,19 +309,17 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         Null slots skip state writes and produce zero output for padding.
         """
         query, key, value = self._split_qkv(conv_output)
-        # fastmath=False gives the bits of the plain FP32 PyTorch gate (the trainer's
-        # expression, impl="reference"), in one kernel.
-        decay = gate_transform(
+        # One launch for l2norm(q), l2norm(k), the gate and beta. With fastmath off it gives
+        # the bits of the separate FP32 ops (the trainer's gate expression included).
+        query, key, decay, update_gate = prepare_gdn_inputs(
+            query,
+            key,
             a.unsqueeze(0),
+            b.unsqueeze(0),
             A_log.float(),
             dt_bias.float(),
-            kind="softplus",
             fastmath=False,
-            impl="fused",
         )
-        update_gate = torch.sigmoid(b).unsqueeze(0)
-        query = l2norm(query, cu_seqlens=cu_seqlens)
-        key = l2norm(key, cu_seqlens=cu_seqlens)
 
         if is_in_batch_invariant_mode():
             recurrent_output, _ = recurrent_gdn(

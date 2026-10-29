@@ -23,6 +23,7 @@ from torchtitan.distributed.batch_invariant import (
     is_in_batch_invariant_mode,
     set_batch_invariance,
 )
+from torchtitan.models.common.attn_gym import l2norm
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.generator.vllm import gdn, registry
 from torchtitan.rl.generator.vllm.batch_invariance import (
@@ -266,54 +267,58 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
                 assert torch.equal(actual[:, -128:], untouched[:, -128:])
 
 
-@pytest.mark.parametrize("heads", [12, 32, 48])
-def test_packed_gate_matches_trainer_expression(monkeypatch, heads: int) -> None:
-    """The packed path's fused gate has the bits of the trainer's FP32 expression, on every
-    bf16 gate value. Heads: Qwen3.5-27B TP4, 35B-A3B TP1, 27B TP1 (each compiles its own
-    kernel)."""
+@pytest.mark.parametrize("key_heads, heads", [(4, 12), (16, 32), (16, 48)])
+def test_packed_prep_matches_separate_ops(
+    monkeypatch, key_heads: int, heads: int
+) -> None:
+    """The packed path's one launch for q/k l2norm, gate and beta has the bits of the
+    separate FP32 ops on every bf16 gate value. Heads: Qwen3.5-27B TP4, 35B-A3B TP1, 27B TP1."""
     device = torch.device("cuda")
+    head_dim = 128
+    key_dim = key_heads * head_dim
     values = torch.arange(-(2**15), 2**15, dtype=torch.int16).view(torch.bfloat16)
     a = values[values.isfinite()].to(device)[:, None].expand(-1, heads).contiguous()
+    b = a.flip(0)
     num_tokens = a.shape[0]
     # Trained Qwen3.5-27B / 35B-A3B reach A_log [-5.6, 4.9], dt_bias [-8.9, 19.3].
     A_log = torch.linspace(-8, 6, heads, device=device).bfloat16()
     dt_bias = torch.linspace(-14, 20, heads, device=device).bfloat16()
+    conv_output = torch.randn(
+        num_tokens, 2 * key_dim + heads * head_dim, device=device, dtype=torch.bfloat16
+    )
     layer = gdn.VLLMInnerGDN.__new__(gdn.VLLMInnerGDN)
     torch.nn.Module.__init__(layer)
-    layer.local_num_k_heads = layer.local_num_v_heads = heads
-    layer.head_k_dim = layer.head_v_dim = 1
-    layer.local_key_dim = heads
+    layer.local_num_k_heads, layer.local_num_v_heads = key_heads, heads
+    layer.head_k_dim = layer.head_v_dim = head_dim
+    layer.local_key_dim = key_dim
     layer.kv_cache = (None, None)
-    decays = []
+    prepared = []
 
-    def chunk(query, key, value, decay, *args, **kwargs):
-        decays.append(decay)
+    def chunk(query, key, value, decay, update_gate, *args, **kwargs):
+        prepared.extend((query, key, decay, update_gate))
         return torch.zeros_like(value)
 
     monkeypatch.setattr(gdn, "is_in_batch_invariant_mode", lambda: False)
-    monkeypatch.setattr(gdn, "l2norm", lambda x, **kwargs: x)
     monkeypatch.setattr(gdn, "chunk_kernel_options", lambda query: None)
     monkeypatch.setattr(gdn, "paged_chunk_gdn", chunk)
-    conv_output = torch.zeros(num_tokens, 3 * heads, device=device)
-    output = torch.empty(num_tokens, heads, 1, device=device)
+    output = torch.empty(num_tokens, heads, head_dim, device=device)
     with torch.inference_mode():
-        layer._forward_gdn(
-            conv_output,
-            a,
-            torch.zeros_like(a),
-            A_log,
-            dt_bias,
-            output,
-            None,
-            None,
-            None,
+        layer._forward_gdn(conv_output, a, b, A_log, dt_bias, output, None, None, None)
+        query, key = (
+            l2norm(
+                conv_output[:, start : start + key_dim].reshape(
+                    1, num_tokens, key_heads, head_dim
+                )
+            )
+            for start in (0, key_dim)
         )
-        # The trainer's gate (torchtitan/models/common/attention/gdn.py).
-        trainer = -torch.exp(A_log.float()) * F.softplus(a.float() + dt_bias)
-    # Bit patterns, so fastmath=True (off by up to ~4e-6) fails here.
-    assert torch.equal(
-        decays[0].view(torch.int32), trainer.unsqueeze(0).view(torch.int32)
-    )
+        # The trainer's gate and beta (torchtitan/models/common/attention/gdn.py).
+        decay = -torch.exp(A_log.float()) * F.softplus(a.float() + dt_bias)
+        separate = (query, key, decay.unsqueeze(0), torch.sigmoid(b).unsqueeze(0))
+    # Bit patterns, so fastmath=True (gate off by up to ~4e-6) fails here.
+    for got, want in zip(prepared, separate, strict=True):
+        dtype = torch.int32 if want.element_size() == 4 else torch.int16
+        assert torch.equal(got.view(dtype), want.view(dtype))
 
 
 def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
