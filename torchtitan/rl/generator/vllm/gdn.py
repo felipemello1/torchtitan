@@ -301,8 +301,8 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         decode_state_indices = gdn_metadata.decode_state_indices
         # A captured graph replays with any decode count, so capture runs every row.
         # vLLM's warmup at packed sizes has no decode requests, so capture is these
-        # kernels' first launch there (the convolution's CuTe DSL compile included):
-        # fine while they have no autotuner.
+        # kernels' first launch there (it can include the convolution's CuTe DSL
+        # compile): fine while they have no autotuner.
         num_decode_rows = (
             decode_state_indices.numel()
             if torch.cuda.is_current_stream_capturing()
@@ -343,8 +343,9 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             cu_seqlens=gdn_metadata.prefill_query_start_loc,
             has_initial_state=has_initial_state,
         ).squeeze(0)
-        # Adding keeps each row's one kernel result: both kernels give null slots zero
-        # output (Attention Gym's paged GDN contract), and `forward` zeroes `output`.
+        # Adding keeps each row's one kernel result: the recurrence and chunk kernels give
+        # null slots zero output (Attention Gym's paged GDN contract), and `forward`
+        # zeroes `output`.
         self._forward_gdn(
             conv_output,
             a[:num_actual_tokens],
