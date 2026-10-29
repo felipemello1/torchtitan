@@ -296,27 +296,22 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             )
             return
         # Decode requests take the decode kernels. The paged convolution and the chunk
-        # kernel, which both cost per sequence, see their tokens as one null-slot sequence
-        # (the metadata builder's `_stage_decode_split`).
+        # kernel, which both slow down on one-token sequences, see their tokens as one
+        # null-slot sequence (the metadata builder's `_stage_decode_split`).
         decode_state_indices = gdn_metadata.decode_state_indices
         # A captured graph replays with any decode count, so capture runs every row.
-        # vLLM's warmup at packed sizes has no decode requests, so capture is this
-        # kernel's first launch there: fine while it has no autotuner.
+        # vLLM's warmup at packed sizes has no decode requests, so capture is these
+        # kernels' first launch there (the convolution's CuTe DSL compile included):
+        # fine while they have no autotuner.
         num_decode_rows = (
             decode_state_indices.numel()
             if torch.cuda.is_current_stream_capturing()
             else gdn_metadata.num_decodes
         )
-        conv_output = paged_causal_conv1d(
-            mixed_qkv[:num_actual_tokens].unsqueeze(0),
-            conv_weight,
-            self.kv_cache[0],
-            gdn_metadata.prefill_state_indices,
-            activation="silu",
-            cu_seqlens=gdn_metadata.prefill_query_start_loc,
-            has_initial_state=has_initial_state,
-        ).squeeze(0)
         if num_decode_rows:
+            # TODO: both decode kernels launch programs for null rows (over 256 rows:
+            # recurrence 14-52 us, convolution 4-5 us); a capped grid looping over rows
+            # makes them cheap.
             # The chunk kernel gives the decode rows zero output, so only the decode
             # recurrence reads their convolution.
             decode_conv_output = causal_conv1d_decode(
@@ -327,8 +322,6 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                 state_indices=decode_state_indices[:num_decode_rows],
                 has_initial_state=has_initial_state[:num_decode_rows],
             )
-            # TODO: Attention Gym's decode kernel launches programs for null rows
-            # (14-52 us over 256 rows); a capped grid looping over rows makes them cheap.
             recurrent_gdn_decode(
                 decode_conv_output,
                 a[:num_decode_rows].unsqueeze(0),
@@ -341,6 +334,15 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                 scale=self.head_k_dim**-0.5,
                 out=output[:num_decode_rows].unsqueeze(0),
             )
+        conv_output = paged_causal_conv1d(
+            mixed_qkv[:num_actual_tokens].unsqueeze(0),
+            conv_weight,
+            self.kv_cache[0],
+            gdn_metadata.prefill_state_indices,
+            activation="silu",
+            cu_seqlens=gdn_metadata.prefill_query_start_loc,
+            has_initial_state=has_initial_state,
+        ).squeeze(0)
         # Adding keeps each row's one kernel result: both kernels give null slots zero
         # output (Attention Gym's paged GDN contract), and `forward` zeroes `output`.
         self._forward_gdn(

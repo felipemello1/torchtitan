@@ -230,9 +230,9 @@ class TorchTitanLinearAttentionMetadataBuilder(
             prefill_state_indices    [0, 0, 9, 0, 0]     ... with the null slot
 
         vLLM's own builder slices the prefill_* fields to the prefill requests; FULL
-        graphs need fixed extents, so these keep every row. The chunk kernel reads the
-        shared ``has_initial_state`` (null slots ignore it), so prefill_has_initial_state
-        stays None. Returns the three fields above by name.
+        graphs need fixed extents, so these keep every row. The paged convolution and the
+        chunk kernel read the shared ``has_initial_state`` (null slots ignore it), so
+        prefill_has_initial_state stays None. Returns the three fields above by name.
         """
         prefill_query_start_loc = self.prefill_query_start_loc[: capacity + 2]
         torch.clamp(

@@ -465,7 +465,8 @@ def test_packed_decode_routing_matches_recurrence(monkeypatch) -> None:
     match the batch-invariant path: one paged conv and the plain recurrence over the batch."""
     torch.manual_seed(0)
     device = torch.device("cuda")
-    # Qwen3.5-0.8B's local TP=1 shapes: 3 resumed decode requests, then a fresh 61-token prefill.
+    # Qwen3.5-0.8B's local TP=1 shapes: 3 decode requests (the middle one fresh), then a
+    # fresh 61-token prefill.
     num_decodes, prefill = 3, 61
     num_tokens = num_decodes + prefill
     offsets = torch.tensor([0, 1, 2, 3, num_tokens], dtype=torch.int32)
@@ -489,7 +490,7 @@ def test_packed_decode_routing_matches_recurrence(monkeypatch) -> None:
             query_start_loc=offsets.to(device),
             query_start_loc_cpu=offsets,
             seq_lens=torch.tensor(
-                [40, 40, 40, prefill], device=device, dtype=torch.int32
+                [40, 1, 40, prefill], device=device, dtype=torch.int32
             ),
             num_reqs=4,
             num_actual_tokens=num_tokens,
@@ -512,6 +513,9 @@ def test_packed_decode_routing_matches_recurrence(monkeypatch) -> None:
         (torch.randn(5, 3, 6144, device=device) * 0.5).bfloat16(),
         torch.randn(5, 16, 128, 128, device=device) * 0.05,
     )
+    # The fresh decode request must not read its slot (decode kernels get has_initial_state).
+    for pool in pools:
+        pool[2].fill_(float("nan"))
     inputs = torch.randn(num_tokens, 6144, device=device, dtype=torch.bfloat16)
     weight = (torch.randn(6144, 4, device=device) / 2).bfloat16()
     a, b = torch.randn(2, num_tokens, 16, device=device, dtype=torch.bfloat16)
