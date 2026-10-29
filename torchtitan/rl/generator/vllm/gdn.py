@@ -309,15 +309,15 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         Null slots skip state writes and produce zero output for padding.
         """
         query, key, value = self._split_qkv(conv_output)
-        # One launch for l2norm(q), l2norm(k), the gate and beta. With fastmath off it gives
-        # the bits of the separate FP32 ops (the trainer's gate expression included).
+        # fastmath=False (the default is True) keeps the bits of the separate FP32 ops,
+        # the trainer's gate included.
         query, key, decay, update_gate = prepare_gdn_inputs(
             query,
             key,
-            a.unsqueeze(0),
-            b.unsqueeze(0),
-            A_log.float(),
-            dt_bias.float(),
+            raw_gate=a.unsqueeze(0),
+            raw_beta=b.unsqueeze(0),
+            A_log=A_log.float(),
+            dt_bias=dt_bias.float(),
             fastmath=False,
         )
 

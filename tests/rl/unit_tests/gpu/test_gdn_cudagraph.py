@@ -272,24 +272,30 @@ def test_packed_prep_matches_separate_ops(
     monkeypatch, key_heads: int, heads: int
 ) -> None:
     """The packed path's one launch for q/k l2norm, gate and beta has the bits of the
-    separate FP32 ops on every bf16 gate value. Heads: Qwen3.5-27B TP4, 35B-A3B TP1, 27B TP1."""
+    separate FP32 ops on every bf16 gate and beta value. Heads: Qwen3.5-27B TP4, 35B-A3B TP1,
+    27B TP1."""
     device = torch.device("cuda")
     head_dim = 128
     key_dim = key_heads * head_dim
     values = torch.arange(-(2**15), 2**15, dtype=torch.int16).view(torch.bfloat16)
     a = values[values.isfinite()].to(device)[:, None].expand(-1, heads).contiguous()
+    # Every bf16 value for beta too, in another order, so swapping a and b fails.
     b = a.flip(0)
     num_tokens = a.shape[0]
     # Trained Qwen3.5-27B / 35B-A3B reach A_log [-5.6, 4.9], dt_bias [-8.9, 19.3].
     A_log = torch.linspace(-8, 6, heads, device=device).bfloat16()
     dt_bias = torch.linspace(-14, 20, heads, device=device).bfloat16()
+    # v is not checked (the chunk kernel is mocked), so one channel per value head.
     conv_output = torch.randn(
-        num_tokens, 2 * key_dim + heads * head_dim, device=device, dtype=torch.bfloat16
+        num_tokens, 2 * key_dim + heads, device=device, dtype=torch.bfloat16
     )
+    # Small rows, where eps changes the norm, and zero rows, where it avoids 0 / 0.
+    conv_output[::7] *= 1e-3
+    conv_output[3::11] = 0
     layer = gdn.VLLMInnerGDN.__new__(gdn.VLLMInnerGDN)
     torch.nn.Module.__init__(layer)
     layer.local_num_k_heads, layer.local_num_v_heads = key_heads, heads
-    layer.head_k_dim = layer.head_v_dim = head_dim
+    layer.head_k_dim, layer.head_v_dim = head_dim, 1
     layer.local_key_dim = key_dim
     layer.kv_cache = (None, None)
     prepared = []
@@ -301,14 +307,14 @@ def test_packed_prep_matches_separate_ops(
     monkeypatch.setattr(gdn, "is_in_batch_invariant_mode", lambda: False)
     monkeypatch.setattr(gdn, "chunk_kernel_options", lambda query: None)
     monkeypatch.setattr(gdn, "paged_chunk_gdn", chunk)
-    output = torch.empty(num_tokens, heads, head_dim, device=device)
+    output = torch.empty(num_tokens, heads, 1, device=device)
     with torch.inference_mode():
         layer._forward_gdn(conv_output, a, b, A_log, dt_bias, output, None, None, None)
         query, key = (
             l2norm(
-                conv_output[:, start : start + key_dim].reshape(
-                    1, num_tokens, key_heads, head_dim
-                )
+                conv_output[:, start : start + key_dim]
+                .contiguous()
+                .view(1, num_tokens, key_heads, head_dim)
             )
             for start in (0, key_dim)
         )
