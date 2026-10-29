@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -52,10 +51,11 @@ class VLLMCudaGraphConfig:
 
     capture_sizes: list[int] | None = None
     """Explicit CUDA graph capture batch sizes. When ``None`` (default), sizes are
-    auto-derived: powers of 2 up to the cap, plus ``max_num_seqs`` and the cap as
-    exact sizes. When set, these sizes are deduped and sorted. When expert
-    sequence parallelism is enabled, capture sizes that are not multiples of
-    its degree are removed."""
+    auto-derived: powers of 2 up to 1024, then 8 sizes per doubling up to the cap
+    (every 128 tokens to 2048, every 256 to 4096, ...), so a step above 1024 tokens
+    pads at most 1/8, plus ``max_num_seqs`` and the cap as exact sizes. When set,
+    these sizes are deduped and sorted. When expert sequence parallelism is
+    enabled, capture sizes that are not multiples of its degree are removed."""
 
     # TODO: Validate CUDA graph capture with MoE / Expert Parallelism.
     # MoE routing produces dynamic shapes that may conflict with full
@@ -77,9 +77,9 @@ class VLLMCudaGraphConfig:
         """Build a vLLM ``CompilationConfig`` for the generator.
 
         When ``capture_sizes`` is set, those exact sizes are captured. Otherwise
-        sizes are auto-derived: powers of 2 up to the cap, plus ``max_num_seqs`` and
-        the cap itself as exact sizes so the largest capture size is always the cap
-        (even when it is not a power of 2). The cap is ``max_num_seqs`` for
+        sizes are auto-derived (see ``capture_sizes``) up to the cap,
+        plus ``max_num_seqs`` and the cap itself as exact sizes so the largest
+        capture size is always the cap. The cap is ``max_num_seqs`` for
         ``FULL_DECODE_ONLY`` (decode batch == num_seqs). ``FULL`` also graphs
         prefill, whose per-step token count is bounded by
         ``max_num_batched_tokens`` (the configured value, else
@@ -128,15 +128,21 @@ class VLLMCudaGraphConfig:
                 )
             sizes = sorted(set(self.capture_sizes))
         else:
-            sizes = [1 << i for i in range(int(math.log2(cap)) + 1)]
+            # A step replays the smallest captured size that holds its tokens. Above
+            # 1024 (mixed prefill + decode steps, e.g. ~1.6k tokens on Qwen3.5), 8 sizes
+            # per doubling cap the padding at 1/8. Below 1024 (mostly decode batches)
+            # powers of 2 keep the graph count low.
+            sizes = [1 << i for i in range(11)]  # 1 to 1024
+            start = 1024
+            while start < cap:
+                step = start // 8
+                sizes += range(start + step, 2 * start + 1, step)
+                start *= 2
             # Always include max_num_seqs (decode batch) and the cap (largest
-            # prefill chunk) as exact sizes so the largest capture size is the cap
-            # even when it is not a power of 2
-            if max_num_seqs not in sizes:
-                sizes.append(max_num_seqs)
-            if cap not in sizes:
-                sizes.append(cap)
-            sizes = sorted(sizes)
+            # prefill chunk) as exact sizes so the largest capture size is the cap.
+            sizes = sorted(
+                {size for size in sizes if size <= cap} | {max_num_seqs, cap}
+            )
 
         if expert_sequence_parallel_size > 1:
             removed_sizes = [
@@ -152,9 +158,17 @@ class VLLMCudaGraphConfig:
             sizes = [
                 size for size in sizes if size % expert_sequence_parallel_size == 0
             ]
-            if not sizes:
+            # Auto sizes above 1024 are multiples of 128, so a degree of 3 or 6 can
+            # keep only those (1152, 1536, ...), and every decode step would replay
+            # a mixed-step graph. A decode batch is padded to a multiple of the
+            # degree, so it needs a size below max_num_seqs + degree.
+            if not sizes or (
+                self.capture_sizes is None
+                and sizes[0] >= max_num_seqs + expert_sequence_parallel_size
+            ):
                 raise ValueError(
-                    "No CUDA graph capture sizes are divisible by "
+                    "No CUDA graph capture sizes for a decode batch of up to "
+                    f"max_num_seqs {max_num_seqs} are divisible by "
                     f"expert_sequence_parallel_size {expert_sequence_parallel_size}"
                 )
 
