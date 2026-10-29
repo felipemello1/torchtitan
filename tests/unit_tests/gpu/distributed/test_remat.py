@@ -119,13 +119,11 @@ class _CountingQKVProjection(Module):
             ColumnParallelLinear.Config(in_features=4, out_features=4)
         )
 
-    def forward(
-        self, x_TD: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x_TD: torch.Tensor) -> torch.Tensor:
         qkv_TD = self.wqkv(x_TD)
         remat.recompute_needs_tensor(qkv_TD)
-        x_TNH = qkv_TD.unsqueeze(1)
-        return x_TNH, x_TNH, x_TNH
+        # Fused [T, n_kv, R, head_dim] like QKVLinear.forward: q, k and v are the same values.
+        return qkv_TD.unsqueeze(1).unsqueeze(2).expand(-1, 1, 3, -1)
 
 
 def _inner_attention(

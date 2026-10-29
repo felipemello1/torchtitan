@@ -121,7 +121,7 @@ class Attention(GQAttention):
         x_TD = maybe_gather_tp_input(self, x_TD)
 
         num_tokens = x_TD.shape[0]
-        xq, xk, xv = QKVLinear.split_heads(self.qkv_linear(x_TD))
+        xq, xk, xv = QKVLinear.split_qkv(self.qkv_linear(x_TD))
 
         # QK normalization before RoPE. Query is additionally scaled by a
         # tuned constant (k is only normalized).

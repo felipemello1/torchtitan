@@ -113,7 +113,7 @@ class GptOssAttention(Attention):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
-        q, k, v = QKVLinear.split_heads(self.qkv_linear(x))
+        q, k, v = QKVLinear.split_qkv(self.qkv_linear(x))
 
         q, k = self.rope(q, k, positions)
 

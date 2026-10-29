@@ -119,10 +119,9 @@ class Attention(Module):
 
 
 class QKVLinear(Module):
-    """Single fused linear projection, split along R dimension.
-
-    Uses a single linear layer and splits the output along the R dimension,
-    where R = n_heads // n_kv_heads + 2 (Q-heads-per-KV-group + K + V).
+    """Single fused linear projection: ``forward`` returns ``[T, n_kv_heads, R, head_dim]``,
+    and ``split_qkv`` splits it along R into q/k/v, where
+    R = n_heads // n_kv_heads + 2 (Q-heads-per-KV-group + K + V).
     Reduces kernel launch overhead compared to three separate projections.
 
     Compatible with ColwiseParallel on the ``wqkv`` linear layer.
@@ -158,18 +157,13 @@ class QKVLinear(Module):
         )
     )
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return the fused output as ``[T, n_kv_heads, R, head_dim]``. ``split_heads`` copies
-        q/k/v out of it; a compiled consumer can fuse those copies into its own reads.
-
-        Example::
-
-            xq_THK, xk_THK, xv_THV = QKVLinear.split_heads(qkv_linear(x_TD))
-        """
+        """Return the fused output as ``[T, n_kv_heads, R, head_dim]``. ``split_qkv`` copies
+        q/k/v out of it; a compiled consumer can fuse those copies into its own reads."""
         # Fused QKV: single matmul, then reshape to expose the R dim.
         # [T, n_kv_heads * R * head_dim] -> [T, n_kv_heads, R, head_dim]
         # Use -1 for n_kv_heads so TP sharding is handled automatically.
         qkv = self.wqkv(x)
-        # split_heads copies the wqkv projection output with bare ops.
+        # split_qkv copies the wqkv projection output with bare ops.
         remat.recompute_needs_tensor(qkv)
         num_tokens = qkv.shape[0]
         with spmd.local():  # TODO(pianpwk): same QKV:S(1) unflatten case handled by even sharding
@@ -192,14 +186,14 @@ class QKVLinear(Module):
         )
         * 3
     )
-    def split_heads(
+    def split_qkv(
         qkv: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Split ``forward``'s output along R into contiguous ``[T, heads, head_dim]`` q/k/v.
 
         Example::
 
-            xq_THK, xk_THK, xv_THV = QKVLinear.split_heads(qkv_linear(x_TD))
+            xq_THK, xk_THK, xv_THV = QKVLinear.split_qkv(qkv_linear(x_TD))
         """
         num_tokens, head_dim = qkv.shape[0], qkv.shape[-1]
         # R = heads_per_kv q heads, then k, then v.
@@ -305,14 +299,12 @@ class GQAttention(Attention):
         return self.wo(out_TD)
 
     # Compiled, the head copies fuse into the q/k norm and RoPE reads. emulate_precision_casts
-    # rounds the normed q/k to bf16 before RoPE, as the separate modules do; without it Inductor
-    # keeps them in fp32, and the train and no_grad graphs can round differently.
-    # No pointwise autotuning, as in ComplexRoPE.forward: RoPE is inlined here.
-    # Limit 16: RoPE and NoPE layers (iRoPE) share this region, 8 graphs each.
+    # rounds the normed q/k to bf16 before RoPE, as the eager modules (and the trainer) do;
+    # without it ~31% of q elements differ from eager. No pointwise autotuning: kernel configs
+    # picked by timing can round differently from run to run.
     @local_compile(
         "qkv_norm_rope",
         batch_invariant=False,
-        recompile_limit=16,
         options={
             "emulate_precision_casts": True,
             "triton.autotune_pointwise": False,
@@ -321,9 +313,10 @@ class GQAttention(Attention):
     def _prepare_qkv(
         self, qkv: torch.Tensor, positions: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return q/k/v as attention reads them, from ``QKVLinear``'s fused output: split heads,
-        then the optional q/k norms (before RoPE, per Qwen3) and RoPE."""
-        xq_THK, xk_THK, xv_THV = QKVLinear.split_heads(qkv)
+        """Return q/k/v as attention reads them, from ``QKVLinear``'s fused output
+        ``[T, n_kv_heads, R, head_dim]``: split, then the optional q/k norms (before RoPE,
+        per Qwen3) and RoPE."""
+        xq_THK, xk_THK, xv_THV = QKVLinear.split_qkv(qkv)
 
         if self.q_norm is not None or self.k_norm is not None:
             assert self.q_norm is not None and self.k_norm is not None

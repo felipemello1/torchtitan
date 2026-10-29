@@ -160,12 +160,12 @@ class TestQKVLinearCheckpointInterop(unittest.TestCase):
 
 
 class TestFusedQKVForwardContiguity(unittest.TestCase):
-    """``split_heads`` must emit contiguous, head-major q/k/v.
+    """``split_qkv`` must emit contiguous, head-major q/k/v.
 
     Splitting the fused ``wqkv`` output along the R dim leaves xk/xv as strided
     views into the fused buffer. PyTorch ops respect strides, but vLLM's
     attention/KV-cache CUDA kernels index q/k/v by raw ``data_ptr()`` assuming a
-    contiguous head-major layout, so ``split_heads`` must materialize them
+    contiguous head-major layout, so ``split_qkv`` must materialize them
     contiguously. These run on CPU.
     """
 
@@ -174,7 +174,7 @@ class TestFusedQKVForwardContiguity(unittest.TestCase):
         fused = _build_qkv_linear()
         num_tokens = 6
         x_TD = torch.randn(num_tokens, _DIM)
-        xq_THK, xk_THK, xv_THV = QKVLinear.split_heads(fused(x_TD))
+        xq_THK, xk_THK, xv_THV = QKVLinear.split_qkv(fused(x_TD))
 
         self.assertEqual(xq_THK.shape, (num_tokens, _N_HEADS, _HEAD_DIM))
         self.assertEqual(xk_THK.shape, (num_tokens, _N_KV_HEADS, _HEAD_DIM))
@@ -197,7 +197,7 @@ class TestFusedQKVForwardContiguity(unittest.TestCase):
     def test_raw_pointer_read_needs_contiguous(self):
         """A consumer reading the base pointer with contiguous head-major strides
         (what vLLM's kernels do) gets the wrong bytes from the strided split, and
-        the correct bytes only after ``split_heads``' ``.contiguous()``.
+        the correct bytes only after ``split_qkv``' ``.contiguous()``.
         """
         fused = _build_qkv_linear()
         num_tokens = 6
@@ -220,9 +220,9 @@ class TestFusedQKVForwardContiguity(unittest.TestCase):
         )
         self.assertFalse(torch.equal(raw, xk_strided))
 
-        # The fix: split_heads returns contiguous xk, so the same raw read
+        # The fix: split_qkv returns contiguous xk, so the same raw read
         # now lands on the correct values.
-        xk_fixed = QKVLinear.split_heads(fused(x_TD))[1]
+        xk_fixed = QKVLinear.split_qkv(fused(x_TD))[1]
         self.assertTrue(xk_fixed.is_contiguous())
         raw_fixed = xk_fixed.as_strided(
             xk_fixed.shape, contig_strides, xk_fixed.storage_offset()
