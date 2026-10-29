@@ -299,8 +299,8 @@ class GQAttention(Attention):
         return self.wo(out_TD)
 
     # Compiled, the head copies fuse into the q/k norm and RoPE reads. emulate_precision_casts
-    # rounds the normed q/k to bf16 before RoPE, as the eager modules (and the trainer) do;
-    # without it ~31% of q elements differ from eager. No pointwise autotuning: kernel configs
+    # rounds the normed q/k to bf16 before RoPE, as the eager modules do; without it ~31%
+    # of q elements differ from eager. No pointwise autotuning: kernel configs
     # picked by timing can round differently from run to run.
     @local_compile(
         "qkv_norm_rope",

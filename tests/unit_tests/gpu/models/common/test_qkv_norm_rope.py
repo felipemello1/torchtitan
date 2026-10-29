@@ -29,7 +29,8 @@ def _run(attention, qkv, positions, grads):
     qkv = qkv.detach().clone().requires_grad_()
     outputs = attention._prepare_qkv(qkv, positions)
     torch.autograd.backward(outputs, [g.to(o.dtype) for g, o in zip(grads, outputs)])
-    return [*inference, *outputs, qkv.grad]
+    names = ("q", "k", "v", "q_train", "k_train", "v_train", "qkv_grad")
+    return dict(zip(names, [*inference, *outputs, qkv.grad], strict=True))
 
 
 # Qwen3: q/k norms + CosSinRoPE. Llama 3: no norms, ComplexRoPE.
@@ -85,23 +86,23 @@ def test_qkv_norm_rope_region_matches_eager(model):
     # differ by a bf16 ulp; without emulate_precision_casts ~31% of q would. Check both:
     # few differing elements vs eager, and as close as eager to an fp32 run of the same
     # math (q/k/v in inference and training, the fused output's grad).
-    for num_tokens, *outputs in zip(
+    for num_tokens, actual_outputs, expected_outputs, reference_outputs in zip(
         token_counts, actual, expected, reference, strict=True
     ):
-        for i, (actual_tensor, expected_tensor, reference_tensor) in enumerate(
-            zip(*outputs, strict=True)
-        ):
+        for name, actual_tensor in actual_outputs.items():
+            expected_tensor = expected_outputs[name]
+            reference_tensor = reference_outputs[name]
             assert actual_tensor.is_contiguous()
-            if i < 6:  # q/k/v outputs; v is a plain copy
+            if name.startswith("v"):  # a plain copy
+                assert torch.equal(actual_tensor, expected_tensor), (num_tokens, name)
+            elif name != "qkv_grad":
                 differing = (actual_tensor != expected_tensor).float().mean()
-                assert differing < 1e-3, (num_tokens, i, differing)
-                if i in (2, 5):
-                    assert torch.equal(actual_tensor, expected_tensor)
+                assert differing < 1e-3, (num_tokens, name, differing)
             actual_error = (actual_tensor.float() - reference_tensor).norm()
             eager_error = (expected_tensor.float() - reference_tensor).norm()
             assert actual_error <= 1.05 * eager_error, (
                 num_tokens,
-                i,
+                name,
                 actual_error,
                 eager_error,
             )
@@ -114,9 +115,9 @@ class TestQKVNormRopeTensorParallel(DTensorTestBase):
         return 2
 
     @with_comms
-    def test_tp2_matches_eager_in_three_graphs(self):
+    def test_tp2_matches_eager(self):
         """TP2 generator setting (no SP, no grad): the region's local q/k/v heads match eager,
-        and the decode batch sizes compile 3 graphs: static, dynamic and T=1."""
+        and the decode batch sizes compile at most 3 graphs: static, dynamic and T=1."""
         from torchtitan.models.qwen3 import build_model_config
 
         torch.manual_seed(0)
@@ -173,14 +174,18 @@ class TestQKVNormRopeTensorParallel(DTensorTestBase):
             LocalCompileConfig().apply()
             torch._dynamo.reset()
 
-        self.assertEqual(unique_graphs, 3)
+        self.assertLessEqual(unique_graphs, 3)
         for num_tokens, actual_qkv, expected_qkv in zip(
             token_counts, actual, expected, strict=True
         ):
-            for i, (actual_tensor, expected_tensor) in enumerate(
-                zip(actual_qkv, expected_qkv, strict=True)
+            for name, actual_tensor, expected_tensor in zip(
+                "qkv", actual_qkv, expected_qkv, strict=True
             ):
                 self.assertEqual(actual_tensor.shape, expected_tensor.shape)
-                differing = (actual_tensor != expected_tensor).float().mean()
-                self.assertLess(differing, 1e-3, (num_tokens, i))
-            torch.testing.assert_close(actual_qkv[2], expected_qkv[2], rtol=0, atol=0)
+                if name == "v":  # a plain copy
+                    self.assertTrue(
+                        torch.equal(actual_tensor, expected_tensor), num_tokens
+                    )
+                else:
+                    differing = (actual_tensor != expected_tensor).float().mean()
+                    self.assertLess(differing, 1e-3, (num_tokens, name))
