@@ -317,7 +317,8 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             A_log.float(),
             dt_bias.float(),
             kind="softplus",
-            impl="reference",
+            fastmath=False,
+            impl="fused",
         )
         update_gate = torch.sigmoid(b).unsqueeze(0)
         # Batch-invariant mode drops the offsets. Here cu_seqlens[-1] is the row
