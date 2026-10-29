@@ -71,7 +71,11 @@ class TorchTitanLinearAttentionMetadataBuilder(
     """Stage shared request buffers before eager execution or native graph replay."""
 
     reorder_batch_threshold = 1
-    supports_update_block_table = True
+    # Run branch (136 v17): build every KV-cache group. At DP>1 a padded decode-only step
+    # replays the packed graph (TorchTitanCudagraphDispatcher.dispatch), and
+    # update_block_table restages the query offsets and decode split only for PACKED
+    # metadata, so the later groups' packed buffers would be stale.
+    supports_update_block_table = False
 
     @classmethod
     def get_cudagraph_support(
