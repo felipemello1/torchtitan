@@ -853,7 +853,7 @@ def test_run_fails_when_the_engine_loops_exit_mid_run() -> None:
         _run_with_generator_watcher(exited)
 
 
-def _scored_group(group_id: int, rewards: list[float]) -> RolloutGroup:
+def _scored_group(group_id: int, rewards: list[float | None]) -> RolloutGroup:
     return RolloutGroup(
         group_id=group_id,
         rollouts=[
@@ -873,11 +873,13 @@ def _scored_group(group_id: int, rewards: list[float]) -> RolloutGroup:
     [
         (1, [[1.0], [0.0]], 0.5, None),
         (2, [[1.0, 0.0], [0.0, 0.0]], 0.25, 0.5),
+        # Unscored rollouts (reward None) are skipped; the prompt with none scored is left out.
+        (2, [[None, 1.0], [None, None]], 1.0, 1.0),
     ],
 )
 def test_validate_rolls_out_each_prompt_n_times(
     num_samples_per_prompt: int,
-    rewards: list[list[float]],
+    rewards: list[list[float | None]],
     expected_mean: float,
     expected_best_of: float | None,
 ) -> None:

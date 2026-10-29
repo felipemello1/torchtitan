@@ -791,11 +791,16 @@ class Controller(Configurable):
             m.Metric("validation/group_failures", m.Sum(float(num_failed_groups)))
         )
         if num_samples_per_prompt > 1:
-            # Equals pass@n when rewards are 0/1.
-            best_rewards = [
-                max(rollout.reward for rollout in group.rollouts)
-                for group in rollout_groups
-            ]
+            # Equals pass@n when rewards are 0/1. A prompt with no scored rollout is left out.
+            best_rewards = []
+            for group in rollout_groups:
+                rewards = [
+                    rollout.reward
+                    for rollout in group.rollouts
+                    if rollout.reward is not None
+                ]
+                if rewards:
+                    best_rewards.append(max(rewards))
             metrics.append(
                 m.Metric(
                     f"validation_reward/best_of_{num_samples_per_prompt}",
