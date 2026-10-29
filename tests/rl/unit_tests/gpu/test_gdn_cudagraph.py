@@ -303,9 +303,8 @@ def test_batch_invariant_decode_matches_prefill(monkeypatch) -> None:
         for start in range(0, num_tokens, tokens_per_step):
             stop = start + tokens_per_step
             rows = [t[:, start:stop].flatten(0, 1) for t in (qkv, a, b)]
-            output = rows[0].new_zeros(rows[0].shape[0], heads, 128)
             initial = torch.full((num_sequences,), start > 0, device=device)
-            layer._forward_gdn(*rows, A_log, bias, output, offsets, slots, initial)
+            output = layer._forward_gdn(*rows, A_log, bias, offsets, slots, initial)
             outputs.append(output.unflatten(0, (num_sequences, tokens_per_step)))
         return torch.cat(outputs, 1), state[1:]
 
@@ -367,13 +366,15 @@ def test_batch_invariant_chunked_and_mixed_steps_match_decode(monkeypatch) -> No
                 step_slots, device=device, dtype=torch.int32
             ),
             has_initial_state=torch.tensor(initial, device=device),
+            state_block_column=torch.zeros(
+                len(step_slots), 1, device=device, dtype=torch.long
+            ),
         )
-        output = rows[0].new_zeros(rows[0].shape[0], heads, 128)
         context = ForwardContext(
             no_compile_layers={}, attn_metadata={"gdn": metadata}, slot_mapping={}
         )
         with override_forward_context(context):
-            layer._forward(*rows, weight, None, A_log, bias, output)
+            output = layer._forward(*rows, weight, None, A_log, bias)
         return output[: num_sequences * length].unflatten(0, (num_sequences, length))
 
     def run(x, a, b, path, chunks):
