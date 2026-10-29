@@ -265,6 +265,48 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
                 assert torch.equal(actual[:, -128:], untouched[:, -128:])
 
 
+def test_packed_gate_matches_fp32_reference(monkeypatch) -> None:
+    """The packed path's fused gate equals the FP32 reference on every bf16 gate value."""
+    device = torch.device("cuda")
+    heads = 64
+    bits = torch.arange(-(2**15), 2**15, dtype=torch.int32).to(torch.int16)
+    values = bits.view(torch.bfloat16).to(device)
+    a = values[values.isfinite()][:, None].expand(-1, heads).contiguous()
+    num_tokens = a.shape[0]
+    # Wider than Qwen3.5 checkpoints (A_log ~[0, 2.8], dt_bias ~[-5, 2]).
+    A_log = torch.linspace(-4, 6, heads, device=device).bfloat16()
+    dt_bias = torch.linspace(-30, 30, heads, device=device).bfloat16()
+    layer = gdn.VLLMInnerGDN.__new__(gdn.VLLMInnerGDN)
+    torch.nn.Module.__init__(layer)
+    layer.local_num_k_heads = layer.local_num_v_heads = heads
+    layer.head_k_dim = layer.head_v_dim = 1
+    layer.local_key_dim = heads
+    layer.kv_cache = (None, None)
+    decays = []
+
+    def chunk(query, key, value, decay, *args, **kwargs):
+        decays.append(decay)
+        return torch.zeros_like(value)
+
+    monkeypatch.setattr(gdn, "is_in_batch_invariant_mode", lambda: False)
+    monkeypatch.setattr(gdn, "l2norm", lambda x, **kwargs: x)
+    monkeypatch.setattr(gdn, "chunk_kernel_options", lambda query: None)
+    monkeypatch.setattr(gdn, "paged_chunk_gdn", chunk)
+    conv_output = torch.zeros(num_tokens, 3 * heads, device=device)
+    output = torch.empty(num_tokens, heads, 1, device=device)
+    with torch.inference_mode():
+        layer._forward_gdn(conv_output, a, a, A_log, dt_bias, output, None, None, None)
+        reference = gdn.gate_transform(
+            a.unsqueeze(0),
+            A_log.float(),
+            dt_bias.float(),
+            kind="softplus",
+            impl="reference",
+        )
+    # fastmath on differs by up to ~4e-6.
+    assert torch.equal(decays[0], reference)
+
+
 def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
     assert int(os.environ["WORLD_SIZE"]) == 1
     # Eager runs the real token count, while FULL replay pads it up to a capture
