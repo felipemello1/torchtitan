@@ -269,7 +269,8 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
 @pytest.mark.parametrize("heads", [12, 32, 48])
 def test_packed_gate_matches_trainer_expression(monkeypatch, heads: int) -> None:
     """The packed path's fused gate has the bits of the trainer's FP32 expression, on every
-    bf16 gate value. Heads: Qwen3.5-27B TP4, 35B-A3B TP1, 27B TP1 (each its own binary)."""
+    bf16 gate value. Heads: Qwen3.5-27B TP4, 35B-A3B TP1, 27B TP1 (each compiles its own
+    kernel)."""
     device = torch.device("cuda")
     values = torch.arange(-(2**15), 2**15, dtype=torch.int16).view(torch.bfloat16)
     a = values[values.isfinite()].to(device)[:, None].expand(-1, heads).contiguous()
