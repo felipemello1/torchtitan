@@ -311,7 +311,8 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         Null slots skip state writes and produce zero output for padding.
         """
         query, key, value = self._split_qkv(conv_output)
-        # One kernel; with fastmath off it matches the FP32 reference bitwise.
+        # fastmath=False gives the bits of the plain FP32 PyTorch gate (the trainer's
+        # expression, impl="reference"), in one kernel.
         decay = gate_transform(
             a.unsqueeze(0),
             A_log.float(),

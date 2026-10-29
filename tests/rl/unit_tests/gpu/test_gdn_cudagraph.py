@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn.functional as F
 from batch_invariant_ops import enable_batch_invariant_mode
 from torchtitan.components.checkpointer import CheckpointManager
 
@@ -265,17 +266,17 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
                 assert torch.equal(actual[:, -128:], untouched[:, -128:])
 
 
-def test_packed_gate_matches_fp32_reference(monkeypatch) -> None:
-    """The packed path's fused gate equals the FP32 reference on every bf16 gate value."""
+@pytest.mark.parametrize("heads", [12, 32, 48])
+def test_packed_gate_matches_trainer_expression(monkeypatch, heads: int) -> None:
+    """The packed path's fused gate has the bits of the trainer's FP32 expression, on every
+    bf16 gate value. Heads: Qwen3.5-27B TP4, 35B-A3B TP1, 27B TP1 (each its own binary)."""
     device = torch.device("cuda")
-    heads = 64
-    bits = torch.arange(-(2**15), 2**15, dtype=torch.int32).to(torch.int16)
-    values = bits.view(torch.bfloat16).to(device)
-    a = values[values.isfinite()][:, None].expand(-1, heads).contiguous()
+    values = torch.arange(-(2**15), 2**15, dtype=torch.int16).view(torch.bfloat16)
+    a = values[values.isfinite()].to(device)[:, None].expand(-1, heads).contiguous()
     num_tokens = a.shape[0]
-    # Wider than Qwen3.5 checkpoints (A_log ~[0, 2.8], dt_bias ~[-5, 2]).
-    A_log = torch.linspace(-4, 6, heads, device=device).bfloat16()
-    dt_bias = torch.linspace(-30, 30, heads, device=device).bfloat16()
+    # Trained Qwen3.5-27B / 35B-A3B reach A_log [-5.6, 4.9], dt_bias [-8.9, 19.3].
+    A_log = torch.linspace(-8, 6, heads, device=device).bfloat16()
+    dt_bias = torch.linspace(-14, 20, heads, device=device).bfloat16()
     layer = gdn.VLLMInnerGDN.__new__(gdn.VLLMInnerGDN)
     torch.nn.Module.__init__(layer)
     layer.local_num_k_heads = layer.local_num_v_heads = heads
@@ -295,16 +296,23 @@ def test_packed_gate_matches_fp32_reference(monkeypatch) -> None:
     conv_output = torch.zeros(num_tokens, 3 * heads, device=device)
     output = torch.empty(num_tokens, heads, 1, device=device)
     with torch.inference_mode():
-        layer._forward_gdn(conv_output, a, a, A_log, dt_bias, output, None, None, None)
-        reference = gdn.gate_transform(
-            a.unsqueeze(0),
-            A_log.float(),
-            dt_bias.float(),
-            kind="softplus",
-            impl="reference",
+        layer._forward_gdn(
+            conv_output,
+            a,
+            torch.zeros_like(a),
+            A_log,
+            dt_bias,
+            output,
+            None,
+            None,
+            None,
         )
-    # fastmath on differs by up to ~4e-6.
-    assert torch.equal(decays[0], reference)
+        # The trainer's gate (torchtitan/models/common/attention/gdn.py).
+        trainer = -torch.exp(A_log.float()) * F.softplus(a.float() + dt_bias)
+    # Bit patterns, so fastmath=True (off by up to ~4e-6) fails here.
+    assert torch.equal(
+        decays[0].view(torch.int32), trainer.unsqueeze(0).view(torch.int32)
+    )
 
 
 def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
