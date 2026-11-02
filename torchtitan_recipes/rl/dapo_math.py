@@ -486,7 +486,6 @@ def _qwen3_30b_a3b_dapo_math_8k_config(
                 # max_total_tokens).
                 num_tokens_per_microbatch_per_dp_rank=4 * max_total_tokens,
                 max_context_length=max_total_tokens,
-                dtype="bfloat16",
             ),
             dist_moe_runtime=DistMoeRuntime.Config(scratch_capacity_factor=4.0),
             parallelism=trainer_parallelism,

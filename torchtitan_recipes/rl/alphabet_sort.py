@@ -222,7 +222,6 @@ def rl_grpo_qwen3_0_6b_flex() -> Controller.Config:
                 disable_accelerator_graphs=True,
                 num_tokens_per_microbatch_per_dp_rank=2 * seq_len,
                 max_context_length=seq_len,
-                dtype="bfloat16",
             ),
             parallelism=trainer_parallelism,
             checkpointer=CheckpointManager.Config(
@@ -277,8 +276,6 @@ def rl_grpo_qwen3_0_6b_flex_batch_invariant() -> Controller.Config:
     config.trainer = dataclasses.replace(
         config.trainer,
         debug=_BATCH_INVARIANT_DEBUG,
-        # fp32 master weights; FSDP mixed precision casts to bf16 for the forward.
-        training=dataclasses.replace(config.trainer.training, dtype="float32"),
         parallelism=dataclasses.replace(
             config.trainer.parallelism, enable_sequence_parallel=False
         ),
@@ -505,7 +502,6 @@ def rl_grpo_qwen3_14b() -> Controller.Config:
                 disable_accelerator_graphs=True,
                 num_tokens_per_microbatch_per_dp_rank=2 * seq_len,
                 max_context_length=seq_len,
-                dtype="bfloat16",
             ),
             parallelism=trainer_parallelism,
             checkpointer=CheckpointManager.Config(
@@ -587,7 +583,6 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> Controller.Config:
                 disable_accelerator_graphs=True,
                 num_tokens_per_microbatch_per_dp_rank=2 * seq_len,
                 max_context_length=seq_len,
-                dtype="bfloat16",
             ),
             parallelism=trainer_parallelism,
             checkpointer=CheckpointManager.Config(
@@ -798,7 +793,6 @@ def rl_grpo_qwen3_5_9b_varlen() -> Controller.Config:
                 disable_accelerator_graphs=True,
                 num_tokens_per_microbatch_per_dp_rank=seq_len,
                 max_context_length=seq_len,
-                dtype="bfloat16",
             ),
             parallelism=trainer_parallelism,
             checkpointer=CheckpointManager.Config(
