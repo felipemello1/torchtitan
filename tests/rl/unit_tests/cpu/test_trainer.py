@@ -24,7 +24,11 @@ from torchtitan.rl.trainer.rdma_microbatch import (
     RDMAMicrobatch,
     RDMAMicrobatchPrefetcher,
 )
-from torchtitan.rl.trainer.trainer import MirroredState, Trainer
+from torchtitan.rl.trainer.trainer import (
+    MirroredState,
+    stochastic_round_to_bf16_,
+    Trainer,
+)
 from torchtitan.trainer import Trainer as DatasetTrainer
 from torchtitan.training_engine import ForwardBackwardResult, TrainingEngine
 
@@ -572,6 +576,7 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
         engine.optim_step.side_effect = optim_step
         trainer.engine = engine
         trainer._transfer_dtype = torch.bfloat16
+        trainer._master_weights = None
         trainer._resume_state = MirroredState()
         trainer.gpu_peak_flops = 1000
         trainer._step_compute_start = 0.0
@@ -638,5 +643,105 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
         )
         device_memory_monitor.get_peak_stats.assert_called_once_with()
         device_memory_monitor.reset_peak_stats.assert_called_once_with()
+
+    asyncio.run(run())
+
+
+def test_stochastic_round_to_bf16_is_unbiased_and_on_grid() -> None:
+    spacing = 2.0**-7  # bf16 spacing just above 1.0
+    values = torch.tensor([1.0 + 0.25 * spacing, -(1.0 + 0.25 * spacing), 0.0123, 1.0])
+    draws = values.repeat(200_000, 1)
+    noise = torch.rand(draws.shape, generator=torch.Generator().manual_seed(0))
+
+    stochastic_round_to_bf16_(draws, noise)
+
+    assert torch.equal(draws, draws.bfloat16().float())
+    torch.testing.assert_close(draws.mean(dim=0), values, rtol=1e-4, atol=0)
+    assert torch.all(draws[:, 3] == 1.0)
+
+
+def test_optim_step_with_stochastic_rounding_updates_the_master() -> None:
+    """The optimizer and the checkpoint see the fp32 master; the parameters then hold its bf16 copy."""
+
+    async def run() -> None:
+        trainer = object.__new__(Trainer)
+        model = torch.nn.Linear(4, 1, bias=False)
+        weight = model.weight
+        spacing = 2.0**-7  # bf16 spacing just above 1.0
+        master = torch.full((1, 4), 1.0 + 0.25 * spacing)
+        with torch.no_grad():
+            weight.copy_(master.bfloat16().float())
+        seen = {}
+
+        def optim_step() -> torch.Tensor:
+            seen["optimizer"] = weight.detach().clone()
+            engine.num_completed_steps += 1
+            with torch.no_grad():
+                weight.add_(spacing)
+            return torch.tensor(1.0)
+
+        def save_checkpoint(*, last_step: bool) -> None:
+            seen["checkpoint"] = weight.detach().clone()
+
+        engine = SimpleNamespace(
+            optim=SimpleNamespace(
+                lr_schedulers=SimpleNamespace(get_metrics=MagicMock(return_value={}))
+            ),
+            parallelism_context=SimpleNamespace(
+                non_data_parallel_size=1, world_mesh=None
+            ),
+            model_parts=[model],
+            num_completed_steps=4,
+            num_flops_per_token=200,
+            has_quantization=False,
+            device=torch.device("cpu"),
+            device_memory_monitor=SimpleNamespace(
+                get_peak_stats=MagicMock(
+                    return_value=SimpleNamespace(
+                        max_active_gib=0.0,
+                        max_active_pct=0.0,
+                        max_reserved_gib=0.0,
+                        max_reserved_pct=0.0,
+                        num_alloc_retries=0,
+                        num_ooms=0,
+                    )
+                ),
+                reset_peak_stats=MagicMock(),
+            ),
+            optim_step=MagicMock(side_effect=optim_step),
+            save_checkpoint=MagicMock(side_effect=save_checkpoint),
+            step_profiler=MagicMock(),
+        )
+        trainer.engine = engine
+        trainer.config = SimpleNamespace(debug=SimpleNamespace(seed=0))
+        trainer._master_weights = [master.clone()]
+        trainer._rounding_generator = torch.Generator()
+        trainer._transfer_dtype = torch.bfloat16
+        trainer._resume_state = MirroredState()
+        trainer.gpu_peak_flops = 1000
+        trainer._step_compute_start = 0.0
+        trainer._step_num_tokens_per_dp_rank = 10
+        trainer._staging_model_state_dict_stream = None
+
+        with (
+            patch(
+                "torchtitan.rl.trainer.trainer.collect_aux_loss_metrics",
+                return_value={},
+            ),
+            patch(
+                "torchtitan.rl.trainer.trainer.compute_training_performance_metrics",
+                return_value={"tokens_per_second": 1.0, "tflops": 1.0},
+            ),
+        ):
+            await Trainer.optim_step(trainer, resume_state={})
+
+        new_master = master + spacing
+        assert torch.equal(seen["optimizer"], master)
+        assert torch.equal(seen["checkpoint"], new_master)
+        assert torch.equal(trainer._master_weights[0], new_master)
+        assert torch.equal(weight, weight.bfloat16().float())
+        # 1 + 1.25 spacings rounds to one of its two bf16 neighbours.
+        neighbours = (weight == 1.0 + spacing) | (weight == 1.0 + 2 * spacing)
+        assert torch.all(neighbours)
 
     asyncio.run(run())
