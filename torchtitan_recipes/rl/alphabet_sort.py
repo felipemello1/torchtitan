@@ -912,9 +912,9 @@ def rl_grpo_qwen3_6_27b_varlen_perf() -> Controller.Config:
         activation_remat=FullActivationRematConfig(),
         parallelism=trainer_parallelism,
         # Keep bf16 parameters to fit the 4 trainer GPUs: fp32 ones with the bf16
-        # moments above need 12 B/param (~81 GB per GPU), and 12 B/param ran out of
-        # memory on this layout. Trade-off: AdamW updates smaller than half a bf16
-        # spacing (|w| / 256) round away.
+        # moments above need 12 B/param (~81 GB per GPU). 12 B/param ran out of
+        # memory with this trainer layout on 96 GB H100s (a 4096-token pretraining
+        # run). Trade-off: AdamW updates below half a bf16 spacing round away.
         training=dataclasses.replace(config.trainer.training, dtype="bfloat16"),
     )
     config.generator = dataclasses.replace(
