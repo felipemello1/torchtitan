@@ -11,7 +11,7 @@ import pickle
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torchstore as ts
@@ -39,6 +39,31 @@ from torchtitan.tools import utils
 from torchtitan.training_engine import TrainingEngine
 
 logger = logging.getLogger(__name__)
+
+
+def stochastic_round_to_bf16_(
+    tensor: torch.Tensor, *, generator: torch.Generator
+) -> None:
+    """Round fp32 values in place onto the bf16 grid, away from zero with probability equal to the dropped fraction.
+
+    Example: 1.0 + 0.25 * 2**-7 (a quarter of the bf16 spacing above 1.0)
+        -> 1.0 + 2**-7 with probability 0.25, else 1.0. The mean equals the input.
+    Non-canonical NaN payloads may become inf or 0.
+
+    Args:
+        tensor: fp32 values, rounded in place. They stay fp32 and are exact in bf16.
+        generator: source of the random bits, on ``tensor``'s device.
+    """
+    random_low_bits = torch.randint(
+        65536,
+        tensor.shape,
+        dtype=torch.int32,
+        device=tensor.device,
+        generator=generator,
+    )
+    # Add 16 random bits below the bf16 mantissa, then drop the low 16 bits. fp32 is
+    # sign-magnitude, so negative values round the same way as positive ones.
+    tensor.view(torch.int32).add_(random_low_bits).bitwise_and_(-65536)
 
 
 class MirroredState(Stateful):
@@ -90,6 +115,23 @@ class Trainer(Configurable):
 
         model: BaseModel.Config
         """Trainer model config, built for ``parallelism``."""
+
+        # TODO: add "error_feedback", the paper's other unbiased rule (+4 B/param residual).
+        bf16_weight_rounding: Literal["nearest", "stochastic"] = "nearest"
+        """How the fp32 master weights round to the bf16 copy used by both the trainer
+        forward and the generator.
+
+        - "nearest": round to nearest. Updates below half a bf16 spacing (|w| / 256)
+          change neither copy until many of them add up.
+        - "stochastic": round away from zero with probability equal to the dropped
+          fraction, so the copy equals the master on average (arXiv 2610.41073).
+          - Between optimizer steps the trainable parameters hold this copy; their fp32
+            master is kept aside (+4 B/param). Frozen parameters keep "nearest".
+          - Each push draws a new copy. A rollout made N pushes ago came from a
+            different copy than the one the trainer forward uses, unless N = 0.
+          - With async checkpointing, checkpoint steps wait for staging.
+          - The noise is seeded by ``debug.seed`` (0 when unset), the step and the parameter.
+        """
 
     def __init__(
         self,
@@ -153,6 +195,14 @@ class Trainer(Configurable):
         )
 
         engine.load_checkpoint()
+        self._master_weights: list[torch.Tensor] | None = None
+        if config.bf16_weight_rounding == "stochastic":
+            trainable_params = self._local_params(trainable_only=True)
+            self._master_weights = [
+                torch.empty_like(param) for param in trainable_params
+            ]
+            # Before the controller's first push, so the generators start from the copy.
+            self._save_master_and_write_rounded_copy(trainable_params)
         self._staging_state_dict = self._setup_staging_model_state_dict()
         if engine.device.type == "cpu":
             self._staging_model_state_dict_stream = None
@@ -374,29 +424,22 @@ class Trainer(Configurable):
         # (|w| / 256), so the rounded copy pushed to the generator does not change.
         # Count the weights whose value in the push dtype changes. Costs one
         # push-dtype copy of the local shards during the optimizer step.
-        local_params = [
-            get_local_tensor(param)
-            for model_part in engine.model_parts
-            for param in model_part.parameters()
-        ]
+        local_params = self._local_params()
         weights_before = [
             param.to(self._transfer_dtype or param.dtype, copy=True)
             for param in local_params
         ]
+        if self._master_weights is not None:
+            # The trainable parameters hold the rounded copy: restore the master the
+            # optimizer updates.
+            with torch.no_grad():
+                for param, master in zip(
+                    self._local_params(trainable_only=True),
+                    self._master_weights,
+                    strict=True,
+                ):
+                    param.copy_(master)
         grad_norm = engine.optim_step()
-        # Before the count, so the next push does not wait for it.
-        self._mark_model_state_dict_ready_for_staging()
-        num_changed = sum(
-            torch.count_nonzero(param.to(before.dtype) != before)
-            for param, before in zip(local_params, weights_before, strict=True)
-        )
-        num_weights = sum(param.numel() for param in local_params)
-        # Replicated weights (e.g. TP norms) count once per rank that holds them.
-        weight_counts = dist_utils.dist_sum_tensor(
-            torch.stack([num_changed, torch.full_like(num_changed, num_weights)]),
-            engine.parallelism_context.world_mesh,
-        )
-        del weights_before
         self._resume_state.value = resume_state
 
         # TODO: Move performance, LR, and auxiliary-loss reporting into a shared
@@ -410,7 +453,30 @@ class Trainer(Configurable):
             has_quantization=engine.has_quantization,
         )
 
+        # The checkpoint saves the fp32 master, before the rounded copy is written.
         engine.save_checkpoint(last_step=last_step)
+        if self._master_weights is not None:
+            if hasattr(engine, "checkpointer"):
+                # An async checkpoint copies the parameters after save() returns: it
+                # must copy the master, not the rounded copy.
+                engine.checkpointer.maybe_wait_for_staging()
+            self._save_master_and_write_rounded_copy(
+                self._local_params(trainable_only=True)
+            )
+        # After the rounded-copy write, so the push reads it. Before the count, so the
+        # next push does not wait for it.
+        self._mark_model_state_dict_ready_for_staging()
+        num_changed = sum(
+            torch.count_nonzero(param.to(before.dtype) != before)
+            for param, before in zip(local_params, weights_before, strict=True)
+        )
+        num_weights = sum(param.numel() for param in local_params)
+        # Replicated weights (e.g. TP norms) count once per rank that holds them.
+        weight_counts = dist_utils.dist_sum_tensor(
+            torch.stack([num_changed, torch.full_like(num_changed, num_weights)]),
+            engine.parallelism_context.world_mesh,
+        )
+        del weights_before
         engine.step_profiler()
         device_mem_stats = engine.device_memory_monitor.get_peak_stats()
         engine.device_memory_monitor.reset_peak_stats()
@@ -449,6 +515,41 @@ class Trainer(Configurable):
                 ),
             },
         )
+
+    def _local_params(self, *, trainable_only: bool = False) -> list[torch.Tensor]:
+        """This rank's shards of the model parameters, as plain tensors."""
+        return [
+            get_local_tensor(param)
+            for model_part in self.engine.model_parts
+            for param in model_part.parameters()
+            if param.requires_grad or not trainable_only
+        ]
+
+    @torch.no_grad()
+    def _save_master_and_write_rounded_copy(
+        self, trainable_params: list[torch.Tensor]
+    ) -> None:
+        """Copy the fp32 master aside, then write its stochastically rounded copy into the parameters.
+
+        The push and the next forward/backward both read this copy. The next
+        ``optim_step`` restores the master before updating it.
+        """
+        seed = self.config.debug.seed or 0
+        for index, (param, master) in enumerate(
+            zip(trainable_params, self._master_weights, strict=True)
+        ):
+            master.copy_(param)
+            # One seed per (step, parameter), the same on every rank: replicated weights
+            # (TP norms, HSDP) round the same way. The multipliers exceed any step count
+            # and parameter count, so no two (step, parameter) pairs share a seed.
+            # TODO: shards of one weight reuse the noise pattern on different elements.
+            # Each element stays unbiased, but paired elements share random bits, so their
+            # rounding is correlated under FSDP, TP or EP. Adding the shard's mesh
+            # coordinates to the seed fixes it.
+            generator = torch.Generator(device=param.device).manual_seed(
+                ((seed * 1_000_003 + self.policy_version) * 100_003 + index) % 2**64
+            )
+            stochastic_round_to_bf16_(param, generator=generator)
 
     @sl.log_trace_span("push_model_state_dict")
     async def push_model_state_dict(self) -> None:
