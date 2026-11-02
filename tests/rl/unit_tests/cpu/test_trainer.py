@@ -543,7 +543,10 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
                     )
                 )
             ),
-            parallelism_context=SimpleNamespace(non_data_parallel_size=1),
+            parallelism_context=SimpleNamespace(
+                non_data_parallel_size=1, world_mesh=None
+            ),
+            model_parts=[torch.nn.Linear(2, 2, bias=False)],
             num_completed_steps=4,
             ntokens_seen=12,
             num_flops_per_token=200,
@@ -554,11 +557,21 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
             save_checkpoint=MagicMock(),
             step_profiler=MagicMock(),
         )
-        engine.optim_step.side_effect = lambda: (
-            setattr(engine, "num_completed_steps", engine.num_completed_steps + 1),
-            torch.tensor(2.0),
-        )[1]
+        weight = engine.model_parts[0].weight
+        torch.nn.init.ones_(weight)
+
+        def optim_step() -> torch.Tensor:
+            engine.num_completed_steps += 1
+            with torch.no_grad():
+                # Near 1.0 the bf16 spacing is 1/128: +0.01 changes the bf16
+                # value, +1e-6 does not. 1 of 4 weights changes.
+                weight[0, 0] += 0.01
+                weight[0, 1] += 1e-6
+            return torch.tensor(2.0)
+
+        engine.optim_step.side_effect = optim_step
         trainer.engine = engine
+        trainer._transfer_dtype = torch.bfloat16
         trainer._resume_state = MirroredState()
         trainer.gpu_peak_flops = 1000
         trainer._step_compute_start = 0.0
@@ -596,6 +609,7 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
         )
         assert result.metrics == {
             "trainer/grad_norm/mean": 2.0,
+            "trainer/pushed_weights_changed_percent": 25.0,
             "trainer/lr/AdamW/0": 0.25,
             "trainer/lr/AdamW/1": 0.125,
             "trainer/policy_version": 5.0,
