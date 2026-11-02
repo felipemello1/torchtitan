@@ -125,11 +125,11 @@ class Trainer(Configurable):
           change neither copy until many of them add up.
         - "stochastic": round away from zero with probability equal to the dropped
           fraction, so the copy equals the master on average (arXiv 2610.41073).
-          Between optimizer steps the trainable parameters hold this copy, and their
-          fp32 master is kept aside (+4 B/param). Frozen parameters keep "nearest".
-          The trainer forward uses the sampler's copy only for on-policy rollouts
-          (target_offpolicy_steps=0); older rollouts came from an independently
-          rounded copy. With async checkpointing, checkpoint steps wait for staging.
+          - Between optimizer steps the trainable parameters hold this copy; their fp32
+            master is kept aside (+4 B/param). Frozen parameters keep "nearest".
+          - Each push draws a new copy. A rollout made N pushes ago came from a
+            different copy than the one the trainer forward uses, unless N = 0.
+          - With async checkpointing, checkpoint steps wait for staging.
         """
 
     def __init__(
@@ -542,8 +542,9 @@ class Trainer(Configurable):
             # (TP norms, HSDP) round the same way. The multipliers exceed any step count
             # and parameter count, so no two (step, parameter) pairs share a seed.
             # TODO: shards of one weight reuse the noise pattern on different elements.
-            # Each element stays unbiased, but paired elements round together under
-            # FSDP, TP or EP. Adding the shard's mesh coordinates to the seed fixes it.
+            # Each element stays unbiased, but paired elements share random bits, so their
+            # rounding is correlated under FSDP, TP or EP. Adding the shard's mesh
+            # coordinates to the seed fixes it.
             generator = torch.Generator(device=param.device).manual_seed(
                 ((seed * 1_000_003 + self.policy_version) * 100_003 + index) % 2**64
             )

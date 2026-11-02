@@ -574,7 +574,7 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics(
             engine.num_completed_steps += 1
             with torch.no_grad():
                 # Near 1.0 the bf16 spacing is 1/128: +0.01 changes the bf16
-                # value, +1e-6 does not. 1 of 128 weights changes.
+                # value, +1e-6 does not. Under nearest, 1 of 128 weights changes.
                 weight[0, 0] += 0.01
                 weight[0, 1] += 1e-6
             return torch.tensor(2.0)
@@ -590,6 +590,8 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics(
         if bf16_weight_rounding == "stochastic":
             # The parameter holds the rounded copy, 1.0. Rows 1-63 of the master sit half
             # a bf16 spacing (2**-8) above it: nearest keeps 1.0, stochastic moves some up.
+            # With this many elements the metric differs from a count taken before the
+            # rounded-copy write, so the test checks the count's order.
             master[1:] += 2**-8
             trainer._master_weights = [master.clone()]
         trainer._resume_state = MirroredState()
