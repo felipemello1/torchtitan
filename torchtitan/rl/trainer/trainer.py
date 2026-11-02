@@ -130,6 +130,7 @@ class Trainer(Configurable):
           - Each push draws a new copy. A rollout made N pushes ago came from a
             different copy than the one the trainer forward uses, unless N = 0.
           - With async checkpointing, checkpoint steps wait for staging.
+          - The noise is seeded by ``debug.seed`` (0 when unset), the step and the parameter.
         """
 
     def __init__(
