@@ -535,6 +535,8 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> Controller.Config:
     Trainer and generator uses TP=2 for dense layers and EP=4 for MoE experts.
 
     Note: Qwen3-30B-A3B has 4 KV heads, so TP degree cannot exceed 4.
+    fp32 master weights, grads and AdamW state take ~114 GiB per trainer GPU,
+    so the trainer needs B200 or GB300 GPUs.
     """
     num_samples_per_prompt = 8
     seq_len = 2048
@@ -905,6 +907,10 @@ def rl_grpo_qwen3_6_27b_varlen_perf() -> Controller.Config:
         ),
         activation_remat=FullActivationRematConfig(),
         parallelism=trainer_parallelism,
+        # bf16 parameters fit 4 H100 trainer GPUs: fp32 ones with the bf16 moments
+        # above take ~81 GB per GPU. Trade-off: AdamW updates smaller than half a
+        # bf16 spacing (|w| / 256) round away.
+        training=dataclasses.replace(config.trainer.training, dtype="bfloat16"),
     )
     config.generator = dataclasses.replace(
         config.generator, model=generator_model, parallelism=generator_parallelism
