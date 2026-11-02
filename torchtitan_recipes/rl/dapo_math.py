@@ -410,7 +410,8 @@ def _qwen3_30b_a3b_dapo_math_8k_config(
 
     One node: trainer FSDP4 / EP4 on 4 GPUs and one generator DP4 / EP4 on 4 GPUs,
     8K responses, 32 prompts x 16 samples per step. fp32 master weights, grads and
-    AdamW state take ~114 GiB per trainer GPU, so the trainer needs B200 or GB300 GPUs.
+    AdamW state take ~114 GiB per trainer GPU, so the trainer needs more than 80 GB
+    per GPU (e.g. B200, GB300).
     """
     max_response_tokens = 8192
     max_total_tokens = 10240

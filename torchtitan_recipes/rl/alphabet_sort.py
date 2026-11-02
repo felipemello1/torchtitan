@@ -536,7 +536,7 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> Controller.Config:
 
     Note: Qwen3-30B-A3B has 4 KV heads, so TP degree cannot exceed 4.
     fp32 master weights, grads and AdamW state take ~114 GiB per trainer GPU,
-    so the trainer needs B200 or GB300 GPUs.
+    so the trainer needs more than 80 GB per GPU (e.g. B200, GB300).
     """
     num_samples_per_prompt = 8
     seq_len = 2048
@@ -824,7 +824,11 @@ def rl_grpo_qwen3_5_9b_varlen() -> Controller.Config:
 
 
 def rl_grpo_qwen3_5_9b_varlen_batch_invariant() -> Controller.Config:
-    """On-policy, batch-invariant Qwen3.5-9B GRPO with matching TP=2."""
+    """On-policy, batch-invariant Qwen3.5-9B GRPO with matching TP=2.
+
+    fp32 master weights, grads and AdamW state take ~67 GiB on each of the 2
+    trainer GPUs, which is tight on 80 GB GPUs.
+    """
     config = rl_grpo_qwen3_5_9b_varlen()
     config.async_loop = dataclasses.replace(config.async_loop, target_offpolicy_steps=0)
     config.trainer = dataclasses.replace(
@@ -907,9 +911,10 @@ def rl_grpo_qwen3_6_27b_varlen_perf() -> Controller.Config:
         ),
         activation_remat=FullActivationRematConfig(),
         parallelism=trainer_parallelism,
-        # bf16 parameters fit 4 H100 trainer GPUs: fp32 ones with the bf16 moments
-        # above take ~81 GB per GPU. Trade-off: AdamW updates smaller than half a
-        # bf16 spacing (|w| / 256) round away.
+        # Keep bf16 parameters to fit the 4 trainer GPUs: fp32 ones with the bf16
+        # moments above need 12 B/param (~81 GB per GPU), and 12 B/param ran out of
+        # memory on this layout. Trade-off: AdamW updates smaller than half a bf16
+        # spacing (|w| / 256) round away.
         training=dataclasses.replace(config.trainer.training, dtype="bfloat16"),
     )
     config.generator = dataclasses.replace(
