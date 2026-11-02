@@ -371,9 +371,9 @@ class Trainer(Configurable):
         lr_metrics = engine.optim.lr_schedulers.get_metrics()
 
         # At small learning rates most AdamW updates are below half a bf16 spacing
-        # (|w| / 256), so the generator's rounded copy of a weight does not change.
-        # Count the weights whose generator-dtype value changes. Costs one
-        # generator-dtype copy of the local shards during the optimizer step.
+        # (|w| / 256), so the rounded copy pushed to the generator does not change.
+        # Count the weights whose value in the push dtype changes. Costs one
+        # push-dtype copy of the local shards during the optimizer step.
         local_params = [
             get_local_tensor(param)
             for model_part in engine.model_parts
@@ -384,6 +384,8 @@ class Trainer(Configurable):
             for param in local_params
         ]
         grad_norm = engine.optim_step()
+        # Before the count, so the next push does not wait for it.
+        self._mark_model_state_dict_ready_for_staging()
         num_changed = sum(
             torch.count_nonzero(param.to(before.dtype) != before)
             for param, before in zip(local_params, weights_before, strict=True)
@@ -395,7 +397,6 @@ class Trainer(Configurable):
             engine.parallelism_context.world_mesh,
         )
         del weights_before
-        self._mark_model_state_dict_ready_for_staging()
         self._resume_state.value = resume_state
 
         # TODO: Move performance, LR, and auxiliary-loss reporting into a shared
@@ -423,7 +424,7 @@ class Trainer(Configurable):
             policy_version=self.policy_version,
             metrics={
                 "trainer/grad_norm/mean": float(grad_norm.item()),
-                "trainer/generator_weights_changed_percent": float(
+                "trainer/pushed_weights_changed_percent": float(
                     100 * weight_counts[0] / weight_counts[1]
                 ),
                 **{f"trainer/{key}": value for key, value in lr_metrics.items()},

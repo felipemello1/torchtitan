@@ -609,7 +609,7 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
         )
         assert result.metrics == {
             "trainer/grad_norm/mean": 2.0,
-            "trainer/generator_weights_changed_percent": 25.0,
+            "trainer/pushed_weights_changed_percent": 25.0,
             "trainer/lr/AdamW/0": 0.25,
             "trainer/lr/AdamW/1": 0.125,
             "trainer/policy_version": 5.0,
