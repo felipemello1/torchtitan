@@ -535,8 +535,8 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> Controller.Config:
     Trainer and generator uses TP=2 for dense layers and EP=4 for MoE experts.
 
     Note: Qwen3-30B-A3B has 4 KV heads, so TP degree cannot exceed 4.
-    fp32 master weights, grads and AdamW state take ~114 GiB per trainer GPU,
-    so the trainer needs more than 80 GB per GPU (e.g. B200, GB300).
+    fp32 master weights, grads and AdamW state take ~114 GiB per trainer GPU
+    before activations, so the trainer needs B200- or GB300-class GPUs.
     """
     num_samples_per_prompt = 8
     seq_len = 2048
