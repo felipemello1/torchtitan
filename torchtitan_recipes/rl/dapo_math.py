@@ -409,7 +409,9 @@ def _qwen3_30b_a3b_dapo_math_8k_config(
     """Build the shared Qwen3-30B-A3B-Base DAPO-Math configuration with Dist-MoE experts.
 
     One node: trainer FSDP4 / EP4 on 4 GPUs and one generator DP4 / EP4 on 4 GPUs,
-    8K responses, 32 prompts x 16 samples per step.
+    8K responses, 32 prompts x 16 samples per step. fp32 master weights, grads and
+    AdamW state take ~114 GiB per trainer GPU before activations, so the trainer
+    needs B200- or GB300-class GPUs.
     """
     max_response_tokens = 8192
     max_total_tokens = 10240
@@ -486,7 +488,6 @@ def _qwen3_30b_a3b_dapo_math_8k_config(
                 # max_total_tokens).
                 num_tokens_per_microbatch_per_dp_rank=4 * max_total_tokens,
                 max_context_length=max_total_tokens,
-                dtype="bfloat16",
             ),
             dist_moe_runtime=DistMoeRuntime.Config(scratch_capacity_factor=4.0),
             parallelism=trainer_parallelism,
