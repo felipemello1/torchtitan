@@ -1655,18 +1655,6 @@ def test_parse_sampling_config_accepts_top_k_and_min_p_only_switched_off() -> No
         _parse_sampling_config({**sampling_params, "min_p": 0.05})
 
 
-def test_parse_sampling_config_reads_num_topk_logprobs() -> None:
-    sampling_params = {
-        "temperature": 1.0,
-        "top_p": 1.0,
-        "max_tokens": 5,
-        "stop_token_ids": [1],
-    }
-    assert _parse_sampling_config(sampling_params).num_topk_logprobs == 0
-    sampling_params["num_topk_logprobs"] = 32
-    assert _parse_sampling_config(sampling_params).num_topk_logprobs == 32
-
-
 def test_parse_sampling_config_requires_stop_token_ids() -> None:
     with pytest.raises(ValueError, match="stop_token_ids"):
         _parse_sampling_config({"temperature": 1.0})

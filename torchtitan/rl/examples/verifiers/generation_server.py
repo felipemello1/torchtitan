@@ -397,5 +397,7 @@ def _parse_sampling_config(value: object):
         max_tokens=int(value["max_tokens"]),
         seed=value.get("seed"),
         stop_token_ids=stop_token_ids,
-        num_topk_logprobs=int(value.get("num_topk_logprobs", 0)),
+        num_topk_logprobs=int(
+            value.get("num_topk_logprobs", 0)
+        ),
     )

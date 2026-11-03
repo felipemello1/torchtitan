@@ -33,6 +33,7 @@ from torchtitan.models.common.attention import (
 from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.common.decoder_sharding import (
     decoder_input_sharding,
+    loss_kwarg_sharding,
     token_id_placement,
 )
 from torchtitan.models.common.multimodal import (
@@ -324,7 +325,9 @@ class KimiK3Model(MultimodalModel):
         }
         if "vision_bank_indices_T" in input_dict:
             input_shardings["vision_bank_indices_T"] = token_id_placement()
-        input_shardings.update(dict.fromkeys(loss_kwargs, input_shardings["labels"]))
+        input_shardings.update(
+            loss_kwarg_sharding(loss_kwargs, input_shardings["labels"])
+        )
         input_dict.update(loss_kwargs)
         if parallelism_context.cp_enabled:
             input_dict = self._cp_shard(

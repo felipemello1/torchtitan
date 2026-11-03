@@ -18,13 +18,14 @@ from torchtitan.distributed.spmd_types import spmd_mesh_group
 
 # Clamp |log(pi_theta/pi_old)| before exp() so a large generator/trainer
 # logprob mismatch cannot overflow exp() to inf/NaN.
-_MAX_LOG_RATIO = 10.0
+MAX_LOG_RATIO = 10.0
 
 
-def _normalize(
+def normalize(
     value: torch.Tensor,
     global_loss_token_counts: torch.Tensor | None,
 ) -> torch.Tensor:
+    """Divide a sum over loss tokens by the global loss-token count; None returns ``value``."""
     if global_loss_token_counts is None:
         return value
     global_loss_token_count = (
@@ -116,7 +117,7 @@ class DAPOLoss(Loss[torch.Tensor]):
         masked_log_ratio = torch.where(
             effective_loss_mask, raw_log_ratio, torch.zeros_like(raw_log_ratio)
         )
-        log_ratio = torch.clamp(masked_log_ratio, -_MAX_LOG_RATIO, _MAX_LOG_RATIO)
+        log_ratio = torch.clamp(masked_log_ratio, -MAX_LOG_RATIO, MAX_LOG_RATIO)
         ratio = torch.exp(log_ratio)
 
         clipped_ratio = torch.clamp(
@@ -125,7 +126,7 @@ class DAPOLoss(Loss[torch.Tensor]):
         token_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
 
         masked_loss = token_loss * effective_loss_mask
-        loss = _normalize(masked_loss.sum(), global_loss_token_counts)
+        loss = normalize(masked_loss.sum(), global_loss_token_counts)
 
         with torch.no_grad():
             diff_for_metrics = torch.where(
@@ -136,10 +137,10 @@ class DAPOLoss(Loss[torch.Tensor]):
             masked_ratio = ratio * effective_loss_mask
             metrics = {
                 "loss/mean": loss.detach(),
-                "loss/ratio_mean": _normalize(
+                "loss/ratio_mean": normalize(
                     masked_ratio.sum(), global_loss_token_counts
                 ),
-                "loss/ratio_clipped_frac": _normalize(
+                "loss/ratio_clipped_frac": normalize(
                     (
                         (torch.abs(ratio - clipped_ratio) > 1e-6).float()
                         * effective_loss_mask
@@ -148,10 +149,10 @@ class DAPOLoss(Loss[torch.Tensor]):
                 ),
                 # Mean per-token log-ratio (log p_trainer - log q_generator) over
                 # sampled tokens. This is the k1 Monte-Carlo estimate of -KL(q || p).
-                "bit_wise/logprob_diff/mean": _normalize(
+                "bit_wise/logprob_diff/mean": normalize(
                     diff_for_metrics.float().sum(), global_loss_token_counts
                 ),
-                "bit_wise/ratio_tokens_different/mean": _normalize(
+                "bit_wise/ratio_tokens_different/mean": normalize(
                     (
                         (diff_for_metrics.abs() > 1e-6).float() * effective_loss_mask
                     ).sum(),
@@ -159,7 +160,7 @@ class DAPOLoss(Loss[torch.Tensor]):
                 ),
                 "bit_wise/logprob_diff/max": diff_for_metrics.abs().max(),
                 # Mean entropy of softmax(logits / temperature) over tokens used by the loss.
-                "trainer/entropy/mean": _normalize(
+                "trainer/entropy/mean": normalize(
                     (token_entropy * effective_loss_mask).sum(),
                     global_loss_token_counts,
                 ),

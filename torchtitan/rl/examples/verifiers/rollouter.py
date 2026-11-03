@@ -564,10 +564,14 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
                         mask = [False] * len(mask)
                     else:
                         trained_nodes.add(index)
-                topk = None
+                topk_token_ids = topk_logprobs = None
                 if generation_metadata.topk_by_generation and any(mask):
                     # The prompt this node's completion was sampled from ends at its first
                     # sampled token.
+                    # TODO: two generations of one rollout with equal prompt lengths and equal
+                    # completions but different prompts share this key, and the later one's rows
+                    # win. Keying on the prompt tokens is strict, but needs a Verifiers run to
+                    # check that each trace's tokens equal the request's.
                     key = (
                         branch_offset + list(node.mask).index(True),
                         tuple(
@@ -581,7 +585,10 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
                             "Verifiers node has no generation with the same prompt length "
                             "and completion tokens, so its top-k logprobs are unknown"
                         )
-                    topk = generation_metadata.topk_by_generation[key]
+                    (
+                        topk_token_ids,
+                        topk_logprobs,
+                    ) = generation_metadata.topk_by_generation[key]
                 for start, end in _trainable_token_spans(mask):
                     absolute_start = branch_offset + start
                     absolute_end = branch_offset + end
@@ -609,13 +616,13 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
                             ),
                             completion_topk_token_ids=(
                                 None
-                                if topk is None
-                                else topk[0][row : row + end - start]
+                                if topk_token_ids is None
+                                else topk_token_ids[row : row + end - start]
                             ),
                             completion_topk_logprobs=(
                                 None
-                                if topk is None
-                                else topk[1][row : row + end - start]
+                                if topk_logprobs is None
+                                else topk_logprobs[row : row + end - start]
                             ),
                             min_policy_version=generation_metadata.min_policy_version,
                             max_policy_version=generation_metadata.max_policy_version,
