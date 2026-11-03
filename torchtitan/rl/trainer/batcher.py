@@ -270,6 +270,7 @@ class Batcher(Configurable):
             dp_degree=2,
             pad_id=0,
             temperature=1.0,
+            num_topk_logprobs=0,
         )
         pending, _ = batcher.add_training_samples(training_sample_group=group0)
         batch, _ = batcher.add_training_samples(training_sample_group=group1)
@@ -342,7 +343,7 @@ class Batcher(Configurable):
         num_pp_microbatches: int = 1,
         pad_id: int,
         temperature: float,
-        num_topk_logprobs: int = 0,
+        num_topk_logprobs: int,
         register_rdma_microbatch: RegisterRDMAMicrobatch | None = None,
         vision_processor: VisionProcessor.Config | None = None,
     ) -> None:
@@ -455,6 +456,7 @@ class Batcher(Configurable):
                 dp_degree=1,
                 pad_id=0,
                 temperature=1.0,
+                num_topk_logprobs=0,
             )
             batcher.add_training_samples(training_sample_group=group0)  # -> (None, True)
             batcher.add_training_samples(training_sample_group=group1)  # -> (TrainerStepBatch, True)
