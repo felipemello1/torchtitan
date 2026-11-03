@@ -108,6 +108,7 @@ from typing import Any
 import torch  # noqa: F401
 
 from torchtitan.components.data.multimodal.vision_processor import VisionProcessor
+from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.renderer import RendererConfig
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import (
@@ -143,6 +144,7 @@ from torchtitan.rl.rollout.rollouter import Rollouter
 from torchtitan.rl.rollout.types import Completion, GenerateFn, Prompt, ReleaseSessionFn
 from torchtitan.rl.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.trainer.batcher import Batcher, TrainerStepBatch
+from torchtitan.rl.trainer.losses import ScoreCenteringLoss
 from torchtitan.rl.trainer.trainer import Trainer
 from torchtitan.tools.garbage_collector import GarbageCollector
 
@@ -614,6 +616,18 @@ class Controller(Configurable):
                         f"positions; set it to {uses_mrope}."
                     )
 
+            loss_config = self.trainer.loss
+            if isinstance(loss_config, ChunkedLossWrapper.Config):
+                loss_config = loss_config.loss_fn
+            uses_score_centering = isinstance(loss_config, ScoreCenteringLoss.Config)
+            if uses_score_centering != (self.generator.sampling.num_topk_logprobs > 0):
+                raise ValueError(
+                    "ScoreCenteringLoss needs generator.sampling.num_topk_logprobs > 0, "
+                    "and other losses need 0 (they take no top-k inputs). Got "
+                    f"{type(loss_config).__qualname__} with num_topk_logprobs="
+                    f"{self.generator.sampling.num_topk_logprobs}."
+                )
+
             # TODO: add a check so that all seq_len related variables make sense
             # e.g. rollout max length cannot be larger than the model max_seq_len
             # or the packing len, etc.
@@ -932,6 +946,7 @@ class Controller(Configurable):
                 ),
                 pad_id=self.tokenizer.eos_id,
                 temperature=self._sampling.temperature,
+                num_topk_logprobs=self._sampling.num_topk_logprobs,
                 output_dir=config.dump_folder,
                 enable_structured_logging=config.trainer.debug.enable_structured_logging,
                 vision_processor=config.vision_processor,
@@ -1105,12 +1120,14 @@ class Controller(Configurable):
         # in a rollouter's own limit. Do it when validation moves out of the controller.
         # Off the event loop: training runs meanwhile, and building the dataset can take seconds.
         samples = await asyncio.to_thread(self._rollouter.get_validation_samples, steps)
+        # Validation rollouts are never trained, so skip the top-k transport.
         sampling = replace(
             self._sampling,
             temperature=validation.temperature,
             top_p=validation.top_p,
             top_k=validation.top_k,
             scored_by_trainer=False,
+            num_topk_logprobs=0,
         )
 
         rollout_groups, validation_metrics = await self._collect_validation_rollouts(

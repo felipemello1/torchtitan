@@ -290,6 +290,7 @@ def test_process_finished_requests_resolves_reply_with_completion():
         assert completion.request_id == "r0"
         assert completion.token_ids == [10, 11]
         assert completion.token_logprobs == [-0.1, -0.1]
+        assert completion.topk_token_ids is None
         assert completion.finish_reason == "length"
         assert completion.min_policy_version == 7  # min = version it was admitted under
         assert completion.max_policy_version == 8  # max = live version at finish
@@ -301,6 +302,42 @@ def test_process_finished_requests_resolves_reply_with_completion():
                 "generator/inflight_requests_at_completion/max"
             ]
             == 1
+        )
+
+    asyncio.run(main())
+
+
+def test_process_finished_requests_splits_topk_logprobs():
+    async def main():
+        dispatcher = _dispatcher()
+        reply = concurrent.futures.Future()
+        reply.set_running_or_notify_cancel()
+        generation = OutstandingGeneration(reply=reply)
+        generation.min_policy_version = 7
+        dispatcher._rank0_outstanding_generations = {"r0": generation}
+        # vLLM's layout with logprobs=2: each position holds [sampled, top-1, top-2], and
+        # the sampled token repeats when it is also in the top-k.
+        logprobs = FlatLogprobs()
+        logprobs.append_fast(
+            [10, 10, 3], [-0.1, -0.1, -2.5], iter([1, 1, 2]), [None] * 3
+        )
+        logprobs.append_fast(
+            [11, 4, 11], [-0.7, -0.5, -0.7], iter([2, 1, 2]), [None] * 3
+        )
+        sample = SimpleNamespace(
+            token_ids=[10, 11], logprobs=logprobs, finish_reason="stop"
+        )
+
+        dispatcher.process_finished_requests(
+            [_finished_request(_request_output(outputs=[sample]))], policy_version=7
+        )
+
+        completion = await asyncio.wrap_future(reply)
+        assert completion.token_logprobs == [-0.1, -0.7]
+        assert completion.topk_token_ids.dtype == np.int32
+        assert completion.topk_token_ids.tolist() == [[10, 3], [4, 11]]
+        np.testing.assert_allclose(
+            completion.topk_logprobs, [[-0.1, -2.5], [-0.5, -0.7]], rtol=1e-6
         )
 
     asyncio.run(main())
@@ -920,6 +957,7 @@ def test_session_kv_holder_rejects_kv_cache_reset_on_model_state_dict_load(tmp_p
             precision=PrecisionConfig(),
             gpu_memory_limit=0.9,
             max_num_batched_tokens=None,
+            num_topk_logprobs=0,
             checkpointer=None,
             dist_moe_runtime=None,
             debug=DebugConfig(),
@@ -943,6 +981,7 @@ def test_batch_invariant_rejects_fp8_kv_cache(tmp_path):
             precision=PrecisionConfig(),
             gpu_memory_limit=0.9,
             max_num_batched_tokens=None,
+            num_topk_logprobs=0,
             checkpointer=None,
             dist_moe_runtime=None,
             debug=DebugConfig(batch_invariant=True),
@@ -982,6 +1021,7 @@ def test_fp8_kv_with_drafts_rejects_an_fa4_without_query_len_in_heads(
             precision=PrecisionConfig(),
             gpu_memory_limit=0.9,
             max_num_batched_tokens=None,
+            num_topk_logprobs=0,
             checkpointer=None,
             dist_moe_runtime=None,
             debug=DebugConfig(),
@@ -1039,6 +1079,7 @@ def _build_engine_kwargs(
         precision=PrecisionConfig(),
         gpu_memory_limit=config.gpu_memory_limit,
         max_num_batched_tokens=config.max_num_batched_tokens,
+        num_topk_logprobs=config.sampling.num_topk_logprobs,
         checkpointer=None,
         dist_moe_runtime=None,
         debug=config.debug,
@@ -1245,6 +1286,7 @@ def test_unsupported_kv_transfer_config_rejected_before_engine_creation(
         ("watermark", r"use VLLMEngine\.Config\.watermark"),
         ("kv_cache_dtype", r"use VLLMEngine\.Config\.kv_cache_dtype"),
         ("kv_transfer_config", r"use VLLMEngine\.Config\.kv_transfer_config"),
+        ("max_logprobs", r"use Generator\.Config\.sampling\.num_topk_logprobs"),
     ],
 )
 def test_extra_engine_args_rejects_torchtitan_owned_keys(key, match):
