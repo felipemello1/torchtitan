@@ -16,6 +16,7 @@ from torchstore import RankRole
 from torchtitan.config import PrecisionConfig, TrainingConfig
 from torchtitan.models.base.module import Module
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.rl.generator.engine_loop import EngineLoopThread
 from torchtitan.rl.trainer.batcher import TrainingMicrobatch
 from torchtitan.rl.trainer.rdma_microbatch import (
     RDMAMicrobatch,
@@ -23,6 +24,13 @@ from torchtitan.rl.trainer.rdma_microbatch import (
 )
 from torchtitan.rl.trainer.trainer import MirroredState, Trainer
 from torchtitan.training_engine import ForwardBackwardResult, TrainingEngine
+
+
+class _InlineEngineThread:
+    """Runs the trainer's engine-thread calls inline, for tests of the method bodies."""
+
+    async def run(self, fn):
+        return fn()
 
 
 def test_mirrored_state_uses_a_fixed_opaque_template() -> None:
@@ -53,6 +61,7 @@ def test_initialize_torchstore_client_uses_publisher_role() -> None:
 def test_push_model_state_dict_puts_on_push_stream_in_worker() -> None:
     async def run() -> None:
         trainer = object.__new__(Trainer)
+        trainer._engine_thread = _InlineEngineThread()
         # Model parts are torchtitan Modules (BaseModel in the engine).
         weight_part = Module()
         weight_part.register_parameter("weight", torch.nn.Parameter(torch.ones(2, 2)))
@@ -103,6 +112,50 @@ def test_push_model_state_dict_puts_on_push_stream_in_worker() -> None:
         assert len(worker_thread_ids) == 2
         assert worker_thread_ids[0] == worker_thread_ids[1]
         assert worker_thread_ids[0] != main_thread_id
+
+    asyncio.run(run())
+
+
+def test_push_replies_while_forward_backward_runs() -> None:
+    async def run() -> None:
+        trainer = object.__new__(Trainer)
+        trainer._engine_thread = EngineLoopThread(name="trainer-engine")
+        model_part = Module()
+        model_part.register_parameter("weight", torch.nn.Parameter(torch.ones(2)))
+        release_forward_backward = threading.Event()
+        trainer.engine = SimpleNamespace(
+            model_parts=[model_part],
+            num_completed_steps=0,
+            pp_has_last_stage=False,
+            forward_backward=lambda **kwargs: release_forward_backward.wait(),
+        )
+        trainer.config = Trainer.Config(model=MagicMock())
+        trainer._transfer_dtype = None
+        trainer._push_model_state_dict_stream = None
+        # If forward/backward blocked this event loop, the push couldn't reply until it ends.
+        # Release it after a while, so that case fails below instead of hanging.
+        timer = threading.Timer(5.0, release_forward_backward.set)
+        timer.start()
+        try:
+            with patch(
+                "torchtitan.rl.trainer.trainer.ts.put_state_dict",
+                new_callable=AsyncMock,
+            ):
+                # The controller's order: push N, then forward/backward N+1.
+                push = asyncio.create_task(trainer.push_model_state_dict())
+                forward_backward = asyncio.create_task(
+                    trainer.forward_backward(
+                        [[_rl_microbatch(0)]], torch.tensor([1]), torch.tensor([1])
+                    )
+                )
+                await push
+                forward_backward_still_running = not release_forward_backward.is_set()
+                release_forward_backward.set()
+                await forward_backward
+        finally:
+            timer.cancel()
+
+        assert forward_backward_still_running
 
     asyncio.run(run())
 
@@ -190,6 +243,7 @@ def test_forward_backward_uses_global_token_count() -> None:
 def test_close_stops_training_engine() -> None:
     async def run() -> None:
         trainer = object.__new__(Trainer)
+        trainer._engine_thread = _InlineEngineThread()
         engine = SimpleNamespace(
             close=MagicMock(),
         )
@@ -231,6 +285,7 @@ def test_get_resume_state_returns_restored_state() -> None:
 def test_forward_backward_accumulates_microbatch_metrics(rdma: bool) -> None:
     async def run() -> None:
         trainer = object.__new__(Trainer)
+        trainer._engine_thread = _InlineEngineThread()
         engine = SimpleNamespace(
             num_completed_steps=4,
             ntokens_seen=10,
@@ -338,6 +393,7 @@ def test_forward_backward_rejects_a_misplaced_rdma_microbatch(
     batch_index: int, dp_rank: int, microbatch_index: int
 ) -> None:
     trainer = object.__new__(Trainer)
+    trainer._engine_thread = _InlineEngineThread()
     trainer.engine = SimpleNamespace(num_completed_steps=0)
     trainer.config = Trainer.Config(model=MagicMock())
     trainer.dp_rank = 1
@@ -376,6 +432,7 @@ def _rl_microbatch(token: int) -> TrainingMicrobatch:
 def test_forward_backward_without_last_pipeline_stage_returns_no_metrics() -> None:
     async def run() -> None:
         trainer = object.__new__(Trainer)
+        trainer._engine_thread = _InlineEngineThread()
         engine = SimpleNamespace(num_completed_steps=0, pp_has_last_stage=False)
         engine.forward_backward = MagicMock(
             return_value=ForwardBackwardResult(
@@ -413,6 +470,7 @@ def test_forward_backward_without_last_pipeline_stage_returns_no_metrics() -> No
 def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
     async def run() -> None:
         trainer = object.__new__(Trainer)
+        trainer._engine_thread = _InlineEngineThread()
         device_mem_stats = SimpleNamespace(
             max_active_gib=3.0,
             max_active_pct=4.0,

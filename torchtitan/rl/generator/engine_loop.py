@@ -37,6 +37,7 @@ class EngineLoopThread:
 
     `engine.step()` blocks, so the engine and everything the engine loop touches run here,
     keeping the caller's (e.g. an actor's) event loop free to take calls while the engine steps.
+    The RL trainer runs its `TrainingEngine` on one too, for the same reason.
 
     Args:
         name: The thread's name.
@@ -51,7 +52,7 @@ class EngineLoopThread:
 
     def call(self, fn: Callable[[], _T]) -> _T:
         """Call `fn` on the engine loop thread, in the caller's contextvars, and block until it returns.
-        For setup, before the engine loop starts."""
+        For setup, before the engine loop starts. From a coroutine, use `run`, which doesn't block."""
         result: concurrent.futures.Future[_T] = concurrent.futures.Future()
 
         def call() -> None:
@@ -65,6 +66,26 @@ class EngineLoopThread:
         # `call_soon_threadsafe` runs `call` in a copy of the caller's contextvars.
         self.event_loop.call_soon_threadsafe(call)
         return result.result()
+
+    async def run(self, fn: Callable[[], _T]) -> _T:
+        """Await `fn`, run as an asyncio task on the engine loop thread in the caller's contextvars."""
+        result: concurrent.futures.Future[_T] = concurrent.futures.Future()
+
+        async def run_fn() -> None:
+            # The caller was cancelled (e.g. the actor stopped) before `fn` started: skip it.
+            if not result.set_running_or_notify_cancel():
+                return
+            # Catch everything: a `SystemExit` escaping a task stops `run_forever` before `result`
+            # resolves.
+            try:
+                result.set_result(fn())
+            except BaseException as exc:
+                result.set_exception(exc)
+
+        # A task, not a plain callback, so `sl.add_step_tag` (e.g. "gc") stays scoped to this call,
+        # as in an actor endpoint's task. `call_soon_threadsafe` copies the caller's contextvars.
+        self.event_loop.call_soon_threadsafe(self.event_loop.create_task, run_fn())
+        return await asyncio.wrap_future(result)
 
 
 class EngineLoop:
