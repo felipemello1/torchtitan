@@ -132,6 +132,15 @@ def test_push_replies_while_forward_backward_runs() -> None:
         trainer.config = Trainer.Config(model=MagicMock())
         trainer._transfer_dtype = None
         trainer._push_model_state_dict_stream = None
+        # state_dict() must run on the engine thread: FSDP's state-dict hooks must not overlap a
+        # forward/backward.
+        model_state_dict_threads = []
+
+        def model_state_dict() -> dict[str, torch.Tensor]:
+            model_state_dict_threads.append(threading.current_thread())
+            return Trainer._model_state_dict(trainer)
+
+        trainer._model_state_dict = model_state_dict
         # If forward/backward blocked this event loop, the push couldn't reply until it ends.
         # Release it after a while, so that case fails below instead of hanging.
         timer = threading.Timer(5.0, release_forward_backward.set)
@@ -154,8 +163,13 @@ def test_push_replies_while_forward_backward_runs() -> None:
                 await forward_backward
         finally:
             timer.cancel()
+            release_forward_backward.set()
+            event_loop = trainer._engine_thread.event_loop
+            event_loop.call_soon_threadsafe(event_loop.stop)
+            trainer._engine_thread.thread.join(timeout=5.0)
 
         assert forward_backward_still_running
+        assert model_state_dict_threads == [trainer._engine_thread.thread]
 
     asyncio.run(run())
 

@@ -71,7 +71,11 @@ class OptimizerStepOutput:
 
 
 def _on_engine_thread(method: Callable[..., Any]) -> Callable[..., Any]:
-    """Turn a sync `Trainer` method into an async one that runs on the engine thread."""
+    """Turn a sync `Trainer` method into an async one that runs on the engine thread.
+
+    Put it above `sl.log_trace_span`, so the span runs on the engine thread and keeps that call's
+    step tags (e.g. "gc").
+    """
 
     @functools.wraps(method)
     async def run_on_engine_thread(self: "Trainer", *args: Any, **kwargs: Any) -> Any:
@@ -491,6 +495,7 @@ class Trainer(Configurable):
           overwrites the TorchStore key.
         """
 
+        # One engine-thread call: a second one would queue behind the next forward/backward.
         def model_state_dict_and_preserve_dtype_keys() -> (
             tuple[dict[str, torch.Tensor], frozenset[str]]
         ):
