@@ -732,7 +732,8 @@ def test_call_on_engine_thread_runs_on_it_in_the_callers_context() -> None:
         _stop_engine_thread(engine_thread)
 
 
-def test_call_on_engine_thread_raises_any_failure_to_the_caller() -> None:
+@pytest.mark.parametrize("method", ["call", "run"])
+def test_call_on_engine_thread_raises_any_failure_to_the_caller(method: str) -> None:
     # Not an `Exception`: the caller must not wait forever on any failure, e.g. of the engine build.
     def fail():
         raise SystemExit("build failed")
@@ -740,7 +741,10 @@ def test_call_on_engine_thread_raises_any_failure_to_the_caller() -> None:
     engine_thread = EngineLoopThread(name="engine-loop")
     try:
         with pytest.raises(SystemExit, match="build failed"):
-            engine_thread.call(fail)
+            if method == "call":
+                engine_thread.call(fail)
+            else:
+                asyncio.run(asyncio.wait_for(engine_thread.run(fail), _TIMEOUT_S))
     finally:
         _stop_engine_thread(engine_thread)
 

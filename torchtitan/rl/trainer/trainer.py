@@ -5,10 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import functools
 import logging
 import os
 import pickle
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -28,6 +30,7 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.observability.metrics import compute_training_performance_metrics
 from torchtitan.rl.controller.metrics import combine_microbatch_metrics
+from torchtitan.rl.generator.engine_loop import EngineLoopThread
 from torchtitan.rl.trainer.batcher import TrainingMicrobatch
 from torchtitan.rl.trainer.rdma_microbatch import (
     RDMAMicrobatch,
@@ -65,6 +68,22 @@ class OptimizerStepOutput:
 
     policy_version: int
     metrics: dict[str, float]
+
+
+def _on_engine_thread(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Turn a sync `Trainer` method into an async one that runs on the engine thread.
+
+    Put it above `sl.log_trace_span`, so the span runs on the engine thread and keeps that call's
+    step tags (e.g. "gc").
+    """
+
+    @functools.wraps(method)
+    async def run_on_engine_thread(self: "Trainer", *args: Any, **kwargs: Any) -> Any:
+        return await self._engine_thread.run(
+            functools.partial(method, self, *args, **kwargs)
+        )
+
+    return run_on_engine_thread
 
 
 class Trainer(Configurable):
@@ -109,6 +128,31 @@ class Trainer(Configurable):
         )
         sl.log_trace_instant("structured_logger_started")
 
+        # The engine is built, run and closed only on this thread, as the generator's is. A
+        # forward/backward blocks for seconds; on the actor's event loop it would delay every reply,
+        # e.g. the weight push's, so the generators would pull new weights one forward/backward late.
+        self._engine_thread = EngineLoopThread(name="trainer-engine")
+        self._engine_thread.call(
+            functools.partial(
+                self._init_engine,
+                config,
+                precision=precision,
+                max_num_documents=max_num_documents,
+                hf_assets_path=hf_assets_path,
+                output_dir=output_dir,
+            )
+        )
+
+    def _init_engine(
+        self,
+        config: Config,
+        *,
+        precision: PrecisionConfig,
+        max_num_documents: int | None,
+        hf_assets_path: str,
+        output_dir: str,
+    ) -> None:
+        """Build and load the engine. Runs on the engine thread."""
         self.config = config
         validate_model_training_config(
             config.model,
@@ -201,7 +245,8 @@ class Trainer(Configurable):
             torch.accelerator.current_stream(self.engine.device)
         )
 
-    async def close(self) -> None:
+    @_on_engine_thread
+    def close(self) -> None:
         """Close actor-local resources before the process mesh stops.
 
         The trainer does not own the distributed process group lifecycle here:
@@ -250,8 +295,9 @@ class Trainer(Configurable):
         )
         return out
 
+    @_on_engine_thread
     @sl.log_trace_span("forward_backward")
-    async def forward_backward(
+    def forward_backward(
         self,
         microbatch_groups: (
             list[list[TrainingMicrobatch]] | list[list[RDMAMicrobatch]]
@@ -357,8 +403,9 @@ class Trainer(Configurable):
             )
         return metrics
 
+    @_on_engine_thread
     @sl.log_trace_span("optim_step")
-    async def optim_step(
+    def optim_step(
         self, *, resume_state: dict[str, Any], last_step: bool = False
     ) -> OptimizerStepOutput:
         """Clip gradients, step optimizer + LR scheduler, return updated state."""
@@ -437,18 +484,29 @@ class Trainer(Configurable):
           current, so TorchStore reads weights after the last optimizer step
           without waiting on later forward/backward work, and forward/backward
           does not mutate persistent model state.
-        - The TorchStore put runs in an `asyncio.to_thread` worker, so it
-          progresses while a synchronous forward/backward blocks this actor's
-          event loop.
+        - `state_dict()` runs on the engine thread, so FSDP's state-dict hooks
+          never overlap a forward/backward.
+        - The TorchStore put runs in an `asyncio.to_thread` worker, and
+          forward/backward runs on the engine thread, so this actor's event loop
+          can reply as soon as the put ends. The reply comes before the next
+          forward/backward ends only because the controller sends this push first.
         - The controller awaits this push before the next optimizer step mutates
           the model, and awaits the generators' pull of it before the next push
           overwrites the TorchStore key.
         """
-        model_state_dict = self._model_state_dict()
+
+        # One engine-thread call: a second one would queue behind the next forward/backward.
+        def model_state_dict_and_preserve_dtype_keys() -> (
+            tuple[dict[str, torch.Tensor], frozenset[str]]
+        ):
+            model_state_dict = self._model_state_dict()
+            return model_state_dict, self._preserve_dtype_keys(model_state_dict)
+
+        model_state_dict, preserve_dtype_keys = await self._engine_thread.run(
+            model_state_dict_and_preserve_dtype_keys
+        )
         await asyncio.to_thread(
-            self._put_model_state_dict,
-            model_state_dict,
-            self._preserve_dtype_keys(model_state_dict),
+            self._put_model_state_dict, model_state_dict, preserve_dtype_keys
         )
 
     def _put_model_state_dict(
