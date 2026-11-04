@@ -167,6 +167,8 @@ def test_push_replies_while_forward_backward_runs() -> None:
             event_loop = trainer._engine_thread.event_loop
             event_loop.call_soon_threadsafe(event_loop.stop)
             trainer._engine_thread.thread.join(timeout=5.0)
+            assert not trainer._engine_thread.thread.is_alive()
+            event_loop.close()
 
         assert forward_backward_still_running
         assert model_state_dict_threads == [trainer._engine_thread.thread]
