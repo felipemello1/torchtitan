@@ -9,6 +9,7 @@
 import logging
 import os
 import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections import namedtuple
@@ -152,6 +153,11 @@ class BaseLogger(Configurable, ABC):
         pass
 
 
+# How long TensorBoardLogger.close() waits for its writer to flush. A healthy close
+# writes at most max_queue=1000 small events, well under a second.
+_TENSORBOARD_CLOSE_TIMEOUT_S = 60.0
+
+
 class TensorBoardLogger(BaseLogger):
     """Logger implementation for TensorBoard."""
 
@@ -177,7 +183,30 @@ class TensorBoardLogger(BaseLogger):
             self.writer.add_scalar(tag, v, step)
 
     def close(self) -> None:
-        self.writer.close()
+        # SummaryWriter.close() waits for its writer thread, which can hang forever in one
+        # write() to a stalled network filesystem. Close in a daemon thread and give up after
+        # a timeout, so the job can still exit; the events still queued are lost.
+        errors: list[BaseException] = []
+
+        def close_writer() -> None:
+            try:
+                self.writer.close()
+            except BaseException as error:
+                errors.append(error)
+
+        closer = threading.Thread(
+            target=close_writer, name="tensorboard_close", daemon=True
+        )
+        closer.start()
+        closer.join(_TENSORBOARD_CLOSE_TIMEOUT_S)
+        if closer.is_alive():
+            logger.error(
+                "TensorBoard writer did not close in %.0f s; its queued events for %s are lost",
+                _TENSORBOARD_CLOSE_TIMEOUT_S,
+                self.writer.log_dir,
+            )
+        elif errors:
+            raise errors[0]
 
 
 class WandBLogger(BaseLogger):
