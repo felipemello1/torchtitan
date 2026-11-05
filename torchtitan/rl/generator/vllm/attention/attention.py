@@ -236,8 +236,10 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             has_out_transform=self.out_transform is not None,
         ):
             # FA4's varlen function has no out=, so copy into vLLM's buffer. Paged KV:
-            # FA4 reads key lengths from seqused_k and rejects cu_seqlens_k. vLLM's
-            # profile run skips this path, so its memory budget misses the fp32 partials.
+            # FA4 reads key lengths from seqused_k and rejects cu_seqlens_k.
+            # TODO: vLLM's profile run skips this path, so its KV-cache budget misses the fp32
+            # partials (~1 GB for 8B heads at 32K max_model_len, 8192-token batch). Run this
+            # path in the profile run; until then, lower gpu_memory_utilization.
             return output[:num_actual_tokens].copy_(
                 varlen_attn_fixed_kv_splits(
                     query[:num_actual_tokens],

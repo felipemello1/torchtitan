@@ -46,7 +46,7 @@ same accumulation order. Three groups of fixes make that hold.
   `is_in_batch_invariant_mode()` is True
   (`torchtitan/models/common/attention/attention.py`, `VarlenInnerAttention.forward`); FA2 is
   already batch-invariant.
-  - FA4 on SM100, full causal layers with head dim 64 or 128: KV is split at fixed
+  - FA4 on SM10x, full causal layers with head dim 64 or 128: KV is split at fixed
     key positions, every `BATCH_INVARIANT_KV_SPLIT_SIZE` (4096) keys. Split 0 is keys
     [0, 4096) and split 1 is [4096, 8192), for every token in any batch, in prefill or
     decode (`varlen_attn_fixed_kv_splits`). This keeps decode fast for a few long
@@ -69,7 +69,7 @@ back to the trainer's ops:
   attention kernel as the trainer for whichever backend the config uses.
   - *Varlen* (Qwen3, the default): the generator runs torchtitan's own
     `VarlenInnerAttention` through vLLM's `CUSTOM` backend -- the same varlen kernel
-    as the trainer (FA3, or FA4 on SM100). The shared split fix above (`num_splits=1`,
+    as the trainer (FA3, or FA4 on SM10x). The shared split fix above (`num_splits=1`,
     or FA4's fixed-size splits) removes the only batch-dependent split-k, so the two
     match bitwise.
   - *Flex* (Qwen3 flex): the generator runs vLLM's `FLEX_ATTENTION` backend.

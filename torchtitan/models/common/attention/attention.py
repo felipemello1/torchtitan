@@ -865,22 +865,23 @@ def use_fixed_kv_splits(
 ) -> bool:
     """True if this attention call should use ``varlen_attn_fixed_kv_splits``.
 
-    Example, batch-invariant mode on, FA4 on SM100:
-        Qwen3 layer (head_dim 128, causal)            -> True
-        Qwen3.5 full-attention layer (head_dim 256)   -> False, keeps num_splits=1
+    Example, batch-invariant mode on, FA4 on SM10x:
+        Qwen3 layer (head_dim 128, causal)             -> True
+        Qwen3.5 full-attention layer (head_dim 256)    -> False, keeps num_splits=1
         GPT-OSS sliding-window or attention-sink layer -> False, keeps num_splits=1
-    Batch-invariant mode off, FA3, or SM12x           -> False
+    Batch-invariant mode off, FA3, SM11x or SM12x      -> False
     """
     return (
         is_in_batch_invariant_mode()
         and current_flash_attention_impl() == "FA4"
-        # FA4 on SM12x runs only one split, and SM11x is untested.
+        # Split-KV runs only on SM10x: FA4 on SM12x allows one split, and torch's FA4
+        # path rejects SM11x.
         and _cuda_device_major() == 10
         # A sliding window moves where splits start, so prefill and decode would split
-        # at different keys.
+        # at different keys. tuple(): a list [-1, 0] would turn splits off on one side only.
         and tuple(window_size) == (-1, 0)
-        # FA4 picks its own split count when head_dim != head_dim_v (MLA). On SM100, FA4
-        # picks a 2-CTA kernel for head dim 256 from the batch shape, so 256 is left out.
+        # FA4 picks its own split count when head_dim != head_dim_v (MLA). On B200 (SM100),
+        # FA4 picks a 2-CTA kernel for head dim 256 from the batch shape, so 256 is left out.
         and head_dim == head_dim_v
         and head_dim in (64, 128)
         # out_transform needs the LSE (attention sinks). FA4 backpropagates through the
@@ -908,8 +909,9 @@ def varlen_attn_fixed_kv_splits(
     Example, size 4096: a token at position 5000 sums keys [0, 4096) and [4096, 5000] as two
     partial results, then combines them. Same bits alone or batched, in prefill or decode.
     """
-    # TODO: call torch's varlen_attn once it takes a fixed KV split size. Today it
-    # passes only num_splits to FA4.
+    # TODO: call torch's varlen_attn once it takes a fixed KV split size. That lets sink
+    # layers split too (torch's LSE has no gradient), removes the generator's output copy
+    # (varlen_attn_out) and keeps torch's custom op. Today torch passes only num_splits.
     from flash_attn.cute import flash_attn_varlen_func
 
     # An upper bound: each sequence uses only the splits its own keys need, so 2 or 16 give

@@ -87,9 +87,10 @@ jobs:
             tests/rl/unit_tests/cpu/test_rl_dist_moe_recipe.py \
             -v
 
-      # Fixed-size FA4 KV splits need SM10x and FA4; this is the only RL workflow with
-      # both. TestBitwiseParityVarlen (one split at these lengths) is the control.
-      # Each class gets its own torchrun launch, so a fresh process group and vLLM engine.
+      # Fixed-size FA4 KV splits need SM10x and FA4; this is the only RL workflow with both.
+      # TestBitwiseParityVarlen runs the same call with one split at these lengths, so if
+      # only the small-split class fails, the splits are the cause. Each class gets its own
+      # torchrun launch, so each gets a fresh process group and vLLM engine.
       - name: Batch-invariant attention parity
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: |
