@@ -38,6 +38,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -61,6 +62,7 @@ from torchtitan.distributed.batch_invariant import (
 )
 from torchtitan.distributed.spmd_types import spmd_mesh_group
 from torchtitan.models.common.attention import FlexInnerAttention
+from torchtitan.models.common.attention import attention as attention_module
 from torchtitan.observability.logging import init_logger
 from torchtitan.rl.controller.controller import Controller
 from torchtitan.rl.generator.vllm.registry import (
@@ -875,6 +877,23 @@ class TestBitwiseParityVarlen(BitwiseParityTestBase):
     __test__ = True
     config_fn = staticmethod(rl_grpo_qwen3_0_6b_varlen_batch_invariant)
     attn_backend = "varlen"
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] in (10, 11),
+    "fixed-size KV splits need FA4 on SM100",
+)
+class TestBitwiseParityVarlenSmallKVSplits(TestBitwiseParityVarlen):
+    """Varlen parity with 128-key KV splits, so the ~200-token sequences span 2 splits."""
+
+    @classmethod
+    def setUpClass(cls):
+        split_size_patch = mock.patch.object(
+            attention_module, "BATCH_INVARIANT_KV_SPLIT_SIZE", 128
+        )
+        split_size_patch.start()
+        cls.addClassCleanup(split_size_patch.stop)
+        super().setUpClass()
 
 
 class TestBitwiseParityFlex(BitwiseParityTestBase):

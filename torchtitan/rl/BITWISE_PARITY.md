@@ -46,6 +46,12 @@ same accumulation order. Three groups of fixes make that hold.
   `is_in_batch_invariant_mode()` is True
   (`torchtitan/models/common/attention/attention.py`, `VarlenInnerAttention.forward`); FA2 is
   already batch-invariant.
+  - FA4 on SM100 splits KV again, at fixed key positions: full causal layers call
+    `batch_invariant_varlen_attn`, which passes FA4's `seqlen_k_per_split`, so split
+    `i` covers keys `[i * BATCH_INVARIANT_KV_SPLIT_SIZE, (i + 1) * ...)` for every
+    token, alone or batched, in prefill or decode. Decoding a few long sequences no
+    longer leaves most SMs idle. Layers with a sliding window, unequal Q/V head dims or
+    an LSE epilogue (attention sinks) keep one split (`use_batch_invariant_kv_splits`).
 - **NCCL collectives:** all-reduce may use ring/tree algorithms with varying
   channel counts, reordering the cross-rank reduction. Forced to single-channel
   tree (`NCCL_ALGO=allreduce:tree`, `NCCL_MAX_NCHANNELS=1`); must be set
@@ -63,8 +69,9 @@ back to the trainer's ops:
   attention kernel as the trainer for whichever backend the config uses.
   - *Varlen* (Qwen3, the default): the generator runs torchtitan's own
     `VarlenInnerAttention` through vLLM's `CUSTOM` backend -- the same FA3 varlen
-    kernel as the trainer. The shared `num_splits=1` fix above removes the only
-    batch-dependent split-k, so the two match bitwise.
+    kernel as the trainer. The shared `num_splits=1` fix above (or, on FA4, the shared
+    fixed-size splits) removes the only batch-dependent split-k, so the two match
+    bitwise.
   - *Flex* (Qwen3 flex): the generator runs vLLM's `FLEX_ATTENTION` backend.
     `BatchInvariantFlexConverter` (a `ModelConfigConverter` wired in via
     `converters=[BatchInvariantFlexConverter.Config()]`) pins

@@ -36,6 +36,10 @@ from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.models.base.module import Module
 from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.attention import InnerAttention
+from torchtitan.models.common.attention.attention import (
+    batch_invariant_varlen_attn,
+    use_batch_invariant_kv_splits,
+)
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.observability.logging import warn_once
 from torchtitan.tools.utils import get_cuda_flash_attention_impl, set_default_dtype
@@ -224,6 +228,29 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             sliding_window_size = self.sliding_window
 
         assert self.alibi_slopes is None, "Alibi slopes not supported yet."
+
+        if use_batch_invariant_kv_splits(
+            query.shape[-1],
+            value_cache.shape[-1],
+            sliding_window_size,
+            has_out_transform=self.out_transform is not None,
+        ):
+            out = output[:num_actual_tokens]
+            out.copy_(
+                batch_invariant_varlen_attn(
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=None,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    scale=self.scale,
+                    seqused_k=seqused_k,
+                    page_table=block_table,
+                )
+            )
+            return out
 
         # FA3 and FA4 infer key lengths from block_table + seqused_k for paged
         # KV. FA4 explicitly rejects page_table together with cu_seqlens_k.

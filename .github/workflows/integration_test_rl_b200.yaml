@@ -87,6 +87,13 @@ jobs:
             tests/rl/unit_tests/cpu/test_rl_dist_moe_recipe.py \
             -v
 
+          # Batch-invariant FA4 fixed-size KV splits need SM100 and FA4, which only
+          # this workflow installs. Own torchrun launch: a fresh vLLM engine.
+          MODEL_PATH=$(python -c "from huggingface_hub import snapshot_download; print(snapshot_download('Qwen/Qwen3-0.6B'))")
+          RL_TEST_DUMP_FOLDER="$RUNNER_TEMP/artifacts-to-be-uploaded/rl" \
+            HF_ASSETS_PATH="$MODEL_PATH" torchrun --nproc-per-node=2 -m pytest \
+            tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityVarlenSmallKVSplits -v
+
       # Runs even if the unit tests failed, so one failure does not hide the other.
       - name: RL integration tests
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}

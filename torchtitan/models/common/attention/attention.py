@@ -12,6 +12,7 @@
 #       the variable name xq/xk/xv disambiguates),
 #   K = query/key head dimension, V = value head dimension.
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, Generic, TYPE_CHECKING, TypeAlias
@@ -502,6 +503,24 @@ class VarlenInnerAttention(InnerAttention, Generic[_VarlenMetadataT]):
             # Preserve the legacy BF16 conversion for full-precision callers.
             attn_dtype = torch.bfloat16
 
+        if use_batch_invariant_kv_splits(
+            q_THK.shape[-1],
+            v_THV.shape[-1],
+            attention_metadata.window_size,
+            has_out_transform=out_transform is not None,
+        ):
+            out_THV = batch_invariant_varlen_attn(
+                q_THK.to(attn_dtype),
+                k_THK.to(attn_dtype),
+                v_THV.to(attn_dtype),
+                cu_seqlens_q=cu_seq_q,
+                cu_seqlens_k=cu_seq_k,
+                max_seqlen_q=max_q,
+                max_seqlen_k=max_k,
+                scale=scale,
+            )
+            return out_THV.to(q_THK.dtype)
+
         with sdpa_kernel(self.sdpa_backends, set_priority=True):
             result = varlen_attn_fn(
                 q_THK.to(attn_dtype),
@@ -820,6 +839,87 @@ def varlen_attn(*args, **kwargs):
 )
 def varlen_attn_with_lse(*args, **kwargs):
     return _varlen_attn(*args, return_aux=VarlenAuxRequest(lse=True), **kwargs)
+
+
+# Batch-invariant mode must sum each token's attention in the same order in every batch,
+# in trainer prefill and in generator decode. FA4 picks its KV split count from the whole
+# batch, so this mode used one split, which idles most SMs when decoding a few long
+# sequences. A fixed size splits every token's keys at the same positions. Smaller sizes
+# decode faster at small batch, but cost the trainer time and fp32 partial buffers.
+BATCH_INVARIANT_KV_SPLIT_SIZE = 4096
+
+
+def use_batch_invariant_kv_splits(
+    head_dim: int,
+    head_dim_v: int,
+    window_size: tuple[int, int],
+    has_out_transform: bool,
+) -> bool:
+    """Whether batch-invariant attention splits KV every ``BATCH_INVARIANT_KV_SPLIT_SIZE``.
+
+    Example: Qwen3 (head_dim 128, causal), FA4 on SM100 -> True.
+    GPT-OSS (sliding window, attention sinks) -> False: it keeps one split.
+    """
+    return (
+        is_in_batch_invariant_mode()
+        and current_flash_attention_impl() == "FA4"
+        and torch.cuda.get_device_capability()[0] in (10, 11)
+        # With a sliding window, splits start at the window's first key block, which
+        # differs between prefill and decode.
+        and window_size == (-1, 0)
+        # FA4 overrides the split count when head_dim != head_dim_v. 64, 128 and 256
+        # are the head dims tested for bitwise parity.
+        and head_dim == head_dim_v
+        and head_dim in (64, 128, 256)
+        # FA4's autograd backpropagates through the LSE, while torch's varlen does not.
+        and not has_out_transform
+    )
+
+
+@spmd.no_typecheck(out_types=spmd.PartitionSpec(("dp", "cp"), "tp", None))
+def batch_invariant_varlen_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor | None,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    scale: float | None,
+    seqused_k: torch.Tensor | None = None,
+    page_table: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Causal FA4 varlen attention with a KV split every ``BATCH_INVARIANT_KV_SPLIT_SIZE``.
+
+    Example: size 4096, max_seqlen_k 10000 -> 3 splits. A token at position 5000 sums
+    keys [0, 4096) and [4096, 5000] separately, alone or batched, in prefill or decode.
+    """
+    from flash_attn.cute import flash_attn_varlen_func
+
+    num_splits = max(1, math.ceil(max_seqlen_k / BATCH_INVARIANT_KV_SPLIT_SIZE))
+    if num_splits > 256:
+        raise ValueError(
+            f"max_seqlen_k={max_seqlen_k} needs {num_splits} KV splits of "
+            f"{BATCH_INVARIANT_KV_SPLIT_SIZE} keys, but FA4 supports at most 256."
+        )
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        seqused_k=seqused_k,
+        page_table=page_table,
+        softmax_scale=scale,
+        causal=True,
+        num_splits=num_splits,
+        seqlen_k_per_split=BATCH_INVARIANT_KV_SPLIT_SIZE,
+        deterministic=torch.are_deterministic_algorithms_enabled(),
+    )
+    return out
 
 
 def local_head_split(
