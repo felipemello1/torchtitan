@@ -17,6 +17,7 @@ from torchtitan.models.common.lora import (
     get_lora_grouped_linear,
     get_lora_linear,
 )
+from torchtitan.models.common.moe import MoE
 
 from .base import ModelConfigTransform
 
@@ -179,6 +180,10 @@ class LoRATransform(ModelConfigTransform):
 
     Built-in dispatch selects the correct LoRA implementation for each target.
     Non-target configs are frozen so only adapter parameters are trainable.
+    Every MoE also gets ``freeze_expert_bias=True``, so no balancing hook moves
+    its expert bias. Applied to a subtree (``@override``), it must cover every
+    MoE layer or none: the balancing hooks reject a mix of frozen and moving
+    biases.
 
     A shared projection config must receive the same LoRA decision at every FQN.
     For example, if ``layers.0.attention.wo`` and ``layers.1.attention.wo``
@@ -305,4 +310,11 @@ class LoRATransform(ModelConfigTransform):
                 f"LoRA target_modules {sorted(unmatched_targets)} did not match any "
                 f"supported projection config in the model config tree."
             )
+
+        # TODO: also stop Kimi K2.7's QK-Clip post-step hook, which rescales frozen
+        # attention weights.
+        # The expert bias is a buffer, so freezing parameters does not stop the
+        # balancing hook from moving it before each optimizer step.
+        for _fqn, moe_config, _parent, _attr in transformed_root.traverse(MoE.Config):
+            moe_config.freeze_expert_bias = True
         return transformed_root
