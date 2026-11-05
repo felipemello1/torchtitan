@@ -38,6 +38,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -60,7 +61,10 @@ from torchtitan.distributed.batch_invariant import (
     set_batch_invariance,
 )
 from torchtitan.distributed.spmd_types import spmd_mesh_group
-from torchtitan.models.common.attention import FlexInnerAttention
+from torchtitan.models.common.attention import (
+    attention as attention_module,
+    FlexInnerAttention,
+)
 from torchtitan.observability.logging import init_logger
 from torchtitan.rl.controller.controller import Controller
 from torchtitan.rl.generator.vllm.registry import (
@@ -875,6 +879,35 @@ class TestBitwiseParityVarlen(BitwiseParityTestBase):
     __test__ = True
     config_fn = staticmethod(rl_grpo_qwen3_0_6b_varlen_batch_invariant)
     attn_backend = "varlen"
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
+    "fixed-size KV splits need FA4 on SM10x",
+)
+class TestBitwiseParityVarlenSmallKVSplits(TestBitwiseParityVarlen):
+    """Varlen parity with 128-key KV splits, so the ~200-token sequences span 2 splits.
+
+    The trainer and vLLM share this process (external_launcher), so one patch covers both.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.enterClassContext(
+            mock.patch.object(attention_module, "BATCH_INVARIANT_KV_SPLIT_SIZE", 128)
+        )
+        super().setUpClass()
+
+    def test_fixed_kv_splits_enabled(self):
+        """Fails if the parity tests in this class would run on one KV split."""
+        self.assertTrue(
+            attention_module.use_fixed_kv_splits(
+                head_dim=128,
+                head_dim_v=128,
+                window_size=(-1, 0),
+                has_out_transform=False,
+            )
+        )
 
 
 class TestBitwiseParityFlex(BitwiseParityTestBase):

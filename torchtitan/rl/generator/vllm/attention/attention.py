@@ -36,6 +36,10 @@ from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.models.base.module import Module
 from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.attention import InnerAttention
+from torchtitan.models.common.attention.attention import (
+    use_fixed_kv_splits,
+    varlen_attn_fixed_kv_splits,
+)
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.observability.logging import warn_once
 from torchtitan.tools.utils import get_cuda_flash_attention_impl, set_default_dtype
@@ -224,6 +228,32 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             sliding_window_size = self.sliding_window
 
         assert self.alibi_slopes is None, "Alibi slopes not supported yet."
+
+        if use_fixed_kv_splits(
+            head_dim=query.shape[-1],
+            head_dim_v=value_cache.shape[-1],
+            window_size=sliding_window_size,
+            has_out_transform=self.out_transform is not None,
+        ):
+            # FA4's varlen function has no out=, so copy into vLLM's buffer. Paged KV:
+            # FA4 reads key lengths from seqused_k and rejects cu_seqlens_k.
+            # TODO: vLLM's profile run skips this path, so its KV-cache budget misses the fp32
+            # partials (~1 GB for 8B heads at 32K max_model_len, 8192-token batch). Run this
+            # path in the profile run; until then, lower gpu_memory_utilization.
+            return output[:num_actual_tokens].copy_(
+                varlen_attn_fixed_kv_splits(
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=None,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    scale=self.scale,
+                    seqused_k=seqused_k,
+                    page_table=block_table,
+                )
+            )
 
         # FA3 and FA4 infer key lengths from block_table + seqused_k for paged
         # KV. FA4 explicitly rejects page_table together with cu_seqlens_k.
