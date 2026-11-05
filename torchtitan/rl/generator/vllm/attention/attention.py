@@ -37,8 +37,8 @@ from torchtitan.models.base.module import Module
 from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.attention import InnerAttention
 from torchtitan.models.common.attention.attention import (
-    batch_invariant_varlen_attn,
-    use_batch_invariant_kv_splits,
+    use_fixed_kv_splits,
+    varlen_attn_fixed_kv_splits,
 )
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.observability.logging import warn_once
@@ -229,15 +229,17 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
 
         assert self.alibi_slopes is None, "Alibi slopes not supported yet."
 
-        if use_batch_invariant_kv_splits(
-            query.shape[-1],
-            value_cache.shape[-1],
-            sliding_window_size,
+        if use_fixed_kv_splits(
+            head_dim=query.shape[-1],
+            head_dim_v=value_cache.shape[-1],
+            window_size=sliding_window_size,
             has_out_transform=self.out_transform is not None,
         ):
-            out = output[:num_actual_tokens]
-            out.copy_(
-                batch_invariant_varlen_attn(
+            # FA4's varlen function has no out=, so copy into vLLM's buffer. Paged KV:
+            # FA4 reads key lengths from seqused_k and rejects cu_seqlens_k. vLLM's
+            # profile run skips this path, so its memory budget misses the fp32 partials.
+            return output[:num_actual_tokens].copy_(
+                varlen_attn_fixed_kv_splits(
                     query[:num_actual_tokens],
                     key_cache,
                     value_cache,
@@ -250,7 +252,6 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
                     page_table=block_table,
                 )
             )
-            return out
 
         # FA3 and FA4 infer key lengths from block_table + seqused_k for paged
         # KV. FA4 explicitly rejects page_table together with cu_seqlens_k.

@@ -87,9 +87,20 @@ jobs:
             tests/rl/unit_tests/cpu/test_rl_dist_moe_recipe.py \
             -v
 
-          # Batch-invariant FA4 fixed-size KV splits need SM100 and FA4, which only
-          # this workflow installs. Own torchrun launch: a fresh vLLM engine.
+      # Fixed-size FA4 KV splits need SM10x and FA4; this is the only RL workflow with
+      # both. TestBitwiseParityVarlen (one split at these lengths) is the control.
+      # Each class gets its own torchrun launch, so a fresh process group and vLLM engine.
+      - name: Batch-invariant attention parity
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: |
+          set -eux
+          source .venv/bin/activate
+          export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+
           MODEL_PATH=$(python -c "from huggingface_hub import snapshot_download; print(snapshot_download('Qwen/Qwen3-0.6B'))")
+          RL_TEST_DUMP_FOLDER="$RUNNER_TEMP/artifacts-to-be-uploaded/rl" \
+            HF_ASSETS_PATH="$MODEL_PATH" torchrun --nproc-per-node=2 -m pytest \
+            tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityVarlen -v
           RL_TEST_DUMP_FOLDER="$RUNNER_TEMP/artifacts-to-be-uploaded/rl" \
             HF_ASSETS_PATH="$MODEL_PATH" torchrun --nproc-per-node=2 -m pytest \
             tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityVarlenSmallKVSplits -v

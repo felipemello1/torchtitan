@@ -12,6 +12,7 @@
 #       the variable name xq/xk/xv disambiguates),
 #   K = query/key head dimension, V = value head dimension.
 
+import functools
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -476,6 +477,30 @@ class VarlenInnerAttention(InnerAttention, Generic[_VarlenMetadataT]):
         max_q = attention_metadata.max_q
         max_k = attention_metadata.max_k
 
+        # Align Q/K with V while preserving its FP16/BF16 projection dtype.
+        attn_dtype = v_THV.dtype
+        if attn_dtype not in (torch.float16, torch.bfloat16):
+            # Preserve the legacy BF16 conversion for full-precision callers.
+            attn_dtype = torch.bfloat16
+
+        if use_fixed_kv_splits(
+            head_dim=q_THK.shape[-1],
+            head_dim_v=v_THV.shape[-1],
+            window_size=attention_metadata.window_size,
+            has_out_transform=out_transform is not None,
+        ):
+            out_THV = varlen_attn_fixed_kv_splits(
+                q_THK.to(attn_dtype),
+                k_THK.to(attn_dtype),
+                v_THV.to(attn_dtype),
+                cu_seqlens_q=cu_seq_q,
+                cu_seqlens_k=cu_seq_k,
+                max_seqlen_q=max_q,
+                max_seqlen_k=max_k,
+                scale=scale,
+            )
+            return out_THV.to(q_THK.dtype)
+
         varlen_kwargs: dict[str, Any] = {}
 
         # TODO(pytorch/pytorch#179760): FA2's auto num_splits heuristic
@@ -496,30 +521,6 @@ class VarlenInnerAttention(InnerAttention, Generic[_VarlenMetadataT]):
             varlen_kwargs["enable_gqa"] = True
 
         varlen_attn_fn = varlen_attn if out_transform is None else varlen_attn_with_lse
-
-        # Align Q/K with V while preserving its FP16/BF16 projection dtype.
-        attn_dtype = v_THV.dtype
-        if attn_dtype not in (torch.float16, torch.bfloat16):
-            # Preserve the legacy BF16 conversion for full-precision callers.
-            attn_dtype = torch.bfloat16
-
-        if use_batch_invariant_kv_splits(
-            q_THK.shape[-1],
-            v_THV.shape[-1],
-            attention_metadata.window_size,
-            has_out_transform=out_transform is not None,
-        ):
-            out_THV = batch_invariant_varlen_attn(
-                q_THK.to(attn_dtype),
-                k_THK.to(attn_dtype),
-                v_THV.to(attn_dtype),
-                cu_seqlens_q=cu_seq_q,
-                cu_seqlens_k=cu_seq_k,
-                max_seqlen_q=max_q,
-                max_seqlen_k=max_k,
-                scale=scale,
-            )
-            return out_THV.to(q_THK.dtype)
 
         with sdpa_kernel(self.sdpa_backends, set_priority=True):
             result = varlen_attn_fn(
@@ -841,43 +842,55 @@ def varlen_attn_with_lse(*args, **kwargs):
     return _varlen_attn(*args, return_aux=VarlenAuxRequest(lse=True), **kwargs)
 
 
-# Batch-invariant mode must sum each token's attention in the same order in every batch,
-# in trainer prefill and in generator decode. FA4 picks its KV split count from the whole
-# batch, so this mode used one split, which idles most SMs when decoding a few long
-# sequences. A fixed size splits every token's keys at the same positions. Smaller sizes
-# decode faster at small batch, but cost the trainer time and fp32 partial buffers.
+# Batch-invariant mode must sum each token's attention in the same order in every batch.
+# One KV split does that but idles most SMs when decoding a few long sequences, and FA4's
+# own split count depends on the batch. So split every token's keys at fixed positions:
+# [0, 4096), [4096, 8192), ... Smaller sizes decode faster at batch 1 but cost the trainer
+# time and fp32 memory. A multiple of 128 (FA4's key tile), shared by trainer and generator.
 BATCH_INVARIANT_KV_SPLIT_SIZE = 4096
 
 
-def use_batch_invariant_kv_splits(
+@functools.cache
+def _cuda_device_major() -> int:
+    # Cached: the gate below runs on every attention call, and this query costs ~3 us.
+    return torch.cuda.get_device_capability()[0]
+
+
+def use_fixed_kv_splits(
+    *,
     head_dim: int,
     head_dim_v: int,
     window_size: tuple[int, int],
     has_out_transform: bool,
 ) -> bool:
-    """Whether batch-invariant attention splits KV every ``BATCH_INVARIANT_KV_SPLIT_SIZE``.
+    """True if this attention call should use ``varlen_attn_fixed_kv_splits``.
 
-    Example: Qwen3 (head_dim 128, causal), FA4 on SM100 -> True.
-    GPT-OSS (sliding window, attention sinks) -> False: it keeps one split.
+    Example, batch-invariant mode on, FA4 on SM100:
+        Qwen3 layer (head_dim 128, causal)            -> True
+        Qwen3.5 full-attention layer (head_dim 256)   -> False, keeps num_splits=1
+        GPT-OSS sliding-window or attention-sink layer -> False, keeps num_splits=1
+    Batch-invariant mode off, FA3, or SM12x           -> False
     """
     return (
         is_in_batch_invariant_mode()
         and current_flash_attention_impl() == "FA4"
-        and torch.cuda.get_device_capability()[0] in (10, 11)
-        # With a sliding window, splits start at the window's first key block, which
-        # differs between prefill and decode.
-        and window_size == (-1, 0)
-        # FA4 overrides the split count when head_dim != head_dim_v. 64, 128 and 256
-        # are the head dims tested for bitwise parity.
+        # FA4 on SM12x runs only one split, and SM11x is untested.
+        and _cuda_device_major() == 10
+        # A sliding window moves where splits start, so prefill and decode would split
+        # at different keys.
+        and tuple(window_size) == (-1, 0)
+        # FA4 picks its own split count when head_dim != head_dim_v (MLA). On SM100, FA4
+        # picks a 2-CTA kernel for head dim 256 from the batch shape, so 256 is left out.
         and head_dim == head_dim_v
-        and head_dim in (64, 128, 256)
-        # FA4's autograd backpropagates through the LSE, while torch's varlen does not.
+        and head_dim in (64, 128)
+        # out_transform needs the LSE (attention sinks). FA4 backpropagates through the
+        # LSE and torch's varlen does not, so these layers would get other gradients.
         and not has_out_transform
     )
 
 
 @spmd.no_typecheck(out_types=spmd.PartitionSpec(("dp", "cp"), "tp", None))
-def batch_invariant_varlen_attn(
+def varlen_attn_fixed_kv_splits(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -890,19 +903,20 @@ def batch_invariant_varlen_attn(
     seqused_k: torch.Tensor | None = None,
     page_table: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Causal FA4 varlen attention with a KV split every ``BATCH_INVARIANT_KV_SPLIT_SIZE``.
+    """Causal FA4 varlen attention, with each sequence's keys split every ``BATCH_INVARIANT_KV_SPLIT_SIZE``.
 
-    Example: size 4096, max_seqlen_k 10000 -> 3 splits. A token at position 5000 sums
-    keys [0, 4096) and [4096, 5000] separately, alone or batched, in prefill or decode.
+    Example, size 4096: a token at position 5000 sums keys [0, 4096) and [4096, 5000] as two
+    partial results, then combines them. Same bits alone or batched, in prefill or decode.
     """
+    # TODO: call torch's varlen_attn once it takes a fixed KV split size. Today it
+    # passes only num_splits to FA4.
     from flash_attn.cute import flash_attn_varlen_func
 
+    # An upper bound: each sequence uses only the splits its own keys need, so 2 or 16 give
+    # the same bits. FA4 skips keys past num_splits * size, so cover max_seqlen_k.
+    # At least 1: an empty batch has max_seqlen_k 0, and FA4 reads 0 as "pick for me".
+    # Memory: fp32 partials of num_splits x tokens x heads x head_dim_v, per call.
     num_splits = max(1, math.ceil(max_seqlen_k / BATCH_INVARIANT_KV_SPLIT_SIZE))
-    if num_splits > 256:
-        raise ValueError(
-            f"max_seqlen_k={max_seqlen_k} needs {num_splits} KV splits of "
-            f"{BATCH_INVARIANT_KV_SPLIT_SIZE} keys, but FA4 supports at most 256."
-        )
     out, _ = flash_attn_varlen_func(
         q,
         k,

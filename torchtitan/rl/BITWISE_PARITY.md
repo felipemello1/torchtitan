@@ -46,12 +46,12 @@ same accumulation order. Three groups of fixes make that hold.
   `is_in_batch_invariant_mode()` is True
   (`torchtitan/models/common/attention/attention.py`, `VarlenInnerAttention.forward`); FA2 is
   already batch-invariant.
-  - FA4 on SM100 splits KV again, at fixed key positions: full causal layers call
-    `batch_invariant_varlen_attn`, which passes FA4's `seqlen_k_per_split`, so split
-    `i` covers keys `[i * BATCH_INVARIANT_KV_SPLIT_SIZE, (i + 1) * ...)` for every
-    token, alone or batched, in prefill or decode. Decoding a few long sequences no
-    longer leaves most SMs idle. Layers with a sliding window, unequal Q/V head dims or
-    an LSE epilogue (attention sinks) keep one split (`use_batch_invariant_kv_splits`).
+  - FA4 on SM100, full causal layers with head dim 64 or 128: KV is split at fixed
+    key positions, every `BATCH_INVARIANT_KV_SPLIT_SIZE` (4096) keys. Split 0 is keys
+    [0, 4096) and split 1 is [4096, 8192), for every token in any batch, in prefill or
+    decode (`varlen_attn_fixed_kv_splits`). This keeps decode fast for a few long
+    sequences. Layers with a sliding window, unequal Q/V head dims, head dim 256 or
+    attention sinks keep `num_splits=1` (`use_fixed_kv_splits`).
 - **NCCL collectives:** all-reduce may use ring/tree algorithms with varying
   channel counts, reordering the cross-rank reduction. Forced to single-channel
   tree (`NCCL_ALGO=allreduce:tree`, `NCCL_MAX_NCHANNELS=1`); must be set
@@ -68,10 +68,10 @@ back to the trainer's ops:
 - **Attention (Varlen / Flex / GPT-OSS):** the generator must run the same
   attention kernel as the trainer for whichever backend the config uses.
   - *Varlen* (Qwen3, the default): the generator runs torchtitan's own
-    `VarlenInnerAttention` through vLLM's `CUSTOM` backend -- the same FA3 varlen
-    kernel as the trainer. The shared `num_splits=1` fix above (or, on FA4, the shared
-    fixed-size splits) removes the only batch-dependent split-k, so the two match
-    bitwise.
+    `VarlenInnerAttention` through vLLM's `CUSTOM` backend -- the same varlen kernel
+    as the trainer (FA3, or FA4 on SM100). The shared split fix above (`num_splits=1`,
+    or FA4's fixed-size splits) removes the only batch-dependent split-k, so the two
+    match bitwise.
   - *Flex* (Qwen3 flex): the generator runs vLLM's `FLEX_ATTENTION` backend.
     `BatchInvariantFlexConverter` (a `ModelConfigConverter` wired in via
     `converters=[BatchInvariantFlexConverter.Config()]`) pins
@@ -79,7 +79,7 @@ back to the trainer's ops:
     layer, so both sides use the same Triton tile size and avoid the
     `flex_decode` kernel.
   - *GPT-OSS* (varlen + per-layer sliding window + attention sinks): the same
-    `CUSTOM` varlen path and `num_splits=1` as Varlen, with the sliding-window
+    `CUSTOM` varlen path as Varlen, always with `num_splits=1`, and the sliding-window
     size baked into each layer's `VarlenInnerAttention` config (identical on both
     sides). The attention sinks are a post-softmax rescale
     (`apply_attention_sink_rescale`, `sigmoid(lse - sinks)`); the vLLM wrapper's
