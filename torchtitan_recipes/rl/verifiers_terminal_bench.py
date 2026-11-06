@@ -49,13 +49,11 @@ from torchtitan.rl.examples.verifiers.rollouter import (
     VerifiersRollouter,
 )
 from torchtitan.rl.examples.verifiers.terminal_bench.harness import (
-    register_harness_alias,
     TerminalBenchTerminusHarnessConfig,
 )
 from torchtitan.rl.examples.verifiers.terminal_bench.taskset import (
     TerminalTasksetConfig,
 )
-from torchtitan.rl.examples.verifiers.worker_setup import register_local_taskset_alias
 from torchtitan.rl.generator.generator import Generator
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import SamplingConfig
@@ -81,6 +79,8 @@ from verifiers.v1.tasksets.harbor import HarborEnvConfig
 from torchtitan_recipes.rl.model_configs import build_rl_model_configs
 
 _ENV_SERVER_WORKERS = 16
+# Verifiers id of the example's taskset and harness: the repo-root package that exports both.
+_TERMINAL_BENCH_PACKAGE_ID = "torchtitan_verifiers_terminal_bench"
 
 
 def _terminal_bench_rollouter_config(
@@ -104,12 +104,11 @@ def _terminal_bench_rollouter_config(
             "Training and Terminal-Bench evaluation must use different datasets"
         )
 
-    taskset_id = register_local_taskset_alias(TerminalTasksetConfig.__module__)
     return VerifiersRollouter.Config(
         training_dataloader=IterableRolloutDataLoader.Config(
             dataset=VerifiersTaskDataset.Config(
                 verifiers_taskset=TerminalTasksetConfig(
-                    id=taskset_id, dataset=train_dataset
+                    id=_TERMINAL_BENCH_PACKAGE_ID, dataset=train_dataset
                 ),
                 seed=42,
                 shuffle=True,
@@ -117,7 +116,7 @@ def _terminal_bench_rollouter_config(
         ),
         validation_dataset=VerifiersTaskDataset.Config(
             verifiers_taskset=TerminalTasksetConfig(
-                id=taskset_id, dataset=validation_dataset
+                id=_TERMINAL_BENCH_PACKAGE_ID, dataset=validation_dataset
             ),
             seed=99,
             shuffle=False,
@@ -126,7 +125,7 @@ def _terminal_bench_rollouter_config(
             environment=HarborEnvConfig(
                 agent=vf.AgentConfig(
                     harness=TerminalBenchTerminusHarnessConfig(
-                        id=register_harness_alias(), version="0.22.0"
+                        id=_TERMINAL_BENCH_PACKAGE_ID, version="0.22.0"
                     ),
                     runtime=vf.DockerConfig(),
                     max_turns=max_turns,
