@@ -28,6 +28,7 @@ from vllm.v1.attention.backends.flash_attn_diffkv import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
+from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.models.base.module import Module
 from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.attention import InnerAttention
@@ -36,7 +37,7 @@ from torchtitan.rl.generator.paged_attention import (
     activate_trainer_flash_attention_impl,
     paged_varlen_attention_out,
 )
-from torchtitan.tools.utils import set_default_dtype
+from torchtitan.tools.utils import get_cuda_flash_attention_impl, set_default_dtype
 
 logger = logging.getLogger(__name__)
 
