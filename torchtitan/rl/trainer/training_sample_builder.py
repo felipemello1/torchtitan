@@ -131,7 +131,7 @@ class TrainingSampleBuilder(Configurable):
             # -> TrainingSampleGroup(group_id=..., training_samples=[], metrics=[failure_metric])
         """
         metrics: list[m.Metric] = list(rollout_group.metrics)
-        # A rollout with reward None wasn't scored (see `RolloutWorker.make_scored_group`): skip
+        # A rollout with reward None wasn't scored (see `BaseRolloutWorker.make_scored_group`): skip
         # it, not its group. A group left with 10 of 16 trains those 10, centered on their 10 rewards.
         rollouts = [
             rollout for rollout in rollout_group.rollouts if rollout.reward is not None

@@ -958,5 +958,5 @@ def rl_grpo_qwen3_6_27b_varlen_perf() -> Controller.Config:
     # Validation beside training would change the step times this recipe measures: validate at the end.
     config.async_loop.validation.validate_at_step_0 = False
     config.async_loop.validation.validate_after_training = True
-    config.rollouter.worker.token_env.max_rollout_tokens = seq_len
+    config.rollouter = _alphabet_sort_rollouter_config(max_rollout_tokens=seq_len)
     return config

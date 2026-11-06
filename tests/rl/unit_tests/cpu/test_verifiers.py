@@ -34,10 +34,13 @@ from torchtitan.rl.examples.verifiers.rollouter import (
     VERIFIERS_REWARD_KEY,
     verifiers_rollout_logs,
     VerifiersRollouter,
+    VerifiersRolloutWorker,
 )
 from torchtitan.rl.generator.types import SamplingConfig
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.rollout.types import Completion, RolloutStatus
+from torchtitan.rl.rollout.advantage import AdvantageEstimator
+from torchtitan.rl.rollout.rubric import RubricOutput
+from torchtitan.rl.rollout.types import Completion, Rollout, RolloutStatus
 
 
 def test_train_client_config_carries_an_in_tree_renderer() -> None:
@@ -214,36 +217,26 @@ def test_muse_glimmer_renderer_survives_verifiers_worker_config() -> None:
     assert parsed.tool_calls[0].arguments == {"query": "hello"}
 
 
-def test_verifiers_rollouter_sends_muse_glimmer_renderer_config(monkeypatch) -> None:
+def test_verifiers_worker_sends_muse_glimmer_renderer_config(monkeypatch) -> None:
     from renderers import CustomRendererConfig
     from torchtitan.components.renderer import from_renderers
     from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
-    generation_server = SimpleNamespace(
-        start=AsyncMock(),
-        close=AsyncMock(),
-        base_url="http://127.0.0.1:2",
-    )
-    env_server = SimpleNamespace(
-        start=AsyncMock(return_value="http://127.0.0.1:1"),
-        close=AsyncMock(),
-    )
-    env_client = SimpleNamespace(wait_for_server_startup=AsyncMock(), close=AsyncMock())
+    env_client = SimpleNamespace(wait_for_server_startup=AsyncMock())
     monkeypatch.setattr(
         "torchtitan.rl.examples.verifiers.rollouter.VerifiersEnvClient",
         lambda _: env_client,
     )
 
-    rollouter = object.__new__(VerifiersRollouter)
-    rollouter._verifiers_config = SimpleNamespace(
-        generation_server=SimpleNamespace(build=lambda: generation_server),
+    worker = object.__new__(VerifiersRolloutWorker)
+    worker._verifiers_config = SimpleNamespace(
+        env_server_address="tcp://127.0.0.1:1",
         connection_timeout_sec=5.0,
         renderer_multiplex=8,
     )
-    rollouter._verifiers_env_server = env_server
-    rollouter._generation_server = None
-    rollouter._verifiers_env_client = None
-    rollouter._verifiers_train_client_config = None
+    worker._generation_server = SimpleNamespace(
+        start=AsyncMock(), base_url="http://127.0.0.1:2/v1"
+    )
     renderers_config = CustomRendererConfig(
         import_path="torchtitan.models.muse_glimmer.renderer.MuseGlimmerRenderer",
         reasoning_strength="low",
@@ -251,19 +244,78 @@ def test_verifiers_rollouter_sends_muse_glimmer_renderer_config(monkeypatch) -> 
     config = from_renderers(renderers_config)
 
     asyncio.run(
-        rollouter.setup_async(
-            actor_system=cast(ActorSystem, None),
+        worker.setup_async(
             tokenizer_config=cast(HuggingFaceTokenizer.Config, None),
             renderer_config=config,
             hf_assets_path="muse-checkpoint",
         )
     )
 
-    sent = rollouter._verifiers_train_client_config
-    assert sent is not None
+    sent = worker._verifiers_train_client_config
+    # The worker's agents call its own generation server.
+    assert sent.base_url == "http://127.0.0.1:2/v1"
     assert sent.renderer == renderers_config
     assert sent.renderer_model_name == "muse-checkpoint"
-    asyncio.run(rollouter.close())
+
+
+def test_setup_spawns_workers_with_the_env_server_address_and_close_stops_the_env_server_first() -> None:
+    from renderers import Qwen3RendererConfig
+    from torchtitan.components.renderer import from_renderers
+
+    events = []
+
+    class _Worker:
+        def __init__(self) -> None:
+            self.setup_async = SimpleNamespace(call_one=AsyncMock())
+            self.wait_for_generate_calls = SimpleNamespace(call_one=AsyncMock())
+
+    class _ActorSystem:
+        async def spawn_rollout_workers(self, config, *, num_workers, num_threads):
+            events.append(("spawn", config.env_server_address))
+            return [_Worker()]
+
+        async def stop_rollout_workers(self) -> None:
+            events.append(("stop_workers",))
+
+    async def start() -> str:
+        events.append(("start_env_server",))
+        return "tcp://127.0.0.1:5555"
+
+    async def close_env_server() -> None:
+        events.append(("close_env_server",))
+
+    worker = VerifiersRolloutWorker.Config(
+        rubric="rubric",
+        generation_server=GenerationServer.Config(max_rollout_tokens=64),
+    )
+    rollouter = object.__new__(VerifiersRollouter)
+    rollouter._config = SimpleNamespace(
+        worker=worker, worker_pool_size=2, num_threads_per_worker=3
+    )
+    rollouter._verifiers_config = rollouter._config
+    rollouter._verifiers_env_server = SimpleNamespace(
+        start=start, close=close_env_server
+    )
+    rollouter._workers = []
+    rollouter._actor_system = None
+    rollouter._inflight_run_group_calls = set()
+
+    async def run() -> None:
+        await rollouter.setup_async(
+            actor_system=cast(ActorSystem, _ActorSystem()),
+            tokenizer_config="tokenizer_config",
+            renderer_config=from_renderers(Qwen3RendererConfig()),
+            hf_assets_path="hf_assets_path",
+        )
+        await rollouter.close()
+
+    asyncio.run(run())
+    assert events == [
+        ("start_env_server",),
+        ("spawn", "tcp://127.0.0.1:5555"),
+        ("close_env_server",),
+        ("stop_workers",),
+    ]
 
 
 def test_trainable_token_spans() -> None:
@@ -292,7 +344,7 @@ def test_verifiers_trace_preserves_generation_metadata() -> None:
             )
         ],
     )
-    turns = VerifiersRollouter.trace_to_rollout_turns(
+    turns = VerifiersRolloutWorker.trace_to_rollout_turns(
         trace=trace,
         generation_metadata=VerifiersGenerationMetadata(
             min_policy_version=3,
@@ -341,7 +393,7 @@ def test_verifiers_multiturn_trace_matches_titanrl_rollout_structure() -> None:
             )
         ],
     )
-    turns = VerifiersRollouter.trace_to_rollout_turns(
+    turns = VerifiersRolloutWorker.trace_to_rollout_turns(
         trace=trace,
         generation_metadata=VerifiersGenerationMetadata(
             min_policy_version=3,
@@ -393,7 +445,7 @@ def test_verifiers_second_branch_stores_its_prompt_as_a_delta_on_the_first() -> 
             ),
         ],
     )
-    turns = VerifiersRollouter.trace_to_rollout_turns(
+    turns = VerifiersRolloutWorker.trace_to_rollout_turns(
         trace=trace,
         generation_metadata=VerifiersGenerationMetadata(
             min_policy_version=1, max_policy_version=1, metrics=[]
@@ -450,7 +502,7 @@ def test_verifiers_trace_attaches_env_replies_to_the_preceding_turn() -> None:
             )
         ],
     )
-    turns = VerifiersRollouter.trace_to_rollout_turns(
+    turns = VerifiersRolloutWorker.trace_to_rollout_turns(
         trace=trace,
         generation_metadata=VerifiersGenerationMetadata(
             min_policy_version=0, max_policy_version=0, metrics=[]
@@ -840,22 +892,22 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
         nodes=[],
         branches=[],
     )
-    rollouter = object.__new__(VerifiersRollouter)
-    rollouter._generation_server = SimpleNamespace(
+    worker = object.__new__(VerifiersRolloutWorker)
+    worker._generation_server = SimpleNamespace(
         model_id="model", pop_generation_metadata=lambda trace_id: None
     )
-    rollouter._verifiers_env_client = SimpleNamespace(
+    worker._verifiers_env_client = SimpleNamespace(
         run=AsyncMock(
             return_value=SimpleNamespace(
                 ok=True, is_timeout=False, errors=[], traces=[trace]
             )
         )
     )
-    rollouter._verifiers_train_client_config = object()
+    worker._verifiers_train_client_config = object()
 
     with caplog.at_level(logging.WARNING):
         rollout = asyncio.run(
-            rollouter._run_single_rollout(
+            worker._run_single_rollout(
                 release_session_fn=AsyncMock(),
                 sample=VerifiersTaskSample(verifiers_task_data={"name": "huge-task"}),
                 sampling=SamplingConfig(),
@@ -885,7 +937,9 @@ def test_rollout_status_maps_timeouts_to_error_timeout(
     trace = SimpleNamespace(ok=ok, is_timeout=is_timeout, is_truncated=False)
     episode = SimpleNamespace(ok=not episode_is_timeout, is_timeout=episode_is_timeout)
 
-    status = VerifiersRollouter.rollout_status(verifiers_episode=episode, trace=trace)
+    status = VerifiersRolloutWorker.rollout_status(
+        verifiers_episode=episode, trace=trace
+    )
 
     assert status is expected
 
@@ -922,25 +976,25 @@ def test_timed_out_rollout_is_logged_and_keeps_no_reward(caplog) -> None:
             SimpleNamespace(nodes=[node], token_ids=[10, 11], logprobs=[0.0, -0.1])
         ],
     )
-    rollouter = object.__new__(VerifiersRollouter)
-    rollouter._generation_server = SimpleNamespace(
+    worker = object.__new__(VerifiersRolloutWorker)
+    worker._generation_server = SimpleNamespace(
         model_id="model",
         pop_generation_metadata=lambda trace_id: VerifiersGenerationMetadata(
             min_policy_version=0, max_policy_version=0, metrics=[]
         ),
     )
-    rollouter._verifiers_env_client = SimpleNamespace(
+    worker._verifiers_env_client = SimpleNamespace(
         run=AsyncMock(
             return_value=SimpleNamespace(
                 ok=True, is_timeout=False, errors=[], traces=[trace]
             )
         )
     )
-    rollouter._verifiers_train_client_config = object()
+    worker._verifiers_train_client_config = object()
 
     with caplog.at_level(logging.WARNING):
         rollout = asyncio.run(
-            rollouter._run_single_rollout(
+            worker._run_single_rollout(
                 release_session_fn=AsyncMock(),
                 sample=VerifiersTaskSample(verifiers_task_data={"name": "slow-task"}),
                 sampling=SamplingConfig(),
@@ -981,24 +1035,24 @@ def test_rollout_releases_every_trace_session_even_if_one_release_fails(caplog) 
         )
         for trace_id, trainable in [("opponent", False), ("policy", True)]
     ]
-    rollouter = object.__new__(VerifiersRollouter)
+    worker = object.__new__(VerifiersRolloutWorker)
     popped_trace_ids = []
-    rollouter._generation_server = SimpleNamespace(
+    worker._generation_server = SimpleNamespace(
         model_id="model", pop_generation_metadata=popped_trace_ids.append
     )
-    rollouter._verifiers_env_client = SimpleNamespace(
+    worker._verifiers_env_client = SimpleNamespace(
         run=AsyncMock(
             return_value=SimpleNamespace(
                 ok=True, is_timeout=False, errors=[], traces=traces
             )
         )
     )
-    rollouter._verifiers_train_client_config = object()
+    worker._verifiers_train_client_config = object()
     release_session_fn = AsyncMock(side_effect=[RuntimeError("router down"), None])
 
     with caplog.at_level(logging.ERROR):
         rollout = asyncio.run(
-            rollouter._run_single_rollout(
+            worker._run_single_rollout(
                 release_session_fn=release_session_fn,
                 sample=VerifiersTaskSample(verifiers_task_data={"name": "task"}),
                 sampling=SamplingConfig(),
@@ -1016,33 +1070,53 @@ def test_rollout_releases_every_trace_session_even_if_one_release_fails(caplog) 
     assert rollout.group_id == 1
 
 
-def test_a_failing_rollout_fails_its_group_only_after_every_sibling_finished() -> None:
-    """The caller releases the group once this raises; no sibling may still be generating."""
+@pytest.mark.parametrize(
+    "num_raised, advantages",
+    [
+        # Centered on the mean of the two scored rollouts (rewards 1 and 2).
+        (1, [-0.5, 0.5]),
+        (3, []),
+    ],
+)
+def test_a_rollout_that_raises_is_kept_but_left_out_of_the_advantage(
+    num_raised, advantages
+) -> None:
+    async def run_single_rollout(*, group_id, rollout_id, **kwargs):
+        if rollout_id < num_raised:
+            raise RuntimeError("env server request failed")
+        return Rollout(
+            group_id=group_id, rollout_id=rollout_id, status=RolloutStatus.COMPLETED
+        )
 
-    async def run_test() -> list[int]:
-        finished = []
+    async def score_group(rollouts, sample):
+        return [
+            RubricOutput(reward=float(rollout.rollout_id), reward_breakdown={})
+            for rollout in rollouts
+        ]
 
-        async def run_single_rollout(*, rollout_id: int, **kwargs) -> None:
-            if rollout_id == 0:
-                raise RuntimeError("rollout 0 failed")
-            await asyncio.sleep(0.01)
-            finished.append(rollout_id)
+    worker = object.__new__(VerifiersRolloutWorker)
+    worker._generation_server = SimpleNamespace(set_generate_fn=lambda fn: None)
+    worker._run_single_rollout = run_single_rollout
+    worker.score_group = score_group
+    worker.advantage_estimator = AdvantageEstimator.Config().build()
 
-        rollouter = object.__new__(VerifiersRollouter)
-        rollouter._generation_server = SimpleNamespace(set_generate_fn=lambda fn: None)
-        rollouter._run_single_rollout = run_single_rollout
-        with pytest.raises(RuntimeError, match="rollout 0 failed"):
-            await rollouter.run_group_rollouts(
-                generate_fn=AsyncMock(),
-                release_session_fn=AsyncMock(),
-                sample=None,
-                group_id=1,
-                group_size=2,
-                sampling=SamplingConfig(),
-            )
-        return finished
+    group = asyncio.run(
+        worker.run_group(
+            generate_fn=AsyncMock(),
+            release_session_fn=AsyncMock(),
+            sample=None,
+            group_id=1,
+            group_size=3,
+            sampling=SamplingConfig(),
+        )
+    )
 
-    assert asyncio.run(run_test()) == [1]
+    failed, scored = group.rollouts[:num_raised], group.rollouts[num_raised:]
+    for rollout in failed:
+        assert rollout.status is RolloutStatus.ERROR_INFRA
+        assert "env server request failed" in rollout.logs["error"]
+        assert (rollout.reward, rollout.advantage) == (None, None)
+    assert [rollout.advantage for rollout in scored] == advantages
 
 
 def test_parse_sampling_config_requires_temperature_top_p_max_tokens() -> None:

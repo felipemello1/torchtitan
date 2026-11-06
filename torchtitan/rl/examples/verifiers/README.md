@@ -25,19 +25,23 @@ single-turn math, no sandbox. [`terminal_bench/`](./terminal_bench) is a multi-t
 
 ![TorchTitan and Verifiers integration architecture](../../../../assets/images/rl_verifiers_integration_architecture.svg)
 
-1. [`data.py`](./data.py) loads the taskset in the controller. Each task goes to the env server
-   as a plain dict (msgpack over ZMQ), and the server rebuilds it.
+1. [`data.py`](./data.py) loads the taskset in the controller, which sends each group's task to a
+   rollout worker.
 2. [`env_server.py`](./env_server.py) runs the Verifiers env server as a local process on the
    controller host. Its pool workers run the agents in the configured runtime, e.g.
    `SubprocessConfig` or `DockerConfig`.
-3. [`generation_server.py`](./generation_server.py), on localhost, serves Verifiers' model calls
-   (token ids over HTTP) and forwards them to TitanRL's generators. It also records what
-   Verifiers' traces leave out: the policy versions and the generation metrics.
-4. `rollouter.py` sends the tasks to Verifiers and turns the trainable agent's trace of each
-   rollout into TitanRL `RolloutTurn`s. TitanRL scores and trains them as usual.
+3. `rollouter.py` runs each group in a rollout worker process (`VerifiersRolloutWorker`), like
+   TitanRL's own rollout groups. The worker sends the task to the env server (a plain dict, msgpack
+   over ZMQ) and turns the trainable agent's trace of each rollout into TitanRL `RolloutTurn`s.
+   The controller receives finished groups only.
+4. [`generation_server.py`](./generation_server.py) serves Verifiers' model calls (token ids over
+   HTTP) and forwards them to TitanRL's generators. Each rollout worker runs its own, on localhost.
+   It also records what Verifiers' traces leave out: the policy versions and the generation
+   metrics.
 
 For CPU-heavy envs, raise the env server's pool (`verifiers_env_server.serve.pool`, e.g.
-`vf.StaticPoolConfig(num_workers=16)`).
+`vf.StaticPoolConfig(num_workers=16)`). At high rollout rates, also raise the
+rollouter's `worker_pool_size`: each rollout worker decodes one trace at a time.
 
 ## Taskset ids
 

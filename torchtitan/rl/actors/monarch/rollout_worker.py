@@ -17,7 +17,7 @@ from torchtitan.components.renderer import RendererConfig
 
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.observability import structured_logger as sl
-from torchtitan.rl.rollout.rollouter import RolloutWorker
+from torchtitan.rl.rollout.rollouter import BaseRolloutWorker
 from torchtitan.rl.rollout.types import RolloutGroup
 
 
@@ -27,7 +27,7 @@ class RolloutWorkerActor(Actor):
     def __init__(
         self,
         *,
-        worker_config: RolloutWorker.Config,
+        worker_config: BaseRolloutWorker.Config,
         num_threads: int,
         structured_logger_init_fn: functools.partial[None] | None,
     ) -> None:
@@ -131,6 +131,7 @@ class RolloutWorkerActor(Actor):
             cancel_group cancels the rollout     _generate_calls = {c}   the router still owes c
             the router answers c                 _generate_calls = {}    this returns
         """
+        # TODO: a call the Verifiers GenerationServer starts after this wait began isn't awaited.
         if self._generate_calls:
             await asyncio.wait(self._generate_calls)
 

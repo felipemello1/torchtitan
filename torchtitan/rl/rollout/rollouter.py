@@ -11,6 +11,7 @@ import contextlib
 import itertools
 import logging
 import random
+from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any, TYPE_CHECKING
@@ -96,7 +97,8 @@ class Rollouter(Configurable):
             `setup_async` too, or the worker pool is still spawned unused.
           - Group execution, fine: keep the stock orchestration and point `worker`
             at a `RolloutWorker.Config` subclass, overriding only what you need
-            (`make_env_group`, `score_group`, `run_group`).
+            (`make_env_group`, `score_group`, `run_group`). A worker whose env isn't a
+            `MessageEnv` subclasses `BaseRolloutWorker` and implements `run_group`.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -107,9 +109,9 @@ class Rollouter(Configurable):
         validation_dataset: RLDataset.Config
         """Builds an iterable validation dataset."""
 
-        worker: RolloutWorker.Config
+        worker: BaseRolloutWorker.Config
         """How a rollout group is built, driven, scored and advantaged. Selects the
-        `RolloutWorker` subclass by config type; one worker is built per pool process."""
+        `BaseRolloutWorker` subclass by config type; one worker is built per pool process."""
 
         worker_pool_size: int = 4
         """CPU rollout worker processes to spawn on the controller host."""
@@ -193,6 +195,9 @@ class Rollouter(Configurable):
         tokenizer_config: HuggingFaceTokenizer.Config,
         renderer_config: RendererConfig,
         hf_assets_path: str,
+        # Replaces `Config.worker` when part of it is known only at setup, e.g. a server address.
+        # TODO: remove once the Verifiers env runs in the rollout worker (its only user).
+        worker_config: BaseRolloutWorker.Config | None = None,
     ) -> None:
         """Spawn the rollout worker pool through ``actor_system`` and initialize it."""
         if self._workers:
@@ -200,7 +205,7 @@ class Rollouter(Configurable):
 
         self._actor_system = actor_system
         self._workers = await actor_system.spawn_rollout_workers(
-            self._config.worker,
+            worker_config if worker_config is not None else self._config.worker,
             num_workers=self._config.worker_pool_size,
             num_threads=self._config.num_threads_per_worker,
         )
@@ -346,19 +351,15 @@ class Rollouter(Configurable):
         self._training_dataloader.load_state_dict(state_dict)
 
 
-class RolloutWorker(Configurable):
-    """Builds, executes, scores, and advantages one rollout group."""
+class BaseRolloutWorker(Configurable, ABC):
+    """Runs one rollout group in a rollout worker process, then scores it and computes its
+    advantages. Subclasses implement `run_group`. `RolloutWorker` is the stock one: it builds
+    each rollout's env from a `MessageEnv` and a `TokenEnv`."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         rubric: Rubric.Config
         """Reward functions + weights used by `score_group`."""
-
-        message_env: MessageEnv.Config
-        """The env to build per sample; `make_env_group` calls `build(env_input=sample)`."""
-
-        token_env: TokenEnv.Config
-        """`TokenEnv` wraps the `MessageEnv` in `make_env_group`."""
 
         advantage: Configurable.Config = field(
             default_factory=AdvantageEstimator.Config
@@ -368,10 +369,7 @@ class RolloutWorker(Configurable):
 
     def __init__(self, config: Config) -> None:
         self.rubric: Rubric = config.rubric.build()
-        self._message_env_config = config.message_env
-        self._token_env_config = config.token_env
         self.advantage_estimator: AdvantageEstimator = config.advantage.build()
-        self._renderer: Renderer
 
     async def setup_async(
         self,
@@ -380,32 +378,7 @@ class RolloutWorker(Configurable):
         renderer_config: RendererConfig,
         hf_assets_path: str,
     ) -> None:
-        """Build runtime dependencies after the worker actor is spawned."""
-        tokenizer = tokenizer_config.build(tokenizer_path=hf_assets_path)
-        self._renderer = renderer_config.build(tokenizer=tokenizer)
-
-    def make_env_group(
-        self,
-        *,
-        sample: object,
-        group_size: int,
-    ) -> list[TokenEnv]:
-        """Construct `group_size` single-use envs from one dataset sample.
-
-        Args:
-            sample: The source sample used to build the environment.
-            group_size: number of sibling envs for this prompt group.
-
-        Returns:
-            `TokenEnv` * `group_size` instances, each ready for one rollout.
-        """
-        return [
-            self._token_env_config.build(
-                message_env=self._message_env_config.build(env_input=sample),
-                renderer=self._renderer,
-            )
-            for _ in range(group_size)
-        ]
+        """Called once in the worker process after it is spawned. The base needs nothing."""
 
     async def score_group(
         self,
@@ -428,6 +401,7 @@ class RolloutWorker(Configurable):
         """
         return await self.rubric.score_group(rollouts, env_input)
 
+    @abstractmethod
     async def run_group(
         self,
         *,
@@ -438,16 +412,10 @@ class RolloutWorker(Configurable):
         group_size: int,
         sampling: SamplingConfig,
     ) -> RolloutGroup:
-        """Roll out and score one prompt group.
-
-        Builds `group_size` sibling envs from one sample and drives them concurrently;
-        each sibling drives its own `generate_fn` calls, so the generator runs a whole
-        group's calls together in one continuous batch. Then `make_scored_group` fills each
-        reward and advantage.
-
-        For custom logic, users can override this method. The override must pass its gather
-        results to `make_scored_group`, which keeps rollouts that aren't `is_trainable()` out of
-        scoring and training.
+        """Roll out and score one prompt group. An implementation gathers its rollouts with
+        `return_exceptions=True` and passes the results to `make_scored_group`, which keeps
+        rollouts that aren't `is_trainable()` out of scoring and training. On a cancel it returns
+        only after every rollout's cleanup ran: `RolloutWorkerActor.cancel_group` waits for that.
 
         Args:
             generate_fn: Async callable that returns a Completion given a prompt.
@@ -461,42 +429,6 @@ class RolloutWorker(Configurable):
         Returns:
             One scored `RolloutGroup`.
         """
-        # One prompt becomes [env] * group_size.
-        envs = self.make_env_group(
-            sample=sample,
-            group_size=group_size,
-        )
-
-        # TODO(perf): siblings in a group share the first-turn prompt; tokenize it once per group and
-        # reuse across the group_size rollouts (truest spot is the worker's first-turn render).
-        try:
-            # produce the rollouts. return_exceptions=True: the gather ends only once every rollout
-            # ended, also when one raises (see `make_scored_group`) or when the whole group is
-            # cancelled (`RolloutWorkerActor.cancel_group`): each rollout first releases its session.
-            results = await asyncio.gather(
-                *(
-                    self._run_single_rollout(
-                        generate_fn=generate_fn,
-                        release_session_fn=release_session_fn,
-                        env=env,
-                        # Offset the base seed per sample so a group's n=1
-                        # requests are diverse yet reproducible run-to-run.
-                        sampling=(
-                            sampling
-                            if sampling.seed is None
-                            else replace(sampling, seed=sampling.seed + sample_idx)
-                        ),
-                        group_id=group_id,
-                        rollout_id=sample_idx,
-                    )
-                    for sample_idx, env in enumerate(envs)
-                ),
-                return_exceptions=True,
-            )
-        finally:
-            # close the envs
-            await asyncio.gather(*(env.close() for env in envs), return_exceptions=True)
-        return await self.make_scored_group(results, sample, group_id=group_id)
 
     async def make_scored_group(
         self, results: list[Rollout | BaseException], sample: object, *, group_id: int
@@ -557,6 +489,108 @@ class RolloutWorker(Configurable):
             for rollout, advantage in zip(centered, advantages, strict=True):
                 rollout.advantage = advantage
         return RolloutGroup(group_id=group_id, rollouts=rollouts)
+
+
+class RolloutWorker(BaseRolloutWorker):
+    """Builds each rollout's env from `message_env` and `token_env`, and drives it against the
+    generator."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseRolloutWorker.Config):
+        message_env: MessageEnv.Config
+        """The env to build per sample; `make_env_group` calls `build(env_input=sample)`."""
+
+        token_env: TokenEnv.Config
+        """`TokenEnv` wraps the `MessageEnv` in `make_env_group`."""
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self._message_env_config = config.message_env
+        self._token_env_config = config.token_env
+        self._renderer: Renderer
+
+    async def setup_async(
+        self,
+        *,
+        tokenizer_config: HuggingFaceTokenizer.Config,
+        renderer_config: RendererConfig,
+        hf_assets_path: str,
+    ) -> None:
+        """Build the renderer that each rollout's `TokenEnv` uses."""
+        tokenizer = tokenizer_config.build(tokenizer_path=hf_assets_path)
+        self._renderer = renderer_config.build(tokenizer=tokenizer)
+
+    def make_env_group(
+        self,
+        *,
+        sample: object,
+        group_size: int,
+    ) -> list[TokenEnv]:
+        """Construct `group_size` single-use envs from one dataset sample.
+
+        Args:
+            sample: The source sample used to build the environment.
+            group_size: number of sibling envs for this prompt group.
+
+        Returns:
+            `TokenEnv` * `group_size` instances, each ready for one rollout.
+        """
+        return [
+            self._token_env_config.build(
+                message_env=self._message_env_config.build(env_input=sample),
+                renderer=self._renderer,
+            )
+            for _ in range(group_size)
+        ]
+
+    async def run_group(
+        self,
+        *,
+        generate_fn: GenerateFn,
+        release_session_fn: ReleaseSessionFn,
+        sample: object,
+        group_id: int,
+        group_size: int,
+        sampling: SamplingConfig,
+    ) -> RolloutGroup:
+        """Build `group_size` envs from `sample`, run them concurrently, then `make_scored_group`.
+        Each rollout makes its own `generate_fn` calls, so the generator batches the group's calls."""
+        # One prompt becomes [env] * group_size.
+        envs = self.make_env_group(
+            sample=sample,
+            group_size=group_size,
+        )
+
+        # TODO(perf): siblings in a group share the first-turn prompt; tokenize it once per group and
+        # reuse across the group_size rollouts (truest spot is the worker's first-turn render).
+        try:
+            # produce the rollouts. return_exceptions=True: the gather ends only once every rollout
+            # ended, also when one raises (see `make_scored_group`) or when the whole group is
+            # cancelled (`RolloutWorkerActor.cancel_group`): each rollout first releases its session.
+            results = await asyncio.gather(
+                *(
+                    self._run_single_rollout(
+                        generate_fn=generate_fn,
+                        release_session_fn=release_session_fn,
+                        env=env,
+                        # Offset the base seed per sample so a group's n=1
+                        # requests are diverse yet reproducible run-to-run.
+                        sampling=(
+                            sampling
+                            if sampling.seed is None
+                            else replace(sampling, seed=sampling.seed + sample_idx)
+                        ),
+                        group_id=group_id,
+                        rollout_id=sample_idx,
+                    )
+                    for sample_idx, env in enumerate(envs)
+                ),
+                return_exceptions=True,
+            )
+        finally:
+            # close the envs
+            await asyncio.gather(*(env.close() for env in envs), return_exceptions=True)
+        return await self.make_scored_group(results, sample, group_id=group_id)
 
     async def _run_single_rollout(
         self,

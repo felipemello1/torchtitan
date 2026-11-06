@@ -136,7 +136,7 @@ class ReleaseSessionFn(Protocol):
 # TODO: let users add a status without editing this file. A StrEnum with members can't be
 # subclassed, and metrics list `RolloutStatus` members. One way: keep these kinds fixed and add a
 # free-form reason string on `Rollout` that metrics key on. To stop training more rollouts today,
-# override `RolloutWorker.score_group` to return reward None.
+# override `BaseRolloutWorker.score_group` to return reward None.
 class RolloutStatus(StrEnum):
     """How a rollout ended. The library reads a status only through the predicates below:
 
@@ -155,7 +155,7 @@ class RolloutStatus(StrEnum):
     An env that hangs on its own lands here too.
     ERROR_ABORT doesn't: the generator aborted the request.
     `RolloutWorker._run_single_rollout` makes any exception ERROR_INFRA, and
-    `RolloutWorker.make_scored_group` marks a sibling that raised past it. A subclass can set
+    `BaseRolloutWorker.make_scored_group` marks a sibling that raised past it. A subclass can set
     ERROR_INFRA by its own rule.
 
     A scored rollout with no completion tokens (e.g. a first prompt past the context) has nothing
