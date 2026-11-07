@@ -16,16 +16,17 @@ from torchtitan.rl.observability.metrics.types import Max, Metric, Min, Sum
 
 
 class ProcessStats:
-    """This process's CPU seconds since the previous read and its anonymous memory, plus its host's
-    available memory. With ``children=True`` they include every live descendant (e.g. a rollout
-    worker's agent subprocesses) and, for CPU, every descendant that already exited and was reaped
-    inside the tree. Not counted: a descendant that left the tree (its parent exited without
-    waiting for it, or it double-forked), and a container's processes (children of dockerd).
+    """Reads this process's CPU seconds since the last read, its anonymous memory, and its host's
+    available memory.
 
-    Records from several processes reduce to the sum (the job), the max (the largest process) and,
-    for host memory, the min (the fullest host).
+        children=False   this process only
+        children=True    plus every live descendant (e.g. a rollout worker's agent subprocesses)
+                         and, for CPU, every descendant already reaped inside the tree
+        never counted    a descendant that left the tree (its parent exited first, or it
+                         double-forked), and a container's processes (children of dockerd)
 
-    Example: ProcessStats("rollout_worker", children=True).metrics() on two workers, reduced:
+    Example: ProcessStats("rollout_worker", children=True).metrics() on two workers, reduced
+    to the sum (the job), the max (the largest worker) and the min (the fullest host):
         perf/rollout_worker/cpu_seconds/sum                      79.2  CPU-s since the last read
         perf/rollout_worker/rss_anon_gib/sum                     52.8
         perf/rollout_worker/rss_anon_gib/max                     27.1
@@ -58,11 +59,12 @@ class ProcessStats:
     def _read(self) -> tuple[float, list[int]]:
         """Total CPU seconds so far, and the live descendants' pids.
 
-        A process's CPU moves into its parent's counters when the parent reaps it. So every
-        parent is read before its children: this process first (`os.times`), then the
-        descendants top-down. A child reaped between its parent's read and its own is missed
-        once, never counted twice. Each reading is then a lower bound, and the total keeps the
-        largest, so missed time shows up at a later read instead of as a negative delta.
+        A reaped child's CPU moves into its parent's counters, so:
+        1. Parents are read before children: this process (`os.times`), then the descendants
+           top-down. A child reaped between its parent's read and its own is missed once,
+           never counted twice.
+        2. The total keeps the largest reading, so the missed time shows up at a later read,
+           not as a negative delta.
 
         Example: read 1 counts a live child at 1.0 s. It exits and is reaped after read 2 reads
         its parent and before read 2 reads it: read 2 keeps read 1's total; read 3 finds the
@@ -75,16 +77,16 @@ class ProcessStats:
         descendants = _descendant_start_times(os.getpid())
         own = os.times()
         seconds = own.user + own.system + own.children_user + own.children_system
-        live = []
+        live_descendants = []
         for pid, start_time in descendants.items():
             stat = _read_stat(pid)
             # None: the process exited. Another start time: its pid now names a new process.
             if stat is not None and stat[_START_TIME] == start_time:
-                live.append(pid)
+                live_descendants.append(pid)
                 seconds += (
                     sum(int(field) for field in stat[_CPU_TIMES]) / _TICKS_PER_SECOND
                 )
-        return max(self._cpu_seconds, seconds), live
+        return max(self._cpu_seconds, seconds), live_descendants
 
 
 # Fields of /proc/<pid>/stat after "(comm)", 0-based: ppid (field 4), utime, stime, cutime,
@@ -94,7 +96,7 @@ _TICKS_PER_SECOND = os.sysconf("SC_CLK_TCK")
 
 
 def _descendant_start_times(pid: int) -> dict[int, str]:
-    """Every live process below ``pid``, parents before children, with its start time.
+    """Every live process below `pid`, parents before children, with its start time.
 
     Example: 100 -> 101 -> 102, and 100 -> 103: keys in the order 101, 103, 102
     """
@@ -124,10 +126,11 @@ def _read_stat(pid: int) -> list[str] | None:
 
 
 def _anonymous_kib(pid: int) -> int:
-    """``Anonymous:`` of /proc/<pid>/smaps_rollup. 0 for a process that has exited (a zombie's
-    read raises ProcessLookupError) or hides it from us (PermissionError: it called
-    prctl(PR_SET_DUMPABLE, 0), or runs a setuid binary). `status`'s RssAnon can read low: each
-    CPU reports its share of the counter late before Linux 6.16."""
+    """`Anonymous:` of /proc/<pid>/smaps_rollup, in KiB. 0 when the process
+    - has exited (a zombie's read raises ProcessLookupError), or
+    - hides it (PermissionError: it called prctl(PR_SET_DUMPABLE, 0), or runs a setuid binary).
+    `status`'s RssAnon is cheaper but can read low before Linux 6.16: each CPU reports its
+    share of the counter late."""
     try:
         rollup = Path(f"/proc/{pid}/smaps_rollup").read_text()
     except (FileNotFoundError, ProcessLookupError, PermissionError):

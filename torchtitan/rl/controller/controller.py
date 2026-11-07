@@ -139,21 +139,6 @@ from torchtitan.tools.garbage_collector import GarbageCollector
 logger = logging.getLogger(__name__)
 
 
-async def _finish_process_metrics_read(task: asyncio.Task) -> None:
-    """Cancel the read if it still runs, and wait until it ends. After an early exit its error is
-    logged, not raised, so it can't replace the error that ended the step. On a normal step the
-    step's own `await` raises it and ends the run: a read fails when a worker or the router
-    died, which ends the job anyway."""
-    task.cancel()
-    await asyncio.wait([task])
-    if not task.cancelled() and task.exception() is not None:
-        logger.warning("Reading process metrics failed: %r", task.exception())
-
-
-async def _awaited(awaitable: Awaitable[Any]) -> Any:
-    return await awaitable
-
-
 @dataclass(kw_only=True, slots=True)
 class ValidationConfig:
     """Held-out validation that runs at the start and end of training"""
@@ -1322,7 +1307,7 @@ class Controller(Configurable):
     async def _read_process_metrics(self) -> list[m.Metric]:
         """CPU since the previous read and memory of the rollout workers (with their agent
         subprocesses), the router and this controller. Workers may run on other hosts."""
-        # A TaskGroup, not gather: once cancelled, it waits for every part to finish.
+        # Once cancelled, a TaskGroup waits for every part to finish, so none outlives the step.
         async with asyncio.TaskGroup() as group:
             worker_metrics = group.create_task(self._rollouter.process_metrics())
             # `create_task` takes a coroutine, and a Monarch `call_one()` returns a Future.
@@ -1369,3 +1354,23 @@ class Controller(Configurable):
             self.config.async_loop.num_prompts_per_train_step, reason="trained"
         )
         return pull_s
+
+
+async def _finish_process_metrics_read(task: asyncio.Task) -> None:
+    """Cancel the step's process-metrics read if it still runs, and wait until it ends.
+
+    A read that failed:
+        early exit (NaN loss, an error, batcher closed)   logged, so it can't hide the step's error
+        normal step                                       already raised by the step's `await`; a
+                                                          read fails only when a worker or the
+                                                          router died, which ends the job anyway
+    """
+    task.cancel()
+    await asyncio.wait([task])
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning("Reading process metrics failed: %r", task.exception())
+
+
+async def _awaited(awaitable: Awaitable[Any]) -> Any:
+    """Wrap an awaitable in a coroutine, for `TaskGroup.create_task`."""
+    return await awaitable
