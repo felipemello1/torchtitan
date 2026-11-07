@@ -295,7 +295,8 @@ def spawn_cpu_procs(num_procs: int) -> ProcMesh:
 
 # Rollout workers need no GPU, and on a trainer or generator host every GPU belongs to a rank.
 # An empty CUDA_VISIBLE_DEVICES keeps any CUDA context a worker's libraries open off those GPUs.
-# TODO: allocator caps (MALLOC_ARENA_MAX=2) if worker memory grows step over step.
+# TODO: cap glibc's memory pools (MALLOC_ARENA_MAX=2) here if a worker's memory grows step
+#   over step: each pool keeps its peak after frees. Not measured on a long run yet.
 ROLLOUT_WORKER_ENV = {"CUDA_VISIBLE_DEVICES": ""}
 
 

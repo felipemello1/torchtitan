@@ -124,9 +124,12 @@ class ActorSystem(Configurable, abc.ABC):
         on_controller_host: bool,
     ) -> list[Any]:
         """Spawn ``num_workers`` rollout worker processes, each running ``num_threads``
-        rollout threads; returns one single-actor handle per worker. Where they run is the
-        actor system's choice, e.g. spread over the hosts the controller doesn't use, or all
-        on the controller's host with ``on_controller_host``."""
+        rollout threads, and return one single-actor handle per worker.
+
+            on_controller_host=False   the actor system picks the hosts (Monarch: every job host
+                                       but the controller's)
+            on_controller_host=True    every worker on the controller's host
+        """
 
     @abc.abstractmethod
     async def stop_rollout_workers(self) -> None:
