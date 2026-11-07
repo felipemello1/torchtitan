@@ -275,8 +275,8 @@ class Rollouter(Configurable):
         if not self._workers:
             raise RuntimeError("rollout worker pool is not initialized")
 
-        # A random worker, as Monarch's `choose` picks one. A worker whose groups fail at once
-        # then gets 1/N of the groups; a least-busy pick would send it every free slot.
+        # Random, so a worker whose groups fail at once gets 1/N of the groups. Picking the least
+        # busy worker would send it every slot that frees up.
         # TODO: random puts 5-7 groups on the busiest worker when the mean is 1 (250 groups on 250
         #   workers). Before groups of tens of GB (1M-token rollouts, 128 per group), reserve
         #   their bytes per worker host at admission, or pick by bytes with a fail-fast guard.
