@@ -116,10 +116,17 @@ class ActorSystem(Configurable, abc.ABC):
 
     @abc.abstractmethod
     async def spawn_rollout_workers(
-        self, config: RolloutWorker.Config, *, num_workers: int, num_threads: int
+        self,
+        config: RolloutWorker.Config,
+        *,
+        num_workers: int,
+        num_threads: int,
+        on_controller_host: bool,
     ) -> list[Any]:
-        """Spawn ``num_workers`` rollout worker processes on the controller host, each
-        running ``num_threads`` rollout threads; returns one single-actor handle per worker."""
+        """Spawn ``num_workers`` rollout worker processes, each running ``num_threads``
+        rollout threads; returns one single-actor handle per worker. Where they run is the
+        actor system's choice, e.g. spread over the hosts the controller doesn't use, or all
+        on the controller's host with ``on_controller_host``."""
 
     @abc.abstractmethod
     async def stop_rollout_workers(self) -> None:
