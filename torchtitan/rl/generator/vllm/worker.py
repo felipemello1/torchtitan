@@ -125,18 +125,19 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
         # TODO: drop once vLLM's estimate charges decode graphs at their own size.
         if is_profiling:
             return
-        # vLLM builds its manager here, with no factory to override. Rebuild it with
-        # the same arguments.
+        # vLLM builds its manager here (`ModelCudaGraphManager(...)` in
+        # GPUModelRunner.initialize_kv_cache), with no factory to override. Rebuild it
+        # with the arguments vLLM passed, read off vLLM's manager.
+        vllm_manager = self.cudagraph_manager
         self.cudagraph_manager = TorchTitanCudaGraphManager(
-            self.vllm_config,
-            self.device,
-            self.cudagraph_manager.cudagraph_mode,
-            decode_query_lens=self.vllm_config.get_decode_cudagraph_query_lens(
-                self.decode_query_len
-            ),
-            lora_capture_cases=self.lora_capture_cases,
-            varlen_decode=self.adaptive_verification is not None,
-            ubatch_runner=self.ubatch_runner,
+            vllm_manager.vllm_config,
+            vllm_manager.device,
+            vllm_manager.cudagraph_mode,
+            # The decode_query_lens vLLM passed, capped at max_num_seqs (capping again is a no-op).
+            decode_query_lens=vllm_manager.decode_max_reqs,
+            lora_capture_cases=vllm_manager.lora_capture_cases,
+            varlen_decode=vllm_manager.varlen_decode,
+            ubatch_runner=vllm_manager.ubatch_runner,
         )
         if isinstance(self.model_state, TorchTitanHybridModelState):
             self.model_state.cudagraph_manager = self.cudagraph_manager
