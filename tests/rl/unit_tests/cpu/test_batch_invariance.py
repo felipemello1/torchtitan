@@ -104,6 +104,8 @@ def test_vllm_logprob_patch_keeps_trainer_fallback_path(monkeypatch):
         "vllm.v1.worker.gpu",
         "vllm.v1.worker.gpu.sample",
         "vllm.v1.worker.gpu.sample.logprob",
+        "vllm.v1.worker.gpu.sample.prompt_logprob",
+        "vllm.v1.worker.gpu.sample.states",
     )
     modules = {name: ModuleType(name) for name in module_names}
     for name, module in modules.items():
@@ -129,7 +131,9 @@ def test_vllm_logprob_patch_keeps_trainer_fallback_path(monkeypatch):
         dtype=torch.bfloat16,
     )
     token_ids = torch.tensor([[3, 0, 2], [2, 1, 3]], dtype=torch.int32)
-    actual = modules[module_names[-1]].compute_token_logprobs(logits, token_ids)
+    actual = modules["vllm.v1.worker.gpu.sample.logprob"].compute_token_logprobs(
+        logits, token_ids
+    )
     expected = torch.log_softmax(logits.float(), dim=-1).gather(
         -1, token_ids.to(torch.int64)
     )
@@ -140,3 +144,14 @@ def test_vllm_logprob_patch_keeps_trainer_fallback_path(monkeypatch):
         assert call_logits is logits
         torch.testing.assert_close(call_labels, token_ids[:, column].to(torch.int64))
         assert call_kwargs == {"vocab_parallel_group": None}
+
+    # Temperature divides like the trainer's compute_logprobs; greedy rows stay unchanged.
+    logits = torch.randn(3, 5)
+    temperature = torch.tensor([0.0, 0.8, 0.7])  # per request
+    expanded_idx_mapping = torch.tensor([1, 0, 2])  # row -> request
+    scaled = logits.clone()
+    modules["vllm.v1.worker.gpu.sample.states"].apply_temperature(
+        scaled, expanded_idx_mapping, temperature
+    )
+    row_temperature = torch.tensor([0.8, 1.0, 0.7])
+    assert torch.equal(scaled, logits / row_temperature.unsqueeze(-1).expand_as(logits))

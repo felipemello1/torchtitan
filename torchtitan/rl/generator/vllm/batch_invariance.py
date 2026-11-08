@@ -18,14 +18,16 @@ def force_logprobs_fn_for_batch_invariance() -> None:
 
     The v2 GPU sampler computes per-token logprobs with a fused Triton kernel
     (``compute_token_logprobs`` -> ``_topk_log_softmax_kernel``) that inlines
-    ``log(softmax(logits))`` and never calls PyTorch ops.
+    ``log(softmax(logits))`` and never calls PyTorch ops. It also divides logits
+    by the temperature in a Triton kernel (``apply_temperature``).
 
-    Swapping the kernel routes the generator and the trainer through
+    Swapping both kernels routes the generator and the trainer through
     the same set of ops, so logprobs match bit-for-bit. The wrapper supplies
     full logits to vLLM, so the wrapper explicitly selects the replicated path.
     """
     import vllm.v1.worker.gpu.sample.logprob as vllm_logprob
     import vllm.v1.worker.gpu.sample.prompt_logprob as vllm_prompt_logprob
+    import vllm.v1.worker.gpu.sample.states as vllm_sampling_states
 
     from torchtitan.components.loss import compute_logprobs
 
@@ -67,7 +69,25 @@ def force_logprobs_fn_for_batch_invariance() -> None:
     # prompt_logprob.py imports the function by name at import time, so patch its
     # binding too, or prompt logprobs stay on the Triton kernel.
     vllm_prompt_logprob.compute_token_logprobs = generator_compute_token_logprobs
+
+    def generator_apply_temperature(
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+    ) -> None:
+        """In place, divide each row of ``[N, V]`` fp32 logits by its request's temperature.
+
+        Greedy rows (temperature 0) stay unchanged, as in vLLM's kernel.
+        """
+        row_temperature = temperature[expanded_idx_mapping]
+        row_temperature = torch.where(row_temperature == 0.0, 1.0, row_temperature)
+        logits.div_(row_temperature.unsqueeze(-1))
+
+    # vLLM's Triton kernel divides less precisely than PyTorch: at temperature 0.8,
+    # 15% of fp32 logits differ by up to 1 ulp (GB300), so the trainer's logprobs
+    # differ too. states.py imports the function by name, so patch its binding.
+    vllm_sampling_states.apply_temperature = generator_apply_temperature
     logger.info(
-        "Patched vLLM compute_token_logprobs with trainer's implementation "
+        "Patched vLLM compute_token_logprobs and apply_temperature with PyTorch ops "
         "so generator and trainer share one logprob code path"
     )
