@@ -13,8 +13,8 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def force_logprobs_fn_for_batch_invariance() -> None:
-    """Make vLLM's v2 logprob path dispatch.
+def patch_vllm_logprob_and_temperature_kernels() -> None:
+    """Replace the Triton logprob and temperature kernels of vLLM's v2 sampler with PyTorch ops.
 
     The v2 GPU sampler computes per-token logprobs with a fused Triton kernel
     (``compute_token_logprobs`` -> ``_topk_log_softmax_kernel``) that inlines
@@ -25,6 +25,7 @@ def force_logprobs_fn_for_batch_invariance() -> None:
     the same set of ops, so logprobs match bit-for-bit. The wrapper supplies
     full logits to vLLM, so the wrapper explicitly selects the replicated path.
     """
+    import vllm.v1.worker.gpu.sample.gumbel as vllm_gumbel
     import vllm.v1.worker.gpu.sample.logprob as vllm_logprob
     import vllm.v1.worker.gpu.sample.prompt_logprob as vllm_prompt_logprob
     import vllm.v1.worker.gpu.sample.states as vllm_sampling_states
@@ -65,11 +66,9 @@ def force_logprobs_fn_for_batch_invariance() -> None:
         ]
         return torch.stack(per_column, dim=-1)  # [N, K]
 
-    vllm_logprob.compute_token_logprobs = generator_compute_token_logprobs
-    # prompt_logprob.py imports the function by name at import time, so patch its
-    # binding too, or prompt logprobs stay on the Triton kernel.
-    vllm_prompt_logprob.compute_token_logprobs = generator_compute_token_logprobs
-
+    # vLLM's Triton kernel divides less precisely than PyTorch: at temperature 0.8,
+    # 15% of fp32 logits differ by up to 1 ulp (GB300), so the trainer's logprobs
+    # differ too.
     def generator_apply_temperature(
         logits: torch.Tensor,
         expanded_idx_mapping: torch.Tensor,
@@ -83,9 +82,21 @@ def force_logprobs_fn_for_batch_invariance() -> None:
         row_temperature = torch.where(row_temperature == 0.0, 1.0, row_temperature)
         logits.div_(row_temperature.unsqueeze(-1))
 
-    # vLLM's Triton kernel divides less precisely than PyTorch: at temperature 0.8,
-    # 15% of fp32 logits differ by up to 1 ulp (GB300), so the trainer's logprobs
-    # differ too. states.py imports the function by name, so patch its binding.
+    # prompt_logprob.py and states.py import these functions by name, so their
+    # bindings are patched too. If vLLM moved a function, patching the old binding
+    # would leave its Triton kernel running with no error, so check first.
+    for importer, name, defining_module in (
+        (vllm_prompt_logprob, "compute_token_logprobs", vllm_logprob),
+        (vllm_sampling_states, "apply_temperature", vllm_gumbel),
+    ):
+        if getattr(importer, name, None) is not getattr(defining_module, name):
+            raise RuntimeError(
+                f"{importer.__name__}.{name} is not {defining_module.__name__}.{name}: "
+                "vLLM moved it, so update this patch"
+            )
+    vllm_logprob.compute_token_logprobs = generator_compute_token_logprobs
+    vllm_prompt_logprob.compute_token_logprobs = generator_compute_token_logprobs
+    vllm_gumbel.apply_temperature = generator_apply_temperature
     vllm_sampling_states.apply_temperature = generator_apply_temperature
     logger.info(
         "Patched vLLM compute_token_logprobs and apply_temperature with PyTorch ops "
