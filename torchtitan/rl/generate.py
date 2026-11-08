@@ -40,6 +40,9 @@ from vllm.sampling_params import RequestOutputKind
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.config import apply_overrides, ConfigLoader
 from torchtitan.distributed.batch_invariant import set_batch_invariance
+from torchtitan.rl.generator.vllm.batch_invariance import (
+    force_logprobs_fn_for_batch_invariance,
+)
 from torchtitan.rl.generator.vllm.engine import add_extra_vllm_engine_args, VLLMEngine
 from torchtitan.rl.generator.vllm.registry import (
     register_to_vllm,
@@ -130,8 +133,11 @@ def generate() -> None:
     )
     logger.info("Registered TorchTitan model with vLLM")
 
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
     set_batch_invariance(gen_config.debug.batch_invariant)
+    if gen_config.debug.batch_invariant:
+        # vLLM's V2 sampler computes logprobs with its own Triton kernel; use the
+        # trainer's function instead, as VLLMEngine does.
+        force_logprobs_fn_for_batch_invariance()
     enable_ep = gen_config.parallelism.expert_parallel_degree > 1
 
     logger.debug("Initializing vLLM LLMEngine with TorchTitan model")

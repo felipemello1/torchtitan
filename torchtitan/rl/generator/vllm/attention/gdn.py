@@ -217,10 +217,13 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         num_tokens = mixed_qkv.shape[0]
         output_shape = (num_tokens, self.local_num_v_heads, self.head_v_dim)
         attn_metadata = get_forward_context().attn_metadata
-        # vLLM's profiling/warmup runs have no attention metadata.
+        # vLLM's warmup runs build no attention metadata. Its profile run builds none
+        # for linear-attention layers.
         if attn_metadata is None:
             return mixed_qkv.new_zeros(output_shape)
         assert isinstance(attn_metadata, dict)
+        if self.prefix not in attn_metadata:
+            return mixed_qkv.new_zeros(output_shape)
         gdn_metadata = attn_metadata[self.prefix]
         assert isinstance(gdn_metadata, TorchTitanLinearAttentionMetadata)
         assert (

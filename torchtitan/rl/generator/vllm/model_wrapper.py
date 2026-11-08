@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+import vllm.envs as envs
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed._state_dict_utils import _create_cpu_state_dict
 from torch.distributed.tensor import DTensor, Replicate
@@ -644,17 +645,6 @@ class VLLMModelWrapper(Module):
         if self._buffer_keys:
             fetch({key: self.model.get_buffer(key) for key in self._buffer_keys})
 
-    def set_num_valid_tokens(self, num_valid_tokens: int) -> None:
-        """Publish how many of this step's tokens are real, for the padding mask.
-
-        vLLM pads a step (CUDA-graph capture size, data-parallel equalization)
-        before the model runs. The runner calls this with the unpadded count. It
-        is a device write with no host sync, so it can run before every graph
-        replay. A no-op for models without Dist-MoE.
-        """
-        if self._num_valid_tokens is not None:
-            self._num_valid_tokens.fill_(num_valid_tokens)
-
     def _dist_moe_num_local_input_tokens(self, num_tokens: int) -> int:
         """Return the Dist-MoE row count every EP rank passes in this step.
 
@@ -691,7 +681,6 @@ class VLLMModelWrapper(Module):
         capture or replay.
         """
         self._dist_moe_runtime = None
-        self._num_valid_tokens: torch.Tensor | None = None
         if not any(
             isinstance(module, DistMoeRoutedExperts) for module in self.model.modules()
         ):
@@ -714,19 +703,19 @@ class VLLMModelWrapper(Module):
                 "backward, so a training context's activation slots would reserve "
                 "memory it can never use."
             )
+        if not envs.VLLM_MOE_SKIP_PADDING:
+            raise ValueError(
+                "Dist-MoE in the generator needs VLLM_MOE_SKIP_PADDING=1 (vLLM's "
+                "default); got 0. Only then does vLLM refresh the forward context's "
+                "padding mask every step, and the mask keeps padding rows off "
+                "Dist-MoE's network."
+            )
         self._dist_moe_runtime = runtime_config.build(
             model_parts=[self.model],
             parallelism_context=self.parallelism_context,
             device=device,
             num_tokens_per_microbatch_per_dp_rank=max_num_batched_tokens,
             pp_schedule=None,
-        )
-        # The runner writes each step's real token count here before the forward
-        # runs, and forward builds the padding mask from it on the device, so
-        # CUDA-graph replay sees the current count. The address must stay fixed
-        # from before capture. Until a step publishes, every token counts as real.
-        self._num_valid_tokens = torch.full(
-            (), torch.iinfo(torch.int32).max, dtype=torch.int32, device=device
         )
 
     # TODO: followup with potentially adding extra kwarg ``sinks`` to vLLM attn
@@ -795,16 +784,17 @@ class VLLMModelWrapper(Module):
             positions = F.pad(positions, (0, num_padding_rows))
 
         with self.parallelism_context.activate_spmd():
-            # Rows past the real token count are padding (true for padding). Only
-            # the MoE reads this mask: Dist-MoE routes those rows to expert -1.
-            # Attention takes its metadata from vLLM, which already excludes padding.
+            # vLLM's padding mask (graph size, DP equalization, an idle DP rank's
+            # dummy rows), captured by graphs and rewritten every step, plus the rows
+            # padded above. Only Dist-MoE reads it: padding rows go to expert -1.
             model_kwargs = {}
             if self._dist_moe_runtime is not None:
-                assert self._num_valid_tokens is not None
-                model_kwargs["padding_mask"] = (
-                    torch.arange(input_ids.shape[0], device=input_ids.device)
-                    >= self._num_valid_tokens
-                )
+                padding_mask = get_forward_context().is_padding
+                if num_padding_rows:
+                    padding_mask = F.pad(
+                        padding_mask, (0, num_padding_rows), value=True
+                    )
+                model_kwargs["padding_mask"] = padding_mask
                 self._dist_moe_runtime.set_num_local_input_tokens_per_call(
                     self._dist_moe_num_local_input_tokens(input_ids.shape[0])
                 )
