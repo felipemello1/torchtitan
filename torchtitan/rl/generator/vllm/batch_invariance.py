@@ -25,6 +25,7 @@ def force_logprobs_fn_for_batch_invariance() -> None:
     full logits to vLLM, so the wrapper explicitly selects the replicated path.
     """
     import vllm.v1.worker.gpu.sample.logprob as vllm_logprob
+    import vllm.v1.worker.gpu.sample.prompt_logprob as vllm_prompt_logprob
 
     from torchtitan.components.loss import compute_logprobs
 
@@ -63,6 +64,9 @@ def force_logprobs_fn_for_batch_invariance() -> None:
         return torch.stack(per_column, dim=-1)  # [N, K]
 
     vllm_logprob.compute_token_logprobs = generator_compute_token_logprobs
+    # prompt_logprob.py imports the function by name at import time, so patch its
+    # binding too, or prompt logprobs stay on the Triton kernel.
+    vllm_prompt_logprob.compute_token_logprobs = generator_compute_token_logprobs
     logger.info(
         "Patched vLLM compute_token_logprobs with trainer's implementation "
         "so generator and trainer share one logprob code path"
