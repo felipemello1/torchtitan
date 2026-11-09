@@ -93,7 +93,7 @@ There is no CLI flag for the path.
 | Config | Model | GPUs |
 | --- | --- | --- |
 | `rl_grpo_qwen35_9b_terminal_bench` | Qwen3.5-9B | 8 trainer, 8 generators x 1 |
-| `rl_dapo_qwen35_35b_a3b_terminal_bench_dist_moe` | Qwen3.5-35B-A3B | 4 trainer, 16 generators x 1 (Dist-MoE) |
+| `rl_dapo_qwen35_35b_a3b_terminal_bench_dist_moe` | Qwen3.5-35B-A3B | 4 trainer, 4 generators x 4 (DP 4 x EP 4, Dist-MoE) |
 
 `torchtitan.rl.train` places every process on the local host, so the 9B recipe needs a
 16-GPU host as written. The 35B-A3B recipe uses Dist-MoE, which needs SM100+ GPUs. It needs
