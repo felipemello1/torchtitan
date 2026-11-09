@@ -118,7 +118,10 @@ class Rollouter(Configurable):
 
         num_threads_per_worker: int = 4
         """Size of each worker process's default thread pool executor, i.e. the pool
-        behind every `asyncio.to_thread` call in that process."""
+        behind every `asyncio.to_thread` call in that process. Rendering runs on it (`TokenEnv`,
+        the Verifiers client), and so does a blocking client that an env calls through
+        `asyncio.to_thread` (e.g. a sandbox SDK). With fewer threads than such calls in flight,
+        rollouts wait for a free thread."""
 
         def __post_init__(self) -> None:
             if self.worker_pool_size < 1:
@@ -195,9 +198,6 @@ class Rollouter(Configurable):
         tokenizer_config: HuggingFaceTokenizer.Config,
         renderer_config: RendererConfig,
         hf_assets_path: str,
-        # Replaces `Config.worker` when part of it is known only at setup, e.g. a server address.
-        # TODO: remove once the Verifiers env runs in the rollout worker (its only user).
-        worker_config: BaseRolloutWorker.Config | None = None,
     ) -> None:
         """Spawn the rollout worker pool through ``actor_system`` and initialize it."""
         if self._workers:
@@ -205,7 +205,7 @@ class Rollouter(Configurable):
 
         self._actor_system = actor_system
         self._workers = await actor_system.spawn_rollout_workers(
-            worker_config if worker_config is not None else self._config.worker,
+            self._config.worker,
             num_workers=self._config.worker_pool_size,
             num_threads=self._config.num_threads_per_worker,
         )
@@ -379,6 +379,9 @@ class BaseRolloutWorker(Configurable, ABC):
         hf_assets_path: str,
     ) -> None:
         """Called once in the worker process after it is spawned. The base needs nothing."""
+
+    async def close(self) -> None:
+        """Release what `setup_async` opened. The worker actor calls it on a graceful stop."""
 
     async def score_group(
         self,

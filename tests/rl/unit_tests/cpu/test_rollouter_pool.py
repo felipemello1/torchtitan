@@ -502,6 +502,9 @@ class _GeneratingWorker:
             raise
         return RolloutGroup(group_id=group_id, rollouts=[])
 
+    async def close(self) -> None:
+        pathlib.Path(self.marker_dir, "closed").touch()
+
 
 class _GeneratingWorkerConfig:
     def __init__(self, marker_dir: str) -> None:
@@ -529,6 +532,7 @@ def test_cancel_group_and_wait_for_generate_calls_on_real_worker_processes(
                                          keeps running
     wait_for_generate_calls              returns only after the call's answer
     the answer is an error               the worker reads it, so asyncio logs nothing
+    stopping the process                 closes the worker
     """
 
     async def run() -> None:
@@ -577,5 +581,6 @@ def test_cancel_group_and_wait_for_generate_calls_on_real_worker_processes(
         finally:
             cloudpickle.unregister_pickle_by_value(sys.modules[__name__])
             await mesh.stop()
+        assert (tmp_path / "closed").exists()
 
     asyncio.run(run())
