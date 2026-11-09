@@ -6,6 +6,7 @@
 
 import asyncio
 
+import pytest
 from renderers import ParsedResponse
 from torchtitan.rl.rollout import RolloutStatus
 
@@ -71,7 +72,9 @@ def test_env_passes_tools_to_render_parse_and_bridge() -> None:
     # Tool schemas are part of the chat template, and XML-style tool parsers need them
     # to type the arguments; every renderer call must see the same list.
     renderer = _RecordingRenderer()
-    env = TokenEnv.Config().build(message_env=_ToolMessageEnv(), renderer=renderer)
+    env = TokenEnv.Config(max_rollout_tokens=1024).build(
+        message_env=_ToolMessageEnv(), renderer=renderer
+    )
 
     async def run():
         await env.init()
@@ -106,7 +109,9 @@ class _ScriptedRenderer(_RecordingRenderer):
 
 def test_env_returns_each_next_prompt_as_a_delta() -> None:
     renderer = _ScriptedRenderer(prompts=[[1, 2, 3], [1, 2, 3, 4, 7], [1, 2, 3, 4, 9]])
-    env = TokenEnv.Config().build(message_env=_ToolMessageEnv(), renderer=renderer)
+    env = TokenEnv.Config(max_rollout_tokens=1024).build(
+        message_env=_ToolMessageEnv(), renderer=renderer
+    )
 
     def completion(token_ids: list[int]) -> Completion:
         return Completion(
@@ -137,3 +142,67 @@ def test_env_returns_each_next_prompt_as_a_delta() -> None:
             [9],
         ),  # edited history: shares [1, 2, 3, 4] with [1, 2, 3, 4, 7] + completion [5]
     ]
+
+
+class _SlowOrFailingMessageEnv(_ToolMessageEnv):
+    def __init__(self, env_raises: bool) -> None:
+        self.env_raises = env_raises
+
+    async def step(self, completion_message) -> MessageEnvStepOutput:
+        if self.env_raises:
+            raise TimeoutError("tool server call timed out")
+        await asyncio.sleep(10)
+        raise AssertionError("the step deadline should have expired")
+
+
+@pytest.mark.parametrize("env_raises", [False, True])
+def test_only_the_step_deadline_is_error_timeout(env_raises: bool) -> None:
+    # A TimeoutError from the env's own code is an env failure: it must reach `RolloutWorker`.
+    env = TokenEnv.Config(max_rollout_tokens=1024, step_timeout_s=0.01).build(
+        message_env=_SlowOrFailingMessageEnv(env_raises), renderer=_RecordingRenderer()
+    )
+
+    async def run():
+        await env.init()
+        return await env.step(
+            Completion(
+                min_policy_version=0,
+                max_policy_version=0,
+                request_id="r0",
+                token_ids=[7, 8],
+                token_logprobs=[-0.1, -0.2],
+                finish_reason="stop",
+            )
+        )
+
+    if env_raises:
+        with pytest.raises(TimeoutError, match="tool server call"):
+            asyncio.run(run())
+    else:
+        assert asyncio.run(run()).status is RolloutStatus.ERROR_TIMEOUT
+
+
+class _FailingParseRenderer(_RecordingRenderer):
+    def parse_response(self, token_ids, *, tools=None):
+        raise ValueError("unparsable tool call")
+
+
+def test_an_aborted_response_is_error_abort_even_if_it_fails_to_parse() -> None:
+    env = TokenEnv.Config(max_rollout_tokens=1024).build(
+        message_env=_ToolMessageEnv(), renderer=_FailingParseRenderer()
+    )
+
+    async def run():
+        await env.init()
+        return await env.step(
+            Completion(
+                min_policy_version=0,
+                max_policy_version=0,
+                request_id="r0",
+                token_ids=[7, 8],
+                token_logprobs=[-0.1, -0.2],
+                finish_reason="abort",
+            )
+        )
+
+    assert asyncio.run(run()).status is RolloutStatus.ERROR_ABORT
