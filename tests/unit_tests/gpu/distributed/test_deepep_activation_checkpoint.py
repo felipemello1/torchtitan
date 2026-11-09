@@ -12,9 +12,9 @@ from unittest.mock import patch
 
 import pytest
 import torch
-import torch.utils.deterministic
 import torch_remat as remat
 from torch.distributed.device_mesh import init_device_mesh
+from torch.testing._internal.common_utils import DeterministicGuard
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
@@ -189,7 +189,6 @@ class _EPActivationCheckpointing(DTensorTestBase):
         buffer_type,
         dispatch_method: str,
         combine_method: str,
-        exact: bool,
         capture: bool = False,
     ) -> None:
         mesh = init_device_mesh(
@@ -216,6 +215,15 @@ class _EPActivationCheckpointing(DTensorTestBase):
                 ),
                 torch.autograd.set_multithreading_enabled(False),
                 set_current_spmd_mesh(mesh),
+                # GptOssGroupedLinear's bias uses repeat_interleave. Its backward
+                # (index_add_) uses atomic adds unless deterministic algorithms
+                # are on. init_buffer reads this flag too, so DeepEP's buffer is
+                # deterministic and the baseline and AC grads match bitwise.
+                # Set here, not in setUp: the spawned rank processes never call
+                # setUp. As in set_determinism, don't fill empty outputs: that
+                # races with comm streams.
+                DeterministicGuard(True, fill_uninitialized_memory=False),
+                patch.dict(os.environ, {"CUBLAS_WORKSPACE_CONFIG": ":4096:8"}),
             ):
                 torch.manual_seed(42)
                 baseline = _Model(
@@ -251,8 +259,7 @@ class _EPActivationCheckpointing(DTensorTestBase):
                     reference.load_state_dict(baseline.state_dict())
                 activation_remat.apply(ac_model)
                 # As in training, the buffer is created after AC is applied. All
-                # models share it, so the baseline also runs deterministic when
-                # the AC model replays.
+                # models share it.
                 baseline.layers["0"].routed_experts.token_dispatcher.init_buffer()
                 ac_model.layers["0"].routed_experts.token_dispatcher.init_buffer()
                 if reference is not None:
@@ -315,7 +322,7 @@ class _EPActivationCheckpointing(DTensorTestBase):
                     # Compare pre-W2 absorption with the previous post-W2 scoring.
                     bf16_rtol = 2 * torch.finfo(torch.bfloat16).eps
                     for value, reference_value in zip(expected, reference_values):
-                        if output_postprocess is not None and exact:
+                        if output_postprocess is not None:
                             torch.testing.assert_close(
                                 value, reference_value, rtol=0, atol=0
                             )
@@ -340,17 +347,10 @@ class _EPActivationCheckpointing(DTensorTestBase):
                     },
                     msg=f"unexpected EP communication replays: {num_calls}",
                 )
-                if exact:
-                    for actual_grad, expected_grad in zip(actual, expected):
-                        torch.testing.assert_close(
-                            actual_grad, expected_grad, rtol=0, atol=0
-                        )
-                else:
-                    # Not bitwise: the receive order can differ between the two
-                    # runs, which changes the summation order of the expert
-                    # weight grads.
-                    for actual_grad, expected_grad in zip(actual, expected):
-                        torch.testing.assert_close(actual_grad, expected_grad)
+                for actual_grad, expected_grad in zip(actual, expected):
+                    torch.testing.assert_close(
+                        actual_grad, expected_grad, rtol=0, atol=0
+                    )
 
 
 @unittest.skipUnless(
@@ -386,7 +386,6 @@ class TestDeepEPActivationCheckpointing(_EPActivationCheckpointing):
             buffer_type=deep_ep.ElasticBuffer,
             dispatch_method="dispatch",
             combine_method="combine",
-            exact=bool(num_replays),
         )
 
     @with_comms
@@ -412,25 +411,6 @@ class TestDeepEPActivationCheckpointing(_EPActivationCheckpointing):
     "requires two CUDA devices and HybridEP",
 )
 class TestHybridEPActivationCheckpointing(_EPActivationCheckpointing):
-    def setUp(self):
-        super().setUp()
-        self.addCleanup(
-            torch.use_deterministic_algorithms,
-            torch.are_deterministic_algorithms_enabled(),
-        )
-        torch.use_deterministic_algorithms(True)
-        # Match set_determinism: filling empty outputs races with comm streams.
-        self.addCleanup(
-            setattr,
-            torch.utils.deterministic,
-            "fill_uninitialized_memory",
-            torch.utils.deterministic.fill_uninitialized_memory,
-        )
-        torch.utils.deterministic.fill_uninitialized_memory = False
-        env = patch.dict(os.environ, {"CUBLAS_WORKSPACE_CONFIG": ":4096:8"})
-        env.start()
-        self.addCleanup(env.stop)
-
     def _check_hybridep_activation_checkpointing(
         self, ac_configs, *, num_replays, capture=False
     ):
@@ -451,7 +431,6 @@ class TestHybridEPActivationCheckpointing(_EPActivationCheckpointing):
                     buffer_type=deep_ep.HybridEPBuffer,
                     dispatch_method="dispatch_with_permute",
                     combine_method="combine_with_unpermute",
-                    exact=True,
                     capture=capture,
                 )
 
