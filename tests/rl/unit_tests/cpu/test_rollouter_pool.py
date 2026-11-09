@@ -115,6 +115,11 @@ class _Worker:
         self.wait_for_generate_calls = _CallOneEndpoint()
         self.sync_log_step = _CallOneEndpoint()
         self.hostname = _CallOneEndpoint()
+        self.process_metrics = SimpleNamespace(
+            call_one=lambda: asyncio.ensure_future(
+                asyncio.sleep(0, result=[f"metric of worker {id(self)}"])
+            )
+        )
 
 
 class _ActorSystem:
@@ -266,6 +271,9 @@ def test_setup_spawns_and_sets_up_every_worker_and_close_stops_them() -> None:
                     "hf_assets_path": "hf_assets_path",
                 }
             ]
+        assert await rollouter.process_metrics() == [
+            f"metric of worker {id(worker)}" for worker in actor_system.workers
+        ]
         await rollouter.close()
         assert actor_system.stopped
 

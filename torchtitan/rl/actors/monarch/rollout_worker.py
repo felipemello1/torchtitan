@@ -18,6 +18,8 @@ from torchtitan.components.renderer import RendererConfig
 
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.observability import structured_logger as sl
+from torchtitan.rl.observability import metrics as m
+from torchtitan.rl.observability.metrics.process import ProcessStats
 from torchtitan.rl.rollout.rollouter import BaseRolloutWorker
 from torchtitan.rl.rollout.types import RolloutGroup
 
@@ -48,6 +50,8 @@ class RolloutWorkerActor(Actor):
         self._group_tasks: dict[int, asyncio.Task] = {}
         # Generate calls sent from this worker that the router hasn't answered yet.
         self._generate_calls: set[asyncio.Future] = set()
+        # With children: an env runtime may run each agent as a subprocess.
+        self._process_stats = ProcessStats("rollout_worker", children=True)
 
     @concurrent_endpoint
     async def setup_async(
@@ -147,6 +151,14 @@ class RolloutWorkerActor(Actor):
     @concurrent_endpoint
     async def hostname(self) -> str:
         return socket.gethostname()
+
+    @concurrent_endpoint
+    async def process_metrics(self) -> list[m.Metric]:
+        """This worker's and its agent subprocesses' CPU since the previous call, and their memory."""
+        # A /proc scan, 0.18-0.30 s on a host with ~2,600 processes. It runs off the event loop, on
+        # one of the `num_threads` default-executor threads that rollouts also use.
+        # TODO: one scan per host instead of one per worker.
+        return await asyncio.to_thread(self._process_stats.metrics)
 
     async def __cleanup__(self, exc: Exception | None) -> None:
         """Monarch runs this on a graceful stop (`mesh.stop()`), after cancelling the endpoint
