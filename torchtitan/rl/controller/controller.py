@@ -165,6 +165,13 @@ class ValidationConfig:
     no periodic validations. A resumed run's start step follows the same rule: freq=25, resumed at 25 -> due at
     25, 50, ...; resumed at 13 -> due at 25, 50, ..."""
 
+    num_samples_per_prompt: int = 1
+    """Rollouts per prompt; `validation_reward/_mean` averages all of them (mean@k). Each runs as its own
+    group, so a failed rollout drops only itself. Above 1, set `temperature` above 0."""
+
+    temperature: float = 0.0
+    """Validation sampling temperature; 0.0 is greedy. top_p is always 1.0."""
+
     validate_at_step_0: bool = True
     """A validation that starts at step 0. Turn it off when you already know that score."""
 
@@ -183,6 +190,15 @@ class ValidationConfig:
             raise ValueError("validation steps must be -1 or non-negative")
         if self.freq is not None and self.freq < 1:
             raise ValueError(f"validation freq must be None or >= 1, got {self.freq}")
+        if self.num_samples_per_prompt < 1:
+            raise ValueError(
+                f"validation num_samples_per_prompt must be >= 1, got {self.num_samples_per_prompt}"
+            )
+        if self.num_samples_per_prompt > 1 and self.temperature == 0.0:
+            raise ValueError(
+                f"validation num_samples_per_prompt={self.num_samples_per_prompt} at temperature 0.0 "
+                "repeats one greedy answer; set temperature above 0"
+            )
 
 
 @dataclass(kw_only=True, slots=True)
@@ -767,8 +783,8 @@ class Controller(Configurable):
     async def _collect_validation_rollouts(
         self, *, samples: list[object], sampling: SamplingConfig, step: int
     ) -> tuple[list[RolloutGroup], list[m.Metric]]:
-        """Sample held-out prompts, run each greedily (n=1) concurrently, and emit validation metrics."""
-        # TODO: group_size=1 (best-of-1) only. Support best-of-N.
+        """Run each held-out prompt as a group of one rollout, concurrently, and emit validation metrics."""
+        # TODO: report pass@k next to the mean when ValidationConfig.num_samples_per_prompt > 1.
         generate = self._make_generate_fn()
         release_session_fn = self._make_release_session_fn()
         # Each id is used once, so validations that run at the same time never share one.
@@ -824,7 +840,7 @@ class Controller(Configurable):
 
     @sl.log_trace_span("validate")
     async def validate(self, *, step: int) -> list[m.Metric]:
-        """Run greedy validation on held-out prompts.
+        """Run validation on held-out prompts: `num_samples_per_prompt` rollouts each, greedy by default.
 
         Args:
             step: Training step this validation starts at.
@@ -844,10 +860,19 @@ class Controller(Configurable):
         # in a rollouter's own limit. Do it when validation moves out of the controller.
         # Off the event loop: training runs meanwhile, and building the dataset can take seconds.
         samples = await asyncio.to_thread(self._rollouter.get_validation_samples, steps)
-        greedy = replace(self._sampling, temperature=0.0, top_p=1.0)
+        validation = self.config.async_loop.validation
+        # Example: prompts [a, b], num_samples_per_prompt=2 -> groups [a, a, b, b].
+        samples = [
+            sample for sample in samples for _ in range(validation.num_samples_per_prompt)
+        ]
+        # A fixed seed would make the repeats of one prompt identical, so repeats sample unseeded.
+        seed = self._sampling.seed if validation.num_samples_per_prompt == 1 else None
+        sampling = replace(
+            self._sampling, temperature=validation.temperature, top_p=1.0, seed=seed
+        )
 
         rollout_groups, validation_metrics = await self._collect_validation_rollouts(
-            samples=samples, sampling=greedy, step=step
+            samples=samples, sampling=sampling, step=step
         )
 
         self.rollout_recorder.record(is_validation=True, rollout_groups=rollout_groups)

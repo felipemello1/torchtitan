@@ -1127,3 +1127,27 @@ def test_shared_generate_fn_keeps_training_and_validation_metrics_separate() -> 
         }
 
     asyncio.run(run())
+
+
+def test_validate_runs_each_prompt_num_samples_times_at_its_temperature() -> None:
+    """num_samples_per_prompt=2, temperature 1.0: prompts [a, b] run as groups [a, a, b, b], top_p 1.0, unseeded."""
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(
+            validation=ValidationConfig(
+                steps=2, num_samples_per_prompt=2, temperature=1.0
+            )
+        )
+    )
+    controller._rollouter = SimpleNamespace(
+        get_validation_samples=lambda steps: ["a", "b"]
+    )
+    controller._sampling = SamplingConfig(temperature=0.7, seed=5)
+    controller.rollout_recorder = Mock()
+    collect = AsyncMock(return_value=([], []))
+    with patch.object(Controller, "_collect_validation_rollouts", collect):
+        asyncio.run(controller.validate(step=3))
+    kwargs = collect.call_args.kwargs
+    assert kwargs["samples"] == ["a", "a", "b", "b"]
+    sampling = kwargs["sampling"]
+    assert (sampling.temperature, sampling.top_p, sampling.seed) == (1.0, 1.0, None)
