@@ -21,5 +21,9 @@ def c4_document_capacity(num_tokens_per_microbatch: int) -> int:
         "C4 document capacity is an estimate. Tune dataloader.max_num_documents "
         "for your workload to balance attention overhead and packing padding.",
     )
-    # Estimate 16 document slots per 8K tokens, with at least 16 for short batches.
-    return max(16, (num_tokens_per_microbatch + 511) // 512)
+    # The packer pads the rest of a row once it holds this many documents. C4 averages
+    # one document per ~460 tokens (Qwen3 tokenizer). The busiest rows measured, from 8k
+    # to 164k tokens, held up to 25 documents more than one per 384 tokens. Empty slots
+    # cost a little attention time, so the margin stays small: one slot per 384 tokens,
+    # plus 32.
+    return (num_tokens_per_microbatch + 383) // 384 + 32
