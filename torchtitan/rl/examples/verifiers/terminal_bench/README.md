@@ -22,7 +22,7 @@ them.
 
 ```text
 +------------------------- GPU actors (Monarch) -------------------------+
-|  router -> vLLM generators  <-- new weights --  trainer (RL loss)      |
+|  vLLM generators (router picks one) <-- weights -- trainer (RL loss)   |
 +-------^-----------------------------------------------------^----------+
         |                                                     |
         | 4. generate                                         | 7. batch

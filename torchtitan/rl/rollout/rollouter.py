@@ -234,16 +234,16 @@ class Rollouter(Configurable):
         )
 
     async def close(self) -> None:
-        """Stop the rollout workers once the generator router owes none of them an answer.
+        """Stop the rollout workers once no generator or the generator router owes them an answer.
 
-        An answer that reaches a stopped worker fails the router, and the finished job exits 130.
-        `Controller.close` closes the generators first, so pending generate calls fail fast. Then,
-        within one _SHUTDOWN_DRAIN_TIMEOUT_S:
+        An answer that reaches a stopped worker fails the actor that sends it (a generator, or the generator
+        router), and the finished job exits 130. `Controller.close` closes the generators first, so pending
+        generate calls fail fast. Then, within one _SHUTDOWN_DRAIN_TIMEOUT_S:
 
             1. wait for the `run_group` calls still running (each fails at its next generate call)
-            2. on every worker, wait for the generate calls the router hasn't answered yet: a
-               cancelled rollout stopped waiting for its call, but the router still answers it.
-               A dead worker's error is logged with its traceback; the other workers still wait.
+            2. on every worker, wait for the generate calls not answered yet: a cancelled rollout stopped
+               waiting for its call, but its generator still answers it. A dead worker's error is logged
+               with its traceback; the other workers still wait.
             3. stop the workers, also after a timeout, an error, or a cancel of `close`
         """
         workers = self._workers
