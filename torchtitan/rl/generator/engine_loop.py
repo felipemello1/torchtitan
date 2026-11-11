@@ -342,6 +342,9 @@ class EngineLoop:
                         )
                     return
 
+                # TODO: if one decision holds a session's release and that session's new generate call
+                # (its rollout was cancelled right after sending it), the release runs first and the call
+                # holds the session's KV again until LRU eviction. Apply releases after `add_requests`.
                 self._engine.release_sessions(
                     decision.released_session_ids, decision.released_group_ids
                 )

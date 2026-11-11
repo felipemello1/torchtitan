@@ -1,89 +1,128 @@
 # Verifiers integration
 
-This directory contains the optional bridge between TitanRL and
-[Verifiers](https://github.com/PrimeIntellect-ai/verifiers). Other TitanRL
-recipes do not import or require Verifiers.
+The optional bridge between TitanRL and [Verifiers](https://github.com/PrimeIntellect-ai/verifiers),
+pinned to Verifiers 0.4.1 (`verifiers.v1` API). Other TitanRL recipes don't import Verifiers.
 
-The ownership boundary is:
+- TitanRL picks the tasks, serves the model calls and trains on the scored groups.
+- Verifiers runs the env, the agent and its tools, the runtime and the task reward.
+- The code here converts tasks and traces between the two.
 
-- TitanRL loads samples, schedules rollout groups, routes generation, tracks
-  policy versions, computes advantages, and trains the policy.
-- Verifiers runs the environment, agent or tool loop, runtime, and task reward.
-- The adapter converts samples and traces between the two systems.
+Words used below:
 
-Reusable bridge code lives alongside this README. Each experiment has its own
-package and dependencies: [`dapo_math/`](./dapo_math) (single-turn math) and
-[`terminal_bench/`](./terminal_bench) (multi-turn terminal agent on Harbor tasks).
+```text
+taskset   the list of tasks, e.g. Terminal-Bench's
+harness   the program that runs the agent, e.g. Terminus
+env       a taskset plus the agents that solve it
+runtime   where an agent runs, e.g. a Docker container or a local process
+trace     Verifiers' record of one agent's run: each message and model call
+group     the rollouts of one task, scored together
+```
+
+Examples, each with its own README and dependencies. Start with [`dapo_math/`](./dapo_math):
+single-turn math, no sandbox. [`terminal_bench/`](./terminal_bench) is a multi-turn terminal agent.
 
 ## Integration flow
 
 ![TorchTitan and Verifiers integration architecture](../../../../assets/images/rl_verifiers_integration_architecture.svg)
 
-1. [`data.py`](./data.py) loads a Verifiers taskset in the TitanRL controller,
-   where TitanRL samples each rollout task. It converts the task's typed data
-   to a plain dictionary because `VerifiersEnvClient` sends that data as
-   msgpack over ZMQ to the separately spawned environment-server process. The
-   server reconstructs the typed task before running the Verifiers environment.
-2. [`env_server.py`](./env_server.py) currently spawns and owns the Verifiers server as
-   a separate local process on the TitanRL controller host. The configured
-   Verifiers runtime is independent: for example, `SubprocessConfig` or
-   `DockerConfig` for the agent. The server and each of its pool workers first run
-   [`worker_setup.py`](./worker_setup.py). Every worker imports that module, so it
-   must not import torch.
-3. [`generation_server.py`](./generation_server.py) exposes TitanRL's `GenerateFn` through the
-   HTTP token-generation protocol expected by Verifiers. It also retains the
-   policy-version span and metrics that are absent from Verifiers traces.
-4. `rollouter.py` sends samples to Verifiers and converts the
-   returned trace graph into TitanRL `RolloutTurn` objects. TitanRL then applies
-   its rubric and advantage estimator normally.
+1. [`data.py`](./data.py) loads the taskset in the controller, which sends each task to a rollout
+   worker as a plain dict. Workers never load the dataset.
+2. `rollouter.py` runs each group in a rollout worker process (`VerifiersRolloutWorker`), like
+   TitanRL's own rollout groups. The worker loads the Verifiers env once. For each rollout, it
+   starts an agent in the configured runtime, e.g. `DockerConfig`, `SubprocessConfig` or
+   `PrimeConfig`.
+3. An agent's model call goes to Verifiers in the same worker. Verifiers turns it into tokens and
+   sends them to [`generation_server.py`](./generation_server.py), a small HTTP server on localhost
+   that forwards them to TitanRL's generators. It also records what Verifiers' traces leave out:
+   the policy versions and the generation metrics.
+4. When a rollout ends, the worker turns the trainable agent's trace into TitanRL `RolloutTurn`s.
+   TitanRL scores and trains them as usual.
 
-The training dataset is the single source of the environment taskset config.
-`VerifiersRollouter.Config` copies it into the environment-server config, so an
-experiment must not configure the same taskset a second time.
+## Taskset ids
 
-For CPU-heavy environments, increase the Verifiers worker-pool size first. A
-future implementation could instead place the environment server in a Monarch
-actor. That would require routable ZMQ and generation-server addresses plus
-actor-owned startup and shutdown; the current integration does not provide
-that placement mode.
+Verifiers loads each taskset, harness or env by id: the name of a Python package. It imports the
+package and takes the one class of that kind in its `__all__`:
+
+```text
+id "torchtitan_verifiers_terminal_bench"
+  import torchtitan_verifiers_terminal_bench
+  __all__ = ["TerminalBenchTerminusHarness", "TerminalTaskset"]
+  taskset -> TerminalTaskset, harness -> TerminalBenchTerminusHarness
+```
+
+Leave the harness or the env unset, and Verifiers takes the one in the taskset's package. If there
+is none, it uses its defaults: the `bash` harness and `SingleAgentEnv`.
+
+Outside this repo, any top-level package name works as the id. Don't reuse a built-in Verifiers
+plugin's name (e.g. `harbor`, `bash`, `codex`): Verifiers looks for its own first.
+
+Configs carry ids, not classes, so each of these processes imports the package:
+the controller and each rollout worker.
+
+`pyproject.toml` ships every `torchtitan_verifiers_*` package. An editable install
+(`pip install -e . --no-deps`) sees only the packages that existed when it ran: rerun it after you
+add or pull a new one.
 
 ## Add an experiment
 
-Create one package per task, with its own dependency list:
+For a task `my_task`:
 
 ```text
-verifiers/
-  data.py
-  env_server.py
-  generation_server.py
-  rollouter.py
-  worker_setup.py
-  my_task/
-    __init__.py
-    recipe module
-    data.py
-    requirements.txt
-    rollouter.py
+torchtitan/rl/examples/verifiers/my_task/
+  __init__.py
+  data.py                                  # your Taskset and its TasksetConfig
+  requirements.txt                         # its own dependencies
+torchtitan_verifiers_my_task/__init__.py   # __all__ re-exports your Taskset
+torchtitan_recipes/rl/verifiers_my_task.py # recipe functions that return a Controller.Config
 ```
 
-1. In `data.py`, define the Verifiers `Taskset` and `TasksetConfig`.
-2. In `rollouter.py`, put that config in
-   `VerifiersTaskDataset.Config.verifiers_taskset`. Configure the agent,
-   harness, runtime, and worker pool, but leave
-   `verifiers_env_server.environment.taskset` unset; `VerifiersRollouter`
-   derives it from the training dataset.
-3. In `recipe module`, select the rollouter from `Controller.Config`.
-4. Place the module under `torchtitan/rl/examples` or pass its fully qualified
-   module path to `--module`.
+Keep the `torchtitan_verifiers_` prefix: `pyproject.toml`, the PR labeler and the reviewer routing
+match it.
 
-Run the recipe with:
+Start the recipe from a copy of
+[`verifiers_dapo_math.py`](../../../../torchtitan_recipes/rl/verifiers_dapo_math.py). Change three
+things:
+
+1. In both `VerifiersTaskDataset.Config`s (training and validation), set your `TasksetConfig`, with
+   `id="torchtitan_verifiers_my_task"`.
+2. Set your agent, harness and runtime in `VerifiersRolloutWorker.Config.environment`. Leave its
+   `taskset` unset: `VerifiersRollouter` copies it from the training dataset.
+3. Set `ValidationConfig.steps` for your validation set: the recipe validates on 30 tasks and
+   raises if there are fewer. -1 reads all of them.
+
+Then run:
 
 ```bash
 python -m torchtitan.rl.train \
-  --module verifiers.my_task \
-  --config <config-name>
+  --module torchtitan_recipes.rl.verifiers_my_task \
+  --config <recipe function name>
 ```
 
-See [DAPO Math](./dapo_math) for a complete single-turn example and
-[Terminal-Bench](./terminal_bench) for a multi-turn agent example. This
-integration pins Verifiers 0.4.0 and uses its `verifiers.v1` API.
+## Scaling
+
+The rollout workers do the env's CPU work: rendering (turning messages into tokens) and decoding
+traces. The agent itself runs in its runtime.
+
+- Workers busy on CPU: raise the rollouter's `worker_pool_size` (default 4; the Terminal-Bench
+  recipe uses 16).
+- Renders waiting: lower the worker's `renderer_multiplex` (rollouts per renderer, default 256). A
+  renderer renders one prompt at a time, behind a lock. More renderers (~75-95 MB each) render in
+  parallel, up to `num_threads_per_worker` at once.
+- Each worker is its own Verifiers run, so run-wide limits apply per worker. Example: 16 workers
+  with `PrimeConfig.creates_per_min=10` start up to 160 sandboxes a minute.
+
+## Which failed rollouts train
+
+A failed rollout either trains (usually at reward 0) or is ERROR_INFRA. ERROR_INFRA means the
+failure isn't the policy's fault. That rollout gets no reward and isn't trained. The rest of its
+group still trains.
+
+- ERROR_INFRA: a grading deadline passed, a model call failed (other than a prompt past the
+  context), the rollout ended before the policy's first turn, or the sandbox, a tool or the task's
+  code failed.
+- Trains: the last prompt grew past the context, another deadline passed (e.g. the agent's), or
+  the agent exited (e.g. the model ran `pkill` on it).
+- A first prompt past the context has no tokens to train, so its whole group is dropped.
+
+The exact rules, in order: `VerifiersRolloutWorker.rollout_status`. The metric
+`rollout/status_rate/error_infra` tracks the share of ERROR_INFRA rollouts.

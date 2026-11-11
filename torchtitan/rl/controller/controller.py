@@ -87,6 +87,7 @@ _trainer_loop
 """
 
 import asyncio
+import contextlib
 import copy
 import itertools
 import json
@@ -95,6 +96,7 @@ import math
 import os
 import time
 import warnings
+from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -128,6 +130,7 @@ from torchtitan.rl.controller.work_buffer import (
 from torchtitan.rl.generator.generator import Generator
 from torchtitan.rl.generator.types import SamplingConfig
 from torchtitan.rl.observability import metrics as m
+from torchtitan.rl.observability.metrics.process import ProcessStats
 from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.recorder import RolloutSampleRecorder
 from torchtitan.rl.rollout.rollouter import Rollouter
@@ -160,8 +163,9 @@ class ValidationConfig:
         due at 75                    ...==x   cancelled: training ended
     """
 
-    steps: int = 20
-    """Maximum prompts per validation. -1 reads the finite source once; 0 disables."""
+    steps: int = -1
+    """Prompts per validation, never repeated. -1 reads the whole validation dataset; N > 0 reads
+    the first N and raises if the dataset has fewer. 0 disables."""
 
     freq: int | None = None
     """A validation comes due at each multiple of `freq` after step 0; none starts at the last step. None:
@@ -581,6 +585,8 @@ class Controller(Configurable):
             stop_token_ids=list(self.renderer.get_stop_token_ids()),
         )
         self._rollouter: Rollouter = config.rollouter.build()
+        # No children: on one node the controller's descendants are the job's other processes.
+        self._process_stats = ProcessStats("controller", children=False)
         self.rollout_recorder = config.rollout_recorder.build(
             dump_dir=config.dump_folder
         )
@@ -827,22 +833,24 @@ class Controller(Configurable):
         # Each id is used once, so validations that run at the same time never share one.
         group_ids = [next(self._validation_group_ids) for _ in samples]
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
-        group_results = await asyncio.gather(
-            *(
-                self._rollouter.run_group_rollouts(
-                    generate_fn=generate,
-                    release_session_fn=release_session_fn,
-                    sample=sample,
-                    group_id=group_id,
-                    group_size=1,
-                    sampling=sampling,
-                )
-                for group_id, sample in zip(group_ids, samples, strict=True)
-            ),
-            return_exceptions=True,
-        )
-        # Drop the generators' pinned cache salts and held KV for these groups.
-        await self.generator_router.release_groups.call_one(group_ids)
+        try:
+            group_results = await asyncio.gather(
+                *(
+                    self._rollouter.run_group_rollouts(
+                        generate_fn=generate,
+                        release_session_fn=release_session_fn,
+                        sample=sample,
+                        group_id=group_id,
+                        group_size=1,
+                        sampling=sampling,
+                    )
+                    for group_id, sample in zip(group_ids, samples, strict=True)
+                ),
+                return_exceptions=True,
+            )
+        finally:
+            # Drop the generators' pinned cache salts and held KV for these groups.
+            await self.generator_router.release_groups.call_one(group_ids)
 
         # Keep the groups that succeeded; log + count the ones that raised.
         rollout_groups: list[RolloutGroup] = []
@@ -894,7 +902,8 @@ class Controller(Configurable):
         logger.info(f"Validation started at step {step}")
         # TODO: read prompts as slots free up and drop each once its metrics are folded, instead of
         # reading every prompt first. That also bounds the slots a validation takes in the generators and
-        # in a rollouter's own limit. Do it when validation moves out of the controller.
+        # in a rollouter's own limit. Keep one fresh dataset per validation, so validations that overlap
+        # each start at the first prompt. Do it when validation moves out of the controller.
         # Off the event loop: training runs meanwhile, and building the dataset can take seconds.
         samples = await asyncio.to_thread(self._rollouter.get_validation_samples, steps)
         greedy = replace(self._sampling, temperature=0.0, top_p=1.0)
@@ -1038,10 +1047,8 @@ class Controller(Configurable):
             # Then cancel covers anything blocked on the queue (which close does not wake); gather awaits all.
             # Cancel the validations too: `_validation_tasks` holds every validation not logged yet. On a
             # healthy end, a validation that already ended keeps its result for the call after training. A
-            # cancelled validation is never logged, and its groups stay pinned in the generators. Its rollouts
-            # keep running until close() if the rollouter shields them (the base Rollouter does).
-            # TODO: abort a cancelled validation's rollouts and release its groups. The generators have no abort
-            # path yet.
+            # cancelled validation is never logged: its groups stop on their workers (see
+            # `Rollouter.run_group_rollouts`), and `_collect_validation_rollouts` still releases them.
             await self._group_buffer.close()
             for task in (*background_tasks, trainer_task, *self._validation_tasks):
                 task.cancel()
@@ -1192,8 +1199,9 @@ class Controller(Configurable):
                     rollouts=[],
                     metrics=[m.Metric("rollout/group_failures", m.Sum(1.0))],
                 )
-            # The group makes no more generation calls, so its cache salts can go.
-            await self.generator_router.release_groups.call_one([work.group_id])
+            finally:
+                # The group makes no more generation calls, so its cache salts can go.
+                await self.generator_router.release_groups.call_one([work.group_id])
             await group_buffer.finalize_work(group)
 
             # Drop both refs (work.rollout_group is the group too): held groups made every full GC slow.
@@ -1279,12 +1287,20 @@ class Controller(Configurable):
                 # Not awaited: it would wait behind an in-flight add_group.
                 self.batcher.sync_log_step.broadcast(step)
                 await self._rollouter.sync_log_step(step)
+            # Read the workers', the router's and the controller's CPU and memory while the trainer
+            # steps. A read covers the time since the previous one (about the previous step); step
+            # 1's covers setup too (env and checkpoint loading).
+            process_metrics_task = asyncio.create_task(self._read_process_metrics())
             step_timer = MetricsTimer()
 
-            with (
-                sl.log_trace_span("train_step"),
-                step_timer.record("timing/step/total"),
-            ):
+            async with contextlib.AsyncExitStack() as step_scope:
+                step_scope.enter_context(sl.log_trace_span("train_step"))
+                step_scope.enter_context(step_timer.record("timing/step/total"))
+                # Every exit waits for the read; an early one (batcher closed, NaN loss, an error)
+                # cancels it first.
+                step_scope.push_async_callback(
+                    _finish_process_metrics_read, process_metrics_task
+                )
                 # Waits for a TrainerStepBatch to be ready (or None on shutdown).
                 with (
                     sl.log_trace_span("wait_for_training_batch"),
@@ -1392,6 +1408,12 @@ class Controller(Configurable):
                         optimizer_result.policy_version, after=push_task
                     )
                 )
+                # Done by now unless the read outlasts the step; then this wait shows how much longer.
+                with (
+                    sl.log_trace_span("blocking_read_process_metrics"),
+                    step_timer.record("timing/step/blocking_read_process_metrics"),
+                ):
+                    process_metrics = await process_metrics_task
 
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.
@@ -1411,6 +1433,7 @@ class Controller(Configurable):
                             for key, value in optimizer_result.metrics.items()
                         ],
                         *self._group_buffer.metrics(),
+                        *process_metrics,
                         *time_metrics,
                         *policy_age_panel,
                         # Background push/pull work time; the trainer's wait for it is timing/step/blocking_*.
@@ -1443,6 +1466,28 @@ class Controller(Configurable):
             await push_task
             await pull_task
 
+    async def _read_process_metrics(self) -> list[m.Metric]:
+        """CPU since the previous read and memory of the rollout workers (with their agent
+        subprocesses), the router and this controller. Workers may run on other hosts."""
+        # Once cancelled, a TaskGroup waits for every part to finish, so none outlives the step.
+        async with asyncio.TaskGroup() as group:
+            worker_metrics = group.create_task(self._rollouter.process_metrics())
+            # `create_task` takes a coroutine, and a Monarch `call_one()` returns a Future.
+            router_metrics = group.create_task(
+                _awaited(self.generator_router.process_metrics.call_one())
+            )
+            # Reading smaps_rollup walks this process's page tables (25-41 ms at 32 GiB), so it
+            # runs in a thread. A cancelled read's thread still finishes on its own; no read
+            # follows an early exit.
+            own_metrics = group.create_task(
+                asyncio.to_thread(self._process_stats.metrics)
+            )
+        return [
+            *worker_metrics.result(),
+            *router_metrics.result(),
+            *own_metrics.result(),
+        ]
+
     async def _push_model_state_dict(self) -> float:
         """Push the trainer's model state dict to TorchStore; returns its wall time in seconds."""
         with sl.log_trace_span("trainer_push_model_state_dict"):
@@ -1471,3 +1516,23 @@ class Controller(Configurable):
             self.config.async_loop.num_prompts_per_train_step, reason="trained"
         )
         return pull_s
+
+
+async def _finish_process_metrics_read(task: asyncio.Task) -> None:
+    """Cancel the step's process-metrics read if it still runs, and wait until it ends.
+
+    A read that failed:
+        early exit (NaN loss, an error, batcher closed)   logged, so it can't hide the step's error
+        normal step                                       already raised by the step's `await`; a
+                                                          read fails only when a worker or the
+                                                          router died, which ends the job anyway
+    """
+    task.cancel()
+    await asyncio.wait([task])
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning("Reading process metrics failed: %r", task.exception())
+
+
+async def _awaited(awaitable: Awaitable[Any]) -> Any:
+    """Wrap an awaitable in a coroutine, for `TaskGroup.create_task`."""
+    return await awaitable

@@ -13,8 +13,6 @@ Terminal-Bench 2.1 Harbor dataset, which the ``harbor`` CLI downloads into
 The Muse Glimmer example is capped at its model's 16K context length.
 """
 
-import math
-
 import verifiers.v1 as vf
 
 from renderers import CustomRendererConfig, Qwen35RendererConfig
@@ -30,8 +28,11 @@ from torchtitan.components.optim import (
 from torchtitan.components.renderer import from_renderers
 from torchtitan.config import PrecisionConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config.transform import apply_transforms
+from torchtitan.config.transform.dist_moe import DistMoeTransform
 from torchtitan.distributed.activation_remat import FullActivationRematConfig
 from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.models.common.dist_moe import DistMoeRuntime
 from torchtitan.models.muse_glimmer import (
     build_model_config as build_muse_glimmer_model_config,
 )
@@ -42,20 +43,15 @@ from torchtitan.rl.controller.controller import (
     ValidationConfig,
 )
 from torchtitan.rl.examples.verifiers.data import VerifiersTaskDataset
-from torchtitan.rl.examples.verifiers.env_server import VerifiersEnvServer
 from torchtitan.rl.examples.verifiers.generation_server import GenerationServer
 from torchtitan.rl.examples.verifiers.rollouter import (
     RewardFromVerifiers,
     VerifiersRollouter,
+    VerifiersRolloutWorker,
 )
 from torchtitan.rl.examples.verifiers.terminal_bench.harness import (
-    register_harness_alias,
     TerminalBenchTerminusHarnessConfig,
 )
-from torchtitan.rl.examples.verifiers.terminal_bench.taskset import (
-    TerminalTasksetConfig,
-)
-from torchtitan.rl.examples.verifiers.worker_setup import register_local_taskset_alias
 from torchtitan.rl.generator.generator import Generator
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import SamplingConfig
@@ -73,84 +69,103 @@ from torchtitan.rl.routing.strategies import (
     LeastLoadedRoutingStrategy,
     StickySessionRoutingStrategy,
 )
-from torchtitan.rl.trainer.losses import GRPOLoss
+from torchtitan.rl.trainer.losses import DAPOLoss, GRPOLoss
 from torchtitan.rl.trainer.trainer import Trainer
 from verifiers.v1.configs.agent import TimeoutConfig as AgentTimeoutConfig
-from verifiers.v1.tasksets.harbor import HarborEnvConfig
+from verifiers.v1.utils.loaders import taskset_config_type
 
 from torchtitan_recipes.rl.model_configs import build_rl_model_configs
 
-_ENV_SERVER_WORKERS = 16
+# Verifiers id of the example's taskset and harness: the repo-root package that exports both.
+_TERMINAL_BENCH_PACKAGE_ID = "torchtitan_verifiers_terminal_bench"
 
 
-def _terminal_bench_rollouter_config(
+def terminal_bench_rollouter_config(
     train_dataset: str,
     validation_dataset: str,
     *,
     max_context_length: int,
     max_turns: int,
-    max_concurrent_rollouts: int,
+    taskset_id: str = _TERMINAL_BENCH_PACKAGE_ID,
 ) -> VerifiersRollouter.Config:
-    """Select Harbor datasets by id.
+    """Build the Terminal-Bench rollouter: Harbor datasets by id, local Docker, in-sandbox Terminus-2.
 
-    ``max_context_length`` is the generator's sequence length; the generation
-    server caps each rollout at it. ``max_turns`` is the agent turn limit,
-    which Verifiers enforces. ``max_concurrent_rollouts`` sizes the env server;
-    set it to the number of rollouts the controller keeps in flight, or the
-    excess queues in the env server and the generators idle.
+    Args:
+        train_dataset: Harbor dataset id for training, e.g. ``"local/tmax@v1"``.
+        validation_dataset: Harbor dataset id for validation; must differ from ``train_dataset``.
+        max_context_length: The generator's sequence length; the generation server caps
+            each rollout at it.
+        max_turns: The agent turn limit, which Verifiers enforces.
+        taskset_id: Verifiers id: the name of a top-level package whose ``__all__`` exports
+            exactly one Taskset (``TerminalTaskset`` or a subclass), and an Env if it needs its
+            own. Both datasets use the config class that Taskset declares. Default: this
+            example's package.
+
+    The harness stays the example's Terminus-2. Runtime and harness are fields of the returned
+    config, e.g. ``worker.environment.agent.runtime``.
     """
     if train_dataset == validation_dataset:
         raise ValueError(
             "Training and Terminal-Bench evaluation must use different datasets"
         )
 
-    taskset_id = register_local_taskset_alias(TerminalTasksetConfig.__module__)
+    taskset_config_cls = taskset_config_type(taskset_id)
     return VerifiersRollouter.Config(
         training_dataloader=IterableRolloutDataLoader.Config(
             dataset=VerifiersTaskDataset.Config(
-                verifiers_taskset=TerminalTasksetConfig(
-                    id=taskset_id, dataset=train_dataset
+                verifiers_taskset=taskset_config_cls(
+                    id=taskset_id,
+                    dataset=train_dataset,
+                    ignore_timeouts=False,
                 ),
                 seed=42,
                 shuffle=True,
             ),
         ),
         validation_dataset=VerifiersTaskDataset.Config(
-            verifiers_taskset=TerminalTasksetConfig(
-                id=taskset_id, dataset=validation_dataset
+            verifiers_taskset=taskset_config_cls(
+                id=taskset_id,
+                dataset=validation_dataset,
+                ignore_timeouts=False,
             ),
             seed=99,
             shuffle=False,
         ),
-        verifiers_env_server=VerifiersEnvServer.Config(
-            environment=HarborEnvConfig(
+        worker=VerifiersRolloutWorker.Config(
+            environment=vf.SingleAgentEnvConfig(
                 agent=vf.AgentConfig(
                     harness=TerminalBenchTerminusHarnessConfig(
-                        id=register_harness_alias(), version="0.22.0"
+                        id=_TERMINAL_BENCH_PACKAGE_ID, version="0.22.0"
                     ),
                     runtime=vf.DockerConfig(),
                     max_turns=max_turns,
-                    timeout=AgentTimeoutConfig(
-                        setup=600,
-                        rollout=7200,
-                        scoring=12000,
-                    ),
+                    # Setup and agent timeouts apply to every task. Grading uses the task's
+                    # verifier timeout from task.toml (ignore_timeouts=False), else Harbor's 600 s.
+                    timeout=AgentTimeoutConfig(setup=600, rollout=7200),
                 ),
             ),
-            serve=vf.ServeConfig(
-                pool=vf.StaticPoolConfig(num_workers=_ENV_SERVER_WORKERS),
-                max_concurrent=math.ceil(max_concurrent_rollouts / _ENV_SERVER_WORKERS),
-                address="tcp://127.0.0.1:0",
+            rubric=Rubric.Config(
+                reward_fns=[RewardFromVerifiers.Config(weight=1.0)],
+                error_reward=0.0,
+            ),
+            generation_server=GenerationServer.Config(
+                max_rollout_tokens=max_context_length
             ),
         ),
-        rubric=Rubric.Config(
-            reward_fns=[RewardFromVerifiers.Config(weight=1.0)],
-            error_reward=0.0,
-        ),
-        generation_server=GenerationServer.Config(
-            max_rollout_tokens=max_context_length
-        ),
-        connection_timeout_sec=1800.0,
+        # TODO: 16 is untuned. Set it from a Terminal-Bench run with Docker: rollouts in flight
+        # per worker, render wait and host RAM.
+        worker_pool_size=16,
+        # The README's toy sandbox: task containers run on the controller's host, the one host
+        # whose Docker the example expects. On another host without Docker, every rollout would
+        # fail at once.
+        # TODO: spread the workers once every worker host runs Docker (or a real sandbox).
+        workers_on_controller_host=True,
+        # 32 threads (Python's default on a host with 28+ CPUs) for the worker's `asyncio.to_thread`
+        # calls. A render waiting for its renderer's lock holds a thread, and Verifiers' runtimes
+        # clean up on these threads (e.g. `docker rm --force`). With the default 4, waiting renders
+        # would hold every thread and block cleanup. More threads don't speed up renders: one
+        # renderer serves up to `renderer_multiplex` rollouts, one render at a time.
+        num_threads_per_worker=32,
     )
 
 
@@ -168,7 +183,7 @@ def rl_grpo_qwen35_9b_terminal_bench() -> Controller.Config:
         num_prompts_per_train_step=12,
         num_samples_per_prompt=32,
         target_offpolicy_steps=3,
-        validation=ValidationConfig(steps=89),
+        validation=ValidationConfig(steps=-1),
     )
     trainer_parallelism = ParallelismConfig(
         data_parallel_replicate_degree=1,
@@ -194,13 +209,11 @@ def rl_grpo_qwen35_9b_terminal_bench() -> Controller.Config:
             filter=KeepExtremeRewardsFilter.Config(keep_errors=True)
         ),
         async_loop=async_loop,
-        rollouter=_terminal_bench_rollouter_config(
+        rollouter=terminal_bench_rollouter_config(
             train_dataset="local/tmax@v1",
             validation_dataset="terminal-bench/terminal-bench-2-1",
             max_context_length=max_context_length,
             max_turns=120,
-            max_concurrent_rollouts=async_loop.max_active_rollout_groups
-            * async_loop.num_samples_per_prompt,
         ),
         renderer=from_renderers(
             Qwen35RendererConfig(
@@ -275,31 +288,33 @@ def rl_grpo_qwen35_9b_terminal_bench() -> Controller.Config:
     )
 
 
-def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
+def rl_dapo_qwen35_35b_a3b_terminal_bench_dist_moe() -> Controller.Config:
     """Qwen3.5-35B-A3B: train on TMax (``local/tmax@v1``), validate on Terminal-Bench 2.1.
 
-    16 GPUs: 8 trainer (FSDP=4, TP=2, EP=8) and 2 generators of 4 GPUs
-    (DP=2, TP=2, EP=4).
+    Dist-MoE routed experts in both roles, so it needs SM100+ GPUs. The 4-GPU trainer
+    needs 288 GB GPUs (GB300, B300). A B200 (180 GB) would keep only about 40 GB per GPU
+    for activations. There, set the trainer's ``data_parallel_shard_degree=4`` (8 GPUs, EP 4
+    and the scratch factor unchanged).
 
-    The layout is constrained from both sides. The model has 2 KV heads, so TP
-    is at most 2 in either role. Trainer EP must be at least TP, divide the 256
-    experts and divide ``dp_shard * tp``; EP=8 spans the whole sparse region, so
-    each rank holds 32 experts. The generator's DP axis only supplies ranks for
-    expert parallelism, so its EP equals DP x TP; 256 experts over 4 ranks is 64
-    each.
+    20 GPUs on GB300 (4 GPUs per host): 5 GPU hosts plus a controller.
+        trainer:     4 GPUs, FSDP 2 x TP 2 x EP 4. Model state is 35.1B x 16 B (fp32
+                     weights, gradients, AdamW m and v) / 4 = 140 GB per GPU.
+        generators:  4 engines, one 4-GPU host each, DP 4 x EP 4. Each GPU holds 64 of
+                     the 256 experts: (2.9B non-routed + 32.2B routed / 4) x 2 B (bf16)
+                     = 22 GB of weights per GPU. The rest holds the KV cache.
 
-    The trainer keeps fp32 master weights, the default. That is about 70 GB of
-    model states per GPU across 8 GPUs before activations, so it needs GPUs with
-    well over 80 GB of memory.
+    Terminal-Bench is generation-bound: a rollout makes up to 120 model calls in a row,
+    with a sandbox command between each, while the trainer processes all of a rollout's
+    tokens in parallel. The trainer state fits one 4-GPU host, so the other 16 GPUs
+    generate.
 
-    Generator CUDA graphs are off because of the standard all-to-all MoE token
-    dispatcher, not DistMoE. That dispatcher copies the split sizes to the host,
-    which CUDA graph capture does not allow
-    ("Cannot copy between CPU and CUDA tensors during CUDA graph capture"). Turn
-    capture back on together with a dispatcher that avoids the host read, such as
-    HybridEP with ``non_blocking_capacity_factor``.
+    With EP 4 a decode step reads at most 64 experts' weights per GPU and MoE layer,
+    not up to 256. The cost: an expert all-to-all in every MoE layer, and the 4 DP
+    ranks step together, each padded to the largest rank's tokens. Dist-MoE's
+    all-to-all keeps split sizes on the GPU, so the engines still run FULL CUDA graphs.
 
-    TODO: migrate to DistMoE and capture generator CUDA graphs in ``FULL`` mode.
+    The model has 2 KV heads, so TP is at most 2. Trainer EP must be at least TP and
+    divide both the 256 experts and FSDP x TP.
     """
     max_context_length = 65536
     max_output_tokens = 16384
@@ -308,18 +323,17 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
         num_prompts_per_train_step=8,
         num_samples_per_prompt=32,
         target_offpolicy_steps=4,
-        validation=ValidationConfig(steps=89),
+        validation=ValidationConfig(steps=-1),
     )
-    # TODO: update to distMoE model config
     trainer_parallelism = ParallelismConfig(
         data_parallel_replicate_degree=1,
-        data_parallel_shard_degree=4,
+        data_parallel_shard_degree=2,
         tensor_parallel_degree=2,
-        expert_parallel_degree=8,
+        expert_parallel_degree=4,
     )
     generator_parallelism = InferenceParallelismConfig(
-        data_parallel_degree=2,
-        tensor_parallel_degree=2,
+        data_parallel_degree=4,
+        tensor_parallel_degree=1,
         expert_parallel_degree=4,
     )
     trainer_model, generator_model = build_rl_model_configs(
@@ -330,20 +344,18 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
         trainer_parallelism=trainer_parallelism,
         generator_parallelism=generator_parallelism,
     )
-    return Controller.Config(
+    config = Controller.Config(
         hf_assets_path="./assets/hf/Qwen3.5-35B-A3B",
         dump_folder="outputs/rl/qwen35_35b_a3b_terminal_bench",
         rollout_recorder=RolloutSampleRecorder.Config(
             filter=KeepExtremeRewardsFilter.Config(keep_errors=True)
         ),
         async_loop=async_loop,
-        rollouter=_terminal_bench_rollouter_config(
+        rollouter=terminal_bench_rollouter_config(
             train_dataset="local/tmax@v1",
             validation_dataset="terminal-bench/terminal-bench-2-1",
             max_context_length=max_context_length,
             max_turns=120,
-            max_concurrent_rollouts=async_loop.max_active_rollout_groups
-            * async_loop.num_samples_per_prompt,
         ),
         renderer=from_renderers(
             Qwen35RendererConfig(
@@ -351,7 +363,7 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
                 thinking_retention="all",
             )
         ),
-        num_generators=2,
+        num_generators=4,
         generator_router=InterGeneratorRouter.Config(
             strategy=StickySessionRoutingStrategy.Config(
                 fallback_strategy=LeastLoadedRoutingStrategy.Config()
@@ -388,6 +400,10 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
                 num_tokens_per_microbatch_per_dp_rank=max_context_length,
             ),
             parallelism=trainer_parallelism,
+            # 4.0 = EP x min(top-k, local experts) / top-k = 4 x 8 / 8: the most one rank
+            # can receive, as a multiple of balanced routing. A rank that receives more
+            # rows than planned raises an error.
+            dist_moe_runtime=DistMoeRuntime.Config(scratch_capacity_factor=4.0),
             activation_remat=FullActivationRematConfig(),
             checkpointer=CheckpointManager.Config(
                 initial_load_in_hf=True,
@@ -397,15 +413,24 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
             ),
             loss=ChunkedLossWrapper.Config(
                 num_chunks=32,
-                loss_fn=GRPOLoss.Config(
-                    global_vocab_size=decoder_vocab_size(trainer_model)
+                loss_fn=DAPOLoss.Config(
+                    ratio_clip_low=0.2,
+                    ratio_clip_high=0.28,
+                    global_vocab_size=decoder_vocab_size(trainer_model),
                 ),
             ),
         ),
         generator=Generator.Config(
             model=generator_model,
-            engine=VLLMEngine.Config(cuda_graph=VLLMCudaGraphConfig(mode="NONE")),
+            engine=VLLMEngine.Config(cuda_graph=VLLMCudaGraphConfig(mode="FULL")),
             parallelism=generator_parallelism,
+            # 4.0 = EP x min(top-k, local experts) / top-k = 4 x 8 / 8: the most one rank
+            # can receive, as a multiple of balanced routing. A rank that receives more
+            # rows than planned raises an error, and vLLM's profiling dummy batch can
+            # route every token to one expert.
+            dist_moe_runtime=DistMoeRuntime.Config(
+                scratch_capacity_factor=4.0, inference=True
+            ),
             checkpointer=None,
             sampling=SamplingConfig(
                 temperature=1.0,
@@ -414,6 +439,10 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
             ),
         ),
     )
+    # Dist-MoE routed experts in both roles.
+    config.trainer = apply_transforms(config.trainer, [DistMoeTransform()])
+    config.generator = apply_transforms(config.generator, [DistMoeTransform()])
+    return config
 
 
 def rl_grpo_muse_glimmer_30b_terminal_bench() -> Controller.Config:
@@ -430,7 +459,7 @@ def rl_grpo_muse_glimmer_30b_terminal_bench() -> Controller.Config:
         num_training_steps=100,
         num_prompts_per_train_step=8,
         num_samples_per_prompt=8,
-        validation=ValidationConfig(steps=89),
+        validation=ValidationConfig(steps=-1),
     )
     trainer_parallelism = ParallelismConfig(
         data_parallel_shard_degree=4,
@@ -457,13 +486,11 @@ def rl_grpo_muse_glimmer_30b_terminal_bench() -> Controller.Config:
             filter=KeepExtremeRewardsFilter.Config(keep_errors=True)
         ),
         async_loop=async_loop,
-        rollouter=_terminal_bench_rollouter_config(
+        rollouter=terminal_bench_rollouter_config(
             train_dataset="local/tmax@v1",
             validation_dataset="terminal-bench/terminal-bench-2-1",
             max_context_length=max_context_length,
             max_turns=8,
-            max_concurrent_rollouts=async_loop.max_active_rollout_groups
-            * async_loop.num_samples_per_prompt,
         ),
         renderer=from_renderers(
             CustomRendererConfig(

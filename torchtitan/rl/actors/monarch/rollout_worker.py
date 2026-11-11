@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import socket
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -18,7 +19,9 @@ from torchtitan.components.renderer import RendererConfig
 
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.observability import structured_logger as sl
-from torchtitan.rl.rollout.rollouter import RolloutWorker
+from torchtitan.rl.observability import metrics as m
+from torchtitan.rl.observability.metrics.process import ProcessStats
+from torchtitan.rl.rollout.rollouter import BaseRolloutWorker
 from torchtitan.rl.rollout.types import RolloutGroup
 
 
@@ -28,18 +31,28 @@ class RolloutWorkerActor(Actor):
     def __init__(
         self,
         *,
-        worker_config: RolloutWorker.Config,
+        worker_config: BaseRolloutWorker.Config,
         num_threads: int,
         structured_logger_init_fn: functools.partial[None] | None,
+        first_worker_index: int,
     ) -> None:
         if structured_logger_init_fn is not None:
+            # Each host's workers form their own proc mesh, so `current_rank()` restarts at 0 on
+            # every host. The offset keeps the log rank unique across hosts.
             structured_logger_init_fn(
-                source="rl_rollout_worker", rank=current_rank().rank
+                source="rl_rollout_worker",
+                rank=first_worker_index + current_rank().rank,
             )
         asyncio.get_running_loop().set_default_executor(
             ThreadPoolExecutor(max_workers=num_threads)
         )
         self._worker = worker_config.build()
+        # group id -> the task running that group's `run_group` here; `cancel_group` cancels it.
+        self._group_tasks: dict[int, asyncio.Task] = {}
+        # Generate calls sent from this worker that the router hasn't answered yet.
+        self._generate_calls: set[asyncio.Future] = set()
+        # With children: an env runtime may run each agent as a subprocess.
+        self._process_stats = ProcessStats("rollout_worker", children=True)
 
     @concurrent_endpoint
     async def setup_async(
@@ -68,15 +81,89 @@ class RolloutWorkerActor(Actor):
         group_size: int,
         sampling: Any,
     ) -> RolloutGroup:
-        return await self._worker.run_group(
-            generate_fn=generate_fn,
-            release_session_fn=release_session_fn,
-            sample=sample,
-            group_id=group_id,
-            group_size=group_size,
-            sampling=sampling,
-        )
+        # If the router replies to a worker that already stopped, Monarch fails the router and the job
+        # exits 130 (https://github.com/meta-pytorch/monarch/issues/5249, a reply-delivery bug). So each
+        # generate call stays in `self._generate_calls` until answered, also after its rollout is cancelled.
+        # TODO(monarch): drop this once Monarch drops such a reply instead of failing the router.
+        async def generate(*args, **kwargs):
+            call = asyncio.ensure_future(generate_fn(*args, **kwargs))
+            self._generate_calls.add(call)
+            call.add_done_callback(self._on_generate_call_done)
+            # TODO: when the rollout is cancelled, abort its request on the generator too; the fix for
+            # Monarch issue 5249 won't. Today the request decodes to its end and can pin its group's
+            # cache salt again.
+            return await asyncio.shield(call)
+
+        self._group_tasks[group_id] = asyncio.current_task()
+        try:
+            return await self._worker.run_group(
+                generate_fn=generate,
+                release_session_fn=release_session_fn,
+                sample=sample,
+                group_id=group_id,
+                group_size=group_size,
+                sampling=sampling,
+            )
+        finally:
+            del self._group_tasks[group_id]
+
+    def _on_generate_call_done(self, call: asyncio.Future) -> None:
+        self._generate_calls.discard(call)
+        # Once its rollout is cancelled, `asyncio.shield` stops watching `call`, so nobody reads its
+        # error and asyncio logs "exception was never retrieved". Read it here. A cancelled `call`
+        # has no error (`exception()` would raise).
+        if not call.cancelled():
+            call.exception()
+
+    @concurrent_endpoint
+    async def cancel_group(self, group_id: int) -> None:
+        """Cancel the group's `run_group` if it still runs on this worker. Returning means the
+        group's work and cleanup ended; its generate calls may still wait for answers
+        (`wait_for_generate_calls`).
+
+            group still runs            cancel it; return once its `finally` blocks ran
+            group already ended         return at once
+            group ignores the cancel    return only when the group ends; the Rollouter stops waiting
+                                        for this call after _SHUTDOWN_DRAIN_TIMEOUT_S
+
+        Monarch starts one sender's concurrent endpoint calls in the order they were sent, so a
+        `run_group` sent before this call is already in `_group_tasks`.
+        """
+        task = self._group_tasks.get(group_id)
+        if task is not None:
+            task.cancel()
+            await asyncio.wait([task])
+
+    @concurrent_endpoint
+    async def wait_for_generate_calls(self) -> None:
+        """Return once this worker got every answer the router owed it when this call started.
+        `Rollouter.close` calls it after every `run_group` ended, so no rollout sends a new call.
+
+            rollout sends generate call c        _generate_calls = {c}
+            cancel_group cancels the rollout     _generate_calls = {c}   the router still owes c
+            the router answers c                 _generate_calls = {}    this returns
+        """
+        # TODO: a call the Verifiers GenerationServer starts after this wait began isn't awaited.
+        if self._generate_calls:
+            await asyncio.wait(self._generate_calls)
 
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:
         sl.set_step(step)
+
+    @concurrent_endpoint
+    async def hostname(self) -> str:
+        return socket.gethostname()
+
+    @concurrent_endpoint
+    async def process_metrics(self) -> list[m.Metric]:
+        """This worker's and its agent subprocesses' CPU since the previous call, and their memory."""
+        # A /proc scan, 0.18-0.30 s on a host with ~2,600 processes. It runs off the event loop, on
+        # one of the `num_threads` default-executor threads that rollouts also use.
+        # TODO: one scan per host instead of one per worker.
+        return await asyncio.to_thread(self._process_stats.metrics)
+
+    async def __cleanup__(self, exc: Exception | None) -> None:
+        """Monarch runs this on a graceful stop (`mesh.stop()`), after cancelling the endpoint
+        calls. A killed process skips it."""
+        await self._worker.close()

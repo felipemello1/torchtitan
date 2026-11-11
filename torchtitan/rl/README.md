@@ -122,6 +122,8 @@ rollouter = Rollouter.Config(
     validation_dataset=MyValidationDataset.Config(),
     worker=RolloutWorker.Config(
         message_env=MyEnv.Config(),
+        # Max prompt tokens, usually the generator's context length.
+        token_env=TokenEnv.Config(max_rollout_tokens=32768),
         rubric=Rubric.Config(
             reward_fns=[RewardCorrect.Config(weight=1.0)]
         ),
@@ -131,8 +133,9 @@ rollouter = Rollouter.Config(
 
 Subclass `RolloutWorker` or `Rollouter` only when an experiment changes their
 behavior. For example, the Verifiers integration keeps a custom
-`VerifiersRollouter` because it owns an external environment server and a
-different rollout protocol.
+`VerifiersRolloutWorker` (a `BaseRolloutWorker`, with no `MessageEnv` or `TokenEnv`)
+because Verifiers runs the env and its agent loop, and a
+`VerifiersRollouter` that copies the training taskset into the worker's env config.
 
 The default path handles rollout, scoring, batching, training, and model state dict transfer.
 

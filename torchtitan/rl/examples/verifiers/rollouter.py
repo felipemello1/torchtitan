@@ -4,21 +4,29 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Rollouter backed by a Verifiers environment service."""
+"""Rollouter that runs Verifiers environments in TitanRL's rollout workers."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from dataclasses import dataclass, field, replace
+import os
+import subprocess
+import uuid
+from dataclasses import dataclass, replace
 from typing import Any, TYPE_CHECKING
 
 import numpy as np
+from verifiers.v1 import errors as verifiers_errors
+from verifiers.v1.clients import ModelContext as VerifiersModelContext
 from verifiers.v1.configs.client import TrainClientConfig as VerifiersTrainClientConfig
+from verifiers.v1.configs.env import EnvConfig as VerifiersEnvConfig
+from verifiers.v1.configs.sampling import SamplingConfig as VerifiersSamplingConfig
 from verifiers.v1.configs.taskset import TasksetConfig as VerifiersTasksetConfig
 from verifiers.v1.dialects.chat import message_to_wire
-from verifiers.v1.serve.client import EnvClient as VerifiersEnvClient
-from verifiers.v1.types import SamplingConfig as VerifiersSamplingConfig
+from verifiers.v1.env import Env as VerifiersEnv, RunSlot as VerifiersRunSlot
+from verifiers.v1.utils.loaders import load_environment, resolve_env_config
 
 from torchtitan.components.data.multimodal.vision_processor import VisionProcessor
 from torchtitan.components.renderer import RendererConfig, RenderersConfigAdapter
@@ -28,16 +36,14 @@ from torchtitan.rl.examples.verifiers.data import (
     VerifiersTaskDataset,
     VerifiersTaskSample,
 )
-from torchtitan.rl.examples.verifiers.env_server import VerifiersEnvServer
 from torchtitan.rl.examples.verifiers.generation_server import (
     GenerationServer,
     GROUP_ID_SAMPLING_PARAM,
     VerifiersGenerationMetadata,
 )
-from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.data import IterableRolloutDataLoader
-from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
-from torchtitan.rl.rollout.rubric import RewardFn, Rubric
+from torchtitan.rl.rollout.rollouter import BaseRolloutWorker, Rollouter
+from torchtitan.rl.rollout.rubric import RewardFn, RubricOutput
 from torchtitan.rl.rollout.types import (
     GenerateFn,
     Prompt,
@@ -51,13 +57,29 @@ from torchtitan.rl.rollout.types import (
 )
 
 if TYPE_CHECKING:
-    from torchtitan.rl.actors.system import ActorSystem
     from torchtitan.rl.generator.types import SamplingConfig
 
 
 logger = logging.getLogger(__name__)
 
 VERIFIERS_REWARD_KEY = "verifiers_reward"
+
+# The container watchdog sweeps once when its worker exits and, if the worker died, again
+# this long after.
+_SECOND_SWEEP_DELAY_SEC = 30
+
+# A generator call that failed, or the connection to it (`verifiers/v1/errors.py`): almost always
+# the generator's side. A ProviderError 400 is read before these, as a prompt past the context.
+# TODO: a policy that breaks its container's network also ends as InterceptionError (the harness
+# can't reach the interception server, exit 97); split that case out if run logs show it.
+_GENERATOR_ERROR_TYPES = frozenset(
+    error_type.__name__
+    for error_type in (
+        verifiers_errors.ProviderError,
+        verifiers_errors.InterceptionError,
+        verifiers_errors.TunnelError,
+    )
+)
 
 
 class RewardFromVerifiers(RewardFn):
@@ -76,17 +98,22 @@ class RewardFromVerifiers(RewardFn):
 
 
 class VerifiersRollouter(Rollouter):
-    """Adapt Verifiers execution to TitanRL's ``Rollouter`` contract.
+    """Runs Verifiers envs as TitanRL rollout groups. Verifiers runs each episode (the agent, its
+    tools, the grader), so TitanRL's `MessageEnv` and `TokenEnv` aren't used. TitanRL picks the
+    tasks, serves the model calls and trains on the scored groups. One group of 8 rollouts:
 
-    Verifiers owns environment execution, including its process pool and the
-    message/tool loop, so this path bypasses TitanRL's ``RolloutWorkerActor``,
-    ``RolloutWorker``, ``MessageEnv``, and ``TokenEnv``. Token-in/token-out is
-    preserved through ``GenerationServer``, which forwards Verifiers model
-    requests to TitanRL's controller-provided ``GenerateFn``.
-
-    TitanRL still owns dataset and group scheduling, generator routing, policy
-    metadata, conversion to ``RolloutTurn``, reward and advantage assignment,
-    and the downstream training path.
+        controller: VerifiersRollouter.run_group_rollouts sends one task to a rollout worker
+            |
+            v
+        rollout worker k: VerifiersRolloutWorker.run_group
+            |  the Verifiers env (loaded once, in setup_async) runs the 8 episodes
+            |      |  each model call, HTTP on 127.0.0.1
+            |      v
+            |  GenerationServer --> generate_fn --> a generator (the router picks it)
+            |
+            |  8 traces --> RolloutTurns --> make_scored_group
+            v
+        controller: one scored RolloutGroup
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -97,28 +124,43 @@ class VerifiersRollouter(Rollouter):
         validation_dataset: VerifiersTaskDataset.Config
         """Verifiers taskset used for validation samples."""
 
-        worker: RolloutWorker.Config | None = None
-        """Inherited schema field; hidden because Verifiers replaces that path."""
+        worker: VerifiersRolloutWorker.Config
+        """How a rollout worker runs a Verifiers group; `__post_init__` fills in
+        `worker.environment.taskset`."""
 
-        worker_pool_size: int = 1
-        """Unused because the Verifiers EnvServer owns its worker pool."""
+        def __post_init__(self) -> None:
+            Rollouter.Config.__post_init__(self)
+            configured_taskset = self.worker.environment.taskset
+            if configured_taskset not in (
+                VerifiersTasksetConfig(),
+                self.training_dataloader.dataset.verifiers_taskset,
+            ):
+                raise ValueError(
+                    "worker.environment.taskset is derived from "
+                    "training_dataloader.dataset.verifiers_taskset and must not configure a "
+                    "different taskset"
+                )
+            self.worker = replace(
+                self.worker,
+                environment=self.worker.environment.model_copy(
+                    update={
+                        "taskset": self.training_dataloader.dataset.verifiers_taskset
+                    }
+                ),
+            )
 
-        num_threads_per_worker: int = 1
-        """Unused because no TitanRL rollout-worker process is spawned."""
 
-        verifiers_env_server: VerifiersEnvServer.Config
-        """Environment server spawned and owned by this rollouter."""
+class VerifiersRolloutWorker(BaseRolloutWorker):
+    """Runs one Verifiers group in a rollout worker process. The flow: `VerifiersRollouter`."""
 
-        rubric: Rubric.Config
-        """TorchTitan rubric that consumes rewards returned by Verifiers."""
-
-        advantage: AdvantageEstimator.Config = field(
-            default_factory=AdvantageEstimator.Config
-        )
-        """TitanRL estimator applied after Verifiers returns rollout rewards."""
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseRolloutWorker.Config):
+        environment: VerifiersEnvConfig
+        """Verifiers env and agent config, e.g. `vf.SingleAgentEnvConfig(agent=...)`. Leave
+        `environment.taskset` unset: `VerifiersRollouter` copies the training taskset in."""
 
         generation_server: GenerationServer.Config
-        """Local HTTP bridge from Verifiers to TitanRL generation."""
+        """Local HTTP bridge from Verifiers to TitanRL generation; each rollout worker runs one."""
 
         renderer_multiplex: int = 256
         """Maximum concurrent rollouts sharing one Verifiers renderer instance.
@@ -127,127 +169,127 @@ class VerifiersRollouter(Rollouter):
         path instead of keeping it specific to the Verifiers client.
         """
 
-        connection_timeout_sec: float = 120.0
-        """Maximum time to wait for the Verifiers server to become healthy."""
-
         def __post_init__(self) -> None:
-            Rollouter.Config.__post_init__(self)
-            configured_taskset = self.verifiers_env_server.environment.taskset
-            if configured_taskset not in (
-                VerifiersTasksetConfig(),
-                self.training_dataloader.dataset.verifiers_taskset,
-            ):
-                raise ValueError(
-                    "verifiers_env_server.environment.taskset is derived from "
-                    "training_dataloader.dataset.verifiers_taskset and must not configure a "
-                    "different taskset"
-                )
-            self.verifiers_env_server = replace(
-                self.verifiers_env_server,
-                environment=self.verifiers_env_server.environment.model_copy(
-                    update={
-                        "taskset": self.training_dataloader.dataset.verifiers_taskset
-                    }
-                ),
-                local_taskset_module=_local_taskset_module(
-                    self.training_dataloader.dataset.verifiers_taskset
-                ),
-            )
             if self.renderer_multiplex <= 0:
                 raise ValueError("renderer_multiplex must be positive")
-            if self.connection_timeout_sec <= 0:
-                raise ValueError("connection_timeout_sec must be positive")
+
+        def to_dict(self) -> dict[str, Any]:
+            # The generic dump can't serialize the pydantic env config.
+            return {
+                **BaseRolloutWorker.Config.to_dict(replace(self, environment=None)),
+                "environment": self.environment.model_dump(mode="json"),
+            }
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self._verifiers_config = config
-        self._rubric: Rubric = config.rubric.build()
-        self._advantage_estimator: AdvantageEstimator = config.advantage.build()
-        self._verifiers_env_server = config.verifiers_env_server.build()
-        self._generation_server: GenerationServer | None = None
-        self._verifiers_env_client: VerifiersEnvClient | None = None
-        self._verifiers_train_client_config: VerifiersTrainClientConfig | None = None
+        # TODO: when look-aside routing lands (https://github.com/pytorch/torchtitan/pull/5990),
+        # re-check this bridge: `generate_fn` then calls the reserved generator directly, so the
+        # bridge is one loopback hop. Dropping it needs an HTTP endpoint on each generator, a
+        # reserve per model call from Verifiers' client, and another home for the policy versions
+        # recorded here.
+        self._generation_server: GenerationServer = config.generation_server.build()
+        self._verifiers_train_client_config: VerifiersTrainClientConfig
+        self._verifiers_env: VerifiersEnv
+        # Holds `env.serving()` from `setup_async` to `close`. Monarch runs those two in
+        # different tasks, which works while the env's serving resources are not bound to a
+        # task (Verifiers 0.4.1's interception server and shared tools are not).
+        self._verifiers_env_serving = contextlib.AsyncExitStack()
+        self._container_watchdog: subprocess.Popen | None = None
 
     async def setup_async(
         self,
         *,
-        actor_system: ActorSystem,
         tokenizer_config: HuggingFaceTokenizer.Config,
         renderer_config: RendererConfig,
         hf_assets_path: str,
         vision_processor_config: VisionProcessor.Config | None = None,
     ) -> None:
-        """Start the EnvServer and connect it to TorchTitan generation.
-
-        Rollouts run in the EnvServer, so no rollout worker pool is spawned through
-        ``actor_system``.
-        """
-        del actor_system, tokenizer_config
+        """Start this worker's generation server, then load and serve the Verifiers env.
+        Verifiers renders with its own renderer, so no tokenizer here."""
+        del tokenizer_config
         if vision_processor_config is not None:
-            # TODO: pass the vision processor to the renderer the EnvServer builds.
+            # TODO: pass the vision processor to the renderer Verifiers builds.
             raise NotImplementedError(
                 "Verifiers environments do not support image prompts yet; unset "
                 "Controller.Config.vision_processor."
             )
-        if self._verifiers_env_client is not None:
-            return
         if not isinstance(renderer_config, RenderersConfigAdapter):
             raise ValueError(
                 "Verifiers requires a renderer configured with from_renderers(...) "
-                "so its client can construct the same renderer in the "
-                "environment-server process"
+                "so its client can construct the same renderer in the rollout worker"
             )
-
-        # Verifiers generates through an HTTP endpoint, while TorchTitan exposes
-        # an in-process GenerateFn. This server bridges those interfaces.
-        # TODO: remove this bridge when the controller can provide a generator
-        # HTTP endpoint directly.
-        generation_server = self._verifiers_config.generation_server.build()
-        verifiers_server_address = await self._verifiers_env_server.start()
-        verifiers_env_client = None
-        try:
-            await generation_server.start()
-            verifiers_env_client = VerifiersEnvClient(verifiers_server_address)
-            await verifiers_env_client.wait_for_server_startup(
-                timeout=self._verifiers_config.connection_timeout_sec
-            )
-            verifiers_train_client_config = VerifiersTrainClientConfig(
-                base_url=generation_server.base_url,
-                # The local endpoint does not authenticate. An empty environment
-                # variable name makes Verifiers send its required "EMPTY" value.
-                api_key_var="",
-                renderer=renderer_config.get_renderers_config(),
-                multiplex=self._verifiers_config.renderer_multiplex,
-                renderer_model_name=hf_assets_path,
-            )
-        except BaseException:
-            if verifiers_env_client is not None:
-                await verifiers_env_client.close()
-            try:
-                await generation_server.close()
-            finally:
-                await self._verifiers_env_server.close()
-            raise
-        self._generation_server = generation_server
-        self._verifiers_env_client = verifiers_env_client
-        self._verifiers_train_client_config = verifiers_train_client_config
+        # Verifiers' client in this worker calls its generation server on loopback. With
+        # http_proxy set, httpx sends even loopback requests to the proxy unless no_proxy
+        # names the host.
+        # TODO: drop once Verifiers' train client ignores env proxies for a loopback base_url.
+        # Keep the host's own entries from either spelling, e.g. NO_PROXY=.corp.internal.
+        entries = (
+            os.environ.get("no_proxy"),
+            os.environ.get("NO_PROXY"),
+            "127.0.0.1",
+            "localhost",
+        )
+        no_proxy = ",".join(dict.fromkeys(entry for entry in entries if entry))
+        os.environ["no_proxy"] = no_proxy
+        os.environ["NO_PROXY"] = no_proxy
+        await self._generation_server.start()
+        self._verifiers_train_client_config = VerifiersTrainClientConfig(
+            base_url=self._generation_server.base_url,
+            # The local endpoint does not authenticate. An empty environment
+            # variable name makes Verifiers send its required "EMPTY" value.
+            api_key_var="",
+            renderer=renderer_config.get_renderers_config(),
+            multiplex=self._verifiers_config.renderer_multiplex,
+            renderer_model_name=hf_assets_path,
+        )
+        # One VF_RUN_ID per worker: "torchtitan-<uuid>", or "<launcher's VF_RUN_ID>-<uuid>".
+        # 1. Verifiers labels each container it starts `verifiers.run=$VF_RUN_ID`.
+        # 2. So the watchdog removes exactly this worker's containers when the worker dies.
+        # 3. Side effect: Verifiers' run-wide creation-rate limits (e.g. `PrimeConfig.creates_per_min`)
+        #    apply per worker.
+        # TODO: drop the side effect once Verifiers keeps the container label and the limiter scope apart.
+        run_id_prefix = os.environ.get("VF_RUN_ID", "torchtitan")
+        os.environ["VF_RUN_ID"] = f"{run_id_prefix}-{uuid.uuid4().hex}"
+        self._container_watchdog = _start_container_watchdog(os.environ["VF_RUN_ID"])
+        # resolve_env_config re-validates `environment` as the config class of the Env that
+        # the taskset's package exports (SingleAgentEnv's if it exports none).
+        self._verifiers_env = load_environment(
+            resolve_env_config(self._verifiers_config.environment)
+        )
+        # The env's serving resources (the interception server its agents call, shared
+        # tools) live until `close`, as in Verifiers' own runner.
+        await self._verifiers_env_serving.enter_async_context(
+            self._verifiers_env.serving()
+        )
 
     async def close(self) -> None:
-        """Close the Verifiers client, generation server, and environment server."""
+        """Stop serving the env, then the generation server and the container watchdog."""
+        env_stopped = False
         try:
-            if self._verifiers_env_client is not None:
-                await self._verifiers_env_client.close()
+            await self._verifiers_env_serving.aclose()
+            env_stopped = True
         finally:
-            self._verifiers_env_client = None
-            self._verifiers_train_client_config = None
-            try:
-                if self._generation_server is not None:
-                    await self._generation_server.close()
-            finally:
-                self._generation_server = None
-                await self._verifiers_env_server.close()
+            await self._generation_server.close()
+            if self._container_watchdog is not None:
+                # "clean": the env is stopped, so no `docker run` is in flight. The watchdog
+                # then sweeps once (normally nothing is left) and exits, skipping the
+                # delayed second sweep that would hold this process's output open. If
+                # `aclose()` raised, a `docker run` may still be in flight: skip "clean", so the
+                # watchdog runs both sweeps.
+                if env_stopped:
+                    self._container_watchdog.stdin.write(b"clean\n")
+                self._container_watchdog.stdin.close()
+                try:
+                    await asyncio.to_thread(self._container_watchdog.wait, 60)
+                except subprocess.TimeoutExpired:
+                    logger.warning(
+                        "The container watchdog of run %s is still sweeping after 60 s; "
+                        "it goes on after this worker exits.",
+                        os.environ["VF_RUN_ID"],
+                    )
 
-    async def run_group_rollouts(
+    async def run_group(
         self,
         *,
         generate_fn: GenerateFn,
@@ -258,16 +300,22 @@ class VerifiersRollouter(Rollouter):
         sampling: SamplingConfig,
     ) -> RolloutGroup:
         """Run sibling rollouts through Verifiers, then compute advantages."""
-        if self._generation_server is None:
-            raise RuntimeError("Verifiers rollouter is not initialized")
+        if not isinstance(sample, VerifiersTaskSample):
+            raise TypeError("Verifiers requires a VerifiersTaskSample")
         # Each group replaces this one slot. That is safe because every group's generate_fn routes the
         # same way; keep per-group state out of it.
         self._generation_server.set_generate_fn(generate_fn)
+        # Rebuild the controller's task from its data, as the taskset's `load` builds it.
+        task_type = self._verifiers_env.taskset.task_type()
+        task = task_type(
+            task_type.data_type().model_validate(sample.verifiers_task_data),
+            self._verifiers_env.taskset.config.task,
+        )
         results = await asyncio.gather(
             *(
                 self._run_single_rollout(
                     release_session_fn=release_session_fn,
-                    sample=sample,
+                    slot=slot,
                     sampling=(
                         sampling
                         if sampling.seed is None
@@ -276,68 +324,68 @@ class VerifiersRollouter(Rollouter):
                     group_id=group_id,
                     rollout_id=rollout_id,
                 )
-                for rollout_id in range(group_size)
+                for rollout_id, slot in enumerate(
+                    self._verifiers_env.slots(task, group_size)
+                )
             ),
             return_exceptions=True,
         )
-        # Raise only after every sibling finished: the caller releases the group next, and a
-        # sibling still generating would pin the group again, with nothing left to release it.
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
-        rollouts = results
+        return await self.make_scored_group(results, sample, group_id=group_id)
 
-        outputs = await self._rubric.score_group(rollouts, sample)
-        for rollout, output in zip(rollouts, outputs, strict=True):
-            rollout.reward = output.reward
-            rollout.reward_breakdown = output.reward_breakdown
+    async def score_group(
+        self, rollouts: list[Rollout], env_input: object
+    ) -> list[RubricOutput]:
+        """Score with the rubric; a trace that Verifiers dropped (e.g. a judge gave a drop
+        verdict) gets reward None, so it isn't trained.
 
-        group = RolloutGroup(group_id=group_id, rollouts=rollouts)
-        advantages = self._advantage_estimator(group)
-        for rollout, advantage in zip(group.rollouts, advantages, strict=True):
-            rollout.advantage = advantage
-        return group
+        Args:
+            rollouts: Sibling rollouts in one prompt group, already stepped.
+            env_input: the env initial input shared by the group.
+
+        Returns:
+            One `RubricOutput` per rollout, in input order.
+        """
+        outputs = await super().score_group(rollouts, env_input)
+        return [
+            RubricOutput(reward=None) if rollout.logs["dropped"] is not None else output
+            for rollout, output in zip(rollouts, outputs, strict=True)
+        ]
 
     async def _run_single_rollout(
         self,
         *,
         release_session_fn: ReleaseSessionFn,
-        sample: object,
+        slot: VerifiersRunSlot,
         sampling: SamplingConfig,
         group_id: int,
         rollout_id: int,
     ) -> Rollout:
-        """Send one task to Verifiers, release its sessions, and convert its trace to a rollout."""
-        if not isinstance(sample, VerifiersTaskSample):
-            raise TypeError("Verifiers requires a VerifiersTaskSample")
-        if (
-            self._generation_server is None
-            or self._verifiers_env_client is None
-            or self._verifiers_train_client_config is None
-        ):
-            raise RuntimeError("Verifiers rollouter is not initialized")
-
-        # One VerifiersEnvClient.run executes a complete rollout. The harness
-        # owns the multi-turn model/tool loop and calls the generation server once per
-        # generation; run returns only after the rollout stops.
-        verifiers_episode = await self._verifiers_env_client.run(
-            task_data=sample.verifiers_task_data,
-            client=self._verifiers_train_client_config,
-            model=self._generation_server.model_id,
-            sampling=VerifiersSamplingConfig(
-                temperature=sampling.temperature,
-                top_p=sampling.top_p,
-                max_tokens=sampling.max_tokens,
-                seed=sampling.seed,
-                **{GROUP_ID_SAMPLING_PARAM: group_id},
+        """Run one Verifiers episode, release its sessions, and convert its trace to a rollout."""
+        # One run_slot executes a complete episode. The harness owns the multi-turn
+        # model/tool loop and calls the generation server once per generation; run_slot
+        # returns only after the episode stops.
+        verifiers_episode = await self._verifiers_env.run_slot(
+            slot,
+            VerifiersModelContext(
+                client=self._verifiers_train_client_config,
+                model=self._generation_server.model_id,
+                sampling=VerifiersSamplingConfig(
+                    temperature=sampling.temperature,
+                    top_p=sampling.top_p,
+                    max_tokens=sampling.max_tokens,
+                    seed=sampling.seed,
+                    **{GROUP_ID_SAMPLING_PARAM: group_id},
+                ),
             ),
         )
-        # `run` returned, so this rollout starts no new calls. For each trace, release its routing
+        # `run_slot` returned, so this rollout starts no new calls. For each trace, release its routing
         # session (Verifiers sends the trace id as X-Session-ID) and take its generation metadata,
         # so another agent's trace (a judge, a simulated user) leaves nothing on the server.
-        # TODO: an attempt Verifiers retried has no trace here, so its held KV waits for the
-        # group's release and its routing pin for the router's `max_sessions` LRU. The generation
-        # server could record each rollout's session ids and release those too.
+        # TODO: an attempt Verifiers retried has no trace here, and a cancelled rollout never gets here,
+        # so their held KV waits for the group's release, their routing pins for the router's
+        # `max_sessions` LRU, and their generation metadata and request counts stay on the
+        # generation server (kept per session id). The generation server could record each
+        # rollout's session ids and release those too.
         generation_metadata_by_session = {
             trace.id: self._generation_server.pop_generation_metadata(trace.id)
             for trace in verifiers_episode.traces
@@ -347,7 +395,8 @@ class VerifiersRollouter(Rollouter):
             try:
                 await release_session_fn(routing_session_id=session_id)
             except Exception:
-                # Not fatal: `max_sessions` evicts an unreleased session.
+                # Not fatal: `release_groups` frees the group's KV when the group ends, and
+                # `max_sessions` evicts the routing pin.
                 logger.exception("releasing routing session %s failed", session_id)
 
         await asyncio.gather(*(release(trace.id) for trace in verifiers_episode.traces))
@@ -355,7 +404,7 @@ class VerifiersRollouter(Rollouter):
         if len(traces) != 1:
             raise ValueError(
                 "Verifiers expects one trainable trace per rollout; got "
-                f"{len(traces)}"
+                f"{len(traces)} (episode error: {verifiers_episode.last_error})"
             )
 
         # Convert Verifiers' graph trace to TitanRL's linear rollout turns.
@@ -368,32 +417,24 @@ class VerifiersRollouter(Rollouter):
             rollout_id=rollout_id,
         )
         status = self.rollout_status(verifiers_episode=verifiers_episode, trace=trace)
-        if not turns:
-            # Verifiers records an overlong first prompt as a failed model call; vLLM, the
-            # renderer and the generation server all word it "maximum context length".
-            first_prompt_too_long = any(
-                call.error is not None
-                and "maximum context length" in call.error.message
-                for call in trace.calls
+        if status is RolloutStatus.TRUNCATED_PROMPT_TOO_LONG and not turns:
+            # The harness builds the first prompt during the episode, so the dataset can't
+            # be filtered for it; flag it here as a data problem, not a policy one.
+            # Not every task has a name; every task has an index.
+            task = slot.task.data.name or slot.task.data.idx
+            logger.warning(
+                "rollout group=%d/rollout=%d: the first prompt of task %s does not fit "
+                "the context; marking TRUNCATED_PROMPT_TOO_LONG",
+                group_id,
+                rollout_id,
+                task,
             )
-            if first_prompt_too_long:
-                # The harness builds the first prompt in the env server, so the dataset can't
-                # be filtered for it; flag it here as a data problem, not a policy one.
-                task = sample.verifiers_task_data.get(
-                    "name", sample.verifiers_task_data.get("idx")
-                )
-                logger.warning(
-                    "rollout group=%d/rollout=%d: the first prompt%s does not fit the "
-                    "context; marking ERROR",
-                    group_id,
-                    rollout_id,
-                    "" if task is None else f" of task {task}",
-                )
-            status = RolloutStatus.ERROR
         logs = verifiers_rollout_logs(verifiers_episode, trace)
         if status.is_error():
             log_failed_rollout(logs, group_id=group_id, rollout_id=rollout_id)
-        else:
+        if turns:
+            # Also for a failed rollout, as on the native path: the rubric applies `error_reward`
+            # if set, else it reads this grade.
             turns[-1].env_rewards[VERIFIERS_REWARD_KEY] = trace.reward
         return Rollout(
             group_id=group_id,
@@ -405,12 +446,68 @@ class VerifiersRollouter(Rollouter):
 
     @staticmethod
     def rollout_status(*, verifiers_episode: Any, trace: Any) -> RolloutStatus:
+        """Return the status of a finished Verifiers rollout: the first row that matches.
+
+            how the rollout ended                                          status
+            a grading deadline passed: the trace stopped as                ERROR_INFRA
+              "finalize_timeout" or "scoring_timeout"
+            its last model call was refused as too long (ProviderError     TRUNCATED_PROMPT_TOO_LONG
+              400, from the renderer or the generation server); graded
+              only if the harness then ends cleanly
+            failed on a generator call (`_GENERATOR_ERROR_TYPES`)          ERROR_INFRA
+            with no turn: the policy never sampled                         ERROR_INFRA
+            another deadline passed (`is_timeout` on the trace or the      ERROR_TIMEOUT
+              episode), e.g. the agent's
+            the harness run failed after the first turn: the trace's last  ERROR
+              error is exactly `HarnessError` (the agent exited, or the
+              harness's own code raised)
+            failed otherwise: the sandbox, a tool, the task's or env's     ERROR_INFRA
+              code, an unknown or no error
+            truncated at `max_turns`                                       TRUNCATED_MAX_TURNS
+            truncated                                                      TRUNCATED_LENGTH
+            completed                                                      COMPLETED
+
+        A failed harness run is mostly the agent exiting (e.g. its own `pkill`). Any other
+        error type names the part that broke, not who broke it, so it is infra, as any env
+        exception is on the native path. The cost: a policy that breaks its sandbox before grading
+        isn't penalized, and an agent the host kills (e.g. out of memory) trains as ERROR.
+        A grading deadline is the grader's, so a solution that hangs the task's tests isn't
+        penalized either.
+        """
+        # A grading deadline is the grader's, not the policy's.
+        # TODO: an env-level finalize deadline (`Env.finalize`, e.g. best_of_n_judge's judge) flags
+        # only the episode, so it still reads as ERROR_TIMEOUT below.
+        if trace.stop_condition in ("finalize_timeout", "scoring_timeout"):
+            return RolloutStatus.ERROR_INFRA
+        last_call_error = trace.calls[-1].error if trace.calls else None
+        # TODO: a harness that dies on the 400 isn't graded (Verifiers skips scoring a failed
+        # run), so the rollout gets 0.0, not credit for its partial work. The in-repo Terminus
+        # harness could end cleanly on a 400.
+        if (
+            last_call_error is not None
+            and last_call_error.type == verifiers_errors.ProviderError.__name__
+            and last_call_error.status_code == 400
+        ):
+            return RolloutStatus.TRUNCATED_PROMPT_TOO_LONG
+        # The failed trace's last error is its final attempt's: a retry puts earlier ones first.
+        error = None if trace.ok else trace.last_error
+        # Before the timeout check: a generator failure that also set a timeout flag is the
+        # generator's.
+        if error is not None and error.type in _GENERATOR_ERROR_TYPES:
+            return RolloutStatus.ERROR_INFRA
+        if trace.num_turns == 0:
+            return RolloutStatus.ERROR_INFRA
         # Verifiers flags an expired deadline with is_timeout: a stage's on its trace (which can keep
         # ok=True), the whole episode's on the episode.
         if trace.is_timeout or verifiers_episode.is_timeout:
             return RolloutStatus.ERROR_TIMEOUT
         if not verifiers_episode.ok or not trace.ok:
-            return RolloutStatus.ERROR
+            if (
+                error is not None
+                and error.type == verifiers_errors.HarnessError.__name__
+            ):
+                return RolloutStatus.ERROR
+            return RolloutStatus.ERROR_INFRA
         if not trace.is_truncated:
             return RolloutStatus.COMPLETED
         if trace.stop_condition == "max_turns":
@@ -425,20 +522,15 @@ class VerifiersRollouter(Rollouter):
         group_id: int,
         rollout_id: int,
     ) -> list[RolloutTurn]:
-        """Flatten a Verifiers trace into TorchTitan's trainable rollout turns.
+        """Flatten a Verifiers trace into TitanRL rollout turns, one per span of trainable tokens.
 
-        For example, a Verifiers branch containing user tokens ``[1, 2]``,
-        sampled assistant tokens ``[3, 4]``, tool-result tokens ``[5, 6]``, and
-        sampled assistant tokens ``[7, 8]`` becomes two TitanRL turns. Their
-        prompts are ``[1, 2]`` and ``[1, 2, 3, 4, 5, 6]``; their completions are
-        ``[3, 4]`` and ``[7, 8]``. Shared sampled graph nodes are emitted once.
-        Non-sampled nodes after a sampled one, e.g. the tool result ``[5, 6]``,
-        become that turn's ``env_messages``, also once per node.
+        Example, one branch: user [1, 2], sampled [3, 4], tool result [5, 6], sampled [7, 8].
 
-        Verifiers does not return TorchTitan policy metadata, so every emitted
-        turn receives the conservative min/max policy-version span accumulated
-        by the generation server for the whole rollout. Generator metrics are
-        attached once to avoid double counting.
+            turn 0   prompt [1, 2]               completion [3, 4]   env_messages [tool result]
+            turn 1   prompt [1, 2, 3, 4, 5, 6]   completion [7, 8]
+
+        A node shared by several branches is emitted once. Every turn gets the rollout-wide
+        min/max policy version from the generation server; generator metrics go on turn 0 only.
         """
         if generation_metadata is None:
             if any(any(node.mask) for node in trace.nodes):
@@ -456,7 +548,8 @@ class VerifiersRollouter(Rollouter):
         previous_token_ids: list[int] = []
 
         for branch in trace.branches:
-            token_ids = branch.token_ids
+            # Verifiers' int32 array; `split_prompt` compares lists.
+            token_ids = branch.token_ids.tolist()
             logprobs = branch.logprobs
             branch_offset = 0
             reply_to: RolloutTurn | None = None
@@ -509,6 +602,49 @@ class VerifiersRollouter(Rollouter):
         return turns
 
 
+def _start_container_watchdog(run_id: str) -> subprocess.Popen:
+    """Start a process that removes the containers labelled `verifiers.run=<run_id>` once this
+    process exits, also on SIGKILL: the kernel then closes this process's end of the pipe.
+
+    A killed worker runs no cleanup of its own: Monarch runs `__cleanup__` only on a graceful
+    stop, and Python can't handle SIGTERM off the main thread, where actor code runs.
+
+    Example: a rollout worker killed mid-episode -> its watchdog runs `docker rm -f` on the
+    episode's containers, then sweeps again `_SECOND_SWEEP_DELAY_SEC` later. A clean
+    `close()` -> one sweep.
+
+    Docker only: without `docker` it removes nothing. Other sandbox providers reap with their own
+    lease or heartbeat.
+    """
+    # TODO: drop this watchdog if Verifiers brings back a reaper for killed processes
+    # (0.4.0's env server had one: `_arm_teardown` in `verifiers/v1/serve/pool.py`).
+    # TODO: a kill of the whole process tree at once (e.g. its cgroup) takes the watchdog too.
+    # TODO: Compose projects (`vf-<uuid>`) carry no run label, so the watchdog misses them;
+    # no Terminal-Bench 2.1 or TMax task uses Compose.
+    # The second sweep catches a container whose `docker run` was still in flight when the
+    # worker died: it runs only on EOF without `close()`'s "clean" line. `docker` errors go
+    # to the worker's stderr.
+    script = (
+        "read -r how; command -v docker >/dev/null || exit 0; "
+        'sweep() { ids=$(docker ps -aq --filter "label=verifiers.run=$1"); '
+        '[ -z "$ids" ] || docker rm -f $ids >/dev/null; }; '
+        'sweep "$1"; [ "$how" = clean ] || { sleep "$2"; sweep "$1"; }'
+    )
+    # Its own session, so a signal sent to the worker's process group doesn't stop it.
+    return subprocess.Popen(
+        [
+            "sh",
+            "-c",
+            script,
+            "container-watchdog",
+            run_id,
+            str(_SECOND_SWEEP_DELAY_SEC),
+        ],
+        stdin=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+
 def _trainable_token_spans(mask: list[bool]) -> list[tuple[int, int]]:
     """Return half-open token spans marked trainable by a Verifiers node mask."""
     spans: list[tuple[int, int]] = []
@@ -520,13 +656,6 @@ def _trainable_token_spans(mask: list[bool]) -> list[tuple[int, int]]:
             spans.append((start, index))
             start = None
     return spans
-
-
-def _local_taskset_module(taskset: VerifiersTasksetConfig) -> str | None:
-    """Return the module backing a locally registered taskset alias."""
-    module = type(taskset).__module__
-    alias = module.replace(".", "_").lower()
-    return module if taskset.id == alias else None
 
 
 def verifiers_rollout_logs(verifiers_episode: Any, trace: Any) -> dict[str, Any]:
@@ -545,6 +674,8 @@ def verifiers_rollout_logs(verifiers_episode: Any, trace: Any) -> dict[str, Any]
         "verifiers_trace_id": trace.id,
         "task": trace.task.key,
         "stop_condition": trace.stop_condition,
+        # Why Verifiers dropped the trace (e.g. a judge gave a drop verdict), or None.
+        "dropped": trace.dropped,
         "errors": [
             error.model_dump(mode="json")
             for error in (*verifiers_episode.errors, *trace.errors)

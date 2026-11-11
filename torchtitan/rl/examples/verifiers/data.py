@@ -12,15 +12,14 @@ from typing import Any
 
 import grain.python as grain
 from verifiers.v1.configs.taskset import TasksetConfig as VerifiersTasksetConfig
-from verifiers.v1.utils.loaders import load_taskset
+from verifiers.v1.utils.loaders import load_taskset, taskset_config_type
 
-from torchtitan.rl.examples.verifiers.worker_setup import register_local_taskset_alias
 from torchtitan.rl.rollout.data import RLDataset
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class VerifiersTaskSample:
-    """Serialized task data dispatched to a stateless Verifiers EnvServer."""
+    """Task data that a rollout worker rebuilds into the Verifiers task to run."""
 
     verifiers_task_data: dict[str, Any]
 
@@ -48,6 +47,18 @@ class VerifiersTaskDataset(RLDataset):
         def __post_init__(self) -> None:
             if self.num_tasks is not None and self.num_tasks <= 0:
                 raise ValueError("num_tasks must be positive")
+            # Verifiers builds the Taskset from the id alone. A config class that the id's
+            # Taskset doesn't declare (e.g. a subclass that kept its parent's id) would
+            # silently run that other Taskset.
+            expected_config_cls = taskset_config_type(self.verifiers_taskset.id)
+            if type(self.verifiers_taskset) is not expected_config_cls:
+                raise ValueError(
+                    f"verifiers_taskset is a {type(self.verifiers_taskset).__name__}, but "
+                    f"id {self.verifiers_taskset.id!r} loads a Taskset configured by "
+                    f"{expected_config_cls.__name__}. Set id to the top-level package that "
+                    "exports your Taskset, or build the config with "
+                    "taskset_config_type(id)(...)."
+                )
 
         def to_dict(self) -> dict[str, Any]:
             return {
@@ -55,13 +66,11 @@ class VerifiersTaskDataset(RLDataset):
                 "num_tasks": self.num_tasks,
                 "seed": self.seed,
                 "shuffle": self.shuffle,
+                "repeat": self.repeat,
             }
 
     def __init__(self, config: Config) -> None:
-        verifiers_taskset_config = config.verifiers_taskset.model_copy(
-            update={"id": register_local_taskset_alias(config.verifiers_taskset.id)}
-        )
-        verifiers_taskset = load_taskset(verifiers_taskset_config)
+        verifiers_taskset = load_taskset(config.verifiers_taskset)
         if config.num_tasks is None and verifiers_taskset.INFINITE:
             raise ValueError(
                 f"Verifiers taskset {config.verifiers_taskset.id!r} is infinite; "
@@ -90,7 +99,9 @@ class VerifiersTaskDataset(RLDataset):
             for task in tasks
         ]
         dataset = grain.MapDataset.source(samples)
-        self._iterator = iter(dataset.repeat().to_iter_dataset())
+        if config.repeat:
+            dataset = dataset.repeat()
+        self._iterator = iter(dataset.to_iter_dataset())
 
     def __iter__(self) -> Iterator[VerifiersTaskSample]:
         return self

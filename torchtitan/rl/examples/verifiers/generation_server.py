@@ -69,12 +69,9 @@ class GenerationServer(Configurable):
         host: str = "127.0.0.1"
         """Interface on which the local HTTP server listens."""
 
-        port: int = 0
-        """Listening port; zero requests an ephemeral port."""
-
         max_rollout_tokens: int
         """Context length; set it to the generator's ``max_model_len``.
-        Prompts of this many tokens or more get a 400.
+        Prompts of this many tokens or more get a 400; any other invalid request gets a 422.
 
         The server advertises this value as ``max_model_len`` through
         ``GET /v1/models`` so Verifiers can reject longer prompts before
@@ -82,8 +79,6 @@ class GenerationServer(Configurable):
         """
 
         def __post_init__(self) -> None:
-            if not 0 <= self.port <= 65535:
-                raise ValueError("port must be between 0 and 65535")
             if self.max_rollout_tokens <= 0:
                 raise ValueError("max_rollout_tokens must be positive")
 
@@ -91,7 +86,6 @@ class GenerationServer(Configurable):
 
     def __init__(self, config: Config) -> None:
         self.host = config.host
-        self.requested_port = config.port
         self.max_rollout_tokens = config.max_rollout_tokens
         self.generate_fn: GenerateFn | None = None
         self.runner: web.AppRunner | None = None
@@ -122,7 +116,9 @@ class GenerationServer(Configurable):
         app.router.add_post("/inference/v1/generate", self._handle_generate_request)
         runner = web.AppRunner(app, access_log_class=_DebugAccessLogger)
         await runner.setup()
-        site = web.TCPSite(runner, self.host, self.requested_port)
+        # Port 0: the OS picks a free port. Each rollout worker runs its own server,
+        # so a fixed port would collide.
+        site = web.TCPSite(runner, self.host, 0)
         await site.start()
         sockets = getattr(site._server, "sockets", None)
         if not sockets:
@@ -176,7 +172,7 @@ class GenerationServer(Configurable):
         session_id = request.headers.get(_SESSION_ID_HEADER)
         if not session_id:
             return web.json_response(
-                {"error": f"missing {_SESSION_ID_HEADER} header"}, status=400
+                {"error": f"missing {_SESSION_ID_HEADER} header"}, status=422
             )
 
         try:
@@ -184,13 +180,16 @@ class GenerationServer(Configurable):
             prompt_token_ids = _validate_token_ids(
                 body.get("token_ids"), field_name="token_ids"
             )
-            # vLLM needs room for one output token. Keep vLLM's wording: Verifiers'
-            # harnesses match it as a context overflow.
+            # vLLM needs room for one output token. A 400 in vLLM's wording: the Verifiers
+            # rollouter and Verifiers' harnesses read it as a context overflow.
             if len(prompt_token_ids) >= self.max_rollout_tokens:
-                raise ValueError(
-                    f"This model's maximum context length is {self.max_rollout_tokens} "
-                    f"tokens, and the prompt has {len(prompt_token_ids)} tokens, "
-                    "leaving no room for an output token"
+                return web.json_response(
+                    {
+                        "error": "This model's maximum context length is "
+                        f"{self.max_rollout_tokens} tokens, and the prompt has "
+                        f"{len(prompt_token_ids)} tokens, leaving no room for an output token"
+                    },
+                    status=400,
                 )
             sampling_params = body.get("sampling_params")
             if not isinstance(sampling_params, dict):
@@ -205,7 +204,8 @@ class GenerationServer(Configurable):
             if body.get("features") is not None:
                 raise ValueError("multimodal features are not supported")
         except (TypeError, ValueError) as error:
-            return web.json_response({"error": str(error)}, status=400)
+            # 422: the Verifiers rollouter reads a 400 as a prompt past the context.
+            return web.json_response({"error": str(error)}, status=422)
 
         request_index = self.request_counts.get(session_id, 0)
         self.request_counts[session_id] = request_index + 1
@@ -345,9 +345,19 @@ def _parse_sampling_config(value: object):
         "skip_special_tokens",
         "routed_experts_prompt_start",
     }
-    unsupported = set(value) - supported - protocol_fields
+    # Verifiers' train client always sends these switched off, so vLLM ignores the model's
+    # generation_config. TorchTitan's generator samples the full vocabulary, which is the
+    # same; it can't honor any other value.
+    disabled_values = {"top_k": -1, "min_p": 0.0}
+    unsupported = set(value) - supported - protocol_fields - set(disabled_values)
     if unsupported:
         raise ValueError(f"unsupported sampling parameters: {sorted(unsupported)}")
+    for name, disabled_value in disabled_values.items():
+        if name in value and value[name] != disabled_value:
+            raise ValueError(
+                f"sampling_params.{name}={value[name]!r} is unsupported: the generator "
+                f"samples from the full vocabulary ({name}={disabled_value!r})"
+            )
 
     # The generator stops only on these ids; the renderer client always sends them.
     stop_token_ids = _validate_token_ids(

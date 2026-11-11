@@ -7,9 +7,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import logging
-from collections.abc import Iterable
+import random
+from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any, TYPE_CHECKING
 
@@ -20,6 +23,7 @@ from torchtitan.components.renderer import RendererConfig
 
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.data import RLDataset, RolloutDataLoader
 from torchtitan.rl.rollout.message_env import MessageEnv
@@ -46,9 +50,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# How long `Rollouter.close` waits for in-flight `run_group` calls before stopping their workers anyway.
-# Drains took under 0.3 s once the generators closed; 30 s only covers a group stuck in a slow env step.
-_RUN_GROUP_DRAIN_TIMEOUT_S = 30.0
+# Caps two waits at shutdown: a cancelled group stopping (`run_group_rollouts`), and `close`.
+# The `run_group` drain took under 0.3 s once the generators closed; 30 s covers a slow env step.
+_SHUTDOWN_DRAIN_TIMEOUT_S = 30.0
 
 
 class Rollouter(Configurable):
@@ -83,6 +87,7 @@ class Rollouter(Configurable):
                     reward_fns=[RewardCorrect.Config(), RewardFormat.Config(weight=0.3)]
                 ),
                 message_env=MyEnv.Config(),
+                token_env=TokenEnv.Config(max_rollout_tokens=32768),
             ),
         ).build()
 
@@ -94,7 +99,8 @@ class Rollouter(Configurable):
             `setup_async` too, or the worker pool is still spawned unused.
           - Group execution, fine: keep the stock orchestration and point `worker`
             at a `RolloutWorker.Config` subclass, overriding only what you need
-            (`make_env_group`, `score_group`, `run_group`).
+            (`make_env_group`, `score_group`, `run_group`). A worker whose env isn't a
+            `MessageEnv` subclasses `BaseRolloutWorker` and implements `run_group`.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -105,16 +111,27 @@ class Rollouter(Configurable):
         validation_dataset: RLDataset.Config
         """Builds an iterable validation dataset."""
 
-        worker: RolloutWorker.Config
+        worker: BaseRolloutWorker.Config
         """How a rollout group is built, driven, scored and advantaged. Selects the
-        `RolloutWorker` subclass by config type; one worker is built per pool process."""
+        `BaseRolloutWorker` subclass by config type; one worker is built per pool process."""
 
         worker_pool_size: int = 4
-        """CPU rollout worker processes to spawn on the controller host."""
+        """CPU rollout worker processes, on the controller's host unless
+        `workers_on_controller_host` is False."""
+
+        # TODO: default to False once a matched multi-node run (workers home vs spread) passes.
+        workers_on_controller_host: bool = True
+        """True: every rollout worker runs on the controller's host. False: the actor system
+        spreads them over the job's other hosts (a one-node run keeps them on this host). Keep
+        True when an env needs something only that host has, e.g. a retriever on its 127.0.0.1
+        or its Docker daemon."""
 
         num_threads_per_worker: int = 4
         """Size of each worker process's default thread pool executor, i.e. the pool
-        behind every `asyncio.to_thread` call in that process."""
+        behind every `asyncio.to_thread` call in that process. Rendering runs on it (`TokenEnv`,
+        the Verifiers client), and so does a blocking client that an env calls through
+        `asyncio.to_thread` (e.g. a sandbox SDK). With fewer threads than such calls in flight,
+        rollouts wait for a free thread."""
 
         def __post_init__(self) -> None:
             if self.worker_pool_size < 1:
@@ -127,6 +144,15 @@ class Rollouter(Configurable):
                     "num_threads_per_worker must be at least 1, got "
                     f"{self.num_threads_per_worker}"
                 )
+            if not self.training_dataloader.dataset.repeat:
+                raise ValueError(
+                    "training_dataloader.dataset.repeat=False: training reads its dataset "
+                    "without end, so it must repeat. Only validation builds a dataset with "
+                    "repeat=False."
+                )
+            # Every validation builds its dataset with repeat=False; a dataset with no end and no
+            # size raises here.
+            replace(self.validation_dataset, repeat=False)
 
     def __init__(self, config: Config) -> None:
         self._config = config
@@ -135,8 +161,8 @@ class Rollouter(Configurable):
             raise ValueError("training_dataloader must build a RolloutDataLoader")
         self._training_dataloader = iter(training_dataloader)
 
-        # The worker pool's actor handle and the actor system that spawned it.
-        self._worker_actors: Any | None = None
+        # One single-actor handle per worker process, and the actor system that spawned them.
+        self._workers: list[Any] = []
         self._actor_system: ActorSystem | None = None
         # `run_group` calls still running on a worker, including those whose caller was cancelled.
         self._inflight_run_group_calls: set[asyncio.Future[RolloutGroup]] = set()
@@ -150,15 +176,30 @@ class Rollouter(Configurable):
         self._training_dataloader.commit(sample_ids)
 
     def get_validation_samples(self, steps: int) -> list[object]:
-        """Materialize one fresh validation pass, optionally bounded by steps."""
-        validation_data = self._config.validation_dataset.build()
+        """Read one fresh validation pass: the first `steps` prompts, or all of them for -1.
+
+        Validation never repeats a prompt. Example, a dataset of 3 prompts:
+            steps=-1  reads the 3
+            steps=2   reads the first 2
+            steps=5   raises: the dataset has only 3
+        """
+        # Built fresh on each call, so every validation starts at the first prompt.
+        validation_dataset = replace(self._config.validation_dataset, repeat=False)
+        validation_data = validation_dataset.build()
         try:
             iterator = iter(validation_data)
         except TypeError as error:
             raise ValueError("validation_dataset must build an iterable") from error
         if steps == -1:
             return list(iterator)
-        return list(itertools.islice(iterator, steps))
+        samples = list(itertools.islice(iterator, steps))
+        if len(samples) < steps:
+            raise ValueError(
+                f"validation_dataset has {len(samples)} prompts, fewer than "
+                f"ValidationConfig.steps={steps}, and validation doesn't repeat prompts. "
+                f"Set steps=-1 to read all {len(samples)}."
+            )
+        return samples
 
     async def setup_async(
         self,
@@ -170,55 +211,85 @@ class Rollouter(Configurable):
         vision_processor_config: VisionProcessor.Config | None = None,
     ) -> None:
         """Spawn the rollout worker pool through ``actor_system`` and initialize it."""
-        if self._worker_actors is not None:
+        if self._workers:
             raise RuntimeError("rollout worker pool is already initialized")
 
         self._actor_system = actor_system
-        self._worker_actors = await actor_system.spawn_rollout_workers(
+        self._workers = await actor_system.spawn_rollout_workers(
             self._config.worker,
             num_workers=self._config.worker_pool_size,
             num_threads=self._config.num_threads_per_worker,
+            on_controller_host=self._config.workers_on_controller_host,
         )
-        await self._worker_actors.setup_async.call(
-            tokenizer_config=tokenizer_config,
-            renderer_config=renderer_config,
-            hf_assets_path=hf_assets_path,
-            vision_processor_config=vision_processor_config,
+        await asyncio.gather(
+            *(
+                worker.setup_async.call_one(
+                    tokenizer_config=tokenizer_config,
+                    renderer_config=renderer_config,
+                    hf_assets_path=hf_assets_path,
+                    vision_processor_config=vision_processor_config,
+                )
+                for worker in self._workers
+            )
         )
 
     async def close(self) -> None:
-        """Wait for in-flight `run_group` calls, then stop the rollout worker pool.
+        """Stop the rollout workers once the generator router owes none of them an answer.
 
-        Close the generators first, so pending `generate_fn` calls fail fast:
+        An answer that reaches a stopped worker fails the router, and the finished job exits 130.
+        `Controller.close` closes the generators first, so pending generate calls fail fast. Then,
+        within one _SHUTDOWN_DRAIN_TIMEOUT_S:
 
-            generators closed -> generate_fn raises -> run_group returns -> stop_rollout_workers()
-            run_group still running after _RUN_GROUP_DRAIN_TIMEOUT_S       -> stop_rollout_workers()
-
-        Why wait: if a worker stops while the generator router still owes it a reply, Monarch fails the
-        router and the finished job exits 130.
+            1. wait for the `run_group` calls still running (each fails at its next generate call)
+            2. on every worker, wait for the generate calls the router hasn't answered yet: a
+               cancelled rollout stopped waiting for its call, but the router still answers it.
+               A dead worker's error is logged with its traceback; the other workers still wait.
+            3. stop the workers, also after a timeout, an error, or a cancel of `close`
         """
+        workers = self._workers
         actor_system = self._actor_system
-        self._worker_actors = None
+        self._workers = []
         self._actor_system = None
         calls = tuple(self._inflight_run_group_calls)
-        if calls:
-            _, pending = await asyncio.wait(calls, timeout=_RUN_GROUP_DRAIN_TIMEOUT_S)
-            if pending:
-                logger.warning(
-                    "Stopping rollout workers with %d run_group calls still running; "
-                    "the job may exit 130",
-                    len(pending),
+        try:
+            async with asyncio.timeout(_SHUTDOWN_DRAIN_TIMEOUT_S):
+                # return_exceptions: a failed group or a dead worker must not end the wait for the others.
+                await asyncio.gather(*calls, return_exceptions=True)
+                results = await asyncio.gather(
+                    *(worker.wait_for_generate_calls.call_one() for worker in workers),
+                    return_exceptions=True,
                 )
-                for call in pending:
-                    call.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-        if actor_system is not None:
-            await actor_system.stop_rollout_workers()
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(
+                        "A rollout worker failed while waiting for its generate calls; "
+                        "the job may exit 130",
+                        exc_info=result,
+                    )
+        except TimeoutError:
+            logger.warning(
+                "Stopping rollout workers before every run_group and generate call ended; "
+                "the job may exit 130"
+            )
+        finally:
+            if actor_system is not None:
+                await actor_system.stop_rollout_workers()
 
     async def sync_log_step(self, step: int) -> None:
         """Propagate the controller log step to every rollout worker."""
-        if self._worker_actors is not None:
-            await self._worker_actors.sync_log_step.call(step)
+        await asyncio.gather(
+            *(worker.sync_log_step.call_one(step) for worker in self._workers)
+        )
+
+    async def process_metrics(self) -> list[m.Metric]:
+        """Every rollout worker's CPU since the previous call and its memory, agent subprocesses
+        included; the metrics processor reduces them over workers."""
+        # TODO: also each host's sum (and its max over hosts), to check a host's CPU and memory
+        #   budget; these sums are job-wide.
+        replies = await asyncio.gather(
+            *(worker.process_metrics.call_one() for worker in self._workers)
+        )
+        return [metric for reply in replies for metric in reply]
 
     async def run_group_rollouts(
         self,
@@ -236,6 +307,11 @@ class Rollouter(Configurable):
         each sibling drives its own `generate_fn` calls, so the generator runs a whole
         group's calls together in one continuous batch. Then `score_group` fills each reward.
 
+        A cancel stops the group on its worker too, so the caller can release the group next:
+
+            caller cancelled         -> cancel_group -> group stopped -> CancelledError raised
+            group ignores the cancel -> CancelledError raised after _SHUTDOWN_DRAIN_TIMEOUT_S
+
         Args:
             generate_fn: Async callable that returns a Completion given a prompt.
             release_session_fn: Async callable each rollout calls after its last turn, to
@@ -248,13 +324,16 @@ class Rollouter(Configurable):
         Returns:
             One scored `RolloutGroup`.
         """
-        if self._worker_actors is None:
+        if not self._workers:
             raise RuntimeError("rollout worker pool is not initialized")
 
-        # `choose` (see ActorSystem's call convention) sends the call to the `run_group`
-        # endpoint of one worker in the pool.
+        # Random, so a worker whose groups fail immediately gets 1/N of the groups. Picking the
+        # least busy worker would send it every slot that frees up.
+        # TODO: before groups of tens of GB (1M-token rollouts, 128 per group), reserve each group's
+        #   bytes per worker host at admission, or pick by bytes with a fail-fast guard.
+        worker = random.choice(self._workers)
         call = asyncio.ensure_future(
-            self._worker_actors.run_group.choose(
+            worker.run_group.call_one(
                 generate_fn=generate_fn,
                 release_session_fn=release_session_fn,
                 sample=sample,
@@ -265,12 +344,26 @@ class Rollouter(Configurable):
         )
         self._inflight_run_group_calls.add(call)
         call.add_done_callback(self._on_run_group_call_done)
-        # Shield `call` from the controller's end-of-training cancel, so `close` can still wait for it.
-        return await asyncio.shield(call)
+        try:
+            # Shield `call` from the controller's end-of-training cancel, so `close` can still wait for it.
+            return await asyncio.shield(call)
+        except asyncio.CancelledError:
+            # Monarch never forwards a cancel to the remote call ("Messaging Adverbs" in its actor docs).
+            # So stop the group on the worker that runs it. Log an error instead of raising it:
+            # a raise here would hide the CancelledError from the caller.
+            async with (
+                _suppress_and_log(
+                    "cancel_group(%d) failed; the group may keep running", group_id
+                ),
+                asyncio.timeout(_SHUTDOWN_DRAIN_TIMEOUT_S),
+            ):
+                await worker.cancel_group.call_one(group_id)
+            raise
 
     def _on_run_group_call_done(self, call: asyncio.Future[RolloutGroup]) -> None:
         self._inflight_run_group_calls.discard(call)
-        # A cancelled caller never reads the error; read it so asyncio does not log it.
+        # Once its caller is cancelled, `asyncio.shield` stops watching `call`, so nobody reads its
+        # error and asyncio logs "exception was never retrieved". Read it here.
         if not call.cancelled():
             call.exception()
 
@@ -283,19 +376,15 @@ class Rollouter(Configurable):
         self._training_dataloader.load_state_dict(state_dict)
 
 
-class RolloutWorker(Configurable):
-    """Builds, executes, scores, and advantages one rollout group."""
+class BaseRolloutWorker(Configurable, ABC):
+    """Runs one rollout group in a rollout worker process, then scores it and computes its
+    advantages. Subclasses implement `run_group`. `RolloutWorker` is the stock one: it builds
+    each rollout's env from a `MessageEnv` and a `TokenEnv`."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         rubric: Rubric.Config
         """Reward functions + weights used by `score_group`."""
-
-        message_env: MessageEnv.Config
-        """The env to build per sample; `make_env_group` calls `build(env_input=sample)`."""
-
-        token_env: TokenEnv.Config = field(default_factory=TokenEnv.Config)
-        """`TokenEnv` wraps the `MessageEnv` in `make_env_group`."""
 
         advantage: Configurable.Config = field(
             default_factory=AdvantageEstimator.Config
@@ -305,9 +394,147 @@ class RolloutWorker(Configurable):
 
     def __init__(self, config: Config) -> None:
         self.rubric: Rubric = config.rubric.build()
+        self.advantage_estimator: AdvantageEstimator = config.advantage.build()
+
+    async def setup_async(
+        self,
+        *,
+        tokenizer_config: HuggingFaceTokenizer.Config,
+        renderer_config: RendererConfig,
+        hf_assets_path: str,
+    ) -> None:
+        """Called once in the worker process after it is spawned. The base needs nothing."""
+
+    async def close(self) -> None:
+        """Release what `setup_async` opened. The worker actor calls it on a graceful stop."""
+
+    async def score_group(
+        self,
+        rollouts: list[Rollout],
+        env_input: object,
+    ) -> list[RubricOutput]:
+        """Score one group's rollouts; `make_scored_group` applies the rewards.
+
+        Default impl delegates to `self.rubric.score_group`. Override for
+        cross-sibling scoring (judge, pairwise, diversity) or partial-credit
+        reward shaping.
+
+        Args:
+            rollouts: Sibling rollouts in one prompt group, already stepped. Only `is_trainable()`
+                rollouts are passed (see `make_scored_group`).
+            env_input: the env initial input shared by the group.
+
+        Returns:
+            One `RubricOutput` per rollout, in input order.
+        """
+        return await self.rubric.score_group(rollouts, env_input)
+
+    @abstractmethod
+    async def run_group(
+        self,
+        *,
+        generate_fn: GenerateFn,
+        release_session_fn: ReleaseSessionFn,
+        sample: object,
+        group_id: int,
+        group_size: int,
+        sampling: SamplingConfig,
+    ) -> RolloutGroup:
+        """Roll out and score one prompt group. An implementation gathers its rollouts with
+        `return_exceptions=True` and passes the results to `make_scored_group`, which keeps
+        rollouts that aren't `is_trainable()` out of scoring and training. On a cancel it returns
+        only after every rollout's cleanup ran: `RolloutWorkerActor.cancel_group` waits for that.
+
+        Args:
+            generate_fn: Async callable that returns a Completion given a prompt.
+            release_session_fn: Async callable each rollout calls after its last turn, to
+                release its routing session.
+            sample: Dataset sample shared by the group.
+            group_id: Stable group id; siblings share it for advantage centering.
+            group_size: Number of sibling rollouts.
+            sampling: Sampling config for every generate call in the group.
+
+        Returns:
+            One scored `RolloutGroup`.
+        """
+
+    async def make_scored_group(
+        self, results: list[Rollout | BaseException], sample: object, *, group_id: int
+    ) -> RolloutGroup:
+        """Turn a group's `gather(..., return_exceptions=True)` results into one scored group. A
+        sibling that raised becomes an `ERROR_INFRA` rollout. `score_group` scores the rollouts
+        that are `is_trainable()`, and their rewards become advantages. The others keep reward and
+        advantage None, so they aren't trained.
+
+        Example, group 7, rewards from `score_group`:
+
+            results     [Rollout(0, COMPLETED), ConnectionError(...), Rollout(2, ERROR)]
+            rollouts    [Rollout(0), Rollout(1, ERROR_INFRA, logs={"error": ...}), Rollout(2)]
+            rewards     [1.0, None, 0.0]       score_group sees rollouts 0 and 2
+            advantages  [0.5, None, -0.5]
+            results     [Rollout(0), CancelledError()]  -> raises the CancelledError
+
+        A reward None from `score_group` (e.g. a judge that failed) also keeps a rollout out of
+        the advantage, and of training. Callers gather with `return_exceptions=True`, so nothing
+        raises before every sibling finished: the controller releases the group on the
+        generators next, and a sibling still generating would pin it again, with nothing left to
+        release it.
+        """
+        rollouts: list[Rollout] = []
+        for rollout_id, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(
+                    "rollout group=%d/rollout=%d raised; marking ERROR_INFRA",
+                    group_id,
+                    rollout_id,
+                    exc_info=result,
+                )
+                result = Rollout(
+                    group_id=group_id,
+                    rollout_id=rollout_id,
+                    status=RolloutStatus.ERROR_INFRA,
+                    logs={"error": repr(result)},
+                )
+            elif isinstance(result, BaseException):
+                raise result
+            rollouts.append(result)
+
+        # A group with no trainable rollout has nothing to score or center.
+        scored = [rollout for rollout in rollouts if rollout.status.is_trainable()]
+        if scored:
+            outputs = await self.score_group(scored, sample)
+            for rollout, output in zip(scored, outputs, strict=True):
+                rollout.reward = output.reward
+                rollout.reward_breakdown = output.reward_breakdown
+        # TODO: run an ordered list of group postprocessors here, e.g. drop a group whose rewards all
+        # match, then compute advantages. The advantage estimator becomes one of them, and so can the
+        # group filters in `TrainingSampleBuilder.build_from_group`.
+        centered = [rollout for rollout in scored if rollout.reward is not None]
+        if centered:
+            advantages = self.advantage_estimator(
+                RolloutGroup(group_id=group_id, rollouts=centered)
+            )
+            for rollout, advantage in zip(centered, advantages, strict=True):
+                rollout.advantage = advantage
+        return RolloutGroup(group_id=group_id, rollouts=rollouts)
+
+
+class RolloutWorker(BaseRolloutWorker):
+    """Builds each rollout's env from `message_env` and `token_env`, and drives it against the
+    generator."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseRolloutWorker.Config):
+        message_env: MessageEnv.Config
+        """The env to build per sample; `make_env_group` calls `build(env_input=sample)`."""
+
+        token_env: TokenEnv.Config
+        """`TokenEnv` wraps the `MessageEnv` in `make_env_group`."""
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
         self._message_env_config = config.message_env
         self._token_env_config = config.token_env
-        self.advantage_estimator: AdvantageEstimator = config.advantage.build()
         self._renderer: Renderer
 
     async def setup_async(
@@ -356,26 +583,6 @@ class RolloutWorker(Configurable):
             for _ in range(group_size)
         ]
 
-    async def score_group(
-        self,
-        rollouts: list[Rollout],
-        env_input: object,
-    ) -> list[RubricOutput]:
-        """Score one group's rollouts; `run_group` applies the rewards.
-
-        Default impl delegates to `self.rubric.score_group`. Override for
-        cross-sibling scoring (judge, pairwise, diversity) or partial-credit
-        reward shaping.
-
-        Args:
-            rollouts: Sibling rollouts in one prompt group, already stepped.
-            env_input: the env initial input shared by the group.
-
-        Returns:
-            One `RubricOutput` per rollout, in input order.
-        """
-        return await self.rubric.score_group(rollouts, env_input)
-
     async def run_group(
         self,
         *,
@@ -386,26 +593,8 @@ class RolloutWorker(Configurable):
         group_size: int,
         sampling: SamplingConfig,
     ) -> RolloutGroup:
-        """Roll out and score one prompt group.
-
-        Builds `group_size` sibling envs from one sample and drives them concurrently;
-        each sibling drives its own `generate_fn` calls, so the generator runs a whole
-        group's calls together in one continuous batch. Then `score_group` fills each reward.
-
-        For custom logic, users can override this method.
-
-        Args:
-            generate_fn: Async callable that returns a Completion given a prompt.
-            release_session_fn: Async callable each rollout calls after its last turn, to
-                release its routing session.
-            sample: Dataset sample shared by the group.
-            group_id: Stable group id; siblings share it for advantage centering.
-            group_size: Number of sibling rollouts.
-            sampling: Sampling config for every generate call in the group.
-
-        Returns:
-            One scored `RolloutGroup`.
-        """
+        """Build `group_size` envs from `sample`, run them concurrently, then `make_scored_group`.
+        Each rollout makes its own `generate_fn` calls, so the generator batches the group's calls."""
         # One prompt becomes [env] * group_size.
         envs = self.make_env_group(
             sample=sample,
@@ -415,8 +604,10 @@ class RolloutWorker(Configurable):
         # TODO(perf): siblings in a group share the first-turn prompt; tokenize it once per group and
         # reuse across the group_size rollouts (truest spot is the worker's first-turn render).
         try:
-            # produce the rollouts
-            rollouts = await asyncio.gather(
+            # produce the rollouts. return_exceptions=True: the gather ends only once every rollout
+            # ended, also when one raises (see `make_scored_group`) or when the whole group is
+            # cancelled (`RolloutWorkerActor.cancel_group`): each rollout first releases its session.
+            results = await asyncio.gather(
                 *(
                     self._run_single_rollout(
                         generate_fn=generate_fn,
@@ -433,24 +624,13 @@ class RolloutWorker(Configurable):
                         rollout_id=sample_idx,
                     )
                     for sample_idx, env in enumerate(envs)
-                )
+                ),
+                return_exceptions=True,
             )
         finally:
             # close the envs
             await asyncio.gather(*(env.close() for env in envs), return_exceptions=True)
-
-        # score
-        outputs = await self.score_group(rollouts, sample)
-        for rollout, output in zip(rollouts, outputs, strict=True):
-            rollout.reward = output.reward
-            rollout.reward_breakdown = output.reward_breakdown
-
-        # Post-scoring: turn group rewards into per-rollout advantages.
-        group = RolloutGroup(group_id=group_id, rollouts=rollouts)
-        advantages = self.advantage_estimator(group)
-        for rollout, advantage in zip(group.rollouts, advantages, strict=True):
-            rollout.advantage = advantage
-        return group
+        return await self.make_scored_group(results, sample, group_id=group_id)
 
     async def _run_single_rollout(
         self,
@@ -463,7 +643,8 @@ class RolloutWorker(Configurable):
         rollout_id: int,
     ) -> Rollout:
         """Produce a single rollout, alternating between env and generator calls,
-        until the env is terminal (env `done`, truncation, errors).
+        until the env is terminal (env `done`, truncation, errors). An exception ends it as
+        `ERROR_INFRA`, which keeps it out of scoring and training.
 
         For custom logic, users can override this method.
 
@@ -487,6 +668,7 @@ class RolloutWorker(Configurable):
         ).to_string(include_turn=False)
         turns: list[RolloutTurn] = []
         status = RolloutStatus.ERROR
+        logs: dict[str, Any] = {}
         try:
             env_step = await env.init()
             while not env_step.status.is_terminal():
@@ -538,25 +720,45 @@ class RolloutWorker(Configurable):
                 env_step = next_env_step
 
             status = env_step.status
-        except Exception:
-            # TODO: at shutdown, every rollout still generating lands here with a ~40-line remote
-            # traceback. Raise a typed error on generator close and log it at info, without the traceback.
+        except Exception as error:
+            # An exception is read as a failure outside the policy: `TokenEnv` turns the policy's
+            # failures into statuses (e.g. ERROR_PARSE), and an env answers bad output instead of
+            # raising (`MessageEnv.step`).
             logger.exception(
-                "rollout %s/rollout=%d failed after %d turn(s); marking ERROR",
+                "rollout %s/rollout=%d failed after %d turn(s); marking ERROR_INFRA",
                 group_id,
                 rollout_id,
                 len(turns),
             )
-            status = RolloutStatus.ERROR
-
-        try:
-            await release_session_fn(routing_session_id=routing_session_id)
-        except Exception:
-            # Not fatal: `max_sessions` evicts an unreleased session.
-            logger.exception("releasing routing session %s failed", routing_session_id)
+            status = RolloutStatus.ERROR_INFRA
+            logs["error"] = repr(error)
+        finally:
+            # A failure is only logged: `release_groups` frees the KV and `max_sessions` evicts the
+            # routing pin. A raised error would turn this rollout into ERROR_INFRA.
+            async with _suppress_and_log(
+                "releasing routing session %s failed", routing_session_id
+            ):
+                await release_session_fn(routing_session_id=routing_session_id)
         return Rollout(
             group_id=group_id,
             rollout_id=rollout_id,
             status=status,
             turns=turns,
+            logs=logs,
         )
+
+
+@contextlib.asynccontextmanager
+async def _suppress_and_log(
+    failure_message: str, *message_args: object
+) -> AsyncIterator[None]:
+    """Like `contextlib.suppress(Exception)`, plus a log line with the traceback.
+
+    Example:
+        async with _suppress_and_log("cancel_group(%d) failed", 7):
+            await cancel_group(7)   # RuntimeError -> logged, not raised; CancelledError -> raised
+    """
+    try:
+        yield
+    except Exception:
+        logger.exception(failure_message, *message_args)

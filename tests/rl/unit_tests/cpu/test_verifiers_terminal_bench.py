@@ -7,8 +7,7 @@
 """CPU checks for the Terminal-Bench Verifiers recipe."""
 
 import asyncio
-import pickle
-import subprocess
+import itertools
 import sys
 from pathlib import PurePosixPath
 from types import SimpleNamespace
@@ -25,41 +24,48 @@ from torchtitan.components.renderer import RenderersConfigAdapter
 from torchtitan.config import ConfigLoader
 from torchtitan.distributed.activation_remat import FullActivationRematConfig
 from torchtitan.rl.controller.controller import Controller
-from torchtitan.rl.examples.verifiers import env_server
 from torchtitan.rl.examples.verifiers.terminal_bench import taskset
 from torchtitan.rl.examples.verifiers.terminal_bench.harness import (
     TerminalBenchTerminusHarness,
     TerminalBenchTerminusHarnessConfig,
 )
 from torchtitan_recipes.rl.verifiers_terminal_bench import (
-    _terminal_bench_rollouter_config,
+    terminal_bench_rollouter_config,
 )
-from verifiers.v1.runtimes import ProgramResult
-from verifiers.v1.serve import env_config_data
-from verifiers.v1.tasksets.harbor import HarborEnvConfig
-from verifiers.v1.utils.loaders import load_harness, resolve_env_config
+from verifiers.v1.agent import resolve_rollout_timeouts
+from verifiers.v1.runtimes import ProgramResult, Runtime
+from verifiers.v1.tasksets.harbor import taskset as harbor_taskset
+from verifiers.v1.utils.compile import resolve_runtime_config
+from verifiers.v1.utils.loaders import (
+    load_environment,
+    load_harness,
+    resolve_env_config,
+)
 
 TRAIN_DATASET = "local/tmax@v1"
 EVAL_DATASET = "terminal-bench/terminal-bench-2-1"
 MAX_CONTEXT_LENGTH = 32768
 MAX_TURNS = 64
-MAX_CONCURRENT_ROLLOUTS = 64
 
 
-def _rollouter_config(train_dataset: str, validation_dataset: str):
-    return _terminal_bench_rollouter_config(
+def _rollouter_config(train_dataset: str, validation_dataset: str, **options):
+    return terminal_bench_rollouter_config(
         train_dataset,
         validation_dataset,
         max_context_length=MAX_CONTEXT_LENGTH,
         max_turns=MAX_TURNS,
-        max_concurrent_rollouts=MAX_CONCURRENT_ROLLOUTS,
+        **options,
     )
 
 
 class _RecordingRuntime:
-    """Records the program the harness prepares, how it runs it, and other commands."""
+    """Records the program the harness prepares and every command it runs, in order."""
 
     def __init__(self) -> None:
+        # The methods below stand in for Verifiers' Runtime; fail if it renames one.
+        assert all(
+            hasattr(Runtime, name) for name in ("prepare_uv_script", "run", "write")
+        )
         self.commands: list[tuple[list[str], dict[str, str]]] = []
         self.files: dict[str, bytes] = {}
 
@@ -67,13 +73,9 @@ class _RecordingRuntime:
         self.source = source
         return ["terminus_harness"]
 
-    async def run_program(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
-        self.argv = argv
-        self.program_env = env
-        return ProgramResult(exit_code=0, stdout="", stderr="")
-
-    async def run(self, argv: list[str], env: dict[str, str]) -> None:
+    async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
         self.commands.append((argv, env))
+        return ProgramResult(exit_code=0, stdout="", stderr="")
 
     async def write(self, path: str, data: bytes) -> None:
         self.files[path] = data
@@ -94,7 +96,7 @@ def _run_terminus_program(
 
     harness_config = _rollouter_config(
         TRAIN_DATASET, EVAL_DATASET
-    ).verifiers_env_server.environment.agent.harness
+    ).worker.environment.agent.harness
     harness = load_harness(harness_config.model_copy(update=options))
     runtime = _RecordingRuntime()
     asyncio.run(
@@ -115,9 +117,10 @@ def _run_terminus_program(
     [(prompts_path, prompts)] = runtime.files.items()
     local_prompts = tmp_path / "prompts.json"
     local_prompts.write_bytes(prompts)
-    argv = [arg.replace(prompts_path, str(local_prompts)) for arg in runtime.argv]
+    [(program_argv, _)] = runtime.commands
+    argv = [arg.replace(prompts_path, str(local_prompts)) for arg in program_argv]
 
-    recorded = SimpleNamespace(argv=runtime.argv, kwargs={}, calls=[])
+    recorded = SimpleNamespace(argv=program_argv, kwargs={}, calls=[])
 
     async def llm_call(*args: object, message_history: list[dict]) -> list[dict]:
         return message_history
@@ -204,13 +207,14 @@ def test_tmux_server_outlives_launch_until_cleanup() -> None:
             SimpleNamespace(prompt="Fix the parser in /app.", system_prompt=None),
         )
     )
-    assert runtime.commands == []
+    # Launch ran the program only.
+    [(_, program_env)] = runtime.commands
 
     asyncio.run(harness.cleanup(trace, runtime))
-    [(argv, env)] = runtime.commands
+    [_, (argv, env)] = runtime.commands
     assert "tmux kill-server" in argv[-1]
     assert env == {"TMUX_TMPDIR": "/tmp/vf-terminus-2-trace"}
-    assert runtime.program_env["TMUX_TMPDIR"] == env["TMUX_TMPDIR"]
+    assert program_env["TMUX_TMPDIR"] == env["TMUX_TMPDIR"]
     # The prompts file cleanup removes is the one launch wrote.
     assert '"$TMUX_TMPDIR.prompts.json"' in argv[-1]
     assert list(runtime.files) == ["/tmp/vf-terminus-2-trace.prompts.json"]
@@ -218,68 +222,123 @@ def test_tmux_server_outlives_launch_until_cleanup() -> None:
 
 def test_agent_runs_inside_docker_and_verifier_uses_same_taskset() -> None:
     config = _rollouter_config(TRAIN_DATASET, EVAL_DATASET)
-    environment = config.verifiers_env_server.environment
+    environment = config.worker.environment
 
-    assert isinstance(environment, HarborEnvConfig)
+    assert isinstance(environment, vf.SingleAgentEnvConfig)
     assert isinstance(environment.agent.runtime, vf.DockerConfig)
     assert isinstance(environment.agent.harness, TerminalBenchTerminusHarnessConfig)
     assert environment.agent.harness.version == "0.22.0"
-    assert config.generation_server.max_rollout_tokens == MAX_CONTEXT_LENGTH
+    assert config.worker.generation_server.max_rollout_tokens == MAX_CONTEXT_LENGTH
     assert environment.agent.max_turns == MAX_TURNS
     assert environment.agent.timeout.rollout == 7200
     assert environment.taskset == config.training_dataloader.dataset.verifiers_taskset
     assert config.training_dataloader.dataset.verifiers_taskset.dataset == TRAIN_DATASET
     assert config.validation_dataset.verifiers_taskset.dataset == EVAL_DATASET
-    assert config.verifiers_env_server.local_taskset_module == taskset.__name__
-    worker_config = resolve_env_config(env_config_data(environment))
-    assert worker_config.agent.harness == environment.agent.harness
+    # What each rollout worker loads.
+    env = load_environment(resolve_env_config(environment))
+    assert type(env.taskset) is taskset.TerminalTaskset
     assert isinstance(
-        load_harness(worker_config.agent.harness), TerminalBenchTerminusHarness
+        load_harness(env.config.agent.harness), TerminalBenchTerminusHarness
     )
 
 
-def test_env_server_workers_skip_the_trainer_imports(monkeypatch) -> None:
-    """A pool worker loads the broker's ``__main__``, runs the pickled ``log_setup``, then
-    resolves the env config, whose taskset id is the local alias. It must find the taskset
-    and the harness without importing torch, vLLM or Monarch.
+def test_taskset_id_picks_the_taskset_config_and_env(tmp_path, monkeypatch) -> None:
+    """A caller's own top-level package, passed as ``taskset_id``, supplies the taskset and
+    the env."""
+    (tmp_path / "caller_terminal_bench").mkdir()
+    (tmp_path / "caller_terminal_bench" / "__init__.py").write_text(
+        "import verifiers.v1 as vf\n"
+        "from verifiers.v1.tasksets.harbor import HarborTask\n"
+        "from torchtitan.rl.examples.verifiers.terminal_bench.taskset import (\n"
+        "    TerminalTaskset,\n"
+        "    TerminalTasksetConfig,\n"
+        ")\n\n\n"
+        "class CallerTasksetConfig(TerminalTasksetConfig):\n"
+        "    pass\n\n\n"
+        "class CallerTaskset(TerminalTaskset, vf.Taskset[HarborTask, CallerTasksetConfig]):\n"
+        "    config: CallerTasksetConfig\n\n\n"
+        "class CallerEnv(vf.SingleAgentEnv):\n"
+        "    pass\n\n\n"
+        "__all__ = ['CallerEnv', 'CallerTaskset']\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    config = _rollouter_config(
+        TRAIN_DATASET, EVAL_DATASET, taskset_id="caller_terminal_bench"
+    )
+
+    # What each rollout worker loads.
+    env = load_environment(resolve_env_config(config.worker.environment))
+    assert type(env).__name__ == "CallerEnv"
+    assert type(env.taskset).__name__ == "CallerTaskset"
+
+
+def _write_harbor_task(task_dir, *, task_toml: str, dockerfile: str | None) -> None:
+    (task_dir / "tests").mkdir(parents=True)
+    (task_dir / "tests" / "test.sh").write_text("exit 0\n")
+    (task_dir / "instruction.md").write_text("Fix the parser.\n")
+    (task_dir / "task.toml").write_text(task_toml)
+    if dockerfile is not None:
+        (task_dir / "environment").mkdir()
+        (task_dir / "environment" / "Dockerfile").write_text(dockerfile)
+
+
+def test_tasks_run_in_the_image_workdir_and_grade_with_task_timeouts(
+    tmp_path, monkeypatch
+) -> None:
+    """Each task gets the start folder and grading timeout that `harbor run` gives it.
+
+    A Terminal-Bench 2.1 task names its folder only in its Dockerfile and declares a
+    verifier timeout. A TMax task from prepare_tmax.py names its folder in task.toml
+    and declares no verifier timeout, so it gets Harbor's 600 s. A WORKDIR that Docker
+    would expand ($HOME) is left to the runtime's default folder.
     """
-    captured = {}
+    monkeypatch.setattr(harbor_taskset, "CACHE", tmp_path)
+    for dataset_dir in ("local_train_v1", "local_validation_v1"):
+        _write_harbor_task(
+            tmp_path / dataset_dir / "terminal-bench",
+            task_toml='[task]\nname = "test/terminal-bench"\n'
+            '[environment]\ndocker_image = "example/dclm:1"\n'
+            "[verifier]\ntimeout_sec = 900.0\n",
+            dockerfile="FROM python:3.13\nWORKDIR /app\nRUN true\nWORKDIR /app/dclm\n",
+        )
+        _write_harbor_task(
+            tmp_path / dataset_dir / "tmax",
+            task_toml='[task]\nname = "test/tmax"\n'
+            '[environment]\ndocker_image = "example/tmax:1"\nworkdir = "/home/user"\n',
+            dockerfile=None,
+        )
+        _write_harbor_task(
+            tmp_path / dataset_dir / "env-var",
+            task_toml='[task]\nname = "test/env-var"\n'
+            '[environment]\ndocker_image = "example/env:1"\n',
+            dockerfile="FROM python:3.13\nWORKDIR $HOME/work\n",
+        )
+    config = _rollouter_config("local/train@v1", "local/validation@v1")
+    agent = config.worker.environment.agent
+    task_type = taskset.TerminalTaskset.task_type()
 
-    def serve_env(**kwargs) -> None:
-        captured["main"] = sys.modules["__main__"]
-        captured["log_setup"] = pickle.dumps(kwargs["log_setup"])
-        captured["config_data"] = pickle.dumps(kwargs["config_data"])
-
-    monkeypatch.setattr(env_server, "serve_env", serve_env)
-    # _run_env_server_process replaces __main__ and edits no_proxy; restore both after the test.
-    monkeypatch.setitem(sys.modules, "__main__", sys.modules["__main__"])
-    monkeypatch.setenv("no_proxy", "")
-    monkeypatch.setenv("NO_PROXY", "")
-    config = _rollouter_config(TRAIN_DATASET, EVAL_DATASET).verifiers_env_server
-    env_server._run_env_server_process(
-        environment=env_config_data(config.environment),
-        serve=config.serve,
-        local_taskset_module=config.local_taskset_module,
-        address_queue=None,
-        death_pipe=None,
+    for dataset in (config.training_dataloader.dataset, config.validation_dataset):
+        runs = {}
+        # A rollout worker rebuilds each task from the data the controller sends.
+        for sample in itertools.islice(dataset.build(), 3):
+            task = task_type(
+                task_type.data_type().model_validate(sample.verifiers_task_data)
+            )
+            runs[task.data.name] = (
+                resolve_runtime_config(agent.runtime, task).workdir,
+                resolve_rollout_timeouts(agent.timeout, task).scoring,
+            )
+        assert runs == {
+            "test/terminal-bench": ("/app/dclm", 900.0),
+            "test/tmax": ("/home/user", 600.0),
+            "test/env-var": (None, 600.0),
+        }
+    # With Verifiers' default ignore_timeouts=True, no task gets a grading timeout.
+    ignoring = config.validation_dataset.verifiers_taskset.model_copy(
+        update={"ignore_timeouts": True}
     )
-
-    # Spawn re-runs __main__ in each worker if it has a module name or a file.
-    assert captured["main"].__spec__ is None
-    assert not hasattr(captured["main"], "__file__")
-    worker = f"""
-import pickle, sys
-from verifiers.v1.utils.loaders import load_harness, resolve_env_config
-pickle.loads({captured["log_setup"]!r})()
-env_config = resolve_env_config(pickle.loads({captured["config_data"]!r}))
-print(type(load_harness(env_config.agent.harness)).__name__)
-print([name for name in ("torch", "vllm", "monarch") if name in sys.modules])
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", worker], capture_output=True, text=True, check=False
-    )
-    assert result.returncode == 0, result.stderr[-2000:]
-    assert result.stdout.split() == ["TerminalBenchTerminusHarness", "[]"]
+    scorings = [task.data.timeout.scoring for task in taskset.TerminalTaskset(ignoring)]
+    assert scorings == [None, None, None]
 
 
 def test_training_cannot_read_benchmark_as_training_data() -> None:
@@ -321,6 +380,9 @@ def test_training_recipe_uses_separate_datasets() -> None:
         == TRAIN_DATASET
     )
     assert config.rollouter.validation_dataset.verifiers_taskset.dataset == EVAL_DATASET
+    # `Controller.__init__` dumps the config. The Verifiers worker's own `to_dict` turns its
+    # pydantic env config into a dict; the generic dump would give its repr, a string.
+    assert isinstance(config.to_dict()["rollouter"]["worker"]["environment"], dict)
 
 
 def _num_kv_heads(model: object) -> int:
@@ -351,9 +413,9 @@ def test_muse_glimmer_terminal_bench_recipe_uses_worker_loadable_renderer() -> N
 
     assert config.trainer.model.max_context_length == 16384
     assert config.generator.model.max_context_length == 16384
-    assert config.rollouter.generation_server.max_rollout_tokens == 16384
+    assert config.rollouter.worker.generation_server.max_rollout_tokens == 16384
     assert config.generator.sampling.max_tokens == 4096
-    assert config.rollouter.verifiers_env_server.environment.agent.max_turns == 8
+    assert config.rollouter.worker.environment.agent.max_turns == 8
     assert config.generator.engine.cuda_graph.mode == "NONE"
     assert isinstance(config.trainer.activation_remat, FullActivationRematConfig)
     assert _num_kv_heads(config.generator.model) == 2
@@ -372,7 +434,7 @@ def test_muse_glimmer_terminal_bench_recipe_uses_worker_loadable_renderer() -> N
     ("name", "trainer_gpus", "num_generators", "gpus_per_generator"),
     [
         ("rl_grpo_qwen35_9b_terminal_bench", 8, 8, 1),
-        ("rl_grpo_qwen35_35b_a3b_terminal_bench", 8, 2, 4),
+        ("rl_dapo_qwen35_35b_a3b_terminal_bench_dist_moe", 4, 4, 4),
     ],
 )
 def test_recipe_layouts_fit_the_model(
@@ -386,8 +448,8 @@ def test_recipe_layouts_fit_the_model(
     The invariants are the ones a launch would otherwise trip over one at a
     time: tensor parallelism divides the KV heads in both roles, and for the MoE
     model expert parallelism divides the experts, is at least the trainer TP
-    degree, and equals DP x TP in the generator. The GPU totals pin the intended
-    16-GPU footprint.
+    degree, and equals DP x TP in the generator. The GPU totals pin each recipe's
+    footprint.
     """
     config = _terminal_bench_config(name)
     trainer = config.trainer.parallelism
@@ -423,24 +485,20 @@ def test_recipe_layouts_fit_the_model(
             generator.data_parallel_degree * generator.tensor_parallel_degree
         )
         assert num_experts % generator.expert_parallel_degree == 0
-        # The standard MoE dispatcher reads split sizes back to the host, which
-        # CUDA graph capture does not allow.
-        assert config.generator.engine.cuda_graph.mode == "NONE"
 
 
 @pytest.mark.parametrize(
     "name",
     [
         "rl_grpo_qwen35_9b_terminal_bench",
-        "rl_grpo_qwen35_35b_a3b_terminal_bench",
+        "rl_dapo_qwen35_35b_a3b_terminal_bench_dist_moe",
     ],
 )
 def test_recipes_share_the_loop_and_keep_fp32_master_weights(name: str) -> None:
     """Every model trains on the same loop; only size-dependent settings differ.
 
     Master weights stay fp32 (the default): at a 1e-6 learning rate bf16
-    parameters round most updates away. The env server must run every rollout
-    the controller keeps in flight, or the excess queues and the generators idle.
+    parameters round most updates away.
     """
     config = _terminal_bench_config(name)
     assert config.precision.dtype == "float32"
@@ -448,14 +506,9 @@ def test_recipes_share_the_loop_and_keep_fp32_master_weights(name: str) -> None:
     assert config.async_loop.num_training_steps == 100
     assert config.async_loop.batcher.training_sample_builder.drop_zero_std_reward_groups
     assert config.generator.sampling.max_tokens == 16384
-    agent = config.rollouter.verifiers_env_server.environment.agent
+    agent = config.rollouter.worker.environment.agent
     assert agent.max_turns == 120
     assert (
-        config.rollouter.generation_server.max_rollout_tokens
+        config.rollouter.worker.generation_server.max_rollout_tokens
         == config.trainer.model.max_context_length
-    )
-    loop = config.async_loop
-    serve = config.rollouter.verifiers_env_server.serve
-    assert serve.pool.num_workers * serve.max_concurrent >= (
-        loop.max_active_rollout_groups * loop.num_samples_per_prompt
     )

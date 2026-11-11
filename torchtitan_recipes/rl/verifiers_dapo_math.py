@@ -36,13 +36,12 @@ from torchtitan.rl.controller.controller import (
 )
 from torchtitan.rl.examples.verifiers.dapo_math.data import VerifiersMathTasksetConfig
 from torchtitan.rl.examples.verifiers.data import VerifiersTaskDataset
-from torchtitan.rl.examples.verifiers.env_server import VerifiersEnvServer
 from torchtitan.rl.examples.verifiers.generation_server import GenerationServer
 from torchtitan.rl.examples.verifiers.rollouter import (
     RewardFromVerifiers,
     VerifiersRollouter,
+    VerifiersRolloutWorker,
 )
-from torchtitan.rl.examples.verifiers.worker_setup import register_local_taskset_alias
 from torchtitan.rl.generator.generator import Generator
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import SamplingConfig
@@ -64,8 +63,9 @@ from torchtitan_recipes.rl.model_configs import build_rl_model_configs
 def _math_taskset_config(
     dataset: Literal["dapo_math", "aime2025"],
 ) -> VerifiersMathTasksetConfig:
-    taskset_id = register_local_taskset_alias(VerifiersMathTasksetConfig.__module__)
-    return VerifiersMathTasksetConfig(id=taskset_id, dataset=dataset)
+    return VerifiersMathTasksetConfig(
+        id="torchtitan_verifiers_dapo_math", dataset=dataset
+    )
 
 
 def _verifiers_math_rollouter_config(
@@ -80,7 +80,7 @@ def _verifiers_math_rollouter_config(
         validation_dataset=VerifiersTaskDataset.Config(
             verifiers_taskset=_math_taskset_config("aime2025"),
         ),
-        verifiers_env_server=VerifiersEnvServer.Config(
+        worker=VerifiersRolloutWorker.Config(
             environment=vf.SingleAgentEnvConfig(
                 agent=vf.AgentConfig(
                     runtime=vf.SubprocessConfig(),
@@ -88,17 +88,13 @@ def _verifiers_math_rollouter_config(
                     harness=VerifiersNullHarnessConfig(id="null"),
                 ),
             ),
-            serve=vf.ServeConfig(
-                pool=vf.StaticPoolConfig(num_workers=1),
-                address="tcp://127.0.0.1:0",
+            rubric=Rubric.Config(
+                reward_fns=[RewardFromVerifiers.Config(weight=1.0)],
+                error_reward=0.0,
             ),
-        ),
-        rubric=Rubric.Config(
-            reward_fns=[RewardFromVerifiers.Config(weight=1.0)],
-            error_reward=0.0,
-        ),
-        generation_server=GenerationServer.Config(
-            max_rollout_tokens=max_rollout_tokens
+            generation_server=GenerationServer.Config(
+                max_rollout_tokens=max_rollout_tokens
+            ),
         ),
     )
 
