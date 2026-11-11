@@ -676,14 +676,14 @@ class Controller(Configurable):
             *,
             request_id: str,
             group_id: int,
-            routing_session_id: str | None = None,
+            routing_session_id: str,
             sampling_config: SamplingConfig | None = None,
         ) -> Completion | None:
             # TODO: a cancelled caller releases while the generator still runs its call,
             #   and a caller that dies never releases. Moot today: nothing cancels a
             #   generate call, and a dead rollout worker fails the run.
             generator = await generator_router.reserve.call_one(
-                request_id, routing_session_id=routing_session_id
+                request_id, routing_session_id=routing_session_id, group_id=group_id
             )
             try:
                 return await generator.generate.call_one(
@@ -1210,7 +1210,7 @@ class Controller(Configurable):
                     metrics=[m.Metric("rollout/group_failures", m.Sum(1.0))],
                 )
             finally:
-                # The group makes no more generation calls, so its cache salts can go.
+                # The group makes no more generation calls: drop its cache salts and evict its KV.
                 await self.generator_router.release_groups.call_one([work.group_id])
             await group_buffer.finalize_work(group)
 

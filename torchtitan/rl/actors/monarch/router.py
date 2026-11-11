@@ -37,8 +37,12 @@ class _InterGeneratorRouterActorEndpoints:
         self._process_stats = ProcessStats("router", children=False)
 
     @concurrent_endpoint
-    async def reserve(self, request_id: str, *, routing_session_id: str | None) -> Any:
-        return super().reserve(request_id, routing_session_id=routing_session_id)
+    async def reserve(
+        self, request_id: str, *, routing_session_id: str, group_id: int
+    ) -> Any:
+        return super().reserve(
+            request_id, routing_session_id=routing_session_id, group_id=group_id
+        )
 
     @concurrent_endpoint
     async def release_reservation(self, request_id: str) -> None:

@@ -1029,7 +1029,7 @@ def test_generate_fn_forwards_the_session_and_releases_on_failure() -> None:
         )
 
     # The session reaches both routing layers: the router and the generator's DP routing.
-    reserve.assert_awaited_once_with("r0", routing_session_id="s0")
+    reserve.assert_awaited_once_with("r0", routing_session_id="s0", group_id=0)
     generate_call.assert_awaited_once_with(
         [1, 2],
         request_id="r0",

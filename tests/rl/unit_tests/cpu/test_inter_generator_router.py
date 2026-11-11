@@ -52,6 +52,7 @@ class _Actor:
         self.prefetch_model_state_dict = _Endpoint(wait=wait_prefetch)
         self.load_model_state_dict = _Endpoint(wait=wait_pull, raises=raises_pull)
         self.release_sessions = _Endpoint()
+        self.release_groups = _Endpoint()
 
 
 def _router(actors, *, strategy=None, hot_swap=False) -> InterGeneratorRouter:
@@ -64,23 +65,25 @@ def _router(actors, *, strategy=None, hot_swap=False) -> InterGeneratorRouter:
     )
 
 
-def _route(router, *, session_id: str | None = None) -> str:
+def _route(router, *, session_id: str | None = None, group_id: int = 0) -> str:
     """Route one generate call that finishes at once; return its generator's name."""
-    name = router.reserve("probe", routing_session_id=session_id).name
+    name = router.reserve(
+        "probe", routing_session_id=session_id, group_id=group_id
+    ).name
     router.release_reservation("probe")
     return name
 
 
 def test_least_loaded_routes_to_lowest_reserved_load():
     router = _router([_Actor("gen0"), _Actor("gen1")])
-    assert router.reserve("r0", routing_session_id=None).name == "gen0"
-    assert router.reserve("r1", routing_session_id=None).name == "gen1"
+    assert router.reserve("r0", routing_session_id=None, group_id=0).name == "gen0"
+    assert router.reserve("r1", routing_session_id=None, group_id=0).name == "gen1"
 
     # Releasing r1 frees gen1, the generator it reserved.
     router.release_reservation("r1")
     assert [h.reserved_load for h in router._generators] == [1, 0]
     # The tie-break alone would pick gen0 (least recently chosen); load picks idle gen1.
-    assert router.reserve("r2", routing_session_id=None).name == "gen1"
+    assert router.reserve("r2", routing_session_id=None, group_id=0).name == "gen1"
 
     router.release_reservation("r0")
     router.release_reservation("r2")
@@ -124,9 +127,9 @@ def test_sticky_session_reuses_generator_for_same_session():
         actors, strategy=StickySessionRoutingStrategy.Config(repin_load_ratio=None)
     )
 
-    assert router.reserve("r0", routing_session_id="s0").name == "gen0"
+    assert router.reserve("r0", routing_session_id="s0", group_id=0).name == "gen0"
     # gen0 is busier than idle gen1, yet s0's next call stays on gen0.
-    assert router.reserve("r1", routing_session_id="s0").name == "gen0"
+    assert router.reserve("r1", routing_session_id="s0", group_id=0).name == "gen0"
 
 
 def test_sticky_session_spreads_new_sessions_started_on_idle_generators():
@@ -170,7 +173,7 @@ def test_new_sessions_spread_over_generators_that_all_drain():
 
     # Every generator drains, so new sessions go to them anyway, spread by load.
     chosen = [
-        router.reserve(f"r{i}", routing_session_id=f"s{i}").name for i in range(4)
+        router.reserve(f"r{i}", routing_session_id=f"s{i}", group_id=0).name for i in range(4)
     ]
     assert sorted(chosen) == ["gen0", "gen0", "gen1", "gen1"]
 
@@ -225,7 +228,7 @@ def test_sticky_session_respects_max_sessions():
         ),
     )
 
-    assert router.reserve("r0", routing_session_id="s0").name == "gen0"
+    assert router.reserve("r0", routing_session_id="s0", group_id=0).name == "gen0"
     # s0 is pinned to gen0 and still in flight, so the least-loaded fallback
     # assigns the new s1 session to gen1. Since max_sessions=1, s1 evicts s0.
     assert _route(router, session_id="s1") == "gen1"
@@ -239,7 +242,7 @@ def test_release_session_unpins_it_and_frees_its_kv_on_its_generator():
     router = _router(
         actors, strategy=StickySessionRoutingStrategy.Config(repin_load_ratio=None)
     )
-    assert router.reserve("r0", routing_session_id="s0").name == "gen0"
+    assert router.reserve("r0", routing_session_id="s0", group_id=0).name == "gen0"
 
     asyncio.run(router.release_session("s0"))
 
@@ -247,6 +250,61 @@ def test_release_session_unpins_it_and_frees_its_kv_on_its_generator():
     assert actors[1].release_sessions.calls == []
     # Unpinned, s0 is a new session: least-loaded picks idle gen1 over busy gen0.
     assert _route(router, session_id="s0") == "gen1"
+
+
+def test_session_release_reaches_only_the_generators_its_calls_went_to():
+    async def _run():
+        actors = [_Actor("gen0"), _Actor("gen1"), _Actor("gen2")]
+        router = _router(actors, strategy=RoundRobinRoutingStrategy.Config())
+        # Round robin sends s0's two turns to gen0 and gen1 (like a re-pinned session), s1's to gen2.
+        assert _route(router, session_id="s0") == "gen0"
+        assert _route(router, session_id="s0") == "gen1"
+        assert _route(router, session_id="s1") == "gen2"
+
+        await router.release_session("s0")
+
+        assert [len(actor.release_sessions.calls) for actor in actors] == [1, 1, 0]
+        assert actors[0].release_sessions.calls == [((["s0"],), {})]
+
+        # s2 never gets its own release (a retried attempt): its group's end forgets it.
+        assert _route(router, session_id="s2", group_id=1) == "gen0"
+        await router.release_groups([1])
+        assert 1 not in router._group_session_ids
+        await router.release_session("s2")
+        assert len(actors[0].release_sessions.calls) == 1
+
+    asyncio.run(_run())
+
+
+def test_group_end_forgets_a_session_that_never_got_its_own_release():
+    async def _run():
+        actors = [_Actor("gen0"), _Actor("gen1")]
+        router = _router(actors)
+        # Both of group 0's sessions are in flight at once, so least-loaded puts them on
+        # different generators.
+        assert router.reserve("s1/t0", routing_session_id="s1", group_id=0).name == "gen0"
+        assert router.reserve("s2/t0", routing_session_id="s2", group_id=0).name == "gen1"
+        router.release_reservation("s1/t0")
+        router.release_reservation("s2/t0")
+        assert router._session_generators == {
+            "s1": [router._generators[0]],
+            "s2": [router._generators[1]],
+        }
+        assert router._group_session_ids == {0: {"s1", "s2"}}
+
+        await router.release_session("s1")
+        assert actors[0].release_sessions.calls == [((["s1"],), {})]
+        assert actors[1].release_sessions.calls == []
+
+        # s2 never gets its own release (a retried attempt): its group's end forgets it.
+        await router.release_groups([0])
+        assert router._session_generators == {}
+        assert router._group_session_ids == {}
+        assert [actor.release_groups.calls for actor in actors] == [[(([0],), {})]] * 2
+        await router.release_session("s2")
+        assert actors[1].release_sessions.calls == []
+
+    asyncio.run(_run())
 
 
 def test_sticky_session_rejects_non_positive_max_sessions():

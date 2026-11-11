@@ -382,7 +382,7 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
         # session (Verifiers sends the trace id as X-Session-ID) and take its generation metadata,
         # so another agent's trace (a judge, a simulated user) leaves nothing on the server.
         # TODO: an attempt Verifiers retried has no trace here, and a cancelled rollout never gets here,
-        # so their held KV waits for the group's release, their routing pins for the router's
+        # so their cached KV waits for the group's release, their routing pins for the router's
         # `max_sessions` LRU, and their generation metadata and request counts stay on the
         # generation server (kept per session id). The generation server could record each
         # rollout's session ids and release those too.
