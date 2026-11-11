@@ -994,6 +994,54 @@ def test_generation_server_returns_routed_experts_from_the_prompt_start() -> Non
     np.testing.assert_array_equal(data.reshape(payload["shape"]), rows)
 
 
+def test_generation_server_validation_replies_carry_no_routed_experts() -> None:
+    rows = np.zeros((3, 2, 2), dtype=np.uint8)
+
+    async def run_test() -> list[dict]:
+        async def generate_fn(prompt, *, request_id, **kwargs):
+            return Completion(
+                min_policy_version=1,
+                max_policy_version=1,
+                request_id=request_id,
+                token_ids=[31, 32],
+                token_logprobs=[-0.1, -0.2],
+                finish_reason="stop",
+                routed_expert_ids=rows,
+            )
+
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server.set_generate_fn(generate_fn)
+        await server.start()
+        payloads = []
+        try:
+            async with ClientSession() as session:
+                for group_id in (7, -1):
+                    response = await session.post(
+                        f"http://{server.host}:{server.port}/inference/v1/generate",
+                        headers={"X-Session-ID": f"group={group_id}/rollout=0"},
+                        json={
+                            "token_ids": [1, 2],
+                            "sampling_params": {
+                                "temperature": 1.0,
+                                "top_p": 1.0,
+                                "max_tokens": 2,
+                                "torchtitan_group_id": group_id,
+                                "stop_token_ids": [99],
+                            },
+                        },
+                    )
+                    assert response.status == 200
+                    payloads.append(await response.json())
+        finally:
+            await server.close()
+        return payloads
+
+    training, validation = asyncio.run(run_test())
+    assert "routed_experts" in training["choices"][0]
+    # Negative group ids are validation, which never trains: no rows.
+    assert "routed_experts" not in validation["choices"][0]
+
+
 def test_generation_server_rejects_aborted_generation() -> None:
     async def run_test() -> None:
         async def generate_fn(

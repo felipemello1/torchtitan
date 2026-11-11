@@ -329,7 +329,8 @@ class GenerationServer(Configurable):
                         "finish_reason": completion.finish_reason,
                         **(
                             {}
-                            if completion.routed_expert_ids is None
+                            # Validation (group ids < 0) is never trained: its rows would only cost memory.
+                            if completion.routed_expert_ids is None or group_id < 0
                             else {
                                 "routed_experts": {
                                     "data": _ROUTED_EXPERTS_PLACEHOLDER,
@@ -351,7 +352,7 @@ class GenerationServer(Configurable):
             json.dumps(_LOGPROBS_CONTENT_PLACEHOLDER)
         )
         response_text = f"{head}[{logprobs_content}]{tail}"
-        if completion.routed_expert_ids is None:
+        if completion.routed_expert_ids is None or group_id < 0:
             return web.Response(text=response_text, content_type="application/json")
         # Base64 needs no JSON escaping: splice it in as bytes instead of json.dumps scanning
         # and copying it (~33 MB at a 64k-token context; 112 -> 27 ms per response).
