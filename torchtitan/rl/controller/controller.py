@@ -1176,7 +1176,8 @@ class Controller(Configurable):
                         group_size=self.config.async_loop.num_samples_per_prompt,
                         sampling=self._sampling,
                     )
-                group.metrics = compute_rollout_metrics(
+                # Extend: the rollouter may return the group with metrics of its own.
+                group.metrics += compute_rollout_metrics(
                     prefix="rollout", rollouts=group.rollouts
                 )
 

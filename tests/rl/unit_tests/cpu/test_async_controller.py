@@ -1056,3 +1056,56 @@ def test_validation_renames_turn_metrics_and_uses_fresh_group_ids() -> None:
     assert keys["validation_math_verify/timeouts/sum"] == 2.0
     assert "generator/queue_time_ms/mean" not in keys
     assert "math_verify/timeouts/sum" not in keys
+
+
+def test_rollout_loop_keeps_the_metrics_the_rollouter_attached() -> None:
+    async def run_group_rollouts(*, group_id: int, **kwargs) -> RolloutGroup:
+        turn = RolloutTurn(
+            rollout_id=RolloutTurnID(group_id=group_id, rollout_id=0, turn_id=0),
+            prompt_prefix_len=0,
+            prompt_delta_token_ids=np.array([1], dtype=np.int32),
+            completion_token_ids=np.array([2], dtype=np.int32),
+            completion_logprobs=np.array([-0.1], dtype=np.float32),
+            min_policy_version=0,
+            max_policy_version=0,
+        )
+        rollout = Rollout(
+            group_id=group_id,
+            rollout_id=0,
+            status=RolloutStatus.COMPLETED,
+            reward=1.0,
+            turns=[turn],
+        )
+        return RolloutGroup(
+            group_id=group_id,
+            rollouts=[rollout],
+            metrics=[m.Metric("rollout/num_compactions", m.Mean(2.0))],
+        )
+
+    works = iter([SimpleNamespace(group_id=7, sample="prompt"), None])
+    finalized: list[RolloutGroup] = []
+    group_buffer = SimpleNamespace(
+        claim_next=AsyncMock(side_effect=lambda: next(works)),
+        finalize_work=AsyncMock(side_effect=finalized.append),
+    )
+    controller = object.__new__(Controller)
+    controller._rollouter = SimpleNamespace(run_group_rollouts=run_group_rollouts)
+    controller.config = SimpleNamespace(
+        async_loop=SimpleNamespace(num_samples_per_prompt=1)
+    )
+    controller._sampling = SamplingConfig()
+    controller.rollout_recorder = Mock()
+    controller.generator_router = SimpleNamespace(
+        release_groups=SimpleNamespace(call_one=AsyncMock())
+    )
+
+    asyncio.run(
+        controller._rollout_loop(
+            group_buffer=group_buffer, generate_fn=None, release_session_fn=None
+        )
+    )
+
+    [group] = finalized
+    keys = m.MetricsProcessor._aggregate_metrics(group.metrics)
+    assert keys["rollout/num_compactions/mean"] == 2.0
+    assert keys["rollout/num_turns/mean"] == 1.0
