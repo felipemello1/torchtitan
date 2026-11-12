@@ -252,6 +252,9 @@ class StateDictAdapter(BaseStateDictAdapter):
         ):
             if sharding is not None:
                 sharding[fused_key] = (tensor.device_mesh, tensor.placements)
+            # TODO: Replicate gathers the whole weight on every rank, and the HF state dict
+            # holds one such copy per layer whose rows the FSDP degree doesn't divide. Shard
+            # the rows (dim + 1) instead, as _split_gdn_in_proj keeps in_proj sharded.
             tensor = tensor.redistribute(
                 tensor.device_mesh,
                 [
@@ -280,8 +283,12 @@ class StateDictAdapter(BaseStateDictAdapter):
             return
         fused = torch.stack([state_dict.pop(key) for key in logical_keys], dim=dim)
         if sharding is not None and fused_key in sharding:
-            assert isinstance(fused, DTensor)
             mesh, placements = sharding[fused_key]
+            if not isinstance(fused, DTensor):
+                raise RuntimeError(
+                    f"{fused_key} was split from a DTensor with placements {placements}, "
+                    f"but its projections stacked to a {type(fused).__name__}."
+                )
             fused = fused.redistribute(mesh, placements)
         state_dict[fused_key] = fused
 
