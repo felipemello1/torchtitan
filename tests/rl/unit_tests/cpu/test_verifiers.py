@@ -29,6 +29,7 @@ from torchtitan.rl.examples.verifiers.generation_server import (
     VerifiersGenerationMetadata,
 )
 from torchtitan.rl.examples.verifiers.rollouter import (
+    _fork_counts,
     _trainable_token_spans,
     log_failed_rollout,
     VERIFIERS_REWARD_KEY,
@@ -899,6 +900,7 @@ def test_timed_out_rollout_is_logged_and_keeps_no_reward(caplog) -> None:
         mask=[False, True],
         sampled=True,
         message=VerifiersAssistantMessage(content="answer"),
+        parent=None,
     )
     span = SimpleNamespace(duration=0.0)
     trace = SimpleNamespace(
@@ -1062,3 +1064,37 @@ def test_parse_sampling_config_requires_temperature_top_p_max_tokens() -> None:
 def test_parse_sampling_config_requires_stop_token_ids() -> None:
     with pytest.raises(ValueError, match="stop_token_ids"):
         _parse_sampling_config({"temperature": 1.0})
+
+
+def test_rollout_logs_why_its_trace_forked() -> None:
+    """One compaction and one unmatched re-sent assistant message."""
+    from verifiers.v1.types import (
+        AssistantMessage as VerifiersAssistantMessage,
+        UserMessage as VerifiersUserMessage,
+    )
+
+    def node(parent, message, sampled):
+        return SimpleNamespace(parent=parent, message=message, sampled=sampled)
+
+    user = VerifiersUserMessage(content="fix it")
+    answer = VerifiersAssistantMessage(content="answer")
+    trace = SimpleNamespace(
+        nodes=[
+            node(None, user, False),
+            node(0, answer, True),
+            node(0, answer, False),  # the agent re-sent the answer re-encoded
+            # Compaction: the summary request starts a new root and re-carries the history.
+            node(None, VerifiersUserMessage(content="summarize"), False),
+            node(3, answer, False),
+            node(4, VerifiersUserMessage(content="now summarize"), False),
+            node(5, VerifiersAssistantMessage(content="## Objective"), True),
+            # The conversation resumes from the summary under the first root.
+            node(0, VerifiersUserMessage(content="summary: ..."), False),
+            node(7, answer, True),
+        ]
+    )
+
+    assert _fork_counts(trace) == {
+        "num_compactions": 1,
+        "num_resent_assistant_messages": 1,
+    }
