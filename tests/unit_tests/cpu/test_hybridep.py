@@ -8,8 +8,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols, ShapeEnv
 
-# The import registers the torch.ops.hybridep ops these tests call.
-from torchtitan.distributed.deepep import hybridep  # noqa: F401
+from torchtitan.distributed.deepep import hybridep
 
 NUM_TOKENS, HIDDEN_DIM, TOP_K, NUM_EXPERTS, EP_SIZE = 16, 4, 2, 8, 2
 NUM_LOCAL_EXPERTS = NUM_EXPERTS // EP_SIZE
@@ -70,6 +69,42 @@ def test_combine_backward_fake_matches_a_rank_with_no_tokens():
         )
     assert grad_x.shape == (NUM_TOKENS, HIDDEN_DIM)
     assert grad_probs.shape == (NUM_TOKENS, NUM_EXPERTS)
+
+
+class _RecordingBuffer:
+    """Stands in for the HybridEP buffer and records the probs combine receives."""
+
+    def __init__(self):
+        self.probs = None
+
+    def combine_with_unpermute(self, *, hidden, probs, handle):
+        del handle
+        self.probs = probs
+        grad_x = hidden.new_zeros(NUM_TOKENS, HIDDEN_DIM)
+        return grad_x, torch.zeros(NUM_TOKENS, NUM_EXPERTS)
+
+
+def test_combine_backward_passes_probs_on_a_rank_with_no_tokens(monkeypatch):
+    buffer = _RecordingBuffer()
+    monkeypatch.setattr(hybridep, "_buffer", buffer)
+    # The eager op reads its dispatch handle from the cache by id. The recording
+    # buffer ignores the handle.
+    monkeypatch.setitem(hybridep._handle_cache, 0, object())
+    grad_scores = torch.empty(0)
+
+    # The op only has a CUDA kernel, so call its eager implementation directly
+    # (CustomOpDef._init_fn is private torch API).
+    hybridep._combine_bwd_impl._init_fn(
+        torch.empty(0, HIDDEN_DIM, dtype=torch.bfloat16),
+        grad_scores,
+        torch.tensor([0]),
+        NUM_TOKENS,
+        NUM_EXPERTS,
+    )
+
+    # Every rank must run combine with probs, or the gradients that other ranks
+    # computed for this rank's routing scores never come back.
+    assert buffer.probs is not None
 
 
 def test_non_blocking_dispatch_fake_rows_are_the_capacity():
