@@ -8,8 +8,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols, ShapeEnv
 
-# The import registers the torch.ops.hybridep ops these tests call.
-from torchtitan.distributed.deepep import hybridep  # noqa: F401
+from torchtitan.distributed.deepep import hybridep
 
 NUM_TOKENS, HIDDEN_DIM, TOP_K, NUM_EXPERTS, EP_SIZE = 16, 4, 2, 8, 2
 NUM_LOCAL_EXPERTS = NUM_EXPERTS // EP_SIZE
@@ -88,6 +87,9 @@ class _RecordingBuffer:
 def test_combine_backward_passes_probs_on_a_rank_with_no_tokens(monkeypatch):
     buffer = _RecordingBuffer()
     monkeypatch.setattr(hybridep, "_buffer", buffer)
+    # The eager op reads its dispatch handle from the cache by id. The recording
+    # buffer ignores the handle.
+    monkeypatch.setitem(hybridep._handle_cache, 0, object())
     grad_scores = torch.empty(0)
 
     # The op only has a CUDA kernel, so call its eager implementation directly
@@ -95,7 +97,7 @@ def test_combine_backward_passes_probs_on_a_rank_with_no_tokens(monkeypatch):
     hybridep._combine_bwd_impl._init_fn(
         torch.empty(0, HIDDEN_DIM, dtype=torch.bfloat16),
         grad_scores,
-        hybridep.DispatchHandle(),
+        torch.tensor([0]),
         NUM_TOKENS,
         NUM_EXPERTS,
     )
