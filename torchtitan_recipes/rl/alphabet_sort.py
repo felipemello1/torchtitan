@@ -25,12 +25,7 @@ from torchtitan.components.optim import (
     OptimizersContainer,
 )
 from torchtitan.components.renderer import from_renderers
-from torchtitan.config import (
-    DebugConfig,
-    OverrideConfig,
-    PrecisionConfig,
-    TrainingConfig,
-)
+from torchtitan.config import DebugConfig, OverrideConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import (
     BatchInvariantFlexConverter,
@@ -227,7 +222,6 @@ def rl_grpo_qwen3_0_6b_flex() -> Controller.Config:
         rollouter=_alphabet_sort_rollouter_config(),
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
         metrics=MetricsProcessor.Config(loggers=[WandBLogger.Config()]),
-        precision=PrecisionConfig(dtype="bfloat16"),
         trainer=Trainer.Config(
             model=trainer_model,
             optim=Optim.Config(
@@ -326,8 +320,6 @@ def rl_grpo_qwen3_0_6b_flex_batch_invariant() -> Controller.Config:
     # latest weights before generating so trainer/generator logprobs stay
     # bitwise-identical (bit_wise/logprob_diff == 0) every step, not just step 1.
     config.async_loop.target_offpolicy_steps = 0
-    # fp32 master weights; FSDP mixed precision casts to bf16 for the forward.
-    config.precision = dataclasses.replace(config.precision, dtype="float32")
     config.trainer = dataclasses.replace(
         config.trainer,
         debug=_BATCH_INVARIANT_DEBUG,
@@ -540,7 +532,6 @@ def rl_grpo_qwen3_14b() -> Controller.Config:
         rollouter=_alphabet_sort_rollouter_config(),
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
         metrics=MetricsProcessor.Config(loggers=[WandBLogger.Config()]),
-        precision=PrecisionConfig(dtype="bfloat16"),
         trainer=Trainer.Config(
             model=trainer_model,
             optim=Optim.Config(
@@ -587,6 +578,8 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> Controller.Config:
     Trainer and generator uses TP=2 for dense layers and EP=4 for MoE experts.
 
     Note: Qwen3-30B-A3B has 4 KV heads, so TP degree cannot exceed 4.
+    fp32 master weights, grads and AdamW state take ~114 GiB per trainer GPU
+    before activations, so the trainer needs B200- or GB300-class GPUs.
     """
     num_samples_per_prompt = 8
     seq_len = 2048
@@ -620,7 +613,6 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> Controller.Config:
         rollouter=_alphabet_sort_rollouter_config(),
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
         metrics=MetricsProcessor.Config(loggers=[WandBLogger.Config()]),
-        precision=PrecisionConfig(dtype="bfloat16"),
         trainer=Trainer.Config(
             model=trainer_model,
             optim=Optim.Config(
@@ -830,7 +822,6 @@ def rl_grpo_qwen3_5_9b_varlen() -> Controller.Config:
         rollouter=_alphabet_sort_rollouter_config(),
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
         metrics=MetricsProcessor.Config(loggers=[WandBLogger.Config()]),
-        precision=PrecisionConfig(dtype="bfloat16"),
         trainer=Trainer.Config(
             model=trainer_model,
             optim=Optim.Config(
@@ -873,7 +864,11 @@ def rl_grpo_qwen3_5_9b_varlen() -> Controller.Config:
 
 
 def rl_grpo_qwen3_5_9b_varlen_batch_invariant() -> Controller.Config:
-    """On-policy, batch-invariant Qwen3.5-9B GRPO with matching TP=2."""
+    """On-policy, batch-invariant Qwen3.5-9B GRPO with matching TP=2.
+
+    fp32 master weights, grads and AdamW state take ~67 GiB on each of the 2
+    trainer GPUs, which is tight on 80 GB GPUs.
+    """
     config = rl_grpo_qwen3_5_9b_varlen()
     config.async_loop = dataclasses.replace(config.async_loop, target_offpolicy_steps=0)
     config.trainer = dataclasses.replace(
@@ -960,6 +955,11 @@ def rl_grpo_qwen3_6_27b_varlen_perf() -> Controller.Config:
         activation_remat=FullActivationRematConfig(),
         parallelism=trainer_parallelism,
     )
+    # Keep bf16 parameters to fit the 4 trainer GPUs: fp32 ones with the bf16
+    # moments above need 12 B/param (~81 GB per GPU). 12 B/param ran out of
+    # memory with this trainer layout on 96 GB H100s (a 4096-token pretraining
+    # run). Trade-off: AdamW updates below half a bf16 spacing round away.
+    config.precision = dataclasses.replace(config.precision, dtype="bfloat16")
     config.generator = dataclasses.replace(
         config.generator, model=generator_model, parallelism=generator_parallelism
     )
