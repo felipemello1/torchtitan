@@ -236,10 +236,10 @@ class LoRATransform(ModelConfigTransform):
     Built-in dispatch selects the correct LoRA implementation for each target.
     Non-target configs are frozen so only adapter parameters are trainable,
     except configs under ``trainable_modules`` paths, which are left unchanged.
-    Every MoE, one under ``trainable_modules`` too, also gets
-    ``freeze_expert_bias=True``, so no balancing hook moves its expert bias.
-    Applied to a subtree (``@override``), it must cover every MoE layer or none:
-    the balancing hooks reject a mix of frozen and moving biases.
+    One exception: every MoE gets ``freeze_expert_bias=True``, also one under
+    ``trainable_modules``, so no balancing hook moves its expert bias. The
+    balancing hooks reject a mix of frozen and moving biases, so a subtree
+    transform (``@override``) must cover every MoE layer or none.
 
     A shared projection config must receive the same LoRA decision at every FQN.
     For example, if ``layers.0.attention.wo`` and ``layers.1.attention.wo``
