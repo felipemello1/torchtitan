@@ -836,10 +836,15 @@ class TestMixedOptimizers(unittest.TestCase):
 
 class TestLRSchedulerWithMixedOptimizers(unittest.TestCase):
     def _build_scheduler(
-        self, config, lr_config, model, training_steps=100, enable_cuda_graph=False
+        self,
+        config,
+        lr_config,
+        model,
+        training_steps=100,
+        enable_accelerator_graph=False,
     ):
         container = config.build(
-            model_parts=[model], enable_cuda_graph=enable_cuda_graph
+            model_parts=[model], enable_accelerator_graph=enable_accelerator_graph
         )
         for opt in container.optimizers:
             opt._opt_called = True
@@ -944,14 +949,15 @@ class TestLRSchedulerWithMixedOptimizers(unittest.TestCase):
         first step runs at 1e-5 x 3/4, whichever of the two states loads first.
 
         DCP loads the lr scheduler first (sorted keys); torch_checkpointing loads the
-        optimizer first. With CUDA graphs the lr stays a tensor.
+        optimizer first. With accelerator graphs the lr stays a tensor.
         """
         lr_config = LRSchedulersContainer.Config(warmup_steps=4)
-        for enable_cuda_graph, scheduler_first in itertools.product(
+        for enable_accelerator_graph, scheduler_first in itertools.product(
             (False, True), (True, False)
         ):
             with self.subTest(
-                enable_cuda_graph=enable_cuda_graph, scheduler_first=scheduler_first
+                enable_accelerator_graph=enable_accelerator_graph,
+                scheduler_first=scheduler_first,
             ):
                 saved_scheduler, saved_container = self._build_scheduler(
                     OptimizersContainer.Config(
@@ -959,7 +965,7 @@ class TestLRSchedulerWithMixedOptimizers(unittest.TestCase):
                     ),
                     lr_config,
                     SimpleModel(),
-                    enable_cuda_graph=enable_cuda_graph,
+                    enable_accelerator_graph=enable_accelerator_graph,
                 )
                 for _ in range(2):
                     saved_scheduler.step()
@@ -970,7 +976,7 @@ class TestLRSchedulerWithMixedOptimizers(unittest.TestCase):
                     ),
                     lr_config,
                     SimpleModel(),
-                    enable_cuda_graph=enable_cuda_graph,
+                    enable_accelerator_graph=enable_accelerator_graph,
                 )
                 if scheduler_first:
                     scheduler.load_state_dict(saved_scheduler.state_dict())
@@ -980,7 +986,7 @@ class TestLRSchedulerWithMixedOptimizers(unittest.TestCase):
 
                 group = container.optimizers[0].param_groups[0]
                 self.assertEqual(
-                    isinstance(group["lr"], torch.Tensor), enable_cuda_graph
+                    isinstance(group["lr"], torch.Tensor), enable_accelerator_graph
                 )
                 self.assertAlmostEqual(float(group["lr"]), 7.5e-6, places=12)
                 self.assertAlmostEqual(group["initial_lr"], 1e-5, places=12)
