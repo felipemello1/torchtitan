@@ -13,6 +13,7 @@ import time
 
 import numpy as np
 import pytest
+import torch
 from datasets import Dataset
 
 from torchtitan.rl.examples.dapo_math import (
@@ -30,6 +31,7 @@ from torchtitan.rl.examples.dapo_math import (
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.types import RolloutTurnID
+from torchtitan_recipes.rl.dapo_math import rl_dapo_qwen3_4b_math_32k
 
 
 def _dapo_rows() -> list[dict]:
@@ -322,3 +324,17 @@ def test_muse_spark_gb300_recipe_shards_sequences_in_the_trainer_only() -> None:
     )
     assert trainer_windows == generator_windows
     assert len(set(trainer_windows)) == 2
+
+
+def test_32k_trainer_recomputes_ffn_w13() -> None:
+    # ActivationRematConfig ignores patterns that match nothing, so check them
+    # against a real block.
+    config = rl_dapo_qwen3_4b_math_32k()
+    remat = config.trainer.activation_remat
+    with torch.device("meta"):
+        block = config.trainer.model.layers[0].build()
+    block.configure_remat_regions(remat.save_regions, remat.recompute_regions)
+
+    assert block.feed_forward.w13.remat_should_recompute("linear")
+    assert not block.feed_forward.w2.remat_should_recompute("linear")
+    assert not block.attention.remat_should_recompute("inner_attention")
