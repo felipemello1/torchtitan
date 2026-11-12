@@ -44,6 +44,7 @@ from torchtitan.models.common.linear import (
     Linear,
     RowParallelLinear,
 )
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.moe.sharding import expert_param_placement_sparse
 from torchtitan.models.common.vision_encoder import (
     InvariantRowParallelLinear,
@@ -53,6 +54,9 @@ from torchtitan.models.common.vision_encoder_sharding import (
     vision_colwise_sharding_config,
     vision_invariant_linear_sharding_config,
     vision_rowwise_sharding_config,
+)
+from torchtitan.models.deepseek_v3 import (
+    build_model_config as build_deepseek_v3_model_config,
 )
 from torchtitan.models.gpt_oss.moe import GptOssGroupedLinear
 from torchtitan.models.llama3 import build_model_config
@@ -744,6 +748,19 @@ def test_lora_freezes_direct_params_on_root_module():
         if p.requires_grad and "lora_a" not in n and "lora_b" not in n
     }
     assert non_lora_trainable == set()
+
+
+def test_lora_freezes_moe_expert_bias():
+    """LoRA freezes the MoE expert bias, so no balancing hook moves it."""
+    # DeepSeek-V3 sets load_balance_coeff=1e-3, so its bias would move each step.
+    model_config = build_deepseek_v3_model_config(
+        "debugmodel", parallelism=ParallelismConfig()
+    )
+    model_config = LoRATransform(target_modules=["wo"]).transform(model_config)
+
+    moe_configs = [moe for _, moe, _, _ in model_config.traverse(MoE.Config)]
+    assert moe_configs
+    assert all(moe.freeze_expert_bias for moe in moe_configs)
 
 
 def test_lora_preserves_frozen_config_type_checks():
