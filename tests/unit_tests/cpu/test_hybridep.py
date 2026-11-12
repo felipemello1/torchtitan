@@ -8,7 +8,8 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols, ShapeEnv
 
-from torchtitan.distributed.deepep import hybridep
+# The import registers the torch.ops.hybridep ops these tests call.
+from torchtitan.distributed.deepep import hybridep  # noqa: F401
 
 NUM_TOKENS, HIDDEN_DIM, TOP_K, NUM_EXPERTS, EP_SIZE = 16, 4, 2, 8, 2
 NUM_LOCAL_EXPERTS = NUM_EXPERTS // EP_SIZE
@@ -63,7 +64,7 @@ def test_combine_backward_fake_matches_a_rank_with_no_tokens():
         grad_x, grad_probs = torch.ops.hybridep.combine_bwd(
             grad_hidden,
             grad_scores,
-            hybridep.DispatchHandle(),
+            torch.empty(1, dtype=torch.int64),
             num_tokens=NUM_TOKENS,
             num_experts=NUM_EXPERTS,
         )
