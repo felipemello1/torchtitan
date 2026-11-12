@@ -25,6 +25,7 @@ from torchtitan.components.optim import (
 from torchtitan.components.renderer import from_renderers
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.activation_remat import ActivationRematConfig
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.qwen3 import build_model_config
 
@@ -173,6 +174,12 @@ def _qwen3_4b_verifiers_config(
                 num_tokens_per_microbatch_per_dp_rank=max_total_tokens,
             ),
             parallelism=trainer_parallelism,
+            # The default, DefaultActivationRematConfig, saves every region: 92 GiB
+            # per GPU at 32K (H100), OOM. Recompute the FFN w13 and its all-gather
+            # instead: 63 GiB, 15% less time than FullActivationRematConfig.
+            activation_remat=ActivationRematConfig(
+                save_regions=["*"], recompute_regions=["feed_forward.w13.*"]
+            ),
             checkpointer=CheckpointManager.Config(
                 initial_load_in_hf=True,
                 interval=100,
