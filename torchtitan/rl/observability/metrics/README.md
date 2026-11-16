@@ -193,6 +193,12 @@ groups (`/max`), except for `_per_s` (`/mean`).
   host's workers, PSS is their real memory there. So this value x the workers on a host is an upper
   bound: check it against the host's free memory.
 
+The rollouter adds two more when each step logs, counted on the controller:
+
+- `rollout_worker/num_rollouts_in_flight_max`: the rollouts in flight on the busiest worker.
+- `rollout_worker/num_rollouts_in_flight_mean`: the mean over workers. A max well above the mean
+  means the load is uneven, so the busiest worker's event loop and threads fill first.
+
 ## vLLM engine metrics
 
 `VllmOtelStatLogger` exports engine-level rollout metrics through
