@@ -393,8 +393,16 @@ def muse_spark_816b_a42b_dapo_math_gb300_config(
             DistMoeTransform(inplace_wgrad_accum=True),
         ],
     )
+    # Block-major generator experts: dist_moe's BF16 GEMMs read them faster. For these
+    # experts (D 4096, F 4096), dist_moe's rule today also fuses SwiGLU into the
+    # dispatch GEMM. Tokens and logprobs are unchanged. Cost: each weight load briefly
+    # holds a second copy of one layer's local experts (1.5 GiB at EP 16).
+    # TODO: the gain (decode step -2.6%, prefill -3%) was measured at EP 4 on four GB300s
+    # with an 8-layer cut; this recipe runs EP 16 x TP 4, not measured. One EP 16
+    # generator run of this recipe, on vs off, would confirm the gain holds there.
     config.generator = apply_transforms(
-        config.generator, [DistMoeTransform(inplace_wgrad_accum=True)]
+        config.generator,
+        [DistMoeTransform(inplace_wgrad_accum=True, bf16_block_major_inference=True)],
     )
     return config
 
