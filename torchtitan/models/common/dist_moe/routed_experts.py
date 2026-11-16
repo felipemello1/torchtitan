@@ -131,8 +131,8 @@ class DistMoeRoutedExperts(Module):
     def _weight_operands(
         self,
     ) -> tuple[
-        torch.Tensor | dist_moe.PreparedWeight,
-        torch.Tensor | dist_moe.PreparedWeight,
+        torch.Tensor | dist_moe.PreparedWeight | dist_moe.PreparedBf16Weight,
+        torch.Tensor | dist_moe.PreparedWeight | dist_moe.PreparedBf16Weight,
     ]:
         """Return W13 and W2 operands for the annex invocation."""
         w13_E2FD = self.w13.weight

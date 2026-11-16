@@ -478,14 +478,16 @@ class ModelStateDictLoader:
             model, frozen_param_keys=frozen_param_keys
         )
         if model_state_dict_load_mode == "gpu_fetch":
-            # gpu_fetch writes into the sharded parameter itself, not a quantized
-            # parameter's high-precision _tensor.
+            # gpu_fetch writes into the sharded parameter itself, not the high-precision
+            # _tensor of an FSDP extension parameter (quantized or block-major experts).
             for _, trainable_params, _ in self._fsdp_load_groups:
                 for key, fsdp_param in trainable_params:
-                    if isinstance(fsdp_param._sharded_param_data, _ShardedFSDPTensor):
+                    sharded_data = fsdp_param._sharded_param_data
+                    if isinstance(sharded_data, _ShardedFSDPTensor):
                         raise ValueError(
                             "model_state_dict_load_mode='gpu_fetch' does not support "
-                            f"quantized parameters ({key})"
+                            "quantized or block-major expert parameters "
+                            f"({key}, {type(sharded_data).__name__})"
                         )
 
         self.prefetched_model_state_dict: dict[str, torch.Tensor] | None = None
@@ -733,11 +735,13 @@ def _fsdp_load_groups(
         if not trainable:
             continue
         for fsdp_param, key in frozen_by_module[module].items():
-            if isinstance(fsdp_param._sharded_param_data, _ShardedFSDPTensor):
+            sharded_data = fsdp_param._sharded_param_data
+            if isinstance(sharded_data, _ShardedFSDPTensor):
                 raise ValueError(
-                    f"Frozen parameter {key} cannot be quantized in the generator: "
-                    "weight syncs leave it out, and its shard cannot be refilled from "
-                    "its quantized unsharded weight."
+                    f"Frozen parameter {key} cannot be a {type(sharded_data).__name__} "
+                    "in the generator (quantized or block-major experts): weight syncs "
+                    "leave it out, and its shard cannot be refilled from its unsharded "
+                    "weight, which holds only the inference copy."
                 )
         groups.append((module, trainable, list(frozen_by_module[module])))
     return groups, buffer_keys

@@ -111,6 +111,10 @@ Set `mxfp8_mega_fused_inference` only on the RL generator, since it does not
 support backward. During validation, the trainer runs under `torch.no_grad()`
 instead.
 
+A BF16 RL generator can likewise read block-major expert weights, which its
+inference GEMMs load faster: set `DistMoeTransform(bf16_block_major_inference=True)`
+on the generator only.
+
 Verified 671B recipes live in `torchtitan_recipes.models.deepseek_v3`, while
 debug and 16B CI recipes live in `torchtitan_recipes.tests.models.deepseek_v3`.
 GraphTrainer follows the corresponding `graph_trainer` and
@@ -141,6 +145,7 @@ Per-layer settings belong to the transform:
 | `bf16_grouped_gemm_preset` | Optional BF16 FPROP/DGRAD schedule override for expert users. `None` uses the annex's shape-aware production defaults. BF16 WGRAD has its own production schedule. |
 | `block_scaled_config` | MXFP8-only annex policy. `pipeline="staged"` uses separate expert kernels; `pipeline="mega"` uses the fused chunk-pipelined implementation. `fast_math` selects approximate fused-SwiGLU sigmoid math, and `kernel_config` is an expert-only CuTe tuning override. |
 | `mxfp8_mega_fused_inference` | MXFP8 RL generator only; requires `pipeline="mega"`. Prepare weights in the interleaved format so the Mega kernel can fuse SwiGLU into the W13 GEMM, for inference only. Quantized weights and scales match training numerics exactly. |
+| `bf16_block_major_inference` | BF16 RL generator only; D and F must be multiples of 64. Selects `BlockMajorDistMoeRoutedExperts`, which hands Dist-MoE a block-major copy of W13/W2 that its BF16 inference GEMMs read faster. Outputs are bitwise equal to row-major weights. A training forward raises. |
 
 One `DistMoeRuntime.Config` owns rank-wide resources shared by every local
 Dist-MoE layer:
@@ -286,6 +291,23 @@ With `reshard_after_forward=False`, pipeline microbatches reuse one prepared
 weight through backward. With `reshard_after_forward=True`, forward and
 backward perform separate unshards and preparations. Without FSDP, the module
 prepares the live parameter directly for each call.
+
+Block-major BF16 experts (`bf16_block_major_inference=True`) use the same
+lifecycle for inference:
+
+1. The post-all-gather hook copies the gathered BF16 weight into
+   `dist_moe.prepare_bf16_block_major_weight`'s layout, `[E, K / 64, N, 64]`.
+2. Each later unshard (every weight sync) refills the same storage, so CUDA
+   graphs keep reading one address.
+3. Parameters, state dicts, and checkpoints keep the row-major layout.
+
+Without FSDP, the forward raises: copying every expert weight on each call
+costs more than the block-major GEMMs save.
+
+Not supported: frozen block-major or MXFP8 generator experts in an FSDP group
+with trainable weights, e.g. LoRA on attention only. Each load would refill the
+frozen experts' shard from their unsharded weight, which holds only the
+inference copy, so the generator raises at start.
 
 The complete `dist_moe.routed_experts` call is an ordered operation wrapped in
 a non-recomputed remat region. Dist-MoE owns its device-side decision to save or

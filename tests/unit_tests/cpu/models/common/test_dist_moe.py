@@ -11,6 +11,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 
 dist_moe = pytest.importorskip(
     "dist_moe",
@@ -36,16 +39,19 @@ from torchtitan.models.common.activation import ClampedSwiGLU, SiTUGLU
 from torchtitan.models.common.attention import VarlenInnerAttention
 from torchtitan.models.common.config_utils import make_routed_experts_config
 from torchtitan.models.common.dist_moe import (
+    BlockMajorDistMoeRoutedExperts,
     DistMoeRoutedExperts,
     DistMoeRuntime,
     MXFP8DistMoeRoutedExperts,
 )
+from torchtitan.models.common.dist_moe.block_major import _DistMoeBf16ShardedTensor
 from torchtitan.models.common.dist_moe.runtime import _DistMoeForwardContext
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.models.common.moe.token_dispatcher import HybridEPTokenDispatcher
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
+from torchtitan.rl.generator import model as generator_model
 from torchtitan.training_engine import TrainingEngine
 from torchtitan_recipes.tests.models.deepseek_v3 import deepseek_v3_debugmodel
 
@@ -522,15 +528,24 @@ def test_dist_moe_lora_rejects_inplace_wgrad() -> None:
         )
 
 
-def test_dist_moe_lora_rejects_mxfp8_before_build() -> None:
-    """Prepared MXFP8 operands are rejected at config transformation time."""
-    with pytest.raises(ValueError, match="MXFP8DistMoeRoutedExperts"):
+@pytest.mark.parametrize(
+    "dist_moe_transform, experts_class_name",
+    [
+        (DistMoeTransform(expert_precision="mxfp8"), "MXFP8DistMoeRoutedExperts"),
+        (
+            DistMoeTransform(bf16_block_major_inference=True),
+            "BlockMajorDistMoeRoutedExperts",
+        ),
+    ],
+)
+def test_dist_moe_lora_rejects_inference_weight_experts_before_build(
+    dist_moe_transform: DistMoeTransform, experts_class_name: str
+) -> None:
+    """LoRA on experts whose FSDP unshard builds inference operands raises at config time."""
+    with pytest.raises(ValueError, match=experts_class_name):
         transform_api.transform_model_config_(
-            _stock_config(),
-            [
-                DistMoeTransform(expert_precision="mxfp8"),
-                LoRATransform(target_modules=["w13"]),
-            ],
+            _stock_config(dim=64),
+            [dist_moe_transform, LoRATransform(target_modules=["w13"])],
         )
 
 
@@ -682,6 +697,172 @@ def test_mxfp8_mega_fused_inference_requires_mxfp8_mega() -> None:
         match="mxfp8_mega_fused_inference requires block_scaled_config",
     ):
         DistMoeTransform(expert_precision="mxfp8", mxfp8_mega_fused_inference=True)
+
+
+def test_bf16_block_major_inference_wraps_weights_for_fsdp() -> None:
+    """The transform flag builds block-major experts, whose weights only FSDP can unshard."""
+    config = DistMoeTransform(bf16_block_major_inference=True).transform(
+        _stock_config(dim=64)
+    )
+    assert isinstance(config, BlockMajorDistMoeRoutedExperts.Config)
+
+    module = config.build()
+    assert isinstance(module.w13.weight, _DistMoeBf16ShardedTensor)
+    assert isinstance(module.w2.weight, _DistMoeBf16ShardedTensor)
+    assert list(module.state_dict()) == ["w13.weight", "w2.weight"]
+    with pytest.raises(RuntimeError, match="built by FSDP's unshard"):
+        module._weight_operands()
+
+
+@pytest.mark.parametrize(
+    ("transform", "dim", "message"),
+    [
+        (
+            lambda: DistMoeTransform(
+                expert_precision="mxfp8", bf16_block_major_inference=True
+            ),
+            64,
+            "requires expert_precision='bf16', got 'mxfp8'",
+        ),
+        (
+            lambda: DistMoeTransform(bf16_block_major_inference=True),
+            96,
+            r"multiples of 64; got D=96, F=64",
+        ),
+    ],
+    ids=["mxfp8", "hidden_dim_96"],
+)
+def test_bf16_block_major_inference_rejects_unsupported_experts(
+    transform, dim: int, message: str
+) -> None:
+    """Block-major weights need BF16 experts with D and F multiples of 64."""
+    with pytest.raises(ValueError, match=message):
+        transform().transform(_stock_config(dim=dim))
+
+
+def test_generator_weight_loads_refill_block_major_experts_in_place(
+    tmp_path, monkeypatch
+) -> None:
+    """Each generator weight load rewrites the experts' block-major copy in the same tensors.
+
+    A stale copy after a load fails, and so does a new tensor: CUDA graphs keep
+    reading the old address.
+    """
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'store'}", rank=0, world_size=1
+    )
+    try:
+        experts = (
+            DistMoeTransform(bf16_block_major_inference=True)
+            .transform(_stock_config(dim=64))
+            .build()
+        )
+        initial_weights = {
+            name: torch.randn(param.shape) for name, param in experts.named_parameters()
+        }
+        with torch.no_grad():
+            for name, param in experts.named_parameters():
+                param.copy_(initial_weights[name])
+        fully_shard(
+            experts,
+            mesh=init_device_mesh("cpu", (1,)),
+            reshard_after_forward=False,
+            mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
+        )
+        experts.set_keep_unsharded_storage(True)
+        # Pinned host memory needs a GPU; keep the receive buffers' state dict as is.
+        monkeypatch.setattr(
+            generator_model,
+            "_create_cpu_state_dict",
+            lambda state_dict, pin_memory: dict(state_dict),
+        )
+        # Unshards the experts, as the generator does before its first forward.
+        loader = generator_model.ModelStateDictLoader(
+            experts,
+            checkpointer_config=None,
+            model_state_dict_load_mode="cpu_prefetch",
+            frozen_param_keys=frozenset(),
+            hf_assets_path="/hf",
+        )
+
+        def block_major_data(weights: dict[str, torch.Tensor]) -> list[torch.Tensor]:
+            """Return the experts' block-major W13 and W2, checked against ``weights``."""
+            w13, w2 = experts._weight_operands()
+            for prepared, name in ((w13, "w13.weight"), (w2, "w2.weight")):
+                # W13 [E, 2, F, D] -> [E, 2F, D]; W2 [E, D, F] is unchanged.
+                expected = dist_moe.prepare_bf16_block_major_weight(
+                    weights[name].flatten(1, -2).bfloat16()
+                )
+                assert prepared.block_major_data.equal(expected.block_major_data), name
+            return [w13.block_major_data, w2.block_major_data]
+
+        initial_data = block_major_data(initial_weights)
+        initial_addresses = [tensor.data_ptr() for tensor in initial_data]
+
+        loaded_weights = {
+            name: torch.randn(weight.shape) for name, weight in initial_weights.items()
+        }
+
+        def fetch(state_dict: dict[str, torch.Tensor]) -> list[str]:
+            with torch.no_grad():
+                for key, tensor in state_dict.items():
+                    tensor.to_local().copy_(loaded_weights[key])
+            return list(state_dict)
+
+        loader.load(fetch)
+
+        loaded_data = block_major_data(loaded_weights)
+        assert all(
+            loaded is initial
+            for loaded, initial in zip(loaded_data, initial_data, strict=True)
+        )
+        assert [tensor.data_ptr() for tensor in loaded_data] == initial_addresses
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "dist_moe_transform",
+    [
+        DistMoeTransform(expert_precision="mxfp8"),
+        DistMoeTransform(bf16_block_major_inference=True),
+    ],
+    ids=["mxfp8", "bf16_block_major"],
+)
+def test_generator_rejects_frozen_inference_weight_experts(
+    tmp_path, monkeypatch, dist_moe_transform: DistMoeTransform
+) -> None:
+    """The generator raises at start when frozen experts share an FSDP group with trainable weights.
+
+    layer FSDP group: experts (frozen, e.g. by LoRA on attention) + adapter (trainable)
+    each load: refill the experts' shard from their unsharded weight -> impossible:
+               these experts keep only their inference copy unsharded
+    """
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'store'}", rank=0, world_size=1
+    )
+    try:
+        layer = torch.nn.Module()
+        layer.experts = dist_moe_transform.transform(_stock_config(dim=64)).build()
+        layer.adapter = torch.nn.Linear(64, 64)
+        fully_shard(layer, mesh=init_device_mesh("cpu", (1,)))
+        # The initial checkpoint load, which normally fills the frozen weights, is not
+        # what this test checks.
+        monkeypatch.setattr(
+            generator_model, "_load_initial_weights", lambda *args, **kwargs: None
+        )
+        with pytest.raises(ValueError, match="Frozen parameter experts.w13.weight"):
+            generator_model.ModelStateDictLoader(
+                layer,
+                checkpointer_config=Mock(),
+                model_state_dict_load_mode="cpu_prefetch",
+                frozen_param_keys=frozenset(
+                    {"experts.w13.weight", "experts.w2.weight"}
+                ),
+                hf_assets_path="/hf",
+            )
+    finally:
+        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize(
