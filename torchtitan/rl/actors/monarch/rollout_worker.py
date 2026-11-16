@@ -35,10 +35,14 @@ class RolloutWorkerActor(Actor):
         worker_config: BaseRolloutWorker.Config,
         num_threads: int,
         structured_logger_init_fn: functools.partial[None] | None,
+        first_worker_index: int,
     ) -> None:
         if structured_logger_init_fn is not None:
+            # Each host's workers form their own proc mesh, so `current_rank()` restarts at 0 on
+            # every host. The offset keeps each worker's log rank unique.
             structured_logger_init_fn(
-                source="rl_rollout_worker", rank=current_rank().rank
+                source="rl_rollout_worker",
+                rank=first_worker_index + current_rank().rank,
             )
         # The pool behind every `asyncio.to_thread` call in this process. It also measures how
         # long each call waits for a free thread.
