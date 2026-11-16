@@ -740,14 +740,47 @@ def test_bf16_block_major_inference_rejects_unsupported_experts(
         transform().transform(_stock_config(dim=dim))
 
 
+@pytest.mark.parametrize("fuse_swiglu", [False, True])
+def test_block_major_experts_follow_dist_moe_swiglu_rule(
+    monkeypatch, fuse_swiglu: bool
+) -> None:
+    """W13 interleaves when ``dist_moe.should_fuse_bf16_swiglu(D, F, activation)`` says so; W2 never does."""
+    calls = []
+
+    def should_fuse_bf16_swiglu(*args):
+        calls.append(args)
+        return fuse_swiglu
+
+    monkeypatch.setattr(dist_moe, "should_fuse_bf16_swiglu", should_fuse_bf16_swiglu)
+    config = DistMoeTransform(bf16_block_major_inference=True).transform(
+        _stock_config(dim=128)
+    )
+    with torch.device("meta"):
+        module = config.build()
+
+    # D 128, F 64: swapped D and F fail.
+    assert calls == [(128, 64, "swiglu")]
+    assert module.w13.weight.fuse_swiglu == fuse_swiglu
+    assert not module.w2.weight.fuse_swiglu
+    # A rebuilt wrapper (FSDP flatten, then unflatten) keeps W13's flag.
+    _, metadata = module.w13.weight.__tensor_flatten__()
+    rebuilt = type(module.w13.weight).__tensor_unflatten__(
+        {"_tensor": module.w13.weight._tensor}, metadata, None, None
+    )
+    assert rebuilt.fuse_swiglu == fuse_swiglu
+
+
+@pytest.mark.parametrize("fuse_swiglu", [False, True])
 def test_generator_weight_loads_refill_block_major_experts_in_place(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, fuse_swiglu: bool
 ) -> None:
     """Each generator weight load rewrites the experts' block-major copy in the same tensors.
 
     A stale copy after a load fails, and so does a new tensor: CUDA graphs keep
-    reading the old address.
+    reading the old address. So does losing W13's interleave through FSDP.
     """
+    # Set dist_moe's interleave policy at this small shape (D 64, F 64).
+    monkeypatch.setattr(dist_moe, "should_fuse_bf16_swiglu", lambda *args: fuse_swiglu)
     dist.init_process_group(
         "gloo", init_method=f"file://{tmp_path / 'store'}", rank=0, world_size=1
     )
@@ -788,11 +821,15 @@ def test_generator_weight_loads_refill_block_major_experts_in_place(
         def block_major_data(weights: dict[str, torch.Tensor]) -> list[torch.Tensor]:
             """Return the experts' block-major W13 and W2, checked against ``weights``."""
             w13, w2 = experts._weight_operands()
-            for prepared, name in ((w13, "w13.weight"), (w2, "w2.weight")):
+            for prepared, name, interleaved in (
+                (w13, "w13.weight", fuse_swiglu),
+                (w2, "w2.weight", False),
+            ):
                 # W13 [E, 2, F, D] -> [E, 2F, D]; W2 [E, D, F] is unchanged.
                 expected = dist_moe.prepare_bf16_block_major_weight(
-                    weights[name].flatten(1, -2).bfloat16()
+                    weights[name].flatten(1, -2).bfloat16(), fuse_swiglu=interleaved
                 )
+                assert prepared._interleaved_fc13 == interleaved, name
                 assert prepared.block_major_data.equal(expected.block_major_data), name
             return [w13.block_major_data, w2.block_major_data]
 

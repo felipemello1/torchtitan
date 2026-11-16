@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import spmd_types as spmd
 import torch
@@ -36,10 +37,10 @@ class _DistMoeBf16Operands:
 
     block_major_data: torch.Tensor
 
-    def prepared(self) -> dist_moe.PreparedBf16Weight:
+    def prepared(self, *, fuse_swiglu: bool) -> dist_moe.PreparedBf16Weight:
         """Return the annex facade consumed by one Dist-MoE invocation."""
         return dist_moe.PreparedBf16Weight._create(
-            block_major_data=self.block_major_data
+            block_major_data=self.block_major_data, interleaved_fc13=fuse_swiglu
         )
 
 
@@ -52,7 +53,39 @@ class _DistMoeBf16ShardedTensor(_ShardedFSDPTensor):
 
     Each unshard that gathers weights (the initial load, each weight sync)
     rewrites the same ``block_major_data``, so CUDA graphs keep one address.
+
+    Args:
+        fuse_swiglu: Also interleave W13's gate and up rows, so the dispatch
+            GEMM computes SwiGLU itself. Always False for W2. Required, so a
+            path that rebuilds the wrapper can't silently drop W13's interleave.
     """
+
+    def __init__(
+        self,
+        tensor: torch.Tensor,
+        *,
+        fuse_swiglu: bool,
+        **logical_metadata: Any,
+    ) -> None:
+        super().__init__(tensor, **logical_metadata)
+        self.fuse_swiglu = fuse_swiglu
+
+    def __tensor_flatten__(self) -> tuple[list[str], tuple[Any, ...]]:
+        return ["_tensor"], (self.dtype, self.fuse_swiglu)
+
+    @classmethod
+    def __tensor_unflatten__(cls, inner_tensors, metadata, outer_size, outer_stride):
+        del outer_size, outer_stride
+        _, fuse_swiglu = metadata
+        return cls(inner_tensors["_tensor"], fuse_swiglu=fuse_swiglu)
+
+    def _rewrap(self, tensor: torch.Tensor) -> _DistMoeBf16ShardedTensor:
+        """Wrap ``tensor`` like this parameter, keeping ``fuse_swiglu``.
+
+        FSDP ops (e.g. ``slice``, ``copy_``) rebuild the wrapper through this,
+        and the base version would reset ``fuse_swiglu``.
+        """
+        return type(self)(tensor, fuse_swiglu=self.fuse_swiglu)
 
     def _build_operands(
         self,
@@ -62,9 +95,15 @@ class _DistMoeBf16ShardedTensor(_ShardedFSDPTensor):
         # W13 [E, 2, F, D] -> [E, 2F, D]; W2 [E, D, F] is unchanged.
         weight_ENK = logical_tensor.flatten(1, -2)
         if out is None:
-            prepared = dist_moe.prepare_bf16_block_major_weight(weight_ENK)
+            prepared = dist_moe.prepare_bf16_block_major_weight(
+                weight_ENK, fuse_swiglu=self.fuse_swiglu
+            )
             return _DistMoeBf16Operands(prepared.block_major_data)
-        dist_moe.prepare_bf16_block_major_weight(weight_ENK, out=out.prepared())
+        dist_moe.prepare_bf16_block_major_weight(
+            weight_ENK,
+            fuse_swiglu=self.fuse_swiglu,
+            out=out.prepared(fuse_swiglu=self.fuse_swiglu),
+        )
         return out
 
 
@@ -75,6 +114,13 @@ class BlockMajorDistMoeRoutedExperts(DistMoeRoutedExperts):
     ``DistMoeRoutedExperts``. FSDP's unshard writes the block-major copy (see
     ``_DistMoeBf16ShardedTensor``), which Dist-MoE's BF16 inference GEMMs read
     faster. A training forward raises.
+
+    Where ``dist_moe.should_fuse_bf16_swiglu`` says it pays, W13's gate and up
+    rows are also interleaved, so the dispatch GEMM computes SwiGLU itself.
+    For example, with dist_moe's rule today:
+
+        D 7168, F 2048, swiglu (DeepSeek-V3)     block-major, interleaved W13
+        D 2048, F 512, swiglu (Qwen3.5-35B-A3B)  block-major
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -98,6 +144,9 @@ class BlockMajorDistMoeRoutedExperts(DistMoeRoutedExperts):
 
     def __init__(self, config: Config):
         super().__init__(config)
+        self.fuse_swiglu = dist_moe.should_fuse_bf16_swiglu(
+            self.hidden_dim, self.intermediate_dim, self.activation
+        )
         self._wrap_weights()
 
     def _parallelize(self, parallelism_context: ParallelismContext) -> None:
@@ -108,12 +157,12 @@ class BlockMajorDistMoeRoutedExperts(DistMoeRoutedExperts):
 
     def _wrap_weights(self) -> None:
         """Wrap W13 and W2 in the FSDP tensor that writes the block-major copy."""
-        for proj in (self.w13, self.w2):
+        for proj, fuse_swiglu in ((self.w13, self.fuse_swiglu), (self.w2, False)):
             if isinstance(proj.weight, _DistMoeBf16ShardedTensor):
                 continue
             weight = proj.weight
             wrapped_weight = torch.nn.Parameter(
-                _DistMoeBf16ShardedTensor(weight.data),
+                _DistMoeBf16ShardedTensor(weight.data, fuse_swiglu=fuse_swiglu),
                 requires_grad=weight.requires_grad,
             )
             spmd.assert_type_like(wrapped_weight, weight)
@@ -138,4 +187,7 @@ class BlockMajorDistMoeRoutedExperts(DistMoeRoutedExperts):
                 "bf16_block_major_inference=False. Got W13 "
                 f"{type(w13_E2FD).__name__} and W2 {type(w2_EDF).__name__}"
             )
-        return w13_E2FD.operands.prepared(), w2_EDF.operands.prepared()
+        return (
+            w13_E2FD.operands.prepared(fuse_swiglu=self.fuse_swiglu),
+            w2_EDF.operands.prepared(fuse_swiglu=False),
+        )

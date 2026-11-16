@@ -113,10 +113,12 @@ class DistMoeTransform(ModelConfigTransform):
             training numerics exactly. Requires
             ``expert_precision="mxfp8"`` and ``block_scaled_config.pipeline="mega"``.
         bf16_block_major_inference: Hand BF16 Dist-MoE a block-major copy of
-            W13/W2, which its inference GEMMs read faster. FSDP's unshard writes
-            the copy at each weight load; parameters and checkpoints keep the
-            row-major layout. RL generator only: a training forward raises.
-            Requires ``expert_precision="bf16"`` and D and F multiples of 64.
+            W13/W2, which its inference GEMMs read faster, with W13's gate and
+            up rows interleaved where ``dist_moe.should_fuse_bf16_swiglu`` says
+            fusing SwiGLU pays. FSDP's unshard writes the copy at each weight
+            load; parameters and checkpoints keep the row-major layout. RL
+            generator only: a training forward raises. Requires
+            ``expert_precision="bf16"`` and D and F multiples of 64.
     """
 
     expert_precision: Literal["bf16", "mxfp8"] = "bf16"

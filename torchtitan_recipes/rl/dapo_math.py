@@ -528,6 +528,10 @@ def _qwen3_30b_a3b_dapo_math_8k_config(
             mxfp8_mega_fused_inference=True,
         )
     else:
+        # TODO: set bf16_block_major_inference=True once a generator A/B on these experts
+        # (E 128, D 2048, F 768) shows bitwise tokens and no step-time loss; only the Muse
+        # Spark and Qwen3.5-35B-A3B generators were measured with it. Expect little:
+        # Qwen3.5-35B-A3B's experts (same D 2048) showed no end-to-end gain.
         generator_transform = DistMoeTransform(expert_precision=expert_precision)
     config.generator = apply_transforms(config.generator, [generator_transform])
     return config
