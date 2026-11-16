@@ -16,6 +16,7 @@ from torchtitan.models.base.module import Module
 from torchtitan.models.common.activation import ClampedSwiGLU, SwiGLU
 from torchtitan.models.common.dist_moe import (
     _dist_moe as dist_moe,
+    BlockMajorDistMoeRoutedExperts,
     DistMoeRoutedExperts,
     MXFP8DistMoeRoutedExperts,
 )
@@ -111,6 +112,11 @@ class DistMoeTransform(ModelConfigTransform):
             the W13 GEMM, for inference only. Quantized weights and scales match
             training numerics exactly. Requires
             ``expert_precision="mxfp8"`` and ``block_scaled_config.pipeline="mega"``.
+        bf16_block_major_inference: Hand BF16 Dist-MoE a block-major copy of
+            W13/W2, which its inference GEMMs read faster. FSDP's unshard writes
+            the copy at each weight load; parameters and checkpoints keep the
+            row-major layout. RL generator only: a training forward raises.
+            Requires ``expert_precision="bf16"`` and D and F multiples of 64.
     """
 
     expert_precision: Literal["bf16", "mxfp8"] = "bf16"
@@ -118,6 +124,7 @@ class DistMoeTransform(ModelConfigTransform):
     bf16_grouped_gemm_preset: dist_moe.Bf16GroupedGemmPreset | None = None
     block_scaled_config: dist_moe.BlockScaledConfig | None = None
     mxfp8_mega_fused_inference: bool = False
+    bf16_block_major_inference: bool = False
 
     def __post_init__(self) -> None:
         if self.expert_precision == "bf16":
@@ -133,6 +140,11 @@ class DistMoeTransform(ModelConfigTransform):
             if self.bf16_grouped_gemm_preset is not None:
                 raise ValueError(
                     "bf16_grouped_gemm_preset requires expert_precision='bf16'"
+                )
+            if self.bf16_block_major_inference:
+                raise ValueError(
+                    "bf16_block_major_inference requires expert_precision='bf16', "
+                    f"got {self.expert_precision!r}"
                 )
             block_scaled_config = (
                 self.block_scaled_config or dist_moe.BlockScaledConfig()
@@ -157,7 +169,11 @@ class DistMoeTransform(ModelConfigTransform):
         if self.expert_precision == "bf16":
             return _replace_routed_experts(
                 model,
-                DistMoeRoutedExperts,
+                (
+                    BlockMajorDistMoeRoutedExperts
+                    if self.bf16_block_major_inference
+                    else DistMoeRoutedExperts
+                ),
                 inplace_wgrad_accum=self.inplace_wgrad_accum,
                 bf16_grouped_gemm_preset=self.bf16_grouped_gemm_preset,
             )
