@@ -593,7 +593,13 @@ def test_verifiers_rollout_logs_keep_the_failure_reason(caplog) -> None:
     assert "rollout=3" not in caplog.text
 
 
+# Over aiohttp's default 1 MiB request limit even as compact JSON: 7 bytes per 6-digit id.
+_LONG_PROMPT = [151644] * 160_000
+
+
 def test_generation_server_forwards_token_request() -> None:
+    """Two calls of one session; the second prompt is over 1 MiB of JSON."""
+
     async def run_test() -> None:
         received = []
 
@@ -628,7 +634,7 @@ def test_generation_server_forwards_token_request() -> None:
                 ],
             )
 
-        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        server = GenerationServer.Config(max_rollout_tokens=262144).build()
         server.set_generate_fn(generate_fn)
         await server.start()
         try:
@@ -643,16 +649,16 @@ def test_generation_server_forwards_token_request() -> None:
                             "object": "model",
                             "created": 0,
                             "owned_by": "torchtitan",
-                            "max_model_len": 40960,
+                            "max_model_len": 262143,
                         }
                     ],
                 }
-                for _ in range(2):
+                for token_ids in ([10, 11], _LONG_PROMPT):
                     response = await session.post(
                         f"http://{server.host}:{server.port}/inference/v1/generate",
                         headers={"X-Session-ID": "group=1/rollout=2"},
                         json={
-                            "token_ids": [10, 11],
+                            "token_ids": token_ids,
                             "sampling_params": {
                                 "temperature": 1.0,
                                 "top_p": 1.0,
@@ -674,7 +680,10 @@ def test_generation_server_forwards_token_request() -> None:
             "group=1/rollout=2/request=0",
             "group=1/rollout=2/request=1",
         ]
-        assert all(request["prompt_token_ids"] == [10, 11] for request in received)
+        assert [len(request["prompt_token_ids"]) for request in received] == [
+            2,
+            len(_LONG_PROMPT),
+        ]
         assert all(request["group_id"] == 1 for request in received)
         assert all(
             request["routing_session_id"] == "group=1/rollout=2" for request in received
@@ -877,6 +886,11 @@ def test_generation_server_logs_each_request_at_debug_only(caplog) -> None:
 
 
 def test_generation_server_rejects_prompt_without_room_for_output() -> None:
+    """Limit 8: Verifiers' renderer client refuses an 8-token prompt before sending it; a direct
+    POST of 8 or more tokens gets a 400."""
+    from openai import AsyncOpenAI
+    from renderers.client import generate, OverlongPromptError
+
     async def run_test() -> None:
         prompt_lengths = []
 
@@ -887,7 +901,28 @@ def test_generation_server_rejects_prompt_without_room_for_output() -> None:
         server = GenerationServer.Config(max_rollout_tokens=8).build()
         server.set_generate_fn(generate_fn)
         await server.start()
+        sampling_params = {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_tokens": 2,
+            "torchtitan_group_id": 1,
+        }
         try:
+            # The client reads the limit from GET /v1/models. A prompt is given, so the renderer
+            # only supplies the stop tokens.
+            client = AsyncOpenAI(base_url=server.base_url, api_key="EMPTY")
+            renderer = SimpleNamespace(get_stop_token_ids=lambda: [99])
+            with pytest.raises(OverlongPromptError):
+                await generate(
+                    client=client,
+                    renderer=renderer,
+                    messages=[],
+                    model=server.model_id,
+                    prompt_ids=[1] * 8,
+                    sampling_params=sampling_params,
+                    extra_headers={"X-Session-ID": "group=1/rollout=2"},
+                )
+
             async with ClientSession() as session:
                 statuses, errors = [], []
                 for num_tokens in (7, 8, 9):
@@ -897,10 +932,7 @@ def test_generation_server_rejects_prompt_without_room_for_output() -> None:
                         json={
                             "token_ids": [1] * num_tokens,
                             "sampling_params": {
-                                "temperature": 1.0,
-                                "top_p": 1.0,
-                                "max_tokens": 2,
-                                "torchtitan_group_id": 1,
+                                **sampling_params,
                                 "stop_token_ids": [99],
                             },
                         },
@@ -1461,6 +1493,35 @@ def test_parse_sampling_config_requires_temperature_top_p_max_tokens() -> None:
             _parse_sampling_config(
                 {key: value for key, value in sampling_params.items() if key != name}
             )
+
+
+@pytest.mark.parametrize(
+    "update, error",
+    [
+        ({}, None),
+        # What Verifiers 0.4.1 sends on every call: values that filter nothing.
+        ({"top_k": -1, "min_p": 0.0}, None),
+        ({"top_k": 20}, r"top_k must be -1 \(no filter\), got 20"),
+        ({"min_p": 0.05}, r"min_p must be 0.0 \(no filter\), got 0.05"),
+    ],
+)
+def test_parse_sampling_config_accepts_only_full_vocabulary_top_k_and_min_p(
+    update, error
+) -> None:
+    sampling_params = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_tokens": 2,
+        "stop_token_ids": [99],
+        **update,
+    }
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            _parse_sampling_config(sampling_params)
+        return
+    assert _parse_sampling_config(sampling_params) == SamplingConfig(
+        temperature=1.0, top_p=1.0, max_tokens=2, stop_token_ids=[99]
+    )
 
 
 def test_parse_sampling_config_requires_stop_token_ids() -> None:

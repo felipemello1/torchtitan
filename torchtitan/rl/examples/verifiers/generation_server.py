@@ -74,12 +74,11 @@ class GenerationServer(Configurable):
         """Interface on which the local HTTP server listens."""
 
         max_rollout_tokens: int
-        """Context length; set it to the generator's ``max_model_len``.
-        Prompts of this many tokens or more get a 400.
+        """Context length; set it to the generator's `max_model_len`. A prompt of this many
+        tokens or more gets a 400.
 
-        The server advertises this value as ``max_model_len`` through
-        ``GET /v1/models`` so Verifiers can reject longer prompts before
-        forwarding them to the generator.
+        `GET /v1/models` advertises one less as `max_model_len`, so Verifiers' renderer refuses a
+        prompt with no room for an output token before sending it.
         """
 
         def __post_init__(self) -> None:
@@ -114,7 +113,9 @@ class GenerationServer(Configurable):
     async def start(self) -> None:
         if self.runner is not None:
             return
-        app = web.Application()
+        # aiohttp refuses a body over 1 MiB by default: a prompt past ~150K token ids. Verifiers'
+        # interception server, which forwards these calls, accepts 1 GiB.
+        app = web.Application(client_max_size=1024**3)
         app.router.add_get("/healthz", self._handle_health_request)
         app.router.add_get("/v1/models", self._handle_models_request)
         app.router.add_post("/inference/v1/generate", self._handle_generate_request)
@@ -164,7 +165,8 @@ class GenerationServer(Configurable):
             "object": "model",
             "created": 0,
             "owned_by": "torchtitan",
-            "max_model_len": self.max_rollout_tokens,
+            # One less than the limit: see `Config.max_rollout_tokens`.
+            "max_model_len": self.max_rollout_tokens - 1,
         }
         return web.json_response({"object": "list", "data": [model]})
 
@@ -369,6 +371,8 @@ def _parse_sampling_config(value: object):
     supported = {
         "temperature",
         "top_p",
+        "top_k",
+        "min_p",
         "max_tokens",
         "seed",
         "stop_token_ids",
@@ -381,6 +385,18 @@ def _parse_sampling_config(value: object):
     unsupported = set(value) - supported - protocol_fields
     if unsupported:
         raise ValueError(f"unsupported sampling parameters: {sorted(unsupported)}")
+    # A filter changes the distribution the generator samples from, but the trainer computes
+    # logprobs over the full vocabulary. So refuse a top_k or min_p that filters.
+    # TODO: support top_k and min_p filters, the way TODO(mask-replay) in
+    #   `SamplingConfig.__post_init__` plans for top_p < 1.
+    if value.get("top_k", -1) != -1:
+        raise ValueError(
+            f"sampling_params.top_k must be -1 (no filter), got {value['top_k']!r}"
+        )
+    if value.get("min_p", 0.0) != 0.0:
+        raise ValueError(
+            f"sampling_params.min_p must be 0.0 (no filter), got {value['min_p']!r}"
+        )
 
     # The generator stops only on these ids; the renderer client always sends them.
     stop_token_ids = _validate_token_ids(
