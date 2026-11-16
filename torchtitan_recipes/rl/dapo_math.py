@@ -393,8 +393,16 @@ def muse_spark_816b_a42b_dapo_math_gb300_config(
             DistMoeTransform(inplace_wgrad_accum=True),
         ],
     )
+    # Block-major generator experts: dist_moe's BF16 GEMMs read them faster. For these
+    # experts (D 4096, F 4096), dist_moe's rule today also fuses SwiGLU into the
+    # dispatch GEMM. Tokens and logprobs are unchanged. Cost: each weight load briefly
+    # holds a second copy of one layer's local experts (1.5 GiB at EP 16).
+    # TODO: the gain (decode step -2.6%, prefill -3%) was measured at EP 4 on four GB300s
+    # with an 8-layer cut; this recipe runs EP 16 x TP 4, not measured. One EP 16
+    # generator run of this recipe, on vs off, would confirm the gain holds there.
     config.generator = apply_transforms(
-        config.generator, [DistMoeTransform(inplace_wgrad_accum=True)]
+        config.generator,
+        [DistMoeTransform(inplace_wgrad_accum=True, bf16_block_major_inference=True)],
     )
     return config
 
@@ -528,6 +536,10 @@ def _qwen3_30b_a3b_dapo_math_8k_config(
             mxfp8_mega_fused_inference=True,
         )
     else:
+        # TODO: set bf16_block_major_inference=True once a generator A/B on these experts
+        # (E 128, D 2048, F 768) shows bitwise tokens and no step-time loss; only the Muse
+        # Spark and Qwen3.5-35B-A3B generators were measured with it. Expect little:
+        # Qwen3.5-35B-A3B's experts (same D 2048) showed no end-to-end gain.
         generator_transform = DistMoeTransform(expert_precision=expert_precision)
     config.generator = apply_transforms(config.generator, [generator_transform])
     return config

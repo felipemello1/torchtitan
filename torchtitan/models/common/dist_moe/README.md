@@ -145,7 +145,7 @@ Per-layer settings belong to the transform:
 | `bf16_grouped_gemm_preset` | Optional BF16 FPROP/DGRAD schedule override for expert users. `None` uses the annex's shape-aware production defaults. BF16 WGRAD has its own production schedule. |
 | `block_scaled_config` | MXFP8-only annex policy. `pipeline="staged"` uses separate expert kernels; `pipeline="mega"` uses the fused chunk-pipelined implementation. `fast_math` selects approximate fused-SwiGLU sigmoid math, and `kernel_config` is an expert-only CuTe tuning override. |
 | `mxfp8_mega_fused_inference` | MXFP8 RL generator only; requires `pipeline="mega"`. Prepare weights in the interleaved format so the Mega kernel can fuse SwiGLU into the W13 GEMM, for inference only. Quantized weights and scales match training numerics exactly. |
-| `bf16_block_major_inference` | BF16 RL generator only; D and F must be multiples of 64. Selects `BlockMajorDistMoeRoutedExperts`, which hands Dist-MoE a block-major copy of W13/W2 that its BF16 inference GEMMs read faster. Outputs are bitwise equal to row-major weights. A training forward raises. |
+| `bf16_block_major_inference` | BF16 RL generator only; D and F must be multiples of 64. Selects `BlockMajorDistMoeRoutedExperts`, which hands Dist-MoE a block-major copy of W13/W2 that its BF16 inference GEMMs read faster. Where `dist_moe.should_fuse_bf16_swiglu` says it pays (large experts), W13's gate and up rows are also interleaved, so the dispatch GEMM computes SwiGLU itself. Outputs are bitwise equal to row-major weights. A training forward raises. |
 
 One `DistMoeRuntime.Config` owns rank-wide resources shared by every local
 Dist-MoE layer:
@@ -296,7 +296,8 @@ Block-major BF16 experts (`bf16_block_major_inference=True`) use the same
 lifecycle for inference:
 
 1. The post-all-gather hook copies the gathered BF16 weight into
-   `dist_moe.prepare_bf16_block_major_weight`'s layout, `[E, K / 64, N, 64]`.
+   `dist_moe.prepare_bf16_block_major_weight`'s layout, `[E, K / 64, N, 64]`,
+   with W13's gate and up rows interleaved when SwiGLU is fused.
 2. Each later unshard (every weight sync) refills the same storage, so CUDA
    graphs keep reading one address.
 3. Parameters, state dicts, and checkpoints keep the row-major layout.

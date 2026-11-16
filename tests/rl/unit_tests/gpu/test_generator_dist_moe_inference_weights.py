@@ -236,7 +236,7 @@ def _check_inference_operands(
     reason="Dist-MoE requires an SM100-or-newer GPU",
 )
 @pytest.mark.parametrize(
-    "expert_transform, experts_cls, operand_fields",
+    "expert_transform, experts_cls, operand_fields, force_swiglu_interleave",
     [
         pytest.param(
             DistMoeTransform(
@@ -246,21 +246,32 @@ def _check_inference_operands(
             ),
             MXFP8DistMoeRoutedExperts,
             ("qdata", "fprop_scale"),
+            False,
             id="mxfp8_mega",
         ),
         pytest.param(
             DistMoeTransform(bf16_block_major_inference=True),
             BlockMajorDistMoeRoutedExperts,
             ("block_major_data",),
+            False,
             id="bf16_block_major",
+        ),
+        pytest.param(
+            DistMoeTransform(bf16_block_major_inference=True),
+            BlockMajorDistMoeRoutedExperts,
+            ("block_major_data",),
+            True,
+            id="bf16_block_major_interleaved",
         ),
     ],
 )
 def test_vllm_generator_refills_dist_moe_inference_weights(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path_factory: pytest.TempPathFactory,
     expert_transform: DistMoeTransform,
     experts_cls: type,
     operand_fields: tuple[str, ...],
+    force_swiglu_interleave: bool,
 ):
     """The generator serves Dist-MoE experts from inference weights that each load refills.
 
@@ -268,7 +279,8 @@ def test_vllm_generator_refills_dist_moe_inference_weights(
     the first unshard. Under FULL CUDA graphs, weight loads refill the retained
     operands (MXFP8 qdata and scales, or the block-major BF16 copy) in place: their
     objects stay fixed while their contents and the generated logprobs follow the
-    loaded weights.
+    loaded weights. ``force_swiglu_interleave`` also interleaves W13's gate and up
+    rows, which dist_moe's size rule skips for the debug experts.
     """
     world_size = (
         dist.get_world_size()
@@ -278,6 +290,8 @@ def test_vllm_generator_refills_dist_moe_inference_weights(
     if world_size != 1:
         pytest.skip(f"requires exactly 1 GPU, got {world_size}")
 
+    if force_swiglu_interleave:
+        monkeypatch.setattr("dist_moe.should_fuse_bf16_swiglu", lambda *args: True)
     config = _generator_config(expert_transform)
     engine = None
     try:
@@ -297,6 +311,15 @@ def test_vllm_generator_refills_dist_moe_inference_weights(
             model_state_dict_load_mode="cpu_prefetch",
         )
         engine = build_inference_engine(config)
+        if force_swiglu_interleave:
+            wrapper = engine.model_executor.driver_worker.get_model()
+            w13_weights = [
+                module._weight_operands()[0]
+                for module in wrapper.model.modules()
+                if isinstance(module, BlockMajorDistMoeRoutedExperts)
+            ]
+            assert w13_weights
+            assert all(w13._interleaved_fc13 for w13 in w13_weights)
         _check_inference_operands(engine, experts_cls, operand_fields)
     finally:
         if engine is not None:
