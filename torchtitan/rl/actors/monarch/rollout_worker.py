@@ -33,7 +33,6 @@ class RolloutWorkerActor(Actor):
         self,
         *,
         worker_config: BaseRolloutWorker.Config,
-        worker_kwargs: dict[str, Any],
         num_threads: int,
         structured_logger_init_fn: functools.partial[None] | None,
     ) -> None:
@@ -47,7 +46,7 @@ class RolloutWorkerActor(Actor):
             "rollout_worker", max_workers=num_threads
         )
         asyncio.get_running_loop().set_default_executor(self._executor)
-        self._worker = worker_config.build(**worker_kwargs)
+        self._worker = worker_config.build()
         # Created at the end of `setup_async`, so setup isn't counted as lag or as a GC pause.
         self._event_loop_lag: m.EventLoopLag
         self._gc_pause: m.GcPause
@@ -123,6 +122,10 @@ class RolloutWorkerActor(Actor):
                 ),
             ]
         return group
+
+    @concurrent_endpoint
+    async def close(self) -> None:
+        await self._worker.close()
 
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:

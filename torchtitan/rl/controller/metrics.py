@@ -236,8 +236,9 @@ def compute_policy_age_metrics(
 
 
 def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metric]:
-    """Build rollout-derived metrics, e.g. lengths and a rate per status. Each turn's
-    per-generation metrics are passed through under their own generator-side keys, unprefixed.
+    """Build rollout-derived metrics, e.g. lengths and a rate per status. Each turn's own
+    metrics (the generator's, and any the rollout worker adds) pass through under their own keys,
+    unprefixed.
 
     Args:
         prefix: Metric namespace (e.g. `"rollout"` or `"validation"`).
@@ -312,8 +313,9 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
         for name, values in sorted(values_by_name.items())
     )
 
-    # Per-generation turn metrics (latencies, output tokens) measured by the generator.
-    # They carry their own keys (e.g. "generator/..."), so they ride through unprefixed.
+    # Each turn's own metrics: the generator's (latencies, output tokens), and any the rollout
+    # worker adds (e.g. a reward's parts). They carry their own keys (e.g. "generator/..."), so
+    # they ride through unprefixed.
     # Fold across turns: group metrics outlive the rollouts (until the step is logged),
     # and every full GC walks them.
     out.extend(
