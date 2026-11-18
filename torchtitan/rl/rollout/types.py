@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import traceback
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, TYPE_CHECKING
@@ -20,10 +21,20 @@ if TYPE_CHECKING:
     from torchtitan.rl.generator.types import SamplingConfig
 
 
+# `RolloutStatus` values by kind. A status can be in several sets, e.g. ERROR_INFRA is in _ERROR
+# and in _NOT_TRAINABLE.
 _TRUNCATED = frozenset(
     {"truncated_length", "truncated_prompt_too_long", "truncated_max_turns"}
 )
-_ERROR = frozenset({"error_parse", "error_timeout", "error_abort", "error"})
+_ERROR = frozenset(
+    {
+        "error",
+        "error_infra",
+        "error_parse",
+        "error_timeout",
+    }
+)
+_NOT_TRAINABLE = frozenset({"error_infra"})
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -150,7 +161,7 @@ class Completion:
     token_ids: list[int]
     token_logprobs: list[float]
     finish_reason: str | None = None
-    """vLLM `CompletionOutput.finish_reason` ("stop" | "length" | "abort")"""
+    """vLLM `CompletionOutput.finish_reason` ("stop" | "length" | "abort" | "error")"""
 
     metrics: list[m.Metric] = field(default_factory=list)
     """Per-generation metrics measured by the generator (latencies); the
@@ -205,24 +216,47 @@ class ReleaseSessionFn(Protocol):
         """
 
 
+# TODO: let users add a status without editing this file. A StrEnum with members can't be subclassed.
+#   Also make the set of trainable statuses a config field, e.g. to leave ERROR and ERROR_TIMEOUT out
+#   of training, instead of editing `_NOT_TRAINABLE`. Not done yet: `is_trainable()` is read by the
+#   rollout worker (`make_scored_group`) and the batcher (`build_from_group`), so both configs need it.
 class RolloutStatus(StrEnum):
-    """Per-rollout status."""
+    """How a rollout ended. Used to debug and decide if a rollout is trainable."""
+
+    COMPLETED = "completed"
+    """The env ended the episode."""
+
+    ERROR = "error"
+
+    ERROR_INFRA = "error_infra"
+    """A failure outside the policy, e.g. an unreachable generator or a crashed env."""
+
+    ERROR_PARSE = "error_parse"
+    """The completion couldn't be parsed, e.g. a malformed tool call."""
+
+    ERROR_TIMEOUT = "error_timeout"
+    """A deadline passed, e.g. the policy ran a command that never ends. Counts as the policy's
+    failure."""
 
     ONGOING = "ongoing"
-    COMPLETED = "completed"
+    """Still running."""
+
     TRUNCATED_LENGTH = "truncated_length"
-    TRUNCATED_PROMPT_TOO_LONG = "truncated_prompt_too_long"
+
     TRUNCATED_MAX_TURNS = "truncated_max_turns"
-    ERROR_PARSE = "error_parse"
-    ERROR_TIMEOUT = "error_timeout"
-    ERROR_ABORT = "error_abort"
-    ERROR = "error"
+    """The turn limit was reached."""
+
+    TRUNCATED_PROMPT_TOO_LONG = "truncated_prompt_too_long"
 
     def is_truncated(self) -> bool:
         return self.value in _TRUNCATED
 
     def is_error(self) -> bool:
         return self.value in _ERROR
+
+    def is_trainable(self) -> bool:
+        """False for a status that is never scored or trained, e.g. ERROR_INFRA."""
+        return self.value not in _NOT_TRAINABLE
 
     def is_terminal(self) -> bool:
         return self is not RolloutStatus.ONGOING
@@ -386,8 +420,10 @@ class Rollout:
     status: RolloutStatus
     """Rollout-level terminal status."""
 
+    # TODO: make it per token, e.g. to give each turn of a multi-turn rollout its own reward.
+    #   Not done yet: `RubricOutput.reward` and the advantage estimators give one float per rollout.
     reward: float | None = None
-    """Final weighted reward, filled by the rubric."""
+    """Final weighted reward, filled by the rubric. None if the rollout wasn't scored."""
 
     reward_breakdown: dict[str, float] = field(default_factory=dict)
     """Raw per-reward-function values, filled by the rubric."""
@@ -398,7 +434,28 @@ class Rollout:
 
     logs: dict[str, Any] = field(default_factory=dict)
     """Rollouter-specific debug record, e.g. why the rollout failed. Saved with the rollout
-    by `RolloutSampleRecorder`; not used for training."""
+    by `RolloutSampleRecorder`; not used for training.
+
+    One shared key, `errors`: a list of `{"type", "message"}` dicts (plus `"traceback"` for an
+    exception, see `error_entry`), logged per type as `rollout/errors/<type>`.
+    Example, a rollout that raised: `{"errors": [{"type": "TimeoutError", "message": "..."}]}`."""
+
+
+# TODO: consider typed errors (`RolloutError`: type, message, traceback) in their own `errors` field
+#   on `Rollout` and `TokenEnvOutput`, next to a free-form `logs`, as Verifiers' `Trace.errors` and
+#   `Trace.info`. It waits: it changes the error metric, the recorder, the failure log and tests.
+def error_entry(error: Exception) -> dict[str, str]:
+    """One `Rollout.logs["errors"]` entry for an exception.
+
+    Example:
+        error_entry(ConnectionError("generator unreachable"))
+        # -> {"type": "ConnectionError", "message": "generator unreachable", "traceback": "Traceback ..."}
+    """
+    return {
+        "type": type(error).__name__,
+        "message": str(error),
+        "traceback": "".join(traceback.format_exception(error)),
+    }
 
 
 @dataclass(kw_only=True, slots=True)
