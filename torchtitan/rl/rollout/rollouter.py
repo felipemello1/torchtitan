@@ -113,15 +113,23 @@ class Rollouter(Configurable):
         """Training rollouts in flight per rollout worker process.
         It sets the pool size, rounded up: 300 training rollouts in flight / 128 per worker -> 3 workers.
 
-        Higher starts fewer processes (~0.7 GiB of private memory each after imports), and more
-        rollouts share each worker's event loop; `rollout_worker/event_loop_lag_ms` metric shows a worker
-        falling behind."""
+        Higher starts fewer processes (~0.8 GiB of private memory each after setup), and more
+        rollouts share each worker's event loop. Too high shows in
+        `rollout_worker/event_loop_lag_ms_per_s` and `rollout_worker/gc_pause_ms`: see "Rollout
+        worker metrics" in `torchtitan/rl/observability/metrics/README.md`."""
 
-        # TODO: at 128 rollouts per worker, renders and parses (`TokenEnv`) may queue on these threads,
-        #   and the event-loop lag metric doesn't show that wait. A span around the render would.
-        num_threads_per_worker: int = 4
-        """Size of each worker process's default thread pool executor, i.e. the pool
-        behind every `asyncio.to_thread` call in that process."""
+        num_threads_per_worker: int = 32
+        """Threads in each worker process's default thread pool, the pool behind every
+        `asyncio.to_thread` call in that process.
+
+        All rollouts in the worker share these threads, and a blocking call holds its thread until it
+        returns. Threads busy on average = blocking calls per second x seconds each, e.g. 0.2 calls per
+        second x 10 s each = 2 threads. Bursts fill more: leave ~4x headroom when a few threads are busy
+        (8 here), ~2x from ~10 busy up. 32 is Python's own default on hosts with 28+ CPUs, and leaves
+        room for envs whose calls block threads for seconds. The pool starts a thread only when a call
+        finds the others busy, and each started thread costs ~4 MiB. Too few shows in
+        `rollout_worker/executor_queue_wait_ms`: see "Rollout worker metrics" in
+        `torchtitan/rl/observability/metrics/README.md`."""
 
         def __post_init__(self) -> None:
             if self.num_threads_per_worker < 1:

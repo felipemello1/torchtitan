@@ -110,7 +110,7 @@ def test_a_group_larger_than_rollouts_per_worker_raises(
 
 
 def test_rollout_loop_keeps_the_metrics_a_worker_sent_with_its_group() -> None:
-    """A rollout worker adds its own metrics to each training group (event-loop lag, peak memory).
+    """A rollout worker adds its own metrics to each training group (e.g. its event-loop lag).
     The controller adds the rollout metrics next to them."""
     work = SimpleNamespace(sample="prompt", group_id=7)
     claims = [work, None]

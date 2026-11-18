@@ -7,6 +7,8 @@
 """Typed metrics for torchtitan RL. Check README.md for details."""
 
 from .console import log_to_console
+from .executor_queue_wait import QueueWaitThreadPoolExecutor
+from .gc_pause import GcPause
 from .loop_lag import EventLoopLag
 from .processor import MetricBackend, MetricsProcessor
 from .types import (
@@ -26,6 +28,7 @@ from .types import (
 __all__ = [
     "EventLoopLag",
     "fold",
+    "GcPause",
     "Max",
     "Mean",
     "Metric",
@@ -34,6 +37,7 @@ __all__ = [
     "MetricValue",
     "Min",
     "NoReduce",
+    "QueueWaitThreadPoolExecutor",
     "Std",
     "Sum",
     "SummaryStats",
