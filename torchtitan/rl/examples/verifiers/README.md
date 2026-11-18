@@ -83,6 +83,49 @@ How many processes: the controller and the rollout workers (one per `rollouts_pe
 rollouts in flight, rounded up). Each worker loads the env and runs its episodes; an agent runs in the
 env's runtime.
 
+## Inside a Verifiers rollout worker
+
+A Verifiers worker runs everything on the worker's one event loop and its executor threads, like any
+rollout worker: see [Rollout workers](../../rollout/ROLLOUT_WORKERS.md) for the worker itself, its
+settings and its metrics. Verifiers adds these pieces (numbers from that page's CPU bench, Verifiers
+0.4.1, Terminal-Bench timing):
+
+| Piece | How many per worker | Runs on | Cost |
+| --- | --- | --- | --- |
+| Interception servers, which the agents call | 1 per 32 rollouts (`ElasticInterceptionPoolConfig.multiplex`, `verifiers==0.4.1 verifiers/v1/configs/interception.py:78`) | the event loop | ~1.5 MiB and no thread each. 100 rollouts, 2 runs each: one server per rollout was no faster. |
+| Renderers: chat messages -> token ids | 1 per 256 model calls in flight (`VerifiersRolloutWorker.Config.renderer_multiplex`, [`rollouter.py`](./rollouter.py)) | executor threads, one render at a time per renderer | ~200 MiB of private memory each with rollouts running (3 extra renderers: 607 MiB). The `renderer_multiplex` docstring's ~170 MB is the memory growth at the moment one loads. A worker keeps each one until it exits. At 64-160 rollouts per worker, a worker never built a second one. At 960 rollouts per worker it built 4, and 1 renderer instead gave the same calls/s with 607 MiB less. |
+| `GenerationServer` | 1 | the event loop | Verifiers' train client calls it over loopback HTTP with the token ids as JSON: 2.7 ms of loop CPU per model call at 12K prompt tokens, 9.1 ms at 64K. |
+
+A renderer runs one render at a time because it takes a lock
+(`verifiers==0.4.1 verifiers/v1/clients/train.py:227-242`). One worker with 960 rollouts and one
+renderer made ~14 model calls/s. At 2.7 ms per render (that run's median), its lock was busy ~4% of
+the time.
+
+**Local Docker runtime** (`vf.DockerConfig()`, as the Terminal-Bench recipe uses). Measured with
+rootless Podman 5.8.5 behind the `docker` command. Docker itself wasn't measured. Below, a running
+rollout is one whose agent is still working, as opposed to one that finished and waits for the rest
+of its group:
+
+- Each running rollout keeps one `docker exec` CLI process attached while its agent runs. The harness
+  runs the agent with `runtime.run` ([`terminal_bench/harness.py`](./terminal_bench/harness.py)),
+  which waits on `docker exec` (`verifiers==0.4.1 verifiers/v1/runtimes/backends/docker.py:689-695`).
+  With Podman, each CLI process holds ~24 MiB of memory (PSS: shared pages split across the processes
+  that map them) and 16 threads. For example, at 600 running rollouts on one host, that is ~14 GiB and
+  ~9,800 threads (extrapolated linearly from 64 measured rollouts).
+- Each rollout's cleanup runs `docker rm --force` in `asyncio.to_thread`
+  (`verifiers==0.4.1 verifiers/v1/runtimes/backends/docker.py:674-688`,
+  `verifiers/v1/runtimes/base.py:245`). Under Podman it took 10.7 s: Podman waits its 10 s stop
+  timeout, because the container's first process, `sleep infinity` (`docker.py:358-363`), ignores
+  the stop signal. So each cleanup holds an executor thread for 10.7 s. With 4 threads and 160
+  rollouts per worker, model calls waited ~10 s for a thread. 32 threads, the default, fix it (sizing
+  rule: [`num_threads_per_worker`](../../rollout/ROLLOUT_WORKERS.md#num_threads_per_worker)). A cleanup
+  with `podman rm --force --time 0` took 0.18 s. Verifiers 0.4.1 doesn't pass `--time`.
+- One egress proxy per sandbox, on the worker's loop, lets the agent reach the interception server.
+  It looks up its target's address on every request, on an executor thread
+  (`verifiers==0.4.1 verifiers/v1/runtimes/egress.py:243`).
+- In total, a local container added ~6 ms of loop CPU per model call: 23.7 vs 17.5 ms with a local
+  process runtime. ~2 ms of it is the egress proxy.
+
 ## Add an experiment
 
 For a task `my_task`:

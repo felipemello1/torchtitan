@@ -228,6 +228,9 @@ class MonarchActorSystem(ActorSystem):
             )
             if num_host_workers == 0:  # fewer workers than hosts
                 continue
+            # TODO: bind each worker's CPUs and memory to one socket with `spawn_procs(proc_bind=...)`. Unbound,
+            #   full GCs ran 1.8x as long (CPU bench, 2-socket Arm host, without gc.freeze()). Waits for a check
+            #   that the job's container image has `numactl` and that the container may set memory policies.
             procs = host.spawn_procs(
                 per_host={"cpus": num_host_workers},
                 bootstrap=apply_rollout_worker_env_defaults,
