@@ -261,6 +261,8 @@ See [Launchers](./actors/monarch/README.md#launchers).
 
 ## Rollout workers on more than one host
 
+How one worker runs, how to size it, and which metrics show trouble: [Rollout workers](rollout/ROLLOUT_WORKERS.md).
+
 By default, rollout workers spread over the generators' hosts: `rollouter.worker_roles` sets
 `generator=True` and leaves the other roles at None (see `RolloutWorkerRoles` in
 `torchtitan/rl/rollout/rollouter.py`). Each worker runs its env on its own host, so whatever a
@@ -311,14 +313,15 @@ For background, see [train/inference mismatch in asynchronous RL](https://yichua
 
 ## Observability
 
-TitanRL exposes four complementary views of a run:
+TitanRL exposes five complementary views of a run:
 
 - **System timelines.** The structured logger emits per-rank JSONL events. Its Gantt generator turns trace spans into a cross-actor timeline for finding idle time, overlap, and bottlenecks. [Read the structured logger guide](../observability/structured_logger/README.md).
 - **Training curves.** Typed metrics from the rollout, controller, trainer, and loss are reduced once per step and sent to the console. [Read the RL metrics guide](./observability/metrics/README.md).
 - **Inference engine health.** vLLM engine metrics can be written to JSONL or exported to an OTLP collector. [Read the vLLM engine metrics guide](./observability/metrics/README.md#vllm-engine-metrics).
+- **Rollout worker health.** Each worker's event-loop stalls, garbage-collection pauses, executor waits, memory and rollouts in flight, and which metric shows which kind of slowdown. [Read the rollout worker guide](./rollout/ROLLOUT_WORKERS.md#which-metric-shows-which-gap).
 - **Rollout inspection.** The rollout logger (`RolloutSampleRecorder`) writes selected training and validation rollouts to `rollout_samples.jsonl`. [Inspect the rollout recorder](./rollout/recorder.py).
 
-Together these answer four different debugging questions: what the distributed system was doing, how the run was learning, how the inference engine was performing, and what the model actually produced.
+Together these answer five different debugging questions: what the distributed system was doing, how the run was learning, how the inference engine was performing, whether the rollout workers kept up, and what the model actually produced.
 
 Reference recipes enable W&B by default. Run `wandb login` before launch, or
 disable it in the recipe with `config.metrics.loggers = []`. Append
