@@ -32,9 +32,10 @@ _ERROR = frozenset(
         "error_infra",
         "error_parse",
         "error_timeout",
+        "first_prompt_too_long",
     }
 )
-_NOT_TRAINABLE = frozenset({"error_infra"})
+_NOT_TRAINABLE = frozenset({"error_infra", "first_prompt_too_long"})
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -238,6 +239,10 @@ class RolloutStatus(StrEnum):
     """A deadline passed, e.g. the policy ran a command that never ends. Counts as the policy's
     failure."""
 
+    FIRST_PROMPT_TOO_LONG = "first_prompt_too_long"
+    """The first prompt alone reached `max_rollout_tokens`, so the policy never answered. A data
+    problem."""
+
     ONGOING = "ongoing"
     """Still running."""
 
@@ -247,6 +252,8 @@ class RolloutStatus(StrEnum):
     """The turn limit was reached."""
 
     TRUNCATED_PROMPT_TOO_LONG = "truncated_prompt_too_long"
+    """A later prompt reached `max_rollout_tokens`, e.g. after a long tool result: it leaves no
+    room for one output token."""
 
     def is_truncated(self) -> bool:
         return self.value in _TRUNCATED
