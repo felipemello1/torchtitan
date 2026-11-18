@@ -12,10 +12,10 @@
 import contextlib
 import logging
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.rollout.types import Rollout
+from torchtitan.rl.rollout.types import Rollout, RolloutStatus
 
 logger = logging.getLogger(__name__)
 
@@ -236,8 +236,8 @@ def compute_policy_age_metrics(
 
 
 def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metric]:
-    """Build rollout-derived metrics: lengths, truncation, reward breakdown, and each turn's
-    per-generation metrics (the latter keep their own generator-side keys, unprefixed).
+    """Build rollout-derived metrics, e.g. lengths and a rate per status. Each turn's
+    per-generation metrics are passed through under their own generator-side keys, unprefixed.
 
     Args:
         prefix: Metric namespace (e.g. `"rollout"` or `"validation"`).
@@ -278,6 +278,29 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
         m.Metric(f"{prefix}/truncation_rate", m.Mean.from_list(truncated)),
         m.Metric(f"{prefix}_reward", m.SummaryStats.from_list(rewards)),
     ]
+
+    # One rate per status: its count over all rollouts, e.g. 2 ERROR of 8 -> Mean(2, count=8).
+    # A loop, so a status added to `RolloutStatus` is recorded with no change here.
+    num_rollouts_by_status = Counter(rollout.status for rollout in rollouts)
+    out.extend(
+        m.Metric(
+            f"{prefix}/status_rate/{status.value}",
+            m.Mean(num_rollouts_by_status[status], count=len(rollouts)),
+        )
+        for status in RolloutStatus
+        if status.is_terminal()
+    )
+
+    # One count per error type in `Rollout.logs["errors"]`, e.g. rollout/errors/TimeoutError.
+    num_errors_by_type = Counter(
+        error["type"]
+        for rollout in rollouts
+        for error in rollout.logs.get("errors", [])
+    )
+    out.extend(
+        m.Metric(f"{prefix}/errors/{error_type}", m.Sum(count))
+        for error_type, count in sorted(num_errors_by_type.items())
+    )
 
     # Per-component reward breakdown
     values_by_name: dict[str, list[float]] = defaultdict(list)

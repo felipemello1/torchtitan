@@ -97,6 +97,12 @@ class MessageEnv(Configurable, abc.ABC):
         finish_reason / length / parse / timeout failures before calling this,
         so the env only sees a well-formed completion message.
 
+        Note: if the model makes a mistake, consider replying with the error or returning
+        `done=True`. Any raise will likely be treated as an infra error (ERROR_INFRA), and the
+        rollout won't be used for training.
+        E.g. for a tool call with wrong arguments, return
+            MessageEnvStepOutput(env_messages=[{"role": "tool", "content": "missing argument 'path'"}])
+
         Args:
             completion_message: the completion decoded into a message.
 
