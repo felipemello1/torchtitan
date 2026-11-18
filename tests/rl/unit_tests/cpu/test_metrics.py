@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass
 from unittest.mock import MagicMock
@@ -906,3 +907,21 @@ def test_event_loop_lag_measures_a_blocked_loop() -> None:
     not_blocked = {type(metric.value): metric.value for metric in after_no_block}
     assert not_blocked[m.Max].value < 200.0
     assert not_blocked[m.Mean].value < 200.0
+
+
+def test_executor_queue_wait_counts_a_job_that_has_not_started() -> None:
+    """One thread, held by a job until the release: the second job starts only after the release,
+    and the flush before it still reads its wait so far."""
+    release = threading.Event()
+    executor = m.QueueWaitThreadPoolExecutor("rollout_worker", max_workers=1)
+    try:
+        executor.submit(release.wait)
+        executor.submit(lambda: None)
+        time.sleep(0.3)
+        metrics = executor.flush()
+    finally:
+        release.set()
+        executor.shutdown()
+    values = {metric.key: metric.value.value for metric in metrics}
+    assert values["rollout_worker/executor_queue_wait_ms"] >= 250.0
+    assert values["rollout_worker/num_executor_jobs_in_flight"] == 2.0

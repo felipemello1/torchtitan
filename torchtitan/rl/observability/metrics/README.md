@@ -157,6 +157,42 @@ supervised and RL runs. Logger construction does not change the environment. See
 [metric exporter configuration](../../../observability/METRICS.md#configure-metric-exporters)
 for custom exporters.
 
+## Rollout worker metrics
+
+Each rollout worker adds these metrics to each training group it returns. The lag, thread pool and
+pause metrics cover the time since that worker's previous training group, validation groups
+included. The memory metrics are read when the group returns. A step logs the largest value over its
+groups (`/max`), except for `_per_s` (`/mean`).
+
+- `rollout_worker/event_loop_lag_ms/max`: the longest time the worker's event loop couldn't run
+  ready work, e.g. during a garbage collection or a slow call that doesn't `await`. If it reads
+  seconds, compare it with `gc_pause_ms`. About as long: a garbage collection. Otherwise: some code
+  holds the loop.
+- `rollout_worker/event_loop_lag_ms_per_s/mean`: how busy the event loop is, as ms it ran late per
+  second, averaged over the workers. With no stall at all, it still reads up to ~20: the check wakes
+  every 50 ms, ~1 ms late when the loop has other work. A long stall raises it too: one 0.5 s stall
+  in 10 s adds 50. Well above ~20 while `event_loop_lag_ms` stays small: the worker's one event loop
+  is near its limit. Lower `rollouter.rollouts_per_worker`, so that more workers share the load.
+- `rollout_worker/executor_queue_wait_ms/max`: the longest an executor job (an `asyncio.to_thread`
+  call) waited for a free thread. A job still waiting when the group returns counts with its wait so
+  far. Tens of ms: a thread was free. About as long as `gc_pause_ms`: a garbage collection ran while
+  the job waited, and no job can start during one. Seconds beyond that: every thread was busy, e.g.
+  with blocking calls. Raise `rollouter.num_threads_per_worker`.
+- `rollout_worker/num_executor_jobs_in_flight/max`: the most executor jobs running or waiting at
+  once. It counts the jobs waiting for a thread too, so when the wait above reads seconds, the load
+  needs at most this many threads. Set the threads to about this value, then check that the wait
+  drops to tens of ms.
+- `rollout_worker/gc_pause_ms/max`: the longest garbage collection. No other Python code in the
+  worker runs during it, the event loop included. The worker freezes its setup objects, so only the
+  rollouts' objects count, e.g. ~0.1 s at 160 rollouts per worker (a CPU bench of workers that each
+  run their Verifiers env). In the hundreds of ms: lower `rollouter.rollouts_per_worker`.
+- `rollout_worker/rss_gib/max`: the largest worker's memory (its resident set size), shared
+  libraries included. Still rising after many steps at the same load: a worker may leak memory.
+- `rollout_worker/pss_gib/max`: the same, with each shared page split among the processes that map
+  it (the proportional set size). This process only: its subprocesses are not counted. Summed over a
+  host's workers, PSS is their real memory there. So this value x the workers on a host is an upper
+  bound: check it against the host's free memory.
+
 ## vLLM engine metrics
 
 `VllmOtelStatLogger` exports engine-level rollout metrics through

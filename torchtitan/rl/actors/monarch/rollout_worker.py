@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import resource
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from monarch.actor import Actor, concurrent_endpoint, current_rank
@@ -25,6 +23,7 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.rollouter import BaseRolloutWorker
 from torchtitan.rl.rollout.types import RolloutGroup
+from torchtitan.tools.garbage_collector import GarbageCollector
 
 
 class RolloutWorkerActor(Actor):
@@ -42,12 +41,16 @@ class RolloutWorkerActor(Actor):
             structured_logger_init_fn(
                 source="rl_rollout_worker", rank=current_rank().rank
             )
-        asyncio.get_running_loop().set_default_executor(
-            ThreadPoolExecutor(max_workers=num_threads)
+        # The pool behind every `asyncio.to_thread` call in this process. It also measures how
+        # long each call waits for a free thread.
+        self._executor = m.QueueWaitThreadPoolExecutor(
+            "rollout_worker", max_workers=num_threads
         )
+        asyncio.get_running_loop().set_default_executor(self._executor)
         self._worker = worker_config.build(**worker_kwargs)
-        # Created at the end of `setup_async`, so setup isn't counted as lag.
+        # Created at the end of `setup_async`, so setup isn't counted as lag or as a GC pause.
         self._event_loop_lag: m.EventLoopLag
+        self._gc_pause: m.GcPause
 
     @concurrent_endpoint
     async def setup_async(
@@ -64,9 +67,18 @@ class RolloutWorkerActor(Actor):
             hf_assets_path=hf_assets_path,
             vision_processor_config=vision_processor_config,
         )
+        # Setup objects (imported modules, the tokenizer: ~0.7-1M objects) live until exit. Freeze
+        # them, so a full collection skips them and stalls the event loop for less time. Trade-off:
+        # CPython 3.12 starts a full collection when its long-lived objects grow by 25%, and frozen
+        # objects no longer count, so full collections come more often. Near the event loop's limit,
+        # the total pause grows.
+        GarbageCollector.freeze(
+            "Full GC before freezing the rollout worker's setup objects"
+        )
         # Start measuring after setup: setup may hold the loop (e.g. building a tokenizer), and that
         # isn't rollout work.
         self._event_loop_lag = m.EventLoopLag("rollout_worker")
+        self._gc_pause = m.GcPause("rollout_worker")
 
     @concurrent_endpoint
     async def run_group(
@@ -87,23 +99,43 @@ class RolloutWorkerActor(Actor):
             group_size=group_size,
             sampling=sampling,
         )
-        # Add this worker's lag and memory metrics to each training group.
-        #   event_loop_lag_ms: the longest delay of this worker's event loop since its previous training group.
-        #   event_loop_lag_ms_per_s: how many ms the loop ran late per second, over the same time.
-        #   peak_memory_gib: the most RAM this process has held since it started, shared libraries included.
-        # The controller ignores the metrics of validation groups (negative ids), so lag measured
+        # Add this worker's metrics to each training group. What each shows and when to act:
+        # "Rollout worker metrics" in `torchtitan/rl/observability/metrics/README.md`.
+        #   Since its previous training group: event_loop_lag_ms, event_loop_lag_ms_per_s,
+        #   executor_queue_wait_ms, num_executor_jobs_in_flight, gc_pause_ms.
+        #   Read now: rss_gib, pss_gib.
+        # The controller ignores the metrics of validation groups (negative ids), so what is measured
         # during validation goes with this worker's next training group.
         if group_id >= 0:
-            # `ru_maxrss` is in KiB on Linux. Nothing resets it.
-            peak_memory_gib = (
-                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
-            )
             group.metrics += [
                 *self._event_loop_lag.flush(),
-                m.Metric("rollout_worker/peak_memory_gib", m.Max(peak_memory_gib)),
+                *self._executor.flush(),
+                *self._gc_pause.flush(),
+                m.Metric(
+                    "rollout_worker/rss_gib",
+                    m.Max(_read_proc_kib("/proc/self/status", "VmRSS") / 2**20),
+                ),
+                # Reading Pss walks the page tables on the event loop: ~0.6 ms per training group with
+                # 64 KiB pages, more with 4 KiB pages.
+                m.Metric(
+                    "rollout_worker/pss_gib",
+                    m.Max(_read_proc_kib("/proc/self/smaps_rollup", "Pss") / 2**20),
+                ),
             ]
         return group
 
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:
         sl.set_step(step)
+
+
+def _read_proc_kib(path: str, field: str) -> int:
+    """Return the kB value of one field of a Linux /proc file.
+
+    Example: the line "VmRSS:  1745628 kB" in /proc/self/status -> 1745628.
+    """
+    with open(path) as proc_file:
+        for line in proc_file:
+            if line.startswith(f"{field}:"):
+                return int(line.split()[1])
+    raise RuntimeError(f"{path} has no {field} line")
