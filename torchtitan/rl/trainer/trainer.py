@@ -43,6 +43,10 @@ from torchtitan.training_engine import TrainingEngine
 
 logger = logging.getLogger(__name__)
 
+# `trainer/pushed_weights_changed_percent` estimates the percent over all elements from every 97th element of
+# each pushed weight (~1% of a full copy). 97 is prime, so the sample doesn't pick the same columns of every row.
+_PUSHED_WEIGHTS_SAMPLE_STRIDE = 97
+
 
 class MirroredState(Stateful):
     """Checkpoint state produced elsewhere and mirrored into the trainer.
@@ -383,8 +387,16 @@ class Trainer(Configurable):
         # scheduler advances in engine.optim_step().
         lr_metrics = engine.optim.lr_schedulers.get_metrics()
 
+        # A sample of each pushed weight, in the dtype the push sends it in.
+        trainable_params = self._trainable_local_params()
+        weights_before = [
+            param.reshape(-1)[::_PUSHED_WEIGHTS_SAMPLE_STRIDE].to(
+                param.dtype if keeps_dtype else self._transfer_dtype or param.dtype,
+                copy=True,
+            )
+            for param, keeps_dtype in trainable_params
+        ]
         grad_norm = engine.optim_step()
-        self._mark_model_state_dict_ready_for_push()
         self._resume_state.value = resume_state
 
         # TODO: Move performance, LR, and auxiliary-loss reporting into a shared
@@ -406,6 +418,27 @@ class Trainer(Configurable):
         )
 
         engine.save_checkpoint(last_step=last_step)
+        # Before the count: once optim_step stops syncing the host, the push won't wait for it.
+        self._mark_model_state_dict_ready_for_push()
+        num_changed = sum(
+            (
+                torch.count_nonzero(
+                    param.reshape(-1)[::_PUSHED_WEIGHTS_SAMPLE_STRIDE].to(before.dtype)
+                    != before
+                )
+                for (param, _), before in zip(
+                    trainable_params, weights_before, strict=True
+                )
+            ),
+            # A tensor even on a rank with no trainable parameters (e.g. a frozen pipeline stage).
+            start=torch.zeros((), dtype=torch.int64, device=engine.device),
+        )
+        num_weights = sum(before.numel() for before in weights_before)
+        # Replicated weights (e.g. TP norms) count once per rank that holds them.
+        weight_counts = dist_utils.dist_sum_tensor(
+            torch.stack([num_changed, torch.full_like(num_changed, num_weights)]),
+            engine.parallelism_context.world_mesh,
+        )
         engine.step_profiler()
         device_mem_stats = engine.device_memory_monitor.get_peak_stats()
         engine.device_memory_monitor.reset_peak_stats()
@@ -419,6 +452,9 @@ class Trainer(Configurable):
             policy_version=self.policy_version,
             metrics={
                 "trainer/grad_norm/mean": float(grad_norm.item()),
+                "trainer/pushed_weights_changed_percent": float(
+                    100 * weight_counts[0] / weight_counts[1]
+                ),
                 **{f"trainer/{key}": value for key, value in lr_metrics.items()},
                 "trainer/policy_version": float(self.policy_version),
                 "trainer/tokens_per_second": performance["tokens_per_second"],
@@ -441,6 +477,25 @@ class Trainer(Configurable):
                 ),
             },
         )
+
+    def _trainable_local_params(self) -> list[tuple[torch.Tensor, bool]]:
+        """This rank's shards of the trainable parameters, each with whether the push keeps its dtype.
+
+        Example: a trainable linear weight, and a norm weight in `preserve_dtype_params`
+            -> [(linear_weight_shard, False), (norm_weight_shard, True)]
+        Frozen parameters (e.g. a LoRA base) are left out: the push does not send them.
+        """
+        preserved = {
+            id(param)
+            for model_part in self.engine.model_parts
+            for _, param in model_part.named_preserve_dtype_params()
+        }
+        return [
+            (dist_utils.get_local_tensor(param), id(param) in preserved)
+            for model_part in self.engine.model_parts
+            for param in model_part.parameters()
+            if param.requires_grad
+        ]
 
     @sl.log_trace_span("push_model_state_dict")
     async def push_model_state_dict(self) -> None:

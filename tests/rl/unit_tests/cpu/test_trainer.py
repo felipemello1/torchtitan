@@ -540,7 +540,9 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
                 dp_replicate=1,
                 dp_shard=1,
                 get_optional_mesh=lambda _: None,
+                world_mesh=None,
             ),
+            model_parts=[Module()],
             num_completed_steps=4,
             ntokens_seen=12,
             has_quantization=False,
@@ -550,11 +552,35 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
             save_checkpoint=MagicMock(),
             step_profiler=MagicMock(),
         )
-        engine.optim_step.side_effect = lambda: (
-            setattr(engine, "num_completed_steps", engine.num_completed_steps + 1),
-            torch.tensor(2.0),
-        )[1]
+        # 64 x 97 elements each, so the metric samples elements 0, 97, 194, ... of each.
+        num_elements = 64 * 97
+        model_part = engine.model_parts[0]
+        model_part.register_parameter(
+            "weight", torch.nn.Parameter(torch.ones(num_elements))
+        )
+        # Not pushed: changes here don't count.
+        model_part.register_parameter(
+            "frozen", torch.nn.Parameter(torch.ones(num_elements), requires_grad=False)
+        )
+        # Pushed in fp32.
+        model_part.norm = RMSNorm.Config(
+            normalized_shape=num_elements, preserve_dtype_params=("weight",)
+        ).build()
+
+        def optim_step() -> torch.Tensor:
+            engine.num_completed_steps += 1
+            with torch.no_grad():
+                # Near 1.0 the bf16 spacing is 1/128: +0.01 changes the bf16 value,
+                # +1e-6 changes only the fp32 value.
+                model_part.weight[0] += 0.01
+                model_part.weight[97] += 1e-6
+                model_part.frozen += 0.01
+                model_part.norm.weight[0] += 1e-6
+            return torch.tensor(2.0)
+
+        engine.optim_step.side_effect = optim_step
         trainer.engine = engine
+        trainer._transfer_dtype = torch.bfloat16
         trainer._resume_state = MirroredState()
         trainer.gpu_peak_flops = 1000
         trainer._step_compute_start = 0.0
@@ -593,6 +619,8 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
         )
         assert result.metrics == {
             "trainer/grad_norm/mean": 2.0,
+            # Of 128 sampled elements, weight[0] and norm.weight[0] changed.
+            "trainer/pushed_weights_changed_percent": 100 * 2 / 128,
             "trainer/lr/AdamW/0": 0.25,
             "trainer/lr/AdamW/1": 0.125,
             "trainer/policy_version": 5.0,
