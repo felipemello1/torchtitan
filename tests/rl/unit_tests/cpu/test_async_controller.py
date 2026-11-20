@@ -462,6 +462,8 @@ def test_batcher_reports_padding_when_document_limit_blocks_greedy_order() -> No
         for ((microbatch,),) in batch.microbatch_groups
     )
     assert _metric_value(batch, "train_batch/padding_frac") == pytest.approx(4 / 9)
+    # 18 token slots, 8 of them padding.
+    assert _metric_value(batch, "train_batch/num_tokens") == 10
 
 
 def test_document_limit_applies_to_each_local_microbatch() -> None:

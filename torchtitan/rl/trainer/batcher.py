@@ -1134,11 +1134,10 @@ class Batcher(Configurable):
         self,
         *,
         num_microbatches: int,
-        training_samples: list[TrainingSample],
+        num_real_tokens: int,
     ) -> float:
         num_tokens_per_rank = self._num_rows_per_microbatch * self.seq_len
         total_slots = num_microbatches * self._dp_degree * num_tokens_per_rank
-        num_real_tokens = sum(len(sample.token_ids) - 1 for sample in training_samples)
         return (total_slots - num_real_tokens) / total_slots
 
     def _packing_metrics(
@@ -1149,9 +1148,11 @@ class Batcher(Configurable):
         num_metric_only_groups: int,
     ) -> list[m.Metric]:
         """Per-training-batch packing + count metrics. (policy age is logged at trainer consume time.)"""
+        # Every input position trained this step, prompt and env tokens included: N - 1 per N-token sample.
+        num_real_tokens = sum(len(sample.token_ids) - 1 for sample in training_samples)
         padding_frac = self._padding_fraction(
             num_microbatches=len(assignments),
-            training_samples=training_samples,
+            num_real_tokens=num_real_tokens,
         )
         image_metrics = []
         if self._vision_processor is not None:
@@ -1178,6 +1179,10 @@ class Batcher(Configurable):
             m.Metric(
                 "train_batch/padding_frac",
                 m.NoReduce(padding_frac),
+            ),
+            m.Metric(
+                "train_batch/num_tokens",
+                m.NoReduce(float(num_real_tokens)),
             ),
             m.Metric(
                 "train_batch/num_microbatches",
