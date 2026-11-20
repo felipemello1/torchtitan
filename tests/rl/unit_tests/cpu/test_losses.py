@@ -7,6 +7,7 @@
 import pytest
 import torch
 
+from torchtitan.components.loss import loss_metric_reduce_op
 from torchtitan.rl.trainer.losses import GRPOLoss
 from torchtitan.rl.trainer.losses.dapo import _normalize, DAPOLoss
 
@@ -129,5 +130,8 @@ def test_icepop_band_matches_reference_icepop() -> None:
     torch.testing.assert_close(grad, reference_logits.grad)
     log_ratio = ratio.log()
     torch.testing.assert_close(
-        metrics["loss/mismatch_kl"], (torch.expm1(log_ratio) - log_ratio).mean()
+        metrics["loss/mismatch_kl/mean"], (torch.expm1(log_ratio) - log_ratio).mean()
     )
+    # ChunkedLossWrapper and the trainer reduce each key by its suffix, and raise on any other.
+    for key in metrics:
+        loss_metric_reduce_op(key)

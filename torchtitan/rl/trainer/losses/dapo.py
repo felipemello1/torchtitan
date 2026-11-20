@@ -180,7 +180,7 @@ class DAPOLoss(Loss[torch.Tensor]):
                 ),
                 # Mean of exp(r) - 1 - r over the same tokens: the k3 estimate of KL(q || p).
                 # Never negative, so mismatches of opposite sign don't cancel out.
-                "loss/mismatch_kl": _normalize(
+                "loss/mismatch_kl/mean": _normalize(
                     (torch.expm1(log_ratio) - log_ratio).float().sum(),
                     global_loss_token_counts,
                 ),
