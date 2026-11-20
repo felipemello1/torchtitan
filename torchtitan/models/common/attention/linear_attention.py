@@ -62,6 +62,7 @@ def chunk_kernel_options(q: torch.Tensor) -> KernelOptions:
     """Attention Gym chunk-kernel options for `q`: the fused kernels, for every input."""
     # TODO: bring back backend="cudnn" (packed fp16/bf16 on SM100/SM103: GDN fwd+bwd 2.3-3.9x faster on GB300) once
     # Attention Gym's vendored cudnn-frontend (v1.30.0) GDN chunk kernel is causally consistent at long packed
-    # lengths (pos 562 of a 78k-token Qwen3.8-27B sequence on GB300: full -11.55 vs prefix -0.0002).
+    # lengths (Qwen3.8-27B, 78k tokens, GB300, Flash attention: pos 562 full -1.91, prefix -10.35; fused -0.0146 both).
+    # KDA's cuDNN kernel shares the vendored code and is untested at these lengths, so it stays fused too.
     del q
     return KernelOptions(backend="fused")
