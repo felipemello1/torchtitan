@@ -76,6 +76,15 @@ class DAPOLoss(Loss[torch.Tensor]):
         """Full vocabulary size from the model spec, set when building RL configs.
         Leave unset for batch-invariant mode to retain the full-gather path."""
 
+        def __post_init__(self) -> None:
+            if (
+                self.ratio_mask is not None
+                and not 0 < self.ratio_mask[0] < self.ratio_mask[1]
+            ):
+                raise ValueError(
+                    f"ratio_mask must be (low, high) with 0 < low < high, got {self.ratio_mask}"
+                )
+
     def __init__(self, config: Config) -> None:
         self.ratio_clip_low = config.ratio_clip_low
         self.ratio_clip_high = config.ratio_clip_high
