@@ -151,6 +151,12 @@ class DAPOLoss(Loss[torch.Tensor]):
                 "bit_wise/logprob_diff/mean": _normalize(
                     diff_for_metrics.float().sum(), global_loss_token_counts
                 ),
+                # Mean of exp(r) - 1 - r over the same tokens: the k3 estimate of KL(q || p).
+                # Never negative, so mismatches of opposite sign don't cancel out.
+                "bit_wise/kl_k3/mean": _normalize(
+                    (torch.expm1(log_ratio) - log_ratio).float().sum(),
+                    global_loss_token_counts,
+                ),
                 "bit_wise/ratio_tokens_different/mean": _normalize(
                     (
                         (diff_for_metrics.abs() > 1e-6).float() * effective_loss_mask
