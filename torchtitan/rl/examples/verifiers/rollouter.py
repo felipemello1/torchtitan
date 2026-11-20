@@ -492,6 +492,11 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
         previous_token_ids: list[int] = []
 
         for branch in trace.branches:
+            # Verifiers marks a path that adds no training sample, e.g. a compaction attempt the
+            # harness rejected: skip it. Its nodes shared with other branches still train there.
+            if not branch.trainable:
+                continue
+
             token_ids = branch.token_ids
             logprobs = branch.logprobs
             branch_offset = 0
