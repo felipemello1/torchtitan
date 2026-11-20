@@ -21,6 +21,7 @@ from torchtitan.components.renderer import RendererConfig
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
+from torchtitan.rl.rollout.curriculum import Curriculum
 from torchtitan.rl.rollout.data import RLDataset, RolloutDataLoader
 from torchtitan.rl.rollout.message_env import MessageEnv
 from torchtitan.rl.rollout.rubric import Rubric, RubricOutput
@@ -88,7 +89,9 @@ class Rollouter(Configurable):
     Customization:
         Rollouter supports customization at several levels:
           - Sample source: provide source configs for training and validation.
-          - Group execution, coarse: override `run_group_rollouts` for your own
+          - Task state that follows training (a difficulty level, a schedule on the
+            train step): set `curriculum`; see `Curriculum`.
+          - Group execution, coarse: override `_run_group_rollouts` for your own
             orchestration. The worker then becomes optional -- but override
             `setup_async` too, or the worker pool is still spawned unused.
           - Group execution, fine: keep the stock orchestration and point `worker`
@@ -131,6 +134,9 @@ class Rollouter(Configurable):
         `rollout_worker/executor_queue_wait_ms`: see "Rollout worker metrics" in
         `torchtitan/rl/observability/metrics/README.md`."""
 
+        curriculum: Curriculum.Config = field(default_factory=Curriculum.Config)
+        """Rewrites training samples from the train step and trained groups' results; the default changes nothing."""
+
         def __post_init__(self) -> None:
             if self.num_threads_per_worker < 1:
                 raise ValueError(
@@ -144,6 +150,10 @@ class Rollouter(Configurable):
         if not isinstance(training_dataloader, RolloutDataLoader):
             raise ValueError("training_dataloader must build a RolloutDataLoader")
         self._training_dataloader = iter(training_dataloader)
+        self._curriculum: Curriculum = config.curriculum.build()
+        self._step = 0
+        # Summaries of finished training groups by group id, until those groups are trained.
+        self._summaries: dict[int, object] = {}
 
         # The worker pool's actor handle and the actor system that spawned it.
         self._worker_actors: Any | None = None
@@ -156,8 +166,17 @@ class Rollouter(Configurable):
         return next(self._training_dataloader)
 
     def commit_training_sample_ids(self, sample_ids: Iterable[int]) -> None:
-        """Mark training samples as safe to omit from the next checkpoint."""
+        """Mark training samples as safe to omit from the next checkpoint, and hand
+        their groups' summaries to the curriculum."""
+        sample_ids = list(sample_ids)
         self._training_dataloader.commit(sample_ids)
+        # A group whose rollout raised has no summary.
+        summaries = [
+            self._summaries.pop(sample_id)
+            for sample_id in sample_ids
+            if sample_id in self._summaries
+        ]
+        self._curriculum.update(step=self._step, summaries=summaries)
 
     def get_validation_samples(self, steps: int) -> list[object]:
         """Materialize one fresh validation pass, optionally bounded by steps."""
@@ -232,7 +251,8 @@ class Rollouter(Configurable):
             await actor_system.stop_rollout_workers()
 
     async def sync_log_step(self, step: int) -> None:
-        """Propagate the controller log step to every rollout worker."""
+        """Record the step for the curriculum and propagate it to every rollout worker."""
+        self._step = step
         if self._worker_actors is not None:
             await self._worker_actors.sync_log_step.call(step)
 
@@ -248,6 +268,8 @@ class Rollouter(Configurable):
     ) -> RolloutGroup:
         """Send one prompt group to a rollout worker and return its scored group.
 
+        Training groups also go through the curriculum: `prepare` before, `summarize` after.
+
         Args:
             generate_fn: Async callable that returns a Completion given a prompt.
             release_session_fn: Async callable each rollout calls after its last turn, to
@@ -260,6 +282,32 @@ class Rollouter(Configurable):
         Returns:
             One scored `RolloutGroup`.
         """
+        # Validation groups (negative ids) skip the curriculum, so every pass plays the same settings.
+        if group_id >= 0:
+            sample = self._curriculum.prepare(sample, step=self._step)
+        group = await self._run_group_rollouts(
+            generate_fn=generate_fn,
+            release_session_fn=release_session_fn,
+            sample=sample,
+            group_id=group_id,
+            group_size=group_size,
+            sampling=sampling,
+        )
+        if group_id >= 0:
+            self._summaries[group_id] = self._curriculum.summarize(sample, group)
+        return group
+
+    async def _run_group_rollouts(
+        self,
+        *,
+        generate_fn: GenerateFn,
+        release_session_fn: ReleaseSessionFn,
+        sample: object,
+        group_id: int,
+        group_size: int,
+        sampling: SamplingConfig,
+    ) -> RolloutGroup:
+        """Run one group on a rollout worker; override for your own orchestration."""
         if self._worker_actors is None:
             raise RuntimeError("rollout worker pool is not initialized")
 
@@ -287,12 +335,18 @@ class Rollouter(Configurable):
             call.exception()
 
     def state_dict(self) -> dict[str, object]:
-        """Return the checkpoint state of the training input iterator."""
-        return self._training_dataloader.state_dict()
+        """Return the checkpoint state of the training input iterator, curriculum and step."""
+        return {
+            "dataloader": self._training_dataloader.state_dict(),
+            "curriculum": self._curriculum.state_dict(),
+            "step": self._step,
+        }
 
     def load_state_dict(self, state_dict: dict[str, object]) -> None:
-        """Restore the training iterator, including uncommitted inputs."""
-        self._training_dataloader.load_state_dict(state_dict)
+        """Restore the training iterator (uncommitted inputs included), curriculum and step."""
+        self._training_dataloader.load_state_dict(state_dict["dataloader"])
+        self._curriculum.load_state_dict(state_dict["curriculum"])
+        self._step = state_dict["step"]
 
 
 def log_failed_rollout(rollout: Rollout) -> None:

@@ -22,6 +22,7 @@ from torchtitan.rl.actors.monarch.system import MonarchActorSystem
 from torchtitan.rl.observability import metrics as m
 
 from torchtitan.rl.rollout import rollouter as rollouter_module, RolloutGroup
+from torchtitan.rl.rollout.curriculum import Curriculum
 from torchtitan.rl.rollout.rollouter import MessageEnvRolloutWorker, Rollouter
 
 
@@ -222,6 +223,9 @@ def _rollouter_without_datasets() -> Rollouter:
     worker_config = WorkerConfig()
     rollouter = object.__new__(Rollouter)
     rollouter._config = SimpleNamespace(worker=worker_config, num_threads_per_worker=2)
+    rollouter._curriculum = Curriculum.Config().build()
+    rollouter._step = 0
+    rollouter._summaries = {}
     rollouter._worker_actors = None
     rollouter._actor_system = None
     rollouter._inflight_run_group_calls = set()
