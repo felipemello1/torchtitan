@@ -130,6 +130,9 @@ def _rollouter_without_datasets() -> Rollouter:
         worker_pool_size=3,
         num_threads_per_worker=2,
     )
+    rollouter._curriculum = None
+    rollouter._step = 0
+    rollouter._summaries = {}
     rollouter._worker_actors = None
     rollouter._actor_system = None
     rollouter._inflight_run_group_calls = set()

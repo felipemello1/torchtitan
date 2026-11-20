@@ -863,6 +863,8 @@ class Controller(Configurable):
             )
         if self.start_step > 0:
             logger.info(f"Resuming RL training from step {self.start_step}")
+            # Rollouts before the first train step see the restored step (e.g. in `Curriculum.prepare`).
+            await self._rollouter.sync_log_step(self.start_step)
 
         # Start each generator's engine loop on all ranks once, before any
         # rank-0-only generate / pull (rank 0 drives the followers through this
