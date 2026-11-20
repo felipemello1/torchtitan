@@ -434,10 +434,7 @@ class Trainer(Configurable):
         # scheduler advances in engine.optim_step().
         lr_metrics = engine.optim.lr_schedulers.get_metrics()
 
-        # At small learning rates most AdamW updates are below half a bf16 spacing
-        # (|w| / 256), so the rounded copy pushed to the generator does not change.
-        # Count the weights whose value in the push dtype changes. Costs one
-        # push-dtype copy of the local shards during the optimizer step.
+        # Count the weights whose push-dtype value this step changes (costs one push-dtype copy).
         local_params = self._local_params()
         weights_before = [
             param.to(self._transfer_dtype or param.dtype, copy=True)
