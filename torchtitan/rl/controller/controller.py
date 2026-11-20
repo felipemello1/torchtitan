@@ -550,6 +550,18 @@ class Controller(Configurable):
             # e.g. rollout max length cannot be larger than the model max_seq_len
             # or the packing len, etc.
 
+            if self.trainer.bf16_weight_rounding == "stochastic" and (
+                self.precision.dtype != "float32"
+                or self.precision.param_dtype != "bfloat16"
+            ):
+                raise ValueError(
+                    "bf16_weight_rounding='stochastic' rounds fp32 master weights "
+                    "to a bf16 copy: it needs precision.dtype='float32' and "
+                    "precision.param_dtype='bfloat16', got "
+                    f"precision.dtype={self.precision.dtype!r} and "
+                    f"precision.param_dtype={self.precision.param_dtype!r}."
+                )
+
             if self.trainer.debug.batch_invariant:
                 if torch.version.hip is not None:
                     raise ValueError(
