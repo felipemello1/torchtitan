@@ -576,18 +576,15 @@ class TestHuggingFaceChatTemplateAutoLoad(unittest.TestCase):
             # Should use the .jinja file (just outputs content), not the inline ChatML
             self.assertEqual(result, "Hello")
 
-    def test_hf_backend_renders_generation_tags(self):
-        """HF {% generation %} tags (e.g. SmolLM3-3B) render as if they were absent."""
-        from torchtitan.experiments.transformers_modeling_backend.tokenizer import (
-            HFBackendTokenizer,
-        )
+    def test_renders_generation_tags(self):
+        """HF {% generation %} tags (e.g. Qwen3.8, SmolLM3-3B) render as if they were absent."""
 
         def render(template):
             with tempfile.TemporaryDirectory() as tmpdir:
                 shutil.copytree(ASSETS_TOKENIZER, tmpdir, dirs_exist_ok=True)
                 with open(os.path.join(tmpdir, "chat_template.jinja"), "w") as f:
                     f.write(template)
-                tok = HFBackendTokenizer(tokenizer_path=tmpdir)
+                tok = HuggingFaceTokenizer(tokenizer_path=tmpdir)
             return tok.apply_chat_template(SAMPLE_MESSAGES, add_generation_prompt=False)
 
         tagged = (
