@@ -71,10 +71,25 @@ class BaseTokenizer(ABC, Configurable):
 
             return datetime.now().strftime(fmt)
 
+        class GenerationExtension(jinja2.ext.Extension):
+            """Render HF's `{% generation %}...{% endgeneration %}` assistant markers as their body."""
+
+            tags = {"generation"}
+
+            def parse(self, parser):
+                lineno = next(parser.stream).lineno
+                body = parser.parse_statements(["name:endgeneration"], drop_needle=True)
+                return jinja2.nodes.CallBlock(
+                    self.call_method("_render_body"), [], [], body
+                ).set_lineno(lineno)
+
+            def _render_body(self, caller):
+                return caller()
+
         env = jinja2.sandbox.ImmutableSandboxedEnvironment(
             trim_blocks=True,
             lstrip_blocks=True,
-            extensions=[jinja2.ext.loopcontrols],
+            extensions=[GenerationExtension, jinja2.ext.loopcontrols],
         )
         env.globals["raise_exception"] = raise_exception
         env.globals["strftime_now"] = strftime_now
