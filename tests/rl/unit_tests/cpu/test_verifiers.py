@@ -342,6 +342,7 @@ def test_verifiers_trace_preserves_generation_metadata() -> None:
                 nodes=[node],
                 token_ids=[10, 11, 12, 13],
                 logprobs=[0.0, 0.0, -0.2, -0.3],
+                trainable=True,
             )
         ],
     )
@@ -391,6 +392,7 @@ def test_verifiers_multiturn_trace_matches_titanrl_rollout_structure() -> None:
                 nodes=[first_node, second_node],
                 token_ids=[10, 11, 12, 13],
                 logprobs=[0.0, -0.1, 0.0, -0.2],
+                trainable=True,
             )
         ],
     )
@@ -438,11 +440,13 @@ def test_verifiers_second_branch_stores_its_prompt_as_a_delta_on_the_first() -> 
                 nodes=[shared, first_leaf],
                 token_ids=[10, 11, 12, 13],
                 logprobs=[0.0, -0.1, 0.0, -0.2],
+                trainable=True,
             ),
             SimpleNamespace(
                 nodes=[shared, second_leaf],
                 token_ids=[10, 11, 14, 15],
                 logprobs=[0.0, -0.1, 0.0, -0.3],
+                trainable=True,
             ),
         ],
     )
@@ -462,6 +466,48 @@ def test_verifiers_second_branch_stores_its_prompt_as_a_delta_on_the_first() -> 
     ]
     assert stored == [(0, [10]), (2, [12]), (2, [14])]
     assert [turn.completion_token_ids.tolist() for turn in turns] == [[11], [13], [15]]
+
+
+def test_verifiers_trace_skips_a_branch_verifiers_marks_untrainable() -> None:
+    """A compaction attempt the harness rejected is a branch with trainable=False: no turn."""
+    from verifiers.v1.types import AssistantMessage as VerifiersAssistantMessage
+
+    def node(token_ids: list[int], content: str) -> SimpleNamespace:
+        message = VerifiersAssistantMessage(content=content)
+        return SimpleNamespace(
+            token_ids=token_ids, mask=[False, True], sampled=True, message=message
+        )
+
+    shared = node([10, 11], "a")
+    kept_leaf = node([12, 13], "b")
+    rejected_leaf = node([14, 15], "c")
+    trace = SimpleNamespace(
+        nodes=[shared, kept_leaf, rejected_leaf],
+        branches=[
+            SimpleNamespace(
+                nodes=[shared, kept_leaf],
+                token_ids=[10, 11, 12, 13],
+                logprobs=[0.0, -0.1, 0.0, -0.2],
+                trainable=True,
+            ),
+            SimpleNamespace(
+                nodes=[shared, rejected_leaf],
+                token_ids=[10, 11, 14, 15],
+                logprobs=[0.0, -0.1, 0.0, -0.3],
+                trainable=False,
+            ),
+        ],
+    )
+    turns = VerifiersRolloutWorker.trace_to_rollout_turns(
+        trace=trace,
+        generation_metadata=VerifiersGenerationMetadata(
+            min_policy_version=1, max_policy_version=1, metrics=[]
+        ),
+        group_id=5,
+        rollout_id=2,
+    )
+
+    assert [turn.completion_token_ids.tolist() for turn in turns] == [[11], [13]]
 
 
 def test_verifiers_trace_attaches_env_replies_to_the_preceding_turn() -> None:
@@ -496,6 +542,7 @@ def test_verifiers_trace_attaches_env_replies_to_the_preceding_turn() -> None:
                 nodes=branch_nodes,
                 token_ids=[0] * len(branch_nodes),
                 logprobs=[0.0] * len(branch_nodes),
+                trainable=True,
             )
             for branch_nodes in (
                 [task, first, out, second],
@@ -976,7 +1023,9 @@ def _one_turn_fields(*, trainable: bool = True) -> dict:
         sampled=True,
         message=VerifiersAssistantMessage(content="ls"),
     )
-    branch = SimpleNamespace(nodes=[node], token_ids=[10, 11], logprobs=[0.0, -0.1])
+    branch = SimpleNamespace(
+        nodes=[node], token_ids=[10, 11], logprobs=[0.0, -0.1], trainable=True
+    )
     return {"nodes": [node], "branches": [branch], "num_turns": 1}
 
 
@@ -1334,7 +1383,9 @@ def test_timed_out_rollout_is_logged_and_keeps_no_reward(caplog) -> None:
         num_turns=1,
         nodes=[node],
         branches=[
-            SimpleNamespace(nodes=[node], token_ids=[10, 11], logprobs=[0.0, -0.1])
+            SimpleNamespace(
+                nodes=[node], token_ids=[10, 11], logprobs=[0.0, -0.1], trainable=True
+            )
         ],
     )
     worker = object.__new__(VerifiersRolloutWorker)
