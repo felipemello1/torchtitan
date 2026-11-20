@@ -1095,3 +1095,32 @@ def test_validation_renames_turn_metrics_and_uses_fresh_group_ids() -> None:
     assert keys["validation_math_verify/timeouts/sum"] == 2.0
     assert "generator/queue_time_ms/mean" not in keys
     assert "math_verify/timeouts/sum" not in keys
+
+
+def test_controller_resume_gives_the_rollouter_the_restored_step() -> None:
+    # Resumed at step 4: rollouts before the first train step must see step 4, e.g. in `Curriculum.prepare`.
+    controller = object.__new__(Controller)
+    controller.config = Mock(max_num_seqs_per_generator_dp_rank=8)
+    controller.config.trainer.parallelism = SimpleNamespace(
+        data_parallel_shard_degree=1,
+        data_parallel_replicate_degree=1,
+        pipeline_parallel_degree=1,
+    )
+    controller.config.generator.engine.uses_mooncake_store = False
+    controller.config.model_state_dict_transport = None
+    controller.tokenizer = SimpleNamespace(eos_id=0)
+    controller._sampling = SimpleNamespace(temperature=1.0)
+    controller._rollouter = AsyncMock(load_state_dict=Mock())
+    actor_system = AsyncMock()
+    actor_system.spawn_trainer.return_value = trainer = AsyncMock()
+    actor_system.spawn_generator_router.return_value = AsyncMock()
+    trainer.rank0.get_policy_version.call_one.return_value = 4
+    trainer.rank0.get_resume_state.call_one.return_value = {"next_index": 11}
+
+    with patch.object(
+        Controller, "_build_actor_system", AsyncMock(return_value=actor_system)
+    ):
+        asyncio.run(controller.setup_async())
+
+    controller._rollouter.load_state_dict.assert_called_once_with({"next_index": 11})
+    controller._rollouter.sync_log_step.assert_awaited_once_with(4)
