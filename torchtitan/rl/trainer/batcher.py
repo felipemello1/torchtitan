@@ -569,6 +569,11 @@ class Batcher(Configurable):
                         / max(num_response_tokens, 1)
                     ),
                 ),
+                # Every non-padding token trained this step, prompt and env tokens included.
+                m.Metric(
+                    "train_batch/num_tokens",
+                    m.NoReduce(float(global_routing_token_counts[0].item())),
+                ),
                 *self._packing_metrics(
                     assignments,
                     training_samples,
