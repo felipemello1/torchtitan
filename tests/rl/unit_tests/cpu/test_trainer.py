@@ -23,7 +23,11 @@ from torchtitan.rl.trainer.rdma_microbatch import (
     RDMAMicrobatch,
     RDMAMicrobatchPrefetcher,
 )
-from torchtitan.rl.trainer.trainer import MirroredState, Trainer
+from torchtitan.rl.trainer.trainer import (
+    MirroredState,
+    stochastic_round_to_bf16_,
+    Trainer,
+)
 from torchtitan.training_engine import ForwardBackwardResult, TrainingEngine
 
 
@@ -510,7 +514,10 @@ def test_forward_backward_without_last_pipeline_stage_returns_no_metrics() -> No
     asyncio.run(run())
 
 
-def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
+@pytest.mark.parametrize("bf16_weight_rounding", ["nearest", "stochastic"])
+def test_optim_step_advances_profiler_and_reports_aux_loss_metrics(
+    bf16_weight_rounding: str,
+) -> None:
     async def run() -> None:
         trainer = object.__new__(Trainer)
         device_mem_stats = SimpleNamespace(
@@ -566,8 +573,12 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
         model_part.norm = RMSNorm.Config(
             normalized_shape=num_elements, preserve_dtype_params=("weight",)
         ).build()
+        weight = model_part.weight
+        master = weight.detach().clone()
+        seen = {}
 
         def optim_step() -> torch.Tensor:
+            seen["optimizer"] = weight.detach().clone()
             engine.num_completed_steps += 1
             with torch.no_grad():
                 # Near 1.0 the bf16 spacing is 1/128: +0.01 changes the bf16 value,
@@ -579,14 +590,29 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
             return torch.tensor(2.0)
 
         engine.optim_step.side_effect = optim_step
+        engine.save_checkpoint.side_effect = lambda last_step: seen.update(
+            checkpoint=weight.detach().clone()
+        )
         trainer.engine = engine
+        trainer.config = SimpleNamespace(debug=SimpleNamespace(seed=0))
         trainer._transfer_dtype = torch.bfloat16
+        trainer._master_weights = None
+        if bf16_weight_rounding == "stochastic":
+            # Only `weight` is rounded: `frozen` doesn't train, and `norm.weight` stays fp32.
+            # It holds the rounded copy, 1.0. Elements 1 and up of the master sit half a
+            # bf16 spacing (2**-8) above it: nearest keeps 1.0, stochastic moves some up,
+            # so the metric also checks that it counts after the rounded-copy write.
+            master[1:] += 2**-8
+            trainer._master_weights = {"weight": master.clone()}
         trainer._resume_state = MirroredState()
         trainer.gpu_peak_flops = 1000
         trainer._step_compute_start = 0.0
         trainer._step_num_tokens_per_dp_rank = 10
         trainer._num_flops = 2000
         trainer._push_model_state_dict_stream = MagicMock()
+        trainer._push_model_state_dict_stream.wait_stream.side_effect = (
+            lambda stream: seen.update(push=weight.detach().clone())
+        )
         compute_stream = MagicMock()
 
         with (
@@ -617,10 +643,30 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
         trainer._push_model_state_dict_stream.wait_stream.assert_called_once_with(
             compute_stream
         )
+        # The optimizer and the checkpoint see the fp32 master. The push and the
+        # next forward see the parameter: the master itself, or its rounded copy.
+        new_master = master.clone()
+        new_master[0] += 0.01
+        new_master[97] += 1e-6
+        assert torch.equal(seen["optimizer"], master)
+        assert torch.equal(seen["checkpoint"], new_master)
+        assert torch.equal(seen["push"], weight)
+        if bf16_weight_rounding == "stochastic":
+            assert torch.equal(trainer._master_weights["weight"], new_master)
+            assert torch.equal(weight, weight.bfloat16().float())
+        else:
+            assert torch.equal(weight, new_master)
+        # Never rounded: `norm.weight` keeps its fp32 update.
+        norm_weight = torch.ones(num_elements)
+        norm_weight[0] += 1e-6
+        assert torch.equal(model_part.norm.weight.detach(), norm_weight)
+        # Sampled elements: 64 of `weight` (in bf16), 64 of `norm.weight` (fp32, 1 changed).
+        num_weight_changed = int((weight[::97].bfloat16() != 1.0).sum())
         assert result.metrics == {
             "trainer/grad_norm/mean": 2.0,
-            # Of 128 sampled elements, weight[0] and norm.weight[0] changed.
-            "trainer/pushed_weights_changed_percent": 100 * 2 / 128,
+            "trainer/pushed_weights_changed_percent": (
+                100 * (num_weight_changed + 1) / 128
+            ),
             "trainer/lr/AdamW/0": 0.25,
             "trainer/lr/AdamW/1": 0.125,
             "trainer/policy_version": 5.0,
@@ -651,3 +697,43 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
         device_memory_monitor.reset_peak_stats.assert_called_once_with()
 
     asyncio.run(run())
+
+
+def test_stochastic_round_to_bf16_is_unbiased_and_on_grid() -> None:
+    spacing = 2.0**-7  # bf16 spacing just above 1.0
+    values = torch.tensor([1.0 + 0.25 * spacing, -(1.0 + 0.25 * spacing), 0.0123, 1.0])
+    draws = values.repeat(200_000, 1)
+
+    stochastic_round_to_bf16_(draws, generator=torch.Generator().manual_seed(0))
+
+    assert torch.equal(draws, draws.bfloat16().float())
+    torch.testing.assert_close(draws.mean(dim=0), values, rtol=1e-4, atol=0)
+    assert torch.all(draws[:, 3] == 1.0)
+
+
+def test_rounded_copy_draws_new_noise_per_step_and_parameter() -> None:
+    def rounded_copies(param_names: list[str], step: int) -> dict[str, torch.Tensor]:
+        trainer = object.__new__(Trainer)
+        model = Module()
+        for name in param_names:
+            # Half a bf16 spacing above 1.0.
+            model.register_parameter(
+                name, torch.nn.Parameter(torch.full((64,), 1.0 + 2**-8))
+            )
+        trainer.engine = SimpleNamespace(model_parts=[model], num_completed_steps=step)
+        trainer.config = SimpleNamespace(debug=SimpleNamespace(seed=0))
+        params = trainer._rounded_params()
+        trainer._master_weights = {
+            name: torch.empty_like(param) for name, param in params.items()
+        }
+        trainer._save_master_and_write_rounded_copy(params)
+        return {name: param.detach().clone() for name, param in params.items()}
+
+    step_1 = rounded_copies(["first", "second"], step=1)
+    step_2 = rounded_copies(["first", "second"], step=2)
+    # As on a later PP stage: `second` is this rank's first parameter.
+    only_second = rounded_copies(["second"], step=1)
+
+    assert not torch.equal(step_1["first"], step_1["second"])
+    assert not torch.equal(step_1["first"], step_2["first"])
+    assert torch.equal(only_second["second"], step_1["second"])
