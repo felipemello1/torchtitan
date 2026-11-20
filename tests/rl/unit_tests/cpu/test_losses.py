@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
+
 import pytest
 import torch
 
@@ -100,3 +102,42 @@ def test_ratio_mask_drops_tokens_outside_band(config_cls) -> None:
     assert metrics_on.keys() == metrics_off.keys()
     for key in metrics_off.keys() - {"loss/mean"}:
         assert torch.equal(metrics_on[key], metrics_off[key]), key
+
+
+def test_icepop_band_matches_reference_icepop() -> None:
+    # IcePop with band [0.2, 5]: -A * ratio on tokens inside the band, summed over all loss tokens.
+    torch.manual_seed(0)
+    logits = torch.randn(8, 32)
+    ratio = torch.tensor([0.05, 0.19, 0.21, 0.9, 1.3, 4.9, 5.1, 20.0])
+    inputs = _inputs_with_ratios(logits, ratio)
+    loss_fn = DAPOLoss.Config(
+        ratio_clip_low=0.8, ratio_clip_high=4.0, ratio_mask=(0.2, 5.0)
+    ).build()
+
+    loss, grad, _ = _loss_and_grad(loss_fn, logits, inputs)
+
+    reference_logits = logits.detach().clone().requires_grad_(True)
+    trainer_logprobs = (
+        reference_logits.log_softmax(-1)
+        .gather(-1, inputs["labels"][:, None])
+        .squeeze(-1)
+    )
+    reference_ratio = torch.exp(trainer_logprobs - inputs["generator_logprobs"])
+    in_band = (ratio >= 0.2) & (ratio <= 5.0)
+    reference_loss = (-inputs["advantages"] * reference_ratio * in_band).sum() / 8
+    reference_loss.backward()
+
+    torch.testing.assert_close(loss, reference_loss.detach())
+    torch.testing.assert_close(grad, reference_logits.grad)
+
+
+def test_ratio_mask_compares_the_unclamped_ratio() -> None:
+    # The loss clamps the log ratio to +-10. A token at ratio e^12 is outside a (1e-6, 1e5) band.
+    torch.manual_seed(0)
+    logits = torch.randn(2, 32)
+    inputs = _inputs_with_ratios(logits, torch.tensor([1.0, math.exp(12)]))
+    loss_fn = DAPOLoss.Config(ratio_mask=(1e-6, 1e5)).build()
+
+    _, metrics = loss_fn(logits, **inputs)
+
+    assert metrics["loss/ratio_masked_frac"].item() == pytest.approx(1 / 2)

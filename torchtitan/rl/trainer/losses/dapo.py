@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -64,9 +65,11 @@ class DAPOLoss(Loss[torch.Tensor]):
 
         ratio_mask: tuple[float, float] | None = None
         """Zeroes the loss of tokens whose ratio is outside ``[low, high]``, whatever the
-        advantage's sign; the clip lets a high ratio with a negative advantage train with
-        weight up to e^10, e.g. after an MoE routing flip. Bounds are ratios, not offsets
-        from 1. ``loss/ratio_clipped_frac`` still counts masked tokens. None: off.
+        advantage's sign. Bounds are ratios, not offsets from 1. None: off.
+
+        The clip alone still trains a token with a high ratio and a negative advantage,
+        with weight up to e^10 (e.g. after an MoE routing flip).
+        ``loss/ratio_clipped_frac`` still counts masked tokens.
 
         Example: IcePop's ``(0.5, 5.0)`` (https://arxiv.org/abs/2510.18855) with ratios
         ``[0.4, 1.1, 6.0]`` trains only the 1.1 token, and the loss still divides by 3.
@@ -145,11 +148,17 @@ class DAPOLoss(Loss[torch.Tensor]):
         token_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
 
         # Masked tokens stay in global_loss_token_counts, so kept tokens' gradients don't grow.
+        # TODO: as INTELLECT-3 does, drop a whole rollout (every document it packs into) when any of its tokens has
+        # ratio < 1e-5: its later tokens follow a token the trainer finds near-impossible, so they are off-policy too.
+        # Needs a per-rollout reduction over the packed sequence.
         policy_gradient_mask = effective_loss_mask
         if self.ratio_mask is not None:
             mask_low, mask_high = self.ratio_mask
+            # Compare the unclamped log ratio: with a band edge above e^10, clamped tokens would stay in the band.
             policy_gradient_mask = (
-                effective_loss_mask & (ratio >= mask_low) & (ratio <= mask_high)
+                effective_loss_mask
+                & (masked_log_ratio >= math.log(mask_low))
+                & (masked_log_ratio <= math.log(mask_high))
             )
         masked_loss = token_loss * policy_gradient_mask
         loss = _normalize(masked_loss.sum(), global_loss_token_counts)
