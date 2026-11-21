@@ -526,6 +526,10 @@ class VerifiersRolloutWorker(BaseRolloutWorker):
         for branch in trace.branches:
             # Verifiers marks a path that adds no training sample, e.g. a compaction attempt the
             # harness rejected: skip it. Its nodes shared with other branches still train there.
+            # TODO: a reply a harness drops without a `compaction_attempt` edge (cut at the context end before a
+            #   compaction, or a rejected summary attempt) is its own trainable leaf, so it trains with the
+            #   rollout's advantage, as in Prime-RL. Skip a non-final leaf whose call ended at `length` with no
+            #   text, or have every Verifiers harness mark the replies it drops.
             if not branch.trainable:
                 continue
 
