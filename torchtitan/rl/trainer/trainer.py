@@ -449,6 +449,9 @@ class Trainer(Configurable):
                     strict=True,
                 ):
                     param.copy_(master)
+        # TODO: skip the optimizer step, or zero its update, when the global grad norm is 0 (no sample has a
+        # nonzero advantage): Adam's momentum still moves the weights on such a batch. Not done: it changes every
+        # recipe's optimizer path, and `drop_zero_std_reward_groups` already drops all-zero-advantage groups.
         grad_norm = engine.optim_step()
         self._resume_state.value = resume_state
 
