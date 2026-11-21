@@ -187,7 +187,7 @@ pool has room. vLLM keeps KV and states in one pool and needs no split
 asks SGLang to do the same).
 
 Size the state pool for the requests an engine runs at once: its share of the
-rollouts in flight, `max_active_rollout_groups x num_samples_per_prompt /
+concurrent rollouts, `num_concurrent_rollout_groups x num_samples_per_prompt /
 number of generators` (`max_num_seqs` is about 2x that, as headroom). Pass
 `max_mamba_cache_size` (3 x those requests) or `mamba_full_memory_ratio` in
 `extra_server_args`; the rest goes to KV. SGLang logs `max_running_requests`

@@ -113,8 +113,8 @@ class Rollouter(Configurable):
         `BaseRolloutWorker` subclass by config type; one worker is built per pool process."""
 
         rollouts_per_worker: int = 128
-        """Training rollouts in flight per rollout worker process.
-        It sets the pool size, rounded up: 300 training rollouts in flight / 128 per worker -> 3 workers.
+        """Concurrent training rollouts per rollout worker process.
+        It sets the pool size, rounded up: 300 concurrent training rollouts / 128 per worker -> 3 workers.
 
         Higher starts fewer processes (~0.8 GiB of private memory each after setup), and more
         rollouts share each worker's event loop. Too high shows in

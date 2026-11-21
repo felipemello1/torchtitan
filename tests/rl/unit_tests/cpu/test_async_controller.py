@@ -18,7 +18,11 @@ from unittest.mock import AsyncMock, Mock, patch
 import numpy as np
 import pytest
 import torch
-from torchtitan.rl.controller.controller import Controller, ValidationConfig
+from torchtitan.rl.controller.controller import (
+    AsyncLoopConfig,
+    Controller,
+    ValidationConfig,
+)
 from torchtitan.rl.controller.metrics import (
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
@@ -65,17 +69,23 @@ def test_controller_config_maybe_log(tmp_path, caplog) -> None:
 
 
 def _controller_config_with_groups(
-    *, num_groups: int, group_size: int, rollouts_per_worker: int = 128
+    *,
+    num_groups: int,
+    group_size: int,
+    rollouts_per_worker: int = 128,
+    target_offpolicy_steps: int = 0,
+    max_concurrent_rollout_groups: int | None = None,
 ) -> Controller.Config:
-    """A CI recipe with `num_groups` training groups of `group_size` in flight."""
+    """A CI recipe with `(target_offpolicy_steps + 1) * num_groups` active slots of `group_size` rollouts."""
     from torchtitan_recipes.tests.rl.alphabet_sort import rl_grpo_qwen3_5_debug_varlen
 
     config = rl_grpo_qwen3_5_debug_varlen(seq_len=128)
     async_loop = dataclasses.replace(
         config.async_loop,
-        target_offpolicy_steps=0,
+        target_offpolicy_steps=target_offpolicy_steps,
         num_prompts_per_train_step=num_groups,
         num_samples_per_prompt=group_size,
+        max_concurrent_rollout_groups=max_concurrent_rollout_groups,
     )
     rollouter = dataclasses.replace(
         config.rollouter, rollouts_per_worker=rollouts_per_worker
@@ -90,6 +100,38 @@ def test_num_rollout_workers_rounds_up_training_rollouts_over_rollouts_per_worke
     # 20 groups of 16: 320 rollouts in flight / 128 per worker = 2.5
     config = _controller_config_with_groups(num_groups=20, group_size=16)
     assert config.num_rollout_workers == 3
+
+
+@pytest.mark.parametrize(
+    "max_concurrent_rollout_groups, expected_workers",
+    [
+        # 180 active slots x 16 = 2,880 rollouts / 128 per worker = 22.5
+        (None, 23),
+        # 8 concurrent groups x 16 = 128 rollouts / 128 per worker = 1
+        (8, 1),
+    ],
+)
+def test_num_rollout_workers_counts_only_the_concurrent_groups(
+    max_concurrent_rollout_groups, expected_workers
+) -> None:
+    # S = 8, P = 20: 180 active slots
+    config = _controller_config_with_groups(
+        num_groups=20,
+        group_size=16,
+        target_offpolicy_steps=8,
+        max_concurrent_rollout_groups=max_concurrent_rollout_groups,
+    )
+    assert config.num_rollout_workers == expected_workers
+
+
+def test_a_concurrent_group_cap_above_the_active_slots_raises() -> None:
+    # S = 8, P = 32: 288 active slots
+    with pytest.raises(ValueError, match=r"\[1, \(S \+ 1\) \* P = 288\], got 289"):
+        AsyncLoopConfig(
+            num_prompts_per_train_step=32,
+            target_offpolicy_steps=8,
+            max_concurrent_rollout_groups=289,
+        )
 
 
 # rollouts_per_worker=0 must raise this ValueError too: `num_rollout_workers` divides by it.
@@ -896,16 +938,20 @@ def _run_with_generator_watcher(
     watcher,
     *,
     trainer_loop=_block_forever,
+    rollout_loop=_block_forever,
     validate=None,
     validation=None,
     on_close=None,
+    max_active_rollout_groups=1,
+    num_concurrent_rollout_groups=1,
 ) -> Controller:
     """Run Controller.run with stub loops: `watcher` waits on the engine loops, `trainer_loop` trains, the rest block."""
     controller = object.__new__(Controller)
     controller.config = SimpleNamespace(
         async_loop=SimpleNamespace(
             num_training_steps=1,
-            max_active_rollout_groups=1,
+            max_active_rollout_groups=max_active_rollout_groups,
+            num_concurrent_rollout_groups=num_concurrent_rollout_groups,
             window_size=None,
             target_offpolicy_steps=0,
             windowed_fifo_batches=None,
@@ -939,13 +985,35 @@ def _run_with_generator_watcher(
             validate=validate or AsyncMock(return_value=[]),
             _make_generate_fn=lambda self: None,
             _data_input_loop=_block_forever,
-            _rollout_loop=_block_forever,
+            _rollout_loop=rollout_loop,
             _batcher_loop=_block_forever,
             _trainer_loop=trainer_loop,
         ),
     ):
         asyncio.run(asyncio.wait_for(controller.run(), timeout=10))
     return controller
+
+
+def test_run_starts_one_rollout_loop_per_concurrent_group() -> None:
+    # 18 active slots (S = 8, P = 2), 3 of them may roll out at once
+    started_loops = []
+
+    async def rollout_loop(self, **kwargs) -> None:
+        started_loops.append(asyncio.current_task().get_name())
+        await asyncio.Event().wait()
+
+    _run_with_generator_watcher(
+        _block_forever,
+        trainer_loop=_train_one_step,
+        rollout_loop=rollout_loop,
+        max_active_rollout_groups=18,
+        num_concurrent_rollout_groups=3,
+    )
+    assert sorted(started_loops) == [
+        "rollout_loop_0",
+        "rollout_loop_1",
+        "rollout_loop_2",
+    ]
 
 
 def test_run_fails_when_an_engine_loop_crashes() -> None:
