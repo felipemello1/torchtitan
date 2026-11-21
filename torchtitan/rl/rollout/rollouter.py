@@ -172,6 +172,10 @@ class Rollouter(Configurable):
         ]
         self._curriculum.update(step=self._step, summaries=summaries)
 
+    def curriculum_metrics(self) -> list[m.Metric]:
+        """The curriculum's metrics after its last update, logged with the train step."""
+        return self._curriculum.metrics()
+
     def get_validation_samples(self, steps: int) -> list[object]:
         """Materialize one fresh validation pass, optionally bounded by steps."""
         validation_data = self._config.validation_dataset.build()

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.curriculum import Curriculum
 
@@ -72,6 +73,9 @@ class _RecordingCurriculum(Curriculum):
     def update(self, *, step, summaries):
         self.updates.append((step, summaries))
         self.level += 1
+
+    def metrics(self):
+        return [m.Metric("curriculum/level", m.NoReduce(float(self.level)))]
 
     def state_dict(self):
         return {"level": self.level}
@@ -198,6 +202,15 @@ def test_commit_hands_update_each_summary_once() -> None:
         assert rollouter._summaries == {}
 
     asyncio.run(run())
+
+
+def test_curriculum_metrics_follow_the_last_update() -> None:
+    assert _rollouter().curriculum_metrics() == []
+
+    rollouter = _rollouter(curriculum=_RecordingCurriculum.Config())
+    rollouter.commit_training_sample_ids([])
+    [metric] = rollouter.curriculum_metrics()
+    assert (metric.key, metric.value.value) == ("curriculum/level", 1.0)
 
 
 def test_state_round_trip() -> None:
