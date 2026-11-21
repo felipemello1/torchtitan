@@ -1103,6 +1103,7 @@ def test_a_rollout_with_no_turn_never_trains_and_each_failure_is_logged(
         is_truncated=False,
         is_timeout=False,
         stop_condition="agent_completed",
+        metrics={},
         errors=[],
         last_error=None,
         timing=SimpleNamespace(
@@ -1390,6 +1391,7 @@ def test_timed_out_rollout_is_logged_and_keeps_no_reward(caplog) -> None:
         is_truncated=False,
         stop_condition="agent_timeout",
         reward=1.0,
+        metrics={},
         errors=[],
         timing=SimpleNamespace(
             setup=span,
@@ -1437,9 +1439,83 @@ def test_timed_out_rollout_is_logged_and_keeps_no_reward(caplog) -> None:
     assert VERIFIERS_REWARD_KEY not in rollout.turns[-1].env_rewards
 
 
+def test_env_metrics_reach_the_last_turn_under_verifiers_env() -> None:
+    from verifiers.v1.types import AssistantMessage as VerifiersAssistantMessage
+
+    node = SimpleNamespace(
+        token_ids=[10, 11],
+        mask=[False, True],
+        sampled=True,
+        message=VerifiersAssistantMessage(content="answer"),
+    )
+    span = SimpleNamespace(duration=0.0)
+    trace = SimpleNamespace(
+        id="trace",
+        task=SimpleNamespace(key="task"),
+        agent=SimpleNamespace(trainable=True),
+        ok=True,
+        is_timeout=False,
+        is_truncated=False,
+        stop_condition="agent_completed",
+        reward=1.0,
+        # A metric function that never ran stays None.
+        metrics={"resolved": 1.0, "parsed_tests": 73.0, "f2p_fraction": None},
+        errors=[],
+        timing=SimpleNamespace(
+            setup=span,
+            agent=SimpleNamespace(duration=0.0, model=span, harness=span),
+            scoring=span,
+        ),
+        calls=[],
+        num_turns=1,
+        nodes=[node],
+        branches=[
+            SimpleNamespace(
+                nodes=[node], token_ids=[10, 11], logprobs=[0.0, -0.1], trainable=True
+            )
+        ],
+    )
+    worker = object.__new__(VerifiersRolloutWorker)
+    worker._generation_server = SimpleNamespace(
+        model_id="model",
+        pop_generation_metadata=lambda trace_id: VerifiersGenerationMetadata(
+            min_policy_version=0, max_policy_version=0, metrics=[]
+        ),
+    )
+    worker._verifiers_env_client = SimpleNamespace(
+        run=AsyncMock(
+            return_value=SimpleNamespace(
+                ok=True, is_timeout=False, errors=[], traces=[trace]
+            )
+        )
+    )
+    worker._verifiers_train_client_config = object()
+
+    rollout = asyncio.run(
+        worker._run_single_rollout(
+            release_session_fn=AsyncMock(),
+            sample=VerifiersTaskSample(verifiers_task_data={"name": "task"}),
+            sampling=SamplingConfig(),
+            group_id=1,
+            rollout_id=2,
+        )
+    )
+
+    env_metrics = {
+        metric.key: metric.value.value
+        for metric in rollout.turns[-1].metrics
+        if metric.key.startswith("verifiers/env/")
+    }
+    assert env_metrics == {
+        "verifiers/env/resolved": 1.0,
+        "verifiers/env/parsed_tests": 73.0,
+    }
+
+
 # TODO: share one fake trace and rollouter between this test,
-# test_rollout_whose_first_prompt_does_not_fit_is_flagged and
-# test_timed_out_rollout_is_logged_and_keeps_no_reward.
+# test_rollout_whose_first_prompt_does_not_fit_is_flagged,
+# test_timed_out_rollout_is_logged_and_keeps_no_reward and
+# test_env_metrics_reach_the_last_turn_under_verifiers_env.
 def test_rollout_releases_every_trace_session_even_if_one_release_fails(caplog) -> None:
     """Each trace generated under its own id; another agent's trace has one too."""
     span = SimpleNamespace(duration=0.0)
