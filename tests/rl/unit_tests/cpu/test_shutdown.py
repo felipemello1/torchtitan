@@ -518,6 +518,7 @@ def test_monarch_actor_system_provisions_every_role_before_spawning(monkeypatch)
             trainer_parallelism=ParallelismConfig(data_parallel_shard_degree=2),
             generator_parallelism=InferenceParallelismConfig(tensor_parallel_degree=2),
             num_generators=2,
+            generator_env={},
         )
     )
 

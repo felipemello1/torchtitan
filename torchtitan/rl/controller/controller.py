@@ -846,6 +846,7 @@ class Controller(Configurable):
                 trainer_parallelism=config.trainer.parallelism,
                 generator_parallelism=config.generator.parallelism,
                 num_generators=config.num_generators,
+                generator_env=config.generator.engine.process_env,
             )
             self.trainer = await actor_system.spawn_trainer(
                 config.trainer,

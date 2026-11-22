@@ -72,6 +72,12 @@ class GenerationEngine(Configurable, abc.ABC):
             starts its master and builds the engines with its address."""
             return False
 
+        @property
+        def process_env(self) -> dict[str, str]:
+            """Environment variables the generator processes start with, on top of the
+            job's (e.g. allocator settings that must be set before CUDA starts)."""
+            return {}
+
     @property
     @abc.abstractmethod
     def data_parallel_size(self) -> int:

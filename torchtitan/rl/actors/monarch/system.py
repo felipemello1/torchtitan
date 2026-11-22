@@ -91,12 +91,14 @@ class MonarchActorSystem(ActorSystem):
         trainer_parallelism: ParallelismConfig,
         generator_parallelism: InferenceParallelismConfig,
         num_generators: int,
+        generator_env: dict[str, str],
     ) -> None:
         self._trainer_mesh, self._generator_meshes = spawn_proc_mesh(
             compute_trainer_world_size(trainer_parallelism),
             compute_generator_world_size(generator_parallelism),
             host_meshes=self._host_meshes,
             num_generators=num_generators,
+            generator_env=generator_env,
         )
         # One process, so the router is a singleton and every caller reaches
         # it with `call_one`. It gets its own mesh rather than sharing the
