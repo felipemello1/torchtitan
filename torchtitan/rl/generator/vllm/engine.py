@@ -206,7 +206,18 @@ class VLLMEngine(GenerationEngine):
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
             }
 
-        def __post_init__(self):
+        def __post_init__(self) -> None:
+            GenerationEngine.Config.__post_init__(self)
+            if self.num_speculative_tokens < 0:
+                raise ValueError(
+                    f"num_speculative_tokens must be >= 0, got {self.num_speculative_tokens}"
+                )
+            if self.num_speculative_tokens > 0 and self.cuda_graph.mode == "FULL":
+                raise ValueError(
+                    f"num_speculative_tokens={self.num_speculative_tokens} needs "
+                    'cuda_graph.mode="FULL_DECODE_ONLY" or "NONE": with drafts, vLLM\'s GDN '
+                    "metadata builder supports CUDA graphs for decode steps only"
+                )
             if self.kv_transfer_config is None:
                 return
             # TODO(acisseJZhong): support prefill/decode disaggregation connectors
@@ -266,19 +277,6 @@ class VLLMEngine(GenerationEngine):
           default for drafts (see `_build_engine_args`).
         - Not supported with `cuda_graph.mode="FULL"` (use FULL_DECODE_ONLY),
           `debug.batch_invariant` or models with a vision encoder."""
-
-        def __post_init__(self) -> None:
-            GenerationEngine.Config.__post_init__(self)
-            if self.num_speculative_tokens < 0:
-                raise ValueError(
-                    f"num_speculative_tokens must be >= 0, got {self.num_speculative_tokens}"
-                )
-            if self.num_speculative_tokens > 0 and self.cuda_graph.mode == "FULL":
-                raise ValueError(
-                    f"num_speculative_tokens={self.num_speculative_tokens} needs "
-                    'cuda_graph.mode="FULL_DECODE_ONLY" or "NONE": with drafts, vLLM\'s GDN '
-                    "metadata builder supports CUDA graphs for decode steps only"
-                )
 
     def __init__(
         self,
