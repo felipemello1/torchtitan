@@ -98,8 +98,9 @@ class Rollouter(Configurable):
             train step): set `curriculum`; see `Curriculum`.
           - Group execution, coarse: override `_run_group_rollouts` for your own
             orchestration. The worker then becomes optional -- but override
-            `setup_async` too, or the worker pool is still spawned unused, and
-            `cancel_group`: the base one stops the group on its rollout worker.
+            `setup_async` too, or the worker pool is still spawned unused.
+            Override `cancel_group` too: the base one stops the group on its
+            rollout worker.
           - Group execution, fine: keep the stock orchestration and point `worker`
             at a `MessageEnvRolloutWorker.Config` subclass, overriding only what you need
             (`make_env_group`, `score_group`, `run_group`). A worker whose env isn't a
@@ -326,7 +327,9 @@ class Rollouter(Configurable):
             raise RuntimeError("rollout worker pool is not initialized")
 
         # `choose` (see ActorSystem's call convention) sends the call to the `run_group`
-        # endpoint of one worker in the pool.
+        # endpoint of one worker in the pool, when called.
+        # Keep this send before the first await of `run_group_rollouts`: a buffer cancel that lands earlier then stops
+        # the task before the send, so `cancel_group` finds every group that was sent.
         call = asyncio.ensure_future(
             self._worker_actors.run_group.choose(
                 generate_fn=generate_fn,

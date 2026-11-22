@@ -63,8 +63,9 @@ class RolloutGroupWork:
     """Task generating this group, set by `track_generation`, so a buffer can cancel it."""
     cancelled: bool = field(default=False, init=False)
     """Set when the buffer cancelled this group's generation (the adaptive buffer, once the group is too old to
-    ever train); its slot stays charged until its `run_group` has ended on its rollout worker (the env server may
-    still be tearing down its episodes), then the rollout loop releases it."""
+    ever train); its slot stays charged until its `run_group` has ended on its rollout worker, or until
+    `Rollouter.cancel_group` gave up after an error or its timeout. Then the rollout loop releases it; the env server
+    may still be tearing down its episodes."""
     # TODO(async-rl): emit JSON lifecycle logging per RolloutGroupWork keyed by group_id:
     # admitted/claimed/finalized/batched/trained/dropped timestamps + policy version at admission and
     # at trainer consumption, for faithful end-to-end visibility.
@@ -203,7 +204,8 @@ class RolloutGroupWorkBuffer(Configurable):
     async def release_cancelled(self, group_id: int) -> None:
         """Rollout loop: free the slot of a group the buffer cancelled, once its `run_group` ended on its worker.
 
-        The env server may still be tearing down the group's episodes.
+        Also called when `Rollouter.cancel_group` gave up after an error or its timeout. The env server may still be
+        tearing down the group's episodes.
 
         Example:
             # the adaptive buffer cancelled g0 (too old); g0's rollout loop sees CancelledError
@@ -370,10 +372,10 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
        claimed is dropped (slot released at once, prompt not retried); with `max_offpolicy_steps=None` nothing is
        dropped. A group still generating is cancelled as soon as the batch being assembled makes it that old, since
        it can never train; it counts as a dropped group at once, and its slot is released once its `run_group` has
-       ended on its rollout worker (the env server may still be tearing down its episodes). The mean age is held
-       under `target_offpolicy_steps` if set, else under `max_offpolicy_steps` if set, by the demand ceiling, at the
-       price of stalls when the workload needs more groups than the ceiling allows. With neither, the demand follows
-       the workload alone.
+       ended on its rollout worker, or once `Rollouter.cancel_group` gave up after an error or its timeout (the env
+       server may still be tearing down its episodes). The mean age is held under `target_offpolicy_steps` if set,
+       else under `max_offpolicy_steps` if set, by the demand ceiling, at the price of stalls when the workload needs
+       more groups than the ceiling allows. With neither, the demand follows the workload alone.
 
     Example:
         buffer = AdaptiveRolloutGroupWorkBuffer.Config(max_offpolicy_steps=10).build(
@@ -554,9 +556,10 @@ class AdaptiveRolloutGroupWorkBuffer(RolloutGroupWorkBuffer):
         """Cancel every claimed group already past `max_offpolicy_steps` for the batch being assembled.
 
         Batches train in version order and age only grows, so such a group would be dropped when it finalized:
-        cancel its generation task now (which stops its rollouts) instead of waiting for its slowest rollout. It
-        counts as a completed, dropped group, as a finalized too-old drop does; its slot stays charged until its
-        `run_group` has ended on its rollout worker (`release_cancelled`). Caller holds the condition.
+        cancel its generation task now instead of waiting for its slowest rollout; the rollout loop then stops the
+        group on its worker (`Rollouter.cancel_group`). It counts as a completed, dropped group, as a finalized
+        too-old drop does; its slot stays charged until the rollout loop calls `release_cancelled`. Caller holds the
+        condition.
         """
         for work in self._work_by_group_id.values():
             if (

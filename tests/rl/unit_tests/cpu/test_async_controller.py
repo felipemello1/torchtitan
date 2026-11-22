@@ -1667,7 +1667,7 @@ def test_adaptive_buffer_cancels_claimed_groups_past_max_offpolicy_steps() -> No
         assert metrics["rollout_buffer/dropped_too_old"] == 0
         # Counted as dropped at once: the dataloader commits it at the next optimizer step
         assert buffer.pop_dropped_group_ids() == [0]
-        # Its slot stays charged until its rollouts stopped and the rollout loop releases it
+        # Its slot stays charged until the rollout loop has stopped it on its worker and releases it
         assert metrics["rollout_buffer/num_groups_claimed"] == 1
         available = metrics["rollout_buffer/available_active_slots"]
         await buffer.release_cancelled(0)

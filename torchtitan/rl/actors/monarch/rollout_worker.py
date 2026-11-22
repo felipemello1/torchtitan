@@ -98,10 +98,6 @@ class RolloutWorkerActor(Actor):
         Monarch starts one sender's concurrent calls in order, so a `run_group` sent before this call is found.
         The cancelled `run_group` call fails with an `ActorError` at its caller.
         """
-        # TODO: a cancel that reaches this worker before the group's `run_group` does nothing, and the group runs
-        # to its end. The buffer cancels only groups past `max_offpolicy_steps` (a fresh claim is ~3 versions
-        # behind at most), so it needs max < 3. Fix: remember cancelled ids and have `run_group` return at once
-        # for one, or require `max_offpolicy_steps >= 3`.
         task = self._group_tasks.get(group_id)
         if task is not None:
             task.cancel()
