@@ -413,17 +413,19 @@ def test_shutdown_continues_after_generator_close_failure(tmp_path):
 
 
 class _FakeHostMesh:
-    """Records the visible devices of each proc mesh spawned on it."""
+    """Records the visible devices and allocator setting of each proc mesh spawned on it."""
 
     def __init__(self, num_hosts=1):
         self.num_hosts = num_hosts
         self.visible_devices = []
+        self.allocator_confs = []
 
     def __len__(self):
         return self.num_hosts
 
     def spawn_procs(self, *, per_host, bootstrap, bootstrap_command):
         self.visible_devices.append(bootstrap_command[get_visible_devices_env_var()])
+        self.allocator_confs.append(bootstrap_command.get("PYTORCH_ALLOC_CONF"))
 
 
 @pytest.fixture
@@ -439,7 +441,8 @@ def bootstrap_cmd_returns_env(monkeypatch):
 def test_spawn_proc_mesh_gives_roles_sharing_a_host_mesh_disjoint_gpus(
     bootstrap_cmd_returns_env,
 ):
-    """Roles on one host mesh get disjoint GPUs; another host mesh starts at GPU 0."""
+    """Roles on one host mesh get disjoint GPUs; another host mesh starts at GPU 0. Only the
+    generators get `generator_env`."""
     mesh_a, mesh_b = _FakeHostMesh(), _FakeHostMesh()
 
     provisioning.spawn_proc_mesh(
@@ -451,10 +454,14 @@ def test_spawn_proc_mesh_gives_roles_sharing_a_host_mesh_disjoint_gpus(
             gpus_per_node=4,
         ),
         num_generators=6,
+        generator_env={"PYTORCH_ALLOC_CONF": "expandable_segments:False"},
     )
 
     assert mesh_a.visible_devices == ["0,1", "2", "3"]
     assert mesh_b.visible_devices == ["0", "1", "2", "3"]
+    off = "expandable_segments:False"
+    assert mesh_a.allocator_confs == [None, off, off]
+    assert mesh_b.allocator_confs == [off] * 4
 
 
 @pytest.mark.parametrize(
@@ -480,6 +487,7 @@ def test_spawn_proc_mesh_checks_gpus_per_host_before_spawning(
                 gpus_per_node=4,
             ),
             num_generators=len(layout),
+            generator_env={},
         )
 
     assert all(mesh.visible_devices == [] for mesh in meshes.values())
